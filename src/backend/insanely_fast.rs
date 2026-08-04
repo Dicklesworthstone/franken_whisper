@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::backend::{extract_segments_from_json, transcript_from_segments};
 use crate::error::{FwError, FwResult};
-use crate::model::{BackendKind, TranscribeRequest, TranscriptionResult};
+use crate::model::{BackendKind, SpeakerCountRequest, TranscribeRequest, TranscriptionResult};
 use crate::process::{command_exists, run_command_cancellable, run_command_with_timeout};
 
 const DEFAULT_BIN: &str = "insanely-fast-whisper";
@@ -25,6 +25,7 @@ pub fn run(
     token: Option<&crate::orchestrator::CancellationToken>,
 ) -> FwResult<TranscriptionResult> {
     let binary = binary();
+    validate_external_speaker_count(request)?;
     let output_path = output_path_for(request, work_dir);
     if let Some(parent) = output_path.parent()
         && !parent.as_os_str().is_empty()
@@ -64,6 +65,7 @@ pub fn run(
         language,
         segments,
         acceleration: None,
+        diarization: None,
         raw_output: raw,
         artifact_paths: vec![output_path.display().to_string()],
     })
@@ -124,21 +126,20 @@ fn build_args(
         );
     }
 
-    // Phase 3: speaker count constraints (diarization).
     if request.diarize
-        && let Some(sc) = &bp.speaker_constraints
+        && let Some(count_request) = bp
+            .acoustic_diarization
+            .as_ref()
+            .map(|request| &request.speaker_count)
     {
-        if let Some(n) = sc.num_speakers {
-            args.push("--num-speakers".to_owned());
-            args.push(n.to_string());
-        }
-        if let Some(n) = sc.min_speakers {
-            args.push("--min-speakers".to_owned());
-            args.push(n.to_string());
-        }
-        if let Some(n) = sc.max_speakers {
-            args.push("--max-speakers".to_owned());
-            args.push(n.to_string());
+        match count_request {
+            SpeakerCountRequest::HardConstraint { count } => {
+                args.push("--num-speakers".to_owned());
+                args.push(count.to_string());
+            }
+            SpeakerCountRequest::Infer
+            | SpeakerCountRequest::Prior { .. }
+            | SpeakerCountRequest::Range { .. } => {}
         }
     }
 
@@ -185,6 +186,31 @@ fn build_args(
     }
 
     args
+}
+
+fn validate_external_speaker_count(request: &TranscribeRequest) -> FwResult<()> {
+    if request.diarize
+        && request
+            .backend_params
+            .acoustic_diarization
+            .as_ref()
+            .is_some_and(|diarization| {
+                matches!(
+                    &diarization.speaker_count,
+                    SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+                ) && matches!(
+                    diarization.engine,
+                    crate::model::DiarizationEngine::External
+                        | crate::model::DiarizationEngine::Neural
+                )
+            })
+    {
+        return Err(FwError::InvalidRequest(
+            "insanely-fast-whisper cannot faithfully execute a soft speaker-count prior or range"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn binary() -> String {
@@ -235,8 +261,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::model::{
-        BackendKind, BackendParams, DeviceMapStrategy, DiarizationConfig, InputSource,
-        InsanelyFastTuningParams, TranscribeRequest,
+        BackendKind, BackendParams, DeviceMapStrategy, DiarizationConfig, DiarizationRequest,
+        InputSource, InsanelyFastTuningParams, SpeakerCountRequest, TranscribeRequest,
     };
 
     use super::{build_args, output_path_for};
@@ -290,6 +316,13 @@ mod tests {
 
     fn has_flag(args: &[String], flag: &str) -> bool {
         args.iter().any(|a| a == flag)
+    }
+
+    fn set_speaker_count(request: &mut TranscribeRequest, speaker_count: SpeakerCountRequest) {
+        request.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            speaker_count,
+            ..DiarizationRequest::default()
+        });
     }
 
     #[test]
@@ -362,14 +395,12 @@ mod tests {
     }
 
     #[test]
-    fn speaker_constraints_only_when_diarize() {
-        use crate::model::SpeakerConstraints;
+    fn hard_speaker_count_only_when_diarize() {
         let mut request = minimal_request();
-        request.backend_params.speaker_constraints = Some(SpeakerConstraints {
-            num_speakers: Some(3),
-            min_speakers: Some(1),
-            max_speakers: Some(5),
-        });
+        set_speaker_count(
+            &mut request,
+            SpeakerCountRequest::HardConstraint { count: 3 },
+        );
 
         // diarize = false → no speaker constraint flags
         let args = build_args(&request, &PathBuf::from("n.wav"), &PathBuf::from("o.json"));
@@ -379,8 +410,8 @@ mod tests {
         request.diarize = true;
         let args = build_args(&request, &PathBuf::from("n.wav"), &PathBuf::from("o.json"));
         assert_eq!(arg_value(&args, "--num-speakers"), Some("3"));
-        assert_eq!(arg_value(&args, "--min-speakers"), Some("1"));
-        assert_eq!(arg_value(&args, "--max-speakers"), Some("5"));
+        assert!(!has_flag(&args, "--min-speakers"));
+        assert!(!has_flag(&args, "--max-speakers"));
     }
 
     #[test]
@@ -459,19 +490,46 @@ mod tests {
     }
 
     #[test]
-    fn partial_speaker_constraints_only_emits_set_fields() {
-        use crate::model::SpeakerConstraints;
+    fn soft_speaker_count_range_is_not_reinterpreted_as_hard_backend_bounds() {
         let mut request = minimal_request();
         request.diarize = true;
-        request.backend_params.speaker_constraints = Some(SpeakerConstraints {
-            num_speakers: None,
-            min_speakers: Some(2),
-            max_speakers: None,
-        });
+        set_speaker_count(
+            &mut request,
+            SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 64,
+            },
+        );
         let args = build_args(&request, &PathBuf::from("n.wav"), &PathBuf::from("o.json"));
         assert!(!has_flag(&args, "--num-speakers"));
-        assert_eq!(arg_value(&args, "--min-speakers"), Some("2"));
+        assert!(!has_flag(&args, "--min-speakers"));
         assert!(!has_flag(&args, "--max-speakers"));
+        super::validate_external_speaker_count(&request)
+            .expect("native acoustic overlay owns the soft range");
+    }
+
+    #[test]
+    fn calibrated_speaker_count_prior_is_rejected_before_subprocess_execution() {
+        let mut request = minimal_request();
+        request.diarize = true;
+        set_speaker_count(
+            &mut request,
+            SpeakerCountRequest::Prior {
+                bins: vec![crate::model::SpeakerCountPriorMass {
+                    count: 2,
+                    probability: 1.0,
+                }],
+            },
+        );
+        request
+            .backend_params
+            .acoustic_diarization
+            .as_mut()
+            .expect("diarization request")
+            .engine = crate::model::DiarizationEngine::External;
+        let error = super::validate_external_speaker_count(&request)
+            .expect_err("external backend cannot silently approximate a count prior");
+        assert!(error.to_string().contains("cannot faithfully execute"));
     }
 
     #[test]
@@ -484,7 +542,7 @@ mod tests {
 
     #[test]
     fn all_params_combined() {
-        use crate::model::{SpeakerConstraints, TimestampLevel};
+        use crate::model::TimestampLevel;
         let mut request = minimal_request();
         request.model = Some("openai/whisper-large-v3-turbo".to_owned());
         request.language = Some("ja".to_owned());
@@ -494,11 +552,10 @@ mod tests {
         request.backend_params.timestamp_level = Some(TimestampLevel::Word);
         request.backend_params.gpu_device = Some("cuda:1".to_owned());
         request.backend_params.flash_attention = Some(true);
-        request.backend_params.speaker_constraints = Some(SpeakerConstraints {
-            num_speakers: Some(4),
-            min_speakers: Some(2),
-            max_speakers: Some(6),
-        });
+        set_speaker_count(
+            &mut request,
+            SpeakerCountRequest::HardConstraint { count: 4 },
+        );
 
         let args = build_args(
             &request,
@@ -517,8 +574,8 @@ mod tests {
         assert_eq!(arg_value(&args, "--device-id"), Some("cuda:1"));
         assert_eq!(arg_value(&args, "--flash"), Some("True"));
         assert_eq!(arg_value(&args, "--num-speakers"), Some("4"));
-        assert_eq!(arg_value(&args, "--min-speakers"), Some("2"));
-        assert_eq!(arg_value(&args, "--max-speakers"), Some("6"));
+        assert!(!has_flag(&args, "--min-speakers"));
+        assert!(!has_flag(&args, "--max-speakers"));
     }
 
     #[test]
@@ -540,15 +597,13 @@ mod tests {
     }
 
     #[test]
-    fn speaker_constraints_without_diarize_omitted() {
-        use crate::model::SpeakerConstraints;
+    fn speaker_count_without_diarize_is_omitted() {
         let mut request = minimal_request();
         request.diarize = false;
-        request.backend_params.speaker_constraints = Some(SpeakerConstraints {
-            num_speakers: Some(5),
-            min_speakers: Some(1),
-            max_speakers: Some(10),
-        });
+        set_speaker_count(
+            &mut request,
+            SpeakerCountRequest::HardConstraint { count: 5 },
+        );
         let args = build_args(&request, &PathBuf::from("n.wav"), &PathBuf::from("o.json"));
         assert!(!has_flag(&args, "--num-speakers"));
         assert!(!has_flag(&args, "--min-speakers"));
@@ -585,15 +640,10 @@ mod tests {
     }
 
     #[test]
-    fn speaker_constraints_all_none_omits_all_speaker_flags() {
-        use crate::model::SpeakerConstraints;
+    fn inferred_speaker_count_omits_all_speaker_flags() {
         let mut request = minimal_request();
         request.diarize = true;
-        request.backend_params.speaker_constraints = Some(SpeakerConstraints {
-            num_speakers: None,
-            min_speakers: None,
-            max_speakers: None,
-        });
+        set_speaker_count(&mut request, SpeakerCountRequest::Infer);
         let args = build_args(&request, &PathBuf::from("n.wav"), &PathBuf::from("o.json"));
         assert!(!has_flag(&args, "--num-speakers"));
         assert!(!has_flag(&args, "--min-speakers"));

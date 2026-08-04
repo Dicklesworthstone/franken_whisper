@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use clap::ValueEnum;
@@ -51,11 +52,37 @@ pub struct VadParams {
     pub samples_overlap: Option<f32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SpeakerConstraints {
-    pub num_speakers: Option<u32>,
-    pub min_speakers: Option<u32>,
-    pub max_speakers: Option<u32>,
+/// One point in an explicitly supplied speaker-count prior.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerCountPriorMass {
+    pub count: u32,
+    pub probability: f64,
+}
+
+/// Typed speaker-count semantics at the common request boundary.
+///
+/// A hard count restricts candidate model search; it never forces assignments
+/// or removes UNKNOWN. `Prior` contributes soft log evidence over its declared
+/// bins; acoustic evidence may select outside that support or remain
+/// unresolved. An engine that cannot preserve these semantics must reject the
+/// request instead of silently approximating it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SpeakerCountRequest {
+    #[default]
+    Infer,
+    Prior {
+        bins: Vec<SpeakerCountPriorMass>,
+    },
+    /// Soft preference over an inclusive interval; evidence may select
+    /// outside the interval or remain unresolved.
+    Range {
+        minimum: u32,
+        maximum: u32,
+    },
+    HardConstraint {
+        count: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -65,6 +92,885 @@ pub struct DiarizationConfig {
     pub suppress_numerals: bool,
     pub device: Option<String>,
     pub batch_size: Option<u32>,
+}
+
+/// Speaker-diarization implementation selected by a library or CLI request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationEngine {
+    /// Select the best admitted implementation, preferring the native acoustic
+    /// engine when its input and evidence requirements are satisfied.
+    Auto,
+    /// Rust-native, waveform-only acoustic diarization.
+    Acoustic,
+    /// User-installed subprocess backend.
+    External,
+    /// Optional in-process neural speaker-embedding engine.
+    Neural,
+}
+
+/// Evidence-gated rollout stage for `auto` acoustic diarization.
+///
+/// Explicit `DiarizationEngine::Acoustic` requests are not changed by this
+/// stage; the gate controls only whether `auto` may select the acoustic engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AcousticDiarizationRolloutStage {
+    /// Acoustic output is not user-visible and cannot satisfy an `auto`
+    /// request. Focused development evidence may still be collected directly.
+    #[default]
+    Shadow,
+    /// The implementation contract is validated, but `auto` remains off.
+    Validated,
+    /// `auto` uses verified external output when present, then acoustic.
+    Fallback,
+    /// `auto` prefers acoustic even when external output is present.
+    Primary,
+    /// `auto` admits only acoustic; external output is not selected.
+    Sole,
+}
+
+/// Conservative action when the selected diarizer cannot make a supported
+/// assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationFallbackPolicy {
+    /// Preserve attributable hard-hint regions and emit unknown elsewhere.
+    Unknown,
+    /// Permit an admitted external backend to attempt the request.
+    External,
+    /// Fail the request with a structured error.
+    Error,
+}
+
+/// Strength assigned to a caller-provided known-speaker interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnownSpeakerPolicy {
+    /// Frames from this interval are immutable must-link evidence.
+    HardMustLink,
+    /// Frames may enroll a profile, but contradictory evidence may downweight
+    /// or reject them.
+    SoftEnrollment,
+}
+
+/// One `speaker-hints-v1` interval.
+///
+/// `speaker_ref` is an opaque identifier scoped to this run. It is not a
+/// biometric or legal identity claim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KnownSpeakerInterval {
+    pub speaker_ref: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub confidence: f64,
+    pub policy: KnownSpeakerPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+}
+
+/// Typed native diarization request (`speaker-hints-v1`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiarizationRequest {
+    pub engine: DiarizationEngine,
+    pub fallback: DiarizationFallbackPolicy,
+    pub speaker_count: SpeakerCountRequest,
+    #[serde(default)]
+    pub known_intervals: Vec<KnownSpeakerInterval>,
+    /// Samples removed from each enrollment edge to avoid boundary bleed.
+    pub enrollment_edge_guard_ms: u32,
+    /// Maximum number of global clustering prototypes.
+    pub max_prototypes: u16,
+    /// Record explicit consent for reusable-profile persistence. Default-off.
+    /// Schema v5 deliberately persists only privacy-safe summaries; raw
+    /// acoustic vectors remain excluded until a separately reviewed schema.
+    #[serde(default)]
+    pub persist_profiles: bool,
+}
+
+impl Default for DiarizationRequest {
+    fn default() -> Self {
+        Self {
+            engine: DiarizationEngine::Auto,
+            fallback: DiarizationFallbackPolicy::Unknown,
+            speaker_count: SpeakerCountRequest::Infer,
+            known_intervals: Vec::new(),
+            enrollment_edge_guard_ms: 100,
+            max_prototypes: 512,
+            persist_profiles: false,
+        }
+    }
+}
+
+/// Hard request-size limits for the bounded `speaker-hints-v1` surface.
+pub const MAX_KNOWN_SPEAKER_INTERVALS: usize = 1_024;
+pub const MAX_SPEAKER_REF_BYTES: usize = 256;
+pub const MAX_HINT_PROVENANCE_BYTES: usize = 4_096;
+pub const MAX_SPEAKER_COUNT: u32 = 64;
+
+/// Stable validation code for malformed diarization requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationValidationCode {
+    TooManyKnownIntervals,
+    EmptySpeakerRef,
+    SpeakerRefTooLong,
+    ProvenanceTooLong,
+    InvalidHintConfidence,
+    ReversedHintInterval,
+    HintOutsideAudio,
+    ContradictoryHardHints,
+    InvalidSpeakerCount,
+    InvalidPrototypeCap,
+}
+
+impl DiarizationValidationCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TooManyKnownIntervals => "diarization.too_many_known_intervals",
+            Self::EmptySpeakerRef => "diarization.empty_speaker_ref",
+            Self::SpeakerRefTooLong => "diarization.speaker_ref_too_long",
+            Self::ProvenanceTooLong => "diarization.provenance_too_long",
+            Self::InvalidHintConfidence => "diarization.invalid_hint_confidence",
+            Self::ReversedHintInterval => "diarization.reversed_hint_interval",
+            Self::HintOutsideAudio => "diarization.hint_outside_audio",
+            Self::ContradictoryHardHints => "diarization.contradictory_hard_hints",
+            Self::InvalidSpeakerCount => "diarization.invalid_speaker_count",
+            Self::InvalidPrototypeCap => "diarization.invalid_prototype_cap",
+        }
+    }
+}
+
+/// Structured validation failure suitable for robot-mode serialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiarizationValidationError {
+    pub code: DiarizationValidationCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_index: Option<usize>,
+}
+
+impl std::fmt::Display for DiarizationValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for DiarizationValidationError {}
+
+impl DiarizationRequest {
+    /// Validate speaker hints and count constraints against the canonical
+    /// normalized audio duration.
+    pub fn validate(&self, audio_duration_ms: u64) -> Result<(), DiarizationValidationError> {
+        if self.max_prototypes == 0 || self.max_prototypes > 512 {
+            return Err(DiarizationValidationError {
+                code: DiarizationValidationCode::InvalidPrototypeCap,
+                message: "max_prototypes must be within 1..=512 for acoustic-v2".to_owned(),
+                hint_index: None,
+            });
+        }
+        if self.known_intervals.len() > MAX_KNOWN_SPEAKER_INTERVALS {
+            return Err(DiarizationValidationError {
+                code: DiarizationValidationCode::TooManyKnownIntervals,
+                message: format!(
+                    "known_intervals exceeds the acoustic-v2 limit of {MAX_KNOWN_SPEAKER_INTERVALS}"
+                ),
+                hint_index: None,
+            });
+        }
+        validate_speaker_count_request(&self.speaker_count)?;
+
+        for (index, hint) in self.known_intervals.iter().enumerate() {
+            if hint.speaker_ref.trim().is_empty() {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::EmptySpeakerRef,
+                    message: "speaker_ref must not be empty".to_owned(),
+                    hint_index: Some(index),
+                });
+            }
+            if hint.speaker_ref.len() > MAX_SPEAKER_REF_BYTES {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::SpeakerRefTooLong,
+                    message: format!(
+                        "speaker_ref exceeds the {MAX_SPEAKER_REF_BYTES}-byte acoustic-v2 limit"
+                    ),
+                    hint_index: Some(index),
+                });
+            }
+            if hint
+                .provenance
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_HINT_PROVENANCE_BYTES)
+            {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::ProvenanceTooLong,
+                    message: format!(
+                        "hint provenance exceeds the {MAX_HINT_PROVENANCE_BYTES}-byte acoustic-v2 limit"
+                    ),
+                    hint_index: Some(index),
+                });
+            }
+            if !hint.confidence.is_finite() || !(0.0..=1.0).contains(&hint.confidence) {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::InvalidHintConfidence,
+                    message: "hint confidence must be finite and within [0, 1]".to_owned(),
+                    hint_index: Some(index),
+                });
+            }
+            if hint.end_ms <= hint.start_ms {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::ReversedHintInterval,
+                    message: "hint interval must satisfy start_ms < end_ms".to_owned(),
+                    hint_index: Some(index),
+                });
+            }
+            if hint.end_ms > audio_duration_ms {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::HintOutsideAudio,
+                    message: format!(
+                        "hint end_ms {} exceeds audio duration {audio_duration_ms}",
+                        hint.end_ms
+                    ),
+                    hint_index: Some(index),
+                });
+            }
+        }
+
+        for (left_index, left) in self.known_intervals.iter().enumerate() {
+            if left.policy != KnownSpeakerPolicy::HardMustLink {
+                continue;
+            }
+            for (right_index, right) in self.known_intervals.iter().enumerate().skip(left_index + 1)
+            {
+                if right.policy == KnownSpeakerPolicy::HardMustLink
+                    && left.speaker_ref != right.speaker_ref
+                    && left.start_ms < right.end_ms
+                    && right.start_ms < left.end_ms
+                {
+                    return Err(DiarizationValidationError {
+                        code: DiarizationValidationCode::ContradictoryHardHints,
+                        message: format!(
+                            "hard hints {left_index} and {right_index} overlap with different speaker_ref values"
+                        ),
+                        hint_index: Some(right_index),
+                    });
+                }
+            }
+        }
+
+        let hard_speaker_count = self
+            .known_intervals
+            .iter()
+            .filter(|hint| hint.policy == KnownSpeakerPolicy::HardMustLink)
+            .map(|hint| hint.speaker_ref.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        if hard_speaker_count > MAX_SPEAKER_COUNT as usize {
+            return Err(DiarizationValidationError {
+                code: DiarizationValidationCode::InvalidSpeakerCount,
+                message: format!(
+                    "hard speaker hints name {hard_speaker_count} distinct speakers but the \
+                     bounded speaker-count domain permits at most {MAX_SPEAKER_COUNT}"
+                ),
+                hint_index: None,
+            });
+        }
+        let constrained_maximum = match self.speaker_count {
+            SpeakerCountRequest::HardConstraint { count } => Some(count as usize),
+            SpeakerCountRequest::Infer
+            | SpeakerCountRequest::Prior { .. }
+            | SpeakerCountRequest::Range { .. } => None,
+        };
+        if let Some(maximum) = constrained_maximum
+            && maximum < hard_speaker_count
+        {
+            return Err(DiarizationValidationError {
+                code: DiarizationValidationCode::InvalidSpeakerCount,
+                message: format!(
+                    "speaker-count request permits at most {maximum} speakers but hard hints name {hard_speaker_count} distinct speakers"
+                ),
+                hint_index: None,
+            });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_speaker_count_request(
+    request: &SpeakerCountRequest,
+) -> Result<(), DiarizationValidationError> {
+    let invalid = |message: String| DiarizationValidationError {
+        code: DiarizationValidationCode::InvalidSpeakerCount,
+        message,
+        hint_index: None,
+    };
+    match request {
+        SpeakerCountRequest::Infer => Ok(()),
+        SpeakerCountRequest::HardConstraint { count } => {
+            if !(1..=MAX_SPEAKER_COUNT).contains(count) {
+                return Err(invalid(format!(
+                    "hard speaker count must be within 1..={MAX_SPEAKER_COUNT}"
+                )));
+            }
+            Ok(())
+        }
+        SpeakerCountRequest::Range { minimum, maximum } => {
+            if *minimum == 0 || minimum > maximum || *maximum > MAX_SPEAKER_COUNT {
+                return Err(invalid(format!(
+                    "speaker-count range must satisfy 1 <= minimum <= maximum <= {MAX_SPEAKER_COUNT}"
+                )));
+            }
+            Ok(())
+        }
+        SpeakerCountRequest::Prior { bins } => {
+            if bins.is_empty() {
+                return Err(invalid(
+                    "speaker-count prior must contain at least one bin".to_owned(),
+                ));
+            }
+            let mut previous_count = None;
+            let mut total = 0.0_f64;
+            for bin in bins {
+                if !(1..=MAX_SPEAKER_COUNT).contains(&bin.count) {
+                    return Err(invalid(format!(
+                        "speaker-count prior support must be within 1..={MAX_SPEAKER_COUNT}"
+                    )));
+                }
+                if previous_count.is_some_and(|previous| bin.count <= previous) {
+                    return Err(invalid(
+                        "speaker-count prior bins must be unique and strictly increasing"
+                            .to_owned(),
+                    ));
+                }
+                if !bin.probability.is_finite() || bin.probability < 0.0 {
+                    return Err(invalid(
+                        "speaker-count prior probabilities must be finite and non-negative"
+                            .to_owned(),
+                    ));
+                }
+                total += bin.probability;
+                previous_count = Some(bin.count);
+            }
+            if !total.is_finite() || (total - 1.0).abs() > 1e-9 {
+                return Err(invalid(
+                    "speaker-count prior probabilities must sum to exactly 1 within 1e-9"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Why a diarization result conservatively fell back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationFallbackStatus {
+    NotNeeded,
+    InsufficientEvidence,
+    CalibrationInvalid,
+    ResourceLimit,
+    UnsatisfiedConstraints,
+    SpeakerCountUnresolved,
+    ExternalBackend,
+}
+
+/// One acoustic speaker turn, independent of ASR segment boundaries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiarizationTurn {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_confidence: Option<f64>,
+    pub overlap_suspected: bool,
+    pub hard_hint_attributed: bool,
+}
+
+/// Why an agent may want to provide another contextual timestamp interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerAttributionQueryReason {
+    UnknownAttribution,
+    LowConfidence,
+    OverlapAmbiguity,
+}
+
+/// Content-bound, feature-value-free request for optional agent supervision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerAttributionQuery {
+    pub query_id_sha256: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub reason: SpeakerAttributionQueryReason,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_speaker_refs: Vec<String>,
+    pub suggested_policy: KnownSpeakerPolicy,
+}
+
+/// Privacy-safe quality summary for one within-run speaker profile.
+///
+/// Raw acoustic vectors and audio are intentionally absent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerProfileSummary {
+    pub speaker_ref: String,
+    pub frame_count: u64,
+    pub voiced_duration_ms: u64,
+    pub reliability: f64,
+    #[serde(default)]
+    pub voice_profile_count: u32,
+    pub channel_profile_count: u32,
+    #[serde(default)]
+    pub training_accepted_count: u32,
+    #[serde(default)]
+    pub training_downweighted_count: u32,
+    #[serde(default)]
+    pub training_quarantined_count: u32,
+    pub anchored: bool,
+    pub soft_hint_contradiction: Option<f64>,
+}
+
+/// Final, feature-value-free disposition of one known-speaker interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerHintDisposition {
+    HardAttributed,
+    Accepted,
+    PartiallyAccepted,
+    Rejected,
+    NoUsableTracklets,
+}
+
+/// Privacy-safe enrollment audit for one known-speaker interval.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerHintEvidenceSummary {
+    pub hint_index: u64,
+    pub speaker_ref: String,
+    pub policy: KnownSpeakerPolicy,
+    pub disposition: SpeakerHintDisposition,
+    pub usable_tracklet_count: u64,
+    pub accepted_tracklet_count: u64,
+    pub rejected_tracklet_count: u64,
+    pub profile_accepted_tracklet_count: u64,
+    pub profile_downweighted_tracklet_count: u64,
+    pub profile_quarantined_tracklet_count: u64,
+    pub applied_weight: f64,
+    pub contradiction_score: Option<f64>,
+}
+
+/// Why one candidate speaker was retained or rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerEvidenceReason {
+    SupportedByHardHint,
+    SupportedByIndependentRecurrence,
+    SupportedByRepeatedTracklets,
+    SupportedByExternalAttribution,
+    NoAssignedSpeech,
+    InsufficientIndependentRecurrence,
+    InsufficientVoicedFrames,
+    InsufficientAssignmentConfidence,
+    InsufficientProfileReliability,
+    MergeCompatibleWithSupportedSpeaker,
+}
+
+/// Feature-value-free occupancy and quality evidence for one speaker label.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerEvidenceSummary {
+    pub speaker_ref: String,
+    pub assigned_tracklet_count: u64,
+    pub independent_tracklet_count: u64,
+    pub recurrence_episode_count: u64,
+    pub voiced_frame_count: u64,
+    pub independent_voiced_frame_count: u64,
+    pub voiced_duration_ms: u64,
+    pub mean_assignment_confidence: f64,
+    pub profile_reliability: f64,
+    pub hard_anchored: bool,
+    pub separated_from_supported_speakers: bool,
+    pub reasons: Vec<SpeakerEvidenceReason>,
+    pub supported: bool,
+}
+
+/// Resolution state for a typed speaker-count request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerCountOutcomeStatus {
+    Resolved,
+    Satisfied,
+    Unsatisfied,
+    Unresolved,
+}
+
+/// Run-level reason attached to speaker-count resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerCountOutcomeReason {
+    EvidenceSupportedCount,
+    RequestedCountMatched,
+    RequestedCountMismatch,
+    SpeakerCountPriorFusionUnavailable,
+    SpeakerCountEvidenceUnresolved,
+    NoSupportedSpeakers,
+    DominantSpeakerShareExceeded,
+    AmbiguousSpeakerSeparation,
+    ExternalAttribution,
+}
+
+/// One normalized probability mass in a bounded speaker-count estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakerCountPosteriorBin {
+    pub count: u32,
+    pub probability: f64,
+}
+
+/// Inclusive count interval supported by the retained acoustic evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakerCountRange {
+    pub minimum: u32,
+    pub maximum: u32,
+}
+
+/// Independent evidence view contributing to speaker-count selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerCountEvidenceLane {
+    MergeRisk,
+    SparseNormalizedEigengap,
+    FeatureJackknife,
+    EffectiveOccupancy,
+    ConstraintGraph,
+    CallerPrior,
+}
+
+/// Why one count-evidence lane could not contribute authoritative evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerCountLaneUnavailableReason {
+    InsufficientPrototypes,
+    InvalidAffinity,
+    SolverDidNotConverge,
+    InsufficientIndependentReplicates,
+    InsufficientVoicedEvidence,
+    NotRequested,
+    CalibrationUnavailable,
+    ResourceLimit,
+    ContradictoryConstraints,
+}
+
+/// Privacy-safe summary of one count-evidence lane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakerCountLaneEvidence {
+    pub lane: SpeakerCountEvidenceLane,
+    pub available: bool,
+    pub proposed_count: Option<u32>,
+    pub confidence: f64,
+    pub unavailable_reason: Option<SpeakerCountLaneUnavailableReason>,
+}
+
+/// Bounded, content-free resource accounting for speaker-count inference.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakerCountResourceSummary {
+    pub prototype_count: u32,
+    pub affinity_pair_evaluations: u64,
+    pub retained_sparse_edges: u32,
+    pub estimated_peak_buffer_bytes: u64,
+    pub stability_replicates: u32,
+    pub solver_iterations: u32,
+    pub solver_sparse_matvec_terms: u64,
+    pub solver_residual: Option<f64>,
+}
+
+/// Authority attached to the fused speaker-count distribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerCountCalibrationStatus {
+    Certified,
+    DevelopmentUncertified,
+    FixedSafeUncalibrated,
+    Unavailable,
+}
+
+/// Versioned, bounded and privacy-safe speaker-count estimate.
+///
+/// `posterior` contains only concrete count bins. `unresolved_probability` is
+/// separate so weak, contradictory, out-of-domain, or resource-limited
+/// evidence cannot be normalized into fabricated certainty over a count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakerCountEstimate {
+    pub schema_version: String,
+    pub selected_count: Option<u32>,
+    pub supported_range: Option<SpeakerCountRange>,
+    pub posterior: Vec<SpeakerCountPosteriorBin>,
+    pub unresolved_probability: f64,
+    pub entropy_bits: f64,
+    pub stability: f64,
+    pub constraint_lower_bound: u32,
+    pub candidate_upper_bound: u32,
+    pub calibration_status: SpeakerCountCalibrationStatus,
+    pub calibration_sha256: String,
+    pub evidence_sha256: String,
+    pub lanes: Vec<SpeakerCountLaneEvidence>,
+    pub resources: SpeakerCountResourceSummary,
+}
+
+impl SpeakerCountEstimate {
+    /// Validate normalization, bounds, deterministic ordering and lane
+    /// availability semantics before this estimate crosses a public boundary.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != "speaker-count-estimate-v2" {
+            return Err("speaker-count estimate schema version is unsupported".to_owned());
+        }
+        if self.constraint_lower_bound == 0
+            || self.candidate_upper_bound == 0
+            || self.candidate_upper_bound > MAX_SPEAKER_COUNT
+        {
+            return Err(format!(
+                "speaker-count estimate bounds must stay within 1..={MAX_SPEAKER_COUNT}"
+            ));
+        }
+        if self.constraint_lower_bound > self.candidate_upper_bound {
+            return Err(
+                "speaker-count estimate lower bound exceeds its candidate upper bound".to_owned(),
+            );
+        }
+        if !unit_interval(self.unresolved_probability) {
+            return Err("speaker-count unresolved probability is not finite in 0..=1".to_owned());
+        }
+        if !unit_interval(self.stability) {
+            return Err("speaker-count stability is not finite in 0..=1".to_owned());
+        }
+        if !self.entropy_bits.is_finite() || self.entropy_bits < 0.0 {
+            return Err("speaker-count entropy is not finite and non-negative".to_owned());
+        }
+        if !lowercase_sha256(&self.calibration_sha256) {
+            return Err(
+                "speaker-count calibration fingerprint is not lowercase SHA-256".to_owned(),
+            );
+        }
+        if !lowercase_sha256(&self.evidence_sha256) {
+            return Err("speaker-count evidence fingerprint is not lowercase SHA-256".to_owned());
+        }
+        if self
+            .resources
+            .solver_residual
+            .is_some_and(|residual| !residual.is_finite() || residual < 0.0)
+        {
+            return Err("speaker-count solver residual is not finite and non-negative".to_owned());
+        }
+        let maximum_edges = u64::from(self.resources.prototype_count)
+            .saturating_mul(u64::from(self.resources.prototype_count.saturating_sub(1)))
+            / 2;
+        if u64::from(self.resources.retained_sparse_edges) > maximum_edges {
+            return Err(
+                "speaker-count retained sparse edges exceed the simple graph bound".to_owned(),
+            );
+        }
+        let maximum_directed_pairs = u64::from(self.resources.prototype_count)
+            .saturating_mul(u64::from(self.resources.prototype_count.saturating_sub(1)));
+        if self.resources.affinity_pair_evaluations > maximum_directed_pairs {
+            return Err(
+                "speaker-count affinity evaluations exceed the directed pair bound".to_owned(),
+            );
+        }
+        if self.resources.prototype_count == 0
+            && (self.resources.affinity_pair_evaluations != 0
+                || self.resources.retained_sparse_edges != 0
+                || self.resources.estimated_peak_buffer_bytes != 0
+                || self.resources.stability_replicates != 0
+                || self.resources.solver_iterations != 0
+                || self.resources.solver_sparse_matvec_terms != 0
+                || self.resources.solver_residual.is_some())
+        {
+            return Err(
+                "speaker-count resource accounting claims work without prototypes".to_owned(),
+            );
+        }
+
+        let mut previous_count = None;
+        let mut concrete_mass = 0.0;
+        let mut entropy_bits = entropy_term(self.unresolved_probability);
+        let mut map = None::<(f64, u32)>;
+        for bin in &self.posterior {
+            if bin.count < self.constraint_lower_bound || bin.count > self.candidate_upper_bound {
+                return Err("speaker-count posterior bin lies outside candidate bounds".to_owned());
+            }
+            if previous_count.is_some_and(|previous| bin.count <= previous) {
+                return Err(
+                    "speaker-count posterior bins are not strictly count-ordered".to_owned(),
+                );
+            }
+            if !bin.probability.is_finite() || bin.probability <= 0.0 || bin.probability > 1.0 {
+                return Err("speaker-count posterior probability is not finite in 0..=1".to_owned());
+            }
+            previous_count = Some(bin.count);
+            concrete_mass += bin.probability;
+            entropy_bits += entropy_term(bin.probability);
+            if map.as_ref().is_none_or(|&(probability, count)| {
+                bin.probability > probability
+                    || (bin.probability.to_bits() == probability.to_bits() && bin.count < count)
+            }) {
+                map = Some((bin.probability, bin.count));
+            }
+        }
+        if (concrete_mass + self.unresolved_probability - 1.0).abs() > 1.0e-9 {
+            return Err(
+                "speaker-count posterior and unresolved mass do not normalize to one".to_owned(),
+            );
+        }
+        if (entropy_bits - self.entropy_bits).abs() > 1.0e-9 {
+            return Err(
+                "speaker-count entropy does not match retained probability mass".to_owned(),
+            );
+        }
+
+        if let Some(range) = self.supported_range
+            && (range.minimum > range.maximum
+                || range.minimum < self.constraint_lower_bound
+                || range.maximum > self.candidate_upper_bound)
+        {
+            return Err("speaker-count supported range lies outside candidate bounds".to_owned());
+        }
+        if let Some(selected) = self.selected_count {
+            let Some((map_probability, map_count)) = map else {
+                return Err(
+                    "speaker-count selection exists without concrete posterior mass".to_owned(),
+                );
+            };
+            if selected != map_count || map_probability < self.unresolved_probability {
+                return Err(
+                    "speaker-count selection is not the authoritative posterior action".to_owned(),
+                );
+            }
+            if self
+                .supported_range
+                .is_none_or(|range| selected < range.minimum || selected > range.maximum)
+            {
+                return Err("speaker-count selection lies outside the supported range".to_owned());
+            }
+        }
+
+        let mut seen_lanes = [false; 6];
+        for lane in &self.lanes {
+            if !unit_interval(lane.confidence) {
+                return Err("speaker-count lane confidence is not finite in 0..=1".to_owned());
+            }
+            let lane_index = match lane.lane {
+                SpeakerCountEvidenceLane::MergeRisk => 0,
+                SpeakerCountEvidenceLane::SparseNormalizedEigengap => 1,
+                SpeakerCountEvidenceLane::FeatureJackknife => 2,
+                SpeakerCountEvidenceLane::EffectiveOccupancy => 3,
+                SpeakerCountEvidenceLane::ConstraintGraph => 4,
+                SpeakerCountEvidenceLane::CallerPrior => 5,
+            };
+            if std::mem::replace(&mut seen_lanes[lane_index], true) {
+                return Err("speaker-count evidence lane is duplicated".to_owned());
+            }
+            if lane.available {
+                if lane.unavailable_reason.is_some() {
+                    return Err(
+                        "available speaker-count lane carries an unavailable reason".to_owned()
+                    );
+                }
+                if lane.proposed_count.is_none() {
+                    return Err("available speaker-count lane has no proposed count".to_owned());
+                }
+            } else if lane.proposed_count.is_some()
+                || lane.confidence != 0.0
+                || lane.unavailable_reason.is_none()
+            {
+                return Err(
+                    "unavailable speaker-count lane carries authoritative evidence".to_owned(),
+                );
+            }
+            if lane.proposed_count.is_some_and(|count| {
+                count < self.constraint_lower_bound || count > self.candidate_upper_bound
+            }) {
+                return Err("speaker-count lane proposal lies outside candidate bounds".to_owned());
+            }
+        }
+        if seen_lanes.iter().any(|seen| !seen) {
+            return Err("speaker-count estimate is missing a required evidence lane".to_owned());
+        }
+        if matches!(
+            self.calibration_status,
+            SpeakerCountCalibrationStatus::FixedSafeUncalibrated
+                | SpeakerCountCalibrationStatus::Unavailable
+        ) && (self.selected_count.is_some()
+            || !self.posterior.is_empty()
+            || self.supported_range.is_some()
+            || self.unresolved_probability.to_bits() != 1.0_f64.to_bits())
+        {
+            return Err(
+                "uncalibrated or unavailable speaker-count evidence claims authority".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn unit_interval(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+fn lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn entropy_term(probability: f64) -> f64 {
+    if probability > 0.0 {
+        -probability * probability.log2()
+    } else {
+        0.0
+    }
+}
+
+/// Auditable result of applying one speaker-count request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerCountOutcome {
+    pub request: SpeakerCountRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<SpeakerCountEstimate>,
+    pub status: SpeakerCountOutcomeStatus,
+    pub supported_speaker_count: u32,
+    pub active_speaker_refs: Vec<String>,
+    pub dominant_speaker_share: f64,
+    pub unknown_voiced_share: f64,
+    pub reasons: Vec<SpeakerCountOutcomeReason>,
+    pub speaker_evidence: Vec<SpeakerEvidenceSummary>,
+}
+
+/// Complete typed diarization result attached to [`TranscriptionResult`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiarizationReport {
+    pub implementation: String,
+    pub contract_version: String,
+    pub feature_schema: String,
+    pub normalized_input_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_document_sha256: Option<String>,
+    pub turns: Vec<DiarizationTurn>,
+    pub profiles: Vec<SpeakerProfileSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hint_evidence: Vec<SpeakerHintEvidenceSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speaker_queries: Vec<SpeakerAttributionQuery>,
+    pub speaker_count: SpeakerCountOutcome,
+    pub fallback_status: DiarizationFallbackStatus,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,10 +1070,11 @@ pub struct BackendParams {
     pub decoding: Option<DecodingParams>,
     /// Voice Activity Detection parameters (whisper.cpp).
     pub vad: Option<VadParams>,
-    /// Speaker count constraints (insanely-fast + diarization).
-    pub speaker_constraints: Option<SpeakerConstraints>,
     /// Diarization-specific pipeline options.
     pub diarization_config: Option<DiarizationConfig>,
+    /// Backend-independent native acoustic diarization request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acoustic_diarization: Option<DiarizationRequest>,
     /// GPU device identifier (insanely-fast, diarization).
     pub gpu_device: Option<String>,
     /// Enable Flash Attention 2 (insanely-fast).
@@ -379,6 +1286,8 @@ pub struct TranscriptionSegment {
     pub end_sec: Option<f64>,
     pub text: String,
     pub speaker: Option<String>,
+    /// ASR token/text confidence. Speaker assignment confidence lives on
+    /// [`DiarizationTurn::speaker_confidence`].
     pub confidence: Option<f64>,
 }
 
@@ -418,6 +1327,8 @@ pub struct TranscriptionResult {
     pub language: Option<String>,
     pub segments: Vec<TranscriptionSegment>,
     pub acceleration: Option<AccelerationReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diarization: Option<DiarizationReport>,
     pub raw_output: Value,
     pub artifact_paths: Vec<String>,
 }
@@ -490,6 +1401,17 @@ pub struct StoredRunDetails {
     pub backend: BackendKind,
     pub transcript: String,
     pub segments: Vec<TranscriptionSegment>,
+    /// Complete typed diarization report recovered from the canonical
+    /// `result_json` payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diarization: Option<DiarizationReport>,
+    /// Privacy-safe projection provenance recovered from the canonical
+    /// `result_json` payload.
+    ///
+    /// The rest of backend `raw_output` is deliberately not exposed from run
+    /// history because it may contain internal model paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_timeline: Option<Value>,
     pub events: Vec<RunEvent>,
     pub warnings: Vec<String>,
     pub acceleration: Option<AccelerationReport>,
@@ -502,6 +1424,66 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn complete_speaker_count_lanes() -> Vec<SpeakerCountLaneEvidence> {
+        vec![
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::MergeRisk,
+                available: true,
+                proposed_count: Some(2),
+                confidence: 0.75,
+                unavailable_reason: None,
+            },
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::SparseNormalizedEigengap,
+                available: false,
+                proposed_count: None,
+                confidence: 0.0,
+                unavailable_reason: Some(SpeakerCountLaneUnavailableReason::SolverDidNotConverge),
+            },
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::FeatureJackknife,
+                available: true,
+                proposed_count: Some(2),
+                confidence: 0.8,
+                unavailable_reason: None,
+            },
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::EffectiveOccupancy,
+                available: true,
+                proposed_count: Some(2),
+                confidence: 0.7,
+                unavailable_reason: None,
+            },
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::ConstraintGraph,
+                available: true,
+                proposed_count: Some(1),
+                confidence: 1.0,
+                unavailable_reason: None,
+            },
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::CallerPrior,
+                available: false,
+                proposed_count: None,
+                confidence: 0.0,
+                unavailable_reason: Some(SpeakerCountLaneUnavailableReason::NotRequested),
+            },
+        ]
+    }
+
+    fn speaker_count_resources() -> SpeakerCountResourceSummary {
+        SpeakerCountResourceSummary {
+            prototype_count: 5,
+            affinity_pair_evaluations: 20,
+            retained_sparse_edges: 6,
+            estimated_peak_buffer_bytes: 4_096,
+            stability_replicates: 5,
+            solver_iterations: 12,
+            solver_sparse_matvec_terms: 2_040,
+            solver_residual: Some(1.0e-8),
+        }
+    }
 
     #[test]
     fn backend_kind_serialization_round_trip() {
@@ -568,7 +1550,7 @@ mod tests {
         assert!(bp.timestamp_level.is_none());
         assert!(bp.decoding.is_none());
         assert!(bp.vad.is_none());
-        assert!(bp.speaker_constraints.is_none());
+        assert!(bp.acoustic_diarization.is_none());
         assert!(bp.diarization_config.is_none());
         assert!(bp.gpu_device.is_none());
         assert!(bp.flash_attention.is_none());
@@ -592,6 +1574,7 @@ mod tests {
                 confidence: Some(0.95),
             }],
             acceleration: None,
+            diarization: None,
             raw_output: json!({"test": true}),
             artifact_paths: vec!["output.json".to_owned()],
         };
@@ -720,17 +1703,176 @@ mod tests {
     }
 
     #[test]
-    fn speaker_constraints_serialization_round_trip() {
-        let sc = SpeakerConstraints {
-            num_speakers: Some(3),
-            min_speakers: Some(1),
-            max_speakers: Some(5),
+    fn speaker_count_request_serialization_round_trip() {
+        for request in [
+            SpeakerCountRequest::Infer,
+            SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 5,
+            },
+            SpeakerCountRequest::HardConstraint { count: 3 },
+            SpeakerCountRequest::Prior {
+                bins: vec![
+                    SpeakerCountPriorMass {
+                        count: 2,
+                        probability: 0.25,
+                    },
+                    SpeakerCountPriorMass {
+                        count: 3,
+                        probability: 0.75,
+                    },
+                ],
+            },
+        ] {
+            let json = serde_json::to_string(&request).unwrap();
+            let deserialized: SpeakerCountRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, request);
+        }
+    }
+
+    #[test]
+    fn speaker_count_estimate_serialization_round_trip() {
+        let entropy_bits = [0.62, 0.23, 0.15].into_iter().map(entropy_term).sum();
+        let estimate = SpeakerCountEstimate {
+            schema_version: "speaker-count-estimate-v2".to_owned(),
+            selected_count: Some(2),
+            supported_range: Some(SpeakerCountRange {
+                minimum: 2,
+                maximum: 3,
+            }),
+            posterior: vec![
+                SpeakerCountPosteriorBin {
+                    count: 2,
+                    probability: 0.62,
+                },
+                SpeakerCountPosteriorBin {
+                    count: 3,
+                    probability: 0.23,
+                },
+            ],
+            unresolved_probability: 0.15,
+            entropy_bits,
+            stability: 0.8,
+            constraint_lower_bound: 1,
+            candidate_upper_bound: 5,
+            calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            calibration_sha256: "a".repeat(64),
+            evidence_sha256: "b".repeat(64),
+            lanes: complete_speaker_count_lanes(),
+            resources: speaker_count_resources(),
         };
-        let json = serde_json::to_string(&sc).unwrap();
-        let deserialized: SpeakerConstraints = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.num_speakers, Some(3));
-        assert_eq!(deserialized.min_speakers, Some(1));
-        assert_eq!(deserialized.max_speakers, Some(5));
+
+        let json = serde_json::to_string(&estimate).unwrap();
+        let deserialized: SpeakerCountEstimate = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, estimate);
+        estimate.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&estimate).unwrap()["calibration_status"],
+            "development_uncertified"
+        );
+        assert_eq!(
+            serde_json::to_value(&estimate).unwrap()["lanes"][1]["unavailable_reason"],
+            "solver_did_not_converge"
+        );
+        assert_eq!(
+            serde_json::to_value(&estimate).unwrap()["resources"]["retained_sparse_edges"],
+            6
+        );
+    }
+
+    #[test]
+    fn speaker_count_estimate_validation_fails_closed() {
+        let mut estimate = SpeakerCountEstimate {
+            schema_version: "speaker-count-estimate-v2".to_owned(),
+            selected_count: None,
+            supported_range: Some(SpeakerCountRange {
+                minimum: 1,
+                maximum: 2,
+            }),
+            posterior: vec![
+                SpeakerCountPosteriorBin {
+                    count: 1,
+                    probability: 0.2,
+                },
+                SpeakerCountPosteriorBin {
+                    count: 2,
+                    probability: 0.3,
+                },
+            ],
+            unresolved_probability: 0.5,
+            entropy_bits: [0.2, 0.3, 0.5].into_iter().map(entropy_term).sum(),
+            stability: 0.0,
+            constraint_lower_bound: 1,
+            candidate_upper_bound: 2,
+            calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            calibration_sha256: "a".repeat(64),
+            evidence_sha256: "b".repeat(64),
+            lanes: complete_speaker_count_lanes(),
+            resources: speaker_count_resources(),
+        };
+        estimate.validate().unwrap();
+
+        estimate.constraint_lower_bound = 0;
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "speaker-count estimate bounds must stay within 1..=64"
+        );
+        estimate.constraint_lower_bound = 1;
+        estimate.posterior.swap(0, 1);
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "speaker-count posterior bins are not strictly count-ordered"
+        );
+        estimate.posterior.swap(0, 1);
+        estimate.selected_count = Some(1);
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "speaker-count selection is not the authoritative posterior action"
+        );
+        estimate.selected_count = None;
+        estimate.lanes[1].available = true;
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "available speaker-count lane carries an unavailable reason"
+        );
+        estimate.lanes[1].available = false;
+        let caller_prior = estimate.lanes.pop().expect("caller-prior lane");
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "speaker-count estimate is missing a required evidence lane"
+        );
+        estimate.lanes.push(caller_prior);
+        estimate.resources.solver_residual = Some(f64::NAN);
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "speaker-count solver residual is not finite and non-negative"
+        );
+        estimate.resources.solver_residual = Some(1.0e-8);
+        estimate.resources.retained_sparse_edges = 11;
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "speaker-count retained sparse edges exceed the simple graph bound"
+        );
+        estimate.resources.retained_sparse_edges = 6;
+        estimate.resources.affinity_pair_evaluations = 21;
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "speaker-count affinity evaluations exceed the directed pair bound"
+        );
+        estimate.resources.affinity_pair_evaluations = 20;
+        let mut unresolved = estimate.clone();
+        unresolved.unresolved_probability = 0.2;
+        unresolved.posterior[0].probability = 0.4;
+        unresolved.posterior[1].probability = 0.4;
+        unresolved.entropy_bits = [0.4, 0.4, 0.2].into_iter().map(entropy_term).sum();
+        unresolved
+            .validate()
+            .expect("consensus gates may withhold selection despite a dominant concrete bin");
+        estimate.calibration_status = SpeakerCountCalibrationStatus::Unavailable;
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "uncalibrated or unavailable speaker-count evidence claims authority"
+        );
     }
 
     #[test]
@@ -873,6 +2015,7 @@ mod tests {
             language: None,
             segments: vec![],
             acceleration: None,
+            diarization: None,
             raw_output: json!(null),
             artifact_paths: vec![],
         };
@@ -1055,6 +2198,11 @@ mod tests {
                     confidence: Some(0.85),
                 },
             ],
+            diarization: None,
+            projection_timeline: Some(json!({
+                "schema_version": "dtw-projection-v2",
+                "word_aligned_safe": true
+            })),
             events: vec![RunEvent {
                 seq: 0,
                 ts_rfc3339: "2026-01-15T10:00:00Z".to_owned(),
@@ -1085,6 +2233,13 @@ mod tests {
         assert_eq!(parsed.backend, BackendKind::WhisperDiarization);
         assert_eq!(parsed.segments.len(), 2);
         assert_eq!(parsed.segments[1].speaker.as_deref(), Some("SPEAKER_01"));
+        assert_eq!(
+            parsed
+                .projection_timeline
+                .as_ref()
+                .expect("projection timeline")["schema_version"],
+            "dtw-projection-v2"
+        );
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.warnings.len(), 1);
         assert!(parsed.acceleration.is_some());
@@ -1103,6 +2258,8 @@ mod tests {
             backend: BackendKind::Auto,
             transcript: String::new(),
             segments: vec![],
+            diarization: None,
+            projection_timeline: None,
             events: vec![],
             warnings: vec![],
             acceleration: None,
@@ -1112,6 +2269,8 @@ mod tests {
         let parsed: StoredRunDetails = serde_json::from_str(&json).unwrap();
         assert!(parsed.transcript.is_empty());
         assert!(parsed.segments.is_empty());
+        assert!(parsed.diarization.is_none());
+        assert!(parsed.projection_timeline.is_none());
         assert!(parsed.events.is_empty());
         assert!(parsed.warnings.is_empty());
         assert!(parsed.acceleration.is_none());
@@ -1153,6 +2312,7 @@ mod tests {
                     confidence: Some(0.97),
                 }],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({"text": "hello world"}),
                 artifact_paths: vec![],
             },
@@ -1402,14 +2562,11 @@ mod tests {
         }
     }
 
-    // --- SpeakerConstraints defaults ---
+    // --- SpeakerCountRequest defaults ---
 
     #[test]
-    fn speaker_constraints_default_all_none() {
-        let sc = SpeakerConstraints::default();
-        assert!(sc.num_speakers.is_none());
-        assert!(sc.min_speakers.is_none());
-        assert!(sc.max_speakers.is_none());
+    fn speaker_count_request_defaults_to_infer() {
+        assert_eq!(SpeakerCountRequest::default(), SpeakerCountRequest::Infer);
     }
 
     #[test]
@@ -1466,9 +2623,9 @@ mod tests {
                 threshold: Some(0.5),
                 ..VadParams::default()
             }),
-            speaker_constraints: Some(SpeakerConstraints {
-                num_speakers: Some(4),
-                ..SpeakerConstraints::default()
+            acoustic_diarization: Some(DiarizationRequest {
+                speaker_count: SpeakerCountRequest::HardConstraint { count: 4 },
+                ..DiarizationRequest::default()
             }),
             diarization_config: Some(DiarizationConfig {
                 no_stem: true,
@@ -1505,7 +2662,13 @@ mod tests {
         assert_eq!(parsed.timestamp_level, Some(TimestampLevel::Word));
         assert!(parsed.decoding.is_some());
         assert!(parsed.vad.is_some());
-        assert!(parsed.speaker_constraints.is_some());
+        assert!(matches!(
+            parsed
+                .acoustic_diarization
+                .as_ref()
+                .map(|request| &request.speaker_count),
+            Some(SpeakerCountRequest::HardConstraint { count: 4 })
+        ));
         assert!(parsed.diarization_config.is_some());
         assert_eq!(parsed.gpu_device.as_deref(), Some("cuda:0"));
         assert_eq!(parsed.flash_attention, Some(true));
@@ -1690,6 +2853,7 @@ mod tests {
                 post_mass: Some(0.99),
                 notes: vec!["jax".to_owned(), "fast".to_owned()],
             }),
+            diarization: None,
             raw_output: json!({}),
             artifact_paths: vec!["a.json".to_owned(), "b.srt".to_owned()],
         };
@@ -1799,6 +2963,7 @@ mod tests {
                 language: None,
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: payload.clone(),
                 artifact_paths: vec![],
             };
@@ -2423,17 +3588,15 @@ mod tests {
     }
 
     #[test]
-    fn speaker_constraints_zero_values_round_trip() {
-        let sc = SpeakerConstraints {
-            num_speakers: Some(0),
-            min_speakers: Some(0),
-            max_speakers: Some(0),
+    fn zero_speaker_count_is_rejected() {
+        let request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 0 },
+            ..DiarizationRequest::default()
         };
-        let json = serde_json::to_string(&sc).unwrap();
-        let parsed: SpeakerConstraints = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.num_speakers, Some(0));
-        assert_eq!(parsed.min_speakers, Some(0));
-        assert_eq!(parsed.max_speakers, Some(0));
+        assert_eq!(
+            request.validate(1_000).expect_err("zero count").code,
+            DiarizationValidationCode::InvalidSpeakerCount
+        );
     }
 
     #[test]
@@ -2514,5 +3677,306 @@ mod tests {
         assert_eq!(parsed.evidence[2], 42);
         assert_eq!(parsed.evidence[3]["nested"]["key"][1], 2);
         assert_eq!(parsed.evidence[4][0], true);
+    }
+
+    fn speaker_hint(
+        speaker_ref: &str,
+        start_ms: u64,
+        end_ms: u64,
+        policy: KnownSpeakerPolicy,
+    ) -> KnownSpeakerInterval {
+        KnownSpeakerInterval {
+            speaker_ref: speaker_ref.to_owned(),
+            start_ms,
+            end_ms,
+            confidence: 0.9,
+            policy,
+            provenance: Some("contextual transcript cue".to_owned()),
+        }
+    }
+
+    #[test]
+    fn acoustic_diarization_request_round_trips_snake_case() {
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            fallback: DiarizationFallbackPolicy::Unknown,
+            known_intervals: vec![speaker_hint(
+                "caller",
+                100,
+                900,
+                KnownSpeakerPolicy::HardMustLink,
+            )],
+            ..DiarizationRequest::default()
+        };
+        let json = serde_json::to_string(&request).expect("serialize request");
+        assert!(json.contains("\"engine\":\"acoustic\""));
+        assert!(json.contains("\"policy\":\"hard_must_link\""));
+        let parsed: DiarizationRequest = serde_json::from_str(&json).expect("deserialize request");
+        assert_eq!(parsed, request);
+        assert!(request.validate(1_000).is_ok());
+    }
+
+    #[test]
+    fn contradictory_hard_hints_fail_with_stable_code() {
+        let request = DiarizationRequest {
+            known_intervals: vec![
+                speaker_hint("near", 0, 800, KnownSpeakerPolicy::HardMustLink),
+                speaker_hint("remote", 700, 1_000, KnownSpeakerPolicy::HardMustLink),
+            ],
+            ..DiarizationRequest::default()
+        };
+        let error = request
+            .validate(1_000)
+            .expect_err("overlapping hard identities must fail");
+        assert_eq!(
+            error.code,
+            DiarizationValidationCode::ContradictoryHardHints
+        );
+        assert_eq!(error.code.as_str(), "diarization.contradictory_hard_hints");
+    }
+
+    #[test]
+    fn speaker_count_request_cannot_merge_distinct_hard_references() {
+        let request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
+            known_intervals: vec![
+                speaker_hint("near", 0, 400, KnownSpeakerPolicy::HardMustLink),
+                speaker_hint("remote", 600, 1_000, KnownSpeakerPolicy::HardMustLink),
+            ],
+            ..DiarizationRequest::default()
+        };
+        let error = request
+            .validate(1_000)
+            .expect_err("two immutable hard references cannot fit one speaker");
+        assert_eq!(error.code, DiarizationValidationCode::InvalidSpeakerCount);
+        assert!(error.message.contains("2 distinct speakers"));
+    }
+
+    #[test]
+    fn soft_count_range_cannot_override_hard_anchor_lower_bound() {
+        let request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 1,
+            },
+            known_intervals: vec![
+                speaker_hint("near", 0, 400, KnownSpeakerPolicy::HardMustLink),
+                speaker_hint("remote", 600, 1_000, KnownSpeakerPolicy::HardMustLink),
+            ],
+            ..DiarizationRequest::default()
+        };
+        assert!(
+            request.validate(1_000).is_ok(),
+            "a soft range may disagree but cannot invalidate immutable acoustic anchors"
+        );
+    }
+
+    #[test]
+    fn hard_anchor_lower_bound_cannot_exceed_the_bounded_count_domain() {
+        let known_intervals = (0..=MAX_SPEAKER_COUNT)
+            .map(|index| {
+                let start_ms = u64::from(index) * 10;
+                speaker_hint(
+                    &format!("speaker_{index:02}"),
+                    start_ms,
+                    start_ms + 5,
+                    KnownSpeakerPolicy::HardMustLink,
+                )
+            })
+            .collect();
+        let request = DiarizationRequest {
+            known_intervals,
+            ..DiarizationRequest::default()
+        };
+        let error = request
+            .validate(u64::from(MAX_SPEAKER_COUNT + 1) * 10)
+            .expect_err("hard-anchor lower bound above K_max must fail closed");
+        assert_eq!(error.code, DiarizationValidationCode::InvalidSpeakerCount);
+        assert!(error.message.contains("permits at most 64"));
+    }
+
+    #[test]
+    fn overlapping_soft_hints_are_advisory() {
+        let request = DiarizationRequest {
+            known_intervals: vec![
+                speaker_hint("near", 0, 800, KnownSpeakerPolicy::SoftEnrollment),
+                speaker_hint("remote", 700, 1_000, KnownSpeakerPolicy::SoftEnrollment),
+            ],
+            ..DiarizationRequest::default()
+        };
+        assert!(request.validate(1_000).is_ok());
+    }
+
+    #[test]
+    fn malformed_hint_and_constraint_codes_are_stable() {
+        let mut request = DiarizationRequest {
+            known_intervals: vec![speaker_hint(
+                "",
+                100,
+                200,
+                KnownSpeakerPolicy::SoftEnrollment,
+            )],
+            ..DiarizationRequest::default()
+        };
+        assert_eq!(
+            request.validate(1_000).expect_err("empty").code,
+            DiarizationValidationCode::EmptySpeakerRef
+        );
+
+        request.known_intervals[0].speaker_ref = "speaker".to_owned();
+        request.known_intervals[0].confidence = f64::NAN;
+        assert_eq!(
+            request.validate(1_000).expect_err("NaN").code,
+            DiarizationValidationCode::InvalidHintConfidence
+        );
+
+        request.known_intervals[0].confidence = 0.8;
+        request.known_intervals[0].end_ms = 1_001;
+        assert_eq!(
+            request.validate(1_000).expect_err("bounds").code,
+            DiarizationValidationCode::HintOutsideAudio
+        );
+
+        request.known_intervals.clear();
+        request.speaker_count = SpeakerCountRequest::Range {
+            minimum: 4,
+            maximum: 3,
+        };
+        assert_eq!(
+            request.validate(1_000).expect_err("constraints").code,
+            DiarizationValidationCode::InvalidSpeakerCount
+        );
+    }
+
+    #[test]
+    fn acoustic_hint_request_limits_fail_before_quadratic_validation() {
+        let hint = speaker_hint("speaker", 0, 1, KnownSpeakerPolicy::SoftEnrollment);
+        let request = DiarizationRequest {
+            known_intervals: vec![hint.clone(); MAX_KNOWN_SPEAKER_INTERVALS + 1],
+            ..DiarizationRequest::default()
+        };
+        assert_eq!(
+            request
+                .validate(1)
+                .expect_err("interval count must be bounded")
+                .code,
+            DiarizationValidationCode::TooManyKnownIntervals
+        );
+
+        let mut request = DiarizationRequest {
+            known_intervals: vec![hint],
+            ..DiarizationRequest::default()
+        };
+        request.known_intervals[0].speaker_ref = "s".repeat(MAX_SPEAKER_REF_BYTES + 1);
+        assert_eq!(
+            request
+                .validate(1)
+                .expect_err("speaker reference must be bounded")
+                .code,
+            DiarizationValidationCode::SpeakerRefTooLong
+        );
+
+        request.known_intervals[0].speaker_ref = "speaker".to_owned();
+        request.known_intervals[0].provenance = Some("p".repeat(MAX_HINT_PROVENANCE_BYTES + 1));
+        assert_eq!(
+            request
+                .validate(1)
+                .expect_err("provenance must be bounded")
+                .code,
+            DiarizationValidationCode::ProvenanceTooLong
+        );
+    }
+
+    #[test]
+    fn diarization_report_is_typed_and_privacy_safe() {
+        let report = DiarizationReport {
+            implementation: "native_acoustic".to_owned(),
+            contract_version: "acoustic-diarization-v2".to_owned(),
+            feature_schema: "acoustic-feature-v1".to_owned(),
+            normalized_input_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            hint_document_sha256: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
+            turns: vec![DiarizationTurn {
+                start_ms: 0,
+                end_ms: 1_000,
+                speaker_ref: Some("near".to_owned()),
+                speaker_confidence: Some(0.91),
+                change_confidence: Some(0.84),
+                overlap_suspected: false,
+                hard_hint_attributed: true,
+            }],
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "near".to_owned(),
+                frame_count: 72,
+                voiced_duration_ms: 720,
+                reliability: 0.9,
+                voice_profile_count: 1,
+                channel_profile_count: 1,
+                training_accepted_count: 1,
+                training_downweighted_count: 0,
+                training_quarantined_count: 0,
+                anchored: true,
+                soft_hint_contradiction: None,
+            }],
+            hint_evidence: vec![SpeakerHintEvidenceSummary {
+                hint_index: 0,
+                speaker_ref: "near".to_owned(),
+                policy: KnownSpeakerPolicy::HardMustLink,
+                disposition: SpeakerHintDisposition::HardAttributed,
+                usable_tracklet_count: 1,
+                accepted_tracklet_count: 1,
+                rejected_tracklet_count: 0,
+                profile_accepted_tracklet_count: 1,
+                profile_downweighted_tracklet_count: 0,
+                profile_quarantined_tracklet_count: 0,
+                applied_weight: 1.0,
+                contradiction_score: None,
+            }],
+            speaker_queries: vec![SpeakerAttributionQuery {
+                query_id_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_owned(),
+                start_ms: 1_000,
+                end_ms: 1_500,
+                reason: SpeakerAttributionQueryReason::LowConfidence,
+                candidate_speaker_refs: vec!["near".to_owned()],
+                suggested_policy: KnownSpeakerPolicy::SoftEnrollment,
+            }],
+            speaker_count: SpeakerCountOutcome {
+                request: SpeakerCountRequest::HardConstraint { count: 1 },
+                estimate: None,
+                status: SpeakerCountOutcomeStatus::Satisfied,
+                supported_speaker_count: 1,
+                active_speaker_refs: vec!["near".to_owned()],
+                dominant_speaker_share: 1.0,
+                unknown_voiced_share: 0.0,
+                reasons: vec![SpeakerCountOutcomeReason::RequestedCountMatched],
+                speaker_evidence: vec![SpeakerEvidenceSummary {
+                    speaker_ref: "near".to_owned(),
+                    assigned_tracklet_count: 1,
+                    independent_tracklet_count: 1,
+                    recurrence_episode_count: 1,
+                    voiced_frame_count: 72,
+                    independent_voiced_frame_count: 72,
+                    voiced_duration_ms: 720,
+                    mean_assignment_confidence: 0.91,
+                    profile_reliability: 0.9,
+                    hard_anchored: true,
+                    separated_from_supported_speakers: true,
+                    reasons: vec![SpeakerEvidenceReason::SupportedByHardHint],
+                    supported: true,
+                }],
+            },
+            fallback_status: DiarizationFallbackStatus::NotNeeded,
+            diagnostics: Vec::new(),
+        };
+        let json = serde_json::to_string(&report).expect("serialize report");
+        assert!(!json.contains("feature_vector"));
+        assert!(!json.contains("raw_audio"));
+        assert_eq!(
+            serde_json::from_str::<DiarizationReport>(&json).expect("deserialize report"),
+            report
+        );
     }
 }

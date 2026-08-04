@@ -1,6 +1,7 @@
 # Build artifacts
 /target
 /target_local
+/.rch-targets
 
 # Legacy upstream repos (reference only, not shipped)
 /legacy_whispercpp/
@@ -16,13 +17,104 @@ storage.sqlite3-shm
 *.sqlite3-wal
 *.sqlite3-shm
 
-# Audio working files
+# Audio working files and confidential local evaluation media
+# Bracketed forms are authoritative on case-sensitive filesystems; the explicit
+# lower/upper spellings below remain readable guardrails for common names.
+*.[wW][aA][vV]
+*.[uU][lL][aA][wW]
+*.[mM][pP]3
+*.[fF][lL][aA][cC]
+*.[oO][gG][gG]
+*.[mM]4[aA]
+*.[aA][aA][cC]
+*.[aA][iI][fF]
+*.[aA][iI][fF][fF]
+*.[aA][mM][rR]
+*.[aA][wW][bB]
+*.[cC][aA][fF]
+*.[oO][pP][uU][sS]
+*.[wW][mM][aA]
+*.3[gG][pP]
+*.[mM][pP]4
+*.[mM][oO][vV]
+*.[wW][eE][bB][mM]
+*.[wW][vV]
+*.[oO][gG][aA]
+*.[mM][kK][aA]
+*.[mM][kK][vV]
+*.[aA][dD][tT][sS]
+*.[aA][cC]3
+*.[eE][aA][cC]3
+*.[dD][tT][sS]
+*.[aA][pP][eE]
+*.[aA][lL][aA][cC]
+*.[aA][uU]
+*.[sS][nN][dD]
+*.[mM][pP]2
+*.[mM][pP][aA]
+*.[mM]4[bBpP]
+*.3[gG]2
+*.[rR][aA]
+*.[rR][mM]
+*.[wW][eE][bB][aA]
+*.[rR][aA][wW]
+*.[pP][cC][mM]
 *.wav
 *.ulaw
 *.mp3
 *.flac
 *.ogg
 *.m4a
+*.aac
+*.aif
+*.aiff
+*.amr
+*.awb
+*.caf
+*.opus
+*.wma
+*.3gp
+*.mp4
+*.mov
+*.webm
+*.WAV
+*.ULAW
+*.MP3
+*.FLAC
+*.OGG
+*.M4A
+*.AAC
+*.AIF
+*.AIFF
+*.AMR
+*.AWB
+*.CAF
+*.OPUS
+*.WMA
+*.3GP
+*.MP4
+*.MOV
+*.WEBM
+
+# Confidential transcript sidecars must remain outside the repository
+*transcript*.md
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[mM][dD]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[tT][xX][tT]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[jJ][sS][oO][nN]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[jJ][sS][oO][nN][lL]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[sS][rR][tT]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[vV][tT][tT]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[cC][sS][vV]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[tT][sS][vV]
+
+# Raw decoder/performance text is never a repository artifact. Retain only
+# aggregate Markdown/JSON evidence; keep spans and decoded text outside Git.
+tests/artifacts/perf/**/*.spans
+tests/artifacts/perf/**/*_if.txt
+tests/artifacts/perf/**/*_seq.txt
+tests/artifacts/perf/**/*sample*.txt
+tests/artifacts/perf/**/*spans*.txt
+tests/artifacts/perf/**/*spans*.jsonl
 
 # Images (keep .webp for README illustration, .png for GitHub social preview)
 *.png
@@ -50,6 +142,11 @@ storage.sqlite3-shm
 
 # Cargo lock is committed (binary crate)
 # Cargo.lock
+
+# ...but NOT for the standalone bench crates under benches/. Each is its own
+# throwaway workspace whose lock is regenerated on first build, and none of the
+# ~20 already in the tree has ever had one committed.
+benches/*/Cargo.lock
 
 # Temporary files
 *.tmp
@@ -143,9 +240,18 @@ target_*/
 
 # Nested crate build artifacts
 crates/*/target/
+benches/*/target/
 
 # Compiler crash reports
 rustc-ice-*.txt
 
 # Python tooling cache (scripts/)
 __pycache__/
+
+# === multi-repo ephemeral cleanup 2026-08-03 ===
+# Stray out-of-tree rustc outputs and one-off probe binaries (normal builds
+# live under target/).
+/librust_out.rlib
+*.rlib
+/lint_probe
+/rust_out

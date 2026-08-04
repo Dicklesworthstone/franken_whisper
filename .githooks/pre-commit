@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+source_spec=":examples/ledger_preflight.rs"
+source_sha=$(git show "$source_spec" | sha256sum | cut -d ' ' -f 1)
+hook_binary="$repo_root/target/ledger-preflight-hook-$source_sha"
+
+mkdir -p "$repo_root/target"
+if [ ! -x "$hook_binary" ]; then
+    git show "$source_spec" | CARGO_MANIFEST_DIR="$repo_root" rustc \
+        --edition=2024 \
+        -C opt-level=1 \
+        - \
+        -o "$hook_binary"
+fi
+
+exec "$hook_binary" validate-staged

@@ -1,0 +1,36 @@
+--- a/crates/ft-kernel-cpu/src/lib.rs
++++ b/crates/ft-kernel-cpu/src/lib.rs
+@@ -796,10 +796,31 @@
+     // Shared M×N tile grid: ~sqrt(threads) blocks per axis (minimises B+A traffic
+     // for square shapes), clamped to the GEMM block-size floors. Returns the block
+     // extents and the list of (i0,j0) tile origins — disjoint rectangles tiling C.
++    /// `FT_SGEMM_TILE_BALANCED=0` restores the historical `floor(sqrt(T))` grid.
++    fn sgemm_tile_balanced() -> bool {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ON.get_or_init(|| !std::env::var("FT_SGEMM_TILE_BALANCED").is_ok_and(|v| v == "0"))
++    }
++
++    /// Rows x cols of the 2-D tile grid.
++    ///
++    /// The historical rule `p = floor(sqrt(T))`, `q = ceil(T/p)` gives `p*q != T` for many
++    /// T: at **T=32 it is 5x7 = 35 tiles on 32 threads**, so a straggler wave of 3 tiles
++    /// runs while 29 threads idle. T=32 is exactly franken_whisper's encoder thread cap.
++    /// Choosing `p` as the largest DIVISOR of T that is <= sqrt(T) makes `p*q == T` exactly
++    /// (32 -> 4x8). T=64 -> 8x8 and T=16 -> 4x4 were already balanced, so they do not move.
++    fn tile_grid(threads: usize) -> (usize, usize) {
++        let lim = (threads as f64).sqrt().floor().max(1.0) as usize;
++        if !sgemm_tile_balanced() {
++            return (lim, threads.div_ceil(lim));
++        }
++        let p = (1..=lim).filter(|c| threads % c == 0).max().unwrap_or(1);
++        (p, threads / p)
++    }
++
+     fn tile_shape(m: usize, n: usize) -> (usize, usize) {
+         let threads = rayon::current_num_threads().max(1);
+-        let p = (threads as f64).sqrt().floor().max(1.0) as usize; // M-blocks
+-        let q = threads.div_ceil(p); // N-blocks
++        let (p, q) = tile_grid(threads);
+         let mb = m.div_ceil(p).max(MIN_BLOCK_ROWS);
+         let nb = n.div_ceil(q).max(MIN_BLOCK_COLS);
+         (mb, nb)

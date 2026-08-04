@@ -3,11 +3,11 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use asupersync::runtime::{Runtime, RuntimeBuilder, spawn_blocking};
-use asupersync::time::{timeout, wall_now};
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use chrono::Utc;
 use franken_kernel::{Budget, TraceId};
 use serde_json::{Value, json};
@@ -18,8 +18,14 @@ use crate::accelerate;
 use crate::audio;
 use crate::backend;
 use crate::conformance;
+use crate::diarization::{self, AcousticBoundaryHints};
 use crate::error::{FwError, FwResult};
-use crate::model::{RunEvent, RunReport, StreamedRunEvent, TranscribeRequest};
+use crate::model::{
+    DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus, DiarizationReport,
+    DiarizationTurn, RunEvent, RunReport, SpeakerCountOutcome, SpeakerCountOutcomeReason,
+    SpeakerCountOutcomeStatus, SpeakerCountRequest, SpeakerEvidenceReason, SpeakerEvidenceSummary,
+    SpeakerProfileSummary, StreamedRunEvent, TranscribeRequest,
+};
 use crate::storage::RunStore;
 
 // ---------------------------------------------------------------------------
@@ -36,7 +42,9 @@ pub enum PipelineStage {
     Normalize,
     /// Voice activity detection pre-filtering (bd-qla.1).
     Vad,
-    /// Source separation / vocal isolation (bd-qla.2, Demucs-inspired placeholder).
+    /// Source separation / vocal isolation (bd-qla.2): energy-based vocal-confidence
+    /// heuristic (RMS + active-speech-coverage analysis, not a neural separator;
+    /// bd-mmx3 tracks a real mask-model replacement).
     Separate,
     /// Execute the transcription backend (whisper-cpp, insanely-fast-whisper, etc.).
     Backend,
@@ -46,7 +54,8 @@ pub enum PipelineStage {
     Align,
     /// Punctuation restoration (bd-qla.4).
     Punctuate,
-    /// Speaker diarization (bd-qla.5, TitaNet-inspired placeholder).
+    /// Speaker diarization: Rust-native waveform regime detection, constrained
+    /// speaker profiling, and word-boundary projection.
     Diarize,
     /// Persist the run report to frankensqlite.
     Persist,
@@ -66,6 +75,36 @@ impl PipelineStage {
             Self::Punctuate => "punctuate",
             Self::Diarize => "diarize",
             Self::Persist => "persist",
+        }
+    }
+
+    const fn mask_bit(self) -> u16 {
+        match self {
+            Self::Ingest => 1 << 0,
+            Self::Normalize => 1 << 1,
+            Self::Vad => 1 << 2,
+            Self::Separate => 1 << 3,
+            Self::Backend => 1 << 4,
+            Self::Accelerate => 1 << 5,
+            Self::Align => 1 << 6,
+            Self::Punctuate => 1 << 7,
+            Self::Diarize => 1 << 8,
+            Self::Persist => 1 << 9,
+        }
+    }
+
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::Ingest => 0,
+            Self::Normalize => 1,
+            Self::Vad => 2,
+            Self::Separate => 3,
+            Self::Backend => 4,
+            Self::Accelerate => 5,
+            Self::Align => 6,
+            Self::Punctuate => 7,
+            Self::Diarize => 8,
+            Self::Persist => 9,
         }
     }
 }
@@ -100,12 +139,16 @@ const DEFAULT_STAGES: [PipelineStage; 10] = [
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     stages: Vec<PipelineStage>,
+    stage_mask: u16,
 }
 
 impl PipelineConfig {
     /// Create a config with the given stages executed in order.
     pub fn new(stages: Vec<PipelineStage>) -> Self {
-        Self { stages }
+        let stage_mask = stages
+            .iter()
+            .fold(0u16, |mask, stage| mask | stage.mask_bit());
+        Self { stages, stage_mask }
     }
 
     /// The ordered list of stages that will be executed.
@@ -115,7 +158,7 @@ impl PipelineConfig {
 
     /// Returns `true` if the given stage is present in this config.
     pub fn has_stage(&self, stage: PipelineStage) -> bool {
-        self.stages.contains(&stage)
+        self.stage_mask & stage.mask_bit() != 0
     }
 
     /// Validate the configuration for structural soundness.
@@ -125,10 +168,14 @@ impl PipelineConfig {
     /// - `Backend` requires `Normalize` before it (which itself requires `Ingest`).
     /// - No duplicate stages.
     pub fn validate(&self) -> FwResult<()> {
-        // Check for duplicates.
-        let mut seen = std::collections::HashSet::new();
-        for stage in &self.stages {
-            if !seen.insert(stage) {
+        let mut positions = [None; DEFAULT_STAGES.len()];
+        for (idx, &stage) in self.stages.iter().enumerate() {
+            let Some(slot) = positions.get_mut(stage.ordinal()) else {
+                return Err(FwError::InvalidRequest(format!(
+                    "unknown pipeline stage: {stage}"
+                )));
+            };
+            if slot.replace(idx).is_some() {
                 return Err(FwError::InvalidRequest(format!(
                     "duplicate pipeline stage: {stage}"
                 )));
@@ -136,7 +183,7 @@ impl PipelineConfig {
         }
 
         // Check ordering constraints.
-        let pos = |s: PipelineStage| self.stages.iter().position(|x| *x == s);
+        let pos = |s: PipelineStage| positions.get(s.ordinal()).copied().flatten();
 
         if let Some(norm_pos) = pos(PipelineStage::Normalize) {
             match pos(PipelineStage::Ingest) {
@@ -236,9 +283,7 @@ impl PipelineConfig {
 
 impl Default for PipelineConfig {
     fn default() -> Self {
-        Self {
-            stages: DEFAULT_STAGES.to_vec(),
-        }
+        Self::new(DEFAULT_STAGES.to_vec())
     }
 }
 
@@ -1152,24 +1197,25 @@ fn checkpoint_or_emit(
     }
 }
 
-async fn run_stage_with_budget<T, F>(
-    stage: &'static str,
-    budget_ms: u64,
-    operation: F,
-) -> FwResult<T>
+fn run_stage_with_budget<T, F>(stage: &'static str, budget_ms: u64, operation: F) -> FwResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> FwResult<T> + Send + 'static,
 {
-    // Keep compatibility across asupersync timeout implementations that
-    // require `Unpin` futures by boxing the spawned future.
-    let wrapped = Box::pin(spawn_blocking(operation));
-    match timeout(wall_now(), budget_duration(budget_ms), wrapped).await {
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(operation());
+    });
+
+    match rx.recv_timeout(budget_duration(budget_ms)) {
         Ok(result) => result,
-        Err(_) => Err(FwError::StageTimeout {
+        Err(RecvTimeoutError::Timeout) => Err(FwError::StageTimeout {
             stage: stage.to_owned(),
             budget_ms,
         }),
+        Err(RecvTimeoutError::Disconnected) => Err(FwError::BackendUnavailable(format!(
+            "stage `{stage}` worker exited before returning a result"
+        ))),
     }
 }
 
@@ -1304,6 +1350,8 @@ struct PipelineIntermediate {
     normalized_input_sha256: Option<String>,
     backend_output_sha256: Option<String>,
     backend_runtime: Option<backend::BackendRuntimeMetadata>,
+    /// Native waveform analysis produced by VAD for later audio stages.
+    native_audio_analysis: Option<Arc<backend::native_audio::NativeAudioAnalysis>>,
     /// VAD result: regions of voice activity as (start_sec, end_sec) pairs.
     vad_regions: Option<Vec<(f64, f64)>>,
     /// Whether VAD determined the audio is silence-only (skip transcription).
@@ -1323,6 +1371,7 @@ impl PipelineIntermediate {
             normalized_input_sha256: None,
             backend_output_sha256: None,
             backend_runtime: None,
+            native_audio_analysis: None,
             vad_regions: None,
             vad_silence_only: false,
             vocal_isolated: false,
@@ -1335,6 +1384,97 @@ fn stage_skip_payload(reason: &str, details: Value) -> Value {
         "reason": reason,
         "details": details,
     })
+}
+
+fn selected_diarization_engine(request: &TranscribeRequest) -> DiarizationEngine {
+    request
+        .backend_params
+        .acoustic_diarization
+        .as_ref()
+        .map_or_else(
+            || {
+                if request.backend == crate::model::BackendKind::WhisperDiarization {
+                    DiarizationEngine::External
+                } else {
+                    DiarizationEngine::Auto
+                }
+            },
+            |config| config.engine,
+        )
+}
+
+const ACOUSTIC_DIARIZATION_ROLLOUT_ENV: &str = "FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT";
+const ACOUSTIC_DIARIZATION_ROLLOUT_ENV_SHORT: &str = "FW_ACOUSTIC_DIARIZATION_ROLLOUT";
+static ACOUSTIC_DIARIZATION_ROLLOUT: std::sync::OnceLock<(
+    crate::model::AcousticDiarizationRolloutStage,
+    bool,
+)> = std::sync::OnceLock::new();
+
+fn parse_acoustic_diarization_rollout(
+    value: &str,
+) -> Option<crate::model::AcousticDiarizationRolloutStage> {
+    use crate::model::AcousticDiarizationRolloutStage;
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "shadow" => Some(AcousticDiarizationRolloutStage::Shadow),
+        "validated" => Some(AcousticDiarizationRolloutStage::Validated),
+        "fallback" => Some(AcousticDiarizationRolloutStage::Fallback),
+        "primary" => Some(AcousticDiarizationRolloutStage::Primary),
+        "sole" => Some(AcousticDiarizationRolloutStage::Sole),
+        _ => None,
+    }
+}
+
+fn acoustic_diarization_rollout() -> (crate::model::AcousticDiarizationRolloutStage, bool) {
+    *ACOUSTIC_DIARIZATION_ROLLOUT.get_or_init(|| {
+        let configured = std::env::var(ACOUSTIC_DIARIZATION_ROLLOUT_ENV)
+            .ok()
+            .or_else(|| std::env::var(ACOUSTIC_DIARIZATION_ROLLOUT_ENV_SHORT).ok());
+        match configured {
+            Some(value) => parse_acoustic_diarization_rollout(&value)
+                .map_or((Default::default(), false), |stage| (stage, true)),
+            None => (Default::default(), true),
+        }
+    })
+}
+
+fn resolved_diarization_engine(
+    request: &TranscribeRequest,
+    result: &crate::model::TranscriptionResult,
+) -> DiarizationEngine {
+    resolved_diarization_engine_for_rollout(request, result, acoustic_diarization_rollout().0)
+}
+
+fn resolved_diarization_engine_for_rollout(
+    request: &TranscribeRequest,
+    result: &crate::model::TranscriptionResult,
+    rollout: crate::model::AcousticDiarizationRolloutStage,
+) -> DiarizationEngine {
+    use crate::model::AcousticDiarizationRolloutStage;
+
+    match selected_diarization_engine(request) {
+        DiarizationEngine::Auto => match rollout {
+            AcousticDiarizationRolloutStage::Shadow
+            | AcousticDiarizationRolloutStage::Validated => DiarizationEngine::External,
+            AcousticDiarizationRolloutStage::Fallback
+                if result_has_external_diarization(result) =>
+            {
+                DiarizationEngine::External
+            }
+            AcousticDiarizationRolloutStage::Fallback
+            | AcousticDiarizationRolloutStage::Primary
+            | AcousticDiarizationRolloutStage::Sole => DiarizationEngine::Acoustic,
+        },
+        explicit => explicit,
+    }
+}
+
+fn external_diarization_fallback_admitted(
+    requested: DiarizationEngine,
+    rollout: crate::model::AcousticDiarizationRolloutStage,
+) -> bool {
+    !(requested == DiarizationEngine::Auto
+        && rollout == crate::model::AcousticDiarizationRolloutStage::Sole)
 }
 
 fn optional_stage_skip(
@@ -1358,12 +1498,24 @@ fn optional_stage_skip(
                 .diarization_config
                 .as_ref()
                 .is_some_and(|config| config.no_stem);
+            let engine = selected_diarization_engine(request);
             if !request.diarize {
                 Some((
                     "diarization_not_requested".to_owned(),
                     stage_skip_payload(
                         "diarization_not_requested",
                         json!({"diarize": request.diarize}),
+                    ),
+                ))
+            } else if matches!(
+                engine,
+                DiarizationEngine::Auto | DiarizationEngine::Acoustic
+            ) {
+                Some((
+                    "native_acoustic_preserves_waveform".to_owned(),
+                    stage_skip_payload(
+                        "native_acoustic_preserves_waveform",
+                        json!({"engine": engine}),
                     ),
                 ))
             } else if no_stem {
@@ -1416,18 +1568,6 @@ fn optional_stage_skip(
                     stage_skip_payload(
                         "diarization_not_requested",
                         json!({"diarize": request.diarize}),
-                    ),
-                ))
-            } else if request.backend == crate::model::BackendKind::WhisperDiarization {
-                // The whisper-diarization backend performs speaker diarization
-                // internally (see whisper_diarization_native.rs); running the
-                // pipeline Diarize stage as well would diarize the segments a
-                // second time. Skip it and let the backend own diarization.
-                Some((
-                    "backend_owns_diarization".to_owned(),
-                    stage_skip_payload(
-                        "backend_owns_diarization",
-                        json!({"backend": request.backend.as_str()}),
                     ),
                 ))
             } else {
@@ -1574,6 +1714,7 @@ async fn run_pipeline_body(
             language: None,
             segments: Vec::new(),
             acceleration: None,
+            diarization: None,
             raw_output: json!({}),
             artifact_paths: Vec::new(),
         });
@@ -1621,7 +1762,11 @@ async fn run_pipeline_body(
         normalized_wav_path: normalized_wav_str,
         request: request.clone(),
         result,
-        events: log.events.clone(),
+        events: if has_persist {
+            Vec::new()
+        } else {
+            log.events.clone()
+        },
         warnings: std::mem::take(&mut inter.warnings),
         evidence: pcx.evidence().to_vec(),
         replay: crate::model::ReplayEnvelope {
@@ -1654,9 +1799,7 @@ async fn run_pipeline_body(
         if let Err(error) = run_stage_with_budget("persist", stage_budgets.persist_ms, move || {
             let store = RunStore::open(&persist_db)?;
             store.persist_report_cancellable(&persist_report, Some(&persist_token))
-        })
-        .await
-        {
+        }) {
             let code = stage_failure_code("persist", &error);
             log.push(
                 "persist",
@@ -1713,9 +1856,7 @@ async fn execute_ingest(
     let ingest_token = pcx.stage_token(stage_budgets.ingest_ms); // ubs:ignore — cancellation token is not a secret
     let input_path = match run_stage_with_budget("ingest", stage_budgets.ingest_ms, move || {
         audio::materialize_input_with_token(&ingest_input, &ingest_dir, Some(&ingest_token))
-    })
-    .await
-    {
+    }) {
         Ok(path) => path,
         Err(error) => {
             let code = stage_failure_code("ingest", &error);
@@ -1773,9 +1914,7 @@ async fn execute_normalize(
             budget_duration(normalize_budget_ms),
             Some(&normalize_token),
         )
-    })
-    .await
-    {
+    }) {
         Ok(path) => path,
         Err(error) => {
             let code = stage_failure_code("normalize", &error);
@@ -1872,9 +2011,10 @@ async fn execute_backend(
         // Capture the adaptive prediction BEFORE deciding whether to use it.
         // This allows calibration tracking even when we fall back to static order.
         let top_backend = selection.recommended_order[0];
-        let predicted_success = backend::router_state_snapshot()
-            .map(|state| state.metrics_for(top_backend).success_rate)
-            .unwrap_or(0.5);
+        // Read just this backend's success_rate under the router lock instead of
+        // cloning the entire RouterState (byte-identical; see
+        // `router_success_rate_for`).
+        let predicted_success = backend::router_success_rate_for(top_backend).unwrap_or(0.5);
         let prediction = (top_backend, predicted_success);
 
         if selection.calibration_score < min_calibration {
@@ -1945,8 +2085,7 @@ async fn execute_backend(
                 tok,
             )
         }
-    })
-    .await;
+    });
 
     if let Some((top_backend, predicted_success)) = adaptive_prediction {
         let top_succeeded = match &execution_result {
@@ -2217,12 +2356,13 @@ async fn execute_backend_speculative(
             // Always carry partial events + stats + merged segments out, so
             // the outer handler can forward speculation events to the NDJSON
             // log regardless of whether the pipeline succeeded or failed.
-            let emitted = pipeline.events().to_vec();
             let stats = pipeline.stats();
             let merged = pipeline.merged_transcript();
+            // Move the event vector out last (consuming the terminal pipeline)
+            // instead of cloning it via `events().to_vec()`.
+            let emitted = pipeline.into_events();
             Ok((inner_result, emitted, stats, merged))
-        })
-        .await;
+        });
 
     let (inner_result, emitted_events, stats, merged) = match outcome {
         Ok(value) => value,
@@ -2296,6 +2436,7 @@ async fn execute_backend_speculative(
                 language,
                 segments: merged,
                 acceleration: None,
+                diarization: None,
                 raw_output: serde_json::json!({
                     "speculative": true,
                     "windows_processed": stats.windows_processed,
@@ -2374,9 +2515,7 @@ async fn execute_accelerate(
             let mut local = result;
             let acceleration = accelerate::apply_with_token(&mut local, Some(&acceleration_token));
             Ok((local, acceleration))
-        })
-        .await
-        {
+        }) {
             Ok(output) => output,
             Err(error) => {
                 let code = stage_failure_code("acceleration", &error);
@@ -2531,9 +2670,15 @@ fn ctc_forced_align(
         });
     };
 
-    if duration <= 0.0 {
+    // Fail closed on a non-finite (NaN/±inf) or subnormal/underflow duration.
+    // A denormal such as f64::MIN_POSITIVE is > 0.0 yet would make sec_per_char
+    // underflow and pin every timestamp to the denormal; NaN would silently
+    // slip past a `<= 0.0` check and be written verbatim. Returning the
+    // all-fallback report carries the authoritative backend offsets through
+    // unchanged.
+    if !duration.is_finite() || duration < 1e-6 {
         notes.push(format!(
-            "audio duration non-positive ({duration:.3}s); skipping alignment"
+            "audio duration non-positive or non-finite ({duration:.3}s); skipping alignment"
         ));
         return Ok(AlignmentReport {
             segments_total: total,
@@ -2546,7 +2691,7 @@ fn ctc_forced_align(
     // Total character count for proportional distribution.
     let total_chars: usize = segments.iter().map(|s| s.text.trim().len().max(1)).sum();
     let chars_per_sec = total_chars as f64 / duration;
-    if chars_per_sec <= 0.0 {
+    if !chars_per_sec.is_finite() || chars_per_sec <= 0.0 {
         notes.push("zero character density; skipping alignment".to_owned());
         return Ok(AlignmentReport {
             segments_total: total,
@@ -2571,18 +2716,26 @@ fn ctc_forced_align(
         let orig_start = segment.start_sec;
         let orig_end = segment.end_sec;
 
+        // The backend/whisper-cli offsets are authoritative. A segment that
+        // carries no original timestamp must NOT be assigned a fabricated one:
+        // a missing original must not be treated as zero drift (which would let
+        // the synthetic cursor timeline overwrite it), so skip it and leave it
+        // untouched.
+        let (Some(os), Some(oe)) = (orig_start, orig_end) else {
+            fallback += 1;
+            continue;
+        };
+
         // Check drift guardrails.
-        let start_drift = orig_start
-            .map(|os| (aligned_start - os).abs())
-            .unwrap_or(0.0);
-        let end_drift = orig_end.map(|oe| (aligned_end - oe).abs()).unwrap_or(0.0);
+        let start_drift = (aligned_start - os).abs();
+        let end_drift = (aligned_end - oe).abs();
 
         let aligned_duration = aligned_end - aligned_start;
 
         if start_drift > config.max_drift_sec || end_drift > config.max_drift_sec {
             // Drift exceeds tolerance -- keep original timestamps.
             fallback += 1;
-            cursor = orig_end.unwrap_or(aligned_end).max(aligned_end);
+            cursor = oe.max(aligned_end);
             continue;
         }
 
@@ -2594,13 +2747,20 @@ fn ctc_forced_align(
                  below minimum {:.3}s; falling back",
                 config.min_segment_duration_sec
             ));
-            cursor = orig_end.unwrap_or(aligned_end).max(aligned_end);
+            cursor = oe.max(aligned_end);
             continue;
         }
 
-        segment.start_sec = Some(aligned_start);
-        segment.end_sec = Some(aligned_end);
-        corrected += 1;
+        // Only overwrite when the aligned values are finite -- never write a
+        // non-finite timestamp over an authoritative offset.
+        if aligned_start.is_finite() && aligned_end.is_finite() {
+            segment.start_sec = Some(aligned_start);
+            segment.end_sec = Some(aligned_end);
+            corrected += 1;
+        } else {
+            // Non-finite aligned values: keep the authoritative original.
+            fallback += 1;
+        }
     }
 
     Ok(AlignmentReport {
@@ -2609,6 +2769,27 @@ fn ctc_forced_align(
         segments_fallback: fallback,
         notes,
     })
+}
+
+fn align_transcription_result(
+    result: &mut crate::model::TranscriptionResult,
+    audio_duration_sec: Option<f64>,
+    config: &AlignConfig,
+    token: &CancellationToken,
+) -> FwResult<AlignmentReport> {
+    if has_canonical_word_alignment(&result.raw_output) {
+        token.checkpoint()?;
+        return Ok(AlignmentReport {
+            segments_total: result.segments.len(),
+            segments_corrected: 0,
+            segments_fallback: result.segments.len(),
+            notes: vec![
+                "preserved authoritative canonical DTW projection timeline; synthetic alignment skipped"
+                    .to_owned(),
+            ],
+        });
+    }
+    ctc_forced_align(&mut result.segments, audio_duration_sec, config, token)
 }
 
 async fn execute_align(
@@ -2644,11 +2825,9 @@ async fn execute_align(
         match run_stage_with_budget("align", align_budget_ms, move || {
             let config = AlignConfig::default();
             let report =
-                ctc_forced_align(&mut result.segments, audio_duration, &config, &align_token)?;
+                align_transcription_result(&mut result, audio_duration, &config, &align_token)?;
             Ok((result, report))
-        })
-        .await
-        {
+        }) {
             Ok(output) => output,
             Err(error) => {
                 let code = stage_failure_code("align", &error);
@@ -2827,11 +3006,29 @@ struct VadReport {
 /// Fallback path:
 /// - if native waveform parsing fails, use a legacy energy scanner with
 ///   deterministic behavior and emit fallback evidence.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "retained as the deterministic legacy VAD evidence baseline"
+    )
+)]
 fn vad_energy_detect(
     normalized_wav: &Path,
     config: &VadConfig,
     token: &CancellationToken,
 ) -> FwResult<VadReport> {
+    vad_energy_detect_with_analysis(normalized_wav, config, token).map(|(report, _)| report)
+}
+
+fn vad_energy_detect_with_analysis(
+    normalized_wav: &Path,
+    config: &VadConfig,
+    token: &CancellationToken,
+) -> FwResult<(
+    VadReport,
+    Option<backend::native_audio::NativeAudioAnalysis>,
+)> {
     token.checkpoint()?;
 
     let analysis = match backend::native_audio::analyze_wav(normalized_wav, None) {
@@ -2842,7 +3039,7 @@ fn vad_energy_detect(
             fallback_report.notes.push(format!(
                 "native_audio parse failed; deterministic legacy fallback activated: {error}"
             ));
-            return Ok(fallback_report);
+            return Ok((fallback_report, None));
         }
     };
 
@@ -2912,17 +3109,20 @@ fn vad_energy_detect(
         })
         .collect();
 
-    Ok(VadReport {
-        frames_total,
-        frames_voiced,
-        voice_ratio,
-        silence_only,
-        regions,
-        detector: "native_audio_waveform",
-        fallback_triggered: false,
-        activity_threshold: config.rms_threshold,
-        notes: Vec::new(),
-    })
+    Ok((
+        VadReport {
+            frames_total,
+            frames_voiced,
+            voice_ratio,
+            silence_only,
+            regions,
+            detector: "native_audio_waveform",
+            fallback_triggered: false,
+            activity_threshold: config.rms_threshold,
+            notes: Vec::new(),
+        },
+        Some(analysis),
+    ))
 }
 
 fn merge_regions_by_gap(regions: &mut Vec<VadRegionMs>, max_gap_ms: u64) {
@@ -3003,10 +3203,11 @@ fn vad_energy_detect_legacy(
         &[] as &[u8]
     };
 
-    let samples: Vec<f64> = pcm_data
-        .chunks_exact(2)
+    let (sample_bytes, _) = pcm_data.as_chunks::<2>();
+    let samples: Vec<f64> = sample_bytes
+        .iter()
         .map(|chunk| {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+            let sample = i16::from_le_bytes(*chunk);
             sample as f64 / 32768.0
         })
         .collect();
@@ -3119,11 +3320,9 @@ async fn execute_vad(
     let vad_token = pcx.stage_token(vad_budget_ms); // ubs:ignore — cancellation token is not a secret
     let config_for_run = vad_config.clone();
 
-    let report = match run_stage_with_budget("vad", vad_budget_ms, move || {
-        vad_energy_detect(&vad_wav, &config_for_run, &vad_token)
-    })
-    .await
-    {
+    let (report, analysis) = match run_stage_with_budget("vad", vad_budget_ms, move || {
+        vad_energy_detect_with_analysis(&vad_wav, &config_for_run, &vad_token)
+    }) {
         Ok(report) => report,
         Err(error) => {
             let code = stage_failure_code("vad", &error);
@@ -3137,6 +3336,7 @@ async fn execute_vad(
         }
     };
 
+    inter.native_audio_analysis = analysis.map(Arc::new);
     let vad_code = if report.silence_only {
         inter.vad_silence_only = true;
         // Provide an empty result for silence-only audio.
@@ -3146,6 +3346,7 @@ async fn execute_vad(
             language: None,
             segments: Vec::new(),
             acceleration: None,
+            diarization: None,
             raw_output: json!({
                 "vad": "silence_only",
                 "detector": report.detector,
@@ -3216,24 +3417,45 @@ struct SeparateReport {
 /// The `vocal_isolated` flag is set to `true` when the speech coverage
 /// fraction exceeds the minimum threshold, indicating the audio has
 /// sufficient vocal content for downstream transcription.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "retained as the deterministic legacy separation evidence baseline"
+    )
+)]
 fn source_separate(normalized_wav: &Path, token: &CancellationToken) -> FwResult<SeparateReport> {
+    source_separate_with_analysis(normalized_wav, None, token)
+}
+
+fn source_separate_with_analysis(
+    normalized_wav: &Path,
+    cached_analysis: Option<&backend::native_audio::NativeAudioAnalysis>,
+    token: &CancellationToken,
+) -> FwResult<SeparateReport> {
     token.checkpoint()?;
 
     // Attempt native audio analysis.  If the file cannot be parsed
     // (e.g. not a valid PCM16 mono WAV), fall back gracefully.
-    let analysis = match backend::native_audio::analyze_wav(normalized_wav, None) {
-        Ok(a) => a,
-        Err(reason) => {
-            return Ok(SeparateReport {
-                vocal_isolated: true,
-                speech_coverage: 0.0,
-                avg_rms: 0.0,
-                active_region_count: 0,
-                notes: vec![format!(
-                    "analysis unavailable ({reason}); assuming vocal content present"
-                )],
-            });
-        }
+    let recomputed_analysis;
+    let analysis = if let Some(analysis) = cached_analysis {
+        analysis
+    } else {
+        recomputed_analysis = match backend::native_audio::analyze_wav(normalized_wav, None) {
+            Ok(analysis) => analysis,
+            Err(reason) => {
+                return Ok(SeparateReport {
+                    vocal_isolated: true,
+                    speech_coverage: 0.0,
+                    avg_rms: 0.0,
+                    active_region_count: 0,
+                    notes: vec![format!(
+                        "analysis unavailable ({reason}); assuming vocal content present"
+                    )],
+                });
+            }
+        };
+        &recomputed_analysis
     };
 
     token.checkpoint()?;
@@ -3296,14 +3518,13 @@ async fn execute_separate(
     );
 
     let sep_wav = normalized_wav.clone();
+    let cached_analysis = inter.native_audio_analysis.clone();
     let sep_budget_ms = stage_budgets.separate_ms;
     let sep_token = pcx.stage_token(sep_budget_ms); // ubs:ignore — cancellation token is not a secret
 
     let report = match run_stage_with_budget("separate", sep_budget_ms, move || {
-        source_separate(&sep_wav, &sep_token)
-    })
-    .await
-    {
+        source_separate_with_analysis(&sep_wav, cached_analysis.as_deref(), &sep_token)
+    }) {
         Ok(report) => report,
         Err(error) => {
             let code = stage_failure_code("separate", &error);
@@ -3365,22 +3586,17 @@ const ABBREVIATIONS: &[&str] = &[
 /// to a known abbreviation rather than ending a sentence.
 fn is_abbreviation_period(text: &str, period_byte_pos: usize) -> bool {
     let before = &text[..period_byte_pos + 1]; // includes the period
-    let lower = before.to_ascii_lowercase();
+    let before_bytes = before.as_bytes();
     for abbr in ABBREVIATIONS {
-        if lower.ends_with(abbr) {
-            // Make sure the abbreviation is word-aligned (preceded by start or
-            // whitespace).
-            let prefix_len = before.len() - abbr.len();
-            if prefix_len == 0 {
-                return true;
-            }
-            if before
-                .as_bytes()
-                .get(prefix_len.wrapping_sub(1))
-                .is_some_and(|b| b.is_ascii_whitespace())
-            {
-                return true;
-            }
+        let abbr_bytes = abbr.as_bytes();
+        if before_bytes.len() < abbr_bytes.len() {
+            continue;
+        }
+        let prefix_len = before_bytes.len() - abbr_bytes.len();
+        if before_bytes[prefix_len..].eq_ignore_ascii_case(abbr_bytes)
+            && (prefix_len == 0 || before_bytes[prefix_len - 1].is_ascii_whitespace())
+        {
+            return true;
         }
     }
     false
@@ -3567,9 +3783,7 @@ async fn execute_punctuate(
         match run_stage_with_budget("punctuate", punct_budget_ms, move || {
             let report = punctuate_segments(&mut result.segments, &punct_token)?;
             Ok((result, report))
-        })
-        .await
-        {
+        }) {
             Ok(output) => output,
             Err(error) => {
                 let code = stage_failure_code("punctuate", &error);
@@ -3607,7 +3821,7 @@ async fn execute_punctuate(
 }
 
 // ---------------------------------------------------------------------------
-// Speaker diarization (bd-qla.5, TitaNet-inspired placeholder)
+// Speaker diarization (bd-qla.5): heuristic 6-D temporal/lexical segment clustering
 // ---------------------------------------------------------------------------
 
 /// Report produced by the speaker diarization stage.
@@ -3631,7 +3845,7 @@ pub(crate) struct DiarizeReport {
     pub(crate) notes: Vec<String>,
 }
 
-/// Acoustic-heuristic feature vector for a segment.
+/// Temporal/lexical-heuristic feature vector for a segment.
 ///
 /// In a real TitaNet-inspired system, this would be a high-dimensional
 /// embedding from a neural speaker encoder.  Here we use an expanded set
@@ -3670,6 +3884,7 @@ impl SpeakerEmbedding {
     }
 
     /// Compute the element-wise mean of a slice of embeddings.
+    #[cfg(test)]
     fn centroid(embeddings: &[SpeakerEmbedding]) -> SpeakerEmbedding {
         let n = embeddings.len() as f64;
         if n < 1.0 {
@@ -3717,22 +3932,40 @@ fn silhouette_score(
     }
 
     let n = embeddings.len();
-    let mut sum = 0.0_f64;
 
+    // The pairwise distance matrix is symmetric — `euclidean_distance(i,j)` ==
+    // `euclidean_distance(j,i)` bit-for-bit, because `(a-b)*(a-b)` == `(b-a)*(b-a)`
+    // in IEEE-754 (negation flips only the sign, squaring clears it) and the sum is
+    // over the same fixed order. So compute each unordered pair's distance ONCE
+    // (n(n-1)/2 sqrt instead of n(n-1)) and fold it into per-point per-cluster
+    // running sums for BOTH endpoints. Each `cluster_sum[i][c]` still accumulates
+    // `d(i,k)` over `k` in strictly increasing index order (the `k<i` terms arrive
+    // from earlier outer iterations, the `k>i` terms from `i`'s own), so a(i)/b(i)
+    // — and thus every s(i) and the mean — are byte-identical to the naive
+    // double-scan below-superseded form. ~2.9x faster (see benches/silhouette_perf).
+    let mut cluster_sum = vec![0.0_f64; n * num_clusters];
+    let mut cluster_count = vec![0u64; n * num_clusters];
     for i in 0..n {
         let ci = assignments[i];
+        for j in (i + 1)..n {
+            let d = embeddings[i].euclidean_distance(&embeddings[j]);
+            let cj = assignments[j];
+            cluster_sum[i * num_clusters + cj] += d;
+            cluster_count[i * num_clusters + cj] += 1;
+            cluster_sum[j * num_clusters + ci] += d;
+            cluster_count[j * num_clusters + ci] += 1;
+        }
+    }
+
+    let mut sum = 0.0_f64;
+    for i in 0..n {
+        let ci = assignments[i];
+        let base = i * num_clusters;
 
         // a(i): mean distance to other points in same cluster.
-        let mut a_sum = 0.0_f64;
-        let mut a_count = 0u64;
-        for (j, emb_j) in embeddings.iter().enumerate() {
-            if j != i && assignments[j] == ci {
-                a_sum += embeddings[i].euclidean_distance(emb_j);
-                a_count += 1;
-            }
-        }
+        let a_count = cluster_count[base + ci];
         let a_i = if a_count > 0 {
-            a_sum / a_count as f64
+            cluster_sum[base + ci] / a_count as f64
         } else {
             0.0
         };
@@ -3743,16 +3976,9 @@ fn silhouette_score(
             if cj == ci {
                 continue;
             }
-            let mut b_sum = 0.0_f64;
-            let mut b_count = 0u64;
-            for (j, emb_j) in embeddings.iter().enumerate() {
-                if assignments[j] == cj {
-                    b_sum += embeddings[i].euclidean_distance(emb_j);
-                    b_count += 1;
-                }
-            }
+            let b_count = cluster_count[base + cj];
             if b_count > 0 {
-                let mean_dist = b_sum / b_count as f64;
+                let mean_dist = cluster_sum[base + cj] / b_count as f64;
                 if mean_dist < b_i {
                     b_i = mean_dist;
                 }
@@ -3771,24 +3997,7 @@ fn silhouette_score(
     Some(sum / n as f64)
 }
 
-/// Resolve the effective target speaker count from [`SpeakerConstraints`].
-///
-/// Priority: `num_speakers` > `max_speakers`.
-/// Returns `None` when no upper bound is specified.
-fn resolve_speaker_target(constraints: Option<&crate::model::SpeakerConstraints>) -> Option<usize> {
-    let sc = constraints?;
-    // Explicit num_speakers overrides everything.
-    if let Some(n) = sc.num_speakers.filter(|&n| n > 0) {
-        return Some(n as usize);
-    }
-    // If only max_speakers is set, use it as the ceiling.
-    if let Some(max_k) = sc.max_speakers.filter(|&m| m > 0) {
-        return Some(max_k as usize);
-    }
-    None
-}
-
-/// Assign speaker labels to segments using acoustic-heuristic feature
+/// Assign speaker labels to segments using temporal/lexical-heuristic feature
 /// clustering.
 ///
 /// Algorithm:
@@ -3807,12 +4016,22 @@ fn resolve_speaker_target(constraints: Option<&crate::model::SpeakerConstraints>
 pub(crate) fn diarize_segments(
     segments: &mut [crate::model::TranscriptionSegment],
     audio_duration: Option<f64>,
-    speaker_constraints: Option<&crate::model::SpeakerConstraints>,
+    speaker_count: &SpeakerCountRequest,
     token: &CancellationToken,
 ) -> FwResult<DiarizeReport> {
+    token.checkpoint()?;
+    if !matches!(speaker_count, SpeakerCountRequest::Infer) {
+        return Err(FwError::InvalidRequest(
+            "heuristic diarization cannot faithfully execute explicit speaker-count inputs; use \
+             the native acoustic diarization engine"
+                .to_owned(),
+        ));
+    }
+
     let total = segments.len();
-    let mut notes: Vec<String> =
-        vec!["heuristic: acoustic-feature clustering without neural speaker encoder".to_owned()];
+    let notes: Vec<String> = vec![
+        "heuristic: temporal/lexical-feature clustering without neural speaker encoder".to_owned(),
+    ];
 
     if segments.is_empty() {
         return Ok(DiarizeReport {
@@ -3824,33 +4043,39 @@ pub(crate) fn diarize_segments(
         });
     }
 
-    token.checkpoint()?;
-
     let duration = audio_duration
         .or_else(|| segments.iter().filter_map(|s| s.end_sec).reduce(f64::max))
         .unwrap_or(1.0)
         .max(1e-6);
 
-    // Precompute normalization denominators across the segment set.
-    let max_seg_duration = segments
-        .iter()
-        .map(|s| {
-            let start = s.start_sec.unwrap_or(0.0);
-            let end = s.end_sec.unwrap_or(start);
-            (end - start).max(0.0)
-        })
-        .fold(0.0_f64, f64::max)
-        .max(1e-6);
-
-    let max_word_count = segments
-        .iter()
-        .map(|s| s.text.split_whitespace().count() as f64)
-        .fold(1.0_f64, f64::max);
-
-    let max_text_len = segments
-        .iter()
-        .map(|s| s.text.len() as f64)
-        .fold(1.0_f64, f64::max);
+    // Precompute normalization denominators AND per-segment word/char counts in a
+    // SINGLE pass, so the embedding map below can reuse the counts instead of
+    // re-splitting each segment's text. The original made four passes over the set
+    // and called `split_whitespace()` twice per segment (once for max_word_count,
+    // once in the map). Byte-identical: each max folds over the same values in the
+    // same order (same init), and the stored counts equal the re-split counts —
+    // ~2x faster (see benches/diarize_extract_perf).
+    let mut word_counts: Vec<usize> = Vec::with_capacity(total);
+    let mut char_counts: Vec<usize> = Vec::with_capacity(total);
+    let mut max_seg_duration = 0.0_f64;
+    let mut max_word_count = 1.0_f64;
+    let mut max_text_len = 1.0_f64;
+    for s in segments.iter() {
+        let start = s.start_sec.unwrap_or(0.0);
+        let end = s.end_sec.unwrap_or(start);
+        max_seg_duration = max_seg_duration.max((end - start).max(0.0));
+        let mut word_count = 0usize;
+        let mut total_chars = 0usize;
+        for word in s.text.split_whitespace() {
+            word_count += 1;
+            total_chars += word.len();
+        }
+        word_counts.push(word_count);
+        char_counts.push(total_chars);
+        max_word_count = max_word_count.max(word_count as f64);
+        max_text_len = max_text_len.max(s.text.len() as f64);
+    }
+    let max_seg_duration = max_seg_duration.max(1e-6);
 
     // Step 1: Compute embeddings with inter-segment gap analysis.
     let embeddings: Vec<SpeakerEmbedding> = segments
@@ -3873,12 +4098,8 @@ pub(crate) fn diarize_segments(
                 0.0
             };
 
-            let mut word_count = 0usize;
-            let mut total_chars = 0usize;
-            for word in seg.text.split_whitespace() {
-                word_count += 1;
-                total_chars += word.len();
-            }
+            let word_count = word_counts[i];
+            let total_chars = char_counts[i];
             let word_count_norm = word_count as f64 / max_word_count;
             let avg_word_len = if word_count == 0 {
                 0.0
@@ -3904,6 +4125,15 @@ pub(crate) fn diarize_segments(
     let similarity_threshold = 0.92;
     let mut cluster_members: Vec<Vec<SpeakerEmbedding>> = Vec::new();
     let mut centroids: Vec<SpeakerEmbedding> = Vec::new();
+    // Running per-cluster feature sums, so an assignment updates the centroid in
+    // O(1) (add + divide) instead of recomputing `centroid()` over every member
+    // (O(cluster_size) per assignment == O(n^2) for a dominant speaker). Each sum
+    // accumulates members in the same push order `centroid()` re-sums them, so the
+    // stored centroid — and thus every subsequent cosine decision and the whole
+    // assignment sequence — is BYTE-IDENTICAL to the recompute form (verified by
+    // benches/diarize_cluster_perf + the equivalence test). `cluster_members`
+    // still provides each cluster's exact running member count.
+    let mut cluster_sums: Vec<[f64; 6]> = Vec::new();
     let mut assignments: Vec<usize> = Vec::with_capacity(total);
 
     for (idx, emb) in embeddings.iter().enumerate() {
@@ -3926,83 +4156,31 @@ pub(crate) fn diarize_segments(
             if let Some(cid) = best_cluster {
                 assignments.push(cid);
                 cluster_members[cid].push(emb.clone());
-                centroids[cid] = SpeakerEmbedding::centroid(&cluster_members[cid]);
+                for (sum, feature) in cluster_sums[cid].iter_mut().zip(&emb.features) {
+                    *sum += *feature;
+                }
+                let count = cluster_members[cid].len() as f64;
+                centroids[cid] = SpeakerEmbedding {
+                    features: std::array::from_fn(|k| cluster_sums[cid][k] / count),
+                };
             } else {
                 // Defensive fallback: should not happen unless centroids bookkeeping diverges.
                 let new_id = centroids.len();
                 centroids.push(emb.clone());
                 cluster_members.push(vec![emb.clone()]);
+                cluster_sums.push(emb.features);
                 assignments.push(new_id);
             }
         } else {
             let new_id = centroids.len();
             centroids.push(emb.clone());
             cluster_members.push(vec![emb.clone()]);
+            cluster_sums.push(emb.features);
             assignments.push(new_id);
         }
     }
 
-    // Step 2b: Apply speaker constraints by merging clusters if over the
-    // target count.  Determine effective max from constraints.
-    let effective_max = resolve_speaker_target(speaker_constraints);
-
-    let unconstrained_count = centroids.len();
-    if let Some(max_k) = effective_max {
-        let max_k = max_k.max(1); // at least 1 cluster
-        while centroids.len() > max_k {
-            // Find the two closest centroids and merge them.
-            let mut best_pair = (0, 1);
-            let mut best_dist = f64::INFINITY;
-            for i in 0..centroids.len() {
-                for j in (i + 1)..centroids.len() {
-                    let d = centroids[i].euclidean_distance(&centroids[j]);
-                    if d < best_dist {
-                        best_dist = d;
-                        best_pair = (i, j);
-                    }
-                }
-            }
-            let (keep, remove) = best_pair;
-            // Move all members of `remove` into `keep`.
-            let removed_members = cluster_members.swap_remove(remove);
-            centroids.swap_remove(remove);
-            // Fix assignments: `remove` was absorbed into `keep`; the
-            // cluster that was last is now at index `remove` due to
-            // swap_remove.
-            let last_idx = centroids.len(); // old len - 1 after swap_remove
-            for a in &mut assignments {
-                if *a == remove {
-                    *a = keep;
-                } else if *a == last_idx {
-                    // This was the swapped-in cluster (formerly at end).
-                    *a = remove;
-                }
-            }
-            cluster_members[keep].extend(removed_members);
-            centroids[keep] = SpeakerEmbedding::centroid(&cluster_members[keep]);
-        }
-
-        if unconstrained_count > centroids.len() {
-            notes.push(format!(
-                "merged {unconstrained_count} clusters down to {} to respect speaker constraints",
-                centroids.len()
-            ));
-        }
-    }
-
-    // Note if fewer speakers detected than requested minimum.
-    if let Some(sc) = speaker_constraints
-        && let Some(min_k) = sc.min_speakers.filter(|&m| m > 0)
-        && (centroids.len() as u32) < min_k
-    {
-        notes.push(format!(
-            "detected {} speakers but min_speakers={min_k} requested; \
-             heuristic cannot synthesize additional speakers",
-            centroids.len()
-        ));
-    }
-
-    // Compact assignment IDs to be contiguous 0..N after potential merges.
+    // Compact assignment IDs to be contiguous 0..N.
     let unique_ids: Vec<usize> = {
         let mut seen: Vec<usize> = assignments.clone();
         seen.sort_unstable();
@@ -4047,10 +4225,27 @@ async fn execute_diarize(
     let mut result = inter.result.take().ok_or_else(|| {
         FwError::InvalidRequest("Diarize requires Backend to have run first".to_owned())
     })?;
+    let normalized_wav = inter.normalized_wav.clone().ok_or_else(|| {
+        FwError::InvalidRequest("Diarize requires Normalize to have run first".to_owned())
+    })?;
 
     checkpoint_or_emit("diarize", pcx, log)?;
 
+    let (rollout_stage, rollout_config_valid) = acoustic_diarization_rollout();
+    let engine = resolved_diarization_engine(request, &result);
     log.mark_stage_start();
+    log.push(
+        "diarize",
+        "diarize.rollout",
+        "resolved evidence-gated diarization rollout",
+        json!({
+            "requested_engine": selected_diarization_engine(request),
+            "resolved_engine": engine,
+            "rollout_stage": rollout_stage,
+            "rollout_config_valid": rollout_config_valid,
+            "external_speaker_evidence": result_has_external_diarization(&result),
+        }),
+    );
     log.push(
         "diarize",
         "diarize.start",
@@ -4059,46 +4254,275 @@ async fn execute_diarize(
             "segments": result.segments.len(),
             "budget_ms": stage_budgets.diarize_ms,
             "audio_duration_sec": inter.normalized_duration,
-            "speaker_constraints": request.backend_params.speaker_constraints.as_ref().map(|sc| json!({
-                "num_speakers": sc.num_speakers,
-                "min_speakers": sc.min_speakers,
-                "max_speakers": sc.max_speakers,
-            })),
+            "engine": engine,
+            "rollout_stage": rollout_stage,
+            "speaker_count": request
+                .backend_params
+                .acoustic_diarization
+                .as_ref()
+                .map(|request| &request.speaker_count)
+                .unwrap_or(&SpeakerCountRequest::Infer),
         }),
     );
 
     let diarize_budget_ms = stage_budgets.diarize_ms;
     let diarize_token = pcx.stage_token(diarize_budget_ms); // ubs:ignore — cancellation token is not a secret
-    let audio_duration = inter.normalized_duration;
-    let speaker_constraints = request.backend_params.speaker_constraints.clone();
-
-    let (updated_result, report) =
-        match run_stage_with_budget("diarize", diarize_budget_ms, move || {
-            let report = diarize_segments(
-                &mut result.segments,
-                audio_duration,
-                speaker_constraints.as_ref(),
-                &diarize_token,
-            )?;
-            Ok((result, report))
+    let acoustic_request = request
+        .backend_params
+        .acoustic_diarization
+        .clone()
+        .unwrap_or_default();
+    let fallback_policy = acoustic_request.fallback;
+    let external_fallback_admitted =
+        external_diarization_fallback_admitted(selected_diarization_engine(request), rollout_stage);
+    let normalized_duration_ms = inter
+        .normalized_duration
+        .and_then(|duration| finite_seconds_interval_to_ms(0.0, duration))
+        .map(|(_, end_ms)| end_ms);
+    let speech_regions_ms = inter
+        .vad_regions
+        .as_ref()
+        .map(|regions| {
+            regions
+                .iter()
+                .filter_map(|&(start, end)| finite_seconds_interval_to_ms(start, end))
+                .collect::<Vec<_>>()
         })
-        .await
-        {
-            Ok(output) => output,
-            Err(error) => {
-                let code = stage_failure_code("diarize", &error);
-                log.push(
-                    "diarize",
-                    &code,
-                    stage_failure_message(&error, "diarization failed"),
-                    json!({"error": error.to_string(), "budget_ms": diarize_budget_ms}),
-                );
-                return Err(error);
+        .unwrap_or_default();
+
+    let (updated_result, report) = match run_stage_with_budget(
+        "diarize",
+        diarize_budget_ms,
+        move || {
+            validate_diarization_execution_request(
+                engine,
+                &acoustic_request,
+                normalized_duration_ms,
+            )?;
+            match engine {
+                DiarizationEngine::Auto | DiarizationEngine::Acoustic => {
+                    let segments_total = result.segments.len();
+                    let wav_bytes = std::fs::read(&normalized_wav)?;
+                    let normalized_input_sha256 = sha256_bytes_hex(&wav_bytes);
+                    let samples = crate::native_engine::decode::read_wav_16k_mono(&wav_bytes)?;
+                    let word_aligned = has_canonical_word_alignment(&result.raw_output);
+                    let word_boundaries_ms = if word_aligned {
+                        transcript_boundaries_ms(&result.segments)
+                    } else {
+                        Vec::new()
+                    };
+                    let boundary_hints = AcousticBoundaryHints {
+                        speech_regions_ms,
+                        word_boundaries_ms,
+                        tiny_diarize_boundaries_ms: Vec::new(),
+                    };
+                    let (diarization_report, projection) = diarization::diarize_acoustic_pcm(
+                        diarization::AcousticDiarizationInput {
+                            samples: &samples,
+                            normalized_input_sha256: &normalized_input_sha256,
+                            segments: &result.segments,
+                            word_aligned,
+                            request: &acoustic_request,
+                            boundary_hints: &boundary_hints,
+                        },
+                        || diarize_token.checkpoint().is_err(),
+                    )?;
+                    if acoustic_request.fallback == DiarizationFallbackPolicy::External
+                        && external_fallback_admitted
+                        && matches!(
+                            &acoustic_request.speaker_count,
+                            SpeakerCountRequest::Infer | SpeakerCountRequest::HardConstraint { .. }
+                        )
+                        && diarization_report.fallback_status
+                            != DiarizationFallbackStatus::NotNeeded
+                        && result_has_external_diarization(&result)
+                    {
+                        let external_report = external_diarization_report(
+                            &result,
+                            &normalized_input_sha256,
+                            &acoustic_request.speaker_count,
+                        )?;
+                        let speakers_detected =
+                            usize::try_from(external_report.speaker_count.supported_speaker_count)
+                                .map_err(|_| {
+                                    FwError::InvalidRequest(
+                                        "external speaker count does not fit this platform"
+                                            .to_owned(),
+                                    )
+                                })?;
+                        let segments_labeled = result
+                            .segments
+                            .iter()
+                            .filter(|segment| segment.speaker.is_some())
+                            .count();
+                        result.diarization = Some(external_report);
+                        Ok((
+                        result,
+                        DiarizeReport {
+                            segments_total,
+                            speakers_detected,
+                            segments_labeled,
+                            silhouette_score: None,
+                            notes: vec![
+                                "native acoustic evidence was insufficient; accepted runtime-verified external diarization"
+                                    .to_owned(),
+                            ],
+                        },
+                    ))
+                    } else {
+                        let notes = diarization_report.diagnostics.clone();
+                        let speakers_detected = usize::try_from(
+                            diarization_report.speaker_count.supported_speaker_count,
+                        )
+                        .map_err(|_| {
+                            FwError::InvalidRequest(
+                                "diarization speaker count does not fit this platform".to_owned(),
+                            )
+                        })?;
+                        apply_native_diarization_projection(
+                            &mut result,
+                            projection,
+                            diarization_report,
+                        );
+                        let segments_labeled = result
+                            .segments
+                            .iter()
+                            .filter(|segment| segment.speaker.is_some())
+                            .count();
+                        Ok((
+                            result,
+                            DiarizeReport {
+                                segments_total,
+                                speakers_detected,
+                                segments_labeled,
+                                silhouette_score: None,
+                                notes,
+                            },
+                        ))
+                    }
+                }
+                DiarizationEngine::External => {
+                    if result_has_external_diarization(&result) {
+                        let segments_total = result.segments.len();
+                        let diarization_report = external_diarization_report(
+                            &result,
+                            &sha256_file(&normalized_wav)?,
+                            &acoustic_request.speaker_count,
+                        )?;
+                        let speakers_detected = usize::try_from(
+                            diarization_report.speaker_count.supported_speaker_count,
+                        )
+                        .map_err(|_| {
+                            FwError::InvalidRequest(
+                                "external speaker count does not fit this platform".to_owned(),
+                            )
+                        })?;
+                        let segments_labeled = result
+                            .segments
+                            .iter()
+                            .filter(|segment| segment.speaker.is_some())
+                            .count();
+                        result.diarization = Some(diarization_report);
+                        Ok((
+                            result,
+                            DiarizeReport {
+                                segments_total,
+                                speakers_detected,
+                                segments_labeled,
+                                silhouette_score: None,
+                                notes: vec![
+                                    "accepted runtime-verified external diarization".to_owned(),
+                                ],
+                            },
+                        ))
+                    } else if fallback_policy == DiarizationFallbackPolicy::Unknown {
+                        let segments_total = result.segments.len();
+                        for segment in &mut result.segments {
+                            segment.speaker = None;
+                        }
+                        result.diarization = Some(unknown_diarization_report(
+                            sha256_file(&normalized_wav)?,
+                            &acoustic_request.speaker_count,
+                            "external diarization was unavailable; emitted unknown speakers",
+                        ));
+                        Ok((
+                            result,
+                            DiarizeReport {
+                                segments_total,
+                                speakers_detected: 0,
+                                segments_labeled: 0,
+                                silhouette_score: None,
+                                notes: vec![
+                                "external diarization was unavailable; emitted unknown speakers"
+                                    .to_owned(),
+                            ],
+                            },
+                        ))
+                    } else {
+                        Err(FwError::InvalidRequest(
+                        "external diarization was requested but no resolved backend supplied valid speaker turns"
+                            .to_owned(),
+                    ))
+                    }
+                }
+                DiarizationEngine::Neural => match acoustic_request.fallback {
+                    DiarizationFallbackPolicy::External => Err(FwError::InvalidRequest(
+                        "neural diarization fallback requires the whisper-diarization backend"
+                            .to_owned(),
+                    )),
+                    DiarizationFallbackPolicy::Unknown => {
+                        let segments_total = result.segments.len();
+                        for segment in &mut result.segments {
+                            segment.speaker = None;
+                        }
+                        result.diarization = Some(unknown_diarization_report(
+                            sha256_file(&normalized_wav)?,
+                            &acoustic_request.speaker_count,
+                            "requested neural engine is unavailable; emitted unknown speakers",
+                        ));
+                        Ok((
+                            result,
+                            DiarizeReport {
+                                segments_total,
+                                speakers_detected: 0,
+                                segments_labeled: 0,
+                                silhouette_score: None,
+                                notes: vec![
+                                    "neural engine unavailable; emitted unknown speakers"
+                                        .to_owned(),
+                                ],
+                            },
+                        ))
+                    }
+                    DiarizationFallbackPolicy::Error => Err(FwError::InvalidRequest(
+                        "neural diarization engine is not admitted in this build".to_owned(),
+                    )),
+                },
             }
-        };
+        },
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let code = stage_failure_code("diarize", &error);
+            log.push(
+                "diarize",
+                &code,
+                stage_failure_message(&error, "diarization failed"),
+                json!({"error": error.to_string(), "budget_ms": diarize_budget_ms}),
+            );
+            return Err(error);
+        }
+    };
 
     inter.result = Some(updated_result);
     inter.warnings.extend(report.notes.iter().cloned());
+    if let Some(diarization_report) = inter
+        .result
+        .as_ref()
+        .and_then(|result| result.diarization.as_ref())
+    {
+        emit_diarization_report_events(log, diarization_report);
+    }
 
     tracing::debug!(
         stage = "diarize",
@@ -4121,6 +4545,418 @@ async fn execute_diarize(
     );
 
     Ok(())
+}
+
+fn validate_diarization_execution_request(
+    engine: DiarizationEngine,
+    request: &crate::model::DiarizationRequest,
+    audio_duration_ms: Option<u64>,
+) -> FwResult<()> {
+    request
+        .validate(audio_duration_ms.unwrap_or(u64::MAX))
+        .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
+    if !request.known_intervals.is_empty()
+        && !matches!(
+            engine,
+            DiarizationEngine::Auto | DiarizationEngine::Acoustic
+        )
+    {
+        return Err(FwError::InvalidRequest(
+            "known speaker intervals require the native acoustic diarization engine".to_owned(),
+        ));
+    }
+    if matches!(
+        request.speaker_count,
+        SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+    ) && matches!(
+        engine,
+        DiarizationEngine::External | DiarizationEngine::Neural
+    ) {
+        return Err(FwError::InvalidRequest(
+            "soft speaker-count priors and ranges require the native acoustic diarization engine; \
+             external and neural engines cannot faithfully fuse soft count evidence"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_native_diarization_projection(
+    result: &mut crate::model::TranscriptionResult,
+    projection: diarization::DiarizationProjection,
+    report: DiarizationReport,
+) {
+    // Speaker projection may alter only the legacy per-segment speaker field.
+    // The backend's top-level transcript remains byte-authoritative even when
+    // its spacing differs from a reconstruction of the segment list.
+    result.segments = projection.segments;
+    result.diarization = Some(report);
+}
+
+fn emit_diarization_report_events(log: &mut EventLog, report: &DiarizationReport) {
+    log.push(
+        "diarize",
+        "diarize.progress",
+        "diarization report assembled",
+        json!({
+            "implementation": report.implementation,
+            "contract_version": report.contract_version,
+            "feature_schema": report.feature_schema,
+            "turns": report.turns.len(),
+            "profiles": report.profiles.len(),
+            "speaker_count": report.speaker_count,
+            "fallback_status": report.fallback_status,
+        }),
+    );
+    for (turn_index, turn) in report.turns.iter().enumerate() {
+        log.push(
+            "diarize",
+            "diarize.change",
+            "speaker turn boundary",
+            json!({
+                "turn_index": turn_index,
+                "start_ms": turn.start_ms,
+                "end_ms": turn.end_ms,
+                "speaker_ref": turn.speaker_ref,
+                "speaker_confidence": turn.speaker_confidence,
+                "change_confidence": turn.change_confidence,
+                "overlap_suspected": turn.overlap_suspected,
+                "hard_hint_attributed": turn.hard_hint_attributed,
+            }),
+        );
+    }
+    for profile in &report.profiles {
+        log.push(
+            "diarize",
+            "diarize.profile",
+            "privacy-safe speaker profile summary",
+            json!({
+                "speaker_ref": profile.speaker_ref,
+                "frame_count": profile.frame_count,
+                "voiced_duration_ms": profile.voiced_duration_ms,
+                "reliability": profile.reliability,
+                "channel_profile_count": profile.channel_profile_count,
+                "anchored": profile.anchored,
+                "soft_hint_contradiction": profile.soft_hint_contradiction,
+            }),
+        );
+    }
+}
+
+fn finite_seconds_interval_to_ms(start_sec: f64, end_sec: f64) -> Option<(u64, u64)> {
+    if !start_sec.is_finite() || !end_sec.is_finite() || start_sec < 0.0 || end_sec <= start_sec {
+        return None;
+    }
+    let start_ms = (start_sec * 1_000.0).round();
+    let end_ms = (end_sec * 1_000.0).round();
+    if start_ms > u64::MAX as f64 || end_ms > u64::MAX as f64 {
+        return None;
+    }
+    let start_ms = start_ms as u64;
+    let end_ms = end_ms as u64;
+    (end_ms > start_ms).then_some((start_ms, end_ms))
+}
+
+fn transcript_boundaries_ms(segments: &[crate::model::TranscriptionSegment]) -> Vec<u64> {
+    let mut boundaries = segments
+        .iter()
+        .flat_map(|segment| [segment.start_sec, segment.end_sec])
+        .flatten()
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= u64::MAX as f64 / 1_000.0)
+        .map(|value| (value * 1_000.0).round() as u64)
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    boundaries
+}
+
+fn has_canonical_word_alignment(raw_output: &Value) -> bool {
+    raw_output
+        .pointer("/projection_timeline/schema_version")
+        .and_then(Value::as_str)
+        == Some(crate::conformance::DTW_PROJECTION_SCHEMA_VERSION)
+        && raw_output
+            .pointer("/projection_timeline/word_aligned_safe")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn result_has_external_diarization(result: &crate::model::TranscriptionResult) -> bool {
+    // The legacy native whisper-diarization adapter labels ASR segments with a
+    // text/temporal heuristic.  Those labels are useful only as historical
+    // diagnostics: they are neither waveform-derived acoustic evidence nor
+    // externally produced speaker evidence, so they must never satisfy this
+    // provenance gate.
+    let legacy_text_temporal_heuristic = result.raw_output.get("diarizer").and_then(Value::as_str)
+        == Some("text-temporal-heuristic")
+        || result.raw_output.get("engine").and_then(Value::as_str)
+            == Some("whisper-diarization-native");
+    result.backend == crate::model::BackendKind::WhisperDiarization
+        && !legacy_text_temporal_heuristic
+        && result.segments.iter().any(|segment| {
+            segment.speaker.is_some()
+                && segment
+                    .start_sec
+                    .zip(segment.end_sec)
+                    .and_then(|(start, end)| finite_seconds_interval_to_ms(start, end))
+                    .is_some()
+        })
+}
+
+fn speaker_count_satisfies_request(speaker_count: u32, request: &SpeakerCountRequest) -> bool {
+    match request {
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => true,
+        SpeakerCountRequest::HardConstraint { count } => speaker_count == *count,
+    }
+}
+
+fn unknown_diarization_report(
+    normalized_input_sha256: String,
+    speaker_count: &SpeakerCountRequest,
+    reason: &str,
+) -> DiarizationReport {
+    let count_request_satisfied = speaker_count_satisfies_request(0, speaker_count);
+    let status = match speaker_count {
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => SpeakerCountOutcomeStatus::Unresolved,
+        SpeakerCountRequest::HardConstraint { .. } => SpeakerCountOutcomeStatus::Unsatisfied,
+    };
+    DiarizationReport {
+        implementation: "fallback-unknown".to_owned(),
+        contract_version: diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION.to_owned(),
+        feature_schema: diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION.to_owned(),
+        normalized_input_sha256,
+        hint_document_sha256: None,
+        turns: Vec::new(),
+        profiles: Vec::new(),
+        hint_evidence: Vec::new(),
+        speaker_queries: Vec::new(),
+        speaker_count: SpeakerCountOutcome {
+            request: speaker_count.clone(),
+            estimate: None,
+            status,
+            supported_speaker_count: 0,
+            active_speaker_refs: Vec::new(),
+            dominant_speaker_share: 0.0,
+            unknown_voiced_share: 1.0,
+            reasons: vec![
+                if matches!(speaker_count, SpeakerCountRequest::Prior { .. }) {
+                    SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable
+                } else if matches!(speaker_count, SpeakerCountRequest::Range { .. }) {
+                    SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved
+                } else if count_request_satisfied {
+                    SpeakerCountOutcomeReason::NoSupportedSpeakers
+                } else {
+                    SpeakerCountOutcomeReason::RequestedCountMismatch
+                },
+            ],
+            speaker_evidence: Vec::new(),
+        },
+        fallback_status: if matches!(
+            speaker_count,
+            SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+        ) {
+            DiarizationFallbackStatus::SpeakerCountUnresolved
+        } else if count_request_satisfied {
+            DiarizationFallbackStatus::InsufficientEvidence
+        } else {
+            DiarizationFallbackStatus::UnsatisfiedConstraints
+        },
+        diagnostics: vec![reason.to_owned()],
+    }
+}
+
+fn external_diarization_report(
+    result: &crate::model::TranscriptionResult,
+    normalized_input_sha256: &str,
+    speaker_count: &SpeakerCountRequest,
+) -> FwResult<DiarizationReport> {
+    if matches!(
+        speaker_count,
+        SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+    ) {
+        return Err(FwError::InvalidRequest(
+            "external diarization cannot faithfully fuse a soft speaker-count prior or range"
+                .to_owned(),
+        ));
+    }
+    let mut intervals = Vec::<(u64, u64, String)>::new();
+    for segment in &result.segments {
+        let Some(speaker_ref) = segment.speaker.as_ref() else {
+            continue;
+        };
+        let speaker_ref = speaker_ref.trim();
+        if speaker_ref.is_empty() {
+            return Err(FwError::InvalidRequest(
+                "external diarization supplied an empty speaker reference".to_owned(),
+            ));
+        }
+        let (start_ms, end_ms) = segment
+            .start_sec
+            .zip(segment.end_sec)
+            .and_then(|(start, end)| finite_seconds_interval_to_ms(start, end))
+            .ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "external diarization supplied a labeled segment without a positive finite millisecond interval"
+                        .to_owned(),
+                )
+            })?;
+        intervals.push((start_ms, end_ms, speaker_ref.to_owned()));
+    }
+    intervals.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.cmp(&right.1))
+            .then(left.2.cmp(&right.2))
+    });
+
+    let mut turns = Vec::<DiarizationTurn>::with_capacity(intervals.len());
+    for (start_ms, end_ms, speaker_ref) in intervals {
+        if let Some(previous) = turns.last_mut()
+            && previous.speaker_ref.as_deref() == Some(speaker_ref.as_str())
+            && start_ms <= previous.end_ms.saturating_add(20)
+        {
+            previous.end_ms = previous.end_ms.max(end_ms);
+            continue;
+        }
+        if turns
+            .last()
+            .is_some_and(|previous| start_ms < previous.end_ms)
+        {
+            return Err(FwError::InvalidRequest(
+                "external diarization supplied overlapping turns for different speakers".to_owned(),
+            ));
+        }
+        turns.push(DiarizationTurn {
+            start_ms,
+            end_ms,
+            speaker_ref: Some(speaker_ref),
+            speaker_confidence: None,
+            change_confidence: None,
+            overlap_suspected: false,
+            hard_hint_attributed: false,
+        });
+    }
+    if turns.is_empty() {
+        return Err(FwError::InvalidRequest(
+            "resolved external diarization did not provide valid timed speaker turns".to_owned(),
+        ));
+    }
+    let mut profile_totals = BTreeMap::<String, (u64, u64)>::new();
+    for turn in &turns {
+        if let Some(speaker_ref) = &turn.speaker_ref {
+            let duration = turn.end_ms - turn.start_ms;
+            let total = profile_totals.entry(speaker_ref.clone()).or_default();
+            total.0 = total.0.saturating_add(duration);
+            total.1 = total.1.saturating_add(1);
+        }
+    }
+    let profiles = profile_totals
+        .iter()
+        .map(
+            |(speaker_ref, (voiced_duration_ms, _))| SpeakerProfileSummary {
+                speaker_ref: speaker_ref.clone(),
+                frame_count: 0,
+                voiced_duration_ms: *voiced_duration_ms,
+                reliability: 0.0,
+                voice_profile_count: 0,
+                channel_profile_count: 0,
+                training_accepted_count: 0,
+                training_downweighted_count: 0,
+                training_quarantined_count: 0,
+                anchored: false,
+                soft_hint_contradiction: None,
+            },
+        )
+        .collect::<Vec<_>>();
+    let speaker_evidence = profile_totals
+        .iter()
+        .map(
+            |(speaker_ref, (voiced_duration_ms, turn_count))| SpeakerEvidenceSummary {
+                speaker_ref: speaker_ref.clone(),
+                assigned_tracklet_count: *turn_count,
+                independent_tracklet_count: *turn_count,
+                recurrence_episode_count: *turn_count,
+                voiced_frame_count: 0,
+                independent_voiced_frame_count: 0,
+                voiced_duration_ms: *voiced_duration_ms,
+                mean_assignment_confidence: 0.0,
+                profile_reliability: 0.0,
+                hard_anchored: false,
+                separated_from_supported_speakers: true,
+                reasons: vec![SpeakerEvidenceReason::SupportedByExternalAttribution],
+                supported: true,
+            },
+        )
+        .collect::<Vec<_>>();
+    let detected_speakers = u32::try_from(profiles.len()).map_err(|_| {
+        FwError::InvalidRequest("external speaker count exceeds report schema".to_owned())
+    })?;
+    let external_segment_count = profiles
+        .iter()
+        .map(|profile| profile.voiced_duration_ms)
+        .sum::<u64>();
+    let dominant_speaker_share = profiles
+        .iter()
+        .map(|profile| profile.voiced_duration_ms)
+        .max()
+        .map_or(0.0, |duration| {
+            duration as f64 / external_segment_count.max(1) as f64
+        });
+    let count_request_satisfied = speaker_count_satisfies_request(detected_speakers, speaker_count);
+    let status = match speaker_count {
+        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } => {
+            SpeakerCountOutcomeStatus::Resolved
+        }
+        SpeakerCountRequest::HardConstraint { .. } if count_request_satisfied => {
+            SpeakerCountOutcomeStatus::Satisfied
+        }
+        SpeakerCountRequest::HardConstraint { .. } => SpeakerCountOutcomeStatus::Unsatisfied,
+        SpeakerCountRequest::Prior { .. } => SpeakerCountOutcomeStatus::Unresolved,
+    };
+    let count_reason = match speaker_count {
+        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } => {
+            SpeakerCountOutcomeReason::EvidenceSupportedCount
+        }
+        SpeakerCountRequest::HardConstraint { .. } if count_request_satisfied => {
+            SpeakerCountOutcomeReason::RequestedCountMatched
+        }
+        SpeakerCountRequest::HardConstraint { .. } => {
+            SpeakerCountOutcomeReason::RequestedCountMismatch
+        }
+        SpeakerCountRequest::Prior { .. } => {
+            SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable
+        }
+    };
+    Ok(DiarizationReport {
+        implementation: "external-backend".to_owned(),
+        contract_version: diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION.to_owned(),
+        feature_schema: "external-unreported".to_owned(),
+        normalized_input_sha256: normalized_input_sha256.to_owned(),
+        hint_document_sha256: None,
+        turns,
+        profiles,
+        hint_evidence: Vec::new(),
+        speaker_queries: Vec::new(),
+        speaker_count: SpeakerCountOutcome {
+            request: speaker_count.clone(),
+            estimate: None,
+            status,
+            supported_speaker_count: detected_speakers,
+            active_speaker_refs: profile_totals.keys().cloned().collect(),
+            dominant_speaker_share,
+            unknown_voiced_share: 0.0,
+            reasons: vec![SpeakerCountOutcomeReason::ExternalAttribution, count_reason],
+            speaker_evidence,
+        },
+        fallback_status: DiarizationFallbackStatus::ExternalBackend,
+        diagnostics: vec![format!(
+            "accepted external speaker assignments covering {external_segment_count} ms; acoustic profile calibration unavailable"
+        )],
+    })
 }
 
 fn state_root() -> FwResult<PathBuf> {
@@ -4189,30 +5025,37 @@ impl EventLog {
             payload,
         };
 
-        self.events.push(event.clone());
-
         if let Some(tx) = &self.event_tx {
+            self.events.push(event.clone());
             let _ = tx.send(StreamedRunEvent {
                 run_id: self.run_id.clone(),
                 event,
             });
+        } else {
+            self.events.push(event);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
     use std::path::PathBuf;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
 
     use asupersync::runtime::RuntimeBuilder;
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     use crate::error::FwError;
     use crate::model::{
-        BackendKind, BackendParams, DiarizationConfig, InputSource, RunEvent, RunReport,
+        AcousticDiarizationRolloutStage, BackendKind, BackendParams, DiarizationConfig,
+        DiarizationEngine, DiarizationFallbackStatus, DiarizationReport, DiarizationRequest,
+        DiarizationTurn, InputSource, KnownSpeakerInterval, KnownSpeakerPolicy, RunEvent,
+        RunReport, SpeakerCountOutcome, SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus,
+        SpeakerCountRequest, SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerProfileSummary,
         StreamedRunEvent, TranscribeRequest, TranscriptionResult, TranscriptionSegment, VadParams,
     };
     use crate::storage::RunStore;
@@ -4223,15 +5066,347 @@ mod tests {
         FinalizerRegistry, PipelineConfig, PipelineCx, PipelineStage, PunctuateReport,
         SeparateReport, SpeakerEmbedding, StageBudgetPolicy, VadConfig, VadRegionMs, VadReport,
         acceleration_cancellation_fence_payload, acceleration_context_payload,
-        acceleration_stream_owner_id, apply_padding, budget_duration, checkpoint_or_emit,
-        ctc_forced_align, diarize_segments, event_elapsed_ms, is_abbreviation_period,
+        acceleration_stream_owner_id, align_transcription_result,
+        apply_native_diarization_projection, apply_padding, budget_duration, checkpoint_or_emit,
+        ctc_forced_align, diarize_segments, emit_diarization_report_events, event_elapsed_ms,
+        external_diarization_fallback_admitted, external_diarization_report,
+        finite_seconds_interval_to_ms, has_canonical_word_alignment, is_abbreviation_period,
         is_decimal_period, is_ellipsis_period, merge_regions_by_gap, ms_to_frames,
-        optional_stage_skip, parse_budget_ms, parse_event_ts_ms, punctuate_segments,
-        recommended_budget, resolve_speaker_target, run_pipeline, run_stage_with_budget,
-        sanitize_process_pid, sha256_bytes_hex, sha256_file, sha256_json_value, silhouette_score,
-        source_separate, split_long_regions, stage_budget_ms, stage_failure_code,
-        stage_failure_message, stage_latency_profile, state_root, vad_energy_detect,
+        optional_stage_skip, parse_acoustic_diarization_rollout, parse_budget_ms,
+        parse_event_ts_ms, punctuate_segments, recommended_budget, resolved_diarization_engine,
+        resolved_diarization_engine_for_rollout, result_has_external_diarization, run_pipeline,
+        run_stage_with_budget, sanitize_process_pid, selected_diarization_engine, sha256_bytes_hex,
+        sha256_file, sha256_json_value, silhouette_score, source_separate,
+        source_separate_with_analysis, split_long_regions, stage_budget_ms, stage_failure_code,
+        stage_failure_message, stage_latency_profile, state_root, transcript_boundaries_ms,
+        vad_energy_detect, vad_energy_detect_with_analysis, validate_diarization_execution_request,
     };
+
+    #[test]
+    fn report_event_snapshot_elision_preserves_pipeline_tail_events() {
+        fn request(root: &std::path::Path, db_name: &str, persist: bool) -> TranscribeRequest {
+            TranscribeRequest {
+                input: InputSource::File {
+                    path: root.join("unused.wav"),
+                },
+                backend: BackendKind::Auto,
+                model: None,
+                language: None,
+                translate: false,
+                diarize: false,
+                persist,
+                db_path: root.join(db_name),
+                timeout_ms: None,
+                backend_params: BackendParams::default(),
+            }
+        }
+
+        fn codes(report: &RunReport) -> Vec<&str> {
+            report
+                .events
+                .iter()
+                .map(|event| event.code.as_str())
+                .collect()
+        }
+
+        fn assert_contiguous_events(events: &[RunEvent]) {
+            assert!(
+                events
+                    .iter()
+                    .enumerate()
+                    .all(|(index, event)| event.seq == index as u64 + 1),
+                "event sequence must remain contiguous"
+            );
+        }
+
+        let dir = tempdir().expect("tempdir should be available");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let persist_config = PipelineConfig::new(vec![PipelineStage::Persist]);
+
+        let persisted = runtime
+            .block_on(run_pipeline(
+                request(dir.path(), "persist.sqlite3", true),
+                dir.path(),
+                None,
+                &persist_config,
+            ))
+            .expect("persist-only pipeline should succeed");
+        assert_eq!(
+            codes(&persisted),
+            vec![
+                "orchestration.budgets",
+                "orchestration.latency_profile",
+                "persist.start",
+                "persist.ok",
+            ]
+        );
+        assert_contiguous_events(&persisted.events);
+
+        let stored = RunStore::open(&dir.path().join("persist.sqlite3"))
+            .expect("store should open")
+            .load_run_details(&persisted.run_id)
+            .expect("stored report should load")
+            .expect("stored report should exist");
+        assert_eq!(
+            stored
+                .events
+                .iter()
+                .map(|event| event.code.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "orchestration.budgets",
+                "orchestration.latency_profile",
+                "persist.start",
+            ]
+        );
+        assert_contiguous_events(&stored.events);
+
+        let skipped = runtime
+            .block_on(run_pipeline(
+                request(dir.path(), "skip.sqlite3", false),
+                dir.path(),
+                None,
+                &persist_config,
+            ))
+            .expect("disabled persistence should return a report");
+        assert_eq!(
+            codes(&skipped),
+            vec![
+                "orchestration.budgets",
+                "orchestration.latency_profile",
+                "persist.skip",
+            ]
+        );
+        assert_contiguous_events(&skipped.events);
+
+        let no_persist = runtime
+            .block_on(run_pipeline(
+                request(dir.path(), "absent.sqlite3", true),
+                dir.path(),
+                None,
+                &PipelineConfig::new(Vec::new()),
+            ))
+            .expect("empty pipeline should return a report");
+        assert_eq!(
+            codes(&no_persist),
+            vec!["orchestration.budgets", "orchestration.latency_profile"]
+        );
+        assert_contiguous_events(&no_persist.events);
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn report_event_snapshot_elision_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 128;
+        const TARGET_ARM_NS: u128 = 50_000_000;
+
+        struct ReportShell {
+            events: Vec<RunEvent>,
+        }
+
+        fn fixture_log() -> EventLog {
+            let trace_id = "0123456789abcdef0123456789abcdef";
+            let events = (0..20)
+                .map(|index| RunEvent {
+                    seq: index + 1,
+                    ts_rfc3339: format!("2026-07-14T00:00:{index:02}Z"),
+                    stage: format!("stage_{}", index % 6),
+                    code: format!("stage.{}.ok", index % 6),
+                    message: format!(
+                        "current-like pipeline event {index:02}: {}",
+                        "measured payload with quotes \"text\", Unicode λ and 🎧 ".repeat(2)
+                    ),
+                    payload: json!({
+                        "index": index,
+                        "trace_id": trace_id,
+                        "nested": {
+                            "label": format!("payload-{index:02}"),
+                            "values": [index, index + 1, index + 2],
+                            "detail": "structured event payload ".repeat(4),
+                        },
+                    }),
+                })
+                .collect();
+
+            EventLog {
+                run_id: "perf-run".to_owned(),
+                trace_id: trace_id.to_owned(),
+                seq: 20,
+                events,
+                event_tx: None,
+                stage_start: None,
+            }
+        }
+
+        fn restore_log(log: &mut EventLog) {
+            let removed = log.events.pop().expect("remove persist.start");
+            assert_eq!(removed.code, "persist.start");
+            log.seq -= 1;
+            log.clear_stage_start();
+        }
+
+        fn time_historical(log: &mut EventLog, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let mut report = ReportShell {
+                    events: log.events.clone(),
+                };
+                log.mark_stage_start();
+                log.push(
+                    "persist",
+                    "persist.start",
+                    "writing run report to frankensqlite",
+                    json!({"db_path": "current-like.sqlite3", "budget_ms": 20_000}),
+                );
+                report.events = log.events.clone();
+                restore_log(log);
+                drop(black_box(report));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_candidate(log: &mut EventLog, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let mut report = ReportShell { events: Vec::new() };
+                log.mark_stage_start();
+                log.push(
+                    "persist",
+                    "persist.start",
+                    "writing run report to frankensqlite",
+                    json!({"db_path": "current-like.sqlite3", "budget_ms": 20_000}),
+                );
+                report.events = log.events.clone();
+                restore_log(log);
+                drop(black_box(report));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let mut historical_log = fixture_log();
+        let mut candidate_log = fixture_log();
+        let fixture_bytes = serde_json::to_vec(&historical_log.events)
+            .expect("serialize current-like event fixture");
+        assert_eq!(
+            fixture_bytes,
+            serde_json::to_vec(&candidate_log.events).expect("serialize candidate fixture")
+        );
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "report_event_snapshot_elision binary_sha256={:x} events={} fixture_bytes={} fixture_sha256={:x}",
+            Sha256::digest(executable),
+            historical_log.events.len(),
+            fixture_bytes.len(),
+            Sha256::digest(&fixture_bytes)
+        );
+
+        let calibration = time_historical(&mut historical_log, CALIBRATION_ITERATIONS);
+        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration)
+            .clamp(512, 20_000) as usize;
+        eprintln!(
+            "report_event_snapshot_elision calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&mut historical_log, iterations));
+            black_box(time_candidate(&mut candidate_log, iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut candidate_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&mut historical_log, iterations);
+            let null_second = time_historical(&mut historical_log, iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical, candidate) = if sample % 2 == 0 {
+                (
+                    time_historical(&mut historical_log, iterations),
+                    time_candidate(&mut candidate_log, iterations),
+                )
+            } else {
+                let candidate = time_candidate(&mut candidate_log, iterations);
+                let historical = time_historical(&mut historical_log, iterations);
+                (historical, candidate)
+            };
+            historical_times.push(historical);
+            candidate_times.push(candidate);
+            speedups.push(historical as f64 / candidate as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "report_event_snapshot_elision samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} candidate_arm_median_ns={} candidate_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&candidate_times),
+            coefficient_of_variation(&candidate_times) * 100.0
+        );
+        eprintln!(
+            "report_event_snapshot_elision null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} candidate_times_ns={candidate_times:?}"
+        );
+
+        assert_eq!(historical_log.events.len(), 20);
+        assert_eq!(candidate_log.events.len(), 20);
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.05),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.05)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
+    }
 
     #[test]
     fn event_log_streams_and_accumulates_with_monotonic_sequence() {
@@ -4257,6 +5432,12 @@ mod tests {
         assert_eq!(streamed[0].event.code, "ingest.start");
         assert_eq!(streamed[1].event.code, "ingest.ok");
         assert_eq!(streamed[2].event.code, "backend.ok");
+        for (retained, streamed) in log.events.iter().zip(&streamed) {
+            assert_eq!(
+                serde_json::to_vec(retained).expect("retained event should serialize"),
+                serde_json::to_vec(&streamed.event).expect("streamed event should serialize")
+            );
+        }
     }
 
     #[test]
@@ -4529,6 +5710,7 @@ mod tests {
                     confidence: Some(0.99),
                 }],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -4619,6 +5801,7 @@ mod tests {
                 language: None,
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -4896,6 +6079,7 @@ mod tests {
                 language: None,
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -5056,17 +6240,10 @@ mod tests {
         // `spawn_blocking` body would otherwise monopolize), so the timeout
         // could never fire. The wide sleep-vs-budget margin keeps the
         // assertion deterministic under host load.
-        let runtime = RuntimeBuilder::new()
-            .worker_threads(2)
-            .blocking_threads(1, 2)
-            .build()
-            .expect("runtime build");
-
-        let result: Result<(), FwError> =
-            runtime.block_on(run_stage_with_budget("backend", 1, || {
-                std::thread::sleep(Duration::from_millis(250));
-                Ok(())
-            }));
+        let result: Result<(), FwError> = run_stage_with_budget("backend", 1, || {
+            std::thread::sleep(Duration::from_millis(250));
+            Ok(())
+        });
         let error = result.expect_err("stage should time out");
 
         if let FwError::StageTimeout { stage, budget_ms } = &error {
@@ -5514,11 +6691,7 @@ mod tests {
 
     #[test]
     fn run_stage_with_budget_returns_value_on_success() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        let result = runtime.block_on(run_stage_with_budget("test", 5_000, || Ok(42)));
+        let result = run_stage_with_budget("test", 5_000, || Ok(42));
         assert_eq!(result.unwrap(), 42);
     }
 
@@ -5934,14 +7107,9 @@ mod tests {
 
     #[test]
     fn run_stage_with_budget_propagates_error() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        let result: crate::error::FwResult<i32> =
-            runtime.block_on(run_stage_with_budget("test", 5_000, || {
-                Err(FwError::InvalidRequest("test error".to_owned()))
-            }));
+        let result: crate::error::FwResult<i32> = run_stage_with_budget("test", 5_000, || {
+            Err(FwError::InvalidRequest("test error".to_owned()))
+        });
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), FwError::InvalidRequest(_)));
     }
@@ -6663,6 +7831,7 @@ mod tests {
                 confidence: Some(0.9),
             }],
             acceleration: None,
+            diarization: None,
             raw_output: json!({}),
             artifact_paths: vec![],
         };
@@ -6716,6 +7885,7 @@ mod tests {
                 language: Some("en".to_owned()),
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -6731,6 +7901,13 @@ mod tests {
         assert!(
             matches!(err, FwError::Cancelled(_)),
             "expected Cancelled error, got: {err:?}"
+        );
+        assert!(
+            store
+                .load_run_details("run-cx-test")
+                .expect("query cancelled persistence")
+                .is_none(),
+            "cancelled persistence must roll back the entire run"
         );
     }
 
@@ -7531,7 +8708,10 @@ mod tests {
         request.backend_params.diarization_config = Some(DiarizationConfig::default());
 
         assert!(optional_stage_skip(PipelineStage::Vad, &request).is_none());
-        assert!(optional_stage_skip(PipelineStage::Separate, &request).is_none());
+        let (reason, payload) = optional_stage_skip(PipelineStage::Separate, &request)
+            .expect("native acoustic diarization must preserve the normalized waveform");
+        assert_eq!(reason, "native_acoustic_preserves_waveform");
+        assert_eq!(payload["details"]["engine"], "auto");
         assert!(optional_stage_skip(PipelineStage::Align, &request).is_none());
         assert!(optional_stage_skip(PipelineStage::Diarize, &request).is_none());
 
@@ -7539,6 +8719,15 @@ mod tests {
         assert!(
             punctuate_skip.is_none(),
             "diarize=true should enable punctuation stage through the diarization packet"
+        );
+
+        request.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            engine: DiarizationEngine::External,
+            ..DiarizationRequest::default()
+        });
+        assert!(
+            optional_stage_skip(PipelineStage::Separate, &request).is_none(),
+            "external diarization retains the source-separation stage"
         );
 
         request.backend_params.diarization_config = Some(DiarizationConfig {
@@ -7551,10 +8740,9 @@ mod tests {
     }
 
     #[test]
-    fn optional_stage_skip_diarize_skipped_when_backend_owns_diarization() {
-        // When diarization is requested AND the whisper-diarization backend is
-        // selected, the backend performs diarization internally. The pipeline
-        // Diarize stage must be skipped to avoid diarizing the segments twice.
+    fn central_diarize_stage_runs_when_backend_already_supplied_assignments() {
+        // Backend assignments are admitted and typed by the central stage
+        // after runtime provenance is available.
         let request = TranscribeRequest {
             input: InputSource::File {
                 path: PathBuf::from("input.wav"),
@@ -7570,11 +8758,10 @@ mod tests {
             backend_params: BackendParams::default(),
         };
 
-        let (reason, payload) = optional_stage_skip(PipelineStage::Diarize, &request)
-            .expect("whisper-diarization backend should skip the pipeline diarize stage");
-        assert_eq!(reason, "backend_owns_diarization");
-        assert_eq!(payload["reason"], "backend_owns_diarization");
-        assert_eq!(payload["details"]["backend"], "whisper_diarization");
+        assert!(
+            optional_stage_skip(PipelineStage::Diarize, &request).is_none(),
+            "central stage must validate and type external assignments"
+        );
 
         // Sanity: a non-diarization backend still runs the diarize stage when
         // diarization is requested.
@@ -7583,6 +8770,548 @@ mod tests {
         assert!(
             optional_stage_skip(PipelineStage::Diarize, &other).is_none(),
             "non-diarization backend should still run the diarize stage"
+        );
+    }
+
+    #[test]
+    fn diarization_engine_selection_is_explicit_and_backend_aware() {
+        let mut request = TranscribeRequest {
+            input: InputSource::File {
+                path: PathBuf::from("input.wav"),
+            },
+            backend: BackendKind::WhisperCpp,
+            model: None,
+            language: None,
+            translate: false,
+            diarize: true,
+            persist: false,
+            db_path: PathBuf::from("db.sqlite3"),
+            timeout_ms: None,
+            backend_params: BackendParams::default(),
+        };
+        assert_eq!(
+            selected_diarization_engine(&request),
+            DiarizationEngine::Auto
+        );
+
+        request.backend = BackendKind::WhisperDiarization;
+        assert_eq!(
+            selected_diarization_engine(&request),
+            DiarizationEngine::External
+        );
+        let external_result = TranscriptionResult {
+            backend: BackendKind::WhisperDiarization,
+            transcript: "synthetic".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(1.0),
+                text: "synthetic".to_owned(),
+                speaker: Some("SPEAKER_00".to_owned()),
+                confidence: Some(0.9),
+            }],
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({"implementation": "external-test"}),
+            artifact_paths: Vec::new(),
+        };
+        assert_eq!(
+            resolved_diarization_engine(&request, &external_result),
+            DiarizationEngine::External
+        );
+        let mut lexical_result = external_result.clone();
+        lexical_result.raw_output = json!({
+            "engine": "whisper-diarization-native",
+            "diarizer": "text-temporal-heuristic",
+        });
+        assert!(
+            !result_has_external_diarization(&lexical_result),
+            "legacy text/temporal labels are not acoustic or external evidence"
+        );
+
+        request.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            ..DiarizationRequest::default()
+        });
+        assert_eq!(
+            selected_diarization_engine(&request),
+            DiarizationEngine::Acoustic
+        );
+        assert_eq!(
+            resolved_diarization_engine(&request, &external_result),
+            DiarizationEngine::Acoustic
+        );
+        assert!(
+            optional_stage_skip(PipelineStage::Diarize, &request).is_none(),
+            "explicit acoustic selection overrides backend ownership"
+        );
+    }
+
+    #[test]
+    fn acoustic_rollout_parser_and_auto_resolution_are_fail_closed() {
+        assert_eq!(
+            parse_acoustic_diarization_rollout(" shadow "),
+            Some(AcousticDiarizationRolloutStage::Shadow)
+        );
+        assert_eq!(
+            parse_acoustic_diarization_rollout("VALIDATED"),
+            Some(AcousticDiarizationRolloutStage::Validated)
+        );
+        assert_eq!(
+            parse_acoustic_diarization_rollout("fallback"),
+            Some(AcousticDiarizationRolloutStage::Fallback)
+        );
+        assert_eq!(
+            parse_acoustic_diarization_rollout("primary"),
+            Some(AcousticDiarizationRolloutStage::Primary)
+        );
+        assert_eq!(
+            parse_acoustic_diarization_rollout("sole"),
+            Some(AcousticDiarizationRolloutStage::Sole)
+        );
+        assert_eq!(parse_acoustic_diarization_rollout("unreviewed"), None);
+        assert_eq!(
+            AcousticDiarizationRolloutStage::default(),
+            AcousticDiarizationRolloutStage::Shadow
+        );
+
+        let request = TranscribeRequest {
+            input: InputSource::File {
+                path: PathBuf::from("input.wav"),
+            },
+            backend: BackendKind::WhisperCpp,
+            model: None,
+            language: None,
+            translate: false,
+            diarize: true,
+            persist: false,
+            db_path: PathBuf::from("db.sqlite3"),
+            timeout_ms: None,
+            backend_params: BackendParams::default(),
+        };
+        let external = TranscriptionResult {
+            backend: BackendKind::WhisperDiarization,
+            transcript: "synthetic".to_owned(),
+            language: None,
+            segments: vec![TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(1.0),
+                text: "synthetic".to_owned(),
+                speaker: Some("SPEAKER_00".to_owned()),
+                confidence: None,
+            }],
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let mut without_external = external.clone();
+        without_external.segments[0].speaker = None;
+
+        for stage in [
+            AcousticDiarizationRolloutStage::Shadow,
+            AcousticDiarizationRolloutStage::Validated,
+        ] {
+            assert_eq!(
+                resolved_diarization_engine_for_rollout(&request, &without_external, stage),
+                DiarizationEngine::External,
+                "{stage:?} must not expose acoustic output through auto"
+            );
+        }
+        assert_eq!(
+            resolved_diarization_engine_for_rollout(
+                &request,
+                &external,
+                AcousticDiarizationRolloutStage::Fallback,
+            ),
+            DiarizationEngine::External
+        );
+        assert_eq!(
+            resolved_diarization_engine_for_rollout(
+                &request,
+                &without_external,
+                AcousticDiarizationRolloutStage::Fallback,
+            ),
+            DiarizationEngine::Acoustic
+        );
+        for stage in [
+            AcousticDiarizationRolloutStage::Primary,
+            AcousticDiarizationRolloutStage::Sole,
+        ] {
+            assert_eq!(
+                resolved_diarization_engine_for_rollout(&request, &external, stage),
+                DiarizationEngine::Acoustic,
+                "{stage:?} must select acoustic through auto"
+            );
+        }
+        assert!(
+            !external_diarization_fallback_admitted(
+                DiarizationEngine::Auto,
+                AcousticDiarizationRolloutStage::Sole,
+            ),
+            "sole auto rollout must never select external fallback output"
+        );
+        assert!(
+            external_diarization_fallback_admitted(
+                DiarizationEngine::Auto,
+                AcousticDiarizationRolloutStage::Primary,
+            ),
+            "primary auto rollout may use an explicitly requested external fallback"
+        );
+
+        let mut explicit = request;
+        explicit.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            ..DiarizationRequest::default()
+        });
+        assert_eq!(
+            resolved_diarization_engine_for_rollout(
+                &explicit,
+                &external,
+                AcousticDiarizationRolloutStage::Shadow,
+            ),
+            DiarizationEngine::Acoustic,
+            "explicit acoustic requests bypass only the auto rollout gate"
+        );
+        assert!(
+            external_diarization_fallback_admitted(
+                DiarizationEngine::Acoustic,
+                AcousticDiarizationRolloutStage::Sole,
+            ),
+            "sole limits auto admission, not an explicit acoustic request's fallback policy"
+        );
+    }
+
+    #[test]
+    fn transcript_boundaries_are_sorted_deduplicated_and_finite() {
+        let segments = vec![
+            TranscriptionSegment {
+                start_sec: Some(1.25),
+                end_sec: Some(2.0),
+                text: "later".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+            TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(1.25),
+                text: "earlier".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+            TranscriptionSegment {
+                start_sec: Some(f64::NAN),
+                end_sec: None,
+                text: "untimed".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+        ];
+        assert_eq!(transcript_boundaries_ms(&segments), vec![0, 1_250, 2_000]);
+    }
+
+    #[test]
+    fn acoustic_projection_requires_typed_canonical_word_alignment_proof() {
+        assert!(!has_canonical_word_alignment(&json!({
+            "word_timestamps": "dtw"
+        })));
+        assert!(has_canonical_word_alignment(&json!({
+            "word_timestamps": "dtw",
+            "projection_timeline": {
+                "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                "word_aligned_safe": true
+            }
+        })));
+        assert!(!has_canonical_word_alignment(&json!({
+            "word_timestamps": "dtw",
+            "projection_timeline": {
+                "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                "word_aligned_safe": false
+            }
+        })));
+        assert!(!has_canonical_word_alignment(&json!({
+            "word_timestamps": "dtw",
+            "projection_timeline": {
+                "schema_version": "dtw-projection-v1",
+                "word_aligned_safe": true
+            }
+        })));
+    }
+
+    fn synthetic_typed_diarization_report() -> DiarizationReport {
+        DiarizationReport {
+            implementation: "native-acoustic-v2".to_owned(),
+            contract_version: "acoustic-diarization-v2".to_owned(),
+            feature_schema: crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION.to_owned(),
+            normalized_input_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            hint_document_sha256: None,
+            turns: vec![DiarizationTurn {
+                start_ms: 0,
+                end_ms: 1_000,
+                speaker_ref: Some("speaker_a".to_owned()),
+                speaker_confidence: Some(0.8),
+                change_confidence: Some(0.7),
+                overlap_suspected: false,
+                hard_hint_attributed: false,
+            }],
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "speaker_a".to_owned(),
+                frame_count: 80,
+                voiced_duration_ms: 800,
+                reliability: 0.75,
+                voice_profile_count: 1,
+                channel_profile_count: 1,
+                training_accepted_count: 0,
+                training_downweighted_count: 0,
+                training_quarantined_count: 0,
+                anchored: false,
+                soft_hint_contradiction: None,
+            }],
+            hint_evidence: Vec::new(),
+            speaker_queries: Vec::new(),
+            speaker_count: SpeakerCountOutcome {
+                request: SpeakerCountRequest::Infer,
+                estimate: None,
+                status: SpeakerCountOutcomeStatus::Resolved,
+                supported_speaker_count: 1,
+                active_speaker_refs: vec!["speaker_a".to_owned()],
+                dominant_speaker_share: 1.0,
+                unknown_voiced_share: 0.0,
+                reasons: vec![SpeakerCountOutcomeReason::EvidenceSupportedCount],
+                speaker_evidence: vec![SpeakerEvidenceSummary {
+                    speaker_ref: "speaker_a".to_owned(),
+                    assigned_tracklet_count: 2,
+                    independent_tracklet_count: 2,
+                    recurrence_episode_count: 1,
+                    voiced_frame_count: 80,
+                    independent_voiced_frame_count: 80,
+                    voiced_duration_ms: 800,
+                    mean_assignment_confidence: 0.8,
+                    profile_reliability: 0.75,
+                    hard_anchored: false,
+                    separated_from_supported_speakers: true,
+                    reasons: vec![SpeakerEvidenceReason::SupportedByRepeatedTracklets],
+                    supported: true,
+                }],
+            },
+            fallback_status: DiarizationFallbackStatus::NotNeeded,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn native_projection_preserves_the_authoritative_transcript_bytes() {
+        let mut result = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "backend spacing  is authoritative\n".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(1.0),
+                text: "backend spacing is authoritative".to_owned(),
+                speaker: None,
+                confidence: Some(0.9),
+            }],
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let transcript = result.transcript.clone();
+        let projection = crate::diarization::DiarizationProjection {
+            segments: vec![TranscriptionSegment {
+                speaker: Some("speaker_a".to_owned()),
+                ..result.segments[0].clone()
+            }],
+            mixed_speaker_segment_indices: Vec::new(),
+            overlap_suspected_segment_indices: Vec::new(),
+        };
+
+        apply_native_diarization_projection(
+            &mut result,
+            projection,
+            synthetic_typed_diarization_report(),
+        );
+
+        assert_eq!(result.transcript, transcript);
+        assert_eq!(result.segments[0].speaker.as_deref(), Some("speaker_a"));
+        assert!(result.diarization.is_some());
+    }
+
+    #[test]
+    fn diarization_details_emit_from_the_diarize_stage() {
+        let mut log = EventLog::new("run".to_owned(), "trace".to_owned(), None);
+        emit_diarization_report_events(&mut log, &synthetic_typed_diarization_report());
+        assert_eq!(
+            log.events
+                .iter()
+                .map(|event| event.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["diarize.progress", "diarize.change", "diarize.profile"]
+        );
+        assert!(log.events.iter().all(|event| event.stage == "diarize"));
+    }
+
+    #[test]
+    fn external_diarization_is_sorted_merged_and_validated() {
+        let result = TranscriptionResult {
+            backend: BackendKind::WhisperDiarization,
+            transcript: "synthetic".to_owned(),
+            language: None,
+            segments: vec![
+                TranscriptionSegment {
+                    start_sec: Some(2.0),
+                    end_sec: Some(3.0),
+                    text: "b".to_owned(),
+                    speaker: Some("speaker_b".to_owned()),
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(1.0),
+                    end_sec: Some(2.0),
+                    text: "a2".to_owned(),
+                    speaker: Some("speaker_a".to_owned()),
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(0.0),
+                    end_sec: Some(1.0),
+                    text: "a1".to_owned(),
+                    speaker: Some("speaker_a".to_owned()),
+                    confidence: None,
+                },
+            ],
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let report = external_diarization_report(
+            &result,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &SpeakerCountRequest::Infer,
+        )
+        .expect("valid external report");
+        assert_eq!(report.turns.len(), 2);
+        assert_eq!(
+            (report.turns[0].start_ms, report.turns[0].end_ms),
+            (0, 2_000)
+        );
+        assert_eq!(report.turns[0].speaker_ref.as_deref(), Some("speaker_a"));
+        assert_eq!(report.turns[1].speaker_ref.as_deref(), Some("speaker_b"));
+
+        let soft_error = external_diarization_report(
+            &result,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 3,
+            },
+        )
+        .expect_err("external report must not discard soft count semantics");
+        assert!(soft_error.to_string().contains("cannot faithfully fuse"));
+
+        let mut overlapping = result;
+        overlapping.segments[0].start_sec = Some(0.5);
+        assert!(
+            external_diarization_report(
+                &overlapping,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &SpeakerCountRequest::Infer,
+            )
+            .expect_err("different external speakers may not overlap")
+            .to_string()
+            .contains("overlapping turns")
+        );
+    }
+
+    #[test]
+    fn known_intervals_are_rejected_when_the_selected_engine_cannot_enforce_them() {
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Auto,
+            known_intervals: vec![KnownSpeakerInterval {
+                speaker_ref: "speaker_a".to_owned(),
+                start_ms: 0,
+                end_ms: 1_000,
+                confidence: 0.9,
+                policy: KnownSpeakerPolicy::HardMustLink,
+                provenance: None,
+            }],
+            ..DiarizationRequest::default()
+        };
+        let error = validate_diarization_execution_request(
+            DiarizationEngine::External,
+            &request,
+            Some(2_000),
+        )
+        .expect_err("external engine would silently ignore known intervals");
+        assert!(error.to_string().contains("require the native acoustic"));
+        assert!(
+            validate_diarization_execution_request(
+                DiarizationEngine::Acoustic,
+                &request,
+                Some(2_000),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn soft_speaker_count_inputs_are_rejected_by_engines_that_cannot_fuse_them() {
+        let prior_request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::Prior {
+                bins: vec![
+                    crate::model::SpeakerCountPriorMass {
+                        count: 1,
+                        probability: 0.25,
+                    },
+                    crate::model::SpeakerCountPriorMass {
+                        count: 2,
+                        probability: 0.75,
+                    },
+                ],
+            },
+            ..DiarizationRequest::default()
+        };
+        let error = validate_diarization_execution_request(
+            DiarizationEngine::External,
+            &prior_request,
+            Some(2_000),
+        )
+        .expect_err("external engine cannot silently approximate a calibrated prior");
+        assert!(error.to_string().contains("cannot faithfully fuse"));
+        assert!(
+            validate_diarization_execution_request(
+                DiarizationEngine::Acoustic,
+                &prior_request,
+                Some(2_000),
+            )
+            .is_ok()
+        );
+
+        let range_request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 4,
+            },
+            ..DiarizationRequest::default()
+        };
+        let error = validate_diarization_execution_request(
+            DiarizationEngine::Neural,
+            &range_request,
+            Some(2_000),
+        )
+        .expect_err("neural engine cannot silently harden a soft count range");
+        assert!(error.to_string().contains("cannot faithfully fuse"));
+    }
+
+    #[test]
+    fn second_intervals_must_remain_positive_after_millisecond_quantization() {
+        assert_eq!(finite_seconds_interval_to_ms(1.0, 1.0004), None);
+        assert_eq!(
+            finite_seconds_interval_to_ms(1.0, 1.0006),
+            Some((1_000, 1_001))
         );
     }
 
@@ -7678,6 +9407,51 @@ mod tests {
             speaker: None,
             confidence: None,
         }
+    }
+
+    #[test]
+    fn alignment_preserves_authoritative_canonical_dtw_units_byte_for_byte() {
+        let original_segments = vec![
+            make_segment(0.0, 0.999, "alpha"),
+            make_segment(0.999, 1.0, "beta"),
+        ];
+        let original_json =
+            serde_json::to_value(&original_segments).expect("serialize original segments");
+        let mut result = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "alpha beta".to_owned(),
+            language: Some("en".to_owned()),
+            segments: original_segments,
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({
+                "word_timestamps": "dtw",
+                "projection_timeline": {
+                    "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                    "word_aligned_safe": true
+                }
+            }),
+            artifact_paths: Vec::new(),
+        };
+        let report = align_transcription_result(
+            &mut result,
+            Some(1.0),
+            &AlignConfig::default(),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("canonical alignment preservation");
+        assert_eq!(report.segments_corrected, 0);
+        assert_eq!(report.segments_fallback, 2);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("canonical DTW"))
+        );
+        assert_eq!(
+            serde_json::to_value(&result.segments).expect("serialize preserved segments"),
+            original_json
+        );
     }
 
     #[test]
@@ -7980,6 +9754,75 @@ mod tests {
             report.notes.iter().any(|n| n.contains("non-positive")),
             "should note non-positive duration"
         );
+    }
+
+    #[test]
+    fn ctc_align_nonfinite_or_denormal_duration_preserves_offsets() {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = AlignConfig::default();
+        // NaN, +inf, and the smallest positive (denormal-class) duration must
+        // all fail closed: every segment falls back and the authoritative
+        // whisper-cli offsets are carried through unchanged (no 2.225e-308, no
+        // NaN in the output).
+        for bad in [f64::NAN, f64::INFINITY, f64::MIN_POSITIVE] {
+            let mut segments = vec![
+                make_segment(0.0, 4.4, "hello"),
+                make_segment(5.2, 8.0, "world"),
+            ];
+            let report = ctc_forced_align(&mut segments, Some(bad), &config, &token).unwrap();
+            assert_eq!(report.segments_total, 2);
+            assert_eq!(
+                report.segments_corrected, 0,
+                "bad duration {bad} must not correct any segment"
+            );
+            assert_eq!(
+                report.segments_fallback, 2,
+                "bad duration {bad} must fall back all segments"
+            );
+            assert_eq!(segments[0].start_sec, Some(0.0));
+            assert_eq!(segments[0].end_sec, Some(4.4));
+            assert_eq!(segments[1].start_sec, Some(5.2));
+            assert_eq!(segments[1].end_sec, Some(8.0));
+        }
+    }
+
+    #[test]
+    fn ctc_align_none_timestamps_left_untouched() {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = AlignConfig::default();
+        // Explicit finite duration so the alignment loop runs; the segment has
+        // no original timestamps, so alignment must skip it rather than
+        // fabricate offsets (missing must not be treated as zero drift).
+        let mut segments = vec![make_segment_no_timestamps("hello world")];
+        let report = ctc_forced_align(&mut segments, Some(10.0), &config, &token).unwrap();
+        assert_eq!(report.segments_total, 1);
+        assert_eq!(report.segments_corrected, 0);
+        assert_eq!(report.segments_fallback, 1);
+        assert_eq!(segments[0].start_sec, None, "missing start must stay None");
+        assert_eq!(segments[0].end_sec, None, "missing end must stay None");
+    }
+
+    #[test]
+    fn ctc_align_skips_missing_but_corrects_present_timestamps() {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = AlignConfig {
+            max_drift_sec: 10.0,
+            min_segment_duration_sec: 0.001,
+        };
+        // First segment carries authoritative offsets (aligned), second has
+        // none (skipped, left None); both accounted for in the report.
+        let mut segments = vec![
+            make_segment(0.0, 5.0, "hello"),
+            make_segment_no_timestamps("world"),
+        ];
+        let report = ctc_forced_align(&mut segments, Some(10.0), &config, &token).unwrap();
+        assert_eq!(report.segments_total, 2);
+        assert_eq!(report.segments_corrected, 1);
+        assert_eq!(report.segments_fallback, 1);
+        assert!(segments[0].start_sec.unwrap().is_finite());
+        assert!(segments[0].end_sec.unwrap().is_finite());
+        assert_eq!(segments[1].start_sec, None);
+        assert_eq!(segments[1].end_sec, None);
     }
 
     #[test]
@@ -8803,6 +10646,271 @@ mod tests {
         assert!(result.notes[0].contains("analysis unavailable"));
     }
 
+    fn assert_vad_reports_equal(actual: &VadReport, expected: &VadReport) {
+        assert_eq!(actual.frames_total, expected.frames_total);
+        assert_eq!(actual.frames_voiced, expected.frames_voiced);
+        assert_eq!(actual.voice_ratio.to_bits(), expected.voice_ratio.to_bits());
+        assert_eq!(actual.silence_only, expected.silence_only);
+        assert_eq!(
+            actual
+                .regions
+                .iter()
+                .map(|(start, end)| (start.to_bits(), end.to_bits()))
+                .collect::<Vec<_>>(),
+            expected
+                .regions
+                .iter()
+                .map(|(start, end)| (start.to_bits(), end.to_bits()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(actual.detector, expected.detector);
+        assert_eq!(actual.fallback_triggered, expected.fallback_triggered);
+        assert_eq!(
+            actual.activity_threshold.to_bits(),
+            expected.activity_threshold.to_bits()
+        );
+        assert_eq!(actual.notes, expected.notes);
+    }
+
+    fn assert_separate_reports_equal(actual: &SeparateReport, expected: &SeparateReport) {
+        assert_eq!(actual.vocal_isolated, expected.vocal_isolated);
+        assert_eq!(
+            actual.speech_coverage.to_bits(),
+            expected.speech_coverage.to_bits()
+        );
+        assert_eq!(actual.avg_rms.to_bits(), expected.avg_rms.to_bits());
+        assert_eq!(actual.active_region_count, expected.active_region_count);
+        assert_eq!(actual.notes, expected.notes);
+    }
+
+    fn representative_vad_samples(sample_rate: u32, seconds: usize) -> Vec<i16> {
+        let sample_rate = sample_rate as usize;
+        (0..sample_rate * seconds)
+            .map(|index| {
+                if (index / (sample_rate / 2)) % 4 == 0 {
+                    0
+                } else {
+                    let phase = index as f64 * 330.0 * std::f64::consts::TAU / sample_rate as f64;
+                    (phase.sin() * 9_000.0) as i16
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cached_vad_analysis_preserves_vad_and_separation_reports() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cached-analysis.wav");
+        write_pcm16_mono_wav_for_vad(&path, 16_000, &representative_vad_samples(16_000, 4));
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = VadConfig::default();
+
+        let historical_vad = vad_energy_detect(&path, &config, &token).unwrap();
+        let (candidate_vad, analysis) =
+            vad_energy_detect_with_analysis(&path, &config, &token).unwrap();
+        assert_vad_reports_equal(&candidate_vad, &historical_vad);
+        let analysis = analysis.expect("valid WAV analysis should be reusable");
+
+        let historical_separation = source_separate(&path, &token).unwrap();
+        let cached_separation =
+            source_separate_with_analysis(&path, Some(&analysis), &token).unwrap();
+        assert_separate_reports_equal(&cached_separation, &historical_separation);
+    }
+
+    #[derive(Debug)]
+    struct SourceSeparationPerfStats {
+        median: f64,
+        p10: f64,
+        p90: f64,
+        wins: usize,
+    }
+
+    fn source_separation_perf_stats(ratios: &[f64]) -> SourceSeparationPerfStats {
+        let mut sorted = ratios.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let last = sorted.len() - 1;
+        SourceSeparationPerfStats {
+            median: sorted[sorted.len() / 2],
+            p10: sorted[last / 10],
+            p90: sorted[last * 9 / 10],
+            wins: ratios.iter().filter(|ratio| **ratio > 1.0).count(),
+        }
+    }
+
+    fn source_separation_ratios_text(ratios: &[f64]) -> String {
+        ratios
+            .iter()
+            .map(|ratio| format!("{ratio:.6}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn separate_report_signature(report: &SeparateReport) -> String {
+        use std::fmt::Write as _;
+
+        let mut signature = format!(
+            "{}|{:016x}|{:016x}|{}",
+            report.vocal_isolated,
+            report.speech_coverage.to_bits(),
+            report.avg_rms.to_bits(),
+            report.active_region_count,
+        );
+        for note in &report.notes {
+            write!(signature, "|{}:{note}", note.len()).expect("writing to a String cannot fail");
+        }
+        signature
+    }
+
+    fn measure_source_separation<const CACHED: bool>(
+        path: &std::path::Path,
+        analysis: &Arc<crate::backend::native_audio::NativeAudioAnalysis>,
+        iterations: usize,
+    ) -> Duration {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..iterations {
+            let report = if CACHED {
+                let analysis = Arc::clone(analysis);
+                source_separate_with_analysis(path, Some(analysis.as_ref()), &token)
+            } else {
+                source_separate(path, &token)
+            }
+            .expect("timed source separation should succeed");
+            checksum ^= report.speech_coverage.to_bits();
+            checksum = checksum.wrapping_add(report.avg_rms.to_bits());
+            checksum = checksum.wrapping_add(report.active_region_count as u64);
+            black_box(&report);
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn paired_source_separation_ratios<const BASE_CACHED: bool, const TEST_CACHED: bool>(
+        path: &std::path::Path,
+        analysis: &Arc<crate::backend::native_audio::NativeAudioAnalysis>,
+        iterations: usize,
+        repetitions: usize,
+    ) -> Vec<f64> {
+        let mut ratios = Vec::with_capacity(repetitions);
+        for repetition in 0..repetitions {
+            let (baseline, test) = if repetition % 2 == 0 {
+                (
+                    measure_source_separation::<BASE_CACHED>(path, analysis, iterations),
+                    measure_source_separation::<TEST_CACHED>(path, analysis, iterations),
+                )
+            } else {
+                let test = measure_source_separation::<TEST_CACHED>(path, analysis, iterations);
+                let baseline = measure_source_separation::<BASE_CACHED>(path, analysis, iterations);
+                (baseline, test)
+            };
+            ratios.push(baseline.as_secs_f64() / test.as_secs_f64());
+        }
+        ratios
+    }
+
+    #[test]
+    #[ignore = "strict-remote release performance A/B"]
+    fn source_separate_cached_analysis_perf() {
+        const TARGET_ARM_SECS: f64 = 0.100;
+        const WARMUP_REPETITIONS: usize = 3;
+        const PAIRED_REPETITIONS: usize = 15;
+        const NULL_MEDIAN_MIN: f64 = 0.97;
+        const NULL_MEDIAN_MAX: f64 = 1.03;
+        const MIN_CANDIDATE_MEDIAN: f64 = 2.0;
+        const REQUIRED_WINS: usize = 15;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("source-separation-perf.wav");
+        let samples = representative_vad_samples(16_000, 10);
+        write_pcm16_mono_wav_for_vad(&path, 16_000, &samples);
+        let analysis = Arc::new(
+            crate::backend::native_audio::analyze_wav(&path, None)
+                .expect("performance fixture should analyze"),
+        );
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let historical = source_separate(&path, &token).unwrap();
+        let candidate =
+            source_separate_with_analysis(&path, Some(analysis.as_ref()), &token).unwrap();
+        assert_separate_reports_equal(&candidate, &historical);
+        let historical_signature = separate_report_signature(&historical);
+        let candidate_signature = separate_report_signature(&candidate);
+        assert_eq!(candidate_signature, historical_signature);
+        let output_sha256 = format!("{:x}", Sha256::digest(candidate_signature.as_bytes()));
+
+        let calibration = measure_source_separation::<false>(&path, &analysis, 1);
+        let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
+        let iterations = iterations.clamp(1, 4_096);
+
+        black_box(paired_source_separation_ratios::<false, false>(
+            &path,
+            &analysis,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let null_ratios = paired_source_separation_ratios::<false, false>(
+            &path,
+            &analysis,
+            iterations,
+            PAIRED_REPETITIONS,
+        );
+        let null = source_separation_perf_stats(&null_ratios);
+
+        black_box(paired_source_separation_ratios::<false, true>(
+            &path,
+            &analysis,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let candidate_ratios = paired_source_separation_ratios::<false, true>(
+            &path,
+            &analysis,
+            iterations,
+            PAIRED_REPETITIONS,
+        );
+        let candidate_stats = source_separation_perf_stats(&candidate_ratios);
+        let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null.median);
+        let keep_eligible = null_valid
+            && candidate_stats.median >= MIN_CANDIDATE_MEDIAN
+            && candidate_stats.p10 > null.p90
+            && candidate_stats.wins >= REQUIRED_WINS;
+
+        eprintln!(
+            "VAD_SEPARATE_CALIBRATION duration_sec=10 samples={} wav_bytes={} signature_bytes={} output_sha256={} baseline_ns={:.3} iterations={} target_arm_ms={:.1}",
+            samples.len(),
+            44 + samples.len() * 2,
+            candidate_signature.len(),
+            output_sha256,
+            calibration.as_secs_f64() * 1_000_000_000.0,
+            iterations,
+            TARGET_ARM_SECS * 1_000.0,
+        );
+        eprintln!(
+            "VAD_SEPARATE_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+            source_separation_ratios_text(&null_ratios),
+            null.median,
+            null.p10,
+            null.p90,
+            null.wins,
+            PAIRED_REPETITIONS,
+        );
+        eprintln!(
+            "VAD_SEPARATE_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
+            source_separation_ratios_text(&candidate_ratios),
+            candidate_stats.median,
+            candidate_stats.p10,
+            candidate_stats.p90,
+            candidate_stats.wins,
+            PAIRED_REPETITIONS,
+            null_valid,
+            keep_eligible,
+        );
+        assert!(
+            keep_eligible,
+            "candidate did not clear the declared keep gate"
+        );
+    }
+
     #[test]
     fn validate_separate_without_normalize_fails() {
         let config = PipelineConfig::new(vec![PipelineStage::Ingest, PipelineStage::Separate]);
@@ -9038,7 +11146,13 @@ mod tests {
     fn diarize_empty_segments() {
         let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
         let mut segments: Vec<TranscriptionSegment> = vec![];
-        let report = diarize_segments(&mut segments, Some(10.0), None, &token).unwrap();
+        let report = diarize_segments(
+            &mut segments,
+            Some(10.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
         assert_eq!(report.segments_total, 0);
         assert_eq!(report.speakers_detected, 0);
         assert_eq!(report.segments_labeled, 0);
@@ -9048,7 +11162,13 @@ mod tests {
     fn diarize_single_segment_gets_speaker_label() {
         let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
         let mut segments = vec![make_segment(0.0, 5.0, "hello world")];
-        let report = diarize_segments(&mut segments, Some(5.0), None, &token).unwrap();
+        let report = diarize_segments(
+            &mut segments,
+            Some(5.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
 
         assert_eq!(report.segments_total, 1);
         assert_eq!(report.speakers_detected, 1);
@@ -9064,7 +11184,13 @@ mod tests {
             make_segment(3.0, 6.0, "world"),
             make_segment(6.0, 10.0, "goodbye"),
         ];
-        let report = diarize_segments(&mut segments, Some(10.0), None, &token).unwrap();
+        let report = diarize_segments(
+            &mut segments,
+            Some(10.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
 
         assert_eq!(report.segments_total, 3);
         assert_eq!(report.segments_labeled, 3);
@@ -9086,7 +11212,13 @@ mod tests {
             speaker: None,
             confidence: Some(0.95),
         }];
-        let _report = diarize_segments(&mut segments, Some(5.0), None, &token).unwrap();
+        let _report = diarize_segments(
+            &mut segments,
+            Some(5.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
 
         assert_eq!(segments[0].text, "hello world");
         assert_eq!(segments[0].confidence, Some(0.95));
@@ -9103,7 +11235,12 @@ mod tests {
             make_segment(0.0, 5.0, "hello"),
             make_segment(5.0, 10.0, "world"),
         ];
-        let result = diarize_segments(&mut segments, Some(10.0), None, &token);
+        let result = diarize_segments(
+            &mut segments,
+            Some(10.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), FwError::Cancelled(_)));
     }
@@ -9115,7 +11252,8 @@ mod tests {
             make_segment(0.0, 5.0, "hello"),
             make_segment(5.0, 10.0, "world"),
         ];
-        let report = diarize_segments(&mut segments, None, None, &token).unwrap();
+        let report =
+            diarize_segments(&mut segments, None, &SpeakerCountRequest::Infer, &token).unwrap();
         assert_eq!(report.segments_total, 2);
         assert_eq!(report.segments_labeled, 2);
     }
@@ -9127,7 +11265,8 @@ mod tests {
             make_segment_no_timestamps("hello"),
             make_segment_no_timestamps("world"),
         ];
-        let report = diarize_segments(&mut segments, None, None, &token).unwrap();
+        let report =
+            diarize_segments(&mut segments, None, &SpeakerCountRequest::Infer, &token).unwrap();
         assert_eq!(report.segments_labeled, 2);
         assert_eq!(report.speakers_detected, 1);
     }
@@ -9202,7 +11341,13 @@ mod tests {
     fn diarize_report_includes_heuristic_note() {
         let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
         let mut segments = vec![make_segment(0.0, 1.0, "test")];
-        let report = diarize_segments(&mut segments, Some(1.0), None, &token).unwrap();
+        let report = diarize_segments(
+            &mut segments,
+            Some(1.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
         assert!(
             report.notes.iter().any(|n| n.contains("heuristic")),
             "diarize report should include heuristic note"
@@ -9274,7 +11419,13 @@ mod tests {
         assert_eq!(punct_report.segments_total, 3);
 
         // Then diarize the already-punctuated segments.
-        let diarize_report = diarize_segments(&mut segments, Some(30.0), None, &token).unwrap();
+        let diarize_report = diarize_segments(
+            &mut segments,
+            Some(30.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
         assert_eq!(diarize_report.segments_total, 3);
         assert_eq!(diarize_report.segments_labeled, 3);
 
@@ -9302,7 +11453,13 @@ mod tests {
         ];
         let original_texts: Vec<String> = segments.iter().map(|s| s.text.clone()).collect();
 
-        let report = diarize_segments(&mut segments, Some(5.0), None, &token).unwrap();
+        let report = diarize_segments(
+            &mut segments,
+            Some(5.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
         assert_eq!(report.segments_labeled, 2);
 
         for (seg, orig) in segments.iter().zip(original_texts.iter()) {
@@ -9330,7 +11487,13 @@ mod tests {
         assert_eq!(punct_report.segments_total, 3);
 
         // Diarize.
-        let diarize_report = diarize_segments(&mut segments, Some(30.0), None, &token).unwrap();
+        let diarize_report = diarize_segments(
+            &mut segments,
+            Some(30.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
         assert_eq!(diarize_report.segments_total, 3);
         assert_eq!(diarize_report.segments_labeled, 3);
 
@@ -9440,7 +11603,9 @@ mod tests {
 
         // Diarize.
         let mut segs2 = vec![make_segment(0.0, 1.0, "hello")];
-        assert!(diarize_segments(&mut segs2, Some(2.0), None, &expired).is_err());
+        assert!(
+            diarize_segments(&mut segs2, Some(2.0), &SpeakerCountRequest::Infer, &expired).is_err()
+        );
 
         // Align.
         let align_config = AlignConfig::default();
@@ -10399,7 +12564,13 @@ mod tests {
             make_segment(1.0, 2.0, "world"),
         ];
         // Some(0.0) → clamped to 1e-6, should not panic or produce NaN.
-        let report = diarize_segments(&mut segments, Some(0.0), None, &token).unwrap();
+        let report = diarize_segments(
+            &mut segments,
+            Some(0.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
         assert_eq!(report.segments_total, 2);
         assert!(
             report.speakers_detected >= 1,
@@ -10495,7 +12666,13 @@ mod tests {
             make_segment(20.0, 22.0, "new speaker joins late"),
             make_segment(22.0, 24.0, "new speaker continues"),
         ];
-        let report = diarize_segments(&mut segments, Some(30.0), None, &token).unwrap();
+        let report = diarize_segments(
+            &mut segments,
+            Some(30.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
 
         assert_eq!(report.segments_total, 4);
         assert_eq!(report.segments_labeled, 4);
@@ -10534,6 +12711,101 @@ mod tests {
             score > 0.9,
             "well-separated clusters should have silhouette > 0.9, got {score}"
         );
+    }
+
+    #[test]
+    fn silhouette_score_matches_naive_double_scan_bit_for_bit() {
+        // The symmetric single-distance-per-pair form must reproduce the naive
+        // double-scan silhouette bit-for-bit (byte-exact restructure, ~2.9x; see
+        // benches/silhouette_perf). Reference = the pre-optimization structure.
+        fn naive(
+            embeddings: &[SpeakerEmbedding],
+            assignments: &[usize],
+            num_clusters: usize,
+        ) -> Option<f64> {
+            if num_clusters < 2 || embeddings.len() < 2 {
+                return None;
+            }
+            let n = embeddings.len();
+            let mut sum = 0.0_f64;
+            for i in 0..n {
+                let ci = assignments[i];
+                let mut a_sum = 0.0_f64;
+                let mut a_count = 0u64;
+                for (j, emb_j) in embeddings.iter().enumerate() {
+                    if j != i && assignments[j] == ci {
+                        a_sum += embeddings[i].euclidean_distance(emb_j);
+                        a_count += 1;
+                    }
+                }
+                let a_i = if a_count > 0 {
+                    a_sum / a_count as f64
+                } else {
+                    0.0
+                };
+                let mut b_i = f64::INFINITY;
+                for cj in 0..num_clusters {
+                    if cj == ci {
+                        continue;
+                    }
+                    let mut b_sum = 0.0_f64;
+                    let mut b_count = 0u64;
+                    for (j, emb_j) in embeddings.iter().enumerate() {
+                        if assignments[j] == cj {
+                            b_sum += embeddings[i].euclidean_distance(emb_j);
+                            b_count += 1;
+                        }
+                    }
+                    if b_count > 0 {
+                        let mean_dist = b_sum / b_count as f64;
+                        if mean_dist < b_i {
+                            b_i = mean_dist;
+                        }
+                    }
+                }
+                let denom = a_i.max(b_i);
+                sum += if denom < 1e-15 {
+                    0.0
+                } else {
+                    (b_i - a_i) / denom
+                };
+            }
+            Some(sum / n as f64)
+        }
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) * 8.0 - 4.0
+        };
+        for &(n, k) in &[
+            (2usize, 2usize),
+            (5, 2),
+            (17, 3),
+            (64, 4),
+            (129, 5),
+            (200, 6),
+        ] {
+            let embeddings: Vec<SpeakerEmbedding> = (0..n)
+                .map(|_| SpeakerEmbedding {
+                    features: std::array::from_fn(|_| next()),
+                })
+                .collect();
+            // Include a deliberately empty cluster id and a singleton cluster to
+            // exercise the a_count==0 / b_count==0 branches.
+            let assignments: Vec<usize> = (0..n)
+                .map(|i| if i == 0 { k - 1 } else { i % (k - 1).max(1) })
+                .collect();
+            let got = silhouette_score(&embeddings, &assignments, k);
+            let want = naive(&embeddings, &assignments, k);
+            assert_eq!(
+                got.map(f64::to_bits),
+                want.map(f64::to_bits),
+                "silhouette mismatch at n={n}, k={k}"
+            );
+        }
     }
 
     #[test]
@@ -10610,7 +12882,13 @@ mod tests {
             make_segment(20.0, 22.0, "new speaker joins late"),
             make_segment(22.0, 24.0, "new speaker continues"),
         ];
-        let report = diarize_segments(&mut segments, Some(30.0), None, &token).unwrap();
+        let report = diarize_segments(
+            &mut segments,
+            Some(30.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
         if report.speakers_detected >= 2 {
             assert!(
                 report.silhouette_score.is_some(),
@@ -10628,7 +12906,13 @@ mod tests {
     fn diarize_single_segment_silhouette_is_none() {
         let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
         let mut segments = vec![make_segment(0.0, 2.0, "single segment only")];
-        let report = diarize_segments(&mut segments, Some(5.0), None, &token).unwrap();
+        let report = diarize_segments(
+            &mut segments,
+            Some(5.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
         assert!(
             report.silhouette_score.is_none(),
             "single-segment diarization should have no silhouette score"
@@ -11288,12 +13572,14 @@ mod tests {
         assert!(is_abbreviation_period("Dr. Smith", 2));
         assert!(is_abbreviation_period("talk to mr. jones", 10));
         assert!(is_abbreviation_period("Mrs. Williams", 3));
+        assert!(is_abbreviation_period("PROF. Ada", 4));
     }
 
     #[test]
     fn is_abbreviation_period_rejects_non_abbrevs() {
         assert!(!is_abbreviation_period("done.", 4));
         assert!(!is_abbreviation_period("hello world.", 11));
+        assert!(!is_abbreviation_period("notdr.", 5));
     }
 
     #[test]
@@ -11737,164 +14023,48 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Speaker constraints integration (bd-3g8)
+    // Speaker count request integration (bd-3g8, bd-8nlu)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_speaker_target_none_when_no_constraints() {
-        assert!(resolve_speaker_target(None).is_none());
-    }
-
-    #[test]
-    fn resolve_speaker_target_uses_num_speakers() {
-        use crate::model::SpeakerConstraints;
-        let sc = SpeakerConstraints {
-            num_speakers: Some(3),
-            min_speakers: Some(1),
-            max_speakers: Some(10),
-        };
-        assert_eq!(resolve_speaker_target(Some(&sc)), Some(3));
-    }
-
-    #[test]
-    fn resolve_speaker_target_falls_back_to_max_speakers() {
-        use crate::model::SpeakerConstraints;
-        let sc = SpeakerConstraints {
-            num_speakers: None,
-            min_speakers: Some(1),
-            max_speakers: Some(5),
-        };
-        assert_eq!(resolve_speaker_target(Some(&sc)), Some(5));
-    }
-
-    #[test]
-    fn resolve_speaker_target_none_when_only_min() {
-        use crate::model::SpeakerConstraints;
-        let sc = SpeakerConstraints {
-            num_speakers: None,
-            min_speakers: Some(2),
-            max_speakers: None,
-        };
-        assert!(resolve_speaker_target(Some(&sc)).is_none());
-    }
-
-    #[test]
-    fn resolve_speaker_target_ignores_zero_num_speakers() {
-        use crate::model::SpeakerConstraints;
-        let sc = SpeakerConstraints {
-            num_speakers: Some(0),
-            min_speakers: None,
-            max_speakers: Some(4),
-        };
-        assert_eq!(resolve_speaker_target(Some(&sc)), Some(4));
-    }
-
-    #[test]
-    fn diarize_respects_num_speakers_constraint() {
-        use crate::model::SpeakerConstraints;
+    fn heuristic_diarization_rejects_explicit_count_inputs_before_mutation() {
         let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
-        // Create segments with very different characteristics so the
-        // unconstrained diarizer produces more than 2 clusters.
-        let mut segments = vec![
-            make_segment(0.0, 1.0, "hello world"),
-            make_segment(1.0, 2.0, "hi there"),
-            make_segment(
-                5.0,
-                8.0,
-                "this is a very long segment with many words to change features",
-            ),
-            make_segment(
-                8.0,
-                11.0,
-                "another very long segment different vocabulary complexity",
-            ),
-            make_segment(20.0, 21.0, "far away short"),
-            make_segment(
-                25.0,
-                30.0,
-                "way at the end of the recording totally different position",
-            ),
+        let original = vec![
+            make_segment(0.0, 1.0, "first segment"),
+            make_segment(1.0, 2.0, "second segment"),
         ];
-
-        let sc = SpeakerConstraints {
-            num_speakers: Some(2),
-            min_speakers: None,
-            max_speakers: None,
-        };
-        let report = diarize_segments(&mut segments, Some(30.0), Some(&sc), &token).unwrap();
-
-        assert_eq!(
-            report.speakers_detected, 2,
-            "should merge clusters down to 2 speakers, got {}",
-            report.speakers_detected
-        );
-        // All segments should have speaker labels.
-        for seg in &segments {
+        for request in [
+            SpeakerCountRequest::HardConstraint { count: 2 },
+            SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 2,
+            },
+            SpeakerCountRequest::Prior {
+                bins: vec![crate::model::SpeakerCountPriorMass {
+                    count: 2,
+                    probability: 1.0,
+                }],
+            },
+        ] {
+            let mut segments = original.clone();
+            let error = diarize_segments(&mut segments, Some(2.0), &request, &token)
+                .expect_err("legacy heuristic cannot execute explicit count semantics");
+            assert!(error.to_string().contains("native acoustic"));
             assert!(
-                seg.speaker.is_some(),
-                "every segment should have a speaker label"
-            );
-        }
-        // Labels should be SPEAKER_00 and SPEAKER_01 only.
-        for seg in &segments {
-            let spk = seg.speaker.as_ref().unwrap();
-            assert!(
-                spk == "SPEAKER_00" || spk == "SPEAKER_01",
-                "label should be SPEAKER_00 or SPEAKER_01, got {spk}"
+                segments.iter().zip(&original).all(|(actual, expected)| {
+                    actual.start_sec == expected.start_sec
+                        && actual.end_sec == expected.end_sec
+                        && actual.text == expected.text
+                        && actual.speaker == expected.speaker
+                        && actual.confidence == expected.confidence
+                }),
+                "rejection must precede segment mutation"
             );
         }
     }
 
     #[test]
-    fn diarize_respects_max_speakers_constraint() {
-        use crate::model::SpeakerConstraints;
-        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
-        let mut segments = vec![
-            make_segment(0.0, 1.0, "short"),
-            make_segment(5.0, 8.0, "this is a very long segment with many words"),
-            make_segment(20.0, 21.0, "far away"),
-            make_segment(25.0, 30.0, "way at the end totally different"),
-        ];
-
-        let sc = SpeakerConstraints {
-            num_speakers: None,
-            min_speakers: None,
-            max_speakers: Some(2),
-        };
-        let report = diarize_segments(&mut segments, Some(30.0), Some(&sc), &token).unwrap();
-
-        assert!(
-            report.speakers_detected <= 2,
-            "should have at most 2 speakers, got {}",
-            report.speakers_detected
-        );
-    }
-
-    #[test]
-    fn diarize_notes_min_speakers_deficit() {
-        use crate::model::SpeakerConstraints;
-        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
-        // A single segment can only produce 1 speaker — min_speakers=3
-        // should produce a note.
-        let mut segments = vec![make_segment(0.0, 5.0, "only one speaker here")];
-
-        let sc = SpeakerConstraints {
-            num_speakers: None,
-            min_speakers: Some(3),
-            max_speakers: None,
-        };
-        let report = diarize_segments(&mut segments, Some(5.0), Some(&sc), &token).unwrap();
-
-        assert_eq!(report.speakers_detected, 1);
-        assert!(
-            report.notes.iter().any(|n| n.contains("min_speakers=3")),
-            "should note the min_speakers deficit, notes: {:?}",
-            report.notes
-        );
-    }
-
-    #[test]
-    fn diarize_constraint_none_same_as_empty_default() {
+    fn diarize_infer_replays_deterministically() {
         let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
         let mut segments1 = vec![
             make_segment(0.0, 2.0, "hello world"),
@@ -11902,13 +14072,24 @@ mod tests {
         ];
         let mut segments2 = segments1.clone();
 
-        let r1 = diarize_segments(&mut segments1, Some(5.0), None, &token).unwrap();
-        let empty_sc = crate::model::SpeakerConstraints::default();
-        let r2 = diarize_segments(&mut segments2, Some(5.0), Some(&empty_sc), &token).unwrap();
+        let r1 = diarize_segments(
+            &mut segments1,
+            Some(5.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
+        let r2 = diarize_segments(
+            &mut segments2,
+            Some(5.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .unwrap();
 
         assert_eq!(
             r1.speakers_detected, r2.speakers_detected,
-            "empty constraints should behave same as None"
+            "explicit inference should replay deterministically"
         );
     }
 }

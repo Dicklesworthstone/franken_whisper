@@ -10,6 +10,32 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
+
+The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
+are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+
+- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
+  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
+  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
+  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
+  conformance metastasis, dependency smuggling, bench-path hardcoding.
+- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
+  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
+  with blocker beads gated on their named probe, `br dep cycles` stays empty.
+
+The three that most often decide whether a number here is real: a **self-speedup is
+MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
+weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
+standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
+success** — one line, revert, next lever, no retraction narrative.
+
+Note: matched decoding parameters and transcript equivalence are part of the ratio here. Greedy
+versus beam is the easiest way in this suite to fabricate a speedup by accident; state the
+parameters explicitly on every row.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
@@ -65,6 +91,20 @@ Input requirements:
 - Optional low-bandwidth TTY/PTY streaming mode (see architecture docs)
 
 External orchestrated tools (invoked as subprocesses, never vendored): `whisper-cli` / `insanely-fast-whisper` / `python3` (backends), `ffmpeg`/`ffprobe` (normalization fallback), and `yt-dlp` for the `youtube` subcommand — each user-installed and overridable via env (`FRANKEN_WHISPER_*_BIN`; yt-dlp via `FRANKEN_WHISPER_YTDLP_BIN`).
+
+### Native engine (`src/native_engine/`)
+
+The REAL in-process pure-Rust Whisper engine lives in `src/native_engine/`
+(ggml parser, log-mel frontend, BPE tokenizer, encoder/decoder transformer,
+greedy decode with whisper.cpp's timestamp rules, cross-attention DTW word
+timestamps). It delegates matmuls to the FrankenTorch path deps
+(`../frankentorch/crates/ft-kernel-cpu` / `ft-core` — a Linux build FAILS if
+that checkout is absent). Behavior levers are env-gated `OnceLock` flags
+(`FW_*` / `FRANKEN_WHISPER_*`), default-off unless a ledger entry records the
+flip; grep `const DEFAULT_ON`/`get_or_init` before trusting any claim about
+what is on. Perf/behavior changes here require the evidence-ledger discipline
+(`docs/NEGATIVE_EVIDENCE.md` / `docs/PERF_LEDGER.md`) and byte-exactness or an
+explicit `DISCREPANCIES.md` entry.
 
 ---
 

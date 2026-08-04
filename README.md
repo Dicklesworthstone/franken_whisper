@@ -14,7 +14,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess — and on CPU it beats whisper.cpp 2.33× on tiny.en, at parity on large-v3-turbo), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native large-v3-turbo engine is 2.99× faster than whisper.cpp on a 124.5-second whole job; tiny.en is 1.52× faster on a 124.5-second transcribe-only workload and 1.51× faster on a 300-second transcribe-only workload.**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -27,18 +27,19 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/
 
 </div>
 
-> **v0.2.0 — the native engine is real, and it is fast.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels, `#![forbid(unsafe_code)]` in-crate) now transcribes **2.33× faster than whisper.cpp on tiny.en and at parity on large-v3-turbo** — CPU vs CPU, same machine (Apple M4 Pro, interleaved runs), while using about 18% less user CPU on the large model (53.8 s vs 65.4 s). Native-vs-whisper.cpp conformance on the reference fixture: **WER 0.0000**.
+> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels, `#![forbid(unsafe_code)]` in-crate) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md).
 >
-> | Model | franken_whisper native (CPU) | whisper.cpp (CPU) | |
-> |---|---|---|---|
-> | tiny.en (11 s clip) | **475 ms** | 1,105 ms | **2.33× faster** |
-> | large-v3-turbo (11 s clip) | **9.73 s** | 9.59 s | parity |
+> | Model / workload | Mode | Matched-greedy result |
+> |---|---|---|
+> | large-v3-turbo, 124.5 s / 5 windows | whole job, no timestamps | **2.99× faster** |
+> | tiny.en, 124.5 s / 5 windows | transcribe only, no timestamps | **1.52× faster** |
+> | tiny.en, 300 s / 10 windows | transcribe only, no timestamps | **1.51× faster** |
 
 ---
 
 ## The Problem
 
-Speech-to-text pipelines are fragmented. To get production-quality transcription you need `whisper.cpp` for speed, `insanely-fast-whisper` for GPU batching, and `whisper-diarization` for speaker identification. Each has its own CLI, output format, error handling, and deployment story. Orchestrating them from scripts means parsing inconsistent stdout, handling timeouts manually, killing zombie subprocesses, and losing all run history when something crashes.
+Speech-to-text pipelines are fragmented. Existing stacks combine `whisper.cpp` for speed, `insanely-fast-whisper` for GPU batching, and Python diarization systems for speaker attribution. Each has its own CLI, output format, error handling, and deployment story. Orchestrating them from scripts means parsing inconsistent stdout, handling timeouts manually, killing zombie subprocesses, and losing all run history when something crashes.
 
 Agent workflows make the problem worse. Modern LLM agents need **structured**, **streaming**, **machine-readable** output, not human-oriented terminal decorations that break the moment they touch `jq`, pipes, or SSH.
 
@@ -47,6 +48,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 `franken_whisper` is a single Rust binary that wraps every major Whisper backend behind a unified, agent-first interface — and ships its own engine:
 
 - **A real in-process Whisper engine, in pure Rust.** ggml model parsing, log-mel frontend, encoder/decoder transformer inference on FrankenTorch CPU kernels, greedy decoding with whisper.cpp's full timestamp-rule suite, and cross-attention DTW word timestamps. No FFI, no Python, no subprocess — drop a ggml model file in place and transcribe.
+- **Rust-native acoustic speaker diarization.** A bounded-memory waveform path separates voice from channel evidence, detects multiscale regime changes, builds robust within-call profiles, accepts hard or soft known-speaker intervals, and projects an independent turn timeline onto DTW word boundaries. It makes no gender or identity claims.
 - **Adaptive Bayesian backend routing.** Each `auto` request runs a formal decision contract with an explicit loss matrix, per-backend Beta posteriors, Brier-scored calibration, and deterministic fallback when the model is mis-calibrated.
 - **Real-time NDJSON streaming.** Every pipeline stage emits sequenced, timestamped events on stable schema `v1.0.0`. No fragile regex; agents parse JSON.
 - **Durable run history.** Every transcription persists to SQLite with full event logs, replay envelopes, and JSONL export/import, even when the process crashes mid-run.
@@ -64,7 +66,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 | Machine-readable errors | exit code only | exceptions | exceptions | **12 structured `FW-*` error codes** |
 | Adaptive backend selection | — | — | — | **Bayesian decision contract** |
 | Run persistence | — | — | — | **SQLite + JSONL replay packs** |
-| Diarization | — | yes (HF token) | yes | **yes (any backend)** |
+| Diarization | TinyDiarize hints | yes (HF token) | yes | **Rust acoustic + normalized external evidence** |
 | GPU acceleration | CUDA / Metal | CUDA / MPS | CUDA | **`frankentorch` / `frankenjax`** |
 | Cancellation | `SIGKILL` | `KeyboardInterrupt` | `SIGKILL` | **cooperative `CancellationToken`** |
 | TTY audio relay | — | — | — | **mulaw + zlib + base64 NDJSON** |
@@ -89,8 +91,9 @@ franken_whisper robot run --input meeting.mp3 --backend auto
 franken_whisper robot run --input meeting.mp3 --speculative \
   --fast-model tiny.en --quality-model large-v3
 
-# Speaker diarization with pyannote
-franken_whisper transcribe --input meeting.mp3 --diarize --hf-token "$HF_TOKEN" --json
+# Built-in acoustic speaker diarization (no Python or HF token)
+franken_whisper transcribe --input meeting.mp3 --diarize \
+  --diarization-engine acoustic --json
 
 # TinyDiarize: whisper.cpp's built-in speaker-turn detection (no HF token needed)
 franken_whisper transcribe --input meeting.mp3 --tiny-diarize --json
@@ -292,8 +295,8 @@ The release profile is aggressively optimized for distribution: `opt-level = "z"
 - **Bridge backend binaries** (optional alternates; the Bayesian router arbitrates):
   - `whisper-cli` (from whisper.cpp); override via `FRANKEN_WHISPER_WHISPER_CPP_BIN`
   - `insanely-fast-whisper` (Python entry point); override via `FRANKEN_WHISPER_INSANELY_FAST_BIN`
-  - `python3` with `pyannote.audio` installed (for the diarization backend); override via `FRANKEN_WHISPER_PYTHON_BIN`
-- **HuggingFace token** (for diarization only): `--hf-token`, `FRANKEN_WHISPER_HF_TOKEN`, or `HF_TOKEN`
+  - `python3` with `pyannote.audio` installed (only for the optional external diarization backend); override via `FRANKEN_WHISPER_PYTHON_BIN`
+- **HuggingFace token** (external diarization only): `--hf-token`, `FRANKEN_WHISPER_HF_TOKEN`, or `HF_TOKEN`. The built-in acoustic engine needs neither Python nor a token.
 
 ### Sibling Crate Dependencies
 
@@ -341,10 +344,10 @@ Output (one JSON object per line, schema `1.0.0`):
 
 ```json
 {"event":"run_start","schema_version":"1.0.0","request":{"input":"audio.mp3","backend":"auto"}}
-{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":1,"stage":"ingest","code":"ingest.start","message":"materializing input"}
-{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":2,"stage":"normalize","code":"normalize.ok","message":"audio normalized"}
-{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":3,"stage":"backend","code":"backend.routing.decision_contract","message":"routing decision","payload":{...}}
-{"event":"run_complete","schema_version":"1.0.0","run_id":"...","backend":"whisper_cpp","transcript":"Hello world..."}
+{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":1,"ts":"2026-07-28T00:00:00Z","stage":"ingest","code":"ingest.start","message":"materializing input","payload":{}}
+{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":2,"ts":"2026-07-28T00:00:01Z","stage":"normalize","code":"normalize.ok","message":"audio normalized","payload":{}}
+{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":3,"ts":"2026-07-28T00:00:02Z","stage":"backend","code":"backend.routing.decision_contract","message":"routing decision","payload":{"chosen_action":"try_whisper_cpp"}}
+{"event":"run_complete","schema_version":"1.0.0","run_id":"...","trace_id":"...","started_at":"2026-07-28T00:00:00Z","finished_at":"2026-07-28T00:00:03Z","backend":"whisper_cpp","language":"en","transcript":"Hello world...","segments":[],"acceleration":null,"diarization":null,"warnings":[],"evidence":[]}
 ```
 
 ### 3. Speaker Diarization
@@ -353,11 +356,163 @@ Output (one JSON object per line, schema `1.0.0`):
 franken_whisper transcribe \
   --input meeting.mp3 \
   --diarize \
-  --hf-token "$HF_TOKEN" \
-  --min-speakers 2 \
-  --max-speakers 5 \
+  --diarization-engine acoustic \
   --json
 ```
+
+Omitting all count options is the primary native path and means automatic
+inference intent. The report always contains a versioned
+`speaker_count.estimate` object. The retained fixed-safe assignment default
+reports explicit uncalibrated/unresolved mass; the development probabilistic
+candidate adds bounded count bins and may select a count only after its
+evidence and occupancy gates pass. A soft preference can be added with
+`--speaker-count-range 2..5` or
+`--speaker-count-prior 2=0.25,3=0.75`. Use
+`--speaker-count-hard 3` only when the caller intentionally wants a hard search
+constraint; it never fabricates occupancy or removes UNKNOWN. Soft count
+options require the native acoustic engine because external/neural backends
+cannot faithfully fuse them.
+
+Known intervals can enroll an opaque speaker reference without retaining the
+hint document's source path or raw source bytes:
+
+```json
+{"schema_version":"speaker-hints-v1","known_intervals":[
+  {"speaker_ref":"caller_a","start_ms":1200,"end_ms":5400,
+   "confidence":0.98,"policy":"hard_must_link"}
+]}
+```
+
+Pass it with `--speaker-hints /private/path/hints.json`. Hard intervals are
+immutable must-links; soft enrollment can be rejected when acoustically
+contradictory. Parsed hint fields are part of the typed request and are
+persisted with the run unless `--no-persist` is used. Labels remain within-run
+references, not biometric identities.
+
+Evaluation uses the frozen `diarization-scorer-v4` contract. In addition to
+DER/JER, it reports a calibrated speaker-count posterior, explicit unresolved
+and zero-probability outcomes, effective occupancy, dominant/reference
+collapse, phantom labels, and optional transcript-free aligned-word WDER.
+This prevents a nominally correct label count from hiding a run where one
+label received nearly all speech. Public ablations aggregate these metrics by
+reference count and duration; `diarization-eval` emits the same evidence only
+as a path-free, aggregate-only confidential result. Aligned-word inputs retain
+opaque non-lexical IDs and timing/speaker annotations, never token text. See
+[`docs/acoustic_diarization_contract.md`](docs/acoustic_diarization_contract.md)
+for the versioned schemas and fail-closed policy.
+
+The multiscale acoustic sidecar is exposed only through the separate public
+evaluation command `diarization-corpus sidecar-study`, using
+`public-diarization-acoustic-sidecar-study-v3` and its v3 runner. It is not a
+`transcribe` option: normal segmentation, clustering, robot output,
+persistence, and acoustic-v2 report bytes remain unchanged. The command runs a
+frozen full-v2 baseline plus twelve ordered sidecar lanes, retains only
+aggregate path-free and transcript-free evidence, and creates both outputs in
+external directories on Linux, Android, and Apple platforms. Other targets
+return `public_corpus.output_platform` before corpus materialization. On a
+successful supported-platform run, stdout bytes exactly match the retained
+study evidence file.
+
+The frozen protocol uses oracle VAD speech regions while leaving speaker count
+in inferred mode. Its DER/JER and speaker-count results therefore measure
+segmentation and clustering conditioned on reference speech activity; they are
+not end-to-end VAD-accuracy evidence.
+
+Development fits separate adjacent-boundary and lagged different-speaker
+calibrations. The boundary-fusion-v2 configuration hash binds the selected change-detector
+mode as well as the sidecar/calibration and selector constants, so materially
+different fallback and peak-selection behavior cannot share an identity.
+Conditional diagnostics begin with one lane-independent universe
+of uniquely reference-labeled 25/50/100/200-frame-lag pairs. Each recording
+retains at most 4,096 members by a score-, label-, and availability-independent
+selection-key-v3 SHA-256 over normalized clipped PCM identity, frame indices,
+and lag. The pair scorer is separately protocol-bound and is not part of that
+key. A reference-labeled selected-sequence-v2 digest binds every retained key,
+frame pair, lag, and same/different label and must match across evaluated lanes. Evidence
+retains aggregate selected/scored same/different counts, overall and per-class
+score coverage, recording support, linked reliability moments, and a 100-bin
+score-order histogram; it retains no selected keys, labels, frame indices, or
+probabilities. The producer bins exact clamped-`f32` scores. The verifier checks
+linked counts, class moments, and first/second-moment feasibility against each
+bin's exact clamped-`f32` support, which rejects direct aggregate
+contradictions. Because the individual selected probabilities are
+intentionally omitted, those sufficient statistics cannot establish every
+member's bin assignment or replay score ordering; they are aggregate internal-
+consistency evidence, not member-level provenance. Promotion requires at least
+0.25 total and per-class score coverage, 100 scored pairs and five recordings in each class, pair
+discrimination/calibration bounds, and substantial owner-specific same-speaker
+auxiliary-dominance evidence wherever Voice and that owner coexist.
+
+A completed study is not an automatic promotion. The artifact records whether
+each candidate was rejected, advanced for held-out certification, or adopted,
+and no lane has such authority until a real public-corpus result establishes
+it. When any lane is accuracy-eligible, development ranks one winner first; if
+that lane fails an operational bound, no lower-ranked lane advances. RTF and
+RSS are host-dependent observations against the live unfused baseline in the
+same invocation; passing them is not a speed or memory-win claim. The
+deterministic accuracy projection removes performance-only failures and
+`NotSelectedByRanking`, zeros timing/RSS, allocator capacities, and target-sized
+retained-state bytes, and clears certification's locked development result hash
+while retaining its accuracy hash before recomputing selection/adoption.
+
+The verifier recomputes aggregate metrics, fine/coarse score-distribution
+consistency, coverages, gates, ranking, dispositions, and hashes. It validates
+calibration fingerprints and fit-count provenance, but aggregate evidence
+cannot prove each omitted probability's histogram membership, refit
+calibrations, regenerate selected pairs, replay audio-derived metrics, or
+reproduce bootstrap intervals; verification proves aggregate internal
+consistency, not member-level provenance or corpus replay. Paired intervals use a fixed versioned
+lane/split seed and a cancellable SplitMix64 stream. Reference annotations use
+a monotonic overlap-aware sweep instead of rescanning all turns every 10 ms.
+
+The library's `adversarial_corpus` module supplies a Rust-native, public-safe
+accuracy harness without checking audio fixtures into the repository. It
+generates transcript-free harmonic calls with deterministic speaker, turn,
+overlap, pitch, playback, and stereo regimes, then applies bounded gain,
+muffling, band-limit, resampling, quantization, clipping, noise, reverb,
+interruption, silence, channel-shift, playback, channel-swap, and overlap
+recipes. Retained repro seeds contain parameters, stable classifications, and
+content hashes—not samples, paths, transcripts, embeddings, or real speaker
+identifiers. Plans declare synthetic source authority or bind a hash of an
+external public-license acknowledgement. The same API attributes the first
+divergent pipeline stage and delta-minimizes a failing transform sequence while
+preserving its exact classification.
+
+For development-only differential diagnosis, `diarization-oracle` can compare
+the native stage document with an operator-installed pyannote, NeMo spectral,
+VBx, EEND, DiaPer, or Sortformer adapter. Start with
+`franken_whisper diarization-oracle registry`, then run the selected adapter
+against absolute external audio and stage-document paths. Comparisons are
+separate for speech activity, opaque word timing, change boundaries,
+label-permutation-invariant clusters, overlap, and final projection. Missing
+or failing tools produce a path-free skipped report; disagreements are
+diagnostic only and can never certify that the native path is wrong. External
+tools remain optional subprocesses with no normal runtime or Cargo dependency.
+The full adapter protocol, environment overrides, privacy rules, and authority
+boundary are in the
+[`acoustic diarization contract`](docs/acoustic_diarization_contract.md#114-stage-aware-external-differential-oracles).
+
+The optional neural path is deliberately not advertised as operational routing
+yet. The library freezes and verifies a license-compatible ECAPA-TDNN source
+revision, deterministic 200-tensor safetensors package, exact package hash and
+metadata, a bounded one-second SpeechBrain-compatible scalar conformance
+frontend, public analytic golden stages, and fail-closed numerical tolerances.
+A bounded safe-Rust ECAPA forward path now implements TDNN/SE-Res2 aggregation,
+attentive statistics pooling, projection, and embedding normalization on
+explicit FrankenTorch CPU kernels, with cooperative cancellation and
+content-redacted diagnostics. The package verifier reuses the native safetensors
+loader; no parallel weight format or sidecar manifest is introduced. A
+separately authenticated 2,160,320-byte public seven-stage oracle lets the
+external conformance test compare all 539,616 frontend and neural `f32` values,
+then recheck all 523,456 neural values through the composed Rust frontend, not
+only selected checkpoints. Safe RAII logical-buffer leases enforce and report
+the preplanned ECAPA-owned logical `f32` scratch-payload bound. Both generated
+artifacts remain outside Git. The
+project does not vendor weights, parse PyTorch checkpoints in the runtime, or
+yet provide a production PCM frontend or enable this representation in
+clustering and fallback policy; common-diarizer integration and evaluation
+remain subsequent gates. See the
+[`ECAPA conformance boundary`](docs/acoustic_diarization_contract.md#115-optional-ecapa-model-and-numerical-conformance-boundary).
 
 ### 4. Microphone Capture
 
@@ -459,7 +614,7 @@ The **JSON** sidecar carries the structured form — `video` metadata, `run` met
 | `--model <M>` | backend-specific | Model name or path forwarded to the engine |
 | `--language <L>` | auto-detect | Language hint (ISO 639-1) |
 | `--backend <B>` | `auto` | `auto`, `whisper-cpp`, `insanely-fast`, `whisper-diarization` |
-| `--diarize` | `false` | Speaker diarization (emits `SPEAKER_NN` labels) |
+| `--diarize` | `false` | Speaker diarization (generated `SPEAKER_NN` labels plus supplied opaque references; uncertain speech stays unlabeled) |
 | `--concurrency <N>` | `3` | Maximum concurrent downloads |
 | `--no-keep-audio` | `false` | Delete each audio file after its transcript is written |
 | `--no-retry` | `false` | Do not retry videos previously marked failed in the manifest |
@@ -495,7 +650,7 @@ franken_whisper deliberately downloads with the forgiving `bestaudio/best` forma
 
 ## Command Reference
 
-`franken_whisper` exposes seven top-level subcommands.
+`franken_whisper` exposes ten top-level subcommands.
 
 ### `transcribe`
 
@@ -521,7 +676,7 @@ franken_whisper transcribe [OPTIONS]
 | `--model <MODEL>` | backend-specific | Model name or path forwarded to backend |
 | `--language <LANG>` | auto-detect | Language hint (ISO 639-1) |
 | `--translate` | `false` | Translate to English |
-| `--diarize` | `false` | Enable speaker diarization |
+| `--diarize` | `false` | Enable the typed speaker-diarization stage |
 
 **Output:**
 
@@ -606,14 +761,20 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 
 **Diarization:**
 
-| Flag | Description |
-|------|-------------|
-| `--num-speakers <N>` | Exact speaker count |
-| `--min-speakers <N>` | Minimum speakers |
-| `--max-speakers <N>` | Maximum speakers |
-| `--no-stem` | Disable vocal isolation (Demucs source separation) |
-| `--suppress-numerals` | Spell out numbers for alignment stability |
-| `--diarization-model <MODEL>` | Override whisper model for the diarization stage |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--diarization-engine <ENGINE>` | `auto` | `auto`, `acoustic`, `external`, or reserved `neural`; explicit `acoustic` selects the Rust waveform engine regardless of rollout stage |
+| `--diarization-fallback <POLICY>` | `unknown` | `unknown`, `external`, or `error` when evidence is insufficient |
+| `--speaker-hints <PATH>` | — | Read a `speaker-hints-v1` document in place; the path is not retained, but parsed fields persist with the run unless `--no-persist` is used |
+| `--enrollment-edge-guard-ms <N>` | `100` | Remove boundary-adjacent audio before enrolling a known interval |
+| `--diarization-max-prototypes <N>` | `512` | Bounded global prototype cap (`1..=512`) |
+| `--persist-speaker-profiles` | `false` | Record explicit persistence consent; schema v5 still stores privacy-safe summaries rather than reusable acoustic vectors |
+| `--speaker-count-hard <K>` | — | Explicit hard search constraint; success still requires independent evidence for every speaker and uncertain speech remains UNKNOWN |
+| `--speaker-count-range <MIN..MAX>` | — | Soft bounded count preference; acoustic evidence may disagree or remain unresolved |
+| `--speaker-count-prior <PRIOR>` | — | Soft point prior (`K`) or normalized distribution (`K=P,K=P`); never forces occupancy |
+| `--no-stem` | `false` | Disable external-backend vocal isolation |
+| `--suppress-numerals` | `false` | Spell out numbers for external alignment stability |
+| `--diarization-model <MODEL>` | — | Override the external diarization model |
 
 **Speculative Streaming:**
 
@@ -627,6 +788,104 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 | `--correction-tolerance-wer <F>` | — | WER tolerance for confirmation vs. retraction |
 | `--no-adaptive` | `false` | Disable adaptive window sizing |
 | `--always-correct` | `false` | Force quality model on every window (evaluation mode) |
+
+### `diarization-corpus`
+
+External-only preparation and aggregate evaluation for public or
+operator-licensed diarization corpora. The registry does not download data or
+accept a license on the operator's behalf.
+
+`registry` is available on every supported CLI target. The artifact-writing
+`build`, `ablate`, and `sidecar-study` commands require Linux, Android, or an
+Apple platform; Windows and other targets return
+`public_corpus.output_platform` before reading corpus media or annotations.
+
+```bash
+# inspect frozen source, license, conversion, and acknowledgement contracts
+franken_whisper diarization-corpus registry
+
+# validate external WAV/RTTM inputs and create one path-free bundle
+franken_whisper diarization-corpus build \
+  --input-root /absolute/external/corpus \
+  --descriptor /absolute/external/corpus/descriptor.json \
+  --output /absolute/external/results/bundle.json \
+  --license-ack <REGISTRY_ACKNOWLEDGEMENT_ID>
+
+# run the existing acoustic-v2 representation/detector/clustering ablation v8
+franken_whisper diarization-corpus ablate \
+  --input-root /absolute/external/corpus \
+  --descriptor /absolute/external/corpus/descriptor.json \
+  --bundle-output /absolute/external/results/ablation-bundle.json \
+  --output /absolute/external/results/ablation-development.json \
+  --license-ack <REGISTRY_ACKNOWLEDGEMENT_ID> \
+  --stage development
+
+# run the separate, evaluation-only multiscale sidecar study
+franken_whisper diarization-corpus sidecar-study \
+  --input-root /absolute/external/corpus \
+  --descriptor /absolute/external/corpus/descriptor.json \
+  --bundle-output /absolute/external/results/sidecar-bundle.json \
+  --output /absolute/external/results/sidecar-development.json \
+  --license-ack <REGISTRY_ACKNOWLEDGEMENT_ID> \
+  --stage development
+```
+
+All path arguments must be absolute. Entire output file names must use lowercase
+ASCII letters, digits, period, underscore, and hyphen and end in the exact
+suffix `.json`; a handle-relative preflight also rejects an existing
+ASCII-case-fold sibling, making ordinary case-sensitive and case-insensitive
+collisions fail consistently. Exact-name no-clobber publication remains the
+atomic creation guard. Input data must
+remain outside the checkout, and bundle/evidence parents must be outside both
+the checkout and input root. Outputs use create-new semantics and are never overwritten. On
+Linux, Android, and Apple platforms, complete JSON is privately staged relative
+to an identity-bound directory handle and atomically published with no-clobber
+semantics. The terminal parent may not be a symlink; it must be owned by the
+effective user and not group/world writable. This protects handle-relative
+directory contents while treating the effective user as trusted, because that
+user can also alter a final artifact afterward. Requested and canonical
+terminal-directory identities are checked throughout. Ancestor rename
+authority, ACLs, privileged mount changes, and arbitrary mount aliases of a
+checkout/input descendant are outside this boundary; use a privately controlled
+output path and filesystem without broader ACL access. Other platforms fail
+closed for this public-artifact path. Add
+`--maximum-recording-duration-ms <N>` to freeze a deterministic prefix. A
+pre-publication failure creates no final-name artifact and never modifies an
+existing final-name entry. After permission verification, later failures
+truncate and synchronize the private staging inode to a zero-length mode-0600
+marker; this is not a secure block erase. Creation is followed by an explicit
+mode-0600 permission operation and verification that the inode is a regular
+file owned by the effective user with exactly those access bits; failure is
+reported before payload serialization. POSIX/NFSv4 ACLs and mount policies
+that grant access beyond Unix mode bits are outside this writer's authority, so
+public-artifact output directories must reside on a filesystem where such
+broader access is absent. A permission-establishment failure leaves an empty
+marker but makes no mode claim. A storage failure during a payload scrub reports
+`public_corpus.output_cleanup_uncertain`. An error after the
+no-clobber rename is reported as
+`public_corpus.output_commit_uncertain`, because the final artifact may already
+exist and is not truncated. An ambiguous rename error uses the same
+commit-uncertain result and conservatively preserves the held inode; only an
+authoritative no-clobber conflict is treated as definitely pre-commit. Bundle
+and evidence files are each published
+atomically, but their two renames are not a cross-file transaction; successful
+evidence publication is the completion signal for the pair. A
+sidecar certification run uses `--stage certification` and must also supply
+`--locked-development-evidence <PATH>`; it evaluates the unfused baseline and
+only the single candidate selected by the exact locked development artifact.
+Both stages parse and hash the complete descriptor and audit its path-free
+cross-split metadata, but materialize WAV, RTTM, and optional word-annotation
+bytes only for the stage's selected split. Certification validates the retained
+development artifact's complete internal contract—including both calibration
+fingerprints and provenance, selected lane, recomputed gates/ranking/disposition,
+and result/accuracy hashes—then binds the current descriptor and protocol before
+opening held-out inputs. This validation does not refit calibration or replay
+development audio. Development and certification
+therefore create distinct split-specific bundle hashes; the shared descriptor
+and protocol hashes are the cross-stage lock.
+Source paths, filenames, recording/speaker identifiers, per-recording
+observations, feature values, audio, and transcripts never enter the aggregate
+study evidence.
 
 ### `robot`
 
@@ -668,7 +927,7 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 
 **Stage Codes.** Each pipeline stage emits paired `*.start` / `*.ok` codes (or `*.error` on failure, `*.skip` when not needed, `*.cancelled` on token fire, `*.timeout` on budget overrun):
 
-`ingest.start`, `ingest.ok`, `normalize.start`, `normalize.ok`, `vad.start`, `vad.ok`, `separate.start`, `separate.ok`, `backend.start`, `backend.ok`, `backend.routing.decision_contract`, `acceleration.start`, `acceleration.ok`, `align.start`, `align.ok`, `punctuate.start`, `punctuate.ok`, `diarize.start`, `diarize.ok`, `persist.start`, `persist.ok`, `orchestration.budgets`, `orchestration.latency_profile`
+`ingest.start`, `ingest.ok`, `normalize.start`, `normalize.ok`, `vad.start`, `vad.ok`, `separate.start`, `separate.ok`, `backend.start`, `backend.ok`, `backend.routing.decision_contract`, `acceleration.start`, `acceleration.ok`, `align.start`, `align.ok`, `punctuate.start`, `punctuate.ok`, `diarize.rollout`, `diarize.start`, `diarize.ok`, `persist.start`, `persist.ok`, `orchestration.budgets`, `orchestration.latency_profile`
 
 **Health Report.** `robot health` probes every subsystem and returns a structured diagnostic:
 
@@ -681,7 +940,7 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
     {"name": "whisper.cpp", "available": true, "path": "/usr/local/bin/whisper-cli", "version": "1.7.2", "issues": []}
   ],
   "ffmpeg": {"name": "ffmpeg", "available": true, "path": "/usr/bin/ffmpeg", "version": null, "issues": []},
-  "database": {"name": "database", "available": true, "path": ".franken_whisper/storage.sqlite3", "version": "schema_v2", "issues": []},
+  "database": {"name": "database", "available": true, "path": ".franken_whisper/storage.sqlite3", "version": "schema_v4", "issues": []},
   "resources": {"disk_free_bytes": 12345, "disk_total_bytes": 67890, "memory_available_bytes": 11111, "memory_total_bytes": 22222},
   "overall_status": "ok"
 }
@@ -797,6 +1056,7 @@ Built on the [FrankenTUI](https://github.com/Dicklesworthstone/frankentui) frame
 | `FRANKEN_WHISPER_HF_TOKEN` | — | HuggingFace token (preferred over `HF_TOKEN`) |
 | `HF_TOKEN` | — | HuggingFace token (fallback) |
 | `FRANKEN_WHISPER_DIARIZATION_DEVICE` | — | GPU device for the diarization backend |
+| `FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT` | `shadow` | `auto` admission stage: `shadow`, `validated`, `fallback`, `primary`, or `sole`; invalid values fail closed to `shadow` |
 | `FRANKEN_WHISPER_STATE_DIR` | `.franken_whisper` | State directory root |
 | `FRANKEN_WHISPER_DB` | `.franken_whisper/storage.sqlite3` | SQLite database path |
 | `FRANKEN_WHISPER_FFMPEG_BIN` | auto | Explicit ffmpeg binary path |
@@ -845,6 +1105,14 @@ Native Rust engine replacements follow a 5-stage rollout under conformance gatin
 | `sole` | Native only (requires `FRANKEN_WHISPER_NATIVE_EXECUTION=1`) |
 
 The execution-path metadata on every `backend.ok` event and replay envelope records the active stage so post-hoc analysis can correlate output drift with rollout transitions.
+
+Acoustic diarization has an independent, default-off `auto` rollout controlled
+by `FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT`. `shadow` and `validated`
+leave acoustic output unexposed; `fallback` admits it only when verified
+external labels are absent; `primary` prefers it; `sole` admits only it.
+Explicit `--diarization-engine acoustic` bypasses this `auto` gate. Every run
+emits `diarize.rollout` with the requested and resolved engine, stage, config
+validity, and external-evidence presence.
 
 ---
 
@@ -1119,7 +1387,9 @@ Set `FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE=1` to bypass the built-in decoder an
 
 ### Storage Internals
 
-The storage layer uses `fsqlite` (from the FrankenSQLite project) with three core tables plus a key-value metadata table. The schema is at version **3** at HEAD.
+The storage layer uses `fsqlite` (from the FrankenSQLite project) with three
+canonical run tables, four derived diarization index tables, and a key-value
+metadata table. The schema is at version **4** at HEAD.
 
 ```sql
 runs     (id PK, started_at, finished_at, backend, input_path,
@@ -1133,16 +1403,26 @@ segments (run_id, idx, start_sec, end_sec, speaker, text, confidence,
 events   (run_id, seq, ts_rfc3339, stage, code, message, payload_json,
           PRIMARY KEY (run_id, seq))
 
+diarization_reports          (run_id PK, implementation, contract_version, ...)
+diarization_turns            (run_id, idx, start_ms, end_ms, speaker_ref, ...)
+speaker_hints                (run_id, idx, speaker_ref, start_ms, end_ms, ...)
+speaker_profile_summaries    (run_id, idx, speaker_ref, reliability, ...)
+          -- deterministic indexes rebuilt from runs.request_json/result_json
+
 _meta    (key TEXT PRIMARY KEY, value TEXT NOT NULL)
-          -- holds 'schema_version' => '3' among other metadata
+          -- holds 'schema_version' => '5' among other metadata
 ```
 
 **Schema Migrations.** When opening older databases, the storage layer walks forward through the migration ladder:
 
 - **v1 → v2:** add `runs.replay_json` and `runs.acceleration_json` (defaulting to `'{}'`).
 - **v2 → v3:** create indexes on hot query paths (recent-runs listing, per-run segment / event lookup) for faster `robot health` and `runs` queries.
+- **v3 → v4:** add privacy-safe normalized diarization indexes and rebuild
+  them from canonical typed request/result JSON.
+- **v4 → v5:** add typed speaker-count status/outcome and per-hint evidence
+  columns, then rebuild the derived index from canonical run JSON.
 
-Migration steps run safely:
+The legacy column-add migration runs safely:
 
 1. Query current journal mode (`PRAGMA journal_mode;`)
 2. Switch from WAL to DELETE for DDL reliability
@@ -2222,6 +2502,7 @@ In addition to conventional unit and integration tests, the project ships dedica
 | [`tests/metamorphic_audio_tests.rs`](tests/metamorphic_audio_tests.rs) | Audio normalization is stable under permutation of decoder paths, silence padding is idempotent, stereo→mono averaging matches manual computation |
 | [`tests/metamorphic_accelerate_tests.rs`](tests/metamorphic_accelerate_tests.rs) | Softmax is permutation-equivariant and scale-invariant; layer-norm output mean ≈ 0, variance ≈ 1; attention scoring respects masking |
 | [`tests/metamorphic_speculation_tests.rs`](tests/metamorphic_speculation_tests.rs) | String-distance functions are symmetric, satisfy the triangle inequality, and window-size adjustments respect bounds |
+| [`src/adversarial_corpus.rs`](src/adversarial_corpus.rs) | Seventeen deterministic, public-safe diarization challenge families; bounded transform composition; exact time-shift contracts; stage-specific regression attribution; minimized content-free repro seeds |
 
 Metamorphic tests catch entire categories of regressions where the "correct" answer is unknown but the *relationship* between inputs and outputs must hold.
 
@@ -2247,9 +2528,7 @@ franken_whisper transcribe --input meeting.mp3 \
   --backend whisper_cpp \
   --model large-v3 \
   --diarize \
-  --hf-token "$HF_TOKEN" \
-  --min-speakers 2 \
-  --max-speakers 8 \
+  --diarization-engine acoustic \
   --vad \
   --json
 ```
@@ -2363,14 +2642,14 @@ This produces the smallest possible binary while retaining full optimization. Th
 |  No network calls during transcription                         |
 |  No telemetry or analytics                                     |
 |  No cloud sync                                                 |
-|  No API keys required (except HuggingFace for diarization)     |
+|  No API keys required for native ASR or acoustic diarization  |
 +----------------------------------------------------------------+
 ```
 
 All processing happens on your hardware using local backend binaries. The only external network access is:
 
 - **ffmpeg auto-provisioning**: one-time download, can be disabled via `FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0`
-- **HuggingFace model downloads**: only when using `--diarize` with `pyannote` models
+- **HuggingFace model downloads**: only when explicitly using an external diarization backend with pyannote models
 
 ### Secrets Redaction
 
@@ -2484,11 +2763,15 @@ CREATE TABLE events (
 -- Key-value schema metadata
 CREATE TABLE _meta (
     key   TEXT PRIMARY KEY,                  -- e.g. 'schema_version'
-    value TEXT NOT NULL                      -- 'schema_version' currently '3'
+    value TEXT NOT NULL                      -- 'schema_version' currently '5'
 );
 
 -- v3 migration adds indexes on hot query paths (recent-runs listing,
 -- per-run segment + event lookup).
+-- v4 adds derived diarization reports, turns, hint audits, and privacy-safe
+-- profile summaries rebuilt from canonical runs JSON.
+-- v5 adds typed speaker-count status/outcome JSON and privacy-safe per-hint
+-- disposition JSON to the derived diarization report index.
 ```
 
 ### NDJSON Export Format
@@ -2567,6 +2850,37 @@ The `BackendParams` aggregate is the catch-all for every backend-specific tuning
 
 ## Performance Characteristics
 
+### Native Engine Speed (measured)
+
+The competitive rows below come from live `whisper-cli` incumbent arms in
+`examples/incumbent_ab.rs`: both binaries run side-by-side in the same
+invocation at 32 requested threads and matched greedy decode settings
+(`whisper-cli -bs 1 -bo 1`).
+
+| Comparison (matched-greedy) | Model | Clip / mode | Result |
+|---|---|---|---|
+| vs `whisper.cpp` (CPU) | `large-v3-turbo` | 124.5 s, whole job, no timestamps | **2.99× faster** |
+| vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, transcribe only, no timestamps | **1.52× faster** |
+| vs `whisper.cpp` (CPU) | `tiny.en` | 300 s, transcribe only, no timestamps | **1.51× faster** |
+
+**Measurement contract.**
+
+- **Campaign wins use the actual incumbent** — a competitive result requires the legacy incumbent arm to run side-by-side with franken in the same harness invocation. A before/after comparison of franken against itself is recorded as a maintenance self-speedup, never as a competitive result.
+- **Paired null (A/A) control, same binary** — every new wall-time A/B verdict must carry an identity null in the same invocation, with order-interleaved arms, so host contention and run-order bias cannot masquerade as a speedup. A counted-mechanism rejection may omit timing inference only when the unchanged count itself proves that no work was removed.
+- **Byte/ULP-exact where claimed** — byte-exact levers are asserted bit-identical to the reference path; the sole numerics-affecting default (poly-exp) is held to WER-Δ 0.000 vs `whisper.cpp`.
+- **Negative-evidence ledger** — new rejected levers record either a numerical same-invocation A/A null or a counted unchanged-work mechanism, plus a concrete retry predicate. The pre-commit gate rejects undecidable rows. See [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md) and [`docs/LEDGER_RESURRECTION.md`](docs/LEDGER_RESURRECTION.md).
+- **Gate.** A result is decidable only when both same-invocation A/A null medians lie in `[0.98, 1.02]` inclusive, its comparison CI95 excludes `1.0`, and its effect clears 2× the widest null-CI edge from `1.0`. A null CI need not straddle `1.0`; its widest edge calibrates the margin. `cv` is recorded as provenance and never decides a verdict.
+
+**Scope.** These are **greedy / temperature-0** comparisons with the reference
+explicitly forced to the same decode mode (`-bs 1 -bo 1`). The turbo row is
+whole-process wall time, including startup, model/audio I/O, inference,
+serialization, and teardown; both arms also use `max_context=0`. The tiny.en
+rows are transcribe-only and exclude one-time model load. All three use a
+quiet Threadripper host at requested/configured width 32 with order-alternating
+pairs and per-engine A/A controls. The full record lives in
+[`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md) and
+[`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
+
 ### Audio Normalization
 
 | Input Format | Duration | Normalization Time | Method |
@@ -2640,7 +2954,7 @@ With the aggressive release profile (`opt-level = "z"`, LTO, stripped):
 | Backend engines | 3 bridge adapters + 3 paired native pilots under rollout governance |
 | Pipeline stages | 10 (composable, independently budgeted) |
 | Stage budget knobs | 12 (10 stages + probe + cleanup) |
-| CLI subcommands | 6 (`transcribe`, `robot`, `runs`, `sync`, `tty-audio`, `tui`) |
+| CLI subcommands | 10 (`transcribe`, `robot`, `runs`, `sync`, `tty-audio`, `diarization-eval`, `diarization-corpus`, `diarization-oracle`, `tui`, `youtube`) |
 | CLI flags (`transcribe`) | 70+ (inference, VAD, diarization, speculative, audio windowing, word timestamps) |
 | Robot event types | 12 (run lifecycle, stage, speculation, health, routing, transcript) |
 | TTY control frame types | 10 (`Handshake`, `HandshakeAck`, `Ack`, `RetransmitRequest`, `RetransmitResponse`, `Backpressure`, `TranscriptPartial`, `TranscriptRetract`, `TranscriptCorrect`, `SessionClose`) |
@@ -2739,14 +3053,19 @@ brew install whisper-cpp                                  # macOS
 export FRANKEN_WHISPER_WHISPER_CPP_BIN=/path/to/whisper-cli
 ```
 
-### `FW-BACKEND-UNAVAILABLE: diarization requires HF token`
+### `FW-BACKEND-UNAVAILABLE: external diarization requires HF token`
 
-Diarization needs a HuggingFace API token for pyannote models:
+The optional pyannote backend needs a HuggingFace API token. The Rust acoustic
+engine does not:
 
 ```bash
 export FRANKEN_WHISPER_HF_TOKEN="hf_your_token_here"
 # or pass directly
 franken_whisper transcribe --input audio.mp3 --diarize --hf-token "hf_..."
+
+# or stay entirely in process
+franken_whisper transcribe --input audio.mp3 --diarize \
+  --diarization-engine acoustic
 ```
 
 The token is automatically redacted from command logs.
@@ -3677,8 +3996,9 @@ The `auto` router will normally pick the right backend, but explicit selection i
 
 ```
 Do you need speaker diarization?
-├─ YES, with high-quality pyannote models      → whisper_diarization
-├─ YES, with built-in fast-only speaker turns  → whisper_cpp + --tiny-diarize
+├─ YES, waveform-derived and dependency-light  → --diarization-engine acoustic
+├─ YES, with an installed pyannote backend     → --diarization-engine external
+├─ YES, turn hints only                        → whisper_cpp + --tiny-diarize
 └─ NO ──┐
         Do you have a CUDA / MPS GPU?
         ├─ YES, batching long audio aggressively  → insanely_fast
@@ -3741,7 +4061,7 @@ For batch jobs, prefer a `Type=oneshot` unit and a `*.timer` for scheduling. Rob
 | `aarch64-unknown-linux-gnu` | Tier 1 (CI-tested) | Install ffmpeg via package manager |
 | `x86_64-apple-darwin` | Tier 1 (CI-tested) | `brew install ffmpeg` |
 | `aarch64-apple-darwin` | Tier 1 (CI-tested) | `brew install ffmpeg` |
-| `x86_64-pc-windows-msvc` | Tier 1 (CI-tested) | Install ffmpeg manually; `dshow` for mic |
+| `x86_64-pc-windows-msvc` | Tier 1 (CI-built) | Install ffmpeg manually; `dshow` for mic; public-corpus artifact writers fail closed |
 | `armv7-unknown-linux-musleabihf` | Best-effort | No auto-provisioned ffmpeg; cross-build via `cross` |
 | WebAssembly | Not supported | Symphonia + clap pull in OS APIs |
 
@@ -3817,7 +4137,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 
 | Use case | Configuration sketch |
 |----------|----------------------|
-| **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --diarize --min-speakers 2 --max-speakers 8 --json` |
+| **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --diarize --diarization-engine acoustic --json` (automatic count inference; optional soft `--speaker-count-range 2..8`) |
 | **Podcast batch processing** | `for f in podcasts/*.mp3; do franken_whisper transcribe --input "$f" --backend whisper_cpp --model large-v3 --json; done` |
 | **Live transcription dashboard** | `robot run --mic --mic-seconds 300 --speculative --fast-model tiny.en --quality-model large-v3` piped to a Server-Sent Events translator |
 | **Voicemail archival** | `transcribe --stdin --backend auto --json` invoked from a mail-handler hook |
@@ -3828,7 +4148,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 | **Forensic transcription with audit trail** | `--json --output-srt --output-vtt` plus a snapshot of the replay pack for chain-of-custody |
 | **Karaoke / lyrics alignment** | `transcribe --input song.mp3 --output-lrc --json` then post-process with the word-level timestamps via library API |
 | **Real-time accessibility captioning** | `robot run --mic --speculative` with `transcript.partial` driving a low-latency UI and `transcript.confirm` / `transcript.correct` updating the canonical text |
-| **Air-gapped sensitive recordings** | Disable all network I/O (`FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0`, manual model deployment, no diarization), use `--no-persist` if even local storage is forbidden |
+| **Air-gapped sensitive recordings** | Disable auto-provisioning, deploy the Whisper model manually, use `--diarization-engine acoustic` when speaker turns are needed, and add `--no-persist` if local transcript storage is forbidden |
 
 The common theme: `franken_whisper` is the same binary in every use case. The configuration changes; the integration story (NDJSON events, structured errors, deterministic replay) does not.
 
@@ -3843,7 +4163,8 @@ run_start         : event, schema_version, request
 run_error         : event, schema_version, code, message
 stage             : event, schema_version, run_id, seq, ts, stage, code, message, payload
 run_complete      : event, schema_version, run_id, trace_id, started_at, finished_at,
-                    backend, language, transcript, segments, acceleration, warnings, evidence
+                    backend, language, transcript, segments, acceleration, diarization,
+                    warnings, evidence
 backends.discovery: event, schema_version, backends
 routing_decision  : event, schema_version, run_id, ts, code
 transcript.partial: event, schema_version, run_id, seq, ts, text, start_sec, end_sec,
@@ -4027,7 +4348,7 @@ idx,start_sec,end_sec,speaker,text,confidence
   "database": {                       // SQLite store at --db
     "name": "database", "available": true,
     "path": ".franken_whisper/storage.sqlite3",
-    "version": "schema_v3",
+    "version": "schema_v4",
     "issues": []
     // The full StorageDiagnostics (page_count, page_size, journal_mode,
     // wal_checkpoint{busy, log_frames, checkpointed_frames}, freelist_count,
@@ -4293,28 +4614,29 @@ The router is doing nothing exotic: it blends priors with empirical data via Bet
 
 ---
 
-## TinyDiarize vs Full Diarization
+## Speaker Diarization Paths
 
-`franken_whisper` exposes two paths to speaker labels:
+| Aspect | Rust acoustic | External | TinyDiarize |
+|--------|---------------|----------|-------------|
+| Selection | `--diarization-engine acoustic` | `--diarization-engine external` | `--tiny-diarize` |
+| Evidence | Waveform voice/channel features and multiscale changes | Backend-defined, normalized only after provenance checks | Decoder turn tokens |
+| Dependencies | Built-in Rust + the normalized PCM already used by ASR | Typically Python, model files, and possibly an HF token | whisper-cli |
+| Output | Independent turns plus conservative projection to ASR segments | Timed backend labels normalized to the common report | Inline turn hints |
+| Known intervals | Hard must-link and soft enrollment | Backend-specific | No |
+| Speaker count | Infer by default; optional fail-closed range or exact search constraint | Backend-specific | No |
+| Unknown/overlap | Explicit unknown and overlap suspicion | Backend-specific | No calibrated assignment |
+| Accuracy authority | Synthetic invariant proof only; public corpus DER/JER remains `NO-DATA` | Depends on the installed backend and corpus | No project accuracy certification |
 
-| Aspect | `--tiny-diarize` (whisper.cpp built-in) | `--diarize` (whisper-diarization / pyannote) |
-|--------|-----------------------------------------|----------------------------------------------|
-| Dependencies | whisper-cli only | Python + pyannote.audio + HuggingFace token + Demucs (for `--no-stem` off) |
-| Output | Speaker-turn tokens injected inline in the transcript | Explicit per-segment `speaker` field with clusterable IDs |
-| Accuracy on 2 speakers | Decent; misses overlap | High; handles overlap, gender, register |
-| Accuracy on 5+ speakers | Degrades quickly | Stable up to 10+ speakers with constraints |
-| Latency overhead | Minimal | +20–60% wall time (separation + clustering) |
-| HF token required | No | Yes |
-| Works offline (post-model-download) | Yes | Yes (after first download) |
-| Cross-engine compatible | Only whisper.cpp | Any backend (the diarization stage runs separately) |
-
-Decision rule: use `--tiny-diarize` when speakers are clearly turn-taking and you just need a hint; use `--diarize` for anything where mis-attribution matters (interviews, depositions, multi-party meetings).
+Use acoustic diarization for dependency-light waveform evidence and auditable
+known intervals. Use an external engine only when its model/deployment tradeoff
+is deliberate. TinyDiarize is a turn hint, not a speaker-profile substitute.
 
 ---
 
 ## Source Separation Tradeoffs (`--no-stem`)
 
-The diarization backend optionally runs Demucs vocal isolation before clustering. This is on by default; pass `--no-stem` to disable.
+The external diarization backend may run Demucs vocal isolation before
+clustering. The Rust acoustic engine does not invoke Demucs or Python.
 
 **Keep stemming on (default) when:**
 
@@ -4373,7 +4695,7 @@ franken_whisper robot schema | jq '.events | keys'
 franken_whisper robot schema | jq '.events["run_complete"].required'
 # ["event", "schema_version", "run_id", "trace_id", "started_at",
 #  "finished_at", "backend", "language", "transcript", "segments",
-#  "acceleration", "warnings", "evidence"]
+#  "acceleration", "diarization", "warnings", "evidence"]
 
 franken_whisper robot schema | jq '.events["routing_decision"].payload'
 # describes the loss_matrix, posterior snapshot, calibration metrics,

@@ -1,0 +1,21 @@
+[package]
+name = "router-success-metric-perf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+sha2 = "0.10"
+
+[[bench]]
+name = "router_success_metric_perf"
+path = "bench.rs"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 1
+panic = "abort"

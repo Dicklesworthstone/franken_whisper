@@ -1,0 +1,15 @@
+[package]
+name = "vtt-timestamp-perf"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bench]]
+name = "vtt_timestamp"
+path = "bench.rs"
+harness = false
+
+[profile.release]
+opt-level = 3

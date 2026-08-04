@@ -1,0 +1,2848 @@
+//! Development-only differential diagnostics against external diarization tools.
+//!
+//! External systems are deliberately treated as fallible diagnostic oracles,
+//! never as authorities over the native Rust pipeline. The adapter protocol is
+//! transcript-free, path-free after execution, and absent from normal
+//! transcription. No external tool is a Cargo or runtime dependency.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::diarization::{
+    ChangePointScore, DiarizationScore, EvaluationTurn, ScoringTurn, score_change_points,
+    score_diarization,
+};
+use crate::error::{FwError, FwResult};
+use crate::orchestrator::CancellationToken;
+use crate::process::run_command_cancellable;
+
+pub const DIFFERENTIAL_ORACLE_PROTOCOL_VERSION: &str =
+    "franken-whisper-diarization-oracle-protocol-v1";
+pub const DIFFERENTIAL_ORACLE_VERSION_SCHEMA: &str =
+    "franken-whisper-diarization-oracle-version-v1";
+pub const DIFFERENTIAL_STAGE_DOCUMENT_SCHEMA: &str =
+    "franken-whisper-diarization-stage-document-v1";
+pub const DIFFERENTIAL_REPORT_SCHEMA: &str = "franken-whisper-differential-report-v1";
+pub const DIFFERENTIAL_COMPARATOR_VERSION: &str = "differential-comparator-v1";
+
+const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_INTERVALS: usize = 200_000;
+const MAX_WORDS: usize = 500_000;
+const MAX_CLUSTERS: usize = 200_000;
+const MAX_TURNS: usize = 200_000;
+const MAX_SAFE_TOKEN_LEN: usize = 128;
+const HASH_HEX_LEN: usize = 64;
+
+/// Supported external diagnostic families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferentialOracleTool {
+    Pyannote,
+    NemoSpectral,
+    Vbx,
+    Eend,
+    Diaper,
+    Sortformer,
+}
+
+impl DifferentialOracleTool {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pyannote => "pyannote",
+            Self::NemoSpectral => "nemo_spectral",
+            Self::Vbx => "vbx",
+            Self::Eend => "eend",
+            Self::Diaper => "diaper",
+            Self::Sortformer => "sortformer",
+        }
+    }
+
+    #[must_use]
+    pub const fn family(self) -> DifferentialOracleFamily {
+        match self {
+            Self::Pyannote | Self::NemoSpectral => DifferentialOracleFamily::Cascaded,
+            Self::Vbx => DifferentialOracleFamily::BayesianHmm,
+            Self::Eend | Self::Diaper | Self::Sortformer => {
+                DifferentialOracleFamily::EndToEndAttractor
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn executable_env(self) -> &'static str {
+        match self {
+            Self::Pyannote => "FRANKEN_WHISPER_PYANNOTE_ORACLE_BIN",
+            Self::NemoSpectral => "FRANKEN_WHISPER_NEMO_SPECTRAL_ORACLE_BIN",
+            Self::Vbx => "FRANKEN_WHISPER_VBX_ORACLE_BIN",
+            Self::Eend => "FRANKEN_WHISPER_EEND_ORACLE_BIN",
+            Self::Diaper => "FRANKEN_WHISPER_DIAPER_ORACLE_BIN",
+            Self::Sortformer => "FRANKEN_WHISPER_SORTFORMER_ORACLE_BIN",
+        }
+    }
+
+    #[must_use]
+    pub const fn default_program(self) -> &'static str {
+        match self {
+            Self::Pyannote => "franken-whisper-pyannote-oracle",
+            Self::NemoSpectral => "franken-whisper-nemo-spectral-oracle",
+            Self::Vbx => "franken-whisper-vbx-oracle",
+            Self::Eend => "franken-whisper-eend-oracle",
+            Self::Diaper => "franken-whisper-diaper-oracle",
+            Self::Sortformer => "franken-whisper-sortformer-oracle",
+        }
+    }
+}
+
+/// Broad architecture class used to avoid treating one implementation as consensus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferentialOracleFamily {
+    Cascaded,
+    BayesianHmm,
+    EndToEndAttractor,
+}
+
+/// Path-free registry entry for one operator-installed adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialOracleRegistryEntry {
+    pub tool: DifferentialOracleTool,
+    pub family: DifferentialOracleFamily,
+    pub executable_env: String,
+    pub default_program: String,
+    pub protocol_version: String,
+    pub authority: DifferentialAuthority,
+}
+
+/// Emit the stable adapter registry without probing the host.
+#[must_use]
+pub fn differential_oracle_registry() -> Vec<DifferentialOracleRegistryEntry> {
+    [
+        DifferentialOracleTool::Pyannote,
+        DifferentialOracleTool::NemoSpectral,
+        DifferentialOracleTool::Vbx,
+        DifferentialOracleTool::Eend,
+        DifferentialOracleTool::Diaper,
+        DifferentialOracleTool::Sortformer,
+    ]
+    .into_iter()
+    .map(|tool| DifferentialOracleRegistryEntry {
+        tool,
+        family: tool.family(),
+        executable_env: tool.executable_env().to_owned(),
+        default_program: tool.default_program().to_owned(),
+        protocol_version: DIFFERENTIAL_ORACLE_PROTOCOL_VERSION.to_owned(),
+        authority: DifferentialAuthority::DiagnosticOnly,
+    })
+    .collect()
+}
+
+/// Fixed authority statement attached to every report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferentialAuthority {
+    DiagnosticOnly,
+}
+
+/// Integer-millisecond activity or overlap interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialInterval {
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// Transcript-free aligned word timing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialWordTiming {
+    /// Opaque identity. Lexical text is forbidden by the adapter contract.
+    pub word_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// Transcript-free cluster assignment for one stable acoustic segment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialClusterAssignment {
+    pub segment_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub cluster_label: String,
+    pub confidence: Option<f64>,
+}
+
+/// Canonical transcript-free output shared by native and external diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialStageDocument {
+    pub schema_version: String,
+    /// Lowercase SHA-256 of the operator-local recording identity.
+    pub recording_key: String,
+    pub duration_ms: u64,
+    pub speech_activity: Option<Vec<DifferentialInterval>>,
+    pub word_timing: Option<Vec<DifferentialWordTiming>>,
+    pub change_boundaries_ms: Option<Vec<u64>>,
+    pub cluster_assignments: Option<Vec<DifferentialClusterAssignment>>,
+    pub overlap: Option<Vec<DifferentialInterval>>,
+    pub final_projection: Option<Vec<EvaluationTurn>>,
+}
+
+/// Frozen comparison thresholds. They define a diagnostic divergence, not a gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialComparisonConfig {
+    pub schema_version: String,
+    pub minimum_interval_iou: f64,
+    pub word_boundary_collar_ms: u64,
+    pub minimum_word_timing_recall: f64,
+    pub change_boundary_collar_ms: u64,
+    pub minimum_change_f1: f64,
+    pub minimum_cluster_segment_coverage: f64,
+    pub maximum_cluster_pair_disagreement: f64,
+    pub maximum_projection_der: f64,
+    pub adjudication_epsilon: f64,
+}
+
+impl Default for DifferentialComparisonConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: "differential-comparison-config-v1".to_owned(),
+            minimum_interval_iou: 0.95,
+            word_boundary_collar_ms: 100,
+            minimum_word_timing_recall: 0.95,
+            change_boundary_collar_ms: 250,
+            minimum_change_f1: 0.90,
+            minimum_cluster_segment_coverage: 0.95,
+            maximum_cluster_pair_disagreement: 0.05,
+            maximum_projection_der: 0.05,
+            adjudication_epsilon: 0.001,
+        }
+    }
+}
+
+/// Ordered stage at which two systems may first diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferentialStage {
+    SpeechActivity,
+    WordTiming,
+    ChangeBoundaries,
+    ClusterAssignments,
+    Overlap,
+    FinalProjection,
+}
+
+/// Whether a stage was comparable and exceeded its frozen diagnostic threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferentialStageState {
+    Equivalent,
+    Divergent,
+    MissingNative,
+    MissingOracle,
+    MissingBoth,
+}
+
+/// Reference-assisted interpretation. Even a reference-favored result is diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferentialAdjudication {
+    NoDisagreement,
+    InconclusiveNoReference,
+    ReferenceFavorsNative,
+    ReferenceFavorsOracle,
+    ReferenceTied,
+    ReferenceStageUnavailable,
+}
+
+/// Set-overlap arithmetic for VAD and overlap regions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialIntervalScore {
+    pub native_duration_ms: u64,
+    pub oracle_duration_ms: u64,
+    pub intersection_ms: u64,
+    pub union_ms: u64,
+    pub native_only_ms: u64,
+    pub oracle_only_ms: u64,
+    pub iou: Option<f64>,
+}
+
+/// Timing agreement over opaque shared word identities.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialWordTimingScore {
+    pub native_word_count: usize,
+    pub oracle_word_count: usize,
+    pub shared_word_count: usize,
+    pub within_collar_count: usize,
+    pub timing_recall: Option<f64>,
+    pub mean_absolute_boundary_error_ms: Option<f64>,
+}
+
+/// Label-permutation-invariant pairwise clustering agreement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialClusterScore {
+    pub native_segment_count: usize,
+    pub oracle_segment_count: usize,
+    pub shared_segment_count: usize,
+    pub segment_coverage: Option<f64>,
+    pub geometry_disagreement_count: usize,
+    pub geometry_disagreement_rate: Option<f64>,
+    pub compared_pair_count: u64,
+    pub pair_disagreement_count: u64,
+    pub pair_disagreement_rate: Option<f64>,
+    pub coassignment_precision: Option<f64>,
+    pub coassignment_recall: Option<f64>,
+    pub coassignment_f1: Option<f64>,
+    pub shared_confidence_count: usize,
+    pub confidence_availability_disagreement_count: usize,
+    pub mean_absolute_confidence_delta: Option<f64>,
+}
+
+/// Label-free projection score derived from the authoritative permutation matcher.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialProjectionScore {
+    pub native_speaker_time_sec: f64,
+    pub missed_speech_sec: f64,
+    pub false_alarm_sec: f64,
+    pub speaker_confusion_sec: f64,
+    pub native_unknown_ms: u64,
+    pub oracle_unknown_ms: u64,
+    pub unknown_status_disagreement_ms: u64,
+    pub der: Option<f64>,
+    pub jer: Option<f64>,
+    pub mapping_cardinality: usize,
+}
+
+/// Stage-specific metric payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "metric", rename_all = "snake_case")]
+pub enum DifferentialStageMetric {
+    Intervals(DifferentialIntervalScore),
+    WordTiming(DifferentialWordTimingScore),
+    ChangeBoundaries(ChangePointScore),
+    ClusterAssignments(DifferentialClusterScore),
+    FinalProjection(DifferentialProjectionScore),
+}
+
+/// One native-versus-oracle comparison and optional reference interpretation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialStageComparison {
+    pub stage: DifferentialStage,
+    pub state: DifferentialStageState,
+    pub metric: Option<DifferentialStageMetric>,
+    pub diagnostic_loss: Option<f64>,
+    pub adjudication: DifferentialAdjudication,
+    pub native_reference_loss: Option<f64>,
+    pub oracle_reference_loss: Option<f64>,
+}
+
+/// External subprocess phase that failed or was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferentialExecutionStage {
+    ResolveExecutable,
+    HashExecutable,
+    VersionProbe,
+    VersionValidation,
+    OracleRun,
+    OracleOutputValidation,
+}
+
+/// Stable reason that an optional external diagnostic did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferentialSkipReason {
+    MissingExecutable,
+    UnreadableExecutable,
+    VersionProbeFailed,
+    VersionProbeTimedOut,
+    InvalidVersionOutput,
+    ProtocolVersionMismatch,
+    ToolIdentityMismatch,
+    OracleRunFailed,
+    OracleRunTimedOut,
+    InvalidOracleOutput,
+    OracleIdentityMismatch,
+}
+
+/// Completed or cleanly skipped diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DifferentialRunStatus {
+    Completed,
+    Skipped,
+}
+
+/// Path-free external-tool provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialProvenance {
+    pub protocol_version: String,
+    pub tool: DifferentialOracleTool,
+    pub family: DifferentialOracleFamily,
+    pub tool_version: Option<String>,
+    pub adapter_version: Option<String>,
+    pub executable_sha256: Option<String>,
+    pub version_stdout_sha256: Option<String>,
+    pub oracle_stdout_sha256: Option<String>,
+    pub audio_sha256: String,
+    pub native_document_sha256: String,
+    pub reference_document_sha256: Option<String>,
+}
+
+/// Retained differential diagnostic. It intentionally contains no paths or content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialOracleReport {
+    pub schema_version: String,
+    pub comparator_version: String,
+    pub authority: DifferentialAuthority,
+    pub native_incorrectness_claim_permitted: bool,
+    pub status: DifferentialRunStatus,
+    pub skip_reason: Option<DifferentialSkipReason>,
+    pub failure_stage: Option<DifferentialExecutionStage>,
+    pub provenance: DifferentialProvenance,
+    pub comparison_config: DifferentialComparisonConfig,
+    pub comparison_config_sha256: String,
+    pub comparisons: Vec<DifferentialStageComparison>,
+    pub earliest_divergence: Option<DifferentialStage>,
+    /// Hash with this field set to the empty string.
+    pub result_sha256: String,
+}
+
+/// External-only developer request. Paths cannot be logged through `Debug` or Serde.
+pub struct DifferentialOracleRequest<'a> {
+    pub project_root: &'a Path,
+    pub audio_path: &'a Path,
+    pub native_document_path: &'a Path,
+    pub reference_document_path: Option<&'a Path>,
+    pub output_path: &'a Path,
+    pub tool: DifferentialOracleTool,
+    pub hard_timeout: Duration,
+    pub comparison_config: DifferentialComparisonConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleVersionDocument {
+    schema_version: String,
+    protocol_version: String,
+    tool: DifferentialOracleTool,
+    tool_version: String,
+    adapter_version: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProgramSpec {
+    program: String,
+    prefix_args: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PreparedInputs {
+    audio_path: PathBuf,
+    native: DifferentialStageDocument,
+    reference: Option<DifferentialStageDocument>,
+    audio_sha256: String,
+    native_sha256: String,
+    reference_sha256: Option<String>,
+}
+
+#[derive(Debug)]
+struct ExternalSuccess {
+    version: OracleVersionDocument,
+    executable_sha256: String,
+    version_stdout_sha256: String,
+    oracle_stdout_sha256: String,
+    oracle: DifferentialStageDocument,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalSkip {
+    reason: DifferentialSkipReason,
+    stage: DifferentialExecutionStage,
+    executable_sha256: Option<String>,
+    version: Option<Box<OracleVersionDocument>>,
+    version_stdout_sha256: Option<String>,
+    oracle_stdout_sha256: Option<String>,
+}
+
+impl ExternalSkip {
+    fn new(reason: DifferentialSkipReason, stage: DifferentialExecutionStage) -> Self {
+        Self {
+            reason,
+            stage,
+            executable_sha256: None,
+            version: None,
+            version_stdout_sha256: None,
+            oracle_stdout_sha256: None,
+        }
+    }
+
+    fn with_executable(mut self, executable_sha256: &str) -> Self {
+        self.executable_sha256 = Some(executable_sha256.to_owned());
+        self
+    }
+
+    fn with_version_probe(mut self, stdout_sha256: &str) -> Self {
+        self.version_stdout_sha256 = Some(stdout_sha256.to_owned());
+        self
+    }
+
+    fn with_valid_version(mut self, version: &OracleVersionDocument, stdout_sha256: &str) -> Self {
+        self.version = Some(Box::new(version.clone()));
+        self.version_stdout_sha256 = Some(stdout_sha256.to_owned());
+        self
+    }
+
+    fn with_oracle_stdout(mut self, stdout_sha256: &str) -> Self {
+        self.oracle_stdout_sha256 = Some(stdout_sha256.to_owned());
+        self
+    }
+}
+
+/// Run one explicit developer diagnostic and create a new path-free report.
+pub fn run_differential_oracle(
+    request: DifferentialOracleRequest<'_>,
+) -> FwResult<DifferentialOracleReport> {
+    let token = CancellationToken::unbounded();
+    run_differential_oracle_with_token(request, &token)
+}
+
+fn run_differential_oracle_with_token(
+    request: DifferentialOracleRequest<'_>,
+    token: &CancellationToken,
+) -> FwResult<DifferentialOracleReport> {
+    validate_comparison_config(&request.comparison_config)?;
+    if request.hard_timeout.is_zero() || request.hard_timeout > Duration::from_secs(24 * 60 * 60) {
+        return Err(oracle_request_error(
+            "hard_timeout",
+            "hard timeout must be within (0, 24 hours]",
+        ));
+    }
+    let project_root = request
+        .project_root
+        .canonicalize()
+        .map_err(|_| oracle_request_error("project_root", "project root could not be resolved"))?;
+    if !project_root.is_dir() {
+        return Err(oracle_request_error(
+            "project_root",
+            "project root must be a directory",
+        ));
+    }
+    let output_path = validate_external_output(&project_root, request.output_path)?;
+    let prepared = prepare_inputs(
+        &project_root,
+        request.audio_path,
+        request.native_document_path,
+        request.reference_document_path,
+        token,
+    )?;
+    let program = resolve_program(request.tool);
+    let report = build_report(
+        request.tool,
+        &program,
+        &prepared,
+        request.hard_timeout,
+        request.comparison_config,
+        token,
+    )?;
+    write_new_report(&output_path, &report)?;
+    Ok(report)
+}
+
+fn build_report(
+    tool: DifferentialOracleTool,
+    program: &ProgramSpec,
+    prepared: &PreparedInputs,
+    hard_timeout: Duration,
+    comparison_config: DifferentialComparisonConfig,
+    token: &CancellationToken,
+) -> FwResult<DifferentialOracleReport> {
+    let external = execute_external(
+        tool,
+        program,
+        &prepared.audio_path,
+        &prepared.native.recording_key,
+        hard_timeout,
+        token,
+    );
+    let comparison_config_sha256 = canonical_sha256(&comparison_config)?;
+    match external {
+        Ok(success) => {
+            if success.oracle.recording_key != prepared.native.recording_key
+                || success.oracle.duration_ms != prepared.native.duration_ms
+            {
+                return finalize_report(DifferentialOracleReport {
+                    schema_version: DIFFERENTIAL_REPORT_SCHEMA.to_owned(),
+                    comparator_version: DIFFERENTIAL_COMPARATOR_VERSION.to_owned(),
+                    authority: DifferentialAuthority::DiagnosticOnly,
+                    native_incorrectness_claim_permitted: false,
+                    status: DifferentialRunStatus::Skipped,
+                    skip_reason: Some(DifferentialSkipReason::OracleIdentityMismatch),
+                    failure_stage: Some(DifferentialExecutionStage::OracleOutputValidation),
+                    provenance: provenance_from(tool, prepared, Some(&success)),
+                    comparison_config,
+                    comparison_config_sha256,
+                    comparisons: Vec::new(),
+                    earliest_divergence: None,
+                    result_sha256: String::new(),
+                });
+            }
+            let comparisons = compare_documents(
+                &prepared.native,
+                &success.oracle,
+                prepared.reference.as_ref(),
+                &comparison_config,
+            )?;
+            let earliest_divergence = comparisons
+                .iter()
+                .find(|comparison| comparison.state == DifferentialStageState::Divergent)
+                .map(|comparison| comparison.stage);
+            finalize_report(DifferentialOracleReport {
+                schema_version: DIFFERENTIAL_REPORT_SCHEMA.to_owned(),
+                comparator_version: DIFFERENTIAL_COMPARATOR_VERSION.to_owned(),
+                authority: DifferentialAuthority::DiagnosticOnly,
+                native_incorrectness_claim_permitted: false,
+                status: DifferentialRunStatus::Completed,
+                skip_reason: None,
+                failure_stage: None,
+                provenance: provenance_from(tool, prepared, Some(&success)),
+                comparison_config,
+                comparison_config_sha256,
+                comparisons,
+                earliest_divergence,
+                result_sha256: String::new(),
+            })
+        }
+        Err(ExternalRunError::Cancelled(error)) => Err(error),
+        Err(ExternalRunError::Skipped(skipped)) => finalize_report(DifferentialOracleReport {
+            schema_version: DIFFERENTIAL_REPORT_SCHEMA.to_owned(),
+            comparator_version: DIFFERENTIAL_COMPARATOR_VERSION.to_owned(),
+            authority: DifferentialAuthority::DiagnosticOnly,
+            native_incorrectness_claim_permitted: false,
+            status: DifferentialRunStatus::Skipped,
+            skip_reason: Some(skipped.reason),
+            failure_stage: Some(skipped.stage),
+            provenance: provenance_from_skip(tool, prepared, &skipped),
+            comparison_config,
+            comparison_config_sha256,
+            comparisons: Vec::new(),
+            earliest_divergence: None,
+            result_sha256: String::new(),
+        }),
+    }
+}
+
+fn provenance_from(
+    tool: DifferentialOracleTool,
+    prepared: &PreparedInputs,
+    success: Option<&ExternalSuccess>,
+) -> DifferentialProvenance {
+    DifferentialProvenance {
+        protocol_version: DIFFERENTIAL_ORACLE_PROTOCOL_VERSION.to_owned(),
+        tool,
+        family: tool.family(),
+        tool_version: success.map(|value| value.version.tool_version.clone()),
+        adapter_version: success.map(|value| value.version.adapter_version.clone()),
+        executable_sha256: success.map(|value| value.executable_sha256.clone()),
+        version_stdout_sha256: success.map(|value| value.version_stdout_sha256.clone()),
+        oracle_stdout_sha256: success.map(|value| value.oracle_stdout_sha256.clone()),
+        audio_sha256: prepared.audio_sha256.clone(),
+        native_document_sha256: prepared.native_sha256.clone(),
+        reference_document_sha256: prepared.reference_sha256.clone(),
+    }
+}
+
+fn provenance_from_skip(
+    tool: DifferentialOracleTool,
+    prepared: &PreparedInputs,
+    skipped: &ExternalSkip,
+) -> DifferentialProvenance {
+    DifferentialProvenance {
+        protocol_version: DIFFERENTIAL_ORACLE_PROTOCOL_VERSION.to_owned(),
+        tool,
+        family: tool.family(),
+        tool_version: skipped
+            .version
+            .as_ref()
+            .map(|value| value.tool_version.clone()),
+        adapter_version: skipped
+            .version
+            .as_ref()
+            .map(|value| value.adapter_version.clone()),
+        executable_sha256: skipped.executable_sha256.clone(),
+        version_stdout_sha256: skipped.version_stdout_sha256.clone(),
+        oracle_stdout_sha256: skipped.oracle_stdout_sha256.clone(),
+        audio_sha256: prepared.audio_sha256.clone(),
+        native_document_sha256: prepared.native_sha256.clone(),
+        reference_document_sha256: prepared.reference_sha256.clone(),
+    }
+}
+
+fn finalize_report(mut report: DifferentialOracleReport) -> FwResult<DifferentialOracleReport> {
+    report.result_sha256 = canonical_sha256(&report)?;
+    verify_differential_report(&report)?;
+    Ok(report)
+}
+
+/// Parse and verify one retained path-free differential report.
+pub fn parse_differential_report(bytes: &[u8]) -> FwResult<DifferentialOracleReport> {
+    let report = serde_json::from_slice(bytes)
+        .map_err(|_| oracle_request_error("report_json", "differential report is invalid"))?;
+    verify_differential_report(&report)?;
+    Ok(report)
+}
+
+/// Verify report authority, state invariants, provenance hashes, and self-hash.
+pub fn verify_differential_report(report: &DifferentialOracleReport) -> FwResult<()> {
+    if report.schema_version != DIFFERENTIAL_REPORT_SCHEMA
+        || report.comparator_version != DIFFERENTIAL_COMPARATOR_VERSION
+    {
+        return Err(oracle_request_error(
+            "report_schema",
+            "unsupported differential report schema or comparator",
+        ));
+    }
+    if report.authority != DifferentialAuthority::DiagnosticOnly
+        || report.native_incorrectness_claim_permitted
+    {
+        return Err(oracle_request_error(
+            "report_authority",
+            "differential reports must remain diagnostic-only",
+        ));
+    }
+    validate_comparison_config(&report.comparison_config)?;
+    if canonical_sha256(&report.comparison_config)? != report.comparison_config_sha256 {
+        return Err(oracle_request_error(
+            "comparison_config_hash",
+            "comparison configuration hash does not match",
+        ));
+    }
+    if report.provenance.protocol_version != DIFFERENTIAL_ORACLE_PROTOCOL_VERSION
+        || report.provenance.family != report.provenance.tool.family()
+        || report
+            .provenance
+            .tool_version
+            .as_deref()
+            .is_some_and(|value| !is_safe_version_token(value))
+        || report
+            .provenance
+            .adapter_version
+            .as_deref()
+            .is_some_and(|value| !is_safe_version_token(value))
+    {
+        return Err(oracle_request_error(
+            "report_provenance",
+            "protocol or tool-family provenance is inconsistent",
+        ));
+    }
+    for hash in [
+        Some(report.provenance.audio_sha256.as_str()),
+        Some(report.provenance.native_document_sha256.as_str()),
+        report.provenance.reference_document_sha256.as_deref(),
+        report.provenance.executable_sha256.as_deref(),
+        report.provenance.version_stdout_sha256.as_deref(),
+        report.provenance.oracle_stdout_sha256.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !is_sha256_hex(hash) {
+            return Err(oracle_request_error(
+                "report_hash",
+                "report provenance contains an invalid SHA-256",
+            ));
+        }
+    }
+    match report.status {
+        DifferentialRunStatus::Completed => {
+            if report.skip_reason.is_some()
+                || report.failure_stage.is_some()
+                || report.provenance.tool_version.is_none()
+                || report.provenance.adapter_version.is_none()
+                || report.provenance.executable_sha256.is_none()
+                || report.provenance.version_stdout_sha256.is_none()
+                || report.provenance.oracle_stdout_sha256.is_none()
+            {
+                return Err(oracle_request_error(
+                    "completed_report",
+                    "completed report is missing required provenance",
+                ));
+            }
+            let expected_stages = [
+                DifferentialStage::SpeechActivity,
+                DifferentialStage::WordTiming,
+                DifferentialStage::ChangeBoundaries,
+                DifferentialStage::ClusterAssignments,
+                DifferentialStage::Overlap,
+                DifferentialStage::FinalProjection,
+            ];
+            if report.comparisons.len() != expected_stages.len()
+                || !report
+                    .comparisons
+                    .iter()
+                    .zip(expected_stages)
+                    .all(|(comparison, stage)| comparison.stage == stage)
+            {
+                return Err(oracle_request_error(
+                    "comparison_order",
+                    "completed report must contain all six ordered comparisons",
+                ));
+            }
+            if report.comparisons.iter().any(|comparison| {
+                comparison
+                    .diagnostic_loss
+                    .is_some_and(|value| !value.is_finite() || value < 0.0)
+                    || comparison
+                        .native_reference_loss
+                        .is_some_and(|value| !value.is_finite() || value < 0.0)
+                    || comparison
+                        .oracle_reference_loss
+                        .is_some_and(|value| !value.is_finite() || value < 0.0)
+                    || matches!(
+                        comparison.state,
+                        DifferentialStageState::Equivalent | DifferentialStageState::Divergent
+                    ) != comparison.metric.is_some()
+            }) {
+                return Err(oracle_request_error(
+                    "comparison_metric",
+                    "completed report contains an invalid comparison metric",
+                ));
+            }
+            let earliest = report
+                .comparisons
+                .iter()
+                .find(|comparison| comparison.state == DifferentialStageState::Divergent)
+                .map(|comparison| comparison.stage);
+            if report.earliest_divergence != earliest {
+                return Err(oracle_request_error(
+                    "earliest_divergence",
+                    "earliest divergence does not match ordered comparisons",
+                ));
+            }
+        }
+        DifferentialRunStatus::Skipped => {
+            if report.skip_reason.is_none()
+                || report.failure_stage.is_none()
+                || !report.comparisons.is_empty()
+                || report.earliest_divergence.is_some()
+            {
+                return Err(oracle_request_error(
+                    "skipped_report",
+                    "skipped report state is inconsistent",
+                ));
+            }
+        }
+    }
+    if !is_sha256_hex(&report.result_sha256) {
+        return Err(oracle_request_error(
+            "result_hash",
+            "report result hash is invalid",
+        ));
+    }
+    let mut unhashed = report.clone();
+    unhashed.result_sha256.clear();
+    if canonical_sha256(&unhashed)? != report.result_sha256 {
+        return Err(oracle_request_error(
+            "result_hash",
+            "report result hash does not match",
+        ));
+    }
+    Ok(())
+}
+
+enum ExternalRunError {
+    Cancelled(FwError),
+    Skipped(ExternalSkip),
+}
+
+fn execute_external(
+    tool: DifferentialOracleTool,
+    program: &ProgramSpec,
+    audio_path: &Path,
+    recording_key: &str,
+    hard_timeout: Duration,
+    token: &CancellationToken,
+) -> Result<ExternalSuccess, ExternalRunError> {
+    token.checkpoint().map_err(ExternalRunError::Cancelled)?;
+    let executable_path = which::which(&program.program).map_err(|_| {
+        ExternalRunError::Skipped(ExternalSkip::new(
+            DifferentialSkipReason::MissingExecutable,
+            DifferentialExecutionStage::ResolveExecutable,
+        ))
+    })?;
+    let executable_sha256 = hash_file(&executable_path, token)
+        .map_err(|error| classify_hash_error(error, DifferentialExecutionStage::HashExecutable))?;
+
+    let mut version_args = program.prefix_args.clone();
+    version_args.extend([
+        "--franken-whisper-diarization-oracle-version".to_owned(),
+        "--protocol".to_owned(),
+        DIFFERENTIAL_ORACLE_PROTOCOL_VERSION.to_owned(),
+    ]);
+    let version_output = run_command_cancellable(
+        &program.program,
+        &version_args,
+        None,
+        token,
+        Some(Duration::from_secs(15)),
+    )
+    .map_err(|error| {
+        enrich_skip_with_executable(
+            classify_command_error(error, DifferentialExecutionStage::VersionProbe),
+            &executable_sha256,
+        )
+    })?;
+    let version_stdout_sha256 = bytes_sha256(&version_output.stdout);
+    let version: OracleVersionDocument =
+        serde_json::from_slice(&version_output.stdout).map_err(|_| {
+            ExternalRunError::Skipped(
+                ExternalSkip::new(
+                    DifferentialSkipReason::InvalidVersionOutput,
+                    DifferentialExecutionStage::VersionValidation,
+                )
+                .with_executable(&executable_sha256)
+                .with_version_probe(&version_stdout_sha256),
+            )
+        })?;
+    validate_version_document(&version, tool).map_err(|error| {
+        enrich_skip_with_version_probe(error, &executable_sha256, &version_stdout_sha256)
+    })?;
+
+    let audio_text = audio_path.to_str().ok_or_else(|| {
+        ExternalRunError::Skipped(
+            ExternalSkip::new(
+                DifferentialSkipReason::OracleRunFailed,
+                DifferentialExecutionStage::OracleRun,
+            )
+            .with_executable(&executable_sha256)
+            .with_valid_version(&version, &version_stdout_sha256),
+        )
+    })?;
+    let mut run_args = program.prefix_args.clone();
+    run_args.extend([
+        "--franken-whisper-diarization-oracle-run".to_owned(),
+        "--protocol".to_owned(),
+        DIFFERENTIAL_ORACLE_PROTOCOL_VERSION.to_owned(),
+        "--audio".to_owned(),
+        audio_text.to_owned(),
+        "--recording-key".to_owned(),
+        recording_key.to_owned(),
+    ]);
+    let output =
+        run_command_cancellable(&program.program, &run_args, None, token, Some(hard_timeout))
+            .map_err(|error| {
+                enrich_skip_with_valid_version(
+                    classify_command_error(error, DifferentialExecutionStage::OracleRun),
+                    &executable_sha256,
+                    &version,
+                    &version_stdout_sha256,
+                )
+            })?;
+    let oracle_stdout_sha256 = bytes_sha256(&output.stdout);
+    let oracle: DifferentialStageDocument =
+        serde_json::from_slice(&output.stdout).map_err(|_| {
+            ExternalRunError::Skipped(
+                ExternalSkip::new(
+                    DifferentialSkipReason::InvalidOracleOutput,
+                    DifferentialExecutionStage::OracleOutputValidation,
+                )
+                .with_executable(&executable_sha256)
+                .with_valid_version(&version, &version_stdout_sha256)
+                .with_oracle_stdout(&oracle_stdout_sha256),
+            )
+        })?;
+    validate_stage_document(&oracle).map_err(|_| {
+        ExternalRunError::Skipped(
+            ExternalSkip::new(
+                DifferentialSkipReason::InvalidOracleOutput,
+                DifferentialExecutionStage::OracleOutputValidation,
+            )
+            .with_executable(&executable_sha256)
+            .with_valid_version(&version, &version_stdout_sha256)
+            .with_oracle_stdout(&oracle_stdout_sha256),
+        )
+    })?;
+
+    Ok(ExternalSuccess {
+        version,
+        executable_sha256,
+        version_stdout_sha256,
+        oracle_stdout_sha256,
+        oracle,
+    })
+}
+
+fn validate_version_document(
+    version: &OracleVersionDocument,
+    expected_tool: DifferentialOracleTool,
+) -> Result<(), ExternalRunError> {
+    if version.schema_version != DIFFERENTIAL_ORACLE_VERSION_SCHEMA {
+        return Err(ExternalRunError::Skipped(ExternalSkip::new(
+            DifferentialSkipReason::InvalidVersionOutput,
+            DifferentialExecutionStage::VersionValidation,
+        )));
+    }
+    if version.protocol_version != DIFFERENTIAL_ORACLE_PROTOCOL_VERSION {
+        return Err(ExternalRunError::Skipped(ExternalSkip::new(
+            DifferentialSkipReason::ProtocolVersionMismatch,
+            DifferentialExecutionStage::VersionValidation,
+        )));
+    }
+    if version.tool != expected_tool {
+        return Err(ExternalRunError::Skipped(ExternalSkip::new(
+            DifferentialSkipReason::ToolIdentityMismatch,
+            DifferentialExecutionStage::VersionValidation,
+        )));
+    }
+    if !is_safe_version_token(&version.tool_version)
+        || !is_safe_version_token(&version.adapter_version)
+    {
+        return Err(ExternalRunError::Skipped(ExternalSkip::new(
+            DifferentialSkipReason::InvalidVersionOutput,
+            DifferentialExecutionStage::VersionValidation,
+        )));
+    }
+    Ok(())
+}
+
+fn classify_hash_error(error: FwError, stage: DifferentialExecutionStage) -> ExternalRunError {
+    if matches!(error, FwError::Cancelled(_)) {
+        ExternalRunError::Cancelled(error)
+    } else {
+        ExternalRunError::Skipped(ExternalSkip::new(
+            DifferentialSkipReason::UnreadableExecutable,
+            stage,
+        ))
+    }
+}
+
+fn classify_command_error(error: FwError, stage: DifferentialExecutionStage) -> ExternalRunError {
+    match error {
+        FwError::Cancelled(_) => ExternalRunError::Cancelled(error),
+        FwError::CommandMissing { .. } => ExternalRunError::Skipped(ExternalSkip::new(
+            DifferentialSkipReason::MissingExecutable,
+            DifferentialExecutionStage::ResolveExecutable,
+        )),
+        FwError::CommandTimedOut { .. } => ExternalRunError::Skipped(ExternalSkip::new(
+            if stage == DifferentialExecutionStage::VersionProbe {
+                DifferentialSkipReason::VersionProbeTimedOut
+            } else {
+                DifferentialSkipReason::OracleRunTimedOut
+            },
+            stage,
+        )),
+        _ => ExternalRunError::Skipped(ExternalSkip::new(
+            if stage == DifferentialExecutionStage::VersionProbe {
+                DifferentialSkipReason::VersionProbeFailed
+            } else {
+                DifferentialSkipReason::OracleRunFailed
+            },
+            stage,
+        )),
+    }
+}
+
+fn enrich_skip_with_executable(
+    error: ExternalRunError,
+    executable_sha256: &str,
+) -> ExternalRunError {
+    match error {
+        ExternalRunError::Cancelled(_) => error,
+        ExternalRunError::Skipped(skipped) => {
+            ExternalRunError::Skipped(skipped.with_executable(executable_sha256))
+        }
+    }
+}
+
+fn enrich_skip_with_version_probe(
+    error: ExternalRunError,
+    executable_sha256: &str,
+    version_stdout_sha256: &str,
+) -> ExternalRunError {
+    match error {
+        ExternalRunError::Cancelled(_) => error,
+        ExternalRunError::Skipped(skipped) => ExternalRunError::Skipped(
+            skipped
+                .with_executable(executable_sha256)
+                .with_version_probe(version_stdout_sha256),
+        ),
+    }
+}
+
+fn enrich_skip_with_valid_version(
+    error: ExternalRunError,
+    executable_sha256: &str,
+    version: &OracleVersionDocument,
+    version_stdout_sha256: &str,
+) -> ExternalRunError {
+    match error {
+        ExternalRunError::Cancelled(_) => error,
+        ExternalRunError::Skipped(skipped) => ExternalRunError::Skipped(
+            skipped
+                .with_executable(executable_sha256)
+                .with_valid_version(version, version_stdout_sha256),
+        ),
+    }
+}
+
+fn resolve_program(tool: DifferentialOracleTool) -> ProgramSpec {
+    let program = std::env::var_os(tool.executable_env())
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| tool.default_program().to_owned());
+    ProgramSpec {
+        program,
+        prefix_args: Vec::new(),
+    }
+}
+
+fn prepare_inputs(
+    project_root: &Path,
+    audio_path: &Path,
+    native_document_path: &Path,
+    reference_document_path: Option<&Path>,
+    token: &CancellationToken,
+) -> FwResult<PreparedInputs> {
+    let audio_path = canonical_external_file(project_root, audio_path, "audio")?;
+    let native_path =
+        canonical_external_file(project_root, native_document_path, "native_document")?;
+    let reference_path = reference_document_path
+        .map(|path| canonical_external_file(project_root, path, "reference_document"))
+        .transpose()?;
+    let native_bytes = read_capped(&native_path, MAX_DOCUMENT_BYTES, "native_document")?;
+    let native = parse_stage_document(&native_bytes)?;
+    let (reference, reference_sha256) = if let Some(path) = reference_path {
+        let bytes = read_capped(&path, MAX_DOCUMENT_BYTES, "reference_document")?;
+        let document = parse_stage_document(&bytes)?;
+        if document.recording_key != native.recording_key
+            || document.duration_ms != native.duration_ms
+        {
+            return Err(oracle_request_error(
+                "reference_identity",
+                "reference and native document identities differ",
+            ));
+        }
+        (Some(document), Some(bytes_sha256(&bytes)))
+    } else {
+        (None, None)
+    };
+    let audio_sha256 = hash_file(&audio_path, token)?;
+    Ok(PreparedInputs {
+        audio_path,
+        native,
+        reference,
+        audio_sha256,
+        native_sha256: bytes_sha256(&native_bytes),
+        reference_sha256,
+    })
+}
+
+/// Parse and validate one canonical transcript-free stage document.
+pub fn parse_stage_document(bytes: &[u8]) -> FwResult<DifferentialStageDocument> {
+    let document = serde_json::from_slice(bytes)
+        .map_err(|_| oracle_request_error("stage_json", "stage document is invalid"))?;
+    validate_stage_document(&document)?;
+    Ok(document)
+}
+
+/// Validate bounded geometry, opaque identities, confidences, and ordering.
+pub fn validate_stage_document(document: &DifferentialStageDocument) -> FwResult<()> {
+    if document.schema_version != DIFFERENTIAL_STAGE_DOCUMENT_SCHEMA {
+        return Err(oracle_request_error(
+            "stage_schema",
+            "unsupported stage document schema version",
+        ));
+    }
+    if !is_sha256_hex(&document.recording_key) {
+        return Err(oracle_request_error(
+            "recording_key",
+            "recording key must be lowercase SHA-256",
+        ));
+    }
+    if document.duration_ms == 0 || document.duration_ms > MAX_DURATION_MS {
+        return Err(oracle_request_error(
+            "duration",
+            "duration must be within (0, 24 hours]",
+        ));
+    }
+    if let Some(intervals) = &document.speech_activity {
+        validate_disjoint_intervals(
+            intervals,
+            document.duration_ms,
+            "speech_activity",
+            MAX_INTERVALS,
+        )?;
+    }
+    if let Some(words) = &document.word_timing {
+        if words.len() > MAX_WORDS {
+            return Err(oracle_request_error(
+                "word_count",
+                "word timing exceeds the supported count",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for word in words {
+            validate_geometry(
+                word.start_ms,
+                word.end_ms,
+                document.duration_ms,
+                "word_timing",
+            )?;
+            if !is_opaque_item_id(&word.word_id, "w-") || !ids.insert(word.word_id.as_str()) {
+                return Err(oracle_request_error(
+                    "word_id",
+                    "word IDs must be unique opaque w- identifiers",
+                ));
+            }
+        }
+    }
+    if let Some(changes) = &document.change_boundaries_ms
+        && (changes.len() > MAX_INTERVALS
+            || !changes.windows(2).all(|window| {
+                window
+                    .first()
+                    .zip(window.get(1))
+                    .is_some_and(|(left, right)| left < right)
+            })
+            || changes
+                .iter()
+                .any(|point| *point == 0 || *point >= document.duration_ms))
+    {
+        return Err(oracle_request_error(
+            "change_boundaries",
+            "change boundaries must be strictly ordered internal milliseconds",
+        ));
+    }
+    if let Some(assignments) = &document.cluster_assignments {
+        if assignments.len() > MAX_CLUSTERS {
+            return Err(oracle_request_error(
+                "cluster_count",
+                "cluster assignments exceed the supported count",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for assignment in assignments {
+            validate_geometry(
+                assignment.start_ms,
+                assignment.end_ms,
+                document.duration_ms,
+                "cluster_assignment",
+            )?;
+            if !is_opaque_item_id(&assignment.segment_id, "seg-")
+                || !ids.insert(assignment.segment_id.as_str())
+                || !is_safe_label(&assignment.cluster_label)
+                || assignment
+                    .confidence
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            {
+                return Err(oracle_request_error(
+                    "cluster_assignment",
+                    "cluster assignments contain an invalid ID, label, or confidence",
+                ));
+            }
+        }
+    }
+    if let Some(intervals) = &document.overlap {
+        validate_disjoint_intervals(intervals, document.duration_ms, "overlap", MAX_INTERVALS)?;
+    }
+    if let Some(turns) = &document.final_projection {
+        if turns.len() > MAX_TURNS {
+            return Err(oracle_request_error(
+                "turn_count",
+                "final projection exceeds the supported turn count",
+            ));
+        }
+        let _ = turns_to_scoring(turns, document.duration_ms, false)?;
+    }
+    Ok(())
+}
+
+fn validate_comparison_config(config: &DifferentialComparisonConfig) -> FwResult<()> {
+    if config.schema_version != "differential-comparison-config-v1" {
+        return Err(oracle_request_error(
+            "comparison_schema",
+            "unsupported comparison configuration schema",
+        ));
+    }
+    for (name, value) in [
+        ("minimum_interval_iou", config.minimum_interval_iou),
+        (
+            "minimum_word_timing_recall",
+            config.minimum_word_timing_recall,
+        ),
+        ("minimum_change_f1", config.minimum_change_f1),
+        (
+            "minimum_cluster_segment_coverage",
+            config.minimum_cluster_segment_coverage,
+        ),
+        (
+            "maximum_cluster_pair_disagreement",
+            config.maximum_cluster_pair_disagreement,
+        ),
+        ("maximum_projection_der", config.maximum_projection_der),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(oracle_request_error(
+                "comparison_threshold",
+                &format!("{name} must be finite and within [0, 1]"),
+            ));
+        }
+    }
+    if !config.adjudication_epsilon.is_finite()
+        || !(0.0..=1.0).contains(&config.adjudication_epsilon)
+    {
+        return Err(oracle_request_error(
+            "adjudication_epsilon",
+            "adjudication epsilon must be finite and within [0, 1]",
+        ));
+    }
+    Ok(())
+}
+
+/// Compare two canonical documents, optionally using a third document for diagnostics.
+pub fn compare_documents(
+    native: &DifferentialStageDocument,
+    oracle: &DifferentialStageDocument,
+    reference: Option<&DifferentialStageDocument>,
+    config: &DifferentialComparisonConfig,
+) -> FwResult<Vec<DifferentialStageComparison>> {
+    validate_stage_document(native)?;
+    validate_stage_document(oracle)?;
+    validate_comparison_config(config)?;
+    if native.recording_key != oracle.recording_key || native.duration_ms != oracle.duration_ms {
+        return Err(oracle_request_error(
+            "comparison_identity",
+            "native and oracle document identities differ",
+        ));
+    }
+    if let Some(reference) = reference {
+        validate_stage_document(reference)?;
+        if reference.recording_key != native.recording_key
+            || reference.duration_ms != native.duration_ms
+        {
+            return Err(oracle_request_error(
+                "reference_identity",
+                "reference and compared document identities differ",
+            ));
+        }
+    }
+
+    let comparisons = vec![
+        compare_interval_stage(
+            DifferentialStage::SpeechActivity,
+            native.speech_activity.as_deref(),
+            oracle.speech_activity.as_deref(),
+            reference.and_then(|value| value.speech_activity.as_deref()),
+            reference.is_some(),
+            config,
+        ),
+        compare_word_stage(
+            native.word_timing.as_deref(),
+            oracle.word_timing.as_deref(),
+            reference.and_then(|value| value.word_timing.as_deref()),
+            reference.is_some(),
+            config,
+        ),
+        compare_change_stage(
+            native.change_boundaries_ms.as_deref(),
+            oracle.change_boundaries_ms.as_deref(),
+            reference.and_then(|value| value.change_boundaries_ms.as_deref()),
+            reference.is_some(),
+            config,
+        )?,
+        compare_cluster_stage(
+            native.cluster_assignments.as_deref(),
+            oracle.cluster_assignments.as_deref(),
+            reference.and_then(|value| value.cluster_assignments.as_deref()),
+            reference.is_some(),
+            config,
+        ),
+        compare_interval_stage(
+            DifferentialStage::Overlap,
+            native.overlap.as_deref(),
+            oracle.overlap.as_deref(),
+            reference.and_then(|value| value.overlap.as_deref()),
+            reference.is_some(),
+            config,
+        ),
+        compare_projection_stage(
+            native.final_projection.as_deref(),
+            oracle.final_projection.as_deref(),
+            reference.and_then(|value| value.final_projection.as_deref()),
+            native.duration_ms,
+            reference.is_some(),
+            config,
+        )?,
+    ];
+    Ok(comparisons)
+}
+
+fn compare_interval_stage(
+    stage: DifferentialStage,
+    native: Option<&[DifferentialInterval]>,
+    oracle: Option<&[DifferentialInterval]>,
+    reference: Option<&[DifferentialInterval]>,
+    reference_document_present: bool,
+    config: &DifferentialComparisonConfig,
+) -> DifferentialStageComparison {
+    compare_optional_stage(
+        stage,
+        native,
+        oracle,
+        reference,
+        reference_document_present,
+        config,
+        |left, right| {
+            let score = score_intervals(left, right);
+            let loss = 1.0 - score.iou.unwrap_or(1.0);
+            (
+                DifferentialStageMetric::Intervals(score),
+                loss,
+                loss > 1.0 - config.minimum_interval_iou,
+            )
+        },
+    )
+}
+
+fn compare_word_stage(
+    native: Option<&[DifferentialWordTiming]>,
+    oracle: Option<&[DifferentialWordTiming]>,
+    reference: Option<&[DifferentialWordTiming]>,
+    reference_document_present: bool,
+    config: &DifferentialComparisonConfig,
+) -> DifferentialStageComparison {
+    compare_optional_stage(
+        DifferentialStage::WordTiming,
+        native,
+        oracle,
+        reference,
+        reference_document_present,
+        config,
+        |left, right| {
+            let score = score_word_timing(left, right, config.word_boundary_collar_ms);
+            let loss = 1.0 - score.timing_recall.unwrap_or(1.0);
+            (
+                DifferentialStageMetric::WordTiming(score),
+                loss,
+                loss > 1.0 - config.minimum_word_timing_recall,
+            )
+        },
+    )
+}
+
+fn compare_change_stage(
+    native: Option<&[u64]>,
+    oracle: Option<&[u64]>,
+    reference: Option<&[u64]>,
+    reference_document_present: bool,
+    config: &DifferentialComparisonConfig,
+) -> FwResult<DifferentialStageComparison> {
+    compare_optional_stage_fallible(
+        DifferentialStage::ChangeBoundaries,
+        native,
+        oracle,
+        reference,
+        reference_document_present,
+        config,
+        |left, right| {
+            let score = score_change_points(
+                &left
+                    .iter()
+                    .map(|value| *value as f64 / 1_000.0)
+                    .collect::<Vec<_>>(),
+                &right
+                    .iter()
+                    .map(|value| *value as f64 / 1_000.0)
+                    .collect::<Vec<_>>(),
+                config.change_boundary_collar_ms as f64 / 1_000.0,
+            )?;
+            let loss = 1.0
+                - score.f1.unwrap_or({
+                    if left.is_empty() && right.is_empty() {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                });
+            Ok((
+                DifferentialStageMetric::ChangeBoundaries(score),
+                loss,
+                loss > 1.0 - config.minimum_change_f1,
+            ))
+        },
+    )
+}
+
+fn compare_cluster_stage(
+    native: Option<&[DifferentialClusterAssignment]>,
+    oracle: Option<&[DifferentialClusterAssignment]>,
+    reference: Option<&[DifferentialClusterAssignment]>,
+    reference_document_present: bool,
+    config: &DifferentialComparisonConfig,
+) -> DifferentialStageComparison {
+    compare_optional_stage(
+        DifferentialStage::ClusterAssignments,
+        native,
+        oracle,
+        reference,
+        reference_document_present,
+        config,
+        |left, right| {
+            let score = score_clusters(left, right);
+            let coverage_loss = 1.0 - score.segment_coverage.unwrap_or(1.0);
+            let geometry_loss = score.geometry_disagreement_rate.unwrap_or(0.0);
+            let loss = score
+                .pair_disagreement_rate
+                .unwrap_or(0.0)
+                .max(coverage_loss)
+                .max(geometry_loss);
+            let divergent = score
+                .segment_coverage
+                .is_some_and(|coverage| coverage < config.minimum_cluster_segment_coverage)
+                || score
+                    .pair_disagreement_rate
+                    .is_some_and(|rate| rate > config.maximum_cluster_pair_disagreement)
+                || score.geometry_disagreement_count > 0;
+            (
+                DifferentialStageMetric::ClusterAssignments(score),
+                loss,
+                divergent,
+            )
+        },
+    )
+}
+
+fn compare_projection_stage(
+    native: Option<&[EvaluationTurn]>,
+    oracle: Option<&[EvaluationTurn]>,
+    reference: Option<&[EvaluationTurn]>,
+    duration_ms: u64,
+    reference_document_present: bool,
+    config: &DifferentialComparisonConfig,
+) -> FwResult<DifferentialStageComparison> {
+    compare_optional_stage_fallible(
+        DifferentialStage::FinalProjection,
+        native,
+        oracle,
+        reference,
+        reference_document_present,
+        config,
+        |left, right| {
+            let left_scoring = turns_to_scoring(left, duration_ms, true)?;
+            let right_scoring = turns_to_scoring(right, duration_ms, true)?;
+            let score = score_diarization(&left_scoring, &right_scoring)?;
+            let native_unknown = merged_turn_intervals(left, true);
+            let oracle_unknown = merged_turn_intervals(right, true);
+            let unknown_score = score_intervals(&native_unknown, &oracle_unknown);
+            let unknown_status_disagreement_ms = unknown_score
+                .native_only_ms
+                .saturating_add(unknown_score.oracle_only_ms);
+            let all_speech = merged_turn_pair_intervals(left, right);
+            let speech_duration_ms = all_speech
+                .iter()
+                .map(|interval| interval.end_ms - interval.start_ms)
+                .sum::<u64>();
+            let unknown_loss = (speech_duration_ms > 0)
+                .then_some(unknown_status_disagreement_ms as f64 / speech_duration_ms as f64);
+            let loss = score.der.unwrap_or(0.0).max(unknown_loss.unwrap_or(0.0));
+            Ok((
+                DifferentialStageMetric::FinalProjection(projection_score(
+                    &score,
+                    &unknown_score,
+                    unknown_status_disagreement_ms,
+                )),
+                loss,
+                loss > config.maximum_projection_der,
+            ))
+        },
+    )
+}
+
+fn compare_optional_stage<T, F>(
+    stage: DifferentialStage,
+    native: Option<&[T]>,
+    oracle: Option<&[T]>,
+    reference: Option<&[T]>,
+    reference_document_present: bool,
+    config: &DifferentialComparisonConfig,
+    mut scorer: F,
+) -> DifferentialStageComparison
+where
+    F: FnMut(&[T], &[T]) -> (DifferentialStageMetric, f64, bool),
+{
+    match (native, oracle) {
+        (None, None) => unavailable_comparison(stage, DifferentialStageState::MissingBoth),
+        (None, Some(_)) => unavailable_comparison(stage, DifferentialStageState::MissingNative),
+        (Some(_), None) => unavailable_comparison(stage, DifferentialStageState::MissingOracle),
+        (Some(native), Some(oracle)) => {
+            let (metric, loss, divergent) = scorer(native, oracle);
+            let (adjudication, native_reference_loss, oracle_reference_loss) = adjudicate(
+                reference_stage(reference, reference_document_present),
+                native,
+                oracle,
+                divergent,
+                config,
+                &mut scorer,
+            );
+            DifferentialStageComparison {
+                stage,
+                state: if divergent {
+                    DifferentialStageState::Divergent
+                } else {
+                    DifferentialStageState::Equivalent
+                },
+                metric: Some(metric),
+                diagnostic_loss: Some(loss),
+                adjudication,
+                native_reference_loss,
+                oracle_reference_loss,
+            }
+        }
+    }
+}
+
+fn compare_optional_stage_fallible<T, F>(
+    stage: DifferentialStage,
+    native: Option<&[T]>,
+    oracle: Option<&[T]>,
+    reference: Option<&[T]>,
+    reference_document_present: bool,
+    config: &DifferentialComparisonConfig,
+    mut scorer: F,
+) -> FwResult<DifferentialStageComparison>
+where
+    F: FnMut(&[T], &[T]) -> FwResult<(DifferentialStageMetric, f64, bool)>,
+{
+    match (native, oracle) {
+        (None, None) => Ok(unavailable_comparison(
+            stage,
+            DifferentialStageState::MissingBoth,
+        )),
+        (None, Some(_)) => Ok(unavailable_comparison(
+            stage,
+            DifferentialStageState::MissingNative,
+        )),
+        (Some(_), None) => Ok(unavailable_comparison(
+            stage,
+            DifferentialStageState::MissingOracle,
+        )),
+        (Some(native), Some(oracle)) => {
+            let (metric, loss, divergent) = scorer(native, oracle)?;
+            let (adjudication, native_reference_loss, oracle_reference_loss) = if !divergent {
+                (DifferentialAdjudication::NoDisagreement, None, None)
+            } else {
+                match reference_stage(reference, reference_document_present) {
+                    ReferenceStage::Present(reference) => {
+                        let (_, native_loss, _) = scorer(reference, native)?;
+                        let (_, oracle_loss, _) = scorer(reference, oracle)?;
+                        (
+                            adjudication_from_losses(
+                                native_loss,
+                                oracle_loss,
+                                config.adjudication_epsilon,
+                            ),
+                            Some(native_loss),
+                            Some(oracle_loss),
+                        )
+                    }
+                    ReferenceStage::Missing => (
+                        DifferentialAdjudication::ReferenceStageUnavailable,
+                        None,
+                        None,
+                    ),
+                    ReferenceStage::NoDocument => (
+                        DifferentialAdjudication::InconclusiveNoReference,
+                        None,
+                        None,
+                    ),
+                }
+            };
+            Ok(DifferentialStageComparison {
+                stage,
+                state: if divergent {
+                    DifferentialStageState::Divergent
+                } else {
+                    DifferentialStageState::Equivalent
+                },
+                metric: Some(metric),
+                diagnostic_loss: Some(loss),
+                adjudication,
+                native_reference_loss,
+                oracle_reference_loss,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReferenceStage<'a, T> {
+    NoDocument,
+    Missing,
+    Present(&'a [T]),
+}
+
+fn reference_stage<T>(
+    reference: Option<&[T]>,
+    reference_document_present: bool,
+) -> ReferenceStage<'_, T> {
+    match (reference_document_present, reference) {
+        (_, Some(reference)) => ReferenceStage::Present(reference),
+        (true, None) => ReferenceStage::Missing,
+        (false, None) => ReferenceStage::NoDocument,
+    }
+}
+
+fn adjudicate<T, F>(
+    reference: ReferenceStage<'_, T>,
+    native: &[T],
+    oracle: &[T],
+    divergent: bool,
+    config: &DifferentialComparisonConfig,
+    scorer: &mut F,
+) -> (DifferentialAdjudication, Option<f64>, Option<f64>)
+where
+    F: FnMut(&[T], &[T]) -> (DifferentialStageMetric, f64, bool),
+{
+    if !divergent {
+        return (DifferentialAdjudication::NoDisagreement, None, None);
+    }
+    let reference = match reference {
+        ReferenceStage::Present(reference) => reference,
+        ReferenceStage::Missing => {
+            return (
+                DifferentialAdjudication::ReferenceStageUnavailable,
+                None,
+                None,
+            );
+        }
+        ReferenceStage::NoDocument => {
+            return (
+                DifferentialAdjudication::InconclusiveNoReference,
+                None,
+                None,
+            );
+        }
+    };
+    let (_, native_loss, _) = scorer(reference, native);
+    let (_, oracle_loss, _) = scorer(reference, oracle);
+    (
+        adjudication_from_losses(native_loss, oracle_loss, config.adjudication_epsilon),
+        Some(native_loss),
+        Some(oracle_loss),
+    )
+}
+
+fn adjudication_from_losses(
+    native_loss: f64,
+    oracle_loss: f64,
+    epsilon: f64,
+) -> DifferentialAdjudication {
+    if (native_loss - oracle_loss).abs() <= epsilon {
+        DifferentialAdjudication::ReferenceTied
+    } else if native_loss < oracle_loss {
+        DifferentialAdjudication::ReferenceFavorsNative
+    } else {
+        DifferentialAdjudication::ReferenceFavorsOracle
+    }
+}
+
+fn unavailable_comparison(
+    stage: DifferentialStage,
+    state: DifferentialStageState,
+) -> DifferentialStageComparison {
+    DifferentialStageComparison {
+        stage,
+        state,
+        metric: None,
+        diagnostic_loss: None,
+        adjudication: DifferentialAdjudication::ReferenceStageUnavailable,
+        native_reference_loss: None,
+        oracle_reference_loss: None,
+    }
+}
+
+fn score_intervals(
+    native: &[DifferentialInterval],
+    oracle: &[DifferentialInterval],
+) -> DifferentialIntervalScore {
+    let native_duration_ms = native
+        .iter()
+        .map(|interval| interval.end_ms - interval.start_ms)
+        .sum::<u64>();
+    let oracle_duration_ms = oracle
+        .iter()
+        .map(|interval| interval.end_ms - interval.start_ms)
+        .sum::<u64>();
+    let mut intersection_ms = 0u64;
+    let mut native_index = 0usize;
+    let mut oracle_index = 0usize;
+    while let (Some(native_interval), Some(oracle_interval)) = (
+        native.get(native_index).copied(),
+        oracle.get(oracle_index).copied(),
+    ) {
+        let overlap_start = native_interval.start_ms.max(oracle_interval.start_ms);
+        let overlap_end = native_interval.end_ms.min(oracle_interval.end_ms);
+        intersection_ms += overlap_end.saturating_sub(overlap_start);
+        if native_interval.end_ms <= oracle_interval.end_ms {
+            native_index += 1;
+        }
+        if oracle_interval.end_ms <= native_interval.end_ms {
+            oracle_index += 1;
+        }
+    }
+    let union_ms = native_duration_ms
+        .saturating_add(oracle_duration_ms)
+        .saturating_sub(intersection_ms);
+    DifferentialIntervalScore {
+        native_duration_ms,
+        oracle_duration_ms,
+        intersection_ms,
+        union_ms,
+        native_only_ms: native_duration_ms.saturating_sub(intersection_ms),
+        oracle_only_ms: oracle_duration_ms.saturating_sub(intersection_ms),
+        iou: (union_ms > 0).then_some(intersection_ms as f64 / union_ms as f64),
+    }
+}
+
+fn score_word_timing(
+    native: &[DifferentialWordTiming],
+    oracle: &[DifferentialWordTiming],
+    collar_ms: u64,
+) -> DifferentialWordTimingScore {
+    let oracle_by_id = oracle
+        .iter()
+        .map(|word| (word.word_id.as_str(), word))
+        .collect::<BTreeMap<_, _>>();
+    let mut shared_word_count = 0usize;
+    let mut within_collar_count = 0usize;
+    let mut boundary_error = 0u128;
+    for word in native {
+        let Some(other) = oracle_by_id.get(word.word_id.as_str()) else {
+            continue;
+        };
+        shared_word_count += 1;
+        let start_error = word.start_ms.abs_diff(other.start_ms);
+        let end_error = word.end_ms.abs_diff(other.end_ms);
+        boundary_error += u128::from(start_error) + u128::from(end_error);
+        within_collar_count += usize::from(start_error <= collar_ms && end_error <= collar_ms);
+    }
+    let denominator = native.len().max(oracle.len());
+    DifferentialWordTimingScore {
+        native_word_count: native.len(),
+        oracle_word_count: oracle.len(),
+        shared_word_count,
+        within_collar_count,
+        timing_recall: (denominator > 0).then_some(within_collar_count as f64 / denominator as f64),
+        mean_absolute_boundary_error_ms: (shared_word_count > 0)
+            .then_some(boundary_error as f64 / (2 * shared_word_count) as f64),
+    }
+}
+
+fn score_clusters(
+    native: &[DifferentialClusterAssignment],
+    oracle: &[DifferentialClusterAssignment],
+) -> DifferentialClusterScore {
+    let oracle_by_id = oracle
+        .iter()
+        .map(|assignment| (assignment.segment_id.as_str(), assignment))
+        .collect::<BTreeMap<_, _>>();
+    let mut contingency = BTreeMap::<(&str, &str), u64>::new();
+    let mut native_sizes = BTreeMap::<&str, u64>::new();
+    let mut oracle_sizes = BTreeMap::<&str, u64>::new();
+    let mut shared = 0u64;
+    let mut geometry_disagreement_count = 0usize;
+    let mut shared_confidence_count = 0usize;
+    let mut confidence_availability_disagreement_count = 0usize;
+    let mut confidence_delta_sum = 0.0f64;
+    for assignment in native {
+        let Some(other) = oracle_by_id.get(assignment.segment_id.as_str()) else {
+            continue;
+        };
+        shared += 1;
+        *contingency
+            .entry((&assignment.cluster_label, &other.cluster_label))
+            .or_default() += 1;
+        *native_sizes
+            .entry(assignment.cluster_label.as_str())
+            .or_default() += 1;
+        *oracle_sizes
+            .entry(other.cluster_label.as_str())
+            .or_default() += 1;
+        geometry_disagreement_count +=
+            usize::from(assignment.start_ms != other.start_ms || assignment.end_ms != other.end_ms);
+        match (assignment.confidence, other.confidence) {
+            (Some(left), Some(right)) => {
+                shared_confidence_count += 1;
+                confidence_delta_sum += (left - right).abs();
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                confidence_availability_disagreement_count += 1;
+            }
+            (None, None) => {}
+        }
+    }
+    let true_positive = contingency.values().copied().map(choose_two).sum::<u64>();
+    let native_positive = native_sizes.values().copied().map(choose_two).sum::<u64>();
+    let oracle_positive = oracle_sizes.values().copied().map(choose_two).sum::<u64>();
+    let false_negative = native_positive.saturating_sub(true_positive);
+    let false_positive = oracle_positive.saturating_sub(true_positive);
+    let compared_pair_count = choose_two(shared);
+    let disagreement = false_negative.saturating_add(false_positive);
+    let maximum_segment_count = native.len().max(oracle.len());
+    let precision = (oracle_positive > 0).then_some(true_positive as f64 / oracle_positive as f64);
+    let recall = (native_positive > 0).then_some(true_positive as f64 / native_positive as f64);
+    let f1 = match (precision, recall) {
+        (Some(precision), Some(recall)) if precision + recall > 0.0 => {
+            Some(2.0 * precision * recall / (precision + recall))
+        }
+        (Some(_), Some(_)) => Some(0.0),
+        _ => None,
+    };
+    DifferentialClusterScore {
+        native_segment_count: native.len(),
+        oracle_segment_count: oracle.len(),
+        shared_segment_count: usize::try_from(shared).unwrap_or(usize::MAX),
+        segment_coverage: (maximum_segment_count > 0)
+            .then_some(shared as f64 / maximum_segment_count as f64),
+        geometry_disagreement_count,
+        geometry_disagreement_rate: (shared > 0)
+            .then_some(geometry_disagreement_count as f64 / shared as f64),
+        compared_pair_count,
+        pair_disagreement_count: disagreement,
+        pair_disagreement_rate: (compared_pair_count > 0)
+            .then_some(disagreement as f64 / compared_pair_count as f64),
+        coassignment_precision: precision,
+        coassignment_recall: recall,
+        coassignment_f1: f1,
+        shared_confidence_count,
+        confidence_availability_disagreement_count,
+        mean_absolute_confidence_delta: (shared_confidence_count > 0)
+            .then_some(confidence_delta_sum / shared_confidence_count as f64),
+    }
+}
+
+const fn choose_two(value: u64) -> u64 {
+    value.saturating_mul(value.saturating_sub(1)) / 2
+}
+
+fn projection_score(
+    score: &DiarizationScore,
+    unknown_score: &DifferentialIntervalScore,
+    unknown_status_disagreement_ms: u64,
+) -> DifferentialProjectionScore {
+    DifferentialProjectionScore {
+        native_speaker_time_sec: score.reference_speaker_time_sec,
+        missed_speech_sec: score.missed_speech_sec,
+        false_alarm_sec: score.false_alarm_sec,
+        speaker_confusion_sec: score.speaker_confusion_sec,
+        native_unknown_ms: unknown_score.native_duration_ms,
+        oracle_unknown_ms: unknown_score.oracle_duration_ms,
+        unknown_status_disagreement_ms,
+        der: score.der,
+        jer: score.jer,
+        mapping_cardinality: score.speaker_mapping.len(),
+    }
+}
+
+fn turns_to_scoring(
+    turns: &[EvaluationTurn],
+    duration_ms: u64,
+    materialize_unknown: bool,
+) -> FwResult<Vec<ScoringTurn>> {
+    turns
+        .iter()
+        .map(|turn| {
+            validate_geometry(turn.start_ms, turn.end_ms, duration_ms, "final_projection")?;
+            if let Some(label) = &turn.speaker
+                && !is_safe_label(label)
+            {
+                return Err(oracle_request_error(
+                    "speaker_label",
+                    "projection speaker labels must be opaque safe tokens",
+                ));
+            }
+            if turn
+                .speaker_confidence
+                .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            {
+                return Err(oracle_request_error(
+                    "speaker_confidence",
+                    "projection confidence must be finite and within [0, 1]",
+                ));
+            }
+            Ok(ScoringTurn {
+                start_sec: turn.start_ms as f64 / 1_000.0,
+                end_sec: turn.end_ms as f64 / 1_000.0,
+                speaker: turn
+                    .speaker
+                    .clone()
+                    .or_else(|| materialize_unknown.then(|| "__fw_unknown".to_owned())),
+                overlap_suspected: turn.overlap_suspected,
+            })
+        })
+        .collect()
+}
+
+fn merged_turn_intervals(
+    turns: &[EvaluationTurn],
+    unknown_only: bool,
+) -> Vec<DifferentialInterval> {
+    merge_intervals(
+        turns
+            .iter()
+            .filter(|turn| !unknown_only || turn.speaker.is_none())
+            .map(|turn| DifferentialInterval {
+                start_ms: turn.start_ms,
+                end_ms: turn.end_ms,
+            })
+            .collect(),
+    )
+}
+
+fn merged_turn_pair_intervals(
+    left: &[EvaluationTurn],
+    right: &[EvaluationTurn],
+) -> Vec<DifferentialInterval> {
+    merge_intervals(
+        left.iter()
+            .chain(right)
+            .map(|turn| DifferentialInterval {
+                start_ms: turn.start_ms,
+                end_ms: turn.end_ms,
+            })
+            .collect(),
+    )
+}
+
+fn merge_intervals(mut intervals: Vec<DifferentialInterval>) -> Vec<DifferentialInterval> {
+    intervals.sort_by_key(|interval| (interval.start_ms, interval.end_ms));
+    let mut merged = Vec::<DifferentialInterval>::with_capacity(intervals.len());
+    for interval in intervals {
+        if let Some(previous) = merged.last_mut()
+            && interval.start_ms <= previous.end_ms
+        {
+            previous.end_ms = previous.end_ms.max(interval.end_ms);
+        } else {
+            merged.push(interval);
+        }
+    }
+    merged
+}
+
+fn validate_disjoint_intervals(
+    intervals: &[DifferentialInterval],
+    duration_ms: u64,
+    field: &str,
+    maximum: usize,
+) -> FwResult<()> {
+    if intervals.len() > maximum {
+        return Err(oracle_request_error(
+            "interval_count",
+            &format!("{field} exceeds the supported interval count"),
+        ));
+    }
+    let mut prior_end = 0u64;
+    for (index, interval) in intervals.iter().enumerate() {
+        validate_geometry(interval.start_ms, interval.end_ms, duration_ms, field)?;
+        if index > 0 && interval.start_ms < prior_end {
+            return Err(oracle_request_error(
+                "interval_order",
+                &format!("{field} must be ordered and non-overlapping"),
+            ));
+        }
+        prior_end = interval.end_ms;
+    }
+    Ok(())
+}
+
+fn validate_geometry(start_ms: u64, end_ms: u64, duration_ms: u64, field: &str) -> FwResult<()> {
+    if start_ms >= end_ms || end_ms > duration_ms {
+        return Err(oracle_request_error(
+            "interval_geometry",
+            &format!("{field} contains invalid interval geometry"),
+        ));
+    }
+    Ok(())
+}
+
+fn is_opaque_item_id(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.len() <= 32
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_safe_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SAFE_TOKEN_LEN
+        && !value.starts_with("__fw_")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+'))
+}
+
+fn is_safe_version_token(value: &str) -> bool {
+    is_safe_label(value)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == HASH_HEX_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_external_file(project_root: &Path, path: &Path, field: &str) -> FwResult<PathBuf> {
+    if !path.is_absolute() {
+        return Err(oracle_request_error(
+            field,
+            "external input paths must be absolute",
+        ));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| oracle_request_error(field, "external input could not be resolved"))?;
+    if canonical.starts_with(project_root) || !canonical.is_file() {
+        return Err(oracle_request_error(
+            field,
+            "external input must be a file outside the project tree",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn validate_external_output(project_root: &Path, path: &Path) -> FwResult<PathBuf> {
+    if !path.is_absolute() || path.exists() {
+        return Err(oracle_request_error(
+            "output",
+            "output must be a new absolute path outside the project tree",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        oracle_request_error("output", "output path must have a parent directory")
+    })?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|_| oracle_request_error("output", "output parent could not be resolved"))?;
+    if parent.starts_with(project_root) || !parent.is_dir() {
+        return Err(oracle_request_error(
+            "output",
+            "output parent must be a directory outside the project tree",
+        ));
+    }
+    let filename = path
+        .file_name()
+        .ok_or_else(|| oracle_request_error("output", "output path must have a filename"))?;
+    Ok(parent.join(filename))
+}
+
+fn read_capped(path: &Path, limit: u64, field: &str) -> FwResult<Vec<u8>> {
+    let file = File::open(path)
+        .map_err(|_| oracle_request_error(field, "external document could not be opened"))?;
+    if file
+        .metadata()
+        .map_err(|_| oracle_request_error(field, "external document metadata could not be read"))?
+        .len()
+        > limit
+    {
+        return Err(oracle_request_error(
+            field,
+            "external document exceeds the safety limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    BufReader::new(file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| oracle_request_error(field, "external document could not be read"))?;
+    if u64::try_from(bytes.len()).map_or(true, |length| length > limit) {
+        return Err(oracle_request_error(
+            field,
+            "external document exceeds the safety limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn hash_file(path: &Path, token: &CancellationToken) -> FwResult<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        token.checkpoint()?;
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_digest(hasher.finalize()))
+}
+
+fn bytes_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_digest(hasher.finalize())
+}
+
+fn canonical_sha256<T: Serialize>(value: &T) -> FwResult<String> {
+    Ok(bytes_sha256(&serde_json::to_vec(value)?))
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn write_new_report(path: &Path, report: &DifferentialOracleReport) -> FwResult<()> {
+    let bytes = serde_json::to_vec_pretty(report)?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| oracle_request_error("output", "new output file could not be created"))?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(&bytes)
+        .map_err(|_| oracle_request_error("output", "output report could not be written"))?;
+    writer
+        .flush()
+        .map_err(|_| oracle_request_error("output", "output report could not be flushed"))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|_| oracle_request_error("output", "output report could not be synchronized"))?;
+    Ok(())
+}
+
+fn oracle_request_error(code: &str, message: &str) -> FwError {
+    FwError::InvalidRequest(format!("differential_oracle.{code}: {message}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn interval(start_ms: u64, end_ms: u64) -> DifferentialInterval {
+        DifferentialInterval { start_ms, end_ms }
+    }
+
+    fn word(id: &str, start_ms: u64, end_ms: u64) -> DifferentialWordTiming {
+        DifferentialWordTiming {
+            word_id: id.to_owned(),
+            start_ms,
+            end_ms,
+        }
+    }
+
+    fn cluster(id: &str, label: &str) -> DifferentialClusterAssignment {
+        DifferentialClusterAssignment {
+            segment_id: id.to_owned(),
+            start_ms: 0,
+            end_ms: 100,
+            cluster_label: label.to_owned(),
+            confidence: Some(0.9),
+        }
+    }
+
+    fn document() -> DifferentialStageDocument {
+        DifferentialStageDocument {
+            schema_version: DIFFERENTIAL_STAGE_DOCUMENT_SCHEMA.to_owned(),
+            recording_key: KEY.to_owned(),
+            duration_ms: 2_000,
+            speech_activity: Some(vec![interval(100, 1_900)]),
+            word_timing: Some(vec![word("w-01", 100, 300), word("w-02", 400, 600)]),
+            change_boundaries_ms: Some(vec![1_000]),
+            cluster_assignments: Some(vec![
+                cluster("seg-01", "a"),
+                cluster("seg-02", "a"),
+                cluster("seg-03", "b"),
+            ]),
+            overlap: Some(vec![interval(900, 1_100)]),
+            final_projection: Some(vec![
+                EvaluationTurn::labeled(100, 1_000, "a"),
+                EvaluationTurn::labeled(1_000, 1_900, "b"),
+            ]),
+        }
+    }
+
+    #[test]
+    fn registry_covers_independent_architecture_families() {
+        let registry = differential_oracle_registry();
+        assert_eq!(registry.len(), 6);
+        assert!(registry.iter().all(|entry| {
+            entry.authority == DifferentialAuthority::DiagnosticOnly
+                && entry.protocol_version == DIFFERENTIAL_ORACLE_PROTOCOL_VERSION
+        }));
+        assert_eq!(
+            registry
+                .iter()
+                .map(|entry| entry.family)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn parser_rejects_unknown_fields_and_lexical_word_ids() {
+        let mut value = serde_json::to_value(document()).expect("serialize");
+        value["unexpected"] = serde_json::json!(true);
+        assert!(parse_stage_document(&serde_json::to_vec(&value).expect("json")).is_err());
+
+        let mut lexical = document();
+        lexical.word_timing.as_mut().expect("words")[0].word_id = "hello".to_owned();
+        assert!(validate_stage_document(&lexical).is_err());
+    }
+
+    #[test]
+    fn external_boundary_rejects_project_inputs_and_outputs() {
+        let project_root = std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("project root");
+        assert!(
+            canonical_external_file(&project_root, &project_root.join("Cargo.toml"), "audio")
+                .is_err()
+        );
+        assert!(
+            validate_external_output(
+                &project_root,
+                &project_root.join("must-not-create-differential-report.json")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn interval_score_handles_empty_and_partial_overlap() {
+        let empty = score_intervals(&[], &[]);
+        assert_eq!(empty.iou, None);
+        let score = score_intervals(&[interval(0, 100)], &[interval(50, 150)]);
+        assert_eq!(score.intersection_ms, 50);
+        assert_eq!(score.union_ms, 150);
+        assert!((score.iou.expect("iou") - 1.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cluster_score_is_label_permutation_invariant() {
+        let native = vec![
+            cluster("seg-01", "a"),
+            cluster("seg-02", "a"),
+            cluster("seg-03", "b"),
+        ];
+        let oracle = vec![
+            cluster("seg-01", "x"),
+            cluster("seg-02", "x"),
+            cluster("seg-03", "y"),
+        ];
+        let score = score_clusters(&native, &oracle);
+        assert_eq!(score.pair_disagreement_count, 0);
+        assert_eq!(score.pair_disagreement_rate, Some(0.0));
+        assert_eq!(score.coassignment_f1, Some(1.0));
+    }
+
+    #[test]
+    fn cluster_comparison_detects_missing_segments_and_anchor_geometry_changes() {
+        let native = document();
+        let mut missing = native.clone();
+        missing
+            .cluster_assignments
+            .as_mut()
+            .expect("cluster assignments")
+            .pop();
+        let comparisons = compare_documents(
+            &native,
+            &missing,
+            None,
+            &DifferentialComparisonConfig::default(),
+        )
+        .expect("compare missing segment");
+        assert_eq!(comparisons[3].state, DifferentialStageState::Divergent);
+        assert!(matches!(
+            comparisons.get(3).and_then(|value| value.metric.as_ref()),
+            Some(DifferentialStageMetric::ClusterAssignments(score))
+                if score.shared_segment_count == 2
+                    && score.segment_coverage == Some(2.0 / 3.0)
+        ));
+
+        let mut moved = native.clone();
+        moved.cluster_assignments.as_mut().expect("clusters")[0].end_ms += 1;
+        let comparisons = compare_documents(
+            &native,
+            &moved,
+            None,
+            &DifferentialComparisonConfig::default(),
+        )
+        .expect("compare moved anchor");
+        assert_eq!(comparisons[3].state, DifferentialStageState::Divergent);
+        assert!(matches!(
+            comparisons.get(3).and_then(|value| value.metric.as_ref()),
+            Some(DifferentialStageMetric::ClusterAssignments(score))
+                if score.geometry_disagreement_count == 1
+        ));
+    }
+
+    #[test]
+    fn cluster_confidence_delta_is_reported_without_assuming_cross_tool_calibration() {
+        let native = document();
+        let mut oracle = native.clone();
+        for assignment in oracle
+            .cluster_assignments
+            .as_mut()
+            .expect("cluster assignments")
+        {
+            assignment.confidence = Some(0.1);
+        }
+        let comparisons = compare_documents(
+            &native,
+            &oracle,
+            None,
+            &DifferentialComparisonConfig::default(),
+        )
+        .expect("compare confidence scales");
+        assert_eq!(comparisons[3].state, DifferentialStageState::Equivalent);
+        assert!(matches!(
+            comparisons.get(3).and_then(|value| value.metric.as_ref()),
+            Some(DifferentialStageMetric::ClusterAssignments(score))
+                if score.shared_confidence_count == 3
+                    && score.mean_absolute_confidence_delta
+                        .is_some_and(|delta| (delta - 0.8).abs() < 1e-12)
+        ));
+    }
+
+    #[test]
+    fn final_projection_is_label_permutation_invariant() {
+        let native = document();
+        let mut oracle = native.clone();
+        for turn in oracle.final_projection.as_mut().expect("turns") {
+            turn.speaker = Some(if turn.speaker.as_deref() == Some("a") {
+                "x".to_owned()
+            } else {
+                "y".to_owned()
+            });
+        }
+        let comparisons = compare_documents(
+            &native,
+            &oracle,
+            None,
+            &DifferentialComparisonConfig::default(),
+        )
+        .expect("compare");
+        let projection = comparisons
+            .iter()
+            .find(|comparison| comparison.stage == DifferentialStage::FinalProjection)
+            .expect("projection");
+        assert_eq!(projection.state, DifferentialStageState::Equivalent);
+        assert_eq!(projection.diagnostic_loss, Some(0.0));
+    }
+
+    #[test]
+    fn matching_unknown_projection_is_equivalent_but_known_unknown_disagreement_is_visible() {
+        let mut native = document();
+        native.final_projection = Some(vec![EvaluationTurn::unknown(100, 1_900)]);
+        let oracle = native.clone();
+        let comparisons = compare_documents(
+            &native,
+            &oracle,
+            None,
+            &DifferentialComparisonConfig::default(),
+        )
+        .expect("matching unknown");
+        assert_eq!(comparisons[5].state, DifferentialStageState::Equivalent);
+        assert_eq!(comparisons[5].diagnostic_loss, Some(0.0));
+
+        let mut known = oracle;
+        known.final_projection = Some(vec![EvaluationTurn::labeled(100, 1_900, "speaker_x")]);
+        let comparisons = compare_documents(
+            &native,
+            &known,
+            None,
+            &DifferentialComparisonConfig::default(),
+        )
+        .expect("known versus unknown");
+        assert_eq!(comparisons[5].state, DifferentialStageState::Divergent);
+        assert!(matches!(
+            comparisons.get(5).and_then(|value| value.metric.as_ref()),
+            Some(DifferentialStageMetric::FinalProjection(score))
+                if score.unknown_status_disagreement_ms == 1_800
+        ));
+    }
+
+    #[test]
+    fn earliest_divergence_respects_stage_order() {
+        let native = document();
+        let mut oracle = native.clone();
+        oracle.change_boundaries_ms = Some(vec![200]);
+        oracle.final_projection = Some(vec![EvaluationTurn::labeled(100, 1_900, "x")]);
+        let comparisons = compare_documents(
+            &native,
+            &oracle,
+            None,
+            &DifferentialComparisonConfig::default(),
+        )
+        .expect("compare");
+        let earliest = comparisons
+            .iter()
+            .find(|comparison| comparison.state == DifferentialStageState::Divergent)
+            .map(|comparison| comparison.stage);
+        assert_eq!(earliest, Some(DifferentialStage::ChangeBoundaries));
+    }
+
+    #[test]
+    fn partial_stage_output_is_not_invented_as_a_difference() {
+        let native = document();
+        let mut oracle = native.clone();
+        oracle.word_timing = None;
+        let comparisons = compare_documents(
+            &native,
+            &oracle,
+            None,
+            &DifferentialComparisonConfig::default(),
+        )
+        .expect("compare");
+        let words = &comparisons[1];
+        assert_eq!(words.state, DifferentialStageState::MissingOracle);
+        assert_eq!(words.metric, None);
+        assert_eq!(
+            words.adjudication,
+            DifferentialAdjudication::ReferenceStageUnavailable
+        );
+    }
+
+    #[test]
+    fn reference_adjudication_can_favor_either_side_without_minting_authority() {
+        let native = document();
+        let reference = native.clone();
+        let mut oracle = native.clone();
+        oracle.speech_activity = Some(vec![interval(100, 1_000)]);
+        let comparisons = compare_documents(
+            &native,
+            &oracle,
+            Some(&reference),
+            &DifferentialComparisonConfig::default(),
+        )
+        .expect("compare");
+        assert_eq!(
+            comparisons[0].adjudication,
+            DifferentialAdjudication::ReferenceFavorsNative
+        );
+    }
+
+    #[test]
+    fn missing_reference_stage_is_distinct_from_missing_reference_document() {
+        let native = document();
+        let mut oracle = native.clone();
+        oracle.speech_activity = Some(vec![interval(100, 1_000)]);
+        let mut reference = native.clone();
+        reference.speech_activity = None;
+        let comparisons = compare_documents(
+            &native,
+            &oracle,
+            Some(&reference),
+            &DifferentialComparisonConfig::default(),
+        )
+        .expect("compare");
+        assert_eq!(
+            comparisons[0].adjudication,
+            DifferentialAdjudication::ReferenceStageUnavailable
+        );
+    }
+
+    #[test]
+    fn missing_binary_is_cleanly_skipped() {
+        let prepared = PreparedInputs {
+            audio_path: PathBuf::from("/dev/null"),
+            native: document(),
+            reference: None,
+            audio_sha256: bytes_sha256(b""),
+            native_sha256: bytes_sha256(b"native"),
+            reference_sha256: None,
+        };
+        let report = build_report(
+            DifferentialOracleTool::Pyannote,
+            &ProgramSpec {
+                program: "franken-whisper-definitely-missing-oracle".to_owned(),
+                prefix_args: Vec::new(),
+            },
+            &prepared,
+            Duration::from_secs(1),
+            DifferentialComparisonConfig::default(),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("skip report");
+        assert_eq!(report.status, DifferentialRunStatus::Skipped);
+        assert_eq!(
+            report.skip_reason,
+            Some(DifferentialSkipReason::MissingExecutable)
+        );
+        assert!(!report.native_incorrectness_claim_permitted);
+    }
+
+    fn shell_program(script: String) -> ProgramSpec {
+        ProgramSpec {
+            program: "sh".to_owned(),
+            prefix_args: vec!["-c".to_owned(), script, "oracle-test".to_owned()],
+        }
+    }
+
+    fn version_json(tool: DifferentialOracleTool) -> String {
+        serde_json::json!({
+            "schema_version": DIFFERENTIAL_ORACLE_VERSION_SCHEMA,
+            "protocol_version": DIFFERENTIAL_ORACLE_PROTOCOL_VERSION,
+            "tool": tool,
+            "tool_version": "1.2.3",
+            "adapter_version": "adapter-1"
+        })
+        .to_string()
+    }
+
+    fn successful_shell_program(
+        tool: DifferentialOracleTool,
+        oracle: &DifferentialStageDocument,
+    ) -> ProgramSpec {
+        let version = version_json(tool);
+        let output = serde_json::to_string(oracle).expect("oracle json");
+        shell_program(format!(
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else printf '%s' '{output}'; fi"
+        ))
+    }
+
+    #[test]
+    fn invalid_version_json_is_cleanly_skipped() {
+        let error = execute_external(
+            DifferentialOracleTool::Pyannote,
+            &shell_program("printf '%s' 'not-json'".to_owned()),
+            Path::new("/dev/null"),
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("invalid version");
+        assert!(matches!(
+            error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::InvalidVersionOutput,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn version_mismatch_is_cleanly_skipped() {
+        let wrong = serde_json::json!({
+            "schema_version": DIFFERENTIAL_ORACLE_VERSION_SCHEMA,
+            "protocol_version": "wrong",
+            "tool": "pyannote",
+            "tool_version": "1",
+            "adapter_version": "1"
+        });
+        let error = execute_external(
+            DifferentialOracleTool::Pyannote,
+            &shell_program(format!("printf '%s' '{wrong}'")),
+            Path::new("/dev/null"),
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("version mismatch");
+        assert!(matches!(
+            error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::ProtocolVersionMismatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_run_json_is_cleanly_skipped() {
+        let version = version_json(DifferentialOracleTool::Pyannote);
+        let program = shell_program(format!(
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else printf '%s' 'invalid'; fi"
+        ));
+        let error = execute_external(
+            DifferentialOracleTool::Pyannote,
+            &program,
+            Path::new("/dev/null"),
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("invalid output");
+        assert!(matches!(
+            error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::InvalidOracleOutput,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn nonzero_run_and_timeout_are_clean_skips() {
+        let version = version_json(DifferentialOracleTool::Pyannote);
+        let failed = shell_program(format!(
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else exit 7; fi"
+        ));
+        let error = execute_external(
+            DifferentialOracleTool::Pyannote,
+            &failed,
+            Path::new("/dev/null"),
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("nonzero");
+        assert!(matches!(
+            error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::OracleRunFailed,
+                ..
+            })
+        ));
+
+        let slow = shell_program(format!(
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else sleep 60; fi"
+        ));
+        let error = execute_external(
+            DifferentialOracleTool::Pyannote,
+            &slow,
+            Path::new("/dev/null"),
+            KEY,
+            Duration::from_millis(40),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("timeout");
+        assert!(matches!(
+            error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::OracleRunTimedOut,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cancellation_propagates_instead_of_becoming_a_skip() {
+        let error = execute_external(
+            DifferentialOracleTool::Pyannote,
+            &successful_shell_program(DifferentialOracleTool::Pyannote, &document()),
+            Path::new("/dev/null"),
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::already_expired(),
+        )
+        .expect_err("cancel");
+        assert!(matches!(
+            error,
+            ExternalRunError::Cancelled(FwError::Cancelled(_))
+        ));
+    }
+
+    #[test]
+    fn completed_report_retains_no_paths_labels_or_word_ids() {
+        let native = document();
+        let prepared = PreparedInputs {
+            audio_path: PathBuf::from("/private/secret-call.m4a"),
+            native: native.clone(),
+            reference: None,
+            audio_sha256: bytes_sha256(b"audio"),
+            native_sha256: bytes_sha256(b"native"),
+            reference_sha256: None,
+        };
+        let report = build_report(
+            DifferentialOracleTool::Pyannote,
+            &successful_shell_program(DifferentialOracleTool::Pyannote, &native),
+            &prepared,
+            Duration::from_secs(1),
+            DifferentialComparisonConfig::default(),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("report");
+        let json = serde_json::to_string(&report).expect("json");
+        for forbidden in ["secret-call", "/private", "\"a\"", "w-01", "seg-01"] {
+            assert!(!json.contains(forbidden), "leaked {forbidden}: {json}");
+        }
+        assert_eq!(report.status, DifferentialRunStatus::Completed);
+        assert!(!report.result_sha256.is_empty());
+        verify_differential_report(&report).expect("verified report");
+
+        let bytes = serde_json::to_vec(&report).expect("report bytes");
+        assert_eq!(
+            parse_differential_report(&bytes).expect("parsed report"),
+            report
+        );
+        let mut tampered = report;
+        tampered.native_incorrectness_claim_permitted = true;
+        assert!(verify_differential_report(&tampered).is_err());
+    }
+
+    #[test]
+    fn failed_run_retains_safe_partial_provenance() {
+        let version = version_json(DifferentialOracleTool::Pyannote);
+        let failed = shell_program(format!(
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else exit 9; fi"
+        ));
+        let prepared = PreparedInputs {
+            audio_path: PathBuf::from("/dev/null"),
+            native: document(),
+            reference: None,
+            audio_sha256: bytes_sha256(b""),
+            native_sha256: bytes_sha256(b"native"),
+            reference_sha256: None,
+        };
+        let report = build_report(
+            DifferentialOracleTool::Pyannote,
+            &failed,
+            &prepared,
+            Duration::from_secs(1),
+            DifferentialComparisonConfig::default(),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("skip report");
+        assert_eq!(report.status, DifferentialRunStatus::Skipped);
+        assert_eq!(report.provenance.tool_version.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            report.provenance.adapter_version.as_deref(),
+            Some("adapter-1")
+        );
+        assert!(
+            report
+                .provenance
+                .executable_sha256
+                .as_deref()
+                .is_some_and(is_sha256_hex)
+        );
+        assert!(report.provenance.oracle_stdout_sha256.is_none());
+        verify_differential_report(&report).expect("verified skip");
+    }
+}

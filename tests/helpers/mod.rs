@@ -66,6 +66,7 @@ pub fn create_test_result() -> TranscriptionResult {
             },
         ],
         acceleration: None,
+        diarization: None,
         raw_output: json!({"text": "Hello world. This is a test."}),
         artifact_paths: vec![],
     }

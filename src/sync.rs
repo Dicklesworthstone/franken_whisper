@@ -8,12 +8,94 @@ use chrono::Utc;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use fsqlite::Connection;
+// The JSONL sync drives the database synchronously from the CLI. `fsqlite`'s
+// own `Connection` is async as of the frankensqlite async migration, so this
+// module speaks to it through the crate's blocking facade; every `Connection`
+// below is that facade, with the same statement methods and error type.
+use crate::storage::{BlockingConnection as Connection, RunStore};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{FwError, FwResult};
+
+/// Whether the JSONL import loops write their rows with the fsqlite "skip
+/// statement savepoint in explicit txn" escape hatch (default). Every import
+/// INSERT/DELETE runs inside `import_inner`'s single `BEGIN;` transaction, which
+/// is the rollback boundary (COMMIT on success, ROLLBACK on any Err or Reject),
+/// so the per-statement savepoint fsqlite wraps around each `execute_with_params`
+/// is redundant bookkeeping. `FW_SYNC_SKIP_STMT_SP=0` restores the per-statement
+/// savepoint path. Imported rows are byte-identical either way. Mirrors the
+/// `persist_report` win (`FW_PERSIST_SKIP_STMT_SP`).
+fn sync_skip_stmt_sp_enabled() -> bool {
+    std::env::var("FW_SYNC_SKIP_STMT_SP").ok().as_deref() != Some("0")
+}
+
+/// How many `run_id`s the incremental `_for_runs` export writers pack into each
+/// `WHERE run_id IN (…)` query, collapsing the legacy per-run N+1 `SELECT` into one
+/// query per chunk (query *setup* dominates for the few-row-per-run results).
+/// Default 512 (well under fsqlite's 32766-variable limit); `FW_SYNC_BATCH_QUERY=0`
+/// forces 1 (= one query per run = the legacy N+1). Rows are grouped by run_id and
+/// emitted in `run_ids` order regardless, so the JSONL is byte-identical either way.
+fn sync_query_batch_size() -> usize {
+    if std::env::var("FW_SYNC_BATCH_QUERY").ok().as_deref() == Some("0") {
+        1
+    } else {
+        512
+    }
+}
+
+/// Import-side mirror of the export N+1 batching (all three tables): pre-fetch the
+/// existing rows for a chunk with one `WHERE … IN (…)` query instead of one
+/// `SELECT … WHERE key = ?` per JSONL line (query *setup* dominates the few-row
+/// lookups). **Default ON** (`FW_SYNC_BATCH_IMPORT=0` restores the legacy per-line
+/// N+1, matching the `FW_SYNC_BATCH_QUERY` kill-switch convention). Proven safe to
+/// flip: the per-line and batched paths call the SAME `apply_{run,segment,event}_row`
+/// conflict logic (differing only in where `existing` comes from) ⇒ byte-identical
+/// imported rows; verified by `sync::tests` (350/0, now exercised through the batched
+/// path by default) + a full-CLI export→import A/B (all 3 tables byte-identical incl.
+/// the conflict/noop re-import path). Measured **~1.29× on `sync/import/runs/50`**
+/// (50.9→39.6 ms, external-env ABBA), matching the export N+1's 1.32×.
+fn sync_batch_import_enabled() -> bool {
+    std::env::var("FW_SYNC_BATCH_IMPORT").ok().as_deref() != Some("0")
+}
+
+/// The 12 `runs` columns in `SELECT`/`INSERT` order, as an owned slice — the
+/// shared representation of "the existing row" for [`apply_run_row`]. Both the
+/// per-line `SELECT` result (a `Row`) and a prefetched/just-inserted row reduce to
+/// this, and `<[SqliteValue]>::get(i)` returns `Option<&SqliteValue>` exactly like
+/// `Row::get(i)`, so the 11-field identical-compare is bit-for-bit the same.
+fn run_row_to_cols(row: &fsqlite::Row) -> Vec<SqliteValue> {
+    (0..12)
+        .map(|i| row.get(i).cloned().unwrap_or(SqliteValue::Null))
+        .collect()
+}
+
+/// Extension over `fsqlite::Connection` for the import write loops: dispatches to
+/// the statement-savepoint-skipping executor when enabled (see
+/// [`sync_skip_stmt_sp_enabled`]). Behaviourally identical to `execute_with_params`
+/// on success; on failure the enclosing `BEGIN;` rollback discards partial rows.
+trait ImportExec {
+    fn import_exec(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, fsqlite::FrankenError>;
+}
+
+impl ImportExec for Connection {
+    fn import_exec(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, fsqlite::FrankenError> {
+        if sync_skip_stmt_sp_enabled() {
+            self.execute_with_params_skip_statement_savepoint_in_explicit_txn(sql, params)
+        } else {
+            self.execute_with_params(sql, params)
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -331,26 +413,27 @@ fn export_inner(db_path: &Path, output_dir: &Path) -> FwResult<SyncManifest> {
     // Export runs
     let runs_tmp = output_dir.join("runs.jsonl.tmp");
     let runs_final = output_dir.join("runs.jsonl");
-    let runs_count = export_table_runs(&connection, &runs_tmp)?;
+    let (runs_count, runs_sha256) = export_table_runs(&connection, &runs_tmp)?;
     atomic_rename(&runs_tmp, &runs_final)?;
 
     // Export segments
     let segments_tmp = output_dir.join("segments.jsonl.tmp");
     let segments_final = output_dir.join("segments.jsonl");
-    let segments_count = export_table_segments(&connection, &segments_tmp)?;
+    let (segments_count, segments_sha256) = export_table_segments(&connection, &segments_tmp)?;
     atomic_rename(&segments_tmp, &segments_final)?;
 
     // Export events
     let events_tmp = output_dir.join("events.jsonl.tmp");
     let events_final = output_dir.join("events.jsonl");
-    let events_count = export_table_events(&connection, &events_tmp)?;
+    let (events_count, events_sha256) = export_table_events(&connection, &events_tmp)?;
     atomic_rename(&events_tmp, &events_final)?;
 
-    // Compute checksums
+    // Checksums streamed while writing (HashingWriter) — no second pass to re-read
+    // the JSONL files. Identical digest to `sha256_file` of the written bytes.
     let checksums = FileChecksums {
-        runs_jsonl_sha256: sha256_file(&runs_final)?,
-        segments_jsonl_sha256: sha256_file(&segments_final)?,
-        events_jsonl_sha256: sha256_file(&events_final)?,
+        runs_jsonl_sha256: runs_sha256,
+        segments_jsonl_sha256: segments_sha256,
+        events_jsonl_sha256: events_sha256,
     };
 
     let manifest = SyncManifest {
@@ -373,7 +456,7 @@ fn export_inner(db_path: &Path, output_dir: &Path) -> FwResult<SyncManifest> {
     Ok(manifest)
 }
 
-fn export_table_runs(connection: &Connection, path: &Path) -> FwResult<u64> {
+fn export_table_runs(connection: &Connection, path: &Path) -> FwResult<(u64, String)> {
     let rows = connection
         .query(
             "SELECT id, started_at, finished_at, backend, input_path, \
@@ -383,7 +466,7 @@ fn export_table_runs(connection: &Connection, path: &Path) -> FwResult<u64> {
         .map_err(|error| FwError::Storage(error.to_string()))?;
 
     let file = fs::File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = HashingWriter::new(BufWriter::new(file));
     let mut count = 0u64;
 
     for row in rows {
@@ -406,10 +489,10 @@ fn export_table_runs(connection: &Connection, path: &Path) -> FwResult<u64> {
     }
     writer.flush()?;
 
-    Ok(count)
+    Ok((count, writer.finalize_hex()))
 }
 
-fn export_table_segments(connection: &Connection, path: &Path) -> FwResult<u64> {
+fn export_table_segments(connection: &Connection, path: &Path) -> FwResult<(u64, String)> {
     let rows = connection
         .query(
             "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
@@ -418,7 +501,7 @@ fn export_table_segments(connection: &Connection, path: &Path) -> FwResult<u64> 
         .map_err(|error| FwError::Storage(error.to_string()))?;
 
     let file = fs::File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = HashingWriter::new(BufWriter::new(file));
     let mut count = 0u64;
 
     for row in rows {
@@ -436,10 +519,10 @@ fn export_table_segments(connection: &Connection, path: &Path) -> FwResult<u64> 
     }
     writer.flush()?;
 
-    Ok(count)
+    Ok((count, writer.finalize_hex()))
 }
 
-fn export_table_events(connection: &Connection, path: &Path) -> FwResult<u64> {
+fn export_table_events(connection: &Connection, path: &Path) -> FwResult<(u64, String)> {
     let rows = connection
         .query(
             "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
@@ -448,7 +531,7 @@ fn export_table_events(connection: &Connection, path: &Path) -> FwResult<u64> {
         .map_err(|error| FwError::Storage(error.to_string()))?;
 
     let file = fs::File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = HashingWriter::new(BufWriter::new(file));
     let mut count = 0u64;
 
     for row in rows {
@@ -466,7 +549,7 @@ fn export_table_events(connection: &Connection, path: &Path) -> FwResult<u64> {
     }
     writer.flush()?;
 
-    Ok(count)
+    Ok((count, writer.finalize_hex()))
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +632,8 @@ fn export_incremental_inner(
     // --- runs ---
     let runs_tmp = output_dir.join("runs.jsonl.tmp");
     let runs_final = output_dir.join("runs.jsonl");
-    let runs_count = export_table_runs_incremental(&connection, &runs_tmp, cursor_used.as_ref())?;
+    let (runs_count, runs_sha256) =
+        export_table_runs_incremental(&connection, &runs_tmp, cursor_used.as_ref())?;
     atomic_rename(&runs_tmp, &runs_final)?;
 
     // Collect the run_ids that were exported so segments/events can be scoped.
@@ -558,20 +642,23 @@ fn export_incremental_inner(
     // --- segments ---
     let segments_tmp = output_dir.join("segments.jsonl.tmp");
     let segments_final = output_dir.join("segments.jsonl");
-    let segments_count = export_table_segments_for_runs(&connection, &segments_tmp, &run_ids)?;
+    let (segments_count, segments_sha256) =
+        export_table_segments_for_runs(&connection, &segments_tmp, &run_ids)?;
     atomic_rename(&segments_tmp, &segments_final)?;
 
     // --- events ---
     let events_tmp = output_dir.join("events.jsonl.tmp");
     let events_final = output_dir.join("events.jsonl");
-    let events_count = export_table_events_for_runs(&connection, &events_tmp, &run_ids)?;
+    let (events_count, events_sha256) =
+        export_table_events_for_runs(&connection, &events_tmp, &run_ids)?;
     atomic_rename(&events_tmp, &events_final)?;
 
-    // Compute checksums
+    // Checksums streamed while writing (HashingWriter) — no re-read pass. Same digest
+    // as `sha256_file` of the written bytes.
     let checksums = FileChecksums {
-        runs_jsonl_sha256: sha256_file(&runs_final)?,
-        segments_jsonl_sha256: sha256_file(&segments_final)?,
-        events_jsonl_sha256: sha256_file(&events_final)?,
+        runs_jsonl_sha256: runs_sha256,
+        segments_jsonl_sha256: segments_sha256,
+        events_jsonl_sha256: events_sha256,
     };
 
     // Determine the new cursor: the maximum `(finished_at, id)` tuple among
@@ -646,7 +733,7 @@ fn export_table_runs_incremental(
     connection: &Connection,
     path: &Path,
     cursor: Option<&SyncCursor>,
-) -> FwResult<u64> {
+) -> FwResult<(u64, String)> {
     let (sql, params) = match cursor {
         Some(c) => (
             "SELECT id, started_at, finished_at, backend, input_path, \
@@ -679,7 +766,10 @@ fn export_table_runs_incremental(
             .map_err(|error| FwError::Storage(error.to_string()))?
     };
 
-    let mut file = fs::File::create(path)?;
+    // BufWriter batches the per-row `writeln!` into ~8 KiB write() syscalls instead
+    // of one syscall per JSONL line (the full-export writers above are already
+    // buffered; these incremental ones were not). Byte-identical output.
+    let mut file = HashingWriter::new(BufWriter::new(fs::File::create(path)?));
     let mut count = 0u64;
 
     for row in rows {
@@ -701,9 +791,9 @@ fn export_table_runs_incremental(
         count += 1;
     }
     file.flush()?;
-    file.sync_all()?;
+    file.get_ref().get_ref().sync_all()?;
 
-    Ok(count)
+    Ok((count, file.finalize_hex()))
 }
 
 /// Collect all run IDs that match the incremental filter, so we can scope
@@ -750,20 +840,35 @@ fn export_table_segments_for_runs(
     connection: &Connection,
     path: &Path,
     run_ids: &[String],
-) -> FwResult<u64> {
-    let mut file = fs::File::create(path)?;
-    let mut count = 0u64;
-
-    for run_id in run_ids {
+) -> FwResult<(u64, String)> {
+    // BufWriter batches the per-row `writeln!` into ~8 KiB write() syscalls instead
+    // of one syscall per JSONL line (the full-export writers above are already
+    // buffered; these incremental ones were not). Byte-identical output.
+    let mut file = HashingWriter::new(BufWriter::new(fs::File::create(path)?));
+    // Batch the per-run N+1 `SELECT` into one `WHERE run_id IN (…)` query per chunk,
+    // grouping rows by run_id and emitting in `run_ids` order (idx-ascending within
+    // each run) ⇒ byte-identical JSONL to the legacy per-run path. Chunk size 1
+    // (`FW_SYNC_BATCH_QUERY=0`) reproduces the legacy one-query-per-run behavior.
+    let mut by_run: HashMap<String, Vec<String>> = HashMap::new();
+    for chunk in run_ids.chunks(sync_query_batch_size()) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
+             FROM segments WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, idx ASC"
+        );
+        let params: Vec<SqliteValue> = chunk
+            .iter()
+            .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+            .collect();
         let rows = connection
-            .query_with_params(
-                "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
-                 FROM segments WHERE run_id = ?1 ORDER BY idx ASC",
-                &[SqliteValue::Text(run_id.clone().into())],
-            )
+            .query_with_params(&sql, &params)
             .map_err(|error| FwError::Storage(error.to_string()))?;
 
         for row in rows {
+            let run_id = value_to_string_sqlite(row.get(0));
             let obj = serde_json::json!({
                 "run_id": value_to_json(row.get(0)),
                 "idx": value_to_json(row.get(1)),
@@ -773,14 +878,26 @@ fn export_table_segments_for_runs(
                 "text": value_to_json(row.get(5)),
                 "confidence": value_to_json(row.get(6)),
             });
-            writeln!(file, "{}", serde_json::to_string(&obj)?)?;
-            count += 1;
+            by_run
+                .entry(run_id)
+                .or_default()
+                .push(serde_json::to_string(&obj)?);
+        }
+    }
+
+    let mut count = 0u64;
+    for run_id in run_ids {
+        if let Some(lines) = by_run.get(run_id) {
+            for line in lines {
+                writeln!(file, "{line}")?;
+                count += 1;
+            }
         }
     }
     file.flush()?;
-    file.sync_all()?;
+    file.get_ref().get_ref().sync_all()?;
 
-    Ok(count)
+    Ok((count, file.finalize_hex()))
 }
 
 /// Export events belonging to a specific set of run_ids.
@@ -788,20 +905,34 @@ fn export_table_events_for_runs(
     connection: &Connection,
     path: &Path,
     run_ids: &[String],
-) -> FwResult<u64> {
-    let mut file = fs::File::create(path)?;
-    let mut count = 0u64;
-
-    for run_id in run_ids {
+) -> FwResult<(u64, String)> {
+    // BufWriter batches the per-row `writeln!` into ~8 KiB write() syscalls instead
+    // of one syscall per JSONL line (the full-export writers above are already
+    // buffered; these incremental ones were not). Byte-identical output.
+    let mut file = HashingWriter::new(BufWriter::new(fs::File::create(path)?));
+    // Batch the per-run N+1 `SELECT` into one `WHERE run_id IN (…)` query per chunk;
+    // group by run_id and emit in `run_ids` order (seq-ascending within each run) ⇒
+    // byte-identical JSONL. `FW_SYNC_BATCH_QUERY=0` (chunk 1) = legacy per-run path.
+    let mut by_run: HashMap<String, Vec<String>> = HashMap::new();
+    for chunk in run_ids.chunks(sync_query_batch_size()) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
+             FROM events WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, seq ASC"
+        );
+        let params: Vec<SqliteValue> = chunk
+            .iter()
+            .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+            .collect();
         let rows = connection
-            .query_with_params(
-                "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
-                 FROM events WHERE run_id = ?1 ORDER BY seq ASC",
-                &[SqliteValue::Text(run_id.clone().into())],
-            )
+            .query_with_params(&sql, &params)
             .map_err(|error| FwError::Storage(error.to_string()))?;
 
         for row in rows {
+            let run_id = value_to_string_sqlite(row.get(0));
             let obj = serde_json::json!({
                 "run_id": value_to_json(row.get(0)),
                 "seq": value_to_json(row.get(1)),
@@ -811,14 +942,26 @@ fn export_table_events_for_runs(
                 "message": value_to_json(row.get(5)),
                 "payload_json": value_to_json(row.get(6)),
             });
-            writeln!(file, "{}", serde_json::to_string(&obj)?)?;
-            count += 1;
+            by_run
+                .entry(run_id)
+                .or_default()
+                .push(serde_json::to_string(&obj)?);
+        }
+    }
+
+    let mut count = 0u64;
+    for run_id in run_ids {
+        if let Some(lines) = by_run.get(run_id) {
+            for line in lines {
+                writeln!(file, "{line}")?;
+                count += 1;
+            }
         }
     }
     file.flush()?;
-    file.sync_all()?;
+    file.get_ref().get_ref().sync_all()?;
 
-    Ok(count)
+    Ok((count, file.finalize_hex()))
 }
 
 /// Find the maximum `(finished_at, id)` tuple among runs matching the
@@ -942,35 +1085,47 @@ fn import_inner(
     {
         fs::create_dir_all(parent)?;
     }
-    let connection = Connection::open(db_path.display().to_string())
-        .map_err(|error| FwError::Storage(error.to_string()))?;
-    ensure_schema(&connection)?;
+    let store = RunStore::open(db_path)?;
+    let connection = store.connection();
+    ensure_schema(connection)?;
 
     // Begin transaction
     connection
         .execute("BEGIN;")
         .map_err(|error| FwError::Storage(error.to_string()))?;
 
-    let result = import_tables(&connection, input_dir, &manifest, conflict_policy);
+    let result = import_tables(connection, input_dir, &manifest, conflict_policy);
 
     match result {
         Ok(import_result) => {
-            if !import_result.conflicts.is_empty() {
-                write_conflicts_file(input_dir, &import_result.conflicts)?;
-                if conflict_policy == ConflictPolicy::Reject {
+            let finalize = (|| -> FwResult<()> {
+                if !import_result.conflicts.is_empty() {
+                    write_conflicts_file(input_dir, &import_result.conflicts)?;
+                    if conflict_policy == ConflictPolicy::Reject {
+                        return Err(FwError::Storage(format!(
+                            "import rejected due to {} conflict(s); see sync_conflicts.jsonl",
+                            import_result.conflicts.len()
+                        )));
+                    }
+                }
+
+                // The normalized diarization tables are a derived cache, but
+                // they must advance atomically with their canonical run JSON.
+                // Rebuild inside this import transaction so malformed typed
+                // payloads cannot commit only the canonical half.
+                store.rebuild_diarization_index()?;
+                connection
+                    .execute("COMMIT;")
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                Ok(())
+            })();
+            match finalize {
+                Ok(()) => Ok(import_result),
+                Err(error) => {
                     let _ = connection.execute("ROLLBACK;");
-                    return Err(FwError::Storage(format!(
-                        "import rejected due to {} conflict(s); see sync_conflicts.jsonl",
-                        import_result.conflicts.len()
-                    )));
+                    Err(error)
                 }
             }
-
-            connection
-                .execute("COMMIT;")
-                .map_err(|error| FwError::Storage(error.to_string()))?;
-
-            Ok(import_result)
         }
         Err(error) => {
             let _ = connection.execute("ROLLBACK;");
@@ -1074,146 +1229,476 @@ fn import_runs(
     let reader = BufReader::new(file);
     let mut count = 0u64;
 
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let row: serde_json::Value = serde_json::from_str(line)?;
-        let id = json_str(&row, "id")?;
-        tracking.imported_run_ids.insert(id.clone());
-
-        // Check for existing row
-        let existing = connection
-            .query_with_params(
-                "SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs WHERE id = ?1",
-                &[SqliteValue::Text(id.clone().into())],
-            )
-            .map_err(|error| FwError::Storage(format!("query runs existing `{id}` failed: {error}")))?;
-
-        if !existing.is_empty() {
-            // Compare payload: if identical, noop; if different, apply conflict policy
-            let existing_row = &existing[0];
-            let identical = value_to_string_sqlite(existing_row.get(1))
-                == json_str(&row, "started_at")?
-                && value_to_string_sqlite(existing_row.get(2)) == json_str(&row, "finished_at")?
-                && value_to_string_sqlite(existing_row.get(3)) == json_str(&row, "backend")?
-                && value_to_string_sqlite(existing_row.get(4)) == json_str(&row, "input_path")?
-                && value_to_string_sqlite(existing_row.get(5))
-                    == json_str(&row, "normalized_wav_path")?
-                && value_to_string_sqlite(existing_row.get(6)) == json_str(&row, "request_json")?
-                && value_to_string_sqlite(existing_row.get(7)) == json_str(&row, "result_json")?
-                && value_to_string_sqlite(existing_row.get(8)) == json_str(&row, "warnings_json")?
-                && value_to_string_sqlite(existing_row.get(9)) == json_str(&row, "transcript")?
-                && value_to_string_sqlite(existing_row.get(10))
-                    == json_string_or_default(&row, "replay_json", "{}")
-                && value_to_string_sqlite(existing_row.get(11))
-                    == json_string_or_default(&row, "acceleration_json", "{}");
-
-            if identical {
-                count += 1;
-                continue; // identical — noop
+    if sync_batch_import_enabled() {
+        // Batched: pre-fetch the existing rows for a chunk of ids with one
+        // `WHERE id IN (…)` query, then run the SAME `apply_run_row` conflict logic
+        // per line ⇒ byte-identical to the per-line path. Chunked to bound memory.
+        let chunk_size = sync_query_batch_size().max(1);
+        let mut chunk: Vec<(String, serde_json::Value)> = Vec::with_capacity(chunk_size);
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
-
-            match conflict_policy {
-                ConflictPolicy::Reject => {
-                    conflicts.push(SyncConflict {
-                        table: "runs".to_owned(),
-                        key: id.clone(),
-                        reason: "different payload for same id".to_owned(),
-                    });
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Skip => {
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Overwrite | ConflictPolicy::OverwriteStrict => {
-                    let existing_segment_idxs = query_segment_idxs_for_run(connection, &id)
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "overwrite capture segments `{id}` failed: {error}"
-                            ))
-                        })?;
-                    tracking
-                        .overwritten_segment_idxs_before
-                        .entry(id.clone())
-                        .or_default()
-                        .extend(existing_segment_idxs);
-
-                    let existing_event_seqs =
-                        query_event_seqs_for_run(connection, &id).map_err(|error| {
-                            FwError::Storage(format!(
-                                "overwrite capture events `{id}` failed: {error}"
-                            ))
-                        })?;
-                    tracking
-                        .overwritten_event_seqs_before
-                        .entry(id.clone())
-                        .or_default()
-                        .extend(existing_event_seqs);
-
-                    connection
-                        .execute_with_params(
-                            "DELETE FROM segments WHERE run_id = ?1",
-                            &[SqliteValue::Text(id.clone().into())],
-                        )
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "overwrite delete segments `{id}` failed: {error}"
-                            ))
-                        })?;
-                    connection
-                        .execute_with_params(
-                            "DELETE FROM events WHERE run_id = ?1",
-                            &[SqliteValue::Text(id.clone().into())],
-                        )
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "overwrite delete events `{id}` failed: {error}"
-                            ))
-                        })?;
-                    connection
-                        .execute_with_params(
-                            "DELETE FROM runs WHERE id = ?1",
-                            &[SqliteValue::Text(id.clone().into())],
-                        )
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "overwrite delete runs `{id}` failed: {error}"
-                            ))
-                        })?;
-                    tracking.overwritten_run_ids.insert(id.clone());
-                    // Fall through to INSERT
-                }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let id = json_str(&row, "id")?;
+            chunk.push((id, row));
+            if chunk.len() >= chunk_size {
+                count +=
+                    flush_run_chunk(connection, &mut chunk, conflict_policy, conflicts, tracking)?;
             }
         }
+        count += flush_run_chunk(connection, &mut chunk, conflict_policy, conflicts, tracking)?;
+    } else {
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let id = json_str(&row, "id")?;
 
-        connection
-            .execute_with_params(
-                "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
-                 normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                &[
-                    SqliteValue::Text(id.clone().into()),
-                    SqliteValue::Text(json_str(&row, "started_at")?.into()),
-                    SqliteValue::Text(json_str(&row, "finished_at")?.into()),
-                    SqliteValue::Text(json_str(&row, "backend")?.into()),
-                    SqliteValue::Text(json_str(&row, "input_path")?.into()),
-                    SqliteValue::Text(json_str(&row, "normalized_wav_path")?.into()),
-                    SqliteValue::Text(json_str(&row, "request_json")?.into()),
-                    SqliteValue::Text(json_str(&row, "result_json")?.into()),
-                    SqliteValue::Text(json_str(&row, "warnings_json")?.into()),
-                    SqliteValue::Text(json_str(&row, "transcript")?.into()),
-                    SqliteValue::Text(json_string_or_default(&row, "replay_json", "{}").into()),
-                    SqliteValue::Text(json_string_or_default(&row, "acceleration_json", "{}").into()),
-                ],
-            )
-            .map_err(|error| FwError::Storage(format!("insert runs `{id}` failed: {error}")))?;
+            // Per-line existing lookup (the N+1 the batched path collapses).
+            let existing_rows = connection
+                .query_with_params(
+                    "SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs WHERE id = ?1",
+                    &[SqliteValue::Text(id.clone().into())],
+                )
+                .map_err(|error| {
+                    FwError::Storage(format!("query runs existing `{id}` failed: {error}"))
+                })?;
+            let existing = existing_rows.first().map(run_row_to_cols);
+            apply_run_row(
+                connection,
+                &id,
+                &row,
+                existing.as_deref(),
+                conflict_policy,
+                conflicts,
+                tracking,
+            )?;
+            count += 1;
+        }
+    }
 
+    Ok(count)
+}
+
+/// Process one `runs` JSONL row against `existing` (the current DB/seen row, or
+/// `None`), applying the identical-compare + [`ConflictPolicy`]. **Shared by the
+/// per-line and batched import paths** so their imported rows are byte-identical —
+/// the only difference is where `existing` comes from (a per-line `SELECT` vs a
+/// prefetched `WHERE id IN (…)` map). Returns `Some(inserted_cols)` when a row was
+/// INSERTed (so the batched caller can update its intra-chunk seen-map), else `None`.
+fn apply_run_row(
+    connection: &Connection,
+    id: &str,
+    row: &serde_json::Value,
+    existing: Option<&[SqliteValue]>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+    tracking: &mut RunImportTracking,
+) -> FwResult<Option<Vec<SqliteValue>>> {
+    tracking.imported_run_ids.insert(id.to_owned());
+
+    if let Some(existing) = existing {
+        // Compare payload: if identical, noop; if different, apply conflict policy.
+        let identical = value_to_string_sqlite(existing.get(1)) == json_str(row, "started_at")?
+            && value_to_string_sqlite(existing.get(2)) == json_str(row, "finished_at")?
+            && value_to_string_sqlite(existing.get(3)) == json_str(row, "backend")?
+            && value_to_string_sqlite(existing.get(4)) == json_str(row, "input_path")?
+            && value_to_string_sqlite(existing.get(5)) == json_str(row, "normalized_wav_path")?
+            && value_to_string_sqlite(existing.get(6)) == json_str(row, "request_json")?
+            && value_to_string_sqlite(existing.get(7)) == json_str(row, "result_json")?
+            && value_to_string_sqlite(existing.get(8)) == json_str(row, "warnings_json")?
+            && value_to_string_sqlite(existing.get(9)) == json_str(row, "transcript")?
+            && value_to_string_sqlite(existing.get(10))
+                == json_string_or_default(row, "replay_json", "{}")
+            && value_to_string_sqlite(existing.get(11))
+                == json_string_or_default(row, "acceleration_json", "{}");
+
+        if identical {
+            return Ok(None); // identical — noop
+        }
+
+        match conflict_policy {
+            ConflictPolicy::Reject => {
+                conflicts.push(SyncConflict {
+                    table: "runs".to_owned(),
+                    key: id.to_owned(),
+                    reason: "different payload for same id".to_owned(),
+                });
+                return Ok(None);
+            }
+            ConflictPolicy::Skip => {
+                return Ok(None);
+            }
+            ConflictPolicy::Overwrite | ConflictPolicy::OverwriteStrict => {
+                let existing_segment_idxs =
+                    query_segment_idxs_for_run(connection, id).map_err(|error| {
+                        FwError::Storage(format!(
+                            "overwrite capture segments `{id}` failed: {error}"
+                        ))
+                    })?;
+                tracking
+                    .overwritten_segment_idxs_before
+                    .entry(id.to_owned())
+                    .or_default()
+                    .extend(existing_segment_idxs);
+
+                let existing_event_seqs =
+                    query_event_seqs_for_run(connection, id).map_err(|error| {
+                        FwError::Storage(format!("overwrite capture events `{id}` failed: {error}"))
+                    })?;
+                tracking
+                    .overwritten_event_seqs_before
+                    .entry(id.to_owned())
+                    .or_default()
+                    .extend(existing_event_seqs);
+
+                connection
+                    .import_exec(
+                        "DELETE FROM segments WHERE run_id = ?1",
+                        &[SqliteValue::Text(id.to_owned().into())],
+                    )
+                    .map_err(|error| {
+                        FwError::Storage(format!(
+                            "overwrite delete segments `{id}` failed: {error}"
+                        ))
+                    })?;
+                connection
+                    .import_exec(
+                        "DELETE FROM events WHERE run_id = ?1",
+                        &[SqliteValue::Text(id.to_owned().into())],
+                    )
+                    .map_err(|error| {
+                        FwError::Storage(format!("overwrite delete events `{id}` failed: {error}"))
+                    })?;
+                connection
+                    .import_exec(
+                        "DELETE FROM runs WHERE id = ?1",
+                        &[SqliteValue::Text(id.to_owned().into())],
+                    )
+                    .map_err(|error| {
+                        FwError::Storage(format!("overwrite delete runs `{id}` failed: {error}"))
+                    })?;
+                tracking.overwritten_run_ids.insert(id.to_owned());
+                // Fall through to INSERT.
+            }
+        }
+    }
+
+    let cols = vec![
+        SqliteValue::Text(id.to_owned().into()),
+        SqliteValue::Text(json_str(row, "started_at")?.into()),
+        SqliteValue::Text(json_str(row, "finished_at")?.into()),
+        SqliteValue::Text(json_str(row, "backend")?.into()),
+        SqliteValue::Text(json_str(row, "input_path")?.into()),
+        SqliteValue::Text(json_str(row, "normalized_wav_path")?.into()),
+        SqliteValue::Text(json_str(row, "request_json")?.into()),
+        SqliteValue::Text(json_str(row, "result_json")?.into()),
+        SqliteValue::Text(json_str(row, "warnings_json")?.into()),
+        SqliteValue::Text(json_str(row, "transcript")?.into()),
+        SqliteValue::Text(json_string_or_default(row, "replay_json", "{}").into()),
+        SqliteValue::Text(json_string_or_default(row, "acceleration_json", "{}").into()),
+    ];
+    connection
+        .import_exec(
+            "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
+             normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            &cols,
+        )
+        .map_err(|error| FwError::Storage(format!("insert runs `{id}` failed: {error}")))?;
+
+    Ok(Some(cols))
+}
+
+/// Batched-import worker: one `WHERE id IN (…)` prefetch for the whole `chunk`,
+/// then [`apply_run_row`] per line in original order. An intra-chunk **seen-map**
+/// (the prefetched map, updated on every INSERT) reproduces the per-line invariant
+/// that a duplicate id later in the file sees the earlier line's insert. Drains
+/// `chunk`. Returns the number of lines processed (== `chunk` len on entry).
+fn flush_run_chunk(
+    connection: &Connection,
+    chunk: &mut Vec<(String, serde_json::Value)>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+    tracking: &mut RunImportTracking,
+) -> FwResult<u64> {
+    if chunk.is_empty() {
+        return Ok(0);
+    }
+
+    // Distinct ids for the IN clause (a duplicate id in the file → one bind).
+    let mut seen = HashSet::new();
+    let unique_ids: Vec<String> = chunk
+        .iter()
+        .map(|(id, _)| id.clone())
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    let placeholders = (1..=unique_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs WHERE id IN ({placeholders})"
+    );
+    let params: Vec<SqliteValue> = unique_ids
+        .iter()
+        .map(|id| SqliteValue::Text(id.clone().into()))
+        .collect();
+    let rows = connection
+        .query_with_params(&sql, &params)
+        .map_err(|error| FwError::Storage(format!("batch query runs existing failed: {error}")))?;
+
+    let mut existing_map: HashMap<String, Vec<SqliteValue>> = HashMap::with_capacity(rows.len());
+    for r in &rows {
+        let cols = run_row_to_cols(r);
+        existing_map.insert(value_to_string_sqlite(cols.first()), cols);
+    }
+
+    let mut count = 0u64;
+    for (id, row) in chunk.drain(..) {
+        let existing = existing_map.get(&id).cloned();
+        if let Some(inserted) = apply_run_row(
+            connection,
+            &id,
+            &row,
+            existing.as_deref(),
+            conflict_policy,
+            conflicts,
+            tracking,
+        )? {
+            existing_map.insert(id, inserted); // seen-map: later dup in chunk sees this insert
+        }
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// The 7 `segments` columns in `SELECT`/`INSERT` order — the shared "existing row"
+/// representation for [`apply_segment_row`] (see [`run_row_to_cols`]).
+fn segment_row_to_cols(row: &fsqlite::Row) -> Vec<SqliteValue> {
+    (0..7)
+        .map(|i| row.get(i).cloned().unwrap_or(SqliteValue::Null))
+        .collect()
+}
+
+/// Per-line bookkeeping for `import_segments` that is independent of where the
+/// "existing row" comes from — shared verbatim by the legacy and batched paths.
+#[derive(Default)]
+struct SegmentImportState {
+    imported_idx_by_run: HashMap<String, HashSet<i64>>,
+    imported_idx_by_overwritten_run: HashMap<String, HashSet<i64>>,
+    known_run_ids: HashSet<String>,
+}
+
+/// The per-line FK check + overwrite/imported idx tracking (runs before the
+/// existing-row lookup in both paths, so batching cannot change it).
+fn record_segment_pre(
+    connection: &Connection,
+    run_id: &str,
+    idx: i64,
+    key: &str,
+    conflict_policy: ConflictPolicy,
+    imported_run_ids: &HashSet<String>,
+    overwritten_run_ids: &HashSet<String>,
+    state: &mut SegmentImportState,
+) -> FwResult<()> {
+    ensure_run_reference_exists(
+        connection,
+        run_id,
+        "segments",
+        key,
+        &mut state.known_run_ids,
+    )?;
+    if conflict_policy == ConflictPolicy::Overwrite && overwritten_run_ids.contains(run_id) {
+        state
+            .imported_idx_by_overwritten_run
+            .entry(run_id.to_owned())
+            .or_default()
+            .insert(idx);
+    }
+    if conflict_policy.allows_child_row_mutation() && imported_run_ids.contains(run_id) {
+        state
+            .imported_idx_by_run
+            .entry(run_id.to_owned())
+            .or_default()
+            .insert(idx);
+    }
+    Ok(())
+}
+
+/// Apply one `segments` JSONL row against `existing` (current DB/seen row, or
+/// `None`). **Shared by the per-line and batched paths** ⇒ byte-identical imported
+/// rows. Returns `Some(inserted_cols)` when a row was INSERTed (so the batched
+/// caller can update its seen-map), else `None`.
+fn apply_segment_row(
+    connection: &Connection,
+    run_id: &str,
+    idx: i64,
+    key: &str,
+    row: &serde_json::Value,
+    existing: Option<&[SqliteValue]>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+) -> FwResult<Option<Vec<SqliteValue>>> {
+    if let Some(existing) = existing {
+        let identical = optional_floats_equal(
+            sqlite_to_optional_f64(existing.get(2)),
+            json_to_optional_f64(row, "start_sec"),
+        ) && optional_floats_equal(
+            sqlite_to_optional_f64(existing.get(3)),
+            json_to_optional_f64(row, "end_sec"),
+        ) && sqlite_to_optional_text(existing.get(4))
+            == json_to_optional_text(row, "speaker")
+            && value_to_string_sqlite(existing.get(5)) == json_str(row, "text")?
+            && optional_floats_equal(
+                sqlite_to_optional_f64(existing.get(6)),
+                json_to_optional_f64(row, "confidence"),
+            );
+
+        if identical {
+            return Ok(None);
+        }
+
+        match conflict_policy {
+            ConflictPolicy::Reject => {
+                conflicts.push(SyncConflict {
+                    table: "segments".to_owned(),
+                    key: key.to_owned(),
+                    reason: "duplicate composite key".to_owned(),
+                });
+                return Ok(None);
+            }
+            ConflictPolicy::Skip => {
+                return Ok(None);
+            }
+            ConflictPolicy::Overwrite => {
+                return Err(FwError::Storage(format!(
+                    "overwrite would require updating conflicting segment row `{run_id}/{idx}`, \
+                     but child-row UPDATE is unsupported in this runtime; \
+                     re-import into an empty target DB for strict replacement"
+                )));
+            }
+            ConflictPolicy::OverwriteStrict => {
+                connection
+                    .import_exec(
+                        "DELETE FROM segments WHERE run_id = ?1 AND idx = ?2",
+                        &[SqliteValue::Text(run_id.to_owned().into()), SqliteValue::Integer(idx)],
+                    )
+                    .map_err(|error| {
+                        FwError::Storage(format!(
+                            "strict overwrite delete conflicting segment `{run_id}/{idx}` failed: {error}"
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    let cols = vec![
+        SqliteValue::Text(run_id.to_owned().into()),
+        SqliteValue::Integer(idx),
+        json_optional_float(row, "start_sec"),
+        json_optional_float(row, "end_sec"),
+        json_optional_text(row, "speaker"),
+        SqliteValue::Text(json_str(row, "text")?.into()),
+        json_optional_float(row, "confidence"),
+    ];
+    connection
+        .import_exec(
+            "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &cols,
+        )
+        .map_err(|error| {
+            FwError::Storage(format!("insert segments `{run_id}/{idx}` failed: {error}"))
+        })?;
+
+    Ok(Some(cols))
+}
+
+/// Batched-import worker for `segments`: one `WHERE run_id IN (…)` prefetch for the
+/// whole chunk (composite `(run_id, idx)` keyed map — fsqlite has no row-value `IN`),
+/// then [`apply_segment_row`] per line in order. The prefetched map doubles as the
+/// intra-chunk seen-map (updated on every INSERT), reproducing the per-line invariant
+/// that a duplicate `(run_id, idx)` later in the file sees the earlier line's insert.
+/// Drains `chunk`. Returns the number of lines processed.
+fn flush_segment_chunk(
+    connection: &Connection,
+    chunk: &mut Vec<(String, i64, serde_json::Value)>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+    state: &mut SegmentImportState,
+    imported_run_ids: &HashSet<String>,
+    overwritten_run_ids: &HashSet<String>,
+) -> FwResult<u64> {
+    if chunk.is_empty() {
+        return Ok(0);
+    }
+
+    let mut seen = HashSet::new();
+    let unique_run_ids: Vec<String> = chunk
+        .iter()
+        .map(|(run_id, _, _)| run_id.clone())
+        .filter(|run_id| seen.insert(run_id.clone()))
+        .collect();
+    let placeholders = (1..=unique_run_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id IN ({placeholders})"
+    );
+    let params: Vec<SqliteValue> = unique_run_ids
+        .iter()
+        .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+        .collect();
+    let rows = connection
+        .query_with_params(&sql, &params)
+        .map_err(|error| {
+            FwError::Storage(format!("batch query segments existing failed: {error}"))
+        })?;
+
+    let mut existing_map: HashMap<(String, i64), Vec<SqliteValue>> = HashMap::new();
+    for r in &rows {
+        let cols = segment_row_to_cols(r);
+        let run_id = value_to_string_sqlite(cols.first());
+        if let Some(SqliteValue::Integer(idx)) = cols.get(1) {
+            existing_map.insert((run_id, *idx), cols);
+        }
+    }
+
+    let mut count = 0u64;
+    for (run_id, idx, row) in chunk.drain(..) {
+        let key = format!("{run_id}/{idx}");
+        record_segment_pre(
+            connection,
+            &run_id,
+            idx,
+            &key,
+            conflict_policy,
+            imported_run_ids,
+            overwritten_run_ids,
+            state,
+        )?;
+        let existing = existing_map.get(&(run_id.clone(), idx)).cloned();
+        if let Some(cols) = apply_segment_row(
+            connection,
+            &run_id,
+            idx,
+            &key,
+            &row,
+            existing.as_deref(),
+            conflict_policy,
+            conflicts,
+        )? {
+            existing_map.insert((run_id, idx), cols); // seen-map for intra-chunk dup
+        }
         count += 1;
     }
 
@@ -1232,142 +1717,312 @@ fn import_segments(
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut count = 0u64;
-    let mut imported_idx_by_run: HashMap<String, HashSet<i64>> = HashMap::new();
-    let mut imported_idx_by_overwritten_run: HashMap<String, HashSet<i64>> = HashMap::new();
-    let mut known_run_ids = HashSet::new();
+    let mut state = SegmentImportState::default();
 
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    if sync_batch_import_enabled() {
+        let chunk_size = sync_query_batch_size().max(1);
+        let mut chunk: Vec<(String, i64, serde_json::Value)> = Vec::with_capacity(chunk_size);
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let run_id = json_str(&row, "run_id")?;
+            let idx = row
+                .get("idx")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| FwError::Storage("missing idx in segments row".to_owned()))?;
+            chunk.push((run_id, idx, row));
+            if chunk.len() >= chunk_size {
+                count += flush_segment_chunk(
+                    connection,
+                    &mut chunk,
+                    conflict_policy,
+                    conflicts,
+                    &mut state,
+                    imported_run_ids,
+                    overwritten_run_ids,
+                )?;
+            }
         }
-
-        let row: serde_json::Value = serde_json::from_str(line)?;
-        let run_id = json_str(&row, "run_id")?;
-        let idx = row
-            .get("idx")
-            .and_then(|value| value.as_i64())
-            .ok_or_else(|| FwError::Storage("missing idx in segments row".to_owned()))?;
-
-        let key = format!("{run_id}/{idx}");
-        ensure_run_reference_exists(connection, &run_id, "segments", &key, &mut known_run_ids)?;
-        if conflict_policy == ConflictPolicy::Overwrite && overwritten_run_ids.contains(&run_id) {
-            imported_idx_by_overwritten_run
-                .entry(run_id.clone())
-                .or_default()
-                .insert(idx);
-        }
-        if conflict_policy.allows_child_row_mutation() && imported_run_ids.contains(&run_id) {
-            imported_idx_by_run
-                .entry(run_id.clone())
-                .or_default()
-                .insert(idx);
-        }
-
-        // Check existing
-        let existing = connection
-            .query_with_params(
-                "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id = ?1 AND idx = ?2",
-                &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(idx)],
-            )
-            .map_err(|error| {
-                FwError::Storage(format!(
-                    "query segments existing `{run_id}/{idx}` failed: {error}"
-                ))
-            })?;
-
-        if !existing.is_empty() {
-            let existing_row = &existing[0];
-            let identical = optional_floats_equal(
-                sqlite_to_optional_f64(existing_row.get(2)),
-                json_to_optional_f64(&row, "start_sec"),
-            ) && optional_floats_equal(
-                sqlite_to_optional_f64(existing_row.get(3)),
-                json_to_optional_f64(&row, "end_sec"),
-            ) && sqlite_to_optional_text(existing_row.get(4))
-                == json_to_optional_text(&row, "speaker")
-                && value_to_string_sqlite(existing_row.get(5)) == json_str(&row, "text")?
-                && optional_floats_equal(
-                    sqlite_to_optional_f64(existing_row.get(6)),
-                    json_to_optional_f64(&row, "confidence"),
-                );
-
-            if identical {
-                count += 1;
+        count += flush_segment_chunk(
+            connection,
+            &mut chunk,
+            conflict_policy,
+            conflicts,
+            &mut state,
+            imported_run_ids,
+            overwritten_run_ids,
+        )?;
+    } else {
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
                 continue;
             }
 
-            match conflict_policy {
-                ConflictPolicy::Reject => {
-                    conflicts.push(SyncConflict {
-                        table: "segments".to_owned(),
-                        key: key.clone(),
-                        reason: "duplicate composite key".to_owned(),
-                    });
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Skip => {
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Overwrite => {
-                    return Err(FwError::Storage(format!(
-                        "overwrite would require updating conflicting segment row `{run_id}/{idx}`, \
-                         but child-row UPDATE is unsupported in this runtime; \
-                         re-import into an empty target DB for strict replacement"
-                    )));
-                }
-                ConflictPolicy::OverwriteStrict => {
-                    connection
-                        .execute_with_params(
-                            "DELETE FROM segments WHERE run_id = ?1 AND idx = ?2",
-                            &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(idx)],
-                        )
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "strict overwrite delete conflicting segment `{run_id}/{idx}` failed: {error}"
-                            ))
-                        })?;
-                }
-            }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let run_id = json_str(&row, "run_id")?;
+            let idx = row
+                .get("idx")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| FwError::Storage("missing idx in segments row".to_owned()))?;
+
+            let key = format!("{run_id}/{idx}");
+            record_segment_pre(
+                connection,
+                &run_id,
+                idx,
+                &key,
+                conflict_policy,
+                imported_run_ids,
+                overwritten_run_ids,
+                &mut state,
+            )?;
+
+            let existing_rows = connection
+                .query_with_params(
+                    "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id = ?1 AND idx = ?2",
+                    &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(idx)],
+                )
+                .map_err(|error| {
+                    FwError::Storage(format!(
+                        "query segments existing `{run_id}/{idx}` failed: {error}"
+                    ))
+                })?;
+            let existing = existing_rows.first().map(segment_row_to_cols);
+            apply_segment_row(
+                connection,
+                &run_id,
+                idx,
+                &key,
+                &row,
+                existing.as_deref(),
+                conflict_policy,
+                conflicts,
+            )?;
+            count += 1;
         }
-
-        connection
-            .execute_with_params(
-                "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    SqliteValue::Text(run_id.clone().into()),
-                    SqliteValue::Integer(idx),
-                    json_optional_float(&row, "start_sec"),
-                    json_optional_float(&row, "end_sec"),
-                    json_optional_text(&row, "speaker"),
-                    SqliteValue::Text(json_str(&row, "text")?.into()),
-                    json_optional_float(&row, "confidence"),
-                ],
-            )
-            .map_err(|error| {
-                FwError::Storage(format!("insert segments `{run_id}/{idx}` failed: {error}"))
-            })?;
-
-        count += 1;
     }
 
     if conflict_policy == ConflictPolicy::Overwrite && !overwritten_run_ids.is_empty() {
         assert_no_stale_segments_for_overwritten_runs(
             overwritten_run_ids,
             overwritten_segment_idxs_before,
-            &imported_idx_by_overwritten_run,
+            &state.imported_idx_by_overwritten_run,
         )?;
     }
     if conflict_policy == ConflictPolicy::OverwriteStrict && !imported_run_ids.is_empty() {
         delete_stale_segments_for_strict_overwrite(
             connection,
             imported_run_ids,
-            &imported_idx_by_run,
+            &state.imported_idx_by_run,
         )?;
+    }
+
+    Ok(count)
+}
+
+/// The 7 `events` columns in `SELECT`/`INSERT` order (see [`segment_row_to_cols`]).
+fn event_row_to_cols(row: &fsqlite::Row) -> Vec<SqliteValue> {
+    (0..7)
+        .map(|i| row.get(i).cloned().unwrap_or(SqliteValue::Null))
+        .collect()
+}
+
+/// Per-line bookkeeping for `import_events` (mirror of [`SegmentImportState`]).
+#[derive(Default)]
+struct EventImportState {
+    imported_seq_by_run: HashMap<String, HashSet<i64>>,
+    imported_seq_by_overwritten_run: HashMap<String, HashSet<i64>>,
+    known_run_ids: HashSet<String>,
+}
+
+/// The per-line FK check + overwrite/imported seq tracking (mirror of
+/// [`record_segment_pre`]).
+fn record_event_pre(
+    connection: &Connection,
+    run_id: &str,
+    seq: i64,
+    key: &str,
+    conflict_policy: ConflictPolicy,
+    imported_run_ids: &HashSet<String>,
+    overwritten_run_ids: &HashSet<String>,
+    state: &mut EventImportState,
+) -> FwResult<()> {
+    ensure_run_reference_exists(connection, run_id, "events", key, &mut state.known_run_ids)?;
+    if conflict_policy == ConflictPolicy::Overwrite && overwritten_run_ids.contains(run_id) {
+        state
+            .imported_seq_by_overwritten_run
+            .entry(run_id.to_owned())
+            .or_default()
+            .insert(seq);
+    }
+    if conflict_policy.allows_child_row_mutation() && imported_run_ids.contains(run_id) {
+        state
+            .imported_seq_by_run
+            .entry(run_id.to_owned())
+            .or_default()
+            .insert(seq);
+    }
+    Ok(())
+}
+
+/// Apply one `events` JSONL row against `existing` (mirror of [`apply_segment_row`];
+/// the compare is all-TEXT). Returns `Some(inserted_cols)` when INSERTed, else `None`.
+fn apply_event_row(
+    connection: &Connection,
+    run_id: &str,
+    seq: i64,
+    key: &str,
+    row: &serde_json::Value,
+    existing: Option<&[SqliteValue]>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+) -> FwResult<Option<Vec<SqliteValue>>> {
+    if let Some(existing) = existing {
+        let identical = value_to_string_sqlite(existing.get(2)) == json_str(row, "ts_rfc3339")?
+            && value_to_string_sqlite(existing.get(3)) == json_str(row, "stage")?
+            && value_to_string_sqlite(existing.get(4)) == json_str(row, "code")?
+            && value_to_string_sqlite(existing.get(5)) == json_str(row, "message")?
+            && value_to_string_sqlite(existing.get(6)) == json_str(row, "payload_json")?;
+        if identical {
+            return Ok(None);
+        }
+
+        match conflict_policy {
+            ConflictPolicy::Reject => {
+                conflicts.push(SyncConflict {
+                    table: "events".to_owned(),
+                    key: key.to_owned(),
+                    reason: "duplicate composite key".to_owned(),
+                });
+                return Ok(None);
+            }
+            ConflictPolicy::Skip => {
+                return Ok(None);
+            }
+            ConflictPolicy::Overwrite => {
+                return Err(FwError::Storage(format!(
+                    "overwrite would require updating conflicting event row `{run_id}/{seq}`, \
+                     but child-row UPDATE is unsupported in this runtime; \
+                     re-import into an empty target DB for strict replacement"
+                )));
+            }
+            ConflictPolicy::OverwriteStrict => {
+                connection
+                    .import_exec(
+                        "DELETE FROM events WHERE run_id = ?1 AND seq = ?2",
+                        &[SqliteValue::Text(run_id.to_owned().into()), SqliteValue::Integer(seq)],
+                    )
+                    .map_err(|error| {
+                        FwError::Storage(format!(
+                            "strict overwrite delete conflicting event `{run_id}/{seq}` failed: {error}"
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    let cols = vec![
+        SqliteValue::Text(run_id.to_owned().into()),
+        SqliteValue::Integer(seq),
+        SqliteValue::Text(json_str(row, "ts_rfc3339")?.into()),
+        SqliteValue::Text(json_str(row, "stage")?.into()),
+        SqliteValue::Text(json_str(row, "code")?.into()),
+        SqliteValue::Text(json_str(row, "message")?.into()),
+        SqliteValue::Text(json_str(row, "payload_json")?.into()),
+    ];
+    connection
+        .import_exec(
+            "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &cols,
+        )
+        .map_err(|error| {
+            FwError::Storage(format!("insert events `{run_id}/{seq}` failed: {error}"))
+        })?;
+
+    Ok(Some(cols))
+}
+
+/// Batched-import worker for `events` (mirror of [`flush_segment_chunk`]; composite
+/// `(run_id, seq)` key, prefetched by `run_id`, seen-map for intra-chunk dups).
+fn flush_event_chunk(
+    connection: &Connection,
+    chunk: &mut Vec<(String, i64, serde_json::Value)>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+    state: &mut EventImportState,
+    imported_run_ids: &HashSet<String>,
+    overwritten_run_ids: &HashSet<String>,
+) -> FwResult<u64> {
+    if chunk.is_empty() {
+        return Ok(0);
+    }
+
+    let mut seen = HashSet::new();
+    let unique_run_ids: Vec<String> = chunk
+        .iter()
+        .map(|(run_id, _, _)| run_id.clone())
+        .filter(|run_id| seen.insert(run_id.clone()))
+        .collect();
+    let placeholders = (1..=unique_run_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id IN ({placeholders})"
+    );
+    let params: Vec<SqliteValue> = unique_run_ids
+        .iter()
+        .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+        .collect();
+    let rows = connection
+        .query_with_params(&sql, &params)
+        .map_err(|error| {
+            FwError::Storage(format!("batch query events existing failed: {error}"))
+        })?;
+
+    let mut existing_map: HashMap<(String, i64), Vec<SqliteValue>> = HashMap::new();
+    for r in &rows {
+        let cols = event_row_to_cols(r);
+        let run_id = value_to_string_sqlite(cols.first());
+        if let Some(SqliteValue::Integer(seq)) = cols.get(1) {
+            existing_map.insert((run_id, *seq), cols);
+        }
+    }
+
+    let mut count = 0u64;
+    for (run_id, seq, row) in chunk.drain(..) {
+        let key = format!("{run_id}/{seq}");
+        record_event_pre(
+            connection,
+            &run_id,
+            seq,
+            &key,
+            conflict_policy,
+            imported_run_ids,
+            overwritten_run_ids,
+            state,
+        )?;
+        let existing = existing_map.get(&(run_id.clone(), seq)).cloned();
+        if let Some(cols) = apply_event_row(
+            connection,
+            &run_id,
+            seq,
+            &key,
+            &row,
+            existing.as_deref(),
+            conflict_policy,
+            conflicts,
+        )? {
+            existing_map.insert((run_id, seq), cols); // seen-map for intra-chunk dup
+        }
+        count += 1;
     }
 
     Ok(count)
@@ -1385,130 +2040,107 @@ fn import_events(
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut count = 0u64;
-    let mut imported_seq_by_run: HashMap<String, HashSet<i64>> = HashMap::new();
-    let mut imported_seq_by_overwritten_run: HashMap<String, HashSet<i64>> = HashMap::new();
-    let mut known_run_ids = HashSet::new();
+    let mut state = EventImportState::default();
 
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    if sync_batch_import_enabled() {
+        let chunk_size = sync_query_batch_size().max(1);
+        let mut chunk: Vec<(String, i64, serde_json::Value)> = Vec::with_capacity(chunk_size);
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let run_id = json_str(&row, "run_id")?;
+            let seq = row
+                .get("seq")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| FwError::Storage("missing seq in events row".to_owned()))?;
+            chunk.push((run_id, seq, row));
+            if chunk.len() >= chunk_size {
+                count += flush_event_chunk(
+                    connection,
+                    &mut chunk,
+                    conflict_policy,
+                    conflicts,
+                    &mut state,
+                    imported_run_ids,
+                    overwritten_run_ids,
+                )?;
+            }
         }
-
-        let row: serde_json::Value = serde_json::from_str(line)?;
-        let run_id = json_str(&row, "run_id")?;
-        let seq = row
-            .get("seq")
-            .and_then(|value| value.as_i64())
-            .ok_or_else(|| FwError::Storage("missing seq in events row".to_owned()))?;
-
-        let key = format!("{run_id}/{seq}");
-        ensure_run_reference_exists(connection, &run_id, "events", &key, &mut known_run_ids)?;
-        if conflict_policy == ConflictPolicy::Overwrite && overwritten_run_ids.contains(&run_id) {
-            imported_seq_by_overwritten_run
-                .entry(run_id.clone())
-                .or_default()
-                .insert(seq);
-        }
-        if conflict_policy.allows_child_row_mutation() && imported_run_ids.contains(&run_id) {
-            imported_seq_by_run
-                .entry(run_id.clone())
-                .or_default()
-                .insert(seq);
-        }
-
-        let existing = connection
-            .query_with_params(
-                "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id = ?1 AND seq = ?2",
-                &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(seq)],
-            )
-            .map_err(|error| {
-                FwError::Storage(format!("query events existing `{run_id}/{seq}` failed: {error}"))
-            })?;
-
-        if !existing.is_empty() {
-            let existing_row = &existing[0];
-            let identical = value_to_string_sqlite(existing_row.get(2))
-                == json_str(&row, "ts_rfc3339")?
-                && value_to_string_sqlite(existing_row.get(3)) == json_str(&row, "stage")?
-                && value_to_string_sqlite(existing_row.get(4)) == json_str(&row, "code")?
-                && value_to_string_sqlite(existing_row.get(5)) == json_str(&row, "message")?
-                && value_to_string_sqlite(existing_row.get(6)) == json_str(&row, "payload_json")?;
-            if identical {
-                count += 1;
+        count += flush_event_chunk(
+            connection,
+            &mut chunk,
+            conflict_policy,
+            conflicts,
+            &mut state,
+            imported_run_ids,
+            overwritten_run_ids,
+        )?;
+    } else {
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
                 continue;
             }
 
-            match conflict_policy {
-                ConflictPolicy::Reject => {
-                    conflicts.push(SyncConflict {
-                        table: "events".to_owned(),
-                        key: key.clone(),
-                        reason: "duplicate composite key".to_owned(),
-                    });
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Skip => {
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Overwrite => {
-                    return Err(FwError::Storage(format!(
-                        "overwrite would require updating conflicting event row `{run_id}/{seq}`, \
-                         but child-row UPDATE is unsupported in this runtime; \
-                         re-import into an empty target DB for strict replacement"
-                    )));
-                }
-                ConflictPolicy::OverwriteStrict => {
-                    connection
-                        .execute_with_params(
-                            "DELETE FROM events WHERE run_id = ?1 AND seq = ?2",
-                            &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(seq)],
-                        )
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "strict overwrite delete conflicting event `{run_id}/{seq}` failed: {error}"
-                            ))
-                        })?;
-                }
-            }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let run_id = json_str(&row, "run_id")?;
+            let seq = row
+                .get("seq")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| FwError::Storage("missing seq in events row".to_owned()))?;
+
+            let key = format!("{run_id}/{seq}");
+            record_event_pre(
+                connection,
+                &run_id,
+                seq,
+                &key,
+                conflict_policy,
+                imported_run_ids,
+                overwritten_run_ids,
+                &mut state,
+            )?;
+
+            let existing_rows = connection
+                .query_with_params(
+                    "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id = ?1 AND seq = ?2",
+                    &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(seq)],
+                )
+                .map_err(|error| {
+                    FwError::Storage(format!("query events existing `{run_id}/{seq}` failed: {error}"))
+                })?;
+            let existing = existing_rows.first().map(event_row_to_cols);
+            apply_event_row(
+                connection,
+                &run_id,
+                seq,
+                &key,
+                &row,
+                existing.as_deref(),
+                conflict_policy,
+                conflicts,
+            )?;
+            count += 1;
         }
-
-        connection
-            .execute_with_params(
-                "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    SqliteValue::Text(run_id.clone().into()),
-                    SqliteValue::Integer(seq),
-                    SqliteValue::Text(json_str(&row, "ts_rfc3339")?.into()),
-                    SqliteValue::Text(json_str(&row, "stage")?.into()),
-                    SqliteValue::Text(json_str(&row, "code")?.into()),
-                    SqliteValue::Text(json_str(&row, "message")?.into()),
-                    SqliteValue::Text(json_str(&row, "payload_json")?.into()),
-                ],
-            )
-            .map_err(|error| {
-                FwError::Storage(format!("insert events `{run_id}/{seq}` failed: {error}"))
-            })?;
-
-        count += 1;
     }
 
     if conflict_policy == ConflictPolicy::Overwrite && !overwritten_run_ids.is_empty() {
         assert_no_stale_events_for_overwritten_runs(
             overwritten_run_ids,
             overwritten_event_seqs_before,
-            &imported_seq_by_overwritten_run,
+            &state.imported_seq_by_overwritten_run,
         )?;
     }
     if conflict_policy == ConflictPolicy::OverwriteStrict && !imported_run_ids.is_empty() {
         delete_stale_events_for_strict_overwrite(
             connection,
             imported_run_ids,
-            &imported_seq_by_run,
+            &state.imported_seq_by_run,
         )?;
     }
 
@@ -1582,7 +2214,7 @@ fn delete_stale_segments_for_strict_overwrite(
                 continue;
             }
             connection
-                .execute_with_params(
+                .import_exec(
                     "DELETE FROM segments WHERE run_id = ?1 AND idx = ?2",
                     &[
                         SqliteValue::Text(run_id.clone().into()),
@@ -1614,7 +2246,7 @@ fn delete_stale_events_for_strict_overwrite(
                 continue;
             }
             connection
-                .execute_with_params(
+                .import_exec(
                     "DELETE FROM events WHERE run_id = ?1 AND seq = ?2",
                     &[
                         SqliteValue::Text(run_id.clone().into()),
@@ -1870,10 +2502,51 @@ fn sync_parent_dir(path: &Path) -> FwResult<()> {
     Ok(())
 }
 
+/// A `Write` adapter that streams every byte through SHA-256 as it forwards them to
+/// the inner writer. Lets the full-export writers compute each JSONL's checksum while
+/// writing it — avoiding a second full pass to re-read the file (`sha256_file`). The
+/// digest equals `sha256_file` of the written bytes exactly (same bytes, same hash).
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        format!("{:x}", self.hasher.finalize())
+    }
+
+    fn get_ref(&self) -> &W {
+        &self.inner
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn sha256_file(path: &Path) -> FwResult<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
+    // 64 KiB read buffer (matches the native-engine hasher): 8× fewer `read()`
+    // syscalls than the previous 8 KiB when checksumming large export/import JSONL.
+    // Same SHA regardless of chunk size.
+    let mut buf = [0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buf)?;
         if read == 0 {
@@ -2241,9 +2914,16 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
     let db_segment_count = count_table(&connection, "segments")?;
     let db_event_count = count_table(&connection, "events")?;
 
-    // --- Read JSONL run IDs ---
+    // --- Read JSONL runs ONCE (the map + the id set) ---
+    // `runs.jsonl` was previously read twice — `collect_jsonl_ids` here and
+    // `load_jsonl_run_map` later. Load the map once and derive the id set from its
+    // keys: both include exactly the lines with a string `id` (skipping empty lines,
+    // parsing every line), so `map.keys()` == `collect_jsonl_ids(runs, "id")` and the
+    // parse-error behavior is identical (runs.jsonl is the only JSON-parsed file;
+    // segments/events use `count_jsonl_lines`, which does not parse).
     let runs_path = resolve_jsonl_path(jsonl_dir, "runs");
-    let jsonl_run_ids = collect_jsonl_ids(&runs_path, "id")?;
+    let jsonl_run_map = load_jsonl_run_map(&runs_path)?;
+    let jsonl_run_ids: HashSet<String> = jsonl_run_map.keys().cloned().collect();
 
     // --- Count JSONL segments and events ---
     let segments_path = resolve_jsonl_path(jsonl_dir, "segments");
@@ -2261,21 +2941,43 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
     missing_from_db.sort();
 
     // --- Compare record content for shared run IDs ---
-    let shared_ids: HashSet<&String> = db_run_ids.intersection(&jsonl_run_ids).collect();
-    let jsonl_run_map = load_jsonl_run_map(&runs_path)?;
+    // (`jsonl_run_map` already loaded above — no second read of runs.jsonl.)
+    let shared_ids: Vec<&String> = db_run_ids.intersection(&jsonl_run_ids).collect();
     let mut mismatched_records: Vec<String> = Vec::new();
 
-    for id in &shared_ids {
-        let db_rows = connection
-            .query_with_params(
-                "SELECT id, started_at, finished_at, backend, input_path, \
-                 normalized_wav_path, request_json, result_json, warnings_json, \
-                 transcript, replay_json, acceleration_json FROM runs WHERE id = ?1",
-                &[SqliteValue::Text((*id).clone().into())],
-            )
+    // Prefetch the DB rows for all shared ids with one `WHERE id IN (…)` per chunk
+    // instead of one `SELECT … WHERE id = ?1` per shared run (query *setup* dominates
+    // the single-row lookups) — the read-only mirror of the import N+1 batch. Byte-
+    // identical: the compare is unchanged and `mismatched_records` is sorted below, so
+    // fetch order is irrelevant. `FW_SYNC_BATCH_QUERY=0` (chunk 1) restores the legacy
+    // per-id N+1. `shared_ids` ⊆ `db_run_ids`, so every id resolves in the map.
+    let mut db_run_map: HashMap<String, Vec<SqliteValue>> =
+        HashMap::with_capacity(shared_ids.len());
+    for chunk in shared_ids.chunks(sync_query_batch_size().max(1)) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, started_at, finished_at, backend, input_path, \
+             normalized_wav_path, request_json, result_json, warnings_json, \
+             transcript, replay_json, acceleration_json FROM runs WHERE id IN ({placeholders})"
+        );
+        let params: Vec<SqliteValue> = chunk
+            .iter()
+            .map(|id| SqliteValue::Text((**id).clone().into()))
+            .collect();
+        let rows = connection
+            .query_with_params(&sql, &params)
             .map_err(|error| FwError::Storage(error.to_string()))?;
+        for row in &rows {
+            let cols = run_row_to_cols(row);
+            db_run_map.insert(value_to_string_sqlite(cols.first()), cols);
+        }
+    }
 
-        if let Some(db_row) = db_rows.first()
+    for id in &shared_ids {
+        if let Some(db_row) = db_run_map.get(*id)
             && let Some(jsonl_value) = jsonl_run_map.get(*id)
         {
             let matches = value_to_string_sqlite(db_row.get(1))
@@ -2355,6 +3057,12 @@ fn count_table(connection: &Connection, table: &str) -> FwResult<u64> {
 }
 
 /// Collect all values of a given string `key` from a JSONL file into a set.
+///
+/// Test-only since `7632a2b` removed the production caller (`validate_sync` now
+/// uses `load_jsonl_run_map().keys()` for the same set — a single read instead of
+/// two); kept as the equivalence reference exercised by the `collect_jsonl_ids_*`
+/// unit tests. `#[cfg(test)]` so a non-test build doesn't warn dead_code.
+#[cfg(test)]
 fn collect_jsonl_ids(path: &Path, key: &str) -> FwResult<HashSet<String>> {
     if !path.exists() {
         return Ok(HashSet::new());
@@ -2468,10 +3176,17 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::model::{
-        BackendKind, BackendParams, InputSource, RunEvent, RunReport, TranscribeRequest,
-        TranscriptionResult, TranscriptionSegment,
+        BackendKind, BackendParams, DiarizationEngine, DiarizationFallbackStatus,
+        DiarizationReport, DiarizationRequest, DiarizationTurn, InputSource, KnownSpeakerInterval,
+        KnownSpeakerPolicy, RunEvent, RunReport, SpeakerCountCalibrationStatus,
+        SpeakerCountEstimate, SpeakerCountEvidenceLane, SpeakerCountLaneEvidence,
+        SpeakerCountLaneUnavailableReason, SpeakerCountOutcome, SpeakerCountOutcomeReason,
+        SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange,
+        SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
+        SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
+        SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
     };
-    use crate::storage::RunStore;
+    use crate::storage::{BlockingConnection, RunStore};
 
     use super::*;
 
@@ -2598,6 +3313,7 @@ mod tests {
                     },
                 ],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({"test": true}),
                 artifact_paths: vec!["out.json".to_owned()],
             },
@@ -2628,6 +3344,221 @@ mod tests {
                 output_payload_hash: Some("sync-output-hash".to_owned()),
             },
         }
+    }
+
+    fn attach_fixture_diarization(report: &mut RunReport) {
+        report.request.diarize = true;
+        report.request.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            speaker_count: SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 2,
+            },
+            known_intervals: vec![KnownSpeakerInterval {
+                speaker_ref: "speaker_a".to_owned(),
+                start_ms: 0,
+                end_ms: 2_000,
+                confidence: 0.92,
+                policy: KnownSpeakerPolicy::SoftEnrollment,
+                provenance: Some("synthetic_sync_fixture".to_owned()),
+            }],
+            ..DiarizationRequest::default()
+        });
+        report.result.diarization = Some(DiarizationReport {
+            implementation: "native-acoustic-v2".to_owned(),
+            contract_version: "acoustic-diarization-v2".to_owned(),
+            feature_schema: "acoustic-feature-v1".to_owned(),
+            normalized_input_sha256:
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            hint_document_sha256: Some(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            ),
+            turns: vec![DiarizationTurn {
+                start_ms: 0,
+                end_ms: 2_000,
+                speaker_ref: Some("speaker_a".to_owned()),
+                speaker_confidence: Some(0.9),
+                change_confidence: Some(0.82),
+                overlap_suspected: false,
+                hard_hint_attributed: false,
+            }],
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "speaker_a".to_owned(),
+                frame_count: 180,
+                voiced_duration_ms: 1_800,
+                reliability: 0.88,
+                voice_profile_count: 1,
+                channel_profile_count: 1,
+                training_accepted_count: 1,
+                training_downweighted_count: 0,
+                training_quarantined_count: 0,
+                anchored: true,
+                soft_hint_contradiction: Some(0.04),
+            }],
+            hint_evidence: vec![SpeakerHintEvidenceSummary {
+                hint_index: 0,
+                speaker_ref: "speaker_a".to_owned(),
+                policy: KnownSpeakerPolicy::SoftEnrollment,
+                disposition: SpeakerHintDisposition::PartiallyAccepted,
+                usable_tracklet_count: 3,
+                accepted_tracklet_count: 2,
+                rejected_tracklet_count: 1,
+                profile_accepted_tracklet_count: 1,
+                profile_downweighted_tracklet_count: 1,
+                profile_quarantined_tracklet_count: 0,
+                applied_weight: 20.0,
+                contradiction_score: Some(0.04),
+            }],
+            speaker_queries: Vec::new(),
+            speaker_count: SpeakerCountOutcome {
+                request: SpeakerCountRequest::Range {
+                    minimum: 1,
+                    maximum: 2,
+                },
+                estimate: Some(synthetic_speaker_count_estimate()),
+                status: SpeakerCountOutcomeStatus::Resolved,
+                supported_speaker_count: 1,
+                active_speaker_refs: vec!["speaker_a".to_owned()],
+                dominant_speaker_share: 1.0,
+                unknown_voiced_share: 0.1,
+                reasons: vec![SpeakerCountOutcomeReason::EvidenceSupportedCount],
+                speaker_evidence: vec![SpeakerEvidenceSummary {
+                    speaker_ref: "speaker_a".to_owned(),
+                    assigned_tracklet_count: 3,
+                    independent_tracklet_count: 2,
+                    recurrence_episode_count: 2,
+                    voiced_frame_count: 180,
+                    independent_voiced_frame_count: 120,
+                    voiced_duration_ms: 1_800,
+                    mean_assignment_confidence: 0.9,
+                    profile_reliability: 0.88,
+                    hard_anchored: false,
+                    separated_from_supported_speakers: true,
+                    reasons: vec![SpeakerEvidenceReason::SupportedByIndependentRecurrence],
+                    supported: true,
+                }],
+            },
+            fallback_status: DiarizationFallbackStatus::NotNeeded,
+            diagnostics: vec!["synthetic sync fixture".to_owned()],
+        });
+        report.result.raw_output = json!({
+            "engine": "whisper.cpp-native",
+            "projection_timeline": {
+                "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                "unit": "seconds",
+                "interval_semantics": "half_open",
+                "timestamp_epsilon_sec": crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC,
+                "minimum_duration_sec": crate::conformance::CANONICAL_PROJECTION_MIN_DURATION_SEC,
+                "input_engine_segments": 2,
+                "input_timed_segments": 2,
+                "canonical_units": 2,
+                "output_segments": 2,
+                "decoder_word_units": 2,
+                "interpolated_fallback_units": 0,
+                "segment_geometry_fallback_units": 0,
+                "interpolated_fallback_segments": 0,
+                "segment_geometry_fallback_segments": 0,
+                "clamped_units": 0,
+                "expanded_units": 0,
+                "fallback_reasons": [],
+                "word_aligned_safe": true,
+                "supported_provenance": [
+                    "decoder_word_timestamp",
+                    "segment_interpolation_fallback",
+                    "segment_geometry_fallback"
+                ]
+            }
+        });
+    }
+
+    fn synthetic_speaker_count_estimate() -> SpeakerCountEstimate {
+        let first_probability = 0.7_f64;
+        let second_probability = 0.15_f64;
+        let unresolved_probability = 0.15_f64;
+        let estimate = SpeakerCountEstimate {
+            schema_version: "speaker-count-estimate-v2".to_owned(),
+            selected_count: Some(1),
+            supported_range: Some(SpeakerCountRange {
+                minimum: 1,
+                maximum: 2,
+            }),
+            posterior: vec![
+                SpeakerCountPosteriorBin {
+                    count: 1,
+                    probability: first_probability,
+                },
+                SpeakerCountPosteriorBin {
+                    count: 2,
+                    probability: second_probability,
+                },
+            ],
+            unresolved_probability,
+            entropy_bits: -first_probability * first_probability.log2()
+                - second_probability * second_probability.log2()
+                - unresolved_probability * unresolved_probability.log2(),
+            stability: 0.8,
+            constraint_lower_bound: 1,
+            candidate_upper_bound: 2,
+            calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            calibration_sha256: "c".repeat(64),
+            evidence_sha256: "d".repeat(64),
+            lanes: vec![
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::MergeRisk,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.8,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::SparseNormalizedEigengap,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.65,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::FeatureJackknife,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.8,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::EffectiveOccupancy,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.88,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::ConstraintGraph,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 1.0,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::CallerPrior,
+                    available: false,
+                    proposed_count: None,
+                    confidence: 0.0,
+                    unavailable_reason: Some(SpeakerCountLaneUnavailableReason::NotRequested),
+                },
+            ],
+            resources: SpeakerCountResourceSummary {
+                prototype_count: 2,
+                affinity_pair_evaluations: 2,
+                retained_sparse_edges: 1,
+                estimated_peak_buffer_bytes: 512,
+                stability_replicates: 5,
+                solver_iterations: 8,
+                solver_sparse_matvec_terms: 128,
+                solver_residual: Some(1.0e-8),
+            },
+        };
+        estimate.validate().expect("synthetic count estimate");
+        estimate
     }
 
     fn test_cursor(ts: &str, run_id: Option<&str>) -> SyncCursor {
@@ -2714,6 +3645,244 @@ mod tests {
         assert_eq!(
             details.replay.output_payload_hash.as_deref(),
             Some("sync-output-hash")
+        );
+    }
+
+    #[test]
+    fn diarization_round_trip_rebuilds_normalized_index() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let target_db = dir.path().join("target.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let source_store = RunStore::open(&source_db).expect("source store");
+        let mut report = fixture_report("run-diarization-sync", &source_db);
+        attach_fixture_diarization(&mut report);
+        source_store
+            .persist_report(&report)
+            .expect("diarization report should persist");
+
+        export(&source_db, &export_dir, &state_root).expect("export");
+        import(&target_db, &export_dir, &state_root, ConflictPolicy::Reject).expect("import");
+
+        let target =
+            BlockingConnection::open(target_db.display().to_string()).expect("target connection");
+        for table in [
+            "diarization_reports",
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+        ] {
+            let rows = target
+                .query(&format!("SELECT COUNT(*) FROM {table};"))
+                .expect("normalized index count");
+            assert_eq!(
+                value_to_string_sqlite(rows[0].get(0)),
+                "1",
+                "{table} should be rebuilt from canonical runs JSONL"
+            );
+        }
+
+        let canonical = target
+            .query(
+                "SELECT request_json, result_json FROM runs \
+                 WHERE id = 'run-diarization-sync';",
+            )
+            .expect("canonical run row");
+        let request: TranscribeRequest =
+            serde_json::from_str(&value_to_string_sqlite(canonical[0].get(0)))
+                .expect("typed request should survive JSONL");
+        let result: TranscriptionResult =
+            serde_json::from_str(&value_to_string_sqlite(canonical[0].get(1)))
+                .expect("typed result should survive JSONL");
+        assert_eq!(
+            request
+                .backend_params
+                .acoustic_diarization
+                .as_ref()
+                .map(|request| request.engine),
+            Some(DiarizationEngine::Acoustic)
+        );
+        assert_eq!(
+            result
+                .diarization
+                .as_ref()
+                .map(|report| report.implementation.as_str()),
+            Some("native-acoustic-v2")
+        );
+        let recovered_request = request
+            .backend_params
+            .acoustic_diarization
+            .as_ref()
+            .expect("typed diarization request");
+        assert_eq!(
+            recovered_request.speaker_count,
+            SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 2
+            }
+        );
+        let recovered_report = result
+            .diarization
+            .as_ref()
+            .expect("typed diarization result");
+        assert_eq!(
+            recovered_report.speaker_count.status,
+            SpeakerCountOutcomeStatus::Resolved
+        );
+        assert_eq!(
+            recovered_report.speaker_count.reasons,
+            vec![SpeakerCountOutcomeReason::EvidenceSupportedCount]
+        );
+        let recovered_estimate = recovered_report
+            .speaker_count
+            .estimate
+            .as_ref()
+            .expect("speaker-count estimate should survive JSONL recovery");
+        recovered_estimate
+            .validate()
+            .expect("recovered speaker-count estimate should remain valid");
+        assert_eq!(
+            recovered_estimate.schema_version,
+            "speaker-count-estimate-v2"
+        );
+        assert_eq!(recovered_estimate.selected_count, Some(1));
+        assert_eq!(recovered_estimate.posterior.len(), 2);
+        assert_eq!(recovered_estimate.resources.prototype_count, 2);
+        assert_eq!(recovered_estimate.resources.retained_sparse_edges, 1);
+        assert_eq!(recovered_estimate.resources.solver_residual, Some(1.0e-8));
+        assert_eq!(
+            recovered_report.hint_evidence[0].disposition,
+            SpeakerHintDisposition::PartiallyAccepted
+        );
+        assert!(
+            !value_to_string_sqlite(canonical[0].get(1)).contains("feature_vector"),
+            "canonical JSONL payload must not acquire reusable biometric vectors"
+        );
+
+        let recovered = RunStore::open(&target_db)
+            .expect("recovered store")
+            .load_run_details("run-diarization-sync")
+            .expect("recovered details query")
+            .expect("recovered details");
+        assert_eq!(
+            recovered
+                .diarization
+                .as_ref()
+                .map(|report| report.turns.as_slice()),
+            report
+                .result
+                .diarization
+                .as_ref()
+                .map(|report| report.turns.as_slice()),
+            "typed speaker turns must survive SQLite -> JSONL -> fresh SQLite"
+        );
+        let recovered_entropy = recovered
+            .diarization
+            .as_ref()
+            .and_then(|report| report.speaker_count.estimate.as_ref())
+            .map(|estimate| estimate.entropy_bits)
+            .expect("recovered speaker-count entropy");
+        let mut expected_diarization = report.result.diarization.clone();
+        let expected_entropy = expected_diarization
+            .as_ref()
+            .and_then(|report| report.speaker_count.estimate.as_ref())
+            .map(|estimate| estimate.entropy_bits)
+            .expect("expected speaker-count entropy");
+        let entropy_tolerance = 4.0 * f64::EPSILON * expected_entropy.abs().max(1.0);
+        assert!(
+            (recovered_entropy - expected_entropy).abs() <= entropy_tolerance,
+            "derived speaker-count entropy must survive JSON numeric normalization within \
+             floating-point roundoff: recovered={recovered_entropy}, expected={expected_entropy}"
+        );
+        expected_diarization
+            .as_mut()
+            .and_then(|report| report.speaker_count.estimate.as_mut())
+            .expect("expected speaker-count estimate")
+            .entropy_bits = recovered_entropy;
+        assert_eq!(
+            recovered.diarization, expected_diarization,
+            "count mode, reasons, occupancy evidence, hint dispositions, and fallback status must \
+             survive SQLite -> JSONL -> fresh SQLite exactly apart from derived-float roundoff"
+        );
+        assert_eq!(
+            recovered
+                .projection_timeline
+                .as_ref()
+                .expect("recovered projection timeline"),
+            &report.result.raw_output["projection_timeline"],
+            "projection provenance must survive recovery without drift"
+        );
+        assert!(
+            !serde_json::to_string(&recovered.projection_timeline)
+                .expect("serialize recovered projection timeline")
+                .contains("feature_vector"),
+            "recovered projection metadata must remain privacy-safe"
+        );
+    }
+
+    #[test]
+    fn diarization_rebuild_failure_rolls_back_canonical_import() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let target_db = dir.path().join("target.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let source_store = RunStore::open(&source_db).expect("source store");
+        let mut report = fixture_report("run-invalid-diarization-import", &source_db);
+        attach_fixture_diarization(&mut report);
+        source_store.persist_report(&report).expect("persist");
+        export(&source_db, &export_dir, &state_root).expect("export");
+
+        let runs_path = export_dir.join("runs.jsonl");
+        let line = fs::read_to_string(&runs_path).expect("runs jsonl");
+        let mut row: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("canonical run row");
+        let mut result: serde_json::Value = serde_json::from_str(
+            row["result_json"]
+                .as_str()
+                .expect("embedded result JSON string"),
+        )
+        .expect("embedded result JSON");
+        result["diarization"] = json!({"invalid": true});
+        row["result_json"] = json!(serde_json::to_string(&result).expect("serialize result"));
+        fs::write(
+            &runs_path,
+            format!("{}\n", serde_json::to_string(&row).expect("serialize row")),
+        )
+        .expect("rewrite runs JSONL");
+
+        let manifest_path = export_dir.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).expect("manifest"))
+                .expect("manifest JSON");
+        manifest["checksums"]["runs_jsonl_sha256"] =
+            json!(sha256_file(&runs_path).expect("runs checksum"));
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("rewrite manifest");
+
+        let error = import(&target_db, &export_dir, &state_root, ConflictPolicy::Reject)
+            .expect_err("invalid derived payload must abort the whole import");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot rebuild diarization report")
+        );
+
+        let target =
+            BlockingConnection::open(target_db.display().to_string()).expect("target connection");
+        let rows = target
+            .query("SELECT COUNT(*) FROM runs;")
+            .expect("canonical run count");
+        assert_eq!(
+            value_to_string_sqlite(rows[0].get(0)),
+            "0",
+            "canonical rows must roll back with the derived-index rebuild"
         );
     }
 
@@ -5167,7 +6336,7 @@ mod tests {
         let export_dir = dir.path().join("export");
         let state_root = dir.path().join("state");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = Connection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, \
              finished_at TEXT NOT NULL, backend TEXT NOT NULL, input_path TEXT NOT NULL, \
@@ -5733,7 +6902,7 @@ mod tests {
         // DB has runs + events tables but NO segments → should fail on iteration 2.
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("no_segments.sqlite3");
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = Connection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, \
              finished_at TEXT NOT NULL, backend TEXT NOT NULL, input_path TEXT NOT NULL, \
@@ -7603,6 +8772,45 @@ mod tests {
     }
 
     #[test]
+    fn incremental_export_multi_run_batched_round_trips() {
+        // Exercises the batched `WHERE run_id IN (…)` path in
+        // export_table_{segments,events}_for_runs with MULTIPLE run_ids in one export
+        // (the single-run incremental tests never hit the multi-param IN clause), and
+        // verifies a full export→import round-trip so the cross-run grouping preserves
+        // every segment/event.
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("multi.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        for i in 0..3 {
+            let report = fixture_report(&format!("multi-{i}"), &db_path);
+            store.persist_report(&report).expect("persist");
+        }
+
+        let manifest =
+            export_incremental(&db_path, &export_dir, &state_root).expect("incremental export");
+        assert_eq!(manifest.row_counts.runs, 3);
+        assert_eq!(manifest.row_counts.segments, 6); // 3 runs × 2 segments
+        assert_eq!(manifest.row_counts.events, 6); // 3 runs × 2 events
+
+        let import_db = dir.path().join("import.sqlite3");
+        let result = import_inner(&import_db, &export_dir, ConflictPolicy::Reject).expect("import");
+        assert_eq!(result.runs_imported, 3);
+
+        let imported = RunStore::open(&import_db).expect("open imported");
+        for i in 0..3 {
+            let details = imported
+                .load_run_details(&format!("multi-{i}"))
+                .expect("load")
+                .expect("run should exist");
+            assert_eq!(details.segments.len(), 2);
+            assert_eq!(details.events.len(), 2);
+        }
+    }
+
+    #[test]
     fn incremental_export_second_run_exports_only_new_records() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("incr_second.sqlite3");
@@ -8064,8 +9272,7 @@ mod tests {
         let store = RunStore::open(&db_path).expect("open");
         // Access the raw connection via the store's public API indirectly:
         // Open a separate connection for this test.
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // No runs -> no export position.
         let result = max_export_position(&conn, None).expect("should succeed");
@@ -8081,8 +9288,7 @@ mod tests {
         let report = fixture_report("ts-run", &db_path);
         store.persist_report(&report).expect("persist");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // With cursor far in the future, no runs match -> None.
         let far_future = test_cursor("2099-12-31T23:59:59Z", Some("zzzzzz"));
@@ -8101,8 +9307,7 @@ mod tests {
         let store = RunStore::open(&db_path).expect("open");
         drop(store);
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         ensure_schema(&conn).expect("schema");
 
         let mut known_run_ids = HashSet::new();
@@ -8132,10 +9337,9 @@ mod tests {
         let report = fixture_report("has-segments", &db_path);
         store.persist_report(&report).expect("persist");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         let output_path = dir.path().join("segments.jsonl");
-        let count =
+        let (count, _sha256) =
             export_table_segments_for_runs(&conn, &output_path, &[]).expect("should succeed");
         assert_eq!(count, 0, "empty run_ids should produce 0 rows");
 
@@ -8764,8 +9968,7 @@ mod tests {
         late.finished_at_rfc3339 = "2026-06-15T12:00:05Z".to_owned();
         store.persist_report(&late).expect("persist late");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // Cursor positioned at early should return late's tuple.
         let after_early = test_cursor("2026-01-01T00:00:05Z", Some("run-early"));
@@ -8791,11 +9994,10 @@ mod tests {
             .persist_report(&fixture_report("evt-run", &db_path))
             .expect("persist");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         let out_path = dir.path().join("events_empty.jsonl");
-        let count = export_table_events_for_runs(&conn, &out_path, &[]).expect("export");
+        let (count, _sha256) = export_table_events_for_runs(&conn, &out_path, &[]).expect("export");
         assert_eq!(count, 0, "empty run_ids should produce zero rows");
         let content = fs::read_to_string(&out_path).expect("read");
         assert!(content.is_empty(), "file should be empty");
@@ -8819,8 +10021,7 @@ mod tests {
         r3.finished_at_rfc3339 = "2026-06-01T00:00:05Z".to_owned();
         store.persist_report(&r3).expect("persist r3");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // None filter → all 3 IDs
         let all = collect_exported_run_ids(&conn, None).expect("all");
@@ -8882,18 +10083,23 @@ mod tests {
         r2.finished_at_rfc3339 = "2026-05-20T00:00:05Z".to_owned();
         store.persist_report(&r2).expect("persist r2");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // No filter → both runs exported.
         let all_path = dir.path().join("all_runs.jsonl");
-        let all_count = export_table_runs_incremental(&conn, &all_path, None).expect("all");
+        let (all_count, all_sha256) =
+            export_table_runs_incremental(&conn, &all_path, None).expect("all");
         assert_eq!(all_count, 2, "no filter should export both runs");
+        assert_eq!(
+            all_sha256,
+            super::sha256_file(&all_path).expect("re-read hash"),
+            "incremental streamed hash must match sha256_file of the written bytes"
+        );
 
         // Cursor at inc-a -> only inc-b.
         let filtered_path = dir.path().join("filtered_runs.jsonl");
         let cursor = test_cursor("2026-01-15T00:00:05Z", Some("inc-a"));
-        let filtered_count =
+        let (filtered_count, _sha256) =
             export_table_runs_incremental(&conn, &filtered_path, Some(&cursor)).expect("filtered");
         assert_eq!(filtered_count, 1, "filter should export only inc-b");
 
@@ -9535,8 +10741,7 @@ mod tests {
         late.started_at_rfc3339 = "2026-06-15T12:00:00Z".to_owned();
         store.persist_report(&late).expect("persist late");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // No filter → returns the overall maximum.
         let result = max_started_at(&conn, None).expect("query");
@@ -10233,8 +11438,7 @@ mod tests {
         let export_dir = dir.path().join("export");
 
         // Create a bare SQLite file with no tables.
-        let _conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("create bare db");
+        let _conn = Connection::open(db_path.display().to_string()).expect("create bare db");
 
         // Create empty JSONL files so validate_sync doesn't fail on missing files.
         fs::create_dir_all(&export_dir).expect("mkdir");
@@ -10324,8 +11528,7 @@ mod tests {
         store
             .persist_report(&fixture_report("run-b", &db_path))
             .expect("persist run-b");
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         conn.execute_with_params(
             "DELETE FROM runs WHERE id = ?1",
             &[SqliteValue::Text("run-a".to_owned().into())],
@@ -10383,8 +11586,7 @@ mod tests {
         r2.finished_at_rfc3339 = "2026-06-01T00:00:05Z".to_owned();
         store.persist_report(&r2).expect("persist r2");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // Cursor with None run_id → unwrap_or_default() = "".
         // Both runs have finished_at == cursor ts, and id > "" for any real id.
@@ -10539,8 +11741,7 @@ mod tests {
         fs::write(&runs_path, serde_json::to_string(&parsed).unwrap()).expect("write");
 
         // Update the DB to have default "{}" for both columns.
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         conn.execute_with_params(
             "UPDATE runs SET replay_json = '{}', acceleration_json = '{}' WHERE id = ?1",
             &[SqliteValue::Text("legacy-1".to_owned().into())],
@@ -10583,8 +11784,7 @@ mod tests {
             .expect("persist");
         drop(store);
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         let mut known = HashSet::new();
         // First call: queries DB, inserts into known_run_ids.
@@ -10616,8 +11816,7 @@ mod tests {
         store.persist_report(&r2).expect("persist r2");
         drop(store);
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         let run_count = count_table(&conn, "runs").expect("count runs");
         assert_eq!(run_count, 2, "should count 2 runs");
 
@@ -10638,13 +11837,12 @@ mod tests {
         store.persist_report(&r).expect("persist");
         drop(store);
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         let output_path = dir.path().join("runs.jsonl");
 
         // Cursor with a future timestamp — no runs should match.
         let cursor = test_cursor("2099-01-01T00:00:00Z", Some("zzz"));
-        let count =
+        let (count, _sha256) =
             export_table_runs_incremental(&conn, &output_path, Some(&cursor)).expect("export");
         assert_eq!(count, 0, "no runs should match a far-future cursor");
 
@@ -11101,8 +12299,13 @@ mod tests {
             .expect("persist");
         let conn = Connection::open(db_path.display().to_string()).expect("conn");
         let out = dir.path().join("runs.jsonl");
-        let count = export_table_runs(&conn, &out).expect("export");
+        let (count, sha256) = export_table_runs(&conn, &out).expect("export");
         assert_eq!(count, 1, "should export 1 run");
+        assert_eq!(
+            sha256,
+            super::sha256_file(&out).expect("re-read hash"),
+            "streamed hash must match sha256_file of the written bytes"
+        );
         let content = fs::read_to_string(&out).expect("read");
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).expect("parse");
         assert_eq!(parsed["id"], "run-exp-1");
@@ -11122,8 +12325,13 @@ mod tests {
             .expect("persist");
         let conn = Connection::open(db_path.display().to_string()).expect("conn");
         let out = dir.path().join("segments.jsonl");
-        let count = export_table_segments(&conn, &out).expect("export");
+        let (count, sha256) = export_table_segments(&conn, &out).expect("export");
         assert_eq!(count, 2, "fixture has 2 segments");
+        assert_eq!(
+            sha256,
+            super::sha256_file(&out).expect("re-read hash"),
+            "streamed hash must match sha256_file of the written bytes"
+        );
         let content = fs::read_to_string(&out).expect("read");
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -11142,8 +12350,13 @@ mod tests {
             .expect("persist");
         let conn = Connection::open(db_path.display().to_string()).expect("conn");
         let out = dir.path().join("events.jsonl");
-        let count = export_table_events(&conn, &out).expect("export");
+        let (count, sha256) = export_table_events(&conn, &out).expect("export");
         assert_eq!(count, 2, "fixture has 2 events");
+        assert_eq!(
+            sha256,
+            super::sha256_file(&out).expect("re-read hash"),
+            "streamed hash must match sha256_file of the written bytes"
+        );
         let content = fs::read_to_string(&out).expect("read");
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -11836,6 +13049,401 @@ mod tests {
         assert!(report.mismatched_records.is_empty());
         assert_eq!(report.db_segment_count, report.jsonl_segment_count);
         assert_eq!(report.db_event_count, report.jsonl_event_count);
+    }
+
+    #[test]
+    fn flush_run_chunk_matches_per_line_reference() {
+        // The batched import (`flush_run_chunk`) must produce a byte-identical `runs`
+        // table to the per-line path, including: an existing-row conflict (→ Overwrite),
+        // a fresh insert, and an intra-chunk DUPLICATE id (the 2nd occurrence must see
+        // the 1st's insert via the seen-map, exactly as the per-line SELECT would).
+        let dir = tempdir().expect("tempdir");
+        let mk = |name: &str| {
+            let c = Connection::open(dir.path().join(name).display().to_string()).expect("open");
+            ensure_schema(&c).expect("schema");
+            c
+        };
+        let row = |id: &str, backend: &str| {
+            serde_json::json!({
+                "id": id, "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": "2026-01-01T00:01:00Z", "backend": backend,
+                "input_path": "/a.wav", "normalized_wav_path": "/a16.wav",
+                "request_json": "{}", "result_json": "{}", "warnings_json": "[]",
+                "transcript": "hello", "replay_json": "{}", "acceleration_json": "{}"
+            })
+        };
+        let sel_all = "SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs ORDER BY id";
+        let dump = |c: &Connection| -> Vec<Vec<String>> {
+            c.query_with_params(sel_all, &[])
+                .expect("dump")
+                .iter()
+                .map(|r| {
+                    run_row_to_cols(r)
+                        .iter()
+                        .map(|v| value_to_string_sqlite(Some(v)))
+                        .collect()
+                })
+                .collect()
+        };
+
+        let cref = mk("ref.sqlite3");
+        let cbat = mk("bat.sqlite3");
+        // Seed both DBs identically with x=cpu (via the shared insert path).
+        for c in [&cref, &cbat] {
+            apply_run_row(
+                c,
+                "x",
+                &row("x", "cpu"),
+                None,
+                ConflictPolicy::Overwrite,
+                &mut Vec::new(),
+                &mut RunImportTracking::default(),
+            )
+            .expect("seed");
+        }
+
+        let import_rows = vec![
+            ("x".to_string(), row("x", "gpu")), // conflicts with seed → overwrite
+            ("y".to_string(), row("y", "cpu")), // new
+            ("y".to_string(), row("y", "cpu")), // intra-chunk dup, identical → noop
+            ("z".to_string(), row("z", "cpu")), // new
+        ];
+
+        // Reference: per-line apply_run_row with a per-line SELECT.
+        {
+            let mut tracking = RunImportTracking::default();
+            let mut conflicts = Vec::new();
+            for (id, r) in &import_rows {
+                let existing_rows = cref
+                    .query_with_params(
+                        "SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs WHERE id = ?1",
+                        &[SqliteValue::Text(id.clone().into())],
+                    )
+                    .expect("per-line select");
+                let existing = existing_rows.first().map(run_row_to_cols);
+                apply_run_row(
+                    &cref,
+                    id,
+                    r,
+                    existing.as_deref(),
+                    ConflictPolicy::Overwrite,
+                    &mut conflicts,
+                    &mut tracking,
+                )
+                .expect("per-line apply");
+            }
+        }
+
+        // Batched: one prefetch + seen-map.
+        {
+            let mut chunk = import_rows.clone();
+            let n = flush_run_chunk(
+                &cbat,
+                &mut chunk,
+                ConflictPolicy::Overwrite,
+                &mut Vec::new(),
+                &mut RunImportTracking::default(),
+            )
+            .expect("flush");
+            assert_eq!(n, 4, "every line counts once");
+            assert!(chunk.is_empty(), "chunk drained");
+        }
+
+        let d = dump(&cbat);
+        assert_eq!(d, dump(&cref), "batched import diverged from per-line");
+        assert_eq!(
+            d.len(),
+            3,
+            "x,y,z — the intra-chunk dup must not double-insert y"
+        );
+        assert_eq!(d[0][3], "gpu", "x overwritten to gpu");
+    }
+
+    #[test]
+    fn flush_segment_chunk_matches_per_line_reference() {
+        // Batched segment import (composite (run_id, idx) key) must produce a
+        // byte-identical `segments` table to the per-line path: an existing-row
+        // conflict (→ OverwriteStrict delete+insert), a fresh insert, and an
+        // intra-chunk DUPLICATE (run_id, idx) that must see the earlier insert.
+        let dir = tempdir().expect("tempdir");
+        let mk = |name: &str| {
+            let c = Connection::open(dir.path().join(name).display().to_string()).expect("open");
+            ensure_schema(&c).expect("schema");
+            c
+        };
+        let run_row = |id: &str| {
+            serde_json::json!({
+                "id": id, "started_at": "t0", "finished_at": "t1", "backend": "cpu",
+                "input_path": "/a.wav", "normalized_wav_path": "/a16.wav",
+                "request_json": "{}", "result_json": "{}", "warnings_json": "[]",
+                "transcript": "hi", "replay_json": "{}", "acceleration_json": "{}"
+            })
+        };
+        let seg = |run_id: &str, idx: i64, text: &str| {
+            serde_json::json!({
+                "run_id": run_id, "idx": idx, "start_sec": (idx as f64),
+                "end_sec": (idx as f64) + 1.0, "speaker": serde_json::Value::Null,
+                "text": text, "confidence": 0.9
+            })
+        };
+        let sel = "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments ORDER BY run_id, idx";
+        let dump = |c: &Connection| -> Vec<Vec<String>> {
+            c.query_with_params(sel, &[])
+                .expect("dump")
+                .iter()
+                .map(|r| {
+                    segment_row_to_cols(r)
+                        .iter()
+                        .map(|v| value_to_string_sqlite(Some(v)))
+                        .collect()
+                })
+                .collect()
+        };
+
+        let cref = mk("segref.sqlite3");
+        let cbat = mk("segbat.sqlite3");
+        // Both DBs need run "r1" (FK check) and a seed segment (r1,0)="old".
+        for c in [&cref, &cbat] {
+            apply_run_row(
+                c,
+                "r1",
+                &run_row("r1"),
+                None,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+                &mut RunImportTracking::default(),
+            )
+            .expect("seed run");
+            apply_segment_row(
+                c,
+                "r1",
+                0,
+                "r1/0",
+                &seg("r1", 0, "old"),
+                None,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+            )
+            .expect("seed seg");
+        }
+
+        let import_rows = vec![
+            ("r1".to_string(), 0i64, seg("r1", 0, "new")), // conflicts seed → overwrite-strict
+            ("r1".to_string(), 1i64, seg("r1", 1, "b")),   // new
+            ("r1".to_string(), 1i64, seg("r1", 1, "b")),   // intra-chunk dup, identical → noop
+        ];
+
+        // Reference: per-line.
+        {
+            let mut st = SegmentImportState::default();
+            let mut cf = Vec::new();
+            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            for (run_id, idx, row) in &import_rows {
+                let key = format!("{run_id}/{idx}");
+                record_segment_pre(
+                    &cref,
+                    run_id,
+                    *idx,
+                    &key,
+                    ConflictPolicy::OverwriteStrict,
+                    &imp,
+                    &ovr,
+                    &mut st,
+                )
+                .expect("pre");
+                let existing_rows = cref
+                    .query_with_params(
+                        "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id = ?1 AND idx = ?2",
+                        &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(*idx)],
+                    )
+                    .expect("select");
+                let existing = existing_rows.first().map(segment_row_to_cols);
+                apply_segment_row(
+                    &cref,
+                    run_id,
+                    *idx,
+                    &key,
+                    row,
+                    existing.as_deref(),
+                    ConflictPolicy::OverwriteStrict,
+                    &mut cf,
+                )
+                .expect("apply");
+            }
+        }
+
+        // Batched.
+        {
+            let mut st = SegmentImportState::default();
+            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            let mut chunk = import_rows.clone();
+            let n = flush_segment_chunk(
+                &cbat,
+                &mut chunk,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+                &mut st,
+                &imp,
+                &ovr,
+            )
+            .expect("flush");
+            assert_eq!(n, 3);
+            assert!(chunk.is_empty());
+        }
+
+        let d = dump(&cbat);
+        assert_eq!(
+            d,
+            dump(&cref),
+            "batched segment import diverged from per-line"
+        );
+        assert_eq!(
+            d.len(),
+            2,
+            "(r1,0)+(r1,1); intra-chunk dup must not double-insert"
+        );
+        assert_eq!(d[0][5], "new", "(r1,0) overwritten to 'new'");
+    }
+
+    #[test]
+    fn flush_event_chunk_matches_per_line_reference() {
+        // Batched event import (composite (run_id, seq) key) must produce a
+        // byte-identical `events` table to the per-line path (conflict → OverwriteStrict,
+        // fresh insert, intra-chunk duplicate (run_id, seq) → seen-map).
+        let dir = tempdir().expect("tempdir");
+        let mk = |name: &str| {
+            let c = Connection::open(dir.path().join(name).display().to_string()).expect("open");
+            ensure_schema(&c).expect("schema");
+            c
+        };
+        let run_row = |id: &str| {
+            serde_json::json!({
+                "id": id, "started_at": "t0", "finished_at": "t1", "backend": "cpu",
+                "input_path": "/a.wav", "normalized_wav_path": "/a16.wav",
+                "request_json": "{}", "result_json": "{}", "warnings_json": "[]",
+                "transcript": "hi", "replay_json": "{}", "acceleration_json": "{}"
+            })
+        };
+        let ev = |run_id: &str, seq: i64, message: &str| {
+            serde_json::json!({
+                "run_id": run_id, "seq": seq, "ts_rfc3339": "2026-01-01T00:00:00Z",
+                "stage": "decode", "code": "info", "message": message, "payload_json": "{}"
+            })
+        };
+        let sel = "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events ORDER BY run_id, seq";
+        let dump = |c: &Connection| -> Vec<Vec<String>> {
+            c.query_with_params(sel, &[])
+                .expect("dump")
+                .iter()
+                .map(|r| {
+                    event_row_to_cols(r)
+                        .iter()
+                        .map(|v| value_to_string_sqlite(Some(v)))
+                        .collect()
+                })
+                .collect()
+        };
+
+        let cref = mk("evref.sqlite3");
+        let cbat = mk("evbat.sqlite3");
+        for c in [&cref, &cbat] {
+            apply_run_row(
+                c,
+                "r1",
+                &run_row("r1"),
+                None,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+                &mut RunImportTracking::default(),
+            )
+            .expect("seed run");
+            apply_event_row(
+                c,
+                "r1",
+                0,
+                "r1/0",
+                &ev("r1", 0, "old"),
+                None,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+            )
+            .expect("seed ev");
+        }
+
+        let import_rows = vec![
+            ("r1".to_string(), 0i64, ev("r1", 0, "new")), // conflicts seed → overwrite-strict
+            ("r1".to_string(), 1i64, ev("r1", 1, "b")),   // new
+            ("r1".to_string(), 1i64, ev("r1", 1, "b")),   // intra-chunk dup, identical → noop
+        ];
+
+        {
+            let mut st = EventImportState::default();
+            let mut cf = Vec::new();
+            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            for (run_id, seq, row) in &import_rows {
+                let key = format!("{run_id}/{seq}");
+                record_event_pre(
+                    &cref,
+                    run_id,
+                    *seq,
+                    &key,
+                    ConflictPolicy::OverwriteStrict,
+                    &imp,
+                    &ovr,
+                    &mut st,
+                )
+                .expect("pre");
+                let existing_rows = cref
+                    .query_with_params(
+                        "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id = ?1 AND seq = ?2",
+                        &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(*seq)],
+                    )
+                    .expect("select");
+                let existing = existing_rows.first().map(event_row_to_cols);
+                apply_event_row(
+                    &cref,
+                    run_id,
+                    *seq,
+                    &key,
+                    row,
+                    existing.as_deref(),
+                    ConflictPolicy::OverwriteStrict,
+                    &mut cf,
+                )
+                .expect("apply");
+            }
+        }
+
+        {
+            let mut st = EventImportState::default();
+            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            let mut chunk = import_rows.clone();
+            let n = flush_event_chunk(
+                &cbat,
+                &mut chunk,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+                &mut st,
+                &imp,
+                &ovr,
+            )
+            .expect("flush");
+            assert_eq!(n, 3);
+            assert!(chunk.is_empty());
+        }
+
+        let d = dump(&cbat);
+        assert_eq!(
+            d,
+            dump(&cref),
+            "batched event import diverged from per-line"
+        );
+        assert_eq!(
+            d.len(),
+            2,
+            "(r1,0)+(r1,1); intra-chunk dup must not double-insert"
+        );
+        assert_eq!(d[0][5], "new", "(r1,0) message overwritten to 'new'");
     }
 
     #[test]

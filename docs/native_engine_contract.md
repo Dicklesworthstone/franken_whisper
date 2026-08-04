@@ -315,24 +315,22 @@ Each native engine should have:
 
 ## 8. Performance
 
-### 8.1 Measured RTFs (reference hardware: Apple M4 Pro)
+### 8.1 Measured CPU performance
 
 Real-Time Factor (RTF) = wall-clock / audio-duration; **< 1.0 means faster
-than realtime**. Measured on this host (Apple M4 Pro, 14 cores = 10P+4E,
-64 GB, macOS 26.2), `release-perf` profile (opt3 + thin-LTO), sole-stage
-native execution, 8 worker threads, jfk.wav (11 s), warm page cache.
-Final interleaved hyperfine vs `whisper-cli` on the same host:
+than realtime**. Competitive results use the actual `whisper-cli` legacy
+incumbent in the same `examples/incumbent_ab.rs` invocation, with matched
+threads and greedy decoding on both sides (`-bs 1 -bo 1`).
 
-| Model | Native wall | Native RTF | whisper-cli CPU | Comparison |
-|-------|-------------|------------|-----------------|------------|
-| tiny.en | **475 ms ± 13** | **0.043** | 1105 ms ± 21 | native **2.33× faster** |
-| large-v3-turbo | **9.731 s ± 0.272** | **0.88** | 9.585 s ± 0.224 | **parity** at lower user CPU (53.8 s vs 65.4 s); whisper-cli Metal 2.169 s |
+| Model | Workload | Decode mode | Result vs `whisper.cpp` CPU |
+|-------|----------|-------------|-----------------------------|
+| tiny.en | 124.5 s / 5 windows | no timestamps | native **1.52× faster** |
+| tiny.en | 300 s / 10 windows | no timestamps | native **1.51× faster** |
 
-Cumulative speedup over the optimization arc (release profile): tiny.en
-1.57 s → 0.475 s (**3.3×**); large-v3-turbo 44.6 s → 9.73 s (**4.6×**). Full
-lever-by-lever breakdown and evidence-backed abandons:
-`tests/artifacts/perf/20260605T0218Z-native-engine-baseline/RESULTS.md`
-(Round 1: `§1–5`; Round 2 f16 / sgemm / attribution: `§6`).
+Before/after measurements of the native engine are maintenance self-speedups,
+not competitive results. Their lever-by-lever record lives in
+`docs/PERF_LEDGER.md`; rejected and non-comparable measurements live in
+`docs/NEGATIVE_EVIDENCE.md`.
 
 #### Decoder per-token floors (Round 2, f16 compute default ON)
 
@@ -396,13 +394,74 @@ Per bd-2th6 acceptance, against the rollout gates in §5:
 | criterion benches (`benches/native_engine_bench.rs`) | committed | landed (Round 2 pass 1) with saved baselines: mel, encoder window, decoder token step, logits GEMV, f16 GEMV dequant throughput, e2e tiny | **MET** |
 | clippy | no regressions | clean | MET |
 
-## 9. References
+## 9. `raw_output` Schema (`native-v2`)
+
+Every native-engine `TranscriptionResult.raw_output` is a JSON object carrying a
+stable `schema_version` string (`SCHEMA_VERSION` in
+`src/backend/whisper_cpp_native.rs`, currently **`native-v2`**). Agents key off
+`schema_version` first; unknown values should be treated as forward-incompatible.
+Bump the version only on a breaking field change (rename/removal/semantic shift),
+never on additive fields.
+
+### 9.1 Full result (model was run)
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `engine` | string | Always `"whisper.cpp-native"` (the in-process real engine, not the subprocess bridge). |
+| `schema_version` | string | `"native-v2"`. |
+| `in_process` | bool | Always `true` — distinguishes this from the bridge adapter's `raw_output`. |
+| `implementation` | string | `"real-inference"` (asserted by the `no_canned_phrases` honesty guard — never a canned/mock marker). |
+| `silence` | bool | `true` iff the energy pre-gate classified the clip as silence. |
+| `model` | string | Model spec as requested (e.g. `tiny.en`). |
+| `model_path` | string | Resolved on-disk ggml path. |
+| `model_version_tag` | string | `fw-native-v1+sha256:<12 hex>` content hash of the model file (replay identity). |
+| `encoder_int8_policy` | object | The calibrated encoder-quantization decision (see §9.2). |
+| `windows` | array | Per-decode-window stats (see §9.3). |
+| `word_timestamps` | string | `"dtw"` (real cross-attention DTW alignment, bd-rjsx), `"interpolated"` (segment-proportional), or `"none"`. |
+
+### 9.2 `encoder_int8_policy` object
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `action` | string | `"f32"` (full-precision encoder) or `"quality_safe_int8"` (calibrated int8). |
+| `reason` | string | Human-readable rationale for the chosen action. |
+| `calibration_id` | string | Identifier of the calibration record that gated the int8 decision. |
+| `corpus_wer_delta_budget` | number | WER-delta budget the calibration was admitted under. |
+| `quant_rel_rmse_budget` | number | Relative-RMSE budget for the quantized weights. |
+
+### 9.3 `windows[]` element
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `window_offset_sec` | number | Start of this 30 s decode window, in seconds. |
+| `tokens` | integer | Result tokens emitted for the window (`result_len`). |
+| `avg_logprob` | number | Mean token log-probability over the result (whisper.cpp quality signal). |
+| `no_speech_prob` | number | No-speech probability from the window's first forward. |
+
+### 9.4 Silence short-circuit
+
+When the energy pre-gate proves silence, the engine returns **without loading the
+model** (saving a multi-GB load). The `raw_output` then carries the same `engine` /
+`schema_version` / `in_process` / `implementation` keys with `silence: true`, an
+empty `windows` array, and `word_timestamps: "none"`, plus two silence-only fields:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `model_loaded` | bool | `false` — the model was never resolved or loaded. |
+| `duration_ms` | integer | Clip duration measured by the pre-gate. |
+
+Because no model was loaded, the silence variant **omits** `model_path`,
+`model_version_tag`, `encoder_int8_policy`, and (on the model-resolution-failure
+path) may also omit them. Consumers must treat those three as optional and gate on
+`model_loaded` / `silence` before reading them.
+
+## 10. References
 
 - `docs/engine_compatibility_spec.md` — Segment invariants and enforcement points
 - `docs/conformance-contract.md` — Conformance axes and parity definitions
 - `docs/benchmark_regression_policy.md` — Performance regression thresholds
 - `tests/artifacts/perf/20260605T0218Z-native-engine-baseline/RESULTS.md` — Optimization arc results + interleaved benchmark numbers
-- `DISCREPANCIES.md` — DISC-004 tail-window truncation analysis
+- `DISCREPANCIES.md` — DISC-003 greedy-vs-beam, DISC-004 tail-window truncation, DISC-005 temperature-fallback ladder divergence
 - `src/conformance.rs` — `CANONICAL_TIMESTAMP_TOLERANCE_SEC`, validation and comparison functions
 - `tests/conformance_harness.rs` — Fixture-driven conformance test infrastructure
 - `tests/replay_envelope.rs` — Replay determinism test infrastructure

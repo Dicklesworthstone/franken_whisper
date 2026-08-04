@@ -288,11 +288,11 @@ fn parse_pcm16_mono_wav(path: &Path) -> Result<WavPcm16Mono, String> {
         }
 
         let chunk = &buf[start..read];
-        let mut iter = chunk.chunks_exact(2);
-        for pair in &mut iter {
-            samples.push(i16::from_le_bytes([pair[0], pair[1]]));
+        let (pairs, remainder) = chunk.as_chunks::<2>();
+        for pair in pairs {
+            samples.push(i16::from_le_bytes(*pair));
         }
-        if let Some(remainder) = iter.remainder().first() {
+        if let Some(remainder) = remainder.first() {
             leftover = Some(*remainder);
         }
     }

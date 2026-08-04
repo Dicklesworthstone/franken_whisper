@@ -35,21 +35,36 @@ and integrates with:
 - optional acceleration pass via `frankentorch` / `frankenjax` feature flags.
 - all engine execution paths accept `CancellationToken` for deadline-aware abort.
 
-4. `postprocess + acceleration` (`src/accelerate.rs`, `src/backend/normalize.rs`):
+4. `native acoustic diarization` (`src/diarization.rs`):
+- memory-safe waveform analysis at 16 kHz with a 25 ms frame / 10 ms hop.
+- independent voice and channel features, nullable pitch, and multiscale
+  Haar-like feature-trajectory contrasts.
+- bounded streaming change detection, robust hard/soft known-interval
+  enrollment, deterministic constrained clustering, temporal refinement,
+  unknown rejection, and overlap suspicion.
+- an independent turn timeline projected onto unchanged ASR text at legal DTW
+  word boundaries.
+- no gender or identity inference; no raw waveform, feature vector, or
+  biometric template persistence.
+
+5. `postprocess + acceleration` (`src/accelerate.rs`, `src/backend/normalize.rs`):
 - unified output normalization via `NormalizedOutput` in `backend/normalize.rs` converts each backend's native JSON into a common intermediate representation.
 - per-backend normalizers: `normalize_whisper_cpp`, `normalize_insanely_fast`, `normalize_whisper_diarization`.
 - `to_transcription_result` converts the normalized intermediate form into `TranscriptionResult`.
 - run confidence normalization acceleration pass with deterministic CPU fallback.
 - acceleration pass is cancellation-aware via `apply_with_token`.
 
-5. `persistence` (`src/storage.rs`, `frankensqlite` only):
+6. `persistence` (`src/storage.rs`, `frankensqlite` only):
 - run metadata, segments, events, and artifacts index in `fsqlite` DB via `RunStore`.
 - schema versioning through `_meta` table with forward migration system.
-- current schema version: 3 (v1 = base tables, v2 = legacy-safe `runs` rebuild for `replay_json` + `acceleration_json`, v3 = query indexes for `runs`/`events` hot paths).
+- current schema version: 4 (v1 = base tables, v2 = legacy-safe `runs`
+  rebuild for `replay_json` + `acceleration_json`, v3 = query indexes,
+  v4 = normalized privacy-safe diarization reports, turns, hint audit rows,
+  and speaker-profile summaries).
 - `persist_report_with_token` accepts `CancellationToken` for deadline-aware persistence.
 - JSONL sync/export as adjunct audit stream via `src/sync.rs`.
 
-6. `interfaces`:
+7. `interfaces`:
 - library API (`franken_whisper` crate, `src/lib.rs`).
 - CLI robot mode (real-time NDJSON stage events + final envelope) via `src/robot.rs`.
 - CLI health report infrastructure via `robot.rs`: `HealthReport`, `build_health_report()`, `emit_health_report()` with dependency checks, resource snapshots, and overall status.
@@ -80,7 +95,7 @@ The 10 canonical stages are defined by the `PipelineStage` enum:
 | `Accelerate`| `acceleration`| GPU confidence normalization pass                           |
 | `Align`     | `align`      | CTC-based forced alignment for timestamp correction          |
 | `Punctuate` | `punctuate`  | Punctuation restoration post-processing                      |
-| `Diarize`   | `diarize`    | Speaker diarization                                          |
+| `Diarize`   | `diarize`    | Typed acoustic/external diarization, provenance gating, and transcript projection |
 | `Persist`   | `persist`    | Persist the run report to frankensqlite                      |
 
 **Dependency constraints** enforced by `PipelineConfig::validate()`:
@@ -374,13 +389,14 @@ CREATE TABLE IF NOT EXISTS _meta (
 );
 ```
 
-Current schema version: **2** (`RunStore::SCHEMA_VERSION`).
+Current schema version: **4** (`RunStore::SCHEMA_VERSION`).
 
 Migration system:
 - `initialize_schema()` creates base tables (runs, segments, events, _meta) then calls `run_migrations()`.
 - `run_migrations()` reads `current_schema_version()` from `_meta` and applies forward migrations in order.
-- Each migration runs inside a transaction (BEGIN/COMMIT with ROLLBACK on failure).
-- Migrations only add columns or tables; they never drop existing structures.
+- Each migration runs inside a transaction or savepoint and rolls back on
+  failure. Legacy table rebuilds copy canonical values deterministically before
+  the old structure is replaced.
 - If the DB schema version exceeds `SCHEMA_VERSION`, the store refuses to open with an explicit upgrade error.
 
 Migration history:
@@ -388,12 +404,24 @@ Migration history:
 |---------|---------------------------------------------------------|
 | 1       | Base schema (runs, segments, events, _meta tables)     |
 | 2       | Add `acceleration_json` and `replay_json` columns to runs |
+| 3       | Add hot-path indexes for runs and events |
+| 4       | Add normalized diarization reports, turns, hint audit rows, and privacy-safe speaker-profile summaries |
 
 ### Source of Truth Tables
 
 - `runs`: id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json.
 - `segments`: run_id, idx, start_sec, end_sec, speaker, text, confidence (PK: run_id + idx).
 - `events`: run_id, seq, ts_rfc3339, stage, code, message, payload_json (PK: run_id + seq).
+- `diarization_reports`: one implementation/contract/fallback summary per run.
+- `diarization_turns`: ordered independent speaker turns per run.
+- `speaker_hints`: canonical known-interval audit rows; the CLI
+  `--speaker-hints` source path is never stored.
+- `speaker_profile_summaries`: reliability, duration, anchoring, and channel
+  counts only; raw acoustic vectors and PCM are schema-forbidden.
+
+JSONL import commits canonical `runs.request_json` / `runs.result_json`, then
+deterministically rebuilds the normalized diarization index. JSONL remains an
+audit/recovery representation; SQLite is authoritative.
 
 ### Constraints
 
@@ -433,6 +461,11 @@ Robot mode CLI (`robot run`) creates an `mpsc::channel`, passes the sender to `F
 
 The `robot schema` subcommand emits a self-describing JSON document with event type specifications, required fields, and examples for each event type.
 
+The diarization stage emits `diarize.rollout` before `diarize.start`. Its
+payload records requested/resolved implementation, the fail-closed rollout
+stage, configuration validity, and whether runtime-verified external speaker
+evidence exists. Hint paths and acoustic vectors are never emitted.
+
 The `robot backends` and `robot health` subcommands emit standalone NDJSON diagnostic events (`backends.discovery` and `health.report`). The `robot routing-history` subcommand emits line-oriented `routing_decision` entries derived from persisted routing events for post-hoc analysis. That event is part of the documented robot schema surface, but it is emitted by `robot routing-history` rather than the live `robot run` stream.
 
 ## 10. Optional TTY/PTY Low-Bandwidth Audio Mode
@@ -469,8 +502,10 @@ Goal:
 - graceful Ctrl+C shutdown controller.
 
 **Remaining future packets**:
-- deeper native compute kernels beyond current acceleration pass (Vad, Separate, Align, Punctuate, Diarize stages currently placeholder),
-- richer diarization fusion with confidence calibration,
+- deeper native compute kernels beyond current acceleration pass (Vad, Separate,
+  Align, and Punctuate still have placeholder or transitional portions),
+- corpus-calibrated acoustic confidence and optional ECAPA-style neural
+  embeddings behind the same diarization contract,
 - online streaming transcript update protocol (live audio chunked inference),
 - native `StreamingEngine` implementations for `InsanelyFastEngine` and `WhisperDiarizationEngine`,
 - wiring `HealthReport` into a `robot health` CLI subcommand,

@@ -1,0 +1,35 @@
+[general]
+enabled = true
+force_local = false
+force_remote = true
+socket_path = "/run/user/1000/rch-cod-fw-i7-m4.sock"
+
+[compilation]
+build_timeout_sec = 1800
+test_timeout_sec = 1800
+
+[transfer]
+compression_level = 3
+remote_base = "/data/tmp/rch"
+exclude_patterns = [
+    ".beads/",
+    ".git/",
+    ".rch-target-*/",
+    ".rch-targets/",
+    "legacy_whispercpp/",
+    "sample_audio_files/",
+    "target/",
+    "tests/artifacts/",
+    "*.mp3",
+    "*.rlib",
+    "*.rmeta",
+    "*.wav",
+]
+
+[transfer.retry]
+max_attempts = 3
+total_timeout_ms = 600000
+
+[self_healing]
+hook_starts_daemon = true
+daemon_installs_hooks = false

@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -21,6 +21,17 @@ const FFMPEG_BIN_ENV: &str = "FRANKEN_WHISPER_FFMPEG_BIN";
 const FFPROBE_BIN_ENV: &str = "FRANKEN_WHISPER_FFPROBE_BIN";
 const FORCE_FFMPEG_NORMALIZE_ENV: &str = "FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE";
 const AUTO_PROVISION_FFMPEG_ENV: &str = "FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG";
+/// When set (default OFF), an input that is ALREADY a 16 kHz mono 16-bit PCM WAV
+/// is handed to the backend verbatim, skipping the symphonia decode → resample →
+/// i16-rewrite → reread roundtrip (measured ~4.6% of e2e wall on a pre-normalized
+/// wav; the whole normalize stage). NOT byte-exact vs the default path: the writer
+/// quantizes with `f32 * i16::MAX (32767)` while the native reader dequantizes with
+/// `i16 / 32768`, so the default path attenuates every sample by 32767/32768;
+/// pass-through preserves the original samples (arguably MORE faithful, but a
+/// different, un-attenuated stream that can shift a few argmax decisions on real
+/// speech). Owner-gated on a WER/transcript check before any default flip; hence
+/// default OFF. `FRANKEN_WHISPER_WAV_PASSTHROUGH=1`.
+const WAV_PASSTHROUGH_ENV: &str = "FRANKEN_WHISPER_WAV_PASSTHROUGH";
 const DEFAULT_STATE_DIR: &str = ".franken_whisper";
 const DEFAULT_STATE_HOME_DIR: &str = ".local/state/franken_whisper";
 const FFMPEG_TOOLS_DIR: &str = "tools/ffmpeg";
@@ -133,6 +144,23 @@ pub(crate) fn normalize_to_wav_with_timeout(
 ) -> FwResult<PathBuf> {
     let output = work_dir.join("normalized_16k_mono.wav");
 
+    // Opt-in fast path: an input already in the target format (16 kHz mono 16-bit
+    // PCM WAV) is fed to the backend verbatim, skipping the decode/resample/rewrite
+    // roundtrip. Not byte-exact vs the default path (writer ×32767 vs reader /32768
+    // attenuation) — see WAV_PASSTHROUGH_ENV — so it is default OFF and never
+    // overrides a forced ffmpeg normalize.
+    if prefer_wav_passthrough() && !force_ffmpeg_normalizer() && is_already_normalized_wav(input) {
+        tracing::info!(
+            stage = "normalize",
+            input = %input.display(),
+            "input already 16 kHz mono 16-bit PCM WAV; passing through (FRANKEN_WHISPER_WAV_PASSTHROUGH)"
+        );
+        if let Some(tok) = token {
+            tok.checkpoint()?;
+        }
+        return Ok(input.to_path_buf());
+    }
+
     // If the user explicitly forces ffmpeg, skip the built-in path entirely.
     if force_ffmpeg_normalizer() {
         tracing::info!(
@@ -218,6 +246,38 @@ fn force_ffmpeg_normalizer() -> bool {
         std::env::var(FORCE_FFMPEG_NORMALIZE_ENV).ok().as_deref(),
         false,
     )
+}
+
+/// Opt-in pass-through for inputs already in the target format (see
+/// [`WAV_PASSTHROUGH_ENV`]). Default OFF.
+fn prefer_wav_passthrough() -> bool {
+    bool_env_enabled_from_raw(std::env::var(WAV_PASSTHROUGH_ENV).ok().as_deref(), false)
+}
+
+/// Cheap header-only probe: is `input` already a 16 kHz, mono, 16-bit **integer**
+/// PCM WAV — i.e. exactly what the backend's `read_wav_16k_mono` consumes, so the
+/// decode → resample → rewrite roundtrip would be pure overhead? `hound` reads only
+/// the RIFF/`fmt ` header here (samples stay lazy), so this is O(1). Any open/parse
+/// error or format mismatch returns `false` and the caller falls through to the
+/// normal normalize path — the fast path never changes which inputs SUCCEED.
+fn is_already_normalized_wav(input: &Path) -> bool {
+    let ext_is_wav = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+    if !ext_is_wav {
+        return false;
+    }
+    match hound::WavReader::open(input) {
+        Ok(reader) => {
+            let spec = reader.spec();
+            spec.channels == 1
+                && spec.sample_rate == 16_000
+                && spec.bits_per_sample == 16
+                && spec.sample_format == hound::SampleFormat::Int
+        }
+        Err(_) => false,
+    }
 }
 
 fn auto_provision_ffmpeg_enabled() -> bool {
@@ -728,21 +788,140 @@ fn append_decoded_audio_to_mono(
 ) {
     let mut sample_buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
     sample_buffer.copy_interleaved_ref(decoded);
-    let interleaved = sample_buffer.samples();
+    append_sanitized_downmix_to_mono(destination, sample_buffer.samples(), channel_count);
+}
 
+/// Append sanitized mono PCM into `destination`, preserving the legacy ingestion
+/// semantics of "replace each non-finite channel sample with silence, then
+/// average complete interleaved frames". Exposed for the benchmark harness; not
+/// part of the stable API.
+pub fn append_sanitized_downmix_to_mono(
+    destination: &mut Vec<f32>,
+    interleaved: &[f32],
+    channel_count: usize,
+) {
     if channel_count <= 1 {
-        destination.extend_from_slice(interleaved);
+        if interleaved.iter().all(|sample| sample.is_finite()) {
+            destination.extend_from_slice(interleaved);
+        } else {
+            destination.extend(
+                interleaved
+                    .iter()
+                    .map(|&sample| if sample.is_finite() { sample } else { 0.0 }),
+            );
+        }
         return;
     }
 
-    for frame in interleaved.chunks(channel_count) {
-        let sum: f32 = frame.iter().copied().sum();
-        destination.push(sum / frame.len() as f32);
+    let frames = interleaved.len() / channel_count;
+    if frames == 0 {
+        return;
+    }
+    destination.reserve(frames);
+
+    if interleaved[..frames * channel_count]
+        .iter()
+        .all(|sample| sample.is_finite())
+    {
+        append_finite_downmix_to_mono(destination, interleaved, channel_count, frames);
+        return;
+    }
+
+    for i in 0..frames {
+        let frame = &interleaved[i * channel_count..(i + 1) * channel_count];
+        let mut sum = 0.0f32;
+        for &sample in frame {
+            sum += if sample.is_finite() { sample } else { 0.0 };
+        }
+        destination.push(sum / channel_count as f32);
     }
 }
 
-fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+fn append_finite_downmix_to_mono(
+    destination: &mut Vec<f32>,
+    interleaved: &[f32],
+    channel_count: usize,
+    frames: usize,
+) {
+    if channel_count == 2 {
+        use std::simd::Simd;
+        const L: usize = 8;
+        let start = destination.len();
+        destination.resize(start + frames, 0.0);
+        let out = &mut destination[start..];
+        let simd_frames = (frames / L) * L;
+        let half = Simd::<f32, L>::splat(0.5);
+        let mut f = 0;
+        while f < simd_frames {
+            let a = Simd::<f32, L>::from_slice(&interleaved[2 * f..2 * f + L]);
+            let b = Simd::<f32, L>::from_slice(&interleaved[2 * f + L..2 * f + 2 * L]);
+            let (lefts, rights) = a.deinterleave(b);
+            ((lefts + rights) * half).copy_to_slice(&mut out[f..f + L]);
+            f += L;
+        }
+        for (i, slot) in out.iter_mut().enumerate().skip(simd_frames) {
+            *slot = (interleaved[2 * i] + interleaved[2 * i + 1]) * 0.5;
+        }
+        return;
+    }
+
+    for i in 0..frames {
+        let frame = &interleaved[i * channel_count..(i + 1) * channel_count];
+        let sum: f32 = frame.iter().copied().sum();
+        destination.push(sum / channel_count as f32);
+    }
+}
+
+/// Average `channels` interleaved samples per frame down to mono. Bit-exact with
+/// the scalar `frame.sum() / channels` reference (`0.0+L+R == L+R`, and `/2.0`
+/// is exact); the stereo fast path uses a SAFE `std::simd` deinterleave. Exposed
+/// for the benchmark harness; not part of the stable API.
+pub fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return interleaved.to_vec();
+    }
+    let frames = interleaved.len() / channels;
+    let mut out = vec![0.0f32; frames];
+
+    if channels == 2 {
+        use std::simd::Simd;
+        const L: usize = 8;
+        let simd_frames = (frames / L) * L;
+        let half = Simd::<f32, L>::splat(0.5);
+        let mut f = 0;
+        while f < simd_frames {
+            // [L0 R0 L1 R1 ...] across two 8-lane loads -> (L0..L7, R0..R7).
+            let a = Simd::<f32, L>::from_slice(&interleaved[2 * f..2 * f + L]);
+            let b = Simd::<f32, L>::from_slice(&interleaved[2 * f + L..2 * f + 2 * L]);
+            let (lefts, rights) = a.deinterleave(b);
+            ((lefts + rights) * half).copy_to_slice(&mut out[f..f + L]);
+            f += L;
+        }
+        for (i, slot) in out.iter_mut().enumerate().skip(simd_frames) {
+            *slot = (interleaved[2 * i] + interleaved[2 * i + 1]) * 0.5;
+        }
+        return out;
+    }
+
+    for (i, slot) in out.iter_mut().enumerate() {
+        let frame = &interleaved[i * channels..(i + 1) * channels];
+        let sum: f32 = frame.iter().copied().sum();
+        *slot = sum / channels as f32;
+    }
+    out
+}
+
+/// Linear-interpolation mono resampler (`src_rate` → `dst_rate`). Bit-exact with
+/// the clamp-on-every-load reference (perf ledger L16). Exposed so the benchmark
+/// harness can measure it directly; not part of the stable API.
+pub fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if input.is_empty() {
+        return Vec::new();
+    }
+    // Guard divisors before any rate arithmetic: dst_rate==0 -> ratio=+Inf and
+    // output_len=Inf.ceil() as usize (capacity-overflow panic); src_rate==0 ->
+    // 0/0=NaN flowing into the clamp. Fail closed with an empty buffer.
+    if src_rate == 0 || dst_rate == 0 {
         return Vec::new();
     }
     if src_rate == dst_rate {
@@ -751,23 +930,67 @@ fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32>
 
     let ratio = src_rate as f64 / dst_rate as f64;
     let output_len = (((input.len() as f64) * dst_rate as f64) / src_rate as f64).ceil() as usize;
-    let mut output = Vec::with_capacity(output_len.max(1));
+    let total = output_len.max(1);
+    let last = input.len() - 1;
+    let mut output = vec![0.0f32; total];
 
-    for idx in 0..output_len.max(1) {
+    // PROBE: SIMD the interior (8 outputs/iter) with a SAFE `std::simd` gather —
+    // same `idx*ratio` f64 position, `floor`, f32 `frac`, and non-fused f32
+    // interp as the scalar form, so bit-exact (guarded by
+    // `resample_mono_linear_is_bit_exact_vs_reference`). Boundary/tail stays
+    // scalar (perf ledger L16: clamps hoisted out of the hot span).
+    use std::simd::{Simd, StdFloat};
+    const L: usize = 8;
+    // Interior = outputs whose `left_idx + 1 <= last` for all 8 lanes. With
+    // `left_idx = floor(idx*ratio)` monotonic, every idx < interior_end is safe.
+    let interior_end = if ratio > 0.0 {
+        (((last as f64) - 1.0) / ratio).floor().max(0.0) as usize
+    } else {
+        0
+    };
+    let simd_end = (interior_end / L) * L;
+    let ratio_v = Simd::<f64, L>::splat(ratio);
+    let lane_base = Simd::<f64, L>::from_array([0., 1., 2., 3., 4., 5., 6., 7.]);
+    let one = Simd::<usize, L>::splat(1);
+    let mut g = 0;
+    while g < simd_end {
+        let src_pos = (lane_base + Simd::splat(g as f64)) * ratio_v;
+        let left_f = src_pos.floor();
+        let lf = left_f.to_array();
+        let left_idx = Simd::<usize, L>::from_array(std::array::from_fn(|k| lf[k] as usize));
+        let fr = (src_pos - left_f).to_array();
+        let frac = Simd::<f32, L>::from_array(std::array::from_fn(|k| fr[k] as f32));
+        let left = Simd::<f32, L>::gather_or_default(input, left_idx);
+        let right = Simd::<f32, L>::gather_or_default(input, left_idx + one);
+        let out = left + (right - left) * frac;
+        output[g..g + L].copy_from_slice(&out.to_array());
+        g += L;
+    }
+    // Scalar boundary + tail (handles the last one/two taps' clamp).
+    for (idx, slot) in output.iter_mut().enumerate().skip(simd_end) {
         let src_pos = idx as f64 * ratio;
         let left_idx = src_pos.floor() as usize;
-        let right_idx = left_idx.saturating_add(1);
-
-        let left = input[left_idx.min(input.len().saturating_sub(1))];
-        let right = input[right_idx.min(input.len().saturating_sub(1))];
         let frac = (src_pos - left_idx as f64) as f32;
-        output.push(left + (right - left) * frac);
+        let (left, right) = if left_idx < last {
+            (input[left_idx], input[left_idx + 1])
+        } else if left_idx <= last {
+            (input[left_idx], input[last])
+        } else {
+            (input[last], input[last])
+        };
+        *slot = left + (right - left) * frac;
     }
 
     output
 }
 
+#[allow(
+    clippy::manual_clamp,
+    reason = "max/min avoids a documented aarch64 nightly clamp miscompile"
+)]
 fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResult<()> {
+    const WRITE_CHUNK_SAMPLES: usize = 8_192;
+
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
@@ -775,9 +998,19 @@ fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResul
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(path, spec).map_err(hound_error_to_fw)?;
-    for sample in samples {
-        let quantized = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
-        writer.write_sample(quantized).map_err(hound_error_to_fw)?;
+    for chunk in samples.chunks(WRITE_CHUNK_SAMPLES) {
+        let mut buffered = writer.get_i16_writer(chunk.len() as u32);
+        for sample in chunk {
+            // Sanitize non-finite inputs to 0.0 (silence). NOTE: use max().min() rather than
+            // f32::clamp — the aarch64 nightly toolchains (Apr–Jun 2026) miscompile `clamp` in
+            // context (a spurious "min > max, or either was NaN" panic on valid finite bounds
+            // like -1.0/1.0); max().min() lowers to plain fmin/fmax and is unaffected. x86 is fine
+            // either way; this keeps the native engine correct on Apple Silicon.
+            let s = if sample.is_finite() { *sample } else { 0.0 };
+            let quantized = (s.max(-1.0).min(1.0) * f32::from(i16::MAX)).round() as i16;
+            buffered.write_sample(quantized);
+        }
+        buffered.flush().map_err(hound_error_to_fw)?;
     }
     writer.finalize().map_err(hound_error_to_fw)?;
     Ok(())
@@ -785,6 +1018,35 @@ fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResul
 
 fn hound_error_to_fw(error: hound::Error) -> FwError {
     FwError::Io(std::io::Error::other(error.to_string()))
+}
+
+fn wav_container_bytes_per_sample(source: &Path) -> Option<u16> {
+    let mut file = fs::File::open(source).ok()?;
+    let mut riff_header = [0_u8; 12];
+    file.read_exact(&mut riff_header).ok()?;
+    if &riff_header[..4] != b"RIFF" || &riff_header[8..] != b"WAVE" {
+        return None;
+    }
+
+    loop {
+        let mut chunk_header = [0_u8; 8];
+        file.read_exact(&mut chunk_header).ok()?;
+        let chunk_len = u32::from_le_bytes(chunk_header[4..].try_into().ok()?);
+        if &chunk_header[..4] == b"fmt " {
+            if chunk_len < 16 {
+                return None;
+            }
+            let mut format = [0_u8; 16];
+            file.read_exact(&mut format).ok()?;
+            let channels = u16::from_le_bytes(format[2..4].try_into().ok()?);
+            let block_align = u16::from_le_bytes(format[12..14].try_into().ok()?);
+            return (channels != 0 && block_align % channels == 0)
+                .then_some(block_align / channels);
+        }
+
+        let padded_len = i64::from(chunk_len) + i64::from(chunk_len & 1);
+        file.seek(SeekFrom::Current(padded_len)).ok()?;
+    }
 }
 
 /// Slice a normalized WAV file at the byte-exact sample range corresponding
@@ -808,7 +1070,7 @@ pub fn slice_pcm_wav_to_temp_path(
     start_ms: u64,
     end_ms: u64,
 ) -> FwResult<PathBuf> {
-    let reader = hound::WavReader::open(source).map_err(hound_error_to_fw)?;
+    let mut reader = hound::WavReader::open(source).map_err(hound_error_to_fw)?;
     let spec = reader.spec();
     if spec.sample_format != hound::SampleFormat::Int {
         return Err(FwError::Unsupported(format!(
@@ -817,22 +1079,70 @@ pub fn slice_pcm_wav_to_temp_path(
             spec.sample_format,
         )));
     }
-    let samples: Vec<i32> = reader
-        .into_samples::<i32>()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(hound_error_to_fw)?;
 
     let channels = u64::from(spec.channels.max(1));
     let sample_rate = u64::from(spec.sample_rate.max(1));
-    let total_frames = (samples.len() as u64) / channels;
-    let total_duration_ms = (total_frames * 1000) / sample_rate;
+    let range_for_frames = |total_frames: u64| {
+        let total_duration_ms = (total_frames * 1000) / sample_rate;
+        let clamped_start = start_ms.min(total_duration_ms);
+        let clamped_end = end_ms.max(clamped_start).min(total_duration_ms);
+        let start_frame = (clamped_start * sample_rate) / 1000;
+        let end_frame = (clamped_end * sample_rate) / 1000;
+        (clamped_start, clamped_end, start_frame, end_frame)
+    };
 
-    let clamped_start = start_ms.min(total_duration_ms);
-    let clamped_end = end_ms.max(clamped_start).min(total_duration_ms);
-    let start_frame = (clamped_start * sample_rate) / 1000;
-    let end_frame = (clamped_end * sample_rate) / 1000;
-    let start_sample = (start_frame * channels) as usize;
-    let end_sample = ((end_frame * channels) as usize).min(samples.len());
+    let seekable_pcm16 =
+        spec.bits_per_sample == 16 && wav_container_bytes_per_sample(source) == Some(2);
+    let (samples, clamped_start, clamped_end, start_sample, end_sample) = if seekable_pcm16 {
+        let total_frames = u64::from(reader.duration());
+        let (clamped_start, clamped_end, start_frame, end_frame) = range_for_frames(total_frames);
+
+        // Hound's duration is derived from the declared data-chunk size. Check the
+        // final frame before creating the destination so a truncated source retains
+        // the historical full-read error and never clobbers an existing output.
+        if total_frames > 0 {
+            reader
+                .seek((total_frames - 1) as u32)
+                .map_err(FwError::Io)?;
+            for sample in reader.samples::<i32>().take(channels as usize) {
+                sample.map_err(hound_error_to_fw)?;
+            }
+        }
+
+        reader.seek(start_frame as u32).map_err(FwError::Io)?;
+        let selected_samples = ((end_frame - start_frame) * channels) as usize;
+        let samples = reader
+            .into_samples::<i32>()
+            .take(selected_samples)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(hound_error_to_fw)?;
+        if samples.len() != selected_samples {
+            return Err(FwError::Io(std::io::Error::other(
+                "Failed to read enough bytes.",
+            )));
+        }
+        let end_sample = samples.len();
+        (samples, clamped_start, clamped_end, 0, end_sample)
+    } else {
+        // Hound's seek offset uses valid bits rather than container width. Keep the
+        // historical full-read path for every non-16-bit format and for PCM16 stored
+        // in a wider container.
+        let samples = reader
+            .into_samples::<i32>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(hound_error_to_fw)?;
+        let total_frames = (samples.len() as u64) / channels;
+        let (clamped_start, clamped_end, start_frame, end_frame) = range_for_frames(total_frames);
+        let start_sample = (start_frame * channels) as usize;
+        let end_sample = ((end_frame * channels) as usize).min(samples.len());
+        (
+            samples,
+            clamped_start,
+            clamped_end,
+            start_sample,
+            end_sample,
+        )
+    };
     let slice = &samples[start_sample..end_sample];
 
     let slice_path = dest_dir.join(format!("slice_{clamped_start}_{clamped_end}.wav"));
@@ -863,7 +1173,45 @@ pub fn probe_duration_seconds(input: &Path) -> Option<f64> {
     probe_duration_seconds_with_timeout(input, ffprobe_timeout())
 }
 
+/// Exact duration of a PCM WAV from its header (frames-per-channel / sample rate),
+/// or `None` if `input` is not a readable WAV. Header-only (`hound` keeps samples
+/// lazy), so O(1). The value equals ffprobe's `format=duration` for PCM WAV; see
+/// [`probe_duration_seconds_with_timeout`].
+fn wav_duration_seconds(input: &Path) -> Option<f64> {
+    let is_wav = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+    if !is_wav {
+        return None;
+    }
+    let reader = hound::WavReader::open(input).ok()?;
+    let sample_rate = reader.spec().sample_rate;
+    if sample_rate == 0 {
+        return None;
+    }
+    let secs = f64::from(reader.duration()) / f64::from(sample_rate);
+    if secs.is_finite() && secs >= 0.0 {
+        Some(secs)
+    } else {
+        None
+    }
+}
+
 pub fn probe_duration_seconds_with_timeout(input: &Path, timeout: Duration) -> Option<f64> {
+    // Fast path: a WAV carries its exact duration in the header, so shelling
+    // `ffprobe` (a per-run subprocess) to recover it is pure overhead. `hound`
+    // reads only the header here — `duration()` is frames-per-channel — and the
+    // result is BIT-IDENTICAL to ffprobe's `format=duration` for PCM WAV: both
+    // reduce to `data_bytes / byte_rate` (`frames/sample_rate` ==
+    // `data_bytes/(block_align·sample_rate)` == `data_bytes/byte_rate`). The
+    // pipeline's normalized audio is always such a WAV, so this removes the
+    // ffprobe spawn from the normalize stage on ffprobe-equipped hosts. Any
+    // parse error / non-WAV falls through to the ffprobe path unchanged.
+    if let Some(secs) = wav_duration_seconds(input) {
+        return Some(secs);
+    }
+
     let ffprobe_program = resolve_ffprobe_program(None).ok()?;
     let args = vec![
         "-v".to_owned(),
@@ -998,6 +1346,288 @@ fn duration_from_env(key: &str, fallback: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::microphone_defaults;
+
+    /// Byte-for-byte reference: the original clamp-on-every-load resampler. The
+    /// optimized [`super::resample_mono_linear`] must reproduce this bit-for-bit
+    /// (it only hoists the redundant interior clamps; arithmetic is unchanged).
+    fn resample_reference(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+        if src_rate == dst_rate {
+            return input.to_vec();
+        }
+        let ratio = src_rate as f64 / dst_rate as f64;
+        let output_len =
+            (((input.len() as f64) * dst_rate as f64) / src_rate as f64).ceil() as usize;
+        let mut output = Vec::with_capacity(output_len.max(1));
+        for idx in 0..output_len.max(1) {
+            let src_pos = idx as f64 * ratio;
+            let left_idx = src_pos.floor() as usize;
+            let right_idx = left_idx.saturating_add(1);
+            let left = input[left_idx.min(input.len().saturating_sub(1))];
+            let right = input[right_idx.min(input.len().saturating_sub(1))];
+            let frac = (src_pos - left_idx as f64) as f32;
+            output.push(left + (right - left) * frac);
+        }
+        output
+    }
+
+    #[test]
+    fn resample_mono_linear_is_bit_exact_vs_reference() {
+        use super::resample_mono_linear;
+        // Cover downsample, upsample, identity, near-edge lengths, and the empty
+        // input — every rate pair the builtin decoder can hand the resampler.
+        let rate_pairs = [
+            (44100u32, 16000u32),
+            (48000, 16000),
+            (22050, 16000),
+            (16000, 16000),
+            (8000, 16000),
+            (16000, 44100),
+        ];
+        let lengths = [0usize, 1, 2, 3, 7, 31, 1000, 4096, 44_101];
+        for &(src, dst) in &rate_pairs {
+            for &n in &lengths {
+                let input: Vec<f32> = (0..n)
+                    .map(|i| {
+                        let x = i as f32 * 0.013;
+                        (x.sin() * 0.6 + (x * 1.7).cos() * 0.3).fract()
+                    })
+                    .collect();
+                let got = resample_mono_linear(&input, src, dst);
+                let want = resample_reference(&input, src, dst);
+                assert_eq!(got.len(), want.len(), "len mismatch {src}->{dst} n={n}");
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "bit mismatch {src}->{dst} n={n} idx={i}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_i16_wav_writer_matches_per_sample_reference_bytes() {
+        use super::write_mono_wav_i16;
+
+        fn write_reference(path: &std::path::Path, samples: &[f32]) {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(path, spec).expect("create reference WAV");
+            for &sample in samples {
+                let sanitized = if sample.is_finite() { sample } else { 0.0 };
+                let quantized = (sanitized.max(-1.0).min(1.0) * f32::from(i16::MAX)).round() as i16;
+                writer
+                    .write_sample(quantized)
+                    .expect("write reference sample");
+            }
+            writer.finalize().expect("finalize reference WAV");
+        }
+
+        let edge_values = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            1.25,
+            -1.25,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.5,
+            -0.5,
+            f32::EPSILON,
+            -f32::EPSILON,
+        ];
+        let dir = tempfile::tempdir().expect("tempdir");
+        for &len in &[0usize, 1, 8_191, 8_192, 8_193, 16_391] {
+            let samples: Vec<f32> = edge_values.iter().copied().cycle().take(len).collect();
+            let reference_path = dir.path().join(format!("reference-{len}.wav"));
+            let buffered_path = dir.path().join(format!("buffered-{len}.wav"));
+            write_reference(&reference_path, &samples);
+            write_mono_wav_i16(&buffered_path, &samples, 16_000).expect("write buffered WAV");
+            assert_eq!(
+                std::fs::read(&buffered_path).expect("read buffered WAV"),
+                std::fs::read(&reference_path).expect("read reference WAV"),
+                "WAV bytes differ at len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn downmix_to_mono_is_bit_exact_vs_reference() {
+        use super::downmix_to_mono;
+        // Byte-for-byte reference: per-frame `sum() / channels` (the pre-SIMD form).
+        fn reference(interleaved: &[f32], channels: usize) -> Vec<f32> {
+            if channels <= 1 {
+                return interleaved.to_vec();
+            }
+            interleaved
+                .chunks(channels)
+                .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
+                .collect()
+        }
+        // Exercise the stereo SIMD path (lengths straddling the 8-frame block,
+        // incl. scalar tails) plus a 3-channel scalar path.
+        for &channels in &[1usize, 2, 3] {
+            for &frames in &[0usize, 1, 7, 8, 9, 15, 16, 1000, 4096, 4099] {
+                let interleaved: Vec<f32> = (0..frames * channels)
+                    .map(|i| {
+                        let x = i as f32 * 0.011;
+                        (x.sin() * 0.7 - (x * 1.3).cos() * 0.25).fract()
+                    })
+                    .collect();
+                let got = downmix_to_mono(&interleaved, channels);
+                let want = reference(&interleaved, channels);
+                assert_eq!(got.len(), want.len(), "len ch={channels} frames={frames}");
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "bit mismatch ch={channels} frames={frames} idx={i}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn append_sanitized_downmix_to_mono_matches_legacy_ingestion() {
+        use super::{append_sanitized_downmix_to_mono, downmix_to_mono};
+
+        fn legacy_reference(interleaved: &[f32], channels: usize) -> Vec<f32> {
+            let clean: Vec<f32> = interleaved
+                .iter()
+                .map(|&sample| if sample.is_finite() { sample } else { 0.0 })
+                .collect();
+            if channels <= 1 {
+                clean
+            } else {
+                downmix_to_mono(&clean, channels)
+            }
+        }
+
+        for &channels in &[1usize, 2, 3] {
+            for &frames in &[0usize, 1, 7, 8, 9, 16, 1000] {
+                let mut interleaved: Vec<f32> = (0..frames * channels + channels.saturating_sub(1))
+                    .map(|i| {
+                        let x = i as f32 * 0.017;
+                        (x.sin() * 0.5 + (x * 0.7).cos() * 0.25).fract()
+                    })
+                    .collect();
+                if !interleaved.is_empty() {
+                    interleaved[0] = f32::NAN;
+                    let middle = interleaved.len() / 2;
+                    interleaved[middle] = f32::INFINITY;
+                    *interleaved.last_mut().expect("non-empty") = f32::NEG_INFINITY;
+                }
+
+                let mut got = Vec::new();
+                append_sanitized_downmix_to_mono(&mut got, &interleaved, channels);
+                let want = legacy_reference(&interleaved, channels);
+                assert_eq!(got.len(), want.len(), "len ch={channels} frames={frames}");
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "bit mismatch ch={channels} frames={frames} idx={i}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn write_mono_wav_i16_sanitizes_non_finite_samples() {
+        use super::write_mono_wav_i16;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sanitized.wav");
+        // NaN / +Inf / -Inf must NOT panic the clamp on the current nightly and
+        // must be written as silence (0); finite subnormals/normals pass through.
+        let samples = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(1), // smallest positive subnormal (finite)
+            1.0,
+            -1.0,
+            0.0,
+            f32::MIN_POSITIVE,
+        ];
+        write_mono_wav_i16(&path, &samples, 16_000).expect("write should not panic");
+
+        let reader = hound::WavReader::open(&path).expect("open sanitized wav");
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, 16_000);
+        assert_eq!(spec.channels, 1);
+        let got: Vec<i16> = reader
+            .into_samples::<i16>()
+            .collect::<Result<_, _>>()
+            .expect("read i16 samples");
+        // Non-finite -> 0; ~0 subnormals -> 0; ±1.0 -> ±full scale.
+        assert_eq!(got, vec![0, 0, 0, 0, 32_767, -32_767, 0, 0]);
+    }
+
+    #[test]
+    fn resample_mono_linear_zero_rate_returns_empty() {
+        use super::resample_mono_linear;
+        let input = [0.1f32, 0.2, 0.3, 0.4];
+        // dst_rate==0 would make ratio=+Inf and output_len=usize::MAX (alloc
+        // panic); src_rate==0 would make ratio=NaN. Both must fail closed.
+        assert!(resample_mono_linear(&input, 16_000, 0).is_empty());
+        assert!(resample_mono_linear(&input, 0, 16_000).is_empty());
+    }
+
+    #[test]
+    fn builtin_decoder_sanitizes_non_finite_float_samples() {
+        use super::normalize_to_wav_with_builtin_decoder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input_wav = dir.path().join("nan_float.wav");
+        let output_wav = dir.path().join("normalized.wav");
+
+        // A 16 kHz mono IEEE-float WAV carrying NaN/Inf alongside finite samples.
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&input_wav, spec).expect("create float wav");
+        for i in 0..16_000 {
+            let s = match i % 4 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                2 => f32::NEG_INFINITY,
+                _ => 0.25,
+            };
+            writer.write_sample(s).expect("write");
+        }
+        writer.finalize().expect("finalize");
+
+        normalize_to_wav_with_builtin_decoder(&input_wav, &output_wav, None)
+            .expect("builtin decoder should sanitize NaN and not panic");
+
+        // Output must be valid 16 kHz mono PCM; NaN/Inf were mapped to silence so
+        // every quantized sample stays within full scale (all i16, all finite).
+        let reader = hound::WavReader::open(&output_wav).expect("open normalized wav");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 16_000);
+        let out: Vec<i16> = reader
+            .into_samples::<i16>()
+            .collect::<Result<_, _>>()
+            .expect("read normalized samples");
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|&s| (-32_767..=32_767).contains(&s)));
+    }
 
     #[test]
     fn explicit_format_and_source_wins() {
@@ -1260,6 +1890,42 @@ mod tests {
     }
 
     #[test]
+    fn slice_pcm_wav_to_temp_path_falls_back_for_wide_pcm16_container() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("wide-pcm16.wav");
+        let samples = [4_000_i32, 11_999_i32];
+        let data_len = (samples.len() * 4) as u32;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&64_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(&source, bytes).expect("write wide wav");
+        assert_eq!(super::wav_container_bytes_per_sample(&source), Some(4));
+
+        let historical_error = hound::WavReader::open(&source)
+            .expect("open wide wav")
+            .into_samples::<i32>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("hound rejects wide PCM16 samples")
+            .to_string();
+        let error = super::slice_pcm_wav_to_temp_path(&source, dir.path(), 0, 1)
+            .expect_err("wide PCM16 retains historical fallback error");
+        assert!(error.to_string().contains(&historical_error));
+    }
+
+    #[test]
     fn slice_pcm_wav_to_temp_path_clamps_oob_range() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("source.wav");
@@ -1295,6 +1961,52 @@ mod tests {
             .collect::<Result<_, _>>()
             .expect("read samples");
         assert_eq!(samples.len(), 0);
+    }
+
+    #[test]
+    fn slice_pcm_wav_to_temp_path_checks_truncated_tail_before_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.wav");
+        write_counter_wav(&source, 4_000, 16_000);
+
+        let mut source_bytes = std::fs::read(&source).expect("read source wav");
+        source_bytes.pop().expect("source has sample bytes");
+        std::fs::write(&source, source_bytes).expect("truncate final sample");
+
+        let destination = dir.path().join("slice_100_100.wav");
+        std::fs::write(&destination, b"destination sentinel").expect("write sentinel");
+        let error = super::slice_pcm_wav_to_temp_path(&source, dir.path(), 100, 100)
+            .expect_err("truncated declared tail must fail");
+
+        assert!(error.to_string().contains("Failed to read enough bytes."));
+        assert_eq!(
+            std::fs::read(destination).expect("read sentinel"),
+            b"destination sentinel"
+        );
+    }
+
+    #[test]
+    fn slice_pcm_wav_to_temp_path_preserves_source_output_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reference_source = dir.path().join("reference.wav");
+        let colliding_source = dir.path().join("slice_250_750.wav");
+        write_counter_wav(&reference_source, 16_000, 16_000);
+        std::fs::copy(&reference_source, &colliding_source).expect("copy collision source");
+
+        let reference_dest = dir.path().join("reference-dest");
+        std::fs::create_dir(&reference_dest).expect("create reference destination");
+        let reference =
+            super::slice_pcm_wav_to_temp_path(&reference_source, &reference_dest, 250, 750)
+                .expect("reference slice");
+        let expected = std::fs::read(reference).expect("read reference slice");
+
+        let collided = super::slice_pcm_wav_to_temp_path(&colliding_source, dir.path(), 250, 750)
+            .expect("colliding slice");
+        assert_eq!(collided, colliding_source);
+        assert_eq!(
+            std::fs::read(collided).expect("read collided slice"),
+            expected
+        );
     }
 
     #[test]
