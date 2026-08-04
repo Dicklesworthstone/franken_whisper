@@ -62,10 +62,10 @@ pub const PUBLIC_CORPUS_REGISTRY_SCHEMA_VERSION: &str = "public-diarization-corp
 pub const PUBLIC_CORPUS_WORD_ANNOTATION_SCHEMA_VERSION: &str =
     "public-diarization-word-annotation-v1";
 /// Schema identity for path-free public representation-ablation evidence.
-pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v10";
+pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v11";
 /// Frozen public ablation implementation identity.
 pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-ablation-runner-v10";
+    "public-diarization-acoustic-ablation-runner-v11";
 /// Schema identity for the separate aggregate-only acoustic sidecar study.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION: &str =
     "public-diarization-acoustic-sidecar-study-v3";
@@ -385,6 +385,36 @@ pub struct PublicSpeakerCountMergeFrontier {
     pub correctly_ordered_frontier_rate: Option<f64>,
 }
 
+/// Oracle-free candidate rules evaluated against the reference count only
+/// after acoustic inference has completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicSpeakerCountHierarchyMethod {
+    MaximumProbabilityDrop,
+    MaximumLogOddsDrop,
+    TwoLevelLeastSquares,
+}
+
+impl PublicSpeakerCountHierarchyMethod {
+    const ALL: [Self; 3] = [
+        Self::MaximumProbabilityDrop,
+        Self::MaximumLogOddsDrop,
+        Self::TwoLevelLeastSquares,
+    ];
+}
+
+/// Development evidence for one content-free hierarchy count rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicSpeakerCountHierarchyCandidate {
+    pub method: PublicSpeakerCountHierarchyMethod,
+    pub recording_count: u64,
+    pub unavailable_count: u64,
+    pub exact_speaker_count_rate: Option<f64>,
+    pub mean_absolute_speaker_count_error: Option<f64>,
+    pub speaker_count_confusion: Vec<PublicSpeakerCountConfusionCell>,
+}
+
 /// Count-posterior quality stratified by the reference speaker count.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -471,6 +501,7 @@ pub struct PublicCorpusAblationSplit {
     /// Reference count versus the concrete posterior MAP before abstention.
     pub speaker_count_posterior_map_confusion: Vec<PublicSpeakerCountConfusionCell>,
     pub speaker_count_merge_frontier: PublicSpeakerCountMergeFrontier,
+    pub speaker_count_hierarchy_candidates: Vec<PublicSpeakerCountHierarchyCandidate>,
     pub speaker_count_strata: Vec<PublicSpeakerCountStratum>,
     pub speaker_count_duration_strata: Vec<PublicSpeakerCountDurationStratum>,
     pub count_posterior_recording_count: u64,
@@ -3491,6 +3522,7 @@ fn evaluate_public_variant(
                     fallback_reason: None,
                     speaker_count_stability: 0.0,
                     count_merge_steps: Vec::new(),
+                    calibration_tracklets: Vec::new(),
                 },
             )
         } else {
@@ -5996,6 +6028,7 @@ fn evaluate_public_sidecar_lane(
                     fallback_reason: None,
                     speaker_count_stability: 0.0,
                     count_merge_steps: Vec::new(),
+                    calibration_tracklets: Vec::new(),
                 },
                 sidecar_evidence,
             )
@@ -7387,6 +7420,132 @@ fn count_merge_frontier_observation(
     )))
 }
 
+fn hierarchy_count_candidate(
+    steps: &[AcousticCountMergeStepEvidence],
+    method: PublicSpeakerCountHierarchyMethod,
+) -> FwResult<Option<u32>> {
+    if steps.len() < 2 {
+        return Ok(None);
+    }
+    if steps.iter().any(|step| {
+        !step.same_speaker_probability.is_finite()
+            || !(0.0..=1.0).contains(&step.same_speaker_probability)
+    }) || !steps.windows(2).all(|window| {
+        window[0].remaining_clusters.checked_sub(1) == Some(window[1].remaining_clusters)
+    }) {
+        return Err(public_corpus_error(
+            "speaker_count_hierarchy_candidate",
+            "hierarchy count candidates require finite probabilities with consecutive descending cluster counts",
+        ));
+    }
+    let split_index = match method {
+        PublicSpeakerCountHierarchyMethod::MaximumProbabilityDrop => {
+            steps
+                .windows(2)
+                .enumerate()
+                .map(|(index, window)| {
+                    (
+                        index + 1,
+                        f64::from(window[0].same_speaker_probability)
+                            - f64::from(window[1].same_speaker_probability),
+                    )
+                })
+                .max_by(|left, right| {
+                    left.1
+                        .total_cmp(&right.1)
+                        .then_with(|| right.0.cmp(&left.0))
+                })
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "speaker_count_hierarchy_candidate",
+                        "probability-drop candidate has no split",
+                    )
+                })?
+                .0
+        }
+        PublicSpeakerCountHierarchyMethod::MaximumLogOddsDrop => {
+            steps
+                .windows(2)
+                .enumerate()
+                .map(|(index, window)| {
+                    let log_odds = |probability: f32| {
+                        let probability = f64::from(probability).clamp(1e-6, 1.0 - 1e-6);
+                        (probability / (1.0 - probability)).ln()
+                    };
+                    (
+                        index + 1,
+                        log_odds(window[0].same_speaker_probability)
+                            - log_odds(window[1].same_speaker_probability),
+                    )
+                })
+                .max_by(|left, right| {
+                    left.1
+                        .total_cmp(&right.1)
+                        .then_with(|| right.0.cmp(&left.0))
+                })
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "speaker_count_hierarchy_candidate",
+                        "log-odds-drop candidate has no split",
+                    )
+                })?
+                .0
+        }
+        PublicSpeakerCountHierarchyMethod::TwoLevelLeastSquares => {
+            (1..steps.len())
+                .map(|split_index| {
+                    let squared_error = |slice: &[AcousticCountMergeStepEvidence]| {
+                        let mean = slice
+                            .iter()
+                            .map(|step| f64::from(step.same_speaker_probability))
+                            .sum::<f64>()
+                            / slice.len() as f64;
+                        slice
+                            .iter()
+                            .map(|step| {
+                                let residual = f64::from(step.same_speaker_probability) - mean;
+                                residual * residual
+                            })
+                            .sum::<f64>()
+                    };
+                    (
+                        split_index,
+                        squared_error(&steps[..split_index]) + squared_error(&steps[split_index..]),
+                    )
+                })
+                .min_by(|left, right| {
+                    left.1
+                        .total_cmp(&right.1)
+                        .then_with(|| left.0.cmp(&right.0))
+                })
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "speaker_count_hierarchy_candidate",
+                        "two-level least-squares candidate has no split",
+                    )
+                })?
+                .0
+        }
+    };
+    u32::try_from(steps[split_index - 1].remaining_clusters)
+        .map(Some)
+        .map_err(|_| {
+            public_corpus_error(
+                "speaker_count_hierarchy_candidate",
+                "hierarchy count candidate exceeds the public count domain",
+            )
+        })
+}
+
+#[derive(Clone, Default)]
+struct HierarchyCandidateAccumulator {
+    recording_count: u64,
+    unavailable_count: u64,
+    exact_count: u64,
+    absolute_error: u64,
+    confusion: BTreeMap<(u32, u32), u64>,
+}
+
 #[derive(Default)]
 struct PublicAblationAccumulator {
     recording_count: u64,
@@ -7427,6 +7586,8 @@ struct PublicAblationAccumulator {
     count_merge_frontier_margin_sum: f64,
     count_merge_frontier_margin_count: u64,
     count_merge_frontier_correctly_ordered_count: u64,
+    speaker_count_hierarchy_candidates:
+        BTreeMap<PublicSpeakerCountHierarchyMethod, HierarchyCandidateAccumulator>,
     speaker_count_strata: BTreeMap<u32, SpeakerCountStratumAccumulator>,
     speaker_count_duration_strata:
         BTreeMap<PublicSpeakerCountDurationBucket, SpeakerCountStratumAccumulator>,
@@ -7656,6 +7817,61 @@ impl PublicAblationAccumulator {
                         public_corpus_error(
                             "ablation_aggregate_overflow",
                             "ordered count merge-frontier count overflowed",
+                        )
+                    })?;
+            }
+        }
+        for method in PublicSpeakerCountHierarchyMethod::ALL {
+            let accumulator = self
+                .speaker_count_hierarchy_candidates
+                .entry(method)
+                .or_default();
+            if let Some(candidate) =
+                hierarchy_count_candidate(&clustering.count_merge_steps, method)?
+            {
+                accumulator.recording_count =
+                    accumulator.recording_count.checked_add(1).ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "hierarchy count-candidate recording count overflowed",
+                        )
+                    })?;
+                accumulator.exact_count = accumulator
+                    .exact_count
+                    .checked_add(u64::from(candidate == reference_speakers))
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "hierarchy exact-count observation count overflowed",
+                        )
+                    })?;
+                accumulator.absolute_error = accumulator
+                    .absolute_error
+                    .checked_add(u64::from(candidate.abs_diff(reference_speakers)))
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "hierarchy absolute count error overflowed",
+                        )
+                    })?;
+                let confusion_count = accumulator
+                    .confusion
+                    .entry((reference_speakers, candidate))
+                    .or_default();
+                *confusion_count = confusion_count.checked_add(1).ok_or_else(|| {
+                    public_corpus_error(
+                        "ablation_aggregate_overflow",
+                        "hierarchy count confusion observation overflowed",
+                    )
+                })?;
+            } else {
+                accumulator.unavailable_count = accumulator
+                    .unavailable_count
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "hierarchy count-candidate unavailable count overflowed",
                         )
                     })?;
             }
@@ -7986,6 +8202,42 @@ impl PublicAblationAccumulator {
                 self.count_merge_frontier_margin_count,
             ),
         };
+        let speaker_count_hierarchy_candidates = PublicSpeakerCountHierarchyMethod::ALL
+            .into_iter()
+            .map(|method| {
+                let accumulator = self
+                    .speaker_count_hierarchy_candidates
+                    .get(&method)
+                    .cloned()
+                    .unwrap_or_default();
+                PublicSpeakerCountHierarchyCandidate {
+                    method,
+                    recording_count: accumulator.recording_count,
+                    unavailable_count: accumulator.unavailable_count,
+                    exact_speaker_count_rate: ratio(
+                        accumulator.exact_count,
+                        accumulator.recording_count,
+                    ),
+                    mean_absolute_speaker_count_error: positive_ratio(
+                        accumulator.absolute_error as f64,
+                        accumulator.recording_count as f64,
+                    ),
+                    speaker_count_confusion: accumulator
+                        .confusion
+                        .into_iter()
+                        .map(
+                            |((reference_speakers, hypothesis_speakers), recording_count)| {
+                                PublicSpeakerCountConfusionCell {
+                                    reference_speakers,
+                                    hypothesis_speakers,
+                                    recording_count,
+                                }
+                            },
+                        )
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>();
         let speaker_count_strata = self
             .speaker_count_strata
             .iter()
@@ -8186,6 +8438,7 @@ impl PublicAblationAccumulator {
             speaker_count_confusion,
             speaker_count_posterior_map_confusion,
             speaker_count_merge_frontier,
+            speaker_count_hierarchy_candidates,
             speaker_count_strata,
             speaker_count_duration_strata,
             count_posterior_recording_count: self.count_posterior_recording_count,
@@ -11295,6 +11548,60 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                     merge_frontier.correctly_ordered_frontier_count,
                     merge_frontier.paired_frontier_observation_count,
                 );
+        let hierarchy_candidates_valid = split.speaker_count_hierarchy_candidates.len()
+            == PublicSpeakerCountHierarchyMethod::ALL.len()
+            && split
+                .speaker_count_hierarchy_candidates
+                .iter()
+                .map(|candidate| candidate.method)
+                .eq(PublicSpeakerCountHierarchyMethod::ALL)
+            && split
+                .speaker_count_hierarchy_candidates
+                .iter()
+                .all(|candidate| {
+                    let confusion_count = candidate
+                        .speaker_count_confusion
+                        .iter()
+                        .map(|cell| cell.recording_count)
+                        .sum::<u64>();
+                    let exact_count = candidate
+                        .speaker_count_confusion
+                        .iter()
+                        .filter(|cell| cell.reference_speakers == cell.hypothesis_speakers)
+                        .map(|cell| cell.recording_count)
+                        .sum::<u64>();
+                    let absolute_error = candidate
+                        .speaker_count_confusion
+                        .iter()
+                        .map(|cell| {
+                            u128::from(cell.hypothesis_speakers.abs_diff(cell.reference_speakers))
+                                * u128::from(cell.recording_count)
+                        })
+                        .sum::<u128>();
+                    candidate.speaker_count_confusion.windows(2).all(|window| {
+                        (window[0].reference_speakers, window[0].hypothesis_speakers)
+                            < (window[1].reference_speakers, window[1].hypothesis_speakers)
+                    }) && candidate
+                        .speaker_count_confusion
+                        .iter()
+                        .all(|cell| cell.recording_count > 0)
+                        && confusion_count == candidate.recording_count
+                        && candidate
+                            .recording_count
+                            .saturating_add(candidate.unavailable_count)
+                            == split.recording_count
+                        && candidate.exact_speaker_count_rate
+                            == ratio(exact_count, candidate.recording_count)
+                        && candidate.mean_absolute_speaker_count_error
+                            == positive_ratio(
+                                absolute_error as f64,
+                                candidate.recording_count as f64,
+                            )
+                        && bounded(candidate.exact_speaker_count_rate)
+                        && candidate
+                            .mean_absolute_speaker_count_error
+                            .is_none_or(finite_nonnegative)
+                });
         let stratum_recording_count = split
             .speaker_count_strata
             .iter()
@@ -11510,6 +11817,7 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
             && confusion_valid
             && posterior_map_confusion_valid
             && merge_frontier_valid
+            && hierarchy_candidates_valid
             && count_strata_valid
             && count_duration_strata_valid
             && count_posterior_valid
@@ -17056,10 +17364,30 @@ mod tests {
             super::count_merge_frontier_observation(&[], 4).expect("empty trace"),
             None
         );
+        for method in super::PublicSpeakerCountHierarchyMethod::ALL {
+            assert_eq!(
+                super::hierarchy_count_candidate(&steps, method)
+                    .expect("valid hierarchy candidate"),
+                Some(4),
+                "{method:?}"
+            );
+            assert_eq!(
+                super::hierarchy_count_candidate(&steps[..1], method).expect("short trace"),
+                None,
+                "{method:?}"
+            );
+        }
 
         let mut invalid = steps;
         invalid[1].remaining_clusters = 3;
         assert!(super::count_merge_frontier_observation(&invalid, 4).is_err());
+        assert!(
+            super::hierarchy_count_candidate(
+                &invalid,
+                super::PublicSpeakerCountHierarchyMethod::MaximumProbabilityDrop,
+            )
+            .is_err()
+        );
         invalid = steps;
         invalid[1].same_speaker_probability = f32::NAN;
         assert!(super::count_merge_frontier_observation(&invalid, 4).is_err());
@@ -17165,6 +17493,17 @@ mod tests {
                 correctly_ordered_frontier_count: 0,
                 correctly_ordered_frontier_rate: None,
             },
+            speaker_count_hierarchy_candidates: super::PublicSpeakerCountHierarchyMethod::ALL
+                .into_iter()
+                .map(|method| super::PublicSpeakerCountHierarchyCandidate {
+                    method,
+                    recording_count: 0,
+                    unavailable_count: 1,
+                    exact_speaker_count_rate: None,
+                    mean_absolute_speaker_count_error: None,
+                    speaker_count_confusion: Vec::new(),
+                })
+                .collect(),
             speaker_count_strata: vec![super::PublicSpeakerCountStratum {
                 reference_speakers: 1,
                 recording_count: 1,
