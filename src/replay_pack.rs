@@ -229,6 +229,7 @@ mod tests {
                     },
                 ],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },

@@ -1,0 +1,9 @@
+[[workers]]
+id = "ovh-a"
+host = "51.222.245.56"
+user = "ubuntu"
+identity_file = "~/.ssh/je_ovh_ssh_key.pem"
+total_slots = 8
+priority = 100
+tags = ["rust"]
+enabled = true

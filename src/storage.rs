@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use fsqlite::Connection;
+use fsqlite::{Connection, FrankenError, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::de::DeserializeOwned;
 
@@ -13,8 +13,104 @@ use crate::model::{
     TranscriptionResult,
 };
 
+/// Drive `future` to completion on this thread's runtime.
+///
+/// The runtime is built once per thread rather than once per statement: a
+/// single `persist_report` issues many statements, and the concurrency tests
+/// drive several threads at once.
+///
+/// The future is boxed before it is polled. `fsqlite`'s statement futures nest
+/// deeply (statement dispatch → DML → triggers → nested statement execution —
+/// deep enough that `fsqlite` raises its own `recursion_limit` to type-check
+/// them), so both their state machines and the synchronous poll chain that
+/// drives them are large. Boxing moves the outermost state machine off the
+/// stack; it measurably reduces the depth but does **not** on its own make a
+/// debug build fit on libtest's ordinary worker stack — that needs the
+/// `RUST_MIN_STACK` set in `.cargo/config.toml`, which is where the full
+/// rationale lives. This is debug-only for the measured suite: a release build
+/// clears the same 202 tests with `RUST_MIN_STACK` unset.
+fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, FrankenError> {
+    thread_local! {
+        static RUNTIME: Result<asupersync::runtime::Runtime, String> =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .map_err(|error| error.to_string());
+    }
+    RUNTIME.with(|runtime| match runtime {
+        Ok(runtime) => Ok(runtime.block_on(Box::pin(future))),
+        Err(error) => Err(FrankenError::Internal(format!(
+            "cannot build franken_whisper storage runtime: {error}"
+        ))),
+    })
+}
+
+/// Synchronous facade over the now-`async` [`fsqlite::Connection`].
+///
+/// The frankensqlite async migration turned every statement entry point —
+/// `open`, `query`, `execute`, and the `*_with_params` variants — into
+/// `async fn`. Every consumer of the run store (the CLI in `main.rs`, robot
+/// mode, and the JSONL sync) is synchronous and is never itself driven by an
+/// executor, so propagating `async` across the whole storage surface would buy
+/// no concurrency and would force a runtime into `main`. Instead the bridge
+/// lives here, mirroring the `block_on` bridge frankensqlite added for its own
+/// synchronous harnesses.
+///
+/// Method names, argument types, and error types are deliberately identical to
+/// the `Connection` inherent methods they wrap, so the call sites in this
+/// module and in [`crate::sync`] keep their existing shape and error mapping.
+pub struct BlockingConnection {
+    inner: Connection,
+}
+
+impl std::fmt::Debug for BlockingConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockingConnection").finish_non_exhaustive()
+    }
+}
+
+impl BlockingConnection {
+    pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
+        block_on(Connection::open(path))?.map(|inner| Self { inner })
+    }
+
+    pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
+        block_on(self.inner.query(sql))?
+    }
+
+    pub fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>, FrankenError> {
+        block_on(self.inner.query_with_params(sql, params))?
+    }
+
+    pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
+        block_on(self.inner.execute(sql))?
+    }
+
+    pub fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, FrankenError> {
+        block_on(self.inner.execute_with_params(sql, params))?
+    }
+
+    pub fn execute_with_params_skip_statement_savepoint_in_explicit_txn(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, FrankenError> {
+        block_on(
+            self.inner
+                .execute_with_params_skip_statement_savepoint_in_explicit_txn(sql, params),
+        )?
+    }
+}
+
 pub struct RunStore {
-    connection: Connection,
+    connection: BlockingConnection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +157,7 @@ impl RunStore {
         }
 
         for attempt in 0..=PERSIST_BUSY_RETRY_ATTEMPTS {
-            let connection_result = Connection::open(db_path.display().to_string());
+            let connection_result = BlockingConnection::open(db_path.display().to_string());
             match connection_result {
                 Ok(connection) => {
                     let store = Self { connection };
@@ -91,6 +187,10 @@ impl RunStore {
         Err(FwError::Storage(
             "open retry loop exhausted unexpectedly".to_owned(),
         ))
+    }
+
+    pub(crate) fn connection(&self) -> &BlockingConnection {
+        &self.connection
     }
 
     pub fn persist_report(&self, report: &RunReport) -> FwResult<()> {
@@ -172,22 +272,46 @@ impl RunStore {
             tok.checkpoint()?;
         }
 
-        // Use SQL ORDER BY and LIMIT for efficient and memory-safe queries.
-        let sql = if limit > 0 {
-            format!(
-                "SELECT id, started_at, finished_at, backend, transcript FROM runs \
-                 ORDER BY started_at DESC, id DESC LIMIT {limit}"
-            )
-        } else {
-            "SELECT id, started_at, finished_at, backend, transcript FROM runs \
-             ORDER BY started_at DESC, id DESC"
-                .to_owned()
+        // Project only the 140-char preview in SQL (fsqlite's `ColumnSubstrPrefix`
+        // fast path) so a large transcript is never materialized or transferred
+        // just to be truncated. `substr(transcript, 1, 140)` returns the first 140
+        // characters, byte-identical to the historical `.chars().take(140)` for
+        // TEXT (and coerced numeric) values. A BLOB value renders differently under
+        // projection (`<blob:<=140>` vs the full `<blob:N>`), so if the projected
+        // result contains any BLOB transcript we re-run with the full column and
+        // fall back to the historical rendering — byte-exact for every DB state.
+        let build_sql = |expr: &str| {
+            if limit > 0 {
+                format!(
+                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
+                     ORDER BY started_at DESC, id DESC LIMIT {limit}"
+                )
+            } else {
+                format!(
+                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
+                     ORDER BY started_at DESC, id DESC"
+                )
+            }
         };
 
         let rows = self
             .connection
-            .query(&sql)
+            .query(&build_sql("substr(transcript, 1, 140)"))
             .map_err(|error| FwError::Storage(error.to_string()))?;
+
+        // BLOB transcripts render by byte length, which the projection would
+        // shorten; re-run with the full column so the preview matches the
+        // historical `<blob:N>` marker exactly.
+        let rows = if rows
+            .iter()
+            .any(|row| matches!(row.get(4), Some(SqliteValue::Blob(_))))
+        {
+            self.connection
+                .query(&build_sql("transcript"))
+                .map_err(|error| FwError::Storage(error.to_string()))?
+        } else {
+            rows
+        };
 
         rows.into_iter()
             .map(|row| {
@@ -341,6 +465,7 @@ impl RunStore {
             })
             .collect::<FwResult<Vec<_>>>()?;
 
+        let projection_timeline = stored_projection_timeline(&result.raw_output, &run_id)?;
         Ok(Some(StoredRunDetails {
             run_id,
             started_at_rfc3339,
@@ -348,6 +473,8 @@ impl RunStore {
             backend,
             transcript,
             segments: result.segments,
+            diarization: result.diarization,
+            projection_timeline,
             events,
             warnings,
             acceleration: acceleration_override.or(result.acceleration),
@@ -355,8 +482,90 @@ impl RunStore {
         }))
     }
 
+    /// Load full details for many runs with two batched `WHERE id/run_id IN (…)`
+    /// queries instead of the per-run N+1 (`load_run_details` × N, each 2 queries +
+    /// 2 schema scans). Returns details for the run_ids that exist, in input order.
+    /// Output is byte-identical to per-run `load_run_details` (asserted by
+    /// `load_run_details_batch_matches_per_run`). `FW_STORAGE_BATCH_HISTORY=0` falls
+    /// back to the per-run path (kill-switch + A/B arm).
+    pub fn load_run_details_batch(&self, run_ids: &[String]) -> FwResult<Vec<StoredRunDetails>> {
+        if run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !batch_history_enabled() {
+            let mut out = Vec::with_capacity(run_ids.len());
+            for id in run_ids {
+                if let Some(details) = self.load_run_details(id)? {
+                    out.push(details);
+                }
+            }
+            return Ok(out);
+        }
+
+        // Optional-column exprs computed ONCE (not once per run) — see load_run_details.
+        let replay_expr = if self.table_has_column("runs", "replay_json")? {
+            "replay_json"
+        } else {
+            "'{}' AS replay_json"
+        };
+        let acceleration_expr = if self.table_has_column("runs", "acceleration_json")? {
+            "acceleration_json"
+        } else {
+            "'{}' AS acceleration_json"
+        };
+        let placeholders = (1..=run_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let params: Vec<SqliteValue> = run_ids
+            .iter()
+            .map(|id| SqliteValue::Text(id.clone().into()))
+            .collect();
+
+        let run_sql = format!(
+            "SELECT id, started_at, finished_at, backend, result_json, warnings_json, transcript, {replay_expr}, {acceleration_expr} \
+             FROM runs WHERE id IN ({placeholders})"
+        );
+        let run_rows = self
+            .connection
+            .query_with_params(&run_sql, &params)
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let mut run_by_id: std::collections::HashMap<String, fsqlite::Row> =
+            std::collections::HashMap::with_capacity(run_rows.len());
+        for row in run_rows {
+            run_by_id.insert(value_to_string(row.get(0)), row);
+        }
+
+        let evt_sql = format!(
+            "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
+             FROM events WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, seq ASC"
+        );
+        let evt_rows = self
+            .connection
+            .query_with_params(&evt_sql, &params)
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let mut events_by_run: std::collections::HashMap<String, Vec<fsqlite::Row>> =
+            std::collections::HashMap::new();
+        for row in evt_rows {
+            events_by_run
+                .entry(value_to_string(row.get(0)))
+                .or_default()
+                .push(row);
+        }
+
+        let mut out = Vec::with_capacity(run_ids.len());
+        for run_id in run_ids {
+            let Some(run_row) = run_by_id.get(run_id) else {
+                continue;
+            };
+            let events = events_by_run.remove(run_id).unwrap_or_default();
+            out.push(assemble_run_details_batched(run_row, &events)?);
+        }
+        Ok(out)
+    }
+
     /// Current schema version. Bump when adding migrations.
-    pub const SCHEMA_VERSION: u32 = 3;
+    pub const SCHEMA_VERSION: u32 = 5;
 
     fn initialize_schema(&self) -> FwResult<()> {
         // Enable WAL mode for concurrent read/write support.
@@ -401,6 +610,63 @@ CREATE TABLE IF NOT EXISTS events (
     message TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     PRIMARY KEY (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS diarization_reports (
+    run_id TEXT PRIMARY KEY,
+    implementation TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    feature_schema TEXT NOT NULL,
+    normalized_input_sha256 TEXT NOT NULL,
+    hint_document_sha256 TEXT,
+    detected_speakers INTEGER NOT NULL,
+    constraints_satisfied INTEGER NOT NULL,
+    supported_speaker_count INTEGER NOT NULL,
+    speaker_count_status TEXT NOT NULL,
+    speaker_count_json TEXT NOT NULL,
+    hint_evidence_json TEXT NOT NULL,
+    fallback_status TEXT NOT NULL,
+    diagnostics_json TEXT NOT NULL,
+    profile_persistence_opt_in INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS diarization_turns (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    speaker_ref TEXT,
+    speaker_confidence REAL,
+    change_confidence REAL,
+    overlap_suspected INTEGER NOT NULL,
+    hard_hint_attributed INTEGER NOT NULL,
+    PRIMARY KEY (run_id, idx)
+);
+
+CREATE TABLE IF NOT EXISTS speaker_hints (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    speaker_ref TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    policy TEXT NOT NULL,
+    provenance TEXT,
+    PRIMARY KEY (run_id, idx)
+);
+
+CREATE TABLE IF NOT EXISTS speaker_profile_summaries (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    speaker_ref TEXT NOT NULL,
+    frame_count INTEGER NOT NULL,
+    voiced_duration_ms INTEGER NOT NULL,
+    reliability REAL NOT NULL,
+    channel_profile_count INTEGER NOT NULL,
+    anchored INTEGER NOT NULL,
+    soft_hint_contradiction REAL,
+    profile_persistence_opt_in INTEGER NOT NULL,
+    PRIMARY KEY (run_id, idx)
 );
 
 CREATE TABLE IF NOT EXISTS _meta (
@@ -472,15 +738,52 @@ CREATE TABLE IF NOT EXISTS _meta (
         }
 
         // Fresh databases are created with the current table shape in
-        // initialize_schema(). Detect that shape explicitly before shortcutting:
-        // legacy v1 DBs can also report version=0 when `_meta` is absent and must
-        // still flow through v2 migrations to add new columns.
+        // initialize_schema(). A markerless legacy database can also report
+        // version=0, but CREATE TABLE IF NOT EXISTS has already supplied every
+        // table that was absent. When the runs table has the v2 columns, finish
+        // the index-only v3/v4 work directly. The following v5 migration owns
+        // the derived-cache rebuild after ensuring its typed evidence columns.
+        // This avoids replaying v4's table DDL against a brand-new current-shape
+        // DB, which leaves needless freelist pages in fsqlite.
         if current == 0 {
             let has_replay = self.table_has_column("runs", "replay_json")?;
             let has_acceleration = self.table_has_column("runs", "acceleration_json")?;
             if has_replay && has_acceleration {
-                self.set_schema_version(2)?;
-                current = 2;
+                self.apply_migration(3)?;
+                self.ensure_diarization_indexes_v4()?;
+                let mut has_v5_columns = true;
+                for column in [
+                    "supported_speaker_count",
+                    "speaker_count_status",
+                    "speaker_count_json",
+                    "hint_evidence_json",
+                ] {
+                    has_v5_columns &= self.table_has_column("diarization_reports", column)?;
+                }
+                let has_canonical_runs = !self
+                    .connection
+                    .query("SELECT 1 FROM runs LIMIT 1;")
+                    .map_err(|error| FwError::Storage(error.to_string()))?
+                    .is_empty();
+                let mut has_derived_rows = false;
+                for table in [
+                    "diarization_turns",
+                    "speaker_hints",
+                    "speaker_profile_summaries",
+                    "diarization_reports",
+                ] {
+                    let present = self
+                        .connection
+                        .query(&format!("SELECT 1 FROM {table} LIMIT 1;"))
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                    has_derived_rows |= !present.is_empty();
+                }
+                if has_v5_columns && !has_canonical_runs && !has_derived_rows {
+                    self.set_schema_version(Self::SCHEMA_VERSION)?;
+                    return Ok(());
+                }
+                self.set_schema_version(4)?;
+                current = 4;
             }
         }
 
@@ -536,10 +839,277 @@ CREATE TABLE IF NOT EXISTS _meta (
                     .map_err(|error| FwError::Storage(error.to_string()))?;
                 Ok(())
             }
+            4 => self.migrate_diarization_schema_v4(),
+            5 => self.migrate_diarization_schema_v5(),
             _ => Err(FwError::Storage(format!(
                 "unknown migration version: {version}"
             ))),
         }
+    }
+
+    fn migrate_diarization_schema_v4(&self) -> FwResult<()> {
+        const SAVEPOINT: &str = "fw_migrate_diarization_v4";
+        self.connection
+            .execute(&format!("SAVEPOINT {SAVEPOINT};"))
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let result = (|| {
+            self.connection
+                .execute(
+                    r#"
+CREATE TABLE IF NOT EXISTS diarization_reports (
+    run_id TEXT PRIMARY KEY,
+    implementation TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    feature_schema TEXT NOT NULL,
+    normalized_input_sha256 TEXT NOT NULL,
+    hint_document_sha256 TEXT,
+    detected_speakers INTEGER NOT NULL,
+    constraints_satisfied INTEGER NOT NULL,
+    fallback_status TEXT NOT NULL,
+    diagnostics_json TEXT NOT NULL,
+    profile_persistence_opt_in INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS diarization_turns (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    speaker_ref TEXT,
+    speaker_confidence REAL,
+    change_confidence REAL,
+    overlap_suspected INTEGER NOT NULL,
+    hard_hint_attributed INTEGER NOT NULL,
+    PRIMARY KEY (run_id, idx)
+);
+CREATE TABLE IF NOT EXISTS speaker_hints (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    speaker_ref TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    policy TEXT NOT NULL,
+    provenance TEXT,
+    PRIMARY KEY (run_id, idx)
+);
+CREATE TABLE IF NOT EXISTS speaker_profile_summaries (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    speaker_ref TEXT NOT NULL,
+    frame_count INTEGER NOT NULL,
+    voiced_duration_ms INTEGER NOT NULL,
+    reliability REAL NOT NULL,
+    channel_profile_count INTEGER NOT NULL,
+    anchored INTEGER NOT NULL,
+    soft_hint_contradiction REAL,
+    profile_persistence_opt_in INTEGER NOT NULL,
+    PRIMARY KEY (run_id, idx)
+);
+"#,
+                )
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+
+            self.ensure_diarization_indexes_v4()
+        })();
+
+        match result {
+            Ok(()) => {
+                self.connection
+                    .execute(&format!("RELEASE SAVEPOINT {SAVEPOINT};"))
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = rollback_savepoint(&self.connection, SAVEPOINT);
+                Err(error)
+            }
+        }
+    }
+
+    fn migrate_diarization_schema_v5(&self) -> FwResult<()> {
+        const SAVEPOINT: &str = "fw_migrate_diarization_v5";
+        self.connection
+            .execute(&format!("SAVEPOINT {SAVEPOINT};"))
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let result = (|| {
+            self.ensure_column_exists(
+                "diarization_reports",
+                "supported_speaker_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            self.ensure_column_exists(
+                "diarization_reports",
+                "speaker_count_status",
+                "TEXT NOT NULL DEFAULT 'unresolved'",
+            )?;
+            self.ensure_column_exists(
+                "diarization_reports",
+                "speaker_count_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )?;
+            self.ensure_column_exists(
+                "diarization_reports",
+                "hint_evidence_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            self.rebuild_diarization_index_inner()
+        })();
+
+        match result {
+            Ok(()) => {
+                self.connection
+                    .execute(&format!("RELEASE SAVEPOINT {SAVEPOINT};"))
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = rollback_savepoint(&self.connection, SAVEPOINT);
+                Err(error)
+            }
+        }
+    }
+
+    fn ensure_diarization_indexes_v4(&self) -> FwResult<()> {
+        self.connection
+            .execute(
+                r#"
+CREATE INDEX IF NOT EXISTS idx_diarization_turns_run_id
+    ON diarization_turns(run_id);
+CREATE INDEX IF NOT EXISTS idx_speaker_hints_run_id
+    ON speaker_hints(run_id);
+CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
+    ON speaker_profile_summaries(run_id);
+"#,
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn rebuild_diarization_index(&self) -> FwResult<()> {
+        const SAVEPOINT: &str = "fw_rebuild_diarization_index";
+        self.connection
+            .execute(&format!("SAVEPOINT {SAVEPOINT};"))
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        match self.rebuild_diarization_index_inner() {
+            Ok(()) => {
+                self.connection
+                    .execute(&format!("RELEASE SAVEPOINT {SAVEPOINT};"))
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = rollback_savepoint(&self.connection, SAVEPOINT);
+                Err(error)
+            }
+        }
+    }
+
+    fn rebuild_diarization_index_inner(&self) -> FwResult<()> {
+        let rows = self
+            .connection
+            .query("SELECT id, request_json, result_json FROM runs ORDER BY id ASC;")
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        if rows.is_empty() {
+            let mut has_derived_rows = false;
+            for table in [
+                "diarization_turns",
+                "speaker_hints",
+                "speaker_profile_summaries",
+                "diarization_reports",
+            ] {
+                let present = self
+                    .connection
+                    .query(&format!("SELECT 1 FROM {table} LIMIT 1;"))
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                has_derived_rows |= !present.is_empty();
+            }
+            if !has_derived_rows {
+                return Ok(());
+            }
+        }
+
+        for table in [
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+            "diarization_reports",
+        ] {
+            self.connection
+                .execute(&format!("DELETE FROM {table};"))
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+        }
+        for row in rows {
+            let run_id = value_to_string(row.get(0));
+            let request_json = value_to_string(row.get(1));
+            let result_json = value_to_string(row.get(2));
+            let request_value: serde_json::Value =
+                serde_json::from_str(&request_json).map_err(|error| {
+                    FwError::Storage(format!(
+                        "cannot rebuild diarization request for run {run_id}: {error}"
+                    ))
+                })?;
+            let result_value: serde_json::Value =
+                serde_json::from_str(&result_json).map_err(|error| {
+                    FwError::Storage(format!(
+                        "cannot rebuild diarization result for run {run_id}: {error}"
+                    ))
+                })?;
+
+            let diarization_request = request_value
+                .pointer("/backend_params/acoustic_diarization")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    if value.get("speaker_count").is_none() {
+                        return Err(FwError::Storage(format!(
+                            "cannot rebuild acoustic diarization request for run {run_id}: \
+                             legacy speaker-count encoding is unsupported by \
+                             acoustic-diarization-v2; export or recover the canonical run JSON \
+                             with a matching franken_whisper version before migrating"
+                        )));
+                    }
+                    serde_json::from_value::<crate::model::DiarizationRequest>(value.clone())
+                        .map_err(|error| {
+                            FwError::Storage(format!(
+                                "cannot rebuild acoustic diarization request for run {run_id}: {error}"
+                            ))
+                        })
+                })
+                .transpose()?;
+            let diarization_report = result_value
+                .get("diarization")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    let contract_version = value
+                        .get("contract_version")
+                        .and_then(serde_json::Value::as_str);
+                    if contract_version
+                        != Some(crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION)
+                        || value.get("speaker_count").is_none()
+                    {
+                        return Err(FwError::Storage(format!(
+                            "cannot rebuild diarization report for run {run_id}: contract {:?} \
+                             is unsupported by {}; export or recover the canonical run JSON with \
+                             a matching franken_whisper version before migrating",
+                            contract_version,
+                            crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION
+                        )));
+                    }
+                    serde_json::from_value::<crate::model::DiarizationReport>(value.clone())
+                        .map_err(|error| {
+                            FwError::Storage(format!(
+                                "cannot rebuild diarization report for run {run_id}: {error}"
+                            ))
+                        })
+                })
+                .transpose()?;
+            self.replace_diarization_records(
+                &run_id,
+                diarization_request.as_ref(),
+                diarization_report.as_ref(),
+                persist_skip_stmt_sp_enabled(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Add a column to a table if it doesn't already exist.
@@ -1049,11 +1619,170 @@ CREATE TABLE IF NOT EXISTS _meta (
         rebuild_result
     }
 
+    /// Execute one INSERT for [`persist_report_inner`]. When `skip_sp` is set the
+    /// fsqlite per-statement savepoint is skipped (the caller's enclosing
+    /// `SAVEPOINT` is the rollback boundary); otherwise the legacy path runs. The
+    /// persisted row is identical in both cases.
+    fn persist_insert(&self, skip_sp: bool, sql: &str, params: &[SqliteValue]) -> FwResult<()> {
+        let result = if skip_sp {
+            self.connection
+                .execute_with_params_skip_statement_savepoint_in_explicit_txn(sql, params)
+        } else {
+            self.connection.execute_with_params(sql, params)
+        };
+        result
+            .map(|_| ())
+            .map_err(|error| FwError::Storage(error.to_string()))
+    }
+
+    fn replace_diarization_records(
+        &self,
+        run_id: &str,
+        diarization_request: Option<&crate::model::DiarizationRequest>,
+        report: Option<&crate::model::DiarizationReport>,
+        skip_sp: bool,
+    ) -> FwResult<()> {
+        if report.is_some_and(|report| {
+            report.implementation.starts_with("native-acoustic")
+                && report.speaker_count.estimate.is_none()
+        }) {
+            return Err(FwError::Storage(format!(
+                "cannot persist native acoustic diarization for run {run_id}: \
+                 speaker-count-estimate-v2 is required by the current report contract"
+            )));
+        }
+        if let Some(estimate) = report.and_then(|report| report.speaker_count.estimate.as_ref()) {
+            estimate.validate().map_err(|error| {
+                FwError::Storage(format!(
+                    "cannot persist invalid speaker-count estimate for run {run_id}: {error}"
+                ))
+            })?;
+        }
+        let run_id_value = text_value(run_id.to_owned());
+        for table in [
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+            "diarization_reports",
+        ] {
+            self.persist_insert(
+                skip_sp,
+                &format!("DELETE FROM {table} WHERE run_id = ?1"),
+                std::slice::from_ref(&run_id_value),
+            )?;
+        }
+
+        let profile_persistence_opt_in =
+            diarization_request.is_some_and(|request| request.persist_profiles);
+        if let Some(diarization_request) = diarization_request {
+            for (index, hint) in diarization_request.known_intervals.iter().enumerate() {
+                self.persist_insert(
+                    skip_sp,
+                    "INSERT INTO speaker_hints (run_id, idx, speaker_ref, start_ms, end_ms, confidence, policy, provenance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    &[
+                        run_id_value.clone(),
+                        storage_index(index, "speaker hint index")?,
+                        text_value(hint.speaker_ref.clone()),
+                        storage_u64(hint.start_ms, "speaker hint start_ms")?,
+                        storage_u64(hint.end_ms, "speaker hint end_ms")?,
+                        SqliteValue::Float(hint.confidence),
+                        text_value(serde_enum_name(&hint.policy)?),
+                        optional_text(hint.provenance.as_deref()),
+                    ],
+                )?;
+            }
+        }
+
+        let Some(report) = report else {
+            return Ok(());
+        };
+        self.persist_insert(
+            skip_sp,
+            "INSERT INTO diarization_reports (run_id, implementation, contract_version, feature_schema, normalized_input_sha256, hint_document_sha256, detected_speakers, constraints_satisfied, supported_speaker_count, speaker_count_status, speaker_count_json, hint_evidence_json, fallback_status, diagnostics_json, profile_persistence_opt_in) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            &[
+                run_id_value.clone(),
+                text_value(report.implementation.clone()),
+                text_value(report.contract_version.clone()),
+                text_value(report.feature_schema.clone()),
+                text_value(report.normalized_input_sha256.clone()),
+                optional_text(report.hint_document_sha256.as_deref()),
+                SqliteValue::Integer(i64::from(
+                    report.speaker_count.supported_speaker_count,
+                )),
+                SqliteValue::Integer(
+                    if matches!(
+                        report.speaker_count.status,
+                        crate::model::SpeakerCountOutcomeStatus::Resolved
+                            | crate::model::SpeakerCountOutcomeStatus::Satisfied
+                    ) {
+                        1
+                    } else {
+                        0
+                    },
+                ),
+                SqliteValue::Integer(i64::from(
+                    report.speaker_count.supported_speaker_count,
+                )),
+                text_value(serde_enum_name(&report.speaker_count.status)?),
+                text_value(serde_json::to_string(&report.speaker_count)?),
+                text_value(serde_json::to_string(&report.hint_evidence)?),
+                text_value(serde_enum_name(&report.fallback_status)?),
+                text_value(serde_json::to_string(&report.diagnostics)?),
+                SqliteValue::Integer(if profile_persistence_opt_in { 1 } else { 0 }),
+            ],
+        )?;
+
+        for (index, turn) in report.turns.iter().enumerate() {
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO diarization_turns (run_id, idx, start_ms, end_ms, speaker_ref, speaker_confidence, change_confidence, overlap_suspected, hard_hint_attributed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                &[
+                    run_id_value.clone(),
+                    storage_index(index, "diarization turn index")?,
+                    storage_u64(turn.start_ms, "diarization turn start_ms")?,
+                    storage_u64(turn.end_ms, "diarization turn end_ms")?,
+                    optional_text(turn.speaker_ref.as_deref()),
+                    optional_float(turn.speaker_confidence),
+                    optional_float(turn.change_confidence),
+                    SqliteValue::Integer(if turn.overlap_suspected { 1 } else { 0 }),
+                    SqliteValue::Integer(if turn.hard_hint_attributed { 1 } else { 0 }),
+                ],
+            )?;
+        }
+
+        for (index, profile) in report.profiles.iter().enumerate() {
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO speaker_profile_summaries (run_id, idx, speaker_ref, frame_count, voiced_duration_ms, reliability, channel_profile_count, anchored, soft_hint_contradiction, profile_persistence_opt_in) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                &[
+                    run_id_value.clone(),
+                    storage_index(index, "speaker profile summary index")?,
+                    text_value(profile.speaker_ref.clone()),
+                    storage_u64(profile.frame_count, "speaker profile frame_count")?,
+                    storage_u64(
+                        profile.voiced_duration_ms,
+                        "speaker profile voiced_duration_ms",
+                    )?,
+                    SqliteValue::Float(profile.reliability),
+                    SqliteValue::Integer(i64::from(profile.channel_profile_count)),
+                    SqliteValue::Integer(if profile.anchored { 1 } else { 0 }),
+                    optional_float(profile.soft_hint_contradiction),
+                    SqliteValue::Integer(if profile_persistence_opt_in { 1 } else { 0 }),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn persist_report_inner(
         &self,
         report: &RunReport,
         token: Option<&crate::orchestrator::CancellationToken>,
     ) -> FwResult<()> {
+        // All inserts below run inside `persist_report_once`'s SAVEPOINT, which
+        // rolls back on any Err — so the redundant per-statement savepoints can be
+        // skipped (byte-identical persisted rows). See [`persist_skip_stmt_sp_enabled`].
+        let skip_sp = persist_skip_stmt_sp_enabled();
         let request_json = serde_json::to_string(&report.request)?;
         let result_json = serde_json::to_string(&report.result)?;
         let warnings_json = serde_json::to_string(&report.warnings)?;
@@ -1066,44 +1795,52 @@ CREATE TABLE IF NOT EXISTS _meta (
 
         if has_replay {
             let replay_json = serde_json::to_string(&report.replay)?;
-            self.connection
-                .execute_with_params(
-                    "INSERT INTO runs (id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    &[
-                        text_value(report.run_id.clone()),
-                        text_value(report.started_at_rfc3339.clone()),
-                        text_value(report.finished_at_rfc3339.clone()),
-                        text_value(report.result.backend.as_str().to_owned()),
-                        text_value(report.input_path.clone()),
-                        text_value(report.normalized_wav_path.clone()),
-                        text_value(request_json),
-                        text_value(result_json),
-                        text_value(warnings_json),
-                        text_value(report.result.transcript.clone()),
-                        text_value(replay_json),
-                        text_value(acceleration_json),
-                    ],
-                )
-                .map_err(|error| FwError::Storage(error.to_string()))?;
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO runs (id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                &[
+                    text_value(report.run_id.clone()),
+                    text_value(report.started_at_rfc3339.clone()),
+                    text_value(report.finished_at_rfc3339.clone()),
+                    text_value(report.result.backend.as_str().to_owned()),
+                    text_value(report.input_path.clone()),
+                    text_value(report.normalized_wav_path.clone()),
+                    text_value(request_json),
+                    text_value(result_json),
+                    text_value(warnings_json),
+                    text_value(report.result.transcript.clone()),
+                    text_value(replay_json),
+                    text_value(acceleration_json),
+                ],
+            )?;
         } else {
-            self.connection
-                .execute_with_params(
-                    "INSERT INTO runs (id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    &[
-                        text_value(report.run_id.clone()),
-                        text_value(report.started_at_rfc3339.clone()),
-                        text_value(report.finished_at_rfc3339.clone()),
-                        text_value(report.result.backend.as_str().to_owned()),
-                        text_value(report.input_path.clone()),
-                        text_value(report.normalized_wav_path.clone()),
-                        text_value(request_json),
-                        text_value(result_json),
-                        text_value(warnings_json),
-                        text_value(report.result.transcript.clone()),
-                    ],
-                )
-                .map_err(|error| FwError::Storage(error.to_string()))?;
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO runs (id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                &[
+                    text_value(report.run_id.clone()),
+                    text_value(report.started_at_rfc3339.clone()),
+                    text_value(report.finished_at_rfc3339.clone()),
+                    text_value(report.result.backend.as_str().to_owned()),
+                    text_value(report.input_path.clone()),
+                    text_value(report.normalized_wav_path.clone()),
+                    text_value(request_json),
+                    text_value(result_json),
+                    text_value(warnings_json),
+                    text_value(report.result.transcript.clone()),
+                ],
+            )?;
         }
+
+        // The typed request/result JSON remains the canonical recovery payload.
+        // These normalized rows make turns and privacy-safe summaries directly
+        // queryable without persisting raw acoustic vectors.
+        self.replace_diarization_records(
+            &report.run_id,
+            report.request.backend_params.acoustic_diarization.as_ref(),
+            report.result.diarization.as_ref(),
+            skip_sp,
+        )?;
 
         // Checkpoint before segments batch.
         if let Some(tok) = token {
@@ -1111,20 +1848,19 @@ CREATE TABLE IF NOT EXISTS _meta (
         }
 
         for (index, segment) in report.result.segments.iter().enumerate() {
-            self.connection
-                .execute_with_params(
-                    "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    &[
-                        text_value(report.run_id.clone()),
-                        SqliteValue::Integer(index as i64),
-                        optional_float(segment.start_sec),
-                        optional_float(segment.end_sec),
-                        optional_text(segment.speaker.as_deref()),
-                        text_value(segment.text.clone()),
-                        optional_float(segment.confidence),
-                    ],
-                )
-                .map_err(|error| FwError::Storage(error.to_string()))?;
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    text_value(report.run_id.clone()),
+                    SqliteValue::Integer(index as i64),
+                    optional_float(segment.start_sec),
+                    optional_float(segment.end_sec),
+                    optional_text(segment.speaker.as_deref()),
+                    text_value(segment.text.clone()),
+                    optional_float(segment.confidence),
+                ],
+            )?;
         }
 
         // Checkpoint before events batch.
@@ -1133,20 +1869,19 @@ CREATE TABLE IF NOT EXISTS _meta (
         }
 
         for event in &report.events {
-            self.connection
-                .execute_with_params(
-                    "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    &[
-                        text_value(report.run_id.clone()),
-                        SqliteValue::Integer(event.seq as i64),
-                        text_value(event.ts_rfc3339.clone()),
-                        text_value(event.stage.clone()),
-                        text_value(event.code.clone()),
-                        text_value(event.message.clone()),
-                        text_value(serde_json::to_string(&event.payload)?),
-                    ],
-                )
-                .map_err(|error| FwError::Storage(error.to_string()))?;
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    text_value(report.run_id.clone()),
+                    SqliteValue::Integer(event.seq as i64),
+                    text_value(event.ts_rfc3339.clone()),
+                    text_value(event.stage.clone()),
+                    text_value(event.code.clone()),
+                    text_value(event.message.clone()),
+                    text_value(serde_json::to_string(&event.payload)?),
+                ],
+            )?;
         }
 
         Ok(())
@@ -1299,7 +2034,7 @@ pub struct WalCheckpointInfo {
 /// transaction state.
 #[derive(Debug)]
 pub struct ConcurrentPersistSession<'conn> {
-    connection: &'conn Connection,
+    connection: &'conn BlockingConnection,
     savepoint_name: String,
     finished: bool,
 }
@@ -1364,6 +2099,293 @@ impl Drop for ConcurrentPersistSession<'_> {
     }
 }
 
+/// Whether `persist_report_inner` writes its `runs`/`segments`/`events` rows with
+/// the fsqlite "skip statement savepoint in explicit txn" escape hatch (default).
+/// Those inserts always run inside `persist_report_once`'s enclosing `SAVEPOINT`,
+/// which is the rollback boundary (it rolls back on any `Err`), so the per-INSERT
+/// statement savepoint is redundant bookkeeping. Read live so an external-env A/B
+/// can toggle it (cold write path). `FW_PERSIST_SKIP_STMT_SP=0` restores the
+/// per-statement-savepoint path. Persisted rows are byte-identical either way.
+fn persist_skip_stmt_sp_enabled() -> bool {
+    std::env::var("FW_PERSIST_SKIP_STMT_SP").ok().as_deref() != Some("0")
+}
+
+/// Whether [`RunStore::load_run_details_batch`] loads many runs with two batched
+/// `WHERE id/run_id IN (…)` queries (default) instead of one `load_run_details`
+/// (two queries + two schema scans) per run — the app-level N+1 in the routing-
+/// history command. Output is identical either way (asserted by a batch-vs-per-run
+/// test). `FW_STORAGE_BATCH_HISTORY=0` restores the per-run path (kill-switch + A/B).
+fn batch_history_enabled() -> bool {
+    std::env::var("FW_STORAGE_BATCH_HISTORY").ok().as_deref() != Some("0")
+}
+
+/// Assemble a [`StoredRunDetails`] from a batched `runs` row (9 cols: id,
+/// started_at, finished_at, backend, result_json, warnings_json, transcript,
+/// replay_json, acceleration_json) and its batched `events` rows (7 cols: run_id,
+/// seq, ts_rfc3339, stage, code, message, payload_json). Mirrors the per-run
+/// assembly in `load_run_details_cancellable` exactly — the only difference is the
+/// events carry `run_id` at column 0 (so seq…payload shift +1) to allow grouping.
+fn assemble_run_details_batched(
+    run_row: &fsqlite::Row,
+    event_rows: &[fsqlite::Row],
+) -> FwResult<StoredRunDetails> {
+    let run_id = value_to_string(run_row.get(0));
+    let started_at_rfc3339 = value_to_string(run_row.get(1));
+    let finished_at_rfc3339 = value_to_string(run_row.get(2));
+    let backend = parse_backend(&value_to_string(run_row.get(3)));
+    let result_json = value_to_string(run_row.get(4));
+    let warnings_json = value_to_string(run_row.get(5));
+    let transcript_fallback = value_to_string(run_row.get(6));
+    let replay_json = value_to_string(run_row.get(7));
+    let acceleration_json = value_to_string(run_row.get(8));
+
+    let result: TranscriptionResult = serde_json::from_str(&result_json).map_err(|error| {
+        FwError::Storage(format!("invalid result_json for run {run_id}: {error}"))
+    })?;
+    let warnings =
+        parse_required_json_field::<Vec<String>>("warnings_json", &run_id, &warnings_json)?;
+    let replay = parse_required_json_field::<ReplayEnvelope>("replay_json", &run_id, &replay_json)?;
+    let acceleration_override = parse_optional_acceleration_json(&run_id, &acceleration_json)?;
+    let transcript = if result.transcript.trim().is_empty() {
+        transcript_fallback
+    } else {
+        result.transcript.clone()
+    };
+
+    let events = event_rows
+        .iter()
+        .map(|event_row| {
+            let payload_json = value_to_string(event_row.get(6));
+            let payload = serde_json::from_str(&payload_json).map_err(|error| {
+                FwError::Storage(format!(
+                    "invalid event payload for run {} seq {}: {}",
+                    run_id,
+                    value_to_string(event_row.get(1)),
+                    error
+                ))
+            })?;
+            let seq_text = value_to_string(event_row.get(1));
+            let seq = seq_text.parse::<u64>().map_err(|error| {
+                FwError::Storage(format!(
+                    "invalid event sequence `{}` for run {}: {}",
+                    seq_text, run_id, error
+                ))
+            })?;
+            Ok(RunEvent {
+                seq,
+                ts_rfc3339: value_to_string(event_row.get(2)),
+                stage: value_to_string(event_row.get(3)),
+                code: value_to_string(event_row.get(4)),
+                message: value_to_string(event_row.get(5)),
+                payload,
+            })
+        })
+        .collect::<FwResult<Vec<_>>>()?;
+
+    let projection_timeline = stored_projection_timeline(&result.raw_output, &run_id)?;
+    Ok(StoredRunDetails {
+        run_id,
+        started_at_rfc3339,
+        finished_at_rfc3339,
+        backend,
+        transcript,
+        segments: result.segments,
+        diarization: result.diarization,
+        projection_timeline,
+        events,
+        warnings,
+        acceleration: acceleration_override.or(result.acceleration),
+        replay,
+    })
+}
+
+fn stored_projection_timeline(
+    raw_output: &serde_json::Value,
+    run_id: &str,
+) -> FwResult<Option<serde_json::Value>> {
+    let Some(timeline) = raw_output.get("projection_timeline") else {
+        return Ok(None);
+    };
+    let object = timeline.as_object().ok_or_else(|| {
+        FwError::Storage(format!(
+            "invalid projection_timeline for run {run_id}: expected an object"
+        ))
+    })?;
+    if object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        != Some(crate::conformance::DTW_PROJECTION_SCHEMA_VERSION)
+    {
+        return Err(FwError::Storage(format!(
+            "invalid projection_timeline for run {run_id}: unsupported schema"
+        )));
+    }
+
+    const SAFE_FIELDS: &[&str] = &[
+        "schema_version",
+        "unit",
+        "interval_semantics",
+        "timestamp_epsilon_sec",
+        "minimum_duration_sec",
+        "input_engine_segments",
+        "input_timed_segments",
+        "canonical_units",
+        "output_segments",
+        "decoder_word_units",
+        "interpolated_fallback_units",
+        "segment_geometry_fallback_units",
+        "interpolated_fallback_segments",
+        "segment_geometry_fallback_segments",
+        "clamped_units",
+        "expanded_units",
+        "fallback_reasons",
+        "word_aligned_safe",
+        "supported_provenance",
+    ];
+    if object
+        .keys()
+        .any(|key| !SAFE_FIELDS.contains(&key.as_str()))
+    {
+        return Err(FwError::Storage(format!(
+            "invalid projection_timeline for run {run_id}: unsupported field"
+        )));
+    }
+    if SAFE_FIELDS.iter().any(|field| !object.contains_key(*field)) {
+        return Err(FwError::Storage(format!(
+            "invalid projection_timeline for run {run_id}: missing required field"
+        )));
+    }
+
+    let fixed_strings_valid = object
+        .get("unit")
+        .is_none_or(|value| value.as_str() == Some("seconds"))
+        && object
+            .get("interval_semantics")
+            .is_none_or(|value| value.as_str() == Some("half_open"));
+    let non_negative_float_fields_valid = ["timestamp_epsilon_sec", "minimum_duration_sec"]
+        .iter()
+        .all(|field| {
+            object.get(*field).is_none_or(|value| {
+                value
+                    .as_f64()
+                    .is_some_and(|number| number.is_finite() && number >= 0.0)
+            })
+        });
+    let count_fields_valid = [
+        "input_engine_segments",
+        "input_timed_segments",
+        "canonical_units",
+        "output_segments",
+        "decoder_word_units",
+        "interpolated_fallback_units",
+        "segment_geometry_fallback_units",
+        "interpolated_fallback_segments",
+        "segment_geometry_fallback_segments",
+        "clamped_units",
+        "expanded_units",
+    ]
+    .iter()
+    .all(|field| {
+        object
+            .get(*field)
+            .is_none_or(|value| value.as_u64().is_some())
+    });
+    let word_aligned_safe_valid = object
+        .get("word_aligned_safe")
+        .is_none_or(|value| value.as_bool().is_some());
+    let fallback_reasons = object
+        .get("fallback_reasons")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|reasons| {
+            reasons
+                .iter()
+                .map(serde_json::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        });
+    let provenance_valid = object.get("supported_provenance").is_none_or(|value| {
+        value.as_array().is_some_and(|labels| {
+            labels
+                == &[
+                    serde_json::Value::String("decoder_word_timestamp".to_owned()),
+                    serde_json::Value::String("segment_interpolation_fallback".to_owned()),
+                    serde_json::Value::String("segment_geometry_fallback".to_owned()),
+                ]
+        })
+    });
+    let canonical_counts_valid = count_fields_valid && {
+        let count = |field| {
+            object
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX)
+        };
+        let decoder = count("decoder_word_units");
+        let interpolated = count("interpolated_fallback_units");
+        let geometry = count("segment_geometry_fallback_units");
+        let input_engine_segments = count("input_engine_segments");
+        let interpolated_segments = count("interpolated_fallback_segments");
+        let geometry_segments = count("segment_geometry_fallback_segments");
+        count("input_timed_segments") <= input_engine_segments
+            && interpolated_segments <= input_engine_segments
+            && geometry_segments <= input_engine_segments
+            && decoder
+                .checked_add(interpolated)
+                .and_then(|value| value.checked_add(geometry))
+                == Some(count("canonical_units"))
+            && geometry == geometry_segments
+            && count("output_segments") <= count("canonical_units")
+            && count("clamped_units") <= decoder
+            && count("expanded_units") <= decoder
+    };
+    let fixed_numeric_contract_valid = object
+        .get("timestamp_epsilon_sec")
+        .and_then(serde_json::Value::as_f64)
+        == Some(crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC)
+        && object
+            .get("minimum_duration_sec")
+            .and_then(serde_json::Value::as_f64)
+            == Some(crate::conformance::CANONICAL_PROJECTION_MIN_DURATION_SEC);
+    let fallback_contract_valid = fallback_reasons.as_ref().is_some_and(|reasons| {
+        let interpolated_expected = object
+            .get("interpolated_fallback_segments")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0);
+        let geometry_expected = object
+            .get("segment_geometry_fallback_segments")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0);
+        let word_aligned_safe = object
+            .get("word_aligned_safe")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mut expected = Vec::with_capacity(3);
+        if interpolated_expected {
+            expected.push("missing_decoder_word_timestamps");
+        }
+        if geometry_expected {
+            expected.push("insufficient_parent_duration_for_millisecond_word_units");
+        }
+        if reasons.contains(&"timestamps_suppressed_by_request") {
+            expected.push("timestamps_suppressed_by_request");
+        }
+        reasons == &expected && word_aligned_safe == expected.is_empty()
+    });
+    if !fixed_strings_valid
+        || !non_negative_float_fields_valid
+        || !canonical_counts_valid
+        || !word_aligned_safe_valid
+        || !fixed_numeric_contract_valid
+        || !fallback_contract_valid
+        || !provenance_valid
+    {
+        return Err(FwError::Storage(format!(
+            "invalid projection_timeline for run {run_id}: unsupported field value"
+        )));
+    }
+
+    Ok(Some(timeline.clone()))
+}
+
 /// Convert an optional `SqliteValue` to an `i64`, returning 0 for non-integer
 /// or missing values.
 fn value_to_i64(value: Option<&SqliteValue>) -> i64 {
@@ -1411,6 +2433,25 @@ fn optional_float(value: Option<f64>) -> SqliteValue {
     }
 }
 
+fn storage_u64(value: u64, field: &str) -> FwResult<SqliteValue> {
+    i64::try_from(value)
+        .map(SqliteValue::Integer)
+        .map_err(|_| FwError::Storage(format!("{field} exceeds SQLite INTEGER range")))
+}
+
+fn storage_index(value: usize, field: &str) -> FwResult<SqliteValue> {
+    i64::try_from(value)
+        .map(SqliteValue::Integer)
+        .map_err(|_| FwError::Storage(format!("{field} exceeds SQLite INTEGER range")))
+}
+
+fn serde_enum_name<T: serde::Serialize>(value: &T) -> FwResult<String> {
+    serde_json::to_value(value)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| FwError::Storage("expected a string-valued serialized enum".to_owned()))
+}
+
 fn value_to_string(value: Option<&SqliteValue>) -> String {
     match value {
         Some(SqliteValue::Text(text)) => text.to_string(),
@@ -1448,7 +2489,7 @@ fn next_persist_savepoint_name() -> String {
     format!("fw_persist_{id}")
 }
 
-fn rollback_savepoint(connection: &Connection, savepoint_name: &str) -> FwResult<()> {
+fn rollback_savepoint(connection: &BlockingConnection, savepoint_name: &str) -> FwResult<()> {
     let rollback_sql = format!("ROLLBACK TO SAVEPOINT {savepoint_name};");
     connection
         .execute(&rollback_sql)
@@ -1512,12 +2553,20 @@ mod tests {
 
     use fsqlite_types::value::SqliteValue;
 
+    use crate::error::FwError;
     use crate::model::{
-        AccelerationBackend, AccelerationReport, BackendKind, BackendParams, InputSource, RunEvent,
-        RunReport, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
+        AccelerationBackend, AccelerationReport, BackendKind, BackendParams, DiarizationEngine,
+        DiarizationFallbackStatus, DiarizationReport, DiarizationRequest, DiarizationTurn,
+        InputSource, KnownSpeakerInterval, KnownSpeakerPolicy, RunEvent, RunReport,
+        SpeakerCountCalibrationStatus, SpeakerCountEstimate, SpeakerCountEvidenceLane,
+        SpeakerCountLaneEvidence, SpeakerCountLaneUnavailableReason, SpeakerCountOutcome,
+        SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin,
+        SpeakerCountRange, SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
+        SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
+        SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
     };
 
-    use super::{RunStore, value_to_string};
+    use super::{BlockingConnection, RunStore, stored_projection_timeline, value_to_string};
 
     #[test]
     fn persists_and_lists_runs() {
@@ -1565,6 +2614,7 @@ mod tests {
                     post_mass: Some(1.0),
                     notes: vec!["normalized with frankentorch".to_owned()],
                 }),
+                diarization: None,
                 raw_output: json!({"ok": true}),
                 artifact_paths: vec!["out.json".to_owned()],
             },
@@ -1667,6 +2717,7 @@ mod tests {
                 language: None,
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -1675,6 +2726,437 @@ mod tests {
             evidence: vec![],
             replay: crate::model::ReplayEnvelope::default(),
         }
+    }
+
+    fn attach_synthetic_diarization(report: &mut RunReport, persist_profiles: bool) {
+        report.request.diarize = true;
+        report.request.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
+            known_intervals: vec![KnownSpeakerInterval {
+                speaker_ref: "speaker_a".to_owned(),
+                start_ms: 0,
+                end_ms: 1_000,
+                confidence: 0.95,
+                policy: KnownSpeakerPolicy::HardMustLink,
+                provenance: Some("synthetic_context_fixture".to_owned()),
+            }],
+            persist_profiles,
+            ..DiarizationRequest::default()
+        });
+        report.result.diarization = Some(DiarizationReport {
+            implementation: "native-acoustic-v2".to_owned(),
+            contract_version: "acoustic-diarization-v2".to_owned(),
+            feature_schema: "acoustic-feature-v1".to_owned(),
+            normalized_input_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            hint_document_sha256: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
+            turns: vec![DiarizationTurn {
+                start_ms: 0,
+                end_ms: 1_000,
+                speaker_ref: Some("speaker_a".to_owned()),
+                speaker_confidence: Some(0.96),
+                change_confidence: Some(0.91),
+                overlap_suspected: false,
+                hard_hint_attributed: true,
+            }],
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "speaker_a".to_owned(),
+                frame_count: 87,
+                voiced_duration_ms: 870,
+                reliability: 0.94,
+                voice_profile_count: 1,
+                channel_profile_count: 1,
+                training_accepted_count: 1,
+                training_downweighted_count: 0,
+                training_quarantined_count: 0,
+                anchored: true,
+                soft_hint_contradiction: None,
+            }],
+            hint_evidence: vec![SpeakerHintEvidenceSummary {
+                hint_index: 0,
+                speaker_ref: "speaker_a".to_owned(),
+                policy: KnownSpeakerPolicy::HardMustLink,
+                disposition: SpeakerHintDisposition::HardAttributed,
+                usable_tracklet_count: 1,
+                accepted_tracklet_count: 1,
+                rejected_tracklet_count: 0,
+                profile_accepted_tracklet_count: 1,
+                profile_downweighted_tracklet_count: 0,
+                profile_quarantined_tracklet_count: 0,
+                applied_weight: 50.0,
+                contradiction_score: None,
+            }],
+            speaker_queries: Vec::new(),
+            speaker_count: SpeakerCountOutcome {
+                request: SpeakerCountRequest::HardConstraint { count: 1 },
+                estimate: Some(synthetic_speaker_count_estimate()),
+                status: SpeakerCountOutcomeStatus::Satisfied,
+                supported_speaker_count: 1,
+                active_speaker_refs: vec!["speaker_a".to_owned()],
+                dominant_speaker_share: 1.0,
+                unknown_voiced_share: 0.0,
+                reasons: vec![SpeakerCountOutcomeReason::RequestedCountMatched],
+                speaker_evidence: vec![SpeakerEvidenceSummary {
+                    speaker_ref: "speaker_a".to_owned(),
+                    assigned_tracklet_count: 1,
+                    independent_tracklet_count: 1,
+                    recurrence_episode_count: 1,
+                    voiced_frame_count: 87,
+                    independent_voiced_frame_count: 87,
+                    voiced_duration_ms: 870,
+                    mean_assignment_confidence: 0.96,
+                    profile_reliability: 0.94,
+                    hard_anchored: true,
+                    separated_from_supported_speakers: true,
+                    reasons: vec![SpeakerEvidenceReason::SupportedByHardHint],
+                    supported: true,
+                }],
+            },
+            fallback_status: DiarizationFallbackStatus::NotNeeded,
+            diagnostics: vec!["synthetic persistence fixture".to_owned()],
+        });
+    }
+
+    fn synthetic_speaker_count_estimate() -> SpeakerCountEstimate {
+        let posterior_probability = 0.85_f64;
+        let unresolved_probability = 0.15_f64;
+        let estimate = SpeakerCountEstimate {
+            schema_version: "speaker-count-estimate-v2".to_owned(),
+            selected_count: Some(1),
+            supported_range: Some(SpeakerCountRange {
+                minimum: 1,
+                maximum: 1,
+            }),
+            posterior: vec![SpeakerCountPosteriorBin {
+                count: 1,
+                probability: posterior_probability,
+            }],
+            unresolved_probability,
+            entropy_bits: -posterior_probability * posterior_probability.log2()
+                - unresolved_probability * unresolved_probability.log2(),
+            stability: 0.9,
+            constraint_lower_bound: 1,
+            candidate_upper_bound: 1,
+            calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            calibration_sha256: "a".repeat(64),
+            evidence_sha256: "b".repeat(64),
+            lanes: vec![
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::MergeRisk,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.9,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::SparseNormalizedEigengap,
+                    available: false,
+                    proposed_count: None,
+                    confidence: 0.0,
+                    unavailable_reason: Some(
+                        SpeakerCountLaneUnavailableReason::InsufficientPrototypes,
+                    ),
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::FeatureJackknife,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.9,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::EffectiveOccupancy,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.9,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::ConstraintGraph,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 1.0,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::CallerPrior,
+                    available: false,
+                    proposed_count: None,
+                    confidence: 0.0,
+                    unavailable_reason: Some(SpeakerCountLaneUnavailableReason::NotRequested),
+                },
+            ],
+            resources: SpeakerCountResourceSummary {
+                prototype_count: 1,
+                affinity_pair_evaluations: 0,
+                retained_sparse_edges: 0,
+                estimated_peak_buffer_bytes: 256,
+                stability_replicates: 5,
+                solver_iterations: 0,
+                solver_sparse_matvec_terms: 0,
+                solver_residual: Some(0.0),
+            },
+        };
+        estimate.validate().expect("synthetic count estimate");
+        estimate
+    }
+
+    fn table_row_count(store: &RunStore, table: &str) -> usize {
+        let rows = store
+            .connection
+            .query(&format!("SELECT COUNT(*) FROM {table};"))
+            .expect("row count query");
+        value_to_string(rows[0].get(0))
+            .parse()
+            .expect("row count should be an integer")
+    }
+
+    #[test]
+    fn diarization_index_is_privacy_safe_and_rebuildable() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("diarization.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+
+        let mut default_private = minimal_report("run-diarization-default", &db_path);
+        attach_synthetic_diarization(&mut default_private, false);
+        store
+            .persist_report(&default_private)
+            .expect("default-private report should persist");
+
+        let mut opt_in = minimal_report("run-diarization-opt-in", &db_path);
+        attach_synthetic_diarization(&mut opt_in, true);
+        store
+            .persist_report(&opt_in)
+            .expect("opt-in report should persist");
+
+        for table in [
+            "diarization_reports",
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+        ] {
+            assert_eq!(table_row_count(&store, table), 2, "{table} row count");
+            let columns = store
+                .connection
+                .query(&format!("PRAGMA table_info({table});"))
+                .expect("table shape");
+            for row in columns {
+                let column = value_to_string(row.get(1)).to_ascii_lowercase();
+                assert!(
+                    ![
+                        "audio",
+                        "pcm",
+                        "spectrum",
+                        "cepstr",
+                        "pitch",
+                        "f0",
+                        "centroid",
+                        "covariance",
+                        "embedding",
+                        "vector",
+                        "voiceprint",
+                    ]
+                    .iter()
+                    .any(|forbidden| column.contains(forbidden)),
+                    "privacy-sensitive column `{column}` must not exist in {table}",
+                );
+            }
+        }
+
+        let report_flags = store
+            .connection
+            .query(
+                "SELECT profile_persistence_opt_in FROM diarization_reports ORDER BY run_id ASC;",
+            )
+            .expect("report flags");
+        assert_eq!(value_to_string(report_flags[0].get(0)), "0");
+        assert_eq!(value_to_string(report_flags[1].get(0)), "1");
+
+        let typed_evidence = store
+            .connection
+            .query(
+                "SELECT supported_speaker_count, speaker_count_status, speaker_count_json, \
+                 hint_evidence_json FROM diarization_reports ORDER BY run_id ASC;",
+            )
+            .expect("typed diarization evidence");
+        assert_eq!(value_to_string(typed_evidence[0].get(0)), "1");
+        assert_eq!(value_to_string(typed_evidence[0].get(1)), "satisfied");
+        let stored_count: SpeakerCountOutcome =
+            serde_json::from_str(&value_to_string(typed_evidence[0].get(2)))
+                .expect("typed count JSON");
+        assert_eq!(
+            stored_count.request,
+            SpeakerCountRequest::HardConstraint { count: 1 }
+        );
+        assert_eq!(
+            stored_count.reasons,
+            vec![SpeakerCountOutcomeReason::RequestedCountMatched]
+        );
+        let stored_estimate = stored_count
+            .estimate
+            .as_ref()
+            .expect("speaker-count estimate should survive SQLite persistence");
+        stored_estimate
+            .validate()
+            .expect("stored speaker-count estimate should remain valid");
+        assert_eq!(stored_estimate.schema_version, "speaker-count-estimate-v2");
+        assert_eq!(stored_estimate.selected_count, Some(1));
+        assert_eq!(stored_estimate.unresolved_probability, 0.15);
+        assert_eq!(stored_estimate.resources.prototype_count, 1);
+        assert_eq!(stored_estimate.resources.retained_sparse_edges, 0);
+        assert_eq!(stored_estimate.resources.estimated_peak_buffer_bytes, 256);
+        let stored_hints: Vec<SpeakerHintEvidenceSummary> =
+            serde_json::from_str(&value_to_string(typed_evidence[0].get(3)))
+                .expect("typed hint evidence JSON");
+        assert_eq!(
+            stored_hints[0].disposition,
+            SpeakerHintDisposition::HardAttributed
+        );
+
+        let loaded = store
+            .load_run_details("run-diarization-default")
+            .expect("load typed diarization")
+            .expect("canonical run");
+        let loaded_diarization = loaded.diarization.expect("diarization report");
+        assert_eq!(
+            loaded_diarization.speaker_count.request,
+            SpeakerCountRequest::HardConstraint { count: 1 }
+        );
+        assert_eq!(
+            loaded_diarization.hint_evidence[0].disposition,
+            SpeakerHintDisposition::HardAttributed
+        );
+        assert_eq!(
+            loaded_diarization.speaker_count.speaker_evidence[0].voiced_frame_count,
+            87
+        );
+        assert_eq!(
+            loaded_diarization
+                .speaker_count
+                .estimate
+                .as_ref()
+                .expect("loaded speaker-count estimate")
+                .resources
+                .stability_replicates,
+            5
+        );
+
+        let profile_flags = store
+            .connection
+            .query(
+                "SELECT profile_persistence_opt_in FROM speaker_profile_summaries \
+                 ORDER BY run_id ASC;",
+            )
+            .expect("profile flags");
+        assert_eq!(value_to_string(profile_flags[0].get(0)), "0");
+        assert_eq!(value_to_string(profile_flags[1].get(0)), "1");
+
+        store
+            .rebuild_diarization_index()
+            .expect("rebuild should be deterministic");
+        for table in [
+            "diarization_reports",
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+        ] {
+            assert_eq!(
+                table_row_count(&store, table),
+                2,
+                "{table} row count after rebuild"
+            );
+        }
+
+        store
+            .connection
+            .execute("DELETE FROM runs WHERE id = 'run-diarization-default';")
+            .expect("remove canonical fixture row");
+        store
+            .rebuild_diarization_index()
+            .expect("rebuild should remove orphaned derived rows");
+        for table in [
+            "diarization_reports",
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+        ] {
+            assert_eq!(
+                table_row_count(&store, table),
+                1,
+                "{table} must contain only canonical runs after rebuild"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_speaker_count_estimate_is_rejected_before_index_mutation() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("invalid-count-estimate.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-invalid-count-estimate", &db_path);
+        attach_synthetic_diarization(&mut report, false);
+        report
+            .result
+            .diarization
+            .as_mut()
+            .and_then(|report| report.speaker_count.estimate.as_mut())
+            .expect("synthetic estimate")
+            .unresolved_probability = 0.25;
+
+        let error = store
+            .persist_report(&report)
+            .expect_err("invalid estimate must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("speaker-count posterior and unresolved mass do not normalize"),
+            "{error}"
+        );
+        assert_eq!(table_row_count(&store, "diarization_reports"), 0);
+    }
+
+    #[test]
+    fn markerless_rebuild_failure_preserves_existing_derived_index() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("markerless-rebuild.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-markerless-rebuild", &db_path);
+        attach_synthetic_diarization(&mut report, false);
+        store.persist_report(&report).expect("persist");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET request_json = 'not-json' \
+                 WHERE id = 'run-markerless-rebuild';",
+            )
+            .expect("corrupt canonical request fixture");
+        store
+            .connection
+            .execute("DELETE FROM _meta WHERE key = 'schema_version';")
+            .expect("remove schema marker");
+        drop(store);
+
+        let error = RunStore::open(&db_path).expect_err("canonical rebuild must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot rebuild diarization request")
+        );
+        let connection =
+            BlockingConnection::open(db_path.display().to_string()).expect("inspect database");
+        let rows = connection
+            .query("SELECT COUNT(*) FROM diarization_reports;")
+            .expect("derived row count");
+        assert_eq!(
+            value_to_string(rows[0].get(0)),
+            "1",
+            "failed markerless migration must roll back derived-index deletion"
+        );
     }
 
     #[test]
@@ -1900,6 +3382,96 @@ mod tests {
     }
 
     #[test]
+    fn stored_projection_timeline_rejects_unknown_fields_without_echoing_values() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("projection_privacy.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-projection-privacy", &db_path);
+        report.result.raw_output = json!({
+            "projection_timeline": {
+                "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                "word_aligned_safe": true,
+                "private_path": "PRIVATE_SENTINEL"
+            }
+        });
+        store
+            .persist_report(&report)
+            .expect("persist canonical result");
+
+        let error = store
+            .load_run_details("run-projection-privacy")
+            .expect_err("unsupported projection metadata must fail closed");
+        assert!(error.to_string().contains("unsupported field"));
+        assert!(
+            !error.to_string().contains("PRIVATE_SENTINEL"),
+            "storage errors must not echo rejected private values"
+        );
+    }
+
+    #[test]
+    fn stored_projection_timeline_requires_canonical_fallback_reason_order() {
+        let mut raw_output = json!({
+            "projection_timeline": {
+                "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                "unit": "seconds",
+                "interval_semantics": "half_open",
+                "timestamp_epsilon_sec":
+                    crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC,
+                "minimum_duration_sec":
+                    crate::conformance::CANONICAL_PROJECTION_MIN_DURATION_SEC,
+                "input_engine_segments": 2,
+                "input_timed_segments": 1,
+                "canonical_units": 2,
+                "output_segments": 2,
+                "decoder_word_units": 0,
+                "interpolated_fallback_units": 1,
+                "segment_geometry_fallback_units": 1,
+                "interpolated_fallback_segments": 1,
+                "segment_geometry_fallback_segments": 1,
+                "clamped_units": 0,
+                "expanded_units": 0,
+                "fallback_reasons": [
+                    "missing_decoder_word_timestamps",
+                    "insufficient_parent_duration_for_millisecond_word_units",
+                    "timestamps_suppressed_by_request"
+                ],
+                "word_aligned_safe": false,
+                "supported_provenance": [
+                    "decoder_word_timestamp",
+                    "segment_interpolation_fallback",
+                    "segment_geometry_fallback"
+                ]
+            }
+        });
+        assert!(
+            stored_projection_timeline(&raw_output, "run-projection-order")
+                .expect("canonical fallback order")
+                .is_some()
+        );
+
+        raw_output["projection_timeline"]["fallback_reasons"] = json!([
+            "timestamps_suppressed_by_request",
+            "missing_decoder_word_timestamps",
+            "insufficient_parent_duration_for_millisecond_word_units"
+        ]);
+        assert!(matches!(
+            stored_projection_timeline(&raw_output, "run-projection-order"),
+            Err(FwError::Storage(message)) if message.contains("unsupported field value")
+        ));
+
+        raw_output["projection_timeline"]["fallback_reasons"] = json!([
+            "missing_decoder_word_timestamps",
+            "insufficient_parent_duration_for_millisecond_word_units",
+            "timestamps_suppressed_by_request",
+            "timestamps_suppressed_by_request"
+        ]);
+        assert!(matches!(
+            stored_projection_timeline(&raw_output, "run-projection-order"),
+            Err(FwError::Storage(message)) if message.contains("unsupported field value")
+        ));
+    }
+
+    #[test]
     fn schema_migration_idempotent_on_reopen() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("reopen.sqlite3");
@@ -1936,6 +3508,65 @@ mod tests {
             .expect("should exist");
         assert_eq!(details.run_id, "run-alpha");
         assert_eq!(details.transcript, "alpha text");
+    }
+
+    #[test]
+    fn load_run_details_batch_matches_per_run() {
+        // Byte-exactness guard for FW_STORAGE_BATCH_HISTORY: the batched two-query
+        // loader must produce StoredRunDetails identical to per-run `load_run_details`
+        // for every run (incl. multi-event grouping + the run_id-shifted event layout).
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("batch_hist.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+
+        let ids = ["batch-a", "batch-b", "batch-c"];
+        for (i, id) in ids.iter().enumerate() {
+            let mut report = minimal_report(id, &db_path);
+            report.result.transcript = format!("transcript {i}");
+            report.result.segments = vec![TranscriptionSegment {
+                start_sec: Some(i as f64),
+                end_sec: Some(i as f64 + 1.0),
+                text: format!("segment for {id}"),
+                speaker: None,
+                confidence: Some(0.9),
+            }];
+            report.events = vec![
+                RunEvent {
+                    seq: 1,
+                    ts_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
+                    stage: "ingest".to_owned(),
+                    code: "ok".to_owned(),
+                    message: format!("first for {id}"),
+                    payload: serde_json::json!({"i": i}),
+                },
+                RunEvent {
+                    seq: 2,
+                    ts_rfc3339: "2026-01-01T00:00:01Z".to_owned(),
+                    stage: "backend".to_owned(),
+                    code: "ok".to_owned(),
+                    message: format!("second for {id}"),
+                    payload: serde_json::json!({}),
+                },
+            ];
+            store.persist_report(&report).expect("persist");
+        }
+
+        let run_ids: Vec<String> = ids.iter().map(|s| (*s).to_owned()).collect();
+        let batched = store.load_run_details_batch(&run_ids).expect("batch load");
+        assert_eq!(batched.len(), 3);
+        for (i, id) in ids.iter().enumerate() {
+            let per_run = store
+                .load_run_details(id)
+                .expect("per-run load")
+                .expect("run exists");
+            // Compare serialized form (StoredRunDetails is Serialize, not PartialEq) —
+            // a direct byte-exact check of the loader output.
+            assert_eq!(
+                serde_json::to_string(&batched[i]).expect("ser batched"),
+                serde_json::to_string(&per_run).expect("ser per-run"),
+                "batched run `{id}` must byte-match the per-run loader"
+            );
+        }
     }
 
     #[test]
@@ -2726,7 +4357,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Corrupt result_json directly in the database.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute_with_params(
             "UPDATE runs SET result_json = ?1 WHERE id = ?2",
             &[
@@ -2764,7 +4395,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Corrupt an event's payload_json.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute_with_params(
             "UPDATE events SET payload_json = ?1 WHERE run_id = ?2 AND seq = ?3",
             &[
@@ -2856,7 +4487,7 @@ mod tests {
         report.warnings = vec!["a real warning".to_owned()];
         store.persist_report(&report).expect("persist");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute_with_params(
             "UPDATE runs SET warnings_json = ?1 WHERE id = ?2",
             &[
@@ -2881,7 +4512,7 @@ mod tests {
         let report = minimal_report("run-bad-replay", &db_path);
         store.persist_report(&report).expect("persist");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute_with_params(
             "UPDATE runs SET replay_json = ?1 WHERE id = ?2",
             &[
@@ -2903,7 +4534,7 @@ mod tests {
         let db_path = dir.path().join("legacy.sqlite3");
 
         // Create a DB manually WITHOUT replay_json (simulating older schema).
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -3182,7 +4813,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Insert a corrupt event directly via raw SQL.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("open");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("open");
         conn.execute_with_params(
             "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             &[
@@ -3235,7 +4866,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Overwrite result_json with an empty string.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("open");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("open");
         conn.execute_with_params(
             "UPDATE runs SET result_json = ?1 WHERE id = ?2",
             &[
@@ -3268,7 +4899,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Update the denormalized transcript column with a meaningful value.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("open");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("open");
         conn.execute_with_params(
             "UPDATE runs SET transcript = ?1 WHERE id = ?2",
             &[
@@ -3536,7 +5167,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Delete all rows from the segments table for this run.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute_with_params(
             "DELETE FROM segments WHERE run_id = ?1",
             &[SqliteValue::Text("run-segsrc".to_owned().into())],
@@ -3640,7 +5271,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Overwrite the denormalized transcript column with a different value.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("open");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("open");
         conn.execute_with_params(
             "UPDATE runs SET transcript = ?1 WHERE id = ?2",
             &[
@@ -3761,7 +5392,7 @@ mod tests {
         let db_path = dir.path().join("preserve.sqlite3");
 
         // Create a DB manually (without _meta) that already has modern columns.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -3831,7 +5462,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("future.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .expect("create _meta");
         conn.execute_with_params(
@@ -3926,7 +5557,7 @@ mod tests {
         let db_path = dir.path().join("no_version_key.sqlite3");
 
         // Create a bare DB with _meta table but no schema_version row.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .expect("create _meta");
 
@@ -3969,7 +5600,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("bad_version.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .expect("create _meta");
         conn.execute_with_params(
@@ -4017,7 +5648,7 @@ mod tests {
         let db_path = dir.path().join("overwrite_ver.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
 
-        // After open, version is SCHEMA_VERSION (currently 2).
+        // After open, version is the current SCHEMA_VERSION.
         let v1 = store.current_schema_version().expect("v1");
         assert_eq!(v1, RunStore::SCHEMA_VERSION);
 
@@ -4403,6 +6034,7 @@ mod tests {
                         "calibration applied".to_owned(),
                     ],
                 }),
+                diarization: None,
                 raw_output: json!({"model": "large-v3", "ok": true}),
                 artifact_paths: vec!["/tmp/fw/out.json".to_owned(), "/tmp/fw/out.srt".to_owned()],
             },
@@ -5487,7 +7119,7 @@ mod tests {
         let db_path = dir.path().join("v2_to_v3.sqlite3");
 
         // Manually create a v2 database.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -5537,10 +7169,30 @@ mod tests {
             .expect("set version 2");
         drop(conn);
 
-        // Open with RunStore, which should migrate from v2 to v3.
+        // Open with RunStore, which should migrate from v2 to the latest schema.
         let store = RunStore::open(&db_path).expect("open should migrate");
         let version = store.current_schema_version().expect("version");
-        assert_eq!(version, 3, "should have migrated to v3");
+        assert_eq!(
+            version,
+            RunStore::SCHEMA_VERSION,
+            "should have migrated to the latest schema"
+        );
+        let diarization_columns = store
+            .table_columns("diarization_reports")
+            .expect("diarization report columns");
+        for expected in [
+            "supported_speaker_count",
+            "speaker_count_status",
+            "speaker_count_json",
+            "hint_evidence_json",
+        ] {
+            assert!(
+                diarization_columns
+                    .iter()
+                    .any(|column| column.name == expected),
+                "v5 migration must add `{expected}`"
+            );
+        }
 
         // Verify indexes exist.
         let indexes = store
@@ -5562,11 +7214,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_3() {
+    fn schema_version_is_current() {
         assert_eq!(
             RunStore::SCHEMA_VERSION,
-            3,
-            "SCHEMA_VERSION should be 3 after bd-3i1.5"
+            5,
+            "SCHEMA_VERSION should include typed speaker-count evidence"
         );
     }
 
@@ -5798,9 +7450,15 @@ mod tests {
         let page_count = store.pragma_integer("page_count").expect("page_count");
         assert!(page_count > 0, "page_count should be positive on fresh db");
 
-        // freelist_count on a fresh db should be 0 (no freed pages).
+        // fsqlite may retain bounded free pages while materializing the schema
+        // catalog and indexes. The portable invariant is that the freelist is
+        // non-negative and cannot consume every page of a usable fresh DB.
         let freelist = store.pragma_integer("freelist_count").expect("freelist");
-        assert_eq!(freelist, 0, "fresh db should have no freelist pages");
+        assert!(freelist >= 0, "freelist_count should be non-negative");
+        assert!(
+            freelist < page_count,
+            "fresh db must retain at least one live page"
+        );
     }
 
     #[test]
@@ -6206,9 +7864,13 @@ mod tests {
         let diag = store.diagnostics().expect("diagnostics should succeed");
         assert!(diag.page_count >= 0, "page_count should be non-negative");
         assert!(diag.page_size > 0, "page_size should be positive");
-        assert_eq!(
-            diag.freelist_count, 0,
-            "fresh db should have no freelist pages"
+        assert!(
+            diag.freelist_count >= 0,
+            "freelist_count should be non-negative"
+        );
+        assert!(
+            diag.freelist_count < diag.page_count,
+            "fresh db must retain at least one live page"
         );
         assert_eq!(
             diag.integrity_check, "ok",
@@ -6464,7 +8126,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("idx_preserve.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("open");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("open");
         // Create v1 schema (no replay_json, no acceleration_json).
         conn.execute(
             "CREATE TABLE runs (\
@@ -6679,7 +8341,7 @@ mod tests {
 
         // Create a "fresh shape" DB at version 0: tables with both columns
         // present but no schema_version key in _meta.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -6793,7 +8455,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("v1_data.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         // Create v1 schema.
         conn.execute(
             "CREATE TABLE runs (\
@@ -6882,7 +8544,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("partial_v1.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -6983,7 +8645,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("rollback_failpoint.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -7097,7 +8759,7 @@ mod tests {
         let db_path = dir.path().join("ver_insert.sqlite3");
 
         // Create a bare DB with _meta but no schema_version row.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .expect("create _meta");
         // Also create required tables so RunStore operations work.

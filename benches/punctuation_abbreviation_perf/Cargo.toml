@@ -1,0 +1,22 @@
+[package]
+name = "punctuation-abbreviation-perf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+
+[workspace]
+
+[dev-dependencies]
+sha2 = "0.10"
+
+[[bench]]
+name = "punctuation_abbreviation_perf"
+path = "src/main.rs"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 1
+panic = "abort"

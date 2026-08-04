@@ -16,19 +16,22 @@
 //!    (`request.model` → `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`), load it, read
 //!    the normalized WAV, decode through the engine.
 //! 2. **Diarize**: assign a speaker to every real segment via the orchestrator's
-//!    heuristic diarizer ([`crate::orchestrator::diarize_segments`]), honoring
-//!    the request's num/min/max speaker constraints. Segments are labeled
-//!    `SPEAKER_NN` (DISC-002: cross-engine labels need not match exactly).
+//!    heuristic diarizer ([`crate::orchestrator::diarize_segments`]). These are
+//!    provisional labels, so explicit count inputs are reserved for the later
+//!    selected diarization stage and never applied to the heuristic. Segments
+//!    are labeled `SPEAKER_NN` (DISC-002: cross-engine labels need not match
+//!    exactly).
 //!
 //! ## Diarizer honesty — NOT a neural speaker encoder
 //!
-//! The diarization stage is an **acoustic-feature/temporal heuristic**: it
-//! clusters segments on temporal position, pacing, turn-taking gaps, and lexical
-//! features. It does **not** run a neural speaker encoder (ECAPA/TitaNet) and
-//! does not extract per-speaker acoustic embeddings from the waveform. The
-//! `raw_output` states this plainly (`"diarizer": "text-temporal-heuristic"` with
-//! a `"diarizer_note"` spelling out the limitation); the neural ECAPA upgrade is
-//! tracked in bd-ohex. Nothing here implies neural diarization.
+//! The diarization stage is a legacy **text/temporal heuristic**: it clusters
+//! segments on temporal position, pacing, turn-taking gaps, and lexical
+//! features. It does **not** extract acoustic speaker evidence from the waveform
+//! and does not run a neural speaker encoder (ECAPA/TitaNet). Its labels are
+//! explicitly rejected by the orchestrator's external-evidence gate, so they
+//! cannot be promoted as acoustic or externally verified diarization. New code
+//! uses [`crate::diarization`] for Rust-native waveform analysis; the neural
+//! ECAPA upgrade remains tracked in bd-ohex.
 //!
 //! ## Model resolution, silence pre-gate, availability
 //!
@@ -48,7 +51,7 @@ use serde_json::{Value, json};
 
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    BackendKind, SpeakerConstraints, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
+    BackendKind, SpeakerCountRequest, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
 };
 use crate::native_engine::{self, NativeWhisperModel, decode};
 use crate::orchestrator::{self, DiarizeReport};
@@ -65,8 +68,8 @@ const DIARIZER_TAG: &str = "text-temporal-heuristic";
 
 /// Honest one-line statement of the diarizer's quality limitation, surfaced in
 /// `raw_output` so no consumer mistakes it for neural diarization.
-const DIARIZER_NOTE: &str = "acoustic-feature clustering without neural speaker encoder; \
-     ECAPA upgrade tracked in bd-ohex";
+const DIARIZER_NOTE: &str = "legacy text/temporal heuristic without waveform speaker evidence; \
+     excluded from acoustic and external evidence gates";
 
 /// Honestly report whether the native whisper-diarization engine can run.
 ///
@@ -118,6 +121,28 @@ fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
     decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
+        // Same quality knobs as the sequential native backend: a request prompt
+        // (`--prompt`) and beam width (`--beam-size`) reach the engine. Diarization
+        // runs one sequential `transcribe_samples`, so both apply cleanly.
+        initial_prompt: request
+            .backend_params
+            .prompt
+            .clone()
+            .filter(|p| !p.is_empty()),
+        beam_size: request
+            .backend_params
+            .decoding
+            .as_ref()
+            .and_then(|d| d.beam_size)
+            .map(|n| n as usize),
+        // Suppress non-speech tokens (whisper `--suppress-nst`) for cleaner text.
+        suppress_nst: request.backend_params.suppress_nst,
+        // Max carried context (whisper `--max-context`); 0 disables prompt carry.
+        max_context: request
+            .backend_params
+            .decoding
+            .as_ref()
+            .and_then(|d| d.max_context),
         timestamps: !request.backend_params.no_timestamps,
         n_threads,
         max_text_ctx: None,
@@ -133,11 +158,40 @@ fn checkpoint_for(
     move || token.map_or(Ok(()), crate::orchestrator::CancellationToken::checkpoint)
 }
 
-/// The effective speaker constraints for diarization: the request's
-/// `num`/`min`/`max` speaker constraints, honored end-to-end by the diarizer.
-/// `None` means "auto-detect speaker count".
-fn speaker_constraints_for(request: &TranscribeRequest) -> Option<SpeakerConstraints> {
-    request.backend_params.speaker_constraints.clone()
+fn speaker_count_for(request: &TranscribeRequest) -> SpeakerCountRequest {
+    request
+        .backend_params
+        .acoustic_diarization
+        .as_ref()
+        .map_or(SpeakerCountRequest::Infer, |request| {
+            request.speaker_count.clone()
+        })
+}
+
+fn validate_speaker_count_capability(request: &TranscribeRequest) -> FwResult<SpeakerCountRequest> {
+    let speaker_count = speaker_count_for(request);
+    let selected_engine = request
+        .backend_params
+        .acoustic_diarization
+        .as_ref()
+        .map_or(crate::model::DiarizationEngine::Auto, |request| {
+            request.engine
+        });
+    if matches!(
+        speaker_count,
+        SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+    ) && matches!(
+        selected_engine,
+        crate::model::DiarizationEngine::External | crate::model::DiarizationEngine::Neural
+    ) {
+        return Err(FwError::InvalidRequest(
+            "soft speaker-count priors and ranges require the native acoustic diarization engine"
+                .to_owned(),
+        ));
+    }
+    // These labels are provisional backend output. The later selected
+    // diarization stage owns every explicit count request.
+    Ok(SpeakerCountRequest::Infer)
 }
 
 /// Compute the whole-clip audio duration in seconds for the diarizer, preferring
@@ -181,6 +235,11 @@ pub fn run(
         tok.checkpoint()?;
     }
 
+    // Reject unsupported count semantics before model resolution, audio reads,
+    // or inference. Invalid soft evidence must not become an expensive late
+    // failure or disappear behind the silence fast path.
+    let speaker_count = validate_speaker_count_capability(request)?;
+
     // Resolve the model spec up front so an unavailability error is reported
     // before any expensive work.
     let spec = effective_model_spec(request)?;
@@ -218,10 +277,10 @@ pub fn run(
         tok.checkpoint()?;
     }
 
-    // Real diarization: assign a speaker to every engine segment via the
-    // heuristic diarizer, honoring the request's speaker constraints.
+    // Legacy diarization: assign provisional speaker labels from transcript
+    // timing/text features. This path cannot fuse soft acoustic count evidence
+    // and never forces cluster collapse from count cardinality alone.
     let mut segments = output.segments.clone();
-    let constraints = speaker_constraints_for(request);
     let duration_sec = audio_duration_sec(request, &output);
     let diarize_token = token
         .copied()
@@ -229,7 +288,7 @@ pub fn run(
     let report = orchestrator::diarize_segments(
         &mut segments,
         duration_sec,
-        constraints.as_ref(),
+        &speaker_count,
         &diarize_token,
     )?;
 
@@ -257,6 +316,7 @@ pub fn run(
         language,
         segments,
         acceleration: None,
+        diarization: None,
         raw_output,
         artifact_paths: Vec::new(),
     })
@@ -367,6 +427,7 @@ fn silence_result(
         language: request.language.clone(),
         segments: Vec::new(),
         acceleration: None,
+        diarization: None,
         raw_output: json!({
             "engine": "whisper-diarization-native",
             "schema_version": SCHEMA_VERSION,
@@ -395,7 +456,8 @@ mod tests {
 
     use crate::backend::Engine;
     use crate::model::{
-        BackendKind, BackendParams, InputSource, SpeakerConstraints, TranscribeRequest,
+        BackendKind, BackendParams, DiarizationRequest, InputSource, SpeakerCountRequest,
+        TranscribeRequest,
     };
     use crate::native_engine::{self, decode};
     use crate::orchestrator::CancellationToken;
@@ -417,6 +479,26 @@ mod tests {
             timeout_ms: None,
             backend_params: BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn decode_params_maps_prompt_and_beam_size() {
+        use crate::model::DecodingParams;
+        let mut req = request();
+        // Defaults: no prompt, greedy.
+        let dp = decode_params(&req);
+        assert_eq!(dp.initial_prompt, None);
+        assert_eq!(dp.beam_size, None);
+        // Request quality knobs (--prompt, --beam-size) reach the engine — the
+        // diarize backend now honors them like the sequential backend.
+        req.backend_params.prompt = Some("clinical notes".to_owned());
+        req.backend_params.decoding = Some(DecodingParams {
+            beam_size: Some(4),
+            ..DecodingParams::default()
+        });
+        let dp = decode_params(&req);
+        assert_eq!(dp.initial_prompt.as_deref(), Some("clinical notes"));
+        assert_eq!(dp.beam_size, Some(4));
     }
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
@@ -623,8 +705,13 @@ mod tests {
             seg(7.0, 9.0, "ask what you can do for your country"),
         ];
         let token = CancellationToken::unbounded();
-        let report = orchestrator::diarize_segments(&mut segments, Some(9.0), None, &token)
-            .expect("diarize");
+        let report = orchestrator::diarize_segments(
+            &mut segments,
+            Some(9.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .expect("diarize");
         assert_eq!(report.segments_labeled, 3);
         let re = regex_speaker();
         for s in &segments {
@@ -669,12 +756,12 @@ mod tests {
         assert_eq!(json["diarizer"].as_str(), Some(DIARIZER_TAG));
         let note = json["diarizer_note"].as_str().expect("note present");
         assert!(
-            note.contains("without neural speaker encoder"),
+            note.contains("without waveform speaker evidence"),
             "note must state the limitation: {note}"
         );
         assert!(
-            note.contains("bd-ohex"),
-            "note must reference the ECAPA upgrade bead: {note}"
+            note.contains("excluded from acoustic and external evidence gates"),
+            "note must state the evidence boundary: {note}"
         );
         let serialized = json.to_string().to_lowercase();
         assert!(
@@ -694,6 +781,7 @@ mod tests {
             segments: vec![seg(0.0, 9.0, "x")],
             language: Some("en".to_owned()),
             windows: vec![],
+            work: decode::DecodeWorkStats::default(),
             word_timings: None,
         };
         assert_eq!(audio_duration_sec(&req, &output), Some(12.0));
@@ -705,6 +793,7 @@ mod tests {
             segments: vec![],
             language: None,
             windows: vec![],
+            work: decode::DecodeWorkStats::default(),
             word_timings: None,
         };
         assert_eq!(audio_duration_sec(&req, &empty), None);
@@ -719,22 +808,6 @@ mod tests {
 
     fn tiny_en_available() -> bool {
         native_engine::find_model_file("tiny.en").is_some()
-    }
-
-    fn load_jfk_samples() -> Option<Vec<f32>> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/native/jfk.wav");
-        let bytes = std::fs::read(path).ok()?;
-        decode::read_wav_16k_mono(&bytes).ok()
-    }
-
-    fn write_samples_wav(dir: &Path, name: &str, samples: &[f32]) -> PathBuf {
-        let pcm: Vec<i16> = samples
-            .iter()
-            .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
-            .collect();
-        let path = dir.join(name);
-        write_pcm16_mono_wav(&path, 16_000, &pcm);
-        path
     }
 
     #[test]
@@ -782,46 +855,68 @@ mod tests {
     }
 
     #[test]
-    fn gated_e2e_min_speakers_two_honored_on_multi_window_clip() {
-        let Some(samples) = load_jfk_samples() else {
-            eprintln!("SKIP gated_e2e_min_speakers: jfk.wav missing");
-            return;
-        };
-        if !tiny_en_available() {
-            eprintln!("SKIP gated_e2e_min_speakers: tiny.en model missing");
-            return;
+    fn explicit_count_inputs_are_reserved_for_the_selected_diarization_stage() {
+        for speaker_count in [
+            SpeakerCountRequest::HardConstraint { count: 2 },
+            SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 4,
+            },
+            SpeakerCountRequest::Prior {
+                bins: vec![crate::model::SpeakerCountPriorMass {
+                    count: 2,
+                    probability: 1.0,
+                }],
+            },
+        ] {
+            let mut req = request();
+            req.model = Some("definitely-not-a-real-model-zzz".to_owned());
+            req.backend_params.acoustic_diarization = Some(DiarizationRequest {
+                speaker_count,
+                ..DiarizationRequest::default()
+            });
+
+            assert_eq!(
+                validate_speaker_count_capability(&req).expect("acoustic-stage count input"),
+                SpeakerCountRequest::Infer,
+                "legacy provisional labels must never consume the acoustic-stage count request"
+            );
         }
-        // Concatenate jfk 3x (~33 s) so the diarizer has many segments to cluster
-        // and can comply with a min_speakers=2 constraint.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut long = Vec::with_capacity(samples.len() * 3);
-        for _ in 0..3 {
-            long.extend_from_slice(&samples);
-        }
-        let wav = write_samples_wav(dir.path(), "jfk3x.wav", &long);
+    }
 
-        let mut req = request();
-        req.model = Some("tiny.en".to_owned());
-        req.language = None;
-        req.backend_params.speaker_constraints = Some(SpeakerConstraints {
-            num_speakers: None,
-            min_speakers: Some(2),
-            max_speakers: None,
-        });
+    #[test]
+    fn soft_external_count_inputs_are_rejected_before_native_inference() {
+        for speaker_count in [
+            SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 4,
+            },
+            SpeakerCountRequest::Prior {
+                bins: vec![crate::model::SpeakerCountPriorMass {
+                    count: 2,
+                    probability: 1.0,
+                }],
+            },
+        ] {
+            let mut req = request();
+            req.model = Some("definitely-not-a-real-model-zzz".to_owned());
+            req.backend_params.acoustic_diarization = Some(DiarizationRequest {
+                engine: crate::model::DiarizationEngine::External,
+                speaker_count,
+                ..DiarizationRequest::default()
+            });
 
-        let result = run(&req, &wav, dir.path(), Duration::from_secs(180), None)
-            .expect("multi-window diarization run");
+            let error = run(
+                &req,
+                Path::new("definitely-not-an-audio-file.wav"),
+                Path::new("."),
+                Duration::from_secs(1),
+                None,
+            )
+            .expect_err("unsupported soft count input must fail before model or audio access");
 
-        let speakers = result.raw_output["speakers_detected"]
-            .as_u64()
-            .expect("speakers_detected present");
-        assert!(
-            speakers >= 2,
-            "min_speakers=2 should yield >= 2 speakers on a multi-segment clip, got {speakers}"
-        );
-        let re = regex_speaker();
-        for s in &result.segments {
-            assert!(re(s.speaker.as_deref().expect("speaker")));
+            assert!(matches!(error, FwError::InvalidRequest(_)));
+            assert!(error.to_string().contains("native acoustic"));
         }
     }
 

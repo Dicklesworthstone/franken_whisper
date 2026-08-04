@@ -173,13 +173,16 @@ impl CorrectionDrift {
         let quality_text = concat_segment_text(quality_segments);
 
         let text_edit_distance = levenshtein(&fast_text, &quality_text);
-
-        // Word-level approximate WER.
-        let fast_words: Vec<&str> = fast_text.split_whitespace().collect();
-        let quality_words: Vec<&str> = quality_text.split_whitespace().collect();
-        let word_edit_dist = levenshtein_words(&fast_words, &quality_words);
-        let max_words = fast_words.len().max(quality_words.len()).max(1);
-        let wer_approx = word_edit_dist as f64 / max_words as f64;
+        let wer_approx = if text_edit_distance == 0 {
+            0.0
+        } else {
+            // Word-level approximate WER.
+            let fast_words: Vec<&str> = fast_text.split_whitespace().collect();
+            let quality_words: Vec<&str> = quality_text.split_whitespace().collect();
+            let word_edit_dist = levenshtein_words(&fast_words, &quality_words);
+            let max_words = fast_words.len().max(quality_words.len()).max(1);
+            word_edit_dist as f64 / max_words as f64
+        };
 
         let confidence_delta =
             (mean_confidence(fast_segments) - mean_confidence(quality_segments)).abs();
@@ -241,6 +244,31 @@ impl CorrectionEvent {
     ) -> Self {
         let quality_confidence_mean = mean_confidence(&corrected_segments);
         let drift = CorrectionDrift::compute(fast_segments, &corrected_segments);
+        Self::from_precomputed_metrics(
+            correction_id,
+            retracted_seq,
+            window_id,
+            quality_model_id,
+            corrected_segments,
+            quality_latency_ms,
+            quality_confidence_mean,
+            drift,
+            corrected_at_rfc3339,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_precomputed_metrics(
+        correction_id: u64,
+        retracted_seq: u64,
+        window_id: u64,
+        quality_model_id: String,
+        corrected_segments: Vec<TranscriptionSegment>,
+        quality_latency_ms: u64,
+        quality_confidence_mean: f64,
+        drift: CorrectionDrift,
+        corrected_at_rfc3339: String,
+    ) -> Self {
         Self {
             correction_id,
             retracted_seq,
@@ -305,17 +333,41 @@ fn mean_confidence(segments: &[TranscriptionSegment]) -> f64 {
 
 /// Concatenate all segment texts separated by a single space.
 fn concat_segment_text(segments: &[TranscriptionSegment]) -> String {
-    segments
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
+    let separator_bytes = segments.len().saturating_sub(1);
+    let capacity = segments.iter().fold(separator_bytes, |bytes, segment| {
+        bytes.saturating_add(segment.text.len())
+    });
+    let mut text = String::with_capacity(capacity);
+    for (index, segment) in segments.iter().enumerate() {
+        if index != 0 {
+            text.push(' ');
+        }
+        text.push_str(&segment.text);
+    }
+    text
 }
 
 /// Character-level Levenshtein distance.
 fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
+    // A shared prefix or suffix contributes zero edits, so exclude both from
+    // the dynamic-programming matrix while retaining Unicode scalar semantics.
+    let common_prefix = a_chars
+        .iter()
+        .zip(&b_chars)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let a_chars = &a_chars[common_prefix..];
+    let b_chars = &b_chars[common_prefix..];
+    let common_suffix = a_chars
+        .iter()
+        .rev()
+        .zip(b_chars.iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let a_chars = &a_chars[..a_chars.len() - common_suffix];
+    let b_chars = &b_chars[..b_chars.len() - common_suffix];
     let m = a_chars.len();
     let n = b_chars.len();
 
@@ -402,6 +454,15 @@ pub struct WindowState {
     pub status: WindowStatus,
 }
 
+/// Scalar window fields needed by the internal streaming loop after a window
+/// has been retained by [`WindowManager`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowReceipt {
+    pub(crate) window_id: u64,
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+}
+
 /// Manages the lifecycle of overlapping audio windows for speculative
 /// dual-model transcription.
 pub struct WindowManager {
@@ -431,12 +492,7 @@ impl WindowManager {
         }
     }
 
-    fn create_window(
-        &mut self,
-        audio_position_ms: u64,
-        end_ms: u64,
-        audio_hash: &str,
-    ) -> SpeculationWindow {
+    fn store_window(&mut self, audio_position_ms: u64, end_ms: u64, audio_hash: String) -> usize {
         let id = self.next_window_id;
         self.next_window_id += 1;
 
@@ -446,17 +502,37 @@ impl WindowManager {
             audio_position_ms,
             end_ms,
             self.overlap_ms,
-            audio_hash.to_owned(),
+            audio_hash,
         );
 
+        let index = self.windows.len();
         self.windows.push(WindowState {
-            window: window.clone(),
+            window,
             fast_result: None,
             quality_result: None,
             status: WindowStatus::Pending,
         });
 
-        window
+        index
+    }
+
+    fn create_window(
+        &mut self,
+        audio_position_ms: u64,
+        end_ms: u64,
+        audio_hash: &str,
+    ) -> SpeculationWindow {
+        let index = self.store_window(audio_position_ms, end_ms, audio_hash.to_owned());
+        self.windows[index].window.clone()
+    }
+
+    fn bounded_end_ms(&self, audio_position_ms: u64, max_end_ms: u64) -> Option<u64> {
+        if audio_position_ms >= max_end_ms {
+            return None;
+        }
+        let natural_end = audio_position_ms.saturating_add(self.window_size_ms);
+        let end_ms = natural_end.min(max_end_ms);
+        (end_ms > audio_position_ms).then_some(end_ms)
     }
 
     /// Create the next speculation window starting at `audio_position_ms`.
@@ -475,15 +551,26 @@ impl WindowManager {
         max_end_ms: u64,
         audio_hash: &str,
     ) -> Option<SpeculationWindow> {
-        if audio_position_ms >= max_end_ms {
-            return None;
-        }
-        let natural_end = audio_position_ms.saturating_add(self.window_size_ms);
-        let end_ms = natural_end.min(max_end_ms);
-        if end_ms <= audio_position_ms {
-            return None;
-        }
+        let end_ms = self.bounded_end_ms(audio_position_ms, max_end_ms)?;
         Some(self.create_window(audio_position_ms, end_ms, audio_hash))
+    }
+
+    /// Retain a bounded window while moving its already-owned audio hash and
+    /// return only the scalar fields consumed by the internal streaming loop.
+    pub(crate) fn next_window_bounded_receipt(
+        &mut self,
+        audio_position_ms: u64,
+        max_end_ms: u64,
+        audio_hash: String,
+    ) -> Option<WindowReceipt> {
+        let end_ms = self.bounded_end_ms(audio_position_ms, max_end_ms)?;
+        let index = self.store_window(audio_position_ms, end_ms, audio_hash);
+        let window = &self.windows[index].window;
+        Some(WindowReceipt {
+            window_id: window.window_id,
+            start_ms: window.start_ms,
+            end_ms: window.end_ms,
+        })
     }
 
     /// Record the fast model result for a window.
@@ -548,9 +635,12 @@ impl WindowManager {
 
     /// Look up a window mutably by its id.
     pub fn get_window_mut(&mut self, window_id: u64) -> Option<&mut WindowState> {
+        // `create_window` assigns IDs in append order, and windows are never
+        // removed or reordered, so a valid ID is its stable vector index.
+        let index = usize::try_from(window_id).ok()?;
         self.windows
-            .iter_mut()
-            .find(|ws| ws.window.window_id == window_id)
+            .get_mut(index)
+            .filter(|ws| ws.window.window_id == window_id)
     }
 
     /// Merge segments from all resolved windows into a single sorted,
@@ -562,16 +652,34 @@ impl WindowManager {
     /// with higher confidence.
     #[must_use]
     pub fn merge_segments(&self) -> Vec<TranscriptionSegment> {
-        let mut all_segments: Vec<TranscriptionSegment> = Vec::new();
+        // Count the resolved segments first so the aggregate is allocated at
+        // exact capacity and each window's chosen segments are cloned directly
+        // into it — avoiding a per-window temporary `Vec` (from `.clone()`) and
+        // the aggregate's incremental reallocation. Byte-identical: `self` is
+        // borrowed so both passes pick the same quality/fast branch per window,
+        // and the same segments are appended in the same order.
+        let mut total = 0usize;
+        for ws in &self.windows {
+            if ws.status != WindowStatus::Resolved {
+                continue;
+            }
+            if let Some(ref quality) = ws.quality_result {
+                total += quality.len();
+            } else if let Some(ref fast) = ws.fast_result {
+                total += fast.segments.len();
+            }
+        }
+
+        let mut all_segments: Vec<TranscriptionSegment> = Vec::with_capacity(total);
 
         for ws in &self.windows {
             if ws.status != WindowStatus::Resolved {
                 continue;
             }
             if let Some(ref quality) = ws.quality_result {
-                all_segments.extend(quality.clone());
+                all_segments.extend(quality.iter().cloned());
             } else if let Some(ref fast) = ws.fast_result {
-                all_segments.extend(fast.segments.clone());
+                all_segments.extend(fast.segments.iter().cloned());
             }
         }
 
@@ -758,20 +866,25 @@ impl CorrectionTracker {
                 ))
             })?;
             partial.retract();
-            let fast_segments = partial.segments.clone();
 
             let correction_id = self.next_correction_id;
             self.next_correction_id += 1;
 
-            let correction = CorrectionEvent::new(
+            let quality_model_id = quality_model_id.to_owned();
+            let corrected_at_rfc3339 = chrono::Utc::now().to_rfc3339();
+            let quality_confidence_mean = mean_confidence(&quality_segments);
+            // The decision above already computed both Levenshtein metrics.
+            // Reuse them instead of cloning the fast segments and rescanning.
+            let correction = CorrectionEvent::from_precomputed_metrics(
                 correction_id,
                 seq,
                 window_id,
-                quality_model_id.to_owned(),
+                quality_model_id,
                 quality_segments,
                 quality_latency_ms,
-                chrono::Utc::now().to_rfc3339(),
-                &fast_segments,
+                quality_confidence_mean,
+                drift,
+                corrected_at_rfc3339,
             );
 
             self.corrections.push(correction.clone());
@@ -1005,6 +1118,7 @@ pub struct SpeculationWindowController {
     fallback_reason: Option<String>,
     next_decision_id: u64,
     consecutive_zero_corrections: u64,
+    historical_double_brier_fold: bool,
 }
 
 impl SpeculationWindowController {
@@ -1038,7 +1152,15 @@ impl SpeculationWindowController {
             fallback_reason: None,
             next_decision_id: 0,
             consecutive_zero_corrections: 0,
+            historical_double_brier_fold: false,
         }
+    }
+
+    /// Select the historical two-fold `apply()` path for same-binary A/B
+    /// measurement. The default remains the single-fold production path.
+    #[doc(hidden)]
+    pub fn set_historical_double_brier_fold(&mut self, enabled: bool) {
+        self.historical_double_brier_fold = enabled;
     }
 
     /// Observe a correction decision and update internal state.
@@ -1076,9 +1198,15 @@ impl SpeculationWindowController {
             return ControllerAction::Hold;
         }
 
-        if self.calibration.brier_score() > Self::BRIER_FALLBACK_THRESHOLD
-            && self.calibration.sample_count() >= 10
-        {
+        self.recommend_with_brier(self.calibration.brier_score())
+    }
+
+    fn recommend_with_brier(&self, brier: f64) -> ControllerAction {
+        if self.state.window_count < Self::MIN_WINDOWS_FOR_ADAPT {
+            return ControllerAction::Hold;
+        }
+
+        if brier > Self::BRIER_FALLBACK_THRESHOLD && self.calibration.sample_count() >= 10 {
             return ControllerAction::Hold;
         }
 
@@ -1118,12 +1246,17 @@ impl SpeculationWindowController {
 
     /// Apply the recommended action and return the new window size.
     pub fn apply(&mut self) -> u64 {
-        let action = self.recommend();
-
         let brier = self.calibration.brier_score();
-        if brier > Self::BRIER_FALLBACK_THRESHOLD && self.calibration.sample_count() >= 10 {
+        let action = self.recommend_with_brier(brier);
+        let fallback_brier = if self.historical_double_brier_fold {
+            self.calibration.brier_score()
+        } else {
+            brier
+        };
+        if fallback_brier > Self::BRIER_FALLBACK_THRESHOLD && self.calibration.sample_count() >= 10
+        {
             self.fallback_active = true;
-            self.fallback_reason = Some(format!("Brier score {brier:.3} > threshold"));
+            self.fallback_reason = Some(format!("Brier score {fallback_brier:.3} > threshold"));
             self.current_window_ms = self.initial_window_ms;
         } else if self.state.correction_rate > Self::RUNAWAY_CORRECTION_RATE {
             self.fallback_active = true;
@@ -1288,12 +1421,51 @@ impl CorrectionEvidenceLedger {
     /// Summary diagnostics as JSON.
     #[must_use]
     pub fn diagnostics(&self) -> serde_json::Value {
+        let mut corrections = 0_usize;
+        let mut fast_latency_sum = 0_u64;
+        let mut quality_latency_sum = 0_u64;
+        let mut wer_sum = 0.0_f64;
+        for entry in &self.entries {
+            corrections += usize::from(is_correction_decision(&entry.decision));
+            fast_latency_sum += entry.fast_latency_ms;
+            quality_latency_sum += entry.quality_latency_ms;
+            wer_sum += entry.drift.wer_approx;
+        }
+
+        let count = self.entries.len();
+        let denominator = count as f64;
+        let correction_rate = if count == 0 {
+            0.0
+        } else {
+            corrections as f64 / denominator
+        };
+        let mean_fast_latency = if count == 0 {
+            0.0
+        } else {
+            fast_latency_sum as f64 / denominator
+        };
+        let mean_quality_latency = if count == 0 {
+            0.0
+        } else {
+            quality_latency_sum as f64 / denominator
+        };
+        let mean_wer = if count == 0 {
+            0.0
+        } else {
+            wer_sum / denominator
+        };
+        let latency_savings_pct = if mean_quality_latency == 0.0 {
+            0.0
+        } else {
+            (mean_quality_latency - mean_fast_latency) / mean_quality_latency * 100.0
+        };
+
         serde_json::json!({
-            "correction_rate": self.correction_rate(),
-            "mean_fast_latency_ms": self.mean_fast_latency(),
-            "mean_quality_latency_ms": self.mean_quality_latency(),
-            "mean_wer": self.mean_wer(),
-            "latency_savings_pct": self.latency_savings_pct(),
+            "correction_rate": correction_rate,
+            "mean_fast_latency_ms": mean_fast_latency,
+            "mean_quality_latency_ms": mean_quality_latency,
+            "mean_wer": mean_wer,
+            "latency_savings_pct": latency_savings_pct,
         })
     }
 
@@ -1384,6 +1556,1445 @@ mod tests {
             confidence,
             speaker: None,
         }
+    }
+
+    const RECEIPT_RUN_ID: &str = "run-2026-07-14T12:34:56Z-0123456789abcdef0123456789abcdef";
+    const RECEIPT_AUDIO_HASH_SEED: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn streaming_window_receipt_state_bytes(manager: &WindowManager) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "window_size_ms": manager.window_size_ms,
+            "overlap_ms": manager.overlap_ms,
+            "min_window_ms": manager.min_window_ms,
+            "max_window_ms": manager.max_window_ms,
+            "next_window_id": manager.next_window_id,
+            "run_id": &manager.run_id,
+            "windows": &manager.windows,
+        }))
+        .expect("serialize streaming window receipt state")
+    }
+
+    fn streaming_window_receipt_historical(
+        window_count: usize,
+    ) -> (WindowManager, Vec<WindowReceipt>) {
+        let mut manager = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+        let max_end_ms = u64::try_from(window_count)
+            .expect("window count fits u64")
+            .saturating_mul(2_500)
+            .saturating_add(500);
+        let mut receipts = Vec::with_capacity(window_count);
+        for index in 0..window_count {
+            let position_ms = u64::try_from(index)
+                .expect("fixture index fits u64")
+                .saturating_mul(2_500);
+            let audio_hash = format!("{RECEIPT_AUDIO_HASH_SEED}:{position_ms}:3000");
+            let window = manager
+                .next_window_bounded(position_ms, max_end_ms, &audio_hash)
+                .expect("historical bounded window");
+            receipts.push(WindowReceipt {
+                window_id: window.window_id,
+                start_ms: window.start_ms,
+                end_ms: window.end_ms,
+            });
+        }
+        (manager, receipts)
+    }
+
+    fn streaming_window_receipt_candidate(
+        window_count: usize,
+    ) -> (WindowManager, Vec<WindowReceipt>) {
+        let mut manager = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+        let max_end_ms = u64::try_from(window_count)
+            .expect("window count fits u64")
+            .saturating_mul(2_500)
+            .saturating_add(500);
+        let mut receipts = Vec::with_capacity(window_count);
+        for index in 0..window_count {
+            let position_ms = u64::try_from(index)
+                .expect("fixture index fits u64")
+                .saturating_mul(2_500);
+            let audio_hash = format!("{RECEIPT_AUDIO_HASH_SEED}:{position_ms}:3000");
+            receipts.push(
+                manager
+                    .next_window_bounded_receipt(position_ms, max_end_ms, audio_hash)
+                    .expect("candidate bounded window"),
+            );
+        }
+        (manager, receipts)
+    }
+
+    #[test]
+    fn streaming_window_receipt_preserves_complete_state() {
+        let (mut historical, historical_receipts) = streaming_window_receipt_historical(513);
+        let (mut candidate, candidate_receipts) = streaming_window_receipt_candidate(513);
+        assert_eq!(candidate_receipts, historical_receipts, "scalar receipts");
+        assert_eq!(
+            streaming_window_receipt_state_bytes(&candidate),
+            streaming_window_receipt_state_bytes(&historical),
+            "complete retained window state"
+        );
+
+        assert!(
+            historical
+                .next_window_bounded(1_282_500, 1_282_500, "unused")
+                .is_none()
+        );
+        assert!(
+            candidate
+                .next_window_bounded_receipt(1_282_500, 1_282_500, "unused".to_owned())
+                .is_none()
+        );
+        assert_eq!(
+            streaming_window_receipt_state_bytes(&candidate),
+            streaming_window_receipt_state_bytes(&historical),
+            "rejected boundary leaves state unchanged"
+        );
+
+        let mut historical_tail = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+        let mut candidate_tail = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+        let audio_hash = format!("{RECEIPT_AUDIO_HASH_SEED}:2500:3000");
+        let historical_window = historical_tail
+            .next_window_bounded(2_500, 2_601, &audio_hash)
+            .expect("historical truncated window");
+        let candidate_receipt = candidate_tail
+            .next_window_bounded_receipt(2_500, 2_601, audio_hash)
+            .expect("candidate truncated window");
+        assert_eq!(
+            candidate_receipt,
+            WindowReceipt {
+                window_id: historical_window.window_id,
+                start_ms: historical_window.start_ms,
+                end_ms: historical_window.end_ms,
+            }
+        );
+        assert_eq!(
+            streaming_window_receipt_state_bytes(&candidate_tail),
+            streaming_window_receipt_state_bytes(&historical_tail),
+            "truncated final-window state"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn streaming_window_receipt_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_WINDOWS: usize = 256;
+        const EXACTNESS_WINDOWS: usize = 513;
+        const TARGET_ARM_NS: u128 = 30_000_000;
+
+        fn time_historical(window_count: usize) -> u128 {
+            let mut manager = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+            let max_end_ms = u64::try_from(window_count)
+                .expect("window count fits u64")
+                .saturating_mul(2_500)
+                .saturating_add(500);
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for index in 0..window_count {
+                let position_ms = u64::try_from(index)
+                    .expect("fixture index fits u64")
+                    .saturating_mul(2_500);
+                let audio_hash = format!("{RECEIPT_AUDIO_HASH_SEED}:{position_ms}:3000");
+                let window = manager
+                    .next_window_bounded(position_ms, max_end_ms, &audio_hash)
+                    .expect("historical timed window");
+                checksum = checksum
+                    .wrapping_add(window.window_id)
+                    .wrapping_add(window.start_ms)
+                    .wrapping_add(window.end_ms);
+            }
+            black_box((&manager.windows, checksum));
+            started.elapsed().as_nanos()
+        }
+
+        fn time_candidate(window_count: usize) -> u128 {
+            let mut manager = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+            let max_end_ms = u64::try_from(window_count)
+                .expect("window count fits u64")
+                .saturating_mul(2_500)
+                .saturating_add(500);
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for index in 0..window_count {
+                let position_ms = u64::try_from(index)
+                    .expect("fixture index fits u64")
+                    .saturating_mul(2_500);
+                let audio_hash = format!("{RECEIPT_AUDIO_HASH_SEED}:{position_ms}:3000");
+                let receipt = manager
+                    .next_window_bounded_receipt(position_ms, max_end_ms, audio_hash)
+                    .expect("candidate timed window");
+                checksum = checksum
+                    .wrapping_add(receipt.window_id)
+                    .wrapping_add(receipt.start_ms)
+                    .wrapping_add(receipt.end_ms);
+            }
+            black_box((&manager.windows, checksum));
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let (historical, historical_receipts) =
+            streaming_window_receipt_historical(EXACTNESS_WINDOWS);
+        let (candidate, candidate_receipts) = streaming_window_receipt_candidate(EXACTNESS_WINDOWS);
+        let historical_bytes = streaming_window_receipt_state_bytes(&historical);
+        let candidate_bytes = streaming_window_receipt_state_bytes(&candidate);
+        assert_eq!(candidate_receipts, historical_receipts, "exact receipts");
+        assert_eq!(candidate_bytes, historical_bytes, "exact retained state");
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "streaming_window_receipt binary_sha256={:x} state_bytes={} state_sha256={:x} exactness_windows={} run_id_bytes={} audio_hash_seed_bytes={}",
+            Sha256::digest(executable),
+            historical_bytes.len(),
+            Sha256::digest(&historical_bytes),
+            EXACTNESS_WINDOWS,
+            RECEIPT_RUN_ID.len(),
+            RECEIPT_AUDIO_HASH_SEED.len()
+        );
+
+        let historical_calibration = time_historical(CALIBRATION_WINDOWS);
+        let candidate_calibration = time_candidate(CALIBRATION_WINDOWS);
+        let window_count = ((TARGET_ARM_NS * CALIBRATION_WINDOWS as u128)
+            / historical_calibration.max(1))
+        .clamp(CALIBRATION_WINDOWS as u128, 16_384) as usize;
+        eprintln!(
+            "streaming_window_receipt calibration_windows={CALIBRATION_WINDOWS} historical_calibration_ns={historical_calibration} candidate_calibration_ns={candidate_calibration} timed_windows={window_count}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(window_count));
+            black_box(time_candidate(window_count));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut candidate_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(window_count);
+            let null_second = time_historical(window_count);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical_time, candidate_time) = if sample % 2 == 0 {
+                (time_historical(window_count), time_candidate(window_count))
+            } else {
+                let candidate_time = time_candidate(window_count);
+                let historical_time = time_historical(window_count);
+                (historical_time, candidate_time)
+            };
+            historical_times.push(historical_time);
+            candidate_times.push(candidate_time);
+            speedups.push(historical_time as f64 / candidate_time as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "streaming_window_receipt samples={SAMPLES} timed_windows={window_count} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_per_window_median_ns={} candidate_per_window_median_ns={} candidate_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times) / window_count as u128,
+            median_ns(&candidate_times) / window_count as u128,
+            coefficient_of_variation(&candidate_times) * 100.0
+        );
+        eprintln!(
+            "streaming_window_receipt null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} candidate_times_ns={candidate_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
+    }
+
+    fn get_window_mut_historical(
+        manager: &mut WindowManager,
+        window_id: u64,
+    ) -> Option<&mut WindowState> {
+        manager
+            .windows
+            .iter_mut()
+            .find(|state| state.window.window_id == window_id)
+    }
+
+    fn window_mut_direct_index_fixture(window_count: usize) -> WindowManager {
+        let mut manager = WindowManager::new("direct-index-run", 3_000, 500);
+        for index in 0..window_count {
+            let position_ms = u64::try_from(index).expect("fixture index fits u64") * 2_500;
+            manager.next_window(position_ms, &format!("audio-{index:04}"));
+        }
+        manager
+    }
+
+    #[test]
+    fn window_mut_direct_index_matches_historical() {
+        const WINDOW_COUNT: usize = 1_024;
+        let mut historical = window_mut_direct_index_fixture(WINDOW_COUNT);
+        let mut candidate = window_mut_direct_index_fixture(WINDOW_COUNT);
+
+        for window_id in 0..WINDOW_COUNT as u64 {
+            let historical_bytes = get_window_mut_historical(&mut historical, window_id)
+                .map(|state| serde_json::to_vec(state).expect("serialize historical state"));
+            let candidate_bytes = candidate
+                .get_window_mut(window_id)
+                .map(|state| serde_json::to_vec(state).expect("serialize candidate state"));
+            assert_eq!(
+                candidate_bytes, historical_bytes,
+                "lookup mismatch for window {window_id}"
+            );
+        }
+
+        for window_id in [WINDOW_COUNT as u64, u64::MAX] {
+            assert!(get_window_mut_historical(&mut historical, window_id).is_none());
+            assert!(candidate.get_window_mut(window_id).is_none());
+        }
+
+        for (window_id, status) in [
+            (0, WindowStatus::FastInProgress),
+            (511, WindowStatus::FastComplete),
+            (1_023, WindowStatus::Resolved),
+        ] {
+            get_window_mut_historical(&mut historical, window_id)
+                .expect("historical fixture window")
+                .status = status;
+            candidate
+                .get_window_mut(window_id)
+                .expect("candidate fixture window")
+                .status = status;
+        }
+        assert_eq!(
+            serde_json::to_vec(&candidate.windows).expect("serialize candidate windows"),
+            serde_json::to_vec(&historical.windows).expect("serialize historical windows"),
+            "complete post-mutation window state"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn window_mut_direct_index_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const WINDOW_COUNT: usize = 1_024;
+        const TARGET_WINDOW_ID: u64 = WINDOW_COUNT as u64 - 1;
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 2;
+        const TARGET_ARM_NS: u128 = 50_000_000;
+
+        fn time_historical(manager: &mut WindowManager, window_id: u64, iterations: usize) -> u128 {
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for _ in 0..iterations {
+                let state =
+                    get_window_mut_historical(black_box(&mut *manager), black_box(window_id))
+                        .expect("historical target window");
+                checksum = checksum.wrapping_add(black_box(state.window.end_ms));
+            }
+            black_box(checksum);
+            started.elapsed().as_nanos()
+        }
+
+        fn time_candidate(manager: &mut WindowManager, window_id: u64, iterations: usize) -> u128 {
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for _ in 0..iterations {
+                let state = black_box(&mut *manager)
+                    .get_window_mut(black_box(window_id))
+                    .expect("candidate target window");
+                checksum = checksum.wrapping_add(black_box(state.window.end_ms));
+            }
+            black_box(checksum);
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let mut historical = window_mut_direct_index_fixture(WINDOW_COUNT);
+        let mut candidate = window_mut_direct_index_fixture(WINDOW_COUNT);
+        let historical_bytes =
+            serde_json::to_vec(&historical.windows).expect("serialize historical fixture");
+        let candidate_bytes =
+            serde_json::to_vec(&candidate.windows).expect("serialize candidate fixture");
+        assert_eq!(candidate_bytes, historical_bytes, "exact fixture bytes");
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "window_mut_direct_index binary_sha256={:x} state_bytes={} state_sha256={:x} windows={} target_window_id={} advance_ms=2500",
+            Sha256::digest(executable),
+            historical_bytes.len(),
+            Sha256::digest(&historical_bytes),
+            WINDOW_COUNT,
+            TARGET_WINDOW_ID
+        );
+
+        let historical_calibration =
+            time_historical(&mut historical, TARGET_WINDOW_ID, CALIBRATION_ITERATIONS);
+        let candidate_calibration =
+            time_candidate(&mut candidate, TARGET_WINDOW_ID, CALIBRATION_ITERATIONS);
+        let historical_iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128)
+            / historical_calibration.max(1))
+        .clamp(1, 16_777_216) as usize;
+        let candidate_iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128)
+            / candidate_calibration.max(1))
+        .clamp(1, 16_777_216) as usize;
+        eprintln!(
+            "window_mut_direct_index calibration_iterations={CALIBRATION_ITERATIONS} historical_calibration_ns={historical_calibration} candidate_calibration_ns={candidate_calibration} historical_iterations={historical_iterations} candidate_iterations={candidate_iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(
+                &mut historical,
+                TARGET_WINDOW_ID,
+                historical_iterations,
+            ));
+            black_box(time_candidate(
+                &mut candidate,
+                TARGET_WINDOW_ID,
+                candidate_iterations,
+            ));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut candidate_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first =
+                time_historical(&mut historical, TARGET_WINDOW_ID, historical_iterations);
+            let null_second =
+                time_historical(&mut historical, TARGET_WINDOW_ID, historical_iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical_time, candidate_time) = if sample % 2 == 0 {
+                (
+                    time_historical(&mut historical, TARGET_WINDOW_ID, historical_iterations),
+                    time_candidate(&mut candidate, TARGET_WINDOW_ID, candidate_iterations),
+                )
+            } else {
+                let candidate_time =
+                    time_candidate(&mut candidate, TARGET_WINDOW_ID, candidate_iterations);
+                let historical_time =
+                    time_historical(&mut historical, TARGET_WINDOW_ID, historical_iterations);
+                (historical_time, candidate_time)
+            };
+            historical_times.push(historical_time);
+            candidate_times.push(candidate_time);
+            speedups.push(
+                (historical_time as f64 / historical_iterations as f64)
+                    / (candidate_time as f64 / candidate_iterations as f64),
+            );
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "window_mut_direct_index samples={SAMPLES} historical_iterations={historical_iterations} candidate_iterations={candidate_iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_per_lookup_median_ns={} candidate_per_lookup_median_ns={} candidate_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times) / historical_iterations as u128,
+            median_ns(&candidate_times) / candidate_iterations as u128,
+            coefficient_of_variation(&candidate_times) * 100.0
+        );
+        eprintln!(
+            "window_mut_direct_index null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} candidate_times_ns={candidate_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
+    }
+
+    fn levenshtein_historical(a: &str, b: &str) -> usize {
+        let a_chars: Vec<char> = a.chars().collect();
+        let b_chars: Vec<char> = b.chars().collect();
+        let m = a_chars.len();
+        let n = b_chars.len();
+
+        if m == 0 {
+            return n;
+        }
+        if n == 0 {
+            return m;
+        }
+
+        let mut prev = (0..=n).collect::<Vec<usize>>();
+        let mut curr = vec![0usize; n + 1];
+
+        for i in 1..=m {
+            curr[0] = i;
+            for j in 1..=n {
+                let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                    0
+                } else {
+                    1
+                };
+                curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+
+        prev[n]
+    }
+
+    fn correction_drift_historical(
+        fast_segments: &[TranscriptionSegment],
+        quality_segments: &[TranscriptionSegment],
+    ) -> CorrectionDrift {
+        let fast_text = concat_segment_text(fast_segments);
+        let quality_text = concat_segment_text(quality_segments);
+        let text_edit_distance = levenshtein_historical(&fast_text, &quality_text);
+        let fast_words = fast_text.split_whitespace().collect::<Vec<_>>();
+        let quality_words = quality_text.split_whitespace().collect::<Vec<_>>();
+        let word_edit_dist = levenshtein_words(&fast_words, &quality_words);
+        let max_words = fast_words.len().max(quality_words.len()).max(1);
+
+        CorrectionDrift {
+            wer_approx: word_edit_dist as f64 / max_words as f64,
+            confidence_delta: (mean_confidence(fast_segments) - mean_confidence(quality_segments))
+                .abs(),
+            segment_count_delta: quality_segments.len() as i32 - fast_segments.len() as i32,
+            text_edit_distance,
+        }
+    }
+
+    fn correction_drift_common_affix_fixture()
+    -> (Vec<TranscriptionSegment>, Vec<TranscriptionSegment>) {
+        let mut fast = Vec::with_capacity(12);
+        let mut quality = Vec::with_capacity(12);
+        for index in 0..12 {
+            let shared = format!(
+                "window segment {index:02} preserves the already agreed streaming transcript context and stable timing detail"
+            );
+            let fast_text = if index == 5 {
+                format!(
+                    "{shared}; the reviewed dosage uses the brown marker before the shared clinical suffix"
+                )
+            } else {
+                format!("{shared}; no correction is required for this portion")
+            };
+            let quality_text = if index == 5 {
+                format!(
+                    "{shared}; the reviewed dosage uses the green marker before the shared clinical suffix"
+                )
+            } else {
+                format!("{shared}; no correction is required for this portion")
+            };
+            fast.push(TranscriptionSegment {
+                text: fast_text,
+                start_sec: Some(f64::from(index) * 1.25),
+                end_sec: Some(f64::from(index + 1) * 1.25),
+                confidence: (index % 4 != 0).then_some(0.78 + f64::from(index) / 200.0),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{:02}", index % 2)),
+            });
+            quality.push(TranscriptionSegment {
+                text: quality_text,
+                start_sec: Some(f64::from(index) * 1.25),
+                end_sec: Some(f64::from(index + 1) * 1.25),
+                confidence: (index % 5 != 0).then_some(0.88 + f64::from(index) / 300.0),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{:02}", index % 2)),
+            });
+        }
+        (fast, quality)
+    }
+
+    fn correction_drift_without_identity_shortcut(
+        fast_segments: &[TranscriptionSegment],
+        quality_segments: &[TranscriptionSegment],
+    ) -> CorrectionDrift {
+        let fast_text = concat_segment_text(fast_segments);
+        let quality_text = concat_segment_text(quality_segments);
+        let text_edit_distance = levenshtein(&fast_text, &quality_text);
+        let fast_words = fast_text.split_whitespace().collect::<Vec<_>>();
+        let quality_words = quality_text.split_whitespace().collect::<Vec<_>>();
+        let word_edit_dist = levenshtein_words(&fast_words, &quality_words);
+        let max_words = fast_words.len().max(quality_words.len()).max(1);
+
+        CorrectionDrift {
+            wer_approx: word_edit_dist as f64 / max_words as f64,
+            confidence_delta: (mean_confidence(fast_segments) - mean_confidence(quality_segments))
+                .abs(),
+            segment_count_delta: quality_segments.len() as i32 - fast_segments.len() as i32,
+            text_edit_distance,
+        }
+    }
+
+    fn correction_drift_identity_fixture() -> (Vec<TranscriptionSegment>, Vec<TranscriptionSegment>)
+    {
+        let fast = (0..12)
+            .map(|index| TranscriptionSegment {
+                text: format!(
+                    "confirmed streaming segment {index:02} retains identical Unicode λ transcript text and detailed contextual wording"
+                ),
+                start_sec: Some(f64::from(index) * 1.25),
+                end_sec: Some(f64::from(index + 1) * 1.25),
+                confidence: (index % 4 != 0).then_some(0.76 + f64::from(index) / 200.0),
+                speaker: (index % 3 == 0).then(|| format!("FAST_{:02}", index % 2)),
+            })
+            .collect::<Vec<_>>();
+        let quality = fast
+            .iter()
+            .enumerate()
+            .map(|(index, segment)| TranscriptionSegment {
+                text: segment.text.clone(),
+                start_sec: segment.start_sec,
+                end_sec: segment.end_sec,
+                confidence: (index % 5 != 0).then_some(0.89 + index as f64 / 300.0),
+                speaker: (index % 3 == 0).then(|| format!("QUALITY_{:02}", index % 2)),
+            })
+            .collect::<Vec<_>>();
+        (fast, quality)
+    }
+
+    #[test]
+    fn correction_drift_identity_shortcut_matches_historical() {
+        let (fast, quality) = correction_drift_identity_fixture();
+        let cases = [
+            (fast, quality),
+            (Vec::new(), Vec::new()),
+            (
+                vec![seg("hello", Some(0.25)), seg("世界 🎧", None)],
+                vec![seg("hello 世界 🎧", Some(0.95))],
+            ),
+            (
+                vec![seg("café λ old suffix", Some(0.5))],
+                vec![seg("café λ new suffix", Some(0.5))],
+            ),
+        ];
+
+        for (fast, quality) in cases {
+            let historical = correction_drift_without_identity_shortcut(&fast, &quality);
+            let candidate = CorrectionDrift::compute(&fast, &quality);
+            assert_eq!(
+                serde_json::to_vec(&candidate).expect("serialize candidate drift"),
+                serde_json::to_vec(&historical).expect("serialize historical drift"),
+                "full drift bytes for fast={fast:?}, quality={quality:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn correction_drift_identity_shortcut_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 2;
+        const TARGET_ARM_NS: u128 = 50_000_000;
+
+        fn time_historical(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(correction_drift_without_identity_shortcut(
+                    black_box(fast),
+                    black_box(quality),
+                ));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_candidate(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(CorrectionDrift::compute(
+                    black_box(fast),
+                    black_box(quality),
+                ));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let (fast, quality) = correction_drift_identity_fixture();
+        let historical_bytes =
+            serde_json::to_vec(&correction_drift_without_identity_shortcut(&fast, &quality))
+                .expect("serialize historical drift");
+        let candidate_bytes = serde_json::to_vec(&CorrectionDrift::compute(&fast, &quality))
+            .expect("serialize candidate drift");
+        assert_eq!(candidate_bytes, historical_bytes, "exact drift bytes");
+
+        let transcript_chars = concat_segment_text(&fast).chars().count();
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "correction_drift_identity_shortcut binary_sha256={:x} result_bytes={} result_sha256={:x} fast_segments={} quality_segments={} transcript_chars={}",
+            Sha256::digest(executable),
+            historical_bytes.len(),
+            Sha256::digest(&historical_bytes),
+            fast.len(),
+            quality.len(),
+            transcript_chars
+        );
+
+        let historical_calibration = time_historical(&fast, &quality, CALIBRATION_ITERATIONS);
+        let candidate_calibration = time_candidate(&fast, &quality, CALIBRATION_ITERATIONS);
+        let historical_iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128)
+            / historical_calibration.max(1))
+        .clamp(1, 131_072) as usize;
+        let candidate_iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128)
+            / candidate_calibration.max(1))
+        .clamp(1, 131_072) as usize;
+        eprintln!(
+            "correction_drift_identity_shortcut calibration_iterations={CALIBRATION_ITERATIONS} historical_calibration_ns={historical_calibration} candidate_calibration_ns={candidate_calibration} historical_iterations={historical_iterations} candidate_iterations={candidate_iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&fast, &quality, historical_iterations));
+            black_box(time_candidate(&fast, &quality, candidate_iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut candidate_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&fast, &quality, historical_iterations);
+            let null_second = time_historical(&fast, &quality, historical_iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical, candidate) = if sample % 2 == 0 {
+                (
+                    time_historical(&fast, &quality, historical_iterations),
+                    time_candidate(&fast, &quality, candidate_iterations),
+                )
+            } else {
+                let candidate = time_candidate(&fast, &quality, candidate_iterations);
+                let historical = time_historical(&fast, &quality, historical_iterations);
+                (historical, candidate)
+            };
+            historical_times.push(historical);
+            candidate_times.push(candidate);
+            speedups.push(
+                (historical as f64 / historical_iterations as f64)
+                    / (candidate as f64 / candidate_iterations as f64),
+            );
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "correction_drift_identity_shortcut samples={SAMPLES} historical_iterations={historical_iterations} candidate_iterations={candidate_iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_per_call_median_ns={} candidate_per_call_median_ns={} candidate_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times) / historical_iterations as u128,
+            median_ns(&candidate_times) / candidate_iterations as u128,
+            coefficient_of_variation(&candidate_times) * 100.0
+        );
+        eprintln!(
+            "correction_drift_identity_shortcut null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} candidate_times_ns={candidate_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
+    }
+
+    #[test]
+    fn correction_drift_common_affix_matches_historical() {
+        let corpus = [
+            "",
+            "a",
+            "same transcript",
+            "shared prefix old shared suffix",
+            "shared prefix new shared suffix",
+            "café λ old 🎧 suffix",
+            "café λ new 🎧 suffix",
+            "日本語の記録",
+            "日本人の記録",
+            "combining e\u{301} marker",
+            "emoji 👋🌍 tail",
+        ];
+        for left in corpus {
+            for right in corpus {
+                assert_eq!(
+                    levenshtein(left, right),
+                    levenshtein_historical(left, right),
+                    "distance mismatch for {left:?} versus {right:?}"
+                );
+            }
+        }
+
+        let (fast, quality) = correction_drift_common_affix_fixture();
+        let historical = correction_drift_historical(&fast, &quality);
+        let candidate = CorrectionDrift::compute(&fast, &quality);
+        assert_eq!(
+            serde_json::to_vec(&candidate).expect("serialize candidate drift"),
+            serde_json::to_vec(&historical).expect("serialize historical drift"),
+            "full correction drift bytes"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn correction_drift_common_affix_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 2;
+        const TARGET_ARM_NS: u128 = 50_000_000;
+
+        fn time_historical(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(correction_drift_historical(
+                    black_box(fast),
+                    black_box(quality),
+                ));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_candidate(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(CorrectionDrift::compute(
+                    black_box(fast),
+                    black_box(quality),
+                ));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let (fast, quality) = correction_drift_common_affix_fixture();
+        let historical_bytes = serde_json::to_vec(&correction_drift_historical(&fast, &quality))
+            .expect("serialize historical drift");
+        let candidate_bytes = serde_json::to_vec(&CorrectionDrift::compute(&fast, &quality))
+            .expect("serialize candidate drift");
+        assert_eq!(candidate_bytes, historical_bytes, "exact drift bytes");
+
+        let fast_chars = concat_segment_text(&fast).chars().count();
+        let quality_chars = concat_segment_text(&quality).chars().count();
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "correction_drift_common_affix binary_sha256={:x} result_bytes={} result_sha256={:x} fast_segments={} quality_segments={} fast_chars={} quality_chars={}",
+            Sha256::digest(executable),
+            historical_bytes.len(),
+            Sha256::digest(&historical_bytes),
+            fast.len(),
+            quality.len(),
+            fast_chars,
+            quality_chars
+        );
+
+        let calibration = time_historical(&fast, &quality, CALIBRATION_ITERATIONS);
+        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration.max(1))
+            .clamp(1, 131_072) as usize;
+        eprintln!(
+            "correction_drift_common_affix calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&fast, &quality, iterations));
+            black_box(time_candidate(&fast, &quality, iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut candidate_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&fast, &quality, iterations);
+            let null_second = time_historical(&fast, &quality, iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical, candidate) = if sample % 2 == 0 {
+                (
+                    time_historical(&fast, &quality, iterations),
+                    time_candidate(&fast, &quality, iterations),
+                )
+            } else {
+                let candidate = time_candidate(&fast, &quality, iterations);
+                let historical = time_historical(&fast, &quality, iterations);
+                (historical, candidate)
+            };
+            historical_times.push(historical);
+            candidate_times.push(candidate);
+            speedups.push(historical as f64 / candidate as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "correction_drift_common_affix samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} candidate_arm_median_ns={} candidate_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&candidate_times),
+            coefficient_of_variation(&candidate_times) * 100.0
+        );
+        eprintln!(
+            "correction_drift_common_affix null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} candidate_times_ns={candidate_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
+    }
+
+    #[test]
+    fn correction_drift_reuse_matches_historical_event_bytes() {
+        let fast = vec![
+            TranscriptionSegment {
+                text: "hello λ world".to_owned(),
+                start_sec: Some(0.0),
+                end_sec: Some(1.25),
+                confidence: Some(0.75),
+                speaker: Some("SPEAKER_00".to_owned()),
+            },
+            TranscriptionSegment {
+                text: "line two with 🎧".to_owned(),
+                start_sec: Some(1.25),
+                end_sec: Some(2.5),
+                confidence: None,
+                speaker: None,
+            },
+        ];
+        let quality = vec![
+            TranscriptionSegment {
+                text: "hello λ earth".to_owned(),
+                start_sec: Some(0.0),
+                end_sec: Some(1.25),
+                confidence: Some(0.95),
+                speaker: Some("SPEAKER_00".to_owned()),
+            },
+            TranscriptionSegment {
+                text: "line two with 🎧 and punctuation.".to_owned(),
+                start_sec: Some(1.25),
+                end_sec: Some(2.5),
+                confidence: None,
+                speaker: None,
+            },
+        ];
+        let corrected_at = "2026-07-14T00:00:00.000000000Z";
+
+        let historical = CorrectionEvent::new(
+            17,
+            23,
+            29,
+            "quality-v2".to_owned(),
+            quality.clone(),
+            431,
+            corrected_at.to_owned(),
+            &fast,
+        );
+        let quality_confidence_mean = mean_confidence(&quality);
+        let drift = CorrectionDrift::compute(&fast, &quality);
+        let reused = CorrectionEvent::from_precomputed_metrics(
+            17,
+            23,
+            29,
+            "quality-v2".to_owned(),
+            quality,
+            431,
+            quality_confidence_mean,
+            drift,
+            corrected_at.to_owned(),
+        );
+
+        assert_eq!(
+            serde_json::to_vec(&reused).expect("serialize reused correction event"),
+            serde_json::to_vec(&historical).expect("serialize historical correction event")
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn correction_drift_reuse_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 2;
+        const TARGET_ARM_NS: u128 = 40_000_000;
+        const CORRECTED_AT: &str = "2026-07-14T00:00:00.000000000Z";
+
+        fn make_tracker(fast: &[TranscriptionSegment]) -> CorrectionTracker {
+            let mut tracker = CorrectionTracker::new(CorrectionTolerance {
+                always_correct: true,
+                ..CorrectionTolerance::default()
+            });
+            tracker.register_partial(PartialTranscript::new(
+                23,
+                29,
+                "fast-v1".to_owned(),
+                fast.to_vec(),
+                137,
+                "2026-07-14T00:00:00.000000000Z".to_owned(),
+            ));
+            tracker
+        }
+
+        fn submit_historical(
+            tracker: &mut CorrectionTracker,
+            quality_segments: Vec<TranscriptionSegment>,
+        ) -> CorrectionDecision {
+            let window_id = 29;
+            let quality_latency_ms = 431;
+            let seq = *tracker
+                .window_to_seq
+                .get(&window_id)
+                .expect("registered historical window");
+            let drift = {
+                let partial = tracker
+                    .partials
+                    .get(&seq)
+                    .expect("registered historical partial");
+                CorrectionDrift::compute(&partial.segments, &quality_segments)
+            };
+
+            tracker.stats.windows_processed += 1;
+            tracker.stats.total_quality_latency_ms += quality_latency_ms;
+            tracker.stats.cumulative_wer += drift.wer_approx;
+            if drift.wer_approx > tracker.stats.max_observed_wer {
+                tracker.stats.max_observed_wer = drift.wer_approx;
+            }
+
+            let needs_correction = tracker.tolerance.always_correct
+                || drift.wer_approx > tracker.tolerance.max_wer
+                || drift.confidence_delta > tracker.tolerance.max_confidence_delta
+                || drift.text_edit_distance > tracker.tolerance.max_edit_distance;
+            assert!(needs_correction, "fixture must exercise correction path");
+
+            let partial = tracker
+                .partials
+                .get_mut(&seq)
+                .expect("registered historical partial");
+            partial.retract();
+            let fast_segments = partial.segments.clone();
+
+            let correction_id = tracker.next_correction_id;
+            tracker.next_correction_id += 1;
+            let correction = CorrectionEvent::new(
+                correction_id,
+                seq,
+                window_id,
+                "quality-v2".to_owned(),
+                quality_segments,
+                quality_latency_ms,
+                chrono::Utc::now().to_rfc3339(),
+                &fast_segments,
+            );
+            tracker.corrections.push(correction.clone());
+            tracker.stats.corrections_emitted += 1;
+            tracker.window_to_seq.remove(&window_id);
+
+            CorrectionDecision::Correct { correction }
+        }
+
+        fn normalized_state_bytes(
+            tracker: &CorrectionTracker,
+            decision: CorrectionDecision,
+        ) -> Option<Vec<u8>> {
+            let CorrectionDecision::Correct {
+                correction: mut event,
+            } = decision
+            else {
+                return None;
+            };
+            event.corrected_at_rfc3339 = CORRECTED_AT.to_owned();
+            let mut stored = tracker.corrections.clone();
+            for correction in &mut stored {
+                correction.corrected_at_rfc3339 = CORRECTED_AT.to_owned();
+            }
+            let partial = tracker
+                .partials
+                .get(&23)
+                .expect("retained corrected partial");
+            serde_json::to_vec(&serde_json::json!({
+                "decision": event,
+                "stored_corrections": stored,
+                "partial_status": partial.status,
+                "windows_processed": tracker.stats.windows_processed,
+                "corrections_emitted": tracker.stats.corrections_emitted,
+                "confirmations_emitted": tracker.stats.confirmations_emitted,
+                "total_fast_latency_ms": tracker.stats.total_fast_latency_ms,
+                "total_quality_latency_ms": tracker.stats.total_quality_latency_ms,
+                "cumulative_wer": tracker.stats.cumulative_wer,
+                "max_observed_wer": tracker.stats.max_observed_wer,
+                "next_correction_id": tracker.next_correction_id,
+                "window_mapping_empty": tracker.window_to_seq.is_empty(),
+            }))
+            .ok()
+        }
+
+        fn time_historical(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let mut cases = (0..iterations)
+                .map(|_| (make_tracker(fast), quality.to_vec()))
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            for (tracker, quality_segments) in &mut cases {
+                black_box(submit_historical(
+                    black_box(tracker),
+                    std::mem::take(quality_segments),
+                ));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_reused(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let mut cases = (0..iterations)
+                .map(|_| (make_tracker(fast), quality.to_vec()))
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            for (tracker, quality_segments) in &mut cases {
+                black_box(
+                    black_box(tracker)
+                        .submit_quality_result(
+                            29,
+                            "quality-v2",
+                            std::mem::take(quality_segments),
+                            431,
+                        )
+                        .expect("candidate correction submission"),
+                );
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let fast = (0..12)
+            .map(|index| TranscriptionSegment {
+                text: format!(
+                    "fast segment {index:02} carries current-window transcript words, Unicode λ, and measured correction detail"
+                ),
+                start_sec: Some(f64::from(index) * 1.25),
+                end_sec: Some(f64::from(index + 1) * 1.25),
+                confidence: (index % 4 != 0).then_some(0.70 + f64::from(index) / 100.0),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{:02}", index % 2)),
+            })
+            .collect::<Vec<_>>();
+        let quality = (0..12)
+            .map(|index| TranscriptionSegment {
+                text: format!(
+                    "quality segment {index:02} carries corrected-window transcript words, Unicode λ, and authoritative correction detail"
+                ),
+                start_sec: Some(f64::from(index) * 1.25),
+                end_sec: Some(f64::from(index + 1) * 1.25),
+                confidence: (index % 5 != 0).then_some(0.85 + f64::from(index) / 200.0),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{:02}", index % 2)),
+            })
+            .collect::<Vec<_>>();
+
+        let mut historical_tracker = make_tracker(&fast);
+        let historical_decision = submit_historical(&mut historical_tracker, quality.clone());
+        let historical_bytes = normalized_state_bytes(&historical_tracker, historical_decision)
+            .expect("historical fixture must correct and serialize");
+        let mut reused_tracker = make_tracker(&fast);
+        let reused_decision = reused_tracker
+            .submit_quality_result(29, "quality-v2", quality.clone(), 431)
+            .expect("candidate correction submission");
+        let reused_bytes = normalized_state_bytes(&reused_tracker, reused_decision)
+            .expect("candidate fixture must correct and serialize");
+        assert_eq!(
+            reused_bytes, historical_bytes,
+            "complete normalized correction state bytes"
+        );
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "correction_drift_reuse binary_sha256={:x} state_bytes={} state_sha256={:x} fast_segments={} quality_segments={}",
+            Sha256::digest(executable),
+            historical_bytes.len(),
+            Sha256::digest(&historical_bytes),
+            fast.len(),
+            quality.len()
+        );
+
+        let calibration = time_historical(&fast, &quality, CALIBRATION_ITERATIONS);
+        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration.max(1))
+            .clamp(1, 2_000) as usize;
+        eprintln!(
+            "correction_drift_reuse calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&fast, &quality, iterations));
+            black_box(time_reused(&fast, &quality, iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut reused_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&fast, &quality, iterations);
+            let null_second = time_historical(&fast, &quality, iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical, reused) = if sample % 2 == 0 {
+                (
+                    time_historical(&fast, &quality, iterations),
+                    time_reused(&fast, &quality, iterations),
+                )
+            } else {
+                let reused = time_reused(&fast, &quality, iterations);
+                let historical = time_historical(&fast, &quality, iterations);
+                (historical, reused)
+            };
+            historical_times.push(historical);
+            reused_times.push(reused);
+            speedups.push(historical as f64 / reused as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "correction_drift_reuse samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} reused_arm_median_ns={} reused_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&reused_times),
+            coefficient_of_variation(&reused_times) * 100.0
+        );
+        eprintln!(
+            "correction_drift_reuse null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} reused_times_ns={reused_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
     }
 
     #[test]
@@ -1903,6 +3514,74 @@ mod tests {
             new_size, initial_ms,
             "Brier fallback should reset to initial window size"
         );
+    }
+
+    #[test]
+    fn speculation_controller_reused_brier_preserves_action_and_evidence() {
+        fn controller_with_history(
+            correction_count: usize,
+            confirmation_count: usize,
+        ) -> SpeculationWindowController {
+            let mut controller = SpeculationWindowController::new(5_000, 1_000, 30_000, 500);
+            let drift = CorrectionDrift {
+                wer_approx: 0.2,
+                confidence_delta: 0.1,
+                segment_count_delta: 0,
+                text_edit_distance: 2,
+            };
+            for index in 0..correction_count {
+                let correction = CorrectionEvent::new(
+                    index as u64,
+                    index as u64,
+                    index as u64,
+                    "quality".to_owned(),
+                    vec![],
+                    100,
+                    "2026-07-24T00:00:00Z".to_owned(),
+                    &[],
+                );
+                controller.observe(&CorrectionDecision::Correct { correction }, &drift);
+            }
+            for index in 0..confirmation_count {
+                controller.observe(
+                    &CorrectionDecision::Confirm {
+                        seq: index as u64,
+                        drift: drift.clone(),
+                    },
+                    &drift,
+                );
+            }
+            controller
+        }
+
+        for (corrections, confirmations) in [(0, 0), (2, 0), (0, 20), (15, 10), (20, 0)] {
+            let mut historical = controller_with_history(corrections, confirmations);
+            let mut candidate = controller_with_history(corrections, confirmations);
+            historical.set_historical_double_brier_fold(true);
+
+            let historical_size = historical.apply();
+            let candidate_size = candidate.apply();
+
+            assert_eq!(candidate_size, historical_size);
+            assert_eq!(
+                candidate.is_fallback_active(),
+                historical.is_fallback_active()
+            );
+            assert_eq!(
+                candidate.evidence().last().map(|entry| &entry.action_taken),
+                historical
+                    .evidence()
+                    .last()
+                    .map(|entry| &entry.action_taken)
+            );
+            assert_eq!(
+                serde_json::to_vec(candidate.evidence().last().expect("candidate evidence"))
+                    .expect("serialize candidate evidence"),
+                serde_json::to_vec(historical.evidence().last().expect("historical evidence"))
+                    .expect("serialize historical evidence"),
+                "corrections={corrections} confirmations={confirmations}"
+            );
+        }
     }
 
     // ── Task #219 — speculation pass 4 edge-case tests ───────────────
@@ -3889,6 +5568,10 @@ mod tests {
         assert_eq!(concat_segment_text(&[seg("solo", None)]), "solo");
         // Empty segments.
         assert_eq!(concat_segment_text(&[]), "");
+        assert_eq!(
+            concat_segment_text(&[seg("", None), seg("naïve café", None), seg("", None),]),
+            " naïve café "
+        );
     }
 
     #[test]

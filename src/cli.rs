@@ -1,15 +1,145 @@
-use std::path::PathBuf;
+use std::fmt;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    BackendKind, BackendParams, DecodingParams, DiarizationConfig, InputSource, OutputFormat,
-    SpeakerConstraints, TimestampLevel, TranscribeRequest, VadParams,
+    BackendKind, BackendParams, DecodingParams, DiarizationConfig, DiarizationEngine,
+    DiarizationFallbackPolicy, DiarizationRequest, InputSource, KnownSpeakerInterval, OutputFormat,
+    SpeakerCountPriorMass, SpeakerCountRequest, TimestampLevel, TranscribeRequest, VadParams,
 };
 use crate::sync::ConflictPolicy;
+
+const MAX_SPEAKER_HINTS_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SpeakerHintsFile {
+    Intervals(Vec<KnownSpeakerInterval>),
+    Document {
+        schema_version: String,
+        known_intervals: Vec<KnownSpeakerInterval>,
+    },
+}
+
+fn parse_speaker_hints(bytes: &[u8]) -> FwResult<Vec<KnownSpeakerInterval>> {
+    let parsed: SpeakerHintsFile = serde_json::from_slice(bytes).map_err(|_| {
+        FwError::InvalidRequest(
+            "speaker hints must be valid speaker-hints-v1 JSON without trailing data".to_owned(),
+        )
+    })?;
+    match parsed {
+        SpeakerHintsFile::Intervals(intervals) => Ok(intervals),
+        SpeakerHintsFile::Document {
+            schema_version,
+            known_intervals,
+        } if schema_version == "speaker-hints-v1" => Ok(known_intervals),
+        SpeakerHintsFile::Document { .. } => Err(FwError::InvalidRequest(
+            "speaker hints document must use schema_version speaker-hints-v1".to_owned(),
+        )),
+    }
+}
+
+fn read_speaker_hints(path: &Path) -> FwResult<Vec<KnownSpeakerInterval>> {
+    let file = std::fs::File::open(path).map_err(|_| {
+        FwError::InvalidRequest("speaker hints file could not be opened".to_owned())
+    })?;
+    if file
+        .metadata()
+        .map_err(|_| {
+            FwError::InvalidRequest("speaker hints file metadata could not be read".to_owned())
+        })?
+        .len()
+        > MAX_SPEAKER_HINTS_BYTES
+    {
+        return Err(FwError::InvalidRequest(
+            "speaker hints file exceeds the 1 MiB safety limit".to_owned(),
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MAX_SPEAKER_HINTS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| FwError::InvalidRequest("speaker hints file could not be read".to_owned()))?;
+    if bytes.len() as u64 > MAX_SPEAKER_HINTS_BYTES {
+        return Err(FwError::InvalidRequest(
+            "speaker hints file exceeds the 1 MiB safety limit".to_owned(),
+        ));
+    }
+    parse_speaker_hints(&bytes)
+}
+
+fn parse_speaker_count_range(value: &str) -> FwResult<(u32, u32)> {
+    let Some((minimum, maximum)) = value.split_once("..") else {
+        return Err(FwError::InvalidRequest(
+            "--speaker-count-range must use MIN..MAX".to_owned(),
+        ));
+    };
+    if maximum.contains("..") {
+        return Err(FwError::InvalidRequest(
+            "--speaker-count-range must contain exactly one `..` separator".to_owned(),
+        ));
+    }
+    let minimum = minimum.trim().parse::<u32>().map_err(|_| {
+        FwError::InvalidRequest("--speaker-count-range MIN must be an unsigned integer".to_owned())
+    })?;
+    let maximum = maximum.trim().parse::<u32>().map_err(|_| {
+        FwError::InvalidRequest("--speaker-count-range MAX must be an unsigned integer".to_owned())
+    })?;
+    Ok((minimum, maximum))
+}
+
+fn parse_speaker_count_prior(value: &str) -> FwResult<Vec<SpeakerCountPriorMass>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(FwError::InvalidRequest(
+            "--speaker-count-prior must not be empty".to_owned(),
+        ));
+    }
+    if !value.contains('=') && !value.contains(',') {
+        let count = value.parse::<u32>().map_err(|_| {
+            FwError::InvalidRequest(
+                "--speaker-count-prior point mass must be an unsigned integer".to_owned(),
+            )
+        })?;
+        return Ok(vec![SpeakerCountPriorMass {
+            count,
+            probability: 1.0,
+        }]);
+    }
+
+    let mut bins = Vec::new();
+    for entry in value.split(',') {
+        let Some((count, probability)) = entry.split_once('=') else {
+            return Err(FwError::InvalidRequest(
+                "--speaker-count-prior distribution must use K=P entries".to_owned(),
+            ));
+        };
+        if probability.contains('=') {
+            return Err(FwError::InvalidRequest(
+                "--speaker-count-prior entries must contain exactly one `=` separator".to_owned(),
+            ));
+        }
+        let count = count.trim().parse::<u32>().map_err(|_| {
+            FwError::InvalidRequest(
+                "--speaker-count-prior counts must be unsigned integers".to_owned(),
+            )
+        })?;
+        let probability = probability.trim().parse::<f64>().map_err(|_| {
+            FwError::InvalidRequest(
+                "--speaker-count-prior probabilities must be finite decimal numbers".to_owned(),
+            )
+        })?;
+        bins.push(SpeakerCountPriorMass { count, probability });
+    }
+    bins.sort_by_key(|bin| bin.count);
+    Ok(bins)
+}
 
 // ---------------------------------------------------------------------------
 // bd-38c.6: Graceful Ctrl+C shutdown via asupersync cancellation protocol
@@ -114,10 +244,304 @@ pub enum Command {
         #[command(subcommand)]
         command: TtyAudioCommand,
     },
+    /// Score external confidential references/hypotheses and emit aggregates only.
+    #[command(name = "diarization-eval")]
+    DiarizationEval(ConfidentialEvaluationArgs),
+    /// Inspect public-corpus contracts, or write evidence on Linux/Android/Apple.
+    #[command(name = "diarization-corpus")]
+    DiarizationCorpus {
+        #[command(subcommand)]
+        command: PublicCorpusCommand,
+    },
+    /// Run explicit development-only differential diagnostics against external tools.
+    #[command(name = "diarization-oracle")]
+    DiarizationOracle {
+        #[command(subcommand)]
+        command: DifferentialOracleCommand,
+    },
     Tui,
     /// Download YouTube audio (videos / playlists / a URL file) and
     /// transcribe each into a markdown + JSON pair.
     Youtube(Box<YoutubeArgs>),
+}
+
+/// Public-corpus registry, preparation, and aggregate evaluation commands.
+#[derive(Debug, Subcommand)]
+pub enum PublicCorpusCommand {
+    /// Emit the built-in corpus/license/conversion registry as JSON.
+    Registry,
+    /// Build a path-free bundle (artifact writing requires Linux/Android/Apple).
+    Build(PublicCorpusBuildArgs),
+    /// Run frozen ablations (artifact writing requires Linux/Android/Apple).
+    Ablate(PublicCorpusAblationArgs),
+    /// Run the sidecar study (artifact writing requires Linux/Android/Apple).
+    SidecarStudy(PublicCorpusSidecarStudyArgs),
+}
+
+/// Developer-only external differential-diagnostic commands.
+#[derive(Debug, Subcommand)]
+pub enum DifferentialOracleCommand {
+    /// Emit the path-free external adapter registry as JSON.
+    Registry,
+    /// Run one external adapter and compare its transcript-free stages.
+    Run(DifferentialOracleArgs),
+}
+
+/// External tool selected for one development-only diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DifferentialOracleToolArg {
+    Pyannote,
+    NemoSpectral,
+    Vbx,
+    Eend,
+    Diaper,
+    Sortformer,
+}
+
+impl From<DifferentialOracleToolArg> for crate::differential_oracle::DifferentialOracleTool {
+    fn from(value: DifferentialOracleToolArg) -> Self {
+        match value {
+            DifferentialOracleToolArg::Pyannote => Self::Pyannote,
+            DifferentialOracleToolArg::NemoSpectral => Self::NemoSpectral,
+            DifferentialOracleToolArg::Vbx => Self::Vbx,
+            DifferentialOracleToolArg::Eend => Self::Eend,
+            DifferentialOracleToolArg::Diaper => Self::Diaper,
+            DifferentialOracleToolArg::Sortformer => Self::Sortformer,
+        }
+    }
+}
+
+/// Arguments for an external, path-free differential diagnostic.
+#[derive(Args)]
+pub struct DifferentialOracleArgs {
+    /// Operator-installed adapter family to probe.
+    #[arg(long, value_enum)]
+    pub tool: DifferentialOracleToolArg,
+
+    /// Absolute external audio path; bytes and path are never retained.
+    #[arg(long)]
+    pub audio: PathBuf,
+
+    /// Absolute external native stage-document path.
+    #[arg(long)]
+    pub native: PathBuf,
+
+    /// Optional absolute external reference stage-document path.
+    #[arg(long)]
+    pub reference: Option<PathBuf>,
+
+    /// New absolute report path outside the project tree.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Hard limit for the external adapter run.
+    #[arg(long, default_value_t = 1_800)]
+    pub timeout_seconds: u64,
+}
+
+impl fmt::Debug for DifferentialOracleArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DifferentialOracleArgs")
+            .field("tool", &self.tool)
+            .field("audio", &"<redacted>")
+            .field("native", &"<redacted>")
+            .field("reference", &self.reference.as_ref().map(|_| "<redacted>"))
+            .field("output", &"<redacted>")
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
+}
+
+/// Arguments for external public-corpus preparation.
+#[derive(Args)]
+pub struct PublicCorpusBuildArgs {
+    /// Absolute external root containing the selected public or licensed inputs.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute path to the external path-bearing corpus descriptor.
+    #[arg(long)]
+    pub descriptor: PathBuf,
+
+    /// New absolute JSON bundle path outside both the checkout and input root.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Exact acknowledgement ID emitted by `diarization-corpus registry`.
+    #[arg(long)]
+    pub license_ack: String,
+}
+
+impl fmt::Debug for PublicCorpusBuildArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicCorpusBuildArgs")
+            .field("input_root", &"<redacted>")
+            .field("descriptor", &"<redacted>")
+            .field("output", &"<redacted>")
+            .field("license_ack", &self.license_ack)
+            .finish()
+    }
+}
+
+/// Arguments for an external, aggregate-only public feature ablation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PublicCorpusEvaluationStageArg {
+    Development,
+    Certification,
+}
+
+impl From<PublicCorpusEvaluationStageArg> for crate::public_corpus::PublicCorpusEvaluationStage {
+    fn from(value: PublicCorpusEvaluationStageArg) -> Self {
+        match value {
+            PublicCorpusEvaluationStageArg::Development => Self::Development,
+            PublicCorpusEvaluationStageArg::Certification => Self::Certification,
+        }
+    }
+}
+
+/// Arguments for an external, aggregate-only public feature ablation.
+#[derive(Args)]
+pub struct PublicCorpusAblationArgs {
+    /// Absolute external root containing selected public inputs.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute path to the external path-bearing corpus descriptor.
+    #[arg(long)]
+    pub descriptor: PathBuf,
+
+    /// New absolute path for the path-free validated corpus bundle.
+    #[arg(long)]
+    pub bundle_output: PathBuf,
+
+    /// New absolute path for aggregate-only ablation evidence.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Exact acknowledgement ID emitted by `diarization-corpus registry`.
+    #[arg(long)]
+    pub license_ack: String,
+
+    /// Deterministically score only each recording prefix of this duration.
+    #[arg(long)]
+    pub maximum_recording_duration_ms: Option<u64>,
+
+    /// Development tuning or hash-locked unseen certification.
+    #[arg(long, value_enum)]
+    pub stage: PublicCorpusEvaluationStageArg,
+
+    /// Existing development evidence required only for certification.
+    #[arg(long)]
+    pub locked_development_evidence: Option<PathBuf>,
+}
+
+impl fmt::Debug for PublicCorpusAblationArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicCorpusAblationArgs")
+            .field("input_root", &"<redacted>")
+            .field("descriptor", &"<redacted>")
+            .field("bundle_output", &"<redacted>")
+            .field("output", &"<redacted>")
+            .field("license_ack", &self.license_ack)
+            .field(
+                "maximum_recording_duration_ms",
+                &self.maximum_recording_duration_ms,
+            )
+            .field("stage", &self.stage)
+            .field("locked_development_evidence", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Arguments for the external, aggregate-only acoustic sidecar study.
+#[derive(Args)]
+pub struct PublicCorpusSidecarStudyArgs {
+    /// Absolute external root containing selected public inputs.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute path to the external path-bearing corpus descriptor.
+    #[arg(long)]
+    pub descriptor: PathBuf,
+
+    /// New absolute path for the path-free validated corpus bundle.
+    #[arg(long)]
+    pub bundle_output: PathBuf,
+
+    /// New absolute path for aggregate-only sidecar-study evidence.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Exact acknowledgement ID emitted by `diarization-corpus registry`.
+    #[arg(long)]
+    pub license_ack: String,
+
+    /// Deterministically score only each recording prefix of this duration.
+    #[arg(long)]
+    pub maximum_recording_duration_ms: Option<u64>,
+
+    /// Development tuning or hash-locked unseen certification.
+    #[arg(long, value_enum)]
+    pub stage: PublicCorpusEvaluationStageArg,
+
+    /// Existing sidecar development evidence required only for certification.
+    #[arg(long)]
+    pub locked_development_evidence: Option<PathBuf>,
+}
+
+impl fmt::Debug for PublicCorpusSidecarStudyArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicCorpusSidecarStudyArgs")
+            .field("input_root", &"<redacted>")
+            .field("descriptor", &"<redacted>")
+            .field("bundle_output", &"<redacted>")
+            .field("output", &"<redacted>")
+            .field("license_ack", &self.license_ack)
+            .field(
+                "maximum_recording_duration_ms",
+                &self.maximum_recording_duration_ms,
+            )
+            .field("stage", &self.stage)
+            .field(
+                "locked_development_evidence",
+                &self
+                    .locked_development_evidence
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Arguments for the local-only confidential diarization evaluator.
+#[derive(Args)]
+pub struct ConfidentialEvaluationArgs {
+    /// Absolute external root containing every private source file.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute path to the path-bearing local evaluation manifest.
+    #[arg(long)]
+    pub manifest: PathBuf,
+
+    /// New absolute JSON path outside the project tree for aggregate output.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+impl fmt::Debug for ConfidentialEvaluationArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfidentialEvaluationArgs")
+            .field("input_root", &"<redacted>")
+            .field("manifest", &"<redacted>")
+            .field("output", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Arguments for the `youtube` subcommand.
@@ -331,6 +755,35 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub diarize: bool,
 
+    /// Speaker diarization implementation.
+    #[arg(long, value_enum, default_value_t = DiarizationEngine::Auto)]
+    pub diarization_engine: DiarizationEngine,
+
+    /// Conservative action when the requested diarizer lacks evidence.
+    #[arg(long, value_enum, default_value_t = DiarizationFallbackPolicy::Unknown)]
+    pub diarization_fallback: DiarizationFallbackPolicy,
+
+    /// Speaker-hints-v1 JSON; its source path is not retained.
+    ///
+    /// Parsed hint fields become part of the request and may be persisted with
+    /// the run unless `--no-persist` is used.
+    #[arg(long)]
+    pub speaker_hints: Option<PathBuf>,
+
+    /// Remove this many milliseconds from each enrollment interval edge.
+    #[arg(long, default_value_t = 100)]
+    pub enrollment_edge_guard_ms: u32,
+
+    /// Maximum global acoustic prototypes (hard ceiling: 512).
+    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u16).range(1..=512))]
+    pub diarization_max_prototypes: u16,
+
+    /// Record consent for future reusable-profile persistence.
+    ///
+    /// Schema v5 stores privacy-safe summaries only, never raw acoustic vectors.
+    #[arg(long)]
+    pub persist_speaker_profiles: bool,
+
     /// Path to frankensqlite database file.
     #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
     pub db: PathBuf,
@@ -516,17 +969,29 @@ pub struct TranscribeArgs {
     #[arg(long, value_enum)]
     pub timestamp_level: Option<TimestampLevel>,
 
-    /// Exact number of speakers (insanely-fast diarization).
-    #[arg(long)]
-    pub num_speakers: Option<u32>,
+    /// Explicit hard speaker count. Unsupported speakers remain UNKNOWN.
+    #[arg(
+        long,
+        value_name = "K",
+        conflicts_with_all = ["speaker_count_range", "speaker_count_prior"]
+    )]
+    pub speaker_count_hard: Option<u32>,
 
-    /// Minimum number of speakers (insanely-fast diarization).
-    #[arg(long)]
-    pub min_speakers: Option<u32>,
+    /// Soft bounded speaker-count preference in MIN..MAX form.
+    #[arg(
+        long,
+        value_name = "MIN..MAX",
+        conflicts_with_all = ["speaker_count_hard", "speaker_count_prior"]
+    )]
+    pub speaker_count_range: Option<String>,
 
-    /// Maximum number of speakers (insanely-fast diarization).
-    #[arg(long)]
-    pub max_speakers: Option<u32>,
+    /// Soft count prior: K for point mass or K=P,K=P for a distribution.
+    #[arg(
+        long,
+        value_name = "PRIOR",
+        conflicts_with_all = ["speaker_count_hard", "speaker_count_range"]
+    )]
+    pub speaker_count_prior: Option<String>,
 
     /// GPU device identifier, e.g. "0" or "mps" (insanely-fast, diarization).
     #[arg(long)]
@@ -751,7 +1216,18 @@ pub enum TtyAudioControlCommand {
 }
 
 impl TranscribeArgs {
+    /// Build a request while retaining these CLI arguments.
+    ///
+    /// Terminal production call sites should prefer [`Self::into_request`] so
+    /// owned values can be moved into the request.
     pub fn to_request(&self) -> FwResult<TranscribeRequest> {
+        self.clone().into_request()
+    }
+
+    /// Consume terminal CLI arguments into a request, moving their owned
+    /// strings and paths instead of cloning them immediately before the CLI
+    /// object is discarded.
+    pub fn into_request(mut self) -> FwResult<TranscribeRequest> {
         let mut mode_count = 0usize;
         if self.input.is_some() {
             mode_count += 1;
@@ -773,9 +1249,22 @@ impl TranscribeArgs {
                 "--input, --stdin, and --mic are mutually exclusive".to_owned(),
             ));
         }
+        if !self.diarize
+            && (self.speaker_hints.is_some()
+                || self.persist_speaker_profiles
+                || self.diarization_engine != DiarizationEngine::Auto
+                || self.diarization_fallback != DiarizationFallbackPolicy::Unknown
+                || self.speaker_count_hard.is_some()
+                || self.speaker_count_range.is_some()
+                || self.speaker_count_prior.is_some())
+        {
+            return Err(FwError::InvalidRequest(
+                "diarization controls require --diarize".to_owned(),
+            ));
+        }
 
-        let input = if let Some(path) = &self.input {
-            InputSource::File { path: path.clone() }
+        let input = if let Some(path) = self.input.take() {
+            InputSource::File { path }
         } else if self.stdin {
             InputSource::Stdin {
                 hint_extension: None,
@@ -783,9 +1272,9 @@ impl TranscribeArgs {
         } else {
             InputSource::Microphone {
                 seconds: self.mic_seconds,
-                device: self.mic_device.clone(),
-                ffmpeg_format: self.mic_ffmpeg_format.clone(),
-                ffmpeg_source: self.mic_ffmpeg_source.clone(),
+                device: self.mic_device.take(),
+                ffmpeg_format: self.mic_ffmpeg_format.take(),
+                ffmpeg_source: self.mic_ffmpeg_source.take(),
             }
         };
 
@@ -839,7 +1328,7 @@ impl TranscribeArgs {
         // VAD params — only build if --vad flag is set.
         let vad = if self.vad {
             Some(VadParams {
-                model_path: self.vad_model.clone(),
+                model_path: self.vad_model.take(),
                 threshold: self.vad_threshold,
                 min_speech_duration_ms: self.vad_min_speech_ms,
                 min_silence_duration_ms: self.vad_min_silence_ms,
@@ -851,26 +1340,14 @@ impl TranscribeArgs {
             None
         };
 
-        // Speaker constraints — only build if any field is set.
-        let speaker_constraints = if self.num_speakers.is_some()
-            || self.min_speakers.is_some()
-            || self.max_speakers.is_some()
-        {
-            Some(SpeakerConstraints {
-                num_speakers: self.num_speakers,
-                min_speakers: self.min_speakers,
-                max_speakers: self.max_speakers,
-            })
-        } else {
-            None
-        };
+        let speaker_count = self.speaker_count_request()?;
 
         // Diarization config — only build if any diarization-specific flag is set.
         let diarization_config =
             if self.no_stem || self.diarization_model.is_some() || self.suppress_numerals {
                 Some(DiarizationConfig {
                     no_stem: self.no_stem,
-                    whisper_model: self.diarization_model.clone(),
+                    whisper_model: self.diarization_model.take(),
                     suppress_numerals: self.suppress_numerals,
                     device: self.gpu_device.clone(),
                     batch_size: self.batch_size,
@@ -879,21 +1356,45 @@ impl TranscribeArgs {
                 None
             };
 
+        let known_intervals = self
+            .speaker_hints
+            .take()
+            .as_deref()
+            .map(read_speaker_hints)
+            .transpose()?
+            .unwrap_or_default();
+        let has_diarization_request = self.diarize
+            || !known_intervals.is_empty()
+            || speaker_count != SpeakerCountRequest::Infer;
+        let acoustic_diarization = has_diarization_request.then_some(DiarizationRequest {
+            engine: self.diarization_engine,
+            fallback: self.diarization_fallback,
+            speaker_count,
+            known_intervals,
+            enrollment_edge_guard_ms: self.enrollment_edge_guard_ms,
+            max_prototypes: self.diarization_max_prototypes,
+            persist_profiles: self.persist_speaker_profiles,
+        });
+
+        let fast_model = self.fast_model.take();
+        let quality_model = self.quality_model.take();
+        let speculative = self.speculative_request_with_models(fast_model, quality_model);
+
         let backend_params = BackendParams {
             output_formats,
             timestamp_level: self.timestamp_level,
             decoding,
             vad,
-            speaker_constraints,
             diarization_config,
-            gpu_device: self.gpu_device.clone(),
+            acoustic_diarization,
+            gpu_device: self.gpu_device.take(),
             flash_attention: if self.flash_attention {
                 Some(true)
             } else {
                 None
             },
-            insanely_fast_hf_token: self.hf_token.clone(),
-            insanely_fast_transcript_path: self.transcript_path.clone(),
+            insanely_fast_hf_token: self.hf_token.take(),
+            insanely_fast_transcript_path: self.transcript_path.take(),
             no_timestamps: self.no_timestamps,
             detect_language_only: self.detect_language_only,
             batch_size: self.batch_size,
@@ -901,7 +1402,7 @@ impl TranscribeArgs {
             threads: self.threads,
             processors: self.processors,
             no_gpu: self.no_gpu,
-            prompt: self.prompt.clone(),
+            prompt: self.prompt.take(),
             carry_initial_prompt: self.carry_initial_prompt,
             no_fallback: self.no_fallback,
             suppress_nst: self.suppress_nst,
@@ -909,28 +1410,55 @@ impl TranscribeArgs {
             duration_ms: self.duration_ms,
             audio_ctx: self.audio_ctx,
             word_threshold: self.word_threshold,
-            suppress_regex: self.suppress_regex.clone(),
+            suppress_regex: self.suppress_regex.take(),
             tiny_diarize: self.tiny_diarize,
             word_timestamps: None,
             insanely_fast_tuning: None,
             alignment: None,
             punctuation: None,
             source_separation: None,
-            speculative: self.to_speculative_request(),
+            speculative,
         };
 
         Ok(TranscribeRequest {
             input,
             backend: self.backend,
-            model: self.model.clone(),
-            language: self.language.clone(),
+            model: self.model.take(),
+            language: self.language.take(),
             translate: self.translate,
             diarize: self.diarize,
             persist: !self.no_persist,
-            db_path: self.db.clone(),
+            db_path: std::mem::take(&mut self.db),
             timeout_ms: self.timeout.map(|secs| secs.saturating_mul(1000)),
             backend_params,
         })
+    }
+
+    fn speaker_count_request(&self) -> FwResult<SpeakerCountRequest> {
+        let specified_modes = usize::from(self.speaker_count_hard.is_some())
+            + usize::from(self.speaker_count_range.is_some())
+            + usize::from(self.speaker_count_prior.is_some());
+        if specified_modes > 1 {
+            return Err(FwError::InvalidRequest(
+                "--speaker-count-hard, --speaker-count-range, and --speaker-count-prior are mutually exclusive"
+                    .to_owned(),
+            ));
+        }
+        let request = if let Some(count) = self.speaker_count_hard {
+            SpeakerCountRequest::HardConstraint { count }
+        } else if let Some(range) = self.speaker_count_range.as_deref() {
+            let (minimum, maximum) = parse_speaker_count_range(range)?;
+            SpeakerCountRequest::Range { minimum, maximum }
+        } else if let Some(prior) = self.speaker_count_prior.as_deref() {
+            SpeakerCountRequest::Prior {
+                bins: parse_speaker_count_prior(prior)?,
+            }
+        } else {
+            SpeakerCountRequest::Infer
+        };
+        crate::model::validate_speaker_count_request(&request)
+            .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
+        Ok(request)
     }
 
     #[must_use]
@@ -941,6 +1469,11 @@ impl TranscribeArgs {
             "language": self.language,
             "translate": self.translate,
             "diarize": self.diarize,
+            "diarization_engine": self.diarization_engine,
+            "diarization_fallback": self.diarization_fallback,
+            "speaker_count": self.speaker_count_request().ok(),
+            "speaker_hints_present": self.speaker_hints.is_some(),
+            "persist_speaker_profiles": self.persist_speaker_profiles,
             "persist": !self.no_persist,
             "db": self.db,
             "speculative": self.speculative,
@@ -988,6 +1521,14 @@ impl TranscribeArgs {
     /// `model.rs` free of any dependency on `streaming.rs`.
     #[must_use]
     pub fn to_speculative_request(&self) -> Option<crate::model::SpeculativeRequest> {
+        self.speculative_request_with_models(self.fast_model.clone(), self.quality_model.clone())
+    }
+
+    fn speculative_request_with_models(
+        &self,
+        fast_model: Option<String>,
+        quality_model: Option<String>,
+    ) -> Option<crate::model::SpeculativeRequest> {
         if !self.speculative {
             return None;
         }
@@ -997,14 +1538,8 @@ impl TranscribeArgs {
         Some(crate::model::SpeculativeRequest {
             window_size_ms,
             overlap_ms,
-            fast_model_name: self
-                .fast_model
-                .clone()
-                .unwrap_or_else(|| "auto-fast".to_owned()),
-            quality_model_name: self
-                .quality_model
-                .clone()
-                .unwrap_or_else(|| "auto-quality".to_owned()),
+            fast_model_name: fast_model.unwrap_or_else(|| "auto-fast".to_owned()),
+            quality_model_name: quality_model.unwrap_or_else(|| "auto-quality".to_owned()),
             max_wer_tolerance: self.correction_tolerance_wer,
             adaptive: !self.no_adaptive,
             always_correct: self.always_correct,
@@ -1030,6 +1565,12 @@ mod tests {
             language: None,
             translate: false,
             diarize: false,
+            diarization_engine: DiarizationEngine::Auto,
+            diarization_fallback: DiarizationFallbackPolicy::Unknown,
+            speaker_hints: None,
+            enrollment_edge_guard_ms: 100,
+            diarization_max_prototypes: 512,
+            persist_speaker_profiles: false,
             db: PathBuf::from("db.sqlite3"),
             no_persist: false,
             timeout: None,
@@ -1062,9 +1603,9 @@ mod tests {
             vad_samples_overlap: None,
             batch_size: None,
             timestamp_level: None,
-            num_speakers: None,
-            min_speakers: None,
-            max_speakers: None,
+            speaker_count_hard: None,
+            speaker_count_range: None,
+            speaker_count_prior: None,
             gpu_device: None,
             flash_attention: false,
             hf_token: None,
@@ -1094,6 +1635,61 @@ mod tests {
             no_adaptive: false,
             always_correct: false,
         }
+    }
+
+    #[test]
+    fn consuming_request_is_byte_identical_to_borrowed_request() {
+        let mut args = minimal_args();
+        args.input = Some(PathBuf::from("audio/naïve input.wav"));
+        args.model = Some("models/large-v3-turbo".to_owned());
+        args.language = Some("日本語".to_owned());
+        args.db = PathBuf::from("state/telemetry.sqlite3");
+        args.vad = true;
+        args.vad_model = Some(PathBuf::from("models/silero-vad.bin"));
+        args.no_stem = true;
+        args.diarization_model = Some("pyannote/speaker-diarization".to_owned());
+        args.gpu_device = Some("cuda:0".to_owned());
+        args.hf_token = Some("token-with-control-\n-boundary".to_owned());
+        args.transcript_path = Some(PathBuf::from("artifacts/transcript.json"));
+        args.prompt = Some("Unicode prompt: déjà vu".to_owned());
+        args.suppress_regex = Some("[♪♫]+".to_owned());
+        args.speculative = true;
+        args.fast_model = Some("tiny.en".to_owned());
+        args.quality_model = Some("large-v3-turbo".to_owned());
+
+        let retained = args.to_request().expect("retained request");
+        let consumed = args.into_request().expect("consumed request");
+        assert_eq!(
+            serde_json::to_vec(&retained).expect("serialize retained request"),
+            serde_json::to_vec(&consumed).expect("serialize consumed request")
+        );
+    }
+
+    #[test]
+    fn consuming_request_preserves_validation_errors() {
+        let mut args = minimal_args();
+        args.input = None;
+        let retained = args
+            .to_request()
+            .expect_err("retained no-input error")
+            .to_string();
+        let consumed = args
+            .into_request()
+            .expect_err("consumed no-input error")
+            .to_string();
+        assert_eq!(retained, consumed);
+
+        let mut args = minimal_args();
+        args.stdin = true;
+        let retained = args
+            .to_request()
+            .expect_err("retained conflicting-input error")
+            .to_string();
+        let consumed = args
+            .into_request()
+            .expect_err("consumed conflicting-input error")
+            .to_string();
+        assert_eq!(retained, consumed);
     }
 
     #[test]
@@ -1210,6 +1806,107 @@ mod tests {
         assert_eq!(summary["backend"], "auto");
         assert_eq!(summary["translate"], false);
         assert_eq!(summary["persist"], true);
+        assert_eq!(summary["diarization_engine"], "auto");
+        assert_eq!(summary["speaker_count"]["mode"], "infer");
+        assert_eq!(summary["speaker_hints_present"], false);
+    }
+
+    #[test]
+    fn native_diarization_controls_build_a_typed_request() {
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.diarization_engine = DiarizationEngine::Acoustic;
+        args.diarization_fallback = DiarizationFallbackPolicy::Error;
+        args.enrollment_edge_guard_ms = 175;
+        args.diarization_max_prototypes = 24;
+        args.persist_speaker_profiles = true;
+
+        let request = args.to_request().expect("valid diarization request");
+        let diarization = request
+            .backend_params
+            .acoustic_diarization
+            .expect("typed request");
+        assert_eq!(diarization.engine, DiarizationEngine::Acoustic);
+        assert_eq!(diarization.fallback, DiarizationFallbackPolicy::Error);
+        assert_eq!(diarization.enrollment_edge_guard_ms, 175);
+        assert_eq!(diarization.max_prototypes, 24);
+        assert!(diarization.persist_profiles);
+        assert!(diarization.known_intervals.is_empty());
+    }
+
+    #[test]
+    fn native_diarization_controls_require_diarize() {
+        let mut args = minimal_args();
+        args.diarization_engine = DiarizationEngine::Acoustic;
+        let error = args
+            .to_request()
+            .expect_err("engine selection without --diarize must fail");
+        assert!(error.to_string().contains("require --diarize"));
+
+        let mut args = minimal_args();
+        args.persist_speaker_profiles = true;
+        assert!(
+            args.to_request()
+                .expect_err("profile persistence without --diarize must fail")
+                .to_string()
+                .contains("require --diarize")
+        );
+
+        let mut args = minimal_args();
+        args.speaker_count_hard = Some(2);
+        assert!(
+            args.to_request()
+                .expect_err("speaker-count search without --diarize must fail")
+                .to_string()
+                .contains("require --diarize")
+        );
+    }
+
+    #[test]
+    fn speaker_hints_parser_accepts_v1_document_and_bare_array() {
+        let interval = r#"{
+            "speaker_ref":"near",
+            "start_ms":100,
+            "end_ms":900,
+            "confidence":0.95,
+            "policy":"hard_must_link"
+        }"#;
+        let bare = parse_speaker_hints(format!("[{interval}]").as_bytes()).expect("bare array");
+        let document = parse_speaker_hints(
+            format!("{{\"schema_version\":\"speaker-hints-v1\",\"known_intervals\":[{interval}]}}")
+                .as_bytes(),
+        )
+        .expect("versioned document");
+        assert_eq!(bare, document);
+        assert_eq!(bare[0].speaker_ref, "near");
+    }
+
+    #[test]
+    fn speaker_hints_parser_rejects_unknown_schema_and_malformed_json() {
+        let wrong_schema = br#"{"schema_version":"speaker-hints-v2","known_intervals":[]}"#;
+        assert!(
+            parse_speaker_hints(wrong_schema)
+                .expect_err("future schema must fail closed")
+                .to_string()
+                .contains("speaker-hints-v1")
+        );
+        assert!(parse_speaker_hints(b"not json").is_err());
+    }
+
+    #[test]
+    fn robot_summary_reports_hint_presence_without_disclosing_the_path() {
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.speaker_hints = Some(PathBuf::from(
+            "/private/confidential-corpus/do-not-disclose.json",
+        ));
+        let summary = args.robot_summary();
+        assert_eq!(summary["speaker_hints_present"], true);
+        assert!(
+            !serde_json::to_string(&summary)
+                .expect("serialize summary")
+                .contains("do-not-disclose")
+        );
     }
 
     #[test]
@@ -1287,42 +1984,133 @@ mod tests {
         assert!(!request.backend_params.tiny_diarize);
     }
 
-    // --- Speaker constraints ---
+    // --- Speaker count request ---
 
     #[test]
-    fn speaker_constraints_none_when_no_speaker_args() {
-        let args = minimal_args();
+    fn speaker_count_infers_when_no_speaker_args() {
+        let mut args = minimal_args();
+        args.diarize = true;
         let request = args.to_request().expect("should succeed");
-        assert!(request.backend_params.speaker_constraints.is_none());
+        assert_eq!(
+            request
+                .backend_params
+                .acoustic_diarization
+                .expect("--diarize creates native request")
+                .speaker_count,
+            SpeakerCountRequest::Infer
+        );
     }
 
     #[test]
-    fn speaker_constraints_built_from_num_speakers() {
+    fn speaker_count_built_from_explicit_hard_count() {
         let mut args = minimal_args();
-        args.num_speakers = Some(3);
+        args.diarize = true;
+        args.speaker_count_hard = Some(3);
+        let summary = args.robot_summary();
+        assert_eq!(summary["speaker_count"]["mode"], "hard_constraint");
+        assert_eq!(summary["speaker_count"]["count"], 3);
         let request = args.to_request().expect("should succeed");
-        let sc = request
+        let count = &request
             .backend_params
-            .speaker_constraints
-            .expect("should be Some");
-        assert_eq!(sc.num_speakers, Some(3));
-        assert!(sc.min_speakers.is_none());
-        assert!(sc.max_speakers.is_none());
+            .acoustic_diarization
+            .expect("speaker count creates a diarization request")
+            .speaker_count;
+        assert_eq!(count, &SpeakerCountRequest::HardConstraint { count: 3 });
     }
 
     #[test]
-    fn speaker_constraints_built_from_min_and_max() {
+    fn speaker_count_built_from_explicit_range() {
         let mut args = minimal_args();
-        args.min_speakers = Some(2);
-        args.max_speakers = Some(8);
+        args.diarize = true;
+        args.speaker_count_range = Some("2..8".to_owned());
         let request = args.to_request().expect("should succeed");
-        let sc = request
+        let count = &request
             .backend_params
-            .speaker_constraints
-            .expect("should be Some");
-        assert!(sc.num_speakers.is_none());
-        assert_eq!(sc.min_speakers, Some(2));
-        assert_eq!(sc.max_speakers, Some(8));
+            .acoustic_diarization
+            .expect("speaker range creates a diarization request")
+            .speaker_count;
+        assert_eq!(
+            count,
+            &SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 8
+            }
+        );
+    }
+
+    #[test]
+    fn speaker_count_point_prior_remains_soft() {
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.speaker_count_prior = Some("3".to_owned());
+        let count = args
+            .to_request()
+            .expect("point prior")
+            .backend_params
+            .acoustic_diarization
+            .expect("diarization request")
+            .speaker_count;
+        assert_eq!(
+            count,
+            SpeakerCountRequest::Prior {
+                bins: vec![SpeakerCountPriorMass {
+                    count: 3,
+                    probability: 1.0,
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn speaker_count_distribution_prior_is_sorted_and_validated() {
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.speaker_count_prior = Some("3=0.75,2=0.25".to_owned());
+        let count = args
+            .to_request()
+            .expect("distribution prior")
+            .backend_params
+            .acoustic_diarization
+            .expect("diarization request")
+            .speaker_count;
+        assert_eq!(
+            count,
+            SpeakerCountRequest::Prior {
+                bins: vec![
+                    SpeakerCountPriorMass {
+                        count: 2,
+                        probability: 0.25,
+                    },
+                    SpeakerCountPriorMass {
+                        count: 3,
+                        probability: 0.75,
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_speaker_count_cli_values_fail_with_typed_messages() {
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.speaker_count_range = Some("4..2".to_owned());
+        assert!(
+            args.to_request()
+                .expect_err("reversed range")
+                .to_string()
+                .contains("minimum <= maximum")
+        );
+
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.speaker_count_prior = Some("2=0.8,3=0.8".to_owned());
+        assert!(
+            args.to_request()
+                .expect_err("unnormalized prior")
+                .to_string()
+                .contains("sum to exactly 1")
+        );
     }
 
     // --- Diarization config ---
@@ -1718,7 +2506,7 @@ mod tests {
         args.batch_size = Some(24);
         args.gpu_device = Some("cuda:0".to_owned());
         args.timestamp_level = Some(TimestampLevel::Word);
-        args.num_speakers = Some(3);
+        args.speaker_count_hard = Some(3);
         args.hf_token = Some("hf_123".to_owned());
         args.transcript_path = Some(PathBuf::from("artifacts/ifw-out.json"));
         args.output_srt = true;
@@ -1761,7 +2549,14 @@ mod tests {
             request.backend_params.timestamp_level,
             Some(TimestampLevel::Word)
         );
-        assert!(request.backend_params.speaker_constraints.is_some());
+        assert!(matches!(
+            request
+                .backend_params
+                .acoustic_diarization
+                .as_ref()
+                .map(|request| &request.speaker_count),
+            Some(SpeakerCountRequest::HardConstraint { count: 3 })
+        ));
         assert_eq!(request.backend_params.output_formats.len(), 2);
         assert!(request.backend_params.diarization_config.is_some());
         assert!(request.backend_params.vad.is_some());
@@ -1816,19 +2611,15 @@ mod tests {
     }
 
     #[test]
-    fn speaker_constraints_all_fields() {
+    fn exact_and_range_speaker_flags_are_rejected_as_ambiguous() {
         let mut args = minimal_args();
-        args.num_speakers = Some(4);
-        args.min_speakers = Some(2);
-        args.max_speakers = Some(6);
-        let request = args.to_request().expect("should succeed");
-        let sc = request
-            .backend_params
-            .speaker_constraints
-            .expect("should be Some");
-        assert_eq!(sc.num_speakers, Some(4));
-        assert_eq!(sc.min_speakers, Some(2));
-        assert_eq!(sc.max_speakers, Some(6));
+        args.diarize = true;
+        args.speaker_count_hard = Some(4);
+        args.speaker_count_range = Some("2..6".to_owned());
+        let error = args
+            .to_request()
+            .expect_err("typed count request cannot represent contradictory modes");
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 
     #[test]
@@ -1972,6 +2763,11 @@ mod tests {
             "language",
             "translate",
             "diarize",
+            "diarization_engine",
+            "diarization_fallback",
+            "speaker_count",
+            "speaker_hints_present",
+            "persist_speaker_profiles",
             "persist",
             "db",
             "speculative",
@@ -2604,5 +3400,182 @@ mod tests {
             },
             other => panic!("expected TtyAudio, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn confidential_evaluation_cli_debug_redacts_every_path() {
+        let args = ConfidentialEvaluationArgs {
+            input_root: PathBuf::from("/PRIVATE/INPUT/ROOT"),
+            manifest: PathBuf::from("/PRIVATE/MANIFEST.json"),
+            output: PathBuf::from("/PRIVATE/OUTPUT.json"),
+        };
+        let debug = format!("{args:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("PRIVATE"));
+        assert!(!debug.contains("MANIFEST"));
+        assert!(!debug.contains("OUTPUT"));
+    }
+
+    #[test]
+    fn public_corpus_cli_parses_build_and_redacts_paths() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-corpus",
+            "build",
+            "--input-root",
+            "/EXTERNAL/PUBLIC",
+            "--descriptor",
+            "/EXTERNAL/PUBLIC/descriptor.json",
+            "--output",
+            "/EXTERNAL/OUTPUT/bundle.json",
+            "--license-ack",
+            "accept-ami-cc-by-4.0",
+        ])
+        .expect("public corpus command");
+        let Command::DiarizationCorpus {
+            command: PublicCorpusCommand::Build(args),
+        } = cli.command
+        else {
+            panic!("expected public corpus build");
+        };
+        assert_eq!(args.license_ack, "accept-ami-cc-by-4.0");
+        let debug = format!("{args:?}");
+        assert!(!debug.contains("EXTERNAL"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn public_corpus_cli_parses_registry() {
+        let cli = Cli::try_parse_from(["franken_whisper", "diarization-corpus", "registry"])
+            .expect("public corpus registry");
+        assert!(matches!(
+            cli.command,
+            Command::DiarizationCorpus {
+                command: PublicCorpusCommand::Registry
+            }
+        ));
+    }
+
+    #[test]
+    fn public_corpus_cli_parses_ablation_and_redacts_every_path() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-corpus",
+            "ablate",
+            "--input-root",
+            "/EXTERNAL/PUBLIC",
+            "--descriptor",
+            "/EXTERNAL/PUBLIC/descriptor.json",
+            "--bundle-output",
+            "/EXTERNAL/OUTPUT/bundle.json",
+            "--output",
+            "/EXTERNAL/OUTPUT/ablation.json",
+            "--license-ack",
+            "accept-ami-cc-by-4.0",
+            "--maximum-recording-duration-ms",
+            "300000",
+            "--stage",
+            "development",
+        ])
+        .expect("public corpus ablation command");
+        let Command::DiarizationCorpus {
+            command: PublicCorpusCommand::Ablate(args),
+        } = cli.command
+        else {
+            panic!("expected public corpus ablation");
+        };
+        assert_eq!(args.license_ack, "accept-ami-cc-by-4.0");
+        assert_eq!(args.maximum_recording_duration_ms, Some(300_000));
+        assert_eq!(args.stage, PublicCorpusEvaluationStageArg::Development);
+        assert!(args.locked_development_evidence.is_none());
+        let debug = format!("{args:?}");
+        assert!(!debug.contains("EXTERNAL"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn public_corpus_cli_parses_sidecar_study_and_redacts_every_path() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-corpus",
+            "sidecar-study",
+            "--input-root",
+            "/SIDE_CAR_SECRET/INPUT",
+            "--descriptor",
+            "/SIDE_CAR_SECRET/INPUT/descriptor.json",
+            "--bundle-output",
+            "/SIDE_CAR_SECRET/OUTPUT/bundle.json",
+            "--output",
+            "/SIDE_CAR_SECRET/OUTPUT/study.json",
+            "--license-ack",
+            "accept-ami-cc-by-4.0",
+            "--maximum-recording-duration-ms",
+            "120000",
+            "--stage",
+            "certification",
+            "--locked-development-evidence",
+            "/SIDE_CAR_SECRET/LOCK/development.json",
+        ])
+        .expect("public corpus sidecar-study command");
+        let debug = format!("{cli:?}");
+        assert!(!debug.contains("SIDE_CAR_SECRET"));
+        assert_eq!(debug.matches("<redacted>").count(), 5);
+
+        let Command::DiarizationCorpus {
+            command: PublicCorpusCommand::SidecarStudy(args),
+        } = cli.command
+        else {
+            panic!("expected public corpus sidecar study");
+        };
+        assert_eq!(args.license_ack, "accept-ami-cc-by-4.0");
+        assert_eq!(args.maximum_recording_duration_ms, Some(120_000));
+        assert_eq!(args.stage, PublicCorpusEvaluationStageArg::Certification);
+        assert!(args.locked_development_evidence.is_some());
+    }
+
+    #[test]
+    fn differential_oracle_cli_parses_registry() {
+        let cli = Cli::try_parse_from(["franken_whisper", "diarization-oracle", "registry"])
+            .expect("oracle registry");
+        assert!(matches!(
+            cli.command,
+            Command::DiarizationOracle {
+                command: DifferentialOracleCommand::Registry
+            }
+        ));
+    }
+
+    #[test]
+    fn differential_oracle_cli_parses_run_and_redacts_every_path() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-oracle",
+            "run",
+            "--tool",
+            "nemo-spectral",
+            "--audio",
+            "/PRIVATE/call.m4a",
+            "--native",
+            "/PRIVATE/native.json",
+            "--reference",
+            "/PRIVATE/reference.json",
+            "--output",
+            "/PRIVATE/report.json",
+            "--timeout-seconds",
+            "90",
+        ])
+        .expect("oracle run");
+        let Command::DiarizationOracle {
+            command: DifferentialOracleCommand::Run(args),
+        } = cli.command
+        else {
+            panic!("expected differential oracle run");
+        };
+        assert_eq!(args.tool, DifferentialOracleToolArg::NemoSpectral);
+        assert_eq!(args.timeout_seconds, 90);
+        let debug = format!("{args:?}");
+        assert!(!debug.contains("PRIVATE"));
+        assert!(!debug.contains("call.m4a"));
+        assert!(debug.contains("<redacted>"));
     }
 }

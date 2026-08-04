@@ -1,0 +1,90 @@
+diff --git a/src/native_engine/nn.rs b/src/native_engine/nn.rs
+index 6a1c905..44c4585 100644
+--- a/src/native_engine/nn.rs
++++ b/src/native_engine/nn.rs
+@@ -171,10 +171,61 @@ fn batch_gemv_cap() -> Option<usize> {
+ /// Default-ON row-morsel scheduler for compute-bound batched f16 GEMV.
+ /// `FW_BATCH_GEMV_ROW_MORSEL=0` restores the legacy output-band/private-buffer
+ /// scheduler for A/B and rollback.
+-fn batch_gemv_row_morsel_enabled() -> bool {
++/// 0 = auto (profitability gate), 1 = force row-morsel, 2 = force column-band.
++static BATCH_GEMV_ROW_MORSEL_MODE: std::sync::atomic::AtomicU8 =
++    std::sync::atomic::AtomicU8::new(0);
++
++fn batch_gemv_row_morsel_init() {
+     use std::sync::OnceLock;
+-    static ENABLED: OnceLock<bool> = OnceLock::new();
+-    *ENABLED.get_or_init(|| std::env::var("FW_BATCH_GEMV_ROW_MORSEL").ok().as_deref() != Some("0"))
++    static INIT: OnceLock<()> = OnceLock::new();
++    INIT.get_or_init(|| {
++        if std::env::var("FW_BATCH_GEMV_ROW_MORSEL").ok().as_deref() == Some("0") {
++            BATCH_GEMV_ROW_MORSEL_MODE.store(2, std::sync::atomic::Ordering::Relaxed);
++        }
++    });
++}
++
++/// Pick the batched-f16-GEMV scheduler for this shape.
++///
++/// Row-morsel re-streams the WHOLE weight once per band (one pass per worker); the
++/// column-band path streams the weight ONCE but pays per-worker private `[tq, out]`
++/// buffers plus a merge. Equating the two extra costs, with `bands ~= workers`:
++/// `bands * out*inp*2` vs `~2 * workers * tq*out*4`  =>  `inp*2 ~= 8*tq`  =>  row-morsel
++/// pays only once **`4*tq >= inp`**.
++fn batch_gemv_use_row_morsel(compute_bound: bool, tq: usize, inp: usize) -> bool {
++    batch_gemv_row_morsel_init();
++    match BATCH_GEMV_ROW_MORSEL_MODE.load(std::sync::atomic::Ordering::Relaxed) {
++        1 => compute_bound,                        // force: legacy routing
++        2 => false,                                // force: always column-band
++        _ => compute_bound && 4 * tq >= inp,       // auto
++    }
++}
++
++/// Select the batched-f16-GEMV scheduler. **Default on** = the shipped row-morsel path.
++///
++/// `gemv_f16_batch` has two schedulers, both proven bit-identical to per-token `gemv_f16`
++/// (`gemv_f16_batch_equals_per_token_gemv`, `gemv_f16_batch_row_morsel_equals_per_token_gemv`),
++/// so this knob **cannot change results** — only scheduling:
++/// * **column-band** (`compute_band`, o-outer): each weight row is fetched once and dotted
++///   against all `tq` tokens ⇒ the weight is streamed **once**. Arithmetic intensity `tq`
++///   flop per weight byte.
++/// * **row-morsel** (`gemv_f16_batch_rows`, t-outer per band): every band re-streams the
++///   **whole** weight ⇒ one pass per band. Intensity `tq / workers`. It wins only when the
++///   shape is compute-bound enough that the extra weight traffic is free (cross-K/V:
++///   weight 3.3 MB, 2.4 GFLOP), and it carries the M2col cvtph-halving tile — which itself
++///   requires `row_band >= 2`, i.e. `tq >= 2 * workers`.
++///
++/// This setter exists so a bench can flip the scheduler **inside one binary** and time the
++/// real `gemv_f16_batch` both ways. An env var is read once per process and cannot do that,
++/// and an A/B split across two process invocations is not admissible.
++pub fn set_batch_gemv_row_morsel(force: Option<bool>) {
++    batch_gemv_row_morsel_init();
++    let mode = match force {
++        None => 0,
++        Some(true) => 1,
++        Some(false) => 2,
++    };
++    BATCH_GEMV_ROW_MORSEL_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+ }
+ 
+ /// Default-ON M2 activation-column tile for the row-morsel f16 batch GEMV: pairs of
+@@ -2996,7 +3047,19 @@ pub fn gemv_f16_batch(
+     // `[rows, out]` morsels directly into `out_slice`, eliminating the legacy
+     // private `[tq, out]` buffers and merge while preserving each dot product's
+     // exact summation order.
+-    if work >= COMPUTE_BOUND_MACS && batch_gemv_row_morsel_enabled() {
++    // Row-morsel re-streams the WHOLE weight once per band (one pass per worker); the
++    // column-band path streams the weight ONCE but pays per-worker private `[tq, out]`
++    // buffers plus a merge. Equating the two extra costs, with `bands ~= workers`:
++    //     bands * out*inp*2   vs   ~2 * workers * tq*out*4
++    //  => inp*2 ~= 8*tq       =>   row-morsel pays only once `4*tq >= inp`.
++    // cross-K/V (inp=1280, tq=1500): 6000 >= 1280 => row-morsel -- correct, it is genuinely
++    // compute-bound (2.4 GFLOP over a 3.3 MB weight).
++    // fc2 prefill (inp=5120, tq<=224): <=896 < 5120 => column-band. The old gate keyed on
++    // `work = tq*out*inp` alone, which conflates "compute-bound" with "big weight": fc2's
++    // weight is 13.1 MB, so at tq=12 row-morsel re-streamed it 12x (157 MB) for 0.157 GFLOP,
++    // AND `row_band = 1` meant the M2col tile never fired. Both schedulers are bit-identical
++    // to per-token `gemv_f16`, so this routing choice cannot change results.
++    if batch_gemv_use_row_morsel(work >= COMPUTE_BOUND_MACS, tq, inp) {
+         gemv_f16_batch_rows(w_f16, out, inp, x, tq, bias, out_slice, workers, use_fused);
+         return;
+     }

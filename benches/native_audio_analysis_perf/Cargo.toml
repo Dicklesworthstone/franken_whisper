@@ -1,0 +1,15 @@
+[package]
+name = "native-audio-analysis-perf"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bench]]
+name = "pcm_rms"
+path = "bench.rs"
+harness = false
+
+[profile.release]
+opt-level = 3

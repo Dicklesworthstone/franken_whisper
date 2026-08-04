@@ -1,0 +1,58 @@
+# Build CPU baseline: x86-64-v3 (AVX2 + FMA + BMI1/2 + ...), i.e. Intel Haswell
+# (2013) / AMD Excavator (2015) and newer — effectively universal on modern
+# machines and on the CI/rch build fleet.
+#
+# WHY: franken_whisper's native engine is SIMD/FMA-heavy (log-mel FFT, layer_norm
+# vertical SIMD) AND it delegates every matmul to FrankenTorch's sgemm. The Rust
+# default target (`x86-64`, SSE2 only) leaves AVX2/FMA on the table for ALL of
+# that. Recompiling with x86-64-v3 is a MEASURED end-to-end win that finally moves
+# the e2e-dominant GEMM:
+#
+#   native_engine_bench (tiny.en, local, same-host A/B)   SSE2      x86-64-v3
+#     encoder_window_tiny                                  263 ms ->  ~204 ms  (1.29x)
+#     decoder_token_step_tiny                              122 ms ->  ~102 ms  (1.20x)
+#     e2e_tiny_jfk (full 11s transcription)                708 ms ->  633 ms   (1.12x)
+#
+# CONFORMANCE: AVX2/FMA changes f32 rounding slightly (fused multiply-add, wider
+# SIMD reductions), but franken_whisper's contract is transcription-level (see
+# docs/conformance-contract.md), NOT bit-exact. native_engine_e2e is 6/6 green
+# under this flag — transcription is unchanged. (#![forbid(unsafe_code)] rules out
+# runtime AVX2 dispatch via #[target_feature], so a build-wide baseline is the
+# only safe way to get these instructions.)
+#
+# TRADE-OFF / REVERT: this raises the minimum CPU to AVX2 (2013+). To target older
+# CPUs, delete this file (reverts to portable SSE2 `x86-64`) or lower to
+# `x86-64-v2`. See docs/PERF_LEDGER.md (lever L7).
+# CRITICAL: gate this to x86_64 ONLY. `target-cpu=x86-64-v3` is an x86 CPU name; passing it
+# to an aarch64 target (Apple Silicon, arm64 linux) is invalid ("not a recognized processor
+# ... ignoring processor") and CORRUPTS aarch64 codegen — it manifests as spurious
+# `f32/f64::clamp`/`is_finite` panics ("min > max, or either was NaN" on valid finite bounds).
+# A global `[build] rustflags` applied it to every target; scope it so aarch64 uses correct
+# default codegen while x86_64 (linux/windows/intel-mac) keeps the AVX2/FMA win.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# Stack size for threads cargo spawns (tests, benches, `cargo run`).
+#
+# WHY: `fsqlite`'s statement API is `async fn`, and `RunStore` drives it
+# synchronously through `storage::block_on` (see the `BlockingConnection` doc
+# comment). Those futures nest deeply — statement dispatch -> DML -> triggers ->
+# nested statement execution, deep enough that `fsqlite` raises its own
+# `recursion_limit` just to type-check them — so the synchronous poll chain is
+# stack-hungry. In a DEBUG build (no inlining, every temporary materialized) that
+# chain overflows libtest's ordinary worker stack: `cargo test --lib storage::`
+# aborted with SIGABRT ("has overflowed its stack") after only 3 of 202 tests.
+# The same 202 tests pass 202/0 with this set. Boxing the outermost future
+# (which `block_on` does) reduces the depth but does not by itself fix it.
+#
+# DEBUG-ONLY, and that is measured, not assumed: the release test binary run
+# directly (bypassing cargo and this file, with RUST_MIN_STACK unset) passes the
+# same 202 tests on its ordinary stack. This proves that exact release suite
+# does not need the override; it does not quantify spare stack headroom for
+# future query shapes. The value only sizes threads, is lazily mapped (an unused
+# large stack costs no resident memory), and does not affect codegen.
+#
+# REVERT: drop this block once the storage layer no longer drives async fsqlite
+# from a synchronous caller (e.g. if the sync surface is made async end to end).
+[env]
+RUST_MIN_STACK = "67108864"

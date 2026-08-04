@@ -20,13 +20,11 @@ fn render_command_for_log(program: &str, args: &[String]) -> String {
         return program.to_owned();
     }
 
-    let mut rendered = Vec::with_capacity(args.len() + 1);
-    rendered.push(program.to_owned());
-
+    let mut capacity = program.len().saturating_add(args.len());
     let mut redact_next = false;
     for arg in args {
         if redact_next {
-            rendered.push("***".to_owned());
+            capacity = capacity.saturating_add(3);
             redact_next = false;
             continue;
         }
@@ -34,20 +32,42 @@ fn render_command_for_log(program: &str, args: &[String]) -> String {
         if let Some((flag, _value)) = arg.split_once('=')
             && is_sensitive_flag(flag)
         {
-            rendered.push(format!("{flag}=***"));
+            capacity = capacity.saturating_add(flag.len().saturating_add(4));
             continue;
         }
 
+        capacity = capacity.saturating_add(arg.len());
         if is_sensitive_flag(arg) {
-            rendered.push(arg.clone());
             redact_next = true;
-            continue;
         }
-
-        rendered.push(arg.clone());
     }
 
-    rendered.join(" ")
+    let mut rendered = String::with_capacity(capacity);
+    rendered.push_str(program);
+    let mut redact_next = false;
+    for arg in args {
+        rendered.push(' ');
+        if redact_next {
+            rendered.push_str("***");
+            redact_next = false;
+            continue;
+        }
+
+        if let Some((flag, _value)) = arg.split_once('=')
+            && is_sensitive_flag(flag)
+        {
+            rendered.push_str(flag);
+            rendered.push_str("=***");
+            continue;
+        }
+
+        rendered.push_str(arg);
+        if is_sensitive_flag(arg) {
+            redact_next = true;
+        }
+    }
+
+    rendered
 }
 
 fn is_sensitive_flag(flag: &str) -> bool {
@@ -150,12 +170,27 @@ pub fn run_command_with_timeout(
     validate_command_output(&rendered, output)
 }
 
+// The early sleeps total 50ms, preserving the original polling phase and
+// steady-state ceiling after accelerating short-lived subprocesses.
+const CANCELLABLE_POLL_CEILING_MS: u64 = 50;
+const CANCELLABLE_EARLY_POLL_MS: [u64; 6] = [1, 2, 4, 8, 16, 19];
+
+fn cancellable_poll_delay(iteration: usize) -> Duration {
+    Duration::from_millis(
+        CANCELLABLE_EARLY_POLL_MS
+            .get(iteration)
+            .copied()
+            .unwrap_or(CANCELLABLE_POLL_CEILING_MS),
+    )
+}
+
 /// Run a subprocess with cancellation-aware polling.
 ///
-/// Instead of a fixed timeout, this variant polls `token.checkpoint()` on every
-/// iteration (50ms sleep). If the checkpoint returns `Err(Cancelled)`, the
-/// child process is killed immediately and the error is propagated. An optional
-/// hard timeout is still respected as a safety net.
+/// Instead of a fixed timeout, this variant polls `token.checkpoint()` after
+/// front-loaded sleeps that rejoin the original 50ms cadence at 50ms. If the
+/// checkpoint returns `Err(Cancelled)`, the child process is killed immediately
+/// and the error is propagated. An optional hard timeout is still respected as
+/// a safety net.
 pub(crate) fn run_command_cancellable(
     program: &str,
     args: &[String],
@@ -181,6 +216,7 @@ pub(crate) fn run_command_cancellable(
 
     let mut child = command.spawn()?;
     let started_at = Instant::now();
+    let mut poll_iteration = 0usize;
 
     let stdout_pipe = child.stdout.take().ok_or_else(|| {
         FwError::Io(std::io::Error::other(format!(
@@ -242,7 +278,8 @@ pub(crate) fn run_command_cancellable(
             ));
         }
 
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(cancellable_poll_delay(poll_iteration));
+        poll_iteration = poll_iteration.saturating_add(1);
     }
 }
 
@@ -310,7 +347,16 @@ mod tests {
 
     use crate::orchestrator::CancellationToken;
 
-    use super::{render_command_for_log, run_command_cancellable};
+    use super::{cancellable_poll_delay, render_command_for_log, run_command_cancellable};
+
+    #[test]
+    fn cancellable_poll_schedule_rejoins_fixed_cadence() {
+        let delays: [u128; 8] =
+            std::array::from_fn(|iteration| cancellable_poll_delay(iteration).as_millis());
+
+        assert_eq!(delays, [1, 2, 4, 8, 16, 19, 50, 50]);
+        assert_eq!(delays[..6].iter().sum::<u128>(), 50);
+    }
 
     #[test]
     fn cancellable_completes_fast_command() {
@@ -486,6 +532,11 @@ mod tests {
             !rendered.contains("secret_api_key"),
             "api key should be redacted"
         );
+        assert_eq!(
+            rendered,
+            "prog --hf-token *** --api-key=*** --token-threshold 0.1 positional"
+        );
+        assert_eq!(render_command_for_log("prog", &[]), "prog");
     }
 
     #[test]

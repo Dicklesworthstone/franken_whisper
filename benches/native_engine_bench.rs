@@ -9,6 +9,10 @@
 //! - `decoder_token_step_*` — ONE decoder `forward_step` at a fixed cache depth.
 //! - `logits_gemv_large`  — the `[n_vocab, n_state]` tied output projection,
 //!   the direct instrument for the f16-GEMV lever.
+//! - `sanitize_downmix`    — built-in decoder ingestion: sanitize + channel
+//!   average over decoded interleaved PCM.
+//! - `acoustic_diarization` — bounded Rust-native acoustic features and the
+//!   complete one-speaker pipeline at fixed synthetic durations.
 //! - `e2e_tiny_jfk`       — full `transcribe_samples` over the jfk fixture.
 //!
 //! # Model gating
@@ -17,6 +21,8 @@
 //! absent the group prints a visible `SKIP` to stderr and registers no
 //! measurements, so CI without models stays green. Only `mel_30s` is fully
 //! hermetic (synthetic audio + synthetic filterbank).
+//! Set `FRANKEN_WHISPER_JFK_WAV=/path/to/jfk.wav` to point clean worktrees at an
+//! external checked fixture without copying binary audio into the worktree.
 //!
 //! # How to A/B (round-2 f16 passes)
 //! Save a pre-change baseline once:
@@ -36,18 +42,31 @@
 //! `logits_gemv_large` and `encoder_window_large` / `decoder_token_step_large`
 //! numbers for the f16 levers specifically.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hint::black_box;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group};
+use ft_kernel_cpu::{sdpa_forward_f32, set_sdpa_br, set_sdpa_br_auto};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use franken_whisper::native_engine::decode::{DecodeParams, LoadedModel};
 use franken_whisper::native_engine::decoder::{self, DecoderState};
 use franken_whisper::native_engine::encoder;
 use franken_whisper::native_engine::ggml::GgmlModel;
 use franken_whisper::native_engine::mel::{self, FRAMES_PER_CHUNK, N_SAMPLES_30S, SAMPLE_RATE};
+use franken_whisper::native_engine::tokenizer::Tokenizer;
 use franken_whisper::native_engine::{
-    Mat, Mel, MelFilterbank, NativeWhisperModel, find_model_file,
+    Mat, Mel, MelFilterbank, NativeWhisperModel, WhisperHParams, find_model_file,
+};
+use franken_whisper::{
+    diarization::{
+        AcousticBoundaryHints, AcousticDiarizationInput, diarize_acoustic_pcm,
+        extract_acoustic_features,
+    },
+    model::{DiarizationEngine, DiarizationRequest, SpeakerCountRequest},
 };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +103,173 @@ fn synthetic_audio(n: usize, seed: u64) -> Vec<f32> {
     out
 }
 
+const SDPA_HARNESS_PAIRS: usize = 41;
+const SDPA_HARNESS_MIN_OF: usize = 3;
+const SDPA_BOOTSTRAP_RESAMPLES: usize = 20_000;
+
+fn native_bench_identity() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "unavailable".to_owned();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return "unavailable".to_owned();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!(
+        "{:x} ({} bytes) {}",
+        hasher.finalize(),
+        bytes.len(),
+        path.display()
+    )
+}
+
+fn native_bench_host_identity() -> String {
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|_| "unavailable".to_owned());
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|_| "unavailable".to_owned());
+    let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|cpuinfo| {
+            cpuinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("model name\t: "))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let mem_total_kib = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|meminfo| {
+            meminfo
+                .lines()
+                .find_map(|line| line.strip_prefix("MemTotal:"))
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    let numa_nodes = std::fs::read_dir("/sys/devices/system/node")
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .strip_prefix("node")
+                        .is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let configured_threads = rayon::current_num_threads();
+    let logical_cpus = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(0);
+
+    format!(
+        "hostname={hostname:?} boot_id={boot_id} cpu_model={cpu_model:?} \
+         logical_cpus={logical_cpus} rayon_configured_threads={configured_threads} \
+         mem_total_kib={mem_total_kib} numa_nodes={numa_nodes}"
+    )
+}
+
+fn native_bench_governor_summary() -> String {
+    let logical_cpus = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(0);
+    let mut by_value = BTreeMap::<String, usize>::new();
+    for cpu in 0..logical_cpus {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_governor");
+        let value = std::fs::read_to_string(path)
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|_| "unavailable".to_owned());
+        *by_value.entry(value).or_default() += 1;
+    }
+    format!("{by_value:?}")
+}
+
+fn native_bench_thread_ticks() -> BTreeMap<u32, u64> {
+    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+        return BTreeMap::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let tid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let after_comm = stat.rsplit_once(") ")?.1;
+            let fields: Vec<&str> = after_comm.split_whitespace().collect();
+            let user = fields.get(11)?.parse::<u64>().ok()?;
+            let system = fields.get(12)?.parse::<u64>().ok()?;
+            Some((tid, user + system))
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct NativeBenchThreadObservation {
+    active_tids: BTreeSet<u32>,
+    max_active_per_arm: usize,
+    peak_process_threads: usize,
+}
+
+impl NativeBenchThreadObservation {
+    fn observe(&mut self, before: &BTreeMap<u32, u64>, after: &BTreeMap<u32, u64>) {
+        let active: Vec<u32> = after
+            .iter()
+            .filter_map(|(tid, ticks)| {
+                (*ticks > before.get(tid).copied().unwrap_or(0)).then_some(*tid)
+            })
+            .collect();
+        self.max_active_per_arm = self.max_active_per_arm.max(active.len());
+        self.peak_process_threads = self.peak_process_threads.max(after.len());
+        self.active_tids.extend(active);
+    }
+}
+
+fn sdpa_harness_percentile(values: &[f64], percentile: usize) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[(sorted.len() - 1) * percentile / 100]
+}
+
+fn sdpa_bootstrap_median_ci(values: &[f64]) -> (f64, f64) {
+    let mut state = 0x1f83_d9ab_fb41_bd6b_u64 ^ values.len() as u64;
+    let mut sample = Vec::with_capacity(values.len());
+    let mut medians = Vec::with_capacity(SDPA_BOOTSTRAP_RESAMPLES);
+    for _ in 0..SDPA_BOOTSTRAP_RESAMPLES {
+        sample.clear();
+        for _ in 0..values.len() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            sample.push(values[state as usize % values.len()]);
+        }
+        sample.sort_by(f64::total_cmp);
+        medians.push(sample[sample.len() / 2]);
+    }
+    medians.sort_by(f64::total_cmp);
+    (
+        medians[SDPA_BOOTSTRAP_RESAMPLES * 25 / 1_000],
+        medians[SDPA_BOOTSTRAP_RESAMPLES * 975 / 1_000],
+    )
+}
+
+fn sdpa_harness_cv(values: &[f64]) -> f64 {
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt() / mean
+}
+
 /// A synthetic `[n_mel, N_FREQ_BINS]` filterbank. The mel-frontend cost is
 /// dominated by the FFT, which is independent of the filter coefficients, so a
 /// deterministic dense bank is representative for timing while keeping the
@@ -95,6 +281,46 @@ fn synthetic_filterbank(n_mel: usize) -> MelFilterbank {
     for v in &mut data {
         // Non-negative weights, like a real mel filterbank.
         *v = (lcg.next_f32() + 1.0) * 0.5;
+    }
+    MelFilterbank {
+        n_mel,
+        n_fft_bins,
+        data,
+    }
+}
+
+/// A REALISTIC sparse triangular mel filterbank (standard Slaney-style mel
+/// triangles), matching what a real ggml model carries: each of the `n_mel`
+/// filters is nonzero over only ~5 contiguous freq bins of `N_FREQ_BINS=201`,
+/// zero elsewhere. Unlike [`synthetic_filterbank`] (dense, every weight nonzero)
+/// this exercises the sparse-projection fast path the production engine actually
+/// hits — the dense bank hides ~13x of wasted multiply-by-zero work.
+fn realistic_mel_filterbank(n_mel: usize) -> MelFilterbank {
+    let n_fft_bins = mel::N_FREQ_BINS;
+    let sr = SAMPLE_RATE as f64;
+    let hz_to_mel = |h: f64| 2595.0 * (1.0 + h / 700.0).log10();
+    let mel_to_hz = |m: f64| 700.0 * (10f64.powf(m / 2595.0) - 1.0);
+    let m_min = hz_to_mel(0.0);
+    let m_max = hz_to_mel(sr / 2.0);
+    // n_mel+2 band edges in mel space, mapped back to Hz.
+    let edges: Vec<f64> = (0..n_mel + 2)
+        .map(|i| mel_to_hz(m_min + (m_max - m_min) * (i as f64) / ((n_mel + 1) as f64)))
+        .collect();
+    let bin_hz = |k: usize| (k as f64) * (sr / 2.0) / ((n_fft_bins - 1) as f64);
+    let mut data = vec![0.0f32; n_mel * n_fft_bins];
+    for m in 0..n_mel {
+        let (lo, ce, hi) = (edges[m], edges[m + 1], edges[m + 2]);
+        for k in 0..n_fft_bins {
+            let f = bin_hz(k);
+            let w = if f >= lo && f <= ce && ce > lo {
+                (f - lo) / (ce - lo)
+            } else if f > ce && f <= hi && hi > ce {
+                (hi - f) / (hi - ce)
+            } else {
+                0.0
+            };
+            data[m * n_fft_bins + k] = w as f32;
+        }
     }
     MelFilterbank {
         n_mel,
@@ -125,17 +351,77 @@ fn load_model(short_name: &str) -> Option<LoadedModel> {
     }
 }
 
+fn jfk_wav_path() -> PathBuf {
+    std::env::var_os("FRANKEN_WHISPER_JFK_WAV")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/native/jfk.wav"
+            ))
+        })
+}
+
+/// Measure the safe resident-model lever for in-process API use.
+///
+/// This targets the loaded-model OpenAI API gap: direct parse+weight conversion
+/// approximates a short-lived caller that drops the model after each request,
+/// while `load_resident` keeps one bounded strong slot and returns an `Arc`
+/// clone on repeat calls. `load_resident_canonical` isolates the remaining
+/// hot-path overhead once an API server has resolved/canonicalized the model
+/// path once during startup.
+fn bench_model_residency_tiny(c: &mut Criterion) {
+    let Some(path) = find_model_file(MODEL_TINY) else {
+        eprintln!("SKIP model_residency_tiny: model {MODEL_TINY} missing");
+        return;
+    };
+    let canonical = path.canonicalize().expect("canonical tiny.en model path");
+
+    let mut group = c.benchmark_group("native_engine/model_residency");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(1));
+
+    group.bench_function("tiny_parse_weights_nonresident", |b| {
+        b.iter(|| {
+            let ggml = GgmlModel::load(black_box(path.as_path())).expect("load ggml tiny.en");
+            let loaded = LoadedModel::from_ggml(ggml).expect("load weights tiny.en");
+            black_box(loaded.hparams.n_vocab)
+        });
+    });
+
+    let resident = NativeWhisperModel::load_resident(&path).expect("resident tiny.en warmup");
+    black_box(resident.loaded().hparams.n_vocab);
+    group.bench_function("tiny_resident_cache_lookup", |b| {
+        b.iter(|| {
+            let model = NativeWhisperModel::load_resident(black_box(path.as_path()))
+                .expect("resident load");
+            black_box(model.loaded().hparams.n_vocab)
+        });
+    });
+
+    group.bench_function("tiny_resident_canonical_lookup", |b| {
+        b.iter(|| {
+            let model = NativeWhisperModel::load_resident_canonical(black_box(canonical.as_path()))
+                .expect("resident canonical load");
+            black_box(model.loaded().hparams.n_vocab)
+        });
+    });
+
+    group.finish();
+}
+
 /// Read the jfk fixture as mono 16 kHz f32, or `None` (with a SKIP) when absent.
 ///
 /// Uses `hound` (a first-class dependency) rather than the crate-private wav
 /// reader so the bench needs no extra visibility widening. The fixture is a
 /// 16 kHz mono i16 WAV (verified); we assert that and normalize to `[-1, 1]`.
 fn load_jfk_samples() -> Option<Vec<f32>> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/native/jfk.wav");
-    let mut reader = match hound::WavReader::open(path) {
+    let path = jfk_wav_path();
+    let mut reader = match hound::WavReader::open(&path) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("SKIP: jfk.wav not readable ({e})");
+            eprintln!("SKIP: jfk.wav not readable at {} ({e})", path.display());
             return None;
         }
     };
@@ -193,6 +479,164 @@ fn bench_mel_30s(c: &mut Criterion) {
         b.iter(|| {
             let m = mel::log_mel(black_box(&audio), black_box(&filters), 8).expect("log_mel");
             black_box(m.n_frames)
+        });
+    });
+
+    group.finish();
+}
+
+/// `mel_30s` over a REALISTIC sparse triangular filterbank — the production case
+/// (real ggml models carry sparse banks). This is the bench where the
+/// sparse-projection lever shows up: with a dense bank (`mel_30s`) the projection
+/// touches all 201 bins per filter; with a real sparse bank only ~5 are nonzero,
+/// so skipping the zeros (bit-exact) removes ~13x of the projection's
+/// multiply-adds. Compare `mel_30s` (dense) vs `mel_30s_realistic` to see the
+/// projection's share of the frontend.
+fn bench_mel_30s_realistic(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native_engine/mel");
+    group.measurement_time(Duration::from_secs(10));
+
+    let audio = synthetic_audio(N_SAMPLES_30S, 0xa11ce);
+    let filters = realistic_mel_filterbank(80);
+
+    group.bench_function("mel_30s_realistic", |b| {
+        b.iter(|| {
+            let m = mel::log_mel(black_box(&audio), black_box(&filters), 8).expect("log_mel");
+            black_box(m.n_frames)
+        });
+    });
+
+    group.finish();
+}
+
+/// Hermetic performance substrate for the native acoustic diarizer.
+///
+/// These measurements intentionally make no accuracy claim: corpus DER/JER is
+/// a separate evidence gate. The duration-labelled feature benches expose
+/// scaling and RTF, while the complete pipeline bench includes streaming
+/// segmentation, enrollment, bounded clustering, smoothing, and projection.
+fn bench_acoustic_diarization(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native_engine/acoustic_diarization");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(250));
+    group.measurement_time(Duration::from_secs(5));
+
+    for seconds in [10_u64, 60] {
+        let samples = synthetic_audio(SAMPLE_RATE * seconds as usize, 0xd1a4_1200 ^ seconds);
+        group.throughput(criterion::Throughput::Elements(samples.len() as u64));
+        group.bench_with_input(
+            criterion::BenchmarkId::new("features", format!("{seconds}s")),
+            &samples,
+            |b, audio| {
+                b.iter(|| {
+                    let summary = extract_acoustic_features(black_box(audio), || false, |_| Ok(()))
+                        .expect("acoustic feature extraction");
+                    black_box(summary)
+                });
+            },
+        );
+    }
+
+    let seconds = 10_u64;
+    let samples = synthetic_audio(SAMPLE_RATE * seconds as usize, 0xd1a4_1200);
+    let request = DiarizationRequest {
+        engine: DiarizationEngine::Acoustic,
+        speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
+        max_prototypes: 64,
+        ..DiarizationRequest::default()
+    };
+    let boundaries = AcousticBoundaryHints {
+        speech_regions_ms: vec![(0, seconds * 1_000)],
+        ..AcousticBoundaryHints::default()
+    };
+    group.throughput(criterion::Throughput::Elements(samples.len() as u64));
+    group.bench_function("pipeline_10s_one_speaker", |b| {
+        b.iter(|| {
+            let output = diarize_acoustic_pcm(
+                AcousticDiarizationInput {
+                    samples: black_box(&samples),
+                    normalized_input_sha256:
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    segments: &[],
+                    word_aligned: false,
+                    request: black_box(&request),
+                    boundary_hints: black_box(&boundaries),
+                },
+                || false,
+            )
+            .expect("native acoustic diarization");
+            black_box(output)
+        });
+    });
+    group.finish();
+}
+
+/// Copy one Whisper encoder window out of a row-major full-mel buffer.
+///
+/// This isolates the decode loop's `mel[:, seek:seek+N_FRAMES]` equivalent:
+/// OpenAI Whisper can hand PyTorch a strided view, while the Rust encoder owns a
+/// compact `[n_mels, n_frames]` buffer and therefore copies/pads the window.
+fn bench_chunk_frames(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native_engine/mel");
+    let n_mel = 80;
+    let n_frames = FRAMES_PER_CHUNK + 1024;
+    let mut lcg = Lcg::new(0xc0ffee);
+    let data: Vec<f32> = (0..n_mel * n_frames).map(|_| lcg.next_f32()).collect();
+    let mel = Mel {
+        n_mel,
+        n_frames,
+        data,
+    };
+
+    group.bench_function("chunk_frames_80x3000_mid", |b| {
+        b.iter(|| {
+            let chunk =
+                mel::chunk_frames(black_box(&mel), black_box(512), black_box(FRAMES_PER_CHUNK));
+            black_box(chunk.data.len())
+        });
+    });
+
+    group.finish();
+}
+
+/// Prepare one encoder window for conv1: old compact-window path vs fused
+/// slice+transpose. This targets the OpenAI view/copy gap recorded for
+/// `chunk_frames`: the encoder ultimately needs time-major data, so avoiding
+/// the intermediate compact mel-major window is the smallest in-crate
+/// zero-copy-style lever.
+fn bench_window_to_time_major(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native_engine/mel");
+    let n_mel = 80;
+    let n_frames = FRAMES_PER_CHUNK + 1024;
+    let mut lcg = Lcg::new(0xc0ffee);
+    let data: Vec<f32> = (0..n_mel * n_frames).map(|_| lcg.next_f32()).collect();
+    let mel = Mel {
+        n_mel,
+        n_frames,
+        data,
+    };
+    let offset = 512;
+
+    group.bench_function("window_to_time_major_old_chunk_then_transpose", |b| {
+        b.iter(|| {
+            let chunk = mel::chunk_frames(
+                black_box(&mel),
+                black_box(offset),
+                black_box(FRAMES_PER_CHUNK),
+            );
+            let time_major = encoder::time_major_mel_window(black_box(&chunk));
+            black_box(time_major.data.len())
+        });
+    });
+
+    group.bench_function("window_to_time_major_fused", |b| {
+        b.iter(|| {
+            let time_major = encoder::time_major_mel_window_from_full_mel(
+                black_box(&mel),
+                black_box(offset),
+                black_box(FRAMES_PER_CHUNK),
+            );
+            black_box(time_major.data.len())
         });
     });
 
@@ -309,6 +753,328 @@ fn bench_decoder_token_step_large(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. self-attention packed K — same-binary, interleaved BASE/candidate A/B
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct PairedRatioStats {
+    median: f64,
+    p10: f64,
+    p90: f64,
+    min: f64,
+    max: f64,
+    cv_pct: f64,
+    wins: usize,
+}
+
+fn paired_ratio_stats(ratios: &[f64]) -> PairedRatioStats {
+    assert!(!ratios.is_empty());
+    let mut sorted = ratios.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let nearest_rank = |percent: usize| {
+        let index = (sorted.len() * percent).div_ceil(100).saturating_sub(1);
+        sorted[index.min(sorted.len() - 1)]
+    };
+    let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    let variance = if ratios.len() > 1 {
+        ratios
+            .iter()
+            .map(|ratio| (ratio - mean).powi(2))
+            .sum::<f64>()
+            / (ratios.len() - 1) as f64
+    } else {
+        0.0
+    };
+    PairedRatioStats {
+        median: sorted[sorted.len() / 2],
+        p10: nearest_rank(10),
+        p90: nearest_rank(90),
+        min: sorted[0],
+        max: sorted[sorted.len() - 1],
+        cv_pct: variance.sqrt() / mean * 100.0,
+        wins: ratios.iter().filter(|&&ratio| ratio > 1.0).count(),
+    }
+}
+
+fn format_ratios(ratios: &[f64]) -> String {
+    ratios
+        .iter()
+        .map(|ratio| format!("{ratio:.6}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn measure_self_attn_arm(
+    cache: &mut franken_whisper::native_engine::nn::KvCache,
+    q: &Mat,
+    k_new: &Mat,
+    v_new: &Mat,
+    n_head: usize,
+    prefill: usize,
+    inner_steps: usize,
+) -> Duration {
+    use franken_whisper::native_engine::nn::attention_with_cache;
+
+    let started = Instant::now();
+    for _ in 0..inner_steps {
+        let output = attention_with_cache(
+            black_box(q),
+            black_box(k_new),
+            black_box(v_new),
+            black_box(n_head),
+            black_box(&mut *cache),
+        )
+        .expect("self-attention step");
+        black_box(output.data.as_slice());
+        cache.truncate_for_bench(prefill);
+    }
+    started.elapsed()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paired_self_attn_ratios(
+    first: &mut franken_whisper::native_engine::nn::KvCache,
+    second: &mut franken_whisper::native_engine::nn::KvCache,
+    q: &Mat,
+    k_new: &Mat,
+    v_new: &Mat,
+    n_head: usize,
+    prefill: usize,
+    inner_steps: usize,
+    repetitions: usize,
+) -> Vec<f64> {
+    let measure = |cache: &mut franken_whisper::native_engine::nn::KvCache| {
+        measure_self_attn_arm(cache, q, k_new, v_new, n_head, prefill, inner_steps)
+    };
+    let mut ratios = Vec::with_capacity(repetitions);
+    for repetition in 0..repetitions {
+        let (first_elapsed, second_elapsed) = if repetition % 2 == 0 {
+            let first_before = measure(first);
+            let second_before = measure(second);
+            let second_after = measure(second);
+            let first_after = measure(first);
+            (first_before + first_after, second_before + second_after)
+        } else {
+            let second_before = measure(second);
+            let first_before = measure(first);
+            let first_after = measure(first);
+            let second_after = measure(second);
+            (first_before + first_after, second_before + second_after)
+        };
+        ratios.push(first_elapsed.as_secs_f64() / second_elapsed.as_secs_f64());
+    }
+    ratios
+}
+
+fn bench_self_attn_column_keys(c: &mut Criterion) {
+    use franken_whisper::native_engine::nn::{KvCache, attention_with_cache};
+
+    // large-v3-turbo decoder geometry: d_model=1280, 20 heads, 448-token text
+    // context. The last-token case maximizes the live score loop without using
+    // a private replica of the production function.
+    const N_STATE: usize = 1280;
+    const N_HEAD: usize = 20;
+    const CAPACITY: usize = 448;
+    const PREFILL: usize = CAPACITY - 1;
+    const INNER_STEPS: usize = 16;
+    const WARMUP_REPS: usize = 3;
+    const PAIRED_REPS: usize = 31;
+
+    let mut lcg = Lcg::new(0xc011_0a7e);
+    let prefill_k = Mat::from_vec(
+        PREFILL,
+        N_STATE,
+        (0..PREFILL * N_STATE)
+            .map(|_| 0.1 * lcg.next_f32())
+            .collect(),
+    );
+    let prefill_v = Mat::from_vec(
+        PREFILL,
+        N_STATE,
+        (0..PREFILL * N_STATE)
+            .map(|_| 0.1 * lcg.next_f32())
+            .collect(),
+    );
+    let q = Mat::from_vec(
+        1,
+        N_STATE,
+        (0..N_STATE).map(|_| 0.1 * lcg.next_f32()).collect(),
+    );
+    let k_new = Mat::from_vec(
+        1,
+        N_STATE,
+        (0..N_STATE).map(|_| 0.1 * lcg.next_f32()).collect(),
+    );
+    let v_new = Mat::from_vec(
+        1,
+        N_STATE,
+        (0..N_STATE).map(|_| 0.1 * lcg.next_f32()).collect(),
+    );
+
+    let prefill = |cache: &mut KvCache| {
+        cache
+            .append(black_box(&prefill_k), black_box(&prefill_v))
+            .expect("prefill self-attention cache");
+    };
+    let mut null_first = KvCache::new_row_major_keys_for_bench(CAPACITY, N_STATE);
+    let mut null_second = KvCache::new_row_major_keys_for_bench(CAPACITY, N_STATE);
+    let mut original = KvCache::new_row_major_keys_for_bench(CAPACITY, N_STATE);
+    let mut candidate = KvCache::new_column_major_keys_for_bench(CAPACITY, N_STATE);
+    prefill(&mut null_first);
+    prefill(&mut null_second);
+    prefill(&mut original);
+    prefill(&mut candidate);
+
+    // Establish the per-function timing floor first. BASE/BASE uses distinct,
+    // identically populated caches and the same ABBA routine as BASE/candidate.
+    black_box(paired_self_attn_ratios(
+        &mut null_first,
+        &mut null_second,
+        &q,
+        &k_new,
+        &v_new,
+        N_HEAD,
+        PREFILL,
+        INNER_STEPS,
+        WARMUP_REPS,
+    ));
+    let null_ratios = paired_self_attn_ratios(
+        &mut null_first,
+        &mut null_second,
+        &q,
+        &k_new,
+        &v_new,
+        N_HEAD,
+        PREFILL,
+        INNER_STEPS,
+        PAIRED_REPS,
+    );
+    let null_stats = paired_ratio_stats(&null_ratios);
+    let (null_ci_low, null_ci_high) = sdpa_bootstrap_median_ci(&null_ratios);
+    let null_half_width = (1.0 - null_ci_low).abs().max((null_ci_high - 1.0).abs());
+    let required_speedup = 1.0 + 2.0 * null_half_width;
+    eprintln!(
+        "SELF_K_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} min={:.6} \
+         max={:.6} median_ci95=[{null_ci_low:.6},{null_ci_high:.6}] cv_pct={:.3} \
+         wins={}/{} cv_is_provenance_only=true",
+        format_ratios(&null_ratios),
+        null_stats.median,
+        null_stats.p10,
+        null_stats.p90,
+        null_stats.min,
+        null_stats.max,
+        null_stats.cv_pct,
+        null_stats.wins,
+        PAIRED_REPS,
+    );
+
+    // Correctness is checked through the real public path before candidate
+    // timing. Both complete 1280-float outputs must match bit-for-bit.
+    let original_out = attention_with_cache(
+        black_box(&q),
+        black_box(&k_new),
+        black_box(&v_new),
+        black_box(N_HEAD),
+        black_box(&mut original),
+    )
+    .expect("original self-attention step");
+    original.truncate_for_bench(PREFILL);
+    let candidate_out = attention_with_cache(
+        black_box(&q),
+        black_box(&k_new),
+        black_box(&v_new),
+        black_box(N_HEAD),
+        black_box(&mut candidate),
+    )
+    .expect("candidate self-attention step");
+    candidate.truncate_for_bench(PREFILL);
+    assert_eq!(
+        original_out
+            .data
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        candidate_out
+            .data
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        "packed K layout changed turbo-shaped attention output"
+    );
+    black_box(original_out.data.as_slice());
+    black_box(candidate_out.data.as_slice());
+
+    black_box(paired_self_attn_ratios(
+        &mut original,
+        &mut candidate,
+        &q,
+        &k_new,
+        &v_new,
+        N_HEAD,
+        PREFILL,
+        INNER_STEPS,
+        WARMUP_REPS,
+    ));
+    let candidate_ratios = paired_self_attn_ratios(
+        &mut original,
+        &mut candidate,
+        &q,
+        &k_new,
+        &v_new,
+        N_HEAD,
+        PREFILL,
+        INNER_STEPS,
+        PAIRED_REPS,
+    );
+    let candidate_stats = paired_ratio_stats(&candidate_ratios);
+    let (candidate_ci_low, candidate_ci_high) = sdpa_bootstrap_median_ci(&candidate_ratios);
+    let verdict = if candidate_stats.median >= required_speedup {
+        "KEEP"
+    } else {
+        "REJECT"
+    };
+    eprintln!(
+        "SELF_K_CANDIDATE reach=attention_with_cache parity=bit_exact ratios=[{}] \
+         median={:.6} p10={:.6} p90={:.6} min={:.6} max={:.6} \
+         median_ci95=[{candidate_ci_low:.6},{candidate_ci_high:.6}] cv_pct={:.3} \
+         wins={}/{} gate=median_vs_null_ci95_2x_margin null_half_width={null_half_width:.6} \
+         required_speedup={required_speedup:.6} cv_is_provenance_only=true verdict={verdict}",
+        format_ratios(&candidate_ratios),
+        candidate_stats.median,
+        candidate_stats.p10,
+        candidate_stats.p90,
+        candidate_stats.min,
+        candidate_stats.max,
+        candidate_stats.cv_pct,
+        candidate_stats.wins,
+        PAIRED_REPS,
+    );
+
+    // These are profiler-reachability loops only, not A/B evidence. The valid
+    // comparison above is interleaved in one routine; these two labels merely
+    // give perf enough samples to verify both production symbols are live.
+    let mut group = c.benchmark_group("native_engine/self_attn_k_layout");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("profile_only_orig_row_major", |b| {
+        b.iter(|| {
+            let elapsed =
+                measure_self_attn_arm(&mut original, &q, &k_new, &v_new, N_HEAD, PREFILL, 1);
+            black_box(elapsed);
+        });
+    });
+    group.bench_function("profile_only_candidate_column_major", |b| {
+        b.iter(|| {
+            let elapsed =
+                measure_self_attn_arm(&mut candidate, &q, &k_new, &v_new, N_HEAD, PREFILL, 1);
+            black_box(elapsed);
+        });
+    });
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // 4. logits_gemv_large — the [n_vocab, n_state] tied output projection
 // ---------------------------------------------------------------------------
 
@@ -389,6 +1155,93 @@ fn bench_e2e_tiny_jfk(c: &mut Criterion) {
     group.finish();
 }
 
+// 5a. e2e_tiny_jfk_no_timestamps — same loaded-model tiny JFK path with
+// timestamp-token segmentation disabled. This mirrors the large head-to-head
+// bench mode and isolates the cost of the timestamped decode policy.
+fn bench_e2e_tiny_jfk_no_timestamps(c: &mut Criterion) {
+    let Some(path) = find_model_file(MODEL_TINY) else {
+        eprintln!("SKIP e2e_tiny_jfk_no_timestamps: model {MODEL_TINY} missing");
+        return;
+    };
+    let Some(samples) = load_jfk_samples() else {
+        eprintln!("SKIP e2e_tiny_jfk_no_timestamps: jfk.wav missing");
+        return;
+    };
+    let model = match NativeWhisperModel::load(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("SKIP e2e_tiny_jfk_no_timestamps: model load failed: {e}");
+            return;
+        }
+    };
+    let params = DecodeParams {
+        language: None,
+        translate: false,
+        timestamps: false,
+        n_threads: 8,
+        ..DecodeParams::default()
+    };
+    let noop = || Ok(());
+
+    let mut group = c.benchmark_group("native_engine/e2e");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    group.bench_function("e2e_tiny_jfk_no_timestamps", |b| {
+        b.iter(|| {
+            let out = model
+                .transcribe(black_box(&samples), &params, &noop)
+                .expect("transcribe");
+            black_box(out.segments.len())
+        });
+    });
+
+    group.finish();
+}
+
+// 5b. e2e_large_jfk — full transcribe over jfk with large-v3-turbo. No word
+// timestamps (matches whisper.cpp `dtw=0`) for an apples-to-apples head-to-head.
+fn bench_e2e_large_jfk(c: &mut Criterion) {
+    let Some(path) = find_model_file(MODEL_LARGE) else {
+        eprintln!("SKIP e2e_large_jfk: model {MODEL_LARGE} missing");
+        return;
+    };
+    let Some(samples) = load_jfk_samples() else {
+        eprintln!("SKIP e2e_large_jfk: jfk.wav missing");
+        return;
+    };
+    let model = match NativeWhisperModel::load(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("SKIP e2e_large_jfk: model load failed: {e}");
+            return;
+        }
+    };
+    let params = DecodeParams {
+        language: None,
+        translate: false,
+        timestamps: false,
+        n_threads: 8,
+        ..DecodeParams::default()
+    };
+    let noop = || Ok(());
+
+    let mut group = c.benchmark_group("native_engine/e2e");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(90));
+
+    group.bench_function("e2e_large_jfk", |b| {
+        b.iter(|| {
+            let out = model
+                .transcribe(black_box(&samples), &params, &noop)
+                .expect("transcribe");
+            black_box(out.segments.len())
+        });
+    });
+
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // 6. f16_gemv_dequant — isolated f16-resident GEMV (dequant + dot) throughput.
 //     Direct instrument for the pass-3 vectorizable-dequant lever: a single
@@ -450,7 +1303,1129 @@ fn bench_f16_gemv_dequant(c: &mut Criterion) {
         });
     }
 
+    // BATCHED f16 gemv (tq>1, the compute-bound path used by cross-KV precompute
+    // and prompt processing). cross-KV shape for large: tq=1500 enc frames,
+    // out=inp=1280. ~2.4 GFLOP — the `FW_BATCH_GEMV_CAP` worker-count lever shows
+    // up here (m=1 dispatch-bound cap8 vs compute-bound scaling).
+    {
+        let (tq, out, inp) = (1500usize, 1280usize, 1280usize);
+        let w = f16_normal_weight(out, inp);
+        let x: Vec<f32> = (0..tq * inp).map(|i| (i as f32 * 0.0001).sin()).collect();
+        let mut out_buf = vec![0.0f32; tq * out];
+        group.throughput(criterion::Throughput::Elements((tq * out * inp) as u64));
+        group.bench_function("f16_gemv_batch_1500x1280x1280", |b| {
+            b.iter(|| {
+                nn::gemv_f16_batch(
+                    black_box(&w),
+                    out,
+                    inp,
+                    black_box(&x),
+                    tq,
+                    None,
+                    &mut out_buf,
+                );
+                black_box(out_buf[0])
+            });
+        });
+    }
+
     group.finish();
+}
+
+fn synthetic_mat(rows: usize, cols: usize, seed: u64) -> Mat {
+    let mut lcg = Lcg::new(seed);
+    Mat::from_vec(
+        rows,
+        cols,
+        (0..rows * cols).map(|_| lcg.next_f32()).collect(),
+    )
+}
+
+fn synthetic_vec(n: usize, seed: u64) -> Vec<f32> {
+    let mut lcg = Lcg::new(seed);
+    (0..n).map(|_| lcg.next_f32()).collect()
+}
+
+fn bench_i7_qkv_activation_reuse(c: &mut Criterion) {
+    use franken_whisper::native_engine::nn;
+
+    let h = synthetic_mat(1500, 1280, 0x51);
+    let wq = nn::quantize_mat_to_i7(&synthetic_mat(1280, 1280, 0x52));
+    let wk = nn::quantize_mat_to_i7(&synthetic_mat(1280, 1280, 0x53));
+    let wv = nn::quantize_mat_to_i7(&synthetic_mat(1280, 1280, 0x54));
+    let bq = synthetic_vec(1280, 0x55);
+    let bv = synthetic_vec(1280, 0x56);
+
+    let mut group = c.benchmark_group("native_engine/i7_qkv");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(2));
+
+    group.bench_function("three_inline_quantize_1500x1280", |b| {
+        b.iter(|| {
+            let q =
+                nn::matmul_bias_i7(black_box(&h), black_box(&wq), Some(black_box(&bq))).expect("q");
+            let k = nn::matmul_bias_i7(black_box(&h), black_box(&wk), None).expect("k");
+            let v =
+                nn::matmul_bias_i7(black_box(&h), black_box(&wv), Some(black_box(&bv))).expect("v");
+            black_box(q.data[0] + k.data[1] + v.data[2])
+        });
+    });
+
+    group.bench_function("shared_activation_1500x1280", |b| {
+        b.iter(|| {
+            let hq = nn::quantize_act_i7(black_box(&h));
+            let q =
+                nn::matmul_bias_i7_quantized(&hq, black_box(&wq), Some(black_box(&bq))).expect("q");
+            let k = nn::matmul_bias_i7_quantized(&hq, black_box(&wk), None).expect("k");
+            let v =
+                nn::matmul_bias_i7_quantized(&hq, black_box(&wv), Some(black_box(&bv))).expect("v");
+            black_box(q.data[0] + k.data[1] + v.data[2])
+        });
+    });
+
+    let hq = nn::quantize_act_i7(&h);
+    group.bench_function("headmajor_attention_1500x1280", |b| {
+        b.iter(|| {
+            let attn = nn::attention_from_i7_qkv(
+                black_box(&hq),
+                black_box(&wq),
+                Some(black_box(&bq)),
+                black_box(&wk),
+                None,
+                black_box(&wv),
+                Some(black_box(&bv)),
+                black_box(20),
+            )
+            .expect("headmajor qkv attention");
+            black_box(attn.data[0])
+        });
+    });
+
+    group.finish();
+}
+
+/// Reconstruct the reverted i7 bias-specialization candidate faithfully:
+/// current production const-specializes bias presence, while the retained
+/// baseline executes the historical runtime `Option` branches. Both arms call
+/// the real turbo-shaped Q/K/V projection body in one self-hashing ELF.
+fn bench_i7_bias_specialization_resurrection(_c: &mut Criterion) {
+    if std::env::args().nth(1).is_some_and(|filter| {
+        !filter.starts_with('-') && !filter.contains("i7_bias_specialization_resurrection")
+    }) {
+        return;
+    }
+
+    use franken_whisper::native_engine::nn;
+
+    #[derive(Clone, Copy)]
+    enum Arm {
+        Historical,
+        Specialized,
+    }
+
+    fn project(
+        arm: Arm,
+        activation: &nn::I7Activation,
+        weight: &nn::I7Mat,
+        bias: Option<&[f32]>,
+    ) -> Mat {
+        match arm {
+            Arm::Historical => nn::matmul_bias_i7_quantized_unspecialized(activation, weight, bias),
+            Arm::Specialized => {
+                nn::matmul_bias_i7_quantized_specialized_ab(activation, weight, bias)
+            }
+        }
+        .expect("turbo-shaped i7 projection")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_qkv(
+        arm: Arm,
+        activation: &nn::I7Activation,
+        q_weight: &nn::I7Mat,
+        k_weight: &nn::I7Mat,
+        v_weight: &nn::I7Mat,
+        q_bias: &[f32],
+        v_bias: &[f32],
+    ) -> [Mat; 3] {
+        [
+            project(arm, activation, q_weight, Some(q_bias)),
+            project(arm, activation, k_weight, None),
+            project(arm, activation, v_weight, Some(v_bias)),
+        ]
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn min_ns_per_qkv(
+        arm: Arm,
+        repetitions: usize,
+        activation: &nn::I7Activation,
+        q_weight: &nn::I7Mat,
+        k_weight: &nn::I7Mat,
+        v_weight: &nn::I7Mat,
+        q_bias: &[f32],
+        v_bias: &[f32],
+        thread_observation: &mut NativeBenchThreadObservation,
+    ) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..SDPA_HARNESS_MIN_OF {
+            let before = native_bench_thread_ticks();
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for _ in 0..repetitions {
+                let outputs = run_qkv(
+                    arm, activation, q_weight, k_weight, v_weight, q_bias, v_bias,
+                );
+                checksum ^= outputs
+                    .iter()
+                    .map(|output| {
+                        u64::from(output.data[0].to_bits())
+                            ^ u64::from(output.data[output.data.len() - 1].to_bits())
+                    })
+                    .fold(0_u64, u64::wrapping_add);
+                black_box(outputs);
+            }
+            let elapsed = started.elapsed().as_nanos() as f64 / repetitions as f64;
+            let after = native_bench_thread_ticks();
+            thread_observation.observe(&before, &after);
+            black_box(checksum);
+            best = best.min(elapsed);
+        }
+        best
+    }
+
+    let activation_source = synthetic_mat(1_500, 1_280, 0xb1a5);
+    let activation = nn::quantize_act_i7(&activation_source);
+    let q_weight = nn::quantize_mat_to_i7(&synthetic_mat(1_280, 1_280, 0xb1a6));
+    let k_weight = nn::quantize_mat_to_i7(&synthetic_mat(1_280, 1_280, 0xb1a7));
+    let v_weight = nn::quantize_mat_to_i7(&synthetic_mat(1_280, 1_280, 0xb1a8));
+    let q_bias = synthetic_vec(1_280, 0xb1a9);
+    let v_bias = synthetic_vec(1_280, 0xb1aa);
+
+    let historical = run_qkv(
+        Arm::Historical,
+        &activation,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &q_bias,
+        &v_bias,
+    );
+    let specialized = run_qkv(
+        Arm::Specialized,
+        &activation,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &q_bias,
+        &v_bias,
+    );
+    assert!(
+        historical
+            .iter()
+            .zip(&specialized)
+            .all(|(baseline, candidate)| baseline
+                .data
+                .iter()
+                .zip(&candidate.data)
+                .all(|(left, right)| left.to_bits() == right.to_bits())),
+        "const-specialized Q/K/V must match the historical runtime-Option body bit-for-bit"
+    );
+    let mut parity_hasher = Sha256::new();
+    for output in &historical {
+        for value in &output.data {
+            parity_hasher.update(value.to_bits().to_le_bytes());
+        }
+    }
+    println!(
+        "I7_BIAS_PARITY shape=1500x1280x1280 projections=3 bias_pattern=some/none/some \
+         output_f32={} sha256={:x}",
+        historical
+            .iter()
+            .map(|output| output.data.len())
+            .sum::<usize>(),
+        parity_hasher.finalize()
+    );
+    println!(
+        "I7_BIAS_HOST {} governors={} loadavg_before={}",
+        native_bench_host_identity(),
+        native_bench_governor_summary(),
+        std::fs::read_to_string("/proc/loadavg")
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|_| "unavailable".to_owned())
+    );
+    println!(
+        "I7_BIAS_PROFILE retained_current_production_self_time_pct=14.34 \
+         attribution_source=docs/PERF_LEDGER.md"
+    );
+
+    let probe_started = Instant::now();
+    black_box(run_qkv(
+        Arm::Historical,
+        &activation,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &q_bias,
+        &v_bias,
+    ));
+    let probe_ns = probe_started.elapsed().as_nanos().max(1);
+    let repetitions =
+        usize::try_from((100_000_000_u128 / probe_ns).clamp(1, 16)).expect("bounded repetitions");
+
+    let mut thread_observation = NativeBenchThreadObservation::default();
+    let mut null_ratios = Vec::with_capacity(SDPA_HARNESS_PAIRS);
+    for pair in 0..SDPA_HARNESS_PAIRS {
+        let (left, right) = if pair.is_multiple_of(2) {
+            (
+                min_ns_per_qkv(
+                    Arm::Historical,
+                    repetitions,
+                    &activation,
+                    &q_weight,
+                    &k_weight,
+                    &v_weight,
+                    &q_bias,
+                    &v_bias,
+                    &mut thread_observation,
+                ),
+                min_ns_per_qkv(
+                    Arm::Historical,
+                    repetitions,
+                    &activation,
+                    &q_weight,
+                    &k_weight,
+                    &v_weight,
+                    &q_bias,
+                    &v_bias,
+                    &mut thread_observation,
+                ),
+            )
+        } else {
+            let right = min_ns_per_qkv(
+                Arm::Historical,
+                repetitions,
+                &activation,
+                &q_weight,
+                &k_weight,
+                &v_weight,
+                &q_bias,
+                &v_bias,
+                &mut thread_observation,
+            );
+            let left = min_ns_per_qkv(
+                Arm::Historical,
+                repetitions,
+                &activation,
+                &q_weight,
+                &k_weight,
+                &v_weight,
+                &q_bias,
+                &v_bias,
+                &mut thread_observation,
+            );
+            (left, right)
+        };
+        null_ratios.push(left / right.max(f64::MIN_POSITIVE));
+    }
+
+    let mut candidate_ratios = Vec::with_capacity(SDPA_HARNESS_PAIRS);
+    for pair in 0..SDPA_HARNESS_PAIRS {
+        let (baseline, candidate) = if pair.is_multiple_of(2) {
+            (
+                min_ns_per_qkv(
+                    Arm::Historical,
+                    repetitions,
+                    &activation,
+                    &q_weight,
+                    &k_weight,
+                    &v_weight,
+                    &q_bias,
+                    &v_bias,
+                    &mut thread_observation,
+                ),
+                min_ns_per_qkv(
+                    Arm::Specialized,
+                    repetitions,
+                    &activation,
+                    &q_weight,
+                    &k_weight,
+                    &v_weight,
+                    &q_bias,
+                    &v_bias,
+                    &mut thread_observation,
+                ),
+            )
+        } else {
+            let candidate = min_ns_per_qkv(
+                Arm::Specialized,
+                repetitions,
+                &activation,
+                &q_weight,
+                &k_weight,
+                &v_weight,
+                &q_bias,
+                &v_bias,
+                &mut thread_observation,
+            );
+            let baseline = min_ns_per_qkv(
+                Arm::Historical,
+                repetitions,
+                &activation,
+                &q_weight,
+                &k_weight,
+                &v_weight,
+                &q_bias,
+                &v_bias,
+                &mut thread_observation,
+            );
+            (baseline, candidate)
+        };
+        candidate_ratios.push(baseline / candidate.max(f64::MIN_POSITIVE));
+    }
+
+    let (null_ci_low, null_ci_high) = sdpa_bootstrap_median_ci(&null_ratios);
+    let (candidate_ci_low, candidate_ci_high) = sdpa_bootstrap_median_ci(&candidate_ratios);
+    let null_half_width = (1.0 - null_ci_low).abs().max((null_ci_high - 1.0).abs());
+    let required_speedup = 1.0 + 2.0 * null_half_width;
+    let candidate_median = sdpa_harness_percentile(&candidate_ratios, 50);
+    let keep = candidate_median > required_speedup && candidate_ci_low > 1.0;
+    println!(
+        "I7_BIAS_NULL ratios={null_ratios:?} median={:.6} \
+         median_ci95=[{null_ci_low:.6},{null_ci_high:.6}] cv={:.6}",
+        sdpa_harness_percentile(&null_ratios, 50),
+        sdpa_harness_cv(&null_ratios)
+    );
+    println!(
+        "I7_BIAS_CANDIDATE ratios={candidate_ratios:?} median={candidate_median:.6} \
+         median_ci95=[{candidate_ci_low:.6},{candidate_ci_high:.6}] cv={:.6} wins={}/{}",
+        sdpa_harness_cv(&candidate_ratios),
+        candidate_ratios
+            .iter()
+            .filter(|ratio| **ratio > 1.0)
+            .count(),
+        SDPA_HARNESS_PAIRS
+    );
+    println!(
+        "I7_BIAS_THREADS configured={} observed_active_union={} \
+         observed_active_max_per_arm={} peak_process_threads={} \
+         observed_source=proc_self_task_cpu_ticks",
+        rayon::current_num_threads(),
+        thread_observation.active_tids.len(),
+        thread_observation.max_active_per_arm,
+        thread_observation.peak_process_threads
+    );
+    println!(
+        "I7_BIAS_GATE method=median_vs_null_ci95_2x_margin \
+         null_ci_straddle_required=false null_half_width={null_half_width:.6} \
+         required_speedup={required_speedup:.6} candidate_median={candidate_median:.6} \
+         candidate_ci95=[{candidate_ci_low:.6},{candidate_ci_high:.6}] \
+         median_clause_clear={} effect_ci_excludes_one={} \
+         cv_is_provenance_only=true verdict={} loadavg_after={}",
+        candidate_median > required_speedup,
+        candidate_ci_low > 1.0,
+        if keep { "KEEP" } else { "REJECT" },
+        std::fs::read_to_string("/proc/loadavg")
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|_| "unavailable".to_owned())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. layer_norm — vertical-SIMD per-row normalization (hermetic).
+//     Direct instrument for the L5 lever: one encoder-window-shaped
+//     `[1500, 384]` layer-norm. No model needed.
+// ---------------------------------------------------------------------------
+
+fn bench_layer_norm(c: &mut Criterion) {
+    use franken_whisper::native_engine::nn;
+
+    let (rows, cols) = (1500usize, 384usize); // a full tiny.en encoder window
+    let mut lcg = Lcg::new(0x1a4e_7c0d);
+    let w: Vec<f32> = (0..cols).map(|_| lcg.next_f32() * 0.5 + 1.0).collect();
+    let b: Vec<f32> = (0..cols).map(|_| lcg.next_f32() * 0.1).collect();
+    let base: Vec<f32> = (0..rows * cols).map(|_| lcg.next_f32()).collect();
+
+    let mut group = c.benchmark_group("native_engine/layer_norm");
+    group.throughput(criterion::Throughput::Elements((rows * cols) as u64));
+    group.bench_function("layer_norm_1500x384", |bch| {
+        bch.iter_batched_ref(
+            || Mat::from_vec(rows, cols, base.clone()),
+            |m| {
+                nn::layer_norm(m, &w, &b, 1e-5);
+                black_box(m.data[0])
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+/// GELU over a tiny.en-large encoder MLP hidden activation ([1500, 1536]).
+/// No model needed — runs everywhere.
+fn bench_gelu(c: &mut Criterion) {
+    use franken_whisper::native_engine::nn;
+
+    let (rows, cols) = (1500usize, 1536usize);
+    let mut lcg = Lcg::new(0x9e1c_0e1f);
+    let base: Vec<f32> = (0..rows * cols)
+        .map(|_| lcg.next_f32() * 6.0 - 3.0)
+        .collect();
+
+    let mut group = c.benchmark_group("native_engine/gelu");
+    group.throughput(criterion::Throughput::Elements((rows * cols) as u64));
+    group.bench_function("gelu_1500x1536", |bch| {
+        bch.iter_batched_ref(
+            || Mat::from_vec(rows, cols, base.clone()),
+            |m| {
+                nn::gelu(m);
+                black_box(m.data[0])
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+/// Linear resampler: 30 s of 44.1 kHz mono → 16 kHz (the most common decode-path
+/// resample; 16 kHz inputs skip it entirely). No model needed — runs everywhere.
+fn bench_resample(c: &mut Criterion) {
+    use franken_whisper::audio::resample_mono_linear;
+
+    let src_rate = 44_100u32;
+    let dst_rate = 16_000u32;
+    let input = synthetic_audio((src_rate as usize) * 30, 0x5e5a_3b1c);
+
+    let mut group = c.benchmark_group("native_engine/resample");
+    group.throughput(criterion::Throughput::Elements(input.len() as u64));
+    group.bench_function("resample_44k_to_16k_30s", |bch| {
+        bch.iter(|| {
+            let out =
+                resample_mono_linear(black_box(&input), black_box(src_rate), black_box(dst_rate));
+            black_box(out.len())
+        });
+    });
+
+    group.finish();
+}
+
+/// Stereo → mono downmix of 30 s of interleaved 44.1 kHz audio (the decode-path
+/// channel average). No model needed — runs everywhere.
+fn bench_downmix(c: &mut Criterion) {
+    use franken_whisper::audio::downmix_to_mono;
+
+    let frames = 44_100usize * 30;
+    let interleaved = synthetic_audio(frames * 2, 0x0d03_3a17);
+
+    let mut group = c.benchmark_group("native_engine/downmix");
+    group.throughput(criterion::Throughput::Elements(interleaved.len() as u64));
+    group.bench_function("downmix_stereo_30s", |bch| {
+        bch.iter(|| {
+            let out = downmix_to_mono(black_box(&interleaved), black_box(2));
+            black_box(out.len())
+        });
+    });
+
+    group.finish();
+}
+
+fn legacy_clean_then_downmix_append(
+    destination: &mut Vec<f32>,
+    interleaved: &[f32],
+    channels: usize,
+) {
+    use franken_whisper::audio::downmix_to_mono;
+
+    let clean: Vec<f32> = interleaved
+        .iter()
+        .map(|&sample| if sample.is_finite() { sample } else { 0.0 })
+        .collect();
+    if channels <= 1 {
+        destination.extend_from_slice(&clean);
+    } else {
+        destination.extend_from_slice(&downmix_to_mono(&clean, channels));
+    }
+}
+
+/// Decoded-packet ingestion path: sanitize IEEE-float PCM and downmix 30 s of
+/// stereo 44.1 kHz audio before resampling. No model needed — runs everywhere.
+fn bench_sanitize_downmix(c: &mut Criterion) {
+    use franken_whisper::audio::append_sanitized_downmix_to_mono;
+
+    let frames = 44_100usize * 30;
+    let interleaved = synthetic_audio(frames * 2, 0x35aa_51d7);
+
+    let mut group = c.benchmark_group("native_engine/sanitize_downmix");
+    group.throughput(criterion::Throughput::Elements(interleaved.len() as u64));
+    group.bench_function("legacy_clean_then_downmix_stereo_30s", |bch| {
+        bch.iter_batched_ref(
+            || Vec::with_capacity(frames),
+            |out| {
+                legacy_clean_then_downmix_append(out, black_box(&interleaved), black_box(2));
+                black_box(out.len())
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("fused_append_stereo_30s", |bch| {
+        bch.iter_batched_ref(
+            || Vec::with_capacity(frames),
+            |out| {
+                append_sanitized_downmix_to_mono(out, black_box(&interleaved), black_box(2));
+                black_box(out.len())
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer construction (hermetic, real Whisper vocabulary cardinality)
+// ---------------------------------------------------------------------------
+
+#[rustfmt::skip]
+const TOKENIZER_SUPPRESS_SYMBOLS: &[&str] = &[
+    "\"", "#", "(", ")", "*", "+", "/", ":", ";", "<", "=", ">", "@", "[", "\\", "]", "^",
+    "_", "`", "{", "|", "}", "~", "「", "」", "『", "』", "<<", ">>", "<<<", ">>>", "--",
+    "---", "-(", "-[", "('", "(\"", "((", "))", "(((", ")))", "[[", "]]", "{{", "}}", "♪♪",
+    "♪♪♪", "♩", "♪", "♫", "♬", "♭", "♮", "♯",
+];
+
+fn tokenizer_suppress_patterns() -> Vec<Vec<u8>> {
+    let mut patterns = Vec::with_capacity(TOKENIZER_SUPPRESS_SYMBOLS.len() * 2 + 2);
+    for symbol in TOKENIZER_SUPPRESS_SYMBOLS {
+        patterns.push(symbol.as_bytes().to_vec());
+        let mut prefixed = Vec::with_capacity(symbol.len() + 1);
+        prefixed.push(b' ');
+        prefixed.extend_from_slice(symbol.as_bytes());
+        patterns.push(prefixed);
+    }
+    patterns.push(b" -".to_vec());
+    patterns.push(b" '".to_vec());
+    patterns
+}
+
+fn tokenizer_bench_vocab() -> Vec<Vec<u8>> {
+    // ggml tiny.en / large-v3-turbo files store 50,257 base tokens; the
+    // remaining declared ids are synthesized control/timestamp tokens.
+    const N_FILE_TOKENS: usize = 50_257;
+    let mut vocab: Vec<Vec<u8>> = (0..N_FILE_TOKENS)
+        .map(|id| format!("token-{id:05}").into_bytes())
+        .collect();
+    let patterns = tokenizer_suppress_patterns();
+    let stride = N_FILE_TOKENS / (patterns.len() + 1);
+    for (index, pattern) in patterns.into_iter().enumerate() {
+        vocab[(index + 1) * stride] = pattern;
+    }
+    vocab
+}
+
+fn tokenizer_prefilter_bench_vocab() -> Vec<Vec<u8>> {
+    let mut vocab = tokenizer_bench_vocab();
+    let patterns: HashSet<Vec<u8>> = tokenizer_suppress_patterns().into_iter().collect();
+    // Profiled from the on-box ggml-tiny.en vocabulary: 881 / 50,257
+    // entries (1.753%) have a first non-prefix-space byte that could match a
+    // suppress pattern. Preserve all exact patterns and add non-matching quote
+    // prefixes until this hermetic vocabulary has the same candidate count.
+    let mut candidates = patterns.len();
+    for (id, token) in vocab.iter_mut().enumerate() {
+        if candidates >= 881 {
+            break;
+        }
+        if patterns.contains(token.as_slice()) {
+            continue;
+        }
+        *token = format!("\"candidate-{id:05}").into_bytes();
+        candidates += 1;
+    }
+    assert_eq!(candidates, 881);
+    vocab
+}
+
+fn tokenizer_bench_hparams() -> WhisperHParams {
+    WhisperHParams {
+        n_vocab: 51_866,
+        n_audio_ctx: 1500,
+        n_audio_state: 1280,
+        n_audio_head: 20,
+        n_audio_layer: 32,
+        n_text_ctx: 448,
+        n_text_state: 1280,
+        n_text_head: 20,
+        n_text_layer: 4,
+        n_mels: 128,
+        ftype: 1,
+    }
+}
+
+fn legacy_build_non_speech(tokens: Vec<Vec<u8>>, patterns: &[Vec<u8>]) -> (Vec<Vec<u8>>, Vec<i32>) {
+    let mut ids = Vec::new();
+    for pattern in patterns {
+        if let Some(id) = tokens.iter().position(|token| token == pattern)
+            && let Ok(id) = i32::try_from(id)
+            && !ids.contains(&id)
+        {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    (tokens, ids)
+}
+
+fn single_scan_without_discriminant_prefilter(tokens: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<i32>) {
+    let patterns = tokenizer_suppress_patterns();
+    let mut remaining = HashSet::with_capacity(patterns.len());
+    remaining.extend(patterns);
+
+    let mut ids = Vec::with_capacity(remaining.len());
+    for (id, token) in tokens.iter().enumerate() {
+        if remaining.remove(token.as_slice())
+            && let Ok(id) = i32::try_from(id)
+        {
+            ids.push(id);
+        }
+        if remaining.is_empty() {
+            break;
+        }
+    }
+    (tokens, ids)
+}
+
+fn bench_tokenizer_from_vocab(c: &mut Criterion) {
+    let hparams = tokenizer_bench_hparams();
+    let vocab = tokenizer_bench_vocab();
+    let patterns = tokenizer_suppress_patterns();
+    let expected = legacy_build_non_speech(vocab.clone(), &patterns).1;
+    let candidate = Tokenizer::from_vocab(&hparams, vocab.clone());
+    assert_eq!(candidate.non_speech_tokens(), expected);
+
+    let mut group = c.benchmark_group("native_engine/tokenizer_from_vocab");
+    group.throughput(criterion::Throughput::Elements(vocab.len() as u64));
+    group.bench_function("legacy_pattern_major", |bch| {
+        bch.iter_batched(
+            || vocab.clone(),
+            |tokens| black_box(legacy_build_non_speech(tokens, black_box(&patterns))),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("single_vocab_scan", |bch| {
+        bch.iter_batched(
+            || vocab.clone(),
+            |tokens| black_box(Tokenizer::from_vocab(black_box(&hparams), tokens)),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+fn bench_tokenizer_suppress_prefilter(c: &mut Criterion) {
+    let hparams = tokenizer_bench_hparams();
+    let vocab = tokenizer_prefilter_bench_vocab();
+    let expected = single_scan_without_discriminant_prefilter(vocab.clone()).1;
+    let candidate = Tokenizer::from_vocab(&hparams, vocab.clone());
+    assert_eq!(candidate.non_speech_tokens(), expected);
+
+    let mut group = c.benchmark_group("native_engine/tokenizer_suppress_prefilter");
+    group.throughput(criterion::Throughput::Elements(vocab.len() as u64));
+    group.bench_function("hash_every_token", |bch| {
+        bch.iter_batched(
+            || vocab.clone(),
+            |tokens| black_box(single_scan_without_discriminant_prefilter(tokens)),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("discriminant_prefilter", |bch| {
+        bch.iter_batched(
+            || vocab.clone(),
+            |tokens| black_box(Tokenizer::from_vocab(black_box(&hparams), tokens)),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+fn tokenizer_decode_with_owned_copy(tokenizer: &Tokenizer, ids: &[i32]) -> String {
+    let mut bytes = Vec::new();
+    for &id in ids {
+        if tokenizer.is_special(id) {
+            continue;
+        }
+        if let Some(token) = tokenizer.token_bytes(id) {
+            bytes.extend_from_slice(token);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn bench_tokenizer_decode_utf8(c: &mut Criterion) {
+    let hparams = tokenizer_bench_hparams();
+    let tokenizer = Tokenizer::from_vocab(&hparams, tokenizer_bench_vocab());
+    let ids: Vec<i32> = (0..256).collect();
+    let expected = tokenizer_decode_with_owned_copy(&tokenizer, &ids);
+    assert_eq!(tokenizer.decode(&ids), expected);
+
+    let mut group = c.benchmark_group("native_engine/tokenizer_decode_utf8");
+    group.throughput(criterion::Throughput::Bytes(expected.len() as u64));
+    group.bench_function("lossy_owned_copy", |bch| {
+        bch.iter(|| {
+            black_box(tokenizer_decode_with_owned_copy(
+                black_box(&tokenizer),
+                black_box(&ids),
+            ))
+        });
+    });
+    group.bench_function("owned_vec_handoff", |bch| {
+        bch.iter(|| black_box(black_box(&tokenizer).decode(black_box(&ids))));
+    });
+    group.finish();
+}
+
+fn timestamp_nodes(n: usize) -> Vec<Value> {
+    (0..n)
+        .map(|i| {
+            let start = i as f64 * 0.25;
+            let end = start + 0.2;
+            match i % 7 {
+                0 => json!({"start": start, "end": end}),
+                1 => json!({"start_sec": start, "end_sec": end}),
+                2 => json!({"timestamp": [start, end]}),
+                3 => json!({"timestamp": {"0": start, "1": end}}),
+                4 => json!({"timestamp": {"start": start, "end": end}}),
+                5 => json!({"offsets": {"from": start * 1000.0, "to": end * 1000.0}}),
+                _ => json!({
+                    "offsets": {"from": "invalid", "to": "invalid"},
+                    "start": start,
+                    "end": end,
+                }),
+            }
+        })
+        .collect()
+}
+
+fn timestamp_number(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_i64().map(|v| v as f64))
+}
+
+fn pointer_timestamp_pair(node: &Value) -> (Option<f64>, Option<f64>) {
+    let start = if let Some(value) = node.pointer("/offsets/from") {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        node.get("start")
+            .or_else(|| node.get("start_sec"))
+            .or_else(|| node.pointer("/timestamp/0"))
+            .or_else(|| node.pointer("/timestamp/start"))
+            .and_then(timestamp_number)
+    };
+    let end = if let Some(value) = node.pointer("/offsets/to") {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        node.get("end")
+            .or_else(|| node.get("end_sec"))
+            .or_else(|| node.pointer("/timestamp/1"))
+            .or_else(|| node.pointer("/timestamp/end"))
+            .and_then(timestamp_number)
+    };
+    (start, end)
+}
+
+fn direct_timestamp_value<'a>(node: &'a Value, index: usize, key: &str) -> Option<&'a Value> {
+    let timestamp = node.get("timestamp")?;
+    timestamp.get(index).or_else(|| timestamp.get(key))
+}
+
+fn direct_timestamp_pair(node: &Value) -> (Option<f64>, Option<f64>) {
+    let start = if let Some(value) = node.get("offsets").and_then(|offsets| offsets.get("from")) {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        node.get("start")
+            .or_else(|| node.get("start_sec"))
+            .or_else(|| direct_timestamp_value(node, 0, "0"))
+            .or_else(|| {
+                node.get("timestamp")
+                    .and_then(|timestamp| timestamp.get("start"))
+            })
+            .and_then(timestamp_number)
+    };
+    let end = if let Some(value) = node.get("offsets").and_then(|offsets| offsets.get("to")) {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        node.get("end")
+            .or_else(|| node.get("end_sec"))
+            .or_else(|| direct_timestamp_value(node, 1, "1"))
+            .or_else(|| {
+                node.get("timestamp")
+                    .and_then(|timestamp| timestamp.get("end"))
+            })
+            .and_then(timestamp_number)
+    };
+    (start, end)
+}
+
+fn shared_parent_timestamp_pair(node: &Value) -> (Option<f64>, Option<f64>) {
+    let offsets = node.get("offsets");
+    let start_offset = offsets.and_then(|offsets| offsets.get("from"));
+    let end_offset = offsets.and_then(|offsets| offsets.get("to"));
+    let start_direct = if start_offset.is_none() {
+        node.get("start").or_else(|| node.get("start_sec"))
+    } else {
+        None
+    };
+    let end_direct = if end_offset.is_none() {
+        node.get("end").or_else(|| node.get("end_sec"))
+    } else {
+        None
+    };
+    let timestamp = if (start_offset.is_none() && start_direct.is_none())
+        || (end_offset.is_none() && end_direct.is_none())
+    {
+        node.get("timestamp")
+    } else {
+        None
+    };
+
+    let start = if let Some(value) = start_offset {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        start_direct
+            .or_else(|| {
+                timestamp.and_then(|timestamp| timestamp.get(0).or_else(|| timestamp.get("0")))
+            })
+            .or_else(|| timestamp.and_then(|timestamp| timestamp.get("start")))
+            .and_then(timestamp_number)
+    };
+    let end = if let Some(value) = end_offset {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        end_direct
+            .or_else(|| {
+                timestamp.and_then(|timestamp| timestamp.get(1).or_else(|| timestamp.get("1")))
+            })
+            .or_else(|| timestamp.and_then(|timestamp| timestamp.get("end")))
+            .and_then(timestamp_number)
+    };
+    (start, end)
+}
+
+fn bench_timestamp_lookup_ab(c: &mut Criterion) {
+    let nodes = timestamp_nodes(500);
+    let reference: Vec<_> = nodes.iter().map(pointer_timestamp_pair).collect();
+    let direct: Vec<_> = nodes.iter().map(direct_timestamp_pair).collect();
+    assert_eq!(
+        direct, reference,
+        "direct lookups must preserve pointer semantics"
+    );
+    let shared_parent: Vec<_> = nodes.iter().map(shared_parent_timestamp_pair).collect();
+    assert_eq!(
+        shared_parent, direct,
+        "shared parent lookups must preserve direct-field semantics"
+    );
+
+    let mut group = c.benchmark_group("native_engine/timestamp_lookup_ab");
+    group.bench_function("pointer_reference", |b| {
+        b.iter(|| {
+            let mut checksum = 0.0;
+            for node in &nodes {
+                let (start, end) = pointer_timestamp_pair(black_box(node));
+                checksum += start.unwrap_or_default() + end.unwrap_or_default();
+            }
+            black_box(checksum)
+        });
+    });
+    group.bench_function("direct_fields", |b| {
+        b.iter(|| {
+            let mut checksum = 0.0;
+            for node in &nodes {
+                let (start, end) = direct_timestamp_pair(black_box(node));
+                checksum += start.unwrap_or_default() + end.unwrap_or_default();
+            }
+            black_box(checksum)
+        });
+    });
+    group.bench_function("shared_parent_fields", |b| {
+        b.iter(|| {
+            let mut checksum = 0.0;
+            for node in &nodes {
+                let (start, end) = shared_parent_timestamp_pair(black_box(node));
+                checksum += start.unwrap_or_default() + end.unwrap_or_default();
+            }
+            black_box(checksum)
+        });
+    });
+    group.finish();
+}
+
+/// Re-run the VOID SDPA `BR` sweep under the fleet harness contract: one ELF,
+/// A/A before A/B, 41 order-alternated ratios, min-of-3 timing, and a
+/// bootstrap-median CI gate. `cv` is emitted only as provenance.
+fn bench_sdpa_br_resurrection(_c: &mut Criterion) {
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|filter| !filter.starts_with('-') && !filter.contains("sdpa_br_resurrection"))
+    {
+        return;
+    }
+
+    fn fill(seed: u64, len: usize) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / 16_777_216.0) - 0.5
+            })
+            .collect()
+    }
+
+    fn run(
+        br: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        nbh: usize,
+        seq: usize,
+        d: usize,
+    ) -> Vec<f32> {
+        set_sdpa_br(br);
+        sdpa_forward_f32(
+            black_box(q),
+            black_box(k),
+            black_box(v),
+            nbh,
+            seq,
+            seq,
+            d,
+            d,
+            1.0 / (d as f32).sqrt(),
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn min_ns_per_call(
+        br: usize,
+        repetitions: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        nbh: usize,
+        seq: usize,
+        d: usize,
+    ) -> f64 {
+        (0..SDPA_HARNESS_MIN_OF)
+            .map(|_| {
+                let started = Instant::now();
+                let mut checksum = 0_u64;
+                for _ in 0..repetitions {
+                    let output = run(br, q, k, v, nbh, seq, d);
+                    checksum ^= output
+                        .chunks(97)
+                        .map(|chunk| u64::from(chunk[0].to_bits()))
+                        .fold(0_u64, u64::wrapping_add);
+                    black_box(output);
+                }
+                black_box(checksum);
+                started.elapsed().as_nanos() as f64
+            })
+            .fold(f64::INFINITY, f64::min)
+            / repetitions as f64
+    }
+
+    let (nbh, seq, d) = (20_usize, 1_500_usize, 64_usize);
+    let q = fill(1, nbh * seq * d);
+    let k = fill(7, nbh * seq * d);
+    let v = fill(13, nbh * seq * d);
+    let baseline_output = run(64, &q, &k, &v, nbh, seq, d);
+    let candidate_output = run(128, &q, &k, &v, nbh, seq, d);
+    assert!(
+        baseline_output
+            .iter()
+            .zip(&candidate_output)
+            .all(|(baseline, candidate)| baseline.to_bits() == candidate.to_bits()),
+        "BR=128 must preserve every output bit"
+    );
+    let mut parity_hasher = Sha256::new();
+    for value in &baseline_output {
+        parity_hasher.update(value.to_bits().to_le_bytes());
+    }
+    println!(
+        "SDPA_BR_PARITY shape={nbh}x{seq}x{d} outputs={} sha256={:x}",
+        baseline_output.len(),
+        parity_hasher.finalize()
+    );
+
+    let probe_started = Instant::now();
+    black_box(run(64, &q, &k, &v, nbh, seq, d));
+    let probe_ns = probe_started.elapsed().as_nanos().max(1);
+    let repetitions =
+        usize::try_from((2_000_000_u128 / probe_ns).clamp(1, 8)).expect("bounded repetitions");
+
+    let mut null_ratios = Vec::with_capacity(SDPA_HARNESS_PAIRS);
+    for pair in 0..SDPA_HARNESS_PAIRS {
+        let (left, right) = if pair.is_multiple_of(2) {
+            (
+                min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d),
+                min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d),
+            )
+        } else {
+            let right = min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d);
+            let left = min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d);
+            (left, right)
+        };
+        null_ratios.push(left / right.max(f64::MIN_POSITIVE));
+    }
+
+    let mut candidate_ratios = Vec::with_capacity(SDPA_HARNESS_PAIRS);
+    for pair in 0..SDPA_HARNESS_PAIRS {
+        let (baseline, candidate) = if pair.is_multiple_of(2) {
+            (
+                min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d),
+                min_ns_per_call(128, repetitions, &q, &k, &v, nbh, seq, d),
+            )
+        } else {
+            let candidate = min_ns_per_call(128, repetitions, &q, &k, &v, nbh, seq, d);
+            let baseline = min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d);
+            (baseline, candidate)
+        };
+        candidate_ratios.push(baseline / candidate.max(f64::MIN_POSITIVE));
+    }
+
+    let (null_ci_low, null_ci_high) = sdpa_bootstrap_median_ci(&null_ratios);
+    let (candidate_ci_low, candidate_ci_high) = sdpa_bootstrap_median_ci(&candidate_ratios);
+    let null_half_width = (1.0 - null_ci_low).abs().max((null_ci_high - 1.0).abs());
+    let required_speedup = 1.0 + 2.0 * null_half_width;
+    let candidate_median = sdpa_harness_percentile(&candidate_ratios, 50);
+    println!(
+        "SDPA_BR_AB br=64/128 repetitions={repetitions} pairs={SDPA_HARNESS_PAIRS} min_of={SDPA_HARNESS_MIN_OF}"
+    );
+    println!(
+        "SDPA_BR_NULL ratios={null_ratios:?} median={:.6} median_ci95=[{null_ci_low:.6},{null_ci_high:.6}] cv={:.6}",
+        sdpa_harness_percentile(&null_ratios, 50),
+        sdpa_harness_cv(&null_ratios)
+    );
+    println!(
+        "SDPA_BR_CANDIDATE ratios={candidate_ratios:?} median={candidate_median:.6} median_ci95=[{candidate_ci_low:.6},{candidate_ci_high:.6}] cv={:.6} wins={}/{}",
+        sdpa_harness_cv(&candidate_ratios),
+        candidate_ratios
+            .iter()
+            .filter(|ratio| **ratio > 1.0)
+            .count(),
+        SDPA_HARNESS_PAIRS
+    );
+    println!(
+        "SDPA_BR_GATE method=median_vs_null_ci95_2x_margin null_half_width={null_half_width:.6} required_speedup={required_speedup:.6} candidate_median={candidate_median:.6} cv_is_provenance_only=true verdict={}",
+        if candidate_median >= required_speedup {
+            "KEEP"
+        } else {
+            "REJECT"
+        }
+    );
+    set_sdpa_br_auto();
 }
 
 // ---------------------------------------------------------------------------
@@ -460,12 +2435,37 @@ fn bench_f16_gemv_dequant(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_mel_30s,
+    bench_mel_30s_realistic,
+    bench_acoustic_diarization,
+    bench_model_residency_tiny,
+    bench_chunk_frames,
+    bench_window_to_time_major,
     bench_encoder_window_tiny,
     bench_encoder_window_large,
     bench_decoder_token_step_tiny,
     bench_decoder_token_step_large,
+    bench_self_attn_column_keys,
     bench_logits_gemv_large,
     bench_f16_gemv_dequant,
+    bench_i7_qkv_activation_reuse,
+    bench_i7_bias_specialization_resurrection,
+    bench_layer_norm,
+    bench_gelu,
+    bench_resample,
+    bench_downmix,
+    bench_sanitize_downmix,
+    bench_tokenizer_from_vocab,
+    bench_tokenizer_suppress_prefilter,
+    bench_tokenizer_decode_utf8,
+    bench_timestamp_lookup_ab,
+    bench_sdpa_br_resurrection,
     bench_e2e_tiny_jfk,
+    bench_e2e_tiny_jfk_no_timestamps,
+    bench_e2e_large_jfk,
 );
-criterion_main!(benches);
+
+fn main() {
+    println!("bench_elf_sha256={}", native_bench_identity());
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
