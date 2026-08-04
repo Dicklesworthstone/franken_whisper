@@ -321,7 +321,7 @@ fn generate_voiced_wav(path: &std::path::Path) {
 }
 
 #[cfg(unix)]
-fn generate_voiced_wav_without_ffmpeg(path: &std::path::Path) {
+fn generate_voiced_wav_without_ffmpeg(path: &std::path::Path, duration_ms: u16) {
     use std::f32::consts::TAU;
 
     let spec = hound::WavSpec {
@@ -331,7 +331,7 @@ fn generate_voiced_wav_without_ffmpeg(path: &std::path::Path) {
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
-    let total_samples = 8_000usize / 4; // 250ms clip
+    let total_samples = 8_000usize * usize::from(duration_ms) / 1_000;
     for idx in 0..total_samples {
         let phase = TAU * 440.0 * (idx as f32 / 8_000.0);
         let sample = (phase.sin() * 0.25 * f32::from(i16::MAX)).round() as i16;
@@ -3006,7 +3006,7 @@ fn tiny_diarize_emits_native_json_artifact_and_preserves_speaker_turn_signal() {
     let state_root = dir.path().join("state");
     let stub_bin = write_whisper_cpp_tiny_diarize_stub_binary(dir.path());
     let input_wav = dir.path().join("tiny_diarize_input.wav");
-    generate_voiced_wav_without_ffmpeg(&input_wav);
+    generate_voiced_wav_without_ffmpeg(&input_wav, 250);
 
     let report = run_transcribe_json_with_stub(
         &[
@@ -3054,6 +3054,160 @@ fn tiny_diarize_emits_native_json_artifact_and_preserves_speaker_turn_signal() {
             .filter_map(serde_json::Value::as_str)
             .any(|path| path.ends_with("/whispercpp_output.json")),
         "expected artifact path basename whispercpp_output.json"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn robot_tiny_diarize_emits_redacted_hint_evidence_and_native_acoustic_report() {
+    let dir = tempdir().expect("private test directory");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_tiny_diarize_stub_binary(dir.path());
+    let input_wav = dir.path().join("tiny_diarize_robot_input.wav");
+    generate_voiced_wav_without_ffmpeg(&input_wav, 1_250);
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args([
+            "robot",
+            "run",
+            "--input",
+            input_wav.to_str().expect("test input must be valid UTF-8"),
+            "--backend",
+            "whisper-cpp",
+            "--tiny-diarize",
+            "--max-context",
+            "0",
+            "--diarize",
+            "--diarization-engine",
+            "acoustic",
+            "--no-persist",
+        ])
+        .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
+        .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        .output()
+        .expect("robot TinyDiarize acoustic run must execute");
+
+    assert!(
+        output.status.success(),
+        "robot TinyDiarize acoustic run must succeed"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let parsed = serde_json::from_str(line);
+            assert!(parsed.is_ok(), "robot output line must be valid NDJSON");
+            parsed.unwrap_or_default()
+        })
+        .collect();
+
+    let hint_evidence = events
+        .iter()
+        .find(|event| {
+            event["event"] == "stage" && event["code"] == "diarize.tiny_diarize_hint_evidence"
+        })
+        .expect("robot run must emit TinyDiarize hint evidence");
+    let serialized_hint_evidence = hint_evidence.to_string();
+    for (description, forbidden) in [
+        ("fixture transcript data", "synthetic speaker one"),
+        ("fixture transcript data", "synthetic speaker two"),
+        ("turn metadata", "speaker_turn_next"),
+        ("backend raw material", "raw_output"),
+    ] {
+        assert!(
+            !serialized_hint_evidence.contains(forbidden),
+            "TinyDiarize hint evidence must not expose {description}"
+        );
+    }
+    assert!(
+        hint_evidence["stage"] == "diarize",
+        "TinyDiarize hint evidence must be a diarize stage event"
+    );
+    let payload = hint_evidence["payload"]
+        .as_object()
+        .expect("TinyDiarize hint evidence payload must be an object");
+    assert!(
+        payload.len() == 6
+            && [
+                "source",
+                "requested",
+                "accepted_count",
+                "validation",
+                "trace_id",
+                "elapsed_ms",
+            ]
+            .into_iter()
+            .all(|field| payload.contains_key(field)),
+        "TinyDiarize hint evidence must contain only aggregate evidence and generic event metadata"
+    );
+    assert!(
+        payload["source"] == "whisper_cpp.transcription",
+        "TinyDiarize hint evidence source must identify whisper.cpp transcription"
+    );
+    assert!(
+        payload["requested"] == true,
+        "TinyDiarize hint evidence must record requested=true"
+    );
+    assert!(
+        payload["accepted_count"] == 1,
+        "TinyDiarize hint evidence must record one accepted boundary"
+    );
+    assert!(
+        payload["validation"] == "accepted",
+        "TinyDiarize hint evidence must record accepted validation"
+    );
+    assert!(
+        payload["trace_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "TinyDiarize hint evidence must retain a non-empty event trace identifier"
+    );
+    assert!(
+        payload["elapsed_ms"].as_u64().is_some(),
+        "TinyDiarize hint evidence must retain bounded elapsed-time metadata"
+    );
+    for forbidden_key in ["offsets", "transcription", "text", "raw_output", "path"] {
+        assert!(
+            !payload.contains_key(forbidden_key),
+            "TinyDiarize hint evidence must not expose `{forbidden_key}`"
+        );
+    }
+
+    let run_complete = events
+        .iter()
+        .find(|event| event["event"] == "run_complete")
+        .expect("robot run must emit run_complete");
+    assert!(
+        run_complete["backend"] == "whisper_cpp",
+        "run_complete must identify the whisper.cpp backend"
+    );
+    assert!(
+        serde_json::from_value::<franken_whisper::model::DiarizationReport>(
+            run_complete["diarization"].clone(),
+        )
+        .is_ok(),
+        "run_complete must contain a typed native acoustic report"
+    );
+    assert!(
+        run_complete["diarization"]["implementation"] == "native-acoustic-v2",
+        "run_complete diarization must identify the native acoustic implementation"
+    );
+    assert!(
+        run_complete["diarization"]["contract_version"] == "acoustic-diarization-v2",
+        "run_complete diarization must use the acoustic contract"
+    );
+    assert!(
+        run_complete["diarization"]["feature_schema"] == "acoustic-feature-v2",
+        "run_complete diarization must use the native acoustic feature schema"
+    );
+    assert!(
+        !run_complete
+            .as_object()
+            .expect("run_complete must be an object")
+            .contains_key("raw_output"),
+        "run_complete must not expose backend raw_output"
     );
 }
 
@@ -3119,7 +3273,7 @@ fn transcribe_file_input_uses_builtin_normalizer_when_ffmpeg_missing() {
     let state_root = dir.path().join("state");
     let stub_bin = write_whisper_cpp_stub_binary(dir.path());
     let input_wav = dir.path().join("file_input_builtin.wav");
-    generate_voiced_wav_without_ffmpeg(&input_wav);
+    generate_voiced_wav_without_ffmpeg(&input_wav, 250);
 
     let report = run_transcribe_json_with_stub_env(
         &[
@@ -3156,7 +3310,7 @@ fn transcribe_file_input_falls_back_to_builtin_when_auto_provision_is_disabled()
     let state_root = dir.path().join("state");
     let stub_bin = write_whisper_cpp_stub_binary(dir.path());
     let input_wav = dir.path().join("file_input_builtin_no_autoprov.wav");
-    generate_voiced_wav_without_ffmpeg(&input_wav);
+    generate_voiced_wav_without_ffmpeg(&input_wav, 250);
 
     let report = run_transcribe_json_with_stub_env(
         &[
@@ -3196,7 +3350,7 @@ fn transcribe_file_input_uses_state_dir_provisioned_ffmpeg_when_path_is_missing(
     let provisioned_bin_dir = state_root.join("tools/ffmpeg/bin");
     let ffmpeg_marker = dir.path().join("ffmpeg_invocation.txt");
     let ffprobe_marker = dir.path().join("ffprobe_invocation.txt");
-    generate_voiced_wav_without_ffmpeg(&input_wav);
+    generate_voiced_wav_without_ffmpeg(&input_wav, 250);
     write_provisioned_ffmpeg_stub(&provisioned_bin_dir);
     write_provisioned_ffprobe_stub(&provisioned_bin_dir);
     let ffmpeg_marker_env = ffmpeg_marker
