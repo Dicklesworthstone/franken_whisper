@@ -50,7 +50,10 @@ use crate::diarization::{
     verify_leakage_audit_hash,
 };
 use crate::error::{FwError, FwResult};
-use crate::model::{DiarizationEngine, DiarizationRequest, SpeakerCountRequest};
+use crate::model::{
+    DiarizationEngine, DiarizationRequest, SpeakerCountEvidenceLane, SpeakerCountRequest,
+    SpeakerEvidenceReason,
+};
 
 /// Schema identity for the path-bearing, external-only adapter input.
 pub const PUBLIC_CORPUS_INPUT_SCHEMA_VERSION: &str = "public-diarization-corpus-input-v2";
@@ -64,16 +67,16 @@ pub const PUBLIC_CORPUS_REGISTRY_SCHEMA_VERSION: &str = "public-diarization-corp
 pub const PUBLIC_CORPUS_WORD_ANNOTATION_SCHEMA_VERSION: &str =
     "public-diarization-word-annotation-v1";
 /// Schema identity for path-free public representation-ablation evidence.
-pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v13";
+pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v15";
 /// Frozen public ablation implementation identity.
 pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-ablation-runner-v13";
+    "public-diarization-acoustic-ablation-runner-v17";
 /// Schema identity for the separate aggregate-only acoustic sidecar study.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION: &str =
-    "public-diarization-acoustic-sidecar-study-v5";
+    "public-diarization-acoustic-sidecar-study-v6";
 /// Frozen implementation identity for the aggregate-only sidecar runner.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-sidecar-study-runner-v5";
+    "public-diarization-acoustic-sidecar-study-runner-v8";
 /// Identity of the bounded development calibration fit.
 pub const PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION: &str =
     "public-sidecar-boundary-calibration-empirical-grid-v2";
@@ -149,6 +152,10 @@ const PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES: usize = 2_000;
 const PUBLIC_SIDECAR_BOOTSTRAP_SEED_POLICY: &str = "fixed-lane-split-bootstrap-seed-v2";
 const PUBLIC_ACOUSTIC_PAIR_MAX_PAIRS_PER_RECORDING: usize = 4_096;
 const PUBLIC_ACOUSTIC_PAIR_MINIMUM_CLASS_OBSERVATIONS: u64 = 16;
+const PUBLIC_CLUSTERING_DIAGNOSTIC_DETECTOR_MODE: AcousticChangeDetectorMode =
+    AcousticChangeDetectorMode::BayesianTwoRegimeV1;
+const PUBLIC_CLUSTERING_DIAGNOSTIC_FEATURE_ABLATION: AcousticFeatureAblation =
+    AcousticFeatureAblation::NoDeltas;
 const PUBLIC_SIDECAR_BOOTSTRAP_SAMPLER: &str = "splitmix64-per-replicate-stream-v1";
 const PUBLIC_SIDECAR_MAX_RETAINED_SIGNALS: u64 = 401;
 const PUBLIC_SIDECAR_MAX_RETAINED_SIGNAL_CAPACITY: u64 = 1_024;
@@ -429,6 +436,29 @@ pub struct PublicSpeakerCountHierarchyCandidate {
     pub speaker_count_confusion: Vec<PublicSpeakerCountConfusionCell>,
 }
 
+const PUBLIC_SPEAKER_COUNT_EVIDENCE_LANES: [SpeakerCountEvidenceLane; 6] = [
+    SpeakerCountEvidenceLane::MergeRisk,
+    SpeakerCountEvidenceLane::SparseNormalizedEigengap,
+    SpeakerCountEvidenceLane::FeatureJackknife,
+    SpeakerCountEvidenceLane::EffectiveOccupancy,
+    SpeakerCountEvidenceLane::ConstraintGraph,
+    SpeakerCountEvidenceLane::CallerPrior,
+];
+
+/// Development evidence for one native speaker-count evidence lane before
+/// calibration and fusion. Reference counts are used only by this aggregate
+/// scorer after inference has completed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicSpeakerCountEvidenceLaneCandidate {
+    pub lane: SpeakerCountEvidenceLane,
+    pub recording_count: u64,
+    pub unavailable_count: u64,
+    pub exact_speaker_count_rate: Option<f64>,
+    pub mean_absolute_speaker_count_error: Option<f64>,
+    pub speaker_count_confusion: Vec<PublicSpeakerCountConfusionCell>,
+}
+
 /// Aggregate-only development fit for the native same/different-speaker map.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -489,6 +519,20 @@ pub struct PublicSpeakerCountDurationStratum {
     pub credible_set_coverage: Option<f64>,
 }
 
+/// Feature-free aggregate reasons why candidate speaker profiles were pruned.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicSpeakerEvidenceDiagnostics {
+    pub candidate_count: u64,
+    pub supported_count: u64,
+    pub no_assigned_speech_count: u64,
+    pub insufficient_independent_recurrence_count: u64,
+    pub insufficient_voiced_frames_count: u64,
+    pub insufficient_assignment_confidence_count: u64,
+    pub insufficient_profile_reliability_count: u64,
+    pub merge_compatible_with_supported_speaker_count: u64,
+}
+
 /// Aggregate metrics for one feature ablation and one frozen corpus split.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -534,6 +578,7 @@ pub struct PublicCorpusAblationSplit {
     pub speaker_count_posterior_map_confusion: Vec<PublicSpeakerCountConfusionCell>,
     pub speaker_count_merge_frontier: PublicSpeakerCountMergeFrontier,
     pub speaker_count_hierarchy_candidates: Vec<PublicSpeakerCountHierarchyCandidate>,
+    pub speaker_count_evidence_lane_candidates: Vec<PublicSpeakerCountEvidenceLaneCandidate>,
     pub acoustic_speaker_pair_calibration_fit: Option<PublicAcousticSpeakerPairCalibrationFit>,
     pub speaker_count_strata: Vec<PublicSpeakerCountStratum>,
     pub speaker_count_duration_strata: Vec<PublicSpeakerCountDurationStratum>,
@@ -558,6 +603,7 @@ pub struct PublicCorpusAblationSplit {
     pub mean_unknown_speaker_share: Option<f64>,
     pub maximum_unknown_speaker_share: Option<f64>,
     pub mean_minority_reference_recall: Option<f64>,
+    pub speaker_evidence_diagnostics: PublicSpeakerEvidenceDiagnostics,
     pub reference_word_count: u64,
     pub scored_word_count: u64,
     pub correct_word_count: u64,
@@ -2669,18 +2715,22 @@ pub fn run_public_corpus_ablation_with_cancel(
     }
     let mut clustering_variants = Vec::with_capacity(AcousticClusteringMode::ALL.len());
     for clustering_mode in AcousticClusteringMode::ALL {
-        let detector_mode = AcousticChangeDetectorMode::FixedSafeV1;
+        let detector_mode = PUBLIC_CLUSTERING_DIAGNOSTIC_DETECTOR_MODE;
+        let feature_ablation = PUBLIC_CLUSTERING_DIAGNOSTIC_FEATURE_ABLATION;
         let splits = if clustering_mode == AcousticClusteringMode::FixedSafeV1 {
-            change_detector_variants
-                .iter()
-                .find(|variant| variant.detector_mode == detector_mode)
-                .map(|variant| variant.splits.clone())
-                .ok_or_else(|| {
-                    public_corpus_error(
-                        "clustering_alignment",
-                        "fixed-safe detector evidence is unavailable",
-                    )
-                })?
+            evaluate_public_variant(
+                &bundle,
+                &input_recordings,
+                &canonical_input,
+                maximum_recording_duration_ms,
+                &diarization_request,
+                &scorer_config,
+                feature_ablation,
+                detector_mode,
+                clustering_mode,
+                Some(evaluation_stage.selected_split()),
+                &mut is_cancelled,
+            )?
         } else {
             evaluate_public_variant(
                 &bundle,
@@ -2689,7 +2739,7 @@ pub fn run_public_corpus_ablation_with_cancel(
                 maximum_recording_duration_ms,
                 &diarization_request,
                 &scorer_config,
-                AcousticFeatureAblation::FullV2,
+                feature_ablation,
                 detector_mode,
                 clustering_mode,
                 Some(evaluation_stage.selected_split()),
@@ -2697,12 +2747,12 @@ pub fn run_public_corpus_ablation_with_cancel(
             )?
         };
         let feature_schema_sha256 =
-            acoustic_feature_schema_sha256(AcousticFeatureAblation::FullV2.schema_version());
+            acoustic_feature_schema_sha256(feature_ablation.schema_version());
         let configuration_sha256 = canonical_sha256(&PublicClusteringConfigurationFingerprint {
             runner_version: PUBLIC_CORPUS_ABLATION_RUNNER_VERSION,
             clustering_mode,
             detector_mode,
-            feature_ablation: AcousticFeatureAblation::FullV2,
+            feature_ablation,
             feature_schema_sha256: &feature_schema_sha256,
             diarization_request_sha256: &diarization_request_sha256,
             speaker_pair_calibration_sha256: &protocol.speaker_pair_calibration_sha256,
@@ -2710,7 +2760,7 @@ pub fn run_public_corpus_ablation_with_cancel(
         clustering_variants.push(PublicCorpusClusteringVariant {
             clustering_mode,
             detector_mode,
-            feature_ablation: AcousticFeatureAblation::FullV2,
+            feature_ablation,
             configuration_sha256,
             splits,
         });
@@ -3554,7 +3604,9 @@ fn evaluate_public_variant(
                     executed_mode: AcousticClusteringMode::FixedSafeV1,
                     fallback_reason: None,
                     speaker_count_stability: 0.0,
+                    count_estimate: None,
                     count_merge_steps: Vec::new(),
+                    speaker_evidence: Vec::new(),
                     calibration_tracklets: Vec::new(),
                 },
             )
@@ -6065,7 +6117,9 @@ fn evaluate_public_sidecar_lane(
                     executed_mode: AcousticClusteringMode::FixedSafeV1,
                     fallback_reason: None,
                     speaker_count_stability: 0.0,
+                    count_estimate: None,
                     count_merge_steps: Vec::new(),
+                    speaker_evidence: Vec::new(),
                     calibration_tracklets: Vec::new(),
                 },
                 sidecar_evidence,
@@ -7978,6 +8032,7 @@ struct PublicAblationAccumulator {
     count_merge_frontier_correctly_ordered_count: u64,
     speaker_count_hierarchy_candidates:
         BTreeMap<PublicSpeakerCountHierarchyMethod, HierarchyCandidateAccumulator>,
+    speaker_count_evidence_lane_candidates: [HierarchyCandidateAccumulator; 6],
     acoustic_pair_observations: Vec<AcousticPairCalibrationObservation>,
     acoustic_pair_recording_count: u64,
     speaker_count_strata: BTreeMap<u32, SpeakerCountStratumAccumulator>,
@@ -8007,6 +8062,7 @@ struct PublicAblationAccumulator {
     unknown_speaker_shares: Vec<f64>,
     minority_reference_recall_sum: f64,
     minority_reference_recall_count: u64,
+    speaker_evidence_diagnostics: PublicSpeakerEvidenceDiagnostics,
     reference_word_count: u64,
     scored_word_count: u64,
     correct_word_count: u64,
@@ -8291,6 +8347,62 @@ impl PublicAblationAccumulator {
                     })?;
             }
         }
+        for (index, lane) in PUBLIC_SPEAKER_COUNT_EVIDENCE_LANES.into_iter().enumerate() {
+            let accumulator = &mut self.speaker_count_evidence_lane_candidates[index];
+            let candidate = clustering
+                .count_estimate
+                .as_ref()
+                .and_then(|estimate| estimate.lanes.iter().find(|evidence| evidence.lane == lane))
+                .and_then(|evidence| evidence.available.then_some(evidence.proposed_count))
+                .flatten();
+            if let Some(candidate) = candidate {
+                accumulator.recording_count =
+                    accumulator.recording_count.checked_add(1).ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "evidence-lane count-candidate recording count overflowed",
+                        )
+                    })?;
+                accumulator.exact_count = accumulator
+                    .exact_count
+                    .checked_add(u64::from(candidate == reference_speakers))
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "evidence-lane exact-count observation count overflowed",
+                        )
+                    })?;
+                accumulator.absolute_error = accumulator
+                    .absolute_error
+                    .checked_add(u64::from(candidate.abs_diff(reference_speakers)))
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "evidence-lane absolute count error overflowed",
+                        )
+                    })?;
+                let confusion_count = accumulator
+                    .confusion
+                    .entry((reference_speakers, candidate))
+                    .or_default();
+                *confusion_count = confusion_count.checked_add(1).ok_or_else(|| {
+                    public_corpus_error(
+                        "ablation_aggregate_overflow",
+                        "evidence-lane count confusion observation overflowed",
+                    )
+                })?;
+            } else {
+                accumulator.unavailable_count = accumulator
+                    .unavailable_count
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "evidence-lane count-candidate unavailable count overflowed",
+                        )
+                    })?;
+            }
+        }
         let stratum = self
             .speaker_count_strata
             .entry(reference_speakers)
@@ -8524,6 +8636,40 @@ impl PublicAblationAccumulator {
             }
             None => {}
         }
+        for evidence in &clustering.speaker_evidence {
+            let diagnostics = &mut self.speaker_evidence_diagnostics;
+            diagnostics.candidate_count = diagnostics.candidate_count.saturating_add(1);
+            diagnostics.supported_count = diagnostics
+                .supported_count
+                .saturating_add(u64::from(evidence.supported));
+            for reason in &evidence.reasons {
+                let count = match reason {
+                    SpeakerEvidenceReason::NoAssignedSpeech => {
+                        &mut diagnostics.no_assigned_speech_count
+                    }
+                    SpeakerEvidenceReason::InsufficientIndependentRecurrence => {
+                        &mut diagnostics.insufficient_independent_recurrence_count
+                    }
+                    SpeakerEvidenceReason::InsufficientVoicedFrames => {
+                        &mut diagnostics.insufficient_voiced_frames_count
+                    }
+                    SpeakerEvidenceReason::InsufficientAssignmentConfidence => {
+                        &mut diagnostics.insufficient_assignment_confidence_count
+                    }
+                    SpeakerEvidenceReason::InsufficientProfileReliability => {
+                        &mut diagnostics.insufficient_profile_reliability_count
+                    }
+                    SpeakerEvidenceReason::MergeCompatibleWithSupportedSpeaker => {
+                        &mut diagnostics.merge_compatible_with_supported_speaker_count
+                    }
+                    SpeakerEvidenceReason::SupportedByHardHint
+                    | SpeakerEvidenceReason::SupportedByIndependentRecurrence
+                    | SpeakerEvidenceReason::SupportedByRepeatedTracklets
+                    | SpeakerEvidenceReason::SupportedByExternalAttribution => continue,
+                };
+                *count = count.saturating_add(1);
+            }
+        }
         let performance = score.performance.as_ref().ok_or_else(|| {
             public_corpus_error(
                 "ablation_performance",
@@ -8627,6 +8773,39 @@ impl PublicAblationAccumulator {
                     .unwrap_or_default();
                 PublicSpeakerCountHierarchyCandidate {
                     method,
+                    recording_count: accumulator.recording_count,
+                    unavailable_count: accumulator.unavailable_count,
+                    exact_speaker_count_rate: ratio(
+                        accumulator.exact_count,
+                        accumulator.recording_count,
+                    ),
+                    mean_absolute_speaker_count_error: positive_ratio(
+                        accumulator.absolute_error as f64,
+                        accumulator.recording_count as f64,
+                    ),
+                    speaker_count_confusion: accumulator
+                        .confusion
+                        .into_iter()
+                        .map(
+                            |((reference_speakers, hypothesis_speakers), recording_count)| {
+                                PublicSpeakerCountConfusionCell {
+                                    reference_speakers,
+                                    hypothesis_speakers,
+                                    recording_count,
+                                }
+                            },
+                        )
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let speaker_count_evidence_lane_candidates = PUBLIC_SPEAKER_COUNT_EVIDENCE_LANES
+            .into_iter()
+            .enumerate()
+            .map(|(index, lane)| {
+                let accumulator = self.speaker_count_evidence_lane_candidates[index].clone();
+                PublicSpeakerCountEvidenceLaneCandidate {
+                    lane,
                     recording_count: accumulator.recording_count,
                     unavailable_count: accumulator.unavailable_count,
                     exact_speaker_count_rate: ratio(
@@ -8859,6 +9038,7 @@ impl PublicAblationAccumulator {
             speaker_count_posterior_map_confusion,
             speaker_count_merge_frontier,
             speaker_count_hierarchy_candidates,
+            speaker_count_evidence_lane_candidates,
             acoustic_speaker_pair_calibration_fit,
             speaker_count_strata,
             speaker_count_duration_strata,
@@ -8916,6 +9096,7 @@ impl PublicAblationAccumulator {
                 self.minority_reference_recall_sum,
                 self.minority_reference_recall_count as f64,
             ),
+            speaker_evidence_diagnostics: self.speaker_evidence_diagnostics,
             reference_word_count: self.reference_word_count,
             scored_word_count: self.scored_word_count,
             correct_word_count: self.correct_word_count,
@@ -11445,21 +11626,22 @@ pub fn verify_public_corpus_ablation_evidence(
         .iter()
         .zip(AcousticClusteringMode::ALL)
     {
-        let expected_schema_sha256 =
-            acoustic_feature_schema_sha256(AcousticFeatureAblation::FullV2.schema_version());
+        let expected_schema_sha256 = acoustic_feature_schema_sha256(
+            PUBLIC_CLUSTERING_DIAGNOSTIC_FEATURE_ABLATION.schema_version(),
+        );
         let expected_configuration_sha256 =
             canonical_sha256(&PublicClusteringConfigurationFingerprint {
                 runner_version: PUBLIC_CORPUS_ABLATION_RUNNER_VERSION,
                 clustering_mode: expected_mode,
-                detector_mode: AcousticChangeDetectorMode::FixedSafeV1,
-                feature_ablation: AcousticFeatureAblation::FullV2,
+                detector_mode: PUBLIC_CLUSTERING_DIAGNOSTIC_DETECTOR_MODE,
+                feature_ablation: PUBLIC_CLUSTERING_DIAGNOSTIC_FEATURE_ABLATION,
                 feature_schema_sha256: &expected_schema_sha256,
                 diarization_request_sha256: &evidence.protocol.diarization_request_sha256,
                 speaker_pair_calibration_sha256: &evidence.protocol.speaker_pair_calibration_sha256,
             })?;
         if variant.clustering_mode != expected_mode
-            || variant.detector_mode != AcousticChangeDetectorMode::FixedSafeV1
-            || variant.feature_ablation != AcousticFeatureAblation::FullV2
+            || variant.detector_mode != PUBLIC_CLUSTERING_DIAGNOSTIC_DETECTOR_MODE
+            || variant.feature_ablation != PUBLIC_CLUSTERING_DIAGNOSTIC_FEATURE_ABLATION
             || variant.configuration_sha256 != expected_configuration_sha256
             || !variant_splits_are_valid(&variant.splits, evidence.protocol.change_calibration_bins)
             || variant.splits.len() != 1
@@ -11499,17 +11681,6 @@ pub fn verify_public_corpus_ablation_evidence(
             "calibrated detector and full-v2 representation aggregates differ",
         ));
     }
-    let fixed_detector_splits = evidence
-        .change_detector_variants
-        .iter()
-        .find(|variant| variant.detector_mode == AcousticChangeDetectorMode::FixedSafeV1)
-        .map(|variant| &variant.splits)
-        .ok_or_else(|| {
-            public_corpus_error(
-                "clustering_alignment",
-                "fixed-safe detector evidence is unavailable",
-            )
-        })?;
     let fixed_clustering_splits = evidence
         .clustering_variants
         .iter()
@@ -11521,10 +11692,10 @@ pub fn verify_public_corpus_ablation_evidence(
                 "fixed-safe clustering evidence is unavailable",
             )
         })?;
-    if fixed_clustering_splits != fixed_detector_splits {
+    if fixed_clustering_splits.is_empty() {
         return Err(public_corpus_error(
             "clustering_alignment",
-            "fixed-safe clustering and detector aggregates differ",
+            "fixed-safe clustering evidence is empty",
         ));
     }
     let gates_match = match evidence.evaluation_stage {
@@ -12026,6 +12197,60 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                             .mean_absolute_speaker_count_error
                             .is_none_or(finite_nonnegative)
                 });
+        let evidence_lane_candidates_valid = split.speaker_count_evidence_lane_candidates.len()
+            == PUBLIC_SPEAKER_COUNT_EVIDENCE_LANES.len()
+            && split
+                .speaker_count_evidence_lane_candidates
+                .iter()
+                .map(|candidate| candidate.lane)
+                .eq(PUBLIC_SPEAKER_COUNT_EVIDENCE_LANES)
+            && split
+                .speaker_count_evidence_lane_candidates
+                .iter()
+                .all(|candidate| {
+                    let confusion_count = candidate
+                        .speaker_count_confusion
+                        .iter()
+                        .map(|cell| cell.recording_count)
+                        .sum::<u64>();
+                    let exact_count = candidate
+                        .speaker_count_confusion
+                        .iter()
+                        .filter(|cell| cell.reference_speakers == cell.hypothesis_speakers)
+                        .map(|cell| cell.recording_count)
+                        .sum::<u64>();
+                    let absolute_error = candidate
+                        .speaker_count_confusion
+                        .iter()
+                        .map(|cell| {
+                            u128::from(cell.hypothesis_speakers.abs_diff(cell.reference_speakers))
+                                * u128::from(cell.recording_count)
+                        })
+                        .sum::<u128>();
+                    candidate.speaker_count_confusion.windows(2).all(|window| {
+                        (window[0].reference_speakers, window[0].hypothesis_speakers)
+                            < (window[1].reference_speakers, window[1].hypothesis_speakers)
+                    }) && candidate
+                        .speaker_count_confusion
+                        .iter()
+                        .all(|cell| cell.recording_count > 0)
+                        && confusion_count == candidate.recording_count
+                        && candidate
+                            .recording_count
+                            .saturating_add(candidate.unavailable_count)
+                            == split.recording_count
+                        && candidate.exact_speaker_count_rate
+                            == ratio(exact_count, candidate.recording_count)
+                        && candidate.mean_absolute_speaker_count_error
+                            == positive_ratio(
+                                absolute_error as f64,
+                                candidate.recording_count as f64,
+                            )
+                        && bounded(candidate.exact_speaker_count_rate)
+                        && candidate
+                            .mean_absolute_speaker_count_error
+                            .is_none_or(finite_nonnegative)
+                });
         let acoustic_pair_fit_valid = (split.split == EvaluationSplit::Development
             || split.acoustic_speaker_pair_calibration_fit.is_none())
             && split
@@ -12206,6 +12431,20 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
             && bounded(split.maximum_unknown_speaker_share)
             && split.mean_unknown_speaker_share <= split.maximum_unknown_speaker_share
             && bounded(split.mean_minority_reference_recall);
+        let speaker_evidence_valid = {
+            let diagnostics = &split.speaker_evidence_diagnostics;
+            diagnostics.supported_count <= diagnostics.candidate_count
+                && [
+                    diagnostics.no_assigned_speech_count,
+                    diagnostics.insufficient_independent_recurrence_count,
+                    diagnostics.insufficient_voiced_frames_count,
+                    diagnostics.insufficient_assignment_confidence_count,
+                    diagnostics.insufficient_profile_reliability_count,
+                    diagnostics.merge_compatible_with_supported_speaker_count,
+                ]
+                .into_iter()
+                .all(|count| count <= diagnostics.candidate_count)
+        };
         let word_metrics_valid = split
             .scored_word_count
             .saturating_add(split.excluded_word_count)
@@ -12272,12 +12511,14 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
             && posterior_map_confusion_valid
             && merge_frontier_valid
             && hierarchy_candidates_valid
+            && evidence_lane_candidates_valid
             && acoustic_pair_fit_valid
             && count_strata_valid
             && count_duration_strata_valid
             && count_posterior_valid
             && count_quantiles_valid
             && occupancy_valid
+            && speaker_evidence_valid
             && word_metrics_valid
             && selective_valid
             && assignment_calibration_valid
@@ -12301,12 +12542,14 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                 posterior_map_confusion_valid,
                 merge_frontier_valid,
                 hierarchy_candidates_valid,
+                evidence_lane_candidates_valid,
                 acoustic_pair_fit_valid,
                 count_strata_valid,
                 count_duration_strata_valid,
                 count_posterior_valid,
                 count_quantiles_valid,
                 occupancy_valid,
+                speaker_evidence_valid,
                 word_metrics_valid,
                 "public ablation split failed aggregate validation"
             );
@@ -16273,6 +16516,12 @@ mod tests {
         pipeline.speaker_count_duration_strata[0].unresolved_recording_count = 2;
         pipeline.count_posterior_unavailable_count = 2;
         pipeline.count_unresolved_recording_count = 2;
+        for candidate in &mut pipeline.speaker_count_hierarchy_candidates {
+            candidate.unavailable_count = 2;
+        }
+        for lane in &mut pipeline.speaker_count_evidence_lane_candidates {
+            lane.unavailable_count = 2;
+        }
         assert!(super::variant_splits_are_valid(
             std::slice::from_ref(&pipeline),
             10,
@@ -18067,6 +18316,17 @@ mod tests {
                     speaker_count_confusion: Vec::new(),
                 })
                 .collect(),
+            speaker_count_evidence_lane_candidates: super::PUBLIC_SPEAKER_COUNT_EVIDENCE_LANES
+                .into_iter()
+                .map(|lane| super::PublicSpeakerCountEvidenceLaneCandidate {
+                    lane,
+                    recording_count: 0,
+                    unavailable_count: 1,
+                    exact_speaker_count_rate: None,
+                    mean_absolute_speaker_count_error: None,
+                    speaker_count_confusion: Vec::new(),
+                })
+                .collect(),
             acoustic_speaker_pair_calibration_fit: None,
             speaker_count_strata: vec![super::PublicSpeakerCountStratum {
                 reference_speakers: 1,
@@ -18113,6 +18373,7 @@ mod tests {
             mean_unknown_speaker_share: Some(0.0),
             maximum_unknown_speaker_share: Some(0.0),
             mean_minority_reference_recall: Some(1.0),
+            speaker_evidence_diagnostics: super::PublicSpeakerEvidenceDiagnostics::default(),
             reference_word_count: 0,
             scored_word_count: 0,
             correct_word_count: 0,
@@ -18240,6 +18501,23 @@ mod tests {
         let mut forged_words = valid.clone();
         forged_words.splits[0].reference_word_count = 1;
         assert!(!super::variant_splits_are_valid(&forged_words.splits, 10));
+
+        let mut forged_lane_conservation = valid.clone();
+        forged_lane_conservation.splits[0].speaker_count_evidence_lane_candidates[0]
+            .unavailable_count = 0;
+        assert!(!super::variant_splits_are_valid(
+            &forged_lane_conservation.splits,
+            10
+        ));
+
+        let mut forged_speaker_evidence = valid.clone();
+        forged_speaker_evidence.splits[0]
+            .speaker_evidence_diagnostics
+            .supported_count = 1;
+        assert!(!super::variant_splits_are_valid(
+            &forged_speaker_evidence.splits,
+            10
+        ));
 
         let mut held_out_fit = valid;
         held_out_fit.splits[1].acoustic_speaker_pair_calibration_fit = Some(fit);
@@ -18715,7 +18993,7 @@ mod tests {
             .into_iter()
             .map(|detector_mode| {
                 let schema_hash = crate::diarization::acoustic_feature_schema_sha256(
-                    AcousticFeatureAblation::FullV2.schema_version(),
+                    super::PUBLIC_CLUSTERING_DIAGNOSTIC_FEATURE_ABLATION.schema_version(),
                 );
                 let configuration_sha256 =
                     super::canonical_sha256(&super::PublicChangeConfigurationFingerprint {
@@ -18752,8 +19030,8 @@ mod tests {
                     super::canonical_sha256(&super::PublicClusteringConfigurationFingerprint {
                         runner_version: super::PUBLIC_CORPUS_ABLATION_RUNNER_VERSION,
                         clustering_mode,
-                        detector_mode: super::AcousticChangeDetectorMode::FixedSafeV1,
-                        feature_ablation: AcousticFeatureAblation::FullV2,
+                        detector_mode: super::PUBLIC_CLUSTERING_DIAGNOSTIC_DETECTOR_MODE,
+                        feature_ablation: super::PUBLIC_CLUSTERING_DIAGNOSTIC_FEATURE_ABLATION,
                         feature_schema_sha256: &schema_hash,
                         diarization_request_sha256: &diarization_request_sha256,
                         speaker_pair_calibration_sha256: &speaker_pair_calibration_sha256,
@@ -18761,8 +19039,8 @@ mod tests {
                     .expect("clustering configuration hash");
                 super::PublicCorpusClusteringVariant {
                     clustering_mode,
-                    detector_mode: super::AcousticChangeDetectorMode::FixedSafeV1,
-                    feature_ablation: AcousticFeatureAblation::FullV2,
+                    detector_mode: super::PUBLIC_CLUSTERING_DIAGNOSTIC_DETECTOR_MODE,
+                    feature_ablation: super::PUBLIC_CLUSTERING_DIAGNOSTIC_FEATURE_ABLATION,
                     configuration_sha256,
                     splits: full_v2_splits.clone(),
                 }
