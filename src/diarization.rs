@@ -7906,6 +7906,18 @@ pub(crate) struct AcousticClusteringEvaluationEvidence {
     pub executed_mode: AcousticClusteringMode,
     pub fallback_reason: Option<AcousticClusteringFallbackReason>,
     pub speaker_count_stability: f32,
+    /// Full-feature lane merge probabilities in descending agglomeration order.
+    ///
+    /// The public evaluator reduces these bounded, content-free values against
+    /// the reference speaker count. Runtime reports never expose them.
+    pub count_merge_steps: Vec<AcousticCountMergeStepEvidence>,
+}
+
+/// Content-free evidence for one count-lane merge frontier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AcousticCountMergeStepEvidence {
+    pub remaining_clusters: usize,
+    pub same_speaker_probability: f32,
 }
 
 /// Compact speaker-homogeneous observation retained after frame segmentation.
@@ -11269,6 +11281,9 @@ pub struct AcousticClusteringResult {
     pub speaker_pair_calibration_sha256: String,
     pub calibration_status: &'static str,
     pub merge_trace: Vec<ClusterMergeTrace>,
+    /// Full-feature probabilistic count-lane trace retained for aggregate
+    /// evaluation. It is empty on the fixed-safe path.
+    pub(crate) count_merge_steps: Vec<AcousticCountMergeStepEvidence>,
 }
 
 /// Lossless convenience projection of an independent acoustic turn timeline.
@@ -11620,6 +11635,11 @@ where
         executed_mode: clustering.executed_mode,
         fallback_reason: clustering.fallback_reason,
         speaker_count_stability: clustering.bootstrap_stability,
+        count_merge_steps: if capture_evaluation_evidence {
+            clustering.count_merge_steps.clone()
+        } else {
+            Vec::new()
+        },
     };
     Ok((
         DiarizationReport {
@@ -11980,6 +12000,7 @@ where
             speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
             calibration_status: "insufficient_identity_evidence",
             merge_trace: Vec::new(),
+            count_merge_steps: Vec::new(),
         });
     }
     let (prototypes, cap_pressure) = build_capped_prototypes(
@@ -12017,6 +12038,7 @@ where
             speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
             calibration_status: "insufficient_evidence",
             merge_trace: Vec::new(),
+            count_merge_steps: Vec::new(),
         });
     }
 
@@ -12042,6 +12064,7 @@ where
     let (
         clusters,
         merge_trace,
+        count_merge_steps,
         bootstrap_stability,
         mut count_estimate,
         executed_mode,
@@ -12057,11 +12080,13 @@ where
             ProbabilisticAgglomeration::Selected {
                 clusters,
                 merge_trace,
+                count_merge_steps,
                 stability,
                 count_estimate,
             } => (
                 clusters,
                 merge_trace,
+                count_merge_steps,
                 stability,
                 Some(count_estimate),
                 AcousticClusteringMode::ProbabilisticV1,
@@ -12070,6 +12095,7 @@ where
             ProbabilisticAgglomeration::Fallback {
                 reason,
                 count_estimate,
+                count_merge_steps,
             } => {
                 let unavailable_reason = match reason {
                     AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions => {
@@ -12104,6 +12130,7 @@ where
                 (
                     clusters,
                     merge_trace,
+                    count_merge_steps,
                     0.0,
                     count_estimate,
                     AcousticClusteringMode::FixedSafeV1,
@@ -12130,6 +12157,7 @@ where
         (
             clusters,
             merge_trace,
+            Vec::new(),
             0.0,
             count_estimate,
             AcousticClusteringMode::FixedSafeV1,
@@ -12213,6 +12241,7 @@ where
             "heuristic_uncalibrated"
         },
         merge_trace,
+        count_merge_steps,
     })
 }
 
@@ -13441,18 +13470,21 @@ struct ProbabilisticLaneResult {
     selected_count: usize,
     groups: Vec<Vec<usize>>,
     risk_curve: SpeakerCountRiskCurve,
+    merge_steps: Vec<AcousticCountMergeStepEvidence>,
 }
 
 enum ProbabilisticAgglomeration {
     Selected {
         clusters: Vec<AcousticCluster>,
         merge_trace: Vec<ClusterMergeTrace>,
+        count_merge_steps: Vec<AcousticCountMergeStepEvidence>,
         stability: f32,
         count_estimate: SpeakerCountEstimate,
     },
     Fallback {
         reason: AcousticClusteringFallbackReason,
         count_estimate: Option<SpeakerCountEstimate>,
+        count_merge_steps: Vec<AcousticCountMergeStepEvidence>,
     },
 }
 
@@ -13467,6 +13499,7 @@ where
     C: FnMut() -> bool,
 {
     let mut lane_results = Vec::with_capacity(SPEAKER_COUNT_PERTURBATION_LANES);
+    let mut full_lane_merge_steps = Vec::new();
     for perturbation in SpeakerPairPerturbation::ALL {
         let Some(result) = probabilistic_agglomeration_lane(
             initial,
@@ -13479,8 +13512,12 @@ where
             return Ok(ProbabilisticAgglomeration::Fallback {
                 reason: AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions,
                 count_estimate: None,
+                count_merge_steps: full_lane_merge_steps,
             });
         };
+        if matches!(perturbation, SpeakerPairPerturbation::Full) {
+            full_lane_merge_steps.clone_from(&result.merge_steps);
+        }
         lane_results.push(result);
     }
     let affinity_build = build_sparse_speaker_affinity(initial, cannot_links, &mut *is_cancelled)?;
@@ -13517,6 +13554,7 @@ where
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::InvalidPosterior,
             count_estimate: None,
+            count_merge_steps: full_lane_merge_steps,
         });
     };
     // `selected_count` is an authority claim, not the only partition action the
@@ -13530,6 +13568,7 @@ where
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::InvalidPosterior,
             count_estimate: Some(count_estimate),
+            count_merge_steps: full_lane_merge_steps,
         });
     };
     let agreeing_lanes = lane_results
@@ -13560,11 +13599,13 @@ where
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::UnstableSpeakerCount,
             count_estimate: Some(count_estimate),
+            count_merge_steps: full_lane_merge_steps,
         });
     };
     Ok(ProbabilisticAgglomeration::Selected {
         clusters,
         merge_trace,
+        count_merge_steps: full_lane_merge_steps,
         stability,
         count_estimate,
     })
@@ -15314,6 +15355,13 @@ where
         selected_count,
         groups: groups.into_iter().flatten().collect(),
         risk_curve,
+        merge_steps: steps
+            .iter()
+            .map(|step| AcousticCountMergeStepEvidence {
+                remaining_clusters: step.remaining_clusters,
+                same_speaker_probability: step.same_speaker_probability,
+            })
+            .collect(),
     }))
 }
 
@@ -24612,6 +24660,14 @@ mod tests {
                 .is_some_and(|residual| { residual <= super::SPEAKER_COUNT_EIGENSOLVER_TOLERANCE }),
             "{resources:#?}"
         );
+        assert_eq!(result.count_merge_steps.len(), 7, "{result:#?}");
+        assert!(result.count_merge_steps.windows(2).all(|window| {
+            window[0].remaining_clusters.checked_sub(1) == Some(window[1].remaining_clusters)
+        }));
+        assert!(result.count_merge_steps.iter().all(|step| {
+            step.same_speaker_probability.is_finite()
+                && (0.0..=1.0).contains(&step.same_speaker_probability)
+        }));
     }
 
     #[test]
@@ -24630,6 +24686,7 @@ mod tests {
                     })
                     .collect(),
             },
+            merge_steps: Vec::new(),
         };
         let lanes = vec![
             lane(2, [5.0, 0.0, 3.0]),
@@ -24679,6 +24736,7 @@ mod tests {
                     })
                     .collect(),
             },
+            merge_steps: Vec::new(),
         };
         let lanes = vec![
             lane(3, &[(2, 3.0), (3, 0.0), (4, 2.0)]),
@@ -24714,6 +24772,7 @@ mod tests {
                     })
                     .collect(),
             },
+            merge_steps: Vec::new(),
         };
         let lanes = vec![
             lane([4.0, 0.0, 3.0]),
@@ -24840,6 +24899,7 @@ mod tests {
                     },
                 ],
             },
+            merge_steps: Vec::new(),
         };
         let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
             .map(|_| lane())
@@ -24920,11 +24980,12 @@ mod tests {
                     },
                 ],
             },
+            merge_steps: Vec::new(),
         };
         let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
             .map(|_| lane())
             .collect::<Vec<_>>();
-        let estimate = super::fused_speaker_count_estimate(
+        let mut estimate = super::fused_speaker_count_estimate(
             &lanes,
             None,
             Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
@@ -24956,6 +25017,15 @@ mod tests {
             None,
             "an unresolved MAP at the bounded ceiling must fail closed instead of treating domain saturation as an operational count"
         );
+        estimate.candidate_upper_bound = 8;
+        estimate
+            .validate()
+            .expect("the same unresolved MAP remains valid inside a wider bounded domain");
+        assert_eq!(
+            super::operational_speaker_count(&estimate),
+            Some(5),
+            "an interior concrete MAP remains usable without becoming an authoritative selected_count"
+        );
     }
 
     #[test]
@@ -24984,6 +25054,7 @@ mod tests {
                     },
                 ],
             },
+            merge_steps: Vec::new(),
         };
         let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
             .map(|_| lane())
@@ -25125,6 +25196,7 @@ mod tests {
                         })
                         .collect(),
                 },
+                merge_steps: Vec::new(),
             };
             let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
                 .map(|_| lane.clone())
@@ -25198,6 +25270,7 @@ mod tests {
                     },
                 ],
             },
+            merge_steps: Vec::new(),
         };
         let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
             .map(|_| lane())
@@ -25282,6 +25355,7 @@ mod tests {
                     },
                 ],
             },
+            merge_steps: Vec::new(),
         };
         let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
             .map(|_| lane())
