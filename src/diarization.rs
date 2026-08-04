@@ -7549,7 +7549,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v7-development";
+    "acoustic-clustering-probabilistic-v9-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -13521,10 +13521,11 @@ where
     };
     // `selected_count` is an authority claim, not the only partition action the
     // diarizer may take.  A calibrated posterior can correctly retain more
-    // unresolved mass than any concrete bin while its concrete MAP remains the
-    // least-lossy operational partition.  Falling back to the fixed-safe
-    // objective in that case used to collapse real multi-speaker recordings to
-    // one speaker and erased the very uncertainty the posterior reported.
+    // unresolved mass than any concrete bin while an interior concrete MAP
+    // remains a useful operational partition. Falling back merely because the
+    // interior action is unresolved collapsed real multi-speaker recordings to
+    // one speaker; an unresolved ceiling MAP is handled separately as domain
+    // saturation rather than being promoted into an eight-way partition.
     let Some(selected_count) = operational_speaker_count(&count_estimate) else {
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::InvalidPosterior,
@@ -13684,22 +13685,31 @@ fn merge_risk_loss_points(
     (!points.is_empty()).then_some(points)
 }
 
-/// Choose the concrete posterior MAP for an operational clustering partition.
+/// Choose a non-saturated concrete posterior MAP for an operational partition.
 ///
 /// This deliberately does not mutate `selected_count`: unresolved mass remains
 /// authoritative for callers deciding whether the inferred count is certified.
-/// The operational action only prevents epistemic uncertainty from triggering
-/// an unrelated fixed-objective collapse.
+/// The operational action prevents ordinary epistemic uncertainty from
+/// triggering an unrelated fixed-objective collapse, but an unresolved MAP at
+/// the bounded ceiling fails closed because it signals domain saturation.
 fn operational_speaker_count(estimate: &SpeakerCountEstimate) -> Option<usize> {
-    estimate
-        .posterior
-        .iter()
-        .max_by(|left, right| {
-            left.probability
-                .total_cmp(&right.probability)
-                .then_with(|| right.count.cmp(&left.count))
-        })
-        .and_then(|bin| usize::try_from(bin.count).ok())
+    let map_bin = estimate.posterior.iter().max_by(|left, right| {
+        left.probability
+            .total_cmp(&right.probability)
+            .then_with(|| right.count.cmp(&left.count))
+    })?;
+    let map_count = usize::try_from(map_bin.count).ok()?;
+    // An unresolved MAP at the bounded search ceiling is evidence that the
+    // model wants support outside its declared domain, not evidence that the
+    // ceiling itself is the least-lossy operational partition. Acting on that
+    // boundary bin fragmented each public K=4 meeting into eight candidates
+    // before evidence pruning collapsed them to one or two output speakers.
+    // A validated hard count still has `selected_count=Some`, so this guard is
+    // confined to uncertain automatic/soft-count inference.
+    if estimate.selected_count.is_none() && map_bin.count == estimate.candidate_upper_bound {
+        return None;
+    }
+    Some(map_count)
 }
 
 /// Return normalized feasible caller weights and their bounded linear-pool mix.
@@ -24943,8 +24953,8 @@ mod tests {
         );
         assert_eq!(
             super::operational_speaker_count(&estimate),
-            Some(5),
-            "the concrete MAP remains usable for clustering without becoming an authoritative selection"
+            None,
+            "an unresolved MAP at the bounded ceiling must fail closed instead of treating domain saturation as an operational count"
         );
     }
 
