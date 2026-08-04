@@ -3439,6 +3439,7 @@ mod tests {
                 }],
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
+            neural_representation: None,
             diagnostics: vec!["synthetic sync fixture".to_owned()],
         });
         report.result.raw_output = json!({

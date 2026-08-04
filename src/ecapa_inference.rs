@@ -832,6 +832,25 @@ impl EcapaModel {
         )
     }
 
+    /// Compute the production frontend and infer one speaker embedding from an
+    /// admitted 16 kHz mono PCM window under one cancellation boundary.
+    pub fn infer_pcm_with_checkpoint(
+        &self,
+        samples: &[f32],
+        config: EcapaInferenceConfig,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        trace: &mut EcapaInferenceTrace,
+    ) -> FwResult<EcapaInferenceOutput> {
+        let frontend = crate::ecapa_conformance::ecapa_frontend_runtime(samples, checkpoint)?;
+        self.infer_with_checkpoint(
+            &frontend.sentence_mean_normalized,
+            frontend.frame_count,
+            config,
+            checkpoint,
+            trace,
+        )
+    }
+
     fn infer_internal(
         &self,
         features: &[f32],
@@ -2899,6 +2918,41 @@ mod tests {
     fn module_forbids_unsafe_code_at_compile_time() {
         let source = include_str!("ecapa_inference.rs");
         assert!(source.contains("#![forbid(unsafe_code)]"));
+    }
+
+    #[test]
+    #[ignore = "requires externally converted public ECAPA weights"]
+    fn external_package_runtime_pcm_smoke() {
+        let weight_path = std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS")
+            .map(std::path::PathBuf::from)
+            .expect("set FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS");
+        let model = EcapaModel::load(&weight_path).expect("load model");
+        let mut trace = EcapaInferenceTrace::default();
+        let output = model
+            .infer_pcm_with_checkpoint(
+                &ecapa_analytic_fixture(),
+                EcapaInferenceConfig::default(),
+                &no_cancel,
+                &mut trace,
+            )
+            .expect("runtime frontend and native ECAPA inference");
+        assert_eq!(
+            output.embedding.as_slice().len(),
+            ECAPA_EMBEDDING_DIMENSIONS
+        );
+        let norm = output
+            .embedding
+            .as_slice()
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!((norm - 1.0).abs() < 1.0e-5, "embedding norm={norm}");
+        assert_eq!(trace.frame_count, 101);
+        assert_eq!(
+            trace.last_stage,
+            Some(EcapaInferenceStage::ProjectionAndNormalization)
+        );
     }
 
     #[test]
