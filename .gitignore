@@ -255,3 +255,5 @@ __pycache__/
 *.rlib
 /lint_probe
 /rust_out
+# br doctor per-run artifacts
+.doctor/
