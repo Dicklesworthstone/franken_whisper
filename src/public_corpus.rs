@@ -27,8 +27,8 @@ use crate::diarization::{
     ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION, ACOUSTIC_SIDECAR_FUSION_VERSION,
     ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION, AcousticBoundaryHints, AcousticChangeDetectorMode,
     AcousticClusteringEvaluationEvidence, AcousticClusteringFallbackReason, AcousticClusteringMode,
-    AcousticDiarizationInput, AcousticFeatureAblation, AcousticScatteringMode,
-    AcousticSidecarEvaluationRequest, AcousticSidecarFusionCalibration,
+    AcousticCountMergeStepEvidence, AcousticDiarizationInput, AcousticFeatureAblation,
+    AcousticScatteringMode, AcousticSidecarEvaluationRequest, AcousticSidecarFusionCalibration,
     AcousticSidecarFusionEvaluationEvidence, AcousticSidecarStudy, AcousticSidecarStudyConfig,
     AcousticSidecarStudyMode, AcousticSidecarStudyObservation, AcousticTrajectoryWaveletMode,
     ChangePointScore, DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION,
@@ -62,10 +62,10 @@ pub const PUBLIC_CORPUS_REGISTRY_SCHEMA_VERSION: &str = "public-diarization-corp
 pub const PUBLIC_CORPUS_WORD_ANNOTATION_SCHEMA_VERSION: &str =
     "public-diarization-word-annotation-v1";
 /// Schema identity for path-free public representation-ablation evidence.
-pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v9";
+pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v10";
 /// Frozen public ablation implementation identity.
 pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-ablation-runner-v9";
+    "public-diarization-acoustic-ablation-runner-v10";
 /// Schema identity for the separate aggregate-only acoustic sidecar study.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION: &str =
     "public-diarization-acoustic-sidecar-study-v3";
@@ -364,6 +364,27 @@ pub struct PublicSpeakerCountConfusionCell {
     pub recording_count: u64,
 }
 
+/// Aggregate diagnostic at the reference-count frontier of the full-feature
+/// probabilistic agglomeration lane.
+///
+/// A well-ordered hierarchy should assign a higher same-speaker probability to
+/// the last merge reaching the reference count than to the first merge below
+/// it. This is diagnostic evidence only; the reference count is never passed
+/// into the diarizer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicSpeakerCountMergeFrontier {
+    pub recording_count: u64,
+    pub to_reference_count_observation_count: u64,
+    pub mean_probability_to_reference_count: Option<f64>,
+    pub below_reference_count_observation_count: u64,
+    pub mean_probability_below_reference_count: Option<f64>,
+    pub paired_frontier_observation_count: u64,
+    pub mean_probability_margin: Option<f64>,
+    pub correctly_ordered_frontier_count: u64,
+    pub correctly_ordered_frontier_rate: Option<f64>,
+}
+
 /// Count-posterior quality stratified by the reference speaker count.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -449,6 +470,7 @@ pub struct PublicCorpusAblationSplit {
     pub speaker_count_confusion: Vec<PublicSpeakerCountConfusionCell>,
     /// Reference count versus the concrete posterior MAP before abstention.
     pub speaker_count_posterior_map_confusion: Vec<PublicSpeakerCountConfusionCell>,
+    pub speaker_count_merge_frontier: PublicSpeakerCountMergeFrontier,
     pub speaker_count_strata: Vec<PublicSpeakerCountStratum>,
     pub speaker_count_duration_strata: Vec<PublicSpeakerCountDurationStratum>,
     pub count_posterior_recording_count: u64,
@@ -3468,6 +3490,7 @@ fn evaluate_public_variant(
                     executed_mode: AcousticClusteringMode::FixedSafeV1,
                     fallback_reason: None,
                     speaker_count_stability: 0.0,
+                    count_merge_steps: Vec::new(),
                 },
             )
         } else {
@@ -5972,6 +5995,7 @@ fn evaluate_public_sidecar_lane(
                     executed_mode: AcousticClusteringMode::FixedSafeV1,
                     fallback_reason: None,
                     speaker_count_stability: 0.0,
+                    count_merge_steps: Vec::new(),
                 },
                 sidecar_evidence,
             )
@@ -7333,6 +7357,36 @@ struct SpeakerCountStratumAccumulator {
     credible_set_observation_count: u64,
 }
 
+fn count_merge_frontier_observation(
+    steps: &[AcousticCountMergeStepEvidence],
+    reference_count: usize,
+) -> FwResult<Option<(Option<f64>, Option<f64>)>> {
+    if steps.is_empty() {
+        return Ok(None);
+    }
+    if steps.iter().any(|step| {
+        !step.same_speaker_probability.is_finite()
+            || !(0.0..=1.0).contains(&step.same_speaker_probability)
+    }) || !steps.windows(2).all(|window| {
+        window[0].remaining_clusters.checked_sub(1) == Some(window[1].remaining_clusters)
+    }) {
+        return Err(public_corpus_error(
+            "count_merge_frontier",
+            "probabilistic count merge steps must be finite probabilities with consecutive descending cluster counts",
+        ));
+    }
+    let probability_at = |count| {
+        steps
+            .iter()
+            .find(|step| step.remaining_clusters == count)
+            .map(|step| f64::from(step.same_speaker_probability))
+    };
+    Ok(Some((
+        probability_at(reference_count),
+        reference_count.checked_sub(1).and_then(probability_at),
+    )))
+}
+
 #[derive(Default)]
 struct PublicAblationAccumulator {
     recording_count: u64,
@@ -7365,6 +7419,14 @@ struct PublicAblationAccumulator {
     absolute_speaker_count_errors: Vec<u64>,
     speaker_count_confusion: BTreeMap<(u32, u32), u64>,
     speaker_count_posterior_map_confusion: BTreeMap<(u32, u32), u64>,
+    count_merge_frontier_recording_count: u64,
+    count_merge_to_reference_probability_sum: f64,
+    count_merge_to_reference_probability_count: u64,
+    count_merge_below_reference_probability_sum: f64,
+    count_merge_below_reference_probability_count: u64,
+    count_merge_frontier_margin_sum: f64,
+    count_merge_frontier_margin_count: u64,
+    count_merge_frontier_correctly_ordered_count: u64,
     speaker_count_strata: BTreeMap<u32, SpeakerCountStratumAccumulator>,
     speaker_count_duration_strata:
         BTreeMap<PublicSpeakerCountDurationBucket, SpeakerCountStratumAccumulator>,
@@ -7533,6 +7595,70 @@ impl PublicAblationAccumulator {
                 .entry((reference_speakers, map_count))
                 .or_default();
             *map_confusion_count = map_confusion_count.saturating_add(1);
+        }
+        let reference_count = usize::try_from(reference_speakers).map_err(|_| {
+            public_corpus_error(
+                "count_merge_frontier",
+                "reference speaker count exceeds the native count domain",
+            )
+        })?;
+        if let Some((to_reference, below_reference)) =
+            count_merge_frontier_observation(&clustering.count_merge_steps, reference_count)?
+        {
+            self.count_merge_frontier_recording_count = self
+                .count_merge_frontier_recording_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "ablation_aggregate_overflow",
+                        "count merge-frontier recording count overflowed",
+                    )
+                })?;
+            if let Some(probability) = to_reference {
+                self.count_merge_to_reference_probability_sum += probability;
+                self.count_merge_to_reference_probability_count = self
+                    .count_merge_to_reference_probability_count
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "to-reference count merge observation count overflowed",
+                        )
+                    })?;
+            }
+            if let Some(probability) = below_reference {
+                self.count_merge_below_reference_probability_sum += probability;
+                self.count_merge_below_reference_probability_count = self
+                    .count_merge_below_reference_probability_count
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "below-reference count merge observation count overflowed",
+                        )
+                    })?;
+            }
+            if let (Some(to_reference), Some(below_reference)) = (to_reference, below_reference) {
+                self.count_merge_frontier_margin_sum += to_reference - below_reference;
+                self.count_merge_frontier_margin_count = self
+                    .count_merge_frontier_margin_count
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "paired count merge-frontier observation count overflowed",
+                        )
+                    })?;
+                self.count_merge_frontier_correctly_ordered_count = self
+                    .count_merge_frontier_correctly_ordered_count
+                    .checked_add(u64::from(to_reference > below_reference))
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "ablation_aggregate_overflow",
+                            "ordered count merge-frontier count overflowed",
+                        )
+                    })?;
+            }
         }
         let stratum = self
             .speaker_count_strata
@@ -7836,6 +7962,30 @@ impl PublicAblationAccumulator {
                 },
             )
             .collect::<Vec<_>>();
+        let speaker_count_merge_frontier = PublicSpeakerCountMergeFrontier {
+            recording_count: self.count_merge_frontier_recording_count,
+            to_reference_count_observation_count: self.count_merge_to_reference_probability_count,
+            mean_probability_to_reference_count: positive_ratio(
+                self.count_merge_to_reference_probability_sum,
+                self.count_merge_to_reference_probability_count as f64,
+            ),
+            below_reference_count_observation_count: self
+                .count_merge_below_reference_probability_count,
+            mean_probability_below_reference_count: positive_ratio(
+                self.count_merge_below_reference_probability_sum,
+                self.count_merge_below_reference_probability_count as f64,
+            ),
+            paired_frontier_observation_count: self.count_merge_frontier_margin_count,
+            mean_probability_margin: signed_ratio(
+                self.count_merge_frontier_margin_sum,
+                self.count_merge_frontier_margin_count as f64,
+            ),
+            correctly_ordered_frontier_count: self.count_merge_frontier_correctly_ordered_count,
+            correctly_ordered_frontier_rate: ratio(
+                self.count_merge_frontier_correctly_ordered_count,
+                self.count_merge_frontier_margin_count,
+            ),
+        };
         let speaker_count_strata = self
             .speaker_count_strata
             .iter()
@@ -8035,6 +8185,7 @@ impl PublicAblationAccumulator {
             maximum_absolute_speaker_count_error,
             speaker_count_confusion,
             speaker_count_posterior_map_confusion,
+            speaker_count_merge_frontier,
             speaker_count_strata,
             speaker_count_duration_strata,
             count_posterior_recording_count: self.count_posterior_recording_count,
@@ -11113,6 +11264,37 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                 .iter()
                 .all(|cell| cell.recording_count > 0)
             && posterior_map_confusion_count == split.count_posterior_recording_count;
+        let merge_frontier = &split.speaker_count_merge_frontier;
+        let merge_frontier_valid = merge_frontier.recording_count <= split.recording_count
+            && merge_frontier.to_reference_count_observation_count
+                <= merge_frontier.recording_count
+            && merge_frontier.below_reference_count_observation_count
+                <= merge_frontier.recording_count
+            && merge_frontier.paired_frontier_observation_count
+                <= merge_frontier
+                    .to_reference_count_observation_count
+                    .min(merge_frontier.below_reference_count_observation_count)
+            && merge_frontier.correctly_ordered_frontier_count
+                <= merge_frontier.paired_frontier_observation_count
+            && bounded(merge_frontier.mean_probability_to_reference_count)
+            && bounded(merge_frontier.mean_probability_below_reference_count)
+            && merge_frontier
+                .mean_probability_margin
+                .is_none_or(|margin| margin.is_finite() && (-1.0..=1.0).contains(&margin))
+            && bounded(merge_frontier.correctly_ordered_frontier_rate)
+            && (merge_frontier.to_reference_count_observation_count > 0)
+                == merge_frontier.mean_probability_to_reference_count.is_some()
+            && (merge_frontier.below_reference_count_observation_count > 0)
+                == merge_frontier
+                    .mean_probability_below_reference_count
+                    .is_some()
+            && (merge_frontier.paired_frontier_observation_count > 0)
+                == merge_frontier.mean_probability_margin.is_some()
+            && merge_frontier.correctly_ordered_frontier_rate
+                == ratio(
+                    merge_frontier.correctly_ordered_frontier_count,
+                    merge_frontier.paired_frontier_observation_count,
+                );
         let stratum_recording_count = split
             .speaker_count_strata
             .iter()
@@ -11327,6 +11509,7 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                 .is_none_or(finite_nonnegative)
             && confusion_valid
             && posterior_map_confusion_valid
+            && merge_frontier_valid
             && count_strata_valid
             && count_duration_strata_valid
             && count_posterior_valid
@@ -16840,6 +17023,48 @@ mod tests {
         assert_eq!(aggregate.sampled_peak_rss_bytes, 123);
     }
 
+    #[test]
+    fn count_merge_frontier_extracts_reference_boundary_and_rejects_bad_traces() {
+        let steps = [
+            super::AcousticCountMergeStepEvidence {
+                remaining_clusters: 5,
+                same_speaker_probability: 0.9,
+            },
+            super::AcousticCountMergeStepEvidence {
+                remaining_clusters: 4,
+                same_speaker_probability: 0.8,
+            },
+            super::AcousticCountMergeStepEvidence {
+                remaining_clusters: 3,
+                same_speaker_probability: 0.2,
+            },
+        ];
+        let observation = super::count_merge_frontier_observation(&steps, 4)
+            .expect("valid merge trace")
+            .expect("non-empty merge trace");
+        assert!(
+            observation
+                .0
+                .is_some_and(|value| (value - f64::from(0.8_f32)).abs() < f64::EPSILON)
+        );
+        assert!(
+            observation
+                .1
+                .is_some_and(|value| (value - f64::from(0.2_f32)).abs() < f64::EPSILON)
+        );
+        assert_eq!(
+            super::count_merge_frontier_observation(&[], 4).expect("empty trace"),
+            None
+        );
+
+        let mut invalid = steps;
+        invalid[1].remaining_clusters = 3;
+        assert!(super::count_merge_frontier_observation(&invalid, 4).is_err());
+        invalid = steps;
+        invalid[1].same_speaker_probability = f32::NAN;
+        assert!(super::count_merge_frontier_observation(&invalid, 4).is_err());
+    }
+
     fn ablation_variant(
         ablation: AcousticFeatureAblation,
         micro_der: Option<f64>,
@@ -16929,6 +17154,17 @@ mod tests {
                 recording_count: 1,
             }],
             speaker_count_posterior_map_confusion: Vec::new(),
+            speaker_count_merge_frontier: super::PublicSpeakerCountMergeFrontier {
+                recording_count: 0,
+                to_reference_count_observation_count: 0,
+                mean_probability_to_reference_count: None,
+                below_reference_count_observation_count: 0,
+                mean_probability_below_reference_count: None,
+                paired_frontier_observation_count: 0,
+                mean_probability_margin: None,
+                correctly_ordered_frontier_count: 0,
+                correctly_ordered_frontier_rate: None,
+            },
             speaker_count_strata: vec![super::PublicSpeakerCountStratum {
                 reference_speakers: 1,
                 recording_count: 1,
