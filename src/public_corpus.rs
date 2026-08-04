@@ -70,7 +70,7 @@ pub const PUBLIC_CORPUS_WORD_ANNOTATION_SCHEMA_VERSION: &str =
 pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v15";
 /// Frozen public ablation implementation identity.
 pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-ablation-runner-v17";
+    "public-diarization-acoustic-ablation-runner-v18";
 /// Schema identity for the separate aggregate-only acoustic sidecar study.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION: &str =
     "public-diarization-acoustic-sidecar-study-v6";
@@ -7963,11 +7963,21 @@ fn fit_acoustic_speaker_pair_calibration(
         }
     }
     let runtime_calibration = acoustic_speaker_pair_calibration();
+    let runtime_channel_weight = f64::from(runtime_calibration.channel_distance_weight);
+    // Persist a declared grid coordinate, not the widened binary value of the
+    // runtime f32. Without this normalization an incumbent `0.1_f32` becomes
+    // `0.10000000149011612_f64`, and evidence generated when the incumbent is
+    // already optimal fails the exact frozen-grid validator.
+    let canonical_runtime_channel_weight = channel_weights
+        .iter()
+        .copied()
+        .find(|candidate| (*candidate - runtime_channel_weight).abs() <= 1e-6)
+        .unwrap_or(runtime_channel_weight);
     let incumbent = (
         baseline_brier,
         f64::from(runtime_calibration.different_logit_intercept),
         f64::from(runtime_calibration.voice_distance_weight),
-        f64::from(runtime_calibration.channel_distance_weight),
+        canonical_runtime_channel_weight,
     );
     let (fitted_brier, intercept, voice_weight, channel_weight) = best
         .filter(|candidate| candidate.0.total_cmp(&baseline_brier).is_lt())
@@ -18199,10 +18209,8 @@ mod tests {
             retained.fitted_voice_distance_weight,
             f64::from(incumbent.voice_distance_weight)
         );
-        assert_eq!(
-            retained.fitted_channel_distance_weight,
-            f64::from(incumbent.channel_distance_weight)
-        );
+        assert_eq!(retained.fitted_channel_distance_weight, 0.1);
+        assert!([0.0, 0.1, 0.25, 0.5, 1.0].contains(&retained.fitted_channel_distance_weight));
     }
 
     fn ablation_variant(
