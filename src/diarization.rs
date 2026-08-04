@@ -7533,7 +7533,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v5-development";
+    "acoustic-clustering-probabilistic-v6-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -13503,12 +13503,15 @@ where
             count_estimate: None,
         });
     };
-    let Some(selected_count) = count_estimate
-        .selected_count
-        .and_then(|count| usize::try_from(count).ok())
-    else {
+    // `selected_count` is an authority claim, not the only partition action the
+    // diarizer may take.  A calibrated posterior can correctly retain more
+    // unresolved mass than any concrete bin while its concrete MAP remains the
+    // least-lossy operational partition.  Falling back to the fixed-safe
+    // objective in that case used to collapse real multi-speaker recordings to
+    // one speaker and erased the very uncertainty the posterior reported.
+    let Some(selected_count) = operational_speaker_count(&count_estimate) else {
         return Ok(ProbabilisticAgglomeration::Fallback {
-            reason: AcousticClusteringFallbackReason::UnstableSpeakerCount,
+            reason: AcousticClusteringFallbackReason::InvalidPosterior,
             count_estimate: Some(count_estimate),
         });
     };
@@ -13525,12 +13528,10 @@ where
         };
         0.5 * (feature_stability + spectral_support)
     });
-    if stability < acoustic_speaker_pair_calibration().minimum_stable_lane_fraction {
-        return Ok(ProbabilisticAgglomeration::Fallback {
-            reason: AcousticClusteringFallbackReason::UnstableSpeakerCount,
-            count_estimate: Some(count_estimate),
-        });
-    }
+    // Do not reject the entire partition merely because the independent
+    // eigengap lane disagrees with otherwise stable feature perturbations.
+    // `coassociation_consensus_clusters` enforces the predeclared 3/5 support
+    // threshold on every actual merge, which is the relevant safety check.
     let Some((clusters, merge_trace)) = coassociation_consensus_clusters(
         initial,
         cannot_links,
@@ -13552,7 +13553,6 @@ where
     })
 }
 
-#[cfg(test)]
 fn fused_merge_risk_count(
     lanes: &[ProbabilisticLaneResult],
     spectral: Option<&SparseEigengapProposal>,
@@ -13574,7 +13574,13 @@ fn fused_count_loss_points(
     policy: SpeakerCountPolicy,
 ) -> Option<Vec<(usize, f64)>> {
     let merge_risk_points = merge_risk_loss_points(lanes, policy)?;
-    let candidate_count = policy.max.checked_sub(policy.min)?.checked_add(1)?;
+    // Cannot-link constraints or unavailable pair evidence can make low counts
+    // unreachable in one or more lanes.  Only the intersection of lane-feasible
+    // counts may receive posterior mass.
+    let candidate_count = merge_risk_points.len();
+    if candidate_count == 0 {
+        return None;
+    }
     let mut points = Vec::with_capacity(merge_risk_points.len());
     for (count, mean_normalized_loss) in merge_risk_points {
         let selected_lane_count = lanes
@@ -13623,6 +13629,7 @@ fn merge_risk_loss_points(
             continue;
         }
         let mut normalized_loss_sum = 0.0;
+        let mut feasible_in_every_lane = true;
         for lane in lanes {
             let minimum = lane
                 .risk_curve
@@ -13636,13 +13643,20 @@ fn merge_risk_loss_points(
                 .iter()
                 .map(|point| point.expected_loss)
                 .max_by(f64::total_cmp)?;
-            let point = lane
+            let Some(point) = lane
                 .risk_curve
                 .points
                 .iter()
-                .find(|point| point.count == count)?;
+                .find(|point| point.count == count)
+            else {
+                feasible_in_every_lane = false;
+                break;
+            };
             let scale = (maximum - minimum).max(1.0e-9);
             normalized_loss_sum += (point.expected_loss - minimum) / scale;
+        }
+        if !feasible_in_every_lane {
+            continue;
         }
         let mean_normalized_loss = normalized_loss_sum / lanes.len() as f64;
         if !mean_normalized_loss.is_finite() {
@@ -13651,6 +13665,24 @@ fn merge_risk_loss_points(
         points.push((count, mean_normalized_loss));
     }
     (!points.is_empty()).then_some(points)
+}
+
+/// Choose the concrete posterior MAP for an operational clustering partition.
+///
+/// This deliberately does not mutate `selected_count`: unresolved mass remains
+/// authoritative for callers deciding whether the inferred count is certified.
+/// The operational action only prevents epistemic uncertainty from triggering
+/// an unrelated fixed-objective collapse.
+fn operational_speaker_count(estimate: &SpeakerCountEstimate) -> Option<usize> {
+    estimate
+        .posterior
+        .iter()
+        .max_by(|left, right| {
+            left.probability
+                .total_cmp(&right.probability)
+                .then_with(|| right.count.cmp(&left.count))
+        })
+        .and_then(|bin| usize::try_from(bin.count).ok())
 }
 
 /// Return normalized feasible caller weights and their bounded linear-pool mix.
@@ -24578,6 +24610,40 @@ mod tests {
     }
 
     #[test]
+    fn fused_merge_risk_excludes_counts_unreachable_in_any_lane() {
+        let lane = |selected_count, points: &[(usize, f64)]| super::ProbabilisticLaneResult {
+            selected_count,
+            groups: vec![vec![0]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count,
+                points: points
+                    .iter()
+                    .map(|&(count, expected_loss)| super::SpeakerCountRiskPoint {
+                        count,
+                        expected_loss,
+                    })
+                    .collect(),
+            },
+        };
+        let lanes = vec![
+            lane(3, &[(2, 3.0), (3, 0.0), (4, 2.0)]),
+            lane(3, &[(3, 0.0), (4, 1.0)]),
+        ];
+        let policy = super::SpeakerCountPolicy {
+            min: 2,
+            max: 4,
+            exact: None,
+        };
+        let points = super::merge_risk_loss_points(&lanes, policy)
+            .expect("the common feasible count domain must remain usable");
+        assert_eq!(
+            points.iter().map(|(count, _)| *count).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(super::fused_merge_risk_count(&lanes, None, policy), Some(3));
+    }
+
+    #[test]
     fn fused_speaker_count_estimate_normalizes_with_explicit_unresolved_mass() {
         let lane = |losses: [f64; 3]| super::ProbabilisticLaneResult {
             selected_count: 2,
@@ -24829,6 +24895,11 @@ mod tests {
                 .iter()
                 .all(|bin| bin.probability < estimate.unresolved_probability),
             "diffuse concrete mass must remain explicit rather than selecting a count: {estimate:#?}"
+        );
+        assert_eq!(
+            super::operational_speaker_count(&estimate),
+            Some(5),
+            "the concrete MAP remains usable for clustering without becoming an authoritative selection"
         );
     }
 
