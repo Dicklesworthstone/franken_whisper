@@ -57,7 +57,6 @@ use rayon::prelude::*;
 
 use crate::error::{FwError, FwResult};
 use crate::model::TranscriptionSegment;
-use rayon::prelude::*;
 
 use super::decoder::{self, DecoderState, DecoderWeights};
 use super::dtw::{self, WordTiming};

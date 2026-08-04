@@ -2026,7 +2026,6 @@ fn dequant_row_dot_2col(
 /// 1.6 M — all blocked) from the logits GEMV (tiny 20 M / turbo 66 M — single-row).
 #[inline]
 fn two_row_blocked(out: usize, inp: usize, use_fused: bool) -> bool {
-    const TWO_ROW_MAX_ELEMS: usize = 1 << 22;
     let _ = (out, inp);
     #[cfg(all(
         target_arch = "x86_64",
@@ -2034,6 +2033,7 @@ fn two_row_blocked(out: usize, inp: usize, use_fused: bool) -> bool {
         target_feature = "fma"
     ))]
     {
+        const TWO_ROW_MAX_ELEMS: usize = 1 << 22;
         return use_fused && out * inp < TWO_ROW_MAX_ELEMS;
     }
     #[allow(unreachable_code)]
