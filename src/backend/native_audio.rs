@@ -192,11 +192,8 @@ pub(crate) fn energy_valleys_from_wav(
         });
     }
 
-    let avg_rms = frame_rms.iter().copied().sum::<f32>() / frame_rms.len() as f32;
-    let max_rms = frame_rms
-        .iter()
-        .copied()
-        .fold(0.0_f32, |acc, rms| acc.max(rms));
+    let (avg_rms, max_rms) =
+        summarize_frame_rms_with_checkpoint(&frame_rms, |_| token.checkpoint())?;
     let activity_threshold =
         ((avg_rms * 1.5).max(MIN_THRESHOLD)).min((max_rms * 0.8).max(MIN_THRESHOLD));
 
@@ -207,6 +204,31 @@ pub(crate) fn energy_valleys_from_wav(
         activity_threshold,
         valleys,
     })
+}
+
+fn summarize_frame_rms_with_checkpoint<F>(
+    frame_rms: &[f32],
+    mut checkpoint: F,
+) -> FwResult<(f32, f32)>
+where
+    F: FnMut(usize) -> FwResult<()>,
+{
+    let mut sum = 0.0_f32;
+    let mut max = 0.0_f32;
+    for (offset, rms) in frame_rms.iter().copied().enumerate() {
+        if offset % ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE == 0 {
+            checkpoint(offset)?;
+        }
+        sum += rms;
+        max = max.max(rms);
+    }
+    checkpoint(frame_rms.len())?;
+    let average = if frame_rms.is_empty() {
+        0.0
+    } else {
+        sum / frame_rms.len() as f32
+    };
+    Ok((average, max))
 }
 
 fn collect_energy_valleys(
@@ -244,6 +266,7 @@ where
             rms,
         });
     }
+    checkpoint(frame_rms.len().saturating_sub(2))?;
     Ok(valleys)
 }
 
@@ -549,8 +572,9 @@ mod tests {
     use crate::error::FwError;
 
     use super::{
-        MAX_ENERGY_VALLEY_CANDIDATES, analyze_wav, collect_energy_valleys,
-        collect_energy_valleys_with_checkpoint, energy_valleys_from_wav,
+        ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE, MAX_ENERGY_VALLEY_CANDIDATES, analyze_wav,
+        collect_energy_valleys, collect_energy_valleys_with_checkpoint, energy_valleys_from_wav,
+        summarize_frame_rms_with_checkpoint,
     };
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
@@ -704,6 +728,120 @@ mod tests {
         .expect_err("cancellation at the stride checkpoint must prevent a partial profile");
         assert!(matches!(error, FwError::Cancelled(_)));
         assert_eq!(offsets, [0, ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE]);
+    }
+
+    #[test]
+    fn energy_valley_collection_checks_cancellation_after_partial_tail() {
+        let mut offsets = Vec::new();
+        let error = collect_energy_valleys_with_checkpoint(
+            &vec![0.0; ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE + 3],
+            0.05,
+            |offset| {
+                offsets.push(offset);
+                if offset == ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE + 1 {
+                    return Err(FwError::Cancelled(
+                        "deterministic tail cancellation".to_owned(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("cancellation after the final partial stride must prevent a stale profile");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert_eq!(
+            offsets,
+            [
+                0,
+                ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE,
+                ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE + 1,
+            ]
+        );
+    }
+
+    #[test]
+    fn energy_valley_rms_summary_checks_cancellation_after_partial_tail() {
+        let mut offsets = Vec::new();
+        let error = summarize_frame_rms_with_checkpoint(
+            &vec![0.25; ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE + 1],
+            |offset| {
+                offsets.push(offset);
+                if offset == ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE + 1 {
+                    return Err(FwError::Cancelled(
+                        "deterministic summary-tail cancellation".to_owned(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("cancellation after the RMS-summary tail must prevent stale thresholds");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert_eq!(
+            offsets,
+            [
+                0,
+                ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE,
+                ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE + 1,
+            ]
+        );
+    }
+
+    #[test]
+    fn energy_valley_checkpointed_helpers_check_exact_stride_tail() {
+        let mut summary_offsets = Vec::new();
+        let summary_error = summarize_frame_rms_with_checkpoint(
+            &vec![0.25; ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE],
+            |offset| {
+                summary_offsets.push(offset);
+                if offset == ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE {
+                    return Err(FwError::Cancelled(
+                        "deterministic exact summary-tail cancellation".to_owned(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("an exact-stride RMS tail must receive its terminal checkpoint");
+        assert!(matches!(summary_error, FwError::Cancelled(_)));
+        assert_eq!(summary_offsets, [0, ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE]);
+
+        let mut valley_offsets = Vec::new();
+        let valley_error = collect_energy_valleys_with_checkpoint(
+            &vec![0.0; ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE + 2],
+            0.05,
+            |offset| {
+                valley_offsets.push(offset);
+                if offset == ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE {
+                    return Err(FwError::Cancelled(
+                        "deterministic exact valley-tail cancellation".to_owned(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("an exact-stride valley tail must receive its terminal checkpoint");
+        assert!(matches!(valley_error, FwError::Cancelled(_)));
+        assert_eq!(valley_offsets, [0, ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE]);
+    }
+
+    #[test]
+    fn energy_valley_checkpointed_helpers_cover_empty_input() {
+        let mut summary_offsets = Vec::new();
+        let summary = summarize_frame_rms_with_checkpoint(&[], |offset| {
+            summary_offsets.push(offset);
+            Ok(())
+        })
+        .expect("empty RMS summary must remain valid");
+        assert_eq!(summary, (0.0, 0.0));
+        assert_eq!(summary_offsets, [0]);
+
+        let mut valley_offsets = Vec::new();
+        let valleys = collect_energy_valleys_with_checkpoint(&[], 0.05, |offset| {
+            valley_offsets.push(offset);
+            Ok(())
+        })
+        .expect("empty valley evidence must remain valid");
+        assert!(valleys.is_empty());
+        assert_eq!(valley_offsets, [0]);
     }
 
     #[test]
