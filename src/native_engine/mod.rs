@@ -408,6 +408,7 @@ pub(crate) fn enc_int8_enabled() -> bool {
 /// and is NOT applied when the weight-roundtrip harness is active (it rewrites the
 /// f32 in place) nor on macOS (the GPU encode stack reads the f32) — see the
 /// `from_ggml` guard. Transcript verified byte-identical off-vs-on (turbo/jfk).
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn enc_free_f32() -> bool {
     const DEFAULT_ON: bool = true;
     static ON: OnceLock<bool> = OnceLock::new();
