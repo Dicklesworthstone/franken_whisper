@@ -36,9 +36,10 @@ use crate::diarization::{
     DIARIZATION_SCORER_VERSION, DiarizationCorpusManifest, DiarizationHypothesisDocument,
     DiarizationLeakageAudit, DiarizationReferenceDocument, DiarizationScorerConfig,
     EvaluationOverlapPolicy, EvaluationPerformanceObservation, EvaluationRegion, EvaluationSplit,
-    EvaluationTurn, EvaluationWord, acoustic_change_calibration,
-    acoustic_change_calibration_sha256, acoustic_feature_schema_sha256,
-    acoustic_sidecar_calibrate_owner_contrast, acoustic_sidecar_fusion_configuration_sha256,
+    EvaluationTurn, EvaluationWord, MAX_SAME_SPEAKER_PROBABILITY_FOR_SEPARATION,
+    acoustic_change_calibration, acoustic_change_calibration_sha256,
+    acoustic_feature_schema_sha256, acoustic_sidecar_calibrate_owner_contrast,
+    acoustic_sidecar_fusion_configuration_sha256,
     acoustic_sidecar_observation_owner_contrast_from_study, acoustic_sidecar_study_config_sha256,
     acoustic_speaker_pair_calibration, acoustic_speaker_pair_calibration_sha256,
     acoustic_tracklet_pair_evidence, audit_diarization_manifest,
@@ -63,16 +64,16 @@ pub const PUBLIC_CORPUS_REGISTRY_SCHEMA_VERSION: &str = "public-diarization-corp
 pub const PUBLIC_CORPUS_WORD_ANNOTATION_SCHEMA_VERSION: &str =
     "public-diarization-word-annotation-v1";
 /// Schema identity for path-free public representation-ablation evidence.
-pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v12";
+pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v13";
 /// Frozen public ablation implementation identity.
 pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-ablation-runner-v12";
+    "public-diarization-acoustic-ablation-runner-v13";
 /// Schema identity for the separate aggregate-only acoustic sidecar study.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION: &str =
-    "public-diarization-acoustic-sidecar-study-v4";
+    "public-diarization-acoustic-sidecar-study-v5";
 /// Frozen implementation identity for the aggregate-only sidecar runner.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-sidecar-study-runner-v4";
+    "public-diarization-acoustic-sidecar-study-runner-v5";
 /// Identity of the bounded development calibration fit.
 pub const PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION: &str =
     "public-sidecar-boundary-calibration-empirical-grid-v2";
@@ -404,13 +405,15 @@ pub enum PublicSpeakerCountHierarchyMethod {
     MaximumProbabilityDrop,
     MaximumLogOddsDrop,
     TwoLevelLeastSquares,
+    RobustSeparationThreshold,
 }
 
 impl PublicSpeakerCountHierarchyMethod {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
         Self::MaximumProbabilityDrop,
         Self::MaximumLogOddsDrop,
         Self::TwoLevelLeastSquares,
+        Self::RobustSeparationThreshold,
     ];
 }
 
@@ -7464,7 +7467,7 @@ fn hierarchy_count_candidate(
     steps: &[AcousticCountMergeStepEvidence],
     method: PublicSpeakerCountHierarchyMethod,
 ) -> FwResult<Option<u32>> {
-    if steps.len() < 2 {
+    if steps.is_empty() {
         return Ok(None);
     }
     if steps.iter().any(|step| {
@@ -7477,6 +7480,30 @@ fn hierarchy_count_candidate(
             "speaker_count_hierarchy_candidate",
             "hierarchy count candidates require finite probabilities with consecutive descending cluster counts",
         ));
+    }
+    if method == PublicSpeakerCountHierarchyMethod::RobustSeparationThreshold {
+        let initial_count = steps[0].remaining_clusters.checked_add(1).ok_or_else(|| {
+            public_corpus_error(
+                "speaker_count_hierarchy_candidate",
+                "initial hierarchy count exceeds the supported domain",
+            )
+        })?;
+        let candidate = steps
+            .iter()
+            .take_while(|step| {
+                step.same_speaker_probability >= MAX_SAME_SPEAKER_PROBABILITY_FOR_SEPARATION
+            })
+            .last()
+            .map_or(initial_count, |step| step.remaining_clusters);
+        return u32::try_from(candidate).map(Some).map_err(|_| {
+            public_corpus_error(
+                "speaker_count_hierarchy_candidate",
+                "hierarchy count candidate exceeds the public count domain",
+            )
+        });
+    }
+    if steps.len() < 2 {
+        return Ok(None);
     }
     let split_index = match method {
         PublicSpeakerCountHierarchyMethod::MaximumProbabilityDrop => {
@@ -7565,6 +7592,12 @@ fn hierarchy_count_candidate(
                     )
                 })?
                 .0
+        }
+        PublicSpeakerCountHierarchyMethod::RobustSeparationThreshold => {
+            return Err(public_corpus_error(
+                "speaker_count_hierarchy_candidate",
+                "robust separation threshold reached an invalid dispatch state",
+            ));
         }
     };
     u32::try_from(steps[split_index - 1].remaining_clusters)
@@ -17814,9 +17847,12 @@ mod tests {
                 Some(4),
                 "{method:?}"
             );
+            let expected_short = (method
+                == super::PublicSpeakerCountHierarchyMethod::RobustSeparationThreshold)
+                .then_some(5);
             assert_eq!(
                 super::hierarchy_count_candidate(&steps[..1], method).expect("short trace"),
-                None,
+                expected_short,
                 "{method:?}"
             );
         }
