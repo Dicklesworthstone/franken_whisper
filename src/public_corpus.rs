@@ -8675,6 +8675,7 @@ impl PublicAblationAccumulator {
                     SpeakerEvidenceReason::SupportedByHardHint
                     | SpeakerEvidenceReason::SupportedByIndependentRecurrence
                     | SpeakerEvidenceReason::SupportedByRepeatedTracklets
+                    | SpeakerEvidenceReason::SupportedByLongObservation
                     | SpeakerEvidenceReason::SupportedByExternalAttribution => continue,
                 };
                 *count = count.saturating_add(1);

@@ -608,6 +608,7 @@ pub enum SpeakerEvidenceReason {
     SupportedByHardHint,
     SupportedByIndependentRecurrence,
     SupportedByRepeatedTracklets,
+    SupportedByLongObservation,
     SupportedByExternalAttribution,
     NoAssignedSpeech,
     InsufficientIndependentRecurrence,
