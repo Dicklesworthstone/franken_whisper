@@ -40,12 +40,13 @@ use crate::diarization::{
     acoustic_change_calibration_sha256, acoustic_feature_schema_sha256,
     acoustic_sidecar_calibrate_owner_contrast, acoustic_sidecar_fusion_configuration_sha256,
     acoustic_sidecar_observation_owner_contrast_from_study, acoustic_sidecar_study_config_sha256,
-    acoustic_speaker_pair_calibration_sha256, acoustic_tracklet_pair_evidence,
-    audit_diarization_manifest, diarize_acoustic_pcm_with_modes_evidence,
-    diarize_acoustic_pcm_with_sidecar_evidence, extract_acoustic_features_with_frames,
-    parse_diarization_corpus_manifest, parse_diarization_reference, score_change_points,
-    score_diarization_documents, select_acoustic_change_evidence_at_threshold,
-    speaker_change_points_ms, verify_leakage_audit_hash,
+    acoustic_speaker_pair_calibration, acoustic_speaker_pair_calibration_sha256,
+    acoustic_tracklet_pair_evidence, audit_diarization_manifest,
+    diarize_acoustic_pcm_with_modes_evidence, diarize_acoustic_pcm_with_sidecar_evidence,
+    extract_acoustic_features_with_frames, parse_diarization_corpus_manifest,
+    parse_diarization_reference, score_change_points, score_diarization_documents,
+    select_acoustic_change_evidence_at_threshold, speaker_change_points_ms,
+    verify_leakage_audit_hash,
 };
 use crate::error::{FwError, FwResult};
 use crate::model::{DiarizationEngine, DiarizationRequest, SpeakerCountRequest};
@@ -7874,7 +7875,16 @@ fn fit_acoustic_speaker_pair_calibration(
             }
         }
     }
-    let (fitted_brier, intercept, voice_weight, channel_weight) = best?;
+    let runtime_calibration = acoustic_speaker_pair_calibration();
+    let incumbent = (
+        baseline_brier,
+        f64::from(runtime_calibration.different_logit_intercept),
+        f64::from(runtime_calibration.voice_distance_weight),
+        f64::from(runtime_calibration.channel_distance_weight),
+    );
+    let (fitted_brier, intercept, voice_weight, channel_weight) = best
+        .filter(|candidate| candidate.0.total_cmp(&baseline_brier).is_lt())
+        .unwrap_or(incumbent);
     let mut fit = PublicAcousticSpeakerPairCalibrationFit {
         fit_id: PUBLIC_ACOUSTIC_PAIR_CALIBRATION_FIT_VERSION.to_owned(),
         target_id: PUBLIC_ACOUSTIC_PAIR_CALIBRATION_TARGET_VERSION.to_owned(),
@@ -11338,17 +11348,20 @@ pub fn verify_public_corpus_ablation_evidence(
                 diarization_request_sha256: &evidence.protocol.diarization_request_sha256,
                 change_calibration_sha256: &evidence.protocol.change_calibration_sha256,
             })?;
-        if variant.ablation != expected_ablation
-            || variant.feature_schema != expected_ablation.schema_version().id()
-            || variant.feature_schema_sha256 != expected_schema_sha256
-            || variant.feature_configuration_sha256 != expected_configuration_sha256
-            || !variant_splits_are_valid(&variant.splits, evidence.protocol.change_calibration_bins)
-            || variant.splits.len() != 1
-            || variant.splits[0].split != evidence.evaluation_stage.selected_split()
-        {
+        let identity_valid = variant.ablation == expected_ablation
+            && variant.feature_schema == expected_ablation.schema_version().id()
+            && variant.feature_schema_sha256 == expected_schema_sha256
+            && variant.feature_configuration_sha256 == expected_configuration_sha256;
+        let aggregates_valid =
+            variant_splits_are_valid(&variant.splits, evidence.protocol.change_calibration_bins);
+        let selected_split_valid = variant.splits.len() == 1
+            && variant.splits[0].split == evidence.evaluation_stage.selected_split();
+        if !identity_valid || !aggregates_valid || !selected_split_valid {
             return Err(public_corpus_error(
                 "ablation_variant_contract",
-                "ablation variant identity, hashes, ordering, or aggregate bounds are invalid",
+                &format!(
+                    "ablation variant {expected_ablation:?} failed: identity_valid={identity_valid}, aggregates_valid={aggregates_valid}, selected_split_valid={selected_split_valid}"
+                ),
             ));
         }
     }
@@ -12179,7 +12192,7 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
             && bounded(split.micro_word_diarization_error_rate)
             && bounded(split.macro_word_diarization_error_rate)
             && (split.scored_word_count > 0 || split.macro_word_diarization_error_rate.is_none());
-        split.recording_count > 0
+        let valid = split.recording_count > 0
             && finite_nonnegative(split.reference_speaker_time_sec)
             && split.micro_der.is_none_or(finite_nonnegative)
             && split.macro_der.is_none_or(finite_nonnegative)
@@ -12244,7 +12257,28 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                     .saturating_add(split.clustering_unstable_count_fallback_count)
             && finite_nonnegative(split.audio_duration_sec)
             && finite_nonnegative(split.wall_time_sec)
-            && split.real_time_factor.is_none_or(finite_nonnegative)
+            && split.real_time_factor.is_none_or(finite_nonnegative);
+        if !valid {
+            tracing::debug!(
+                split = ?split.split,
+                calibration_valid,
+                assignment_calibration_valid,
+                selective_valid,
+                confusion_valid,
+                posterior_map_confusion_valid,
+                merge_frontier_valid,
+                hierarchy_candidates_valid,
+                acoustic_pair_fit_valid,
+                count_strata_valid,
+                count_duration_strata_valid,
+                count_posterior_valid,
+                count_quantiles_valid,
+                occupancy_valid,
+                word_metrics_valid,
+                "public ablation split failed aggregate validation"
+            );
+        }
+        valid
     })
 }
 
@@ -17842,6 +17876,48 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         assert!(super::fit_acoustic_speaker_pair_calibration(&same_only, 1).is_none());
+
+        let ambiguous_features = (0_u8..16)
+            .flat_map(|index| {
+                [
+                    super::AcousticPairCalibrationObservation {
+                        selection_key: [index; 32],
+                        voice_distance: 1.0,
+                        channel_distance: 0.0,
+                        support: 1.0,
+                        baseline_different_log_odds: -20.0,
+                        different_speaker: false,
+                    },
+                    super::AcousticPairCalibrationObservation {
+                        selection_key: [index.saturating_add(16); 32],
+                        voice_distance: 1.0,
+                        channel_distance: 0.0,
+                        support: 1.0,
+                        baseline_different_log_odds: 20.0,
+                        different_speaker: true,
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let retained = super::fit_acoustic_speaker_pair_calibration(&ambiguous_features, 2)
+            .expect("incumbent is retained when the grid cannot improve it");
+        let incumbent = super::acoustic_speaker_pair_calibration();
+        assert_eq!(
+            retained.fitted_balanced_brier_score,
+            retained.baseline_balanced_brier_score
+        );
+        assert_eq!(
+            retained.fitted_different_logit_intercept,
+            f64::from(incumbent.different_logit_intercept)
+        );
+        assert_eq!(
+            retained.fitted_voice_distance_weight,
+            f64::from(incumbent.voice_distance_weight)
+        );
+        assert_eq!(
+            retained.fitted_channel_distance_weight,
+            f64::from(incumbent.channel_distance_weight)
+        );
     }
 
     fn ablation_variant(
