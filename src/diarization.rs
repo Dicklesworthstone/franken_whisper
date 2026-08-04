@@ -43,14 +43,17 @@ pub const ACOUSTIC_DIARIZATION_CONTRACT_VERSION: &str = "acoustic-diarization-v2
 pub const NEURAL_DIARIZATION_CONTRACT_VERSION: &str = "neural-diarization-common-v1";
 /// Versioned direct cosine use of the pinned 192-coordinate ECAPA embedding in
 /// the common diarizer's identity-coordinate contract.
-pub const ECAPA_SPEAKER_REPRESENTATION_VERSION: &str = "ecapa-tdnn-voxceleb-cosine-v2-development";
+pub const ECAPA_SPEAKER_REPRESENTATION_VERSION: &str = "ecapa-tdnn-voxceleb-cosine-v4-development";
 // Public AMI development observations put the useful conservative separation
 // point near cosine distance 0.80. The intercept includes the shared 12:1
 // false-merge:false-split loss: at this distance the model emits the 12/13
 // same-speaker probability at which either action has equal expected loss.
 const ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT: f32 = 0.80;
+const ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE: f32 = 0.70;
 const ECAPA_PAIR_DIFFERENT_LOGIT_INTERCEPT: f32 = -10.484_906;
 const ECAPA_PAIR_COSINE_DISTANCE_WEIGHT: f32 = 10.0;
+const ECAPA_SEGMENT_LOG_LIKELIHOOD_MAX_WEIGHT: f32 = 4.0;
+const ECAPA_LONG_SINGLE_OBSERVATION_MIN_FRAMES: usize = 200;
 type EcapaSpeakerEmbedding = [f32; ECAPA_EMBEDDING_DIMENSIONS];
 type EcapaTrackletEmbeddings = BTreeMap<usize, EcapaSpeakerEmbedding>;
 
@@ -7740,9 +7743,13 @@ pub fn ecapa_speaker_pair_calibration_sha256() -> String {
     hasher.update(ECAPA_SPEAKER_REPRESENTATION_VERSION.as_bytes());
     hasher.update(ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION.as_bytes());
     hasher.update(acoustic_speaker_pair_calibration_sha256().as_bytes());
+    hasher.update((ECAPA_LONG_SINGLE_OBSERVATION_MIN_FRAMES as u64).to_le_bytes());
     for value in [
+        ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT,
+        ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE,
         ECAPA_PAIR_DIFFERENT_LOGIT_INTERCEPT,
         ECAPA_PAIR_COSINE_DISTANCE_WEIGHT,
+        ECAPA_SEGMENT_LOG_LIKELIHOOD_MAX_WEIGHT,
         shared.channel_distance_weight,
         shared.full_support_frames,
         shared.false_split_loss,
@@ -14242,11 +14249,26 @@ where
     // reliability, separation, and occupancy checks must still support every
     // emitted speaker. This avoids making an undercounted posterior MAP
     // self-fulfilling without promoting the proposal to calibrated authority.
-    let operational_partition = if use_neural_operating_point {
-        neural_operational_partition_count(&count_estimate, &lane_results, policy)
+    let neural_partition_eligible = use_neural_operating_point
+        && cannot_links.is_empty()
+        && initial.iter().all(|cluster| {
+            cluster.neural_voice.is_some()
+                && cluster.hard_anchor.is_none()
+                && cluster.label_hint.is_none()
+        });
+    let inferred_neural_partition = if neural_partition_eligible && policy.exact.is_none() {
+        infer_neural_spherical_partition(initial, policy, is_cancelled)?
     } else {
-        operational_partition_count(&count_estimate, &lane_results, policy)
+        None
     };
+    let operational_partition =
+        if let Some((count, confidence, _, _)) = inferred_neural_partition.as_ref() {
+            Some((*count, *confidence))
+        } else if use_neural_operating_point {
+            neural_operational_partition_count(&count_estimate, &lane_results, policy)
+        } else {
+            operational_partition_count(&count_estimate, &lane_results, policy)
+        };
     let Some((selected_count, feature_stability)) = operational_partition else {
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::InvalidPosterior,
@@ -14254,26 +14276,43 @@ where
             count_merge_steps: full_lane_merge_steps,
         });
     };
-    let stability = spectral_proposal.map_or(feature_stability, |proposal| {
-        let spectral_support = if proposal.count == selected_count {
-            proposal.confidence as f32
-        } else {
-            0.0
-        };
-        0.5 * (feature_stability + spectral_support)
-    });
+    let stability = if inferred_neural_partition.is_some() {
+        feature_stability
+    } else {
+        spectral_proposal.map_or(feature_stability, |proposal| {
+            let spectral_support = if proposal.count == selected_count {
+                proposal.confidence as f32
+            } else {
+                0.0
+            };
+            0.5 * (feature_stability + spectral_support)
+        })
+    };
     // Do not reject the entire partition merely because the independent
     // eigengap lane disagrees with otherwise stable feature perturbations.
     // `coassociation_consensus_clusters` enforces the predeclared 3/5 support
     // threshold on every actual merge, which is the relevant safety check.
-    let Some((clusters, merge_trace)) = coassociation_consensus_clusters(
-        initial,
-        cannot_links,
-        &lane_results,
-        selected_count,
-        is_cancelled,
-    )?
-    else {
+    let inferred_partition =
+        inferred_neural_partition.map(|(_, _, clusters, trace)| (clusters, trace));
+    let neural_partition = if inferred_partition.is_some() {
+        inferred_partition
+    } else if neural_partition_eligible {
+        spherical_neural_clusters(initial, selected_count, is_cancelled)?
+    } else {
+        None
+    };
+    let consensus_partition = if neural_partition.is_none() {
+        coassociation_consensus_clusters(
+            initial,
+            cannot_links,
+            &lane_results,
+            selected_count,
+            is_cancelled,
+        )?
+    } else {
+        None
+    };
+    let Some((clusters, merge_trace)) = neural_partition.or(consensus_partition) else {
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::UnstableSpeakerCount,
             count_estimate: Some(count_estimate),
@@ -14287,6 +14326,321 @@ where
         stability,
         count_estimate,
     })
+}
+
+fn infer_neural_spherical_partition<C>(
+    initial: &[AcousticCluster],
+    policy: SpeakerCountPolicy,
+    is_cancelled: &mut C,
+) -> FwResult<Option<(usize, f32, Vec<AcousticCluster>, Vec<ClusterMergeTrace>)>>
+where
+    C: FnMut() -> bool,
+{
+    const MIN_CLUSTER_NEURAL_WEIGHT: f32 = 100.0;
+
+    let maximum = policy.max.min(initial.len());
+    for count in (policy.min.max(2)..=maximum).rev() {
+        let Some((clusters, merge_trace)) =
+            spherical_neural_clusters(initial, count, is_cancelled)?
+        else {
+            continue;
+        };
+        if clusters.iter().any(|cluster| {
+            cluster.neural_weight < MIN_CLUSTER_NEURAL_WEIGHT
+                || (cluster.prototype_members.len() < 2
+                    && cluster.neural_weight < ECAPA_LONG_SINGLE_OBSERVATION_MIN_FRAMES as f32)
+        }) {
+            continue;
+        }
+        let mut minimum_distance = f32::INFINITY;
+        let mut all_separated = true;
+        for left in 0..clusters.len() {
+            for right in left + 1..clusters.len() {
+                let Some(distance) = clusters[left]
+                    .neural_voice
+                    .as_ref()
+                    .zip(clusters[right].neural_voice.as_ref())
+                    .and_then(|(left, right)| {
+                        ecapa_cosine_distance(left, right, SpeakerPairPerturbation::Full)
+                    })
+                else {
+                    all_separated = false;
+                    break;
+                };
+                minimum_distance = minimum_distance.min(distance);
+                if !clusters_have_robust_different_speaker_evidence(
+                    &clusters[left],
+                    &clusters[right],
+                ) {
+                    all_separated = false;
+                    break;
+                }
+            }
+            if !all_separated {
+                break;
+            }
+        }
+        if all_separated {
+            let confidence = ((minimum_distance - ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE)
+                / (2.0 - ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE))
+                .clamp(0.0, 1.0);
+            return Ok(Some((count, confidence, clusters, merge_trace)));
+        }
+    }
+    if speaker_count_allowed(1, policy) {
+        let Some((clusters, merge_trace)) = spherical_neural_clusters(initial, 1, is_cancelled)?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some((1, 0.5, clusters, merge_trace)));
+    }
+    Ok(None)
+}
+
+fn spherical_neural_clusters<C>(
+    initial: &[AcousticCluster],
+    selected_count: usize,
+    is_cancelled: &mut C,
+) -> FwResult<Option<(Vec<AcousticCluster>, Vec<ClusterMergeTrace>)>>
+where
+    C: FnMut() -> bool,
+{
+    const MAX_ITERATIONS: usize = 32;
+    const MAX_STARTS: usize = 4;
+
+    if selected_count == 0
+        || selected_count > initial.len()
+        || initial.iter().any(|cluster| cluster.neural_voice.is_none())
+    {
+        return Ok(None);
+    }
+    if selected_count == initial.len() {
+        return Ok(Some((initial.to_vec(), Vec::new())));
+    }
+
+    let mut start_candidates = (0..initial.len()).collect::<Vec<_>>();
+    start_candidates.sort_by(|&left, &right| {
+        initial[right]
+            .neural_weight
+            .total_cmp(&initial[left].neural_weight)
+            .then(initial[left].earliest_ms.cmp(&initial[right].earliest_ms))
+            .then(left.cmp(&right))
+    });
+    start_candidates.truncate(MAX_STARTS.min(start_candidates.len()));
+
+    let mut best = None::<(f64, Vec<usize>, Vec<EcapaSpeakerEmbedding>)>;
+    for (start_number, &first_seed) in start_candidates.iter().enumerate() {
+        if is_cancelled() {
+            return Err(FwError::Cancelled(format!(
+                "neural spherical clustering cancelled at start {start_number}"
+            )));
+        }
+        let Some(first_center) = initial[first_seed].neural_voice else {
+            return Ok(None);
+        };
+        let mut centers = vec![first_center];
+        while centers.len() < selected_count {
+            let next = initial
+                .iter()
+                .enumerate()
+                .filter(|(_, cluster)| {
+                    centers.iter().all(|center| {
+                        cluster.neural_voice.as_ref().is_some_and(|embedding| {
+                            ecapa_cosine_distance(embedding, center, SpeakerPairPerturbation::Full)
+                                .is_some_and(|distance| distance > f32::EPSILON)
+                        })
+                    })
+                })
+                .filter_map(|(index, cluster)| {
+                    let embedding = cluster.neural_voice.as_ref()?;
+                    let nearest = centers
+                        .iter()
+                        .filter_map(|center| {
+                            ecapa_cosine_distance(embedding, center, SpeakerPairPerturbation::Full)
+                        })
+                        .min_by(f32::total_cmp)?;
+                    let score = nearest * cluster.neural_weight.max(1.0).sqrt();
+                    Some((score, index))
+                })
+                .max_by(|left, right| {
+                    left.0
+                        .total_cmp(&right.0)
+                        .then_with(|| right.1.cmp(&left.1))
+                })
+                .map(|(_, index)| index);
+            let Some(next) = next else {
+                break;
+            };
+            let Some(next_center) = initial[next].neural_voice else {
+                return Ok(None);
+            };
+            centers.push(next_center);
+        }
+        if centers.len() != selected_count {
+            continue;
+        }
+
+        let mut assignments = vec![usize::MAX; initial.len()];
+        let mut run_valid = true;
+        for iteration in 0..MAX_ITERATIONS {
+            if iteration.is_multiple_of(4) && is_cancelled() {
+                return Err(FwError::Cancelled(format!(
+                    "neural spherical clustering cancelled at iteration {iteration}"
+                )));
+            }
+            let next_assignments = initial
+                .iter()
+                .map(|cluster| {
+                    let embedding = cluster.neural_voice.as_ref()?;
+                    centers
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(center_index, center)| {
+                            ecapa_cosine_distance(embedding, center, SpeakerPairPerturbation::Full)
+                                .map(|distance| (distance, center_index))
+                        })
+                        .min_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)))
+                        .map(|(_, center_index)| center_index)
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(next_assignments) = next_assignments else {
+                run_valid = false;
+                break;
+            };
+            let converged = next_assignments == assignments;
+            assignments = next_assignments;
+
+            let mut next_centers = Vec::with_capacity(selected_count);
+            let mut valid = true;
+            for center_index in 0..selected_count {
+                let members = assignments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, assignment)| **assignment == center_index)
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                if members.is_empty() {
+                    valid = false;
+                    break;
+                }
+                let mut centroid = [0.0_f32; ECAPA_EMBEDDING_DIMENSIONS];
+                let mut total_weight = 0.0_f32;
+                for member in members {
+                    let weight = initial[member].neural_weight.max(1.0);
+                    let Some(embedding) = initial[member].neural_voice else {
+                        valid = false;
+                        break;
+                    };
+                    for dimension in 0..ECAPA_EMBEDDING_DIMENSIONS {
+                        centroid[dimension] += weight * embedding[dimension];
+                    }
+                    total_weight += weight;
+                }
+                if !valid {
+                    break;
+                }
+                let Some(norm) = ecapa_embedding_norm(&centroid) else {
+                    valid = false;
+                    break;
+                };
+                for value in &mut centroid {
+                    *value = (f64::from(*value) / norm) as f32;
+                }
+                if total_weight <= f32::EPSILON {
+                    valid = false;
+                    break;
+                }
+                next_centers.push(centroid);
+            }
+            if !valid {
+                run_valid = false;
+                break;
+            }
+            centers = next_centers;
+            if converged {
+                break;
+            }
+        }
+        if !run_valid
+            || assignments
+                .iter()
+                .any(|assignment| *assignment == usize::MAX)
+            || (0..selected_count)
+                .any(|center| !assignments.iter().any(|assignment| *assignment == center))
+        {
+            continue;
+        }
+        let objective_terms = initial
+            .iter()
+            .zip(&assignments)
+            .map(|(cluster, &assignment)| {
+                let distance = ecapa_cosine_distance(
+                    cluster.neural_voice.as_ref()?,
+                    &centers[assignment],
+                    SpeakerPairPerturbation::Full,
+                )?;
+                Some(f64::from(cluster.neural_weight.max(1.0)) * f64::from(distance).powi(2))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(objective_terms) = objective_terms else {
+            continue;
+        };
+        let objective = objective_terms.into_iter().sum::<f64>();
+        if !objective.is_finite() {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_objective, best_assignments, _)| {
+                objective < *best_objective
+                    || (objective.to_bits() == best_objective.to_bits()
+                        && assignments < *best_assignments)
+            })
+        {
+            best = Some((objective, assignments, centers));
+        }
+    }
+
+    let Some((_, assignments, _)) = best else {
+        return Ok(None);
+    };
+    let mut grouped = vec![Vec::<usize>::new(); selected_count];
+    for (index, assignment) in assignments.into_iter().enumerate() {
+        grouped[assignment].push(index);
+    }
+    let mut active = initial.len();
+    let mut merge_trace = Vec::with_capacity(initial.len().saturating_sub(selected_count));
+    let mut clusters = Vec::with_capacity(selected_count);
+    for members in grouped {
+        let Some((&first, rest)) = members.split_first() else {
+            return Ok(None);
+        };
+        let mut cluster = initial[first].clone();
+        for &member in rest {
+            let pair_evidence =
+                cluster_pair_evidence(&cluster, &initial[member], SpeakerPairPerturbation::Full);
+            merge_cluster(&mut cluster, &initial[member]);
+            active = active.saturating_sub(1);
+            merge_trace.push(ClusterMergeTrace {
+                remaining_clusters: active,
+                distance: pair_evidence
+                    .map_or(1.0, |evidence| 1.0 - evidence.same_speaker_probability),
+                same_speaker_probability: pair_evidence
+                    .map(|evidence| evidence.same_speaker_probability),
+                voice_distance: pair_evidence.map(|evidence| evidence.voice_distance),
+                channel_distance: pair_evidence.map(|evidence| evidence.channel_distance),
+                left_anchor: None,
+                right_anchor: None,
+            });
+        }
+        clusters.push(cluster);
+    }
+    clusters.sort_by(|left, right| {
+        left.earliest_ms
+            .cmp(&right.earliest_ms)
+            .then_with(|| compare_float_vectors(&left.voice, &right.voice))
+    });
+    Ok(Some((clusters, merge_trace)))
 }
 
 #[cfg(test)]
@@ -16707,6 +17061,20 @@ where
             0.90
         };
         costs.push(unknown_cost);
+        if neural_embeddings.is_some() {
+            // ECAPA supplies one embedding likelihood per variable-duration
+            // tracklet. Treating a 200 ms fragment and a multi-second turn as
+            // equal observations let a fixed transition penalty erase long,
+            // well-supported minority turns. Bounded evidence-duration
+            // weighting approximates accumulated frame likelihood without
+            // allowing one long segment to dominate the whole recording.
+            let evidence_weight = ecapa_segment_evidence_weight(tracklet.identity_frame_count);
+            for cost in &mut costs {
+                if cost.is_finite() {
+                    *cost *= evidence_weight;
+                }
+            }
+        }
         emissions.push(costs);
     }
 
@@ -16875,6 +17243,11 @@ fn calibrate_assignment_confidence(raw_confidence: f32) -> f32 {
     let bounded = raw_confidence.clamp(0.0, 1.0);
     (ACOUSTIC_ASSIGNMENT_CONFIDENCE_FLOOR + ACOUSTIC_ASSIGNMENT_CONFIDENCE_SCALE * bounded)
         .clamp(0.0, 1.0)
+}
+
+fn ecapa_segment_evidence_weight(identity_frame_count: usize) -> f32 {
+    (identity_frame_count as f32 / acoustic_speaker_pair_calibration().full_support_frames)
+        .clamp(0.25, ECAPA_SEGMENT_LOG_LIKELIHOOD_MAX_WEIGHT)
 }
 
 fn should_abstain_after_viterbi_local_emission(local_score: f32) -> bool {
@@ -17335,7 +17708,11 @@ fn evaluate_speaker_evidence(
             // self-validating as a new speaker.
             let has_independent_recurrence = evidence.recurrence_episode_count
                 >= MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES
-                || evidence.independent_tracklet_count >= 2;
+                || evidence.independent_tracklet_count >= 2
+                || (cluster.neural_voice.is_some()
+                    && evidence.independent_tracklet_count == 1
+                    && evidence.independent_voiced_frame_count
+                        >= ECAPA_LONG_SINGLE_OBSERVATION_MIN_FRAMES);
             let mut reasons = Vec::new();
             if evidence.assigned_tracklet_count == 0 {
                 reasons.push(SpeakerEvidenceReason::NoAssignedSpeech);
@@ -17418,6 +17795,8 @@ fn evaluate_speaker_evidence(
         } else {
             let support_reason = if summaries[candidate].hard_anchored {
                 SpeakerEvidenceReason::SupportedByHardHint
+            } else if summaries[candidate].independent_tracklet_count == 1 {
+                SpeakerEvidenceReason::SupportedByLongObservation
             } else if summaries[candidate].recurrence_episode_count
                 < MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES
             {
@@ -17441,9 +17820,7 @@ fn clusters_have_robust_different_speaker_evidence(
             .into_iter()
             .filter_map(|perturbation| cluster_pair_evidence(left, right, perturbation))
             .filter(|evidence| evidence.support >= MIN_SPEAKER_SEPARATION_SUPPORT)
-            .filter(|evidence| {
-                evidence.voice_distance >= ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT
-            })
+            .filter(|evidence| evidence.voice_distance >= ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE)
             .count()
             >= MIN_SPEAKER_SEPARATION_LANES;
     }
@@ -27835,6 +28212,13 @@ mod tests {
             + super::ECAPA_PAIR_COSINE_DISTANCE_WEIGHT * distance;
         let same_probability = super::logistic_probability(-different_log_odds);
         assert!((same_probability - merge_threshold).abs() < 1.0e-6);
+        assert!(
+            super::ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE
+                < super::ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT
+        );
+        assert_eq!(super::ecapa_segment_evidence_weight(0), 0.25);
+        assert_eq!(super::ecapa_segment_evidence_weight(50), 1.0);
+        assert_eq!(super::ecapa_segment_evidence_weight(1_000), 4.0);
         let calibration_sha256 = super::ecapa_speaker_pair_calibration_sha256();
         assert_eq!(calibration_sha256.len(), 64);
         assert!(
@@ -27897,6 +28281,99 @@ mod tests {
         assert!(
             (super::ecapa_embedding_norm(&profile.embedding).expect("profile norm") - 1.0).abs()
                 < 1.0e-6
+        );
+    }
+
+    #[test]
+    fn spherical_neural_inference_finds_two_dense_separated_speakers() {
+        let tracklets = sequential_profile_tracklets(&[0.0; 8], 500, 50);
+        let mut first = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        first[3] = 1.0;
+        let mut second = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        second[117] = 1.0;
+        let embeddings = (0usize..8)
+            .map(|index| (index, if index < 4 { first } else { second }))
+            .collect::<BTreeMap<_, _>>();
+        let (prototypes, _) = super::build_capped_prototypes(
+            &tracklets,
+            &BTreeMap::new(),
+            512,
+            Some(&embeddings),
+            &mut || false,
+        )
+        .expect("neural prototypes");
+        let request = DiarizationRequest::default();
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, 4_000).expect("empty enrollment");
+        let initial = super::initial_clusters(&prototypes, &enrollment, None);
+        let policy = super::SpeakerCountPolicy {
+            min: 1,
+            max: 4,
+            exact: None,
+        };
+        let inferred = super::infer_neural_spherical_partition(&initial, policy, &mut || false)
+            .expect("spherical inference")
+            .expect("count proposal");
+        assert_eq!(inferred.0, 2);
+        assert_eq!(inferred.2.len(), 2);
+        assert!(super::clusters_have_robust_different_speaker_evidence(
+            &inferred.2[0],
+            &inferred.2[1]
+        ));
+
+        let identical_embeddings = (0usize..8)
+            .map(|index| (index, first))
+            .collect::<BTreeMap<_, _>>();
+        let (prototypes, _) = super::build_capped_prototypes(
+            &tracklets,
+            &BTreeMap::new(),
+            512,
+            Some(&identical_embeddings),
+            &mut || false,
+        )
+        .expect("identical prototypes");
+        let initial = super::initial_clusters(&prototypes, &enrollment, None);
+        let inferred = super::infer_neural_spherical_partition(&initial, policy, &mut || false)
+            .expect("one-speaker inference")
+            .expect("one-speaker proposal");
+        assert_eq!(inferred.0, 1);
+    }
+
+    #[test]
+    fn neural_inference_retains_one_well_supported_long_minority_turn() {
+        let tracklets = sequential_profile_tracklets(&[0.0; 5], 3_000, 300);
+        let mut dominant = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        dominant[11] = 1.0;
+        let mut minority = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        minority[173] = 1.0;
+        let embeddings = (0usize..5)
+            .map(|index| (index, if index < 4 { dominant } else { minority }))
+            .collect::<BTreeMap<_, _>>();
+        let request = DiarizationRequest::default();
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, 15_000).expect("empty enrollment");
+        let (result, _) = super::cluster_acoustic_tracklets_with_mode_internal(
+            &tracklets,
+            &enrollment,
+            &request.speaker_count,
+            512,
+            super::AcousticClusteringMode::ProbabilisticV1,
+            Some(&embeddings),
+            || false,
+        )
+        .expect("neural clustering");
+
+        assert_eq!(result.detected_speakers, 2, "{result:#?}");
+        let long_singleton = result
+            .speaker_evidence
+            .iter()
+            .find(|evidence| evidence.independent_tracklet_count == 1)
+            .expect("minority evidence");
+        assert!(long_singleton.supported, "{long_singleton:#?}");
+        assert!(
+            long_singleton
+                .reasons
+                .contains(&SpeakerEvidenceReason::SupportedByLongObservation)
         );
     }
 
