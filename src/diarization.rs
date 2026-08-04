@@ -11281,9 +11281,6 @@ pub struct AcousticClusteringResult {
     pub speaker_pair_calibration_sha256: String,
     pub calibration_status: &'static str,
     pub merge_trace: Vec<ClusterMergeTrace>,
-    /// Full-feature probabilistic count-lane trace retained for aggregate
-    /// evaluation. It is empty on the fixed-safe path.
-    pub(crate) count_merge_steps: Vec<AcousticCountMergeStepEvidence>,
 }
 
 /// Lossless convenience projection of an independent acoustic turn timeline.
@@ -11517,7 +11514,7 @@ where
     };
     let enrollment = enroll_known_speaker_profiles(&tracklets, request, audio_duration_ms)
         .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
-    let clustering = cluster_acoustic_tracklets_with_mode(
+    let (clustering, count_merge_steps) = cluster_acoustic_tracklets_with_mode_internal(
         &tracklets,
         &enrollment,
         &request.speaker_count,
@@ -11636,7 +11633,7 @@ where
         fallback_reason: clustering.fallback_reason,
         speaker_count_stability: clustering.bootstrap_stability,
         count_merge_steps: if capture_evaluation_evidence {
-            clustering.count_merge_steps.clone()
+            count_merge_steps
         } else {
             Vec::new()
         },
@@ -11944,8 +11941,33 @@ pub fn cluster_acoustic_tracklets_with_mode<C>(
     speaker_count: &SpeakerCountRequest,
     requested_prototype_cap: usize,
     requested_mode: AcousticClusteringMode,
-    mut is_cancelled: C,
+    is_cancelled: C,
 ) -> FwResult<AcousticClusteringResult>
+where
+    C: FnMut() -> bool,
+{
+    Ok(cluster_acoustic_tracklets_with_mode_internal(
+        tracklets,
+        enrollment,
+        speaker_count,
+        requested_prototype_cap,
+        requested_mode,
+        is_cancelled,
+    )?
+    .0)
+}
+
+fn cluster_acoustic_tracklets_with_mode_internal<C>(
+    tracklets: &[AcousticTracklet],
+    enrollment: &SpeakerEnrollment,
+    speaker_count: &SpeakerCountRequest,
+    requested_prototype_cap: usize,
+    requested_mode: AcousticClusteringMode,
+    mut is_cancelled: C,
+) -> FwResult<(
+    AcousticClusteringResult,
+    Vec<AcousticCountMergeStepEvidence>,
+)>
 where
     C: FnMut() -> bool,
 {
@@ -11972,36 +11994,38 @@ where
         .iter()
         .all(|tracklet| !tracklet.voice_valid.iter().any(|valid| *valid))
     {
-        return Ok(AcousticClusteringResult {
-            assignments: tracklets.iter().map(unknown_assignment).collect(),
-            profiles: enrollment.summaries.clone(),
-            count_estimate: unavailable_speaker_count_estimate(
-                speaker_count,
-                constraint_lower_bound,
-                1,
-                0,
-                SpeakerCountCalibrationStatus::Unavailable,
-                SpeakerCountLaneUnavailableReason::InsufficientVoicedEvidence,
-            ),
-            detected_speakers: 0,
-            prototype_count: 0,
-            prototype_cap: requested_prototype_cap,
-            cap_pressure: false,
-            constraints_satisfied: count_request_allows_zero(speaker_count),
-            speaker_evidence: Vec::new(),
-            dominant_speaker_share: 0.0,
-            unknown_voiced_share: 0.0,
-            speaker_separation_satisfied: true,
-            bootstrap_stability: 0.0,
-            requested_mode,
-            executed_mode: AcousticClusteringMode::FixedSafeV1,
-            fallback_reason: (requested_mode == AcousticClusteringMode::ProbabilisticV1)
-                .then_some(AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions),
-            speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
-            calibration_status: "insufficient_identity_evidence",
-            merge_trace: Vec::new(),
-            count_merge_steps: Vec::new(),
-        });
+        return Ok((
+            AcousticClusteringResult {
+                assignments: tracklets.iter().map(unknown_assignment).collect(),
+                profiles: enrollment.summaries.clone(),
+                count_estimate: unavailable_speaker_count_estimate(
+                    speaker_count,
+                    constraint_lower_bound,
+                    1,
+                    0,
+                    SpeakerCountCalibrationStatus::Unavailable,
+                    SpeakerCountLaneUnavailableReason::InsufficientVoicedEvidence,
+                ),
+                detected_speakers: 0,
+                prototype_count: 0,
+                prototype_cap: requested_prototype_cap,
+                cap_pressure: false,
+                constraints_satisfied: count_request_allows_zero(speaker_count),
+                speaker_evidence: Vec::new(),
+                dominant_speaker_share: 0.0,
+                unknown_voiced_share: 0.0,
+                speaker_separation_satisfied: true,
+                bootstrap_stability: 0.0,
+                requested_mode,
+                executed_mode: AcousticClusteringMode::FixedSafeV1,
+                fallback_reason: (requested_mode == AcousticClusteringMode::ProbabilisticV1)
+                    .then_some(AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions),
+                speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
+                calibration_status: "insufficient_identity_evidence",
+                merge_trace: Vec::new(),
+            },
+            Vec::new(),
+        ));
     }
     let (prototypes, cap_pressure) = build_capped_prototypes(
         tracklets,
@@ -12010,36 +12034,38 @@ where
         &mut is_cancelled,
     )?;
     if prototypes.is_empty() {
-        return Ok(AcousticClusteringResult {
-            assignments: tracklets.iter().map(unknown_assignment).collect(),
-            profiles: enrollment.summaries.clone(),
-            count_estimate: unavailable_speaker_count_estimate(
-                speaker_count,
-                constraint_lower_bound,
-                1,
-                0,
-                SpeakerCountCalibrationStatus::Unavailable,
-                SpeakerCountLaneUnavailableReason::InsufficientPrototypes,
-            ),
-            detected_speakers: 0,
-            prototype_count: 0,
-            prototype_cap: requested_prototype_cap,
-            cap_pressure,
-            constraints_satisfied: count_request_allows_zero(speaker_count),
-            speaker_evidence: Vec::new(),
-            dominant_speaker_share: 0.0,
-            unknown_voiced_share: 0.0,
-            speaker_separation_satisfied: true,
-            bootstrap_stability: 0.0,
-            requested_mode,
-            executed_mode: AcousticClusteringMode::FixedSafeV1,
-            fallback_reason: (requested_mode == AcousticClusteringMode::ProbabilisticV1)
-                .then_some(AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions),
-            speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
-            calibration_status: "insufficient_evidence",
-            merge_trace: Vec::new(),
-            count_merge_steps: Vec::new(),
-        });
+        return Ok((
+            AcousticClusteringResult {
+                assignments: tracklets.iter().map(unknown_assignment).collect(),
+                profiles: enrollment.summaries.clone(),
+                count_estimate: unavailable_speaker_count_estimate(
+                    speaker_count,
+                    constraint_lower_bound,
+                    1,
+                    0,
+                    SpeakerCountCalibrationStatus::Unavailable,
+                    SpeakerCountLaneUnavailableReason::InsufficientPrototypes,
+                ),
+                detected_speakers: 0,
+                prototype_count: 0,
+                prototype_cap: requested_prototype_cap,
+                cap_pressure,
+                constraints_satisfied: count_request_allows_zero(speaker_count),
+                speaker_evidence: Vec::new(),
+                dominant_speaker_share: 0.0,
+                unknown_voiced_share: 0.0,
+                speaker_separation_satisfied: true,
+                bootstrap_stability: 0.0,
+                requested_mode,
+                executed_mode: AcousticClusteringMode::FixedSafeV1,
+                fallback_reason: (requested_mode == AcousticClusteringMode::ProbabilisticV1)
+                    .then_some(AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions),
+                speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
+                calibration_status: "insufficient_evidence",
+                merge_trace: Vec::new(),
+            },
+            Vec::new(),
+        ));
     }
 
     let initial_clusters = initial_clusters(&prototypes, enrollment);
@@ -12217,32 +12243,34 @@ where
         .map(|evidence| evidence.speaker_ref.as_str())
         .collect::<BTreeSet<_>>();
     let profiles = clustering_profile_summaries(&clusters, &labels, enrollment, &supported_labels);
-    Ok(AcousticClusteringResult {
-        assignments,
-        profiles,
-        count_estimate,
-        detected_speakers,
-        prototype_count: prototypes.len(),
-        prototype_cap: requested_prototype_cap,
-        cap_pressure,
-        constraints_satisfied,
-        speaker_evidence,
-        dominant_speaker_share,
-        unknown_voiced_share,
-        speaker_separation_satisfied,
-        bootstrap_stability,
-        requested_mode,
-        executed_mode,
-        fallback_reason,
-        speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
-        calibration_status: if executed_mode == AcousticClusteringMode::ProbabilisticV1 {
-            "development_posterior_uncertified"
-        } else {
-            "heuristic_uncalibrated"
+    Ok((
+        AcousticClusteringResult {
+            assignments,
+            profiles,
+            count_estimate,
+            detected_speakers,
+            prototype_count: prototypes.len(),
+            prototype_cap: requested_prototype_cap,
+            cap_pressure,
+            constraints_satisfied,
+            speaker_evidence,
+            dominant_speaker_share,
+            unknown_voiced_share,
+            speaker_separation_satisfied,
+            bootstrap_stability,
+            requested_mode,
+            executed_mode,
+            fallback_reason,
+            speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
+            calibration_status: if executed_mode == AcousticClusteringMode::ProbabilisticV1 {
+                "development_posterior_uncertified"
+            } else {
+                "heuristic_uncalibrated"
+            },
+            merge_trace,
         },
-        merge_trace,
         count_merge_steps,
-    })
+    ))
 }
 
 /// Convert smoothed acoustic assignments into a finite, monotonic turn
@@ -24623,7 +24651,7 @@ mod tests {
             .collect::<Vec<_>>();
         let enrollment =
             enroll_known_speaker_profiles(&tracklets, &request, 3_200).expect("enrollment");
-        let result = super::cluster_acoustic_tracklets_with_mode(
+        let (result, count_merge_steps) = super::cluster_acoustic_tracklets_with_mode_internal(
             &tracklets,
             &enrollment,
             &request.speaker_count,
@@ -24660,11 +24688,11 @@ mod tests {
                 .is_some_and(|residual| { residual <= super::SPEAKER_COUNT_EIGENSOLVER_TOLERANCE }),
             "{resources:#?}"
         );
-        assert_eq!(result.count_merge_steps.len(), 7, "{result:#?}");
-        assert!(result.count_merge_steps.windows(2).all(|window| {
+        assert_eq!(count_merge_steps.len(), 7, "{result:#?}");
+        assert!(count_merge_steps.windows(2).all(|window| {
             window[0].remaining_clusters.checked_sub(1) == Some(window[1].remaining_clusters)
         }));
-        assert!(result.count_merge_steps.iter().all(|step| {
+        assert!(count_merge_steps.iter().all(|step| {
             step.same_speaker_probability.is_finite()
                 && (0.0..=1.0).contains(&step.same_speaker_probability)
         }));
