@@ -7494,6 +7494,7 @@ const MIN_SPEAKER_EVIDENCE_RELIABILITY: f32 = 0.30;
 const MIN_SPEAKER_SEPARATION_SUPPORT: f32 = 0.40;
 pub(crate) const MAX_SAME_SPEAKER_PROBABILITY_FOR_SEPARATION: f32 = 0.45;
 const MIN_SPEAKER_SEPARATION_LANES: usize = 3;
+const MIN_SPEAKER_ASSIGNMENT_LANES: usize = 3;
 const MAX_MULTI_SPEAKER_DOMINANT_SHARE: f32 = 0.98;
 // Channel conditions are useful within a recording, but must remain secondary:
 // the same vocal source may legitimately appear through both a nearby
@@ -7533,8 +7534,11 @@ const ACOUSTIC_ASSIGNMENT_CONFIDENCE_SCALE: f32 = 1.0;
 /// This is deliberately not a calibrated temporal probability threshold: it
 /// excludes transition, duration, and accumulated-path evidence. Unlike a
 /// softmax over every candidate speaker, dominated extra states cannot reduce
-/// it solely because the inferred count is larger.
-const DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE: f32 = 0.55;
+/// it solely because the inferred count is larger. The binary indifference
+/// point retains a Viterbi label exactly when it is at least as plausible as
+/// its strongest local competitor; downstream speaker-evidence gates remain
+/// authoritative.
+const DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE: f32 = 0.50;
 const MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE: f32 = 0.20;
 const MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_RATIO: f32 = 0.65;
 /// Frozen identity for the first variance-aware change posterior.
@@ -7551,7 +7555,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v14-hierarchy-propose-evidence-prune-development";
+    "acoustic-clustering-probabilistic-v18-jackknife-median-assignment-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -15972,24 +15976,20 @@ where
                 }
                 let enrolled_profile = enrollment.profiles.get(&labels[cluster_index]);
                 let mut cost = if clustering_mode == AcousticClusteringMode::ProbabilisticV1 {
-                    let cluster_evidence = tracklet_cluster_pair_evidence(tracklet, cluster);
-                    let profile_evidence = enrolled_profile.and_then(|profile| {
-                        tracklet_profile_pair_evidence(
+                    let cluster_probability =
+                        robust_tracklet_cluster_same_speaker_probability(tracklet, cluster);
+                    let profile_probability = enrolled_profile.and_then(|profile| {
+                        robust_tracklet_profile_same_speaker_probability(
                             tracklet,
                             profile,
                             &enrollment.voice_dimension_weights,
                         )
                     });
-                    cluster_evidence
+                    cluster_probability
                         .into_iter()
-                        .chain(profile_evidence)
-                        .max_by(|left, right| {
-                            left.same_speaker_probability
-                                .total_cmp(&right.same_speaker_probability)
-                        })
-                        .map_or(1_000_000.0, |value| {
-                            -value.same_speaker_probability.max(1e-6).ln()
-                        })
+                        .chain(profile_probability)
+                        .max_by(f32::total_cmp)
+                        .map_or(1_000_000.0, |probability| -probability.max(1e-6).ln())
                 } else {
                     enrolled_profile.map_or_else(
                         || tracklet_cluster_distance(tracklet, cluster),
@@ -16371,6 +16371,7 @@ fn tracklet_cluster_distance(tracklet: &AcousticTracklet, cluster: &AcousticClus
 fn tracklet_cluster_pair_evidence(
     tracklet: &AcousticTracklet,
     cluster: &AcousticCluster,
+    perturbation: SpeakerPairPerturbation,
 ) -> Option<AcousticSpeakerPairEvidence> {
     let tracklet_scale = tracklet.voice_variance.map(|variance| variance.max(0.025));
     speaker_pair_evidence_from_statistics(
@@ -16388,7 +16389,39 @@ fn tracklet_cluster_pair_evidence(
         &cluster.channel,
         cluster.channel_valid,
         cluster.channel_dimensions,
-        SpeakerPairPerturbation::Full,
+        perturbation,
+    )
+}
+
+fn median_same_speaker_probability(
+    evidence: impl IntoIterator<Item = Option<AcousticSpeakerPairEvidence>>,
+) -> Option<f32> {
+    let mut probabilities = evidence
+        .into_iter()
+        .flatten()
+        .map(|evidence| evidence.same_speaker_probability)
+        .filter(|probability| probability.is_finite() && (0.0..=1.0).contains(probability))
+        .collect::<Vec<_>>();
+    if probabilities.len() < MIN_SPEAKER_ASSIGNMENT_LANES {
+        return None;
+    }
+    probabilities.sort_by(f32::total_cmp);
+    let midpoint = probabilities.len() / 2;
+    if probabilities.len() % 2 == 0 {
+        Some((probabilities[midpoint - 1] + probabilities[midpoint]) * 0.5)
+    } else {
+        Some(probabilities[midpoint])
+    }
+}
+
+fn robust_tracklet_cluster_same_speaker_probability(
+    tracklet: &AcousticTracklet,
+    cluster: &AcousticCluster,
+) -> Option<f32> {
+    median_same_speaker_probability(
+        SpeakerPairPerturbation::ALL
+            .into_iter()
+            .map(|perturbation| tracklet_cluster_pair_evidence(tracklet, cluster, perturbation)),
     )
 }
 
@@ -16466,6 +16499,7 @@ fn tracklet_profile_pair_evidence(
     tracklet: &AcousticTracklet,
     profile: &AcousticSpeakerProfile,
     dimension_weights: &[f32; VOICE_VECTOR_DIMENSIONS],
+    perturbation: SpeakerPairPerturbation,
 ) -> Option<AcousticSpeakerPairEvidence> {
     let tracklet_scale = tracklet.voice_variance.map(|variance| variance.max(0.025));
     let selected_channel = profile.channel_subprofiles.iter().min_by(|left, right| {
@@ -16509,13 +16543,27 @@ fn tracklet_profile_pair_evidence(
                 &profile_channel,
                 profile_channel_valid,
                 profile.channel_dimensions,
-                SpeakerPairPerturbation::Full,
+                perturbation,
             )
         })
         .max_by(|left, right| {
             left.same_speaker_probability
                 .total_cmp(&right.same_speaker_probability)
         })
+}
+
+fn robust_tracklet_profile_same_speaker_probability(
+    tracklet: &AcousticTracklet,
+    profile: &AcousticSpeakerProfile,
+    dimension_weights: &[f32; VOICE_VECTOR_DIMENSIONS],
+) -> Option<f32> {
+    median_same_speaker_probability(
+        SpeakerPairPerturbation::ALL
+            .into_iter()
+            .map(|perturbation| {
+                tracklet_profile_pair_evidence(tracklet, profile, dimension_weights, perturbation)
+            }),
+    )
 }
 
 fn unknown_assignment(tracklet: &AcousticTracklet) -> AcousticSpeakerAssignment {
@@ -16637,9 +16685,16 @@ fn evaluate_speaker_evidence(
                     / evidence.independent_voiced_frame_count as f32
             };
             let hard_anchored = cluster.hard_anchor.is_some();
+            // Multiple independently assigned tracklets are legitimate support
+            // even when they form one uninterrupted speaking episode. Requiring
+            // a silence or intervening speaker made a clear, long first turn
+            // impossible to recognize in multi-speaker recordings. The voiced-
+            // frame, confidence, reliability, and robust separation checks below
+            // still prevent a single interval or duplicate acoustic regime from
+            // self-validating as a new speaker.
             let has_independent_recurrence = evidence.recurrence_episode_count
                 >= MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES
-                || (clusters.len() == 1 && evidence.independent_tracklet_count >= 2);
+                || evidence.independent_tracklet_count >= 2;
             let mut reasons = Vec::new();
             if evidence.assigned_tracklet_count == 0 {
                 reasons.push(SpeakerEvidenceReason::NoAssignedSpeech);
@@ -24658,6 +24713,23 @@ mod tests {
     }
 
     #[test]
+    fn separated_contiguous_speaker_blocks_are_supported_by_repeated_tracklets() {
+        let tracklets = sequential_profile_tracklets(&[0.0, 0.0, 0.0, 4.0, 4.0, 4.0], 500, 50);
+        let result = cluster_with_hard_count(&tracklets, 2);
+
+        assert!(result.constraints_satisfied, "{result:#?}");
+        assert_eq!(result.detected_speakers, 2, "{result:#?}");
+        assert!(result.speaker_evidence.iter().all(|evidence| {
+            evidence.supported
+                && evidence.independent_tracklet_count >= 2
+                && evidence.recurrence_episode_count == 1
+                && evidence
+                    .reasons
+                    .contains(&SpeakerEvidenceReason::SupportedByRepeatedTracklets)
+        }));
+    }
+
+    #[test]
     fn hard_count_with_identical_features_is_unsatisfied_and_deterministic() {
         let tracklets = sequential_profile_tracklets(&[0.0; 6], 500, 50);
         let first = cluster_with_hard_count(&tracklets, 3);
@@ -26097,6 +26169,7 @@ mod tests {
     #[test]
     fn speaker_pair_loss_threshold_and_hash_are_stable() {
         let calibration = super::acoustic_speaker_pair_calibration();
+        assert_eq!(calibration.different_logit_intercept, -3.0);
         let merge_threshold = calibration.false_merge_loss
             / (calibration.false_merge_loss + calibration.false_split_loss);
         assert!((merge_threshold - (12.0 / 13.0)).abs() < f32::EPSILON);
@@ -26113,6 +26186,46 @@ mod tests {
     }
 
     #[test]
+    fn assignment_jackknife_uses_a_quorum_median_and_rejects_sparse_evidence() {
+        let evidence = |same_speaker_probability| {
+            Some(super::AcousticSpeakerPairEvidence {
+                voice_distance: 1.0,
+                channel_distance: 0.0,
+                different_log_odds: 0.0,
+                same_speaker_probability,
+                active_voice_dimensions: VOICE_VECTOR_DIMENSIONS,
+                support: 1.0,
+            })
+        };
+        let robust = super::median_same_speaker_probability([
+            evidence(0.1),
+            evidence(0.4),
+            evidence(0.5),
+            evidence(0.6),
+            evidence(0.9),
+        ]);
+        assert_eq!(robust, Some(0.5));
+
+        let even_quorum = super::median_same_speaker_probability([
+            evidence(0.1),
+            evidence(0.3),
+            evidence(0.7),
+            evidence(0.9),
+            None,
+        ]);
+        assert_eq!(even_quorum, Some(0.5));
+
+        let sparse = super::median_same_speaker_probability([
+            evidence(0.2),
+            evidence(0.8),
+            None,
+            evidence(f32::NAN),
+            evidence(1.1),
+        ]);
+        assert_eq!(sparse, None);
+    }
+
+    #[test]
     fn development_assignment_reporting_map_is_bounded_monotone() {
         let raw = [0.0_f32, 0.25, 0.55, 0.75, 1.0];
         let calibrated = raw.map(super::calibrate_assignment_confidence);
@@ -26126,7 +26239,12 @@ mod tests {
         );
         assert!((0.0..=1.0).contains(calibrated.last().expect("last confidence")));
         let rejection_threshold = super::DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE;
+        assert_eq!(rejection_threshold, 0.5);
         assert!(raw[1] < rejection_threshold);
+        assert!(!super::should_abstain_after_viterbi_local_emission(0.5));
+        assert!(super::should_abstain_after_viterbi_local_emission(
+            0.5 - f32::EPSILON
+        ));
         assert_eq!(super::calibrate_assignment_confidence(raw[1]), raw[1]);
     }
 
