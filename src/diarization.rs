@@ -7502,6 +7502,7 @@ const CHANNEL_DISTANCE_WEIGHT: f32 = 0.08;
 const SPEAKER_PAIR_MINIMUM_ACTIVE_DIMENSIONS: usize = 4;
 const SPEAKER_COUNT_PERTURBATION_LANES: usize = 5;
 const SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE: usize = 8;
+const SPEAKER_COUNT_DENSE_EIGENSOLVER_MAX_PROTOTYPES: usize = 64;
 const SPEAKER_COUNT_EIGENSOLVER_MAX_ITERATIONS: usize = 96;
 const SPEAKER_COUNT_EIGENSOLVER_TOLERANCE: f64 = 1.0e-7;
 const SPEAKER_COUNT_EIGENSOLVER_DIAGONAL_SHIFT: f64 = 1.01;
@@ -7509,6 +7510,7 @@ const SPEAKER_COUNT_SOFT_PRIOR_MIX_WEIGHT: f64 = 0.15;
 const SPEAKER_COUNT_SOFT_PRIOR_STABILITY_ATTENUATION: f64 = 0.50;
 const SPEAKER_COUNT_JACKKNIFE_LOG_WEIGHT: f64 = 0.25;
 const SPEAKER_COUNT_SPECTRAL_LOG_WEIGHT: f64 = 0.35;
+const SPEAKER_COUNT_INFER_LOG_COMPLEXITY_PER_ADDITIONAL_SPEAKER: f64 = std::f64::consts::LN_2;
 const SPEAKER_COUNT_STABILITY_EVIDENCE_WEIGHT: f64 = 0.55;
 const SPEAKER_COUNT_RISK_EVIDENCE_WEIGHT: f64 = 0.30;
 const SPEAKER_COUNT_SPECTRAL_EVIDENCE_WEIGHT: f64 = 0.15;
@@ -7549,7 +7551,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v9-development";
+    "acoustic-clustering-probabilistic-v14-hierarchy-propose-evidence-prune-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -7640,6 +7642,7 @@ pub fn acoustic_speaker_pair_calibration_sha256() -> String {
     hasher.update((SPEAKER_PAIR_MINIMUM_ACTIVE_DIMENSIONS as u64).to_le_bytes());
     hasher.update((SPEAKER_COUNT_PERTURBATION_LANES as u64).to_le_bytes());
     hasher.update((SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE as u64).to_le_bytes());
+    hasher.update((SPEAKER_COUNT_DENSE_EIGENSOLVER_MAX_PROTOTYPES as u64).to_le_bytes());
     hasher.update((SPEAKER_COUNT_EIGENSOLVER_MAX_ITERATIONS as u64).to_le_bytes());
     for value in [
         SPEAKER_COUNT_EIGENSOLVER_TOLERANCE,
@@ -7648,6 +7651,7 @@ pub fn acoustic_speaker_pair_calibration_sha256() -> String {
         SPEAKER_COUNT_SOFT_PRIOR_STABILITY_ATTENUATION,
         SPEAKER_COUNT_JACKKNIFE_LOG_WEIGHT,
         SPEAKER_COUNT_SPECTRAL_LOG_WEIGHT,
+        SPEAKER_COUNT_INFER_LOG_COMPLEXITY_PER_ADDITIONAL_SPEAKER,
         SPEAKER_COUNT_STABILITY_EVIDENCE_WEIGHT,
         SPEAKER_COUNT_RISK_EVIDENCE_WEIGHT,
         SPEAKER_COUNT_SPECTRAL_EVIDENCE_WEIGHT,
@@ -7906,11 +7910,18 @@ pub(crate) struct AcousticClusteringEvaluationEvidence {
     pub executed_mode: AcousticClusteringMode,
     pub fallback_reason: Option<AcousticClusteringFallbackReason>,
     pub speaker_count_stability: f32,
+    /// Complete privacy-safe count estimate retained only for aggregate public
+    /// evaluation of the individual evidence lanes.
+    pub count_estimate: Option<SpeakerCountEstimate>,
     /// Full-feature lane merge probabilities in descending agglomeration order.
     ///
     /// The public evaluator reduces these bounded, content-free values against
     /// the reference speaker count. Runtime reports never expose them.
     pub count_merge_steps: Vec<AcousticCountMergeStepEvidence>,
+    /// Feature-free support/rejection summaries for aggregate diagnostics.
+    /// Speaker labels and per-recording rows are never serialized by the
+    /// public evaluator.
+    pub speaker_evidence: Vec<AcousticSpeakerEvidenceSummary>,
     /// Normalized sufficient statistics retained only in the public evaluator
     /// for speaker-pair calibration. This field is never serialized into a
     /// runtime report or public evidence artifact.
@@ -11636,8 +11647,16 @@ where
         executed_mode: clustering.executed_mode,
         fallback_reason: clustering.fallback_reason,
         speaker_count_stability: clustering.bootstrap_stability,
+        count_estimate: capture_evaluation_evidence
+            .then(|| clustering.count_estimate.clone())
+            .flatten(),
         count_merge_steps: if capture_evaluation_evidence {
             count_merge_steps
+        } else {
+            Vec::new()
+        },
+        speaker_evidence: if capture_evaluation_evidence {
+            clustering.speaker_evidence.clone()
         } else {
             Vec::new()
         },
@@ -13508,6 +13527,7 @@ struct ProbabilisticLaneResult {
     groups: Vec<Vec<usize>>,
     risk_curve: SpeakerCountRiskCurve,
     merge_steps: Vec<AcousticCountMergeStepEvidence>,
+    merge_replay: Vec<(usize, usize)>,
 }
 
 enum ProbabilisticAgglomeration {
@@ -13595,24 +13615,22 @@ where
         });
     };
     // `selected_count` is an authority claim, not the only partition action the
-    // diarizer may take.  A calibrated posterior can correctly retain more
+    // diarizer may take. A calibrated posterior can correctly retain more
     // unresolved mass than any concrete bin while an interior concrete MAP
-    // remains a useful operational partition. Falling back merely because the
-    // interior action is unresolved collapsed real multi-speaker recordings to
-    // one speaker; an unresolved ceiling MAP is handled separately as domain
-    // saturation rather than being promoted into an eight-way partition.
-    let Some(selected_count) = operational_speaker_count(&count_estimate) else {
+    // remains a useful operational partition. The hierarchy elbow supplies a
+    // conservative over-partition proposal: downstream recurrence, confidence,
+    // reliability, separation, and occupancy checks must still support every
+    // emitted speaker. This avoids making an undercounted posterior MAP
+    // self-fulfilling without promoting the proposal to calibrated authority.
+    let Some((selected_count, feature_stability)) =
+        operational_partition_count(&count_estimate, &lane_results, policy)
+    else {
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::InvalidPosterior,
             count_estimate: Some(count_estimate),
             count_merge_steps: full_lane_merge_steps,
         });
     };
-    let agreeing_lanes = lane_results
-        .iter()
-        .filter(|result| result.selected_count == selected_count)
-        .count();
-    let feature_stability = agreeing_lanes as f32 / SPEAKER_COUNT_PERTURBATION_LANES as f32;
     let stability = spectral_proposal.map_or(feature_stability, |proposal| {
         let spectral_support = if proposal.count == selected_count {
             proposal.confidence as f32
@@ -13790,6 +13808,70 @@ fn operational_speaker_count(estimate: &SpeakerCountEstimate) -> Option<usize> {
     Some(map_count)
 }
 
+fn hierarchy_probability_drop_count(
+    steps: &[AcousticCountMergeStepEvidence],
+    policy: SpeakerCountPolicy,
+) -> Option<usize> {
+    steps
+        .windows(2)
+        .filter_map(|window| {
+            let count = window[0].remaining_clusters;
+            let drop = f64::from(window[0].same_speaker_probability)
+                - f64::from(window[1].same_speaker_probability);
+            (count >= policy.min
+                && count <= policy.max
+                && count < policy.max
+                && drop.is_finite()
+                && drop > 0.0)
+                .then_some((count, drop))
+        })
+        .max_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| right.0.cmp(&left.0))
+        })
+        .map(|(count, _)| count)
+}
+
+fn operational_partition_count(
+    estimate: &SpeakerCountEstimate,
+    lanes: &[ProbabilisticLaneResult],
+    policy: SpeakerCountPolicy,
+) -> Option<(usize, f32)> {
+    let posterior_count = operational_speaker_count(estimate);
+    if let Some(exact) = policy.exact {
+        return (posterior_count == Some(exact)).then_some((exact, 1.0));
+    }
+
+    let mut hierarchy_counts = lanes
+        .iter()
+        .filter_map(|lane| hierarchy_probability_drop_count(&lane.merge_steps, policy))
+        .collect::<Vec<_>>();
+    hierarchy_counts.sort_unstable();
+    let hierarchy_count = hierarchy_counts
+        .get(hierarchy_counts.len().checked_div(2)?)
+        .copied();
+    let selected_count = match (posterior_count, hierarchy_count) {
+        (Some(posterior), Some(hierarchy)) => posterior.max(hierarchy),
+        (Some(posterior), None) => posterior,
+        (None, Some(hierarchy)) => hierarchy,
+        (None, None) => return None,
+    };
+    let agreeing_lanes = if hierarchy_count == Some(selected_count) {
+        hierarchy_counts
+            .iter()
+            .filter(|&&count| count == selected_count)
+            .count()
+    } else {
+        lanes
+            .iter()
+            .filter(|lane| lane.selected_count == selected_count)
+            .count()
+    };
+    let stability = agreeing_lanes as f32 / SPEAKER_COUNT_PERTURBATION_LANES as f32;
+    Some((selected_count, stability.clamp(0.0, 1.0)))
+}
+
 /// Return normalized feasible caller weights and their bounded linear-pool mix.
 ///
 /// A clipped prior can only contribute the probability mass it retains in the
@@ -13876,6 +13958,7 @@ fn fused_speaker_count_estimate(
         0.0
     };
     let mut losses = fused_count_loss_points(lanes, spectral, policy)?;
+    apply_infer_count_complexity_prior(&mut losses, request, policy.min);
     losses.sort_by_key(|(count, _)| *count);
     let minimum_loss = losses
         .iter()
@@ -14114,6 +14197,19 @@ fn fused_speaker_count_estimate(
     };
     estimate.validate().ok()?;
     Some(estimate)
+}
+
+fn apply_infer_count_complexity_prior(
+    losses: &mut [(usize, f64)],
+    request: &SpeakerCountRequest,
+    minimum_count: usize,
+) {
+    if matches!(request, SpeakerCountRequest::Infer) {
+        for (count, loss) in losses {
+            *loss += SPEAKER_COUNT_INFER_LOG_COMPLEXITY_PER_ADDITIONAL_SPEAKER
+                * count.saturating_sub(minimum_count) as f64;
+        }
+    }
 }
 
 fn speaker_count_evidence_sha256(
@@ -14546,6 +14642,53 @@ impl SparseSpeakerAffinityGraph {
     }
 }
 
+fn dense_normalized_affinity_matrix(graph: &SparseSpeakerAffinityGraph) -> FwResult<Vec<Vec<f64>>> {
+    let node_count = graph.rows.len();
+    if node_count == 0 || graph.degrees.len() != node_count {
+        return Err(FwError::InvalidRequest(
+            "speaker-count dense affinity dimensions are invalid".to_owned(),
+        ));
+    }
+    let mut matrix = vec![vec![0.0; node_count]; node_count];
+    for (row, neighbors) in graph.rows.iter().enumerate() {
+        let row_degree = graph.degrees[row];
+        if !row_degree.is_finite() || row_degree <= 0.0 {
+            return Err(FwError::InvalidRequest(
+                "speaker-count dense affinity degree is invalid".to_owned(),
+            ));
+        }
+        matrix[row][row] = 1.0 / row_degree;
+        for &(column, weight) in neighbors {
+            let Some(&column_degree) = graph.degrees.get(column) else {
+                return Err(FwError::InvalidRequest(
+                    "speaker-count dense affinity neighbor is out of bounds".to_owned(),
+                ));
+            };
+            let denominator = (row_degree * column_degree).sqrt();
+            if !weight.is_finite()
+                || weight <= 0.0
+                || !denominator.is_finite()
+                || denominator <= 0.0
+            {
+                return Err(FwError::InvalidRequest(
+                    "speaker-count dense affinity weight is invalid".to_owned(),
+                ));
+            }
+            matrix[row][column] = weight / denominator;
+        }
+    }
+    for row in 0..node_count {
+        for column in row + 1..node_count {
+            if (matrix[row][column] - matrix[column][row]).abs() > f64::EPSILON {
+                return Err(FwError::InvalidRequest(
+                    "speaker-count dense affinity is not symmetric".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(matrix)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct SparseEigengapProposal {
     count: usize,
@@ -14559,6 +14702,7 @@ struct SparseEigengapProposal {
 struct SparseEigengapRun {
     proposal: Option<SparseEigengapProposal>,
     iterations: usize,
+    sparse_matvec_iterations: usize,
     residual: Option<f64>,
     subspace_dimensions: usize,
     unavailable_reason: Option<SpeakerCountLaneUnavailableReason>,
@@ -14574,6 +14718,7 @@ impl SparseEigengapRun {
         Self {
             proposal: None,
             iterations,
+            sparse_matvec_iterations: iterations,
             residual,
             subspace_dimensions,
             unavailable_reason: Some(reason),
@@ -14635,9 +14780,7 @@ where
             ) else {
                 continue;
             };
-            let weight = f64::from(
-                ((2.0 * evidence.same_speaker_probability - 1.0).max(0.0)) * evidence.support,
-            );
+            let weight = f64::from(evidence.same_speaker_probability * evidence.support);
             if weight.is_finite() && weight > 0.0 {
                 neighbors.push((weight, right));
             }
@@ -14797,7 +14940,7 @@ fn speaker_count_resource_summary(
     let solver_sparse_matvec_terms = sparse_product_terms
         .checked_mul(solver.subspace_dimensions)
         .and_then(|terms| terms.checked_mul(2))
-        .and_then(|terms| terms.checked_mul(solver.iterations))
+        .and_then(|terms| terms.checked_mul(solver.sparse_matvec_iterations))
         .and_then(|terms| u64::try_from(terms).ok())
         .ok_or_else(|| {
             FwError::InvalidRequest("speaker-count solver operation count overflow".to_owned())
@@ -14874,6 +15017,7 @@ where
         return Ok(SparseEigengapRun {
             proposal: Some(proposal),
             iterations: 0,
+            sparse_matvec_iterations: 0,
             residual: Some(0.0),
             subspace_dimensions: 1,
             unavailable_reason: None,
@@ -14896,70 +15040,108 @@ where
             0,
         ));
     }
-    let subspace_dimensions = bounded_maximum.saturating_add(1).min(node_count);
-    let mut basis = deterministic_spectral_basis(graph, subspace_dimensions)?;
-    let mut residual = f64::INFINITY;
-    let mut iterations = 0usize;
-    let mut rayleigh = vec![vec![0.0; subspace_dimensions]; subspace_dimensions];
-    for iteration in 0..SPEAKER_COUNT_EIGENSOLVER_MAX_ITERATIONS {
-        if is_cancelled() {
-            return Err(FwError::Cancelled(format!(
-                "speaker-count eigensolver cancelled after {iteration} iterations"
-            )));
-        }
-        let mut next = basis
-            .iter()
-            .map(|column| {
-                let mut product = graph.apply_normalized(column)?;
-                for (value, &input) in product.iter_mut().zip(column) {
-                    *value += SPEAKER_COUNT_EIGENSOLVER_DIAGONAL_SHIFT * input;
+    let (mut eigenvalues, iterations, residual, subspace_dimensions, sparse_matvec_iterations) =
+        if node_count <= SPEAKER_COUNT_DENSE_EIGENSOLVER_MAX_PROTOTYPES {
+            let matrix = dense_normalized_affinity_matrix(graph)?;
+            let Some(run) =
+                jacobi_symmetric_eigenvalues(matrix, &mut is_cancelled, "dense eigensolver")?
+            else {
+                return Ok(SparseEigengapRun {
+                    proposal: None,
+                    iterations: jacobi_iteration_cap(node_count)?,
+                    sparse_matvec_iterations: 0,
+                    residual: None,
+                    subspace_dimensions: node_count,
+                    unavailable_reason: Some(
+                        SpeakerCountLaneUnavailableReason::SolverDidNotConverge,
+                    ),
+                });
+            };
+            (run.eigenvalues, run.iterations, run.residual, node_count, 0)
+        } else {
+            let subspace_dimensions = bounded_maximum.saturating_add(1).min(node_count);
+            let mut basis = deterministic_spectral_basis(graph, subspace_dimensions)?;
+            let mut residual = f64::INFINITY;
+            let mut iterations = 0usize;
+            let mut rayleigh = vec![vec![0.0; subspace_dimensions]; subspace_dimensions];
+            for iteration in 0..SPEAKER_COUNT_EIGENSOLVER_MAX_ITERATIONS {
+                if is_cancelled() {
+                    return Err(FwError::Cancelled(format!(
+                        "speaker-count eigensolver cancelled after {iteration} iterations"
+                    )));
                 }
-                Some(product)
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                FwError::InvalidRequest(
-                    "speaker-count eigensolver encountered an invalid sparse product".to_owned(),
-                )
-            })?;
-        if !orthonormalize_columns(&mut next) {
-            return Ok(SparseEigengapRun::unavailable(
-                SpeakerCountLaneUnavailableReason::SolverDidNotConverge,
-                iteration + 1,
-                None,
-                subspace_dimensions,
-            ));
-        }
-        basis = next;
-        let applied = basis
-            .iter()
-            .map(|column| graph.apply_normalized(column))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                FwError::InvalidRequest(
-                    "speaker-count eigensolver encountered an invalid Rayleigh product".to_owned(),
-                )
-            })?;
-        for row in 0..subspace_dimensions {
-            for column in 0..subspace_dimensions {
-                rayleigh[row][column] = dot_f64(&basis[row], &applied[column])?;
+                let mut next = basis
+                    .iter()
+                    .map(|column| {
+                        let mut product = graph.apply_normalized(column)?;
+                        for (value, &input) in product.iter_mut().zip(column) {
+                            *value += SPEAKER_COUNT_EIGENSOLVER_DIAGONAL_SHIFT * input;
+                        }
+                        Some(product)
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        FwError::InvalidRequest(
+                            "speaker-count eigensolver encountered an invalid sparse product"
+                                .to_owned(),
+                        )
+                    })?;
+                if !orthonormalize_columns(&mut next) {
+                    return Ok(SparseEigengapRun::unavailable(
+                        SpeakerCountLaneUnavailableReason::SolverDidNotConverge,
+                        iteration + 1,
+                        None,
+                        subspace_dimensions,
+                    ));
+                }
+                basis = next;
+                let applied = basis
+                    .iter()
+                    .map(|column| graph.apply_normalized(column))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        FwError::InvalidRequest(
+                            "speaker-count eigensolver encountered an invalid Rayleigh product"
+                                .to_owned(),
+                        )
+                    })?;
+                for row in 0..subspace_dimensions {
+                    for column in 0..subspace_dimensions {
+                        rayleigh[row][column] = dot_f64(&basis[row], &applied[column])?;
+                    }
+                }
+                residual = invariant_subspace_residual(&basis, &applied, &rayleigh)?;
+                iterations = iteration + 1;
+                if residual <= SPEAKER_COUNT_EIGENSOLVER_TOLERANCE {
+                    break;
+                }
             }
-        }
-        residual = invariant_subspace_residual(&basis, &applied, &rayleigh)?;
-        iterations = iteration + 1;
-        if residual <= SPEAKER_COUNT_EIGENSOLVER_TOLERANCE {
-            break;
-        }
-    }
-    if residual > SPEAKER_COUNT_EIGENSOLVER_TOLERANCE {
-        return Ok(SparseEigengapRun::unavailable(
-            SpeakerCountLaneUnavailableReason::SolverDidNotConverge,
-            iterations,
-            residual.is_finite().then_some(residual),
-            subspace_dimensions,
-        ));
-    }
-    let mut eigenvalues = jacobi_symmetric_eigenvalues(rayleigh)?;
+            if residual > SPEAKER_COUNT_EIGENSOLVER_TOLERANCE {
+                return Ok(SparseEigengapRun::unavailable(
+                    SpeakerCountLaneUnavailableReason::SolverDidNotConverge,
+                    iterations,
+                    residual.is_finite().then_some(residual),
+                    subspace_dimensions,
+                ));
+            }
+            let Some(run) =
+                jacobi_symmetric_eigenvalues(rayleigh, &mut is_cancelled, "Rayleigh eigensolver")?
+            else {
+                return Ok(SparseEigengapRun::unavailable(
+                    SpeakerCountLaneUnavailableReason::SolverDidNotConverge,
+                    iterations,
+                    Some(residual),
+                    subspace_dimensions,
+                ));
+            };
+            (
+                run.eigenvalues,
+                iterations,
+                residual,
+                subspace_dimensions,
+                iterations,
+            )
+        };
     eigenvalues.sort_by(|left, right| right.total_cmp(left));
     for eigenvalue in &mut eigenvalues {
         *eigenvalue = eigenvalue.clamp(-1.0, 1.0);
@@ -15012,6 +15194,7 @@ where
     Ok(SparseEigengapRun {
         proposal: Some(proposal),
         iterations,
+        sparse_matvec_iterations,
         residual: Some(residual),
         subspace_dimensions,
         unavailable_reason: None,
@@ -15121,7 +15304,29 @@ fn invariant_subspace_residual(
     }
 }
 
-fn jacobi_symmetric_eigenvalues(mut matrix: Vec<Vec<f64>>) -> FwResult<Vec<f64>> {
+struct JacobiEigenvalueRun {
+    eigenvalues: Vec<f64>,
+    iterations: usize,
+    residual: f64,
+}
+
+fn jacobi_iteration_cap(dimensions: usize) -> FwResult<usize> {
+    dimensions
+        .checked_mul(dimensions)
+        .and_then(|value| value.checked_mul(64))
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker-count Jacobi iteration cap overflow".to_owned())
+        })
+}
+
+fn jacobi_symmetric_eigenvalues<C>(
+    mut matrix: Vec<Vec<f64>>,
+    mut is_cancelled: C,
+    phase: &str,
+) -> FwResult<Option<JacobiEigenvalueRun>>
+where
+    C: FnMut() -> bool,
+{
     let dimensions = matrix.len();
     if dimensions == 0 || matrix.iter().any(|row| row.len() != dimensions) {
         return Err(FwError::InvalidRequest(
@@ -15148,13 +15353,13 @@ fn jacobi_symmetric_eigenvalues(mut matrix: Vec<Vec<f64>>) -> FwResult<Vec<f64>>
         }
         row += 1;
     }
-    let iteration_cap = dimensions
-        .checked_mul(dimensions)
-        .and_then(|value| value.checked_mul(64))
-        .ok_or_else(|| {
-            FwError::InvalidRequest("speaker-count Jacobi iteration cap overflow".to_owned())
-        })?;
-    for _ in 0..iteration_cap {
+    let iteration_cap = jacobi_iteration_cap(dimensions)?;
+    for iteration in 0..iteration_cap {
+        if is_cancelled() {
+            return Err(FwError::Cancelled(format!(
+                "speaker-count {phase} cancelled after {iteration} rotations"
+            )));
+        }
         let mut largest = 0.0_f64;
         let mut pivot = None;
         for (row, matrix_row) in matrix.iter().enumerate() {
@@ -15167,7 +15372,11 @@ fn jacobi_symmetric_eigenvalues(mut matrix: Vec<Vec<f64>>) -> FwResult<Vec<f64>>
             }
         }
         if largest <= 1.0e-12 {
-            return Ok((0..dimensions).map(|index| matrix[index][index]).collect());
+            return Ok(Some(JacobiEigenvalueRun {
+                eigenvalues: (0..dimensions).map(|index| matrix[index][index]).collect(),
+                iterations: iteration,
+                residual: largest,
+            }));
         }
         let Some((left, right)) = pivot else {
             break;
@@ -15201,9 +15410,7 @@ fn jacobi_symmetric_eigenvalues(mut matrix: Vec<Vec<f64>>) -> FwResult<Vec<f64>>
             index += 1;
         }
     }
-    Err(FwError::InvalidRequest(
-        "speaker-count Jacobi eigensolver did not converge".to_owned(),
-    ))
+    Ok(None)
 }
 
 fn dot_f64(left: &[f64], right: &[f64]) -> FwResult<f64> {
@@ -15399,7 +15606,37 @@ where
                 same_speaker_probability: step.same_speaker_probability,
             })
             .collect(),
+        merge_replay: steps.iter().map(|step| (step.left, step.right)).collect(),
     }))
+}
+
+fn probabilistic_lane_groups_at_count(
+    lane: &ProbabilisticLaneResult,
+    initial_count: usize,
+    selected_count: usize,
+) -> Option<Vec<Vec<usize>>> {
+    if selected_count == 0 || selected_count > initial_count {
+        return None;
+    }
+    let accepted_merges = initial_count.checked_sub(selected_count)?;
+    if lane.merge_replay.len() < accepted_merges {
+        return (lane.selected_count == selected_count && lane.groups.len() == selected_count)
+            .then(|| lane.groups.clone());
+    }
+    let mut groups = (0..initial_count)
+        .map(|index| Some(vec![index]))
+        .collect::<Vec<_>>();
+    for &(left, right) in lane.merge_replay.iter().take(accepted_merges) {
+        if left >= groups.len() || right >= groups.len() || left == right {
+            return None;
+        }
+        let right_group = groups[right].take()?;
+        let left_group = groups[left].as_mut()?;
+        left_group.extend(right_group);
+        left_group.sort_unstable();
+    }
+    let groups = groups.into_iter().flatten().collect::<Vec<_>>();
+    (groups.len() == selected_count).then_some(groups)
 }
 
 fn coassociation_consensus_clusters<C>(
@@ -15415,7 +15652,11 @@ where
     let initial_count = initial.len();
     let mut coassociation = vec![vec![0u8; initial_count]; initial_count];
     for lane in lanes {
-        for group in &lane.groups {
+        let Some(groups) = probabilistic_lane_groups_at_count(lane, initial_count, selected_count)
+        else {
+            return Ok(None);
+        };
+        for group in &groups {
             for &left in group {
                 for &right in group {
                     coassociation[left][right] = coassociation[left][right].saturating_add(1);
@@ -24753,6 +24994,7 @@ mod tests {
                     .collect(),
             },
             merge_steps: Vec::new(),
+            merge_replay: Vec::new(),
         };
         let lanes = vec![
             lane(2, [5.0, 0.0, 3.0]),
@@ -24803,6 +25045,7 @@ mod tests {
                     .collect(),
             },
             merge_steps: Vec::new(),
+            merge_replay: Vec::new(),
         };
         let lanes = vec![
             lane(3, &[(2, 3.0), (3, 0.0), (4, 2.0)]),
@@ -24823,6 +25066,35 @@ mod tests {
     }
 
     #[test]
+    fn consensus_replays_each_lane_hierarchy_at_the_fused_count() {
+        let lane = super::ProbabilisticLaneResult {
+            selected_count: 4,
+            groups: vec![vec![0], vec![1], vec![2], vec![3]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count: 4,
+                points: (1..=4)
+                    .map(|count| super::SpeakerCountRiskPoint {
+                        count,
+                        expected_loss: (4 - count) as f64,
+                    })
+                    .collect(),
+            },
+            merge_steps: Vec::new(),
+            merge_replay: vec![(0, 1), (2, 3), (0, 2)],
+        };
+
+        assert_eq!(
+            super::probabilistic_lane_groups_at_count(&lane, 4, 2),
+            Some(vec![vec![0, 1], vec![2, 3]])
+        );
+        assert_eq!(
+            super::probabilistic_lane_groups_at_count(&lane, 4, 1),
+            Some(vec![vec![0, 1, 2, 3]])
+        );
+        assert_eq!(super::probabilistic_lane_groups_at_count(&lane, 4, 5), None);
+    }
+
+    #[test]
     fn fused_speaker_count_estimate_normalizes_with_explicit_unresolved_mass() {
         let lane = |losses: [f64; 3]| super::ProbabilisticLaneResult {
             selected_count: 2,
@@ -24839,6 +25111,7 @@ mod tests {
                     .collect(),
             },
             merge_steps: Vec::new(),
+            merge_replay: Vec::new(),
         };
         let lanes = vec![
             lane([4.0, 0.0, 3.0]),
@@ -24875,6 +25148,101 @@ mod tests {
         assert!(
             estimate.unresolved_probability >= 0.15,
             "development evidence must retain unresolved mass: {estimate:#?}"
+        );
+    }
+
+    #[test]
+    fn infer_geometric_complexity_prior_halves_each_additional_count_weight() {
+        let mut losses = vec![(1, 0.0), (2, 0.0), (3, 0.0)];
+        super::apply_infer_count_complexity_prior(&mut losses, &SpeakerCountRequest::Infer, 1);
+        assert_eq!(losses[0], (1, 0.0));
+        assert_eq!(losses[1], (2, std::f64::consts::LN_2));
+        assert_eq!(losses[2], (3, 2.0 * std::f64::consts::LN_2));
+
+        let first_weight = (-losses[0].1).exp();
+        let second_weight = (-losses[1].1).exp();
+        let third_weight = (-losses[2].1).exp();
+        assert!((first_weight / second_weight - 2.0).abs() < 1.0e-12);
+        assert!((second_weight / third_weight - 2.0).abs() < 1.0e-12);
+
+        let mut hard_constraint_losses = vec![(1, 0.0), (2, 0.0), (3, 0.0)];
+        super::apply_infer_count_complexity_prior(
+            &mut hard_constraint_losses,
+            &SpeakerCountRequest::HardConstraint { count: 2 },
+            1,
+        );
+        assert_eq!(hard_constraint_losses, vec![(1, 0.0), (2, 0.0), (3, 0.0)]);
+    }
+
+    #[test]
+    fn hierarchy_elbow_can_propose_more_clusters_than_an_undercounted_posterior() {
+        let lane = || super::ProbabilisticLaneResult {
+            selected_count: 1,
+            groups: vec![vec![0, 1, 2, 3, 4]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count: 1,
+                points: (1..=5)
+                    .map(|count| super::SpeakerCountRiskPoint {
+                        count,
+                        expected_loss: 2.0 * (count - 1) as f64,
+                    })
+                    .collect(),
+            },
+            merge_steps: vec![
+                super::AcousticCountMergeStepEvidence {
+                    remaining_clusters: 4,
+                    same_speaker_probability: 0.90,
+                },
+                super::AcousticCountMergeStepEvidence {
+                    remaining_clusters: 3,
+                    same_speaker_probability: 0.80,
+                },
+                super::AcousticCountMergeStepEvidence {
+                    remaining_clusters: 2,
+                    same_speaker_probability: 0.20,
+                },
+                super::AcousticCountMergeStepEvidence {
+                    remaining_clusters: 1,
+                    same_speaker_probability: 0.10,
+                },
+            ],
+            merge_replay: vec![(0, 1), (0, 2), (0, 3), (0, 4)],
+        };
+        let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
+            .map(|_| lane())
+            .collect::<Vec<_>>();
+        let policy = super::SpeakerCountPolicy {
+            min: 1,
+            max: 5,
+            exact: None,
+        };
+        let estimate = super::fused_speaker_count_estimate(
+            &lanes,
+            None,
+            Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+            &SpeakerCountRequest::Infer,
+            policy,
+            1,
+            super::unavailable_speaker_count_resources(5).expect("resource summary"),
+        )
+        .expect("posterior estimate");
+        assert_eq!(super::operational_speaker_count(&estimate), Some(1));
+        assert_eq!(
+            super::operational_partition_count(&estimate, &lanes, policy),
+            Some((3, 1.0))
+        );
+        assert_eq!(
+            super::operational_partition_count(
+                &estimate,
+                &lanes,
+                super::SpeakerCountPolicy {
+                    min: 1,
+                    max: 1,
+                    exact: Some(1),
+                },
+            ),
+            Some((1, 1.0)),
+            "a hierarchy proposal must never override a hard count"
         );
     }
 
@@ -24966,6 +25334,7 @@ mod tests {
                 ],
             },
             merge_steps: Vec::new(),
+            merge_replay: Vec::new(),
         };
         let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
             .map(|_| lane())
@@ -25047,6 +25416,7 @@ mod tests {
                 ],
             },
             merge_steps: Vec::new(),
+            merge_replay: Vec::new(),
         };
         let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
             .map(|_| lane())
@@ -25080,17 +25450,35 @@ mod tests {
         );
         assert_eq!(
             super::operational_speaker_count(&estimate),
-            None,
-            "an unresolved MAP at the bounded ceiling must fail closed instead of treating domain saturation as an operational count"
+            Some(2),
+            "the geometric complexity prior must make the lowest equally supported count the operational action without making it authoritative"
         );
         estimate.candidate_upper_bound = 8;
         estimate
             .validate()
-            .expect("the same unresolved MAP remains valid inside a wider bounded domain");
+            .expect("the same unresolved posterior remains valid inside a wider bounded domain");
         assert_eq!(
             super::operational_speaker_count(&estimate),
+            Some(2),
+            "widening the domain must not change an interior operational MAP"
+        );
+
+        let mut saturated = estimate;
+        let first_probability = saturated.posterior[0].probability;
+        let last_index = saturated.posterior.len() - 1;
+        saturated.posterior[0].probability = saturated.posterior[last_index].probability;
+        saturated.posterior[last_index].probability = first_probability;
+        saturated.candidate_upper_bound = 5;
+        assert_eq!(
+            super::operational_speaker_count(&saturated),
+            None,
+            "an unresolved MAP at the bounded ceiling must fail closed instead of treating domain saturation as an operational count"
+        );
+        saturated.candidate_upper_bound = 8;
+        assert_eq!(
+            super::operational_speaker_count(&saturated),
             Some(5),
-            "an interior concrete MAP remains usable without becoming an authoritative selected_count"
+            "the same concrete MAP is usable when it is not the search ceiling"
         );
     }
 
@@ -25121,6 +25509,7 @@ mod tests {
                 ],
             },
             merge_steps: Vec::new(),
+            merge_replay: Vec::new(),
         };
         let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
             .map(|_| lane())
@@ -25263,6 +25652,7 @@ mod tests {
                         .collect(),
                 },
                 merge_steps: Vec::new(),
+                merge_replay: Vec::new(),
             };
             let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
                 .map(|_| lane.clone())
@@ -25337,6 +25727,7 @@ mod tests {
                 ],
             },
             merge_steps: Vec::new(),
+            merge_replay: Vec::new(),
         };
         let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
             .map(|_| lane())
@@ -25422,6 +25813,7 @@ mod tests {
                 ],
             },
             merge_steps: Vec::new(),
+            merge_replay: Vec::new(),
         };
         let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
             .map(|_| lane())
@@ -25549,6 +25941,76 @@ mod tests {
             proposal.count, 1,
             "a missing fifth eigenvalue must not fabricate a terminal K=4 gap: {proposal:#?}"
         );
+    }
+
+    #[test]
+    fn dense_eigengap_path_is_deterministic_for_four_components() {
+        let mut rows = vec![Vec::new(); 12];
+        let mut degrees = vec![1.0; 12];
+        let mut undirected_edge_count = 0usize;
+        for component_start in [0usize, 3, 6, 9] {
+            for left in component_start..component_start + 3 {
+                for right in left + 1..component_start + 3 {
+                    rows[left].push((right, 1.0));
+                    rows[right].push((left, 1.0));
+                    degrees[left] += 1.0;
+                    degrees[right] += 1.0;
+                    undirected_edge_count += 1;
+                }
+            }
+        }
+        let graph = super::SparseSpeakerAffinityGraph {
+            rows,
+            degrees,
+            undirected_edge_count,
+        };
+        let first = super::sparse_normalized_eigengap_run(&graph, 1, 8, || false)
+            .expect("dense spectral solver");
+        let second = super::sparse_normalized_eigengap_run(&graph, 1, 8, || false)
+            .expect("deterministic dense spectral solver");
+        assert_eq!(first, second);
+        assert_eq!(
+            first.proposal.as_ref().map(|proposal| proposal.count),
+            Some(4)
+        );
+        assert_eq!(first.sparse_matvec_iterations, 0);
+        assert_eq!(first.subspace_dimensions, 12);
+        assert!(first.iterations > 0);
+        assert!(
+            first
+                .residual
+                .is_some_and(|residual| residual <= super::SPEAKER_COUNT_EIGENSOLVER_TOLERANCE)
+        );
+    }
+
+    #[test]
+    fn sparse_affinity_retains_ranked_edges_below_classification_threshold() {
+        let request = DiarizationRequest::default();
+        let tracklets = vec![
+            profile_tracklet(0, 0, 500, -0.2, 0.0, 50),
+            profile_tracklet(1, 500, 1_000, 0.2, 0.0, 50),
+        ];
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, 1_000).expect("enrollment");
+        let (prototypes, cap_pressure) =
+            super::build_capped_prototypes(&tracklets, &BTreeMap::new(), 512, &mut || false)
+                .expect("prototypes");
+        assert!(!cap_pressure);
+        let clusters = super::initial_clusters(&prototypes, &enrollment);
+        let pair = super::cluster_pair_evidence(
+            &clusters[0],
+            &clusters[1],
+            super::SpeakerPairPerturbation::Full,
+        )
+        .expect("pair evidence");
+        assert!(pair.same_speaker_probability < 0.5);
+
+        let affinity =
+            super::build_sparse_speaker_affinity(&clusters, &BTreeSet::new(), &mut || false)
+                .expect("affinity");
+        let graph = affinity.graph.expect("positive ranked affinity graph");
+        assert_eq!(graph.undirected_edge_count, 1);
+        assert!(graph.rows[0][0].1 > 0.0);
     }
 
     #[test]
