@@ -31,7 +31,7 @@ use crate::diarization::{
     AcousticScatteringMode, AcousticSidecarEvaluationRequest, AcousticSidecarFusionCalibration,
     AcousticSidecarFusionEvaluationEvidence, AcousticSidecarStudy, AcousticSidecarStudyConfig,
     AcousticSidecarStudyMode, AcousticSidecarStudyObservation, AcousticTrajectoryWaveletMode,
-    ChangePointScore, DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION,
+    AcousticTracklet, ChangePointScore, DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION,
     DIARIZATION_HYPOTHESIS_SCHEMA_VERSION, DIARIZATION_REFERENCE_SCHEMA_VERSION,
     DIARIZATION_SCORER_VERSION, DiarizationCorpusManifest, DiarizationHypothesisDocument,
     DiarizationLeakageAudit, DiarizationReferenceDocument, DiarizationScorerConfig,
@@ -40,7 +40,8 @@ use crate::diarization::{
     acoustic_change_calibration_sha256, acoustic_feature_schema_sha256,
     acoustic_sidecar_calibrate_owner_contrast, acoustic_sidecar_fusion_configuration_sha256,
     acoustic_sidecar_observation_owner_contrast_from_study, acoustic_sidecar_study_config_sha256,
-    acoustic_speaker_pair_calibration_sha256, audit_diarization_manifest,
+    acoustic_speaker_pair_calibration_sha256, acoustic_tracklet_pair_evidence,
+    audit_diarization_manifest,
     diarize_acoustic_pcm_with_modes_evidence, diarize_acoustic_pcm_with_sidecar_evidence,
     extract_acoustic_features_with_frames, parse_diarization_corpus_manifest,
     parse_diarization_reference, score_change_points, score_diarization_documents,
@@ -62,10 +63,10 @@ pub const PUBLIC_CORPUS_REGISTRY_SCHEMA_VERSION: &str = "public-diarization-corp
 pub const PUBLIC_CORPUS_WORD_ANNOTATION_SCHEMA_VERSION: &str =
     "public-diarization-word-annotation-v1";
 /// Schema identity for path-free public representation-ablation evidence.
-pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v11";
+pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v12";
 /// Frozen public ablation implementation identity.
 pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-ablation-runner-v11";
+    "public-diarization-acoustic-ablation-runner-v12";
 /// Schema identity for the separate aggregate-only acoustic sidecar study.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION: &str =
     "public-diarization-acoustic-sidecar-study-v3";
@@ -127,6 +128,14 @@ pub const PUBLIC_CORPUS_SIDECAR_MAX_RELATIVE_RTF_REGRESSION: f64 = 0.25;
 /// Maximum relative sampled peak-RSS regression admitted for promotion.
 pub const PUBLIC_CORPUS_SIDECAR_MAX_RELATIVE_RSS_REGRESSION: f64 = 0.25;
 
+/// Development-only fit identity for the native acoustic speaker-pair model.
+pub const PUBLIC_ACOUSTIC_PAIR_CALIBRATION_FIT_VERSION: &str =
+    "public-acoustic-tracklet-pair-balanced-brier-grid-v1";
+/// Reference target excludes overlap, ignored regions, and tracklets spanning
+/// more than one known speaker.
+pub const PUBLIC_ACOUSTIC_PAIR_CALIBRATION_TARGET_VERSION: &str =
+    "different-speaker-given-two-reference-homogeneous-tracklets-v1";
+
 const PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS: u64 = 250;
 const PUBLIC_SIDECAR_RELIABILITY_BINS: usize = 10;
 const PUBLIC_SIDECAR_FIT_BINS: usize = 256;
@@ -137,6 +146,8 @@ const PUBLIC_SIDECAR_MAX_RETAINED_PAIR_SAMPLE_CAPACITY: usize = 8_192;
 const PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS: usize = 1;
 const PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES: usize = 2_000;
 const PUBLIC_SIDECAR_BOOTSTRAP_SEED_POLICY: &str = "fixed-lane-split-bootstrap-seed-v2";
+const PUBLIC_ACOUSTIC_PAIR_MAX_PAIRS_PER_RECORDING: usize = 4_096;
+const PUBLIC_ACOUSTIC_PAIR_MINIMUM_CLASS_OBSERVATIONS: u64 = 16;
 const PUBLIC_SIDECAR_BOOTSTRAP_SAMPLER: &str = "splitmix64-per-replicate-stream-v1";
 const PUBLIC_SIDECAR_MAX_RETAINED_SIGNALS: u64 = 401;
 const PUBLIC_SIDECAR_MAX_RETAINED_SIGNAL_CAPACITY: u64 = 1_024;
@@ -415,6 +426,24 @@ pub struct PublicSpeakerCountHierarchyCandidate {
     pub speaker_count_confusion: Vec<PublicSpeakerCountConfusionCell>,
 }
 
+/// Aggregate-only development fit for the native same/different-speaker map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicAcousticSpeakerPairCalibrationFit {
+    pub fit_id: String,
+    pub target_id: String,
+    pub recording_count: u64,
+    pub observation_count: u64,
+    pub same_speaker_observation_count: u64,
+    pub different_speaker_observation_count: u64,
+    pub baseline_balanced_brier_score: f64,
+    pub fitted_balanced_brier_score: f64,
+    pub fitted_different_logit_intercept: f64,
+    pub fitted_voice_distance_weight: f64,
+    pub fitted_channel_distance_weight: f64,
+    pub calibration_sha256: String,
+}
+
 /// Count-posterior quality stratified by the reference speaker count.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -502,6 +531,7 @@ pub struct PublicCorpusAblationSplit {
     pub speaker_count_posterior_map_confusion: Vec<PublicSpeakerCountConfusionCell>,
     pub speaker_count_merge_frontier: PublicSpeakerCountMergeFrontier,
     pub speaker_count_hierarchy_candidates: Vec<PublicSpeakerCountHierarchyCandidate>,
+    pub acoustic_speaker_pair_calibration_fit: Option<PublicAcousticSpeakerPairCalibrationFit>,
     pub speaker_count_strata: Vec<PublicSpeakerCountStratum>,
     pub speaker_count_duration_strata: Vec<PublicSpeakerCountDurationStratum>,
     pub count_posterior_recording_count: u64,
