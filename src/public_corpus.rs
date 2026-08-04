@@ -68,10 +68,10 @@ pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
     "public-diarization-acoustic-ablation-runner-v12";
 /// Schema identity for the separate aggregate-only acoustic sidecar study.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION: &str =
-    "public-diarization-acoustic-sidecar-study-v3";
+    "public-diarization-acoustic-sidecar-study-v4";
 /// Frozen implementation identity for the aggregate-only sidecar runner.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-sidecar-study-runner-v3";
+    "public-diarization-acoustic-sidecar-study-runner-v4";
 /// Identity of the bounded development calibration fit.
 pub const PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION: &str =
     "public-sidecar-boundary-calibration-empirical-grid-v2";
@@ -3690,6 +3690,7 @@ fn evaluate_public_variant(
             AcousticPairCalibrationContext {
                 reference: &clipped_reference,
                 recording_sha256: &recording_evidence.audio_sha256,
+                fit_enabled: manifest_recording.split == EvaluationSplit::Development,
             },
         )?;
     }
@@ -6245,6 +6246,7 @@ fn evaluate_public_sidecar_lane(
             AcousticPairCalibrationContext {
                 reference: &loaded.reference,
                 recording_sha256: &recording_evidence.audio_sha256,
+                fit_enabled: target_split == EvaluationSplit::Development,
             },
         )?;
     }
@@ -7596,6 +7598,7 @@ struct AcousticPairCalibrationObservation {
 struct AcousticPairCalibrationContext<'a> {
     reference: &'a DiarizationReferenceDocument,
     recording_sha256: &'a str,
+    fit_enabled: bool,
 }
 
 impl PartialEq for AcousticPairCalibrationObservation {
@@ -8008,11 +8011,15 @@ impl PublicAblationAccumulator {
                 "recording count exceeds the supported range",
             )
         })?;
-        let acoustic_pair_observations = reference_labeled_acoustic_pair_observations(
-            pair_calibration.reference,
-            &clustering.calibration_tracklets,
-            pair_calibration.recording_sha256,
-        );
+        let acoustic_pair_observations = if pair_calibration.fit_enabled {
+            reference_labeled_acoustic_pair_observations(
+                pair_calibration.reference,
+                &clustering.calibration_tracklets,
+                pair_calibration.recording_sha256,
+            )
+        } else {
+            Vec::new()
+        };
         if !acoustic_pair_observations.is_empty() {
             self.acoustic_pair_recording_count = self
                 .acoustic_pair_recording_count
@@ -8606,7 +8613,8 @@ impl PublicAblationAccumulator {
         let acoustic_speaker_pair_calibration_fit = fit_acoustic_speaker_pair_calibration(
             &self.acoustic_pair_observations,
             self.acoustic_pair_recording_count,
-        );
+        )
+        .filter(|_| split == EvaluationSplit::Development);
         let speaker_count_strata = self
             .speaker_count_strata
             .iter()
@@ -11972,33 +11980,36 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                             .mean_absolute_speaker_count_error
                             .is_none_or(finite_nonnegative)
                 });
-        let acoustic_pair_fit_valid = split
-            .acoustic_speaker_pair_calibration_fit
-            .as_ref()
-            .is_none_or(|fit| {
-                fit.fit_id == PUBLIC_ACOUSTIC_PAIR_CALIBRATION_FIT_VERSION
-                    && fit.target_id == PUBLIC_ACOUSTIC_PAIR_CALIBRATION_TARGET_VERSION
-                    && fit.recording_count > 0
-                    && fit.recording_count <= split.recording_count
-                    && fit.same_speaker_observation_count
-                        >= PUBLIC_ACOUSTIC_PAIR_MINIMUM_CLASS_OBSERVATIONS
-                    && fit.different_speaker_observation_count
-                        >= PUBLIC_ACOUSTIC_PAIR_MINIMUM_CLASS_OBSERVATIONS
-                    && fit
-                        .same_speaker_observation_count
-                        .saturating_add(fit.different_speaker_observation_count)
-                        == fit.observation_count
-                    && bounded(Some(fit.baseline_balanced_brier_score))
-                    && bounded(Some(fit.fitted_balanced_brier_score))
-                    && fit.fitted_balanced_brier_score <= fit.baseline_balanced_brier_score + 1e-12
-                    && (-8.0..=4.0).contains(&fit.fitted_different_logit_intercept)
-                    && (0.0..=16.0).contains(&fit.fitted_voice_distance_weight)
-                    && [0.0, 0.1, 0.25, 0.5, 1.0].contains(&fit.fitted_channel_distance_weight)
-                    && (fit.fitted_different_logit_intercept * 2.0).fract() == 0.0
-                    && (fit.fitted_voice_distance_weight * 2.0).fract() == 0.0
-                    && is_sha256_hex(&fit.calibration_sha256)
-                    && acoustic_pair_calibration_fit_sha256(fit) == fit.calibration_sha256
-            });
+        let acoustic_pair_fit_valid = (split.split == EvaluationSplit::Development
+            || split.acoustic_speaker_pair_calibration_fit.is_none())
+            && split
+                .acoustic_speaker_pair_calibration_fit
+                .as_ref()
+                .is_none_or(|fit| {
+                    fit.fit_id == PUBLIC_ACOUSTIC_PAIR_CALIBRATION_FIT_VERSION
+                        && fit.target_id == PUBLIC_ACOUSTIC_PAIR_CALIBRATION_TARGET_VERSION
+                        && fit.recording_count > 0
+                        && fit.recording_count <= split.recording_count
+                        && fit.same_speaker_observation_count
+                            >= PUBLIC_ACOUSTIC_PAIR_MINIMUM_CLASS_OBSERVATIONS
+                        && fit.different_speaker_observation_count
+                            >= PUBLIC_ACOUSTIC_PAIR_MINIMUM_CLASS_OBSERVATIONS
+                        && fit
+                            .same_speaker_observation_count
+                            .saturating_add(fit.different_speaker_observation_count)
+                            == fit.observation_count
+                        && bounded(Some(fit.baseline_balanced_brier_score))
+                        && bounded(Some(fit.fitted_balanced_brier_score))
+                        && fit.fitted_balanced_brier_score
+                            <= fit.baseline_balanced_brier_score + 1e-12
+                        && (-8.0..=4.0).contains(&fit.fitted_different_logit_intercept)
+                        && (0.0..=16.0).contains(&fit.fitted_voice_distance_weight)
+                        && [0.0, 0.1, 0.25, 0.5, 1.0].contains(&fit.fitted_channel_distance_weight)
+                        && (fit.fitted_different_logit_intercept * 2.0).fract() == 0.0
+                        && (fit.fitted_voice_distance_weight * 2.0).fract() == 0.0
+                        && is_sha256_hex(&fit.calibration_sha256)
+                        && acoustic_pair_calibration_fit_sha256(fit) == fit.calibration_sha256
+                });
         let stratum_recording_count = split
             .speaker_count_strata
             .iter()
@@ -18082,16 +18093,45 @@ mod tests {
 
     #[test]
     fn ablation_split_verifier_recomputes_count_and_word_conservation() {
-        let valid = ablation_variant(AcousticFeatureAblation::FullV2, Some(0.2), Some(0.3));
+        let observations = (0_u8..16)
+            .flat_map(|index| {
+                [
+                    super::AcousticPairCalibrationObservation {
+                        selection_key: [index; 32],
+                        voice_distance: 0.25,
+                        channel_distance: 0.0,
+                        support: 1.0,
+                        baseline_different_log_odds: -2.0,
+                        different_speaker: false,
+                    },
+                    super::AcousticPairCalibrationObservation {
+                        selection_key: [index.saturating_add(16); 32],
+                        voice_distance: 1.25,
+                        channel_distance: 0.0,
+                        support: 1.0,
+                        baseline_different_log_odds: 2.0,
+                        different_speaker: true,
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let fit = super::fit_acoustic_speaker_pair_calibration(&observations, 1)
+            .expect("balanced development fit");
+        let mut valid = ablation_variant(AcousticFeatureAblation::FullV2, Some(0.2), Some(0.3));
+        valid.splits[0].acoustic_speaker_pair_calibration_fit = Some(fit.clone());
         assert!(super::variant_splits_are_valid(&valid.splits, 10));
 
         let mut forged_count = valid.clone();
         forged_count.splits[0].exact_speaker_count_rate = Some(0.0);
         assert!(!super::variant_splits_are_valid(&forged_count.splits, 10));
 
-        let mut forged_words = valid;
+        let mut forged_words = valid.clone();
         forged_words.splits[0].reference_word_count = 1;
         assert!(!super::variant_splits_are_valid(&forged_words.splits, 10));
+
+        let mut held_out_fit = valid;
+        held_out_fit.splits[1].acoustic_speaker_pair_calibration_fit = Some(fit);
+        assert!(!super::variant_splits_are_valid(&held_out_fit.splits, 10));
     }
 
     #[allow(clippy::too_many_arguments)]
