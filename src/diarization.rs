@@ -7509,13 +7509,14 @@ const SPEAKER_COUNT_OCCUPANCY_STABILITY_WEIGHT: f64 = 0.30;
 /// assignment posterior. Rejection uses the same local score, so a reporting
 /// map cannot silently increase selective coverage.
 pub const ACOUSTIC_ASSIGNMENT_CONFIDENCE_CALIBRATION_VERSION: &str =
-    "development-normalized-local-emission-v3";
+    "development-best-competitor-local-margin-v4";
 const ACOUSTIC_ASSIGNMENT_CONFIDENCE_FLOOR: f32 = 0.0;
 const ACOUSTIC_ASSIGNMENT_CONFIDENCE_SCALE: f32 = 1.0;
-/// Development-only operating point for the count-dependent local emission
-/// score. This is deliberately not a calibrated probability threshold: adding
-/// a finite competing state changes the score. A frozen public development
-/// protocol must establish selective-coverage calibration before promotion.
+/// Development-only operating point for the local best-competitor margin.
+/// This is deliberately not a calibrated temporal probability threshold: it
+/// excludes transition, duration, and accumulated-path evidence. Unlike a
+/// softmax over every candidate speaker, dominated extra states cannot reduce
+/// it solely because the inferred count is larger.
 const DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE: f32 = 0.55;
 const MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE: f32 = 0.20;
 const MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_RATIO: f32 = 0.65;
@@ -7533,7 +7534,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v6-development";
+    "acoustic-clustering-probabilistic-v8-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -7595,7 +7596,7 @@ pub const fn acoustic_speaker_pair_calibration() -> AcousticSpeakerPairCalibrati
         channel_distance_weight: 0.10,
         full_support_frames: 50.0,
         false_split_loss: 1.0,
-        false_merge_loss: 12.0,
+        false_merge_loss: 4.0,
         maximum_unknown_prior: 0.80,
         minimum_stable_lane_fraction: 3.0 / 5.0,
     }
@@ -13553,6 +13554,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn fused_merge_risk_count(
     lanes: &[ProbabilisticLaneResult],
     spectral: Option<&SparseEigengapProposal>,
@@ -15785,14 +15787,15 @@ where
             let raw_confidence = if hard {
                 1.0
             } else if clustering_mode == AcousticClusteringMode::ProbabilisticV1 {
-                // A pairwise same-speaker score is not a temporal assignment
-                // posterior: it ignores competing speakers, UNKNOWN, and the
-                // Viterbi transition/duration/path evidence. Normalize only
-                // the complete finite local-emission state-space, then retain
-                // the resulting local score's narrower evidence claim.
-                // Profile reliability remains an independent gate in
-                // `evaluate_speaker_evidence`.
-                normalized_local_emission_score(&emissions[index], state)
+                // Compare the chosen local emission with its strongest finite
+                // competitor, including UNKNOWN. A full-state softmax made the
+                // rejection decision depend on candidate cardinality: adding
+                // dominated speaker states could turn the same acoustic margin
+                // from accepted into UNKNOWN. This pairwise local margin keeps
+                // the narrower non-temporal evidence claim without that count
+                // coupling. Profile reliability remains an independent gate
+                // in `evaluate_speaker_evidence`.
+                best_competitor_local_emission_score(&emissions[index], state)
             } else {
                 // Assignment discrimination and accumulated profile reliability
                 // are separate evidence gates. Multiplying by raw reliability
@@ -15867,6 +15870,31 @@ fn calibrate_assignment_confidence(raw_confidence: f32) -> f32 {
 
 fn should_abstain_after_viterbi_local_emission(local_score: f32) -> bool {
     local_score < DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE
+}
+
+/// Score one state against its strongest finite local competitor.
+///
+/// This is the binary softmax `exp(-chosen) / (exp(-chosen) + exp(-other))`
+/// evaluated in logit form. It includes UNKNOWN whenever UNKNOWN is the best
+/// competitor, remains finite for large costs, and is invariant to additional
+/// dominated states. It is not a temporal path posterior.
+fn best_competitor_local_emission_score(costs: &[f32], state: usize) -> f32 {
+    let Some(&chosen_cost) = costs.get(state) else {
+        return 0.0;
+    };
+    if !chosen_cost.is_finite() {
+        return 0.0;
+    }
+    let strongest_competitor = costs
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(candidate, cost)| *candidate != state && cost.is_finite())
+        .map(|(_, cost)| cost)
+        .min_by(f32::total_cmp);
+    strongest_competitor.map_or(1.0, |competitor_cost| {
+        logistic_probability(competitor_cost - chosen_cost)
+    })
 }
 
 /// Select a secondary known-speaker candidate only for a suspected overlap.
@@ -25442,7 +25470,7 @@ mod tests {
         let calibration = super::acoustic_speaker_pair_calibration();
         let merge_threshold = calibration.false_merge_loss
             / (calibration.false_merge_loss + calibration.false_split_loss);
-        assert!((merge_threshold - (12.0 / 13.0)).abs() < f32::EPSILON);
+        assert!((merge_threshold - (4.0 / 5.0)).abs() < f32::EPSILON);
         assert_eq!(super::SpeakerPairPerturbation::ALL.len(), 5);
         assert!(
             !super::SpeakerPairPerturbation::NoPitchCoordinates.includes(20)
@@ -25491,32 +25519,35 @@ mod tests {
     }
 
     #[test]
-    fn local_emission_rejection_operating_point_is_count_dependent_and_uncertified() {
+    fn local_margin_rejection_is_invariant_to_dominated_extra_states() {
         let two_states = [0.0_f32, std::f32::consts::LN_2];
-        let three_states = [0.0_f32, std::f32::consts::LN_2, std::f32::consts::LN_2];
-        let two_state_score = super::normalized_local_emission_score(&two_states, 0);
-        let three_state_score = super::normalized_local_emission_score(&three_states, 0);
+        let four_states = [
+            0.0_f32,
+            std::f32::consts::LN_2,
+            std::f32::consts::LN_2 * 2.0,
+            std::f32::consts::LN_2 * 3.0,
+        ];
+        let two_state_score = super::best_competitor_local_emission_score(&two_states, 0);
+        let four_state_score = super::best_competitor_local_emission_score(&four_states, 0);
         assert!((two_state_score - (2.0 / 3.0)).abs() < f32::EPSILON);
-        assert!((three_state_score - 0.5).abs() < f32::EPSILON);
+        assert!((four_state_score - (2.0 / 3.0)).abs() < f32::EPSILON);
         assert!(
             two_state_score >= super::DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE
-                && three_state_score < super::DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE,
-            "adding a finite competing state changes the development operating-point decision"
+                && four_state_score >= super::DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE,
+            "dominated extra states must not change the development operating-point decision"
         );
         assert!(
             super::ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION.contains("development"),
-            "the count-dependent score remains development-only until frozen calibration"
+            "the local-margin score remains development-only until frozen calibration"
         );
     }
 
     #[test]
     fn post_viterbi_local_abstention_is_explicitly_not_path_optimality() {
         let accepted_path_label =
-            super::normalized_local_emission_score(&[0.0_f32, std::f32::consts::LN_2], 0);
-        let abstained_path_label = super::normalized_local_emission_score(
-            &[0.0_f32, std::f32::consts::LN_2, std::f32::consts::LN_2],
-            0,
-        );
+            super::best_competitor_local_emission_score(&[0.0_f32, std::f32::consts::LN_2], 0);
+        let abstained_path_label =
+            super::best_competitor_local_emission_score(&[std::f32::consts::LN_2, 0.0], 0);
         assert!(
             !super::should_abstain_after_viterbi_local_emission(accepted_path_label),
             "the local score can retain a Viterbi-selected label"
@@ -25525,6 +25556,18 @@ mod tests {
             super::should_abstain_after_viterbi_local_emission(abstained_path_label),
             "the post-Viterbi gate may report UNKNOWN without rerunning temporal inference"
         );
+    }
+
+    #[test]
+    fn local_margin_score_is_bounded_and_includes_unknown_as_a_competitor() {
+        let costs = [0.0_f32, 2.0, std::f32::consts::LN_2];
+        let known_score = super::best_competitor_local_emission_score(&costs, 0);
+        assert!((known_score - (2.0 / 3.0)).abs() < f32::EPSILON);
+        assert_eq!(
+            super::best_competitor_local_emission_score(&costs, costs.len()),
+            0.0
+        );
+        assert_eq!(super::best_competitor_local_emission_score(&[0.0], 0), 1.0);
     }
 
     #[test]
