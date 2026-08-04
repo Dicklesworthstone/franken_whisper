@@ -30,8 +30,8 @@ use crate::diarization::{
     AcousticCountMergeStepEvidence, AcousticDiarizationInput, AcousticFeatureAblation,
     AcousticScatteringMode, AcousticSidecarEvaluationRequest, AcousticSidecarFusionCalibration,
     AcousticSidecarFusionEvaluationEvidence, AcousticSidecarStudy, AcousticSidecarStudyConfig,
-    AcousticSidecarStudyMode, AcousticSidecarStudyObservation, AcousticTrajectoryWaveletMode,
-    AcousticTracklet, ChangePointScore, DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION,
+    AcousticSidecarStudyMode, AcousticSidecarStudyObservation, AcousticTracklet,
+    AcousticTrajectoryWaveletMode, ChangePointScore, DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION,
     DIARIZATION_HYPOTHESIS_SCHEMA_VERSION, DIARIZATION_REFERENCE_SCHEMA_VERSION,
     DIARIZATION_SCORER_VERSION, DiarizationCorpusManifest, DiarizationHypothesisDocument,
     DiarizationLeakageAudit, DiarizationReferenceDocument, DiarizationScorerConfig,
@@ -41,12 +41,11 @@ use crate::diarization::{
     acoustic_sidecar_calibrate_owner_contrast, acoustic_sidecar_fusion_configuration_sha256,
     acoustic_sidecar_observation_owner_contrast_from_study, acoustic_sidecar_study_config_sha256,
     acoustic_speaker_pair_calibration_sha256, acoustic_tracklet_pair_evidence,
-    audit_diarization_manifest,
-    diarize_acoustic_pcm_with_modes_evidence, diarize_acoustic_pcm_with_sidecar_evidence,
-    extract_acoustic_features_with_frames, parse_diarization_corpus_manifest,
-    parse_diarization_reference, score_change_points, score_diarization_documents,
-    select_acoustic_change_evidence_at_threshold, speaker_change_points_ms,
-    verify_leakage_audit_hash,
+    audit_diarization_manifest, diarize_acoustic_pcm_with_modes_evidence,
+    diarize_acoustic_pcm_with_sidecar_evidence, extract_acoustic_features_with_frames,
+    parse_diarization_corpus_manifest, parse_diarization_reference, score_change_points,
+    score_diarization_documents, select_acoustic_change_evidence_at_threshold,
+    speaker_change_points_ms, verify_leakage_audit_hash,
 };
 use crate::error::{FwError, FwResult};
 use crate::model::{DiarizationEngine, DiarizationRequest, SpeakerCountRequest};
@@ -3688,6 +3687,10 @@ fn evaluate_public_variant(
             &change_collar_metrics,
             &change_threshold_sweep,
             &clustering_evidence,
+            AcousticPairCalibrationContext {
+                reference: &clipped_reference,
+                recording_sha256: &recording_evidence.audio_sha256,
+            },
         )?;
     }
     let splits = [
@@ -6239,6 +6242,10 @@ fn evaluate_public_sidecar_lane(
             &change_collar_metrics,
             &change_threshold_sweep,
             &clustering_evidence,
+            AcousticPairCalibrationContext {
+                reference: &loaded.reference,
+                recording_sha256: &recording_evidence.audio_sha256,
+            },
         )?;
     }
     if selected_recording_count == 0 {
@@ -7576,6 +7583,313 @@ struct HierarchyCandidateAccumulator {
     confusion: BTreeMap<(u32, u32), u64>,
 }
 
+#[derive(Clone)]
+struct AcousticPairCalibrationObservation {
+    selection_key: [u8; 32],
+    voice_distance: f64,
+    channel_distance: f64,
+    support: f64,
+    baseline_different_log_odds: f64,
+    different_speaker: bool,
+}
+
+struct AcousticPairCalibrationContext<'a> {
+    reference: &'a DiarizationReferenceDocument,
+    recording_sha256: &'a str,
+}
+
+impl PartialEq for AcousticPairCalibrationObservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.selection_key == other.selection_key
+    }
+}
+
+impl Eq for AcousticPairCalibrationObservation {}
+
+impl PartialOrd for AcousticPairCalibrationObservation {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AcousticPairCalibrationObservation {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.selection_key.cmp(&other.selection_key)
+    }
+}
+
+fn homogeneous_reference_speaker<'a>(
+    reference: &'a DiarizationReferenceDocument,
+    tracklet: &AcousticTracklet,
+) -> Option<&'a str> {
+    if reference
+        .ignored_regions
+        .iter()
+        .any(|region| region.start_ms < tracklet.end_ms && tracklet.start_ms < region.end_ms)
+    {
+        return None;
+    }
+    let mut speakers = BTreeSet::new();
+    let mut covered_ms = 0_u64;
+    let mut covered_until_ms = tracklet.start_ms;
+    for turn in &reference.turns {
+        if turn.start_ms >= tracklet.end_ms {
+            break;
+        }
+        if turn.end_ms <= tracklet.start_ms {
+            continue;
+        }
+        speakers.insert(turn.speaker.as_deref()?);
+        if speakers.len() > 1 {
+            return None;
+        }
+        let overlap_start_ms = turn.start_ms.max(tracklet.start_ms);
+        let overlap_end_ms = turn.end_ms.min(tracklet.end_ms);
+        let novel_start_ms = overlap_start_ms.max(covered_until_ms);
+        if overlap_end_ms > novel_start_ms {
+            covered_ms = covered_ms.saturating_add(overlap_end_ms - novel_start_ms);
+            covered_until_ms = covered_until_ms.max(overlap_end_ms);
+        }
+    }
+    let voiced_ms = u64::try_from(tracklet.voiced_frame_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(10);
+    if speakers.len() == 1
+        && covered_ms >= 200
+        && covered_ms.saturating_mul(4) >= voiced_ms.saturating_mul(3)
+    {
+        speakers.first().copied()
+    } else {
+        None
+    }
+}
+
+fn acoustic_pair_selection_key(
+    recording_sha256: &str,
+    left_tracklet: usize,
+    right_tracklet: usize,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"public-acoustic-tracklet-pair-bottom-k-v1\0");
+    hasher.update(recording_sha256.as_bytes());
+    hasher.update((left_tracklet as u64).to_le_bytes());
+    hasher.update((right_tracklet as u64).to_le_bytes());
+    hasher.finalize().into()
+}
+
+fn reference_labeled_acoustic_pair_observations(
+    reference: &DiarizationReferenceDocument,
+    tracklets: &[AcousticTracklet],
+    recording_sha256: &str,
+) -> Vec<AcousticPairCalibrationObservation> {
+    let labels = tracklets
+        .iter()
+        .map(|tracklet| homogeneous_reference_speaker(reference, tracklet))
+        .collect::<Vec<_>>();
+    let mut retained = BinaryHeap::with_capacity(PUBLIC_ACOUSTIC_PAIR_MAX_PAIRS_PER_RECORDING + 1);
+    for left in 0..tracklets.len() {
+        let Some(left_speaker) = labels[left] else {
+            continue;
+        };
+        for right in left + 1..tracklets.len() {
+            let Some(right_speaker) = labels[right] else {
+                continue;
+            };
+            let Some(evidence) =
+                acoustic_tracklet_pair_evidence(&tracklets[left], &tracklets[right])
+            else {
+                continue;
+            };
+            let observation = AcousticPairCalibrationObservation {
+                selection_key: acoustic_pair_selection_key(recording_sha256, left, right),
+                voice_distance: f64::from(evidence.voice_distance),
+                channel_distance: f64::from(evidence.channel_distance),
+                support: f64::from(evidence.support),
+                baseline_different_log_odds: f64::from(evidence.different_log_odds),
+                different_speaker: left_speaker != right_speaker,
+            };
+            if retained.len() < PUBLIC_ACOUSTIC_PAIR_MAX_PAIRS_PER_RECORDING {
+                retained.push(observation);
+            } else if retained
+                .peek()
+                .is_some_and(|largest| observation.selection_key < largest.selection_key)
+            {
+                retained.pop();
+                retained.push(observation);
+            }
+        }
+    }
+    retained.into_sorted_vec()
+}
+
+fn acoustic_pair_different_probability(
+    observation: &AcousticPairCalibrationObservation,
+    intercept: f64,
+    voice_weight: f64,
+    channel_weight: f64,
+) -> f64 {
+    let log_odds = observation.support * (intercept + voice_weight * observation.voice_distance)
+        + channel_weight * observation.channel_distance;
+    if log_odds >= 0.0 {
+        1.0 / (1.0 + (-log_odds).exp())
+    } else {
+        let exponential = log_odds.exp();
+        exponential / (1.0 + exponential)
+    }
+}
+
+fn balanced_acoustic_pair_brier(
+    observations: &[AcousticPairCalibrationObservation],
+    intercept: f64,
+    voice_weight: f64,
+    channel_weight: f64,
+) -> Option<f64> {
+    let different_count = observations
+        .iter()
+        .filter(|observation| observation.different_speaker)
+        .count();
+    let same_count = observations.len().checked_sub(different_count)?;
+    if same_count == 0 || different_count == 0 {
+        return None;
+    }
+    let same_weight = 0.5 / same_count as f64;
+    let different_weight = 0.5 / different_count as f64;
+    Some(
+        observations
+            .iter()
+            .map(|observation| {
+                let probability = acoustic_pair_different_probability(
+                    observation,
+                    intercept,
+                    voice_weight,
+                    channel_weight,
+                );
+                let target = f64::from(u8::from(observation.different_speaker));
+                let weight = if observation.different_speaker {
+                    different_weight
+                } else {
+                    same_weight
+                };
+                weight * (probability - target).powi(2)
+            })
+            .sum(),
+    )
+}
+
+fn baseline_balanced_acoustic_pair_brier(
+    observations: &[AcousticPairCalibrationObservation],
+) -> Option<f64> {
+    let different_count = observations
+        .iter()
+        .filter(|observation| observation.different_speaker)
+        .count();
+    let same_count = observations.len().checked_sub(different_count)?;
+    if same_count == 0 || different_count == 0 {
+        return None;
+    }
+    let same_weight = 0.5 / same_count as f64;
+    let different_weight = 0.5 / different_count as f64;
+    Some(
+        observations
+            .iter()
+            .map(|observation| {
+                let probability = if observation.baseline_different_log_odds >= 0.0 {
+                    1.0 / (1.0 + (-observation.baseline_different_log_odds).exp())
+                } else {
+                    let exponential = observation.baseline_different_log_odds.exp();
+                    exponential / (1.0 + exponential)
+                };
+                let target = f64::from(u8::from(observation.different_speaker));
+                let weight = if observation.different_speaker {
+                    different_weight
+                } else {
+                    same_weight
+                };
+                weight * (probability - target).powi(2)
+            })
+            .sum(),
+    )
+}
+
+fn acoustic_pair_calibration_fit_sha256(fit: &PublicAcousticSpeakerPairCalibrationFit) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(fit.fit_id.as_bytes());
+    hasher.update(fit.target_id.as_bytes());
+    hasher.update(fit.recording_count.to_le_bytes());
+    hasher.update(fit.observation_count.to_le_bytes());
+    hasher.update(fit.same_speaker_observation_count.to_le_bytes());
+    hasher.update(fit.different_speaker_observation_count.to_le_bytes());
+    for value in [
+        fit.baseline_balanced_brier_score,
+        fit.fitted_balanced_brier_score,
+        fit.fitted_different_logit_intercept,
+        fit.fitted_voice_distance_weight,
+        fit.fitted_channel_distance_weight,
+    ] {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn fit_acoustic_speaker_pair_calibration(
+    observations: &[AcousticPairCalibrationObservation],
+    recording_count: u64,
+) -> Option<PublicAcousticSpeakerPairCalibrationFit> {
+    let different_count = observations
+        .iter()
+        .filter(|observation| observation.different_speaker)
+        .count();
+    let same_count = observations.len().checked_sub(different_count)?;
+    if u64::try_from(same_count).ok()? < PUBLIC_ACOUSTIC_PAIR_MINIMUM_CLASS_OBSERVATIONS
+        || u64::try_from(different_count).ok()? < PUBLIC_ACOUSTIC_PAIR_MINIMUM_CLASS_OBSERVATIONS
+    {
+        return None;
+    }
+    let baseline_brier = baseline_balanced_acoustic_pair_brier(observations)?;
+    let channel_weights = [0.0, 0.1, 0.25, 0.5, 1.0];
+    let mut best = None::<(f64, f64, f64, f64)>;
+    for intercept_index in -16..=8 {
+        let intercept = f64::from(intercept_index) * 0.5;
+        for voice_index in 0..=32 {
+            let voice_weight = f64::from(voice_index) * 0.5;
+            for channel_weight in channel_weights {
+                let brier = balanced_acoustic_pair_brier(
+                    observations,
+                    intercept,
+                    voice_weight,
+                    channel_weight,
+                )?;
+                let candidate = (brier, intercept, voice_weight, channel_weight);
+                if best.is_none_or(|current| {
+                    candidate.0.total_cmp(&current.0).is_lt()
+                        || (candidate.0 == current.0
+                            && (candidate.1, candidate.2, candidate.3)
+                                < (current.1, current.2, current.3))
+                }) {
+                    best = Some(candidate);
+                }
+            }
+        }
+    }
+    let (fitted_brier, intercept, voice_weight, channel_weight) = best?;
+    let mut fit = PublicAcousticSpeakerPairCalibrationFit {
+        fit_id: PUBLIC_ACOUSTIC_PAIR_CALIBRATION_FIT_VERSION.to_owned(),
+        target_id: PUBLIC_ACOUSTIC_PAIR_CALIBRATION_TARGET_VERSION.to_owned(),
+        recording_count,
+        observation_count: u64::try_from(observations.len()).ok()?,
+        same_speaker_observation_count: u64::try_from(same_count).ok()?,
+        different_speaker_observation_count: u64::try_from(different_count).ok()?,
+        baseline_balanced_brier_score: canonical_evidence_number(baseline_brier),
+        fitted_balanced_brier_score: canonical_evidence_number(fitted_brier),
+        fitted_different_logit_intercept: intercept,
+        fitted_voice_distance_weight: voice_weight,
+        fitted_channel_distance_weight: channel_weight,
+        calibration_sha256: String::new(),
+    };
+    fit.calibration_sha256 = acoustic_pair_calibration_fit_sha256(&fit);
+    Some(fit)
+}
+
 #[derive(Default)]
 struct PublicAblationAccumulator {
     recording_count: u64,
@@ -7618,6 +7932,8 @@ struct PublicAblationAccumulator {
     count_merge_frontier_correctly_ordered_count: u64,
     speaker_count_hierarchy_candidates:
         BTreeMap<PublicSpeakerCountHierarchyMethod, HierarchyCandidateAccumulator>,
+    acoustic_pair_observations: Vec<AcousticPairCalibrationObservation>,
+    acoustic_pair_recording_count: u64,
     speaker_count_strata: BTreeMap<u32, SpeakerCountStratumAccumulator>,
     speaker_count_duration_strata:
         BTreeMap<PublicSpeakerCountDurationBucket, SpeakerCountStratumAccumulator>,
@@ -7684,6 +8000,7 @@ impl PublicAblationAccumulator {
         change_collar_metrics: &[ChangeMetricObservation],
         change_threshold_sweep: &[ChangeMetricObservation],
         clustering: &AcousticClusteringEvaluationEvidence,
+        pair_calibration: AcousticPairCalibrationContext<'_>,
     ) -> FwResult<()> {
         self.recording_count = self.recording_count.checked_add(1).ok_or_else(|| {
             public_corpus_error(
@@ -7691,6 +8008,24 @@ impl PublicAblationAccumulator {
                 "recording count exceeds the supported range",
             )
         })?;
+        let acoustic_pair_observations = reference_labeled_acoustic_pair_observations(
+            pair_calibration.reference,
+            &clustering.calibration_tracklets,
+            pair_calibration.recording_sha256,
+        );
+        if !acoustic_pair_observations.is_empty() {
+            self.acoustic_pair_recording_count = self
+                .acoustic_pair_recording_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "ablation_aggregate_overflow",
+                        "acoustic pair-calibration recording count overflowed",
+                    )
+                })?;
+            self.acoustic_pair_observations
+                .extend(acoustic_pair_observations);
+        }
         self.reference_speaker_time_sec += score.diarization.reference_speaker_time_sec;
         self.missed_speech_sec += score.diarization.missed_speech_sec;
         self.false_alarm_sec += score.diarization.false_alarm_sec;
@@ -8268,6 +8603,10 @@ impl PublicAblationAccumulator {
                 }
             })
             .collect::<Vec<_>>();
+        let acoustic_speaker_pair_calibration_fit = fit_acoustic_speaker_pair_calibration(
+            &self.acoustic_pair_observations,
+            self.acoustic_pair_recording_count,
+        );
         let speaker_count_strata = self
             .speaker_count_strata
             .iter()
@@ -8469,6 +8808,7 @@ impl PublicAblationAccumulator {
             speaker_count_posterior_map_confusion,
             speaker_count_merge_frontier,
             speaker_count_hierarchy_candidates,
+            acoustic_speaker_pair_calibration_fit,
             speaker_count_strata,
             speaker_count_duration_strata,
             count_posterior_recording_count: self.count_posterior_recording_count,
@@ -11632,6 +11972,33 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                             .mean_absolute_speaker_count_error
                             .is_none_or(finite_nonnegative)
                 });
+        let acoustic_pair_fit_valid = split
+            .acoustic_speaker_pair_calibration_fit
+            .as_ref()
+            .is_none_or(|fit| {
+                fit.fit_id == PUBLIC_ACOUSTIC_PAIR_CALIBRATION_FIT_VERSION
+                    && fit.target_id == PUBLIC_ACOUSTIC_PAIR_CALIBRATION_TARGET_VERSION
+                    && fit.recording_count > 0
+                    && fit.recording_count <= split.recording_count
+                    && fit.same_speaker_observation_count
+                        >= PUBLIC_ACOUSTIC_PAIR_MINIMUM_CLASS_OBSERVATIONS
+                    && fit.different_speaker_observation_count
+                        >= PUBLIC_ACOUSTIC_PAIR_MINIMUM_CLASS_OBSERVATIONS
+                    && fit
+                        .same_speaker_observation_count
+                        .saturating_add(fit.different_speaker_observation_count)
+                        == fit.observation_count
+                    && bounded(Some(fit.baseline_balanced_brier_score))
+                    && bounded(Some(fit.fitted_balanced_brier_score))
+                    && fit.fitted_balanced_brier_score <= fit.baseline_balanced_brier_score + 1e-12
+                    && (-8.0..=4.0).contains(&fit.fitted_different_logit_intercept)
+                    && (0.0..=16.0).contains(&fit.fitted_voice_distance_weight)
+                    && [0.0, 0.1, 0.25, 0.5, 1.0].contains(&fit.fitted_channel_distance_weight)
+                    && (fit.fitted_different_logit_intercept * 2.0).fract() == 0.0
+                    && (fit.fitted_voice_distance_weight * 2.0).fract() == 0.0
+                    && is_sha256_hex(&fit.calibration_sha256)
+                    && acoustic_pair_calibration_fit_sha256(fit) == fit.calibration_sha256
+            });
         let stratum_recording_count = split
             .speaker_count_strata
             .iter()
@@ -11848,6 +12215,7 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
             && posterior_map_confusion_valid
             && merge_frontier_valid
             && hierarchy_candidates_valid
+            && acoustic_pair_fit_valid
             && count_strata_valid
             && count_duration_strata_valid
             && count_posterior_valid
@@ -17423,6 +17791,48 @@ mod tests {
         assert!(super::count_merge_frontier_observation(&invalid, 4).is_err());
     }
 
+    #[test]
+    fn acoustic_pair_calibration_fit_is_bounded_balanced_and_hashed() {
+        let observations = (0_u8..64)
+            .flat_map(|index| {
+                [
+                    super::AcousticPairCalibrationObservation {
+                        selection_key: [index; 32],
+                        voice_distance: 0.35,
+                        channel_distance: 0.0,
+                        support: 1.0,
+                        baseline_different_log_odds: -1.6,
+                        different_speaker: false,
+                    },
+                    super::AcousticPairCalibrationObservation {
+                        selection_key: [index.saturating_add(64); 32],
+                        voice_distance: 1.25,
+                        channel_distance: 0.0,
+                        support: 1.0,
+                        baseline_different_log_odds: 2.0,
+                        different_speaker: true,
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let fit =
+            super::fit_acoustic_speaker_pair_calibration(&observations, 2).expect("two-class fit");
+        assert_eq!(fit.observation_count, 128);
+        assert_eq!(fit.same_speaker_observation_count, 64);
+        assert_eq!(fit.different_speaker_observation_count, 64);
+        assert!(fit.fitted_balanced_brier_score <= fit.baseline_balanced_brier_score);
+        assert_eq!(
+            fit.calibration_sha256,
+            super::acoustic_pair_calibration_fit_sha256(&fit)
+        );
+        let same_only = observations
+            .iter()
+            .filter(|observation| !observation.different_speaker)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(super::fit_acoustic_speaker_pair_calibration(&same_only, 1).is_none());
+    }
+
     fn ablation_variant(
         ablation: AcousticFeatureAblation,
         micro_der: Option<f64>,
@@ -17534,6 +17944,7 @@ mod tests {
                     speaker_count_confusion: Vec::new(),
                 })
                 .collect(),
+            acoustic_speaker_pair_calibration_fit: None,
             speaker_count_strata: vec![super::PublicSpeakerCountStratum {
                 reference_speakers: 1,
                 recording_count: 1,
