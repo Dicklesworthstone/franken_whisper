@@ -32,7 +32,7 @@ use crate::model::{
 /// Stable identifier for the native acoustic diarization contract.
 pub const ACOUSTIC_DIARIZATION_CONTRACT_VERSION: &str = "acoustic-diarization-v2";
 /// Frozen implementation identity for retained diarization evaluation results.
-pub const DIARIZATION_SCORER_VERSION: &str = "diarization-scorer-v4";
+pub const DIARIZATION_SCORER_VERSION: &str = "diarization-scorer-v5";
 /// Schema identity for reference annotations accepted by the frozen scorer.
 pub const DIARIZATION_REFERENCE_SCHEMA_VERSION: &str = "diarization-reference-v2";
 /// Schema identity for system hypotheses accepted by the frozen scorer.
@@ -333,6 +333,8 @@ pub struct SpeakerCountScore {
 pub struct SpeakerCountPosteriorScore {
     pub reference_speakers: usize,
     pub posterior_available: bool,
+    /// Highest-probability concrete count before unresolved-mass rejection.
+    pub map_count: Option<u32>,
     pub selected_count: Option<u32>,
     pub unresolved: bool,
     pub reference_probability: Option<f64>,
@@ -1892,6 +1894,7 @@ fn score_speaker_count_posterior(
         return SpeakerCountPosteriorScore {
             reference_speakers,
             posterior_available: false,
+            map_count: None,
             selected_count: None,
             unresolved: true,
             reference_probability: None,
@@ -1914,6 +1917,17 @@ fn score_speaker_count_posterior(
             SpeakerCountCalibrationStatus::Certified
                 | SpeakerCountCalibrationStatus::DevelopmentUncertified
         );
+    let map_count = posterior_available.then(|| {
+        estimate
+            .posterior
+            .iter()
+            .max_by(|left, right| {
+                left.probability
+                    .total_cmp(&right.probability)
+                    .then_with(|| right.count.cmp(&left.count))
+            })
+            .map(|bin| bin.count)
+    });
     let reference_count = u32::try_from(reference_speakers).unwrap_or(u32::MAX);
     let reference_probability = posterior_available.then(|| {
         estimate
@@ -1994,6 +2008,7 @@ fn score_speaker_count_posterior(
     SpeakerCountPosteriorScore {
         reference_speakers,
         posterior_available,
+        map_count: map_count.flatten(),
         selected_count: estimate.selected_count,
         unresolved: estimate.selected_count.is_none(),
         reference_probability,
@@ -7534,7 +7549,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v8-development";
+    "acoustic-clustering-probabilistic-v7-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -7596,7 +7611,7 @@ pub const fn acoustic_speaker_pair_calibration() -> AcousticSpeakerPairCalibrati
         channel_distance_weight: 0.10,
         full_support_frames: 50.0,
         false_split_loss: 1.0,
-        false_merge_loss: 4.0,
+        false_merge_loss: 12.0,
         maximum_unknown_prior: 0.80,
         minimum_stable_lane_fraction: 3.0 / 5.0,
     }
@@ -16800,6 +16815,7 @@ mod tests {
         .expect("posterior score");
         let score = result.speaker_count_posterior;
         assert!(score.posterior_available);
+        assert_eq!(score.map_count, Some(2));
         assert_eq!(score.selected_count, Some(2));
         assert!(!score.unresolved);
         assert_close(score.reference_probability.expect("reference mass"), 0.7);
@@ -16830,6 +16846,7 @@ mod tests {
         .speaker_count_posterior;
         assert!(unresolved.posterior_available);
         assert!(unresolved.unresolved);
+        assert_eq!(unresolved.map_count, Some(1));
         assert_eq!(unresolved.selected_count, None);
         assert_eq!(unresolved.unresolved_probability, Some(0.5));
         assert!(unresolved.credible_set_includes_unresolved);
@@ -25470,7 +25487,7 @@ mod tests {
         let calibration = super::acoustic_speaker_pair_calibration();
         let merge_threshold = calibration.false_merge_loss
             / (calibration.false_merge_loss + calibration.false_split_loss);
-        assert!((merge_threshold - (4.0 / 5.0)).abs() < f32::EPSILON);
+        assert!((merge_threshold - (12.0 / 13.0)).abs() < f32::EPSILON);
         assert_eq!(super::SpeakerPairPerturbation::ALL.len(), 5);
         assert!(
             !super::SpeakerPairPerturbation::NoPitchCoordinates.includes(20)

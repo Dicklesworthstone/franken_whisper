@@ -62,10 +62,10 @@ pub const PUBLIC_CORPUS_REGISTRY_SCHEMA_VERSION: &str = "public-diarization-corp
 pub const PUBLIC_CORPUS_WORD_ANNOTATION_SCHEMA_VERSION: &str =
     "public-diarization-word-annotation-v1";
 /// Schema identity for path-free public representation-ablation evidence.
-pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v8";
+pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v9";
 /// Frozen public ablation implementation identity.
 pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-ablation-runner-v8";
+    "public-diarization-acoustic-ablation-runner-v9";
 /// Schema identity for the separate aggregate-only acoustic sidecar study.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION: &str =
     "public-diarization-acoustic-sidecar-study-v3";
@@ -447,6 +447,8 @@ pub struct PublicCorpusAblationSplit {
     pub p95_absolute_speaker_count_error: Option<f64>,
     pub maximum_absolute_speaker_count_error: Option<u64>,
     pub speaker_count_confusion: Vec<PublicSpeakerCountConfusionCell>,
+    /// Reference count versus the concrete posterior MAP before abstention.
+    pub speaker_count_posterior_map_confusion: Vec<PublicSpeakerCountConfusionCell>,
     pub speaker_count_strata: Vec<PublicSpeakerCountStratum>,
     pub speaker_count_duration_strata: Vec<PublicSpeakerCountDurationStratum>,
     pub count_posterior_recording_count: u64,
@@ -7362,6 +7364,7 @@ struct PublicAblationAccumulator {
     absolute_speaker_count_error: u64,
     absolute_speaker_count_errors: Vec<u64>,
     speaker_count_confusion: BTreeMap<(u32, u32), u64>,
+    speaker_count_posterior_map_confusion: BTreeMap<(u32, u32), u64>,
     speaker_count_strata: BTreeMap<u32, SpeakerCountStratumAccumulator>,
     speaker_count_duration_strata:
         BTreeMap<PublicSpeakerCountDurationBucket, SpeakerCountStratumAccumulator>,
@@ -7524,6 +7527,13 @@ impl PublicAblationAccumulator {
             .entry((reference_speakers, hypothesis_speakers))
             .or_default();
         *confusion_count = confusion_count.saturating_add(1);
+        if let Some(map_count) = score.speaker_count_posterior.map_count {
+            let map_confusion_count = self
+                .speaker_count_posterior_map_confusion
+                .entry((reference_speakers, map_count))
+                .or_default();
+            *map_confusion_count = map_confusion_count.saturating_add(1);
+        }
         let stratum = self
             .speaker_count_strata
             .entry(reference_speakers)
@@ -7813,6 +7823,19 @@ impl PublicAblationAccumulator {
                 },
             )
             .collect::<Vec<_>>();
+        let speaker_count_posterior_map_confusion = self
+            .speaker_count_posterior_map_confusion
+            .iter()
+            .map(
+                |(&(reference_speakers, hypothesis_speakers), &recording_count)| {
+                    PublicSpeakerCountConfusionCell {
+                        reference_speakers,
+                        hypothesis_speakers,
+                        recording_count,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
         let speaker_count_strata = self
             .speaker_count_strata
             .iter()
@@ -8011,6 +8034,7 @@ impl PublicAblationAccumulator {
             ),
             maximum_absolute_speaker_count_error,
             speaker_count_confusion,
+            speaker_count_posterior_map_confusion,
             speaker_count_strata,
             speaker_count_duration_strata,
             count_posterior_recording_count: self.count_posterior_recording_count,
@@ -11072,6 +11096,23 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                     confusion_absolute_error as f64,
                     split.recording_count as f64,
                 );
+        let posterior_map_confusion_count = split
+            .speaker_count_posterior_map_confusion
+            .iter()
+            .map(|cell| cell.recording_count)
+            .sum::<u64>();
+        let posterior_map_confusion_valid = split
+            .speaker_count_posterior_map_confusion
+            .windows(2)
+            .all(|window| {
+                (window[0].reference_speakers, window[0].hypothesis_speakers)
+                    < (window[1].reference_speakers, window[1].hypothesis_speakers)
+            })
+            && split
+                .speaker_count_posterior_map_confusion
+                .iter()
+                .all(|cell| cell.recording_count > 0)
+            && posterior_map_confusion_count == split.count_posterior_recording_count;
         let stratum_recording_count = split
             .speaker_count_strata
             .iter()
@@ -11285,6 +11326,7 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                 .mean_absolute_speaker_count_error
                 .is_none_or(finite_nonnegative)
             && confusion_valid
+            && posterior_map_confusion_valid
             && count_strata_valid
             && count_duration_strata_valid
             && count_posterior_valid
@@ -16886,6 +16928,7 @@ mod tests {
                 hypothesis_speakers: 1,
                 recording_count: 1,
             }],
+            speaker_count_posterior_map_confusion: Vec::new(),
             speaker_count_strata: vec![super::PublicSpeakerCountStratum {
                 reference_speakers: 1,
                 recording_count: 1,
