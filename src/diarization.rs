@@ -7512,7 +7512,13 @@ pub const ACOUSTIC_ASSIGNMENT_CONFIDENCE_CALIBRATION_VERSION: &str =
     "development-normalized-local-emission-v3";
 const ACOUSTIC_ASSIGNMENT_CONFIDENCE_FLOOR: f32 = 0.0;
 const ACOUSTIC_ASSIGNMENT_CONFIDENCE_SCALE: f32 = 1.0;
+/// Development-only operating point for the count-dependent local emission
+/// score. This is deliberately not a calibrated probability threshold: adding
+/// a finite competing state changes the score. A frozen public development
+/// protocol must establish selective-coverage calibration before promotion.
+const DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE: f32 = 0.55;
 const MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE: f32 = 0.20;
+const MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_RATIO: f32 = 0.65;
 /// Frozen identity for the first variance-aware change posterior.
 pub const ACOUSTIC_CHANGE_CALIBRATION_VERSION: &str = "acoustic-change-posterior-v2";
 /// Public development protocol used to fit the v2 operating point.
@@ -7527,7 +7533,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v4-development";
+    "acoustic-clustering-probabilistic-v5-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -7575,7 +7581,6 @@ pub struct AcousticSpeakerPairCalibration {
     pub full_support_frames: f32,
     pub false_split_loss: f32,
     pub false_merge_loss: f32,
-    pub minimum_assignment_probability: f32,
     pub maximum_unknown_prior: f32,
     pub minimum_stable_lane_fraction: f32,
 }
@@ -7591,7 +7596,6 @@ pub const fn acoustic_speaker_pair_calibration() -> AcousticSpeakerPairCalibrati
         full_support_frames: 50.0,
         false_split_loss: 1.0,
         false_merge_loss: 12.0,
-        minimum_assignment_probability: 0.55,
         maximum_unknown_prior: 0.80,
         minimum_stable_lane_fraction: 3.0 / 5.0,
     }
@@ -7612,7 +7616,6 @@ pub fn acoustic_speaker_pair_calibration_sha256() -> String {
         calibration.full_support_frames,
         calibration.false_split_loss,
         calibration.false_merge_loss,
-        calibration.minimum_assignment_probability,
         calibration.maximum_unknown_prior,
         calibration.minimum_stable_lane_fraction,
     ] {
@@ -7647,6 +7650,9 @@ pub fn acoustic_speaker_pair_calibration_sha256() -> String {
     for value in [
         ACOUSTIC_ASSIGNMENT_CONFIDENCE_FLOOR,
         ACOUSTIC_ASSIGNMENT_CONFIDENCE_SCALE,
+        DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE,
+        MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE,
+        MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_RATIO,
     ] {
         hasher.update(value.to_bits().to_le_bytes());
     }
@@ -13214,14 +13220,15 @@ fn resolve_count_policy(
     request: &SpeakerCountRequest,
     available: usize,
 ) -> FwResult<SpeakerCountPolicy> {
+    let bounded_available = available.min(MAX_SPEAKER_COUNT as usize);
     let (min, max, exact) = match request {
-        SpeakerCountRequest::Infer => (1, available.clamp(1, 8), None),
-        SpeakerCountRequest::Range { .. } => (1, available, None),
+        SpeakerCountRequest::Infer => (1, bounded_available.min(8), None),
+        SpeakerCountRequest::Range { .. } => (1, bounded_available, None),
         SpeakerCountRequest::HardConstraint { count } => {
             let exact = *count as usize;
             (exact, exact, Some(exact))
         }
-        SpeakerCountRequest::Prior { .. } => (1, available, None),
+        SpeakerCountRequest::Prior { .. } => (1, bounded_available, None),
     };
     if min == 0 || min > max || min > available {
         return Err(FwError::InvalidRequest(format!(
@@ -13614,6 +13621,62 @@ fn merge_risk_loss_points(
     (!points.is_empty()).then_some(points)
 }
 
+/// Return normalized feasible caller weights and their bounded linear-pool mix.
+///
+/// A clipped prior can only contribute the probability mass it retains in the
+/// feasible count domain. A clipped range contributes its feasible width over
+/// its declared width. Neither soft input may regain the full mix weight after
+/// its unavailable support has been discarded.
+fn soft_count_prior_mix(
+    request: &SpeakerCountRequest,
+    candidate_counts: &[usize],
+    acoustic_selection_stability: f64,
+) -> Option<(Vec<f64>, f64)> {
+    let mut weights = vec![0.0; candidate_counts.len()];
+    let retained_feasible_mass = match request {
+        SpeakerCountRequest::Prior { bins } => {
+            for (index, count) in candidate_counts.iter().enumerate() {
+                weights[index] = bins
+                    .iter()
+                    .find(|bin| bin.count as usize == *count)
+                    .map_or(0.0, |bin| bin.probability);
+            }
+            weights.iter().sum::<f64>()
+        }
+        SpeakerCountRequest::Range { minimum, maximum } => {
+            let declared_width = maximum.checked_sub(*minimum)?.checked_add(1)?;
+            let mut feasible_width = 0_u32;
+            for (index, count) in candidate_counts.iter().enumerate() {
+                let count = u32::try_from(*count).ok()?;
+                if (*minimum..=*maximum).contains(&count) {
+                    weights[index] = 1.0;
+                    feasible_width = feasible_width.saturating_add(1);
+                }
+            }
+            f64::from(feasible_width) / f64::from(declared_width)
+        }
+        SpeakerCountRequest::Infer | SpeakerCountRequest::HardConstraint { .. } => 0.0,
+    };
+    let feasible_weight_sum = weights.iter().sum::<f64>();
+    if !retained_feasible_mass.is_finite()
+        || !feasible_weight_sum.is_finite()
+        || retained_feasible_mass <= 0.0
+        || feasible_weight_sum <= 0.0
+    {
+        return Some((weights, 0.0));
+    }
+    for weight in &mut weights {
+        *weight /= feasible_weight_sum;
+    }
+    let effective_mix_weight = SPEAKER_COUNT_SOFT_PRIOR_MIX_WEIGHT
+        * (1.0 - SPEAKER_COUNT_SOFT_PRIOR_STABILITY_ATTENUATION * acoustic_selection_stability)
+        * retained_feasible_mass.clamp(0.0, 1.0);
+    Some((
+        weights,
+        effective_mix_weight.clamp(0.0, SPEAKER_COUNT_SOFT_PRIOR_MIX_WEIGHT),
+    ))
+}
+
 fn fused_speaker_count_estimate(
     lanes: &[ProbabilisticLaneResult],
     spectral: Option<&SparseEigengapProposal>,
@@ -13677,7 +13740,7 @@ fn fused_speaker_count_estimate(
         .count() as f64
         / lanes.len() as f64;
 
-    // A soft request is deliberately a bounded linear pool rather than a
+    // A soft request is deliberately bounded linear evidence rather than a
     // log-pool. Log evidence gives a caller's zero or near-zero probability
     // unbounded leverage and can therefore behave like an undeclared hard
     // constraint. The linear pool guarantees that every acoustically
@@ -13686,36 +13749,18 @@ fn fused_speaker_count_estimate(
     // attenuates the caller's influence further, so a contradictory hint
     // cannot veto unanimous evidence indirectly through the unresolved-mass
     // threshold.
-    let mut soft_prior_weights = vec![0.0; concrete_weights.len()];
-    match request {
-        SpeakerCountRequest::Prior { bins } => {
-            for (index, (count, _)) in concrete_weights.iter().enumerate() {
-                soft_prior_weights[index] = bins
-                    .iter()
-                    .find(|bin| bin.count as usize == *count)
-                    .map_or(0.0, |bin| bin.probability);
-            }
-        }
-        SpeakerCountRequest::Range { minimum, maximum } => {
-            for (index, (count, _)) in concrete_weights.iter().enumerate() {
-                let count = u32::try_from(*count).ok()?;
-                if (*minimum..=*maximum).contains(&count) {
-                    soft_prior_weights[index] = 1.0;
-                }
-            }
-        }
-        SpeakerCountRequest::Infer | SpeakerCountRequest::HardConstraint { .. } => {}
-    }
-    let soft_prior_weight_sum = soft_prior_weights.iter().sum::<f64>();
-    if soft_prior_weight_sum.is_finite() && soft_prior_weight_sum > 0.0 {
-        let effective_prior_mix_weight = SPEAKER_COUNT_SOFT_PRIOR_MIX_WEIGHT
-            * (1.0 - SPEAKER_COUNT_SOFT_PRIOR_STABILITY_ATTENUATION * acoustic_selection_stability);
+    let counts = concrete_weights
+        .iter()
+        .map(|(count, _)| *count)
+        .collect::<Vec<_>>();
+    let (soft_prior_weights, effective_prior_mix_weight) =
+        soft_count_prior_mix(request, &counts, acoustic_selection_stability)?;
+    if effective_prior_mix_weight > 0.0 {
         for ((_, acoustic_weight), prior_weight) in
             concrete_weights.iter_mut().zip(soft_prior_weights)
         {
-            let normalized_prior_weight = prior_weight / soft_prior_weight_sum;
             *acoustic_weight = (1.0 - effective_prior_mix_weight) * *acoustic_weight
-                + effective_prior_mix_weight * normalized_prior_weight;
+                + effective_prior_mix_weight * prior_weight;
         }
     }
     let concrete_weight_sum = concrete_weights
@@ -14069,43 +14114,55 @@ fn speaker_count_prior_lane(
 ) -> Option<SpeakerCountLaneEvidence> {
     match request {
         SpeakerCountRequest::Prior { bins } => {
-            let proposed = bins
-                .iter()
-                .filter(|bin| {
-                    bin.count >= constraint_lower_bound && bin.count <= candidate_upper_bound
-                })
-                .max_by(|left, right| {
-                    left.probability
-                        .total_cmp(&right.probability)
-                        .then_with(|| right.count.cmp(&left.count))
-                });
-            Some(proposed.map_or_else(
-                || {
+            let feasible = bins.iter().filter(|bin| {
+                bin.count >= constraint_lower_bound && bin.count <= candidate_upper_bound
+            });
+            let retained_feasible_mass = feasible.clone().map(|bin| bin.probability).sum::<f64>();
+            let proposed = feasible.max_by(|left, right| {
+                left.probability
+                    .total_cmp(&right.probability)
+                    .then_with(|| right.count.cmp(&left.count))
+            });
+            Some(
+                if !retained_feasible_mass.is_finite() || retained_feasible_mass <= 0.0 {
                     unavailable_count_prior_lane(
                         SpeakerCountLaneUnavailableReason::ContradictoryConstraints,
                     )
+                } else {
+                    proposed.map_or_else(
+                        || {
+                            unavailable_count_prior_lane(
+                                SpeakerCountLaneUnavailableReason::ContradictoryConstraints,
+                            )
+                        },
+                        |proposed| SpeakerCountLaneEvidence {
+                            lane: SpeakerCountEvidenceLane::CallerPrior,
+                            available: true,
+                            proposed_count: Some(proposed.count),
+                            confidence: retained_feasible_mass,
+                            unavailable_reason: None,
+                        },
+                    )
                 },
-                |proposed| SpeakerCountLaneEvidence {
-                    lane: SpeakerCountEvidenceLane::CallerPrior,
-                    available: true,
-                    proposed_count: Some(proposed.count),
-                    confidence: proposed.probability,
-                    unavailable_reason: None,
-                },
-            ))
+            )
         }
         SpeakerCountRequest::Range { minimum, maximum } => {
-            let width = maximum.checked_sub(*minimum)?.checked_add(1)?;
-            if *maximum < constraint_lower_bound || *minimum > candidate_upper_bound {
+            let declared_width = maximum.checked_sub(*minimum)?.checked_add(1)?;
+            let feasible_minimum = (*minimum).max(constraint_lower_bound);
+            let feasible_maximum = (*maximum).min(candidate_upper_bound);
+            if feasible_minimum > feasible_maximum {
                 Some(unavailable_count_prior_lane(
                     SpeakerCountLaneUnavailableReason::ContradictoryConstraints,
                 ))
             } else {
+                let feasible_width = feasible_maximum
+                    .checked_sub(feasible_minimum)?
+                    .checked_add(1)?;
                 Some(SpeakerCountLaneEvidence {
                     lane: SpeakerCountEvidenceLane::CallerPrior,
                     available: true,
-                    proposed_count: Some((*minimum).max(constraint_lower_bound)),
-                    confidence: 1.0 / f64::from(width),
+                    proposed_count: Some(feasible_minimum),
+                    confidence: f64::from(feasible_width) / f64::from(declared_width),
                     unavailable_reason: None,
                 })
             }
@@ -15685,7 +15742,11 @@ where
                 (discrimination * reliability).clamp(0.0, 1.0)
             };
             let reject = if clustering_mode == AcousticClusteringMode::ProbabilisticV1 {
-                raw_confidence < acoustic_speaker_pair_calibration().minimum_assignment_probability
+                // This is a post-Viterbi local abstention gate. It can replace
+                // the reported label with UNKNOWN, but it does not rerun the
+                // dynamic program and must not be described as an optimal
+                // temporal UNKNOWN path.
+                should_abstain_after_viterbi_local_emission(raw_confidence)
             } else {
                 chosen_cost > 1.35 || raw_confidence < 0.30
             };
@@ -15703,24 +15764,12 @@ where
                     && clustering_mode == AcousticClusteringMode::ProbabilisticV1
                     && tracklet.overlap_suspected
                 {
-                    let chosen_local_score =
-                        normalized_local_emission_score(&emissions[index], state);
-                    emissions[index][..clusters.len()]
-                        .iter()
-                        .enumerate()
-                        .filter(|(candidate, cost)| *candidate != state && cost.is_finite())
-                        .map(|(candidate, _)| {
-                            (
-                                candidate,
-                                normalized_local_emission_score(&emissions[index], candidate),
-                            )
-                        })
-                        .filter(|(_, local_score)| {
-                            *local_score >= MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE
-                                && chosen_local_score >= MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE
-                                && *local_score / chosen_local_score.max(1e-6) >= 0.65
-                        })
-                        .max_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)))
+                    select_secondary_overlap_state(
+                        &emissions[index],
+                        state,
+                        clusters.len(),
+                        tracklet.overlap_suspected,
+                    )
                 } else {
                     None
                 };
@@ -15750,6 +15799,40 @@ fn calibrate_assignment_confidence(raw_confidence: f32) -> f32 {
     let bounded = raw_confidence.clamp(0.0, 1.0);
     (ACOUSTIC_ASSIGNMENT_CONFIDENCE_FLOOR + ACOUSTIC_ASSIGNMENT_CONFIDENCE_SCALE * bounded)
         .clamp(0.0, 1.0)
+}
+
+fn should_abstain_after_viterbi_local_emission(local_score: f32) -> bool {
+    local_score < DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE
+}
+
+/// Select a secondary known-speaker candidate only for a suspected overlap.
+///
+/// Local scores are normalized over every finite emission state, including
+/// UNKNOWN. UNKNOWN itself can never be emitted as the secondary speaker. The
+/// fixed minima are development operating points, not temporal calibration.
+fn select_secondary_overlap_state(
+    costs: &[f32],
+    primary_state: usize,
+    known_speaker_count: usize,
+    overlap_suspected: bool,
+) -> Option<(usize, f32)> {
+    if !overlap_suspected || primary_state >= known_speaker_count {
+        return None;
+    }
+    let primary_score = normalized_local_emission_score(costs, primary_state);
+    if primary_score < MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE {
+        return None;
+    }
+    costs[..known_speaker_count.min(costs.len())]
+        .iter()
+        .enumerate()
+        .filter(|(candidate, cost)| *candidate != primary_state && cost.is_finite())
+        .map(|(candidate, _)| (candidate, normalized_local_emission_score(costs, candidate)))
+        .filter(|(_, score)| {
+            *score >= MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE
+                && *score / primary_score.max(1e-6) >= MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_RATIO
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)))
 }
 
 /// Return one finite state's normalized local emission score using bounded
@@ -24718,6 +24801,192 @@ mod tests {
     }
 
     #[test]
+    fn bounded_soft_prior_and_range_can_reduce_but_not_remove_unresolved_mass() {
+        let lane = || super::ProbabilisticLaneResult {
+            selected_count: 5,
+            groups: vec![vec![0], vec![1]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count: 5,
+                points: vec![
+                    super::SpeakerCountRiskPoint {
+                        count: 2,
+                        expected_loss: 0.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 3,
+                        expected_loss: 0.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 4,
+                        expected_loss: 0.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 5,
+                        expected_loss: 0.0,
+                    },
+                ],
+            },
+        };
+        let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
+            .map(|_| lane())
+            .collect::<Vec<_>>();
+        let policy = super::SpeakerCountPolicy {
+            min: 2,
+            max: 5,
+            exact: None,
+        };
+        let estimate_for = |request: &SpeakerCountRequest| {
+            super::fused_speaker_count_estimate(
+                &lanes,
+                None,
+                Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+                request,
+                policy,
+                1,
+                super::unavailable_speaker_count_resources(5).expect("resource summary"),
+            )
+            .expect("bounded soft-count estimate")
+        };
+        let acoustic_only = estimate_for(&SpeakerCountRequest::Infer);
+        let prior = estimate_for(&SpeakerCountRequest::Prior {
+            bins: vec![crate::model::SpeakerCountPriorMass {
+                count: 5,
+                probability: 1.0,
+            }],
+        });
+        let range = estimate_for(&SpeakerCountRequest::Range {
+            minimum: 5,
+            maximum: 5,
+        });
+        for estimate in [&acoustic_only, &prior, &range] {
+            estimate
+                .validate()
+                .expect("valid bounded soft-count estimate");
+            assert_eq!(estimate.selected_count, None);
+            assert!(estimate.unresolved_probability > 0.5);
+        }
+        assert!(
+            prior.unresolved_probability < acoustic_only.unresolved_probability
+                && range.unresolved_probability < acoustic_only.unresolved_probability,
+            "bounded soft inputs may only reduce unresolved mass through their bounded concrete-weight shift"
+        );
+    }
+
+    #[test]
+    fn clipped_prior_mix_uses_only_retained_feasible_mass() {
+        let request = SpeakerCountRequest::Prior {
+            bins: vec![
+                crate::model::SpeakerCountPriorMass {
+                    count: 1,
+                    probability: 0.7,
+                },
+                crate::model::SpeakerCountPriorMass {
+                    count: 2,
+                    probability: 0.2,
+                },
+                crate::model::SpeakerCountPriorMass {
+                    count: 3,
+                    probability: 0.1,
+                },
+            ],
+        };
+        let (weights, mix) =
+            super::soft_count_prior_mix(&request, &[2, 3], 0.0).expect("prior mix");
+        assert!((weights[0] - 2.0 / 3.0).abs() < 1.0e-12, "{weights:?}");
+        assert!((weights[1] - 1.0 / 3.0).abs() < 1.0e-12, "{weights:?}");
+        assert!(
+            (mix - super::SPEAKER_COUNT_SOFT_PRIOR_MIX_WEIGHT * 0.3).abs() < 1.0e-12,
+            "only the retained 0.3 prior mass may influence the feasible posterior"
+        );
+        let lane = super::speaker_count_prior_lane(&request, 2, 3).expect("prior lane");
+        assert!(lane.available);
+        assert_eq!(lane.proposed_count, Some(2));
+        assert!(
+            (lane.confidence - 0.3).abs() < 1.0e-12,
+            "CallerPrior must report the retained feasible mass used by fusion"
+        );
+    }
+
+    #[test]
+    fn partially_feasible_range_mix_uses_feasible_width_fraction() {
+        let request = SpeakerCountRequest::Range {
+            minimum: 1,
+            maximum: 4,
+        };
+        let (weights, mix) =
+            super::soft_count_prior_mix(&request, &[2, 3], 0.0).expect("range mix");
+        assert_eq!(weights, vec![0.5, 0.5]);
+        assert!(
+            (mix - super::SPEAKER_COUNT_SOFT_PRIOR_MIX_WEIGHT * 0.5).abs() < 1.0e-12,
+            "two retained counts from a declared width of four may contribute half the base mix"
+        );
+        let lane = super::speaker_count_prior_lane(&request, 2, 3).expect("range lane");
+        assert!(lane.available);
+        assert_eq!(lane.proposed_count, Some(2));
+        assert!(
+            (lane.confidence - 0.5).abs() < 1.0e-12,
+            "CallerPrior must report the feasible width fraction used by fusion"
+        );
+    }
+
+    #[test]
+    fn count_policy_caps_soft_search_and_estimate_domain_at_max_speakers() {
+        let available = crate::model::MAX_SPEAKER_COUNT as usize + 7;
+        let hard = super::resolve_count_policy(
+            &SpeakerCountRequest::HardConstraint { count: 3 },
+            available,
+        )
+        .expect("hard policy");
+        assert_eq!((hard.min, hard.max, hard.exact), (3, 3, Some(3)));
+        let requests = vec![
+            SpeakerCountRequest::Infer,
+            SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: crate::model::MAX_SPEAKER_COUNT,
+            },
+            SpeakerCountRequest::Prior {
+                bins: vec![crate::model::SpeakerCountPriorMass {
+                    count: crate::model::MAX_SPEAKER_COUNT,
+                    probability: 1.0,
+                }],
+            },
+        ];
+        for request in requests {
+            let policy = super::resolve_count_policy(&request, available)
+                .expect("soft count policy must cap, not reject, excess candidates");
+            assert!(policy.max <= crate::model::MAX_SPEAKER_COUNT as usize);
+            let lane = super::ProbabilisticLaneResult {
+                selected_count: policy.min,
+                groups: vec![vec![0]],
+                risk_curve: super::SpeakerCountRiskCurve {
+                    selected_count: policy.min,
+                    points: (policy.min..=policy.max)
+                        .map(|count| super::SpeakerCountRiskPoint {
+                            count,
+                            expected_loss: (count - policy.min) as f64,
+                        })
+                        .collect(),
+                },
+            };
+            let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
+                .map(|_| lane.clone())
+                .collect::<Vec<_>>();
+            let estimate = super::fused_speaker_count_estimate(
+                &lanes,
+                None,
+                Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+                &request,
+                policy,
+                1,
+                super::unavailable_speaker_count_resources(policy.max).expect("resource summary"),
+            )
+            .expect("bounded candidate domain must yield an estimate");
+            estimate.validate().expect("bounded estimate");
+            assert!(estimate.candidate_upper_bound <= crate::model::MAX_SPEAKER_COUNT);
+        }
+    }
+
+    #[test]
     fn soft_count_prior_does_not_exclude_acoustically_supported_counts() {
         let lane = || super::ProbabilisticLaneResult {
             selected_count: 1,
@@ -24798,6 +25067,55 @@ mod tests {
         assert!(
             count_three_probability(&estimate) > count_three_probability(&acoustic_only),
             "the bounded soft prior must still move posterior mass toward its support"
+        );
+    }
+
+    #[test]
+    fn soft_count_range_does_not_exclude_conflicting_acoustic_selection() {
+        let lane = || super::ProbabilisticLaneResult {
+            selected_count: 1,
+            groups: vec![vec![0, 1, 2]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count: 1,
+                points: vec![
+                    super::SpeakerCountRiskPoint {
+                        count: 1,
+                        expected_loss: 0.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 2,
+                        expected_loss: 8.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 3,
+                        expected_loss: 12.0,
+                    },
+                ],
+            },
+        };
+        let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
+            .map(|_| lane())
+            .collect::<Vec<_>>();
+        let request = SpeakerCountRequest::Range {
+            minimum: 2,
+            maximum: 3,
+        };
+        let policy = super::resolve_count_policy(&request, 3).expect("range search policy");
+        let estimate = super::fused_speaker_count_estimate(
+            &lanes,
+            None,
+            Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+            &request,
+            policy,
+            1,
+            super::unavailable_speaker_count_resources(3).expect("resource summary"),
+        )
+        .expect("soft range estimate");
+        estimate.validate().expect("valid estimate");
+        assert_eq!(
+            estimate.selected_count,
+            Some(1),
+            "a soft range may move posterior mass but cannot prohibit a stronger out-of-range acoustic selection"
         );
     }
 
@@ -25003,7 +25321,7 @@ mod tests {
     }
 
     #[test]
-    fn development_assignment_calibration_is_bounded_monotone_and_does_not_change_rejection() {
+    fn development_assignment_reporting_map_is_bounded_monotone() {
         let raw = [0.0_f32, 0.25, 0.55, 0.75, 1.0];
         let calibrated = raw.map(super::calibrate_assignment_confidence);
         assert!((calibrated[0] - 0.0).abs() < f32::EPSILON);
@@ -25015,22 +25333,91 @@ mod tests {
                 .all(|pair| pair[0] <= pair[1] && (0.0..=1.0).contains(&pair[0]))
         );
         assert!((0.0..=1.0).contains(calibrated.last().expect("last confidence")));
-        let rejection_threshold =
-            super::acoustic_speaker_pair_calibration().minimum_assignment_probability;
+        let rejection_threshold = super::DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE;
         assert!(raw[1] < rejection_threshold);
         assert_eq!(super::calibrate_assignment_confidence(raw[1]), raw[1]);
     }
 
     #[test]
     fn normalized_local_emission_score_is_finite_and_includes_unknown() {
-        let costs = [0.0_f32, std::f32::consts::LN_2, f32::INFINITY];
+        let costs = [
+            0.0_f32,
+            std::f32::consts::LN_2,
+            std::f32::consts::LN_2 * 2.0,
+        ];
         let first = super::normalized_local_emission_score(&costs, 0);
         let second = super::normalized_local_emission_score(&costs, 1);
-        assert!((first - (2.0 / 3.0)).abs() < f32::EPSILON);
-        assert!((second - (1.0 / 3.0)).abs() < f32::EPSILON);
-        assert!((first + second - 1.0).abs() < f32::EPSILON);
-        assert_eq!(super::normalized_local_emission_score(&costs, 2), 0.0);
+        let unknown = super::normalized_local_emission_score(&costs, 2);
+        assert!((first - (4.0 / 7.0)).abs() < f32::EPSILON);
+        assert!((second - (2.0 / 7.0)).abs() < f32::EPSILON);
+        assert!((unknown - (1.0 / 7.0)).abs() < f32::EPSILON);
+        assert!((first + second + unknown - 1.0).abs() < 1e-6);
         assert_eq!(super::normalized_local_emission_score(&costs, 3), 0.0);
+    }
+
+    #[test]
+    fn local_emission_rejection_operating_point_is_count_dependent_and_uncertified() {
+        let two_states = [0.0_f32, std::f32::consts::LN_2];
+        let three_states = [0.0_f32, std::f32::consts::LN_2, std::f32::consts::LN_2];
+        let two_state_score = super::normalized_local_emission_score(&two_states, 0);
+        let three_state_score = super::normalized_local_emission_score(&three_states, 0);
+        assert!((two_state_score - (2.0 / 3.0)).abs() < f32::EPSILON);
+        assert!((three_state_score - 0.5).abs() < f32::EPSILON);
+        assert!(
+            two_state_score >= super::DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE
+                && three_state_score < super::DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE,
+            "adding a finite competing state changes the development operating-point decision"
+        );
+        assert!(
+            super::ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION.contains("development"),
+            "the count-dependent score remains development-only until frozen calibration"
+        );
+    }
+
+    #[test]
+    fn post_viterbi_local_abstention_is_explicitly_not_path_optimality() {
+        let accepted_path_label =
+            super::normalized_local_emission_score(&[0.0_f32, std::f32::consts::LN_2], 0);
+        let abstained_path_label = super::normalized_local_emission_score(
+            &[0.0_f32, std::f32::consts::LN_2, std::f32::consts::LN_2],
+            0,
+        );
+        assert!(
+            !super::should_abstain_after_viterbi_local_emission(accepted_path_label),
+            "the local score can retain a Viterbi-selected label"
+        );
+        assert!(
+            super::should_abstain_after_viterbi_local_emission(abstained_path_label),
+            "the post-Viterbi gate may report UNKNOWN without rerunning temporal inference"
+        );
+    }
+
+    #[test]
+    fn overlap_secondary_selector_requires_overlap_mass_ratio_and_unknown_competition() {
+        let accepted = super::select_secondary_overlap_state(&[0.0, 0.3, 3.0], 0, 2, true);
+        assert_eq!(accepted.map(|(state, _)| state), Some(1));
+
+        let below_minimum = super::select_secondary_overlap_state(&[0.0, 2.5, 8.0], 0, 2, true);
+        assert_eq!(below_minimum, None, "secondary mass must clear its floor");
+
+        let below_ratio = super::select_secondary_overlap_state(&[0.0, 0.8, 8.0], 0, 2, true);
+        assert_eq!(
+            below_ratio, None,
+            "secondary mass must be close to primary mass"
+        );
+
+        let unknown_dominates =
+            super::select_secondary_overlap_state(&[0.0, 0.2, -3.0], 0, 2, true);
+        assert_eq!(
+            unknown_dominates, None,
+            "finite UNKNOWN mass must suppress uncompetitive known-speaker overlap attribution"
+        );
+
+        let non_overlap = super::select_secondary_overlap_state(&[0.0, 0.3, 3.0], 0, 2, false);
+        assert_eq!(
+            non_overlap, None,
+            "secondary attribution requires overlap evidence"
+        );
     }
 
     #[test]

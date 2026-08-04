@@ -62,8 +62,8 @@ pub struct SpeakerCountPriorMass {
 /// Typed speaker-count semantics at the common request boundary.
 ///
 /// A hard count restricts candidate model search; it never forces assignments
-/// or removes UNKNOWN. `Prior` contributes soft log evidence over its declared
-/// bins; acoustic evidence may select outside that support or remain
+/// or removes UNKNOWN. `Prior` contributes bounded linear evidence over its
+/// declared bins; acoustic evidence may select outside that support or remain
 /// unresolved. An engine that cannot preserve these semantics must reject the
 /// request instead of silently approximating it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

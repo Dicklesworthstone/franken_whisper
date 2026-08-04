@@ -46,8 +46,8 @@ The decision state consists of:
 - microturn voice and channel sufficient statistics plus quality masks;
 - hard and soft known-speaker intervals;
 - current robust profiles and channel subprofiles;
-- one typed speaker-count request: inference, calibrated prior, range, or hard
-  search constraint;
+- one typed speaker-count request: inference, caller prior, range, or hard
+  search constraint; probabilistic count evidence is v5 development-uncertified;
 - prior temporal assignment;
 - algorithm, feature-schema, weights, and calibration identities;
 - remaining time, memory, and prototype budgets.
@@ -671,7 +671,7 @@ lock was minted, and no held-out recording was read. These results establish
 real public development evidence and performance observations, not production
 promotion or held-out certification.
 
-The subsequent `acoustic-clustering-probabilistic-v3-development` count
+The subsequent `acoustic-clustering-probabilistic-v5-development` count
 candidate adds a separately versioned `speaker-count-estimate-v2` report. It
 has not inherited the v2 evaluation authority: until a new frozen public
 development bundle passes the count, DER/JER, calibration, determinism, memory,
@@ -843,9 +843,18 @@ not the rest of backend raw output or its internal model paths.
 
 The fixed-safe speaker assignment combines best-versus-second margin with
 profile reliability and reports `heuristic_uncalibrated`. The probabilistic
-development candidate reports a separately versioned likelihood calibration;
-the raw likelihood, not the reported mapping, controls unknown rejection so a
-confidence transform cannot silently expand coverage. Speaker-change
+development candidate reports a separately versioned normalized local-emission
+score, not a calibrated temporal posterior. The local score, not the reported
+mapping, controls post-Viterbi abstention so a confidence transform cannot
+silently expand coverage. This abstention can replace a Viterbi label with
+`UNKNOWN`; it does not rerun the dynamic program and therefore makes no claim
+that the returned sequence is the final path-optimal temporal assignment.
+Pre-gating low local-emission states before Viterbi, or choosing the next
+viable state after a local rejection, are separate v5 development evaluation
+candidates. They cannot replace the conservative post-Viterbi abstention until
+frozen public comparative DER, JER, and selective-risk calibration establishes
+the changed loss tradeoff.
+Speaker-change
 candidates separately carry the versioned v2 posterior, component evidence,
 supporting-scale mask, refinement offset, detector identity, fallback reason,
 and calibration hash. The retained scoring surface reports Brier score,
