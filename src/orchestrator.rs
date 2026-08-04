@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use asupersync::runtime::{Runtime, RuntimeBuilder};
@@ -19,15 +19,22 @@ use crate::audio;
 use crate::backend;
 use crate::conformance;
 use crate::diarization::{self, AcousticBoundaryHints};
+use crate::ecapa_conformance::{ECAPA_PACKAGE_FILENAME, ECAPA_PACKAGE_SHA256};
+use crate::ecapa_inference::EcapaModel;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus,
-    DiarizationReport, DiarizationTurn, RunEvent, RunReport, SpeakerCountOutcome,
+    DiarizationReport, DiarizationRequest, DiarizationTurn, KnownSpeakerPolicy,
+    NeuralSpeakerRepresentationReason, NeuralSpeakerRepresentationStatus,
+    NeuralSpeakerRepresentationSummary, RunEvent, RunReport, SpeakerCountOutcome,
     SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountRequest,
-    SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerProfileSummary, StreamedRunEvent,
-    TranscribeRequest,
+    SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerHintDisposition,
+    SpeakerHintEvidenceSummary, SpeakerProfileSummary, StreamedRunEvent, TranscribeRequest,
 };
 use crate::storage::RunStore;
+
+static ECAPA_MODEL_CACHE: OnceLock<Arc<EcapaModel>> = OnceLock::new();
+static ECAPA_MODEL_LOAD_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // Composable pipeline stages (bd-qla.6)
@@ -1082,6 +1089,60 @@ fn sha256_file(path: &Path) -> FwResult<String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sha256_file_with_checkpoint(
+    path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        checkpoint()?;
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    checkpoint()?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn load_cached_ecapa_model(
+    model_path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<(Arc<EcapaModel>, bool)> {
+    let observed_sha256 = sha256_file_with_checkpoint(model_path, checkpoint)?;
+    if observed_sha256 != ECAPA_PACKAGE_SHA256 {
+        return Err(FwError::InvalidRequest(
+            "ecapa.model_package: resolved model does not match the pinned package SHA-256"
+                .to_owned(),
+        ));
+    }
+    if let Some(model) = ECAPA_MODEL_CACHE.get() {
+        return Ok((Arc::clone(model), true));
+    }
+    let _load_guard = ECAPA_MODEL_LOAD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(model) = ECAPA_MODEL_CACHE.get() {
+        return Ok((Arc::clone(model), true));
+    }
+    checkpoint()?;
+    let candidate = Arc::new(EcapaModel::load_with_checkpoint(model_path, checkpoint)?);
+    match ECAPA_MODEL_CACHE.set(Arc::clone(&candidate)) {
+        Ok(()) => Ok((candidate, false)),
+        Err(_) => ECAPA_MODEL_CACHE
+            .get()
+            .map(|model| (Arc::clone(model), true))
+            .ok_or_else(|| {
+                FwError::BackendUnavailable(
+                    "ECAPA model cache did not retain a successfully loaded model".to_owned(),
+                )
+            }),
+    }
 }
 
 fn acceleration_context_payload(
@@ -4681,40 +4742,273 @@ async fn execute_diarize(
                     ))
                     }
                 }
-                DiarizationEngine::Neural => match acoustic_request.fallback {
-                    DiarizationFallbackPolicy::External => Err(FwError::InvalidRequest(
-                        "neural diarization fallback requires the whisper-diarization backend"
-                            .to_owned(),
-                    )),
-                    DiarizationFallbackPolicy::Unknown => {
-                        let segments_total = result.segments.len();
-                        for segment in &mut result.segments {
-                            segment.speaker = None;
-                        }
-                        result.diarization = Some(unknown_diarization_report(
-                            sha256_file(&normalized_wav)?,
-                            &acoustic_request.speaker_count,
-                            "requested neural engine is unavailable; emitted unknown speakers",
-                        ));
-                        Ok((
-                            result,
-                            DiarizeReport {
-                                segments_total,
-                                speakers_detected: 0,
-                                segments_labeled: 0,
-                                silhouette_score: None,
-                                notes: vec![
-                                    "neural engine unavailable; emitted unknown speakers"
-                                        .to_owned(),
-                                ],
-                            },
+                DiarizationEngine::Neural => {
+                    let segments_total = result.segments.len();
+                    let wav_bytes = std::fs::read(&normalized_wav)?;
+                    let normalized_input_sha256 = sha256_bytes_hex(&wav_bytes);
+                    let word_aligned = has_canonical_word_alignment(&result.raw_output);
+                    let neural_attempt = match crate::native_engine::weights::resolve_aux_model(
+                        ECAPA_PACKAGE_FILENAME,
+                    ) {
+                        Err(error) => Err((
+                            NeuralSpeakerRepresentationReason::ModelUnavailable,
+                            error,
                             None,
-                        ))
+                        )),
+                        Ok(model_path) => {
+                            match load_cached_ecapa_model(&model_path, &|| {
+                                diarize_token.checkpoint()
+                            }) {
+                                Err(error) => Err((
+                                    NeuralSpeakerRepresentationReason::ModelInvalid,
+                                    error,
+                                    None,
+                                )),
+                                Ok((model, model_cache_hit)) => {
+                                    let samples = crate::native_engine::decode::read_wav_16k_mono(
+                                        &wav_bytes,
+                                    )?;
+                                    let word_boundaries_ms = if word_aligned {
+                                        transcript_boundaries_ms(&result.segments)
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let (tiny_diarize_boundaries_ms, tiny_diarize_hint_evidence) =
+                                        tiny_diarize_boundary_hints(
+                                            tiny_diarize_requested,
+                                            result.backend == BackendKind::WhisperCpp,
+                                            &result.raw_output,
+                                            normalized_duration_ms,
+                                        );
+                                    let boundary_hints = AcousticBoundaryHints {
+                                        speech_regions_ms,
+                                        word_boundaries_ms,
+                                        tiny_diarize_boundaries_ms,
+                                    };
+                                    match diarization::diarize_neural_pcm(
+                                        diarization::AcousticDiarizationInput {
+                                            samples: &samples,
+                                            normalized_input_sha256: &normalized_input_sha256,
+                                            segments: &result.segments,
+                                            word_aligned,
+                                            request: &acoustic_request,
+                                            boundary_hints: &boundary_hints,
+                                        },
+                                        model.as_ref(),
+                                        &|| diarize_token.checkpoint(),
+                                    ) {
+                                        Ok((mut report, projection)) => {
+                                            report.diagnostics.push(format!(
+                                                "speaker_representation_model_cache={}",
+                                                if model_cache_hit { "hit" } else { "miss" }
+                                            ));
+                                            Ok((
+                                                report,
+                                                projection,
+                                                Some(tiny_diarize_hint_evidence),
+                                            ))
+                                        }
+                                        Err(error) => Err((
+                                            NeuralSpeakerRepresentationReason::InferenceFailed,
+                                            error,
+                                            Some(tiny_diarize_hint_evidence),
+                                        )),
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    match neural_attempt {
+                        Ok((diarization_report, projection, hint_evidence)) => {
+                            if acoustic_request.fallback == DiarizationFallbackPolicy::External
+                                && diarization_report.fallback_status
+                                    != DiarizationFallbackStatus::NotNeeded
+                                && result_has_external_diarization(&result)
+                            {
+                                let mut external_report = external_diarization_report(
+                                    &result,
+                                    &normalized_input_sha256,
+                                    &acoustic_request.speaker_count,
+                                )?;
+                                external_report.neural_representation =
+                                    diarization_report.neural_representation;
+                                external_report.diagnostics.push(
+                                    "neural speaker evidence was insufficient; accepted runtime-verified external diarization"
+                                        .to_owned(),
+                                );
+                                let speakers_detected = usize::try_from(
+                                    external_report.speaker_count.supported_speaker_count,
+                                )
+                                .map_err(|_| {
+                                    FwError::InvalidRequest(
+                                        "external speaker count does not fit this platform"
+                                            .to_owned(),
+                                    )
+                                })?;
+                                let segments_labeled = result
+                                    .segments
+                                    .iter()
+                                    .filter(|segment| segment.speaker.is_some())
+                                    .count();
+                                result.diarization = Some(external_report);
+                                Ok((
+                                    result,
+                                    DiarizeReport {
+                                        segments_total,
+                                        speakers_detected,
+                                        segments_labeled,
+                                        silhouette_score: None,
+                                        notes: vec![
+                                            "neural speaker evidence was insufficient; accepted runtime-verified external diarization"
+                                                .to_owned(),
+                                        ],
+                                    },
+                                    hint_evidence,
+                                ))
+                            } else {
+                                let notes = diarization_report.diagnostics.clone();
+                                let speakers_detected = usize::try_from(
+                                    diarization_report.speaker_count.supported_speaker_count,
+                                )
+                                .map_err(|_| {
+                                    FwError::InvalidRequest(
+                                        "diarization speaker count does not fit this platform"
+                                            .to_owned(),
+                                    )
+                                })?;
+                                apply_native_diarization_projection(
+                                    &mut result,
+                                    projection,
+                                    diarization_report,
+                                );
+                                let segments_labeled = result
+                                    .segments
+                                    .iter()
+                                    .filter(|segment| segment.speaker.is_some())
+                                    .count();
+                                Ok((
+                                    result,
+                                    DiarizeReport {
+                                        segments_total,
+                                        speakers_detected,
+                                        segments_labeled,
+                                        silhouette_score: None,
+                                        notes,
+                                    },
+                                    hint_evidence,
+                                ))
+                            }
+                        }
+                        Err((reason, error, hint_evidence)) => {
+                            if matches!(error, FwError::Cancelled(_) | FwError::StageTimeout { .. })
+                            {
+                                return Err(error);
+                            }
+                            let reason_code = neural_representation_reason_code(reason);
+                            match acoustic_request.fallback {
+                                DiarizationFallbackPolicy::External
+                                    if result_has_external_diarization(&result) =>
+                                {
+                                    let mut external_report = external_diarization_report(
+                                        &result,
+                                        &normalized_input_sha256,
+                                        &acoustic_request.speaker_count,
+                                    )?;
+                                    external_report.neural_representation =
+                                        Some(unavailable_neural_representation_summary(reason));
+                                    external_report.diagnostics.push(format!(
+                                        "neural_representation_fallback={reason_code}"
+                                    ));
+                                    let speakers_detected = usize::try_from(
+                                        external_report.speaker_count.supported_speaker_count,
+                                    )
+                                    .map_err(|_| {
+                                        FwError::InvalidRequest(
+                                            "external speaker count does not fit this platform"
+                                                .to_owned(),
+                                        )
+                                    })?;
+                                    let segments_labeled = result
+                                        .segments
+                                        .iter()
+                                        .filter(|segment| segment.speaker.is_some())
+                                        .count();
+                                    result.diarization = Some(external_report);
+                                    Ok((
+                                        result,
+                                        DiarizeReport {
+                                            segments_total,
+                                            speakers_detected,
+                                            segments_labeled,
+                                            silhouette_score: None,
+                                            notes: vec![format!(
+                                                "neural representation unavailable ({reason_code}); accepted runtime-verified external diarization"
+                                            )],
+                                        },
+                                        hint_evidence,
+                                    ))
+                                }
+                                DiarizationFallbackPolicy::Unknown => {
+                                    let (mut report, projection) =
+                                        unknown_neural_diarization_with_hard_hints(
+                                            normalized_input_sha256,
+                                            &acoustic_request,
+                                            &result.segments,
+                                            word_aligned,
+                                            &format!(
+                                                "neural_representation_fallback={reason_code}; emitted unknown speakers"
+                                            ),
+                                        )?;
+                                    report.implementation =
+                                        "native-ecapa-unavailable-v1".to_owned();
+                                    report.contract_version =
+                                        diarization::NEURAL_DIARIZATION_CONTRACT_VERSION.to_owned();
+                                    report.feature_schema =
+                                        diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION
+                                            .to_owned();
+                                    report.neural_representation =
+                                        Some(unavailable_neural_representation_summary(reason));
+                                    let speakers_detected = usize::try_from(
+                                        report.speaker_count.supported_speaker_count,
+                                    )
+                                    .map_err(|_| {
+                                        FwError::InvalidRequest(
+                                            "hard-hint speaker count does not fit this platform"
+                                                .to_owned(),
+                                        )
+                                    })?;
+                                    apply_native_diarization_projection(
+                                        &mut result,
+                                        projection,
+                                        report,
+                                    );
+                                    let segments_labeled = result
+                                        .segments
+                                        .iter()
+                                        .filter(|segment| segment.speaker.is_some())
+                                        .count();
+                                    Ok((
+                                        result,
+                                        DiarizeReport {
+                                            segments_total,
+                                            speakers_detected,
+                                            segments_labeled,
+                                            silhouette_score: None,
+                                            notes: vec![format!(
+                                                "neural representation unavailable ({reason_code}); emitted unknown speakers"
+                                            )],
+                                        },
+                                        hint_evidence,
+                                    ))
+                                }
+                                DiarizationFallbackPolicy::External
+                                | DiarizationFallbackPolicy::Error => Err(FwError::InvalidRequest(
+                                    format!("neural diarization unavailable: {reason_code}"),
+                                )),
+                            }
+                        }
                     }
-                    DiarizationFallbackPolicy::Error => Err(FwError::InvalidRequest(
-                        "neural diarization engine is not admitted in this build".to_owned(),
-                    )),
-                },
+                }
             }
         },
     ) {
@@ -4780,26 +5074,19 @@ fn validate_diarization_execution_request(
     request
         .validate(audio_duration_ms.unwrap_or(u64::MAX))
         .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
-    if !request.known_intervals.is_empty()
-        && !matches!(
-            engine,
-            DiarizationEngine::Auto | DiarizationEngine::Acoustic
-        )
-    {
+    if !request.known_intervals.is_empty() && matches!(engine, DiarizationEngine::External) {
         return Err(FwError::InvalidRequest(
-            "known speaker intervals require the native acoustic diarization engine".to_owned(),
+            "known speaker intervals require a native diarization engine".to_owned(),
         ));
     }
     if matches!(
         request.speaker_count,
         SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
-    ) && matches!(
-        engine,
-        DiarizationEngine::External | DiarizationEngine::Neural
-    ) {
+    ) && matches!(engine, DiarizationEngine::External)
+    {
         return Err(FwError::InvalidRequest(
             "soft speaker-count priors and ranges require the native acoustic diarization engine; \
-             external and neural engines cannot faithfully fuse soft count evidence"
+             external engines cannot faithfully fuse soft count evidence"
                 .to_owned(),
         ));
     }
@@ -5083,6 +5370,36 @@ fn speaker_count_satisfies_request(speaker_count: u32, request: &SpeakerCountReq
     }
 }
 
+const fn neural_representation_reason_code(
+    reason: NeuralSpeakerRepresentationReason,
+) -> &'static str {
+    match reason {
+        NeuralSpeakerRepresentationReason::ShortTracklet => "short_tracklet",
+        NeuralSpeakerRepresentationReason::InsufficientIdentityEvidence => {
+            "insufficient_identity_evidence"
+        }
+        NeuralSpeakerRepresentationReason::InsufficientTracklets => "insufficient_tracklets",
+        NeuralSpeakerRepresentationReason::ModelUnavailable => "model_unavailable",
+        NeuralSpeakerRepresentationReason::ModelInvalid => "model_invalid",
+        NeuralSpeakerRepresentationReason::InferenceFailed => "inference_failed",
+    }
+}
+
+fn unavailable_neural_representation_summary(
+    reason: NeuralSpeakerRepresentationReason,
+) -> NeuralSpeakerRepresentationSummary {
+    NeuralSpeakerRepresentationSummary {
+        schema_version: "neural-speaker-representation-summary-v1".to_owned(),
+        provider_version: diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
+        model_package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
+        status: NeuralSpeakerRepresentationStatus::Unavailable,
+        embedded_tracklet_count: 0,
+        zero_padded_tracklet_count: 0,
+        skipped_tracklet_count: 0,
+        reasons: vec![reason],
+    }
+}
+
 fn unknown_diarization_report(
     normalized_input_sha256: String,
     speaker_count: &SpeakerCountRequest,
@@ -5136,8 +5453,176 @@ fn unknown_diarization_report(
         } else {
             DiarizationFallbackStatus::UnsatisfiedConstraints
         },
+        neural_representation: None,
         diagnostics: vec![reason.to_owned()],
     }
+}
+
+fn unknown_neural_diarization_with_hard_hints(
+    normalized_input_sha256: String,
+    request: &DiarizationRequest,
+    segments: &[crate::model::TranscriptionSegment],
+    word_aligned: bool,
+    reason: &str,
+) -> FwResult<(DiarizationReport, diarization::DiarizationProjection)> {
+    let mut hard_hints = request
+        .known_intervals
+        .iter()
+        .filter(|hint| hint.policy == KnownSpeakerPolicy::HardMustLink)
+        .collect::<Vec<_>>();
+    hard_hints.sort_by(|left, right| {
+        left.start_ms
+            .cmp(&right.start_ms)
+            .then(left.end_ms.cmp(&right.end_ms))
+            .then(left.speaker_ref.cmp(&right.speaker_ref))
+    });
+    let mut turns = Vec::<DiarizationTurn>::new();
+    for hint in hard_hints {
+        if let Some(previous) = turns.last_mut()
+            && previous.speaker_ref.as_deref() == Some(hint.speaker_ref.as_str())
+            && hint.start_ms <= previous.end_ms
+        {
+            previous.end_ms = previous.end_ms.max(hint.end_ms);
+            continue;
+        }
+        turns.push(DiarizationTurn {
+            start_ms: hint.start_ms,
+            end_ms: hint.end_ms,
+            speaker_ref: Some(hint.speaker_ref.clone()),
+            speaker_confidence: Some(1.0),
+            change_confidence: None,
+            overlap_suspected: false,
+            hard_hint_attributed: true,
+        });
+    }
+    let projection =
+        diarization::project_diarization_onto_segments(segments, &turns, word_aligned)?;
+    let mut report =
+        unknown_diarization_report(normalized_input_sha256, &request.speaker_count, reason);
+    report.hint_document_sha256 = (!request.known_intervals.is_empty())
+        .then(|| diarization::canonical_hint_document_sha256(&request.known_intervals));
+    report.turns = turns;
+    report.hint_evidence = request
+        .known_intervals
+        .iter()
+        .enumerate()
+        .map(|(hint_index, hint)| SpeakerHintEvidenceSummary {
+            hint_index: hint_index as u64,
+            speaker_ref: hint.speaker_ref.clone(),
+            policy: hint.policy,
+            disposition: if hint.policy == KnownSpeakerPolicy::HardMustLink {
+                SpeakerHintDisposition::HardAttributed
+            } else {
+                SpeakerHintDisposition::NoUsableTracklets
+            },
+            usable_tracklet_count: 0,
+            accepted_tracklet_count: 0,
+            rejected_tracklet_count: 0,
+            profile_accepted_tracklet_count: 0,
+            profile_downweighted_tracklet_count: 0,
+            profile_quarantined_tracklet_count: 0,
+            applied_weight: if hint.policy == KnownSpeakerPolicy::HardMustLink {
+                hint.confidence
+            } else {
+                0.0
+            },
+            contradiction_score: None,
+        })
+        .collect();
+
+    let mut active_speaker_refs = report
+        .turns
+        .iter()
+        .filter_map(|turn| turn.speaker_ref.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    active_speaker_refs.sort();
+    let supported_speaker_count = u32::try_from(active_speaker_refs.len()).map_err(|_| {
+        FwError::InvalidRequest("hard-hint speaker count exceeds the report schema".to_owned())
+    })?;
+    let total_hard_duration_ms = report
+        .turns
+        .iter()
+        .map(|turn| turn.end_ms.saturating_sub(turn.start_ms))
+        .sum::<u64>();
+    let dominant_speaker_share = active_speaker_refs
+        .iter()
+        .map(|speaker| {
+            report
+                .turns
+                .iter()
+                .filter(|turn| turn.speaker_ref.as_ref() == Some(speaker))
+                .map(|turn| turn.end_ms.saturating_sub(turn.start_ms))
+                .sum::<u64>()
+        })
+        .max()
+        .map_or(0.0, |maximum| {
+            maximum as f64 / total_hard_duration_ms.max(1) as f64
+        });
+    let hard_count_satisfied = matches!(
+        request.speaker_count,
+        SpeakerCountRequest::HardConstraint { count } if count == supported_speaker_count
+    );
+    report.speaker_count.status = if hard_count_satisfied {
+        SpeakerCountOutcomeStatus::Satisfied
+    } else {
+        match request.speaker_count {
+            SpeakerCountRequest::HardConstraint { .. } => SpeakerCountOutcomeStatus::Unsatisfied,
+            SpeakerCountRequest::Infer
+            | SpeakerCountRequest::Prior { .. }
+            | SpeakerCountRequest::Range { .. } => SpeakerCountOutcomeStatus::Unresolved,
+        }
+    };
+    report.speaker_count.supported_speaker_count = supported_speaker_count;
+    report.speaker_count.active_speaker_refs = active_speaker_refs.clone();
+    report.speaker_count.dominant_speaker_share = dominant_speaker_share;
+    report.speaker_count.reasons = vec![if hard_count_satisfied {
+        SpeakerCountOutcomeReason::RequestedCountMatched
+    } else if supported_speaker_count > 0 {
+        SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved
+    } else {
+        SpeakerCountOutcomeReason::NoSupportedSpeakers
+    }];
+    report.speaker_count.speaker_evidence = active_speaker_refs
+        .into_iter()
+        .map(|speaker_ref| {
+            let voiced_duration_ms = report
+                .turns
+                .iter()
+                .filter(|turn| turn.speaker_ref.as_ref() == Some(&speaker_ref))
+                .map(|turn| turn.end_ms.saturating_sub(turn.start_ms))
+                .sum::<u64>();
+            SpeakerEvidenceSummary {
+                speaker_ref,
+                assigned_tracklet_count: 0,
+                independent_tracklet_count: 0,
+                recurrence_episode_count: 0,
+                voiced_frame_count: 0,
+                independent_voiced_frame_count: 0,
+                voiced_duration_ms,
+                mean_assignment_confidence: 1.0,
+                profile_reliability: 0.0,
+                hard_anchored: true,
+                separated_from_supported_speakers: true,
+                reasons: vec![SpeakerEvidenceReason::SupportedByHardHint],
+                supported: true,
+            }
+        })
+        .collect();
+    report.fallback_status = if hard_count_satisfied {
+        DiarizationFallbackStatus::InsufficientEvidence
+    } else if matches!(
+        request.speaker_count,
+        SpeakerCountRequest::Infer
+            | SpeakerCountRequest::Prior { .. }
+            | SpeakerCountRequest::Range { .. }
+    ) {
+        DiarizationFallbackStatus::SpeakerCountUnresolved
+    } else {
+        DiarizationFallbackStatus::UnsatisfiedConstraints
+    };
+    Ok((report, projection))
 }
 
 fn external_diarization_report(
@@ -5324,6 +5809,7 @@ fn external_diarization_report(
             speaker_evidence,
         },
         fallback_status: DiarizationFallbackStatus::ExternalBackend,
+        neural_representation: None,
         diagnostics: vec![format!(
             "accepted external speaker assignments covering {external_segment_count} ms; acoustic profile calibration unavailable"
         )],
@@ -5447,12 +5933,13 @@ mod tests {
         parse_acoustic_diarization_rollout, parse_budget_ms, parse_event_ts_ms, punctuate_segments,
         recommended_budget, resolved_diarization_engine, resolved_diarization_engine_for_rollout,
         result_has_external_diarization, run_pipeline, run_stage_with_budget, sanitize_process_pid,
-        selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_json_value,
-        silhouette_score, source_separate, source_separate_with_analysis, split_long_regions,
-        stage_budget_ms, stage_failure_code, stage_failure_message, stage_latency_profile,
-        state_root, tiny_diarize_boundary_hints, tiny_diarize_hint_evidence_payload,
-        transcript_boundaries_ms, vad_energy_detect, vad_energy_detect_with_analysis,
-        validate_diarization_execution_request,
+        selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_file_with_checkpoint,
+        sha256_json_value, silhouette_score, source_separate, source_separate_with_analysis,
+        split_long_regions, stage_budget_ms, stage_failure_code, stage_failure_message,
+        stage_latency_profile, state_root, tiny_diarize_boundary_hints,
+        tiny_diarize_hint_evidence_payload, transcript_boundaries_ms,
+        unknown_neural_diarization_with_hard_hints, vad_energy_detect,
+        vad_energy_detect_with_analysis, validate_diarization_execution_request,
     };
 
     #[test]
@@ -6707,6 +7194,44 @@ mod tests {
         let file_hash = sha256_file(&path).expect("file hash should compute");
         let bytes_hash = sha256_bytes_hex(b"franken-whisper");
         assert_eq!(file_hash, bytes_hash);
+    }
+
+    #[test]
+    fn checkpointed_file_hash_matches_and_propagates_cancellation() {
+        let dir = tempdir().expect("tempdir should be available");
+        let path = dir.path().join("checkpointed.bin");
+        let bytes = vec![0x5a_u8; 130_000];
+        std::fs::write(&path, &bytes).expect("fixture should write");
+        assert_eq!(
+            sha256_file_with_checkpoint(&path, &|| Ok(())).expect("checkpointed hash"),
+            sha256_bytes_hex(&bytes)
+        );
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let error = sha256_file_with_checkpoint(&path, &|| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                Err(FwError::Cancelled("test cancellation".to_owned()))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("checkpoint cancellation must propagate");
+        assert!(matches!(error, FwError::Cancelled(_)));
+    }
+
+    #[test]
+    fn ecapa_cache_rejects_wrong_package_before_consulting_cached_model() {
+        let dir = tempdir().expect("tempdir should be available");
+        let path = dir.path().join("not-the-pinned-model.safetensors");
+        std::fs::write(&path, b"not a model").expect("fixture should write");
+        let error = super::load_cached_ecapa_model(&path, &|| Ok(()))
+            .expect_err("wrong package hash must fail closed");
+        let rendered = error.to_string();
+        assert!(rendered.contains("pinned package SHA-256"));
+        assert!(
+            !rendered.contains(path.to_string_lossy().as_ref()),
+            "model errors must not retain local paths"
+        );
     }
 
     #[test]
@@ -9469,6 +9994,7 @@ mod tests {
                 }],
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
+            neural_representation: None,
             diagnostics: Vec::new(),
         }
     }
@@ -9619,15 +10145,81 @@ mod tests {
             Some(2_000),
         )
         .expect_err("external engine would silently ignore known intervals");
-        assert!(error.to_string().contains("require the native acoustic"));
-        assert!(
-            validate_diarization_execution_request(
-                DiarizationEngine::Acoustic,
-                &request,
-                Some(2_000),
-            )
-            .is_ok()
+        assert!(error.to_string().contains("require a native"));
+        for engine in [DiarizationEngine::Acoustic, DiarizationEngine::Neural] {
+            assert!(validate_diarization_execution_request(engine, &request, Some(2_000)).is_ok());
+        }
+    }
+
+    #[test]
+    fn neural_unknown_fallback_preserves_only_hard_hint_attribution() {
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Neural,
+            known_intervals: vec![
+                KnownSpeakerInterval {
+                    speaker_ref: "alice".to_owned(),
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    confidence: 0.95,
+                    policy: KnownSpeakerPolicy::HardMustLink,
+                    provenance: None,
+                },
+                KnownSpeakerInterval {
+                    speaker_ref: "alice".to_owned(),
+                    start_ms: 1_000,
+                    end_ms: 1_200,
+                    confidence: 0.90,
+                    policy: KnownSpeakerPolicy::HardMustLink,
+                    provenance: None,
+                },
+                KnownSpeakerInterval {
+                    speaker_ref: "uncertain".to_owned(),
+                    start_ms: 1_300,
+                    end_ms: 1_600,
+                    confidence: 0.75,
+                    policy: KnownSpeakerPolicy::SoftEnrollment,
+                    provenance: None,
+                },
+                KnownSpeakerInterval {
+                    speaker_ref: "bob".to_owned(),
+                    start_ms: 2_000,
+                    end_ms: 2_500,
+                    confidence: 0.99,
+                    policy: KnownSpeakerPolicy::HardMustLink,
+                    provenance: None,
+                },
+            ],
+            ..DiarizationRequest::default()
+        };
+        request.validate(3_000).expect("valid hints");
+        let segments = vec![
+            make_segment(0.2, 0.4, "hard alice"),
+            make_segment(1.3, 1.5, "soft remains unknown"),
+            make_segment(2.1, 2.3, "hard bob"),
+        ];
+        let (report, projection) = unknown_neural_diarization_with_hard_hints(
+            "a".repeat(64),
+            &request,
+            &segments,
+            true,
+            "model unavailable",
+        )
+        .expect("hard-hint-preserving fallback");
+        assert_eq!(report.turns.len(), 2, "adjacent alice hints must merge");
+        assert_eq!(report.turns[0].speaker_ref.as_deref(), Some("alice"));
+        assert_eq!(report.turns[0].end_ms, 1_200);
+        assert_eq!(report.turns[1].speaker_ref.as_deref(), Some("bob"));
+        assert!(report.turns.iter().all(|turn| turn.hard_hint_attributed));
+        assert_eq!(report.speaker_count.supported_speaker_count, 2);
+        assert_eq!(
+            report.speaker_count.status,
+            SpeakerCountOutcomeStatus::Unresolved
         );
+        assert!(report.hint_document_sha256.is_some());
+        assert_eq!(report.hint_evidence.len(), 4);
+        assert_eq!(projection.segments[0].speaker.as_deref(), Some("alice"));
+        assert_eq!(projection.segments[1].speaker, None);
+        assert_eq!(projection.segments[2].speaker.as_deref(), Some("bob"));
     }
 
     #[test]
@@ -9670,13 +10262,14 @@ mod tests {
             },
             ..DiarizationRequest::default()
         };
-        let error = validate_diarization_execution_request(
-            DiarizationEngine::Neural,
-            &range_request,
-            Some(2_000),
-        )
-        .expect_err("neural engine cannot silently harden a soft count range");
-        assert!(error.to_string().contains("cannot faithfully fuse"));
+        assert!(
+            validate_diarization_execution_request(
+                DiarizationEngine::Neural,
+                &range_request,
+                Some(2_000),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

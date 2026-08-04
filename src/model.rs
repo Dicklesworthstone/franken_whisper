@@ -476,6 +476,45 @@ pub enum DiarizationFallbackStatus {
     ExternalBackend,
 }
 
+/// Stable execution state for the optional neural speaker representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NeuralSpeakerRepresentationStatus {
+    Ready,
+    Degraded,
+    Unavailable,
+}
+
+/// Feature-value-free reason that the neural representation was degraded or
+/// unavailable. These codes are safe to emit in robot mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NeuralSpeakerRepresentationReason {
+    ShortTracklet,
+    InsufficientIdentityEvidence,
+    InsufficientTracklets,
+    ModelUnavailable,
+    ModelInvalid,
+    InferenceFailed,
+}
+
+/// Privacy-safe provenance and coverage for an optional ECAPA execution.
+///
+/// Raw embeddings and model paths are deliberately absent. The exact package
+/// digest is public model provenance rather than user-derived information.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeuralSpeakerRepresentationSummary {
+    pub schema_version: String,
+    pub provider_version: String,
+    pub model_package_sha256: String,
+    pub status: NeuralSpeakerRepresentationStatus,
+    pub embedded_tracklet_count: u64,
+    pub zero_padded_tracklet_count: u64,
+    pub skipped_tracklet_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<NeuralSpeakerRepresentationReason>,
+}
+
 /// One acoustic speaker turn, independent of ASR segment boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiarizationTurn {
@@ -969,6 +1008,8 @@ pub struct DiarizationReport {
     pub speaker_queries: Vec<SpeakerAttributionQuery>,
     pub speaker_count: SpeakerCountOutcome,
     pub fallback_status: DiarizationFallbackStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neural_representation: Option<NeuralSpeakerRepresentationSummary>,
     #[serde(default)]
     pub diagnostics: Vec<String>,
 }
@@ -3969,6 +4010,7 @@ mod tests {
                 }],
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
+            neural_representation: None,
             diagnostics: Vec::new(),
         };
         let json = serde_json::to_string(&report).expect("serialize report");

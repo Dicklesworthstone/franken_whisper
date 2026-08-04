@@ -13979,6 +13979,7 @@ fn public_corpus_error(code: &str, message: &str) -> FwError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
     use serde_json::json;
@@ -14004,6 +14005,245 @@ mod tests {
         AcousticFeatureAblation, DIARIZATION_REFERENCE_SCHEMA_VERSION,
         DiarizationReferenceDocument, EvaluationRegion, EvaluationSplit, EvaluationTurn,
     };
+
+    #[test]
+    #[ignore = "requires external public AMI descriptor/audio and converted ECAPA weights"]
+    fn external_ecapa_public_recording_reports_authoritative_score() {
+        let descriptor_path = std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_DESCRIPTOR")
+            .map(PathBuf::from)
+            .expect("set FRANKEN_WHISPER_ECAPA_TEST_DESCRIPTOR");
+        let audio_path = std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_AUDIO")
+            .map(PathBuf::from)
+            .expect("set FRANKEN_WHISPER_ECAPA_TEST_AUDIO");
+        let weight_path = std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS")
+            .map(PathBuf::from)
+            .expect("set FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS");
+        let project_root = std::env::current_dir().expect("project root");
+        let input_root = descriptor_path.parent().expect("descriptor parent");
+        let bundle = super::materialize_public_corpus_bundle_for_split_with_cancel(
+            &project_root,
+            input_root,
+            &descriptor_path,
+            "accept-ami-cc-by-4.0",
+            None,
+            None,
+            || false,
+        )
+        .expect("validated public corpus bundle");
+        assert_eq!(bundle.references.len(), 1, "single-recording descriptor");
+        let reference = &bundle.references[0];
+        let audio_bytes = std::fs::read(audio_path).expect("read public WAV");
+        let samples = crate::native_engine::decode::read_wav_16k_mono(&audio_bytes)
+            .expect("decode public WAV");
+        let decoded_duration_ms = u64::try_from(samples.len()).expect("sample count fits") / 16;
+        assert!(
+            decoded_duration_ms.abs_diff(reference.duration_ms) <= 1,
+            "decoded and reference durations differ by more than one millisecond: decoded={decoded_duration_ms} reference={}",
+            reference.duration_ms,
+        );
+        let model = crate::ecapa_inference::EcapaModel::load(&weight_path).expect("load model");
+        let speaker_count = std::env::var("FRANKEN_WHISPER_ECAPA_TEST_SPEAKER_COUNT")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map(|count| crate::model::SpeakerCountRequest::HardConstraint { count })
+                    .expect("FRANKEN_WHISPER_ECAPA_TEST_SPEAKER_COUNT must be an integer")
+            })
+            .unwrap_or(crate::model::SpeakerCountRequest::Infer);
+        let request = crate::model::DiarizationRequest {
+            engine: crate::model::DiarizationEngine::Neural,
+            fallback: crate::model::DiarizationFallbackPolicy::Unknown,
+            speaker_count,
+            ..crate::model::DiarizationRequest::default()
+        };
+        let boundary_hints = crate::diarization::AcousticBoundaryHints {
+            speech_regions_ms: super::merged_scored_speech_regions(
+                &reference.turns,
+                &reference.ignored_regions,
+            ),
+            ..crate::diarization::AcousticBoundaryHints::default()
+        };
+        let started = std::time::Instant::now();
+        let (report, _) = crate::diarization::diarize_neural_pcm(
+            crate::diarization::AcousticDiarizationInput {
+                samples: &samples,
+                normalized_input_sha256: &super::hash_pcm_prefix(&samples),
+                segments: &[],
+                word_aligned: false,
+                request: &request,
+                boundary_hints: &boundary_hints,
+            },
+            &model,
+            &|| Ok(()),
+        )
+        .expect("native ECAPA common-stack diarization");
+        let wall_time_ms = u64::try_from(started.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let representation = report
+            .neural_representation
+            .as_ref()
+            .expect("neural representation summary");
+        assert!(representation.embedded_tracklet_count > 0);
+        let hypothesis = crate::diarization::DiarizationHypothesisDocument {
+            schema_version: crate::diarization::DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
+            recording_id: reference.recording_id.clone(),
+            duration_ms: reference.duration_ms,
+            turns: report
+                .turns
+                .iter()
+                .map(|turn| crate::diarization::EvaluationTurn {
+                    start_ms: turn.start_ms,
+                    end_ms: turn.end_ms,
+                    speaker: turn.speaker_ref.clone(),
+                    speaker_confidence: turn.speaker_confidence,
+                    overlap_suspected: turn.overlap_suspected,
+                })
+                .collect(),
+            speaker_count_estimate: report.speaker_count.estimate.clone(),
+            performance: Some(crate::diarization::EvaluationPerformanceObservation {
+                audio_duration_ms: reference.duration_ms,
+                wall_time_ms,
+                peak_rss_bytes: super::sampled_process_rss_bytes(),
+            }),
+        };
+        let scorer_config = crate::diarization::DiarizationScorerConfig {
+            schema_version: crate::diarization::DIARIZATION_SCORER_CONFIG_SCHEMA_VERSION.to_owned(),
+            speaker_boundary_collar_ms: 250,
+            change_boundary_collar_ms: 250,
+            overlap_policy: crate::diarization::EvaluationOverlapPolicy::Exclude,
+            calibration_bins: 10,
+            count_top_k: 3,
+            count_credible_mass_millionths: 900_000,
+            dominant_speaker_collapse_share_millionths: 990_000,
+            minimum_reference_speaker_recall_millionths: 100_000,
+            minimum_effective_occupancy_ms: 250,
+        };
+        let score =
+            crate::diarization::score_diarization_documents(reference, &hypothesis, &scorer_config)
+                .expect("authoritative public-corpus score");
+        assert!(score.diarization.der.is_some());
+        let observations = crate::diarization::ecapa_tracklet_evaluation_observations(
+            &samples,
+            &boundary_hints,
+            &model,
+            &|| Ok(()),
+        )
+        .expect("ECAPA public-development observations");
+        let mut ambiguous_tracklet_count = 0usize;
+        let labeled_observations = observations
+            .iter()
+            .filter_map(|observation| {
+                let mut overlap_by_speaker = BTreeMap::<String, u64>::new();
+                for turn in &reference.turns {
+                    let Some(speaker) = turn.speaker.as_ref() else {
+                        continue;
+                    };
+                    let overlap_start = observation.start_ms.max(turn.start_ms);
+                    let overlap_end = observation.end_ms.min(turn.end_ms);
+                    let overlap = overlap_end.saturating_sub(overlap_start);
+                    if overlap > 0 {
+                        *overlap_by_speaker.entry(speaker.clone()).or_default() += overlap;
+                    }
+                }
+                let covered_ms = overlap_by_speaker.values().copied().sum::<u64>();
+                let duration_ms = observation.end_ms.saturating_sub(observation.start_ms);
+                let dominant = overlap_by_speaker
+                    .into_iter()
+                    .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)));
+                let Some((speaker, dominant_ms)) = dominant else {
+                    ambiguous_tracklet_count += 1;
+                    return None;
+                };
+                if duration_ms == 0
+                    || covered_ms.saturating_mul(5) < duration_ms.saturating_mul(4)
+                    || dominant_ms.saturating_mul(5) < covered_ms.saturating_mul(4)
+                {
+                    ambiguous_tracklet_count += 1;
+                    return None;
+                }
+                Some((speaker, &observation.embedding))
+            })
+            .collect::<Vec<_>>();
+        let mut same_distances = Vec::<f32>::new();
+        let mut different_distances = Vec::<f32>::new();
+        for left in 0..labeled_observations.len() {
+            for right in left + 1..labeled_observations.len() {
+                let Some(distance) = crate::diarization::ecapa_evaluation_cosine_distance(
+                    labeled_observations[left].1,
+                    labeled_observations[right].1,
+                ) else {
+                    continue;
+                };
+                if labeled_observations[left].0 == labeled_observations[right].0 {
+                    same_distances.push(distance);
+                } else {
+                    different_distances.push(distance);
+                }
+            }
+        }
+        same_distances.sort_by(f32::total_cmp);
+        different_distances.sort_by(f32::total_cmp);
+        let quantile = |values: &[f32], numerator: usize| {
+            (!values.is_empty()).then(|| {
+                let index = values.len().saturating_sub(1).saturating_mul(numerator) / 10;
+                values[index]
+            })
+        };
+        let pair_distance_summary = serde_json::json!({
+            "embedded_tracklets": observations.len(),
+            "labeled_tracklets": labeled_observations.len(),
+            "ambiguous_tracklets": ambiguous_tracklet_count,
+            "same_pair_count": same_distances.len(),
+            "same_p10": quantile(&same_distances, 1),
+            "same_p50": quantile(&same_distances, 5),
+            "same_p90": quantile(&same_distances, 9),
+            "different_pair_count": different_distances.len(),
+            "different_p10": quantile(&different_distances, 1),
+            "different_p50": quantile(&different_distances, 5),
+            "different_p90": quantile(&different_distances, 9),
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "recording_id": score.recording_id,
+                "oracle_vad": true,
+                "der": score.diarization.der,
+                "jer": score.diarization.jer,
+                "reference_speaker_time_sec": score.diarization.reference_speaker_time_sec,
+                "missed_speech_sec": score.diarization.missed_speech_sec,
+                "false_alarm_sec": score.diarization.false_alarm_sec,
+                "speaker_confusion_sec": score.diarization.speaker_confusion_sec,
+                "scored_duration_sec": score.scored_duration_sec,
+                "selective_coverage": score.selective_attribution.coverage,
+                "selective_risk": score.selective_attribution.selective_risk,
+                "reference_speakers": score.speaker_count.reference_speakers,
+                "speaker_count_request": &request.speaker_count,
+                "hypothesis_speakers": score.speaker_count.hypothesis_speakers,
+                "effective_speakers": score.speaker_occupancy.effective_speaker_count,
+                "count_absolute_error": score.speaker_count.absolute_error,
+                "count_exact_match": score.speaker_count.absolute_error == 0,
+                "dominant_speaker_share": score.speaker_occupancy.dominant_speaker_share,
+                "unknown_speaker_share": score.speaker_occupancy.unknown_speaker_share,
+                "count_status": report.speaker_count.status,
+                "count_selected": report.speaker_count.estimate.as_ref().and_then(|estimate| estimate.selected_count),
+                "count_unresolved_probability": report.speaker_count.estimate.as_ref().map(|estimate| estimate.unresolved_probability),
+                "speaker_pair_calibration_sha256": report.speaker_count.estimate.as_ref().map(|estimate| estimate.calibration_sha256.as_str()),
+                "count_posterior_map": score.speaker_count_posterior.map_count,
+                "count_lanes": report.speaker_count.estimate.as_ref().map(|estimate| &estimate.lanes),
+                "speaker_evidence": &report.speaker_count.speaker_evidence,
+                "fallback_status": report.fallback_status,
+                "turn_count": report.turns.len(),
+                "pair_distance_summary": pair_distance_summary,
+                "embedded_tracklets": representation.embedded_tracklet_count,
+                "skipped_tracklets": representation.skipped_tracklet_count,
+                "wall_time_ms": wall_time_ms,
+                "score_sha256": score.result_sha256,
+            }))
+            .expect("serialize aggregate public score")
+        );
+    }
 
     fn private_tempdir(label: &str) -> tempfile::TempDir {
         let directory = tempdir().unwrap_or_else(|error| panic!("{label}: {error}"));

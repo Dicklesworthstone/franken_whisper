@@ -963,13 +963,14 @@ denominator.
 
 The six-dimensional temporal/lexical heuristic is not an acoustic fallback.
 An explicit acoustic request cannot silently invoke external or lexical
-behavior. Soft count priors and ranges are rejected by external/neural engines
-instead of being silently hardened into backend min/max controls. Every
-fallback names its source and reason.
+behavior. Soft count priors and ranges are consumed by the native acoustic and
+explicit neural engines and rejected by external engines instead of being
+silently hardened into backend min/max controls. Every fallback names its
+source and reason.
 
 ## 9. Scoring
 
-The retained evaluation authority is `diarization-scorer-v4`. Low-level
+The retained evaluation authority is `diarization-scorer-v5`. Low-level
 metric helpers are not sufficient evidence by themselves: a retained verdict
 must be produced by `score_diarization_documents` from these exact versioned
 documents:
@@ -1484,9 +1485,12 @@ files. A missing `--reference` is valid and produces
 
 `src/ecapa_conformance.rs` freezes the model/evidence contract and
 `src/ecapa_inference.rs` implements its bounded safe-Rust ECAPA-TDNN forward
-path. Neither module admits neural inference into `auto`, changes the acoustic
-default, downloads a model, or parses a framework checkpoint at runtime.
-Profile/clustering integration and routing remain separate work.
+path. An explicit `neural` request uses the production PCM frontend and routes
+the normalized representation through the common segmentation, constraints,
+count, temporal UNKNOWN/overlap, label, and projection contracts. It does not
+enter `auto`, change the acoustic default, download a model, or parse a
+framework checkpoint at runtime. Public-corpus accuracy and calibration remain
+development-uncertified.
 
 The source is
 [`speechbrain/spkrec-ecapa-voxceleb`](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/tree/eac27266f68caa806381260bd44ace38b136c76a)

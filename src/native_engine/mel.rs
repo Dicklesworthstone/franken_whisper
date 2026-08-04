@@ -78,16 +78,51 @@ pub(crate) fn fixed_frame_power_spectrum(
     }
 
     let hann = cached_hann_window();
-    let twiddles = cached_fft_twiddles();
     let mut fft_in = [0.0_f32; N_FFT];
     for (windowed, (&sample, &weight)) in fft_in.iter_mut().zip(frame.iter().zip(hann.iter())) {
         *windowed = sample * weight;
     }
+    fixed_windowed_frame_power_spectrum(&fft_in, out)
+}
+
+/// Compute one one-sided power spectrum from an already-windowed frame.
+///
+/// ECAPA and Whisper share the same 400-point transform geometry but require
+/// different analysis windows. Keeping window selection outside this primitive
+/// lets the ECAPA frontend reuse the native FFT without weakening Whisper's
+/// pinned periodic-Hann behavior.
+pub(crate) fn fixed_windowed_frame_power_spectrum(
+    windowed_frame: &[f32],
+    out: &mut [f32; N_FREQ_BINS],
+) -> FwResult<()> {
+    if windowed_frame.len() != N_FFT {
+        return Err(FwError::InvalidRequest(format!(
+            "fixed spectrum frame must contain exactly {N_FFT} samples, got {}",
+            windowed_frame.len()
+        )));
+    }
+    if windowed_frame.iter().any(|sample| !sample.is_finite()) {
+        return Err(FwError::InvalidRequest(
+            "fixed spectrum frame contains a non-finite PCM sample".to_owned(),
+        ));
+    }
+
+    let twiddles = cached_fft_twiddles();
     let mut fft_out = [0.0_f32; 2 * N_FFT];
     if rfft_enabled() {
-        fft_twoforone(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+        fft_twoforone(
+            windowed_frame,
+            &mut fft_out,
+            &twiddles.levels,
+            &twiddles.base,
+        );
     } else {
-        fft(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+        fft(
+            windowed_frame,
+            &mut fft_out,
+            &twiddles.levels,
+            &twiddles.base,
+        );
     }
     for (bin, power) in out.iter_mut().enumerate() {
         let re = fft_out[2 * bin];

@@ -1098,6 +1098,75 @@ pub fn ecapa_frontend_conformance(samples: &[f32]) -> FwResult<EcapaFrontendOutp
             log_fbank_db.push(db);
         }
     }
+    finalize_ecapa_frontend(frame_count, log_fbank_db, global_max)
+}
+
+/// Compute the pinned SpeechBrain frontend for one admitted production window.
+///
+/// This path uses the same safe-Rust 400-point FFT as the native Whisper
+/// frontend, with ECAPA's distinct periodic-Hamming window applied explicitly.
+/// The scalar DFT in [`ecapa_frontend_conformance`] remains the independent
+/// numerical oracle.
+pub fn ecapa_frontend_runtime(
+    samples: &[f32],
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<EcapaFrontendOutput> {
+    validate_ecapa_runtime_input(samples)?;
+    checkpoint()?;
+
+    let frame_count = samples.len() / ECAPA_HOP_SAMPLES + 1;
+    let value_count = frame_count
+        .checked_mul(ECAPA_MEL_BANDS)
+        .ok_or_else(|| ecapa_error("frontend_size", "frontend output size overflows"))?;
+    let mel_filters = frontend_mel_filters();
+    let mut log_fbank_db = Vec::with_capacity(value_count);
+    let mut global_max = f32::NEG_INFINITY;
+    let mut windowed = [0.0_f32; ECAPA_WINDOW_SAMPLES];
+    let mut power = [0.0_f32; ECAPA_FFT_BINS];
+
+    for frame_index in 0..frame_count {
+        if frame_index.is_multiple_of(16) {
+            checkpoint()?;
+        }
+        let frame_origin =
+            frame_index as isize * ECAPA_HOP_SAMPLES as isize - (ECAPA_WINDOW_SAMPLES / 2) as isize;
+        for (sample_index, output) in windowed.iter_mut().enumerate() {
+            let source_index = frame_origin + sample_index as isize;
+            let sample = usize::try_from(source_index)
+                .ok()
+                .and_then(|index| samples.get(index))
+                .copied()
+                .unwrap_or(0.0);
+            *output = sample * periodic_hamming(sample_index) as f32;
+        }
+        crate::native_engine::mel::fixed_windowed_frame_power_spectrum(&windowed, &mut power)?;
+        for mel in 0..ECAPA_MEL_BANDS {
+            let filter_base = mel * ECAPA_FFT_BINS;
+            let energy = power
+                .iter()
+                .enumerate()
+                .map(|(frequency, value)| value * mel_filters[filter_base + frequency])
+                .sum::<f32>();
+            let db = 10.0 * energy.max(FRONTEND_AMIN).log10();
+            global_max = global_max.max(db);
+            log_fbank_db.push(db);
+        }
+    }
+    checkpoint()?;
+    finalize_ecapa_frontend(frame_count, log_fbank_db, global_max)
+}
+
+fn finalize_ecapa_frontend(
+    frame_count: usize,
+    mut log_fbank_db: Vec<f32>,
+    global_max: f32,
+) -> FwResult<EcapaFrontendOutput> {
+    if frame_count == 0 || !global_max.is_finite() {
+        return Err(ecapa_error(
+            "frontend_value",
+            "frontend produced no finite frames",
+        ));
+    }
     let floor = global_max - FRONTEND_TOP_DB;
     for value in &mut log_fbank_db {
         *value = value.max(floor);
@@ -1783,6 +1852,52 @@ mod tests {
                 comparison.maximum_absolute_error
             );
         }
+    }
+
+    #[test]
+    fn runtime_frontend_matches_scalar_oracle() {
+        let samples = ecapa_analytic_fixture();
+        let expected = ecapa_frontend_conformance(&samples).expect("scalar frontend");
+        let actual = ecapa_frontend_runtime(&samples, &|| Ok(())).expect("runtime frontend");
+        assert_eq!(actual.frame_count, expected.frame_count);
+        assert_eq!(actual.mel_band_count, expected.mel_band_count);
+        for (stage, expected_values, actual_values) in [
+            (
+                "log_fbank_db",
+                expected.log_fbank_db.as_slice(),
+                actual.log_fbank_db.as_slice(),
+            ),
+            (
+                "sentence_mean_normalized",
+                expected.sentence_mean_normalized.as_slice(),
+                actual.sentence_mean_normalized.as_slice(),
+            ),
+        ] {
+            let maximum_error = expected_values
+                .iter()
+                .zip(actual_values)
+                .map(|(expected, actual)| (expected - actual).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                maximum_error <= 2.0e-3,
+                "{stage} runtime FFT drifted from the scalar oracle by {maximum_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_frontend_honors_validation_and_cancellation() {
+        let admitted = vec![0.0; ECAPA_MINIMUM_RUNTIME_SAMPLES];
+        assert!(ecapa_frontend_runtime(&admitted, &|| Ok(())).is_ok());
+        assert!(
+            ecapa_frontend_runtime(&admitted[..ECAPA_MINIMUM_RUNTIME_SAMPLES - 1], &|| Ok(()))
+                .is_err()
+        );
+        let error = ecapa_frontend_runtime(&admitted, &|| {
+            Err(FwError::Cancelled("test cancellation".to_owned()))
+        })
+        .expect_err("cancelled frontend fails");
+        assert!(matches!(error, FwError::Cancelled(_)));
     }
 
     #[test]

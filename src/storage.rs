@@ -2816,6 +2816,7 @@ mod tests {
                 }],
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
+            neural_representation: None,
             diagnostics: vec!["synthetic persistence fixture".to_owned()],
         });
     }

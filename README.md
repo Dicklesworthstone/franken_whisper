@@ -370,8 +370,8 @@ evidence and occupancy gates pass. A soft preference can be added with
 `--speaker-count-prior 2=0.25,3=0.75`. Use
 `--speaker-count-hard 3` only when the caller intentionally wants a hard search
 constraint; it never fabricates occupancy or removes UNKNOWN. Soft count
-options require the native acoustic engine because external/neural backends
-cannot faithfully fuse them.
+options are supported by the native acoustic and explicit neural engines;
+external backends reject them rather than silently hardening them.
 
 Known intervals can enroll an opaque speaker reference without retaining the
 hint document's source path or raw source bytes:
@@ -389,7 +389,7 @@ contradictory. Parsed hint fields are part of the typed request and are
 persisted with the run unless `--no-persist` is used. Labels remain within-run
 references, not biometric identities.
 
-Evaluation uses the frozen `diarization-scorer-v4` contract. In addition to
+Evaluation uses the frozen `diarization-scorer-v5` contract. In addition to
 DER/JER, it reports a calibrated speaker-count posterior, explicit unresolved
 and zero-probability outcomes, effective occupancy, dominant/reference
 collapse, phantom labels, and optional transcript-free aligned-word WDER.
@@ -492,26 +492,32 @@ The full adapter protocol, environment overrides, privacy rules, and authority
 boundary are in the
 [`acoustic diarization contract`](docs/acoustic_diarization_contract.md#114-stage-aware-external-differential-oracles).
 
-The optional neural path is deliberately not advertised as operational routing
-yet. The library freezes and verifies a license-compatible ECAPA-TDNN source
-revision, deterministic 200-tensor safetensors package, exact package hash and
-metadata, a bounded one-second SpeechBrain-compatible scalar conformance
-frontend, public analytic golden stages, and fail-closed numerical tolerances.
-A bounded safe-Rust ECAPA forward path now implements TDNN/SE-Res2 aggregation,
-attentive statistics pooling, projection, and embedding normalization on
-explicit FrankenTorch CPU kernels, with cooperative cancellation and
-content-redacted diagnostics. The package verifier reuses the native safetensors
-loader; no parallel weight format or sidecar manifest is introduced. A
+An explicit `--diarization-engine neural` request now runs the pinned ECAPA-TDNN
+speaker representation in process through the same segmentation, known-speaker
+constraints, profile/count machinery, temporal UNKNOWN/overlap handling,
+canonical labels, and transcript projection as the acoustic engine. It remains
+outside `auto` while public-corpus accuracy and calibration are development-only,
+and it never downloads a model: the exact converted package must already resolve
+through the auxiliary model search path. The library freezes and verifies the
+license-compatible source revision, deterministic 200-tensor safetensors
+package, exact package hash and metadata, a scalar conformance oracle, public
+analytic golden stages, and fail-closed numerical tolerances. The bounded
+safe-Rust forward path implements the production periodic-Hamming PCM frontend,
+TDNN/SE-Res2 aggregation, attentive statistics pooling, projection, and
+embedding normalization on explicit FrankenTorch CPU kernels, with cooperative
+cancellation, content-hash-validated process caching, and content-redacted
+diagnostics. The package verifier reuses the native safetensors loader; no
+parallel weight format or sidecar manifest is introduced. A
 separately authenticated 2,160,320-byte public seven-stage oracle lets the
 external conformance test compare all 539,616 frontend and neural `f32` values,
 then recheck all 523,456 neural values through the composed Rust frontend, not
 only selected checkpoints. Safe RAII logical-buffer leases enforce and report
 the preplanned ECAPA-owned logical `f32` scratch-payload bound. Both generated
 artifacts remain outside Git. The
-project does not vendor weights, parse PyTorch checkpoints in the runtime, or
-yet provide a production PCM frontend or enable this representation in
-clustering and fallback policy; common-diarizer integration and evaluation
-remain subsequent gates. See the
+project does not vendor weights or parse PyTorch checkpoints at runtime. Direct
+192-dimensional cosine evidence is currently marked development-uncertified;
+failed public-development candidates remain negative evidence rather than
+rollout authority. See the
 [`ECAPA conformance boundary`](docs/acoustic_diarization_contract.md#115-optional-ecapa-model-and-numerical-conformance-boundary).
 
 ### 4. Microphone Capture
@@ -763,7 +769,7 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--diarization-engine <ENGINE>` | `auto` | `auto`, `acoustic`, `external`, or reserved `neural`; explicit `acoustic` selects the Rust waveform engine regardless of rollout stage |
+| `--diarization-engine <ENGINE>` | `auto` | `auto`, `acoustic`, `external`, or explicit `neural`; neural requires the pinned converted ECAPA package and remains outside automatic routing |
 | `--diarization-fallback <POLICY>` | `unknown` | `unknown`, `external`, or `error` when evidence is insufficient |
 | `--speaker-hints <PATH>` | — | Read a `speaker-hints-v1` document in place; the path is not retained, but parsed fields persist with the run unless `--no-persist` is used |
 | `--enrollment-edge-guard-ms <N>` | `100` | Remove boundary-adjacent audio before enrolling a known interval |
@@ -3997,6 +4003,7 @@ The `auto` router will normally pick the right backend, but explicit selection i
 ```
 Do you need speaker diarization?
 ├─ YES, waveform-derived and dependency-light  → --diarization-engine acoustic
+├─ YES, Rust-native ECAPA and model is installed → --diarization-engine neural
 ├─ YES, with an installed pyannote backend     → --diarization-engine external
 ├─ YES, turn hints only                        → whisper_cpp + --tiny-diarize
 └─ NO ──┐
@@ -4616,20 +4623,22 @@ The router is doing nothing exotic: it blends priors with empirical data via Bet
 
 ## Speaker Diarization Paths
 
-| Aspect | Rust acoustic | External | TinyDiarize |
-|--------|---------------|----------|-------------|
-| Selection | `--diarization-engine acoustic` | `--diarization-engine external` | `--tiny-diarize` |
-| Evidence | Waveform voice/channel features and multiscale changes | Backend-defined, normalized only after provenance checks | Decoder turn tokens |
-| Dependencies | Built-in Rust + the normalized PCM already used by ASR | Typically Python, model files, and possibly an HF token | whisper-cli |
-| Output | Independent turns plus conservative projection to ASR segments | Timed backend labels normalized to the common report | Inline turn hints |
-| Known intervals | Hard must-link and soft enrollment | Backend-specific | No |
-| Speaker count | Infer by default; optional fail-closed range or exact search constraint | Backend-specific | No |
-| Unknown/overlap | Explicit unknown and overlap suspicion | Backend-specific | No calibrated assignment |
-| Accuracy authority | Synthetic invariant proof only; public corpus DER/JER remains `NO-DATA` | Depends on the installed backend and corpus | No project accuracy certification |
+| Aspect | Rust acoustic | Rust neural | External | TinyDiarize |
+|--------|---------------|-------------|----------|-------------|
+| Selection | `--diarization-engine acoustic` | `--diarization-engine neural` | `--diarization-engine external` | `--tiny-diarize` |
+| Evidence | Hand-authored waveform voice/channel features and multiscale changes | Pinned ECAPA embeddings plus separately retained channel evidence | Backend-defined, normalized only after provenance checks | Decoder turn tokens |
+| Dependencies | Built-in Rust + normalized PCM | Built-in Rust + user-installed, hash-pinned ECAPA safetensors | Typically Python, model files, and possibly an HF token | whisper-cli |
+| Output | Independent turns plus conservative projection to ASR segments | The same common turn/report/projection contract | Timed backend labels normalized to the common report | Inline turn hints |
+| Known intervals | Hard must-link and soft enrollment | Hard must-link and soft enrollment | Backend-specific | No |
+| Speaker count | Infer by default; optional soft range/prior or exact search constraint | Same bounded inference and constraint contract | Backend-specific | No |
+| Unknown/overlap | Explicit unknown and overlap suspicion | Same common handling | Backend-specific | No calibrated assignment |
+| Accuracy authority | Public-development evidence exists; rollout remains uncertified | Public-development candidates exist but currently fail promotion gates | Depends on the installed backend and corpus | No project accuracy certification |
 
 Use acoustic diarization for dependency-light waveform evidence and auditable
-known intervals. Use an external engine only when its model/deployment tradeoff
-is deliberate. TinyDiarize is a turn hint, not a speaker-profile substitute.
+known intervals. Use explicit neural diarization when the pinned model is
+installed and development-uncertified accuracy is acceptable. Use an external
+engine only when its model/deployment tradeoff is deliberate. TinyDiarize is a
+turn hint, not a speaker-profile substitute.
 
 ---
 
