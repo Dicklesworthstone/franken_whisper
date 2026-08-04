@@ -7911,6 +7911,10 @@ pub(crate) struct AcousticClusteringEvaluationEvidence {
     /// The public evaluator reduces these bounded, content-free values against
     /// the reference speaker count. Runtime reports never expose them.
     pub count_merge_steps: Vec<AcousticCountMergeStepEvidence>,
+    /// Normalized sufficient statistics retained only in the public evaluator
+    /// for speaker-pair calibration. This field is never serialized into a
+    /// runtime report or public evidence artifact.
+    pub calibration_tracklets: Vec<AcousticTracklet>,
 }
 
 /// Content-free evidence for one count-lane merge frontier.
@@ -11634,6 +11638,11 @@ where
         speaker_count_stability: clustering.bootstrap_stability,
         count_merge_steps: if capture_evaluation_evidence {
             count_merge_steps
+        } else {
+            Vec::new()
+        },
+        calibration_tracklets: if capture_evaluation_evidence {
+            tracklets
         } else {
             Vec::new()
         },
@@ -16138,6 +16147,35 @@ fn tracklet_cluster_pair_evidence(
         &cluster.channel,
         cluster.channel_valid,
         cluster.channel_dimensions,
+        SpeakerPairPerturbation::Full,
+    )
+}
+
+/// Evaluate one normalized tracklet pair with the frozen full-feature model.
+///
+/// This crate-private entry point exists solely so the public-corpus runner can
+/// fit and score the model without copying feature values into its artifact.
+pub(crate) fn acoustic_tracklet_pair_evidence(
+    left: &AcousticTracklet,
+    right: &AcousticTracklet,
+) -> Option<AcousticSpeakerPairEvidence> {
+    let left_scale = left.voice_variance.map(|variance| variance.max(0.025));
+    let right_scale = right.voice_variance.map(|variance| variance.max(0.025));
+    speaker_pair_evidence_from_statistics(
+        &left.voice_mean,
+        &left.voice_valid,
+        &left_scale,
+        left.identity_frame_count as f32,
+        &left.channel_mean,
+        left.channel_valid,
+        left.channel_dimensions,
+        &right.voice_mean,
+        &right.voice_valid,
+        &right_scale,
+        right.identity_frame_count as f32,
+        &right.channel_mean,
+        right.channel_valid,
+        right.channel_dimensions,
         SpeakerPairPerturbation::Full,
     )
 }
