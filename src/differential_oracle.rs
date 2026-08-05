@@ -23,13 +23,41 @@ use crate::orchestrator::CancellationToken;
 use crate::process::run_command_cancellable;
 
 pub const DIFFERENTIAL_ORACLE_PROTOCOL_VERSION: &str =
-    "franken-whisper-diarization-oracle-protocol-v1";
+    "franken-whisper-diarization-oracle-protocol-v2";
 pub const DIFFERENTIAL_ORACLE_VERSION_SCHEMA: &str =
-    "franken-whisper-diarization-oracle-version-v1";
+    "franken-whisper-diarization-oracle-version-v2";
 pub const DIFFERENTIAL_STAGE_DOCUMENT_SCHEMA: &str =
     "franken-whisper-diarization-stage-document-v1";
-pub const DIFFERENTIAL_REPORT_SCHEMA: &str = "franken-whisper-differential-report-v1";
-pub const DIFFERENTIAL_COMPARATOR_VERSION: &str = "differential-comparator-v1";
+pub const DIFFERENTIAL_REPORT_SCHEMA: &str = "franken-whisper-differential-report-v2";
+pub const DIFFERENTIAL_COMPARATOR_VERSION: &str = "differential-comparator-v2";
+/// Cross-language hash encoding: recursively sort object keys, emit compact JSON,
+/// and preserve array order and serde_json's scalar rendering.
+pub const DIFFERENTIAL_CANONICAL_JSON_VERSION: &str = "lexicographic-canonical-json-v1";
+
+/// Frozen upstream model selected for the first end-to-end learned comparator.
+pub const SORTFORMER_ORACLE_MODEL_ID: &str = "nvidia/diar_streaming_sortformer_4spk-v2.1";
+/// Immutable Hugging Face repository revision used by the comparator contract.
+pub const SORTFORMER_ORACLE_MODEL_REVISION: &str = "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d";
+/// SHA-256 advertised by Hugging Face LFS metadata for the pinned `.nemo` artifact.
+/// The adapter must independently hash its local bytes and attest this exact value.
+pub const SORTFORMER_ORACLE_ARTIFACT_SHA256: &str =
+    "8abd32832159c6ac1148c926b7276f35ba34582c444e559dce1f1253fea42ef8";
+/// Byte length advertised by the pinned upstream repository.
+pub const SORTFORMER_ORACLE_ARTIFACT_BYTES: u64 = 471_367_680;
+/// Fixed number of output speaker slots in the pinned model.
+pub const SORTFORMER_ORACLE_MAX_SPEAKERS: usize = 4;
+/// Temporal stride of the pinned model's output probabilities.
+pub const SORTFORMER_ORACLE_OUTPUT_FRAME_MS: u32 = 80;
+/// Maximum end-of-file rounding difference accepted between PCM and stage duration.
+pub const SORTFORMER_AUDIO_DURATION_TOLERANCE_MS: u32 = 79;
+/// Exact operator adapter version accepted by the v1 contract.
+pub const SORTFORMER_ORACLE_ADAPTER_VERSION: &str = "franken-whisper-sortformer-oracle-v1";
+/// Pinned NeMo Speech source revision expected behind the operator adapter.
+pub const SORTFORMER_ORACLE_TOOL_VERSION: &str =
+    "nemo-speech-40ace43c7cf151af78dc22027c02feeca7e06b6a";
+/// SHA-256 of the canonical JSON serialization of [`sortformer_oracle_contract`].
+pub const SORTFORMER_ORACLE_CONTRACT_SHA256: &str =
+    "77237f0457b8c9623056891e3c354c22eecd93a7824fb30909adc2c1733489f8";
 
 const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -37,6 +65,9 @@ const MAX_INTERVALS: usize = 200_000;
 const MAX_WORDS: usize = 500_000;
 const MAX_CLUSTERS: usize = 200_000;
 const MAX_TURNS: usize = 200_000;
+const MAX_COMPARISON_CHANGE_POINTS: usize = 2_048;
+const MAX_COMPARISON_TURNS: usize = 2_048;
+const MAX_COMPARISON_SPEAKERS: usize = 32;
 const MAX_SAFE_TOKEN_LEN: usize = 128;
 const HASH_HEX_LEN: usize = 64;
 
@@ -120,6 +151,148 @@ pub struct DifferentialOracleRegistryEntry {
     pub default_program: String,
     pub protocol_version: String,
     pub authority: DifferentialAuthority,
+    pub model_contract: Option<DifferentialOracleModelContract>,
+    pub model_contract_sha256: Option<String>,
+}
+
+/// Frozen model, input, streaming, and post-processing semantics for an oracle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialOracleModelContract {
+    pub schema_version: String,
+    pub canonical_json_version: String,
+    pub model_id: String,
+    pub model_revision: String,
+    /// Expected content hash from upstream metadata; local bytes are independently hashed.
+    pub upstream_artifact_sha256: String,
+    pub upstream_artifact_bytes: u64,
+    pub upstream_license: String,
+    pub input_format: String,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub output_frame_ms: u32,
+    pub audio_duration_tolerance_ms: u32,
+    pub output_end_alignment: String,
+    pub validate_all_pcm_samples: bool,
+    pub runtime_fingerprint_schema: String,
+    pub runtime_fingerprint_required_fields: Vec<String>,
+    pub maximum_speakers: u16,
+    pub speaker_count_mode: String,
+    pub label_order: String,
+    pub batch_size: u16,
+    pub device: String,
+    pub compute_dtype: String,
+    pub autocast: bool,
+    pub quantization: String,
+    pub data_loader_workers: u16,
+    pub torch_intraop_threads: u16,
+    pub torch_interop_threads: u16,
+    pub deterministic_algorithms: bool,
+    pub chunk_frames: u32,
+    pub right_context_frames: u32,
+    pub fifo_frames: u32,
+    pub speaker_cache_update_period_frames: u32,
+    pub speaker_cache_frames: u32,
+    pub nominal_input_buffer_latency_ms: u32,
+    pub postprocessing_onset_millionths: u32,
+    pub postprocessing_offset_millionths: u32,
+    pub postprocessing_pad_onset_ms: u32,
+    pub postprocessing_pad_offset_ms: u32,
+    pub postprocessing_min_duration_on_ms: u32,
+    pub postprocessing_min_duration_off_ms: u32,
+}
+
+/// Path-free runtime facts attested by the operator adapter and validated by the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifferentialOracleRuntimeFingerprint {
+    pub schema_version: String,
+    pub python_version: String,
+    pub nemo_version: String,
+    pub torch_version: String,
+    pub torchaudio_version: String,
+    pub numpy_version: String,
+    pub blas_backend: String,
+    pub operating_system: String,
+    pub machine_architecture: String,
+    pub cpu_feature_tier: String,
+    pub device: String,
+    pub compute_dtype: String,
+    pub autocast: bool,
+    pub quantization: String,
+    pub torch_intraop_threads: u16,
+    pub torch_interop_threads: u16,
+    pub data_loader_workers: u16,
+    pub deterministic_algorithms: bool,
+}
+
+/// Return the exact Sortformer profile accepted by the external adapter seam.
+#[must_use]
+pub fn sortformer_oracle_contract() -> DifferentialOracleModelContract {
+    DifferentialOracleModelContract {
+        schema_version: "franken-whisper-sortformer-oracle-contract-v1".to_owned(),
+        canonical_json_version: DIFFERENTIAL_CANONICAL_JSON_VERSION.to_owned(),
+        model_id: SORTFORMER_ORACLE_MODEL_ID.to_owned(),
+        model_revision: SORTFORMER_ORACLE_MODEL_REVISION.to_owned(),
+        upstream_artifact_sha256: SORTFORMER_ORACLE_ARTIFACT_SHA256.to_owned(),
+        upstream_artifact_bytes: SORTFORMER_ORACLE_ARTIFACT_BYTES,
+        upstream_license: "nvidia-open-model-license".to_owned(),
+        input_format: "pcm_s16le_mono_wav".to_owned(),
+        sample_rate_hz: 16_000,
+        channels: 1,
+        output_frame_ms: SORTFORMER_ORACLE_OUTPUT_FRAME_MS,
+        audio_duration_tolerance_ms: SORTFORMER_AUDIO_DURATION_TOLERANCE_MS,
+        output_end_alignment: "output_frame_or_document_duration".to_owned(),
+        validate_all_pcm_samples: true,
+        runtime_fingerprint_schema: "sortformer-runtime-fingerprint-v1".to_owned(),
+        runtime_fingerprint_required_fields: [
+            "schema_version",
+            "python_version",
+            "nemo_version",
+            "torch_version",
+            "torchaudio_version",
+            "numpy_version",
+            "blas_backend",
+            "operating_system",
+            "machine_architecture",
+            "cpu_feature_tier",
+            "device",
+            "compute_dtype",
+            "autocast",
+            "quantization",
+            "torch_intraop_threads",
+            "torch_interop_threads",
+            "data_loader_workers",
+            "deterministic_algorithms",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        maximum_speakers: 4,
+        speaker_count_mode: "infer_up_to_four".to_owned(),
+        label_order: "arrival_time_order".to_owned(),
+        batch_size: 1,
+        device: "cpu".to_owned(),
+        compute_dtype: "float32".to_owned(),
+        autocast: false,
+        quantization: "none".to_owned(),
+        data_loader_workers: 0,
+        torch_intraop_threads: 8,
+        torch_interop_threads: 1,
+        deterministic_algorithms: true,
+        chunk_frames: 340,
+        right_context_frames: 40,
+        fifo_frames: 40,
+        speaker_cache_update_period_frames: 300,
+        speaker_cache_frames: 188,
+        nominal_input_buffer_latency_ms: 30_400,
+        postprocessing_onset_millionths: 500_000,
+        postprocessing_offset_millionths: 500_000,
+        postprocessing_pad_onset_ms: 0,
+        postprocessing_pad_offset_ms: 0,
+        postprocessing_min_duration_on_ms: 0,
+        postprocessing_min_duration_off_ms: 0,
+    }
 }
 
 /// Emit the stable adapter registry without probing the host.
@@ -141,6 +314,10 @@ pub fn differential_oracle_registry() -> Vec<DifferentialOracleRegistryEntry> {
         default_program: tool.default_program().to_owned(),
         protocol_version: DIFFERENTIAL_ORACLE_PROTOCOL_VERSION.to_owned(),
         authority: DifferentialAuthority::DiagnosticOnly,
+        model_contract: (tool == DifferentialOracleTool::Sortformer)
+            .then(sortformer_oracle_contract),
+        model_contract_sha256: (tool == DifferentialOracleTool::Sortformer)
+            .then(|| SORTFORMER_ORACLE_CONTRACT_SHA256.to_owned()),
     })
     .collect()
 }
@@ -357,6 +534,9 @@ pub struct DifferentialStageComparison {
 pub enum DifferentialExecutionStage {
     ResolveExecutable,
     HashExecutable,
+    InputValidation,
+    InputPostRunValidation,
+    EligibilityValidation,
     VersionProbe,
     VersionValidation,
     OracleRun,
@@ -369,14 +549,19 @@ pub enum DifferentialExecutionStage {
 pub enum DifferentialSkipReason {
     MissingExecutable,
     UnreadableExecutable,
+    InputContractMismatch,
+    InputIdentityMismatch,
     VersionProbeFailed,
     VersionProbeTimedOut,
     InvalidVersionOutput,
     ProtocolVersionMismatch,
     ToolIdentityMismatch,
+    ModelContractMismatch,
     OracleRunFailed,
     OracleRunTimedOut,
     InvalidOracleOutput,
+    ModelCapacityExceeded,
+    ReferenceModelCapacityExceeded,
     OracleIdentityMismatch,
 }
 
@@ -397,6 +582,13 @@ pub struct DifferentialProvenance {
     pub family: DifferentialOracleFamily,
     pub tool_version: Option<String>,
     pub adapter_version: Option<String>,
+    /// Host-selected contract, present even when the external tool is unavailable.
+    pub expected_model_contract_sha256: Option<String>,
+    /// Contract actually attested by a successfully validated version probe.
+    pub model_contract_sha256: Option<String>,
+    pub model_artifact_sha256: Option<String>,
+    pub model_artifact_bytes: Option<u64>,
+    pub runtime_fingerprint_sha256: Option<String>,
     pub executable_sha256: Option<String>,
     pub version_stdout_sha256: Option<String>,
     pub oracle_stdout_sha256: Option<String>,
@@ -445,6 +637,11 @@ struct OracleVersionDocument {
     tool: DifferentialOracleTool,
     tool_version: String,
     adapter_version: String,
+    model_contract_sha256: Option<String>,
+    model_artifact_sha256: Option<String>,
+    model_artifact_bytes: Option<u64>,
+    runtime_fingerprint: Option<DifferentialOracleRuntimeFingerprint>,
+    runtime_fingerprint_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -520,8 +717,8 @@ impl ExternalSkip {
 pub fn run_differential_oracle(
     request: DifferentialOracleRequest<'_>,
 ) -> FwResult<DifferentialOracleReport> {
-    let token = CancellationToken::unbounded();
-    run_differential_oracle_with_token(request, &token)
+    let cancellation = CancellationToken::unbounded();
+    run_differential_oracle_with_token(request, &cancellation)
 }
 
 fn run_differential_oracle_with_token(
@@ -574,10 +771,48 @@ fn build_report(
     comparison_config: DifferentialComparisonConfig,
     token: &CancellationToken,
 ) -> FwResult<DifferentialOracleReport> {
+    token.checkpoint()?;
+    if tool == DifferentialOracleTool::Sortformer
+        && prepared
+            .reference
+            .as_ref()
+            .and_then(|reference| reference.final_projection.as_deref())
+            .is_some_and(|turns| {
+                turns
+                    .iter()
+                    .filter_map(|turn| turn.speaker.as_deref())
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    > SORTFORMER_ORACLE_MAX_SPEAKERS
+            })
+    {
+        let skipped = ExternalSkip::new(
+            DifferentialSkipReason::ReferenceModelCapacityExceeded,
+            DifferentialExecutionStage::EligibilityValidation,
+        );
+        let comparison_config_sha256 = canonical_sha256(&comparison_config)?;
+        return finalize_report(DifferentialOracleReport {
+            schema_version: DIFFERENTIAL_REPORT_SCHEMA.to_owned(),
+            comparator_version: DIFFERENTIAL_COMPARATOR_VERSION.to_owned(),
+            authority: DifferentialAuthority::DiagnosticOnly,
+            native_incorrectness_claim_permitted: false,
+            status: DifferentialRunStatus::Skipped,
+            skip_reason: Some(skipped.reason),
+            failure_stage: Some(skipped.stage),
+            provenance: provenance_from_skip(tool, prepared, &skipped),
+            comparison_config,
+            comparison_config_sha256,
+            comparisons: Vec::new(),
+            earliest_divergence: None,
+            result_sha256: String::new(),
+        });
+    }
     let external = execute_external(
         tool,
         program,
         &prepared.audio_path,
+        &prepared.audio_sha256,
+        prepared.native.duration_ms,
         &prepared.native.recording_key,
         hard_timeout,
         token,
@@ -604,11 +839,12 @@ fn build_report(
                     result_sha256: String::new(),
                 });
             }
-            let comparisons = compare_documents(
+            let comparisons = compare_documents_with_token(
                 &prepared.native,
                 &success.oracle,
                 prepared.reference.as_ref(),
                 &comparison_config,
+                token,
             )?;
             let earliest_divergence = comparisons
                 .iter()
@@ -660,6 +896,15 @@ fn provenance_from(
         family: tool.family(),
         tool_version: success.map(|value| value.version.tool_version.clone()),
         adapter_version: success.map(|value| value.version.adapter_version.clone()),
+        expected_model_contract_sha256: (tool == DifferentialOracleTool::Sortformer)
+            .then(|| SORTFORMER_ORACLE_CONTRACT_SHA256.to_owned()),
+        model_contract_sha256: success
+            .and_then(|value| value.version.model_contract_sha256.clone()),
+        model_artifact_sha256: success
+            .and_then(|value| value.version.model_artifact_sha256.clone()),
+        model_artifact_bytes: success.and_then(|value| value.version.model_artifact_bytes),
+        runtime_fingerprint_sha256: success
+            .and_then(|value| value.version.runtime_fingerprint_sha256.clone()),
         executable_sha256: success.map(|value| value.executable_sha256.clone()),
         version_stdout_sha256: success.map(|value| value.version_stdout_sha256.clone()),
         oracle_stdout_sha256: success.map(|value| value.oracle_stdout_sha256.clone()),
@@ -686,6 +931,24 @@ fn provenance_from_skip(
             .version
             .as_ref()
             .map(|value| value.adapter_version.clone()),
+        expected_model_contract_sha256: (tool == DifferentialOracleTool::Sortformer)
+            .then(|| SORTFORMER_ORACLE_CONTRACT_SHA256.to_owned()),
+        model_contract_sha256: skipped
+            .version
+            .as_ref()
+            .and_then(|value| value.model_contract_sha256.clone()),
+        model_artifact_sha256: skipped
+            .version
+            .as_ref()
+            .and_then(|value| value.model_artifact_sha256.clone()),
+        model_artifact_bytes: skipped
+            .version
+            .as_ref()
+            .and_then(|value| value.model_artifact_bytes),
+        runtime_fingerprint_sha256: skipped
+            .version
+            .as_ref()
+            .and_then(|value| value.runtime_fingerprint_sha256.clone()),
         executable_sha256: skipped.executable_sha256.clone(),
         version_stdout_sha256: skipped.version_stdout_sha256.clone(),
         oracle_stdout_sha256: skipped.oracle_stdout_sha256.clone(),
@@ -752,10 +1015,55 @@ pub fn verify_differential_report(report: &DifferentialOracleReport) -> FwResult
             "protocol or tool-family provenance is inconsistent",
         ));
     }
+    let has_version_attestation = report.provenance.tool_version.is_some();
+    if has_version_attestation != report.provenance.adapter_version.is_some() {
+        return Err(oracle_request_error(
+            "report_provenance",
+            "tool and adapter version attestations must appear together",
+        ));
+    }
+    let has_model_attestation = report.provenance.model_contract_sha256.is_some()
+        || report.provenance.model_artifact_sha256.is_some()
+        || report.provenance.model_artifact_bytes.is_some()
+        || report.provenance.runtime_fingerprint_sha256.is_some();
+    let model_contract_valid = if report.provenance.tool == DifferentialOracleTool::Sortformer {
+        report.provenance.expected_model_contract_sha256.as_deref()
+            == Some(SORTFORMER_ORACLE_CONTRACT_SHA256)
+            && if has_version_attestation {
+                report.provenance.tool_version.as_deref() == Some(SORTFORMER_ORACLE_TOOL_VERSION)
+                    && report.provenance.adapter_version.as_deref()
+                        == Some(SORTFORMER_ORACLE_ADAPTER_VERSION)
+                    && report.provenance.model_contract_sha256.as_deref()
+                        == Some(SORTFORMER_ORACLE_CONTRACT_SHA256)
+                    && report.provenance.model_artifact_sha256.as_deref()
+                        == Some(SORTFORMER_ORACLE_ARTIFACT_SHA256)
+                    && report.provenance.model_artifact_bytes
+                        == Some(SORTFORMER_ORACLE_ARTIFACT_BYTES)
+                    && report
+                        .provenance
+                        .runtime_fingerprint_sha256
+                        .as_deref()
+                        .is_some_and(is_sha256_hex)
+            } else {
+                !has_model_attestation
+            }
+    } else {
+        report.provenance.expected_model_contract_sha256.is_none() && !has_model_attestation
+    };
+    if !model_contract_valid {
+        return Err(oracle_request_error(
+            "report_model_contract",
+            "model provenance does not match the tool's frozen contract",
+        ));
+    }
     for hash in [
         Some(report.provenance.audio_sha256.as_str()),
         Some(report.provenance.native_document_sha256.as_str()),
         report.provenance.reference_document_sha256.as_deref(),
+        report.provenance.expected_model_contract_sha256.as_deref(),
+        report.provenance.model_contract_sha256.as_deref(),
+        report.provenance.model_artifact_sha256.as_deref(),
+        report.provenance.runtime_fingerprint_sha256.as_deref(),
         report.provenance.executable_sha256.as_deref(),
         report.provenance.version_stdout_sha256.as_deref(),
         report.provenance.oracle_stdout_sha256.as_deref(),
@@ -848,6 +1156,7 @@ pub fn verify_differential_report(report: &DifferentialOracleReport) -> FwResult
                     "skipped report state is inconsistent",
                 ));
             }
+            validate_skipped_report_provenance(report)?;
         }
     }
     if !is_sha256_hex(&report.result_sha256) {
@@ -867,6 +1176,104 @@ pub fn verify_differential_report(report: &DifferentialOracleReport) -> FwResult
     Ok(())
 }
 
+fn validate_skipped_report_provenance(report: &DifferentialOracleReport) -> FwResult<()> {
+    let reason = report
+        .skip_reason
+        .ok_or_else(|| oracle_request_error("skipped_report", "skip reason is missing"))?;
+    let stage = report
+        .failure_stage
+        .ok_or_else(|| oracle_request_error("skipped_report", "failure stage is missing"))?;
+    let reason_matches_stage = match reason {
+        DifferentialSkipReason::MissingExecutable => {
+            stage == DifferentialExecutionStage::ResolveExecutable
+        }
+        DifferentialSkipReason::UnreadableExecutable => matches!(
+            stage,
+            DifferentialExecutionStage::ResolveExecutable
+                | DifferentialExecutionStage::HashExecutable
+        ),
+        DifferentialSkipReason::InputContractMismatch => {
+            stage == DifferentialExecutionStage::InputValidation
+        }
+        DifferentialSkipReason::InputIdentityMismatch => matches!(
+            stage,
+            DifferentialExecutionStage::InputValidation
+                | DifferentialExecutionStage::InputPostRunValidation
+        ),
+        DifferentialSkipReason::ReferenceModelCapacityExceeded => {
+            stage == DifferentialExecutionStage::EligibilityValidation
+        }
+        DifferentialSkipReason::VersionProbeFailed
+        | DifferentialSkipReason::VersionProbeTimedOut => {
+            stage == DifferentialExecutionStage::VersionProbe
+        }
+        DifferentialSkipReason::InvalidVersionOutput
+        | DifferentialSkipReason::ProtocolVersionMismatch
+        | DifferentialSkipReason::ToolIdentityMismatch
+        | DifferentialSkipReason::ModelContractMismatch => {
+            stage == DifferentialExecutionStage::VersionValidation
+        }
+        DifferentialSkipReason::OracleRunFailed | DifferentialSkipReason::OracleRunTimedOut => {
+            stage == DifferentialExecutionStage::OracleRun
+        }
+        DifferentialSkipReason::InvalidOracleOutput
+        | DifferentialSkipReason::ModelCapacityExceeded
+        | DifferentialSkipReason::OracleIdentityMismatch => {
+            stage == DifferentialExecutionStage::OracleOutputValidation
+        }
+    };
+    if !reason_matches_stage {
+        return Err(oracle_request_error(
+            "skipped_report",
+            "skip reason and failure stage are inconsistent",
+        ));
+    }
+
+    let provenance = &report.provenance;
+    let has_executable = provenance.executable_sha256.is_some();
+    let has_version = provenance.tool_version.is_some();
+    let has_version_stdout = provenance.version_stdout_sha256.is_some();
+    let has_oracle_stdout = provenance.oracle_stdout_sha256.is_some();
+    let valid_presence = match stage {
+        DifferentialExecutionStage::EligibilityValidation => {
+            !has_executable && !has_version && !has_version_stdout && !has_oracle_stdout
+        }
+        DifferentialExecutionStage::ResolveExecutable => {
+            has_executable == (reason == DifferentialSkipReason::UnreadableExecutable)
+                && !has_version
+                && !has_version_stdout
+                && !has_oracle_stdout
+        }
+        DifferentialExecutionStage::HashExecutable => {
+            !has_executable && !has_version && !has_version_stdout && !has_oracle_stdout
+        }
+        DifferentialExecutionStage::InputValidation => {
+            has_executable && !has_version && !has_version_stdout && !has_oracle_stdout
+        }
+        DifferentialExecutionStage::VersionProbe => {
+            has_executable && !has_version && !has_version_stdout && !has_oracle_stdout
+        }
+        DifferentialExecutionStage::VersionValidation => {
+            has_executable && !has_version && has_version_stdout && !has_oracle_stdout
+        }
+        DifferentialExecutionStage::OracleRun => {
+            has_executable && has_version && has_version_stdout && !has_oracle_stdout
+        }
+        DifferentialExecutionStage::InputPostRunValidation
+        | DifferentialExecutionStage::OracleOutputValidation => {
+            has_executable && has_version && has_version_stdout && has_oracle_stdout
+        }
+    };
+    if !valid_presence {
+        return Err(oracle_request_error(
+            "skipped_report",
+            "failure stage and retained provenance are inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
 enum ExternalRunError {
     Cancelled(FwError),
     Skipped(ExternalSkip),
@@ -876,6 +1283,8 @@ fn execute_external(
     tool: DifferentialOracleTool,
     program: &ProgramSpec,
     audio_path: &Path,
+    expected_audio_sha256: &str,
+    expected_duration_ms: u64,
     recording_key: &str,
     hard_timeout: Duration,
     token: &CancellationToken,
@@ -889,6 +1298,24 @@ fn execute_external(
     })?;
     let executable_sha256 = hash_file(&executable_path, token)
         .map_err(|error| classify_hash_error(error, DifferentialExecutionStage::HashExecutable))?;
+    let executable_program = executable_path.to_str().ok_or_else(|| {
+        ExternalRunError::Skipped(
+            ExternalSkip::new(
+                DifferentialSkipReason::UnreadableExecutable,
+                DifferentialExecutionStage::ResolveExecutable,
+            )
+            .with_executable(&executable_sha256),
+        )
+    })?;
+    validate_tool_input(tool, audio_path, expected_duration_ms, token)
+        .map_err(|error| enrich_skip_with_executable(error, &executable_sha256))?;
+    validate_audio_identity(
+        audio_path,
+        expected_audio_sha256,
+        DifferentialExecutionStage::InputValidation,
+        token,
+    )
+    .map_err(|error| enrich_skip_with_executable(error, &executable_sha256))?;
 
     let mut version_args = program.prefix_args.clone();
     version_args.extend([
@@ -897,7 +1324,7 @@ fn execute_external(
         DIFFERENTIAL_ORACLE_PROTOCOL_VERSION.to_owned(),
     ]);
     let version_output = run_command_cancellable(
-        &program.program,
+        executable_program,
         &version_args,
         None,
         token,
@@ -945,17 +1372,39 @@ fn execute_external(
         "--recording-key".to_owned(),
         recording_key.to_owned(),
     ]);
-    let output =
-        run_command_cancellable(&program.program, &run_args, None, token, Some(hard_timeout))
-            .map_err(|error| {
-                enrich_skip_with_valid_version(
-                    classify_command_error(error, DifferentialExecutionStage::OracleRun),
-                    &executable_sha256,
-                    &version,
-                    &version_stdout_sha256,
-                )
-            })?;
+    let output = run_command_cancellable(
+        executable_program,
+        &run_args,
+        None,
+        token,
+        Some(hard_timeout),
+    )
+    .map_err(|error| {
+        enrich_skip_with_valid_version(
+            classify_command_error(error, DifferentialExecutionStage::OracleRun),
+            &executable_sha256,
+            &version,
+            &version_stdout_sha256,
+        )
+    })?;
     let oracle_stdout_sha256 = bytes_sha256(&output.stdout);
+    validate_audio_identity(
+        audio_path,
+        expected_audio_sha256,
+        DifferentialExecutionStage::InputPostRunValidation,
+        token,
+    )
+    .map_err(|error| {
+        enrich_skip_with_oracle_stdout(
+            enrich_skip_with_valid_version(
+                error,
+                &executable_sha256,
+                &version,
+                &version_stdout_sha256,
+            ),
+            &oracle_stdout_sha256,
+        )
+    })?;
     let oracle: DifferentialStageDocument =
         serde_json::from_slice(&output.stdout).map_err(|_| {
             ExternalRunError::Skipped(
@@ -968,7 +1417,10 @@ fn execute_external(
                 .with_oracle_stdout(&oracle_stdout_sha256),
             )
         })?;
-    validate_stage_document(&oracle).map_err(|_| {
+    validate_stage_document_with_token(&oracle, token).map_err(|error| {
+        if matches!(error, FwError::Cancelled(_)) {
+            return ExternalRunError::Cancelled(error);
+        }
         ExternalRunError::Skipped(
             ExternalSkip::new(
                 DifferentialSkipReason::InvalidOracleOutput,
@@ -979,6 +1431,16 @@ fn execute_external(
             .with_oracle_stdout(&oracle_stdout_sha256),
         )
     })?;
+    token.checkpoint().map_err(ExternalRunError::Cancelled)?;
+    validate_tool_stage_document(tool, &oracle).map_err(|reason| {
+        ExternalRunError::Skipped(
+            ExternalSkip::new(reason, DifferentialExecutionStage::OracleOutputValidation)
+                .with_executable(&executable_sha256)
+                .with_valid_version(&version, &version_stdout_sha256)
+                .with_oracle_stdout(&oracle_stdout_sha256),
+        )
+    })?;
+    token.checkpoint().map_err(ExternalRunError::Cancelled)?;
 
     Ok(ExternalSuccess {
         version,
@@ -1013,10 +1475,156 @@ fn validate_version_document(
     }
     if !is_safe_version_token(&version.tool_version)
         || !is_safe_version_token(&version.adapter_version)
+        || version
+            .model_contract_sha256
+            .as_deref()
+            .is_some_and(|value| !is_sha256_hex(value))
+        || version
+            .model_artifact_sha256
+            .as_deref()
+            .is_some_and(|value| !is_sha256_hex(value))
+        || version
+            .runtime_fingerprint_sha256
+            .as_deref()
+            .is_some_and(|value| !is_sha256_hex(value))
+        || version.model_artifact_bytes == Some(0)
     {
         return Err(ExternalRunError::Skipped(ExternalSkip::new(
             DifferentialSkipReason::InvalidVersionOutput,
             DifferentialExecutionStage::VersionValidation,
+        )));
+    }
+    if expected_tool != DifferentialOracleTool::Sortformer
+        && (version.model_contract_sha256.is_some()
+            || version.model_artifact_sha256.is_some()
+            || version.model_artifact_bytes.is_some()
+            || version.runtime_fingerprint.is_some()
+            || version.runtime_fingerprint_sha256.is_some())
+    {
+        return Err(ExternalRunError::Skipped(ExternalSkip::new(
+            DifferentialSkipReason::InvalidVersionOutput,
+            DifferentialExecutionStage::VersionValidation,
+        )));
+    }
+    let runtime_fingerprint_valid =
+        version
+            .runtime_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| {
+                validate_sortformer_runtime_fingerprint(fingerprint)
+                    && canonical_sha256(fingerprint).ok().as_deref()
+                        == version.runtime_fingerprint_sha256.as_deref()
+            });
+    if expected_tool == DifferentialOracleTool::Sortformer
+        && (version.tool_version != SORTFORMER_ORACLE_TOOL_VERSION
+            || version.adapter_version != SORTFORMER_ORACLE_ADAPTER_VERSION
+            || version.model_contract_sha256.as_deref() != Some(SORTFORMER_ORACLE_CONTRACT_SHA256)
+            || version.model_artifact_sha256.as_deref() != Some(SORTFORMER_ORACLE_ARTIFACT_SHA256)
+            || version.model_artifact_bytes != Some(SORTFORMER_ORACLE_ARTIFACT_BYTES)
+            || !runtime_fingerprint_valid)
+    {
+        return Err(ExternalRunError::Skipped(ExternalSkip::new(
+            DifferentialSkipReason::ModelContractMismatch,
+            DifferentialExecutionStage::VersionValidation,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sortformer_runtime_fingerprint(
+    fingerprint: &DifferentialOracleRuntimeFingerprint,
+) -> bool {
+    let contract = sortformer_oracle_contract();
+    let safe_tokens = [
+        fingerprint.python_version.as_str(),
+        fingerprint.nemo_version.as_str(),
+        fingerprint.torch_version.as_str(),
+        fingerprint.torchaudio_version.as_str(),
+        fingerprint.numpy_version.as_str(),
+        fingerprint.blas_backend.as_str(),
+        fingerprint.operating_system.as_str(),
+        fingerprint.machine_architecture.as_str(),
+        fingerprint.cpu_feature_tier.as_str(),
+    ];
+    fingerprint.schema_version == contract.runtime_fingerprint_schema
+        && safe_tokens.into_iter().all(is_safe_version_token)
+        && fingerprint.device == contract.device
+        && fingerprint.compute_dtype == contract.compute_dtype
+        && fingerprint.autocast == contract.autocast
+        && fingerprint.quantization == contract.quantization
+        && fingerprint.torch_intraop_threads == contract.torch_intraop_threads
+        && fingerprint.torch_interop_threads == contract.torch_interop_threads
+        && fingerprint.data_loader_workers == contract.data_loader_workers
+        && fingerprint.deterministic_algorithms == contract.deterministic_algorithms
+}
+
+fn validate_tool_input(
+    tool: DifferentialOracleTool,
+    audio_path: &Path,
+    expected_duration_ms: u64,
+    token: &CancellationToken,
+) -> Result<(), ExternalRunError> {
+    if tool != DifferentialOracleTool::Sortformer {
+        return Ok(());
+    }
+    token.checkpoint().map_err(ExternalRunError::Cancelled)?;
+    let mut reader = hound::WavReader::open(audio_path).map_err(|_| input_contract_error())?;
+    let spec = reader.spec();
+    if spec.channels != 1
+        || spec.sample_rate != 16_000
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        return Err(input_contract_error());
+    }
+    let mut sample_count = 0u64;
+    for sample in reader.samples::<i16>() {
+        if sample_count.is_multiple_of(64 * 1024) {
+            token.checkpoint().map_err(ExternalRunError::Cancelled)?;
+        }
+        sample.map_err(|_| input_contract_error())?;
+        sample_count = sample_count.saturating_add(1);
+    }
+    token.checkpoint().map_err(ExternalRunError::Cancelled)?;
+    let duration_ms = sample_count
+        .saturating_mul(1_000)
+        .checked_div(u64::from(spec.sample_rate))
+        .ok_or_else(input_contract_error)?;
+    if duration_ms.abs_diff(expected_duration_ms)
+        > u64::from(SORTFORMER_AUDIO_DURATION_TOLERANCE_MS)
+    {
+        return Err(input_contract_error());
+    }
+    Ok(())
+}
+
+fn input_contract_error() -> ExternalRunError {
+    ExternalRunError::Skipped(ExternalSkip::new(
+        DifferentialSkipReason::InputContractMismatch,
+        DifferentialExecutionStage::InputValidation,
+    ))
+}
+
+fn validate_audio_identity(
+    audio_path: &Path,
+    expected_audio_sha256: &str,
+    stage: DifferentialExecutionStage,
+    token: &CancellationToken,
+) -> Result<(), ExternalRunError> {
+    let observed = hash_file(audio_path, token).map_err(|error| {
+        if matches!(error, FwError::Cancelled(_)) {
+            ExternalRunError::Cancelled(error)
+        } else {
+            ExternalRunError::Skipped(ExternalSkip::new(
+                DifferentialSkipReason::InputIdentityMismatch,
+                stage,
+            ))
+        }
+    })?;
+    if observed != expected_audio_sha256 {
+        return Err(ExternalRunError::Skipped(ExternalSkip::new(
+            DifferentialSkipReason::InputIdentityMismatch,
+            stage,
         )));
     }
     Ok(())
@@ -1037,8 +1645,12 @@ fn classify_command_error(error: FwError, stage: DifferentialExecutionStage) -> 
     match error {
         FwError::Cancelled(_) => ExternalRunError::Cancelled(error),
         FwError::CommandMissing { .. } => ExternalRunError::Skipped(ExternalSkip::new(
-            DifferentialSkipReason::MissingExecutable,
-            DifferentialExecutionStage::ResolveExecutable,
+            if stage == DifferentialExecutionStage::VersionProbe {
+                DifferentialSkipReason::VersionProbeFailed
+            } else {
+                DifferentialSkipReason::OracleRunFailed
+            },
+            stage,
         )),
         FwError::CommandTimedOut { .. } => ExternalRunError::Skipped(ExternalSkip::new(
             if stage == DifferentialExecutionStage::VersionProbe {
@@ -1102,6 +1714,18 @@ fn enrich_skip_with_valid_version(
     }
 }
 
+fn enrich_skip_with_oracle_stdout(
+    error: ExternalRunError,
+    oracle_stdout_sha256: &str,
+) -> ExternalRunError {
+    match error {
+        ExternalRunError::Cancelled(_) => error,
+        ExternalRunError::Skipped(skipped) => {
+            ExternalRunError::Skipped(skipped.with_oracle_stdout(oracle_stdout_sha256))
+        }
+    }
+}
+
 fn resolve_program(tool: DifferentialOracleTool) -> ProgramSpec {
     let program = std::env::var_os(tool.executable_env())
         .and_then(|value| value.into_string().ok())
@@ -1127,10 +1751,10 @@ fn prepare_inputs(
         .map(|path| canonical_external_file(project_root, path, "reference_document"))
         .transpose()?;
     let native_bytes = read_capped(&native_path, MAX_DOCUMENT_BYTES, "native_document")?;
-    let native = parse_stage_document(&native_bytes)?;
+    let native = parse_stage_document_with_token(&native_bytes, token)?;
     let (reference, reference_sha256) = if let Some(path) = reference_path {
         let bytes = read_capped(&path, MAX_DOCUMENT_BYTES, "reference_document")?;
-        let document = parse_stage_document(&bytes)?;
+        let document = parse_stage_document_with_token(&bytes, token)?;
         if document.recording_key != native.recording_key
             || document.duration_ms != native.duration_ms
         {
@@ -1156,14 +1780,30 @@ fn prepare_inputs(
 
 /// Parse and validate one canonical transcript-free stage document.
 pub fn parse_stage_document(bytes: &[u8]) -> FwResult<DifferentialStageDocument> {
+    parse_stage_document_with_token(bytes, &CancellationToken::unbounded())
+}
+
+fn parse_stage_document_with_token(
+    bytes: &[u8],
+    token: &CancellationToken,
+) -> FwResult<DifferentialStageDocument> {
     let document = serde_json::from_slice(bytes)
         .map_err(|_| oracle_request_error("stage_json", "stage document is invalid"))?;
-    validate_stage_document(&document)?;
+    token.checkpoint()?;
+    validate_stage_document_with_token(&document, token)?;
     Ok(document)
 }
 
 /// Validate bounded geometry, opaque identities, confidences, and ordering.
 pub fn validate_stage_document(document: &DifferentialStageDocument) -> FwResult<()> {
+    validate_stage_document_with_token(document, &CancellationToken::unbounded())
+}
+
+fn validate_stage_document_with_token(
+    document: &DifferentialStageDocument,
+    token: &CancellationToken,
+) -> FwResult<()> {
+    token.checkpoint()?;
     if document.schema_version != DIFFERENTIAL_STAGE_DOCUMENT_SCHEMA {
         return Err(oracle_request_error(
             "stage_schema",
@@ -1188,6 +1828,7 @@ pub fn validate_stage_document(document: &DifferentialStageDocument) -> FwResult
             document.duration_ms,
             "speech_activity",
             MAX_INTERVALS,
+            token,
         )?;
     }
     if let Some(words) = &document.word_timing {
@@ -1198,7 +1839,10 @@ pub fn validate_stage_document(document: &DifferentialStageDocument) -> FwResult
             ));
         }
         let mut ids = BTreeSet::new();
-        for word in words {
+        for (index, word) in words.iter().enumerate() {
+            if index.is_multiple_of(4_096) {
+                token.checkpoint()?;
+            }
             validate_geometry(
                 word.start_ms,
                 word.end_ms,
@@ -1238,7 +1882,10 @@ pub fn validate_stage_document(document: &DifferentialStageDocument) -> FwResult
             ));
         }
         let mut ids = BTreeSet::new();
-        for assignment in assignments {
+        for (index, assignment) in assignments.iter().enumerate() {
+            if index.is_multiple_of(4_096) {
+                token.checkpoint()?;
+            }
             validate_geometry(
                 assignment.start_ms,
                 assignment.end_ms,
@@ -1260,7 +1907,13 @@ pub fn validate_stage_document(document: &DifferentialStageDocument) -> FwResult
         }
     }
     if let Some(intervals) = &document.overlap {
-        validate_disjoint_intervals(intervals, document.duration_ms, "overlap", MAX_INTERVALS)?;
+        validate_disjoint_intervals(
+            intervals,
+            document.duration_ms,
+            "overlap",
+            MAX_INTERVALS,
+            token,
+        )?;
     }
     if let Some(turns) = &document.final_projection {
         if turns.len() > MAX_TURNS {
@@ -1269,9 +1922,204 @@ pub fn validate_stage_document(document: &DifferentialStageDocument) -> FwResult
                 "final projection exceeds the supported turn count",
             ));
         }
-        let _ = turns_to_scoring(turns, document.duration_ms, false)?;
+        let _ = turns_to_scoring(turns, document.duration_ms, false, token)?;
+    }
+    token.checkpoint()?;
+    Ok(())
+}
+
+fn validate_tool_stage_document(
+    tool: DifferentialOracleTool,
+    document: &DifferentialStageDocument,
+) -> Result<(), DifferentialSkipReason> {
+    if tool != DifferentialOracleTool::Sortformer {
+        return Ok(());
+    }
+    let Some(turns) = document.final_projection.as_deref() else {
+        return Err(DifferentialSkipReason::InvalidOracleOutput);
+    };
+    if document.speech_activity.is_none()
+        || document.change_boundaries_ms.is_none()
+        || document.overlap.is_none()
+        || document.word_timing.is_some()
+        || document.cluster_assignments.is_some()
+    {
+        return Err(DifferentialSkipReason::InvalidOracleOutput);
+    }
+
+    let labels = turns
+        .iter()
+        .filter_map(|turn| turn.speaker.as_deref())
+        .collect::<BTreeSet<_>>();
+    if labels.len() > SORTFORMER_ORACLE_MAX_SPEAKERS {
+        return Err(DifferentialSkipReason::ModelCapacityExceeded);
+    }
+    if turns
+        .iter()
+        .any(|turn| turn.speaker.is_none() || turn.overlap_suspected)
+    {
+        return Err(DifferentialSkipReason::InvalidOracleOutput);
+    }
+    let mut speaker_indices = BTreeSet::new();
+    for label in &labels {
+        let Some(suffix) = label.strip_prefix("speaker_") else {
+            return Err(DifferentialSkipReason::InvalidOracleOutput);
+        };
+        let Ok(index) = suffix.parse::<usize>() else {
+            return Err(DifferentialSkipReason::InvalidOracleOutput);
+        };
+        if index >= SORTFORMER_ORACLE_MAX_SPEAKERS || *label != format!("speaker_{index}") {
+            return Err(DifferentialSkipReason::InvalidOracleOutput);
+        }
+        speaker_indices.insert(index);
+    }
+    if !speaker_indices.iter().copied().eq(0..speaker_indices.len()) {
+        return Err(DifferentialSkipReason::InvalidOracleOutput);
+    }
+    if !turns.windows(2).all(|window| {
+        window
+            .first()
+            .zip(window.get(1))
+            .is_some_and(|(left, right)| {
+                (left.start_ms, left.end_ms, left.speaker.as_deref())
+                    <= (right.start_ms, right.end_ms, right.speaker.as_deref())
+            })
+    }) {
+        return Err(DifferentialSkipReason::InvalidOracleOutput);
+    }
+    let mut prior_end_by_speaker = BTreeMap::<&str, u64>::new();
+    let mut first_onset_by_speaker_index = BTreeMap::<usize, u64>::new();
+    for turn in turns {
+        let label = turn
+            .speaker
+            .as_deref()
+            .ok_or(DifferentialSkipReason::InvalidOracleOutput)?;
+        let output_frame_ms = u64::from(SORTFORMER_ORACLE_OUTPUT_FRAME_MS);
+        if turn.start_ms % output_frame_ms != 0
+            || (turn.end_ms != document.duration_ms && turn.end_ms % output_frame_ms != 0)
+        {
+            return Err(DifferentialSkipReason::InvalidOracleOutput);
+        }
+        let index = label
+            .strip_prefix("speaker_")
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or(DifferentialSkipReason::InvalidOracleOutput)?;
+        first_onset_by_speaker_index
+            .entry(index)
+            .and_modify(|onset| *onset = (*onset).min(turn.start_ms))
+            .or_insert(turn.start_ms);
+        if prior_end_by_speaker
+            .insert(label, turn.end_ms)
+            .is_some_and(|prior_end| turn.start_ms < prior_end)
+        {
+            return Err(DifferentialSkipReason::InvalidOracleOutput);
+        }
+    }
+    let mut onsets = first_onset_by_speaker_index.values().copied();
+    let mut prior_onset = onsets.next();
+    if onsets.any(|onset| {
+        let out_of_order = prior_onset.is_some_and(|prior| prior > onset);
+        prior_onset = Some(onset);
+        out_of_order
+    }) {
+        return Err(DifferentialSkipReason::InvalidOracleOutput);
+    }
+    if document
+        .change_boundaries_ms
+        .as_ref()
+        .is_some_and(|changes| {
+            changes
+                .iter()
+                .any(|point| point % u64::from(SORTFORMER_ORACLE_OUTPUT_FRAME_MS) != 0)
+        })
+    {
+        return Err(DifferentialSkipReason::InvalidOracleOutput);
+    }
+    let (derived_speech_activity, derived_overlap, derived_change_boundaries) =
+        derive_sortformer_stages(turns).ok_or(DifferentialSkipReason::InvalidOracleOutput)?;
+    if document.change_boundaries_ms.as_deref() != Some(derived_change_boundaries.as_slice()) {
+        return Err(DifferentialSkipReason::InvalidOracleOutput);
+    }
+    if document.speech_activity.as_deref() != Some(derived_speech_activity.as_slice())
+        || document.overlap.as_deref() != Some(derived_overlap.as_slice())
+    {
+        return Err(DifferentialSkipReason::InvalidOracleOutput);
     }
     Ok(())
+}
+
+fn derive_sortformer_stages(
+    turns: &[EvaluationTurn],
+) -> Option<(
+    Vec<DifferentialInterval>,
+    Vec<DifferentialInterval>,
+    Vec<u64>,
+)> {
+    let mut events = BTreeMap::<u64, BTreeMap<&str, i32>>::new();
+    for turn in turns {
+        let speaker = turn.speaker.as_deref()?;
+        *events
+            .entry(turn.start_ms)
+            .or_default()
+            .entry(speaker)
+            .or_default() += 1;
+        *events
+            .entry(turn.end_ms)
+            .or_default()
+            .entry(speaker)
+            .or_default() -= 1;
+    }
+
+    let mut active = BTreeMap::<&str, i32>::new();
+    let mut speech = Vec::new();
+    let mut overlap = Vec::new();
+    let mut change_boundaries = Vec::new();
+    let mut previous_ms = None;
+    for (point_ms, deltas) in events {
+        if let Some(start_ms) = previous_ms
+            && start_ms < point_ms
+        {
+            if !active.is_empty() {
+                push_merged_interval(&mut speech, start_ms, point_ms);
+            }
+            if active.len() >= 2 {
+                push_merged_interval(&mut overlap, start_ms, point_ms);
+            }
+        }
+        let active_before = !active.is_empty();
+        let mut membership_changed = false;
+        for (speaker, delta) in deltas {
+            let was_active = active.contains_key(speaker);
+            let next = active.get(speaker).copied().unwrap_or(0) + delta;
+            match next {
+                0 => {
+                    active.remove(speaker);
+                }
+                1 => {
+                    active.insert(speaker, next);
+                }
+                _ => return None,
+            }
+            membership_changed |= was_active != active.contains_key(speaker);
+        }
+        if active_before && !active.is_empty() && membership_changed {
+            change_boundaries.push(point_ms);
+        }
+        previous_ms = Some(point_ms);
+    }
+    active
+        .is_empty()
+        .then_some((speech, overlap, change_boundaries))
+}
+
+fn push_merged_interval(intervals: &mut Vec<DifferentialInterval>, start_ms: u64, end_ms: u64) {
+    if let Some(last) = intervals.last_mut()
+        && last.end_ms == start_ms
+    {
+        last.end_ms = end_ms;
+        return;
+    }
+    intervals.push(DifferentialInterval { start_ms, end_ms });
 }
 
 fn validate_comparison_config(config: &DifferentialComparisonConfig) -> FwResult<()> {
@@ -1323,8 +2171,26 @@ pub fn compare_documents(
     reference: Option<&DifferentialStageDocument>,
     config: &DifferentialComparisonConfig,
 ) -> FwResult<Vec<DifferentialStageComparison>> {
-    validate_stage_document(native)?;
-    validate_stage_document(oracle)?;
+    compare_documents_with_token(
+        native,
+        oracle,
+        reference,
+        config,
+        &CancellationToken::unbounded(),
+    )
+}
+
+fn compare_documents_with_token(
+    native: &DifferentialStageDocument,
+    oracle: &DifferentialStageDocument,
+    reference: Option<&DifferentialStageDocument>,
+    config: &DifferentialComparisonConfig,
+    token: &CancellationToken,
+) -> FwResult<Vec<DifferentialStageComparison>> {
+    validate_stage_document_with_token(native, token)?;
+    validate_stage_document_with_token(oracle, token)?;
+    validate_comparison_complexity(native, "native")?;
+    validate_comparison_complexity(oracle, "oracle")?;
     validate_comparison_config(config)?;
     if native.recording_key != oracle.recording_key || native.duration_ms != oracle.duration_ms {
         return Err(oracle_request_error(
@@ -1333,7 +2199,8 @@ pub fn compare_documents(
         ));
     }
     if let Some(reference) = reference {
-        validate_stage_document(reference)?;
+        validate_stage_document_with_token(reference, token)?;
+        validate_comparison_complexity(reference, "reference")?;
         if reference.recording_key != native.recording_key
             || reference.duration_ms != native.duration_ms
         {
@@ -1344,54 +2211,98 @@ pub fn compare_documents(
         }
     }
 
-    let comparisons = vec![
-        compare_interval_stage(
-            DifferentialStage::SpeechActivity,
-            native.speech_activity.as_deref(),
-            oracle.speech_activity.as_deref(),
-            reference.and_then(|value| value.speech_activity.as_deref()),
-            reference.is_some(),
-            config,
-        ),
-        compare_word_stage(
-            native.word_timing.as_deref(),
-            oracle.word_timing.as_deref(),
-            reference.and_then(|value| value.word_timing.as_deref()),
-            reference.is_some(),
-            config,
-        ),
-        compare_change_stage(
-            native.change_boundaries_ms.as_deref(),
-            oracle.change_boundaries_ms.as_deref(),
-            reference.and_then(|value| value.change_boundaries_ms.as_deref()),
-            reference.is_some(),
-            config,
-        )?,
-        compare_cluster_stage(
-            native.cluster_assignments.as_deref(),
-            oracle.cluster_assignments.as_deref(),
-            reference.and_then(|value| value.cluster_assignments.as_deref()),
-            reference.is_some(),
-            config,
-        ),
-        compare_interval_stage(
-            DifferentialStage::Overlap,
-            native.overlap.as_deref(),
-            oracle.overlap.as_deref(),
-            reference.and_then(|value| value.overlap.as_deref()),
-            reference.is_some(),
-            config,
-        ),
-        compare_projection_stage(
-            native.final_projection.as_deref(),
-            oracle.final_projection.as_deref(),
-            reference.and_then(|value| value.final_projection.as_deref()),
-            native.duration_ms,
-            reference.is_some(),
-            config,
-        )?,
-    ];
+    let mut comparisons = Vec::with_capacity(6);
+    token.checkpoint()?;
+    comparisons.push(compare_interval_stage(
+        DifferentialStage::SpeechActivity,
+        native.speech_activity.as_deref(),
+        oracle.speech_activity.as_deref(),
+        reference.and_then(|value| value.speech_activity.as_deref()),
+        reference.is_some(),
+        config,
+    ));
+    token.checkpoint()?;
+    comparisons.push(compare_word_stage(
+        native.word_timing.as_deref(),
+        oracle.word_timing.as_deref(),
+        reference.and_then(|value| value.word_timing.as_deref()),
+        reference.is_some(),
+        config,
+    ));
+    token.checkpoint()?;
+    comparisons.push(compare_change_stage(
+        native.change_boundaries_ms.as_deref(),
+        oracle.change_boundaries_ms.as_deref(),
+        reference.and_then(|value| value.change_boundaries_ms.as_deref()),
+        reference.is_some(),
+        config,
+    )?);
+    token.checkpoint()?;
+    comparisons.push(compare_cluster_stage(
+        native.cluster_assignments.as_deref(),
+        oracle.cluster_assignments.as_deref(),
+        reference.and_then(|value| value.cluster_assignments.as_deref()),
+        reference.is_some(),
+        config,
+    ));
+    token.checkpoint()?;
+    comparisons.push(compare_interval_stage(
+        DifferentialStage::Overlap,
+        native.overlap.as_deref(),
+        oracle.overlap.as_deref(),
+        reference.and_then(|value| value.overlap.as_deref()),
+        reference.is_some(),
+        config,
+    ));
+    token.checkpoint()?;
+    comparisons.push(compare_projection_stage(
+        native.final_projection.as_deref(),
+        oracle.final_projection.as_deref(),
+        reference.and_then(|value| value.final_projection.as_deref()),
+        native.duration_ms,
+        reference.is_some(),
+        config,
+        token,
+    )?);
+    token.checkpoint()?;
     Ok(comparisons)
+}
+
+fn validate_comparison_complexity(
+    document: &DifferentialStageDocument,
+    role: &str,
+) -> FwResult<()> {
+    if document
+        .change_boundaries_ms
+        .as_ref()
+        .is_some_and(|changes| changes.len() > MAX_COMPARISON_CHANGE_POINTS)
+    {
+        return Err(oracle_request_error(
+            "comparison_change_count",
+            &format!("{role} change-point count exceeds the safe comparison cap"),
+        ));
+    }
+    if let Some(turns) = &document.final_projection {
+        if turns.len() > MAX_COMPARISON_TURNS {
+            return Err(oracle_request_error(
+                "comparison_turn_count",
+                &format!("{role} turn count exceeds the safe comparison cap"),
+            ));
+        }
+        let mut speakers = turns
+            .iter()
+            .filter_map(|turn| turn.speaker.as_deref())
+            .collect::<BTreeSet<_>>()
+            .len();
+        speakers += usize::from(turns.iter().any(|turn| turn.speaker.is_none()));
+        if speakers > MAX_COMPARISON_SPEAKERS {
+            return Err(oracle_request_error(
+                "comparison_speaker_count",
+                &format!("{role} speaker count exceeds the safe comparison cap"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn compare_interval_stage(
@@ -1536,6 +2447,7 @@ fn compare_projection_stage(
     duration_ms: u64,
     reference_document_present: bool,
     config: &DifferentialComparisonConfig,
+    token: &CancellationToken,
 ) -> FwResult<DifferentialStageComparison> {
     compare_optional_stage_fallible(
         DifferentialStage::FinalProjection,
@@ -1545,9 +2457,11 @@ fn compare_projection_stage(
         reference_document_present,
         config,
         |left, right| {
-            let left_scoring = turns_to_scoring(left, duration_ms, true)?;
-            let right_scoring = turns_to_scoring(right, duration_ms, true)?;
+            token.checkpoint()?;
+            let left_scoring = turns_to_scoring(left, duration_ms, true, token)?;
+            let right_scoring = turns_to_scoring(right, duration_ms, true, token)?;
             let score = score_diarization(&left_scoring, &right_scoring)?;
+            token.checkpoint()?;
             let native_unknown = merged_turn_intervals(left, true);
             let oracle_unknown = merged_turn_intervals(right, true);
             let unknown_score = score_intervals(&native_unknown, &oracle_unknown);
@@ -1965,10 +2879,15 @@ fn turns_to_scoring(
     turns: &[EvaluationTurn],
     duration_ms: u64,
     materialize_unknown: bool,
+    token: &CancellationToken,
 ) -> FwResult<Vec<ScoringTurn>> {
     turns
         .iter()
-        .map(|turn| {
+        .enumerate()
+        .map(|(index, turn)| {
+            if index.is_multiple_of(4_096) {
+                token.checkpoint()?;
+            }
             validate_geometry(turn.start_ms, turn.end_ms, duration_ms, "final_projection")?;
             if let Some(label) = &turn.speaker
                 && !is_safe_label(label)
@@ -2051,6 +2970,7 @@ fn validate_disjoint_intervals(
     duration_ms: u64,
     field: &str,
     maximum: usize,
+    token: &CancellationToken,
 ) -> FwResult<()> {
     if intervals.len() > maximum {
         return Err(oracle_request_error(
@@ -2060,6 +2980,9 @@ fn validate_disjoint_intervals(
     }
     let mut prior_end = 0u64;
     for (index, interval) in intervals.iter().enumerate() {
+        if index.is_multiple_of(4_096) {
+            token.checkpoint()?;
+        }
         validate_geometry(interval.start_ms, interval.end_ms, duration_ms, field)?;
         if index > 0 && interval.start_ms < prior_end {
             return Err(oracle_request_error(
@@ -2207,7 +3130,48 @@ fn bytes_sha256(bytes: &[u8]) -> String {
 }
 
 fn canonical_sha256<T: Serialize>(value: &T) -> FwResult<String> {
-    Ok(bytes_sha256(&serde_json::to_vec(value)?))
+    Ok(bytes_sha256(&canonical_json_bytes(value)?))
+}
+
+fn canonical_json_bytes<T: Serialize>(value: &T) -> FwResult<Vec<u8>> {
+    let value = serde_json::to_value(value)?;
+    let mut output = Vec::new();
+    write_lexicographic_json(&value, &mut output)?;
+    Ok(output)
+}
+
+fn write_lexicographic_json(value: &serde_json::Value, output: &mut Vec<u8>) -> FwResult<()> {
+    match value {
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => serde_json::to_writer(output, value)?,
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, item) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                write_lexicographic_json(item, output)?;
+            }
+            output.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push(b'{');
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (index, (key, item)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key)?;
+                output.push(b':');
+                write_lexicographic_json(item, output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
 }
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
@@ -2310,6 +3274,58 @@ mod tests {
                 .len(),
             3
         );
+        assert!(registry.iter().all(|entry| {
+            (entry.tool == DifferentialOracleTool::Sortformer) == entry.model_contract.is_some()
+                && (entry.tool == DifferentialOracleTool::Sortformer)
+                    == entry.model_contract_sha256.is_some()
+        }));
+    }
+
+    #[test]
+    fn sortformer_registry_pins_canonical_model_contract() {
+        let contract = sortformer_oracle_contract();
+        assert_eq!(
+            canonical_sha256(&contract).expect("contract hash"),
+            SORTFORMER_ORACLE_CONTRACT_SHA256
+        );
+        assert_eq!(contract.model_id, SORTFORMER_ORACLE_MODEL_ID);
+        assert_eq!(contract.model_revision, SORTFORMER_ORACLE_MODEL_REVISION);
+        assert_eq!(contract.maximum_speakers, 4);
+        assert_eq!(contract.output_frame_ms, 80);
+        assert_eq!(contract.device, "cpu");
+        assert_eq!(contract.compute_dtype, "float32");
+        assert!(!contract.autocast);
+        assert_eq!(contract.quantization, "none");
+        assert_eq!(
+            contract.canonical_json_version,
+            DIFFERENTIAL_CANONICAL_JSON_VERSION
+        );
+        assert_eq!(
+            contract.upstream_artifact_sha256,
+            SORTFORMER_ORACLE_ARTIFACT_SHA256
+        );
+        assert_eq!(contract.nominal_input_buffer_latency_ms, 30_400);
+    }
+
+    #[test]
+    fn canonical_json_is_compact_and_lexicographically_keyed() {
+        let left: serde_json::Value =
+            serde_json::from_str(r#"{"z":[{"b":2,"a":1}],"a":"value"}"#).expect("left JSON");
+        let right: serde_json::Value =
+            serde_json::from_str(r#"{"a":"value","z":[{"a":1,"b":2}]}"#).expect("right JSON");
+        let expected = br#"{"a":"value","z":[{"a":1,"b":2}]}"#;
+        assert_eq!(
+            canonical_json_bytes(&left).expect("canonical left"),
+            expected
+        );
+        assert_eq!(
+            canonical_json_bytes(&right).expect("canonical right"),
+            expected
+        );
+        assert_eq!(
+            canonical_sha256(&left).expect("left hash"),
+            canonical_sha256(&right).expect("right hash")
+        );
     }
 
     #[test]
@@ -2321,6 +3337,117 @@ mod tests {
         let mut lexical = document();
         lexical.word_timing.as_mut().expect("words")[0].word_id = "hello".to_owned();
         assert!(validate_stage_document(&lexical).is_err());
+    }
+
+    #[test]
+    fn sortformer_stage_contract_rejects_nonfinite_unknown_and_over_capacity_output() {
+        let mut nonfinite = sortformer_document();
+        nonfinite.final_projection.as_mut().expect("projection")[0].speaker_confidence =
+            Some(f64::NAN);
+        assert!(validate_stage_document(&nonfinite).is_err());
+
+        let mut unknown = sortformer_document();
+        unknown.final_projection.as_mut().expect("projection")[0] =
+            EvaluationTurn::unknown(100, 1_000);
+        assert_eq!(
+            validate_tool_stage_document(DifferentialOracleTool::Sortformer, &unknown),
+            Err(DifferentialSkipReason::InvalidOracleOutput)
+        );
+
+        let mut over_capacity = sortformer_document();
+        over_capacity.final_projection = Some(
+            (0..=SORTFORMER_ORACLE_MAX_SPEAKERS)
+                .map(|index| {
+                    EvaluationTurn::labeled(
+                        u64::try_from(index).expect("index") * 100,
+                        u64::try_from(index + 1).expect("index") * 100,
+                        format!("speaker_{index}"),
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(
+            validate_tool_stage_document(DifferentialOracleTool::Sortformer, &over_capacity),
+            Err(DifferentialSkipReason::ModelCapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn sortformer_stage_contract_enforces_frame_order_and_cross_stage_consistency() {
+        let mut wrong_arrival_order = sortformer_document();
+        let turns = wrong_arrival_order
+            .final_projection
+            .as_mut()
+            .expect("projection");
+        turns[0].speaker = Some("speaker_1".to_owned());
+        turns[1].speaker = Some("speaker_0".to_owned());
+        assert_eq!(
+            validate_tool_stage_document(DifferentialOracleTool::Sortformer, &wrong_arrival_order),
+            Err(DifferentialSkipReason::InvalidOracleOutput)
+        );
+
+        let mut unaligned = sortformer_document();
+        unaligned.final_projection.as_mut().expect("projection")[0].start_ms = 161;
+        unaligned.speech_activity = Some(vec![interval(161, 1_920)]);
+        assert_eq!(
+            validate_tool_stage_document(DifferentialOracleTool::Sortformer, &unaligned),
+            Err(DifferentialSkipReason::InvalidOracleOutput)
+        );
+
+        let mut contradictory_activity = sortformer_document();
+        contradictory_activity.speech_activity = Some(vec![interval(160, 960)]);
+        assert_eq!(
+            validate_tool_stage_document(
+                DifferentialOracleTool::Sortformer,
+                &contradictory_activity
+            ),
+            Err(DifferentialSkipReason::InvalidOracleOutput)
+        );
+
+        let mut contradictory_overlap = sortformer_document();
+        contradictory_overlap.overlap = Some(vec![interval(160, 240)]);
+        assert_eq!(
+            validate_tool_stage_document(
+                DifferentialOracleTool::Sortformer,
+                &contradictory_overlap
+            ),
+            Err(DifferentialSkipReason::InvalidOracleOutput)
+        );
+
+        let mut contradictory_change = sortformer_document();
+        contradictory_change.change_boundaries_ms = Some(vec![800]);
+        assert_eq!(
+            validate_tool_stage_document(DifferentialOracleTool::Sortformer, &contradictory_change),
+            Err(DifferentialSkipReason::InvalidOracleOutput)
+        );
+
+        let mut flagged_overlap = sortformer_document();
+        flagged_overlap
+            .final_projection
+            .as_mut()
+            .expect("projection")[0]
+            .overlap_suspected = true;
+        assert_eq!(
+            validate_tool_stage_document(DifferentialOracleTool::Sortformer, &flagged_overlap),
+            Err(DifferentialSkipReason::InvalidOracleOutput)
+        );
+    }
+
+    #[test]
+    fn sortformer_arrival_order_allows_simultaneous_first_onsets() {
+        let mut document = sortformer_document();
+        document.speech_activity = Some(vec![interval(160, 960)]);
+        document.change_boundaries_ms = Some(vec![480]);
+        document.overlap = Some(vec![interval(160, 480)]);
+        document.final_projection = Some(vec![
+            EvaluationTurn::labeled(160, 480, "speaker_1"),
+            EvaluationTurn::labeled(160, 960, "speaker_0"),
+        ]);
+        validate_stage_document(&document).expect("valid generic geometry");
+        assert_eq!(
+            validate_tool_stage_document(DifferentialOracleTool::Sortformer, &document),
+            Ok(())
+        );
     }
 
     #[test]
@@ -2350,6 +3477,101 @@ mod tests {
         assert_eq!(score.intersection_ms, 50);
         assert_eq!(score.union_ms, 150);
         assert!((score.iou.expect("iou") - 1.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn comparison_rejects_quadratic_workloads_before_scoring() {
+        let mut excessive_changes = document();
+        excessive_changes.duration_ms = 10_000;
+        excessive_changes.change_boundaries_ms = Some(
+            (1..=u64::try_from(MAX_COMPARISON_CHANGE_POINTS + 1).expect("change cap")).collect(),
+        );
+        assert!(
+            compare_documents(
+                &excessive_changes,
+                &excessive_changes,
+                None,
+                &DifferentialComparisonConfig::default()
+            )
+            .is_err()
+        );
+
+        let mut excessive_speakers = document();
+        excessive_speakers.final_projection = Some(
+            (0..=MAX_COMPARISON_SPEAKERS)
+                .map(|index| {
+                    EvaluationTurn::labeled(
+                        u64::try_from(index).expect("index") * 10,
+                        u64::try_from(index + 1).expect("index") * 10,
+                        format!("speaker_{index}"),
+                    )
+                })
+                .collect(),
+        );
+        assert!(
+            compare_documents(
+                &excessive_speakers,
+                &excessive_speakers,
+                None,
+                &DifferentialComparisonConfig::default()
+            )
+            .is_err()
+        );
+
+        let mut excessive_turns = document();
+        excessive_turns.duration_ms = 10_000;
+        excessive_turns.final_projection = Some(
+            (0..=MAX_COMPARISON_TURNS)
+                .map(|index| {
+                    EvaluationTurn::labeled(
+                        u64::try_from(index).expect("index"),
+                        u64::try_from(index + 1).expect("index"),
+                        "speaker_0",
+                    )
+                })
+                .collect(),
+        );
+        assert!(
+            compare_documents(
+                &excessive_turns,
+                &excessive_turns,
+                None,
+                &DifferentialComparisonConfig::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn command_disappearance_is_attributed_to_the_attempted_stage() {
+        let version_error = classify_command_error(
+            FwError::CommandMissing {
+                command: "disappeared".to_owned(),
+            },
+            DifferentialExecutionStage::VersionProbe,
+        );
+        assert!(matches!(
+            version_error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::VersionProbeFailed,
+                stage: DifferentialExecutionStage::VersionProbe,
+                ..
+            })
+        ));
+        let run_error = classify_command_error(
+            FwError::CommandMissing {
+                command: "disappeared".to_owned(),
+            },
+            DifferentialExecutionStage::OracleRun,
+        );
+        assert!(matches!(
+            run_error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::OracleRunFailed,
+                stage: DifferentialExecutionStage::OracleRun,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2605,6 +3827,103 @@ mod tests {
             Some(DifferentialSkipReason::MissingExecutable)
         );
         assert!(!report.native_incorrectness_claim_permitted);
+        let mut forged = report;
+        forged.provenance.version_stdout_sha256 = Some(bytes_sha256(b"impossible"));
+        forged.result_sha256.clear();
+        forged.result_sha256 = canonical_sha256(&forged).expect("forged self hash");
+        assert!(verify_differential_report(&forged).is_err());
+    }
+
+    #[test]
+    fn sortformer_over_capacity_reference_is_retained_as_ineligible() {
+        let native = sortformer_document();
+        let mut reference = native.clone();
+        reference.final_projection = Some(
+            (0..=SORTFORMER_ORACLE_MAX_SPEAKERS)
+                .map(|index| {
+                    EvaluationTurn::labeled(
+                        u64::try_from(index).expect("index") * 100,
+                        u64::try_from(index + 1).expect("index") * 100,
+                        format!("reference_{index}"),
+                    )
+                })
+                .collect(),
+        );
+        let prepared = PreparedInputs {
+            audio_path: PathBuf::from("/does/not/need/to/exist.wav"),
+            native,
+            reference: Some(reference),
+            audio_sha256: bytes_sha256(b"audio"),
+            native_sha256: bytes_sha256(b"native"),
+            reference_sha256: Some(bytes_sha256(b"reference")),
+        };
+        let report = build_report(
+            DifferentialOracleTool::Sortformer,
+            &ProgramSpec {
+                program: "franken-whisper-definitely-missing-oracle".to_owned(),
+                prefix_args: Vec::new(),
+            },
+            &prepared,
+            Duration::from_secs(1),
+            DifferentialComparisonConfig::default(),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("capacity skip report");
+        assert_eq!(report.status, DifferentialRunStatus::Skipped);
+        assert_eq!(
+            report.skip_reason,
+            Some(DifferentialSkipReason::ReferenceModelCapacityExceeded)
+        );
+        assert_eq!(
+            report.failure_stage,
+            Some(DifferentialExecutionStage::EligibilityValidation)
+        );
+        assert_eq!(
+            report.provenance.expected_model_contract_sha256.as_deref(),
+            Some(SORTFORMER_ORACLE_CONTRACT_SHA256)
+        );
+        assert!(report.provenance.model_contract_sha256.is_none());
+        assert!(report.provenance.model_artifact_sha256.is_none());
+        assert!(report.provenance.runtime_fingerprint_sha256.is_none());
+        verify_differential_report(&report).expect("verified capacity skip");
+    }
+
+    #[test]
+    fn cancellation_precedes_sortformer_capacity_eligibility_skip() {
+        let native = sortformer_document();
+        let mut reference = native.clone();
+        reference.final_projection = Some(
+            (0..=SORTFORMER_ORACLE_MAX_SPEAKERS)
+                .map(|index| {
+                    EvaluationTurn::labeled(
+                        u64::try_from(index).expect("index") * 100,
+                        u64::try_from(index + 1).expect("index") * 100,
+                        format!("reference_{index}"),
+                    )
+                })
+                .collect(),
+        );
+        let prepared = PreparedInputs {
+            audio_path: PathBuf::from("/does/not/need/to/exist.wav"),
+            native,
+            reference: Some(reference),
+            audio_sha256: bytes_sha256(b"audio"),
+            native_sha256: bytes_sha256(b"native"),
+            reference_sha256: Some(bytes_sha256(b"reference")),
+        };
+        let error = build_report(
+            DifferentialOracleTool::Sortformer,
+            &ProgramSpec {
+                program: "franken-whisper-definitely-missing-oracle".to_owned(),
+                prefix_args: Vec::new(),
+            },
+            &prepared,
+            Duration::from_secs(1),
+            DifferentialComparisonConfig::default(),
+            &CancellationToken::already_expired(),
+        )
+        .expect_err("cancel before capacity classification");
+        assert!(matches!(error, FwError::Cancelled(_)));
     }
 
     fn shell_program(script: String) -> ProgramSpec {
@@ -2614,15 +3933,81 @@ mod tests {
         }
     }
 
+    fn sortformer_runtime_fingerprint() -> DifferentialOracleRuntimeFingerprint {
+        DifferentialOracleRuntimeFingerprint {
+            schema_version: "sortformer-runtime-fingerprint-v1".to_owned(),
+            python_version: "3.13.5".to_owned(),
+            nemo_version: "2.6.0".to_owned(),
+            torch_version: "2.8.0".to_owned(),
+            torchaudio_version: "2.8.0".to_owned(),
+            numpy_version: "2.3.1".to_owned(),
+            blas_backend: "accelerate".to_owned(),
+            operating_system: "macos-15.5".to_owned(),
+            machine_architecture: "aarch64".to_owned(),
+            cpu_feature_tier: "neon-dotprod".to_owned(),
+            device: "cpu".to_owned(),
+            compute_dtype: "float32".to_owned(),
+            autocast: false,
+            quantization: "none".to_owned(),
+            torch_intraop_threads: 8,
+            torch_interop_threads: 1,
+            data_loader_workers: 0,
+            deterministic_algorithms: true,
+        }
+    }
+
     fn version_json(tool: DifferentialOracleTool) -> String {
-        serde_json::json!({
+        let mut version = serde_json::json!({
             "schema_version": DIFFERENTIAL_ORACLE_VERSION_SCHEMA,
             "protocol_version": DIFFERENTIAL_ORACLE_PROTOCOL_VERSION,
             "tool": tool,
             "tool_version": "1.2.3",
             "adapter_version": "adapter-1"
-        })
-        .to_string()
+        });
+        if tool == DifferentialOracleTool::Sortformer {
+            let runtime_fingerprint = sortformer_runtime_fingerprint();
+            version["tool_version"] = serde_json::json!(SORTFORMER_ORACLE_TOOL_VERSION);
+            version["adapter_version"] = serde_json::json!(SORTFORMER_ORACLE_ADAPTER_VERSION);
+            version["model_contract_sha256"] = serde_json::json!(SORTFORMER_ORACLE_CONTRACT_SHA256);
+            version["model_artifact_sha256"] = serde_json::json!(SORTFORMER_ORACLE_ARTIFACT_SHA256);
+            version["model_artifact_bytes"] = serde_json::json!(SORTFORMER_ORACLE_ARTIFACT_BYTES);
+            version["runtime_fingerprint_sha256"] =
+                serde_json::json!(canonical_sha256(&runtime_fingerprint).expect("runtime hash"));
+            version["runtime_fingerprint"] =
+                serde_json::to_value(runtime_fingerprint).expect("runtime JSON");
+        }
+        version.to_string()
+    }
+
+    fn sortformer_document() -> DifferentialStageDocument {
+        DifferentialStageDocument {
+            schema_version: DIFFERENTIAL_STAGE_DOCUMENT_SCHEMA.to_owned(),
+            recording_key: KEY.to_owned(),
+            duration_ms: 2_000,
+            speech_activity: Some(vec![interval(160, 1_920)]),
+            word_timing: None,
+            change_boundaries_ms: Some(vec![960]),
+            cluster_assignments: None,
+            overlap: Some(Vec::new()),
+            final_projection: Some(vec![
+                EvaluationTurn::labeled(160, 960, "speaker_0"),
+                EvaluationTurn::labeled(960, 1_920, "speaker_1"),
+            ]),
+        }
+    }
+
+    fn write_sortformer_audio(path: &Path) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create canonical WAV");
+        for _ in 0..32_000 {
+            writer.write_sample(0i16).expect("write sample");
+        }
+        writer.finalize().expect("finalize WAV");
     }
 
     fn successful_shell_program(
@@ -2636,12 +4021,18 @@ mod tests {
         ))
     }
 
+    fn test_audio_sha256(path: &Path) -> String {
+        hash_file(path, &CancellationToken::no_deadline()).expect("hash test audio")
+    }
+
     #[test]
     fn invalid_version_json_is_cleanly_skipped() {
         let error = execute_external(
             DifferentialOracleTool::Pyannote,
             &shell_program("printf '%s' 'not-json'".to_owned()),
             Path::new("/dev/null"),
+            &bytes_sha256(b""),
+            2_000,
             KEY,
             Duration::from_secs(1),
             &CancellationToken::no_deadline(),
@@ -2669,6 +4060,8 @@ mod tests {
             DifferentialOracleTool::Pyannote,
             &shell_program(format!("printf '%s' '{wrong}'")),
             Path::new("/dev/null"),
+            &bytes_sha256(b""),
+            2_000,
             KEY,
             Duration::from_secs(1),
             &CancellationToken::no_deadline(),
@@ -2684,6 +4077,374 @@ mod tests {
     }
 
     #[test]
+    fn non_sortformer_version_rejects_model_provenance_fields() {
+        let mut polluted: serde_json::Value =
+            serde_json::from_str(&version_json(DifferentialOracleTool::Pyannote))
+                .expect("version JSON");
+        polluted["model_contract_sha256"] = serde_json::json!(bytes_sha256(b"pollution"));
+        let error = execute_external(
+            DifferentialOracleTool::Pyannote,
+            &shell_program(format!("printf '%s' '{polluted}'")),
+            Path::new("/dev/null"),
+            &bytes_sha256(b""),
+            2_000,
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("polluted non-Sortformer version");
+        assert!(matches!(
+            error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::InvalidVersionOutput,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sortformer_rejects_input_and_model_contract_mismatches() {
+        let invalid_input = execute_external(
+            DifferentialOracleTool::Sortformer,
+            &successful_shell_program(DifferentialOracleTool::Sortformer, &sortformer_document()),
+            Path::new("/dev/null"),
+            &bytes_sha256(b""),
+            2_000,
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("input contract");
+        assert!(matches!(
+            invalid_input,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::InputContractMismatch,
+                ..
+            })
+        ));
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let audio = directory.path().join("canonical.wav");
+        write_sortformer_audio(&audio);
+        for (field, wrong_value) in [
+            (
+                "model_contract_sha256",
+                serde_json::json!(bytes_sha256(b"wrong contract")),
+            ),
+            (
+                "model_artifact_sha256",
+                serde_json::json!(bytes_sha256(b"wrong artifact")),
+            ),
+            (
+                "runtime_fingerprint_sha256",
+                serde_json::json!(bytes_sha256(b"wrong runtime fingerprint")),
+            ),
+            ("model_artifact_bytes", serde_json::json!(1)),
+            ("tool_version", serde_json::json!("wrong-tool-version")),
+            (
+                "adapter_version",
+                serde_json::json!("wrong-adapter-version"),
+            ),
+        ] {
+            let mut wrong_version: serde_json::Value =
+                serde_json::from_str(&version_json(DifferentialOracleTool::Sortformer))
+                    .expect("version JSON");
+            wrong_version[field] = wrong_value;
+            let error = execute_external(
+                DifferentialOracleTool::Sortformer,
+                &shell_program(format!("printf '%s' '{wrong_version}'")),
+                &audio,
+                &test_audio_sha256(&audio),
+                2_000,
+                KEY,
+                Duration::from_secs(1),
+                &CancellationToken::no_deadline(),
+            )
+            .expect_err("model contract mismatch");
+            assert!(matches!(
+                error,
+                ExternalRunError::Skipped(ExternalSkip {
+                    reason: DifferentialSkipReason::ModelContractMismatch,
+                    ..
+                })
+            ));
+        }
+
+        let mut missing_runtime: serde_json::Value =
+            serde_json::from_str(&version_json(DifferentialOracleTool::Sortformer))
+                .expect("version JSON");
+        missing_runtime
+            .as_object_mut()
+            .expect("version object")
+            .remove("runtime_fingerprint_sha256");
+        let error = execute_external(
+            DifferentialOracleTool::Sortformer,
+            &shell_program(format!("printf '%s' '{missing_runtime}'")),
+            &audio,
+            &test_audio_sha256(&audio),
+            2_000,
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("missing runtime fingerprint");
+        assert!(matches!(
+            error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::ModelContractMismatch,
+                ..
+            })
+        ));
+
+        let mut wrong_runtime: serde_json::Value =
+            serde_json::from_str(&version_json(DifferentialOracleTool::Sortformer))
+                .expect("version JSON");
+        wrong_runtime["runtime_fingerprint"]["device"] = serde_json::json!("cuda");
+        let fingerprint: DifferentialOracleRuntimeFingerprint =
+            serde_json::from_value(wrong_runtime["runtime_fingerprint"].clone())
+                .expect("runtime fingerprint");
+        wrong_runtime["runtime_fingerprint_sha256"] =
+            serde_json::json!(canonical_sha256(&fingerprint).expect("runtime hash"));
+        let error = execute_external(
+            DifferentialOracleTool::Sortformer,
+            &shell_program(format!("printf '%s' '{wrong_runtime}'")),
+            &audio,
+            &test_audio_sha256(&audio),
+            2_000,
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("runtime profile mismatch");
+        assert!(matches!(
+            error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::ModelContractMismatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sortformer_validates_pcm_duration_completeness_identity_and_cancellation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let audio = directory.path().join("canonical.wav");
+        write_sortformer_audio(&audio);
+
+        let duration_error = validate_tool_input(
+            DifferentialOracleTool::Sortformer,
+            &audio,
+            90_000,
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("duration mismatch");
+        assert!(matches!(
+            duration_error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::InputContractMismatch,
+                ..
+            })
+        ));
+
+        let cancelled = validate_tool_input(
+            DifferentialOracleTool::Sortformer,
+            &audio,
+            2_000,
+            &CancellationToken::already_expired(),
+        )
+        .expect_err("cancel input validation");
+        assert!(matches!(
+            cancelled,
+            ExternalRunError::Cancelled(FwError::Cancelled(_))
+        ));
+
+        let identity_error = execute_external(
+            DifferentialOracleTool::Sortformer,
+            &successful_shell_program(DifferentialOracleTool::Sortformer, &sortformer_document()),
+            &audio,
+            &bytes_sha256(b"different audio"),
+            2_000,
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("audio identity mismatch");
+        assert!(matches!(
+            identity_error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::InputIdentityMismatch,
+                ..
+            })
+        ));
+
+        let mutating_audio = directory.path().join("mutating.wav");
+        write_sortformer_audio(&mutating_audio);
+        let expected_hash = test_audio_sha256(&mutating_audio);
+        let version = version_json(DifferentialOracleTool::Sortformer);
+        let output = serde_json::to_string(&sortformer_document()).expect("oracle JSON");
+        let mutating_program = shell_program(format!(
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else printf x >> \"$5\"; printf '%s' '{output}'; fi"
+        ));
+        let mutation_error = execute_external(
+            DifferentialOracleTool::Sortformer,
+            &mutating_program,
+            &mutating_audio,
+            &expected_hash,
+            2_000,
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("post-run audio mutation");
+        assert!(matches!(
+            mutation_error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::InputIdentityMismatch,
+                stage: DifferentialExecutionStage::InputPostRunValidation,
+                ..
+            })
+        ));
+
+        let truncated = directory.path().join("truncated.wav");
+        write_sortformer_audio(&truncated);
+        let truncated_len = std::fs::metadata(&truncated)
+            .expect("truncated metadata")
+            .len();
+        OpenOptions::new()
+            .write(true)
+            .open(&truncated)
+            .expect("open truncated fixture")
+            .set_len(truncated_len - 2)
+            .expect("truncate fixture tail");
+        let truncated_error = validate_tool_input(
+            DifferentialOracleTool::Sortformer,
+            &truncated,
+            2_000,
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("truncated PCM");
+        assert!(matches!(
+            truncated_error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::InputContractMismatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sortformer_fixture_replay_is_deterministic_and_cancellable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let audio = directory.path().join("canonical.wav");
+        write_sortformer_audio(&audio);
+        let program =
+            successful_shell_program(DifferentialOracleTool::Sortformer, &sortformer_document());
+        let first = execute_external(
+            DifferentialOracleTool::Sortformer,
+            &program,
+            &audio,
+            &test_audio_sha256(&audio),
+            2_000,
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("first replay");
+        let second = execute_external(
+            DifferentialOracleTool::Sortformer,
+            &program,
+            &audio,
+            &test_audio_sha256(&audio),
+            2_000,
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("second replay");
+        assert_eq!(first.oracle, second.oracle);
+        assert_eq!(first.oracle_stdout_sha256, second.oracle_stdout_sha256);
+        assert_eq!(first.version_stdout_sha256, second.version_stdout_sha256);
+
+        let version = version_json(DifferentialOracleTool::Sortformer);
+        let run_marker = directory.path().join("oracle-run-entered");
+        let slow = shell_program(format!(
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else printf '%s' entered > '{}'; sleep 60; fi",
+            run_marker.display()
+        ));
+        let cancelled = execute_external(
+            DifferentialOracleTool::Sortformer,
+            &slow,
+            &audio,
+            &test_audio_sha256(&audio),
+            2_000,
+            KEY,
+            Duration::from_secs(10),
+            &CancellationToken::with_deadline_from_now(Duration::from_secs(2)),
+        )
+        .expect_err("cancelled during oracle run");
+        assert!(matches!(
+            cancelled,
+            ExternalRunError::Cancelled(FwError::Cancelled(_))
+        ));
+        assert!(run_marker.is_file(), "oracle run branch was not entered");
+    }
+
+    #[test]
+    fn sortformer_report_distinguishes_expected_and_validated_attestations() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let audio = directory.path().join("canonical.wav");
+        write_sortformer_audio(&audio);
+        let version = version_json(DifferentialOracleTool::Sortformer);
+        let prepared = PreparedInputs {
+            audio_path: audio.clone(),
+            native: sortformer_document(),
+            reference: None,
+            audio_sha256: test_audio_sha256(&audio),
+            native_sha256: bytes_sha256(b"native"),
+            reference_sha256: None,
+        };
+        let report = build_report(
+            DifferentialOracleTool::Sortformer,
+            &shell_program(format!(
+                "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else exit 9; fi"
+            )),
+            &prepared,
+            Duration::from_secs(1),
+            DifferentialComparisonConfig::default(),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("validated-version skip report");
+        assert_eq!(
+            report.skip_reason,
+            Some(DifferentialSkipReason::OracleRunFailed)
+        );
+        assert_eq!(
+            report.provenance.expected_model_contract_sha256.as_deref(),
+            Some(SORTFORMER_ORACLE_CONTRACT_SHA256)
+        );
+        assert_eq!(
+            report.provenance.model_contract_sha256.as_deref(),
+            Some(SORTFORMER_ORACLE_CONTRACT_SHA256)
+        );
+        assert_eq!(
+            report.provenance.model_artifact_sha256.as_deref(),
+            Some(SORTFORMER_ORACLE_ARTIFACT_SHA256)
+        );
+        assert!(
+            report
+                .provenance
+                .runtime_fingerprint_sha256
+                .as_deref()
+                .is_some_and(is_sha256_hex)
+        );
+        verify_differential_report(&report).expect("verified report");
+
+        let mut forged = report;
+        forged.provenance.model_artifact_sha256 = Some(bytes_sha256(b"forged artifact"));
+        assert!(verify_differential_report(&forged).is_err());
+    }
+
+    #[test]
     fn invalid_run_json_is_cleanly_skipped() {
         let version = version_json(DifferentialOracleTool::Pyannote);
         let program = shell_program(format!(
@@ -2693,6 +4454,8 @@ mod tests {
             DifferentialOracleTool::Pyannote,
             &program,
             Path::new("/dev/null"),
+            &bytes_sha256(b""),
+            2_000,
             KEY,
             Duration::from_secs(1),
             &CancellationToken::no_deadline(),
@@ -2717,6 +4480,8 @@ mod tests {
             DifferentialOracleTool::Pyannote,
             &failed,
             Path::new("/dev/null"),
+            &bytes_sha256(b""),
+            2_000,
             KEY,
             Duration::from_secs(1),
             &CancellationToken::no_deadline(),
@@ -2737,6 +4502,8 @@ mod tests {
             DifferentialOracleTool::Pyannote,
             &slow,
             Path::new("/dev/null"),
+            &bytes_sha256(b""),
+            2_000,
             KEY,
             Duration::from_millis(40),
             &CancellationToken::no_deadline(),
@@ -2757,6 +4524,8 @@ mod tests {
             DifferentialOracleTool::Pyannote,
             &successful_shell_program(DifferentialOracleTool::Pyannote, &document()),
             Path::new("/dev/null"),
+            &bytes_sha256(b""),
+            2_000,
             KEY,
             Duration::from_secs(1),
             &CancellationToken::already_expired(),
@@ -2771,11 +4540,14 @@ mod tests {
     #[test]
     fn completed_report_retains_no_paths_labels_or_word_ids() {
         let native = document();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let audio_path = directory.path().join("private-secret-call.m4a");
+        std::fs::write(&audio_path, b"audio").expect("write test audio");
         let prepared = PreparedInputs {
-            audio_path: PathBuf::from("/private/secret-call.m4a"),
+            audio_path: audio_path.clone(),
             native: native.clone(),
             reference: None,
-            audio_sha256: bytes_sha256(b"audio"),
+            audio_sha256: test_audio_sha256(&audio_path),
             native_sha256: bytes_sha256(b"native"),
             reference_sha256: None,
         };
@@ -2801,6 +4573,9 @@ mod tests {
             parse_differential_report(&bytes).expect("parsed report"),
             report
         );
+        let mut polluted = report.clone();
+        polluted.provenance.expected_model_contract_sha256 = Some(bytes_sha256(b"polluted"));
+        assert!(verify_differential_report(&polluted).is_err());
         let mut tampered = report;
         tampered.native_incorrectness_claim_permitted = true;
         assert!(verify_differential_report(&tampered).is_err());

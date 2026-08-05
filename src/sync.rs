@@ -3443,7 +3443,7 @@ mod tests {
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             operational_partition: Some(DiarizationOperationalPartitionSummary {
-                schema_version: "diarization-operational-partition-v1".to_owned(),
+                schema_version: "diarization-operational-partition-v2".to_owned(),
                 method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
                 selected_count: 1,
                 confidence: 0.7,
@@ -3524,6 +3524,7 @@ mod tests {
             .operational_partition
             .as_mut()
             .expect("fixture neural operational partition");
+        operational_partition.method = DiarizationOperationalPartitionMethod::EcapaFusedConsensus;
         operational_partition.calibration_sha256 = fused_calibration_sha256;
         diarization.neural_representation = Some(NeuralSpeakerRepresentationSummary {
             schema_version: "neural-speaker-representation-summary-v1".to_owned(),
@@ -3985,6 +3986,15 @@ mod tests {
         assert_eq!(
             neural_summary.reasons,
             vec![NeuralSpeakerRepresentationReason::ShortTracklet]
+        );
+        assert_eq!(
+            result
+                .diarization
+                .as_ref()
+                .and_then(|diarization| diarization.operational_partition.as_ref())
+                .map(|partition| partition.method),
+            Some(DiarizationOperationalPartitionMethod::EcapaFusedConsensus),
+            "typed fused partition provenance must survive SQLite -> JSONL -> fresh SQLite",
         );
         assert!(
             !value_to_string_sqlite(canonical[0].get(1)).contains("feature_vector"),
