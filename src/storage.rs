@@ -1069,6 +1069,42 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                         "cannot rebuild diarization result for run {run_id}: {error}"
                     ))
                 })?;
+            if !request_value.is_object() {
+                return Err(FwError::Storage(format!(
+                    "cannot rebuild diarization request for run {run_id}: canonical request JSON root must be an object"
+                )));
+            }
+            if !result_value.is_object() {
+                return Err(FwError::Storage(format!(
+                    "cannot rebuild diarization result for run {run_id}: canonical result JSON root must be an object"
+                )));
+            }
+
+            let request_enables_diarization = match request_value.get("diarize") {
+                None => false,
+                Some(serde_json::Value::Bool(enabled)) => *enabled,
+                Some(_) => {
+                    return Err(FwError::Storage(format!(
+                        "cannot rebuild diarization request for run {run_id}: field `diarize` must be a boolean"
+                    )));
+                }
+            };
+            let result_has_diarization = result_value
+                .get("diarization")
+                .is_some_and(|value| !value.is_null());
+            let request_has_diarization_configuration = request_value
+                .pointer("/backend_params/acoustic_diarization")
+                .is_some_and(|value| !value.is_null());
+            if !request_enables_diarization
+                && !request_has_diarization_configuration
+                && !result_has_diarization
+            {
+                // Old and deliberately minimal non-diarization rows need not
+                // deserialize as today's complete TranscribeRequest. Derived
+                // diarization tables were cleared above, so there is nothing
+                // further to authenticate or rebuild for this run.
+                continue;
+            }
 
             if request_value
                 .pointer("/backend_params/acoustic_diarization")
@@ -2806,7 +2842,7 @@ mod tests {
                 start_ms: 0,
                 end_ms: 1_000,
                 speaker_ref: Some("speaker_a".to_owned()),
-                speaker_confidence: Some(0.96),
+                speaker_confidence: Some(1.0),
                 change_confidence: Some(0.91),
                 overlap_suspected: false,
                 hard_hint_attributed: true,
@@ -2865,7 +2901,14 @@ mod tests {
                 }],
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
-            operational_partition: None,
+            operational_partition: Some(DiarizationOperationalPartitionSummary {
+                schema_version: "diarization-operational-partition-v1".to_owned(),
+                method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
+                selected_count: 1,
+                confidence: 0.85,
+                calibration_sha256: crate::diarization::acoustic_speaker_pair_calibration_sha256(),
+                authority: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            }),
             neural_representation: None,
             diagnostics: Vec::new(),
         });
@@ -3482,6 +3525,139 @@ mod tests {
             1,
             "failed rebuild must preserve the prior derived index"
         );
+    }
+
+    #[test]
+    fn rebuild_skips_only_exact_non_diarization_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("strict-diarize-flag-rebuild.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_id = "run-strict-diarize-flag";
+        let mut report = minimal_report(run_id, &db_path);
+        attach_synthetic_diarization(&mut report, false);
+        store.persist_report(&report).expect("valid report");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+
+        store
+            .connection
+            .execute_with_params(
+                "UPDATE runs SET request_json = ?1, result_json = ?2 WHERE id = ?3;",
+                &[
+                    SqliteValue::Text(json!({"diarize": "false"}).to_string().into()),
+                    SqliteValue::Text(json!({"diarization": null}).to_string().into()),
+                    SqliteValue::Text(run_id.to_owned().into()),
+                ],
+            )
+            .expect("inject non-boolean diarize flag");
+        let error = store
+            .rebuild_diarization_index()
+            .expect_err("present non-boolean diarize flag must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot rebuild diarization request"),
+            "{error}"
+        );
+        assert_eq!(
+            table_row_count(&store, "diarization_reports"),
+            1,
+            "failed rebuild must preserve the prior derived index"
+        );
+
+        store
+            .connection
+            .execute_with_params(
+                "UPDATE runs SET request_json = ?1 WHERE id = ?2;",
+                &[
+                    SqliteValue::Text("[]".to_owned().into()),
+                    SqliteValue::Text(run_id.to_owned().into()),
+                ],
+            )
+            .expect("inject non-object request root");
+        let request_root_error = store
+            .rebuild_diarization_index()
+            .expect_err("non-object request root must fail closed");
+        assert!(
+            request_root_error
+                .to_string()
+                .contains("cannot rebuild diarization request"),
+            "{request_root_error}"
+        );
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+
+        store
+            .connection
+            .execute_with_params(
+                "UPDATE runs SET request_json = ?1, result_json = ?2 WHERE id = ?3;",
+                &[
+                    SqliteValue::Text(json!({"diarize": false}).to_string().into()),
+                    SqliteValue::Text("[]".to_owned().into()),
+                    SqliteValue::Text(run_id.to_owned().into()),
+                ],
+            )
+            .expect("inject non-object result root");
+        let result_root_error = store
+            .rebuild_diarization_index()
+            .expect_err("non-object result root must fail closed");
+        assert!(
+            result_root_error
+                .to_string()
+                .contains("cannot rebuild diarization result"),
+            "{result_root_error}"
+        );
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+
+        store
+            .connection
+            .execute_with_params(
+                "UPDATE runs SET request_json = ?1, result_json = ?2 WHERE id = ?3;",
+                &[
+                    SqliteValue::Text(
+                        json!({
+                            "diarize": false,
+                            "backend_params": {
+                                "acoustic_diarization": {
+                                    "unknown_inert_field": [0.1, 0.2]
+                                }
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ),
+                    SqliteValue::Text(json!({"diarization": null}).to_string().into()),
+                    SqliteValue::Text(run_id.to_owned().into()),
+                ],
+            )
+            .expect("install explicitly inert nested request");
+        let nested_request_error = store
+            .rebuild_diarization_index()
+            .expect_err("present nested diarization parameters require strict decoding");
+        assert!(
+            nested_request_error
+                .to_string()
+                .contains("cannot rebuild acoustic diarization request"),
+            "{nested_request_error}"
+        );
+        assert_eq!(
+            table_row_count(&store, "diarization_reports"),
+            1,
+            "failed nested request rebuild must preserve the prior derived index"
+        );
+
+        store
+            .connection
+            .execute_with_params(
+                "UPDATE runs SET request_json = ?1 WHERE id = ?2;",
+                &[
+                    SqliteValue::Text(json!({"diarize": false}).to_string().into()),
+                    SqliteValue::Text(run_id.to_owned().into()),
+                ],
+            )
+            .expect("install exact minimal non-diarization request");
+        store
+            .rebuild_diarization_index()
+            .expect("exact minimal non-diarization row remains migratable");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 0);
     }
 
     #[test]

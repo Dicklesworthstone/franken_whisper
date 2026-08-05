@@ -7703,6 +7703,7 @@ mod tests {
         );
         base.implementation = "native-ecapa-unavailable-v1".to_owned();
         base.contract_version = crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION.to_owned();
+        base.fallback_status = DiarizationFallbackStatus::SpeakerCountUnresolved;
         base.neural_representation = Some(
             super::unavailable_neural_representation_summary(
                 crate::model::NeuralSpeakerRepresentationReason::InsufficientTracklets,
@@ -11118,11 +11119,14 @@ mod tests {
                 .map(|summary| summary.status),
             Some(crate::model::NeuralSpeakerRepresentationStatus::Unavailable)
         );
-        assert!(
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+            == crate::model::DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK));
+        assert_eq!(
             report
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.contains("model_unavailable"))
+                .neural_representation
+                .as_ref()
+                .map(|summary| summary.reasons.as_slice()),
+            Some(&[crate::model::NeuralSpeakerRepresentationReason::ModelUnavailable][..])
         );
         assert_eq!(
             serde_json::to_vec(&report).expect("serialize first fallback"),
@@ -16252,7 +16256,12 @@ mod tests {
             let mut segments = original.clone();
             let error = diarize_segments(&mut segments, Some(2.0), &request, &token)
                 .expect_err("legacy heuristic cannot execute explicit count semantics");
-            assert!(error.to_string().contains("native acoustic"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("native in-process diarization engine"),
+                "{error}"
+            );
             assert!(
                 segments.iter().zip(&original).all(|(actual, expected)| {
                     actual.start_sec == expected.start_sec

@@ -3177,15 +3177,16 @@ mod tests {
 
     use crate::model::{
         BackendKind, BackendParams, DiarizationEngine, DiarizationFallbackStatus,
+        DiarizationOperationalPartitionMethod, DiarizationOperationalPartitionSummary,
         DiarizationReport, DiarizationRequest, DiarizationTurn, InputSource, KnownSpeakerInterval,
         KnownSpeakerPolicy, NeuralSpeakerRepresentationReason, NeuralSpeakerRepresentationStatus,
         NeuralSpeakerRepresentationSummary, RunEvent, RunReport, SpeakerCountCalibrationStatus,
         SpeakerCountEstimate, SpeakerCountEvidenceLane, SpeakerCountLaneEvidence,
-        SpeakerCountLaneUnavailableReason, SpeakerCountOutcome, SpeakerCountOutcomeReason,
-        SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange,
-        SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
-        SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
-        SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
+        SpeakerCountOutcome, SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus,
+        SpeakerCountPosteriorBin, SpeakerCountRange, SpeakerCountRequest,
+        SpeakerCountResourceSummary, SpeakerEvidenceReason, SpeakerEvidenceSummary,
+        SpeakerHintDisposition, SpeakerHintEvidenceSummary, SpeakerProfileSummary,
+        TranscribeRequest, TranscriptionResult, TranscriptionSegment,
     };
     use crate::storage::{BlockingConnection, RunStore};
 
@@ -3441,7 +3442,14 @@ mod tests {
                 }],
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
-            operational_partition: None,
+            operational_partition: Some(DiarizationOperationalPartitionSummary {
+                schema_version: "diarization-operational-partition-v1".to_owned(),
+                method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
+                selected_count: 1,
+                confidence: 0.7,
+                calibration_sha256: crate::diarization::acoustic_speaker_pair_calibration_sha256(),
+                authority: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            }),
             neural_representation: None,
             diagnostics: Vec::new(),
         });
@@ -3484,6 +3492,12 @@ mod tests {
             .as_mut()
             .expect("fixture diarization request")
             .engine = DiarizationEngine::EcapaFused;
+        let neural_request = report
+            .request
+            .backend_params
+            .acoustic_diarization
+            .as_ref()
+            .expect("fixture neural diarization request");
         let diarization = report
             .result
             .diarization
@@ -3503,7 +3517,14 @@ mod tests {
             .estimate
             .as_mut()
             .expect("fixture speaker count estimate")
-            .calibration_sha256 = fused_calibration_sha256;
+            .calibration_sha256 = fused_calibration_sha256.clone();
+        diarization.hint_document_sha256 =
+            Some(crate::model::speaker_hint_document_sha256(neural_request));
+        let operational_partition = diarization
+            .operational_partition
+            .as_mut()
+            .expect("fixture neural operational partition");
+        operational_partition.calibration_sha256 = fused_calibration_sha256;
         diarization.neural_representation = Some(NeuralSpeakerRepresentationSummary {
             schema_version: "neural-speaker-representation-summary-v1".to_owned(),
             provider_version: crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
@@ -3590,10 +3611,10 @@ mod tests {
                 },
                 SpeakerCountLaneEvidence {
                     lane: SpeakerCountEvidenceLane::CallerPrior,
-                    available: false,
-                    proposed_count: None,
-                    confidence: 0.0,
-                    unavailable_reason: Some(SpeakerCountLaneUnavailableReason::NotRequested),
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 1.0,
+                    unavailable_reason: None,
                 },
             ],
             resources: SpeakerCountResourceSummary {
