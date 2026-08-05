@@ -3443,7 +3443,7 @@ mod tests {
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             operational_partition: None,
             neural_representation: None,
-            diagnostics: vec!["synthetic sync fixture".to_owned()],
+            diagnostics: Vec::new(),
         });
         report.result.raw_output = json!({
             "engine": "whisper.cpp-native",

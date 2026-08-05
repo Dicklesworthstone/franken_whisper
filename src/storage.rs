@@ -2867,7 +2867,7 @@ mod tests {
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             operational_partition: None,
             neural_representation: None,
-            diagnostics: vec!["synthetic persistence fixture".to_owned()],
+            diagnostics: Vec::new(),
         });
     }
 
