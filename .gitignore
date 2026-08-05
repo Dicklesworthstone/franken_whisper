@@ -96,6 +96,21 @@ storage.sqlite3-shm
 *.MOV
 *.WEBM
 
+# Model weights, converted tensor packages, and array dumps are operator-local.
+# Contracts and aggregate hashes may be committed; the payloads may not.
+*.[nN][eE][mM][oO]
+*.[pP][tT]
+*.[pP][tT][hH]
+*.[cC][kK][pP][tT]
+*.[sS][aA][fF][eE][tT][eE][nN][sS][oO][rR][sS]
+*.[oO][nN][nN][xX]
+*.[nN][pP][yY]
+*.[nN][pP][zZ]
+*.[gG][gG][uU][fF]
+*.[gG][gG][mM][lL]
+[gG][gG][mM][lL]-*.[bB][iI][nN]
+[pP][yY][tT][oO][rR][cC][hH]_[mM][oO][dD][eE][lL]*.[bB][iI][nN]
+
 # Confidential transcript sidecars must remain outside the repository
 *transcript*.md
 *[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[mM][dD]
