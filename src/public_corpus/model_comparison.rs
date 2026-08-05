@@ -880,7 +880,7 @@ where
     if evaluation_split != EvaluationSplit::Development {
         return Err(model_comparison_error(
             "split",
-            "the uncertified v1 comparison is restricted to the development split",
+            "the uncertified v2 comparison is restricted to the development split",
         ));
     }
     if sortformer_hard_timeout
@@ -2201,12 +2201,14 @@ pub fn verify_public_model_comparison_evidence(
             || aggregate.available_case.recording_count != aggregate.outcomes.completed
             || aggregate.common_complete_case.recording_count
                 != evidence.common_complete_recording_count
-            || aggregate.common_complete_case.recording_count
-                > aggregate.available_case.recording_count
+            || !common_complete_metrics_are_subset(
+                &aggregate.available_case,
+                &aggregate.common_complete_case,
+            )
         {
             return Err(model_comparison_error(
                 "aggregate_integrity",
-                "model-comparison aggregate counts are inconsistent",
+                "model-comparison aggregate counts or common-complete subset metrics are inconsistent",
             ));
         }
         validate_metric_numbers(&aggregate.available_case)?;
@@ -2266,10 +2268,12 @@ pub fn verify_public_model_comparison_evidence(
         evidence.observation_count,
     )?;
     let sortformer = &evidence.lanes[3];
-    if sortformer.outcomes.completed > 0 && evidence.sortformer_runtime_identity.is_none() {
+    if sortformer_runtime_identity_required(&sortformer.outcomes)
+        && evidence.sortformer_runtime_identity.is_none()
+    {
         return Err(model_comparison_error(
             "sortformer_runtime_identity",
-            "completed Sortformer outcomes require a retained runtime identity",
+            "model-produced Sortformer outcomes require a retained runtime identity",
         ));
     }
     if deterministic_accuracy_sha256(evidence)? != evidence.deterministic_accuracy_sha256 {
@@ -2287,6 +2291,225 @@ pub fn verify_public_model_comparison_evidence(
         ));
     }
     Ok(())
+}
+
+fn sortformer_runtime_identity_required(outcomes: &ModelComparisonOutcomeCounts) -> bool {
+    outcomes.completed > 0
+        || outcomes
+            .failed_by_code
+            .get(&ModelComparisonOutcomeCode::ScoringFailed)
+            .is_some_and(|count| *count > 0)
+}
+
+fn common_complete_metrics_are_subset(
+    available: &ModelComparisonAggregateMetrics,
+    common: &ModelComparisonAggregateMetrics,
+) -> bool {
+    if common.recording_count > available.recording_count {
+        return false;
+    }
+    if common.recording_count == available.recording_count {
+        return common == available;
+    }
+    let Some(extra_recordings) = available
+        .recording_count
+        .checked_sub(common.recording_count)
+    else {
+        return false;
+    };
+    let minimum_extra_duration_sec = extra_recordings as f64 / 1_000.0;
+    if exceeds(
+        minimum_extra_duration_sec,
+        available.audio_duration_sec - common.audio_duration_sec,
+    ) || exceeds(
+        minimum_extra_duration_sec,
+        available.wall_time_sec - common.wall_time_sec,
+    ) {
+        return false;
+    }
+
+    // Only retained additive sufficient statistics are ordered for a strict
+    // subset. Means and rates need not be monotone, and the rounded change
+    // MAE cannot safely reconstruct its hidden sum for large match counts.
+    let common_float_sums = [
+        common.audio_duration_sec,
+        common.reference_speaker_time_sec,
+        common.missed_speech_sec,
+        common.false_alarm_sec,
+        common.speaker_confusion_sec,
+        common.overlap_reference_sec,
+        common.overlap_hypothesis_sec,
+        common.overlap_true_positive_sec,
+        common.overlap_false_positive_sec,
+        common.overlap_false_negative_sec,
+        common.selective_reference_speaker_time_sec,
+        common.selective_covered_speaker_time_sec,
+        common.selective_error_covered_speaker_time_sec,
+        common.labeled_speaker_time_sec,
+        common.unknown_speaker_time_sec,
+        common.wall_time_sec,
+    ];
+    let available_float_sums = [
+        available.audio_duration_sec,
+        available.reference_speaker_time_sec,
+        available.missed_speech_sec,
+        available.false_alarm_sec,
+        available.speaker_confusion_sec,
+        available.overlap_reference_sec,
+        available.overlap_hypothesis_sec,
+        available.overlap_true_positive_sec,
+        available.overlap_false_positive_sec,
+        available.overlap_false_negative_sec,
+        available.selective_reference_speaker_time_sec,
+        available.selective_covered_speaker_time_sec,
+        available.selective_error_covered_speaker_time_sec,
+        available.labeled_speaker_time_sec,
+        available.unknown_speaker_time_sec,
+        available.wall_time_sec,
+    ];
+    let common_integer_sums = [
+        common.scored_region_total_absolute_speaker_count_error,
+        common.scored_region_exact_speaker_count,
+        common.full_timeline_total_absolute_speaker_count_error,
+        common.full_timeline_exact_speaker_count,
+        common.count_estimate_resolved,
+        common.count_estimate_unresolved,
+        common.count_estimate_total_absolute_error,
+        common.count_estimate_exact,
+        common.change_reference_count,
+        common.change_hypothesis_count,
+        common.change_matched_count,
+    ];
+    let available_integer_sums = [
+        available.scored_region_total_absolute_speaker_count_error,
+        available.scored_region_exact_speaker_count,
+        available.full_timeline_total_absolute_speaker_count_error,
+        available.full_timeline_exact_speaker_count,
+        available.count_estimate_resolved,
+        available.count_estimate_unresolved,
+        available.count_estimate_total_absolute_error,
+        available.count_estimate_exact,
+        available.change_reference_count,
+        available.change_hypothesis_count,
+        available.change_matched_count,
+    ];
+    let macro_support_is_monotone = (common.macro_der.is_none() || available.macro_der.is_some())
+        && (common.macro_jer.is_none() || available.macro_jer.is_some());
+    if !macro_support_is_monotone
+        || !common_float_sums
+            .into_iter()
+            .zip(available_float_sums)
+            .all(|(common_value, available_value)| common_value <= available_value)
+        || !common_integer_sums
+            .into_iter()
+            .zip(available_integer_sums)
+            .all(|(common_value, available_value)| common_value <= available_value)
+    {
+        return false;
+    }
+    if common.change_matched_count == available.change_matched_count
+        && common.change_mean_absolute_error_sec != available.change_mean_absolute_error_sec
+    {
+        return false;
+    }
+
+    let Some(scored_error_delta) = available
+        .scored_region_total_absolute_speaker_count_error
+        .checked_sub(common.scored_region_total_absolute_speaker_count_error)
+    else {
+        return false;
+    };
+    let Some(scored_exact_delta) = available
+        .scored_region_exact_speaker_count
+        .checked_sub(common.scored_region_exact_speaker_count)
+    else {
+        return false;
+    };
+    let Some(full_timeline_error_delta) = available
+        .full_timeline_total_absolute_speaker_count_error
+        .checked_sub(common.full_timeline_total_absolute_speaker_count_error)
+    else {
+        return false;
+    };
+    let Some(full_timeline_exact_delta) = available
+        .full_timeline_exact_speaker_count
+        .checked_sub(common.full_timeline_exact_speaker_count)
+    else {
+        return false;
+    };
+    let Some(resolved_delta) = available
+        .count_estimate_resolved
+        .checked_sub(common.count_estimate_resolved)
+    else {
+        return false;
+    };
+    let Some(count_error_delta) = available
+        .count_estimate_total_absolute_error
+        .checked_sub(common.count_estimate_total_absolute_error)
+    else {
+        return false;
+    };
+    let Some(count_exact_delta) = available
+        .count_estimate_exact
+        .checked_sub(common.count_estimate_exact)
+    else {
+        return false;
+    };
+    let Some(change_reference_delta) = available
+        .change_reference_count
+        .checked_sub(common.change_reference_count)
+    else {
+        return false;
+    };
+    let Some(change_hypothesis_delta) = available
+        .change_hypothesis_count
+        .checked_sub(common.change_hypothesis_count)
+    else {
+        return false;
+    };
+    let Some(change_matched_delta) = available
+        .change_matched_count
+        .checked_sub(common.change_matched_count)
+    else {
+        return false;
+    };
+    let scored_count_delta_is_possible = scored_error_delta
+        .checked_add(scored_exact_delta)
+        .is_some_and(|accounted| accounted >= extra_recordings)
+        && scored_exact_delta <= extra_recordings;
+    let full_timeline_count_delta_is_possible = full_timeline_error_delta
+        .checked_add(full_timeline_exact_delta)
+        .is_some_and(|accounted| accounted >= extra_recordings)
+        && full_timeline_exact_delta <= extra_recordings;
+    let resolved_count_delta_is_possible = count_error_delta
+        .checked_add(count_exact_delta)
+        .is_some_and(|accounted| accounted >= resolved_delta)
+        && count_exact_delta <= resolved_delta;
+    let change_delta_is_possible = change_matched_delta <= change_reference_delta
+        && change_matched_delta <= change_hypothesis_delta;
+    let selective_reference_delta = available.selective_reference_speaker_time_sec
+        - common.selective_reference_speaker_time_sec;
+    let selective_covered_delta =
+        available.selective_covered_speaker_time_sec - common.selective_covered_speaker_time_sec;
+    let selective_error_delta = available.selective_error_covered_speaker_time_sec
+        - common.selective_error_covered_speaker_time_sec;
+    let selective_delta_is_possible = !exceeds(selective_covered_delta, selective_reference_delta)
+        && !exceeds(selective_error_delta, selective_covered_delta);
+    let reference_speaker_time_delta =
+        available.reference_speaker_time_sec - common.reference_speaker_time_sec;
+    let missed_speech_delta = available.missed_speech_sec - common.missed_speech_sec;
+    let speaker_confusion_delta = available.speaker_confusion_sec - common.speaker_confusion_sec;
+    let diarization_delta_is_possible = !exceeds(
+        missed_speech_delta + speaker_confusion_delta,
+        reference_speaker_time_delta,
+    );
+
+    scored_count_delta_is_possible
+        && full_timeline_count_delta_is_possible
+        && resolved_count_delta_is_possible
+        && change_delta_is_possible
+        && selective_delta_is_possible
+        && diarization_delta_is_possible
 }
 
 fn common_reference_metrics_equal(
@@ -2400,14 +2623,20 @@ fn validate_metric_numbers(metrics: &ModelComparisonAggregateMetrics) -> FwResul
             < metrics
                 .recording_count
                 .saturating_sub(metrics.scored_region_exact_speaker_count)
+        || (metrics.scored_region_exact_speaker_count == metrics.recording_count
+            && metrics.scored_region_total_absolute_speaker_count_error != 0)
         || metrics.full_timeline_total_absolute_speaker_count_error
             < metrics
                 .recording_count
                 .saturating_sub(metrics.full_timeline_exact_speaker_count)
+        || (metrics.full_timeline_exact_speaker_count == metrics.recording_count
+            && metrics.full_timeline_total_absolute_speaker_count_error != 0)
         || metrics.count_estimate_total_absolute_error
             < metrics
                 .count_estimate_resolved
                 .saturating_sub(metrics.count_estimate_exact)
+        || (metrics.count_estimate_exact == metrics.count_estimate_resolved
+            && metrics.count_estimate_total_absolute_error != 0)
         || (metrics.count_estimate_resolved == 0
             && metrics.count_estimate_total_absolute_error != 0)
         || metrics.change_matched_count > metrics.change_reference_count
@@ -2427,6 +2656,22 @@ fn validate_metric_numbers(metrics: &ModelComparisonAggregateMetrics) -> FwResul
         || exceeds(
             metrics.selective_error_covered_speaker_time_sec,
             metrics.selective_covered_speaker_time_sec,
+        )
+        || exceeds(
+            metrics.missed_speech_sec + metrics.speaker_confusion_sec,
+            metrics.reference_speaker_time_sec,
+        )
+        || !option_close(
+            Some(metrics.selective_reference_speaker_time_sec),
+            Some(metrics.reference_speaker_time_sec),
+        )
+        || !option_close(
+            Some(
+                metrics.labeled_speaker_time_sec
+                    + metrics.unknown_speaker_time_sec
+                    + metrics.missed_speech_sec,
+            ),
+            Some(metrics.reference_speaker_time_sec + metrics.false_alarm_sec),
         )
         || !option_close(
             Some(metrics.overlap_reference_sec),
@@ -2489,6 +2734,16 @@ fn validate_metric_numbers(metrics: &ModelComparisonAggregateMetrics) -> FwResul
     }
     if metrics.audio_duration_sec <= 0.0
         || metrics.wall_time_sec <= 0.0
+        || exceeds(
+            metrics.recording_count as f64 / 1_000.0,
+            metrics.audio_duration_sec,
+        )
+        || exceeds(
+            metrics.recording_count as f64 / 1_000.0,
+            metrics.wall_time_sec,
+        )
+        || metrics.macro_der.is_some() != (metrics.reference_speaker_time_sec > 0.0)
+        || metrics.macro_jer.is_some() != (metrics.reference_speaker_time_sec > 0.0)
         || !option_close(
             metrics.micro_der,
             ratio_f64(
@@ -2581,6 +2836,12 @@ fn validate_metric_numbers(metrics: &ModelComparisonAggregateMetrics) -> FwResul
             metrics.real_time_factor,
             ratio_f64(metrics.wall_time_sec, metrics.audio_duration_sec),
         )
+        || metrics.change_mean_absolute_error_sec.is_some_and(|error| {
+            exceeds(
+                error,
+                comparison_scorer_config().change_boundary_collar_ms as f64 / 1_000.0,
+            )
+        })
         || (metrics.change_matched_count == 0 && metrics.change_mean_absolute_error_sec.is_some())
         || (metrics.change_matched_count > 0 && metrics.change_mean_absolute_error_sec.is_none())
     {
@@ -2723,6 +2984,64 @@ mod tests {
             .expect("fixture score")
     }
 
+    fn aggregate(recording_count: usize) -> ModelComparisonAggregateMetrics {
+        let count = ModelComparisonCountObservation {
+            reference_full_timeline: 1,
+            hypothesis_full_timeline: 1,
+            selected_count: Some(1),
+        };
+        let mut accumulator = ModelComparisonAccumulator::default();
+        for _ in 0..recording_count {
+            accumulator.push(&score("reference-a", "hypothesis-x"), count, 250);
+        }
+        accumulator.finish()
+    }
+
+    fn set_scored_count_metrics(
+        metrics: &mut ModelComparisonAggregateMetrics,
+        total_absolute_error: u64,
+        exact: u64,
+    ) {
+        metrics.scored_region_total_absolute_speaker_count_error = total_absolute_error;
+        metrics.scored_region_mean_absolute_speaker_count_error =
+            ratio_f64(total_absolute_error as f64, metrics.recording_count as f64);
+        metrics.scored_region_exact_speaker_count = exact;
+        metrics.scored_region_exact_speaker_count_rate =
+            ratio_f64(exact as f64, metrics.recording_count as f64);
+    }
+
+    fn set_full_timeline_count_metrics(
+        metrics: &mut ModelComparisonAggregateMetrics,
+        total_absolute_error: u64,
+        exact: u64,
+    ) {
+        metrics.full_timeline_total_absolute_speaker_count_error = total_absolute_error;
+        metrics.full_timeline_mean_absolute_speaker_count_error =
+            ratio_f64(total_absolute_error as f64, metrics.recording_count as f64);
+        metrics.full_timeline_exact_speaker_count = exact;
+        metrics.full_timeline_exact_speaker_count_rate =
+            ratio_f64(exact as f64, metrics.recording_count as f64);
+    }
+
+    fn set_resolved_count_metrics(
+        metrics: &mut ModelComparisonAggregateMetrics,
+        total_absolute_error: u64,
+        exact: u64,
+    ) {
+        metrics.count_estimate_total_absolute_error = total_absolute_error;
+        metrics.count_estimate_mean_absolute_error = ratio_f64(
+            total_absolute_error as f64,
+            metrics.count_estimate_resolved as f64,
+        );
+        metrics.count_estimate_exact = exact;
+        metrics.count_estimate_exact_rate =
+            ratio_f64(exact as f64, metrics.count_estimate_resolved as f64);
+    }
+
+    fn assert_valid_metrics(metrics: &ModelComparisonAggregateMetrics) {
+        validate_metric_numbers(metrics).expect("fixture aggregate must be internally valid");
+    }
+
     #[test]
     fn williams_schedule_balances_every_lane_and_position() {
         for lane in ModelComparisonLane::ALL {
@@ -2783,6 +3102,31 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn sortformer_model_produced_outcomes_require_runtime_identity() {
+        assert!(!sortformer_runtime_identity_required(
+            &ModelComparisonOutcomeCounts::default()
+        ));
+
+        let completed = ModelComparisonOutcomeCounts {
+            completed: 1,
+            ..ModelComparisonOutcomeCounts::default()
+        };
+        assert!(sortformer_runtime_identity_required(&completed));
+
+        let mut scoring_failed = ModelComparisonOutcomeCounts::default();
+        scoring_failed
+            .failed_by_code
+            .insert(ModelComparisonOutcomeCode::ScoringFailed, 1);
+        assert!(sortformer_runtime_identity_required(&scoring_failed));
+
+        let mut execution_failed = ModelComparisonOutcomeCounts::default();
+        execution_failed
+            .failed_by_code
+            .insert(ModelComparisonOutcomeCode::SortformerExecutionFailed, 1);
+        assert!(!sortformer_runtime_identity_required(&execution_failed));
     }
 
     #[test]
@@ -2905,6 +3249,459 @@ mod tests {
         assert!(!json.contains("public-model-comparison-fixture"));
         assert!(!json.contains("reference-a"));
         assert!(!json.contains("hypothesis-x"));
+    }
+
+    #[test]
+    fn common_complete_subset_requires_equal_metrics_at_equal_cardinality() {
+        let mut accumulator = ModelComparisonAccumulator::default();
+        let count = ModelComparisonCountObservation {
+            reference_full_timeline: 1,
+            hypothesis_full_timeline: 1,
+            selected_count: Some(1),
+        };
+        accumulator.push(&score("reference-a", "hypothesis-x"), count, 250);
+        let available = accumulator.finish();
+        let mut forged_common = available.clone();
+        forged_common.wall_time_sec += 0.001;
+        forged_common.real_time_factor = ratio_f64(
+            forged_common.wall_time_sec,
+            forged_common.audio_duration_sec,
+        );
+
+        assert!(common_complete_metrics_are_subset(&available, &available));
+        assert!(!common_complete_metrics_are_subset(
+            &available,
+            &forged_common,
+        ));
+    }
+
+    #[test]
+    fn common_complete_subset_preserves_macro_metric_support() {
+        let count = ModelComparisonCountObservation {
+            reference_full_timeline: 1,
+            hypothesis_full_timeline: 1,
+            selected_count: Some(1),
+        };
+        let mut available_accumulator = ModelComparisonAccumulator::default();
+        available_accumulator.push(&score("reference-a", "hypothesis-x"), count, 250);
+        available_accumulator.push(&score("reference-b", "hypothesis-y"), count, 250);
+        let available = available_accumulator.finish();
+        let mut common_accumulator = ModelComparisonAccumulator::default();
+        common_accumulator.push(&score("reference-a", "hypothesis-x"), count, 250);
+        let common = common_accumulator.finish();
+
+        let mut missing_available_der = available.clone();
+        missing_available_der.macro_der = None;
+        assert!(!common_complete_metrics_are_subset(
+            &missing_available_der,
+            &common,
+        ));
+        let mut missing_available_jer = available.clone();
+        missing_available_jer.macro_jer = None;
+        assert!(!common_complete_metrics_are_subset(
+            &missing_available_jer,
+            &common,
+        ));
+        let mut missing_common_macro_metrics = common;
+        missing_common_macro_metrics.reference_speaker_time_sec = 0.0;
+        missing_common_macro_metrics.micro_der = None;
+        missing_common_macro_metrics.macro_der = None;
+        missing_common_macro_metrics.macro_jer = None;
+        missing_common_macro_metrics.selective_reference_speaker_time_sec = 0.0;
+        missing_common_macro_metrics.selective_covered_speaker_time_sec = 0.0;
+        missing_common_macro_metrics.selective_error_covered_speaker_time_sec = 0.0;
+        missing_common_macro_metrics.selective_coverage = None;
+        missing_common_macro_metrics.selective_risk = None;
+        missing_common_macro_metrics.labeled_speaker_time_sec = 0.0;
+        missing_common_macro_metrics.unknown_speaker_time_sec = 0.0;
+        missing_common_macro_metrics.unknown_speaker_share = None;
+        assert_valid_metrics(&missing_common_macro_metrics);
+        assert!(common_complete_metrics_are_subset(
+            &available,
+            &missing_common_macro_metrics,
+        ));
+    }
+
+    #[test]
+    fn common_complete_subset_rejects_non_monotone_sufficient_statistics() {
+        let count = ModelComparisonCountObservation {
+            reference_full_timeline: 1,
+            hypothesis_full_timeline: 1,
+            selected_count: Some(1),
+        };
+        let mut available_accumulator = ModelComparisonAccumulator::default();
+        available_accumulator.push(&score("reference-a", "hypothesis-x"), count, 250);
+        available_accumulator.push(&score("reference-b", "hypothesis-y"), count, 250);
+        let available = available_accumulator.finish();
+        let mut common_accumulator = ModelComparisonAccumulator::default();
+        common_accumulator.push(&score("reference-a", "hypothesis-x"), count, 250);
+        let common = common_accumulator.finish();
+
+        assert!(common_complete_metrics_are_subset(&available, &common));
+        macro_rules! assert_float_sum_rejected {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    let mut forged_common = common.clone();
+                    forged_common.$field = available.$field + 0.001;
+                    assert!(
+                        !common_complete_metrics_are_subset(&available, &forged_common),
+                        "accepted non-monotone {}",
+                        stringify!($field),
+                    );
+                )+
+            };
+        }
+        macro_rules! assert_integer_sum_rejected {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    let mut forged_common = common.clone();
+                    forged_common.$field = available.$field.saturating_add(1);
+                    assert!(
+                        !common_complete_metrics_are_subset(&available, &forged_common),
+                        "accepted non-monotone {}",
+                        stringify!($field),
+                    );
+                )+
+            };
+        }
+        assert_float_sum_rejected!(
+            audio_duration_sec,
+            reference_speaker_time_sec,
+            missed_speech_sec,
+            false_alarm_sec,
+            speaker_confusion_sec,
+            overlap_reference_sec,
+            overlap_hypothesis_sec,
+            overlap_true_positive_sec,
+            overlap_false_positive_sec,
+            overlap_false_negative_sec,
+            selective_reference_speaker_time_sec,
+            selective_covered_speaker_time_sec,
+            selective_error_covered_speaker_time_sec,
+            labeled_speaker_time_sec,
+            unknown_speaker_time_sec,
+            wall_time_sec,
+        );
+        assert_integer_sum_rejected!(
+            scored_region_total_absolute_speaker_count_error,
+            scored_region_exact_speaker_count,
+            full_timeline_total_absolute_speaker_count_error,
+            full_timeline_exact_speaker_count,
+            count_estimate_resolved,
+            count_estimate_unresolved,
+            count_estimate_total_absolute_error,
+            count_estimate_exact,
+            change_reference_count,
+            change_hypothesis_count,
+            change_matched_count,
+        );
+
+        let mut available_with_matched_change = available;
+        available_with_matched_change.change_reference_count = 1;
+        available_with_matched_change.change_hypothesis_count = 1;
+        available_with_matched_change.change_matched_count = 1;
+        available_with_matched_change.change_mean_absolute_error_sec = Some(0.1);
+        assert!(common_complete_metrics_are_subset(
+            &available_with_matched_change,
+            &common,
+        ));
+    }
+
+    #[test]
+    fn common_complete_strict_subset_requires_strict_extent_and_stable_change_mae() {
+        let available = aggregate(2);
+        let common = aggregate(1);
+        assert_valid_metrics(&available);
+        assert_valid_metrics(&common);
+        assert!(common_complete_metrics_are_subset(&available, &common));
+
+        let mut forged_audio = common.clone();
+        forged_audio.audio_duration_sec = available.audio_duration_sec;
+        forged_audio.real_time_factor =
+            ratio_f64(forged_audio.wall_time_sec, forged_audio.audio_duration_sec);
+        assert_valid_metrics(&forged_audio);
+        assert!(!common_complete_metrics_are_subset(
+            &available,
+            &forged_audio,
+        ));
+
+        let mut forged_wall_time = common.clone();
+        forged_wall_time.wall_time_sec = available.wall_time_sec;
+        forged_wall_time.real_time_factor = ratio_f64(
+            forged_wall_time.wall_time_sec,
+            forged_wall_time.audio_duration_sec,
+        );
+        assert_valid_metrics(&forged_wall_time);
+        assert!(!common_complete_metrics_are_subset(
+            &available,
+            &forged_wall_time,
+        ));
+
+        let mut sub_millisecond_audio = common.clone();
+        sub_millisecond_audio.audio_duration_sec = available.audio_duration_sec - 0.0005;
+        sub_millisecond_audio.real_time_factor = ratio_f64(
+            sub_millisecond_audio.wall_time_sec,
+            sub_millisecond_audio.audio_duration_sec,
+        );
+        assert_valid_metrics(&sub_millisecond_audio);
+        assert!(!common_complete_metrics_are_subset(
+            &available,
+            &sub_millisecond_audio,
+        ));
+
+        let mut sub_millisecond_wall_time = common.clone();
+        sub_millisecond_wall_time.wall_time_sec = available.wall_time_sec - 0.0005;
+        sub_millisecond_wall_time.real_time_factor = ratio_f64(
+            sub_millisecond_wall_time.wall_time_sec,
+            sub_millisecond_wall_time.audio_duration_sec,
+        );
+        assert_valid_metrics(&sub_millisecond_wall_time);
+        assert!(!common_complete_metrics_are_subset(
+            &available,
+            &sub_millisecond_wall_time,
+        ));
+
+        let mut available_with_change = available;
+        available_with_change.change_reference_count = 1;
+        available_with_change.change_hypothesis_count = 1;
+        available_with_change.change_matched_count = 1;
+        available_with_change.change_mean_absolute_error_sec = Some(0.1);
+        let mut forged_change_mae = common;
+        forged_change_mae.change_reference_count = 1;
+        forged_change_mae.change_hypothesis_count = 1;
+        forged_change_mae.change_matched_count = 1;
+        forged_change_mae.change_mean_absolute_error_sec = Some(0.2);
+        assert_valid_metrics(&available_with_change);
+        assert_valid_metrics(&forged_change_mae);
+        assert!(!common_complete_metrics_are_subset(
+            &available_with_change,
+            &forged_change_mae,
+        ));
+
+        let available_without_change = aggregate(2);
+        let common_without_change = aggregate(1);
+        assert_eq!(available_without_change.change_matched_count, 0);
+        assert_eq!(common_without_change.change_mean_absolute_error_sec, None);
+        assert!(common_complete_metrics_are_subset(
+            &available_without_change,
+            &common_without_change,
+        ));
+    }
+
+    #[test]
+    fn common_complete_subset_rejects_impossible_speaker_count_deltas() {
+        let available = aggregate(2);
+        let common = aggregate(1);
+
+        let mut scored_available = available.clone();
+        let mut scored_common = common.clone();
+        set_scored_count_metrics(&mut scored_available, 2, 0);
+        set_scored_count_metrics(&mut scored_common, 2, 0);
+        assert_valid_metrics(&scored_available);
+        assert_valid_metrics(&scored_common);
+        assert!(!common_complete_metrics_are_subset(
+            &scored_available,
+            &scored_common,
+        ));
+
+        let mut full_available = available.clone();
+        let mut full_common = common.clone();
+        set_full_timeline_count_metrics(&mut full_available, 2, 0);
+        set_full_timeline_count_metrics(&mut full_common, 2, 0);
+        assert_valid_metrics(&full_available);
+        assert_valid_metrics(&full_common);
+        assert!(!common_complete_metrics_are_subset(
+            &full_available,
+            &full_common,
+        ));
+
+        let mut resolved_available = available;
+        let mut resolved_common = common;
+        set_resolved_count_metrics(&mut resolved_available, 2, 0);
+        set_resolved_count_metrics(&mut resolved_common, 2, 0);
+        assert_valid_metrics(&resolved_available);
+        assert_valid_metrics(&resolved_common);
+        assert!(!common_complete_metrics_are_subset(
+            &resolved_available,
+            &resolved_common,
+        ));
+
+        let available = aggregate(3);
+        let common = aggregate(2);
+
+        let mut scored_available = available.clone();
+        let mut scored_common = common.clone();
+        set_scored_count_metrics(&mut scored_available, 2, 2);
+        set_scored_count_metrics(&mut scored_common, 2, 0);
+        assert_valid_metrics(&scored_available);
+        assert_valid_metrics(&scored_common);
+        assert!(!common_complete_metrics_are_subset(
+            &scored_available,
+            &scored_common,
+        ));
+
+        let mut full_available = available.clone();
+        let mut full_common = common.clone();
+        set_full_timeline_count_metrics(&mut full_available, 2, 2);
+        set_full_timeline_count_metrics(&mut full_common, 2, 0);
+        assert_valid_metrics(&full_available);
+        assert_valid_metrics(&full_common);
+        assert!(!common_complete_metrics_are_subset(
+            &full_available,
+            &full_common,
+        ));
+
+        let mut resolved_available = available;
+        let mut resolved_common = common;
+        set_resolved_count_metrics(&mut resolved_available, 2, 2);
+        set_resolved_count_metrics(&mut resolved_common, 2, 0);
+        assert_valid_metrics(&resolved_available);
+        assert_valid_metrics(&resolved_common);
+        assert!(!common_complete_metrics_are_subset(
+            &resolved_available,
+            &resolved_common,
+        ));
+    }
+
+    #[test]
+    fn common_complete_subset_rejects_impossible_change_and_time_deltas() {
+        let available = aggregate(2);
+        let common = aggregate(1);
+
+        let mut missing_reference_change = available.clone();
+        missing_reference_change.change_reference_count = 1;
+        missing_reference_change.change_hypothesis_count = 2;
+        missing_reference_change.change_matched_count = 1;
+        missing_reference_change.change_mean_absolute_error_sec = Some(0.1);
+        let mut common_change = common.clone();
+        common_change.change_reference_count = 1;
+        common_change.change_hypothesis_count = 1;
+        assert_valid_metrics(&missing_reference_change);
+        assert_valid_metrics(&common_change);
+        assert!(!common_complete_metrics_are_subset(
+            &missing_reference_change,
+            &common_change,
+        ));
+
+        let mut missing_hypothesis_change = available.clone();
+        missing_hypothesis_change.change_reference_count = 2;
+        missing_hypothesis_change.change_hypothesis_count = 1;
+        missing_hypothesis_change.change_matched_count = 1;
+        missing_hypothesis_change.change_mean_absolute_error_sec = Some(0.1);
+        assert_valid_metrics(&missing_hypothesis_change);
+        assert!(!common_complete_metrics_are_subset(
+            &missing_hypothesis_change,
+            &common_change,
+        ));
+
+        let mut excessive_coverage = common.clone();
+        excessive_coverage.selective_covered_speaker_time_sec = 0.0;
+        excessive_coverage.selective_error_covered_speaker_time_sec = 0.0;
+        excessive_coverage.selective_coverage = Some(0.0);
+        excessive_coverage.selective_risk = None;
+        assert_valid_metrics(&excessive_coverage);
+        assert!(!common_complete_metrics_are_subset(
+            &available,
+            &excessive_coverage,
+        ));
+
+        let mut excessive_selective_error = available.clone();
+        excessive_selective_error.selective_covered_speaker_time_sec = 1.0;
+        excessive_selective_error.selective_error_covered_speaker_time_sec = 1.0;
+        excessive_selective_error.selective_coverage = Some(0.5);
+        excessive_selective_error.selective_risk = Some(1.0);
+        assert_valid_metrics(&excessive_selective_error);
+        assert!(!common_complete_metrics_are_subset(
+            &excessive_selective_error,
+            &common,
+        ));
+
+        let mut excessive_diarization_error = available;
+        excessive_diarization_error.missed_speech_sec = 2.0;
+        excessive_diarization_error.false_alarm_sec = 1.0;
+        excessive_diarization_error.micro_der = Some(1.5);
+        excessive_diarization_error.selective_covered_speaker_time_sec = 0.0;
+        excessive_diarization_error.selective_error_covered_speaker_time_sec = 0.0;
+        excessive_diarization_error.selective_coverage = Some(0.0);
+        excessive_diarization_error.selective_risk = None;
+        excessive_diarization_error.labeled_speaker_time_sec = 0.0;
+        excessive_diarization_error.unknown_speaker_time_sec = 1.0;
+        excessive_diarization_error.unknown_speaker_share = Some(1.0);
+        let mut diarization_common = common;
+        diarization_common.selective_covered_speaker_time_sec = 0.0;
+        diarization_common.selective_error_covered_speaker_time_sec = 0.0;
+        diarization_common.selective_coverage = Some(0.0);
+        diarization_common.selective_risk = None;
+        diarization_common.labeled_speaker_time_sec = 0.0;
+        diarization_common.unknown_speaker_time_sec = 1.0;
+        diarization_common.unknown_speaker_share = Some(1.0);
+        assert_valid_metrics(&excessive_diarization_error);
+        assert_valid_metrics(&diarization_common);
+        assert!(!common_complete_metrics_are_subset(
+            &excessive_diarization_error,
+            &diarization_common,
+        ));
+    }
+
+    #[test]
+    fn aggregate_validation_enforces_frozen_scorer_identities() {
+        let aggregate = aggregate(2);
+        assert_valid_metrics(&aggregate);
+
+        let mut excessive_change_error = aggregate.clone();
+        excessive_change_error.change_reference_count = 1;
+        excessive_change_error.change_hypothesis_count = 1;
+        excessive_change_error.change_matched_count = 1;
+        excessive_change_error.change_mean_absolute_error_sec = Some(0.251);
+        assert!(validate_metric_numbers(&excessive_change_error).is_err());
+
+        let mut missing_macro_der = aggregate.clone();
+        missing_macro_der.macro_der = None;
+        assert!(validate_metric_numbers(&missing_macro_der).is_err());
+        let mut missing_macro_jer = aggregate.clone();
+        missing_macro_jer.macro_jer = None;
+        assert!(validate_metric_numbers(&missing_macro_jer).is_err());
+
+        let mut excessive_reference_error = aggregate.clone();
+        excessive_reference_error.missed_speech_sec = 2.1;
+        excessive_reference_error.false_alarm_sec = 2.1;
+        excessive_reference_error.micro_der = Some(2.1);
+        assert!(validate_metric_numbers(&excessive_reference_error).is_err());
+
+        let mut mismatched_selective_reference = aggregate.clone();
+        mismatched_selective_reference.selective_reference_speaker_time_sec = 2.1;
+        mismatched_selective_reference.selective_coverage = ratio_f64(2.0, 2.1);
+        assert!(validate_metric_numbers(&mismatched_selective_reference).is_err());
+
+        let mut mismatched_occupancy = aggregate.clone();
+        mismatched_occupancy.labeled_speaker_time_sec = 2.1;
+        assert!(validate_metric_numbers(&mismatched_occupancy).is_err());
+
+        let mut sub_millisecond_audio_per_recording = aggregate.clone();
+        sub_millisecond_audio_per_recording.audio_duration_sec = 0.001;
+        sub_millisecond_audio_per_recording.real_time_factor = ratio_f64(
+            sub_millisecond_audio_per_recording.wall_time_sec,
+            sub_millisecond_audio_per_recording.audio_duration_sec,
+        );
+        assert!(validate_metric_numbers(&sub_millisecond_audio_per_recording).is_err());
+
+        let mut sub_millisecond_wall_time_per_recording = aggregate.clone();
+        sub_millisecond_wall_time_per_recording.wall_time_sec = 0.001;
+        sub_millisecond_wall_time_per_recording.real_time_factor = ratio_f64(
+            sub_millisecond_wall_time_per_recording.wall_time_sec,
+            sub_millisecond_wall_time_per_recording.audio_duration_sec,
+        );
+        assert!(validate_metric_numbers(&sub_millisecond_wall_time_per_recording).is_err());
+
+        let mut impossible_scored_exact = aggregate.clone();
+        set_scored_count_metrics(&mut impossible_scored_exact, 1, 2);
+        assert!(validate_metric_numbers(&impossible_scored_exact).is_err());
+        let mut impossible_full_exact = aggregate.clone();
+        set_full_timeline_count_metrics(&mut impossible_full_exact, 1, 2);
+        assert!(validate_metric_numbers(&impossible_full_exact).is_err());
+        let mut impossible_resolved_exact = aggregate;
+        set_resolved_count_metrics(&mut impossible_resolved_exact, 1, 2);
+        assert!(validate_metric_numbers(&impossible_resolved_exact).is_err());
     }
 
     #[test]
