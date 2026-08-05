@@ -304,6 +304,35 @@ fn run(cli: Cli) -> FwResult<()> {
                 println!("{}", serde_json::to_string_pretty(&evidence)?);
                 Ok(())
             }
+            PublicCorpusCommand::CompareModels(args) => {
+                let current_dir = std::env::current_dir().map_err(|_| {
+                    FwError::InvalidRequest(
+                        "public_corpus.project_root: current directory could not be resolved"
+                            .to_owned(),
+                    )
+                })?;
+                let project_root =
+                    franken_whisper::confidential_evaluation::discover_project_root(&current_dir)?;
+                let evidence =
+                    franken_whisper::public_corpus::run_public_model_comparison_with_cancel(
+                        franken_whisper::public_corpus::PublicModelComparisonRequest {
+                            project_root: &project_root,
+                            input_root: &args.input_root,
+                            descriptor_path: &args.descriptor,
+                            bundle_output_path: &args.bundle_output,
+                            evidence_output_path: &args.output,
+                            license_acknowledgement_id: &args.license_ack,
+                            evaluation_split:
+                                franken_whisper::diarization::EvaluationSplit::Development,
+                            sortformer_hard_timeout: Duration::from_secs(
+                                franken_whisper::public_corpus::PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS,
+                            ),
+                        },
+                        ShutdownController::is_shutting_down,
+                    )?;
+                println!("{}", serde_json::to_string_pretty(&evidence)?);
+                Ok(())
+            }
         },
         Command::DiarizationOracle { command } => match command {
             DifferentialOracleCommand::Registry => {
