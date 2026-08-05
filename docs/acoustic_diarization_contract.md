@@ -1411,11 +1411,17 @@ Sortformer four-speaker contract is declared capacity-ineligible and is never
 passed to the model. Consecutive sorted observations follow a four-row Williams
 schedule, and `order_balance_complete` is true only after a complete schedule.
 Every declared lane is retained as completed, skipped, or failed with a stable
-reason. The command requires eight native Rayon workers to match the pinned
-Sortformer intra-op thread count and applies a frozen 1800-second limit to each
-Sortformer `OracleRun` subprocess. That value is not a whole-observation cap:
-hashing, WAV validation, version probing, and output validation are separately
-bounded or cancellation-aware.
+reason. Each complete effective native request and the protocol itself have
+pinned canonical SHA-256 identities, preventing inherited defaults from
+drifting under the same protocol version. The command requires eight native
+Rayon workers to match the pinned Sortformer intra-op thread count and applies
+a frozen 1800-second limit to each Sortformer `OracleRun` subprocess. That
+value is not a whole-observation cap:
+the version probe has a separate 15-second limit, while hashing, WAV and output
+validation, and scoring do not inherit either subprocess deadline. Only the
+subprocess polling loops currently observe the caller-owned cancellation
+predicate, so whole-attempt cancellation latency remains unavailable rather
+than certified.
 
 The aggregate comparison evidence is `diagnostic_only`,
 `development_uncertified`, forbids a superiority claim, and records

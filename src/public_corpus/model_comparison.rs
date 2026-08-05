@@ -42,6 +42,8 @@ pub const PUBLIC_MODEL_COMPARISON_RUNNER_VERSION: &str =
     "public-diarization-model-comparison-runner-v1";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION: &str =
     "public-diarization-model-comparison-protocol-v1";
+pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256: &str =
+    "460fb723a390398bc1d4171fb97d50d089cd18749c15ad7b5b62c0c69719056f";
 pub const PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION: &str = "four-lane-balanced-williams-v1";
 pub const PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS: u64 = 1_800;
 
@@ -137,6 +139,9 @@ pub enum ModelComparisonOutcomeCode {
     SortformerAdapterUnavailable,
     SortformerRuntimeIneligible,
     NativeExecutionFailed,
+    EcapaInvalidRequest,
+    EcapaContractViolation,
+    EcapaStageTimedOut,
     EcapaExecutionFailed,
     SortformerExecutionFailed,
     ScoringFailed,
@@ -163,6 +168,9 @@ impl ModelComparisonOutcomeCode {
             Self::SortformerAdapterUnavailable => "sortformer_adapter_unavailable",
             Self::SortformerRuntimeIneligible => "sortformer_runtime_ineligible",
             Self::NativeExecutionFailed => "native_execution_failed",
+            Self::EcapaInvalidRequest => "ecapa_invalid_request",
+            Self::EcapaContractViolation => "ecapa_contract_violation",
+            Self::EcapaStageTimedOut => "ecapa_stage_timed_out",
             Self::EcapaExecutionFailed => "ecapa_execution_failed",
             Self::SortformerExecutionFailed => "sortformer_execution_failed",
             Self::ScoringFailed => "scoring_failed",
@@ -423,6 +431,9 @@ pub struct PublicModelComparisonProtocol {
     pub speaker_boundary_collar_ms: u64,
     pub change_boundary_collar_ms: u64,
     pub scorer_config_sha256: String,
+    pub native_acoustic_request_sha256: String,
+    pub native_ecapa_request_sha256: String,
+    pub native_ecapa_fused_request_sha256: String,
     pub native_rayon_threads: u16,
     pub sortformer_intraop_threads: u16,
     pub sortformer_interop_threads: u16,
@@ -491,7 +502,7 @@ pub struct PublicModelComparisonRequest<'a> {
 }
 
 enum EcapaAvailability {
-    Ready(EcapaModel),
+    Ready(Box<EcapaModel>),
     Unavailable,
     Invalid,
 }
@@ -918,6 +929,12 @@ where
         ));
     }
     let protocol_sha256 = super::canonical_sha256(&protocol)?;
+    if protocol_sha256 != PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256 {
+        return Err(model_comparison_error(
+            "protocol_drift",
+            "model-comparison protocol changed without a versioned digest update",
+        ));
+    }
     cancellation_checkpoint(&is_cancelled)?;
 
     let mut cancellation_adapter = || is_cancelled();
@@ -1270,6 +1287,9 @@ fn comparison_scorer_config() -> DiarizationScorerConfig {
 
 fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol> {
     let scorer_config = comparison_scorer_config();
+    let native_acoustic_request = comparison_diarization_request(DiarizationEngine::Acoustic);
+    let native_ecapa_request = comparison_diarization_request(DiarizationEngine::Ecapa);
+    let native_ecapa_fused_request = comparison_diarization_request(DiarizationEngine::EcapaFused);
     let sortformer_contract = sortformer_oracle_contract();
     let sortformer_max_speakers = u16::try_from(SORTFORMER_ORACLE_MAX_SPEAKERS).map_err(|_| {
         model_comparison_error(
@@ -1299,6 +1319,11 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         speaker_boundary_collar_ms: scorer_config.speaker_boundary_collar_ms,
         change_boundary_collar_ms: scorer_config.change_boundary_collar_ms,
         scorer_config_sha256: super::canonical_sha256(&scorer_config)?,
+        native_acoustic_request_sha256: super::canonical_sha256(&native_acoustic_request)?,
+        native_ecapa_request_sha256: super::canonical_sha256(&native_ecapa_request)?,
+        native_ecapa_fused_request_sha256: super::canonical_sha256(
+            &native_ecapa_fused_request,
+        )?,
         native_rayon_threads: sortformer_contract.torch_intraop_threads,
         sortformer_intraop_threads: sortformer_contract.torch_intraop_threads,
         sortformer_interop_threads: sortformer_contract.torch_interop_threads,
@@ -1333,7 +1358,7 @@ where
     };
     let checkpoint = || cancellation_checkpoint(is_cancelled);
     match EcapaModel::load_with_checkpoint(&model_path, &checkpoint) {
-        Ok(model) => Ok(EcapaAvailability::Ready(model)),
+        Ok(model) => Ok(EcapaAvailability::Ready(Box::new(model))),
         Err(error @ FwError::Cancelled(_)) => Err(error),
         Err(_) => Ok(EcapaAvailability::Invalid),
     }
@@ -1369,7 +1394,7 @@ where
                     request: &diarization_request,
                     boundary_hints: &boundary_hints,
                 },
-                || is_cancelled(),
+                is_cancelled,
             );
             let (report, _) = match result {
                 Ok(value) => value,
@@ -1421,10 +1446,10 @@ where
             let (report, _) = match result {
                 Ok(value) => value,
                 Err(error @ FwError::Cancelled(_)) => return Err(error),
-                Err(_) => {
+                Err(error) => {
                     return Ok(InternalLaneOutcome::failed(
                         lane,
-                        ModelComparisonOutcomeCode::EcapaExecutionFailed,
+                        classify_ecapa_failure(&error),
                     ));
                 }
             };
@@ -1729,6 +1754,31 @@ fn classify_sortformer_skip(
     })
 }
 
+fn classify_ecapa_failure(error: &FwError) -> ModelComparisonOutcomeCode {
+    match error {
+        FwError::InvalidRequest(_) => ModelComparisonOutcomeCode::EcapaInvalidRequest,
+        FwError::ContractViolation(_) => ModelComparisonOutcomeCode::EcapaContractViolation,
+        FwError::StageTimeout { .. } | FwError::CommandTimedOut { .. } => {
+            ModelComparisonOutcomeCode::EcapaStageTimedOut
+        }
+        FwError::Cancelled(_) => {
+            debug_assert!(
+                false,
+                "cancellation must be propagated before ECAPA classification"
+            );
+            ModelComparisonOutcomeCode::EcapaExecutionFailed
+        }
+        FwError::Io(_)
+        | FwError::Json(_)
+        | FwError::CommandMissing { .. }
+        | FwError::CommandFailed { .. }
+        | FwError::BackendUnavailable(_)
+        | FwError::Storage(_)
+        | FwError::Unsupported(_)
+        | FwError::MissingArtifact(_) => ModelComparisonOutcomeCode::EcapaExecutionFailed,
+    }
+}
+
 fn lane_resource_evidence(
     lane: ModelComparisonLane,
     sortformer_timeout_seconds: u64,
@@ -1957,6 +2007,9 @@ fn lane_outcome_codes_valid(
         ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused => matches!(
             code,
             ModelComparisonOutcomeCode::EcapaModelInvalid
+                | ModelComparisonOutcomeCode::EcapaInvalidRequest
+                | ModelComparisonOutcomeCode::EcapaContractViolation
+                | ModelComparisonOutcomeCode::EcapaStageTimedOut
                 | ModelComparisonOutcomeCode::EcapaExecutionFailed
                 | ModelComparisonOutcomeCode::ScoringFailed
         ),
@@ -2006,6 +2059,13 @@ fn validate_shared_ecapa_outcomes(
     Ok(())
 }
 
+/// Verify the retained artifact's frozen schema, self-hashes, lane accounting,
+/// and aggregate invariants.
+///
+/// This is intentionally a structural verifier. Aggregate-only evidence does
+/// not retain the per-recording outcomes needed to recompute observation-set
+/// membership or metrics; source reconstruction requires the separately
+/// validated public bundle and a fresh comparison run.
 pub fn verify_public_model_comparison_evidence(
     evidence: &PublicModelComparisonEvidence,
 ) -> FwResult<()> {
@@ -2061,12 +2121,14 @@ pub fn verify_public_model_comparison_evidence(
             ));
         }
     }
-    if super::canonical_sha256(&evidence.protocol)? != evidence.protocol_sha256
+    if evidence.protocol_sha256 != PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256
+        || super::canonical_sha256(&evidence.protocol)? != evidence.protocol_sha256
         || evidence.lanes.len() != ModelComparisonLane::ALL.len()
         || evidence.common_complete_recording_count > evidence.observation_count
         || evidence.execution_order_sha256
             != expected_execution_order_sha256(evidence.observation_count)?
-        || evidence.order_balance_complete != (evidence.observation_count % schedule_period == 0)
+        || evidence.order_balance_complete
+            != evidence.observation_count.is_multiple_of(schedule_period)
         || (evidence.common_complete_recording_count == 0
             && evidence.common_complete_observation_set_sha256 != empty_common_complete_sha256())
     {
@@ -2635,6 +2697,15 @@ mod tests {
     }
 
     #[test]
+    fn frozen_protocol_digest_detects_unversioned_default_drift() {
+        let protocol = frozen_model_comparison_protocol().expect("frozen protocol");
+        assert_eq!(
+            super::super::canonical_sha256(&protocol).expect("canonical protocol digest"),
+            PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256
+        );
+    }
+
+    #[test]
     fn installed_broken_sortformer_is_a_failure_not_a_capability_skip() {
         for reason in [
             DifferentialSkipReason::VersionProbeFailed,
@@ -2650,6 +2721,25 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn ecapa_failures_retain_stable_payload_free_error_classes() {
+        assert_eq!(
+            classify_ecapa_failure(&FwError::InvalidRequest("private detail".to_owned())),
+            ModelComparisonOutcomeCode::EcapaInvalidRequest
+        );
+        assert_eq!(
+            classify_ecapa_failure(&FwError::ContractViolation("private detail".to_owned())),
+            ModelComparisonOutcomeCode::EcapaContractViolation
+        );
+        assert_eq!(
+            classify_ecapa_failure(&FwError::StageTimeout {
+                stage: "ecapa".to_owned(),
+                budget_ms: 1,
+            }),
+            ModelComparisonOutcomeCode::EcapaStageTimedOut
+        );
     }
 
     #[test]
