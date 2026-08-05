@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC;
 use crate::ecapa_conformance::{
-    ECAPA_EMBEDDING_DIMENSIONS, ECAPA_MAXIMUM_RUNTIME_SAMPLES, ECAPA_MINIMUM_RUNTIME_SAMPLES,
-    ECAPA_PACKAGE_SHA256, ECAPA_SAMPLE_RATE_HZ,
+    ECAPA_CONTRACT_SHA256, ECAPA_EMBEDDING_DIMENSIONS, ECAPA_MAXIMUM_RUNTIME_SAMPLES,
+    ECAPA_MINIMUM_RUNTIME_SAMPLES, ECAPA_PACKAGE_SHA256, ECAPA_SAMPLE_RATE_HZ,
 };
 use crate::ecapa_inference::{EcapaInferenceConfig, EcapaInferenceTrace, EcapaModel};
 use crate::error::{FwError, FwResult};
@@ -7860,6 +7860,100 @@ pub fn ecapa_speaker_pair_calibration_sha256(
     format!("{:x}", hasher.finalize())
 }
 
+/// Stable SHA-256 of the evaluation-only residual-speaker birth policy.
+///
+/// This is deliberately separate from, and does not replace,
+/// [`ecapa_speaker_pair_calibration_sha256`]: changing the experimental search
+/// must not rewrite the incumbent pair model's identity or make a candidate
+/// result look production-certified.
+#[must_use]
+pub(crate) fn ecapa_residual_birth_policy_sha256() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ecapa-residual-speaker-birth-policy\0");
+    hasher.update(ECAPA_RESIDUAL_BIRTH_VERSION.as_bytes());
+    hasher.update(ECAPA_RESIDUAL_BIRTH_BASELINE_VERSION.as_bytes());
+    hasher.update(ECAPA_RESIDUAL_BIRTH_EVIDENCE_SCHEMA_VERSION.as_bytes());
+    hasher.update(ECAPA_RESIDUAL_BIRTH_COMMON_OBSERVATION_VERSION.as_bytes());
+    hasher.update(ECAPA_SPEAKER_REPRESENTATION_VERSION.as_bytes());
+    hasher.update(NEURAL_DIARIZATION_CONTRACT_VERSION.as_bytes());
+    hasher.update(ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION.as_bytes());
+    hasher.update(ECAPA_PACKAGE_SHA256.as_bytes());
+    hasher.update(ECAPA_CONTRACT_SHA256.as_bytes());
+    hasher.update(
+        ecapa_speaker_pair_calibration_sha256(DiarizationSpeakerEvidenceMode::EcapaOnly).as_bytes(),
+    );
+    hasher.update(acoustic_feature_schema_sha256(AcousticFeatureSchemaVersion::V2).as_bytes());
+    hasher.update(ACOUSTIC_CHANGE_FIXED_SAFE_VERSION.as_bytes());
+    for value in [
+        ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS,
+        ECAPA_RESIDUAL_BIRTH_MAX_PAIR_PROPOSALS_PER_PARENT,
+        ECAPA_RESIDUAL_BIRTH_LLOYD_ITERATIONS,
+        MIN_SPEAKER_SEPARATION_LANES,
+        MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES,
+        SPEAKER_COUNT_PERTURBATION_LANES,
+        ECAPA_EMBEDDING_DIMENSIONS,
+        MAX_SPEAKER_COUNT as usize,
+    ] {
+        hasher.update((value as u64).to_le_bytes());
+    }
+    hasher.update(ECAPA_RESIDUAL_BIRTH_MAX_SCRATCH_PAYLOAD_BYTES.to_le_bytes());
+    for value in [
+        ECAPA_RESIDUAL_BIRTH_MIN_NEURAL_SUPPORT,
+        ECAPA_RESIDUAL_BIRTH_LONG_SINGLETON_MIN_TOTAL_SUPPORT,
+        ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT,
+        ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE,
+        ECAPA_HELDOUT_COMPETITOR_DISTANCE_MARGIN,
+    ] {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    hasher.update((ACOUSTIC_CANCELLATION_INTERVAL_FRAMES as u64).to_le_bytes());
+    hasher.update(b"equal-tracklet-leave-one-out-residual-ranking-v1");
+    hasher.update(b"reciprocal-leave-pair-out-discovery-v1");
+    hasher.update(b"one-global-proposal-no-runner-up-v1");
+    hasher.update(b"global-residual-gain-zero-singleton-dispersion-stable-id-ties-v1");
+    hasher.update(b"disjoint-heldout-validation-after-freeze-v1");
+    hasher.update(b"five-coordinate-jackknife-views-three-required-v1");
+    hasher.update(b"joint-same-and-all-different-view-gate-max-min-margin-v1");
+    hasher.update(b"seeded-equal-tracklet-spherical-lloyd-strict-tie-background-v1");
+    hasher.update(b"true-temporal-recurrence-episodes-v1");
+    hasher.update(b"one-birth-per-recording-v1");
+    hasher.update(b"count-and-prototype-ceilings-before-birth-v1");
+    hasher.update(b"final-all-pairs-robust-separation-v1");
+    hasher.update(b"untouched-incumbents-cloned-byte-for-byte-v1");
+    hasher.update(b"exact-raw-member-conservation-v1");
+    hasher.update(b"conservative-checked-scratch-payload-accounting-v1");
+    hasher.update(b"route:development-only-no-env-no-default-flip-v1");
+    for mode in EcapaResidualBirthMode::ALL {
+        hasher.update(b"mode:");
+        hasher.update(mode.id().as_bytes());
+        hasher.update([0]);
+    }
+    hasher.update(b"eligibility:speaker-count-infer-only");
+    hasher.update(b"eligibility:evidence-mode-ecapa-only");
+    hasher.update(b"eligibility:requested-probabilistic-v1");
+    hasher.update(b"eligibility:executed-ecapa-spherical");
+    hasher.update(b"eligibility:empty-hint-document");
+    hasher.update(b"eligibility:empty-hint-evidence");
+    hasher.update(b"eligibility:empty-training-evidence");
+    hasher.update(b"eligibility:empty-hard-assignments");
+    hasher.update(b"eligibility:empty-soft-priors");
+    hasher.update(b"eligibility:empty-cannot-links");
+    hasher.update(b"eligibility:empty-profiles");
+    hasher.update(b"eligibility:empty-reserved-speaker-refs");
+    hasher.update(b"route-order:request,evidence,constraints,executed-partition");
+    for proposal in EcapaResidualBirthProposalKind::ALL {
+        hasher.update(b"proposal:");
+        hasher.update(proposal.id().as_bytes());
+        hasher.update([0]);
+    }
+    for fallback in EcapaResidualBirthFallbackReason::ALL {
+        hasher.update(b"fallback:");
+        hasher.update(fallback.id().as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn speaker_pair_calibration_sha256_for_mode(
     evidence_mode: DiarizationSpeakerEvidenceMode,
 ) -> String {
@@ -11948,6 +12042,150 @@ const MIN_ECAPA_TRACKLET_VOICED_FRAMES: usize = 20;
 const ECAPA_HELDOUT_MINIMUM_SOURCE_SAMPLES: usize = ECAPA_SAMPLE_RATE_HZ * 2;
 const ECAPA_HELDOUT_SINGLETON_MIN_TOTAL_WEIGHT: f32 = 200.0;
 const ECAPA_HELDOUT_COMPETITOR_DISTANCE_MARGIN: f32 = 0.05;
+/// Frozen identity for the evaluation-only residual-speaker birth policy.
+///
+/// This identity is deliberately separate from the incumbent pair calibration
+/// and never participates in a production report.
+pub(crate) const ECAPA_RESIDUAL_BIRTH_VERSION: &str =
+    "ecapa-cross-fitted-residual-speaker-birth-v1-development";
+pub(crate) const ECAPA_RESIDUAL_BIRTH_BASELINE_VERSION: &str = "ecapa-spherical-incumbent-v1";
+pub(crate) const ECAPA_RESIDUAL_BIRTH_EVIDENCE_SCHEMA_VERSION: &str =
+    "ecapa-residual-speaker-birth-evidence-v1";
+const ECAPA_RESIDUAL_BIRTH_COMMON_OBSERVATION_VERSION: &str =
+    "ecapa-residual-common-observation-v1";
+const ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS: usize = 8;
+const ECAPA_RESIDUAL_BIRTH_MAX_PAIR_PROPOSALS_PER_PARENT: usize = 28;
+const ECAPA_RESIDUAL_BIRTH_MIN_NEURAL_SUPPORT: f32 = 100.0;
+const ECAPA_RESIDUAL_BIRTH_LONG_SINGLETON_MIN_TOTAL_SUPPORT: f32 = 200.0;
+const ECAPA_RESIDUAL_BIRTH_LLOYD_ITERATIONS: usize = 8;
+const ECAPA_RESIDUAL_BIRTH_MAX_SCRATCH_PAYLOAD_BYTES: u64 = 64 * 1024;
+
+/// Explicit routing for the residual-speaker birth experiment.
+///
+/// Every production entry point supplies [`Self::DisabledIncumbent`]. The
+/// candidate is reachable only through the test/evaluation seam below; there
+/// is intentionally no environment variable, `OnceLock`, or default flip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EcapaResidualBirthMode {
+    DisabledIncumbent,
+    DevelopmentCandidateV1,
+}
+
+impl EcapaResidualBirthMode {
+    const ALL: [Self; 2] = [Self::DisabledIncumbent, Self::DevelopmentCandidateV1];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::DisabledIncumbent => "disabled_incumbent",
+            Self::DevelopmentCandidateV1 => "development_candidate_v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EcapaResidualBirthProposalKind {
+    ReciprocalPair,
+    LongSingleton,
+}
+
+impl EcapaResidualBirthProposalKind {
+    const ALL: [Self; 2] = [Self::ReciprocalPair, Self::LongSingleton];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::ReciprocalPair => "reciprocal_pair",
+            Self::LongSingleton => "long_singleton",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EcapaResidualBirthFallbackReason {
+    DisabledIncumbent,
+    RequestNotInfer,
+    EvidenceModeNotEcapaOnly,
+    ConstrainedPartition,
+    IncumbentNotEcapaSpherical,
+    CountCeilingReached,
+    InsufficientRepresentedMembers,
+    NoCrossFittedResidualCandidate,
+    HeldoutValidationFailed,
+    SeededSplitDegenerate,
+    CandidateSupportFailed,
+    IncumbentPreservationFailed,
+    FinalSeparationFailed,
+}
+
+impl EcapaResidualBirthFallbackReason {
+    const ALL: [Self; 13] = [
+        Self::DisabledIncumbent,
+        Self::RequestNotInfer,
+        Self::EvidenceModeNotEcapaOnly,
+        Self::ConstrainedPartition,
+        Self::IncumbentNotEcapaSpherical,
+        Self::CountCeilingReached,
+        Self::InsufficientRepresentedMembers,
+        Self::NoCrossFittedResidualCandidate,
+        Self::HeldoutValidationFailed,
+        Self::SeededSplitDegenerate,
+        Self::CandidateSupportFailed,
+        Self::IncumbentPreservationFailed,
+        Self::FinalSeparationFailed,
+    ];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::DisabledIncumbent => "disabled_incumbent",
+            Self::RequestNotInfer => "request_not_infer",
+            Self::EvidenceModeNotEcapaOnly => "evidence_mode_not_ecapa_only",
+            Self::ConstrainedPartition => "constrained_partition",
+            Self::IncumbentNotEcapaSpherical => "incumbent_not_ecapa_spherical",
+            Self::CountCeilingReached => "count_ceiling_reached",
+            Self::InsufficientRepresentedMembers => "insufficient_represented_members",
+            Self::NoCrossFittedResidualCandidate => "no_cross_fitted_residual_candidate",
+            Self::HeldoutValidationFailed => "heldout_validation_failed",
+            Self::SeededSplitDegenerate => "seeded_split_degenerate",
+            Self::CandidateSupportFailed => "candidate_support_failed",
+            Self::IncumbentPreservationFailed => "incumbent_preservation_failed",
+            Self::FinalSeparationFailed => "final_separation_failed",
+        }
+    }
+}
+
+/// Bounded, feature-free work counters for one residual-birth attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct EcapaResidualBirthResourceSummary {
+    pub parent_count_scanned: u64,
+    pub residual_observation_count: u64,
+    pub leave_pair_out_pair_count: u64,
+    pub candidate_split_count: u64,
+    pub committed_birth_count: u64,
+    pub lloyd_assignment_visits: u64,
+    pub robust_view_comparison_count: u64,
+    pub maximum_retained_residual_observations: u64,
+    pub peak_scratch_payload_bytes: u64,
+    pub operation_count: u64,
+    pub cancellation_check_count: u64,
+}
+
+/// Evaluation-only diagnostics kept separate from the incumbent partition and
+/// from every runtime report so a rejected candidate remains byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct EcapaResidualBirthEvaluationEvidence {
+    pub schema_version: String,
+    pub mode: EcapaResidualBirthMode,
+    pub policy_sha256: String,
+    pub common_observation_sha256: String,
+    pub proposal_kind: Option<EcapaResidualBirthProposalKind>,
+    pub birth_applied: bool,
+    pub fallback_reason: Option<EcapaResidualBirthFallbackReason>,
+    pub incumbent_cluster_count: u64,
+    pub output_cluster_count: u64,
+    pub resources: EcapaResidualBirthResourceSummary,
+}
 
 struct EcapaTrackletWindows {
     discovery: Vec<f32>,
@@ -13177,7 +13415,7 @@ fn cluster_acoustic_tracklets_with_budgeted_enrollment<C>(
     requested_mode: AcousticClusteringMode,
     neural_embeddings: Option<&EcapaTrackletEmbeddings>,
     evidence_mode: DiarizationSpeakerEvidenceMode,
-    mut is_cancelled: C,
+    is_cancelled: C,
 ) -> FwResult<(
     AcousticClusteringResult,
     Vec<AcousticCountMergeStepEvidence>,
@@ -13185,6 +13423,63 @@ fn cluster_acoustic_tracklets_with_budgeted_enrollment<C>(
 where
     C: FnMut() -> bool,
 {
+    let (clustering, count_merge_steps, _) =
+        cluster_acoustic_tracklets_with_budgeted_enrollment_and_residual_birth(
+            tracklets,
+            enrollment,
+            speaker_count,
+            requested_prototype_cap,
+            requested_mode,
+            neural_embeddings,
+            evidence_mode,
+            EcapaResidualBirthMode::DisabledIncumbent,
+            "",
+            is_cancelled,
+        )?;
+    Ok((clustering, count_merge_steps))
+}
+
+fn cluster_acoustic_tracklets_with_budgeted_enrollment_and_residual_birth<C>(
+    tracklets: &[AcousticTracklet],
+    enrollment: &mut SpeakerEnrollment,
+    speaker_count: &SpeakerCountRequest,
+    requested_prototype_cap: usize,
+    requested_mode: AcousticClusteringMode,
+    neural_embeddings: Option<&EcapaTrackletEmbeddings>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
+    residual_birth_mode: EcapaResidualBirthMode,
+    common_observation_sha256: &str,
+    mut is_cancelled: C,
+) -> FwResult<(
+    AcousticClusteringResult,
+    Vec<AcousticCountMergeStepEvidence>,
+    EcapaResidualBirthEvaluationEvidence,
+)>
+where
+    C: FnMut() -> bool,
+{
+    let mut residual_birth =
+        residual_birth_evidence(residual_birth_mode, common_observation_sha256, 0);
+    if residual_birth_mode == EcapaResidualBirthMode::DevelopmentCandidateV1 {
+        residual_birth.fallback_reason = if !matches!(speaker_count, SpeakerCountRequest::Infer) {
+            Some(EcapaResidualBirthFallbackReason::RequestNotInfer)
+        } else if evidence_mode != DiarizationSpeakerEvidenceMode::EcapaOnly {
+            Some(EcapaResidualBirthFallbackReason::EvidenceModeNotEcapaOnly)
+        } else if requested_mode != AcousticClusteringMode::ProbabilisticV1
+            || enrollment.hint_document_sha256.is_some()
+            || !enrollment.evidence.is_empty()
+            || !enrollment.training_evidence.is_empty()
+            || !enrollment.hard_assignments.is_empty()
+            || !enrollment.soft_priors.is_empty()
+            || !enrollment.cannot_links.is_empty()
+            || !enrollment.profiles.is_empty()
+            || !enrollment.reserved_speaker_refs.is_empty()
+        {
+            Some(EcapaResidualBirthFallbackReason::ConstrainedPartition)
+        } else {
+            None
+        };
+    }
     let valid_evidence_context = match evidence_mode {
         DiarizationSpeakerEvidenceMode::AcousticV2 => neural_embeddings.is_none(),
         DiarizationSpeakerEvidenceMode::EcapaOnly
@@ -13234,6 +13529,12 @@ where
         DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => true,
     };
     if identity_evidence_unavailable {
+        if residual_birth_mode == EcapaResidualBirthMode::DevelopmentCandidateV1
+            && residual_birth.fallback_reason.is_none()
+        {
+            residual_birth.fallback_reason =
+                Some(EcapaResidualBirthFallbackReason::InsufficientRepresentedMembers);
+        }
         let assignments = tracklets.iter().map(unknown_assignment).collect::<Vec<_>>();
         let (_, unknown_voiced_share) = assignment_voiced_shares(tracklets, &assignments)?;
         return Ok((
@@ -13269,6 +13570,7 @@ where
                 merge_trace: Vec::new(),
             },
             Vec::new(),
+            residual_birth,
         ));
     }
     let preliminary_neural_profiles =
@@ -13305,6 +13607,12 @@ where
         )));
     }
     if initial_clusters.is_empty() {
+        if residual_birth_mode == EcapaResidualBirthMode::DevelopmentCandidateV1
+            && residual_birth.fallback_reason.is_none()
+        {
+            residual_birth.fallback_reason =
+                Some(EcapaResidualBirthFallbackReason::InsufficientRepresentedMembers);
+        }
         let assignments = tracklets.iter().map(unknown_assignment).collect::<Vec<_>>();
         let (_, unknown_voiced_share) = assignment_voiced_shares(tracklets, &assignments)?;
         return Ok((
@@ -13340,6 +13648,7 @@ where
                 merge_trace: Vec::new(),
             },
             Vec::new(),
+            residual_birth,
         ));
     }
     let global_prototype_count = initial_clusters.len();
@@ -13362,14 +13671,14 @@ where
     let count_policy =
         apply_count_constraint_floor(count_policy, constraint_lower_bound, initial_clusters.len())?;
     let (
-        clusters,
+        mut clusters,
         merge_trace,
         count_merge_steps,
         bootstrap_stability,
         mut count_estimate,
         executed_mode,
         fallback_reason,
-        operational_partition,
+        mut operational_partition,
     ) = if requested_mode == AcousticClusteringMode::ProbabilisticV1 {
         match probabilistic_agglomerate_clusters(
             &initial_clusters,
@@ -13490,6 +13799,73 @@ where
             Some(operational_partition),
         )
     };
+    if residual_birth_mode == EcapaResidualBirthMode::DevelopmentCandidateV1
+        && residual_birth.fallback_reason.is_none()
+    {
+        let spherical_incumbent = executed_mode == AcousticClusteringMode::ProbabilisticV1
+            && operational_partition.as_ref().is_some_and(|partition| {
+                partition.method == DiarizationOperationalPartitionMethod::EcapaSpherical
+            });
+        if spherical_incumbent {
+            let Some(neural_embeddings) = neural_embeddings else {
+                return Err(FwError::ContractViolation(
+                    "ECAPA spherical residual birth lost its prepared embeddings".to_owned(),
+                ));
+            };
+            let (replacement, evidence) = apply_ecapa_residual_birth(
+                &clusters,
+                tracklets,
+                neural_embeddings,
+                count_policy,
+                global_prototype_count,
+                requested_prototype_cap,
+                residual_birth_mode,
+                common_observation_sha256,
+                &mut is_cancelled,
+            )?;
+            residual_birth = evidence;
+            if let Some(replacement) = replacement {
+                let prior_partition = operational_partition.clone().ok_or_else(|| {
+                    FwError::ContractViolation(
+                        "accepted residual birth lost its incumbent partition provenance"
+                            .to_owned(),
+                    )
+                })?;
+                clusters = replacement;
+                if let Some(partition) = operational_partition.as_mut() {
+                    partition.selected_count = u32::try_from(clusters.len()).map_err(|_| {
+                        FwError::ContractViolation(
+                            "residual speaker count exceeds operational schema".to_owned(),
+                        )
+                    })?;
+                    // The incumbent K-way consensus margin does not describe
+                    // the development-only K+1 residual split.
+                    partition.confidence = 0.0;
+                }
+                if let Some(estimate) = count_estimate.as_mut() {
+                    estimate.evidence_sha256 = residual_birth_count_evidence_sha256(
+                        &estimate.evidence_sha256,
+                        &prior_partition,
+                        &residual_birth,
+                    );
+                }
+            }
+        } else {
+            residual_birth.fallback_reason =
+                Some(EcapaResidualBirthFallbackReason::IncumbentNotEcapaSpherical);
+            residual_birth.incumbent_cluster_count = clusters.len() as u64;
+            residual_birth.output_cluster_count = clusters.len() as u64;
+        }
+    } else if residual_birth_mode == EcapaResidualBirthMode::DisabledIncumbent {
+        residual_birth = residual_birth_evidence(
+            residual_birth_mode,
+            common_observation_sha256,
+            clusters.len(),
+        );
+    } else {
+        residual_birth.incumbent_cluster_count = clusters.len() as u64;
+        residual_birth.output_cluster_count = clusters.len() as u64;
+    }
     let labels = canonical_cluster_labels(&clusters, enrollment);
     let mut assignments = viterbi_assignments(
         tracklets,
@@ -13594,6 +13970,7 @@ where
             merge_trace,
         },
         count_merge_steps,
+        residual_birth,
     ))
 }
 
@@ -16118,6 +16495,1338 @@ fn neural_singleton_has_heldout_support(
         }
     }
     true
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EcapaResidualObservation {
+    member: usize,
+    residual_distance: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EcapaResidualBirthProposal {
+    parent_index: usize,
+    kind: EcapaResidualBirthProposalKind,
+    first_seed: usize,
+    second_seed: Option<usize>,
+    discovery_score: f32,
+}
+
+struct EcapaResidualBirthBudget<'a, C>
+where
+    C: FnMut() -> bool,
+{
+    is_cancelled: &'a mut C,
+    operations: u64,
+    cancellation_checks: u64,
+}
+
+impl<'a, C> EcapaResidualBirthBudget<'a, C>
+where
+    C: FnMut() -> bool,
+{
+    fn new(is_cancelled: &'a mut C) -> FwResult<Self> {
+        let mut budget = Self {
+            is_cancelled,
+            operations: 0,
+            cancellation_checks: 0,
+        };
+        budget.check("before residual-speaker birth")?;
+        Ok(budget)
+    }
+
+    fn check(&mut self, stage: &str) -> FwResult<()> {
+        self.cancellation_checks = self.cancellation_checks.saturating_add(1);
+        if (self.is_cancelled)() {
+            return Err(FwError::Cancelled(format!(
+                "residual-speaker birth cancelled {stage}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn observe(&mut self, count: usize, stage: &str) -> FwResult<()> {
+        for _ in 0..count {
+            self.operations = self.operations.saturating_add(1);
+            if self
+                .operations
+                .is_multiple_of(ACOUSTIC_CANCELLATION_INTERVAL_FRAMES as u64)
+            {
+                self.check(stage)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn residual_birth_evidence(
+    mode: EcapaResidualBirthMode,
+    common_observation_sha256: &str,
+    incumbent_cluster_count: usize,
+) -> EcapaResidualBirthEvaluationEvidence {
+    EcapaResidualBirthEvaluationEvidence {
+        schema_version: ECAPA_RESIDUAL_BIRTH_EVIDENCE_SCHEMA_VERSION.to_owned(),
+        mode,
+        policy_sha256: ecapa_residual_birth_policy_sha256(),
+        common_observation_sha256: common_observation_sha256.to_owned(),
+        proposal_kind: None,
+        birth_applied: false,
+        fallback_reason: Some(EcapaResidualBirthFallbackReason::DisabledIncumbent),
+        incumbent_cluster_count: incumbent_cluster_count as u64,
+        output_cluster_count: incumbent_cluster_count as u64,
+        resources: EcapaResidualBirthResourceSummary::default(),
+    }
+}
+
+fn residual_birth_scratch_payload_upper_bound(incumbent: &[AcousticCluster]) -> Option<u64> {
+    let total_members = incumbent.iter().try_fold(0usize, |total, cluster| {
+        total.checked_add(cluster.prototype_members.len())
+    })?;
+    let largest_parent = incumbent
+        .iter()
+        .map(|cluster| cluster.prototype_members.len())
+        .max()
+        .unwrap_or(0);
+    // Conservative simultaneous high-water bound for member-index vectors in
+    // discovery, validation, two Lloyd generations, rebuilt child payloads,
+    // output clusters, and conservation checks. Fixed payload covers retained
+    // residuals/proposal plus eight live embedding centroids and cluster shells.
+    let member_slots = largest_parent.checked_mul(6)?.checked_add(
+        total_members
+            .checked_mul(3)?
+            .checked_add(ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS + 4)?,
+    )?;
+    let member_bytes = member_slots.checked_mul(std::mem::size_of::<usize>())?;
+    let cluster_bytes = incumbent
+        .len()
+        .checked_add(4)?
+        .checked_mul(std::mem::size_of::<AcousticCluster>())?;
+    let fixed_bytes = ECAPA_EMBEDDING_DIMENSIONS
+        .checked_mul(std::mem::size_of::<f32>())?
+        .checked_mul(8)?
+        .checked_add(
+            std::mem::size_of::<EcapaResidualObservation>()
+                .checked_mul(ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS)?,
+        )?
+        .checked_add(std::mem::size_of::<EcapaResidualBirthProposal>())?;
+    u64::try_from(
+        member_bytes
+            .checked_add(cluster_bytes)?
+            .checked_add(fixed_bytes)?,
+    )
+    .ok()
+}
+
+fn tracklet_for_residual_member<'a, C>(
+    tracklets: &'a [AcousticTracklet],
+    member: usize,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+) -> FwResult<Option<(usize, &'a AcousticTracklet)>>
+where
+    C: FnMut() -> bool,
+{
+    if let Some(tracklet) = tracklets
+        .get(member)
+        .filter(|tracklet| tracklet.tracklet_index == member)
+    {
+        budget.observe(1, "while indexing residual-speaker tracklets")?;
+        return Ok(Some((member, tracklet)));
+    }
+    for (position, tracklet) in tracklets.iter().enumerate() {
+        budget.observe(1, "while indexing residual-speaker tracklets")?;
+        if tracklet.tracklet_index == member {
+            return Ok(Some((position, tracklet)));
+        }
+    }
+    Ok(None)
+}
+
+fn residual_embedding_norm<C>(
+    embedding: &EcapaSpeakerEmbedding,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    stage: &str,
+) -> FwResult<Option<f64>>
+where
+    C: FnMut() -> bool,
+{
+    let mut squared_norm = 0.0_f64;
+    for value in embedding {
+        budget.observe(1, stage)?;
+        if !value.is_finite() {
+            return Ok(None);
+        }
+        squared_norm += f64::from(*value) * f64::from(*value);
+    }
+    Ok((squared_norm.is_finite() && squared_norm > f64::EPSILON).then(|| squared_norm.sqrt()))
+}
+
+fn equal_tracklet_discovery_centroid<C>(
+    members: &[usize],
+    neural_embeddings: &EcapaTrackletEmbeddings,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+) -> FwResult<Option<EcapaSpeakerEmbedding>>
+where
+    C: FnMut() -> bool,
+{
+    if members.is_empty() {
+        return Ok(None);
+    }
+    let mut centroid = [0.0_f32; ECAPA_EMBEDDING_DIMENSIONS];
+    for member in members {
+        let Some(representation) = neural_embeddings.get(member) else {
+            return Ok(None);
+        };
+        for (value, observation) in centroid.iter_mut().zip(representation.discovery) {
+            budget.observe(1, "while constructing an equal-tracklet centroid")?;
+            *value += observation;
+        }
+    }
+    let divisor = members.len() as f32;
+    for value in &mut centroid {
+        budget.observe(1, "while normalizing an equal-tracklet centroid")?;
+        *value /= divisor;
+    }
+    let Some(norm) = residual_embedding_norm(
+        &centroid,
+        budget,
+        "while measuring an equal-tracklet centroid",
+    )?
+    else {
+        return Ok(None);
+    };
+    for value in &mut centroid {
+        budget.observe(1, "while unit-normalizing an equal-tracklet centroid")?;
+        *value = (f64::from(*value) / norm) as f32;
+    }
+    Ok(Some(centroid))
+}
+
+fn residual_birth_distance<C>(
+    left: &EcapaSpeakerEmbedding,
+    right: &EcapaSpeakerEmbedding,
+    perturbation: SpeakerPairPerturbation,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    resources: &mut EcapaResidualBirthResourceSummary,
+) -> FwResult<Option<f32>>
+where
+    C: FnMut() -> bool,
+{
+    resources.robust_view_comparison_count =
+        resources.robust_view_comparison_count.saturating_add(1);
+    let mut dot = 0.0_f64;
+    let mut left_squared_norm = 0.0_f64;
+    let mut right_squared_norm = 0.0_f64;
+    let mut active_dimensions = 0usize;
+    for dimension in 0..ECAPA_EMBEDDING_DIMENSIONS {
+        budget.observe(1, "while comparing residual-speaker observations")?;
+        if !perturbation.includes_neural(dimension) {
+            continue;
+        }
+        let left_value = f64::from(left[dimension]);
+        let right_value = f64::from(right[dimension]);
+        if !left_value.is_finite() || !right_value.is_finite() {
+            return Ok(None);
+        }
+        dot += left_value * right_value;
+        left_squared_norm += left_value * left_value;
+        right_squared_norm += right_value * right_value;
+        active_dimensions = active_dimensions.saturating_add(1);
+    }
+    if active_dimensions < SPEAKER_PAIR_MINIMUM_ACTIVE_DIMENSIONS
+        || left_squared_norm <= f64::EPSILON
+        || right_squared_norm <= f64::EPSILON
+    {
+        return Ok(None);
+    }
+    let similarity = dot / (left_squared_norm.sqrt() * right_squared_norm.sqrt());
+    Ok(similarity
+        .is_finite()
+        .then_some((1.0 - similarity.clamp(-1.0, 1.0)) as f32))
+}
+
+fn robust_residual_relation<C>(
+    left: &EcapaSpeakerEmbedding,
+    right: &EcapaSpeakerEmbedding,
+    same_speaker: bool,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    resources: &mut EcapaResidualBirthResourceSummary,
+) -> FwResult<Option<(usize, f32)>>
+where
+    C: FnMut() -> bool,
+{
+    let mut passing_views = 0usize;
+    let mut full_distance = None;
+    for perturbation in SpeakerPairPerturbation::ALL {
+        let Some(distance) = residual_birth_distance(left, right, perturbation, budget, resources)?
+        else {
+            return Ok(None);
+        };
+        if matches!(perturbation, SpeakerPairPerturbation::Full) {
+            full_distance = Some(distance);
+        }
+        let passes = if same_speaker {
+            distance <= ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT
+        } else {
+            distance >= ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE
+        };
+        passing_views = passing_views.saturating_add(usize::from(passes));
+    }
+    Ok(full_distance.map(|distance| (passing_views, distance)))
+}
+
+fn joint_residual_view_evidence<C, const SAME: usize, const DIFFERENT: usize>(
+    same_pairs: [(&EcapaSpeakerEmbedding, &EcapaSpeakerEmbedding); SAME],
+    different_pairs: [(&EcapaSpeakerEmbedding, &EcapaSpeakerEmbedding); DIFFERENT],
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    resources: &mut EcapaResidualBirthResourceSummary,
+) -> FwResult<Option<(usize, f32, f32)>>
+where
+    C: FnMut() -> bool,
+{
+    if SAME == 0 || DIFFERENT == 0 {
+        return Ok(None);
+    }
+    let mut jointly_passing_views = 0usize;
+    let mut full_same_maximum = None::<f32>;
+    let mut full_different_minimum = None::<f32>;
+    for perturbation in SpeakerPairPerturbation::ALL {
+        let mut same_maximum = 0.0_f32;
+        for &(left, right) in &same_pairs {
+            let Some(distance) =
+                residual_birth_distance(left, right, perturbation, budget, resources)?
+            else {
+                return Ok(None);
+            };
+            same_maximum = same_maximum.max(distance);
+        }
+        let mut different_minimum = f32::INFINITY;
+        for &(left, right) in &different_pairs {
+            let Some(distance) =
+                residual_birth_distance(left, right, perturbation, budget, resources)?
+            else {
+                return Ok(None);
+            };
+            different_minimum = different_minimum.min(distance);
+        }
+        if same_maximum <= ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT
+            && different_minimum >= ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE
+        {
+            jointly_passing_views = jointly_passing_views.saturating_add(1);
+        }
+        if matches!(perturbation, SpeakerPairPerturbation::Full) {
+            full_same_maximum = Some(same_maximum);
+            full_different_minimum = Some(different_minimum);
+        }
+    }
+    Ok(full_same_maximum
+        .zip(full_different_minimum)
+        .map(|(same, different)| (jointly_passing_views, same, different)))
+}
+
+fn residual_candidate_episode_count<C>(
+    candidate_members: &[usize],
+    tracklets: &[AcousticTracklet],
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+) -> FwResult<usize>
+where
+    C: FnMut() -> bool,
+{
+    let mut episodes = 0usize;
+    let mut previous_position = None;
+    let mut previous_end_ms = 0u64;
+    for (position, tracklet) in tracklets.iter().enumerate() {
+        budget.observe(1, "while counting residual-speaker recurrence")?;
+        if candidate_members
+            .binary_search(&tracklet.tracklet_index)
+            .is_err()
+        {
+            continue;
+        }
+        let starts_new_episode = previous_position.is_none_or(|previous| {
+            position != previous + 1
+                || tracklet.start_ms
+                    > previous_end_ms.saturating_add(samples_to_ms(ACOUSTIC_HOP_SAMPLES))
+        });
+        if starts_new_episode {
+            episodes = episodes.saturating_add(1);
+        }
+        previous_position = Some(position);
+        previous_end_ms = tracklet.end_ms;
+    }
+    Ok(episodes)
+}
+
+fn ranked_parent_residuals<C>(
+    parent: &AcousticCluster,
+    neural_embeddings: &EcapaTrackletEmbeddings,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    resources: &mut EcapaResidualBirthResourceSummary,
+) -> FwResult<Vec<EcapaResidualObservation>>
+where
+    C: FnMut() -> bool,
+{
+    let mut represented = Vec::with_capacity(parent.prototype_members.len());
+    for member in &parent.prototype_members {
+        budget.observe(1, "while scanning represented residual members")?;
+        if neural_embeddings.contains_key(member) {
+            represented.push(*member);
+        }
+    }
+    if represented.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let mut sum = [0.0_f32; ECAPA_EMBEDDING_DIMENSIONS];
+    for member in &represented {
+        let Some(representation) = neural_embeddings.get(member) else {
+            return Ok(Vec::new());
+        };
+        for (value, observation) in sum.iter_mut().zip(representation.discovery) {
+            budget.observe(1, "while accumulating leave-one-out residuals")?;
+            *value += observation;
+        }
+    }
+    let mut retained =
+        Vec::<EcapaResidualObservation>::with_capacity(ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS);
+    let represented_count = represented.len();
+    for member in represented {
+        let Some(representation) = neural_embeddings.get(&member) else {
+            continue;
+        };
+        let mut leave_one_out = sum;
+        for (value, observation) in leave_one_out.iter_mut().zip(representation.discovery) {
+            budget.observe(1, "while constructing leave-one-out residuals")?;
+            *value -= observation;
+        }
+        let divisor = (represented_count.saturating_sub(1)) as f32;
+        if divisor <= 0.0 {
+            continue;
+        }
+        for value in &mut leave_one_out {
+            budget.observe(1, "while scaling leave-one-out residuals")?;
+            *value /= divisor;
+        }
+        let Some(norm) = residual_embedding_norm(
+            &leave_one_out,
+            budget,
+            "while measuring a leave-one-out residual",
+        )?
+        else {
+            continue;
+        };
+        for value in &mut leave_one_out {
+            budget.observe(1, "while normalizing leave-one-out residuals")?;
+            *value = (f64::from(*value) / norm) as f32;
+        }
+        let Some(residual_distance) = residual_birth_distance(
+            &representation.discovery,
+            &leave_one_out,
+            SpeakerPairPerturbation::Full,
+            budget,
+            resources,
+        )?
+        else {
+            continue;
+        };
+        resources.residual_observation_count =
+            resources.residual_observation_count.saturating_add(1);
+        let observation = EcapaResidualObservation {
+            member,
+            residual_distance,
+        };
+        if retained.len() < ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS {
+            retained.push(observation);
+        } else if retained.last().is_some_and(|worst| {
+            observation
+                .residual_distance
+                .total_cmp(&worst.residual_distance)
+                .then_with(|| worst.member.cmp(&observation.member))
+                .is_gt()
+        }) {
+            retained[ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS - 1] = observation;
+        }
+        retained.sort_by(|left, right| {
+            right
+                .residual_distance
+                .total_cmp(&left.residual_distance)
+                .then(left.member.cmp(&right.member))
+        });
+        resources.maximum_retained_residual_observations = resources
+            .maximum_retained_residual_observations
+            .max(retained.len() as u64);
+    }
+    Ok(retained)
+}
+
+fn residual_support<C>(
+    members: &[usize],
+    neural_embeddings: &EcapaTrackletEmbeddings,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+) -> FwResult<Option<f32>>
+where
+    C: FnMut() -> bool,
+{
+    let mut support = 0.0_f32;
+    for member in members {
+        budget.observe(1, "while summing residual-speaker support")?;
+        let Some(representation) = neural_embeddings.get(member) else {
+            return Ok(None);
+        };
+        let weight = representation.discovery_weight;
+        if !weight.is_finite() || weight < 0.0 {
+            return Ok(None);
+        }
+        support += weight;
+    }
+    Ok(support.is_finite().then_some(support))
+}
+
+fn proposal_is_better(
+    candidate: EcapaResidualBirthProposal,
+    incumbent: EcapaResidualBirthProposal,
+) -> bool {
+    candidate
+        .discovery_score
+        .total_cmp(&incumbent.discovery_score)
+        .then_with(|| incumbent.parent_index.cmp(&candidate.parent_index))
+        .then_with(|| incumbent.first_seed.cmp(&candidate.first_seed))
+        .then_with(|| incumbent.second_seed.cmp(&candidate.second_seed))
+        .is_gt()
+}
+
+fn represented_parent_members<C>(
+    parent: &AcousticCluster,
+    neural_embeddings: &EcapaTrackletEmbeddings,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+) -> FwResult<Vec<usize>>
+where
+    C: FnMut() -> bool,
+{
+    let mut represented = Vec::with_capacity(parent.prototype_members.len());
+    for member in &parent.prototype_members {
+        budget.observe(1, "while collecting represented parent members")?;
+        if neural_embeddings.contains_key(member) {
+            represented.push(*member);
+        }
+    }
+    Ok(represented)
+}
+
+fn discover_residual_birth_proposal<C>(
+    incumbent: &[AcousticCluster],
+    tracklets: &[AcousticTracklet],
+    neural_embeddings: &EcapaTrackletEmbeddings,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    resources: &mut EcapaResidualBirthResourceSummary,
+) -> FwResult<Option<EcapaResidualBirthProposal>>
+where
+    C: FnMut() -> bool,
+{
+    let mut best_pair = None::<EcapaResidualBirthProposal>;
+    let mut best_singleton = None::<EcapaResidualBirthProposal>;
+    for (parent_index, parent) in incumbent.iter().enumerate() {
+        budget.observe(1, "while scanning incumbent residual parents")?;
+        resources.parent_count_scanned = resources.parent_count_scanned.saturating_add(1);
+        let ranked = ranked_parent_residuals(parent, neural_embeddings, budget, resources)?;
+        if ranked.len() < 2 {
+            continue;
+        }
+        let represented_members = represented_parent_members(parent, neural_embeddings, budget)?;
+        let mut enumerated_pairs = 0usize;
+        for left in 0..ranked.len() {
+            for right in left + 1..ranked.len() {
+                if enumerated_pairs >= ECAPA_RESIDUAL_BIRTH_MAX_PAIR_PROPOSALS_PER_PARENT {
+                    break;
+                }
+                enumerated_pairs += 1;
+                resources.leave_pair_out_pair_count =
+                    resources.leave_pair_out_pair_count.saturating_add(1);
+                let first = ranked[left];
+                let second = ranked[right];
+                let mut candidate_members = [first.member, second.member];
+                candidate_members.sort_unstable();
+                if residual_candidate_episode_count(&candidate_members, tracklets, budget)?
+                    < MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES
+                {
+                    continue;
+                }
+                let mut remainder_members = Vec::with_capacity(represented_members.len());
+                for member in &represented_members {
+                    budget.observe(1, "while excluding residual-pair seeds")?;
+                    if !candidate_members.contains(member) {
+                        remainder_members.push(*member);
+                    }
+                }
+                if residual_support(&candidate_members, neural_embeddings, budget)?
+                    .is_none_or(|support| support < ECAPA_RESIDUAL_BIRTH_MIN_NEURAL_SUPPORT)
+                    || residual_support(&remainder_members, neural_embeddings, budget)?
+                        .is_none_or(|support| support < ECAPA_RESIDUAL_BIRTH_MIN_NEURAL_SUPPORT)
+                {
+                    continue;
+                }
+                let Some(remainder) = equal_tracklet_discovery_centroid(
+                    &remainder_members,
+                    neural_embeddings,
+                    budget,
+                )?
+                else {
+                    continue;
+                };
+                let Some(first_embedding) = neural_embeddings.get(&first.member) else {
+                    continue;
+                };
+                let Some(second_embedding) = neural_embeddings.get(&second.member) else {
+                    continue;
+                };
+                let Some((joint_views, same_distance, different_distance)) =
+                    joint_residual_view_evidence(
+                        [(&first_embedding.discovery, &second_embedding.discovery)],
+                        [
+                            (&first_embedding.discovery, &remainder),
+                            (&second_embedding.discovery, &remainder),
+                        ],
+                        budget,
+                        resources,
+                    )?
+                else {
+                    continue;
+                };
+                if joint_views < MIN_SPEAKER_SEPARATION_LANES
+                    || same_distance + ECAPA_HELDOUT_COMPETITOR_DISTANCE_MARGIN > different_distance
+                {
+                    continue;
+                }
+                let proposal = EcapaResidualBirthProposal {
+                    parent_index,
+                    kind: EcapaResidualBirthProposalKind::ReciprocalPair,
+                    first_seed: first.member.min(second.member),
+                    second_seed: Some(first.member.max(second.member)),
+                    discovery_score: different_distance - same_distance,
+                };
+                if best_pair.is_none_or(|current| proposal_is_better(proposal, current)) {
+                    best_pair = Some(proposal);
+                }
+            }
+        }
+        for observation in ranked {
+            let candidate_members = [observation.member];
+            let mut remainder_members = Vec::with_capacity(represented_members.len());
+            for member in &represented_members {
+                budget.observe(1, "while excluding a residual singleton seed")?;
+                if *member != observation.member {
+                    remainder_members.push(*member);
+                }
+            }
+            if residual_support(&candidate_members, neural_embeddings, budget)?
+                .is_none_or(|support| support < ECAPA_RESIDUAL_BIRTH_MIN_NEURAL_SUPPORT)
+                || residual_support(&remainder_members, neural_embeddings, budget)?
+                    .is_none_or(|support| support < ECAPA_RESIDUAL_BIRTH_MIN_NEURAL_SUPPORT)
+            {
+                continue;
+            }
+            let Some(remainder) =
+                equal_tracklet_discovery_centroid(&remainder_members, neural_embeddings, budget)?
+            else {
+                continue;
+            };
+            let Some(candidate) = neural_embeddings.get(&observation.member) else {
+                continue;
+            };
+            let Some((different_views, distance)) = robust_residual_relation(
+                &candidate.discovery,
+                &remainder,
+                false,
+                budget,
+                resources,
+            )?
+            else {
+                continue;
+            };
+            if different_views < MIN_SPEAKER_SEPARATION_LANES {
+                continue;
+            }
+            let proposal = EcapaResidualBirthProposal {
+                parent_index,
+                kind: EcapaResidualBirthProposalKind::LongSingleton,
+                first_seed: observation.member,
+                second_seed: None,
+                discovery_score: distance,
+            };
+            if best_singleton.is_none_or(|current| proposal_is_better(proposal, current)) {
+                best_singleton = Some(proposal);
+            }
+        }
+    }
+    // Freeze exactly one global discovery-only proposal under one score and
+    // deterministic tie order. Validation can reject it, but must never reveal
+    // or promote a runner-up.
+    Ok(match (best_pair, best_singleton) {
+        (Some(pair), Some(singleton)) => Some(if proposal_is_better(singleton, pair) {
+            singleton
+        } else {
+            pair
+        }),
+        (Some(pair), None) => Some(pair),
+        (None, Some(singleton)) => Some(singleton),
+        (None, None) => None,
+    })
+}
+
+fn validate_frozen_residual_birth_proposal<C>(
+    proposal: EcapaResidualBirthProposal,
+    incumbent: &[AcousticCluster],
+    neural_embeddings: &EcapaTrackletEmbeddings,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    resources: &mut EcapaResidualBirthResourceSummary,
+) -> FwResult<bool>
+where
+    C: FnMut() -> bool,
+{
+    let Some(parent) = incumbent.get(proposal.parent_index) else {
+        return Ok(false);
+    };
+    let seed_members = proposal.second_seed.map_or_else(
+        || vec![proposal.first_seed],
+        |second| vec![proposal.first_seed, second],
+    );
+    let mut remainder_members = Vec::with_capacity(parent.prototype_members.len());
+    for member in &parent.prototype_members {
+        budget.observe(1, "while constructing the frozen validation remainder")?;
+        if !seed_members.contains(member) {
+            remainder_members.push(*member);
+        }
+    }
+    let Some(remainder) =
+        equal_tracklet_discovery_centroid(&remainder_members, neural_embeddings, budget)?
+    else {
+        return Ok(false);
+    };
+    let Some(first) = neural_embeddings.get(&proposal.first_seed) else {
+        return Ok(false);
+    };
+    match proposal.kind {
+        EcapaResidualBirthProposalKind::ReciprocalPair => {
+            let Some(second_seed) = proposal.second_seed else {
+                return Ok(false);
+            };
+            let Some(second) = neural_embeddings.get(&second_seed) else {
+                return Ok(false);
+            };
+            let (Some(first_validation), Some(second_validation)) =
+                (first.validation.as_ref(), second.validation.as_ref())
+            else {
+                return Ok(false);
+            };
+            let Some((joint_views, same_distance, different_distance)) =
+                joint_residual_view_evidence(
+                    [
+                        (first_validation, &second.discovery),
+                        (second_validation, &first.discovery),
+                    ],
+                    [
+                        (first_validation, &remainder),
+                        (second_validation, &remainder),
+                    ],
+                    budget,
+                    resources,
+                )?
+            else {
+                return Ok(false);
+            };
+            Ok(joint_views >= MIN_SPEAKER_SEPARATION_LANES
+                && same_distance + ECAPA_HELDOUT_COMPETITOR_DISTANCE_MARGIN <= different_distance)
+        }
+        EcapaResidualBirthProposalKind::LongSingleton => {
+            let Some(validation) = first.validation.as_ref() else {
+                return Ok(false);
+            };
+            if first.discovery_weight + first.validation_weight
+                < ECAPA_RESIDUAL_BIRTH_LONG_SINGLETON_MIN_TOTAL_SUPPORT
+            {
+                return Ok(false);
+            }
+            let Some((joint_views, same_distance, remainder_distance)) =
+                joint_residual_view_evidence(
+                    [(&first.discovery, validation)],
+                    [(validation, &remainder)],
+                    budget,
+                    resources,
+                )?
+            else {
+                return Ok(false);
+            };
+            Ok(joint_views >= MIN_SPEAKER_SEPARATION_LANES
+                && same_distance + ECAPA_HELDOUT_COMPETITOR_DISTANCE_MARGIN <= remainder_distance)
+        }
+    }
+}
+
+fn merge_residual_cluster<C>(
+    destination: &mut AcousticCluster,
+    source: &AcousticCluster,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    resources: &mut EcapaResidualBirthResourceSummary,
+) -> FwResult<bool>
+where
+    C: FnMut() -> bool,
+{
+    if destination.evidence_mode != DiarizationSpeakerEvidenceMode::EcapaOnly
+        || source.evidence_mode != DiarizationSpeakerEvidenceMode::EcapaOnly
+    {
+        return Ok(false);
+    }
+    let total = destination.weight + source.weight;
+    let left_weight = destination.weight / total.max(f32::EPSILON);
+    let right_weight = source.weight / total.max(f32::EPSILON);
+    let merge_distance = match (
+        destination.neural_voice.as_ref(),
+        source.neural_voice.as_ref(),
+    ) {
+        (Some(left), Some(right)) => residual_birth_distance(
+            left,
+            right,
+            SpeakerPairPerturbation::Full,
+            budget,
+            resources,
+        )?
+        .unwrap_or(10.0),
+        _ => 10.0,
+    };
+    match (destination.neural_voice, source.neural_voice.as_ref()) {
+        (None, Some(source_voice)) => {
+            destination.neural_voice = Some(*source_voice);
+            destination.neural_weight = source.neural_weight.max(0.0);
+        }
+        (Some(destination_voice), Some(source_voice)) => {
+            let destination_weight = destination.neural_weight.max(0.0);
+            let source_weight = source.neural_weight.max(0.0);
+            let total_neural_weight = destination_weight + source_weight;
+            if total_neural_weight > f32::EPSILON {
+                let mut centroid = destination_voice;
+                for dimension in 0..ECAPA_EMBEDDING_DIMENSIONS {
+                    budget.observe(1, "while rebuilding a residual neural centroid")?;
+                    centroid[dimension] = (destination_weight * centroid[dimension]
+                        + source_weight * source_voice[dimension])
+                        / total_neural_weight;
+                }
+                if residual_embedding_norm(
+                    &centroid,
+                    budget,
+                    "while validating a rebuilt neural centroid",
+                )?
+                .is_some()
+                {
+                    destination.neural_voice = Some(centroid);
+                    destination.neural_weight = total_neural_weight;
+                } else {
+                    return Ok(false);
+                }
+            }
+        }
+        _ => {}
+    }
+    for dimension in 0..VOICE_VECTOR_DIMENSIONS {
+        budget.observe(1, "while rebuilding residual acoustic metadata")?;
+        if !destination.voice_valid[dimension] && !source.voice_valid[dimension] {
+            continue;
+        }
+        if !destination.voice_valid[dimension] {
+            destination.voice[dimension] = source.voice[dimension];
+            destination.scale[dimension] = source.scale[dimension];
+            destination.voice_valid[dimension] = true;
+            continue;
+        }
+        if !source.voice_valid[dimension] {
+            continue;
+        }
+        let delta = destination.voice[dimension] - source.voice[dimension];
+        destination.voice[dimension] =
+            left_weight * destination.voice[dimension] + right_weight * source.voice[dimension];
+        destination.scale[dimension] = left_weight * destination.scale[dimension]
+            + right_weight * source.scale[dimension]
+            + left_weight * right_weight * delta * delta;
+    }
+    if !destination.channel_valid && source.channel_valid {
+        destination.channel = source.channel;
+        destination.channel_valid = true;
+        destination.channel_dimensions = source.channel_dimensions;
+    } else if destination.channel_valid && source.channel_valid {
+        destination.channel_dimensions = destination
+            .channel_dimensions
+            .min(source.channel_dimensions);
+        for dimension in 0..destination.channel_dimensions {
+            budget.observe(1, "while rebuilding residual channel metadata")?;
+            destination.channel[dimension] = left_weight * destination.channel[dimension]
+                + right_weight * source.channel[dimension];
+        }
+    }
+    if destination
+        .prototype_members
+        .last()
+        .zip(source.prototype_members.first())
+        .is_some_and(|(left, right)| left >= right)
+    {
+        return Ok(false);
+    }
+    for member in &source.prototype_members {
+        budget.observe(1, "while preserving rebuilt residual members")?;
+        destination.prototype_members.push(*member);
+    }
+    destination.sse += source.sse
+        + destination.weight * source.weight / total.max(f32::EPSILON)
+            * merge_distance
+            * merge_distance;
+    destination.weight = total;
+    destination.earliest_ms = destination.earliest_ms.min(source.earliest_ms);
+    destination.reliability =
+        left_weight * destination.reliability + right_weight * source.reliability;
+    if destination.hard_anchor.is_none() {
+        destination.hard_anchor.clone_from(&source.hard_anchor);
+    }
+    if destination.label_hint.is_none() {
+        destination.label_hint.clone_from(&source.label_hint);
+    }
+    Ok(true)
+}
+
+fn rebuild_residual_cluster<C>(
+    members: &[usize],
+    tracklets: &[AcousticTracklet],
+    neural_embeddings: &EcapaTrackletEmbeddings,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    resources: &mut EcapaResidualBirthResourceSummary,
+) -> FwResult<Option<AcousticCluster>>
+where
+    C: FnMut() -> bool,
+{
+    let Some((&first, rest)) = members.split_first() else {
+        return Ok(None);
+    };
+    let Some((_, first_tracklet)) = tracklet_for_residual_member(tracklets, first, budget)? else {
+        return Ok(None);
+    };
+    let hard_assignments = BTreeMap::new();
+    let mut cluster = cluster_from_prototype(&prototype_from_tracklet(
+        first_tracklet,
+        &hard_assignments,
+        Some(neural_embeddings),
+        DiarizationSpeakerEvidenceMode::EcapaOnly,
+    ));
+    for member in rest {
+        let Some((_, tracklet)) = tracklet_for_residual_member(tracklets, *member, budget)? else {
+            return Ok(None);
+        };
+        let next = cluster_from_prototype(&prototype_from_tracklet(
+            tracklet,
+            &hard_assignments,
+            Some(neural_embeddings),
+            DiarizationSpeakerEvidenceMode::EcapaOnly,
+        ));
+        if !merge_residual_cluster(&mut cluster, &next, budget, resources)? {
+            return Ok(None);
+        }
+    }
+    cluster.prototype_members.sort_unstable();
+    let Some(centroid) =
+        equal_tracklet_discovery_centroid(&cluster.prototype_members, neural_embeddings, budget)?
+    else {
+        return Ok(None);
+    };
+    let Some(support) = residual_support(&cluster.prototype_members, neural_embeddings, budget)?
+    else {
+        return Ok(None);
+    };
+    cluster.neural_voice = Some(centroid);
+    cluster.neural_weight = support;
+    cluster.reliability = (support / ECAPA_PROFILE_RELIABILITY_FULL_SUPPORT_FRAMES).clamp(0.0, 1.0);
+    Ok(Some(cluster))
+}
+
+fn residual_clusters_have_robust_separation<C>(
+    left: &AcousticCluster,
+    right: &AcousticCluster,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    resources: &mut EcapaResidualBirthResourceSummary,
+) -> FwResult<bool>
+where
+    C: FnMut() -> bool,
+{
+    if left.evidence_mode != DiarizationSpeakerEvidenceMode::EcapaOnly
+        || right.evidence_mode != DiarizationSpeakerEvidenceMode::EcapaOnly
+        || left.neural_weight.min(right.neural_weight) < ECAPA_RESIDUAL_BIRTH_MIN_NEURAL_SUPPORT
+    {
+        return Ok(false);
+    }
+    let (Some(left_voice), Some(right_voice)) =
+        (left.neural_voice.as_ref(), right.neural_voice.as_ref())
+    else {
+        return Ok(false);
+    };
+    let mut separated_views = 0usize;
+    for perturbation in SpeakerPairPerturbation::ALL {
+        let Some(distance) =
+            residual_birth_distance(left_voice, right_voice, perturbation, budget, resources)?
+        else {
+            return Ok(false);
+        };
+        separated_views = separated_views.saturating_add(usize::from(
+            distance >= ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE,
+        ));
+    }
+    Ok(separated_views >= MIN_SPEAKER_SEPARATION_LANES)
+}
+
+fn clone_residual_cluster<C>(
+    cluster: &AcousticCluster,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+) -> FwResult<AcousticCluster>
+where
+    C: FnMut() -> bool,
+{
+    let mut prototype_members = Vec::with_capacity(cluster.prototype_members.len());
+    for member in &cluster.prototype_members {
+        budget.observe(1, "while cloning an untouched incumbent cluster")?;
+        prototype_members.push(*member);
+    }
+    Ok(AcousticCluster {
+        prototype_members,
+        evidence_mode: cluster.evidence_mode,
+        neural_voice: cluster.neural_voice,
+        neural_weight: cluster.neural_weight,
+        voice: cluster.voice,
+        voice_valid: cluster.voice_valid,
+        scale: cluster.scale,
+        channel: cluster.channel,
+        channel_valid: cluster.channel_valid,
+        channel_dimensions: cluster.channel_dimensions,
+        weight: cluster.weight,
+        sse: cluster.sse,
+        earliest_ms: cluster.earliest_ms,
+        hard_anchor: cluster.hard_anchor.clone(),
+        label_hint: cluster.label_hint.clone(),
+        reliability: cluster.reliability,
+    })
+}
+
+fn split_frozen_residual_birth_proposal<C>(
+    proposal: EcapaResidualBirthProposal,
+    incumbent: &[AcousticCluster],
+    tracklets: &[AcousticTracklet],
+    neural_embeddings: &EcapaTrackletEmbeddings,
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+    resources: &mut EcapaResidualBirthResourceSummary,
+) -> FwResult<Result<Vec<AcousticCluster>, EcapaResidualBirthFallbackReason>>
+where
+    C: FnMut() -> bool,
+{
+    let Some(parent) = incumbent.get(proposal.parent_index) else {
+        return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+    };
+    let represented_members = represented_parent_members(parent, neural_embeddings, budget)?;
+    if represented_members.len() != parent.prototype_members.len() {
+        return Ok(Err(
+            EcapaResidualBirthFallbackReason::IncumbentPreservationFailed,
+        ));
+    }
+    let seed_members = proposal.second_seed.map_or_else(
+        || vec![proposal.first_seed],
+        |second| vec![proposal.first_seed, second],
+    );
+    let mut candidate_members = seed_members.clone();
+    candidate_members.sort_unstable();
+    candidate_members.dedup();
+    let mut background_members = Vec::with_capacity(represented_members.len());
+    for member in &represented_members {
+        budget.observe(1, "while initializing a residual seeded split")?;
+        if !candidate_members.contains(member) {
+            background_members.push(*member);
+        }
+    }
+    if candidate_members.is_empty() || background_members.is_empty() {
+        return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+    }
+    let Some(mut candidate_center) =
+        equal_tracklet_discovery_centroid(&candidate_members, neural_embeddings, budget)?
+    else {
+        return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+    };
+    let Some(mut background_center) =
+        equal_tracklet_discovery_centroid(&background_members, neural_embeddings, budget)?
+    else {
+        return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+    };
+    for _ in 0..ECAPA_RESIDUAL_BIRTH_LLOYD_ITERATIONS {
+        let mut next_candidate = Vec::with_capacity(represented_members.len());
+        let mut next_background = Vec::with_capacity(represented_members.len());
+        for member in &represented_members {
+            resources.lloyd_assignment_visits = resources.lloyd_assignment_visits.saturating_add(1);
+            budget.observe(1, "while assigning a seeded residual split")?;
+            if seed_members.contains(member) {
+                next_candidate.push(*member);
+                continue;
+            }
+            let Some(representation) = neural_embeddings.get(member) else {
+                return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+            };
+            let Some(candidate_distance) = residual_birth_distance(
+                &representation.discovery,
+                &candidate_center,
+                SpeakerPairPerturbation::Full,
+                budget,
+                resources,
+            )?
+            else {
+                return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+            };
+            let Some(background_distance) = residual_birth_distance(
+                &representation.discovery,
+                &background_center,
+                SpeakerPairPerturbation::Full,
+                budget,
+                resources,
+            )?
+            else {
+                return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+            };
+            // Strict comparison is intentional: exact ties stay with the
+            // incumbent/background side and cannot manufacture a new speaker.
+            if candidate_distance < background_distance {
+                next_candidate.push(*member);
+            } else {
+                next_background.push(*member);
+            }
+        }
+        if next_candidate.is_empty() || next_background.is_empty() {
+            return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+        }
+        candidate_members = next_candidate;
+        background_members = next_background;
+        let Some(next_candidate_center) =
+            equal_tracklet_discovery_centroid(&candidate_members, neural_embeddings, budget)?
+        else {
+            return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+        };
+        let Some(next_background_center) =
+            equal_tracklet_discovery_centroid(&background_members, neural_embeddings, budget)?
+        else {
+            return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+        };
+        candidate_center = next_candidate_center;
+        background_center = next_background_center;
+    }
+    let candidate_support =
+        residual_support(&candidate_members, neural_embeddings, budget)?.unwrap_or(0.0);
+    let background_support =
+        residual_support(&background_members, neural_embeddings, budget)?.unwrap_or(0.0);
+    let candidate_episodes =
+        residual_candidate_episode_count(&candidate_members, tracklets, budget)?;
+    let recurrence_supported = match proposal.kind {
+        EcapaResidualBirthProposalKind::ReciprocalPair => {
+            candidate_episodes >= MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES
+        }
+        EcapaResidualBirthProposalKind::LongSingleton => true,
+    };
+    if candidate_support < ECAPA_RESIDUAL_BIRTH_MIN_NEURAL_SUPPORT
+        || background_support < ECAPA_RESIDUAL_BIRTH_MIN_NEURAL_SUPPORT
+        || !recurrence_supported
+    {
+        return Ok(Err(
+            EcapaResidualBirthFallbackReason::CandidateSupportFailed,
+        ));
+    }
+    let Some(candidate_cluster) = rebuild_residual_cluster(
+        &candidate_members,
+        tracklets,
+        neural_embeddings,
+        budget,
+        resources,
+    )?
+    else {
+        return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+    };
+    let Some(background_cluster) = rebuild_residual_cluster(
+        &background_members,
+        tracklets,
+        neural_embeddings,
+        budget,
+        resources,
+    )?
+    else {
+        return Ok(Err(EcapaResidualBirthFallbackReason::SeededSplitDegenerate));
+    };
+    let mut children = [background_cluster, candidate_cluster];
+    if children[0]
+        .earliest_ms
+        .cmp(&children[1].earliest_ms)
+        .then_with(|| compare_cluster_identity(&children[0], &children[1]))
+        .then_with(|| {
+            children[0]
+                .prototype_members
+                .cmp(&children[1].prototype_members)
+        })
+        .is_gt()
+    {
+        children.swap(0, 1);
+    }
+    let mut output = Vec::with_capacity(incumbent.len().saturating_add(1));
+    let mut children = children.into_iter();
+    for (index, cluster) in incumbent.iter().enumerate() {
+        budget.observe(1, "while preserving incumbent cluster order")?;
+        if index == proposal.parent_index {
+            let (Some(first), Some(second)) = (children.next(), children.next()) else {
+                return Ok(Err(
+                    EcapaResidualBirthFallbackReason::IncumbentPreservationFailed,
+                ));
+            };
+            output.push(first);
+            output.push(second);
+        } else {
+            output.push(clone_residual_cluster(cluster, budget)?);
+        }
+    }
+    let mut exact_parent_partition = parent.prototype_members.len()
+        == candidate_members
+            .len()
+            .saturating_add(background_members.len());
+    for member in &parent.prototype_members {
+        budget.observe(1, "while checking exact residual member conservation")?;
+        let candidate = candidate_members.binary_search(member).is_ok();
+        let background = background_members.binary_search(member).is_ok();
+        exact_parent_partition &= candidate ^ background;
+    }
+    if !exact_parent_partition {
+        return Ok(Err(
+            EcapaResidualBirthFallbackReason::IncumbentPreservationFailed,
+        ));
+    }
+    for left in 0..output.len() {
+        for right in left + 1..output.len() {
+            if !residual_clusters_have_robust_separation(
+                &output[left],
+                &output[right],
+                budget,
+                resources,
+            )? {
+                return Ok(Err(EcapaResidualBirthFallbackReason::FinalSeparationFailed));
+            }
+        }
+    }
+    Ok(Ok(output))
+}
+
+fn apply_ecapa_residual_birth<C>(
+    incumbent: &[AcousticCluster],
+    tracklets: &[AcousticTracklet],
+    neural_embeddings: &EcapaTrackletEmbeddings,
+    policy: SpeakerCountPolicy,
+    initial_prototype_count: usize,
+    requested_prototype_cap: usize,
+    mode: EcapaResidualBirthMode,
+    common_observation_sha256: &str,
+    is_cancelled: &mut C,
+) -> FwResult<(
+    Option<Vec<AcousticCluster>>,
+    EcapaResidualBirthEvaluationEvidence,
+)>
+where
+    C: FnMut() -> bool,
+{
+    let mut evidence = residual_birth_evidence(mode, common_observation_sha256, incumbent.len());
+    if mode == EcapaResidualBirthMode::DisabledIncumbent {
+        return Ok((None, evidence));
+    }
+    evidence.fallback_reason = None;
+    if incumbent.len().saturating_add(1) > policy.max
+        || incumbent.len().saturating_add(1) > MAX_SPEAKER_COUNT as usize
+        || incumbent.len().saturating_add(1) > initial_prototype_count
+        || incumbent.len().saturating_add(1) > requested_prototype_cap
+    {
+        evidence.fallback_reason = Some(EcapaResidualBirthFallbackReason::CountCeilingReached);
+        return Ok((None, evidence));
+    }
+    let mut budget = EcapaResidualBirthBudget::new(is_cancelled)?;
+    budget.observe(
+        incumbent.len(),
+        "while bounding residual-speaker scratch payload",
+    )?;
+    let scratch_payload = residual_birth_scratch_payload_upper_bound(incumbent);
+    evidence.resources.peak_scratch_payload_bytes = scratch_payload.unwrap_or(u64::MAX);
+    if scratch_payload
+        .is_none_or(|payload| payload > ECAPA_RESIDUAL_BIRTH_MAX_SCRATCH_PAYLOAD_BYTES)
+    {
+        evidence.fallback_reason =
+            Some(EcapaResidualBirthFallbackReason::NoCrossFittedResidualCandidate);
+        evidence.resources.operation_count = budget.operations;
+        evidence.resources.cancellation_check_count = budget.cancellation_checks;
+        return Ok((None, evidence));
+    }
+    let mut has_represented_parent = false;
+    for cluster in incumbent {
+        let mut represented = 0usize;
+        for member in &cluster.prototype_members {
+            budget.observe(1, "while checking represented residual members")?;
+            represented =
+                represented.saturating_add(usize::from(neural_embeddings.contains_key(member)));
+        }
+        has_represented_parent |= represented >= 2;
+    }
+    if !has_represented_parent {
+        evidence.fallback_reason =
+            Some(EcapaResidualBirthFallbackReason::InsufficientRepresentedMembers);
+        evidence.resources.operation_count = budget.operations;
+        evidence.resources.cancellation_check_count = budget.cancellation_checks;
+        return Ok((None, evidence));
+    }
+    let proposal = discover_residual_birth_proposal(
+        incumbent,
+        tracklets,
+        neural_embeddings,
+        &mut budget,
+        &mut evidence.resources,
+    )?;
+    let Some(proposal) = proposal else {
+        evidence.fallback_reason =
+            Some(EcapaResidualBirthFallbackReason::NoCrossFittedResidualCandidate);
+        evidence.resources.operation_count = budget.operations;
+        evidence.resources.cancellation_check_count = budget.cancellation_checks;
+        return Ok((None, evidence));
+    };
+    evidence.proposal_kind = Some(proposal.kind);
+    if !validate_frozen_residual_birth_proposal(
+        proposal,
+        incumbent,
+        neural_embeddings,
+        &mut budget,
+        &mut evidence.resources,
+    )? {
+        evidence.fallback_reason = Some(EcapaResidualBirthFallbackReason::HeldoutValidationFailed);
+        evidence.resources.operation_count = budget.operations;
+        evidence.resources.cancellation_check_count = budget.cancellation_checks;
+        return Ok((None, evidence));
+    }
+    evidence.resources.candidate_split_count = 1;
+    let split = split_frozen_residual_birth_proposal(
+        proposal,
+        incumbent,
+        tracklets,
+        neural_embeddings,
+        &mut budget,
+        &mut evidence.resources,
+    )?;
+    evidence.resources.operation_count = budget.operations;
+    evidence.resources.cancellation_check_count = budget.cancellation_checks;
+    match split {
+        Ok(output) => {
+            evidence.birth_applied = true;
+            evidence.fallback_reason = None;
+            evidence.output_cluster_count = output.len() as u64;
+            evidence.resources.committed_birth_count = 1;
+            Ok((Some(output), evidence))
+        }
+        Err(reason) => {
+            evidence.fallback_reason = Some(reason);
+            Ok((None, evidence))
+        }
+    }
 }
 
 fn infer_neural_spherical_partition<C>(
