@@ -306,7 +306,7 @@ fn saturating_duration_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const PIPE_CAPTURE_STOP_DRAIN_GRACE: Duration = Duration::from_millis(100);
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 const PIPE_CAPTURE_FALLBACK_GRACE: Duration = Duration::from_secs(1);
@@ -341,10 +341,10 @@ impl PipeReader {
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 impl PipeReader {
     fn finish(self) -> FwResult<PipeCapture> {
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
         let result = match self.receiver.recv_timeout(PIPE_CAPTURE_FALLBACK_GRACE) {
             Ok(result) => result.map_err(FwError::Io),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.stop.store(true, std::sync::atomic::Ordering::Release);
                 return Err(FwError::ContractViolation(
                     "subprocess output pipe remained open after the child terminated".to_owned(),
                 ));
@@ -391,14 +391,51 @@ where
 {
     let (tx, rx) = std::sync::mpsc::channel();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_stop = std::sync::Arc::clone(&stop);
     let handle = thread::spawn(move || {
-        let _ = tx.send(read_pipe_with_limit(pipe));
+        let _ = tx.send(read_pipe_with_limit_fallback(pipe, &reader_stop));
     });
     PipeReader {
         receiver: rx,
         stop,
         handle,
     }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn read_pipe_with_limit_fallback<R: Read>(
+    mut pipe: R,
+    stop: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<PipeCapture> {
+    let mut buf = [0u8; 8192];
+    let mut bytes = Vec::new();
+    let mut limit_exceeded = false;
+
+    loop {
+        let read = pipe.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let retained = remaining.min(read);
+        bytes.extend_from_slice(&buf[..retained]);
+        if retained < read {
+            limit_exceeded = true;
+        }
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(PipeCapture {
+                bytes,
+                limit_exceeded,
+                drain_incomplete: true,
+            });
+        }
+    }
+
+    Ok(PipeCapture {
+        bytes,
+        limit_exceeded,
+        drain_incomplete: false,
+    })
 }
 
 #[cfg(any(
@@ -482,6 +519,7 @@ fn read_pipe_with_limit_until_stopped_with_grace<R: Read>(
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    drain_incomplete = true;
                     break;
                 }
                 thread::sleep(Duration::from_millis(1));
@@ -524,9 +562,7 @@ fn validate_captured_command_output(
             (false, true) => "stderr",
             (false, false) => unreachable!("validated output has no exceeded stream"),
         };
-        return Err(FwError::ContractViolation(format!(
-            "subprocess {stream} exceeded the {MAX_CAPTURED_OUTPUT_BYTES}-byte capture limit"
-        )));
+        return Err(capture_limit_error(stream));
     }
     validate_command_output(
         rendered,
@@ -536,6 +572,22 @@ fn validate_captured_command_output(
             stderr: stderr.bytes,
         },
     )
+}
+
+fn capture_limit_error(stream: &str) -> FwError {
+    FwError::ContractViolation(capture_limit_message(stream))
+}
+
+fn capture_limit_message(stream: &str) -> String {
+    format!("subprocess {stream} exceeded the {MAX_CAPTURED_OUTPUT_BYTES}-byte capture limit")
+}
+
+pub(crate) fn is_stdout_capture_limit_error(error: &FwError) -> bool {
+    let FwError::ContractViolation(message) = error else {
+        return false;
+    };
+    message == &capture_limit_message("stdout")
+        || message == &capture_limit_message("stdout and stderr")
 }
 
 #[cfg(test)]
@@ -671,7 +723,7 @@ mod tests {
             .expect("finish reader with open writer");
         assert_eq!(capture.bytes, b"complete output");
         assert!(!capture.limit_exceeded);
-        assert!(!capture.drain_incomplete);
+        assert!(capture.drain_incomplete);
         assert!(started_at.elapsed() < Duration::from_secs(1));
     }
 

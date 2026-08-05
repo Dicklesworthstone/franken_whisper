@@ -39,7 +39,9 @@ use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::error::{FwError, FwResult};
 use crate::orchestrator::CancellationToken;
-use crate::process::run_command_cancellable;
+use crate::process::{
+    MAX_CAPTURED_OUTPUT_BYTES, is_stdout_capture_limit_error, run_command_cancellable,
+};
 
 /// Environment override for the `yt-dlp` binary path/name.
 const YTDLP_ENV_OVERRIDE: &str = "FRANKEN_WHISPER_YTDLP_BIN";
@@ -53,14 +55,6 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(120);
 const EXPAND_TIMEOUT: Duration = Duration::from_secs(300);
 /// Downloads can legitimately run long (politeness sleeps + retries).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
-
-/// Mirror of [`crate::process`]'s private `MAX_CAPTURED_OUTPUT_BYTES` (the 4 MiB
-/// per-command stdout/stderr capture cap). [`expand_playlist`] uses it to detect
-/// a cap-truncated flat-playlist capture and refuse to silently drop the tail
-/// videos of an oversized playlist. **Coupling note:** if the cap in
-/// `process.rs` changes, update this constant (a `process.rs` change is the
-/// right place for a true uncapped expansion path; see the follow-up bead).
-const EXPAND_CAPTURE_CAP: usize = 4 * 1024 * 1024;
 
 /// Resolved `yt-dlp` tool: absolute path, parsed version, staleness flag.
 ///
@@ -502,29 +496,13 @@ pub fn expand_playlist(
     ];
     let output = match run_ytdlp(info, &args, token, EXPAND_TIMEOUT) {
         Ok(output) => output,
-        // The process layer reports output overflow explicitly. Retain the
-        // legacy SIGPIPE signature as well for older or platform-specific
-        // writers that terminate when their output pipe closes. On THIS
-        // command both cases mean that flat-playlist JSON overran the capture
-        // cap, so surface an actionable request error rather than losing rows.
-        Err(err) if is_capture_truncation_failure(&err) => {
+        // The process layer reports stdout overflow explicitly, so surface an
+        // actionable request error rather than losing playlist rows.
+        Err(err) if is_stdout_capture_limit_error(&err) => {
             return Err(playlist_too_large_error(url));
         }
         Err(err) => return Err(err),
     };
-    // CORRECTNESS: `expand_playlist`'s stdout flows through the shared 4 MiB
-    // capture cap (`process::MAX_CAPTURED_OUTPUT_BYTES`). A large playlist's
-    // flat-JSON can EXCEED that cap (realistic flat lines are ~1.2–3 KB each, so
-    // a ~1,400–3,500 entry playlist — well within YouTube's 5,000-video limit —
-    // overruns 4 MiB). When that happens the capture is silently shortened
-    // mid-line and the tail videos are lost with no error. Detect a capture that
-    // hit the cap and refuse to return a truncated list, rather than silently
-    // dropping videos. (Root-cause fix — a dedicated uncapped/streaming
-    // expansion path — lives in `process.rs`, which this module does not own;
-    // flagged for a follow-up bead.)
-    if output.stdout.len() >= EXPAND_CAPTURE_CAP {
-        return Err(playlist_too_large_error(url));
-    }
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut refs = Vec::new();
@@ -564,28 +542,8 @@ fn playlist_too_large_error(url: &str) -> FwError {
          exceeded the {} MiB capture cap and would be truncated (silently dropping \
          videos). Split it into smaller playlists, or pass the individual video URLs \
          (e.g. via --batch-file).",
-        EXPAND_CAPTURE_CAP / (1024 * 1024)
+        MAX_CAPTURED_OUTPUT_BYTES / (1024 * 1024)
     ))
-}
-
-/// Whether this error says that the flat-playlist stdout exceeded the capture
-/// cap, either explicitly or through the legacy SIGPIPE failure signature.
-fn is_capture_truncation_failure(err: &FwError) -> bool {
-    match err {
-        FwError::ContractViolation(message) => {
-            message.starts_with("subprocess stdout") && message.ends_with("-byte capture limit")
-        }
-        FwError::CommandFailed {
-            status,
-            stderr_suffix,
-            ..
-        } => {
-            // 141 == 128 + SIGPIPE(13); -1 == killed by signal (no exit code).
-            let signal_like = *status == 141 || *status < 0;
-            signal_like && stderr_suffix.trim().is_empty()
-        }
-        _ => false,
-    }
 }
 
 /// The only fields retained from yt-dlp's much larger flat-playlist objects.
@@ -903,9 +861,10 @@ fn video_meta_from_json(value: &serde_json::Value) -> FwResult<VideoMeta> {
 /// Execution flows through [`run_command_cancellable`], which polls `token` on
 /// every iteration and kills the child process when the token fires. For
 /// best-audio (`-f ba`) downloads yt-dlp does **not** normally spawn an
-/// `ffmpeg` child (no `-x` re-encode is requested), so killing the yt-dlp
-/// process is sufficient; in the rare case it does, the OS reaps the orphaned
-/// child when the parent dies. A token firing maps to [`FwError::Cancelled`].
+/// `ffmpeg` child (no `-x` re-encode is requested). Cancellation currently
+/// guarantees termination and reaping of the direct yt-dlp process only;
+/// process-tree termination for an unexpectedly inherited descendant remains
+/// a separate contract gap. A token firing maps to [`FwError::Cancelled`].
 ///
 /// # Errors
 ///
@@ -1649,26 +1608,26 @@ mod tests {
         let explicit = FwError::ContractViolation(
             "subprocess stdout exceeded the 4194304-byte capture limit".to_owned(),
         );
-        assert!(is_capture_truncation_failure(&explicit));
+        assert!(is_stdout_capture_limit_error(&explicit));
         let stderr_only = FwError::ContractViolation(
             "subprocess stderr exceeded the 4194304-byte capture limit".to_owned(),
         );
-        assert!(!is_capture_truncation_failure(&stderr_only));
-        // SIGPIPE-style death with empty stderr (our cap closed the pipe).
+        assert!(!is_stdout_capture_limit_error(&stderr_only));
+        // Signal-style failures are not evidence of capture overflow.
         let sigpipe = FwError::from_command_failure("yt-dlp ...".to_owned(), 141, String::new());
-        assert!(is_capture_truncation_failure(&sigpipe));
+        assert!(!is_stdout_capture_limit_error(&sigpipe));
         let killed = FwError::from_command_failure("yt-dlp ...".to_owned(), -1, "  \n".to_owned());
-        assert!(is_capture_truncation_failure(&killed));
+        assert!(!is_stdout_capture_limit_error(&killed));
         // A genuine yt-dlp error writes to stderr -> NOT a truncation signature.
         let real = FwError::from_command_failure(
             "yt-dlp ...".to_owned(),
             1,
             "ERROR: Private video".to_owned(),
         );
-        assert!(!is_capture_truncation_failure(&real));
+        assert!(!is_stdout_capture_limit_error(&real));
         // A normal non-signal failure with empty stderr is also not it.
         let plain = FwError::from_command_failure("yt-dlp ...".to_owned(), 2, String::new());
-        assert!(!is_capture_truncation_failure(&plain));
+        assert!(!is_stdout_capture_limit_error(&plain));
     }
 
     #[test]
