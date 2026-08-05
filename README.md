@@ -934,9 +934,9 @@ RAYON_NUM_THREADS=8 franken_whisper diarization-corpus compare-models \
 worker counts at eight, and applies a frozen 1800-second timeout to each
 Sortformer oracle-run subprocess. The application downloads neither the ECAPA
 package nor the Sortformer adapter/model; absent operator-installed components
-become typed lane skips. The protocol pins the complete effective native
-request for each lane by SHA-256 and pins its own canonical digest, so changing
-an inherited request default requires an explicit protocol update.
+become typed lane skips. Protocol v2 pins the complete effective native request
+for each lane, its ordered payload-free outcome taxonomy, and its own canonical
+digest. Any change to those bindings requires a new version-and-digest pair.
 
 The comparison evidence is aggregate-only and cannot authorize a superiority
 or production-routing claim. Its wall-time scopes are intentionally unlike and

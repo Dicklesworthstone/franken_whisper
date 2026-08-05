@@ -62,12 +62,13 @@ pub use model_comparison::{
     ModelComparisonExternalRuntimeIdentity, ModelComparisonLane, ModelComparisonLaneAggregate,
     ModelComparisonOutcomeCode, ModelComparisonOutcomeCounts, ModelComparisonOutcomeStatus,
     ModelComparisonResourceAuthority, ModelComparisonResourceEvidence,
-    ModelComparisonWallTimeScope, PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256,
-    PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION, PUBLIC_MODEL_COMPARISON_RUNNER_VERSION,
-    PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION, PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION,
-    PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS, PublicModelComparisonEvidence,
-    PublicModelComparisonProtocol, PublicModelComparisonRequest, model_comparison_schedule_row,
-    run_public_model_comparison_with_cancel, verify_public_model_comparison_evidence,
+    ModelComparisonWallTimeScope, PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION,
+    PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256, PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION,
+    PUBLIC_MODEL_COMPARISON_RUNNER_VERSION, PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION,
+    PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION, PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS,
+    PublicModelComparisonEvidence, PublicModelComparisonProtocol, PublicModelComparisonRequest,
+    model_comparison_schedule_row, run_public_model_comparison_with_cancel,
+    verify_public_model_comparison_evidence,
 };
 
 /// Schema identity for the path-bearing, external-only adapter input.
