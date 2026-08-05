@@ -1334,7 +1334,7 @@ impl DiarizationReport {
         validate_diarization_turns(&self.turns)?;
         validate_speaker_profiles(&self.profiles)?;
         validate_hint_evidence(&self.hint_evidence)?;
-        validate_speaker_queries(&self.speaker_queries)?;
+        validate_speaker_queries(&self.normalized_input_sha256, &self.speaker_queries)?;
         validate_speaker_count_outcome(&self.speaker_count)?;
         validate_speaker_count_estimate_request_binding(&self.speaker_count)?;
         validate_diarization_references(self)?;
@@ -1736,7 +1736,7 @@ fn validate_report_hint_binding(
     }
 
     let expected_digest = (!request.known_intervals.is_empty())
-        .then(|| crate::diarization::canonical_hint_document_sha256(&request.known_intervals));
+        .then(|| speaker_hint_document_sha256(&request.known_intervals));
     if report.hint_document_sha256 != expected_digest {
         return Err("diarization report hint digest differs from the execution request".to_owned());
     }
@@ -1997,13 +1997,13 @@ fn validate_speaker_profiles(profiles: &[SpeakerProfileSummary]) -> Result<(), S
 }
 
 fn validate_hint_evidence(hints: &[SpeakerHintEvidenceSummary]) -> Result<(), String> {
-    let mut previous_index = None;
-    for hint in hints {
+    for (index, hint) in hints.iter().enumerate() {
         validate_report_speaker_ref(&hint.speaker_ref, "speaker hint evidence speaker_ref")?;
-        if previous_index.is_some_and(|previous| hint.hint_index <= previous) {
-            return Err("speaker hint evidence is not strictly index-ordered".to_owned());
+        let expected_index = u64::try_from(index)
+            .map_err(|_| "speaker hint evidence index exceeds the report schema".to_owned())?;
+        if hint.hint_index != expected_index {
+            return Err("speaker hint evidence indices are not contiguous from zero".to_owned());
         }
-        previous_index = Some(hint.hint_index);
         if !hint.applied_weight.is_finite() || hint.applied_weight < 0.0 {
             return Err("speaker hint applied weight is not finite and non-negative".to_owned());
         }
@@ -2076,7 +2076,10 @@ fn validate_hint_evidence(hints: &[SpeakerHintEvidenceSummary]) -> Result<(), St
     Ok(())
 }
 
-fn validate_speaker_queries(queries: &[SpeakerAttributionQuery]) -> Result<(), String> {
+fn validate_speaker_queries(
+    normalized_input_sha256: &str,
+    queries: &[SpeakerAttributionQuery],
+) -> Result<(), String> {
     const MAX_SPEAKER_QUERIES: usize = 32;
     if queries.len() > MAX_SPEAKER_QUERIES {
         return Err(format!(
@@ -2109,10 +2112,29 @@ fn validate_speaker_queries(queries: &[SpeakerAttributionQuery]) -> Result<(), S
             }
             previous_speaker = Some(speaker_ref.as_str());
         }
-        if query.reason == SpeakerAttributionQueryReason::UnknownAttribution
-            && !query.candidate_speaker_refs.is_empty()
+        let expected_candidate_count = match query.reason {
+            SpeakerAttributionQueryReason::UnknownAttribution => 0,
+            SpeakerAttributionQueryReason::LowConfidence => 1,
+            SpeakerAttributionQueryReason::OverlapAmbiguity => 2,
+        };
+        if query.candidate_speaker_refs.len() != expected_candidate_count {
+            return Err(
+                "speaker attribution query candidate count is inconsistent with its reason"
+                    .to_owned(),
+            );
+        }
+        if query.suggested_policy != KnownSpeakerPolicy::SoftEnrollment {
+            return Err(
+                "machine-generated speaker attribution query suggests a hard policy".to_owned(),
+            );
+        }
+        if query.query_id_sha256
+            != speaker_attribution_query_sha256(normalized_input_sha256, query)
         {
-            return Err("unknown-attribution query claims candidate speakers".to_owned());
+            return Err(
+                "speaker attribution query ID does not bind its normalized input and fields"
+                    .to_owned(),
+            );
         }
     }
     Ok(())
@@ -5597,9 +5619,7 @@ mod tests {
             )],
             ..DiarizationRequest::default()
         };
-        report.hint_document_sha256 = Some(crate::diarization::canonical_hint_document_sha256(
-            &request.known_intervals,
-        ));
+        report.hint_document_sha256 = Some(speaker_hint_document_sha256(&request.known_intervals));
         request
     }
 
@@ -5951,10 +5971,9 @@ mod tests {
         let mut mismatched_identity = request.clone();
         mismatched_identity.known_intervals[0].speaker_ref = "other".to_owned();
         let mut identity_report = report.clone();
-        identity_report.hint_document_sha256 =
-            Some(crate::diarization::canonical_hint_document_sha256(
-                &mismatched_identity.known_intervals,
-            ));
+        identity_report.hint_document_sha256 = Some(speaker_hint_document_sha256(
+            &mismatched_identity.known_intervals,
+        ));
         assert!(
             identity_report
                 .validate_against_request(&mismatched_identity, None)
