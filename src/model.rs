@@ -2205,7 +2205,8 @@ fn validate_report_kind_invariants(
     if native_success
         && matches!(
             report.fallback_status,
-            DiarizationFallbackStatus::CalibrationInvalid
+            DiarizationFallbackStatus::InsufficientEvidence
+                | DiarizationFallbackStatus::CalibrationInvalid
                 | DiarizationFallbackStatus::ResourceLimit
         )
     {
@@ -2268,6 +2269,14 @@ fn validate_report_kind_invariants(
         {
             return Err(
                 "native dominance reason disagrees with supported-speaker occupancy".to_owned(),
+            );
+        }
+        if dominance_breached
+            && report.fallback_status == DiarizationFallbackStatus::NotNeeded
+        {
+            return Err(
+                "native dominant-speaker breach cannot claim that no fallback was needed"
+                    .to_owned(),
             );
         }
     }
@@ -7915,7 +7924,7 @@ mod tests {
         let mut native_fallback = typed_diarization_report_fixture();
         let mut error_request = matching_acoustic_request(&mut native_fallback);
         error_request.fallback = DiarizationFallbackPolicy::Error;
-        native_fallback.fallback_status = DiarizationFallbackStatus::InsufficientEvidence;
+        native_fallback.fallback_status = DiarizationFallbackStatus::UnsatisfiedConstraints;
         assert!(
             native_fallback
                 .validate_against_request(&error_request, None)
@@ -7966,6 +7975,7 @@ mod tests {
         );
 
         for unproduced_cause in [
+            DiarizationFallbackStatus::InsufficientEvidence,
             DiarizationFallbackStatus::CalibrationInvalid,
             DiarizationFallbackStatus::ResourceLimit,
         ] {
@@ -8324,6 +8334,31 @@ mod tests {
         rounded_occupancy
             .validate()
             .expect("f32 producer rounding cannot invalidate a unit occupancy sum");
+
+        let mut forged_dominance_fallback = typed_diarization_report_fixture();
+        forged_dominance_fallback
+            .speaker_count
+            .supported_speaker_count = 2;
+        forged_dominance_fallback
+            .speaker_count
+            .dominant_speaker_share = 0.99;
+        forged_dominance_fallback
+            .speaker_count
+            .reasons
+            .push(SpeakerCountOutcomeReason::DominantSpeakerShareExceeded);
+        forged_dominance_fallback
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .selected_count = 2;
+        assert!(
+            validate_report_kind_invariants(
+                &forged_dominance_fallback,
+                DiarizationReportKind::NativeAcoustic,
+            )
+            .expect_err("dominant-speaker breach requires a native fallback")
+            .contains("no fallback was needed")
+        );
 
         let mut report = typed_diarization_report_fixture();
         report.speaker_count.reasons = vec![SpeakerCountOutcomeReason::EvidenceSupportedCount];
