@@ -2792,8 +2792,7 @@ mod tests {
             persist_profiles,
             ..DiarizationRequest::default()
         };
-        let hint_document_sha256 =
-            crate::model::speaker_hint_document_sha256(&diarization_request.known_intervals);
+        let hint_document_sha256 = crate::model::speaker_hint_document_sha256(&diarization_request);
         report.request.backend_params.acoustic_diarization = Some(diarization_request);
         report.result.diarization = Some(DiarizationReport {
             implementation: "native-acoustic-v2".to_owned(),
