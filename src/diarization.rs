@@ -18,14 +18,16 @@ use sha2::{Digest, Sha256};
 use crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC;
 use crate::ecapa_conformance::{
     ECAPA_EMBEDDING_DIMENSIONS, ECAPA_MAXIMUM_RUNTIME_SAMPLES, ECAPA_MINIMUM_RUNTIME_SAMPLES,
-    ECAPA_PACKAGE_SHA256,
+    ECAPA_PACKAGE_SHA256, ECAPA_SAMPLE_RATE_HZ,
 };
 use crate::ecapa_inference::{EcapaInferenceConfig, EcapaInferenceTrace, EcapaModel};
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus, DiarizationReport,
-    DiarizationRequest, DiarizationTurn, KnownSpeakerInterval, KnownSpeakerPolicy,
-    MAX_SPEAKER_COUNT, NeuralSpeakerRepresentationReason, NeuralSpeakerRepresentationStatus,
+    DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus,
+    DiarizationOperationalPartitionMethod, DiarizationOperationalPartitionSummary,
+    DiarizationReport, DiarizationRequest, DiarizationSpeakerEvidenceMode, DiarizationTurn,
+    KnownSpeakerInterval, KnownSpeakerPolicy, MAX_SPEAKER_COUNT, NeuralModelLoadSource,
+    NeuralSpeakerRepresentationReason, NeuralSpeakerRepresentationStatus,
     NeuralSpeakerRepresentationSummary, SpeakerAttributionQuery, SpeakerAttributionQueryReason,
     SpeakerCountCalibrationStatus, SpeakerCountEstimate, SpeakerCountEvidenceLane,
     SpeakerCountLaneEvidence, SpeakerCountLaneUnavailableReason, SpeakerCountOutcome,
@@ -36,26 +38,54 @@ use crate::model::{
 };
 
 /// Stable identifier for the native acoustic diarization contract.
-pub const ACOUSTIC_DIARIZATION_CONTRACT_VERSION: &str = "acoustic-diarization-v2";
+pub const ACOUSTIC_DIARIZATION_CONTRACT_VERSION: &str = "acoustic-diarization-v3";
 /// Stable contract identity for ECAPA embeddings routed through the common
 /// acoustic segmentation, constraints, clustering, temporal, and projection
 /// stack.
-pub const NEURAL_DIARIZATION_CONTRACT_VERSION: &str = "neural-diarization-common-v1";
+pub const NEURAL_DIARIZATION_CONTRACT_VERSION: &str = "neural-diarization-common-v2";
 /// Versioned direct cosine use of the pinned 192-coordinate ECAPA embedding in
 /// the common diarizer's identity-coordinate contract.
-pub const ECAPA_SPEAKER_REPRESENTATION_VERSION: &str = "ecapa-tdnn-voxceleb-cosine-v4-development";
+pub const ECAPA_SPEAKER_REPRESENTATION_VERSION: &str = "ecapa-tdnn-voxceleb-cosine-v6-development";
 // Public AMI development observations put the useful conservative separation
 // point near cosine distance 0.80. The intercept includes the shared 12:1
 // false-merge:false-split loss: at this distance the model emits the 12/13
 // same-speaker probability at which either action has equal expected loss.
 const ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT: f32 = 0.80;
-const ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE: f32 = 0.70;
+// A final speaker-support gate must never certify a split that the declared
+// false-merge:false-split loss model still classifies as merge-compatible.
+// The robust multi-view gate therefore starts at the same calibrated
+// equal-loss boundary; recurrence and lane consensus make it stricter, not a
+// lower hidden operating point.
+const ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE: f32 =
+    ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT;
 const ECAPA_PAIR_DIFFERENT_LOGIT_INTERCEPT: f32 = -10.484_906;
 const ECAPA_PAIR_COSINE_DISTANCE_WEIGHT: f32 = 10.0;
 const ECAPA_SEGMENT_LOG_LIKELIHOOD_MAX_WEIGHT: f32 = 4.0;
-const ECAPA_LONG_SINGLE_OBSERVATION_MIN_FRAMES: usize = 200;
 type EcapaSpeakerEmbedding = [f32; ECAPA_EMBEDDING_DIMENSIONS];
-type EcapaTrackletEmbeddings = BTreeMap<usize, EcapaSpeakerEmbedding>;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EcapaTrackletRepresentation {
+    discovery: EcapaSpeakerEmbedding,
+    validation: Option<EcapaSpeakerEmbedding>,
+    discovery_weight: f32,
+    validation_weight: f32,
+}
+
+impl EcapaTrackletRepresentation {
+    fn assignment_embedding(&self) -> &EcapaSpeakerEmbedding {
+        self.validation.as_ref().unwrap_or(&self.discovery)
+    }
+
+    fn assignment_weight(self) -> f32 {
+        if self.validation.is_some() {
+            self.validation_weight
+        } else {
+            self.discovery_weight
+        }
+    }
+}
+
+type EcapaTrackletEmbeddings = BTreeMap<usize, EcapaTrackletRepresentation>;
 
 #[derive(Debug, Clone, Copy)]
 struct EcapaSpeakerProfile {
@@ -7544,6 +7574,11 @@ const SPEAKER_COUNT_SOFT_PRIOR_STABILITY_ATTENUATION: f64 = 0.50;
 const SPEAKER_COUNT_JACKKNIFE_LOG_WEIGHT: f64 = 0.25;
 const SPEAKER_COUNT_SPECTRAL_LOG_WEIGHT: f64 = 0.35;
 const SPEAKER_COUNT_INFER_LOG_COMPLEXITY_PER_ADDITIONAL_SPEAKER: f64 = std::f64::consts::LN_2;
+// Fixed-safe ECAPA uses one frozen effective identity complexity per cluster.
+// It must not inherit the availability mask of the unrelated classical
+// feature vector, and using all embedding coordinates as free parameters would
+// grossly over-penalize a normalized pretrained representation.
+const ECAPA_FIXED_SAFE_EFFECTIVE_PARAMETER_COUNT: usize = VOICE_VECTOR_DIMENSIONS;
 const SPEAKER_COUNT_STABILITY_EVIDENCE_WEIGHT: f64 = 0.55;
 const SPEAKER_COUNT_RISK_EVIDENCE_WEIGHT: f64 = 0.30;
 const SPEAKER_COUNT_SPECTRAL_EVIDENCE_WEIGHT: f64 = 0.15;
@@ -7587,7 +7622,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v17-binary-indifference-assignment-development";
+    "acoustic-clustering-probabilistic-v18-calibrated-separation-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -7736,21 +7771,35 @@ pub fn acoustic_speaker_pair_calibration_sha256() -> String {
 
 /// Stable SHA-256 of the development ECAPA cosine speaker-pair contract.
 #[must_use]
-pub fn ecapa_speaker_pair_calibration_sha256() -> String {
+pub fn ecapa_speaker_pair_calibration_sha256(
+    evidence_mode: DiarizationSpeakerEvidenceMode,
+) -> String {
     let shared = acoustic_speaker_pair_calibration();
     let mut hasher = Sha256::new();
     hasher.update(b"ecapa-speaker-pair-calibration\0");
+    hasher.update(match evidence_mode {
+        DiarizationSpeakerEvidenceMode::EcapaOnly => b"ecapa-only".as_slice(),
+        DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+            b"ecapa-with-acoustic-channel".as_slice()
+        }
+        DiarizationSpeakerEvidenceMode::AcousticV2 => b"acoustic-v2-invalid".as_slice(),
+        DiarizationSpeakerEvidenceMode::External => b"external-invalid".as_slice(),
+        DiarizationSpeakerEvidenceMode::None => b"none-invalid".as_slice(),
+    });
     hasher.update(ECAPA_SPEAKER_REPRESENTATION_VERSION.as_bytes());
     hasher.update(ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION.as_bytes());
     hasher.update(acoustic_speaker_pair_calibration_sha256().as_bytes());
-    hasher.update((ECAPA_LONG_SINGLE_OBSERVATION_MIN_FRAMES as u64).to_le_bytes());
     for value in [
         ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT,
         ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE,
         ECAPA_PAIR_DIFFERENT_LOGIT_INTERCEPT,
         ECAPA_PAIR_COSINE_DISTANCE_WEIGHT,
         ECAPA_SEGMENT_LOG_LIKELIHOOD_MAX_WEIGHT,
-        shared.channel_distance_weight,
+        if evidence_mode == DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel {
+            shared.channel_distance_weight
+        } else {
+            0.0
+        },
         shared.full_support_frames,
         shared.false_split_loss,
         shared.false_merge_loss,
@@ -7760,12 +7809,58 @@ pub fn ecapa_speaker_pair_calibration_sha256() -> String {
         hasher.update(value.to_bits().to_le_bytes());
     }
     hasher.update((ECAPA_EMBEDDING_DIMENSIONS as u64).to_le_bytes());
+    hasher.update((ECAPA_FIXED_SAFE_EFFECTIVE_PARAMETER_COUNT as u64).to_le_bytes());
+    hasher.update((ECAPA_SAMPLE_RATE_HZ as u64).to_le_bytes());
+    hasher.update((ECAPA_MINIMUM_RUNTIME_SAMPLES as u64).to_le_bytes());
+    hasher.update((ECAPA_MAXIMUM_RUNTIME_SAMPLES as u64).to_le_bytes());
+    hasher.update((ECAPA_HELDOUT_MINIMUM_SOURCE_SAMPLES as u64).to_le_bytes());
+    hasher.update(
+        ECAPA_HELDOUT_SINGLETON_MIN_TOTAL_WEIGHT
+            .to_bits()
+            .to_le_bytes(),
+    );
+    hasher.update(
+        ECAPA_HELDOUT_COMPETITOR_DISTANCE_MARGIN
+            .to_bits()
+            .to_le_bytes(),
+    );
+    hasher.update(b"disjoint-first-last-heldout-windows-v1");
     hasher.update(b"coordinate-jackknife-modulo-four-v1");
+    hasher.update(match evidence_mode {
+        DiarizationSpeakerEvidenceMode::EcapaOnly => {
+            b"robust-separation-cosine-threshold-v1".as_slice()
+        }
+        DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+            b"robust-separation-joint-log-odds-v1".as_slice()
+        }
+        DiarizationSpeakerEvidenceMode::AcousticV2 => {
+            b"robust-separation-acoustic-invalid".as_slice()
+        }
+        DiarizationSpeakerEvidenceMode::External => {
+            b"robust-separation-external-invalid".as_slice()
+        }
+        DiarizationSpeakerEvidenceMode::None => b"robust-separation-none-invalid".as_slice(),
+    });
     hasher.update((SPEAKER_COUNT_PERTURBATION_LANES as u64).to_le_bytes());
     hasher.update((SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE as u64).to_le_bytes());
     hasher.update((SPEAKER_COUNT_DENSE_EIGENSOLVER_MAX_PROTOTYPES as u64).to_le_bytes());
     hasher.update((SPEAKER_COUNT_EIGENSOLVER_MAX_ITERATIONS as u64).to_le_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn speaker_pair_calibration_sha256_for_mode(
+    evidence_mode: DiarizationSpeakerEvidenceMode,
+) -> String {
+    match evidence_mode {
+        DiarizationSpeakerEvidenceMode::AcousticV2 => acoustic_speaker_pair_calibration_sha256(),
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+            ecapa_speaker_pair_calibration_sha256(evidence_mode)
+        }
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => {
+            acoustic_speaker_pair_calibration_sha256()
+        }
+    }
 }
 
 /// Explicit speaker-change detector selection used by public ablations.
@@ -10336,6 +10431,7 @@ pub enum ProfileTrainingReason {
     LowVoicedCoverage,
     RobustDistanceOutlier,
     LeaveOneOutInconsistent,
+    MissingRepresentation,
 }
 
 /// Auditable profile-training decision. Hard attribution is intentionally
@@ -11363,6 +11459,7 @@ pub struct AcousticClusteringResult {
     pub requested_mode: AcousticClusteringMode,
     pub executed_mode: AcousticClusteringMode,
     pub fallback_reason: Option<AcousticClusteringFallbackReason>,
+    pub operational_partition: Option<DiarizationOperationalPartitionSummary>,
     pub speaker_pair_calibration_sha256: String,
     pub calibration_status: &'static str,
     pub merge_trace: Vec<ClusterMergeTrace>,
@@ -11397,7 +11494,52 @@ enum SpeakerRepresentationProvider<'a> {
     EcapaTdnnV1 {
         model: &'a EcapaModel,
         checkpoint: &'a (dyn Fn() -> FwResult<()> + Sync),
+        evidence_mode: DiarizationSpeakerEvidenceMode,
     },
+}
+
+/// Adapts the legacy boolean cancellation hooks in the shared acoustic stack
+/// without erasing the original structured checkpoint error. In particular, a
+/// stage deadline must remain `StageTimeout`, not be rewritten as a generic
+/// cancellation merely because acoustic extraction polls through a boolean.
+struct CheckpointCancellationAdapter<'a> {
+    checkpoint: &'a (dyn Fn() -> FwResult<()> + Sync),
+    first_error: std::sync::Mutex<Option<FwError>>,
+}
+
+impl<'a> CheckpointCancellationAdapter<'a> {
+    fn new(checkpoint: &'a (dyn Fn() -> FwResult<()> + Sync)) -> Self {
+        Self {
+            checkpoint,
+            first_error: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        let Err(error) = (self.checkpoint)() else {
+            return false;
+        };
+        if let Ok(mut captured) = self.first_error.lock()
+            && captured.is_none()
+        {
+            *captured = Some(error);
+        }
+        true
+    }
+
+    fn restore<T>(&self, result: FwResult<T>) -> FwResult<T> {
+        match result {
+            Err(FwError::Cancelled(message)) => {
+                if let Ok(mut captured) = self.first_error.lock()
+                    && let Some(error) = captured.take()
+                {
+                    return Err(error);
+                }
+                Err(FwError::Cancelled(message))
+            }
+            other => other,
+        }
+    }
 }
 
 /// Run the optional in-process ECAPA representation through the exact common
@@ -11407,25 +11549,100 @@ enum SpeakerRepresentationProvider<'a> {
 /// evidence, known-speaker constraints, profile construction, count selection,
 /// temporal smoothing, unknown/overlap handling, labels, and transcript
 /// projection remain shared with [`diarize_acoustic_pcm`].
-pub fn diarize_neural_pcm(
+pub fn diarize_ecapa_pcm(
     input: AcousticDiarizationInput<'_>,
     model: &EcapaModel,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<(DiarizationReport, DiarizationProjection)> {
-    let (report, projection, _, _, _) = diarize_acoustic_pcm_with_detector_evidence_internal(
+    let evidence_mode = match input.request.engine {
+        DiarizationEngine::Ecapa => DiarizationSpeakerEvidenceMode::EcapaOnly,
+        DiarizationEngine::EcapaFused => DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        engine => {
+            return Err(FwError::InvalidRequest(format!(
+                "ECAPA diarization requires the `ecapa` or CLI `ecapa-fused` engine (JSON: `ecapa_fused`), not {engine:?}"
+            )));
+        }
+    };
+    let cancellation = CheckpointCancellationAdapter::new(checkpoint);
+    let outcome = diarize_acoustic_pcm_with_detector_evidence_internal(
         input,
         AcousticFeatureAblation::FullV2,
         AcousticChangeDetectorMode::FixedSafeV1,
         AcousticClusteringMode::ProbabilisticV1,
         None,
         false,
-        SpeakerRepresentationProvider::EcapaTdnnV1 { model, checkpoint },
-        || checkpoint().is_err(),
-    )?;
+        SpeakerRepresentationProvider::EcapaTdnnV1 {
+            model,
+            checkpoint,
+            evidence_mode,
+        },
+        || cancellation.is_cancelled(),
+    );
+    let (report, projection, _, _, _) = cancellation.restore(outcome)?;
     Ok((report, projection))
 }
 
 const MIN_ECAPA_TRACKLET_IDENTITY_FRAMES: usize = 20;
+const ECAPA_HELDOUT_MINIMUM_SOURCE_SAMPLES: usize = ECAPA_SAMPLE_RATE_HZ * 2;
+const ECAPA_HELDOUT_SINGLETON_MIN_TOTAL_WEIGHT: f32 = 200.0;
+const ECAPA_HELDOUT_COMPETITOR_DISTANCE_MARGIN: f32 = 0.05;
+
+struct EcapaTrackletWindows {
+    discovery: Vec<f32>,
+    validation: Option<Vec<f32>>,
+    zero_padded: bool,
+}
+
+fn prepare_ecapa_tracklet_windows(source: &[f32]) -> Option<EcapaTrackletWindows> {
+    if source.is_empty() {
+        return None;
+    }
+    if source.len() >= ECAPA_HELDOUT_MINIMUM_SOURCE_SAMPLES {
+        let window_samples = (source.len() / 2).min(ECAPA_MAXIMUM_RUNTIME_SAMPLES);
+        return Some(EcapaTrackletWindows {
+            discovery: source[..window_samples].to_vec(),
+            validation: Some(source[source.len() - window_samples..].to_vec()),
+            zero_padded: false,
+        });
+    }
+    if source.len() < ECAPA_MINIMUM_RUNTIME_SAMPLES {
+        let mut padded = vec![0.0_f32; ECAPA_MINIMUM_RUNTIME_SAMPLES];
+        let offset = (ECAPA_MINIMUM_RUNTIME_SAMPLES - source.len()) / 2;
+        padded[offset..offset + source.len()].copy_from_slice(source);
+        return Some(EcapaTrackletWindows {
+            discovery: padded,
+            validation: None,
+            zero_padded: true,
+        });
+    }
+    Some(EcapaTrackletWindows {
+        discovery: source.to_vec(),
+        validation: None,
+        zero_padded: false,
+    })
+}
+
+fn represented_ecapa_weight(
+    identity_frame_count: usize,
+    represented_samples: usize,
+    source_samples: usize,
+) -> f32 {
+    if identity_frame_count == 0 || source_samples == 0 {
+        return 0.0;
+    }
+    let observed_samples = represented_samples.min(source_samples);
+    ((identity_frame_count as f64 * observed_samples as f64 / source_samples as f64) as f32)
+        .clamp(1.0, identity_frame_count as f32)
+}
+
+fn clamp_ecapa_pcm(window: &mut [f32]) {
+    // The canonical WAV decoder is expected to produce this range. Clamp one-
+    // ULP container overshoot rather than making model execution depend on the
+    // source codec's integer-to-float endpoint convention.
+    for sample in window {
+        *sample = sample.clamp(-1.0, 1.0);
+    }
+}
 
 fn apply_ecapa_speaker_representations(
     samples: &[f32],
@@ -11467,33 +11684,61 @@ fn apply_ecapa_speaker_representations(
         }
 
         let source = &samples[start_sample..end_sample];
-        let mut pcm_window = if source.len() > ECAPA_MAXIMUM_RUNTIME_SAMPLES {
-            let offset = (source.len() - ECAPA_MAXIMUM_RUNTIME_SAMPLES) / 2;
-            source[offset..offset + ECAPA_MAXIMUM_RUNTIME_SAMPLES].to_vec()
-        } else if source.len() < ECAPA_MINIMUM_RUNTIME_SAMPLES {
-            let mut padded = vec![0.0_f32; ECAPA_MINIMUM_RUNTIME_SAMPLES];
-            let offset = (ECAPA_MINIMUM_RUNTIME_SAMPLES - source.len()) / 2;
-            padded[offset..offset + source.len()].copy_from_slice(source);
+        let Some(mut windows) = prepare_ecapa_tracklet_windows(source) else {
+            skipped_tracklet_count = skipped_tracklet_count.saturating_add(1);
+            saw_short_tracklet = true;
+            continue;
+        };
+        if windows.zero_padded {
             zero_padded_tracklet_count = zero_padded_tracklet_count.saturating_add(1);
             saw_short_tracklet = true;
-            padded
-        } else {
-            source.to_vec()
-        };
-        // The canonical WAV decoder is expected to produce this range. Clamp
-        // one-ULP container overshoot rather than making model execution depend
-        // on the source codec's integer-to-float endpoint convention.
-        for sample in &mut pcm_window {
-            *sample = sample.clamp(-1.0, 1.0);
         }
-        let mut trace = EcapaInferenceTrace::default();
-        let output = model.infer_pcm_with_checkpoint(
-            &pcm_window,
+        clamp_ecapa_pcm(&mut windows.discovery);
+        let mut discovery_trace = EcapaInferenceTrace::default();
+        let discovery = model.infer_pcm_with_checkpoint(
+            &windows.discovery,
             EcapaInferenceConfig::default(),
             checkpoint,
-            &mut trace,
+            &mut discovery_trace,
         )?;
-        embeddings.insert(tracklet.tracklet_index, output.embedding.into_array());
+        let validation = if let Some(validation) = windows.validation.as_mut() {
+            clamp_ecapa_pcm(validation);
+            let mut validation_trace = EcapaInferenceTrace::default();
+            Some(
+                model
+                    .infer_pcm_with_checkpoint(
+                        validation,
+                        EcapaInferenceConfig::default(),
+                        checkpoint,
+                        &mut validation_trace,
+                    )?
+                    .embedding
+                    .into_array(),
+            )
+        } else {
+            None
+        };
+        let discovery_weight = represented_ecapa_weight(
+            tracklet.identity_frame_count,
+            windows.discovery.len(),
+            source.len(),
+        );
+        let validation_weight = windows.validation.as_ref().map_or(0.0, |validation| {
+            represented_ecapa_weight(
+                tracklet.identity_frame_count,
+                validation.len(),
+                source.len(),
+            )
+        });
+        embeddings.insert(
+            tracklet.tracklet_index,
+            EcapaTrackletRepresentation {
+                discovery: discovery.embedding.into_array(),
+                validation,
+                discovery_weight,
+                validation_weight,
+            },
+        );
         embedded_tracklet_count = embedded_tracklet_count.saturating_add(1);
     }
     checkpoint()?;
@@ -11515,25 +11760,25 @@ fn apply_ecapa_speaker_representations(
     } else {
         NeuralSpeakerRepresentationStatus::Degraded
     };
-    Ok((
-        NeuralSpeakerRepresentationSummary {
-            schema_version: "neural-speaker-representation-summary-v1".to_owned(),
-            provider_version: ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
-            model_package_sha256: model.info().package_sha256.clone(),
-            status,
-            embedded_tracklet_count: report_count(
-                embedded_tracklet_count,
-                "embedded tracklet count",
-            )?,
-            zero_padded_tracklet_count: report_count(
-                zero_padded_tracklet_count,
-                "zero-padded tracklet count",
-            )?,
-            skipped_tracklet_count: report_count(skipped_tracklet_count, "skipped tracklet count")?,
-            reasons,
-        },
-        embeddings,
-    ))
+    let summary = NeuralSpeakerRepresentationSummary {
+        schema_version: "neural-speaker-representation-summary-v1".to_owned(),
+        provider_version: ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
+        expected_model_package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
+        loaded_model_package_sha256: Some(model.info().package_sha256.clone()),
+        model_load_source: Some(NeuralModelLoadSource::Direct),
+        status,
+        embedded_tracklet_count: report_count(embedded_tracklet_count, "embedded tracklet count")?,
+        zero_padded_tracklet_count: report_count(
+            zero_padded_tracklet_count,
+            "zero-padded tracklet count",
+        )?,
+        skipped_tracklet_count: report_count(skipped_tracklet_count, "skipped tracklet count")?,
+        reasons,
+    };
+    summary
+        .validate()
+        .map_err(|error| FwError::ContractViolation(error.to_owned()))?;
+    Ok((summary, embeddings))
 }
 
 #[cfg(test)]
@@ -11573,10 +11818,10 @@ pub(crate) fn ecapa_tracklet_evaluation_observations(
             embeddings
                 .get(&tracklet.tracklet_index)
                 .copied()
-                .map(|embedding| EcapaTrackletEvaluationObservation {
+                .map(|representation| EcapaTrackletEvaluationObservation {
                     start_ms: tracklet.start_ms,
                     end_ms: tracklet.end_ms,
-                    embedding,
+                    embedding: representation.discovery,
                 })
         })
         .collect())
@@ -11600,6 +11845,22 @@ where
     C: FnMut() -> bool,
 {
     diarize_acoustic_pcm_with_ablation(input, AcousticFeatureAblation::FullV2, is_cancelled)
+}
+
+/// Run the native acoustic pipeline while preserving structured checkpoint
+/// failures such as stage deadlines.
+///
+/// The shared acoustic implementation still accepts a boolean cancellation
+/// poll for its inner loops. This adapter records the first structured error
+/// and restores it when the inner pipeline returns its generic cancellation
+/// sentinel.
+pub fn diarize_acoustic_pcm_with_checkpoint(
+    input: AcousticDiarizationInput<'_>,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<(DiarizationReport, DiarizationProjection)> {
+    let cancellation = CheckpointCancellationAdapter::new(checkpoint);
+    let outcome = diarize_acoustic_pcm(input, || cancellation.is_cancelled());
+    cancellation.restore(outcome)
 }
 
 /// Run one frozen representation ablation through the otherwise identical
@@ -11745,8 +12006,17 @@ where
             DiarizationEngine::Auto | DiarizationEngine::Acoustic,
             SpeakerRepresentationProvider::AcousticV2
         ) | (
-            DiarizationEngine::Neural,
-            SpeakerRepresentationProvider::EcapaTdnnV1 { .. }
+            DiarizationEngine::Ecapa,
+            SpeakerRepresentationProvider::EcapaTdnnV1 {
+                evidence_mode: DiarizationSpeakerEvidenceMode::EcapaOnly,
+                ..
+            }
+        ) | (
+            DiarizationEngine::EcapaFused,
+            SpeakerRepresentationProvider::EcapaTdnnV1 {
+                evidence_mode: DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+                ..
+            }
         )
     );
     if !engine_matches_provider {
@@ -11807,17 +12077,45 @@ where
     } else {
         AcousticSidecarFusionEvaluationEvidence::default()
     };
-    let (neural_representation, neural_embeddings) = match representation_provider {
-        SpeakerRepresentationProvider::AcousticV2 => (None, BTreeMap::new()),
-        SpeakerRepresentationProvider::EcapaTdnnV1 { model, checkpoint } => {
-            let (summary, embeddings) =
-                apply_ecapa_speaker_representations(samples, &tracklets, model, checkpoint)?;
-            (Some(summary), embeddings)
-        }
-    };
-    let enrollment = enroll_known_speaker_profiles(&tracklets, request, audio_duration_ms)
+    let (mut neural_representation, neural_embeddings, evidence_mode) =
+        match representation_provider {
+            SpeakerRepresentationProvider::AcousticV2 => (
+                None,
+                BTreeMap::new(),
+                DiarizationSpeakerEvidenceMode::AcousticV2,
+            ),
+            SpeakerRepresentationProvider::EcapaTdnnV1 {
+                model,
+                checkpoint,
+                evidence_mode,
+            } => {
+                let (summary, embeddings) =
+                    apply_ecapa_speaker_representations(samples, &tracklets, model, checkpoint)?;
+                (Some(summary), embeddings, evidence_mode)
+            }
+        };
+    let mut enrollment = enroll_known_speaker_profiles(&tracklets, request, audio_duration_ms)
         .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
-    let (mut clustering, count_merge_steps) = cluster_acoustic_tracklets_with_mode_internal(
+    if neural_representation.is_some() {
+        let (quarantined, contradictory) =
+            apply_neural_enrollment_hygiene(&tracklets, &mut enrollment, &neural_embeddings);
+        if quarantined > 0
+            && let Some(summary) = neural_representation.as_mut()
+        {
+            summary.status = NeuralSpeakerRepresentationStatus::Degraded;
+            if contradictory
+                && !summary
+                    .reasons
+                    .contains(&NeuralSpeakerRepresentationReason::ContradictoryEnrollment)
+            {
+                summary
+                    .reasons
+                    .push(NeuralSpeakerRepresentationReason::ContradictoryEnrollment);
+            }
+            summary.validate().map_err(FwError::ContractViolation)?;
+        }
+    }
+    let (clustering, count_merge_steps) = cluster_acoustic_tracklets_with_mode_internal(
         &tracklets,
         &enrollment,
         &request.speaker_count,
@@ -11826,26 +12124,30 @@ where
         neural_representation
             .is_some()
             .then_some(&neural_embeddings),
+        evidence_mode,
         is_cancelled,
     )?;
-    if neural_representation.is_some() {
-        let calibration_sha256 = ecapa_speaker_pair_calibration_sha256();
-        clustering
-            .speaker_pair_calibration_sha256
-            .clone_from(&calibration_sha256);
-        clustering.calibration_status = "ecapa_cosine_development_uncertified";
-        if let Some(estimate) = clustering.count_estimate.as_mut() {
-            estimate.calibration_sha256 = calibration_sha256;
-            estimate
-                .validate()
-                .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
-        }
-    }
     let turns = diarization_turns_from_assignments(&clustering.assignments, audio_duration_ms)?;
     let speaker_queries =
         speaker_attribution_queries(&clustering.assignments, normalized_input_sha256);
     let projection = project_diarization_onto_segments(segments, &turns, word_aligned)?;
-    let fallback_status = if matches!(
+    let neural_identity_unavailable = neural_representation
+        .as_ref()
+        .is_some_and(|summary| summary.status == NeuralSpeakerRepresentationStatus::Unavailable);
+    let fallback_status = if neural_identity_unavailable {
+        if matches!(
+            request.speaker_count,
+            SpeakerCountRequest::Infer
+                | SpeakerCountRequest::Prior { .. }
+                | SpeakerCountRequest::Range { .. }
+        ) {
+            DiarizationFallbackStatus::SpeakerCountUnresolved
+        } else if !clustering.constraints_satisfied {
+            DiarizationFallbackStatus::UnsatisfiedConstraints
+        } else {
+            DiarizationFallbackStatus::InsufficientEvidence
+        }
+    } else if matches!(
         request.speaker_count,
         SpeakerCountRequest::Infer
             | SpeakerCountRequest::Prior { .. }
@@ -11948,14 +12250,15 @@ where
     ];
     if let Some(summary) = neural_representation.as_ref() {
         diagnostics.push(format!(
-            "speaker_representation={} status={:?} embedded_tracklets={} zero_padded_tracklets={} skipped_tracklets={} reasons={:?} model_package_sha256={}",
+            "speaker_representation={} status={:?} embedded_tracklets={} zero_padded_tracklets={} skipped_tracklets={} reasons={:?} expected_model_package_sha256={} loaded_model_package_sha256={:?}",
             summary.provider_version,
             summary.status,
             summary.embedded_tracklet_count,
             summary.zero_padded_tracklet_count,
             summary.skipped_tracklet_count,
             summary.reasons,
-            summary.model_package_sha256,
+            summary.expected_model_package_sha256,
+            summary.loaded_model_package_sha256,
         ));
     }
     let clustering_evaluation = AcousticClusteringEvaluationEvidence {
@@ -11982,37 +12285,58 @@ where
             Vec::new()
         },
     };
-    Ok((
-        DiarizationReport {
-            implementation: if neural_representation.is_some() {
-                "native-ecapa-common-v1".to_owned()
-            } else {
-                match feature_ablation.schema_version() {
-                    AcousticFeatureSchemaVersion::V1 => "native-acoustic-v1",
-                    AcousticFeatureSchemaVersion::V2 => "native-acoustic-v2",
-                }
-                .to_owned()
-            },
-            contract_version: if neural_representation.is_some() {
-                NEURAL_DIARIZATION_CONTRACT_VERSION.to_owned()
-            } else {
-                ACOUSTIC_DIARIZATION_CONTRACT_VERSION.to_owned()
-            },
-            feature_schema: neural_representation.as_ref().map_or_else(
-                || feature_ablation.schema_version().id().to_owned(),
-                |summary| summary.provider_version.clone(),
-            ),
-            normalized_input_sha256: normalized_input_sha256.to_owned(),
-            hint_document_sha256: enrollment.hint_document_sha256,
-            turns,
-            profiles: clustering.profiles,
-            hint_evidence,
-            speaker_queries,
-            speaker_count,
-            fallback_status,
-            neural_representation,
-            diagnostics,
+    let report = DiarizationReport {
+        implementation: if neural_identity_unavailable {
+            "native-ecapa-unavailable-v1".to_owned()
+        } else if neural_representation.is_some() {
+            match evidence_mode {
+                DiarizationSpeakerEvidenceMode::EcapaOnly => "native-ecapa-only-v1",
+                DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => "native-ecapa-fused-v1",
+                _ => "native-ecapa-invalid",
+            }
+            .to_owned()
+        } else {
+            match feature_ablation.schema_version() {
+                AcousticFeatureSchemaVersion::V1 => "native-acoustic-v1",
+                AcousticFeatureSchemaVersion::V2 => "native-acoustic-v2",
+            }
+            .to_owned()
         },
+        contract_version: if neural_representation.is_some() {
+            NEURAL_DIARIZATION_CONTRACT_VERSION.to_owned()
+        } else {
+            ACOUSTIC_DIARIZATION_CONTRACT_VERSION.to_owned()
+        },
+        // ECAPA replaces only the identity representation. The common
+        // segmentation and channel features remain acoustic-v2 and model
+        // provenance has its own typed field below.
+        feature_schema: feature_ablation.schema_version().id().to_owned(),
+        speaker_evidence_mode: if neural_identity_unavailable {
+            DiarizationSpeakerEvidenceMode::None
+        } else {
+            evidence_mode
+        },
+        normalized_input_sha256: normalized_input_sha256.to_owned(),
+        hint_document_sha256: enrollment.hint_document_sha256,
+        turns,
+        profiles: clustering.profiles,
+        hint_evidence,
+        speaker_queries,
+        speaker_count,
+        fallback_status,
+        operational_partition: if neural_identity_unavailable {
+            None
+        } else {
+            clustering.operational_partition
+        },
+        neural_representation,
+        diagnostics,
+    };
+    report
+        .validate_against_request(request, Some(audio_duration_ms))
+        .map_err(FwError::ContractViolation)?;
+    Ok((
+        report,
         projection,
         change_evaluation_evidence,
         clustering_evaluation,
@@ -12201,6 +12525,7 @@ fn report_count(value: usize, field: &str) -> FwResult<u64> {
 #[derive(Debug, Clone)]
 struct AcousticPrototype {
     members: Vec<usize>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
     neural_voice: Option<EcapaSpeakerEmbedding>,
     neural_weight: f32,
     voice: [f32; VOICE_VECTOR_DIMENSIONS],
@@ -12217,6 +12542,7 @@ struct AcousticPrototype {
 #[derive(Debug, Clone)]
 struct AcousticCluster {
     prototype_members: Vec<usize>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
     neural_voice: Option<EcapaSpeakerEmbedding>,
     neural_weight: f32,
     voice: [f32; VOICE_VECTOR_DIMENSIONS],
@@ -12313,6 +12639,7 @@ where
         requested_prototype_cap,
         requested_mode,
         None,
+        DiarizationSpeakerEvidenceMode::AcousticV2,
         is_cancelled,
     )?
     .0)
@@ -12325,6 +12652,7 @@ fn cluster_acoustic_tracklets_with_mode_internal<C>(
     requested_prototype_cap: usize,
     requested_mode: AcousticClusteringMode,
     neural_embeddings: Option<&EcapaTrackletEmbeddings>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
     mut is_cancelled: C,
 ) -> FwResult<(
     AcousticClusteringResult,
@@ -12333,6 +12661,18 @@ fn cluster_acoustic_tracklets_with_mode_internal<C>(
 where
     C: FnMut() -> bool,
 {
+    let valid_evidence_context = match evidence_mode {
+        DiarizationSpeakerEvidenceMode::AcousticV2 => neural_embeddings.is_none(),
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => neural_embeddings.is_some(),
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => false,
+    };
+    if !valid_evidence_context {
+        return Err(FwError::InvalidRequest(
+            "speaker evidence mode does not match the supplied native representation".to_owned(),
+        ));
+    }
+    let pair_calibration_sha256 = speaker_pair_calibration_sha256_for_mode(evidence_mode);
     if requested_prototype_cap == 0 || requested_prototype_cap > 512 {
         return Err(FwError::InvalidRequest(
             "acoustic-v2 prototype cap must be within 1..=512".to_owned(),
@@ -12355,13 +12695,26 @@ where
         .collect::<BTreeSet<_>>()
         .len()
         .max(1);
-    if tracklets
-        .iter()
-        .all(|tracklet| !tracklet.voice_valid.iter().any(|valid| *valid))
-    {
+    let identity_evidence_unavailable = match evidence_mode {
+        DiarizationSpeakerEvidenceMode::AcousticV2 => {
+            tracklets
+                .iter()
+                .all(|tracklet| !tracklet.voice_valid.iter().any(|valid| *valid))
+                && enrollment.hard_assignments.is_empty()
+        }
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+            neural_embeddings.is_none_or(BTreeMap::is_empty)
+                && enrollment.hard_assignments.is_empty()
+        }
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => true,
+    };
+    if identity_evidence_unavailable {
+        let assignments = tracklets.iter().map(unknown_assignment).collect::<Vec<_>>();
+        let (_, unknown_voiced_share) = assignment_voiced_shares(tracklets, &assignments)?;
         return Ok((
             AcousticClusteringResult {
-                assignments: tracklets.iter().map(unknown_assignment).collect(),
+                assignments,
                 profiles: enrollment.summaries.clone(),
                 count_estimate: unavailable_speaker_count_estimate(
                     speaker_count,
@@ -12370,6 +12723,7 @@ where
                     0,
                     SpeakerCountCalibrationStatus::Unavailable,
                     SpeakerCountLaneUnavailableReason::InsufficientVoicedEvidence,
+                    &pair_calibration_sha256,
                 ),
                 detected_speakers: 0,
                 prototype_count: 0,
@@ -12378,14 +12732,15 @@ where
                 constraints_satisfied: count_request_allows_zero(speaker_count),
                 speaker_evidence: Vec::new(),
                 dominant_speaker_share: 0.0,
-                unknown_voiced_share: 0.0,
+                unknown_voiced_share,
                 speaker_separation_satisfied: true,
                 bootstrap_stability: 0.0,
                 requested_mode,
                 executed_mode: AcousticClusteringMode::FixedSafeV1,
                 fallback_reason: (requested_mode == AcousticClusteringMode::ProbabilisticV1)
                     .then_some(AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions),
-                speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
+                operational_partition: None,
+                speaker_pair_calibration_sha256: pair_calibration_sha256,
                 calibration_status: "insufficient_identity_evidence",
                 merge_trace: Vec::new(),
             },
@@ -12397,12 +12752,15 @@ where
         &enrollment.hard_assignments,
         requested_prototype_cap,
         neural_embeddings,
+        evidence_mode,
         &mut is_cancelled,
     )?;
     if prototypes.is_empty() {
+        let assignments = tracklets.iter().map(unknown_assignment).collect::<Vec<_>>();
+        let (_, unknown_voiced_share) = assignment_voiced_shares(tracklets, &assignments)?;
         return Ok((
             AcousticClusteringResult {
-                assignments: tracklets.iter().map(unknown_assignment).collect(),
+                assignments,
                 profiles: enrollment.summaries.clone(),
                 count_estimate: unavailable_speaker_count_estimate(
                     speaker_count,
@@ -12411,6 +12769,7 @@ where
                     0,
                     SpeakerCountCalibrationStatus::Unavailable,
                     SpeakerCountLaneUnavailableReason::InsufficientPrototypes,
+                    &pair_calibration_sha256,
                 ),
                 detected_speakers: 0,
                 prototype_count: 0,
@@ -12419,14 +12778,15 @@ where
                 constraints_satisfied: count_request_allows_zero(speaker_count),
                 speaker_evidence: Vec::new(),
                 dominant_speaker_share: 0.0,
-                unknown_voiced_share: 0.0,
+                unknown_voiced_share,
                 speaker_separation_satisfied: true,
                 bootstrap_stability: 0.0,
                 requested_mode,
                 executed_mode: AcousticClusteringMode::FixedSafeV1,
                 fallback_reason: (requested_mode == AcousticClusteringMode::ProbabilisticV1)
                     .then_some(AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions),
-                speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
+                operational_partition: None,
+                speaker_pair_calibration_sha256: pair_calibration_sha256,
                 calibration_status: "insufficient_evidence",
                 merge_trace: Vec::new(),
             },
@@ -12436,7 +12796,12 @@ where
 
     let neural_profiles =
         neural_embeddings.map(|embeddings| build_ecapa_speaker_profiles(enrollment, embeddings));
-    let initial_clusters = initial_clusters(&prototypes, enrollment, neural_profiles.as_ref());
+    let initial_clusters = initial_clusters(
+        &prototypes,
+        enrollment,
+        neural_profiles.as_ref(),
+        evidence_mode,
+    );
     let requested_minimum = match speaker_count {
         SpeakerCountRequest::HardConstraint { count } => *count as usize,
         SpeakerCountRequest::Infer
@@ -12463,13 +12828,16 @@ where
         mut count_estimate,
         executed_mode,
         fallback_reason,
+        operational_partition,
     ) = if requested_mode == AcousticClusteringMode::ProbabilisticV1 {
         match probabilistic_agglomerate_clusters(
             &initial_clusters,
             &enrollment.cannot_links,
             speaker_count,
             count_policy,
-            neural_embeddings.is_some(),
+            neural_embeddings,
+            evidence_mode,
+            &pair_calibration_sha256,
             &mut is_cancelled,
         )? {
             ProbabilisticAgglomeration::Selected {
@@ -12478,6 +12846,7 @@ where
                 count_merge_steps,
                 stability,
                 count_estimate,
+                operational_partition,
             } => (
                 clusters,
                 merge_trace,
@@ -12486,10 +12855,11 @@ where
                 Some(count_estimate),
                 AcousticClusteringMode::ProbabilisticV1,
                 None,
+                Some(operational_partition),
             ),
             ProbabilisticAgglomeration::Fallback {
                 reason,
-                count_estimate,
+                count_estimate: _,
                 count_merge_steps,
             } => {
                 let unavailable_reason = match reason {
@@ -12506,21 +12876,32 @@ where
                         SpeakerCountLaneUnavailableReason::CalibrationUnavailable
                     }
                 };
-                let count_estimate = count_estimate.or_else(|| {
-                    unavailable_speaker_count_estimate(
-                        speaker_count,
-                        constraint_lower_bound,
-                        initial_clusters.len(),
-                        initial_clusters.len(),
-                        SpeakerCountCalibrationStatus::Unavailable,
-                        unavailable_reason,
-                    )
-                });
+                // The probabilistic proposal was rejected, so it cannot remain
+                // the public count authority for the fixed-safe partition.
+                // Its merge evidence remains available only through the
+                // evaluation-only `count_merge_steps` returned alongside this
+                // result.
+                let count_estimate = unavailable_speaker_count_estimate(
+                    speaker_count,
+                    constraint_lower_bound,
+                    initial_clusters.len(),
+                    initial_clusters.len(),
+                    SpeakerCountCalibrationStatus::FixedSafeUncalibrated,
+                    unavailable_reason,
+                    &pair_calibration_sha256,
+                );
                 let (clusters, merge_trace) = agglomerate_clusters(
                     initial_clusters,
                     &enrollment.cannot_links,
                     count_policy,
                     &mut is_cancelled,
+                )?;
+                let operational_partition = operational_partition_summary(
+                    DiarizationOperationalPartitionMethod::FixedSafeAgglomerative,
+                    clusters.len(),
+                    0.0,
+                    pair_calibration_sha256.clone(),
+                    SpeakerCountCalibrationStatus::FixedSafeUncalibrated,
                 )?;
                 (
                     clusters,
@@ -12530,6 +12911,7 @@ where
                     count_estimate,
                     AcousticClusteringMode::FixedSafeV1,
                     Some(reason),
+                    Some(operational_partition),
                 )
             }
         }
@@ -12548,7 +12930,15 @@ where
             initial_cluster_count,
             SpeakerCountCalibrationStatus::FixedSafeUncalibrated,
             SpeakerCountLaneUnavailableReason::CalibrationUnavailable,
+            &pair_calibration_sha256,
         );
+        let operational_partition = operational_partition_summary(
+            DiarizationOperationalPartitionMethod::FixedSafeAgglomerative,
+            clusters.len(),
+            0.0,
+            pair_calibration_sha256.clone(),
+            SpeakerCountCalibrationStatus::FixedSafeUncalibrated,
+        )?;
         (
             clusters,
             merge_trace,
@@ -12557,6 +12947,7 @@ where
             count_estimate,
             AcousticClusteringMode::FixedSafeV1,
             None,
+            Some(operational_partition),
         )
     };
     let labels = canonical_cluster_labels(&clusters, enrollment);
@@ -12569,8 +12960,14 @@ where
         neural_embeddings,
         &mut is_cancelled,
     )?;
-    let speaker_evidence =
-        evaluate_speaker_evidence(tracklets, &clusters, &labels, enrollment, &assignments)?;
+    let speaker_evidence = evaluate_speaker_evidence(
+        tracklets,
+        &clusters,
+        &labels,
+        enrollment,
+        &assignments,
+        neural_embeddings,
+    )?;
     retain_supported_assignments(&speaker_evidence, &mut assignments);
     let detected_speakers = assignments
         .iter()
@@ -12631,11 +13028,19 @@ where
             requested_mode,
             executed_mode,
             fallback_reason,
-            speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
-            calibration_status: if executed_mode == AcousticClusteringMode::ProbabilisticV1 {
-                "development_posterior_uncertified"
-            } else {
-                "heuristic_uncalibrated"
+            operational_partition,
+            speaker_pair_calibration_sha256: pair_calibration_sha256,
+            calibration_status: match (evidence_mode, executed_mode) {
+                (_, AcousticClusteringMode::FixedSafeV1) => "fixed_safe_uncalibrated",
+                (
+                    DiarizationSpeakerEvidenceMode::EcapaOnly,
+                    AcousticClusteringMode::ProbabilisticV1,
+                ) => "ecapa_cosine_development_uncertified",
+                (
+                    DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+                    AcousticClusteringMode::ProbabilisticV1,
+                ) => "ecapa_fused_development_uncertified",
+                (_, AcousticClusteringMode::ProbabilisticV1) => "development_posterior_uncertified",
             },
             merge_trace,
         },
@@ -13171,8 +13576,20 @@ fn validate_ecapa_tracklet_embeddings(
         .iter()
         .map(|tracklet| tracklet.tracklet_index)
         .collect::<BTreeSet<_>>();
-    for (&tracklet_index, embedding) in embeddings {
-        if !tracklet_indexes.contains(&tracklet_index) || ecapa_embedding_norm(embedding).is_none()
+    for (&tracklet_index, representation) in embeddings {
+        let valid_validation = match representation.validation.as_ref() {
+            Some(validation) => {
+                ecapa_embedding_norm(validation).is_some()
+                    && representation.validation_weight.is_finite()
+                    && representation.validation_weight > 0.0
+            }
+            None => representation.validation_weight == 0.0,
+        };
+        if !tracklet_indexes.contains(&tracklet_index)
+            || ecapa_embedding_norm(&representation.discovery).is_none()
+            || !representation.discovery_weight.is_finite()
+            || representation.discovery_weight <= 0.0
+            || !valid_validation
         {
             return Err(FwError::InvalidRequest(
                 "ECAPA tracklet embeddings must be finite, non-zero, and reference an existing tracklet"
@@ -13202,11 +13619,16 @@ fn build_ecapa_speaker_profiles(
 
     let mut centroids = BTreeMap::<String, (Option<EcapaSpeakerEmbedding>, f32)>::new();
     for ((speaker_ref, tracklet_index), weight) in admitted_weights {
-        let Some(embedding) = embeddings.get(&tracklet_index) else {
+        let Some(representation) = embeddings.get(&tracklet_index) else {
             continue;
         };
         let entry = centroids.entry(speaker_ref).or_insert((None, 0.0));
-        merge_ecapa_centroid(&mut entry.0, &mut entry.1, Some(embedding), weight);
+        merge_ecapa_centroid(
+            &mut entry.0,
+            &mut entry.1,
+            Some(&representation.discovery),
+            weight.min(representation.discovery_weight),
+        );
     }
     centroids
         .into_iter()
@@ -13216,11 +13638,239 @@ fn build_ecapa_speaker_profiles(
         .collect()
 }
 
+/// Apply an ECAPA leave-one-out check to soft enrollment observations before
+/// they are allowed to shape a known-speaker profile.
+///
+/// A hard observation is authoritative attribution and is never removed here.
+/// It may, however, provide the independent reference against which a soft
+/// observation is checked. Without hard evidence, a soft observation needs at
+/// least two other admitted observations for the same speaker; this prevents a
+/// two-sample disagreement from arbitrarily selecting a winner. The decision
+/// must hold in three of the five deterministic ECAPA coordinate views as well
+/// as the full view.
+fn apply_neural_enrollment_hygiene(
+    tracklets: &[AcousticTracklet],
+    enrollment: &mut SpeakerEnrollment,
+    embeddings: &EcapaTrackletEmbeddings,
+) -> (usize, bool) {
+    let mut quarantined = Vec::<(usize, Option<f32>, ProfileTrainingReason)>::new();
+    for (candidate_index, candidate) in enrollment.training_evidence.iter().enumerate() {
+        if candidate.hard_attribution
+            || candidate.disposition == ProfileTrainingDisposition::Quarantined
+            || candidate.applied_weight <= 0.0
+        {
+            continue;
+        }
+        let Some(candidate_embedding) = embeddings
+            .get(&candidate.tracklet_index)
+            .map(|representation| &representation.discovery)
+        else {
+            quarantined.push((
+                candidate_index,
+                None,
+                ProfileTrainingReason::MissingRepresentation,
+            ));
+            continue;
+        };
+        let peers = enrollment
+            .training_evidence
+            .iter()
+            .enumerate()
+            .filter(|(peer_index, peer)| {
+                *peer_index != candidate_index
+                    && peer.speaker_ref == candidate.speaker_ref
+                    && peer.disposition != ProfileTrainingDisposition::Quarantined
+                    && peer.applied_weight > 0.0
+                    && embeddings.contains_key(&peer.tracklet_index)
+            })
+            .collect::<Vec<_>>();
+        let hard_peers = peers
+            .iter()
+            .copied()
+            .filter(|(_, peer)| peer.hard_attribution)
+            .collect::<Vec<_>>();
+        let reference_peers = if hard_peers.is_empty() {
+            if peers.len() < 2 {
+                continue;
+            }
+            peers
+        } else {
+            hard_peers
+        };
+        let mut reference = None;
+        let mut reference_weight = 0.0_f32;
+        for (_, peer) in reference_peers {
+            let Some(representation) = embeddings.get(&peer.tracklet_index) else {
+                continue;
+            };
+            merge_ecapa_centroid(
+                &mut reference,
+                &mut reference_weight,
+                Some(&representation.discovery),
+                peer.applied_weight.min(representation.discovery_weight),
+            );
+        }
+        let Some(reference) = reference else {
+            continue;
+        };
+        let full_distance = ecapa_cosine_distance(
+            candidate_embedding,
+            &reference,
+            SpeakerPairPerturbation::Full,
+        );
+        let inconsistent_views = SpeakerPairPerturbation::ALL
+            .into_iter()
+            .filter(|&perturbation| {
+                ecapa_cosine_distance(candidate_embedding, &reference, perturbation).is_some_and(
+                    |distance| distance > ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT,
+                )
+            })
+            .count();
+        if full_distance.is_some_and(|distance| {
+            distance > ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT
+        }) && inconsistent_views >= 3
+        {
+            quarantined.push((
+                candidate_index,
+                full_distance,
+                ProfileTrainingReason::LeaveOneOutInconsistent,
+            ));
+        }
+    }
+
+    for (training_index, contradiction, reason) in &quarantined {
+        let training = &mut enrollment.training_evidence[*training_index];
+        let previous_disposition = training.disposition;
+        let previous_weight = training.applied_weight;
+        training.disposition = ProfileTrainingDisposition::Quarantined;
+        training.reason = *reason;
+        training.applied_weight = 0.0;
+        enrollment
+            .soft_priors
+            .remove(&(training.tracklet_index, training.speaker_ref.clone()));
+        if let Some(hint) = enrollment.evidence.get_mut(training.hint_index) {
+            match previous_disposition {
+                ProfileTrainingDisposition::Accepted => {
+                    hint.profile_accepted_tracklet_count =
+                        hint.profile_accepted_tracklet_count.saturating_sub(1);
+                }
+                ProfileTrainingDisposition::Downweighted => {
+                    hint.profile_downweighted_tracklet_count =
+                        hint.profile_downweighted_tracklet_count.saturating_sub(1);
+                }
+                ProfileTrainingDisposition::Quarantined => {}
+            }
+            hint.profile_quarantined_tracklet_count += 1;
+            hint.applied_weight = (hint.applied_weight - previous_weight).max(0.0);
+            if let Some(contradiction) = contradiction {
+                hint.contradiction_score = Some(
+                    hint.contradiction_score
+                        .map_or(*contradiction, |current| current.max(*contradiction)),
+                );
+            }
+        }
+    }
+
+    if quarantined.is_empty() {
+        return (0, false);
+    }
+
+    // Rebuild the private classical profile summaries from the retained
+    // observations too. This prevents a quarantined neural outlier from
+    // leaking back into a per-tracklet classical fallback state.
+    let tracklets_by_index = tracklets
+        .iter()
+        .map(|tracklet| (tracklet.tracklet_index, tracklet))
+        .collect::<BTreeMap<_, _>>();
+    let mut observations_by_speaker = BTreeMap::<String, Vec<EnrollmentObservation>>::new();
+    for training in &enrollment.training_evidence {
+        if training.disposition == ProfileTrainingDisposition::Quarantined
+            || training.applied_weight <= 0.0
+        {
+            continue;
+        }
+        let Some(tracklet) = tracklets_by_index.get(&training.tracklet_index) else {
+            continue;
+        };
+        observations_by_speaker
+            .entry(training.speaker_ref.clone())
+            .or_default()
+            .push(EnrollmentObservation {
+                tracklet_index: training.tracklet_index,
+                hint_index: training.hint_index,
+                voice: tracklet.voice_mean,
+                voice_valid: tracklet.voice_valid,
+                channel: tracklet.channel_mean,
+                channel_valid: tracklet.channel_valid,
+                channel_dimensions: tracklet.channel_dimensions,
+                frame_count: tracklet.frame_count,
+                voiced_duration_ms: tracklet.voiced_frame_count as u64 * 10,
+                weight: training.applied_weight,
+                hard: training.hard_attribution,
+            });
+    }
+    let mut profiles = BTreeMap::new();
+    let mut profile_training_observations = BTreeMap::new();
+    for (speaker_ref, observations) in observations_by_speaker {
+        let accepted_count = enrollment
+            .training_evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.speaker_ref == speaker_ref
+                    && evidence.disposition == ProfileTrainingDisposition::Accepted
+            })
+            .count();
+        let downweighted_count = enrollment
+            .training_evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.speaker_ref == speaker_ref
+                    && evidence.disposition == ProfileTrainingDisposition::Downweighted
+            })
+            .count();
+        let quarantined_count = enrollment
+            .training_evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.speaker_ref == speaker_ref
+                    && evidence.disposition == ProfileTrainingDisposition::Quarantined
+            })
+            .count();
+        let maximum_contradiction = enrollment
+            .evidence
+            .iter()
+            .filter(|hint| hint.speaker_ref == speaker_ref)
+            .filter_map(|hint| hint.contradiction_score)
+            .max_by(f32::total_cmp);
+        let profile = build_speaker_profile(
+            speaker_ref.clone(),
+            &observations,
+            maximum_contradiction,
+            accepted_count,
+            downweighted_count,
+            quarantined_count,
+        );
+        profile_training_observations.insert(speaker_ref.clone(), observations);
+        profiles.insert(speaker_ref, profile);
+    }
+    let (voice_dimension_weights, metric_adaptation) =
+        supervised_metric_adaptation(&profiles, &profile_training_observations);
+    enrollment.profiles = profiles;
+    enrollment.summaries = enrollment.profiles.values().map(profile_summary).collect();
+    enrollment.voice_dimension_weights = voice_dimension_weights;
+    enrollment.metric_adaptation = metric_adaptation;
+    let contradictory = quarantined
+        .iter()
+        .any(|(_, _, reason)| *reason == ProfileTrainingReason::LeaveOneOutInconsistent);
+    (quarantined.len(), contradictory)
+}
+
 fn build_capped_prototypes<C>(
     tracklets: &[AcousticTracklet],
     hard_assignments: &BTreeMap<usize, String>,
     cap: usize,
     neural_embeddings: Option<&EcapaTrackletEmbeddings>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
     is_cancelled: &mut C,
 ) -> FwResult<(Vec<AcousticPrototype>, bool)>
 where
@@ -13242,32 +13892,69 @@ where
             .then_with(|| compare_float_vectors(&left.voice_mean, &right.voice_mean))
             .then(left.tracklet_index.cmp(&right.tracklet_index))
     });
+    let distinct_hard_references = ordered
+        .iter()
+        .filter_map(|tracklet| hard_assignments.get(&tracklet.tracklet_index))
+        .collect::<BTreeSet<_>>();
+    if distinct_hard_references.len() > cap {
+        return Err(FwError::InvalidRequest(
+            "prototype cap cannot preserve all incompatible hard anchors".to_owned(),
+        ));
+    }
+
     let mut prototypes = Vec::<AcousticPrototype>::with_capacity(cap);
+    let mut hard_slots = BTreeMap::<String, usize>::new();
     let mut cap_pressure = false;
-    for (position, tracklet) in ordered.into_iter().enumerate() {
+    let mut visited = 0usize;
+
+    // Reserve one immutable prototype per hard reference before any free
+    // prototype can consume capacity. Observations for the same reference are
+    // valid must-links and may be compacted together, but unrelated speech is
+    // never allowed to donate a centroid to a named hard anchor.
+    for tracklet in ordered
+        .iter()
+        .copied()
+        .filter(|tracklet| hard_assignments.contains_key(&tracklet.tracklet_index))
+    {
+        let position = visited;
+        visited = visited.saturating_add(1);
         if position % ACOUSTIC_CANCELLATION_INTERVAL_FRAMES == 0 && is_cancelled() {
             return Err(FwError::Cancelled(format!(
                 "acoustic clustering cancelled at tracklet {position}"
             )));
         }
-        let prototype = AcousticPrototype {
-            members: vec![tracklet.tracklet_index],
-            neural_voice: neural_embeddings
-                .and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
-                .copied(),
-            neural_weight: neural_embeddings
-                .and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
-                .map_or(0.0, |_| tracklet.identity_frame_count.max(1) as f32),
-            voice: tracklet.voice_mean,
-            voice_valid: tracklet.voice_valid,
-            variance: tracklet.voice_variance.map(|value| value.max(0.025)),
-            channel: tracklet.channel_mean,
-            channel_valid: tracklet.channel_valid,
-            channel_dimensions: tracklet.channel_dimensions,
-            frame_count: tracklet.frame_count,
-            earliest_ms: tracklet.start_ms,
-            hard_anchor: hard_assignments.get(&tracklet.tracklet_index).cloned(),
-        };
+        let anchor = hard_assignments
+            .get(&tracklet.tracklet_index)
+            .ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "hard prototype lost its validated speaker reference".to_owned(),
+                )
+            })?;
+        let prototype =
+            prototype_from_tracklet(tracklet, hard_assignments, neural_embeddings, evidence_mode);
+        if let Some(&slot) = hard_slots.get(anchor) {
+            merge_prototype(&mut prototypes[slot], &prototype);
+        } else {
+            let slot = prototypes.len();
+            hard_slots.insert(anchor.clone(), slot);
+            prototypes.push(prototype);
+        }
+    }
+
+    for tracklet in ordered
+        .iter()
+        .copied()
+        .filter(|tracklet| !hard_assignments.contains_key(&tracklet.tracklet_index))
+    {
+        let position = visited;
+        visited = visited.saturating_add(1);
+        if position % ACOUSTIC_CANCELLATION_INTERVAL_FRAMES == 0 && is_cancelled() {
+            return Err(FwError::Cancelled(format!(
+                "acoustic clustering cancelled at tracklet {position}"
+            )));
+        }
+        let prototype =
+            prototype_from_tracklet(tracklet, hard_assignments, neural_embeddings, evidence_mode);
         if prototypes.len() < cap {
             prototypes.push(prototype);
             continue;
@@ -13276,23 +13963,42 @@ where
         let selected = prototypes
             .iter()
             .enumerate()
-            .filter(|(_, existing)| {
-                anchors_compatible(
-                    existing.hard_anchor.as_ref(),
-                    prototype.hard_anchor.as_ref(),
-                )
-            })
+            .filter(|(_, existing)| existing.hard_anchor.is_none())
             .map(|(index, existing)| (prototype_distance(existing, &prototype), index))
             .min_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)))
-            .map(|(_, index)| index)
-            .ok_or_else(|| {
-                FwError::InvalidRequest(
-                    "prototype cap cannot preserve all incompatible hard anchors".to_owned(),
-                )
-            })?;
-        merge_prototype(&mut prototypes[selected], &prototype);
+            .map(|(_, index)| index);
+        if let Some(selected) = selected {
+            merge_prototype(&mut prototypes[selected], &prototype);
+        }
     }
     Ok((prototypes, cap_pressure))
+}
+
+fn prototype_from_tracklet(
+    tracklet: &AcousticTracklet,
+    hard_assignments: &BTreeMap<usize, String>,
+    neural_embeddings: Option<&EcapaTrackletEmbeddings>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
+) -> AcousticPrototype {
+    AcousticPrototype {
+        members: vec![tracklet.tracklet_index],
+        evidence_mode,
+        neural_voice: neural_embeddings
+            .and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
+            .map(|representation| representation.discovery),
+        neural_weight: neural_embeddings
+            .and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
+            .map_or(0.0, |representation| representation.discovery_weight),
+        voice: tracklet.voice_mean,
+        voice_valid: tracklet.voice_valid,
+        variance: tracklet.voice_variance.map(|value| value.max(0.025)),
+        channel: tracklet.channel_mean,
+        channel_valid: tracklet.channel_valid,
+        channel_dimensions: tracklet.channel_dimensions,
+        frame_count: tracklet.frame_count,
+        earliest_ms: tracklet.start_ms,
+        hard_anchor: hard_assignments.get(&tracklet.tracklet_index).cloned(),
+    }
 }
 
 fn compare_float_vectors<const N: usize>(left: &[f32; N], right: &[f32; N]) -> std::cmp::Ordering {
@@ -13305,16 +14011,10 @@ fn compare_float_vectors<const N: usize>(left: &[f32; N], right: &[f32; N]) -> s
     std::cmp::Ordering::Equal
 }
 
-fn anchors_compatible(left: Option<&String>, right: Option<&String>) -> bool {
-    left.is_none() || right.is_none() || left == right
-}
-
 fn prototype_distance(left: &AcousticPrototype, right: &AcousticPrototype) -> f32 {
-    left.neural_voice
-        .as_ref()
-        .zip(right.neural_voice.as_ref())
-        .and_then(|(left, right)| ecapa_cosine_distance(left, right, SpeakerPairPerturbation::Full))
-        .or_else(|| {
+    debug_assert_eq!(left.evidence_mode, right.evidence_mode);
+    match left.evidence_mode {
+        DiarizationSpeakerEvidenceMode::AcousticV2 => {
             masked_variance_normalized_distance(
                 &left.voice,
                 &left.voice_valid,
@@ -13323,18 +14023,45 @@ fn prototype_distance(left: &AcousticPrototype, right: &AcousticPrototype) -> f3
                 &right.voice_valid,
                 &right.variance,
             )
-        })
-        .unwrap_or(10.0)
-        + channel_distance(
-            &left.channel,
-            left.channel_valid,
-            &right.channel,
-            right.channel_valid,
-            left.channel_dimensions.min(right.channel_dimensions),
-        )
+            .unwrap_or(10.0)
+                + channel_distance(
+                    &left.channel,
+                    left.channel_valid,
+                    &right.channel,
+                    right.channel_valid,
+                    left.channel_dimensions.min(right.channel_dimensions),
+                )
+        }
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+            let voice_distance = left
+                .neural_voice
+                .as_ref()
+                .zip(right.neural_voice.as_ref())
+                .and_then(|(left, right)| {
+                    ecapa_cosine_distance(left, right, SpeakerPairPerturbation::Full)
+                })
+                .unwrap_or(10.0);
+            voice_distance
+                + if left.evidence_mode == DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+                {
+                    channel_distance(
+                        &left.channel,
+                        left.channel_valid,
+                        &right.channel,
+                        right.channel_valid,
+                        left.channel_dimensions.min(right.channel_dimensions),
+                    )
+                } else {
+                    0.0
+                }
+        }
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 10.0,
+    }
 }
 
 fn merge_prototype(destination: &mut AcousticPrototype, source: &AcousticPrototype) {
+    debug_assert_eq!(destination.evidence_mode, source.evidence_mode);
     let total = destination.frame_count + source.frame_count;
     let left_weight = destination.frame_count as f32 / total as f32;
     let right_weight = source.frame_count as f32 / total as f32;
@@ -13435,11 +14162,12 @@ fn initial_clusters(
     prototypes: &[AcousticPrototype],
     enrollment: &SpeakerEnrollment,
     neural_profiles: Option<&EcapaSpeakerProfiles>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
 ) -> Vec<AcousticCluster> {
     let mut anchored = BTreeMap::<String, AcousticCluster>::new();
     let mut clusters = Vec::new();
-    for (prototype_index, prototype) in prototypes.iter().enumerate() {
-        let cluster = cluster_from_prototype(prototype_index, prototype);
+    for prototype in prototypes {
+        let cluster = cluster_from_prototype(prototype);
         if let Some(anchor) = &prototype.hard_anchor {
             anchored
                 .entry(anchor.clone())
@@ -13451,11 +14179,13 @@ fn initial_clusters(
     }
     for (speaker_ref, mut cluster) in anchored {
         if let Some(profile) = enrollment.profiles.get(&speaker_ref) {
-            apply_profile_prior(
-                &mut cluster,
-                profile,
-                neural_profiles.and_then(|profiles| profiles.get(&speaker_ref)),
-            );
+            // The anchored cluster already contains the hard-hint observations
+            // used to construct this profile. Merging that profile back into
+            // the cluster would count the same evidence twice (including the
+            // neural centroid and its duration). Reliability is metadata, not
+            // another observation, so it may still strengthen the quality
+            // gate without changing the centroid or weight.
+            cluster.reliability = cluster.reliability.max(profile.reliability);
         }
         cluster.hard_anchor = Some(speaker_ref.clone());
         cluster.label_hint = Some(speaker_ref);
@@ -13466,10 +14196,17 @@ fn initial_clusters(
         .values()
         .filter(|profile| !profile.anchored)
     {
-        clusters.push(cluster_from_profile(
-            profile,
-            neural_profiles.and_then(|profiles| profiles.get(&profile.speaker_ref)),
-        ));
+        let neural_profile =
+            neural_profiles.and_then(|profiles| profiles.get(&profile.speaker_ref));
+        if matches!(
+            evidence_mode,
+            DiarizationSpeakerEvidenceMode::EcapaOnly
+                | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+        ) && neural_profile.is_none()
+        {
+            continue;
+        }
+        clusters.push(cluster_from_profile(profile, neural_profile, evidence_mode));
     }
     clusters.sort_by(|left, right| {
         left.hard_anchor
@@ -13481,9 +14218,10 @@ fn initial_clusters(
     clusters
 }
 
-fn cluster_from_prototype(index: usize, prototype: &AcousticPrototype) -> AcousticCluster {
+fn cluster_from_prototype(prototype: &AcousticPrototype) -> AcousticCluster {
     AcousticCluster {
-        prototype_members: vec![index],
+        prototype_members: prototype.members.clone(),
+        evidence_mode: prototype.evidence_mode,
         neural_voice: prototype.neural_voice,
         neural_weight: prototype.neural_weight,
         voice: prototype.voice,
@@ -13504,6 +14242,7 @@ fn cluster_from_prototype(index: usize, prototype: &AcousticPrototype) -> Acoust
 fn cluster_from_profile(
     profile: &AcousticSpeakerProfile,
     neural_profile: Option<&EcapaSpeakerProfile>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
 ) -> AcousticCluster {
     let mut scale = [0.0_f32; VOICE_VECTOR_DIMENSIONS];
     for (dimension, scale_value) in scale.iter_mut().enumerate() {
@@ -13512,6 +14251,7 @@ fn cluster_from_profile(
     }
     AcousticCluster {
         prototype_members: Vec::new(),
+        evidence_mode,
         neural_voice: neural_profile.map(|profile| profile.embedding),
         neural_weight: neural_profile.map_or(0.0, |profile| profile.weight),
         voice: profile.voice_median,
@@ -13533,17 +14273,8 @@ fn cluster_from_profile(
     }
 }
 
-fn apply_profile_prior(
-    cluster: &mut AcousticCluster,
-    profile: &AcousticSpeakerProfile,
-    neural_profile: Option<&EcapaSpeakerProfile>,
-) {
-    let prior = cluster_from_profile(profile, neural_profile);
-    merge_cluster(cluster, &prior);
-    cluster.reliability = cluster.reliability.max(profile.reliability);
-}
-
 fn merge_cluster(destination: &mut AcousticCluster, source: &AcousticCluster) {
+    debug_assert_eq!(destination.evidence_mode, source.evidence_mode);
     let total = destination.weight + source.weight;
     let left_weight = destination.weight / total.max(f32::EPSILON);
     let right_weight = source.weight / total.max(f32::EPSILON);
@@ -13609,11 +14340,9 @@ fn merge_cluster(destination: &mut AcousticCluster, source: &AcousticCluster) {
 }
 
 fn cluster_distance(left: &AcousticCluster, right: &AcousticCluster) -> f32 {
-    left.neural_voice
-        .as_ref()
-        .zip(right.neural_voice.as_ref())
-        .and_then(|(left, right)| ecapa_cosine_distance(left, right, SpeakerPairPerturbation::Full))
-        .or_else(|| {
+    debug_assert_eq!(left.evidence_mode, right.evidence_mode);
+    match left.evidence_mode {
+        DiarizationSpeakerEvidenceMode::AcousticV2 => {
             masked_variance_normalized_distance(
                 &left.voice,
                 &left.voice_valid,
@@ -13622,15 +14351,41 @@ fn cluster_distance(left: &AcousticCluster, right: &AcousticCluster) -> f32 {
                 &right.voice_valid,
                 &right.scale,
             )
-        })
-        .unwrap_or(10.0)
-        + channel_distance(
-            &left.channel,
-            left.channel_valid,
-            &right.channel,
-            right.channel_valid,
-            left.channel_dimensions.min(right.channel_dimensions),
-        )
+            .unwrap_or(10.0)
+                + channel_distance(
+                    &left.channel,
+                    left.channel_valid,
+                    &right.channel,
+                    right.channel_valid,
+                    left.channel_dimensions.min(right.channel_dimensions),
+                )
+        }
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+            let voice_distance = left
+                .neural_voice
+                .as_ref()
+                .zip(right.neural_voice.as_ref())
+                .and_then(|(left, right)| {
+                    ecapa_cosine_distance(left, right, SpeakerPairPerturbation::Full)
+                })
+                .unwrap_or(10.0);
+            voice_distance
+                + if left.evidence_mode == DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+                {
+                    channel_distance(
+                        &left.channel,
+                        left.channel_valid,
+                        &right.channel,
+                        right.channel_valid,
+                        left.channel_dimensions.min(right.channel_dimensions),
+                    )
+                } else {
+                    0.0
+                }
+        }
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 10.0,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -13670,10 +14425,14 @@ impl SpeakerPairPerturbation {
     /// dynamics, or formant semantics.
     const fn includes_neural(self, dimension: usize) -> bool {
         match self {
-            Self::Full | Self::NoChannelEvidence => true,
+            Self::Full => true,
             Self::NoPitchCoordinates => !dimension.is_multiple_of(4),
             Self::NoDynamicCoordinates => dimension % 4 != 1,
             Self::NoFormantCoordinates => dimension % 4 != 2,
+            // The historical lane name describes the acoustic-v2 view. ECAPA
+            // has no channel coordinates in its embedding, so omit the fourth
+            // modulo-four partition here instead of duplicating `Full`.
+            Self::NoChannelEvidence => dimension % 4 != 3,
         }
     }
 }
@@ -13756,10 +14515,12 @@ fn merge_ecapa_centroid(
         centroid[dimension] =
             (left_weight * centroid[dimension] + right_weight * source[dimension]) / total_weight;
     }
-    if let Some(norm) = ecapa_embedding_norm(&centroid) {
-        for value in &mut centroid {
-            *value = (f64::from(*value) / norm) as f32;
-        }
+    // Retain the actual weighted mean rather than normalizing after every
+    // incremental merge. Cosine consumers normalize at comparison time; an
+    // eager normalization discards the previous resultant magnitude while
+    // retaining its summed weight, making all later centroids merge-order
+    // dependent.
+    if ecapa_embedding_norm(&centroid).is_some() {
         *destination = Some(centroid);
         *destination_weight = total_weight;
     } else {
@@ -13773,40 +14534,48 @@ fn cluster_pair_evidence(
     right: &AcousticCluster,
     perturbation: SpeakerPairPerturbation,
 ) -> Option<AcousticSpeakerPairEvidence> {
-    if let Some((left_neural, right_neural)) =
-        left.neural_voice.as_ref().zip(right.neural_voice.as_ref())
-    {
-        return ecapa_speaker_pair_evidence(
-            left_neural,
-            left.neural_weight,
+    debug_assert_eq!(left.evidence_mode, right.evidence_mode);
+    match left.evidence_mode {
+        DiarizationSpeakerEvidenceMode::AcousticV2 => speaker_pair_evidence_from_statistics(
+            &left.voice,
+            &left.voice_valid,
+            &left.scale,
+            left.weight,
             &left.channel,
             left.channel_valid,
             left.channel_dimensions,
-            right_neural,
-            right.neural_weight,
+            &right.voice,
+            &right.voice_valid,
+            &right.scale,
+            right.weight,
             &right.channel,
             right.channel_valid,
             right.channel_dimensions,
             perturbation,
-        );
+        ),
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => left
+            .neural_voice
+            .as_ref()
+            .zip(right.neural_voice.as_ref())
+            .and_then(|(left_neural, right_neural)| {
+                ecapa_speaker_pair_evidence(
+                    left_neural,
+                    left.neural_weight,
+                    &left.channel,
+                    left.channel_valid,
+                    left.channel_dimensions,
+                    right_neural,
+                    right.neural_weight,
+                    &right.channel,
+                    right.channel_valid,
+                    right.channel_dimensions,
+                    perturbation,
+                    left.evidence_mode,
+                )
+            }),
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => None,
     }
-    speaker_pair_evidence_from_statistics(
-        &left.voice,
-        &left.voice_valid,
-        &left.scale,
-        left.weight,
-        &left.channel,
-        left.channel_valid,
-        left.channel_dimensions,
-        &right.voice,
-        &right.voice_valid,
-        &right.scale,
-        right.weight,
-        &right.channel,
-        right.channel_valid,
-        right.channel_dimensions,
-        perturbation,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13822,9 +14591,13 @@ fn ecapa_speaker_pair_evidence(
     right_channel_valid: bool,
     right_channel_dimensions: usize,
     perturbation: SpeakerPairPerturbation,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
 ) -> Option<AcousticSpeakerPairEvidence> {
     let voice_distance = ecapa_cosine_distance(left, right, perturbation)?;
-    let channel_distance = if perturbation.includes_channel() {
+    let channel_distance = if evidence_mode
+        == DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+        && perturbation.includes_channel()
+    {
         raw_channel_distance(
             left_channel,
             left_channel_valid,
@@ -14163,6 +14936,7 @@ enum ProbabilisticAgglomeration {
         count_merge_steps: Vec<AcousticCountMergeStepEvidence>,
         stability: f32,
         count_estimate: SpeakerCountEstimate,
+        operational_partition: DiarizationOperationalPartitionSummary,
     },
     Fallback {
         reason: AcousticClusteringFallbackReason,
@@ -14171,12 +14945,39 @@ enum ProbabilisticAgglomeration {
     },
 }
 
+fn operational_partition_summary(
+    method: DiarizationOperationalPartitionMethod,
+    selected_count: usize,
+    confidence: f32,
+    calibration_sha256: String,
+    authority: SpeakerCountCalibrationStatus,
+) -> FwResult<DiarizationOperationalPartitionSummary> {
+    let summary = DiarizationOperationalPartitionSummary {
+        schema_version: "diarization-operational-partition-v1".to_owned(),
+        method,
+        selected_count: u32::try_from(selected_count).map_err(|_| {
+            FwError::InvalidRequest(
+                "operational diarization partition count exceeds the report schema".to_owned(),
+            )
+        })?,
+        confidence: f64::from(confidence),
+        calibration_sha256,
+        authority,
+    };
+    summary
+        .validate()
+        .map_err(|error| FwError::ContractViolation(error.to_owned()))?;
+    Ok(summary)
+}
+
 fn probabilistic_agglomerate_clusters<C>(
     initial: &[AcousticCluster],
     cannot_links: &BTreeSet<(String, String)>,
     request: &SpeakerCountRequest,
     policy: SpeakerCountPolicy,
-    use_neural_operating_point: bool,
+    neural_embeddings: Option<&EcapaTrackletEmbeddings>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
+    pair_calibration_sha256: &str,
     is_cancelled: &mut C,
 ) -> FwResult<ProbabilisticAgglomeration>
 where
@@ -14234,6 +15035,7 @@ where
         policy,
         constraint_lower_bound,
         resources,
+        pair_calibration_sha256,
     ) else {
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::InvalidPosterior,
@@ -14249,7 +15051,11 @@ where
     // reliability, separation, and occupancy checks must still support every
     // emitted speaker. This avoids making an undercounted posterior MAP
     // self-fulfilling without promoting the proposal to calibrated authority.
+    let use_neural_operating_point = neural_embeddings.is_some_and(|embeddings| {
+        !embeddings.is_empty() && initial.iter().any(|cluster| cluster.neural_voice.is_some())
+    });
     let neural_partition_eligible = use_neural_operating_point
+        && evidence_mode == DiarizationSpeakerEvidenceMode::EcapaOnly
         && cannot_links.is_empty()
         && initial.iter().all(|cluster| {
             cluster.neural_voice.is_some()
@@ -14257,7 +15063,14 @@ where
                 && cluster.label_hint.is_none()
         });
     let inferred_neural_partition = if neural_partition_eligible && policy.exact.is_none() {
-        infer_neural_spherical_partition(initial, policy, is_cancelled)?
+        let Some(neural_embeddings) = neural_embeddings else {
+            return Ok(ProbabilisticAgglomeration::Fallback {
+                reason: AcousticClusteringFallbackReason::InvalidPosterior,
+                count_estimate: Some(count_estimate),
+                count_merge_steps: full_lane_merge_steps,
+            });
+        };
+        infer_neural_spherical_partition(initial, policy, neural_embeddings, is_cancelled)?
     } else {
         None
     };
@@ -14277,7 +15090,10 @@ where
         });
     };
     let stability = if inferred_neural_partition.is_some() {
-        feature_stability
+        // The spherical proposal currently reports a separation margin, not a
+        // bootstrap or cross-resample stability estimate. Keep the public
+        // stability field honest until an actual stability estimator exists.
+        0.0
     } else {
         spectral_proposal.map_or(feature_stability, |proposal| {
             let spectral_support = if proposal.count == selected_count {
@@ -14312,6 +15128,7 @@ where
     } else {
         None
     };
+    let used_neural_spherical_partition = neural_partition.is_some();
     let Some((clusters, merge_trace)) = neural_partition.or(consensus_partition) else {
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::UnstableSpeakerCount,
@@ -14319,18 +15136,102 @@ where
             count_merge_steps: full_lane_merge_steps,
         });
     };
+    let operational_partition = operational_partition_summary(
+        if used_neural_spherical_partition {
+            DiarizationOperationalPartitionMethod::EcapaSpherical
+        } else {
+            DiarizationOperationalPartitionMethod::ProbabilisticConsensus
+        },
+        selected_count,
+        feature_stability,
+        pair_calibration_sha256.to_owned(),
+        SpeakerCountCalibrationStatus::DevelopmentUncertified,
+    )?;
     Ok(ProbabilisticAgglomeration::Selected {
         clusters,
         merge_trace,
         count_merge_steps: full_lane_merge_steps,
         stability,
         count_estimate,
+        operational_partition,
     })
+}
+
+fn neural_singleton_has_heldout_support(
+    cluster_index: usize,
+    clusters: &[AcousticCluster],
+    neural_embeddings: &EcapaTrackletEmbeddings,
+) -> bool {
+    let Some(cluster) = clusters.get(cluster_index) else {
+        return false;
+    };
+    let [tracklet_index] = cluster.prototype_members.as_slice() else {
+        return false;
+    };
+    let Some(representation) = neural_embeddings.get(tracklet_index) else {
+        return false;
+    };
+    let Some(validation) = representation.validation.as_ref() else {
+        return false;
+    };
+    let Some(discovery_center) = cluster.neural_voice.as_ref() else {
+        return false;
+    };
+    if representation.discovery_weight + representation.validation_weight
+        < ECAPA_HELDOUT_SINGLETON_MIN_TOTAL_WEIGHT
+    {
+        return false;
+    }
+
+    let same_view_count = SpeakerPairPerturbation::ALL
+        .into_iter()
+        .filter_map(|perturbation| {
+            ecapa_cosine_distance(validation, discovery_center, perturbation)
+        })
+        .filter(|distance| *distance <= ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT)
+        .count();
+    if same_view_count < MIN_SPEAKER_SEPARATION_LANES {
+        return false;
+    }
+    let Some(own_distance) =
+        ecapa_cosine_distance(validation, discovery_center, SpeakerPairPerturbation::Full)
+    else {
+        return false;
+    };
+
+    for (other_index, other) in clusters.iter().enumerate() {
+        if other_index == cluster_index {
+            continue;
+        }
+        let Some(other_center) = other.neural_voice.as_ref() else {
+            return false;
+        };
+        let different_view_count = SpeakerPairPerturbation::ALL
+            .into_iter()
+            .filter_map(|perturbation| {
+                ecapa_cosine_distance(validation, other_center, perturbation)
+            })
+            .filter(|distance| *distance >= ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE)
+            .count();
+        if different_view_count < MIN_SPEAKER_SEPARATION_LANES {
+            return false;
+        }
+        let Some(other_distance) =
+            ecapa_cosine_distance(validation, other_center, SpeakerPairPerturbation::Full)
+        else {
+            return false;
+        };
+        if own_distance + ECAPA_HELDOUT_COMPETITOR_DISTANCE_MARGIN > other_distance {
+            return false;
+        }
+    }
+    true
 }
 
 fn infer_neural_spherical_partition<C>(
     initial: &[AcousticCluster],
     policy: SpeakerCountPolicy,
+    neural_embeddings: &EcapaTrackletEmbeddings,
     is_cancelled: &mut C,
 ) -> FwResult<Option<(usize, f32, Vec<AcousticCluster>, Vec<ClusterMergeTrace>)>>
 where
@@ -14339,18 +15240,23 @@ where
     const MIN_CLUSTER_NEURAL_WEIGHT: f32 = 100.0;
 
     let maximum = policy.max.min(initial.len());
-    for count in (policy.min.max(2)..=maximum).rev() {
+    'candidate_count: for count in (policy.min.max(2)..=maximum).rev() {
         let Some((clusters, merge_trace)) =
             spherical_neural_clusters(initial, count, is_cancelled)?
         else {
             continue;
         };
-        if clusters.iter().any(|cluster| {
-            cluster.neural_weight < MIN_CLUSTER_NEURAL_WEIGHT
+        for (cluster_index, cluster) in clusters.iter().enumerate() {
+            if cluster.neural_weight < MIN_CLUSTER_NEURAL_WEIGHT
                 || (cluster.prototype_members.len() < 2
-                    && cluster.neural_weight < ECAPA_LONG_SINGLE_OBSERVATION_MIN_FRAMES as f32)
-        }) {
-            continue;
+                    && !neural_singleton_has_heldout_support(
+                        cluster_index,
+                        &clusters,
+                        neural_embeddings,
+                    ))
+            {
+                continue 'candidate_count;
+            }
         }
         let mut minimum_distance = f32::INFINITY;
         let mut all_separated = true;
@@ -14413,6 +15319,11 @@ where
         || initial.iter().any(|cluster| cluster.neural_voice.is_none())
     {
         return Ok(None);
+    }
+    if is_cancelled() {
+        return Err(FwError::Cancelled(
+            "neural spherical clustering cancelled before partition construction".to_owned(),
+        ));
     }
     if selected_count == initial.len() {
         return Ok(Some((initial.to_vec(), Vec::new())));
@@ -14946,6 +15857,7 @@ fn fused_speaker_count_estimate(
     policy: SpeakerCountPolicy,
     constraint_lower_bound: usize,
     resources: SpeakerCountResourceSummary,
+    calibration_sha256: &str,
 ) -> Option<SpeakerCountEstimate> {
     let merge_risk_losses = merge_risk_loss_points(lanes, policy)?;
     let merge_risk_count = merge_risk_losses
@@ -15136,7 +16048,6 @@ fn fused_speaker_count_estimate(
         + count_entropy_term(unresolved_probability);
     let constraint_lower_bound = u32::try_from(constraint_lower_bound).ok()?;
     let candidate_upper_bound = u32::try_from(policy.max).ok()?;
-    let calibration_sha256 = acoustic_speaker_pair_calibration_sha256();
     let evidence_sha256 = speaker_count_evidence_sha256(
         lanes,
         spectral,
@@ -15144,6 +16055,7 @@ fn fused_speaker_count_estimate(
         request,
         constraint_lower_bound,
         candidate_upper_bound,
+        calibration_sha256,
     );
     let prior_lane =
         speaker_count_prior_lane(request, constraint_lower_bound, candidate_upper_bound)?;
@@ -15158,7 +16070,7 @@ fn fused_speaker_count_estimate(
         constraint_lower_bound,
         candidate_upper_bound,
         calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
-        calibration_sha256,
+        calibration_sha256: calibration_sha256.to_owned(),
         evidence_sha256,
         lanes: vec![
             SpeakerCountLaneEvidence {
@@ -15229,10 +16141,12 @@ fn speaker_count_evidence_sha256(
     request: &SpeakerCountRequest,
     constraint_lower_bound: u32,
     candidate_upper_bound: u32,
+    calibration_sha256: &str,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION.as_bytes());
     hasher.update(ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION.as_bytes());
+    hasher.update(calibration_sha256.as_bytes());
     hasher.update(constraint_lower_bound.to_le_bytes());
     hasher.update(candidate_upper_bound.to_le_bytes());
     hash_speaker_count_resources(&mut hasher, resources);
@@ -15303,6 +16217,7 @@ fn unavailable_speaker_count_estimate(
     prototype_count: usize,
     calibration_status: SpeakerCountCalibrationStatus,
     unavailable_reason: SpeakerCountLaneUnavailableReason,
+    calibration_sha256: &str,
 ) -> Option<SpeakerCountEstimate> {
     let constraint_lower_bound = u32::try_from(constraint_lower_bound).ok()?;
     let available_candidates = u32::try_from(available_candidates)
@@ -15324,6 +16239,7 @@ fn unavailable_speaker_count_estimate(
     hasher.update(candidate_upper_bound.to_le_bytes());
     hasher.update(speaker_count_calibration_status_label(calibration_status).as_bytes());
     hasher.update(speaker_count_lane_unavailable_reason_label(unavailable_reason).as_bytes());
+    hasher.update(calibration_sha256.as_bytes());
     let resources = unavailable_speaker_count_resources(prototype_count)?;
     hash_speaker_count_resources(&mut hasher, &resources);
     let evidence_sha256 = format!("{:x}", hasher.finalize());
@@ -15361,7 +16277,7 @@ fn unavailable_speaker_count_estimate(
         constraint_lower_bound,
         candidate_upper_bound,
         calibration_status,
-        calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
+        calibration_sha256: calibration_sha256.to_owned(),
         evidence_sha256,
         lanes,
         resources,
@@ -16867,7 +17783,16 @@ fn evaluate_cluster_count(
     let sse = current.iter().map(|cluster| cluster.sse).sum::<f32>();
     let voice_parameter_count = current
         .iter()
-        .map(|cluster| cluster.voice_valid.iter().filter(|&&valid| valid).count())
+        .map(|cluster| match cluster.evidence_mode {
+            DiarizationSpeakerEvidenceMode::AcousticV2 => {
+                cluster.voice_valid.iter().filter(|&&valid| valid).count()
+            }
+            DiarizationSpeakerEvidenceMode::EcapaOnly
+            | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+                ECAPA_FIXED_SAFE_EFFECTIVE_PARAMETER_COUNT
+            }
+            DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 0,
+        })
         .sum::<usize>();
     let penalty = 0.035 * voice_parameter_count as f32 * total_weight.ln();
     let objective = sse + penalty;
@@ -16985,36 +17910,54 @@ where
                 let mut cost = if clustering_mode == AcousticClusteringMode::ProbabilisticV1 {
                     let cluster_evidence =
                         tracklet_cluster_pair_evidence(tracklet, cluster, neural_embeddings);
-                    let profile_evidence = enrolled_profile.and_then(|profile| {
-                        tracklet_profile_pair_evidence(
-                            tracklet,
-                            profile,
-                            &enrollment.voice_dimension_weights,
-                        )
-                    });
-                    cluster_evidence
-                        .into_iter()
-                        .chain(profile_evidence)
-                        .max_by(|left, right| {
-                            left.same_speaker_probability
-                                .total_cmp(&right.same_speaker_probability)
-                        })
-                        .map_or(1_000_000.0, |value| {
-                            -value.same_speaker_probability.max(1e-6).ln()
-                        })
-                } else {
-                    enrolled_profile.map_or_else(
-                        || tracklet_cluster_distance(tracklet, cluster, neural_embeddings),
-                        |profile| {
-                            tracklet_cluster_distance(tracklet, cluster, neural_embeddings).min(
-                                tracklet_profile_distance(
-                                    tracklet,
-                                    profile,
-                                    &enrollment.voice_dimension_weights,
-                                ),
+                    let selected_evidence = if matches!(
+                        cluster.evidence_mode,
+                        DiarizationSpeakerEvidenceMode::EcapaOnly
+                            | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+                    ) {
+                        // A loaded ECAPA observation and ECAPA-backed state use
+                        // the neural likelihood as the identity authority. The
+                        // uncalibrated acoustic enrolled-profile score is only
+                        // available in AcousticV2 mode; taking an optimistic
+                        // max here could erase a genuine ECAPA contradiction or
+                        // silently contaminate an ECAPA-only ablation.
+                        cluster_evidence
+                    } else {
+                        let profile_evidence = enrolled_profile.and_then(|profile| {
+                            tracklet_profile_pair_evidence(
+                                tracklet,
+                                profile,
+                                &enrollment.voice_dimension_weights,
                             )
-                        },
-                    )
+                        });
+                        cluster_evidence.into_iter().chain(profile_evidence).max_by(
+                            |left, right| {
+                                left.same_speaker_probability
+                                    .total_cmp(&right.same_speaker_probability)
+                            },
+                        )
+                    };
+                    selected_evidence.map_or(1_000_000.0, |value| {
+                        -value.same_speaker_probability.max(1e-6).ln()
+                    })
+                } else {
+                    let cluster_distance =
+                        tracklet_cluster_distance(tracklet, cluster, neural_embeddings);
+                    if matches!(
+                        cluster.evidence_mode,
+                        DiarizationSpeakerEvidenceMode::EcapaOnly
+                            | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+                    ) {
+                        cluster_distance
+                    } else {
+                        enrolled_profile.map_or(cluster_distance, |profile| {
+                            cluster_distance.min(tracklet_profile_distance(
+                                tracklet,
+                                profile,
+                                &enrollment.voice_dimension_weights,
+                            ))
+                        })
+                    }
                 };
                 if let Some(prior) = enrollment
                     .soft_priors
@@ -17061,14 +18004,16 @@ where
             0.90
         };
         costs.push(unknown_cost);
-        if neural_embeddings.is_some() {
+        if let Some(representation) =
+            neural_embeddings.and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
+        {
             // ECAPA supplies one embedding likelihood per variable-duration
             // tracklet. Treating a 200 ms fragment and a multi-second turn as
             // equal observations let a fixed transition penalty erase long,
             // well-supported minority turns. Bounded evidence-duration
             // weighting approximates accumulated frame likelihood without
             // allowing one long segment to dominate the whole recording.
-            let evidence_weight = ecapa_segment_evidence_weight(tracklet.identity_frame_count);
+            let evidence_weight = ecapa_segment_evidence_weight(representation.assignment_weight());
             for cost in &mut costs {
                 if cost.is_finite() {
                     *cost *= evidence_weight;
@@ -17245,8 +18190,8 @@ fn calibrate_assignment_confidence(raw_confidence: f32) -> f32 {
         .clamp(0.0, 1.0)
 }
 
-fn ecapa_segment_evidence_weight(identity_frame_count: usize) -> f32 {
-    (identity_frame_count as f32 / acoustic_speaker_pair_calibration().full_support_frames)
+fn ecapa_segment_evidence_weight(represented_identity_frames: f32) -> f32 {
+    (represented_identity_frames.max(0.0) / acoustic_speaker_pair_calibration().full_support_frames)
         .clamp(0.25, ECAPA_SEGMENT_LOG_LIKELIHOOD_MAX_WEIGHT)
 }
 
@@ -17385,13 +18330,8 @@ fn tracklet_cluster_distance(
     cluster: &AcousticCluster,
     neural_embeddings: Option<&EcapaTrackletEmbeddings>,
 ) -> f32 {
-    neural_embeddings
-        .and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
-        .zip(cluster.neural_voice.as_ref())
-        .and_then(|(tracklet, cluster)| {
-            ecapa_cosine_distance(tracklet, cluster, SpeakerPairPerturbation::Full)
-        })
-        .or_else(|| {
+    match cluster.evidence_mode {
+        DiarizationSpeakerEvidenceMode::AcousticV2 => {
             masked_variance_normalized_distance(
                 &tracklet.voice_mean,
                 &tracklet.voice_valid,
@@ -17400,15 +18340,47 @@ fn tracklet_cluster_distance(
                 &cluster.voice_valid,
                 &cluster.scale,
             )
-        })
-        .unwrap_or(10.0)
-        + channel_distance(
-            &tracklet.channel_mean,
-            tracklet.channel_valid,
-            &cluster.channel,
-            cluster.channel_valid,
-            tracklet.channel_dimensions.min(cluster.channel_dimensions),
-        )
+            .unwrap_or(10.0)
+                + channel_distance(
+                    &tracklet.channel_mean,
+                    tracklet.channel_valid,
+                    &cluster.channel,
+                    cluster.channel_valid,
+                    tracklet.channel_dimensions.min(cluster.channel_dimensions),
+                )
+        }
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+            let Some(voice_distance) = neural_embeddings
+                .and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
+                .zip(cluster.neural_voice.as_ref())
+                .and_then(|(representation, cluster)| {
+                    ecapa_cosine_distance(
+                        representation.assignment_embedding(),
+                        cluster,
+                        SpeakerPairPerturbation::Full,
+                    )
+                })
+            else {
+                return 10.0;
+            };
+            voice_distance
+                + if cluster.evidence_mode
+                    == DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+                {
+                    channel_distance(
+                        &tracklet.channel_mean,
+                        tracklet.channel_valid,
+                        &cluster.channel,
+                        cluster.channel_valid,
+                        tracklet.channel_dimensions.min(cluster.channel_dimensions),
+                    )
+                } else {
+                    0.0
+                }
+        }
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 10.0,
+    }
 }
 
 fn tracklet_cluster_pair_evidence(
@@ -17416,42 +18388,49 @@ fn tracklet_cluster_pair_evidence(
     cluster: &AcousticCluster,
     neural_embeddings: Option<&EcapaTrackletEmbeddings>,
 ) -> Option<AcousticSpeakerPairEvidence> {
-    if let Some((tracklet_neural, cluster_neural)) = neural_embeddings
-        .and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
-        .zip(cluster.neural_voice.as_ref())
-    {
-        return ecapa_speaker_pair_evidence(
-            tracklet_neural,
-            tracklet.identity_frame_count.max(1) as f32,
-            &tracklet.channel_mean,
-            tracklet.channel_valid,
-            tracklet.channel_dimensions,
-            cluster_neural,
-            cluster.neural_weight,
-            &cluster.channel,
-            cluster.channel_valid,
-            cluster.channel_dimensions,
-            SpeakerPairPerturbation::Full,
-        );
+    match cluster.evidence_mode {
+        DiarizationSpeakerEvidenceMode::AcousticV2 => {
+            let tracklet_scale = tracklet.voice_variance.map(|variance| variance.max(0.025));
+            speaker_pair_evidence_from_statistics(
+                &tracklet.voice_mean,
+                &tracklet.voice_valid,
+                &tracklet_scale,
+                tracklet.identity_frame_count as f32,
+                &tracklet.channel_mean,
+                tracklet.channel_valid,
+                tracklet.channel_dimensions,
+                &cluster.voice,
+                &cluster.voice_valid,
+                &cluster.scale,
+                cluster.weight,
+                &cluster.channel,
+                cluster.channel_valid,
+                cluster.channel_dimensions,
+                SpeakerPairPerturbation::Full,
+            )
+        }
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => neural_embeddings
+            .and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
+            .zip(cluster.neural_voice.as_ref())
+            .and_then(|(tracklet_neural, cluster_neural)| {
+                ecapa_speaker_pair_evidence(
+                    tracklet_neural.assignment_embedding(),
+                    tracklet_neural.assignment_weight(),
+                    &tracklet.channel_mean,
+                    tracklet.channel_valid,
+                    tracklet.channel_dimensions,
+                    cluster_neural,
+                    cluster.neural_weight,
+                    &cluster.channel,
+                    cluster.channel_valid,
+                    cluster.channel_dimensions,
+                    SpeakerPairPerturbation::Full,
+                    cluster.evidence_mode,
+                )
+            }),
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => None,
     }
-    let tracklet_scale = tracklet.voice_variance.map(|variance| variance.max(0.025));
-    speaker_pair_evidence_from_statistics(
-        &tracklet.voice_mean,
-        &tracklet.voice_valid,
-        &tracklet_scale,
-        tracklet.identity_frame_count as f32,
-        &tracklet.channel_mean,
-        tracklet.channel_valid,
-        tracklet.channel_dimensions,
-        &cluster.voice,
-        &cluster.voice_valid,
-        &cluster.scale,
-        cluster.weight,
-        &cluster.channel,
-        cluster.channel_valid,
-        cluster.channel_dimensions,
-        SpeakerPairPerturbation::Full,
-    )
 }
 
 /// Evaluate one normalized tracklet pair with the frozen full-feature model.
@@ -17601,6 +18580,7 @@ fn evaluate_speaker_evidence(
     labels: &[String],
     enrollment: &SpeakerEnrollment,
     assignments: &[AcousticSpeakerAssignment],
+    neural_embeddings: Option<&EcapaTrackletEmbeddings>,
 ) -> FwResult<Vec<AcousticSpeakerEvidenceSummary>> {
     #[derive(Debug, Clone, Copy, Default)]
     struct Accumulator {
@@ -17687,10 +18667,12 @@ fn evaluate_speaker_evidence(
         }
     }
 
+    let mut heldout_supported = vec![false; clusters.len()];
     let mut summaries = labels
         .iter()
         .zip(clusters)
-        .map(|(label, cluster)| {
+        .enumerate()
+        .map(|(cluster_index, (label, cluster))| {
             let evidence = accumulated.get(label).copied().unwrap_or_default();
             let mean_assignment_confidence = if evidence.independent_voiced_frame_count == 0 {
                 0.0
@@ -17699,6 +18681,24 @@ fn evaluate_speaker_evidence(
                     / evidence.independent_voiced_frame_count as f32
             };
             let hard_anchored = cluster.hard_anchor.is_some();
+            let singleton_member_assigned = cluster
+                .prototype_members
+                .as_slice()
+                .first()
+                .is_some_and(|tracklet_index| {
+                    cluster.prototype_members.len() == 1
+                        && assignments.iter().any(|assignment| {
+                            assignment.tracklet_index == *tracklet_index
+                                && assignment.speaker_ref.as_deref() == Some(label.as_str())
+                        })
+                });
+            let has_heldout_singleton_support = !hard_anchored
+                && evidence.independent_tracklet_count == 1
+                && singleton_member_assigned
+                && neural_embeddings.is_some_and(|embeddings| {
+                    neural_singleton_has_heldout_support(cluster_index, clusters, embeddings)
+                });
+            heldout_supported[cluster_index] = has_heldout_singleton_support;
             // Multiple independently assigned tracklets are legitimate support
             // even when they form one uninterrupted speaking episode. Requiring
             // a silence or intervening speaker made a clear, long first turn
@@ -17709,10 +18709,7 @@ fn evaluate_speaker_evidence(
             let has_independent_recurrence = evidence.recurrence_episode_count
                 >= MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES
                 || evidence.independent_tracklet_count >= 2
-                || (cluster.neural_voice.is_some()
-                    && evidence.independent_tracklet_count == 1
-                    && evidence.independent_voiced_frame_count
-                        >= ECAPA_LONG_SINGLE_OBSERVATION_MIN_FRAMES);
+                || has_heldout_singleton_support;
             let mut reasons = Vec::new();
             if evidence.assigned_tracklet_count == 0 {
                 reasons.push(SpeakerEvidenceReason::NoAssignedSpeech);
@@ -17795,8 +18792,8 @@ fn evaluate_speaker_evidence(
         } else {
             let support_reason = if summaries[candidate].hard_anchored {
                 SpeakerEvidenceReason::SupportedByHardHint
-            } else if summaries[candidate].independent_tracklet_count == 1 {
-                SpeakerEvidenceReason::SupportedByLongObservation
+            } else if heldout_supported[candidate] {
+                SpeakerEvidenceReason::SupportedByHeldoutObservation
             } else if summaries[candidate].recurrence_episode_count
                 < MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES
             {
@@ -17816,13 +18813,36 @@ fn clusters_have_robust_different_speaker_evidence(
     right: &AcousticCluster,
 ) -> bool {
     if left.neural_voice.is_some() && right.neural_voice.is_some() {
-        return SpeakerPairPerturbation::ALL
-            .into_iter()
-            .filter_map(|perturbation| cluster_pair_evidence(left, right, perturbation))
-            .filter(|evidence| evidence.support >= MIN_SPEAKER_SEPARATION_SUPPORT)
-            .filter(|evidence| evidence.voice_distance >= ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE)
-            .count()
-            >= MIN_SPEAKER_SEPARATION_LANES;
+        debug_assert_eq!(left.evidence_mode, right.evidence_mode);
+        return match left.evidence_mode {
+            DiarizationSpeakerEvidenceMode::EcapaOnly => {
+                SpeakerPairPerturbation::ALL
+                    .into_iter()
+                    .filter_map(|perturbation| cluster_pair_evidence(left, right, perturbation))
+                    .filter(|evidence| evidence.support >= MIN_SPEAKER_SEPARATION_SUPPORT)
+                    .filter(|evidence| {
+                        evidence.voice_distance >= ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE
+                    })
+                    .count()
+                    >= MIN_SPEAKER_SEPARATION_LANES
+            }
+            DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+                let robust_voice_baseline = ECAPA_PAIR_DIFFERENT_LOGIT_INTERCEPT
+                    + ECAPA_PAIR_COSINE_DISTANCE_WEIGHT * ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE;
+                SpeakerPairPerturbation::ALL
+                    .into_iter()
+                    .filter_map(|perturbation| cluster_pair_evidence(left, right, perturbation))
+                    .filter(|evidence| evidence.support >= MIN_SPEAKER_SEPARATION_SUPPORT)
+                    .filter(|evidence| {
+                        evidence.different_log_odds >= evidence.support * robust_voice_baseline
+                    })
+                    .count()
+                    >= MIN_SPEAKER_SEPARATION_LANES
+            }
+            DiarizationSpeakerEvidenceMode::AcousticV2
+            | DiarizationSpeakerEvidenceMode::External
+            | DiarizationSpeakerEvidenceMode::None => false,
+        };
     }
     SpeakerPairPerturbation::ALL
         .into_iter()
@@ -24728,6 +25748,20 @@ mod tests {
             .collect()
     }
 
+    fn ecapa_representation(
+        discovery: super::EcapaSpeakerEmbedding,
+        validation: Option<super::EcapaSpeakerEmbedding>,
+        discovery_weight: f32,
+        validation_weight: f32,
+    ) -> super::EcapaTrackletRepresentation {
+        super::EcapaTrackletRepresentation {
+            discovery,
+            validation,
+            discovery_weight,
+            validation_weight,
+        }
+    }
+
     fn cluster_with_hard_count(
         tracklets: &[AcousticTracklet],
         count: u32,
@@ -26038,6 +27072,7 @@ mod tests {
             512,
             super::AcousticClusteringMode::ProbabilisticV1,
             None,
+            crate::model::DiarizationSpeakerEvidenceMode::AcousticV2,
             || false,
         )
         .expect("probabilistic clustering");
@@ -26234,6 +27269,7 @@ mod tests {
             },
             1,
             super::unavailable_speaker_count_resources(3).expect("resource summary"),
+            &super::acoustic_speaker_pair_calibration_sha256(),
         )
         .expect("fused estimate");
         estimate.validate().expect("valid estimate");
@@ -26326,6 +27362,7 @@ mod tests {
             policy,
             1,
             super::unavailable_speaker_count_resources(5).expect("resource summary"),
+            &super::acoustic_speaker_pair_calibration_sha256(),
         )
         .expect("posterior estimate");
         assert_eq!(super::operational_speaker_count(&estimate), Some(1));
@@ -26464,6 +27501,7 @@ mod tests {
             },
             1,
             super::unavailable_speaker_count_resources(3).expect("resource summary"),
+            &super::acoustic_speaker_pair_calibration_sha256(),
         )
         .expect("prior-disagreement estimate");
         estimate.validate().expect("valid estimate");
@@ -26535,6 +27573,7 @@ mod tests {
             },
             1,
             super::unavailable_speaker_count_resources(3).expect("resource summary"),
+            &super::acoustic_speaker_pair_calibration_sha256(),
         )
         .expect("diffuse-count estimate");
         estimate.validate().expect("valid diffuse-count estimate");
@@ -26630,6 +27669,7 @@ mod tests {
                 policy,
                 1,
                 super::unavailable_speaker_count_resources(5).expect("resource summary"),
+                &super::acoustic_speaker_pair_calibration_sha256(),
             )
             .expect("bounded soft-count estimate")
         };
@@ -26767,6 +27807,7 @@ mod tests {
                 policy,
                 1,
                 super::unavailable_speaker_count_resources(policy.max).expect("resource summary"),
+                &super::acoustic_speaker_pair_calibration_sha256(),
             )
             .expect("bounded candidate domain must yield an estimate");
             estimate.validate().expect("bounded estimate");
@@ -26852,6 +27893,7 @@ mod tests {
             policy,
             1,
             super::unavailable_speaker_count_resources(3).expect("resource summary"),
+            &super::acoustic_speaker_pair_calibration_sha256(),
         )
         .expect("soft-prior estimate");
         estimate.validate().expect("valid estimate");
@@ -26876,6 +27918,7 @@ mod tests {
             policy,
             1,
             super::unavailable_speaker_count_resources(3).expect("resource summary"),
+            &super::acoustic_speaker_pair_calibration_sha256(),
         )
         .expect("acoustic-only estimate");
         let count_three_probability = |estimate: &crate::model::SpeakerCountEstimate| {
@@ -26933,6 +27976,7 @@ mod tests {
             policy,
             1,
             super::unavailable_speaker_count_resources(3).expect("resource summary"),
+            &super::acoustic_speaker_pair_calibration_sha256(),
         )
         .expect("soft range estimate");
         estimate.validate().expect("valid estimate");
@@ -27094,11 +28138,22 @@ mod tests {
         ];
         let enrollment =
             enroll_known_speaker_profiles(&tracklets, &request, 1_000).expect("enrollment");
-        let (prototypes, cap_pressure) =
-            super::build_capped_prototypes(&tracklets, &BTreeMap::new(), 512, None, &mut || false)
-                .expect("prototypes");
+        let (prototypes, cap_pressure) = super::build_capped_prototypes(
+            &tracklets,
+            &BTreeMap::new(),
+            512,
+            None,
+            crate::model::DiarizationSpeakerEvidenceMode::AcousticV2,
+            &mut || false,
+        )
+        .expect("prototypes");
         assert!(!cap_pressure);
-        let clusters = super::initial_clusters(&prototypes, &enrollment, None);
+        let clusters = super::initial_clusters(
+            &prototypes,
+            &enrollment,
+            None,
+            crate::model::DiarizationSpeakerEvidenceMode::AcousticV2,
+        );
         let pair = super::cluster_pair_evidence(
             &clusters[0],
             &clusters[1],
@@ -27163,6 +28218,83 @@ mod tests {
             Some(super::AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions)
         );
         assert_eq!(result.bootstrap_stability, 0.0);
+        let estimate = result
+            .count_estimate
+            .as_ref()
+            .expect("fixed-safe count evidence");
+        assert_eq!(
+            estimate.calibration_status,
+            SpeakerCountCalibrationStatus::FixedSafeUncalibrated
+        );
+        assert_eq!(estimate.selected_count, None);
+        let partition = result
+            .operational_partition
+            .as_ref()
+            .expect("fixed-safe operational partition");
+        assert_eq!(
+            partition.method,
+            crate::model::DiarizationOperationalPartitionMethod::FixedSafeAgglomerative
+        );
+        assert_eq!(partition.authority, estimate.calibration_status);
+        assert_eq!(partition.calibration_sha256, estimate.calibration_sha256);
+    }
+
+    #[test]
+    fn unavailable_acoustic_identity_reports_unknown_occupancy_and_preserves_hard_hints() {
+        let mut tracklets = vec![
+            profile_tracklet(0, 0, 500, 0.0, 0.0, 50),
+            profile_tracklet(1, 500, 1_000, 0.0, 0.0, 50),
+        ];
+        for tracklet in &mut tracklets {
+            tracklet.voice_valid.fill(false);
+            tracklet.voice_support.fill(0);
+        }
+
+        let unknown_request = DiarizationRequest::default();
+        let unknown_enrollment = enroll_known_speaker_profiles(&tracklets, &unknown_request, 1_000)
+            .expect("empty enrollment");
+        let unknown = super::cluster_acoustic_tracklets_with_mode(
+            &tracklets,
+            &unknown_enrollment,
+            &unknown_request.speaker_count,
+            512,
+            super::AcousticClusteringMode::ProbabilisticV1,
+            || false,
+        )
+        .expect("explicit unknown fallback");
+        assert_eq!(unknown.detected_speakers, 0);
+        assert!(
+            unknown
+                .assignments
+                .iter()
+                .all(|value| value.speaker_ref.is_none())
+        );
+        assert_eq!(unknown.dominant_speaker_share, 0.0);
+        assert_eq!(unknown.unknown_voiced_share, 1.0);
+
+        let hard_request = DiarizationRequest {
+            known_intervals: vec![known_interval(
+                "alice",
+                0,
+                500,
+                KnownSpeakerPolicy::HardMustLink,
+            )],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let hard_enrollment = enroll_known_speaker_profiles(&tracklets, &hard_request, 1_000)
+            .expect("hard enrollment without acoustic identity coordinates");
+        let hard = super::cluster_acoustic_tracklets_with_mode(
+            &tracklets,
+            &hard_enrollment,
+            &hard_request.speaker_count,
+            512,
+            super::AcousticClusteringMode::ProbabilisticV1,
+            || false,
+        )
+        .expect("hard attribution fallback");
+        assert_eq!(hard.assignments[0].speaker_ref.as_deref(), Some("alice"));
+        assert!(hard.assignments[0].hard_attribution);
     }
 
     #[test]
@@ -28186,6 +29318,7 @@ mod tests {
             false,
             0,
             super::SpeakerPairPerturbation::Full,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
         )
         .expect("same evidence");
         let different = super::ecapa_speaker_pair_evidence(
@@ -28200,6 +29333,7 @@ mod tests {
             false,
             0,
             super::SpeakerPairPerturbation::Full,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
         )
         .expect("different evidence");
         assert!(same.same_speaker_probability > 0.95, "{same:?}");
@@ -28212,20 +29346,220 @@ mod tests {
             + super::ECAPA_PAIR_COSINE_DISTANCE_WEIGHT * distance;
         let same_probability = super::logistic_probability(-different_log_odds);
         assert!((same_probability - merge_threshold).abs() < 1.0e-6);
-        assert!(
-            super::ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE
-                < super::ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT
+        assert_eq!(
+            super::ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE,
+            super::ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT
         );
-        assert_eq!(super::ecapa_segment_evidence_weight(0), 0.25);
-        assert_eq!(super::ecapa_segment_evidence_weight(50), 1.0);
-        assert_eq!(super::ecapa_segment_evidence_weight(1_000), 4.0);
-        let calibration_sha256 = super::ecapa_speaker_pair_calibration_sha256();
-        assert_eq!(calibration_sha256.len(), 64);
+        let robust_log_odds = super::ECAPA_PAIR_DIFFERENT_LOGIT_INTERCEPT
+            + super::ECAPA_PAIR_COSINE_DISTANCE_WEIGHT
+                * super::ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE;
+        let robust_same_probability = super::logistic_probability(-robust_log_odds);
         assert!(
-            calibration_sha256
+            robust_same_probability <= merge_threshold + 1.0e-6,
+            "the final separation gate must not certify a pair that the declared loss model would merge"
+        );
+        let below_gate_same_probability = super::logistic_probability(
+            -(super::ECAPA_PAIR_DIFFERENT_LOGIT_INTERCEPT
+                + super::ECAPA_PAIR_COSINE_DISTANCE_WEIGHT
+                    * (super::ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE - 0.10)),
+        );
+        assert!(below_gate_same_probability > merge_threshold);
+        assert_eq!(super::ecapa_segment_evidence_weight(0.0), 0.25);
+        assert_eq!(super::ecapa_segment_evidence_weight(50.0), 1.0);
+        assert_eq!(super::ecapa_segment_evidence_weight(1_000.0), 4.0);
+        let ecapa_only_sha256 = super::ecapa_speaker_pair_calibration_sha256(
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+        );
+        let fused_sha256 = super::ecapa_speaker_pair_calibration_sha256(
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        );
+        assert_eq!(ecapa_only_sha256.len(), 64);
+        assert!(
+            ecapa_only_sha256
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
         );
+        assert_ne!(ecapa_only_sha256, fused_sha256);
+    }
+
+    #[test]
+    fn ecapa_only_ignores_channel_while_fused_mode_uses_it_explicitly() {
+        let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        embedding[3] = 1.0;
+        let quiet_channel = [0.0_f32; super::CHANNEL_VECTOR_DIMENSIONS];
+        let remote_channel = [1.0_f32; super::CHANNEL_VECTOR_DIMENSIONS];
+        let ecapa_only = super::ecapa_speaker_pair_evidence(
+            &embedding,
+            50.0,
+            &quiet_channel,
+            true,
+            super::CHANNEL_VECTOR_DIMENSIONS,
+            &embedding,
+            50.0,
+            &remote_channel,
+            true,
+            super::CHANNEL_VECTOR_DIMENSIONS,
+            super::SpeakerPairPerturbation::Full,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+        )
+        .expect("ECAPA-only evidence");
+        let fused = super::ecapa_speaker_pair_evidence(
+            &embedding,
+            50.0,
+            &quiet_channel,
+            true,
+            super::CHANNEL_VECTOR_DIMENSIONS,
+            &embedding,
+            50.0,
+            &remote_channel,
+            true,
+            super::CHANNEL_VECTOR_DIMENSIONS,
+            super::SpeakerPairPerturbation::Full,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        )
+        .expect("fused evidence");
+        assert_eq!(ecapa_only.channel_distance, 0.0);
+        assert!(fused.channel_distance > 0.0);
+        assert!(fused.same_speaker_probability < ecapa_only.same_speaker_probability);
+    }
+
+    #[test]
+    fn fused_channel_evidence_survives_the_final_robust_separation_gate() {
+        let component = (1.0_f32 / 8.0).sqrt();
+        let mut first = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        let mut orthogonal = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        for remainder in 0..4 {
+            first[remainder] = component;
+            first[remainder + 4] = component;
+            orthogonal[remainder] = component;
+            orthogonal[remainder + 4] = -component;
+        }
+        let target_distance = super::ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE - 0.005;
+        let cosine = 1.0 - target_distance;
+        let sine = (1.0 - cosine * cosine).sqrt();
+        let second = std::array::from_fn(|index| cosine * first[index] + sine * orthogonal[index]);
+        let observed_distance =
+            super::ecapa_cosine_distance(&first, &second, super::SpeakerPairPerturbation::Full)
+                .expect("finite near-threshold distance");
+        assert!((observed_distance - target_distance).abs() < 1.0e-5);
+
+        let tracklets = vec![
+            profile_tracklet(0, 0, 5_000, 0.0, 0.0, 500),
+            profile_tracklet(1, 5_000, 10_000, 0.0, 0.0, 500),
+            profile_tracklet(2, 10_000, 15_000, 0.0, 1.0, 500),
+            profile_tracklet(3, 15_000, 20_000, 0.0, 1.0, 500),
+        ];
+        let embeddings = BTreeMap::from([
+            (0usize, ecapa_representation(first, None, 500.0, 0.0)),
+            (1usize, ecapa_representation(first, None, 500.0, 0.0)),
+            (2usize, ecapa_representation(second, None, 500.0, 0.0)),
+            (3usize, ecapa_representation(second, None, 500.0, 0.0)),
+        ]);
+        let request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 2 },
+            ..DiarizationRequest::default()
+        };
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, 20_000).expect("enrollment");
+        let run = |evidence_mode| {
+            super::cluster_acoustic_tracklets_with_mode_internal(
+                &tracklets,
+                &enrollment,
+                &request.speaker_count,
+                512,
+                super::AcousticClusteringMode::ProbabilisticV1,
+                Some(&embeddings),
+                evidence_mode,
+                || false,
+            )
+            .expect("near-threshold ECAPA clustering")
+            .0
+        };
+        let ecapa_only = run(crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly);
+        let fused = run(crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel);
+        assert_eq!(ecapa_only.detected_speakers, 1, "{ecapa_only:#?}");
+        assert!(!ecapa_only.constraints_satisfied);
+        assert_eq!(fused.detected_speakers, 2, "{fused:#?}");
+        assert!(fused.constraints_satisfied, "{fused:#?}");
+        assert_eq!(
+            fused
+                .speaker_evidence
+                .iter()
+                .filter(|evidence| evidence.supported)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn ecapa_neural_jackknife_uses_five_distinct_coordinate_views() {
+        let masks = super::SpeakerPairPerturbation::ALL
+            .into_iter()
+            .map(|perturbation| {
+                (0..crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS)
+                    .filter(|&dimension| perturbation.includes_neural(dimension))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(masks.len(), super::SPEAKER_COUNT_PERTURBATION_LANES);
+    }
+
+    #[test]
+    fn ecapa_centroid_merge_is_weighted_and_order_invariant() {
+        let mut first = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        first[0] = 1.0;
+        let mut second = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        second[1] = 1.0;
+        let mut third = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        third[2] = 1.0;
+
+        let merge = |values: &[(&super::EcapaSpeakerEmbedding, f32)]| {
+            let mut centroid = None;
+            let mut weight = 0.0;
+            for &(embedding, embedding_weight) in values {
+                super::merge_ecapa_centroid(
+                    &mut centroid,
+                    &mut weight,
+                    Some(embedding),
+                    embedding_weight,
+                );
+            }
+            (centroid.expect("finite centroid"), weight)
+        };
+        let (forward, forward_weight) = merge(&[(&first, 2.0), (&second, 3.0), (&third, 5.0)]);
+        let (reverse, reverse_weight) = merge(&[(&third, 5.0), (&second, 3.0), (&first, 2.0)]);
+        assert_eq!(forward_weight, 10.0);
+        assert_eq!(reverse_weight, 10.0);
+        for (actual, expected) in forward.into_iter().zip([0.2, 0.3, 0.5]) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        for (left, right) in forward.into_iter().zip(reverse) {
+            assert!((left - right).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn ecapa_long_tracklet_windows_are_disjoint_bounded_and_weight_only_observed_audio() {
+        let source = (0..super::ECAPA_SAMPLE_RATE_HZ * 30)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        let windows = super::prepare_ecapa_tracklet_windows(&source).expect("non-empty source");
+        let validation = windows.validation.as_ref().expect("held-out window");
+        assert_eq!(
+            windows.discovery.len(),
+            super::ECAPA_MAXIMUM_RUNTIME_SAMPLES
+        );
+        assert_eq!(validation.len(), super::ECAPA_MAXIMUM_RUNTIME_SAMPLES);
+        assert_eq!(windows.discovery[0], 0.0);
+        assert_eq!(
+            validation[0],
+            (source.len() - super::ECAPA_MAXIMUM_RUNTIME_SAMPLES) as f32
+        );
+        assert!(windows.discovery.last().expect("discovery sample") < &validation[0]);
+        let represented =
+            super::represented_ecapa_weight(3_000, windows.discovery.len(), source.len());
+        assert_eq!(represented, 300.0);
+        assert!(represented < 3_000.0);
     }
 
     #[test]
@@ -28233,13 +29567,15 @@ mod tests {
         let tracklets = sequential_profile_tracklets(&[0.0, 1.0, 2.0], 500, 50);
         let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
         embedding[0] = 1.0;
-        let embeddings = BTreeMap::from([(0usize, embedding)]);
+        let embeddings =
+            BTreeMap::from([(0usize, ecapa_representation(embedding, None, 50.0, 0.0))]);
         let hard_assignments = BTreeMap::from([(2usize, "known".to_owned())]);
         let (prototypes, cap_pressure) = super::build_capped_prototypes(
             &tracklets,
             &hard_assignments,
             512,
             Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
             &mut || false,
         )
         .expect("neural prototypes");
@@ -28255,6 +29591,191 @@ mod tests {
                 && prototype.hard_anchor.as_deref() == Some("known")
                 && prototype.neural_voice.is_none()
         }));
+    }
+
+    #[test]
+    fn neural_prototype_cap_never_donates_unrelated_evidence_to_a_hard_anchor() {
+        let tracklets = sequential_profile_tracklets(&[0.0, 1.0], 500, 50);
+        let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        embedding[0] = 1.0;
+        let embeddings =
+            BTreeMap::from([(0usize, ecapa_representation(embedding, None, 50.0, 0.0))]);
+        let hard_assignments = BTreeMap::from([(1usize, "known".to_owned())]);
+
+        let (capped, cap_pressure) = super::build_capped_prototypes(
+            &tracklets,
+            &hard_assignments,
+            1,
+            Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            &mut || false,
+        )
+        .expect("hard-first capped prototypes");
+        assert!(cap_pressure);
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].members, [1]);
+        assert_eq!(capped[0].hard_anchor.as_deref(), Some("known"));
+        assert!(capped[0].neural_voice.is_none());
+
+        let (uncapped, cap_pressure) = super::build_capped_prototypes(
+            &tracklets,
+            &hard_assignments,
+            2,
+            Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            &mut || false,
+        )
+        .expect("separate hard and free prototypes");
+        assert!(!cap_pressure);
+        assert_eq!(uncapped.len(), 2);
+        assert!(uncapped.iter().any(|prototype| {
+            prototype.members == [0]
+                && prototype.hard_anchor.is_none()
+                && prototype.neural_voice.is_some()
+        }));
+        assert!(uncapped.iter().any(|prototype| {
+            prototype.members == [1]
+                && prototype.hard_anchor.as_deref() == Some("known")
+                && prototype.neural_voice.is_none()
+        }));
+
+        let incompatible =
+            BTreeMap::from([(0usize, "alice".to_owned()), (1usize, "bob".to_owned())]);
+        assert!(
+            super::build_capped_prototypes(
+                &tracklets,
+                &incompatible,
+                1,
+                Some(&embeddings),
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+                &mut || false,
+            )
+            .expect_err("one slot cannot preserve two hard identities")
+            .to_string()
+            .contains("cannot preserve all incompatible hard anchors")
+        );
+    }
+
+    #[test]
+    fn ecapa_modes_preserve_distinct_hard_references_despite_identical_embeddings() {
+        let request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 2 },
+            known_intervals: vec![
+                known_interval("alice", 0, 500, KnownSpeakerPolicy::HardMustLink),
+                known_interval("bob", 500, 1_000, KnownSpeakerPolicy::HardMustLink),
+            ],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let tracklets = sequential_profile_tracklets(&[0.0, 0.0], 500, 50);
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, 1_000).expect("enrollment");
+        assert!(
+            enrollment
+                .cannot_links
+                .contains(&("alice".to_owned(), "bob".to_owned()))
+        );
+        let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        embedding[7] = 1.0;
+        let embeddings = BTreeMap::from([
+            (0usize, ecapa_representation(embedding, None, 50.0, 0.0)),
+            (1usize, ecapa_representation(embedding, None, 50.0, 0.0)),
+        ]);
+
+        for evidence_mode in [
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        ] {
+            let (result, _) = super::cluster_acoustic_tracklets_with_mode_internal(
+                &tracklets,
+                &enrollment,
+                &request.speaker_count,
+                512,
+                super::AcousticClusteringMode::ProbabilisticV1,
+                Some(&embeddings),
+                evidence_mode,
+                || false,
+            )
+            .expect("hard-constrained ECAPA clustering");
+            assert_eq!(
+                result.detected_speakers, 2,
+                "{evidence_mode:?}: {result:#?}"
+            );
+            assert_eq!(result.assignments[0].speaker_ref.as_deref(), Some("alice"));
+            assert_eq!(result.assignments[1].speaker_ref.as_deref(), Some("bob"));
+            assert!(
+                result
+                    .assignments
+                    .iter()
+                    .all(|value| value.hard_attribution)
+            );
+            assert!(
+                result.constraints_satisfied,
+                "{evidence_mode:?}: {result:#?}"
+            );
+            assert_eq!(
+                result
+                    .operational_partition
+                    .as_ref()
+                    .expect("typed constrained partition")
+                    .method,
+                crate::model::DiarizationOperationalPartitionMethod::ProbabilisticConsensus
+            );
+        }
+    }
+
+    #[test]
+    fn ecapa_fixed_safe_result_is_invariant_to_acoustic_voice_validity_masks() {
+        let tracklets = sequential_profile_tracklets(&[0.0, 0.0, 1.0, 1.0], 500, 50);
+        let mut masked_tracklets = tracklets.clone();
+        for tracklet in &mut masked_tracklets {
+            tracklet.voice_valid.fill(false);
+            tracklet.voice_support.fill(0);
+        }
+        let request = DiarizationRequest::default();
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, 2_000).expect("enrollment");
+        let masked_enrollment = enroll_known_speaker_profiles(&masked_tracklets, &request, 2_000)
+            .expect("masked enrollment");
+        let mut first = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        first[3] = 1.0;
+        let mut second = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        second[117] = 1.0;
+        let embeddings = (0usize..4)
+            .map(|index| {
+                (
+                    index,
+                    ecapa_representation(if index < 2 { first } else { second }, None, 50.0, 0.0),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let run = |input_tracklets: &[super::AcousticTracklet],
+                   input_enrollment: &super::SpeakerEnrollment| {
+            super::cluster_acoustic_tracklets_with_mode_internal(
+                input_tracklets,
+                input_enrollment,
+                &request.speaker_count,
+                512,
+                super::AcousticClusteringMode::FixedSafeV1,
+                Some(&embeddings),
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+                || false,
+            )
+            .expect("fixed-safe ECAPA clustering")
+            .0
+        };
+        let baseline = run(&tracklets, &enrollment);
+        let masked = run(&masked_tracklets, &masked_enrollment);
+        assert_eq!(baseline, masked);
+        assert_eq!(baseline.calibration_status, "fixed_safe_uncalibrated");
+        assert_eq!(
+            baseline
+                .operational_partition
+                .as_ref()
+                .expect("fixed-safe partition")
+                .authority,
+            SpeakerCountCalibrationStatus::FixedSafeUncalibrated
+        );
     }
 
     #[test]
@@ -28274,7 +29795,10 @@ mod tests {
             .expect("accepted soft enrollment");
         let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
         embedding[7] = 1.0;
-        let embeddings = BTreeMap::from([(0usize, embedding), (1usize, embedding)]);
+        let embeddings = BTreeMap::from([
+            (0usize, ecapa_representation(embedding, None, 50.0, 0.0)),
+            (1usize, ecapa_representation(embedding, None, 50.0, 0.0)),
+        ]);
         let profiles = super::build_ecapa_speaker_profiles(&enrollment, &embeddings);
         let profile = profiles.get("alice").expect("neural alice profile");
         assert!(profile.weight > 0.0);
@@ -28285,6 +29809,155 @@ mod tests {
     }
 
     #[test]
+    fn neural_soft_enrollment_without_embeddings_cannot_create_a_named_state() {
+        let tracklets = sequential_profile_tracklets(&[0.0, 0.0], 500, 50);
+        let soft_request = DiarizationRequest {
+            known_intervals: vec![known_interval(
+                "alice",
+                0,
+                1_000,
+                KnownSpeakerPolicy::SoftEnrollment,
+            )],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let mut soft_enrollment = enroll_known_speaker_profiles(&tracklets, &soft_request, 1_000)
+            .expect("soft enrollment");
+        let embeddings = BTreeMap::new();
+        assert_eq!(
+            super::apply_neural_enrollment_hygiene(&tracklets, &mut soft_enrollment, &embeddings,),
+            (2, false)
+        );
+        assert!(soft_enrollment.soft_priors.is_empty());
+        assert!(soft_enrollment.profiles.is_empty());
+        assert!(soft_enrollment.summaries.is_empty());
+        assert!(soft_enrollment.training_evidence.iter().all(|evidence| {
+            evidence.disposition == super::ProfileTrainingDisposition::Quarantined
+                && evidence.reason == super::ProfileTrainingReason::MissingRepresentation
+                && evidence.applied_weight == 0.0
+        }));
+        let neural_profiles = super::build_ecapa_speaker_profiles(&soft_enrollment, &embeddings);
+        assert!(neural_profiles.is_empty());
+        assert!(
+            super::initial_clusters(
+                &[],
+                &soft_enrollment,
+                Some(&neural_profiles),
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            )
+            .is_empty()
+        );
+
+        let hard_request = DiarizationRequest {
+            known_intervals: vec![known_interval(
+                "alice",
+                0,
+                1_000,
+                KnownSpeakerPolicy::HardMustLink,
+            )],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let mut hard_enrollment = enroll_known_speaker_profiles(&tracklets, &hard_request, 1_000)
+            .expect("hard enrollment");
+        assert_eq!(
+            super::apply_neural_enrollment_hygiene(&tracklets, &mut hard_enrollment, &embeddings,),
+            (0, false)
+        );
+        let (hard_prototypes, _) = super::build_capped_prototypes(
+            &tracklets,
+            &hard_enrollment.hard_assignments,
+            2,
+            Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            &mut || false,
+        )
+        .expect("hard attribution survives without an embedding");
+        let hard_clusters = super::initial_clusters(
+            &hard_prototypes,
+            &hard_enrollment,
+            Some(&BTreeMap::new()),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+        );
+        assert_eq!(hard_clusters.len(), 1);
+        assert_eq!(hard_clusters[0].hard_anchor.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn neural_soft_enrollment_quarantines_a_repeatable_ecapa_outlier() {
+        let tracklets = sequential_profile_tracklets(&[0.0; 4], 500, 50);
+        let request = DiarizationRequest {
+            known_intervals: (0_u64..4)
+                .map(|index| {
+                    known_interval(
+                        "alice",
+                        index * 500,
+                        (index + 1) * 500,
+                        KnownSpeakerPolicy::SoftEnrollment,
+                    )
+                })
+                .collect(),
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let mut enrollment = enroll_known_speaker_profiles(&tracklets, &request, 2_000)
+            .expect("classically consistent enrollment");
+        assert!(enrollment.training_evidence.iter().all(|evidence| {
+            evidence.disposition != super::ProfileTrainingDisposition::Quarantined
+        }));
+
+        let mut consistent = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        consistent[3] = 1.0;
+        let contradictory = consistent.map(|value| -value);
+        let embeddings = (0usize..4)
+            .map(|index| {
+                (
+                    index,
+                    ecapa_representation(
+                        if index == 3 {
+                            contradictory
+                        } else {
+                            consistent
+                        },
+                        None,
+                        50.0,
+                        0.0,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            super::apply_neural_enrollment_hygiene(&tracklets, &mut enrollment, &embeddings),
+            (1, true)
+        );
+        let rejected = &enrollment.training_evidence[3];
+        assert_eq!(
+            rejected.disposition,
+            super::ProfileTrainingDisposition::Quarantined
+        );
+        assert_eq!(
+            rejected.reason,
+            super::ProfileTrainingReason::LeaveOneOutInconsistent
+        );
+        assert_eq!(rejected.applied_weight, 0.0);
+        assert_eq!(enrollment.evidence[3].profile_quarantined_tracklet_count, 1);
+        assert_eq!(enrollment.evidence[3].applied_weight, 0.0);
+        assert!(enrollment.evidence[3].contradiction_score.is_some());
+        assert_eq!(enrollment.summaries[0].training_quarantined_count, 1);
+
+        let profiles = super::build_ecapa_speaker_profiles(&enrollment, &embeddings);
+        let profile = profiles.get("alice").expect("retained clean profile");
+        let distance = super::ecapa_cosine_distance(
+            &profile.embedding,
+            &consistent,
+            super::SpeakerPairPerturbation::Full,
+        )
+        .expect("finite retained profile");
+        assert!(distance < 1.0e-6, "profile distance={distance}");
+    }
+
+    #[test]
     fn spherical_neural_inference_finds_two_dense_separated_speakers() {
         let tracklets = sequential_profile_tracklets(&[0.0; 8], 500, 50);
         let mut first = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
@@ -28292,89 +29965,355 @@ mod tests {
         let mut second = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
         second[117] = 1.0;
         let embeddings = (0usize..8)
-            .map(|index| (index, if index < 4 { first } else { second }))
+            .map(|index| {
+                (
+                    index,
+                    ecapa_representation(if index < 4 { first } else { second }, None, 50.0, 0.0),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let (prototypes, _) = super::build_capped_prototypes(
             &tracklets,
             &BTreeMap::new(),
             512,
             Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
             &mut || false,
         )
         .expect("neural prototypes");
         let request = DiarizationRequest::default();
         let enrollment =
             enroll_known_speaker_profiles(&tracklets, &request, 4_000).expect("empty enrollment");
-        let initial = super::initial_clusters(&prototypes, &enrollment, None);
+        let initial = super::initial_clusters(
+            &prototypes,
+            &enrollment,
+            None,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+        );
         let policy = super::SpeakerCountPolicy {
             min: 1,
             max: 4,
             exact: None,
         };
-        let inferred = super::infer_neural_spherical_partition(&initial, policy, &mut || false)
-            .expect("spherical inference")
-            .expect("count proposal");
+        let inferred =
+            super::infer_neural_spherical_partition(&initial, policy, &embeddings, &mut || false)
+                .expect("spherical inference")
+                .expect("count proposal");
         assert_eq!(inferred.0, 2);
         assert_eq!(inferred.2.len(), 2);
         assert!(super::clusters_have_robust_different_speaker_evidence(
             &inferred.2[0],
             &inferred.2[1]
         ));
+        let (clustering, _) = super::cluster_acoustic_tracklets_with_mode_internal(
+            &tracklets,
+            &enrollment,
+            &SpeakerCountRequest::Infer,
+            512,
+            super::AcousticClusteringMode::ProbabilisticV1,
+            Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            || false,
+        )
+        .expect("common neural clustering stack");
+        let operational = clustering
+            .operational_partition
+            .as_ref()
+            .expect("typed operational partition");
+        assert_eq!(
+            operational.method,
+            crate::model::DiarizationOperationalPartitionMethod::EcapaSpherical
+        );
+        assert_eq!(operational.selected_count, 2);
+        assert_eq!(
+            operational.authority,
+            SpeakerCountCalibrationStatus::DevelopmentUncertified
+        );
+        operational.validate().expect("valid partition provenance");
+
+        let (fused_clustering, _) = super::cluster_acoustic_tracklets_with_mode_internal(
+            &tracklets,
+            &enrollment,
+            &SpeakerCountRequest::Infer,
+            512,
+            super::AcousticClusteringMode::ProbabilisticV1,
+            Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+            || false,
+        )
+        .expect("common fused clustering stack");
+        let fused_operational = fused_clustering
+            .operational_partition
+            .as_ref()
+            .expect("typed fused operational partition");
+        assert_eq!(
+            fused_operational.method,
+            crate::model::DiarizationOperationalPartitionMethod::ProbabilisticConsensus
+        );
+        assert_eq!(
+            fused_operational.calibration_sha256,
+            super::ecapa_speaker_pair_calibration_sha256(
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+            )
+        );
+        assert_ne!(
+            fused_operational.calibration_sha256,
+            operational.calibration_sha256
+        );
 
         let identical_embeddings = (0usize..8)
-            .map(|index| (index, first))
+            .map(|index| (index, ecapa_representation(first, None, 50.0, 0.0)))
             .collect::<BTreeMap<_, _>>();
         let (prototypes, _) = super::build_capped_prototypes(
             &tracklets,
             &BTreeMap::new(),
             512,
             Some(&identical_embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
             &mut || false,
         )
         .expect("identical prototypes");
-        let initial = super::initial_clusters(&prototypes, &enrollment, None);
-        let inferred = super::infer_neural_spherical_partition(&initial, policy, &mut || false)
-            .expect("one-speaker inference")
-            .expect("one-speaker proposal");
+        let initial = super::initial_clusters(
+            &prototypes,
+            &enrollment,
+            None,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+        );
+        let inferred = super::infer_neural_spherical_partition(
+            &initial,
+            policy,
+            &identical_embeddings,
+            &mut || false,
+        )
+        .expect("one-speaker inference")
+        .expect("one-speaker proposal");
         assert_eq!(inferred.0, 1);
     }
 
     #[test]
-    fn neural_inference_retains_one_well_supported_long_minority_turn() {
+    fn heldout_validation_supports_only_a_repeatable_long_singleton() {
         let tracklets = sequential_profile_tracklets(&[0.0; 5], 3_000, 300);
         let mut dominant = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
-        dominant[11] = 1.0;
+        dominant[3] = 1.0;
         let mut minority = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
-        minority[173] = 1.0;
+        minority[117] = 1.0;
         let embeddings = (0usize..5)
-            .map(|index| (index, if index < 4 { dominant } else { minority }))
+            .map(|index| {
+                let embedding = if index < 4 { dominant } else { minority };
+                (
+                    index,
+                    ecapa_representation(embedding, Some(embedding), 150.0, 150.0),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
-        let request = DiarizationRequest::default();
-        let enrollment =
-            enroll_known_speaker_profiles(&tracklets, &request, 15_000).expect("empty enrollment");
-        let (result, _) = super::cluster_acoustic_tracklets_with_mode_internal(
+        let (prototypes, _) = super::build_capped_prototypes(
             &tracklets,
-            &enrollment,
-            &request.speaker_count,
+            &BTreeMap::new(),
             512,
+            Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            &mut || false,
+        )
+        .expect("held-out prototypes");
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &DiarizationRequest::default(), 15_000)
+                .expect("empty enrollment");
+        let initial = super::initial_clusters(
+            &prototypes,
+            &enrollment,
+            None,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+        );
+        let policy = super::SpeakerCountPolicy {
+            min: 1,
+            max: 3,
+            exact: None,
+        };
+        let inferred =
+            super::infer_neural_spherical_partition(&initial, policy, &embeddings, &mut || false)
+                .expect("held-out inference")
+                .expect("held-out partition");
+        assert_eq!(inferred.0, 2);
+        let singleton_index = inferred
+            .2
+            .iter()
+            .position(|cluster| cluster.prototype_members.len() == 1)
+            .expect("minority singleton");
+        assert!(super::neural_singleton_has_heldout_support(
+            singleton_index,
+            &inferred.2,
+            &embeddings,
+        ));
+
+        let mut contradicted = embeddings.clone();
+        contradicted
+            .get_mut(&4)
+            .expect("minority representation")
+            .validation = Some(dominant);
+        let contradicted_inference =
+            super::infer_neural_spherical_partition(&initial, policy, &contradicted, &mut || false)
+                .expect("contradicted inference")
+                .expect("conservative one-speaker partition");
+        assert_eq!(contradicted_inference.0, 1);
+
+        let mut no_heldout = embeddings.clone();
+        let minority_representation = no_heldout.get_mut(&4).expect("minority representation");
+        minority_representation.validation = None;
+        minority_representation.validation_weight = 0.0;
+        assert!(!super::neural_singleton_has_heldout_support(
+            singleton_index,
+            &inferred.2,
+            &no_heldout,
+        ));
+    }
+
+    #[test]
+    fn spherical_neural_fast_path_observes_cancellation() {
+        let tracklets = sequential_profile_tracklets(&[0.0, 1.0], 500, 50);
+        let mut first = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        first[3] = 1.0;
+        let mut second = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        second[117] = 1.0;
+        let embeddings = BTreeMap::from([
+            (0usize, ecapa_representation(first, None, 50.0, 0.0)),
+            (1usize, ecapa_representation(second, None, 50.0, 0.0)),
+        ]);
+        let (prototypes, _) = super::build_capped_prototypes(
+            &tracklets,
+            &BTreeMap::new(),
+            512,
+            Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            &mut || false,
+        )
+        .expect("neural prototypes");
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &DiarizationRequest::default(), 1_000)
+                .expect("empty enrollment");
+        let initial = super::initial_clusters(
+            &prototypes,
+            &enrollment,
+            None,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+        );
+        let error = super::spherical_neural_clusters(&initial, initial.len(), &mut || true)
+            .expect_err("cancel before K equals N fast path");
+        assert!(matches!(error, FwError::Cancelled(_)));
+    }
+
+    #[test]
+    fn neural_checkpoint_adapter_preserves_stage_timeout_identity() {
+        let checkpoint = || {
+            Err(FwError::StageTimeout {
+                stage: "diarize".to_owned(),
+                budget_ms: 123,
+            })
+        };
+        let adapter = super::CheckpointCancellationAdapter::new(&checkpoint);
+        assert!(adapter.is_cancelled());
+        let error = adapter
+            .restore::<()>(Err(FwError::Cancelled(
+                "boolean acoustic checkpoint".to_owned(),
+            )))
+            .expect_err("original timeout identity");
+        assert!(matches!(
+            error,
+            FwError::StageTimeout {
+                ref stage,
+                budget_ms: 123
+            } if stage == "diarize"
+        ));
+    }
+
+    #[test]
+    fn acoustic_checkpoint_entrypoint_preserves_stage_timeout_identity() {
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            ..DiarizationRequest::default()
+        };
+        let samples = vec![0.0_f32; 1_600];
+        let checkpoint = || {
+            Err(FwError::StageTimeout {
+                stage: "diarize".to_owned(),
+                budget_ms: 321,
+            })
+        };
+        let error = super::diarize_acoustic_pcm_with_checkpoint(
+            super::AcousticDiarizationInput {
+                samples: &samples,
+                normalized_input_sha256:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                segments: &[],
+                word_aligned: false,
+                request: &request,
+                boundary_hints: &super::AcousticBoundaryHints::default(),
+            },
+            &checkpoint,
+        )
+        .expect_err("the structured stage timeout must survive boolean polling");
+        assert!(matches!(
+            error,
+            FwError::StageTimeout {
+                ref stage,
+                budget_ms: 321
+            } if stage == "diarize"
+        ));
+    }
+
+    #[test]
+    fn ecapa_contradiction_cannot_be_overridden_by_classical_enrolled_profile() {
+        let tracklets = sequential_profile_tracklets(&[0.0, 0.0], 1_000, 100);
+        let request = DiarizationRequest {
+            known_intervals: vec![known_interval(
+                "alice",
+                0,
+                1_000,
+                KnownSpeakerPolicy::HardMustLink,
+            )],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let enrollment = enroll_known_speaker_profiles(&tracklets, &request, 2_000)
+            .expect("known-speaker enrollment");
+        let mut alice = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        alice[3] = 1.0;
+        let contradiction = alice.map(|value| -value);
+        let embeddings = BTreeMap::from([
+            (0usize, ecapa_representation(alice, None, 100.0, 0.0)),
+            (
+                1usize,
+                ecapa_representation(contradiction, None, 100.0, 0.0),
+            ),
+        ]);
+        let (prototypes, _) = super::build_capped_prototypes(
+            &tracklets[..1],
+            &enrollment.hard_assignments,
+            512,
+            Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+            &mut || false,
+        )
+        .expect("anchored prototype");
+        let neural_profiles = super::build_ecapa_speaker_profiles(&enrollment, &embeddings);
+        let clusters = super::initial_clusters(
+            &prototypes,
+            &enrollment,
+            Some(&neural_profiles),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        );
+        let labels = vec!["alice".to_owned()];
+        let assignments = super::viterbi_assignments(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
             super::AcousticClusteringMode::ProbabilisticV1,
             Some(&embeddings),
-            || false,
+            &mut || false,
         )
-        .expect("neural clustering");
-
-        assert_eq!(result.detected_speakers, 2, "{result:#?}");
-        let long_singleton = result
-            .speaker_evidence
-            .iter()
-            .find(|evidence| evidence.independent_tracklet_count == 1)
-            .expect("minority evidence");
-        assert!(long_singleton.supported, "{long_singleton:#?}");
-        assert!(
-            long_singleton
-                .reasons
-                .contains(&SpeakerEvidenceReason::SupportedByLongObservation)
-        );
+        .expect("neural assignment");
+        assert_eq!(assignments[0].speaker_ref.as_deref(), Some("alice"));
+        assert_eq!(assignments[1].speaker_ref, None);
     }
 
     #[test]
@@ -28392,53 +30331,82 @@ mod tests {
             .expect("decode 16 kHz mono WAV");
         samples.truncate(samples.len().min(16_000 * 10));
         let duration_ms = u64::try_from(samples.len()).expect("sample count fits") / 16;
-        let request = crate::model::DiarizationRequest {
-            engine: crate::model::DiarizationEngine::Neural,
-            fallback: crate::model::DiarizationFallbackPolicy::Unknown,
-            speaker_count: crate::model::SpeakerCountRequest::Infer,
-            ..crate::model::DiarizationRequest::default()
-        };
         let boundary_hints = super::AcousticBoundaryHints {
             speech_regions_ms: vec![(0, duration_ms)],
             ..super::AcousticBoundaryHints::default()
         };
-        let (report, projection) = super::diarize_neural_pcm(
-            super::AcousticDiarizationInput {
-                samples: &samples,
-                normalized_input_sha256:
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                segments: &[],
-                word_aligned: false,
-                request: &request,
-                boundary_hints: &boundary_hints,
-            },
-            &model,
-            &|| Ok(()),
-        )
-        .expect("native ECAPA common-stack diarization");
-        let representation = report
-            .neural_representation
-            .expect("neural provenance summary");
-        assert!(
-            representation.embedded_tracklet_count > 0,
-            "{representation:?}"
-        );
-        assert_eq!(
-            representation.model_package_sha256,
-            crate::ecapa_conformance::ECAPA_PACKAGE_SHA256
-        );
-        assert_eq!(report.implementation, "native-ecapa-common-v1");
-        assert_eq!(
-            report.contract_version,
-            super::NEURAL_DIARIZATION_CONTRACT_VERSION
-        );
-        assert!(projection.segments.is_empty());
-        assert!(report.turns.iter().all(|turn| {
-            turn.start_ms < turn.end_ms
-                && turn.end_ms <= duration_ms
-                && turn
-                    .speaker_confidence
-                    .is_none_or(|confidence| confidence.is_finite())
-        }));
+        for (engine, expected_implementation, expected_evidence_mode) in [
+            (
+                crate::model::DiarizationEngine::Ecapa,
+                "native-ecapa-only-v1",
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            ),
+            (
+                crate::model::DiarizationEngine::EcapaFused,
+                "native-ecapa-fused-v1",
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+            ),
+        ] {
+            let request = crate::model::DiarizationRequest {
+                engine,
+                fallback: crate::model::DiarizationFallbackPolicy::Unknown,
+                speaker_count: crate::model::SpeakerCountRequest::Infer,
+                ..crate::model::DiarizationRequest::default()
+            };
+            let (report, projection) = super::diarize_ecapa_pcm(
+                super::AcousticDiarizationInput {
+                    samples: &samples,
+                    normalized_input_sha256:
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    segments: &[],
+                    word_aligned: false,
+                    request: &request,
+                    boundary_hints: &boundary_hints,
+                },
+                &model,
+                &|| Ok(()),
+            )
+            .expect("native ECAPA common-stack diarization");
+            let representation = report
+                .neural_representation
+                .as_ref()
+                .expect("neural provenance summary");
+            assert!(
+                representation.embedded_tracklet_count > 0,
+                "{representation:?}"
+            );
+            assert_eq!(
+                representation.loaded_model_package_sha256.as_deref(),
+                Some(crate::ecapa_conformance::ECAPA_PACKAGE_SHA256)
+            );
+            assert_eq!(report.implementation, expected_implementation);
+            assert_eq!(report.speaker_evidence_mode, expected_evidence_mode);
+            assert_eq!(
+                report.contract_version,
+                super::NEURAL_DIARIZATION_CONTRACT_VERSION
+            );
+            assert_eq!(
+                report.feature_schema,
+                super::ACOUSTIC_FEATURE_SCHEMA_VERSION
+            );
+            report.validate().expect("valid ECAPA report");
+            if let Some(operational) = report.operational_partition.as_ref() {
+                operational.validate().expect("valid partition provenance");
+                if engine == crate::model::DiarizationEngine::EcapaFused {
+                    assert_ne!(
+                        operational.method,
+                        crate::model::DiarizationOperationalPartitionMethod::EcapaSpherical
+                    );
+                }
+            }
+            assert!(projection.segments.is_empty());
+            assert!(report.turns.iter().all(|turn| {
+                turn.start_ms < turn.end_ms
+                    && turn.end_ms <= duration_ms
+                    && turn
+                        .speaker_confidence
+                        .is_none_or(|confidence| confidence.is_finite())
+            }));
+        }
     }
 }
