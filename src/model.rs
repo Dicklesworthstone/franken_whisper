@@ -54,6 +54,7 @@ pub struct VadParams {
 
 /// One point in an explicitly supplied speaker-count prior.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeakerCountPriorMass {
     pub count: u32,
     pub probability: f64,
@@ -67,7 +68,7 @@ pub struct SpeakerCountPriorMass {
 /// unresolved. An engine that cannot preserve these semantics must reject the
 /// request instead of silently approximating it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SpeakerCountRequest {
     #[default]
     Infer,
@@ -105,8 +106,24 @@ pub enum DiarizationEngine {
     Acoustic,
     /// User-installed subprocess backend.
     External,
-    /// Optional in-process neural speaker-embedding engine.
-    Neural,
+    /// In-process ECAPA speaker identity without acoustic channel fusion.
+    Ecapa,
+    /// In-process ECAPA identity with separately bounded acoustic channel
+    /// evidence in pair and temporal scoring.
+    EcapaFused,
+}
+
+/// Speaker-evidence representation that actually produced a diarization
+/// report. This is distinct from the requested engine because a neural request
+/// may conservatively execute the native acoustic fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationSpeakerEvidenceMode {
+    AcousticV2,
+    EcapaOnly,
+    EcapaWithAcousticChannel,
+    External,
+    None,
 }
 
 /// Evidence-gated rollout stage for `auto` acoustic diarization.
@@ -137,6 +154,9 @@ pub enum AcousticDiarizationRolloutStage {
 pub enum DiarizationFallbackPolicy {
     /// Preserve attributable hard-hint regions and emit unknown elsewhere.
     Unknown,
+    /// If a neural representation is unavailable or insufficient, rerun the
+    /// exact common stack with the native acoustic-v2 identity representation.
+    Acoustic,
     /// Permit an admitted external backend to attempt the request.
     External,
     /// Fail the request with a structured error.
@@ -159,6 +179,7 @@ pub enum KnownSpeakerPolicy {
 /// `speaker_ref` is an opaque identifier scoped to this run. It is not a
 /// biometric or legal identity claim.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KnownSpeakerInterval {
     pub speaker_ref: String,
     pub start_ms: u64,
@@ -171,6 +192,7 @@ pub struct KnownSpeakerInterval {
 
 /// Typed native diarization request (`speaker-hints-v1`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiarizationRequest {
     pub engine: DiarizationEngine,
     pub fallback: DiarizationFallbackPolicy,
@@ -493,9 +515,20 @@ pub enum NeuralSpeakerRepresentationReason {
     ShortTracklet,
     InsufficientIdentityEvidence,
     InsufficientTracklets,
+    ContradictoryEnrollment,
     ModelUnavailable,
     ModelInvalid,
     InferenceFailed,
+}
+
+/// Typed origin of the loaded ECAPA model instance. `Direct` is used by the
+/// embedding library API; orchestrated CLI runs refine it to a cache hit/miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NeuralModelLoadSource {
+    Direct,
+    CacheHit,
+    CacheMiss,
 }
 
 /// Privacy-safe provenance and coverage for an optional ECAPA execution.
@@ -503,10 +536,15 @@ pub enum NeuralSpeakerRepresentationReason {
 /// Raw embeddings and model paths are deliberately absent. The exact package
 /// digest is public model provenance rather than user-derived information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NeuralSpeakerRepresentationSummary {
     pub schema_version: String,
     pub provider_version: String,
-    pub model_package_sha256: String,
+    pub expected_model_package_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loaded_model_package_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_load_source: Option<NeuralModelLoadSource>,
     pub status: NeuralSpeakerRepresentationStatus,
     pub embedded_tracklet_count: u64,
     pub zero_padded_tracklet_count: u64,
@@ -515,8 +553,175 @@ pub struct NeuralSpeakerRepresentationSummary {
     pub reasons: Vec<NeuralSpeakerRepresentationReason>,
 }
 
+impl NeuralSpeakerRepresentationSummary {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != "neural-speaker-representation-summary-v1" {
+            return Err("neural representation summary schema version is unsupported".to_owned());
+        }
+        if self.provider_version.trim().is_empty() || self.provider_version.len() > 128 {
+            return Err("neural representation provider version is invalid".to_owned());
+        }
+        if !lowercase_sha256(&self.expected_model_package_sha256)
+            || self
+                .loaded_model_package_sha256
+                .as_ref()
+                .is_some_and(|digest| !lowercase_sha256(digest))
+        {
+            return Err("neural representation model digest is not lowercase SHA-256".to_owned());
+        }
+        if self
+            .loaded_model_package_sha256
+            .as_deref()
+            .is_some_and(|digest| digest != self.expected_model_package_sha256.as_str())
+        {
+            return Err(
+                "loaded neural model digest does not match the expected package".to_owned(),
+            );
+        }
+        match self.status {
+            NeuralSpeakerRepresentationStatus::Ready
+                if self.loaded_model_package_sha256.as_deref()
+                    != Some(self.expected_model_package_sha256.as_str())
+                    || self.embedded_tracklet_count == 0
+                    || !self.reasons.is_empty() =>
+            {
+                return Err(
+                    "ready neural representation summary is internally inconsistent".to_owned(),
+                );
+            }
+            NeuralSpeakerRepresentationStatus::Degraded
+                if self.loaded_model_package_sha256.as_deref()
+                    != Some(self.expected_model_package_sha256.as_str())
+                    || self.embedded_tracklet_count == 0
+                    || self.reasons.is_empty() =>
+            {
+                return Err(
+                    "degraded neural representation summary is internally inconsistent".to_owned(),
+                );
+            }
+            NeuralSpeakerRepresentationStatus::Unavailable
+                if self.embedded_tracklet_count != 0
+                    || self.zero_padded_tracklet_count != 0
+                    || self.reasons.is_empty() =>
+            {
+                return Err(
+                    "unavailable neural representation summary claims observed model evidence"
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
+        let model_was_unavailable = self.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                NeuralSpeakerRepresentationReason::ModelUnavailable
+                    | NeuralSpeakerRepresentationReason::ModelInvalid
+            )
+        });
+        if model_was_unavailable && self.loaded_model_package_sha256.is_some() {
+            return Err(
+                "unavailable or invalid neural model claims a loaded package digest".to_owned(),
+            );
+        }
+        if self.loaded_model_package_sha256.is_some() != self.model_load_source.is_some() {
+            return Err(
+                "neural model digest and load source must either both be present or both be absent"
+                    .to_owned(),
+            );
+        }
+        if self
+            .reasons
+            .contains(&NeuralSpeakerRepresentationReason::InferenceFailed)
+            && self.loaded_model_package_sha256.is_none()
+        {
+            return Err(
+                "neural inference failure must identify the successfully loaded model source"
+                    .to_owned(),
+            );
+        }
+        if self.zero_padded_tracklet_count > self.embedded_tracklet_count {
+            return Err(
+                "zero-padded neural tracklet count exceeds embedded tracklet count".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Algorithm that produced the concrete partition consumed by temporal
+/// decoding. This is deliberately separate from the calibrated speaker-count
+/// estimate: an unresolved posterior may coexist with a conservative,
+/// explicitly non-authoritative operational partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationOperationalPartitionMethod {
+    FixedSafeAgglomerative,
+    ProbabilisticConsensus,
+    EcapaSpherical,
+}
+
+/// Typed, privacy-safe provenance for the concrete partition actually used by
+/// the common diarization stack.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiarizationOperationalPartitionSummary {
+    pub schema_version: String,
+    pub method: DiarizationOperationalPartitionMethod,
+    pub selected_count: u32,
+    pub confidence: f64,
+    pub calibration_sha256: String,
+    pub authority: SpeakerCountCalibrationStatus,
+}
+
+impl DiarizationOperationalPartitionSummary {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != "diarization-operational-partition-v1" {
+            return Err("operational partition schema version is unsupported".to_owned());
+        }
+        if self.authority == SpeakerCountCalibrationStatus::Certified {
+            return Err(
+                "certified operational partitions are not admitted without a registered calibration digest"
+                    .to_owned(),
+            );
+        }
+        if !(1..=MAX_SPEAKER_COUNT).contains(&self.selected_count) {
+            return Err(format!(
+                "operational partition count must stay within 1..={MAX_SPEAKER_COUNT}"
+            ));
+        }
+        if !unit_interval(self.confidence) {
+            return Err("operational partition confidence is not finite in 0..=1".to_owned());
+        }
+        if !lowercase_sha256(&self.calibration_sha256) {
+            return Err(
+                "operational partition calibration digest is not lowercase SHA-256".to_owned(),
+            );
+        }
+        match self.method {
+            DiarizationOperationalPartitionMethod::EcapaSpherical
+            | DiarizationOperationalPartitionMethod::ProbabilisticConsensus
+                if self.authority != SpeakerCountCalibrationStatus::DevelopmentUncertified =>
+            {
+                return Err(
+                    "probabilistic operational partition has incompatible authority".to_owned(),
+                );
+            }
+            DiarizationOperationalPartitionMethod::FixedSafeAgglomerative
+                if self.authority != SpeakerCountCalibrationStatus::FixedSafeUncalibrated =>
+            {
+                return Err(
+                    "fixed-safe operational partition must be explicitly uncalibrated".to_owned(),
+                );
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 /// One acoustic speaker turn, independent of ASR segment boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiarizationTurn {
     pub start_ms: u64,
     pub end_ms: u64,
@@ -541,6 +746,7 @@ pub enum SpeakerAttributionQueryReason {
 
 /// Content-bound, feature-value-free request for optional agent supervision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeakerAttributionQuery {
     pub query_id_sha256: String,
     pub start_ms: u64,
@@ -555,6 +761,7 @@ pub struct SpeakerAttributionQuery {
 ///
 /// Raw acoustic vectors and audio are intentionally absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeakerProfileSummary {
     pub speaker_ref: String,
     pub frame_count: u64,
@@ -586,6 +793,7 @@ pub enum SpeakerHintDisposition {
 
 /// Privacy-safe enrollment audit for one known-speaker interval.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeakerHintEvidenceSummary {
     pub hint_index: u64,
     pub speaker_ref: String,
@@ -608,7 +816,10 @@ pub enum SpeakerEvidenceReason {
     SupportedByHardHint,
     SupportedByIndependentRecurrence,
     SupportedByRepeatedTracklets,
-    SupportedByLongObservation,
+    /// One long observation was split into disjoint discovery and validation
+    /// windows; the held-out window independently selected and separated the
+    /// discovery cluster.
+    SupportedByHeldoutObservation,
     SupportedByExternalAttribution,
     NoAssignedSpeech,
     InsufficientIndependentRecurrence,
@@ -620,6 +831,7 @@ pub enum SpeakerEvidenceReason {
 
 /// Feature-value-free occupancy and quality evidence for one speaker label.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeakerEvidenceSummary {
     pub speaker_ref: String,
     pub assigned_tracklet_count: u64,
@@ -769,6 +981,12 @@ impl SpeakerCountEstimate {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != "speaker-count-estimate-v2" {
             return Err("speaker-count estimate schema version is unsupported".to_owned());
+        }
+        if self.calibration_status == SpeakerCountCalibrationStatus::Certified {
+            return Err(
+                "certified speaker-count estimates are not admitted without a registered calibration digest"
+                    .to_owned(),
+            );
         }
         if self.constraint_lower_bound == 0
             || self.candidate_upper_bound == 0
@@ -948,7 +1166,9 @@ impl SpeakerCountEstimate {
         ) && (self.selected_count.is_some()
             || !self.posterior.is_empty()
             || self.supported_range.is_some()
-            || self.unresolved_probability.to_bits() != 1.0_f64.to_bits())
+            || self.unresolved_probability.to_bits() != 1.0_f64.to_bits()
+            || self.entropy_bits.to_bits() != 0.0_f64.to_bits()
+            || self.stability.to_bits() != 0.0_f64.to_bits())
         {
             return Err(
                 "uncalibrated or unavailable speaker-count evidence claims authority".to_owned(),
@@ -979,6 +1199,7 @@ fn entropy_term(probability: f64) -> f64 {
 
 /// Auditable result of applying one speaker-count request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeakerCountOutcome {
     pub request: SpeakerCountRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -994,10 +1215,12 @@ pub struct SpeakerCountOutcome {
 
 /// Complete typed diarization result attached to [`TranscriptionResult`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiarizationReport {
     pub implementation: String,
     pub contract_version: String,
     pub feature_schema: String,
+    pub speaker_evidence_mode: DiarizationSpeakerEvidenceMode,
     pub normalized_input_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint_document_sha256: Option<String>,
@@ -1010,9 +1233,1038 @@ pub struct DiarizationReport {
     pub speaker_count: SpeakerCountOutcome,
     pub fallback_status: DiarizationFallbackStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_partition: Option<DiarizationOperationalPartitionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neural_representation: Option<NeuralSpeakerRepresentationSummary>,
     #[serde(default)]
     pub diagnostics: Vec<String>,
+}
+
+impl DiarizationReport {
+    /// Validate the complete typed contract before a report crosses a durable
+    /// public boundary.
+    pub fn validate(&self) -> Result<(), String> {
+        if !lowercase_sha256(&self.normalized_input_sha256) {
+            return Err("normalized input digest is not lowercase SHA-256".to_owned());
+        }
+        if self
+            .hint_document_sha256
+            .as_ref()
+            .is_some_and(|digest| !lowercase_sha256(digest))
+        {
+            return Err("hint document digest is not lowercase SHA-256".to_owned());
+        }
+
+        let report_kind = classify_diarization_report(self)?;
+        if let Some(estimate) = self.speaker_count.estimate.as_ref() {
+            estimate
+                .validate()
+                .map_err(|error| format!("invalid speaker-count estimate: {error}"))?;
+        }
+        if let Some(partition) = self.operational_partition.as_ref() {
+            partition
+                .validate()
+                .map_err(|error| format!("invalid operational partition: {error}"))?;
+        }
+        if let Some(summary) = self.neural_representation.as_ref() {
+            summary
+                .validate()
+                .map_err(|error| format!("invalid neural representation: {error}"))?;
+            validate_neural_provider_binding(summary, report_kind)?;
+        }
+
+        validate_diarization_turns(&self.turns)?;
+        validate_speaker_profiles(&self.profiles)?;
+        validate_hint_evidence(&self.hint_evidence)?;
+        validate_speaker_queries(&self.speaker_queries)?;
+        validate_speaker_count_outcome(&self.speaker_count)?;
+        validate_speaker_count_estimate_request_binding(&self.speaker_count)?;
+        validate_diarization_references(self)?;
+
+        if self.hint_document_sha256.is_some() != !self.hint_evidence.is_empty() {
+            return Err(
+                "hint document digest and hint evidence must either both be present or both be absent"
+                    .to_owned(),
+            );
+        }
+        if let Some(partition) = self.operational_partition.as_ref() {
+            let estimate = self.speaker_count.estimate.as_ref().ok_or_else(|| {
+                "operational partition exists without a speaker-count estimate".to_owned()
+            })?;
+            if partition.calibration_sha256 != estimate.calibration_sha256 {
+                return Err(
+                    "operational partition and speaker-count estimate calibration digests differ"
+                        .to_owned(),
+                );
+            }
+            if partition.authority != estimate.calibration_status {
+                return Err(
+                    "operational partition authority differs from the speaker-count estimate"
+                        .to_owned(),
+                );
+            }
+            if partition.selected_count < estimate.constraint_lower_bound
+                || partition.selected_count > estimate.candidate_upper_bound
+            {
+                return Err(
+                    "operational partition count lies outside speaker-count candidate bounds"
+                        .to_owned(),
+                );
+            }
+            if partition.method == DiarizationOperationalPartitionMethod::FixedSafeAgglomerative
+                && (estimate.selected_count.is_some()
+                    || estimate.supported_range.is_some()
+                    || !estimate.posterior.is_empty()
+                    || estimate.unresolved_probability.to_bits() != 1.0_f64.to_bits()
+                    || estimate.entropy_bits.to_bits() != 0.0_f64.to_bits()
+                    || estimate.stability.to_bits() != 0.0_f64.to_bits())
+            {
+                return Err(
+                    "fixed-safe operational partition is paired with authoritative posterior fields"
+                        .to_owned(),
+                );
+            }
+        }
+
+        validate_report_calibration_binding(self)?;
+        validate_report_kind_invariants(self, report_kind)?;
+        Ok(())
+    }
+
+    /// Validate a report against the exact request that authorized its
+    /// execution. When the normalized duration is unavailable, the greatest
+    /// request/report interval end is used only as a conservative lower bound
+    /// so non-duration request invariants can still be checked.
+    pub fn validate_against_request(
+        &self,
+        request: &DiarizationRequest,
+        audio_duration_ms: Option<u64>,
+    ) -> Result<(), String> {
+        self.validate()?;
+
+        let observed_duration_lower_bound = request
+            .known_intervals
+            .iter()
+            .map(|hint| hint.end_ms)
+            .chain(self.turns.iter().map(|turn| turn.end_ms))
+            .chain(self.speaker_queries.iter().map(|query| query.end_ms))
+            .max()
+            .unwrap_or(0);
+        if let Some(duration_ms) = audio_duration_ms
+            && duration_ms < observed_duration_lower_bound
+        {
+            return Err(format!(
+                "diarization request/report interval end {observed_duration_lower_bound} exceeds audio duration {duration_ms}"
+            ));
+        }
+        request
+            .validate(audio_duration_ms.unwrap_or(observed_duration_lower_bound))
+            .map_err(|error| format!("invalid diarization request: {error}"))?;
+
+        if self.speaker_count.request != request.speaker_count {
+            return Err(
+                "diarization report speaker-count request differs from the execution request"
+                    .to_owned(),
+            );
+        }
+
+        let report_kind = classify_diarization_report(self)?;
+        validate_report_request_kind_binding(self, request, report_kind)?;
+        validate_report_hint_binding(self, request, report_kind)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiarizationReportKind {
+    NativeAcoustic,
+    NativeEcapaOnly,
+    NativeEcapaFused,
+    NativeEcapaUnavailable,
+    External,
+    FallbackUnknown,
+}
+
+fn classify_diarization_report(
+    report: &DiarizationReport,
+) -> Result<DiarizationReportKind, String> {
+    const ACOUSTIC_CONTRACT: &str = "acoustic-diarization-v3";
+    const NEURAL_CONTRACT: &str = "neural-diarization-common-v2";
+    const ACOUSTIC_FEATURE_V1: &str = "acoustic-feature-v1";
+    const ACOUSTIC_FEATURE_V2: &str = "acoustic-feature-v2";
+
+    let (kind, contract, feature_schema, evidence_mode) = match report.implementation.as_str() {
+        "native-acoustic-v1" => (
+            DiarizationReportKind::NativeAcoustic,
+            ACOUSTIC_CONTRACT,
+            ACOUSTIC_FEATURE_V1,
+            DiarizationSpeakerEvidenceMode::AcousticV2,
+        ),
+        "native-acoustic-v2" => (
+            DiarizationReportKind::NativeAcoustic,
+            ACOUSTIC_CONTRACT,
+            ACOUSTIC_FEATURE_V2,
+            DiarizationSpeakerEvidenceMode::AcousticV2,
+        ),
+        "native-ecapa-only-v1" => (
+            DiarizationReportKind::NativeEcapaOnly,
+            NEURAL_CONTRACT,
+            ACOUSTIC_FEATURE_V2,
+            DiarizationSpeakerEvidenceMode::EcapaOnly,
+        ),
+        "native-ecapa-fused-v1" => (
+            DiarizationReportKind::NativeEcapaFused,
+            NEURAL_CONTRACT,
+            ACOUSTIC_FEATURE_V2,
+            DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        ),
+        "native-ecapa-unavailable-v1" => (
+            DiarizationReportKind::NativeEcapaUnavailable,
+            NEURAL_CONTRACT,
+            ACOUSTIC_FEATURE_V2,
+            DiarizationSpeakerEvidenceMode::None,
+        ),
+        "external-backend" => (
+            DiarizationReportKind::External,
+            ACOUSTIC_CONTRACT,
+            "external-unreported",
+            DiarizationSpeakerEvidenceMode::External,
+        ),
+        "fallback-unknown" => (
+            DiarizationReportKind::FallbackUnknown,
+            ACOUSTIC_CONTRACT,
+            ACOUSTIC_FEATURE_V2,
+            DiarizationSpeakerEvidenceMode::None,
+        ),
+        implementation => {
+            return Err(format!(
+                "diarization implementation {implementation:?} is not admitted by the current report contract"
+            ));
+        }
+    };
+    if report.contract_version != contract
+        || report.feature_schema != feature_schema
+        || report.speaker_evidence_mode != evidence_mode
+    {
+        return Err(format!(
+            "diarization implementation {} requires contract {contract}, feature schema {feature_schema}, and evidence mode {evidence_mode:?}",
+            report.implementation
+        ));
+    }
+    Ok(kind)
+}
+
+fn validate_neural_provider_binding(
+    summary: &NeuralSpeakerRepresentationSummary,
+    kind: DiarizationReportKind,
+) -> Result<(), String> {
+    let native_ecapa_report = matches!(
+        kind,
+        DiarizationReportKind::NativeEcapaOnly
+            | DiarizationReportKind::NativeEcapaFused
+            | DiarizationReportKind::NativeEcapaUnavailable
+    );
+    if native_ecapa_report {
+        return validate_current_ecapa_provider(summary);
+    }
+    if summary.provider_version != crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION {
+        return Ok(());
+    }
+
+    validate_current_ecapa_provider(summary)
+}
+
+fn validate_current_ecapa_provider(
+    summary: &NeuralSpeakerRepresentationSummary,
+) -> Result<(), String> {
+    if summary.provider_version != crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION {
+        return Err("ECAPA execution declares an unrecognized provider version".to_owned());
+    }
+    let admitted_package_sha256 = crate::ecapa_conformance::ECAPA_PACKAGE_SHA256;
+    if summary.expected_model_package_sha256 != admitted_package_sha256 {
+        return Err(
+            "known ECAPA provider declares an unrecognized expected model package".to_owned(),
+        );
+    }
+    if summary
+        .loaded_model_package_sha256
+        .as_deref()
+        .is_some_and(|digest| digest != admitted_package_sha256)
+    {
+        return Err("known ECAPA provider claims an unrecognized loaded model package".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_report_calibration_binding(report: &DiarizationReport) -> Result<(), String> {
+    let expected_calibration_sha256 = match report.speaker_evidence_mode {
+        DiarizationSpeakerEvidenceMode::AcousticV2 => {
+            Some(crate::diarization::acoustic_speaker_pair_calibration_sha256())
+        }
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => Some(
+            crate::diarization::ecapa_speaker_pair_calibration_sha256(report.speaker_evidence_mode),
+        ),
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => None,
+    };
+    let Some(expected_calibration_sha256) = expected_calibration_sha256 else {
+        return Ok(());
+    };
+
+    if report
+        .speaker_count
+        .estimate
+        .as_ref()
+        .is_some_and(|estimate| estimate.calibration_sha256 != expected_calibration_sha256)
+    {
+        return Err(
+            "speaker-count estimate calibration digest is incompatible with the evidence mode"
+                .to_owned(),
+        );
+    }
+    if report
+        .operational_partition
+        .as_ref()
+        .is_some_and(|partition| partition.calibration_sha256 != expected_calibration_sha256)
+    {
+        return Err(
+            "operational partition calibration digest is incompatible with the evidence mode"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_report_request_kind_binding(
+    report: &DiarizationReport,
+    request: &DiarizationRequest,
+    kind: DiarizationReportKind,
+) -> Result<(), String> {
+    match kind {
+        DiarizationReportKind::NativeAcoustic => match request.engine {
+            DiarizationEngine::Auto | DiarizationEngine::Acoustic => {
+                if report.neural_representation.is_some() {
+                    return Err(
+                        "direct native acoustic report claims an unrequested neural attempt"
+                            .to_owned(),
+                    );
+                }
+            }
+            DiarizationEngine::Ecapa | DiarizationEngine::EcapaFused
+                if request.fallback == DiarizationFallbackPolicy::Acoustic =>
+            {
+                let summary = report.neural_representation.as_ref().ok_or_else(|| {
+                    "neural-to-acoustic fallback report omits neural attempt provenance".to_owned()
+                })?;
+                validate_current_ecapa_provider(summary)?;
+            }
+            _ => {
+                return Err(
+                    "native acoustic implementation is incompatible with the requested engine and fallback"
+                        .to_owned(),
+                );
+            }
+        },
+        DiarizationReportKind::NativeEcapaOnly => {
+            if request.engine != DiarizationEngine::Ecapa {
+                return Err(
+                    "ECAPA-only implementation is incompatible with the requested engine"
+                        .to_owned(),
+                );
+            }
+        }
+        DiarizationReportKind::NativeEcapaFused => {
+            if request.engine != DiarizationEngine::EcapaFused {
+                return Err(
+                    "fused ECAPA implementation is incompatible with the requested engine"
+                        .to_owned(),
+                );
+            }
+        }
+        DiarizationReportKind::NativeEcapaUnavailable => {
+            if !matches!(
+                request.engine,
+                DiarizationEngine::Ecapa | DiarizationEngine::EcapaFused
+            ) || request.fallback != DiarizationFallbackPolicy::Unknown
+            {
+                return Err(
+                    "unavailable ECAPA implementation is incompatible with the requested engine and fallback"
+                        .to_owned(),
+                );
+            }
+        }
+        DiarizationReportKind::External => {
+            validate_external_request_semantics(request)?;
+            match request.engine {
+                DiarizationEngine::Auto | DiarizationEngine::External => {
+                    if report.neural_representation.is_some() {
+                        return Err(
+                            "direct external report claims an unrequested neural attempt"
+                                .to_owned(),
+                        );
+                    }
+                }
+                DiarizationEngine::Acoustic
+                    if request.fallback == DiarizationFallbackPolicy::External =>
+                {
+                    if report.neural_representation.is_some() {
+                        return Err(
+                            "acoustic-to-external fallback report claims a neural attempt"
+                                .to_owned(),
+                        );
+                    }
+                }
+                DiarizationEngine::Ecapa | DiarizationEngine::EcapaFused
+                    if request.fallback == DiarizationFallbackPolicy::External =>
+                {
+                    let summary = report.neural_representation.as_ref().ok_or_else(|| {
+                        "neural-to-external fallback report omits neural attempt provenance"
+                            .to_owned()
+                    })?;
+                    validate_current_ecapa_provider(summary)?;
+                }
+                _ => {
+                    return Err(
+                        "external implementation is incompatible with the requested engine and fallback"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        DiarizationReportKind::FallbackUnknown => {
+            validate_external_request_semantics(request)?;
+            if !matches!(
+                request.engine,
+                DiarizationEngine::Auto | DiarizationEngine::External
+            ) || request.fallback != DiarizationFallbackPolicy::Unknown
+            {
+                return Err(
+                    "unknown fallback implementation is incompatible with the requested engine and fallback"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_external_request_semantics(request: &DiarizationRequest) -> Result<(), String> {
+    if !request.known_intervals.is_empty() {
+        return Err(
+            "external diarization cannot preserve known-speaker interval semantics".to_owned(),
+        );
+    }
+    if matches!(
+        request.speaker_count,
+        SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+    ) {
+        return Err(
+            "external diarization cannot preserve soft speaker-count request semantics".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_report_hint_binding(
+    report: &DiarizationReport,
+    request: &DiarizationRequest,
+    kind: DiarizationReportKind,
+) -> Result<(), String> {
+    if matches!(
+        kind,
+        DiarizationReportKind::External | DiarizationReportKind::FallbackUnknown
+    ) {
+        return Ok(());
+    }
+
+    let expected_digest = (!request.known_intervals.is_empty())
+        .then(|| crate::diarization::canonical_hint_document_sha256(&request.known_intervals));
+    if report.hint_document_sha256 != expected_digest {
+        return Err("diarization report hint digest differs from the execution request".to_owned());
+    }
+    if report.hint_evidence.len() != request.known_intervals.len() {
+        return Err(
+            "diarization report hint evidence does not cover every requested interval".to_owned(),
+        );
+    }
+    for (index, (evidence, hint)) in report
+        .hint_evidence
+        .iter()
+        .zip(&request.known_intervals)
+        .enumerate()
+    {
+        let expected_index = u64::try_from(index)
+            .map_err(|_| "diarization hint index exceeds the report schema".to_owned())?;
+        if evidence.hint_index != expected_index
+            || evidence.speaker_ref != hint.speaker_ref
+            || evidence.policy != hint.policy
+        {
+            return Err(format!(
+                "diarization hint evidence {index} does not identify its requested interval"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_report_kind_invariants(
+    report: &DiarizationReport,
+    kind: DiarizationReportKind,
+) -> Result<(), String> {
+    let native_success = matches!(
+        kind,
+        DiarizationReportKind::NativeAcoustic
+            | DiarizationReportKind::NativeEcapaOnly
+            | DiarizationReportKind::NativeEcapaFused
+    );
+    if native_success && report.speaker_count.estimate.is_none() {
+        return Err("native diarization reports require a speaker-count estimate".to_owned());
+    }
+    if native_success && report.fallback_status == DiarizationFallbackStatus::ExternalBackend {
+        return Err("native diarization cannot claim external-backend fallback status".to_owned());
+    }
+
+    match kind {
+        DiarizationReportKind::NativeAcoustic => {
+            if report
+                .operational_partition
+                .as_ref()
+                .is_some_and(|partition| {
+                    partition.method == DiarizationOperationalPartitionMethod::EcapaSpherical
+                })
+            {
+                return Err(
+                    "native acoustic evidence cannot claim an ECAPA spherical partition".to_owned(),
+                );
+            }
+        }
+        DiarizationReportKind::NativeEcapaOnly => {
+            let summary = report.neural_representation.as_ref().ok_or_else(|| {
+                "successful ECAPA-only diarization requires neural representation provenance"
+                    .to_owned()
+            })?;
+            if !matches!(
+                summary.status,
+                NeuralSpeakerRepresentationStatus::Ready
+                    | NeuralSpeakerRepresentationStatus::Degraded
+            ) {
+                return Err(
+                    "successful ECAPA-only diarization requires ready or degraded neural evidence"
+                        .to_owned(),
+                );
+            }
+        }
+        DiarizationReportKind::NativeEcapaFused => {
+            let summary = report.neural_representation.as_ref().ok_or_else(|| {
+                "successful fused ECAPA diarization requires neural representation provenance"
+                    .to_owned()
+            })?;
+            if !matches!(
+                summary.status,
+                NeuralSpeakerRepresentationStatus::Ready
+                    | NeuralSpeakerRepresentationStatus::Degraded
+            ) {
+                return Err(
+                    "successful fused ECAPA diarization requires ready or degraded neural evidence"
+                        .to_owned(),
+                );
+            }
+            if report
+                .operational_partition
+                .as_ref()
+                .is_some_and(|partition| {
+                    partition.method == DiarizationOperationalPartitionMethod::EcapaSpherical
+                })
+            {
+                return Err(
+                    "fused ECAPA evidence cannot claim an ECAPA-only spherical partition"
+                        .to_owned(),
+                );
+            }
+        }
+        DiarizationReportKind::NativeEcapaUnavailable => {
+            let summary = report.neural_representation.as_ref().ok_or_else(|| {
+                "unavailable ECAPA report requires neural attempt provenance".to_owned()
+            })?;
+            if summary.status != NeuralSpeakerRepresentationStatus::Unavailable {
+                return Err(
+                    "unavailable ECAPA report must carry unavailable neural provenance".to_owned(),
+                );
+            }
+            if report.speaker_count.estimate.is_some()
+                || report.operational_partition.is_some()
+                || !report.profiles.is_empty()
+                || !report.speaker_queries.is_empty()
+                || matches!(
+                    report.fallback_status,
+                    DiarizationFallbackStatus::NotNeeded
+                        | DiarizationFallbackStatus::ExternalBackend
+                )
+            {
+                return Err(
+                    "unavailable ECAPA report claims evidence that its fallback path cannot produce"
+                        .to_owned(),
+                );
+            }
+        }
+        DiarizationReportKind::External => {
+            if report.fallback_status != DiarizationFallbackStatus::ExternalBackend
+                || report.speaker_count.estimate.is_some()
+                || report.operational_partition.is_some()
+                || report.hint_document_sha256.is_some()
+                || !report.hint_evidence.is_empty()
+                || !report.speaker_queries.is_empty()
+            {
+                return Err(
+                    "external diarization report claims unsupported native or hint evidence"
+                        .to_owned(),
+                );
+            }
+            if report.speaker_count.unknown_voiced_share.to_bits() != 0.0_f64.to_bits()
+                || !report
+                    .speaker_count
+                    .reasons
+                    .contains(&SpeakerCountOutcomeReason::ExternalAttribution)
+                || report
+                    .speaker_count
+                    .speaker_evidence
+                    .iter()
+                    .any(|evidence| {
+                        evidence.reasons
+                            != vec![SpeakerEvidenceReason::SupportedByExternalAttribution]
+                    })
+            {
+                return Err(
+                    "external diarization report has inconsistent attribution evidence".to_owned(),
+                );
+            }
+        }
+        DiarizationReportKind::FallbackUnknown => {
+            if report.neural_representation.is_some()
+                || report.speaker_count.estimate.is_some()
+                || report.operational_partition.is_some()
+                || report.hint_document_sha256.is_some()
+                || !report.turns.is_empty()
+                || !report.profiles.is_empty()
+                || !report.hint_evidence.is_empty()
+                || !report.speaker_queries.is_empty()
+                || report.speaker_count.supported_speaker_count != 0
+                || !report.speaker_count.active_speaker_refs.is_empty()
+                || !report.speaker_count.speaker_evidence.is_empty()
+                || matches!(
+                    report.fallback_status,
+                    DiarizationFallbackStatus::NotNeeded
+                        | DiarizationFallbackStatus::ExternalBackend
+                )
+            {
+                return Err(
+                    "unknown fallback report claims speaker or model evidence that it cannot produce"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_diarization_turns(turns: &[DiarizationTurn]) -> Result<(), String> {
+    for (index, turn) in turns.iter().enumerate() {
+        if turn.end_ms <= turn.start_ms {
+            return Err(format!(
+                "diarization turn {index} has a non-positive interval"
+            ));
+        }
+        if let Some(speaker_ref) = turn.speaker_ref.as_deref() {
+            validate_report_speaker_ref(speaker_ref, "diarization turn speaker_ref")?;
+        } else if turn.speaker_confidence.is_some() {
+            return Err(format!(
+                "diarization turn {index} has confidence without a speaker reference"
+            ));
+        }
+        for (field, confidence) in [
+            ("speaker_confidence", turn.speaker_confidence),
+            ("change_confidence", turn.change_confidence),
+        ] {
+            if confidence.is_some_and(|value| !unit_interval(value)) {
+                return Err(format!(
+                    "diarization turn {index} {field} is not finite in 0..=1"
+                ));
+            }
+        }
+        if turn.hard_hint_attributed
+            && (turn.speaker_ref.is_none()
+                || turn.speaker_confidence.map(f64::to_bits) != Some(1.0_f64.to_bits())
+                || turn.overlap_suspected)
+        {
+            return Err(format!(
+                "diarization turn {index} has inconsistent hard-hint attribution"
+            ));
+        }
+        if let Some(previous) = index.checked_sub(1).and_then(|prior| turns.get(prior)) {
+            let previous_key = (
+                previous.start_ms,
+                previous.end_ms,
+                previous.speaker_ref.as_deref(),
+            );
+            let current_key = (turn.start_ms, turn.end_ms, turn.speaker_ref.as_deref());
+            if previous_key > current_key {
+                return Err("diarization turns are not deterministically time-ordered".to_owned());
+            }
+            if previous_key == current_key {
+                return Err("diarization turns contain a duplicate interval and speaker".to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_speaker_profiles(profiles: &[SpeakerProfileSummary]) -> Result<(), String> {
+    let mut speaker_refs = BTreeSet::new();
+    for profile in profiles {
+        validate_report_speaker_ref(&profile.speaker_ref, "speaker profile speaker_ref")?;
+        if !speaker_refs.insert(profile.speaker_ref.as_str()) {
+            return Err("speaker profiles contain a duplicate speaker_ref".to_owned());
+        }
+        if !unit_interval(profile.reliability) {
+            return Err("speaker profile reliability is not finite in 0..=1".to_owned());
+        }
+        if profile
+            .soft_hint_contradiction
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err("speaker profile contradiction is not finite and non-negative".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_hint_evidence(hints: &[SpeakerHintEvidenceSummary]) -> Result<(), String> {
+    let mut previous_index = None;
+    for hint in hints {
+        validate_report_speaker_ref(&hint.speaker_ref, "speaker hint evidence speaker_ref")?;
+        if previous_index.is_some_and(|previous| hint.hint_index <= previous) {
+            return Err("speaker hint evidence is not strictly index-ordered".to_owned());
+        }
+        previous_index = Some(hint.hint_index);
+        if !hint.applied_weight.is_finite() || hint.applied_weight < 0.0 {
+            return Err("speaker hint applied weight is not finite and non-negative".to_owned());
+        }
+        if hint
+            .contradiction_score
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err("speaker hint contradiction is not finite and non-negative".to_owned());
+        }
+        let disposition_count = hint
+            .accepted_tracklet_count
+            .checked_add(hint.rejected_tracklet_count)
+            .ok_or_else(|| "speaker hint tracklet counts overflow".to_owned())?;
+        if disposition_count != hint.usable_tracklet_count {
+            return Err(
+                "speaker hint accepted and rejected counts do not cover usable tracklets"
+                    .to_owned(),
+            );
+        }
+        let profile_count = hint
+            .profile_accepted_tracklet_count
+            .checked_add(hint.profile_downweighted_tracklet_count)
+            .and_then(|count| count.checked_add(hint.profile_quarantined_tracklet_count))
+            .ok_or_else(|| "speaker hint profile counts overflow".to_owned())?;
+        if profile_count > hint.accepted_tracklet_count {
+            return Err("speaker hint profile counts exceed accepted tracklets".to_owned());
+        }
+        if hint.usable_tracklet_count == 0 && hint.applied_weight.to_bits() != 0.0_f64.to_bits() {
+            return Err("speaker hint without usable tracklets carries applied weight".to_owned());
+        }
+        match hint.disposition {
+            SpeakerHintDisposition::HardAttributed
+                if hint.policy != KnownSpeakerPolicy::HardMustLink =>
+            {
+                return Err("hard-attributed hint does not use hard-must-link policy".to_owned());
+            }
+            SpeakerHintDisposition::Accepted
+                if hint.policy != KnownSpeakerPolicy::SoftEnrollment
+                    || hint.accepted_tracklet_count == 0
+                    || hint.rejected_tracklet_count != 0
+                    || hint.profile_downweighted_tracklet_count != 0
+                    || hint.profile_quarantined_tracklet_count != 0 =>
+            {
+                return Err("accepted speaker hint has inconsistent evidence counts".to_owned());
+            }
+            SpeakerHintDisposition::PartiallyAccepted
+                if hint.policy != KnownSpeakerPolicy::SoftEnrollment
+                    || hint.accepted_tracklet_count == 0
+                    || (hint.rejected_tracklet_count == 0
+                        && hint.profile_downweighted_tracklet_count == 0
+                        && hint.profile_quarantined_tracklet_count == 0) =>
+            {
+                return Err(
+                    "partially accepted speaker hint has inconsistent evidence counts".to_owned(),
+                );
+            }
+            SpeakerHintDisposition::Rejected
+                if hint.policy != KnownSpeakerPolicy::SoftEnrollment
+                    || hint.usable_tracklet_count == 0
+                    || hint.accepted_tracklet_count != 0 =>
+            {
+                return Err("rejected speaker hint has inconsistent evidence counts".to_owned());
+            }
+            SpeakerHintDisposition::NoUsableTracklets if hint.usable_tracklet_count != 0 => {
+                return Err("no-usable-tracklets hint claims usable evidence".to_owned());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_speaker_queries(queries: &[SpeakerAttributionQuery]) -> Result<(), String> {
+    const MAX_SPEAKER_QUERIES: usize = 32;
+    if queries.len() > MAX_SPEAKER_QUERIES {
+        return Err(format!(
+            "speaker attribution queries exceed the limit of {MAX_SPEAKER_QUERIES}"
+        ));
+    }
+    let mut query_ids = BTreeSet::new();
+    let mut previous_interval = None;
+    for query in queries {
+        if !lowercase_sha256(&query.query_id_sha256) {
+            return Err("speaker attribution query ID is not lowercase SHA-256".to_owned());
+        }
+        if !query_ids.insert(query.query_id_sha256.as_str()) {
+            return Err("speaker attribution queries contain a duplicate query ID".to_owned());
+        }
+        if query.end_ms <= query.start_ms {
+            return Err("speaker attribution query has a non-positive interval".to_owned());
+        }
+        if previous_interval.is_some_and(|previous| previous > (query.start_ms, query.end_ms)) {
+            return Err("speaker attribution queries are not time-ordered".to_owned());
+        }
+        previous_interval = Some((query.start_ms, query.end_ms));
+        let mut previous_speaker = None;
+        for speaker_ref in &query.candidate_speaker_refs {
+            validate_report_speaker_ref(speaker_ref, "speaker query candidate speaker_ref")?;
+            if previous_speaker.is_some_and(|previous: &str| previous >= speaker_ref.as_str()) {
+                return Err(
+                    "speaker query candidate references are not strictly ordered".to_owned(),
+                );
+            }
+            previous_speaker = Some(speaker_ref.as_str());
+        }
+        if query.reason == SpeakerAttributionQueryReason::UnknownAttribution
+            && !query.candidate_speaker_refs.is_empty()
+        {
+            return Err("unknown-attribution query claims candidate speakers".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_speaker_count_outcome(outcome: &SpeakerCountOutcome) -> Result<(), String> {
+    validate_speaker_count_request(&outcome.request)
+        .map_err(|error| format!("invalid speaker-count request in report: {error}"))?;
+    if outcome.supported_speaker_count > MAX_SPEAKER_COUNT {
+        return Err(format!(
+            "supported speaker count exceeds the limit of {MAX_SPEAKER_COUNT}"
+        ));
+    }
+    if !unit_interval(outcome.dominant_speaker_share)
+        || !unit_interval(outcome.unknown_voiced_share)
+    {
+        return Err("speaker occupancy shares are not finite in 0..=1".to_owned());
+    }
+    if outcome.dominant_speaker_share + outcome.unknown_voiced_share > 1.0 + 1.0e-9 {
+        return Err(
+            "speaker occupancy shares exceed the common voiced-time denominator".to_owned(),
+        );
+    }
+    if outcome.supported_speaker_count == 0
+        && outcome.dominant_speaker_share.to_bits() != 0.0_f64.to_bits()
+    {
+        return Err("zero supported speakers carry a non-zero dominant share".to_owned());
+    }
+    if outcome.reasons.is_empty() || slice_has_duplicates(&outcome.reasons) {
+        return Err("speaker-count outcome reasons are empty or duplicated".to_owned());
+    }
+
+    let mut active_refs = BTreeSet::new();
+    let mut previous_active_ref = None;
+    for speaker_ref in &outcome.active_speaker_refs {
+        validate_report_speaker_ref(speaker_ref, "active speaker_ref")?;
+        if previous_active_ref.is_some_and(|previous: &str| previous >= speaker_ref.as_str()) {
+            return Err("active speaker references are not strictly ordered".to_owned());
+        }
+        previous_active_ref = Some(speaker_ref.as_str());
+        active_refs.insert(speaker_ref.as_str());
+    }
+    if outcome.active_speaker_refs.len() != outcome.supported_speaker_count as usize {
+        return Err("supported speaker count does not match active references".to_owned());
+    }
+
+    let mut evidence_refs = BTreeSet::new();
+    let mut supported_evidence_refs = BTreeSet::new();
+    for evidence in &outcome.speaker_evidence {
+        validate_report_speaker_ref(&evidence.speaker_ref, "speaker evidence speaker_ref")?;
+        if !evidence_refs.insert(evidence.speaker_ref.as_str()) {
+            return Err("speaker evidence contains a duplicate speaker_ref".to_owned());
+        }
+        if evidence.independent_tracklet_count > evidence.assigned_tracklet_count
+            || evidence.recurrence_episode_count > evidence.independent_tracklet_count
+            || evidence.independent_voiced_frame_count > evidence.voiced_frame_count
+        {
+            return Err("speaker evidence independent counts exceed total counts".to_owned());
+        }
+        if !unit_interval(evidence.mean_assignment_confidence)
+            || !unit_interval(evidence.profile_reliability)
+        {
+            return Err("speaker evidence confidence is not finite in 0..=1".to_owned());
+        }
+        if evidence.reasons.is_empty() || slice_has_duplicates(&evidence.reasons) {
+            return Err("speaker evidence reasons are empty or duplicated".to_owned());
+        }
+        let has_support_reason = evidence.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                SpeakerEvidenceReason::SupportedByHardHint
+                    | SpeakerEvidenceReason::SupportedByIndependentRecurrence
+                    | SpeakerEvidenceReason::SupportedByRepeatedTracklets
+                    | SpeakerEvidenceReason::SupportedByHeldoutObservation
+                    | SpeakerEvidenceReason::SupportedByExternalAttribution
+            )
+        });
+        if evidence.supported != has_support_reason {
+            return Err("speaker evidence support flag disagrees with its reasons".to_owned());
+        }
+        if evidence.hard_anchored && !evidence.supported {
+            return Err("hard-anchored speaker evidence is not supported".to_owned());
+        }
+        if evidence.supported && !evidence.separated_from_supported_speakers {
+            return Err("supported speaker evidence is not robustly separated".to_owned());
+        }
+        if evidence.supported {
+            supported_evidence_refs.insert(evidence.speaker_ref.as_str());
+        }
+    }
+    if active_refs != supported_evidence_refs {
+        return Err("active speaker references do not match supported speaker evidence".to_owned());
+    }
+
+    match &outcome.request {
+        SpeakerCountRequest::HardConstraint { count } => {
+            let expected_status = if outcome.supported_speaker_count == *count {
+                SpeakerCountOutcomeStatus::Satisfied
+            } else {
+                SpeakerCountOutcomeStatus::Unsatisfied
+            };
+            if outcome.status != expected_status {
+                return Err("hard speaker-count request has inconsistent outcome status".to_owned());
+            }
+        }
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. }
+            if !matches!(
+                outcome.status,
+                SpeakerCountOutcomeStatus::Resolved | SpeakerCountOutcomeStatus::Unresolved
+            ) =>
+        {
+            return Err(
+                "soft speaker-count request has a hard-constraint outcome status".to_owned(),
+            );
+        }
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => {}
+    }
+    let required_reason = match outcome.status {
+        SpeakerCountOutcomeStatus::Resolved if outcome.supported_speaker_count == 0 => {
+            return Err("resolved speaker-count outcome has no supported speakers".to_owned());
+        }
+        SpeakerCountOutcomeStatus::Resolved => SpeakerCountOutcomeReason::EvidenceSupportedCount,
+        SpeakerCountOutcomeStatus::Satisfied => SpeakerCountOutcomeReason::RequestedCountMatched,
+        SpeakerCountOutcomeStatus::Unsatisfied => SpeakerCountOutcomeReason::RequestedCountMismatch,
+        SpeakerCountOutcomeStatus::Unresolved => {
+            if !outcome.reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable
+                        | SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved
+                        | SpeakerCountOutcomeReason::NoSupportedSpeakers
+                )
+            }) {
+                return Err(
+                    "unresolved speaker-count outcome lacks an unresolved reason".to_owned(),
+                );
+            }
+            return Ok(());
+        }
+    };
+    if !outcome.reasons.contains(&required_reason) {
+        return Err("speaker-count outcome status disagrees with its reasons".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_speaker_count_estimate_request_binding(
+    outcome: &SpeakerCountOutcome,
+) -> Result<(), String> {
+    if outcome.status == SpeakerCountOutcomeStatus::Satisfied
+        && let SpeakerCountRequest::HardConstraint { count } = &outcome.request
+        && let Some(estimate) = outcome.estimate.as_ref()
+        && (estimate.constraint_lower_bound != *count || estimate.candidate_upper_bound != *count)
+    {
+        return Err(
+            "hard speaker-count request does not match the estimate candidate bounds".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_diarization_references(report: &DiarizationReport) -> Result<(), String> {
+    let active_refs = report
+        .speaker_count
+        .active_speaker_refs
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for turn in &report.turns {
+        if turn
+            .speaker_ref
+            .as_deref()
+            .is_some_and(|speaker_ref| !active_refs.contains(speaker_ref))
+        {
+            return Err("diarization turn references a non-active speaker".to_owned());
+        }
+    }
+    for query in &report.speaker_queries {
+        if query
+            .candidate_speaker_refs
+            .iter()
+            .any(|speaker_ref| !active_refs.contains(speaker_ref.as_str()))
+        {
+            return Err("speaker query references a non-active candidate".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_report_speaker_ref(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} is empty"));
+    }
+    if value.len() > MAX_SPEAKER_REF_BYTES {
+        return Err(format!(
+            "{field} exceeds the {MAX_SPEAKER_REF_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
+
+fn slice_has_duplicates<T: PartialEq>(values: &[T]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[..index].contains(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1512,6 +2764,16 @@ mod tests {
                 unavailable_reason: Some(SpeakerCountLaneUnavailableReason::NotRequested),
             },
         ]
+    }
+
+    fn hard_one_speaker_count_lanes() -> Vec<SpeakerCountLaneEvidence> {
+        let mut lanes = complete_speaker_count_lanes();
+        for lane in &mut lanes {
+            if lane.proposed_count.is_some() {
+                lane.proposed_count = Some(1);
+            }
+        }
+        lanes
     }
 
     fn speaker_count_resources() -> SpeakerCountResourceSummary {
@@ -3756,6 +5018,41 @@ mod tests {
         let parsed: DiarizationRequest = serde_json::from_str(&json).expect("deserialize request");
         assert_eq!(parsed, request);
         assert!(request.validate(1_000).is_ok());
+
+        let acoustic_fallback = DiarizationRequest {
+            engine: DiarizationEngine::EcapaFused,
+            fallback: DiarizationFallbackPolicy::Acoustic,
+            ..DiarizationRequest::default()
+        };
+        let json = serde_json::to_string(&acoustic_fallback).expect("serialize acoustic fallback");
+        assert!(json.contains("\"fallback\":\"acoustic\""));
+        assert_eq!(
+            serde_json::from_str::<DiarizationRequest>(&json)
+                .expect("deserialize acoustic fallback"),
+            acoustic_fallback
+        );
+        for (engine, encoded) in [
+            (DiarizationEngine::Ecapa, "ecapa"),
+            (DiarizationEngine::EcapaFused, "ecapa_fused"),
+        ] {
+            let request = DiarizationRequest {
+                engine,
+                ..DiarizationRequest::default()
+            };
+            let json = serde_json::to_string(&request).expect("serialize ECAPA mode");
+            assert!(json.contains(&format!("\"engine\":\"{encoded}\"")));
+            assert_eq!(
+                serde_json::from_str::<DiarizationRequest>(&json).expect("parse ECAPA mode"),
+                request
+            );
+        }
+        assert!(
+            serde_json::from_str::<DiarizationRequest>(
+                r#"{"engine":"neural","fallback":"unknown","speaker_count":"infer","known_intervals":[],"enrollment_edge_guard_ms":100,"max_prototypes":512,"persist_profiles":false}"#,
+            )
+            .is_err(),
+            "the ambiguous legacy neural mode must not silently choose a fusion policy"
+        );
     }
 
     #[test]
@@ -3929,12 +5226,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn diarization_report_is_typed_and_privacy_safe() {
-        let report = DiarizationReport {
-            implementation: "native_acoustic".to_owned(),
-            contract_version: "acoustic-diarization-v2".to_owned(),
-            feature_schema: "acoustic-feature-v1".to_owned(),
+    fn typed_diarization_report_fixture() -> DiarizationReport {
+        let unresolved_probability = 0.2_f64;
+        let concrete_probability = 0.8_f64;
+        let calibration_sha256 = crate::diarization::acoustic_speaker_pair_calibration_sha256();
+        DiarizationReport {
+            implementation: "native-acoustic-v2".to_owned(),
+            contract_version: "acoustic-diarization-v3".to_owned(),
+            feature_schema: "acoustic-feature-v2".to_owned(),
+            speaker_evidence_mode: DiarizationSpeakerEvidenceMode::AcousticV2,
             normalized_input_sha256:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             hint_document_sha256: Some(
@@ -3944,7 +5244,7 @@ mod tests {
                 start_ms: 0,
                 end_ms: 1_000,
                 speaker_ref: Some("near".to_owned()),
-                speaker_confidence: Some(0.91),
+                speaker_confidence: Some(1.0),
                 change_confidence: Some(0.84),
                 overlap_suspected: false,
                 hard_hint_attributed: true,
@@ -3987,7 +5287,31 @@ mod tests {
             }],
             speaker_count: SpeakerCountOutcome {
                 request: SpeakerCountRequest::HardConstraint { count: 1 },
-                estimate: None,
+                estimate: Some(SpeakerCountEstimate {
+                    schema_version: "speaker-count-estimate-v2".to_owned(),
+                    selected_count: Some(1),
+                    supported_range: Some(SpeakerCountRange {
+                        minimum: 1,
+                        maximum: 1,
+                    }),
+                    posterior: vec![SpeakerCountPosteriorBin {
+                        count: 1,
+                        probability: concrete_probability,
+                    }],
+                    unresolved_probability,
+                    entropy_bits: entropy_term(concrete_probability)
+                        + entropy_term(unresolved_probability),
+                    stability: 0.8,
+                    constraint_lower_bound: 1,
+                    candidate_upper_bound: 1,
+                    calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+                    calibration_sha256: calibration_sha256.clone(),
+                    evidence_sha256:
+                        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                            .to_owned(),
+                    lanes: hard_one_speaker_count_lanes(),
+                    resources: speaker_count_resources(),
+                }),
                 status: SpeakerCountOutcomeStatus::Satisfied,
                 supported_speaker_count: 1,
                 active_speaker_refs: vec!["near".to_owned()],
@@ -4002,7 +5326,7 @@ mod tests {
                     voiced_frame_count: 72,
                     independent_voiced_frame_count: 72,
                     voiced_duration_ms: 720,
-                    mean_assignment_confidence: 0.91,
+                    mean_assignment_confidence: 1.0,
                     profile_reliability: 0.9,
                     hard_anchored: true,
                     separated_from_supported_speakers: true,
@@ -4011,15 +5335,852 @@ mod tests {
                 }],
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
+            operational_partition: Some(DiarizationOperationalPartitionSummary {
+                schema_version: "diarization-operational-partition-v1".to_owned(),
+                method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
+                selected_count: 1,
+                confidence: 0.42,
+                calibration_sha256,
+                authority: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            }),
             neural_representation: None,
             diagnostics: Vec::new(),
+        }
+    }
+
+    fn ready_neural_summary() -> NeuralSpeakerRepresentationSummary {
+        NeuralSpeakerRepresentationSummary {
+            schema_version: "neural-speaker-representation-summary-v1".to_owned(),
+            provider_version: crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
+            expected_model_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256
+                .to_owned(),
+            loaded_model_package_sha256: Some(
+                crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
+            ),
+            model_load_source: Some(NeuralModelLoadSource::Direct),
+            status: NeuralSpeakerRepresentationStatus::Ready,
+            embedded_tracklet_count: 1,
+            zero_padded_tracklet_count: 0,
+            skipped_tracklet_count: 0,
+            reasons: Vec::new(),
+        }
+    }
+
+    fn unavailable_neural_summary() -> NeuralSpeakerRepresentationSummary {
+        NeuralSpeakerRepresentationSummary {
+            schema_version: "neural-speaker-representation-summary-v1".to_owned(),
+            provider_version: crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
+            expected_model_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256
+                .to_owned(),
+            loaded_model_package_sha256: None,
+            model_load_source: None,
+            status: NeuralSpeakerRepresentationStatus::Unavailable,
+            embedded_tracklet_count: 0,
+            zero_padded_tracklet_count: 0,
+            skipped_tracklet_count: 0,
+            reasons: vec![NeuralSpeakerRepresentationReason::ModelUnavailable],
+        }
+    }
+
+    fn set_report_calibration_for_mode(
+        report: &mut DiarizationReport,
+        mode: DiarizationSpeakerEvidenceMode,
+    ) -> Result<(), &'static str> {
+        let calibration_sha256 = match mode {
+            DiarizationSpeakerEvidenceMode::AcousticV2 => {
+                crate::diarization::acoustic_speaker_pair_calibration_sha256()
+            }
+            DiarizationSpeakerEvidenceMode::EcapaOnly
+            | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+                crate::diarization::ecapa_speaker_pair_calibration_sha256(mode)
+            }
+            DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => {
+                return Err("test helper requires a native evidence mode");
+            }
         };
+        report
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("native test report estimate")
+            .calibration_sha256
+            .clone_from(&calibration_sha256);
+        report
+            .operational_partition
+            .as_mut()
+            .expect("native test report partition")
+            .calibration_sha256 = calibration_sha256;
+        Ok(())
+    }
+
+    fn external_diarization_report_fixture() -> DiarizationReport {
+        let mut report = typed_diarization_report_fixture();
+        report.implementation = "external-backend".to_owned();
+        report.feature_schema = "external-unreported".to_owned();
+        report.speaker_evidence_mode = DiarizationSpeakerEvidenceMode::External;
+        report.hint_document_sha256 = None;
+        report.hint_evidence.clear();
+        report.speaker_queries.clear();
+        report.speaker_count.estimate = None;
+        report.speaker_count.reasons = vec![
+            SpeakerCountOutcomeReason::ExternalAttribution,
+            SpeakerCountOutcomeReason::RequestedCountMatched,
+        ];
+        report.speaker_count.speaker_evidence = vec![SpeakerEvidenceSummary {
+            speaker_ref: "near".to_owned(),
+            assigned_tracklet_count: 1,
+            independent_tracklet_count: 1,
+            recurrence_episode_count: 1,
+            voiced_frame_count: 0,
+            independent_voiced_frame_count: 0,
+            voiced_duration_ms: 1_000,
+            mean_assignment_confidence: 0.0,
+            profile_reliability: 0.0,
+            hard_anchored: false,
+            separated_from_supported_speakers: true,
+            reasons: vec![SpeakerEvidenceReason::SupportedByExternalAttribution],
+            supported: true,
+        }];
+        report.turns[0].speaker_confidence = None;
+        report.turns[0].change_confidence = None;
+        report.turns[0].hard_hint_attributed = false;
+        report.profiles[0] = SpeakerProfileSummary {
+            speaker_ref: "near".to_owned(),
+            frame_count: 0,
+            voiced_duration_ms: 1_000,
+            reliability: 0.0,
+            voice_profile_count: 0,
+            channel_profile_count: 0,
+            training_accepted_count: 0,
+            training_downweighted_count: 0,
+            training_quarantined_count: 0,
+            anchored: false,
+            soft_hint_contradiction: None,
+        };
+        report.fallback_status = DiarizationFallbackStatus::ExternalBackend;
+        report.operational_partition = None;
+        report
+    }
+
+    fn unknown_diarization_report_fixture() -> DiarizationReport {
+        let mut report = typed_diarization_report_fixture();
+        report.implementation = "fallback-unknown".to_owned();
+        report.feature_schema = "acoustic-feature-v2".to_owned();
+        report.speaker_evidence_mode = DiarizationSpeakerEvidenceMode::None;
+        report.hint_document_sha256 = None;
+        report.turns.clear();
+        report.profiles.clear();
+        report.hint_evidence.clear();
+        report.speaker_queries.clear();
+        report.speaker_count = SpeakerCountOutcome {
+            request: SpeakerCountRequest::Infer,
+            estimate: None,
+            status: SpeakerCountOutcomeStatus::Unresolved,
+            supported_speaker_count: 0,
+            active_speaker_refs: Vec::new(),
+            dominant_speaker_share: 0.0,
+            unknown_voiced_share: 1.0,
+            reasons: vec![SpeakerCountOutcomeReason::NoSupportedSpeakers],
+            speaker_evidence: Vec::new(),
+        };
+        report.fallback_status = DiarizationFallbackStatus::InsufficientEvidence;
+        report.operational_partition = None;
+        report.neural_representation = None;
+        report
+    }
+
+    fn fixed_safe_diarization_report_fixture() -> DiarizationReport {
+        let mut report = typed_diarization_report_fixture();
+        let estimate = report
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("native test report estimate");
+        estimate.selected_count = None;
+        estimate.supported_range = None;
+        estimate.posterior.clear();
+        estimate.unresolved_probability = 1.0;
+        estimate.entropy_bits = 0.0;
+        estimate.stability = 0.0;
+        estimate.calibration_status = SpeakerCountCalibrationStatus::FixedSafeUncalibrated;
+        let partition = report
+            .operational_partition
+            .as_mut()
+            .expect("native test report partition");
+        partition.method = DiarizationOperationalPartitionMethod::FixedSafeAgglomerative;
+        partition.confidence = 0.0;
+        partition.authority = SpeakerCountCalibrationStatus::FixedSafeUncalibrated;
+        report
+    }
+
+    fn use_infer_count_request(report: &mut DiarizationReport) {
+        report.speaker_count.request = SpeakerCountRequest::Infer;
+        report.speaker_count.status = SpeakerCountOutcomeStatus::Resolved;
+        report.speaker_count.reasons = vec![SpeakerCountOutcomeReason::EvidenceSupportedCount];
+        let estimate = report
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("native test report estimate");
+        estimate.candidate_upper_bound = 5;
+        estimate.lanes = complete_speaker_count_lanes();
+    }
+
+    fn matching_acoustic_request(report: &mut DiarizationReport) -> DiarizationRequest {
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            fallback: DiarizationFallbackPolicy::Unknown,
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
+            known_intervals: vec![speaker_hint(
+                "near",
+                0,
+                1_000,
+                KnownSpeakerPolicy::HardMustLink,
+            )],
+            ..DiarizationRequest::default()
+        };
+        report.hint_document_sha256 = Some(crate::diarization::canonical_hint_document_sha256(
+            &request.known_intervals,
+        ));
+        request
+    }
+
+    #[test]
+    fn diarization_report_is_typed_and_privacy_safe() {
+        let report = typed_diarization_report_fixture();
         let json = serde_json::to_string(&report).expect("serialize report");
         assert!(!json.contains("feature_vector"));
         assert!(!json.contains("raw_audio"));
+        report
+            .operational_partition
+            .as_ref()
+            .expect("typed operational partition")
+            .validate()
+            .expect("valid operational partition");
         assert_eq!(
             serde_json::from_str::<DiarizationReport>(&json).expect("deserialize report"),
             report
+        );
+        report.validate().expect("valid report contract");
+    }
+
+    #[test]
+    fn all_production_diarization_report_tuples_validate() {
+        let mut acoustic_v1 = typed_diarization_report_fixture();
+        acoustic_v1.implementation = "native-acoustic-v1".to_owned();
+        acoustic_v1.feature_schema = "acoustic-feature-v1".to_owned();
+        acoustic_v1.validate().expect("native acoustic v1 tuple");
+
+        let mut acoustic_fallback = typed_diarization_report_fixture();
+        acoustic_fallback.neural_representation = Some(ready_neural_summary());
+        acoustic_fallback
+            .validate()
+            .expect("acoustic fallback may retain valid neural attempt provenance");
+
+        let mut ecapa_only = typed_diarization_report_fixture();
+        ecapa_only.implementation = "native-ecapa-only-v1".to_owned();
+        ecapa_only.contract_version = "neural-diarization-common-v2".to_owned();
+        ecapa_only.speaker_evidence_mode = DiarizationSpeakerEvidenceMode::EcapaOnly;
+        ecapa_only.neural_representation = Some(ready_neural_summary());
+        set_report_calibration_for_mode(&mut ecapa_only, DiarizationSpeakerEvidenceMode::EcapaOnly)
+            .expect("ECAPA-only test calibration");
+        ecapa_only
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .method = DiarizationOperationalPartitionMethod::EcapaSpherical;
+        ecapa_only.validate().expect("native ECAPA-only tuple");
+
+        let mut ecapa_fused = ecapa_only.clone();
+        ecapa_fused.implementation = "native-ecapa-fused-v1".to_owned();
+        ecapa_fused.speaker_evidence_mode =
+            DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel;
+        set_report_calibration_for_mode(
+            &mut ecapa_fused,
+            DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        )
+        .expect("fused ECAPA test calibration");
+        ecapa_fused
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .method = DiarizationOperationalPartitionMethod::ProbabilisticConsensus;
+        ecapa_fused.validate().expect("native fused ECAPA tuple");
+
+        let mut external = external_diarization_report_fixture();
+        external.neural_representation = Some(ready_neural_summary());
+        external
+            .validate()
+            .expect("external fallback may retain valid neural attempt provenance");
+
+        unknown_diarization_report_fixture()
+            .validate()
+            .expect("unknown fallback tuple");
+
+        let mut unavailable = unknown_diarization_report_fixture();
+        unavailable.implementation = "native-ecapa-unavailable-v1".to_owned();
+        unavailable.contract_version = "neural-diarization-common-v2".to_owned();
+        unavailable.neural_representation = Some(unavailable_neural_summary());
+        unavailable
+            .validate()
+            .expect("unavailable ECAPA tuple with honest provenance");
+    }
+
+    #[test]
+    fn diarization_request_rejects_unknown_sensitive_fields_at_every_nested_level() {
+        let request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::Prior {
+                bins: vec![SpeakerCountPriorMass {
+                    count: 1,
+                    probability: 1.0,
+                }],
+            },
+            known_intervals: vec![speaker_hint(
+                "near",
+                0,
+                100,
+                KnownSpeakerPolicy::SoftEnrollment,
+            )],
+            ..DiarizationRequest::default()
+        };
+        let value = serde_json::to_value(request).expect("request JSON");
+
+        let mut top_level = value.clone();
+        top_level["raw_audio"] = json!([0, 1]);
+        assert!(serde_json::from_value::<DiarizationRequest>(top_level).is_err());
+
+        let mut interval = value.clone();
+        interval["known_intervals"][0]["embedding"] = json!([0.1, 0.2]);
+        assert!(serde_json::from_value::<DiarizationRequest>(interval).is_err());
+
+        let mut count_request = value.clone();
+        count_request["speaker_count"]["raw_audio"] = json!([0, 1]);
+        assert!(serde_json::from_value::<DiarizationRequest>(count_request).is_err());
+
+        let mut prior_bin = value;
+        prior_bin["speaker_count"]["bins"][0]["embedding"] = json!([0.1]);
+        assert!(serde_json::from_value::<DiarizationRequest>(prior_bin).is_err());
+    }
+
+    #[test]
+    fn diarization_report_rejects_unknown_sensitive_fields_at_every_nested_level() {
+        let value = serde_json::to_value(typed_diarization_report_fixture()).expect("report JSON");
+
+        let mut top_level = value.clone();
+        top_level["embedding"] = json!([0.1]);
+        assert!(serde_json::from_value::<DiarizationReport>(top_level).is_err());
+
+        let mut turn = value.clone();
+        turn["turns"][0]["raw_audio"] = json!([0, 1]);
+        assert!(serde_json::from_value::<DiarizationReport>(turn).is_err());
+
+        let mut profile = value.clone();
+        profile["profiles"][0]["embedding"] = json!([0.1]);
+        assert!(serde_json::from_value::<DiarizationReport>(profile).is_err());
+
+        let mut hint = value.clone();
+        hint["hint_evidence"][0]["raw_audio"] = json!([0, 1]);
+        assert!(serde_json::from_value::<DiarizationReport>(hint).is_err());
+
+        let mut query = value.clone();
+        query["speaker_queries"][0]["embedding"] = json!([0.1]);
+        assert!(serde_json::from_value::<DiarizationReport>(query).is_err());
+
+        let mut outcome = value.clone();
+        outcome["speaker_count"]["raw_audio"] = json!([0, 1]);
+        assert!(serde_json::from_value::<DiarizationReport>(outcome).is_err());
+
+        let mut evidence = value;
+        evidence["speaker_count"]["speaker_evidence"][0]["embedding"] = json!([0.1]);
+        assert!(serde_json::from_value::<DiarizationReport>(evidence).is_err());
+    }
+
+    #[test]
+    fn forged_certification_is_rejected_without_an_admitted_digest_registry() {
+        let mut report = typed_diarization_report_fixture();
+        report
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("estimate")
+            .calibration_status = SpeakerCountCalibrationStatus::Certified;
+        assert!(
+            report
+                .validate()
+                .expect_err("forged estimate certification must fail")
+                .contains("not admitted")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        use_infer_count_request(&mut report);
+        report
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .authority = SpeakerCountCalibrationStatus::Certified;
+        assert!(
+            report
+                .validate()
+                .expect_err("forged partition certification must fail")
+                .contains("not admitted")
+        );
+    }
+
+    #[test]
+    fn operational_partition_authority_matrix_preserves_distinct_actions() {
+        fixed_safe_diarization_report_fixture()
+            .validate()
+            .expect("fixed-safe partition with unavailable posterior fields");
+
+        let mut report = typed_diarization_report_fixture();
+        use_infer_count_request(&mut report);
+        report
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .selected_count = 2;
+        report
+            .validate()
+            .expect("operational hierarchy count may differ from the posterior MAP");
+
+        let mut report = typed_diarization_report_fixture();
+        report
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("estimate")
+            .selected_count = None;
+        report
+            .validate()
+            .expect("finalization may clear a posterior selection without erasing the partition");
+
+        let mut report = fixed_safe_diarization_report_fixture();
+        report
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .method = DiarizationOperationalPartitionMethod::ProbabilisticConsensus;
+        report
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .authority = SpeakerCountCalibrationStatus::DevelopmentUncertified;
+        assert!(
+            report
+                .validate()
+                .expect_err("partition and estimate authorities must match")
+                .contains("authority differs")
+        );
+
+        let mut estimate = fixed_safe_diarization_report_fixture()
+            .speaker_count
+            .estimate
+            .expect("estimate");
+        estimate.stability = 0.5;
+        assert!(
+            estimate
+                .validate()
+                .expect_err("fixed-safe estimates cannot claim posterior stability")
+                .contains("claims authority")
+        );
+    }
+
+    #[test]
+    fn diarization_report_binds_known_provider_and_evidence_calibration() {
+        let mut report = typed_diarization_report_fixture();
+        report
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("estimate")
+            .calibration_sha256 = "f".repeat(64);
+        report
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .calibration_sha256 = "f".repeat(64);
+        assert!(
+            report
+                .validate()
+                .expect_err("acoustic evidence must use the admitted calibration")
+                .contains("incompatible with the evidence mode")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report.implementation = "native-ecapa-only-v1".to_owned();
+        report.contract_version = "neural-diarization-common-v2".to_owned();
+        report.speaker_evidence_mode = DiarizationSpeakerEvidenceMode::EcapaOnly;
+        let mut summary = ready_neural_summary();
+        summary.provider_version = "unrecognized-ecapa-provider".to_owned();
+        report.neural_representation = Some(summary);
+        report
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .method = DiarizationOperationalPartitionMethod::EcapaSpherical;
+        set_report_calibration_for_mode(&mut report, DiarizationSpeakerEvidenceMode::EcapaOnly)
+            .expect("ECAPA-only test calibration");
+        assert!(
+            report
+                .validate()
+                .expect_err("native ECAPA report must use the admitted provider version")
+                .contains("unrecognized provider version")
+        );
+
+        let mut report = external_diarization_report_fixture();
+        let mut summary = ready_neural_summary();
+        summary.provider_version =
+            crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned();
+        summary.expected_model_package_sha256 = "f".repeat(64);
+        summary.loaded_model_package_sha256 = Some("f".repeat(64));
+        report.neural_representation = Some(summary);
+        assert!(
+            report
+                .validate()
+                .expect_err("known provider must bind its package digest")
+                .contains("unrecognized expected model package")
+        );
+
+        let mut report = external_diarization_report_fixture();
+        let mut summary = ready_neural_summary();
+        summary.provider_version =
+            crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned();
+        summary.expected_model_package_sha256 =
+            crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned();
+        summary.loaded_model_package_sha256 =
+            Some(crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned());
+        report.neural_representation = Some(summary);
+        report
+            .validate()
+            .expect("known provider with the admitted package digest");
+    }
+
+    #[test]
+    fn diarization_report_validates_against_exact_request() {
+        let mut report = typed_diarization_report_fixture();
+        let request = matching_acoustic_request(&mut report);
+        report
+            .validate_against_request(&request, None)
+            .expect("unknown audio duration uses observed intervals as a lower bound");
+        report
+            .validate_against_request(&request, Some(1_500))
+            .expect("known audio duration covers all intervals");
+        assert!(
+            report
+                .validate_against_request(&request, Some(1_499))
+                .expect_err("reported intervals cannot exceed the known audio duration")
+                .contains("exceeds audio duration")
+        );
+
+        let mut mismatched_count = request.clone();
+        mismatched_count.speaker_count = SpeakerCountRequest::HardConstraint { count: 2 };
+        assert!(
+            report
+                .validate_against_request(&mismatched_count, None)
+                .expect_err("report must bind the exact count request")
+                .contains("speaker-count request differs")
+        );
+
+        let mut mismatched_hint = request.clone();
+        mismatched_hint.known_intervals[0].confidence = 0.5;
+        assert!(
+            report
+                .validate_against_request(&mismatched_hint, None)
+                .expect_err("report must bind the canonical hint document")
+                .contains("hint digest differs")
+        );
+
+        let mut mismatched_identity = request.clone();
+        mismatched_identity.known_intervals[0].speaker_ref = "other".to_owned();
+        let mut identity_report = report.clone();
+        identity_report.hint_document_sha256 =
+            Some(crate::diarization::canonical_hint_document_sha256(
+                &mismatched_identity.known_intervals,
+            ));
+        assert!(
+            identity_report
+                .validate_against_request(&mismatched_identity, None)
+                .expect_err("hint evidence identities must match the request")
+                .contains("does not identify")
+        );
+
+        let mut mismatched_engine = request.clone();
+        mismatched_engine.engine = DiarizationEngine::External;
+        assert!(
+            report
+                .validate_against_request(&mismatched_engine, None)
+                .expect_err("native report cannot satisfy an external request")
+                .contains("incompatible with the requested engine")
+        );
+    }
+
+    #[test]
+    fn report_request_binding_admits_only_honest_fallback_paths() {
+        let mut acoustic_fallback = typed_diarization_report_fixture();
+        let mut acoustic_fallback_request = matching_acoustic_request(&mut acoustic_fallback);
+        acoustic_fallback_request.engine = DiarizationEngine::EcapaFused;
+        acoustic_fallback_request.fallback = DiarizationFallbackPolicy::Acoustic;
+        acoustic_fallback.neural_representation = Some(unavailable_neural_summary());
+        acoustic_fallback
+            .validate_against_request(&acoustic_fallback_request, None)
+            .expect("neural request may fall back to acoustic with attempt provenance");
+
+        let mut forged_acoustic_fallback = acoustic_fallback.clone();
+        forged_acoustic_fallback
+            .neural_representation
+            .as_mut()
+            .expect("neural attempt")
+            .provider_version = "unrecognized-ecapa-provider".to_owned();
+        assert!(
+            forged_acoustic_fallback
+                .validate_against_request(&acoustic_fallback_request, None)
+                .expect_err("ECAPA fallback provenance must bind the admitted provider")
+                .contains("unrecognized provider version")
+        );
+
+        let external = external_diarization_report_fixture();
+        let external_request = DiarizationRequest {
+            engine: DiarizationEngine::External,
+            fallback: DiarizationFallbackPolicy::Error,
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
+            ..DiarizationRequest::default()
+        };
+        external
+            .validate_against_request(&external_request, None)
+            .expect("direct external report with preservable request semantics");
+
+        let mut external_fallback = external.clone();
+        external_fallback.neural_representation = Some(unavailable_neural_summary());
+        let neural_external_request = DiarizationRequest {
+            engine: DiarizationEngine::Ecapa,
+            fallback: DiarizationFallbackPolicy::External,
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
+            ..DiarizationRequest::default()
+        };
+        external_fallback
+            .validate_against_request(&neural_external_request, None)
+            .expect("neural request may fall back externally with attempt provenance");
+
+        let mut lossy_external_request = external_request.clone();
+        lossy_external_request.known_intervals = vec![speaker_hint(
+            "near",
+            0,
+            500,
+            KnownSpeakerPolicy::HardMustLink,
+        )];
+        assert!(
+            external
+                .validate_against_request(&lossy_external_request, None)
+                .expect_err("external report cannot silently discard hints")
+                .contains("cannot preserve known-speaker")
+        );
+
+        let unknown = unknown_diarization_report_fixture();
+        let unknown_request = DiarizationRequest {
+            engine: DiarizationEngine::External,
+            fallback: DiarizationFallbackPolicy::Unknown,
+            ..DiarizationRequest::default()
+        };
+        unknown
+            .validate_against_request(&unknown_request, None)
+            .expect("external unavailability may conservatively emit unknown");
+    }
+
+    #[test]
+    fn diarization_report_validation_rejects_cross_object_inconsistency() {
+        let mut report = typed_diarization_report_fixture();
+        report.normalized_input_sha256 = "A".repeat(64);
+        assert!(report.validate().unwrap_err().contains("normalized input"));
+
+        let mut report = typed_diarization_report_fixture();
+        report.turns[0].speaker_confidence = Some(1.1);
+        assert!(
+            report
+                .validate()
+                .unwrap_err()
+                .contains("speaker_confidence")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report.profiles[0].reliability = f64::NAN;
+        assert!(
+            report
+                .validate()
+                .unwrap_err()
+                .contains("profile reliability")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report.hint_evidence[0].accepted_tracklet_count = 0;
+        assert!(report.validate().unwrap_err().contains("do not cover"));
+
+        let mut report = typed_diarization_report_fixture();
+        report.speaker_queries[0].query_id_sha256 = "invalid".to_owned();
+        assert!(report.validate().unwrap_err().contains("query ID"));
+
+        let mut report = typed_diarization_report_fixture();
+        report.speaker_count.active_speaker_refs.clear();
+        assert!(report.validate().unwrap_err().contains("active references"));
+
+        let mut report = typed_diarization_report_fixture();
+        report.speaker_count.unknown_voiced_share = 0.1;
+        assert!(
+            report
+                .validate()
+                .unwrap_err()
+                .contains("common voiced-time denominator")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .calibration_sha256 = "f".repeat(64);
+        assert!(report.validate().unwrap_err().contains("digests differ"));
+
+        let mut fused = typed_diarization_report_fixture();
+        fused.implementation = "native-ecapa-fused-v1".to_owned();
+        fused.contract_version = "neural-diarization-common-v2".to_owned();
+        fused.speaker_evidence_mode = DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel;
+        fused.neural_representation = Some(ready_neural_summary());
+        set_report_calibration_for_mode(
+            &mut fused,
+            DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        )
+        .expect("fused ECAPA test calibration");
+        fused
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .method = DiarizationOperationalPartitionMethod::EcapaSpherical;
+        assert!(
+            fused
+                .validate()
+                .unwrap_err()
+                .contains("ECAPA-only spherical")
+        );
+    }
+
+    #[test]
+    fn diarization_report_validation_rejects_nested_and_mode_mismatches() {
+        let mut report = typed_diarization_report_fixture();
+        report
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .selected_count = 0;
+        assert!(
+            report
+                .validate()
+                .expect_err("zero operational count must fail")
+                .contains("operational partition")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report.implementation = "native-ecapa-only-v1".to_owned();
+        report.contract_version = "neural-diarization-common-v2".to_owned();
+        report.speaker_evidence_mode = DiarizationSpeakerEvidenceMode::EcapaOnly;
+        set_report_calibration_for_mode(&mut report, DiarizationSpeakerEvidenceMode::EcapaOnly)
+            .expect("ECAPA-only test calibration");
+        assert!(
+            report
+                .validate()
+                .expect_err("ECAPA mode without provenance must fail")
+                .contains("requires neural representation provenance")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .method = DiarizationOperationalPartitionMethod::EcapaSpherical;
+        assert!(
+            report
+                .validate()
+                .expect_err("acoustic evidence cannot claim ECAPA spherical partition")
+                .contains("native acoustic evidence")
+        );
+
+        for mode in [
+            DiarizationSpeakerEvidenceMode::External,
+            DiarizationSpeakerEvidenceMode::None,
+        ] {
+            let mut report = typed_diarization_report_fixture();
+            report.speaker_evidence_mode = mode;
+            assert!(
+                report
+                    .validate()
+                    .expect_err("non-native evidence cannot claim a native partition")
+                    .contains("requires contract")
+            );
+        }
+
+        let mut report = typed_diarization_report_fixture();
+        report.neural_representation = Some(NeuralSpeakerRepresentationSummary {
+            schema_version: "malformed".to_owned(),
+            provider_version: "ecapa-test-v1".to_owned(),
+            expected_model_package_sha256: "d".repeat(64),
+            loaded_model_package_sha256: None,
+            model_load_source: None,
+            status: NeuralSpeakerRepresentationStatus::Unavailable,
+            embedded_tracklet_count: 0,
+            zero_padded_tracklet_count: 0,
+            skipped_tracklet_count: 0,
+            reasons: vec![NeuralSpeakerRepresentationReason::ModelUnavailable],
+        });
+        assert!(
+            report
+                .validate()
+                .expect_err("malformed neural summary must fail")
+                .contains("neural representation")
+        );
+    }
+
+    #[test]
+    fn neural_summary_rejects_unknown_biometric_fields() {
+        let value = serde_json::json!({
+            "schema_version": "neural-speaker-representation-summary-v1",
+            "provider_version": "ecapa-test-v1",
+            "expected_model_package_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "status": "unavailable",
+            "embedded_tracklet_count": 0,
+            "zero_padded_tracklet_count": 0,
+            "skipped_tracklet_count": 0,
+            "reasons": ["model_unavailable"],
+            "embedding": [0.1, 0.2]
+        });
+        assert!(
+            serde_json::from_value::<NeuralSpeakerRepresentationSummary>(value).is_err(),
+            "unknown biometric fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn neural_representation_summary_distinguishes_expected_from_loaded_model() {
+        let expected = "d".repeat(64);
+        let unavailable = NeuralSpeakerRepresentationSummary {
+            schema_version: "neural-speaker-representation-summary-v1".to_owned(),
+            provider_version: "ecapa-test-v1".to_owned(),
+            expected_model_package_sha256: expected.clone(),
+            loaded_model_package_sha256: None,
+            model_load_source: None,
+            status: NeuralSpeakerRepresentationStatus::Unavailable,
+            embedded_tracklet_count: 0,
+            zero_padded_tracklet_count: 0,
+            skipped_tracklet_count: 0,
+            reasons: vec![NeuralSpeakerRepresentationReason::ModelUnavailable],
+        };
+        unavailable.validate().expect("honest unavailable summary");
+
+        let mut false_observation = unavailable;
+        false_observation.loaded_model_package_sha256 = Some(expected);
+        assert!(
+            false_observation
+                .validate()
+                .expect_err("missing model cannot claim a loaded digest")
+                .contains("claims a loaded package")
         );
     }
 }
