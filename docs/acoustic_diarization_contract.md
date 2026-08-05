@@ -1529,8 +1529,8 @@ rows with silent runtime drift cannot be treated as matched.
 
 The v2 version document adds `model_contract_sha256`,
 `model_artifact_sha256`, `model_artifact_bytes`, and
-`runtime_fingerprint_sha256`. All are mandatory for a successfully validated
-Sortformer probe. The retained report separately records
+the structured `runtime_fingerprint` plus `runtime_fingerprint_sha256`. All are
+mandatory for a successfully validated Sortformer probe. The retained report separately records
 `expected_model_contract_sha256` even when no adapter is available and records
 the observed contract/artifact/runtime attestations only after a valid version
 probe. Non-Sortformer tools must omit all model-contract fields. The tool and
@@ -1584,6 +1584,16 @@ use the frozen Hungarian speaker mapping and retain only label-free DER/JER
 components. Missing stages remain explicitly missing; they are not converted
 into errors or fabricated values. `earliest_divergence` is the first present
 stage whose frozen diagnostic threshold is exceeded.
+
+Parsing caps and comparison caps are intentionally distinct. A stage document
+may be retained for diagnosis at the general safety limits, but the current
+quadratic change-point/final-turn scorers refuse to compare any single native,
+oracle, or reference document with more than 2,048 change points, 2,048 final
+turns, or 32 distinct speaker labels (counting UNKNOWN as one label). This
+prevents a schema-valid diagnostic from turning dynamic programming, atomic
+interval construction, or Hungarian assignment into an unbounded CPU or memory
+request. Larger rows require a future sweep/banded scorer with cancellation
+inside the algorithm; they are not silently sampled or truncated.
 
 An optional third stage document can help interpret a disagreement. Its only
 categories are `reference_favors_native`, `reference_favors_oracle`,
