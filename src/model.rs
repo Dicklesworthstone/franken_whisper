@@ -2271,9 +2271,7 @@ fn validate_report_kind_invariants(
                 "native dominance reason disagrees with supported-speaker occupancy".to_owned(),
             );
         }
-        if dominance_breached
-            && report.fallback_status == DiarizationFallbackStatus::NotNeeded
-        {
+        if dominance_breached && report.fallback_status == DiarizationFallbackStatus::NotNeeded {
             return Err(
                 "native dominant-speaker breach cannot claim that no fallback was needed"
                     .to_owned(),
