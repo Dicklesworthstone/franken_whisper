@@ -36,9 +36,9 @@ evaluation evidence:
 The ECAPA provider identity is
 `ecapa-tdnn-voxceleb-cosine-v6-development`; the current native probabilistic
 clustering identity is
-`acoustic-clustering-probabilistic-v18-calibrated-separation-development`.
+`acoustic-clustering-probabilistic-v19-typed-fused-consensus-development`.
 The nested wire schemas remain `neural-speaker-representation-summary-v1` and
-`diarization-operational-partition-v1`. Their names are schema identities, not
+`diarization-operational-partition-v2`. Their names are schema identities, not
 an accepted `neural` CLI or JSON engine value.
 
 ## 2. Canonical data flow
@@ -703,11 +703,11 @@ The subsequent historical
 separately versioned `speaker-count-estimate-v2` report. It did not inherit the
 v2 evaluation authority, and neither historical study confers authority on the
 current
-`acoustic-clustering-probabilistic-v18-calibrated-separation-development`
-identity. The current v18 identity remains `DevelopmentUncertified`; this
+`acoustic-clustering-probabilistic-v19-typed-fused-consensus-development`
+identity. The current v19 identity remains `DevelopmentUncertified`; this
 subsection contains no retained promotion or production-accuracy evidence for
 it. The default acoustic assignment path therefore remains `fixed_safe_v1`;
-the explicit ECAPA development modes exercise v18 only because the caller opts
+the explicit ECAPA development modes exercise v19 only because the caller opts
 into that uncertified path. Native fixed-safe runs still emit the
 count-estimate object, but with
 `fixed_safe_uncalibrated`, no concrete bins or selected count, and all
@@ -1220,7 +1220,7 @@ corrupt-package invalidation behavior without changing report bytes.
 They must never expose a model path, embedding coordinates, PCM, filterbank or
 other feature values, tensor values, or per-tracklet neural payloads.
 
-The privacy-safe `diarization-operational-partition-v1` summary may retain its
+The privacy-safe `diarization-operational-partition-v2` summary may retain its
 method, selected count, confidence, calibration digest, and authority. Its
 confidence is operational evidence, not automatically a calibrated posterior:
 `FixedSafeUncalibrated` and `DevelopmentUncertified` authority remain explicit
@@ -1565,8 +1565,10 @@ path. The orchestrator routes both explicit ECAPA engines through
 UNKNOWN/overlap, label, and projection contracts. `ecapa` uses ECAPA
 coordinates for speaker identity without acoustic channel evidence in pair
 scoring. `ecapa-fused` adds separately bounded acoustic channel evidence and
-consensus to that ECAPA identity path and is not eligible for the
-`EcapaSpherical` operational partition. Neither mode enters `auto`, changes
+five-lane coassociation consensus to that ECAPA identity path. Its typed
+operational method is `EcapaFusedConsensus`; it cannot claim the ECAPA-only
+`EcapaSpherical` method. The evaluation-only supported-profile redecode route
+accepts only those exact evidence/method pairs. Neither mode enters `auto`, changes
 the acoustic default, downloads a model, or parses a framework checkpoint at
 runtime. Public-corpus accuracy and calibration remain
 development-uncertified.
@@ -1576,7 +1578,7 @@ boundary at cosine distance `0.80`. Robust final-assignment and held-out
 validation separation begin at that same `0.80` boundary. Lane consensus and
 temporal recurrence may require stricter evidence; they may never introduce a
 hidden, weaker `0.70` separation gate. This bound is part of
-`acoustic-clustering-probabilistic-v18-calibrated-separation-development`; it
+`acoustic-clustering-probabilistic-v19-typed-fused-consensus-development`; it
 is a versioned conservative decision policy, not an accuracy-certification
 claim.
 

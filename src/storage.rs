@@ -2902,7 +2902,7 @@ mod tests {
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             operational_partition: Some(DiarizationOperationalPartitionSummary {
-                schema_version: "diarization-operational-partition-v1".to_owned(),
+                schema_version: "diarization-operational-partition-v2".to_owned(),
                 method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
                 selected_count: 1,
                 confidence: 0.85,
@@ -3291,7 +3291,7 @@ mod tests {
             .as_mut()
             .expect("diarization")
             .operational_partition = Some(DiarizationOperationalPartitionSummary {
-            schema_version: "diarization-operational-partition-v1".to_owned(),
+            schema_version: "diarization-operational-partition-v2".to_owned(),
             method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
             selected_count: 0,
             confidence: 0.5,
@@ -3365,7 +3365,7 @@ mod tests {
             .as_mut()
             .expect("diarization")
             .operational_partition = Some(DiarizationOperationalPartitionSummary {
-            schema_version: "diarization-operational-partition-v1".to_owned(),
+            schema_version: "diarization-operational-partition-v2".to_owned(),
             method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
             selected_count: 1,
             confidence: 0.5,

@@ -540,7 +540,10 @@ artifacts remain outside Git. The
 project does not vendor weights or parse PyTorch checkpoints at runtime. The
 current provider identity is
 `ecapa-tdnn-voxceleb-cosine-v6-development`; the current clustering policy is
-`acoustic-clustering-probabilistic-v18-calibrated-separation-development`.
+`acoustic-clustering-probabilistic-v19-typed-fused-consensus-development`.
+Reports distinguish the ECAPA-only `ecapa_spherical` partition from the
+channel-aware five-lane `ecapa_fused_consensus` partition; cross-mode method
+claims fail validation.
 Its equal-loss different-speaker boundary is cosine distance `0.80`, and robust
 final-assignment and held-out-validation separation begin at the same `0.80`.
 Lane consensus and temporal recurrence may require stricter evidence, never a
