@@ -276,6 +276,8 @@ pub enum PublicCorpusCommand {
     Ablate(PublicCorpusAblationArgs),
     /// Run the sidecar study (artifact writing requires Linux/Android/Apple).
     SidecarStudy(PublicCorpusSidecarStudyArgs),
+    /// Compare native and learned diarizers in one aggregate-only invocation.
+    CompareModels(PublicCorpusModelComparisonArgs),
 }
 
 /// Developer-only external differential-diagnostic commands.
@@ -513,6 +515,43 @@ impl fmt::Debug for PublicCorpusSidecarStudyArgs {
                     .as_ref()
                     .map(|_| "<redacted>"),
             )
+            .finish()
+    }
+}
+
+/// Arguments for the aggregate-only learned-versus-native comparison.
+#[derive(Args)]
+pub struct PublicCorpusModelComparisonArgs {
+    /// Absolute external root containing selected public inputs.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute path to the external path-bearing corpus descriptor.
+    #[arg(long)]
+    pub descriptor: PathBuf,
+
+    /// New absolute path for the path-free validated corpus bundle.
+    #[arg(long)]
+    pub bundle_output: PathBuf,
+
+    /// New absolute path for aggregate-only model-comparison evidence.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Exact acknowledgement ID emitted by `diarization-corpus registry`.
+    #[arg(long)]
+    pub license_ack: String,
+}
+
+impl fmt::Debug for PublicCorpusModelComparisonArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicCorpusModelComparisonArgs")
+            .field("input_root", &"<redacted>")
+            .field("descriptor", &"<redacted>")
+            .field("bundle_output", &"<redacted>")
+            .field("output", &"<redacted>")
+            .field("license_ack", &self.license_ack)
             .finish()
     }
 }
@@ -3531,6 +3570,37 @@ mod tests {
         assert_eq!(args.maximum_recording_duration_ms, Some(120_000));
         assert_eq!(args.stage, PublicCorpusEvaluationStageArg::Certification);
         assert!(args.locked_development_evidence.is_some());
+    }
+
+    #[test]
+    fn public_corpus_cli_parses_model_comparison_and_redacts_every_path() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-corpus",
+            "compare-models",
+            "--input-root",
+            "/MODEL_COMPARE_SECRET/INPUT",
+            "--descriptor",
+            "/MODEL_COMPARE_SECRET/INPUT/descriptor.json",
+            "--bundle-output",
+            "/MODEL_COMPARE_SECRET/OUTPUT/bundle.json",
+            "--output",
+            "/MODEL_COMPARE_SECRET/OUTPUT/evidence.json",
+            "--license-ack",
+            "accept-ami-cc-by-4.0",
+        ])
+        .expect("public corpus model-comparison command");
+        let debug = format!("{cli:?}");
+        assert!(!debug.contains("MODEL_COMPARE_SECRET"));
+        assert_eq!(debug.matches("<redacted>").count(), 4);
+
+        let Command::DiarizationCorpus {
+            command: PublicCorpusCommand::CompareModels(args),
+        } = cli.command
+        else {
+            panic!("expected public corpus model comparison");
+        };
+        assert_eq!(args.license_ack, "accept-ami-cc-by-4.0");
     }
 
     #[test]

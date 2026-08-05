@@ -55,6 +55,21 @@ use crate::model::{
     SpeakerEvidenceReason,
 };
 
+mod model_comparison;
+
+pub use model_comparison::{
+    MODEL_COMPARISON_WILLIAMS_SCHEDULE, ModelComparisonAggregateMetrics,
+    ModelComparisonExternalRuntimeIdentity, ModelComparisonLane, ModelComparisonLaneAggregate,
+    ModelComparisonOutcomeCode, ModelComparisonOutcomeCounts, ModelComparisonOutcomeStatus,
+    ModelComparisonResourceAuthority, ModelComparisonResourceEvidence,
+    ModelComparisonWallTimeScope, PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION,
+    PUBLIC_MODEL_COMPARISON_RUNNER_VERSION, PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION,
+    PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION, PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS,
+    PublicModelComparisonEvidence, PublicModelComparisonProtocol, PublicModelComparisonRequest,
+    model_comparison_schedule_row, run_public_model_comparison_with_cancel,
+    verify_public_model_comparison_evidence,
+};
+
 /// Schema identity for the path-bearing, external-only adapter input.
 pub const PUBLIC_CORPUS_INPUT_SCHEMA_VERSION: &str = "public-diarization-corpus-input-v2";
 /// Schema identity for the path-free generated bundle.
