@@ -1155,7 +1155,12 @@ fn record_stage_failure(
             stage.as_str()
         ));
     }
-    trace.fallback_reason = Some(match &error {
+    trace.fallback_reason = Some(classify_ecapa_fallback_reason(&error));
+    error
+}
+
+pub(crate) fn classify_ecapa_fallback_reason(error: &FwError) -> EcapaFallbackReason {
+    match error {
         FwError::InvalidRequest(message) if message.contains("ecapa.inference_resource") => {
             EcapaFallbackReason::ResourceLimit
         }
@@ -1175,8 +1180,7 @@ fn record_stage_failure(
         }
         FwError::InvalidRequest(_) => EcapaFallbackReason::NumericalFailure,
         _ => EcapaFallbackReason::InternalContractFailure,
-    });
-    error
+    }
 }
 
 #[derive(Default)]

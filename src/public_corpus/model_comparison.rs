@@ -29,7 +29,7 @@ use crate::differential_oracle::{
 use crate::ecapa_conformance::{
     ECAPA_CONTRACT_SHA256, ECAPA_PACKAGE_FILENAME, ECAPA_PACKAGE_SHA256,
 };
-use crate::ecapa_inference::EcapaModel;
+use crate::ecapa_inference::{EcapaFallbackReason, EcapaModel, classify_ecapa_fallback_reason};
 use crate::error::{FwError, FwResult};
 use crate::model::{
     DiarizationEngine, DiarizationFallbackPolicy, DiarizationRequest, SpeakerCountEstimate,
@@ -37,13 +37,15 @@ use crate::model::{
 };
 use crate::orchestrator::CancellationToken;
 
-pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v1";
+pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v2";
 pub const PUBLIC_MODEL_COMPARISON_RUNNER_VERSION: &str =
-    "public-diarization-model-comparison-runner-v1";
+    "public-diarization-model-comparison-runner-v2";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION: &str =
-    "public-diarization-model-comparison-protocol-v1";
+    "public-diarization-model-comparison-protocol-v2";
+pub const PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION: &str =
+    "public-diarization-model-comparison-outcomes-v2";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256: &str =
-    "460fb723a390398bc1d4171fb97d50d089cd18749c15ad7b5b62c0c69719056f";
+    "8fc9679ea061cec04bc62533a70ddbaacaafb2e41501c6e2a06e6d13b11140b7";
 pub const PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION: &str = "four-lane-balanced-williams-v1";
 pub const PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS: u64 = 1_800;
 
@@ -139,7 +141,12 @@ pub enum ModelComparisonOutcomeCode {
     SortformerAdapterUnavailable,
     SortformerRuntimeIneligible,
     NativeExecutionFailed,
-    EcapaInvalidRequest,
+    EcapaInvalidInput,
+    EcapaResourceLimit,
+    EcapaCheckpointFailure,
+    EcapaInternalContractFailure,
+    EcapaNumericalFailure,
+    EcapaPipelineRejected,
     EcapaContractViolation,
     EcapaStageTimedOut,
     EcapaExecutionFailed,
@@ -148,6 +155,26 @@ pub enum ModelComparisonOutcomeCode {
 }
 
 impl ModelComparisonOutcomeCode {
+    const ALL: [Self; 17] = [
+        Self::EcapaModelUnavailable,
+        Self::EcapaModelInvalid,
+        Self::SortformerModelCapacityExceeded,
+        Self::SortformerAdapterUnavailable,
+        Self::SortformerRuntimeIneligible,
+        Self::NativeExecutionFailed,
+        Self::EcapaInvalidInput,
+        Self::EcapaResourceLimit,
+        Self::EcapaCheckpointFailure,
+        Self::EcapaInternalContractFailure,
+        Self::EcapaNumericalFailure,
+        Self::EcapaPipelineRejected,
+        Self::EcapaContractViolation,
+        Self::EcapaStageTimedOut,
+        Self::EcapaExecutionFailed,
+        Self::SortformerExecutionFailed,
+        Self::ScoringFailed,
+    ];
+
     #[must_use]
     pub const fn is_skip(self) -> bool {
         matches!(
@@ -168,7 +195,12 @@ impl ModelComparisonOutcomeCode {
             Self::SortformerAdapterUnavailable => "sortformer_adapter_unavailable",
             Self::SortformerRuntimeIneligible => "sortformer_runtime_ineligible",
             Self::NativeExecutionFailed => "native_execution_failed",
-            Self::EcapaInvalidRequest => "ecapa_invalid_request",
+            Self::EcapaInvalidInput => "ecapa_invalid_input",
+            Self::EcapaResourceLimit => "ecapa_resource_limit",
+            Self::EcapaCheckpointFailure => "ecapa_checkpoint_failure",
+            Self::EcapaInternalContractFailure => "ecapa_internal_contract_failure",
+            Self::EcapaNumericalFailure => "ecapa_numerical_failure",
+            Self::EcapaPipelineRejected => "ecapa_pipeline_rejected",
             Self::EcapaContractViolation => "ecapa_contract_violation",
             Self::EcapaStageTimedOut => "ecapa_stage_timed_out",
             Self::EcapaExecutionFailed => "ecapa_execution_failed",
@@ -431,6 +463,8 @@ pub struct PublicModelComparisonProtocol {
     pub speaker_boundary_collar_ms: u64,
     pub change_boundary_collar_ms: u64,
     pub scorer_config_sha256: String,
+    pub outcome_taxonomy_version: String,
+    pub outcome_codes: Vec<ModelComparisonOutcomeCode>,
     pub native_acoustic_request_sha256: String,
     pub native_ecapa_request_sha256: String,
     pub native_ecapa_fused_request_sha256: String,
@@ -1319,6 +1353,8 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         speaker_boundary_collar_ms: scorer_config.speaker_boundary_collar_ms,
         change_boundary_collar_ms: scorer_config.change_boundary_collar_ms,
         scorer_config_sha256: super::canonical_sha256(&scorer_config)?,
+        outcome_taxonomy_version: PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION.to_owned(),
+        outcome_codes: ModelComparisonOutcomeCode::ALL.to_vec(),
         native_acoustic_request_sha256: super::canonical_sha256(&native_acoustic_request)?,
         native_ecapa_request_sha256: super::canonical_sha256(&native_ecapa_request)?,
         native_ecapa_fused_request_sha256: super::canonical_sha256(
@@ -1447,10 +1483,10 @@ where
                 Ok(value) => value,
                 Err(error @ FwError::Cancelled(_)) => return Err(error),
                 Err(error) => {
-                    return Ok(InternalLaneOutcome::failed(
-                        lane,
-                        classify_ecapa_failure(&error),
-                    ));
+                    let Some(code) = classify_ecapa_failure(&error) else {
+                        return Err(error);
+                    };
+                    return Ok(InternalLaneOutcome::failed(lane, code));
                 }
             };
             score_native_report(lane, report, reference, scorer_config)
@@ -1754,20 +1790,32 @@ fn classify_sortformer_skip(
     })
 }
 
-fn classify_ecapa_failure(error: &FwError) -> ModelComparisonOutcomeCode {
+fn classify_ecapa_failure(error: &FwError) -> Option<ModelComparisonOutcomeCode> {
     match error {
-        FwError::InvalidRequest(_) => ModelComparisonOutcomeCode::EcapaInvalidRequest,
-        FwError::ContractViolation(_) => ModelComparisonOutcomeCode::EcapaContractViolation,
+        FwError::InvalidRequest(message) if message.starts_with("ecapa.") => {
+            Some(match classify_ecapa_fallback_reason(error) {
+                EcapaFallbackReason::InvalidInput => ModelComparisonOutcomeCode::EcapaInvalidInput,
+                EcapaFallbackReason::ResourceLimit => {
+                    ModelComparisonOutcomeCode::EcapaResourceLimit
+                }
+                EcapaFallbackReason::CheckpointFailure => {
+                    ModelComparisonOutcomeCode::EcapaCheckpointFailure
+                }
+                EcapaFallbackReason::InternalContractFailure => {
+                    ModelComparisonOutcomeCode::EcapaInternalContractFailure
+                }
+                EcapaFallbackReason::NumericalFailure => {
+                    ModelComparisonOutcomeCode::EcapaNumericalFailure
+                }
+                EcapaFallbackReason::Cancelled => return None,
+            })
+        }
+        FwError::InvalidRequest(_) => Some(ModelComparisonOutcomeCode::EcapaPipelineRejected),
+        FwError::ContractViolation(_) => Some(ModelComparisonOutcomeCode::EcapaContractViolation),
         FwError::StageTimeout { .. } | FwError::CommandTimedOut { .. } => {
-            ModelComparisonOutcomeCode::EcapaStageTimedOut
+            Some(ModelComparisonOutcomeCode::EcapaStageTimedOut)
         }
-        FwError::Cancelled(_) => {
-            debug_assert!(
-                false,
-                "cancellation must be propagated before ECAPA classification"
-            );
-            ModelComparisonOutcomeCode::EcapaExecutionFailed
-        }
+        FwError::Cancelled(_) => None,
         FwError::Io(_)
         | FwError::Json(_)
         | FwError::CommandMissing { .. }
@@ -1775,7 +1823,7 @@ fn classify_ecapa_failure(error: &FwError) -> ModelComparisonOutcomeCode {
         | FwError::BackendUnavailable(_)
         | FwError::Storage(_)
         | FwError::Unsupported(_)
-        | FwError::MissingArtifact(_) => ModelComparisonOutcomeCode::EcapaExecutionFailed,
+        | FwError::MissingArtifact(_) => Some(ModelComparisonOutcomeCode::EcapaExecutionFailed),
     }
 }
 
@@ -2007,7 +2055,12 @@ fn lane_outcome_codes_valid(
         ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused => matches!(
             code,
             ModelComparisonOutcomeCode::EcapaModelInvalid
-                | ModelComparisonOutcomeCode::EcapaInvalidRequest
+                | ModelComparisonOutcomeCode::EcapaInvalidInput
+                | ModelComparisonOutcomeCode::EcapaResourceLimit
+                | ModelComparisonOutcomeCode::EcapaCheckpointFailure
+                | ModelComparisonOutcomeCode::EcapaInternalContractFailure
+                | ModelComparisonOutcomeCode::EcapaNumericalFailure
+                | ModelComparisonOutcomeCode::EcapaPipelineRejected
                 | ModelComparisonOutcomeCode::EcapaContractViolation
                 | ModelComparisonOutcomeCode::EcapaStageTimedOut
                 | ModelComparisonOutcomeCode::EcapaExecutionFailed
@@ -2697,8 +2750,17 @@ mod tests {
     }
 
     #[test]
-    fn frozen_protocol_digest_detects_unversioned_default_drift() {
+    fn frozen_protocol_version_and_digest_detect_contract_drift() {
         let protocol = frozen_model_comparison_protocol().expect("frozen protocol");
+        assert_eq!(
+            protocol.schema_version,
+            PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            protocol.outcome_taxonomy_version,
+            PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION
+        );
+        assert_eq!(protocol.outcome_codes, ModelComparisonOutcomeCode::ALL);
         assert_eq!(
             super::super::canonical_sha256(&protocol).expect("canonical protocol digest"),
             PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256
@@ -2725,20 +2787,61 @@ mod tests {
 
     #[test]
     fn ecapa_failures_retain_stable_payload_free_error_classes() {
+        let cases = [
+            (
+                FwError::InvalidRequest("ecapa.input_shape: private detail".to_owned()),
+                ModelComparisonOutcomeCode::EcapaInvalidInput,
+                "\"ecapa_invalid_input\"",
+            ),
+            (
+                FwError::InvalidRequest("ecapa.inference_resource: private detail".to_owned()),
+                ModelComparisonOutcomeCode::EcapaResourceLimit,
+                "\"ecapa_resource_limit\"",
+            ),
+            (
+                FwError::InvalidRequest("ecapa.checkpoint_failure: private detail".to_owned()),
+                ModelComparisonOutcomeCode::EcapaCheckpointFailure,
+                "\"ecapa_checkpoint_failure\"",
+            ),
+            (
+                FwError::InvalidRequest("ecapa.kernel_failure: private detail".to_owned()),
+                ModelComparisonOutcomeCode::EcapaInternalContractFailure,
+                "\"ecapa_internal_contract_failure\"",
+            ),
+            (
+                FwError::InvalidRequest("ecapa.numerical_value: private detail".to_owned()),
+                ModelComparisonOutcomeCode::EcapaNumericalFailure,
+                "\"ecapa_numerical_failure\"",
+            ),
+            (
+                FwError::InvalidRequest("private detail".to_owned()),
+                ModelComparisonOutcomeCode::EcapaPipelineRejected,
+                "\"ecapa_pipeline_rejected\"",
+            ),
+            (
+                FwError::ContractViolation("private detail".to_owned()),
+                ModelComparisonOutcomeCode::EcapaContractViolation,
+                "\"ecapa_contract_violation\"",
+            ),
+            (
+                FwError::StageTimeout {
+                    stage: "ecapa".to_owned(),
+                    budget_ms: 1,
+                },
+                ModelComparisonOutcomeCode::EcapaStageTimedOut,
+                "\"ecapa_stage_timed_out\"",
+            ),
+        ];
+        for (error, expected, expected_json) in cases {
+            let classified = classify_ecapa_failure(&error).expect("non-cancellation class");
+            assert_eq!(classified, expected);
+            let serialized = serde_json::to_string(&classified).expect("serialize class");
+            assert_eq!(serialized, expected_json);
+            assert!(!serialized.contains("private detail"));
+        }
         assert_eq!(
-            classify_ecapa_failure(&FwError::InvalidRequest("private detail".to_owned())),
-            ModelComparisonOutcomeCode::EcapaInvalidRequest
-        );
-        assert_eq!(
-            classify_ecapa_failure(&FwError::ContractViolation("private detail".to_owned())),
-            ModelComparisonOutcomeCode::EcapaContractViolation
-        );
-        assert_eq!(
-            classify_ecapa_failure(&FwError::StageTimeout {
-                stage: "ecapa".to_owned(),
-                budget_ms: 1,
-            }),
-            ModelComparisonOutcomeCode::EcapaStageTimedOut
+            classify_ecapa_failure(&FwError::Cancelled("private detail".to_owned())),
+            None
         );
     }
 
