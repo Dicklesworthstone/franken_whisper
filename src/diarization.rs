@@ -10647,11 +10647,12 @@ fn enroll_known_speaker_profiles_with_authority(
                 EnrollmentIdentityAuthority::AcousticV2 => {
                     tracklet.identity_frame_count.max(1) as f32
                 }
-                EnrollmentIdentityAuthority::Ecapa(embeddings) => embeddings
-                    .get(&tracklet.tracklet_index)
-                    .map_or(tracklet.voiced_frame_count.max(1) as f32, |representation| {
-                        representation.discovery_weight.max(1.0)
-                    }),
+                EnrollmentIdentityAuthority::Ecapa(embeddings) => {
+                    embeddings.get(&tracklet.tracklet_index).map_or(
+                        tracklet.voiced_frame_count.max(1) as f32,
+                        |representation| representation.discovery_weight.max(1.0),
+                    )
+                }
             };
             let weight = if hard {
                 identity_weight
@@ -10712,23 +10713,15 @@ fn enroll_known_speaker_profiles_with_authority(
     let mut profiles = BTreeMap::new();
     let mut profile_training_observations = BTreeMap::<String, Vec<EnrollmentObservation>>::new();
     for (speaker_ref, observations) in by_speaker {
-        let (accepted, speaker_training_evidence, maximum_contradiction) =
-            match identity_authority {
-                EnrollmentIdentityAuthority::AcousticV2 => {
-                    admit_acoustic_enrollment_observations(
-                        &speaker_ref,
-                        observations,
-                        &mut evidence,
-                    )
-                }
-                EnrollmentIdentityAuthority::Ecapa(_) => {
-                    admit_ecapa_enrollment_observations(
-                        &speaker_ref,
-                        observations,
-                        &mut evidence,
-                    )
-                }
-            };
+        let (accepted, speaker_training_evidence, maximum_contradiction) = match identity_authority
+        {
+            EnrollmentIdentityAuthority::AcousticV2 => {
+                admit_acoustic_enrollment_observations(&speaker_ref, observations, &mut evidence)
+            }
+            EnrollmentIdentityAuthority::Ecapa(_) => {
+                admit_ecapa_enrollment_observations(&speaker_ref, observations, &mut evidence)
+            }
+        };
         if accepted.is_empty() {
             continue;
         }
@@ -10824,10 +10817,9 @@ fn admit_acoustic_enrollment_observations(
     } else {
         hard_observations
     };
-    let (provisional, provisional_valid) =
-        robust_location(&provisional_source, |observation| {
-            (observation.voice, observation.voice_valid)
-        });
+    let (provisional, provisional_valid) = robust_location(&provisional_source, |observation| {
+        (observation.voice, observation.voice_valid)
+    });
     let mut accepted = Vec::new();
     let mut maximum_contradiction = 0.0_f32;
     for observation in observations {
@@ -10847,8 +10839,7 @@ fn admit_acoustic_enrollment_observations(
             accepted.push(observation);
         } else {
             evidence.rejected_tracklet_count += 1;
-            evidence.applied_weight =
-                (evidence.applied_weight - observation.weight).max(0.0);
+            evidence.applied_weight = (evidence.applied_weight - observation.weight).max(0.0);
             maximum_contradiction = maximum_contradiction.max(contradiction);
             evidence.contradiction_score = Some(
                 evidence
@@ -11810,11 +11801,7 @@ fn apply_ecapa_speaker_representations(
             source.len(),
         );
         let validation_weight = windows.validation.as_ref().map_or(0.0, |validation| {
-            represented_ecapa_weight(
-                tracklet.voiced_frame_count,
-                validation.len(),
-                source.len(),
-            )
+            represented_ecapa_weight(tracklet.voiced_frame_count, validation.len(), source.len())
         });
         embeddings.insert(
             tracklet.tracklet_index,
@@ -12727,9 +12714,7 @@ fn unavailable_neural_speaker_count_outcome(
         })
         .collect::<FwResult<Vec<_>>>()?;
     let status = match request {
-        SpeakerCountRequest::HardConstraint { count }
-            if *count == supported_speaker_count =>
-        {
+        SpeakerCountRequest::HardConstraint { count } if *count == supported_speaker_count => {
             SpeakerCountOutcomeStatus::Satisfied
         }
         SpeakerCountRequest::HardConstraint { .. } => SpeakerCountOutcomeStatus::Unsatisfied,
@@ -12739,9 +12724,7 @@ fn unavailable_neural_speaker_count_outcome(
     };
     let status_reason = match status {
         SpeakerCountOutcomeStatus::Satisfied => SpeakerCountOutcomeReason::RequestedCountMatched,
-        SpeakerCountOutcomeStatus::Unsatisfied => {
-            SpeakerCountOutcomeReason::RequestedCountMismatch
-        }
+        SpeakerCountOutcomeStatus::Unsatisfied => SpeakerCountOutcomeReason::RequestedCountMismatch,
         SpeakerCountOutcomeStatus::Unresolved if supported_speaker_count == 0 => {
             SpeakerCountOutcomeReason::NoSupportedSpeakers
         }
@@ -13945,17 +13928,12 @@ fn build_ecapa_speaker_profiles(
             let weighted_distance_sum = observations
                 .iter()
                 .filter_map(|(observation, observation_weight)| {
-                    ecapa_cosine_distance(
-                        observation,
-                        &embedding,
-                        SpeakerPairPerturbation::Full,
-                    )
-                    .map(|distance| distance * observation_weight)
+                    ecapa_cosine_distance(observation, &embedding, SpeakerPairPerturbation::Full)
+                        .map(|distance| distance * observation_weight)
                 })
                 .sum::<f32>();
             let mean_distance = weighted_distance_sum / weight.max(f32::EPSILON);
-            let coherence = (1.0
-                - mean_distance / ECAPA_PROFILE_RELIABILITY_COHERENCE_DISTANCE)
+            let coherence = (1.0 - mean_distance / ECAPA_PROFILE_RELIABILITY_COHERENCE_DISTANCE)
                 .clamp(0.0, 1.0);
             let support = (weight / ECAPA_PROFILE_RELIABILITY_FULL_SUPPORT_FRAMES).clamp(0.0, 1.0);
             let represented_count = observations.len();
@@ -14374,17 +14352,13 @@ fn compare_optional_float_vectors<const N: usize>(
     }
 }
 
-fn compare_cluster_identity(
-    left: &AcousticCluster,
-    right: &AcousticCluster,
-) -> std::cmp::Ordering {
+fn compare_cluster_identity(left: &AcousticCluster, right: &AcousticCluster) -> std::cmp::Ordering {
     debug_assert_eq!(left.evidence_mode, right.evidence_mode);
     match left.evidence_mode {
         DiarizationSpeakerEvidenceMode::EcapaOnly
-        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => compare_optional_float_vectors(
-            left.neural_voice.as_ref(),
-            right.neural_voice.as_ref(),
-        ),
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+            compare_optional_float_vectors(left.neural_voice.as_ref(), right.neural_voice.as_ref())
+        }
         DiarizationSpeakerEvidenceMode::AcousticV2 => {
             compare_float_vectors(&left.voice, &right.voice)
         }
@@ -14615,10 +14589,9 @@ fn initial_clusters(
 fn cluster_from_prototype(prototype: &AcousticPrototype) -> AcousticCluster {
     let reliability = match prototype.evidence_mode {
         DiarizationSpeakerEvidenceMode::EcapaOnly
-        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
-            (prototype.neural_weight / ECAPA_PROFILE_RELIABILITY_FULL_SUPPORT_FRAMES)
-                .clamp(0.0, 1.0)
-        }
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => (prototype.neural_weight
+            / ECAPA_PROFILE_RELIABILITY_FULL_SUPPORT_FRAMES)
+            .clamp(0.0, 1.0),
         DiarizationSpeakerEvidenceMode::AcousticV2 => {
             (prototype.frame_count as f32 / 100.0).min(1.0)
         }
@@ -14690,7 +14663,8 @@ fn cluster_from_profile(
         } else {
             [0.0; CHANNEL_VECTOR_DIMENSIONS]
         },
-        channel_valid: (!neural_identity || fused_channel) && !profile.channel_subprofiles.is_empty(),
+        channel_valid: (!neural_identity || fused_channel)
+            && !profile.channel_subprofiles.is_empty(),
         channel_dimensions: if !neural_identity || fused_channel {
             profile.channel_dimensions
         } else {
@@ -16486,9 +16460,7 @@ fn fused_speaker_count_estimate(
         .sum::<f64>()
         + count_entropy_term(unresolved_probability);
     let (constraint_lower_bound, candidate_upper_bound) = match request {
-        SpeakerCountRequest::HardConstraint { count }
-            if policy.exact == Some(*count as usize) =>
-        {
+        SpeakerCountRequest::HardConstraint { count } if policy.exact == Some(*count as usize) => {
             (*count, *count)
         }
         SpeakerCountRequest::HardConstraint { .. } => return None,
@@ -16674,9 +16646,7 @@ fn unavailable_speaker_count_estimate(
         SpeakerCountRequest::HardConstraint { count } => *count,
         SpeakerCountRequest::Infer
         | SpeakerCountRequest::Prior { .. }
-        | SpeakerCountRequest::Range { .. } => {
-            u32::try_from(constraint_lower_bound).ok()?
-        }
+        | SpeakerCountRequest::Range { .. } => u32::try_from(constraint_lower_bound).ok()?,
     };
     let available_candidates = u32::try_from(available_candidates)
         .ok()?
@@ -19465,8 +19435,8 @@ fn clustering_profile_summaries(
                 DiarizationSpeakerEvidenceMode::EcapaOnly
                     | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
             ) {
-                let neural_profile = neural_profiles
-                    .and_then(|profiles| profiles.get(labels[index].as_str()));
+                let neural_profile =
+                    neural_profiles.and_then(|profiles| profiles.get(labels[index].as_str()));
                 summary.reliability = f64::from(
                     neural_profile.map_or(cluster.reliability, |profile| profile.reliability),
                 );
@@ -19516,13 +19486,16 @@ mod tests {
     };
     use crate::FwError;
     use crate::model::{
-        DiarizationEngine, DiarizationFallbackStatus, DiarizationRequest, DiarizationTurn,
-        KnownSpeakerInterval, KnownSpeakerPolicy, SpeakerAttributionQueryReason,
-        SpeakerCountCalibrationStatus, SpeakerCountEstimate, SpeakerCountEvidenceLane,
-        SpeakerCountLaneEvidence, SpeakerCountLaneUnavailableReason, SpeakerCountOutcomeReason,
-        SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange,
-        SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
-        SpeakerHintDisposition, TranscriptionSegment,
+        DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus, DiarizationReport,
+        DiarizationRequest, DiarizationSpeakerEvidenceMode, DiarizationTurn, KnownSpeakerInterval,
+        KnownSpeakerPolicy, NeuralModelLoadSource, NeuralSpeakerRepresentationReason,
+        NeuralSpeakerRepresentationStatus, NeuralSpeakerRepresentationSummary,
+        SpeakerAttributionQueryReason, SpeakerCountCalibrationStatus, SpeakerCountEstimate,
+        SpeakerCountEvidenceLane, SpeakerCountLaneEvidence, SpeakerCountLaneUnavailableReason,
+        SpeakerCountOutcome, SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus,
+        SpeakerCountPosteriorBin, SpeakerCountRange, SpeakerCountRequest,
+        SpeakerCountResourceSummary, SpeakerEvidenceReason, SpeakerHintDisposition,
+        TranscriptionSegment,
     };
     use sha2::{Digest, Sha256};
 
@@ -19602,6 +19575,50 @@ mod tests {
                 solver_sparse_matvec_terms: 24,
                 solver_residual: Some(0.01),
             },
+        }
+    }
+
+    fn unavailable_ecapa_report(speaker_count_request: SpeakerCountRequest) -> DiarizationReport {
+        DiarizationReport {
+            implementation: "native-ecapa-unavailable-v1".to_owned(),
+            contract_version: super::NEURAL_DIARIZATION_CONTRACT_VERSION.to_owned(),
+            feature_schema: super::ACOUSTIC_FEATURE_SCHEMA_VERSION.to_owned(),
+            speaker_evidence_mode: DiarizationSpeakerEvidenceMode::None,
+            normalized_input_sha256: "a".repeat(64),
+            hint_document_sha256: None,
+            turns: Vec::new(),
+            profiles: Vec::new(),
+            hint_evidence: Vec::new(),
+            speaker_queries: Vec::new(),
+            speaker_count: SpeakerCountOutcome {
+                request: speaker_count_request,
+                estimate: None,
+                status: SpeakerCountOutcomeStatus::Unresolved,
+                supported_speaker_count: 0,
+                active_speaker_refs: Vec::new(),
+                dominant_speaker_share: 0.0,
+                unknown_voiced_share: 0.0,
+                reasons: vec![SpeakerCountOutcomeReason::NoSupportedSpeakers],
+                speaker_evidence: Vec::new(),
+            },
+            fallback_status: DiarizationFallbackStatus::SpeakerCountUnresolved,
+            operational_partition: None,
+            neural_representation: Some(NeuralSpeakerRepresentationSummary {
+                schema_version: "neural-speaker-representation-summary-v1".to_owned(),
+                provider_version: super::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
+                expected_model_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256
+                    .to_owned(),
+                loaded_model_package_sha256: Some(
+                    crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
+                ),
+                model_load_source: Some(NeuralModelLoadSource::PackageVerified),
+                status: NeuralSpeakerRepresentationStatus::Unavailable,
+                embedded_tracklet_count: 0,
+                zero_padded_tracklet_count: 0,
+                skipped_tracklet_count: 1,
+                reasons: vec![NeuralSpeakerRepresentationReason::ShortTracklet],
+            }),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -26855,8 +26872,7 @@ mod tests {
         let enrollment_c =
             enroll_known_speaker_profiles(&tracklets, &request_c, 2_000).expect("enrollment c");
         assert_ne!(
-            enrollment_a.hint_document_sha256,
-            enrollment_b.hint_document_sha256,
+            enrollment_a.hint_document_sha256, enrollment_b.hint_document_sha256,
             "hint_index is positional, so request order must be digest-bound"
         );
         assert_eq!(enrollment_a.summaries, enrollment_b.summaries);
@@ -29774,6 +29790,79 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_ecapa_attempt_defers_only_configured_fallback_request_binding() {
+        let report = unavailable_ecapa_report(SpeakerCountRequest::Infer);
+        report
+            .validate()
+            .expect("structurally valid unavailable report");
+
+        for fallback in [
+            DiarizationFallbackPolicy::Acoustic,
+            DiarizationFallbackPolicy::External,
+        ] {
+            let request = DiarizationRequest {
+                engine: DiarizationEngine::Ecapa,
+                fallback,
+                ..DiarizationRequest::default()
+            };
+            assert!(
+                report
+                    .validate_against_request(&request, Some(1_000))
+                    .is_err(),
+                "the intermediate unavailable attempt is not the final fallback result"
+            );
+            super::validate_native_diarization_report(&report, &request, 1_000, true)
+                .expect("the orchestrator must receive a structurally valid fallback trigger");
+        }
+
+        let unknown_request = DiarizationRequest {
+            engine: DiarizationEngine::Ecapa,
+            fallback: DiarizationFallbackPolicy::Unknown,
+            ..DiarizationRequest::default()
+        };
+        super::validate_native_diarization_report(&report, &unknown_request, 1_000, true)
+            .expect("unknown fallback is the final exactly bound unavailable report");
+
+        let mismatched_unknown_request = DiarizationRequest {
+            engine: DiarizationEngine::Ecapa,
+            fallback: DiarizationFallbackPolicy::Unknown,
+            speaker_count: SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 2,
+            },
+            ..DiarizationRequest::default()
+        };
+        assert!(
+            super::validate_native_diarization_report(
+                &report,
+                &mismatched_unknown_request,
+                1_000,
+                true,
+            )
+            .is_err(),
+            "final unknown output must retain exact request binding"
+        );
+
+        let mut malformed = report;
+        malformed.normalized_input_sha256 = "not-a-digest".to_owned();
+        let acoustic_fallback_request = DiarizationRequest {
+            engine: DiarizationEngine::Ecapa,
+            fallback: DiarizationFallbackPolicy::Acoustic,
+            ..DiarizationRequest::default()
+        };
+        assert!(
+            super::validate_native_diarization_report(
+                &malformed,
+                &acoustic_fallback_request,
+                1_000,
+                true,
+            )
+            .is_err(),
+            "deferred request binding must never defer structural validation"
+        );
+    }
+
+    #[test]
     fn ecapa_cosine_distance_is_normalized_and_discriminative() {
         let mut first = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
         first[3] = 1.0;
@@ -30298,7 +30387,9 @@ mod tests {
         let tracklets = sequential_profile_tracklets(&[0.0; 6], 500, 50);
         let mut acoustically_unusable = tracklets.clone();
         for (index, tracklet) in acoustically_unusable.iter_mut().enumerate() {
-            tracklet.voice_mean.fill(if index.is_multiple_of(2) { -9.0 } else { 9.0 });
+            tracklet
+                .voice_mean
+                .fill(if index.is_multiple_of(2) { -9.0 } else { 9.0 });
             tracklet.voice_variance.fill(81.0);
             tracklet.voice_valid.fill(false);
             tracklet.voice_support.fill(0);
@@ -30317,12 +30408,7 @@ mod tests {
         let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
         embedding[7] = 1.0;
         let embeddings = (0usize..6)
-            .map(|index| {
-                (
-                    index,
-                    ecapa_representation(embedding, None, 50.0, 0.0),
-                )
-            })
+            .map(|index| (index, ecapa_representation(embedding, None, 50.0, 0.0)))
             .collect::<BTreeMap<_, _>>();
 
         let enroll_for_ecapa = |input_tracklets: &[super::AcousticTracklet]| {
