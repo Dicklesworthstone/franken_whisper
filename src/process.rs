@@ -125,21 +125,22 @@ pub fn run_command_with_timeout(
             )))
         })?;
 
-        let stdout_rx = spawn_pipe_reader(stdout_pipe);
-        let stderr_rx = spawn_pipe_reader(stderr_pipe);
+        let stdout_reader = spawn_pipe_reader(stdout_pipe);
+        let stderr_reader = spawn_pipe_reader(stderr_pipe);
 
         loop {
             if let Some(status) = child.try_wait()? {
-                let stdout = recv_pipe_output(stdout_rx)?;
-                let stderr = recv_pipe_output(stderr_rx)?;
+                let stdout = stdout_reader.finish()?;
+                let stderr = stderr_reader.finish()?;
                 return validate_captured_command_output(&rendered, status, stdout, stderr);
             }
 
             if started_at.elapsed() >= limit {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = recv_pipe_output_after_termination(stdout_rx);
-                let stderr = recv_pipe_output_after_termination(stderr_rx)
+                let _ = stdout_reader.finish();
+                let stderr = stderr_reader
+                    .finish()
                     .map(|capture| capture.bytes)
                     .unwrap_or_default();
                 let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
@@ -235,13 +236,13 @@ pub(crate) fn run_command_cancellable_with_probe(
         )))
     })?;
 
-    let stdout_rx = spawn_pipe_reader(stdout_pipe);
-    let stderr_rx = spawn_pipe_reader(stderr_pipe);
+    let stdout_reader = spawn_pipe_reader(stdout_pipe);
+    let stderr_reader = spawn_pipe_reader(stderr_pipe);
 
     loop {
         if let Some(status) = child.try_wait()? {
-            let stdout = recv_pipe_output(stdout_rx)?;
-            let stderr = recv_pipe_output(stderr_rx)?;
+            let stdout = stdout_reader.finish()?;
+            let stderr = stderr_reader.finish()?;
             return validate_captured_command_output(&rendered, status, stdout, stderr);
         }
 
@@ -249,15 +250,15 @@ pub(crate) fn run_command_cancellable_with_probe(
         if let Err(err) = token.checkpoint() {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = recv_pipe_output_after_termination(stdout_rx);
-            let _ = recv_pipe_output_after_termination(stderr_rx);
+            let _ = stdout_reader.finish();
+            let _ = stderr_reader.finish();
             return Err(err);
         }
         if additional_cancel.is_some_and(|probe| probe()) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = recv_pipe_output_after_termination(stdout_rx);
-            let _ = recv_pipe_output_after_termination(stderr_rx);
+            let _ = stdout_reader.finish();
+            let _ = stderr_reader.finish();
             return Err(FwError::Cancelled(
                 "subprocess cancelled by caller predicate".to_owned(),
             ));
@@ -269,8 +270,9 @@ pub(crate) fn run_command_cancellable_with_probe(
         {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = recv_pipe_output_after_termination(stdout_rx);
-            let stderr = recv_pipe_output_after_termination(stderr_rx)
+            let _ = stdout_reader.finish();
+            let stderr = stderr_reader
+                .finish()
                 .map(|capture| capture.bytes)
                 .unwrap_or_default();
             let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
@@ -305,8 +307,9 @@ fn saturating_duration_ms(duration: Duration) -> u64 {
 }
 
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
-const PIPE_CAPTURE_COMPLETION_GRACE: Duration = Duration::from_secs(1);
-const PIPE_CAPTURE_TERMINATION_GRACE: Duration = Duration::from_millis(100);
+const PIPE_CAPTURE_STOP_DRAIN_GRACE: Duration = Duration::from_millis(100);
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+const PIPE_CAPTURE_FALLBACK_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct PipeCapture {
@@ -314,17 +317,93 @@ struct PipeCapture {
     limit_exceeded: bool,
 }
 
-fn spawn_pipe_reader<R>(pipe: R) -> std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>
+struct PipeReader {
+    receiver: std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+impl PipeReader {
+    fn finish(self) -> FwResult<PipeCapture> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let result = recv_pipe_output(self.receiver);
+        if self.handle.join().is_err() {
+            return Err(FwError::Io(std::io::Error::other(
+                "subprocess pipe reader panicked",
+            )));
+        }
+        result
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+impl PipeReader {
+    fn finish(self) -> FwResult<PipeCapture> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let result = match self.receiver.recv_timeout(PIPE_CAPTURE_FALLBACK_GRACE) {
+            Ok(result) => result.map_err(FwError::Io),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(FwError::ContractViolation(
+                    "subprocess output pipe remained open after the child terminated".to_owned(),
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(FwError::Io(std::io::Error::other(
+                    "subprocess pipe reader terminated",
+                )));
+            }
+        };
+        if self.handle.join().is_err() {
+            return Err(FwError::Io(std::io::Error::other(
+                "subprocess pipe reader panicked",
+            )));
+        }
+        result
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn spawn_pipe_reader<R>(pipe: R) -> PipeReader
+where
+    R: Read + Send + std::os::fd::AsFd + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_stop = std::sync::Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        let result = set_pipe_nonblocking(&pipe)
+            .and_then(|()| read_pipe_with_limit_until_stopped(pipe, &reader_stop));
+        let _ = tx.send(result);
+    });
+    PipeReader {
+        receiver: rx,
+        stop,
+        handle,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn spawn_pipe_reader<R>(pipe: R) -> PipeReader
 where
     R: Read + Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = thread::spawn(move || {
         let _ = tx.send(read_pipe_with_limit(pipe));
     });
-    rx
+    PipeReader {
+        receiver: rx,
+        stop,
+        handle,
+    }
 }
 
+#[cfg(any(
+    test,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
 fn read_pipe_with_limit<R: Read>(mut pipe: R) -> std::io::Result<PipeCapture> {
     let mut buf = [0u8; 8192];
     let mut bytes = Vec::new();
@@ -349,31 +428,67 @@ fn read_pipe_with_limit<R: Read>(mut pipe: R) -> std::io::Result<PipeCapture> {
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn set_pipe_nonblocking<Fd: std::os::fd::AsFd>(pipe: &Fd) -> std::io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(pipe).map_err(errno_to_io_error)?;
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK).map_err(errno_to_io_error)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn errno_to_io_error(error: rustix::io::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(error.raw_os_error())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn read_pipe_with_limit_until_stopped<R: Read>(
+    mut pipe: R,
+    stop: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<PipeCapture> {
+    let mut buf = [0u8; 8192];
+    let mut bytes = Vec::new();
+    let mut limit_exceeded = false;
+    let mut stop_observed_at = None;
+
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => {
+                let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(bytes.len());
+                let retained = remaining.min(read);
+                bytes.extend_from_slice(&buf[..retained]);
+                if retained < read {
+                    limit_exceeded = true;
+                }
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let observed_at = stop_observed_at.get_or_insert_with(Instant::now);
+                    if observed_at.elapsed() >= PIPE_CAPTURE_STOP_DRAIN_GRACE {
+                        break;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(PipeCapture {
+        bytes,
+        limit_exceeded,
+    })
+}
+
 fn recv_pipe_output(
     rx: std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>,
 ) -> FwResult<PipeCapture> {
-    recv_pipe_output_with_timeout(rx, PIPE_CAPTURE_COMPLETION_GRACE)
-}
-
-fn recv_pipe_output_after_termination(
-    rx: std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>,
-) -> FwResult<PipeCapture> {
-    recv_pipe_output_with_timeout(rx, PIPE_CAPTURE_TERMINATION_GRACE)
-}
-
-fn recv_pipe_output_with_timeout(
-    rx: std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>,
-    timeout: Duration,
-) -> FwResult<PipeCapture> {
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result.map_err(FwError::Io),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(FwError::ContractViolation(
-            "subprocess output pipe remained open after the child terminated".to_owned(),
-        )),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(FwError::Io(
-            std::io::Error::other("subprocess pipe reader terminated"),
-        )),
-    }
+    rx.recv()
+        .map_err(|_| FwError::Io(std::io::Error::other("subprocess pipe reader terminated")))?
+        .map_err(FwError::Io)
 }
 
 fn validate_captured_command_output(
@@ -523,18 +638,20 @@ mod tests {
         assert!(recv_pipe_output(rx).is_err());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
-    fn recv_pipe_output_is_bounded_when_pipe_stays_open() {
-        use super::{PipeCapture, recv_pipe_output_with_timeout};
-        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<PipeCapture>>();
+    fn pipe_reader_finish_joins_when_writer_stays_open() {
+        use std::io::Write;
+
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        writer.write_all(b"complete output").expect("write fixture");
         let started_at = std::time::Instant::now();
-        let result = recv_pipe_output_with_timeout(rx, Duration::from_millis(5));
-        assert!(matches!(
-            result,
-            Err(crate::error::FwError::ContractViolation(_))
-        ));
+        let capture = super::spawn_pipe_reader(reader)
+            .finish()
+            .expect("finish reader with open writer");
+        assert_eq!(capture.bytes, b"complete output");
+        assert!(!capture.limit_exceeded);
         assert!(started_at.elapsed() < Duration::from_secs(1));
-        drop(tx);
     }
 
     #[test]
