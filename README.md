@@ -939,7 +939,9 @@ become typed lane skips.
 The comparison evidence is aggregate-only and cannot authorize a superiority
 or production-routing claim. Its wall-time scopes are intentionally unlike and
 not cross-lane comparable: ECAPA model loading is shared and reported
-separately, while each Sortformer observation is a cold external process.
+separately, while each Sortformer observation includes executable and input
+attestation, a version-probe subprocess, a cold oracle subprocess, output
+validation, and scoring.
 Authoritative isolated peak RSS and cancellation-latency measurements are not
 yet available. The companion path-free public bundle is record-level scorer
 input and therefore retains opaque public recording/speaker IDs and reference

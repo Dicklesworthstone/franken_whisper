@@ -189,7 +189,7 @@ pub enum ModelComparisonResourceAuthority {
 pub enum ModelComparisonWallTimeScope {
     NativeAcousticPipelineAndScorer,
     NativeEcapaPipelineAndScorerSharedModelLoadExcluded,
-    ExternalSortformerColdProcessAndScorerPerObservation,
+    ExternalSortformerAttestationValidationColdOracleAndScorerPerObservation,
 }
 
 /// Counts for every declared outcome, including stable reasons.
@@ -1315,7 +1315,7 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         native_ecapa_fused_postprocessing:
             "fixed_safe_v1_change+probabilistic_v1_clustering+unknown_fallback".to_owned(),
         sortformer_postprocessing: "pinned_sortformer_oracle_contract_v2".to_owned(),
-        wall_time_policy: "measured_per_observation;native_ecapa_shared_model_load_separate;sortformer_cold_process_per_observation;not_cross_lane_comparable".to_owned(),
+        wall_time_policy: "measured_per_observation;native_ecapa_shared_model_load_separate;sortformer_executable_and_input_attestation+version_probe+cold_oracle_run+output_validation+scorer_per_observation;not_cross_lane_comparable".to_owned(),
         aggregate_only: true,
         production_route_changed: false,
     })
@@ -1747,7 +1747,7 @@ fn lane_resource_evidence(
                 ModelComparisonWallTimeScope::NativeEcapaPipelineAndScorerSharedModelLoadExcluded
             }
             ModelComparisonLane::ExternalSortformer => {
-                ModelComparisonWallTimeScope::ExternalSortformerColdProcessAndScorerPerObservation
+                ModelComparisonWallTimeScope::ExternalSortformerAttestationValidationColdOracleAndScorerPerObservation
             }
         },
         wall_time_cross_lane_comparable: false,
@@ -2491,7 +2491,7 @@ fn validate_resource_evidence(
             ModelComparisonWallTimeScope::NativeEcapaPipelineAndScorerSharedModelLoadExcluded
         }
         ModelComparisonLane::ExternalSortformer => {
-            ModelComparisonWallTimeScope::ExternalSortformerColdProcessAndScorerPerObservation
+            ModelComparisonWallTimeScope::ExternalSortformerAttestationValidationColdOracleAndScorerPerObservation
         }
     };
     let expected_peak_authority = if lane == ModelComparisonLane::ExternalSortformer {
