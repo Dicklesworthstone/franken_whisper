@@ -110,7 +110,7 @@ pub enum DiarizationEngine {
     /// In-process ECAPA speaker identity without acoustic channel fusion.
     Ecapa,
     /// In-process ECAPA identity with separately bounded acoustic channel
-    /// evidence in pair and temporal scoring.
+    /// evidence when a compatible channel-valid pair can actually be scored.
     EcapaFused,
 }
 
@@ -698,7 +698,9 @@ pub enum DiarizationOperationalPartitionMethod {
     EcapaSpherical,
     /// Five-lane ECAPA consensus clustering whose pair evidence, speaker-count
     /// estimate, separation checks, and downstream emissions retain the
-    /// authorized acoustic-channel side evidence.
+    /// authorized acoustic-channel side evidence. Emission of this method
+    /// proves that at least one selected consensus merge joined a compatible
+    /// channel-valid pair.
     EcapaFusedConsensus,
 }
 
@@ -2298,9 +2300,7 @@ fn validate_report_kind_invariants(
                     )
                 })
             {
-                return Err(
-                    "native acoustic evidence cannot claim an ECAPA spherical partition".to_owned(),
-                );
+                return Err("native acoustic evidence cannot claim an ECAPA partition".to_owned());
             }
         }
         DiarizationReportKind::NativeEcapaOnly => {
@@ -2349,11 +2349,7 @@ fn validate_report_kind_invariants(
                 .operational_partition
                 .as_ref()
                 .is_some_and(|partition| {
-                    matches!(
-                        partition.method,
-                        DiarizationOperationalPartitionMethod::EcapaSpherical
-                            | DiarizationOperationalPartitionMethod::ProbabilisticConsensus
-                    )
+                    partition.method == DiarizationOperationalPartitionMethod::EcapaSpherical
                 })
             {
                 return Err(
@@ -6967,7 +6963,7 @@ mod tests {
     }
 
     #[test]
-    fn all_production_diarization_report_tuples_validate() {
+    fn admitted_diarization_report_tuples_validate() {
         let mut acoustic_v1 = typed_diarization_report_fixture();
         acoustic_v1.implementation = "native-acoustic-v1".to_owned();
         acoustic_v1.feature_schema = "acoustic-feature-v1".to_owned();
@@ -8131,12 +8127,9 @@ mod tests {
             .as_mut()
             .expect("partition")
             .method = DiarizationOperationalPartitionMethod::ProbabilisticConsensus;
-        assert!(
-            fused
-                .validate()
-                .expect_err("fused ECAPA cannot claim generic consensus provenance")
-                .contains("incompatible operational partition provenance")
-        );
+        fused
+            .validate()
+            .expect("degraded fused ECAPA may underclaim generic consensus provenance");
 
         let mut private_diagnostic = typed_diarization_report_fixture();
         private_diagnostic.diagnostics = vec![

@@ -36,7 +36,7 @@ evaluation evidence:
 The ECAPA provider identity is
 `ecapa-tdnn-voxceleb-cosine-v6-development`; the current native probabilistic
 clustering identity is
-`acoustic-clustering-probabilistic-v19-typed-fused-consensus-development`.
+`acoustic-clustering-probabilistic-v20-channel-evidence-bound-fused-consensus-development`.
 The nested wire schemas remain `neural-speaker-representation-summary-v1` and
 `diarization-operational-partition-v2`. Their names are schema identities, not
 an accepted `neural` CLI or JSON engine value.
@@ -71,7 +71,7 @@ The decision state consists of:
 - hard and soft known-speaker intervals;
 - current robust profiles and channel subprofiles;
 - one typed speaker-count request: inference, caller prior, range, or hard
-  search constraint; the current probabilistic count/assignment identity is v18
+  search constraint; the current probabilistic count/assignment identity is v20
   and remains development-uncertified;
 - prior temporal assignment;
 - algorithm, feature-schema, weights, and calibration identities;
@@ -703,11 +703,11 @@ The subsequent historical
 separately versioned `speaker-count-estimate-v2` report. It did not inherit the
 v2 evaluation authority, and neither historical study confers authority on the
 current
-`acoustic-clustering-probabilistic-v19-typed-fused-consensus-development`
-identity. The current v19 identity remains `DevelopmentUncertified`; this
+`acoustic-clustering-probabilistic-v20-channel-evidence-bound-fused-consensus-development`
+identity. The current v20 identity remains `DevelopmentUncertified`; this
 subsection contains no retained promotion or production-accuracy evidence for
 it. The default acoustic assignment path therefore remains `fixed_safe_v1`;
-the explicit ECAPA development modes exercise v19 only because the caller opts
+the explicit ECAPA development modes exercise v20 only because the caller opts
 into that uncertified path. Native fixed-safe runs still emit the
 count-estimate object, but with
 `fixed_safe_uncalibrated`, no concrete bins or selected count, and all
@@ -965,7 +965,7 @@ does not invent speakers merely to satisfy a range minimum or exact count; it
 reports `unsatisfied_constraints`, reports `speaker_count_unresolved`, or
 returns a hard error according to typed fallback policy.
 
-The bounded development speaker-count design, currently identified by the v18
+The bounded development speaker-count design, currently identified by the v20
 probabilistic clustering identity above, uses five deterministic semantic
 views: full evidence, no pitch, no dynamics, no formants, and no channel. It
 retains their complete bounded merge-risk curves, combines them with a
@@ -1564,13 +1564,20 @@ path. The orchestrator routes both explicit ECAPA engines through
 `diarize_ecapa_pcm` and the common segmentation, constraints, count, temporal
 UNKNOWN/overlap, label, and projection contracts. `ecapa` uses ECAPA
 coordinates for speaker identity without acoustic channel evidence in pair
-scoring. `ecapa-fused` adds separately bounded acoustic channel evidence and
-five-lane coassociation consensus to that ECAPA identity path. Its typed
-operational method is `EcapaFusedConsensus`; it cannot claim the ECAPA-only
-`EcapaSpherical` method. The evaluation-only supported-profile redecode route
-accepts only those exact evidence/method pairs. Neither mode enters `auto`, changes
-the acoustic default, downloads a model, or parses a framework checkpoint at
-runtime. Public-corpus accuracy and calibration remain
+scoring. `ecapa-fused` authorizes separately bounded acoustic channel evidence
+and five-lane coassociation consensus on that ECAPA identity path. It reports the
+typed `EcapaFusedConsensus` operational method only when at least one selected
+consensus merge joins a compatible ECAPA pair with valid channel dimensions. With missing
+or mutually constrained channel evidence it underclaims generic
+`ProbabilisticConsensus` provenance and the supported-profile redecode route is
+ineligible. It can never claim the ECAPA-only `EcapaSpherical` method. The
+evaluation-only supported-profile redecode route accepts only the exact
+ECAPA-only/spherical or channel-proven fused/consensus pairs, and only when
+every acoustic tracklet has a neural representation. Partial neural coverage
+therefore leaves missing speech UNKNOWN except for immutable hard attribution
+and makes the redecode candidate a deterministic no-op. Neither mode enters
+`auto`, changes the acoustic default, downloads a model, or parses a framework
+checkpoint at runtime. Public-corpus accuracy and calibration remain
 development-uncertified.
 
 The ECAPA development decision policy places its equal-loss different-speaker
@@ -1578,7 +1585,7 @@ boundary at cosine distance `0.80`. Robust final-assignment and held-out
 validation separation begin at that same `0.80` boundary. Lane consensus and
 temporal recurrence may require stricter evidence; they may never introduce a
 hidden, weaker `0.70` separation gate. This bound is part of
-`acoustic-clustering-probabilistic-v19-typed-fused-consensus-development`; it
+`acoustic-clustering-probabilistic-v20-channel-evidence-bound-fused-consensus-development`; it
 is a versioned conservative decision policy, not an accuracy-certification
 claim.
 

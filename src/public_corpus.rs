@@ -19429,7 +19429,7 @@ mod tests {
                 crate::model::DiarizationEngine::EcapaFused,
             ],
             preparation_contract:
-                "one-observation-one-incumbent-partition-one-privacy-safe-supported-profile-topology-three-arms-exact-typed-route-retain-ineligible-noop-v3",
+                "one-observation-one-incumbent-partition-one-privacy-safe-supported-profile-topology-three-arms-channel-bound-complete-neural-coverage-typed-route-retain-ineligible-noop-v4",
             recurrence_contract:
                 "bounded-label-state-viterbi-duration-summary-path-history-approximation-not-global-optimum-v1",
             accuracy_authority_contract:
@@ -20390,6 +20390,7 @@ mod tests {
                         ),
                     )
                 )
+                && row.common_observation.embedded_tracklet_count == row.baseline.tracklet_count
                 && row.baseline.frozen_count_estimate_present
                 && row.baseline.frozen_count_constraints_feasible
                 && super::is_sha256_hex(&row.baseline.speaker_count_estimate_sha256)
@@ -20459,7 +20460,8 @@ mod tests {
             let incumbent_contract_matches = row.baseline.mode
                 == crate::diarization::SupportedProfileRedecodeMode::DisabledIncumbent
                 && row.baseline.variant_configuration_sha256 == baseline_variant_sha256
-                && row.baseline.tracklet_count == row.common_observation.embedded_tracklet_count
+                && row.baseline.tracklet_count > 0
+                && row.common_observation.embedded_tracklet_count <= row.baseline.tracklet_count
                 && row.baseline.profile_row_count == 0
                 && row.baseline.supported_speaker_count == 0
                 && row.baseline.output_detected_speaker_count
@@ -20481,7 +20483,8 @@ mod tests {
             let candidate_common_contract = row.candidate.mode
                 == crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1
                 && row.candidate.variant_configuration_sha256 == redecode_policy_sha256
-                && row.candidate.tracklet_count == row.common_observation.embedded_tracklet_count
+                && row.candidate.tracklet_count > 0
+                && row.common_observation.embedded_tracklet_count <= row.candidate.tracklet_count
                 && row.candidate.output_detected_speaker_count
                     <= row.frozen_total_profile_row_count
                 && row.candidate.changed_assignment_count <= row.candidate.tracklet_count
@@ -21902,6 +21905,41 @@ mod tests {
         supported_profile_redecode_gate_finalize_ineligible_pair(row, expected);
     }
 
+    fn supported_profile_redecode_gate_make_fused_generic_consensus_pair(
+        row: &mut PublicSupportedProfileRedecodePairRow,
+        expected: &mut PublicSupportedProfileRedecodeExpectedPairBinding,
+    ) {
+        assert_eq!(
+            row.evidence_mode,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        );
+        for arm in [&mut row.baseline, &mut row.candidate] {
+            arm.frozen_operational_partition_method =
+                Some(crate::model::DiarizationOperationalPartitionMethod::ProbabilisticConsensus);
+            arm.frozen_route_eligible = false;
+        }
+        expected.frozen_operational_partition_method =
+            row.baseline.frozen_operational_partition_method;
+        expected.frozen_route_eligible = false;
+        supported_profile_redecode_gate_finalize_ineligible_pair(row, expected);
+    }
+
+    fn supported_profile_redecode_gate_make_incomplete_neural_coverage_pair(
+        row: &mut PublicSupportedProfileRedecodePairRow,
+        expected_common: &mut PublicEcapaCommonObservationBinding,
+        expected: &mut PublicSupportedProfileRedecodeExpectedPairBinding,
+    ) {
+        assert!(row.baseline.tracklet_count > 1);
+        row.common_observation.embedded_tracklet_count =
+            row.baseline.tracklet_count.saturating_sub(1);
+        expected_common.embedded_tracklet_count = row.common_observation.embedded_tracklet_count;
+        for arm in [&mut row.baseline, &mut row.candidate] {
+            arm.frozen_route_eligible = false;
+        }
+        expected.frozen_route_eligible = false;
+        supported_profile_redecode_gate_finalize_ineligible_pair(row, expected);
+    }
+
     fn supported_profile_redecode_gate_make_count_missing_pair(
         row: &mut PublicSupportedProfileRedecodePairRow,
         expected: &mut PublicSupportedProfileRedecodeExpectedPairBinding,
@@ -22092,7 +22130,7 @@ mod tests {
         let (
             frozen_reference,
             mut rows,
-            common,
+            mut common,
             mut expected_pair_bindings,
             memory,
             policy,
@@ -22106,6 +22144,15 @@ mod tests {
         supported_profile_redecode_gate_make_count_missing_pair(
             &mut rows[1],
             &mut expected_pair_bindings[1],
+        );
+        supported_profile_redecode_gate_make_fused_generic_consensus_pair(
+            &mut rows[3],
+            &mut expected_pair_bindings[3],
+        );
+        supported_profile_redecode_gate_make_incomplete_neural_coverage_pair(
+            &mut rows[5],
+            &mut common[5],
+            &mut expected_pair_bindings[5],
         );
 
         let gate = public_supported_profile_redecode_gate_row(
@@ -22125,6 +22172,8 @@ mod tests {
                 .contains(&PublicSupportedProfileRedecodeGateFailure::CandidateRouteIneligible)
         );
         for unexpected in [
+            PublicSupportedProfileRedecodeGateFailure::CommonObservationMismatch,
+            PublicSupportedProfileRedecodeGateFailure::IncumbentContractMismatch,
             PublicSupportedProfileRedecodeGateFailure::CandidateContractMismatch,
             PublicSupportedProfileRedecodeGateFailure::CandidateReplayMismatch,
             PublicSupportedProfileRedecodeGateFailure::RejectedCandidateOutputMismatch,

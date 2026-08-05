@@ -48,7 +48,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 `franken_whisper` is a single Rust binary that wraps every major Whisper backend behind a unified, agent-first interface — and ships its own engine:
 
 - **A real in-process Whisper engine, in pure Rust.** ggml model parsing, log-mel frontend, encoder/decoder transformer inference on FrankenTorch CPU kernels, greedy decoding with whisper.cpp's full timestamp-rule suite, and cross-attention DTW word timestamps. No FFI, no Python, no subprocess — drop a ggml model file in place and transcribe.
-- **Rust-native acoustic and ECAPA speaker diarization.** The bounded-memory acoustic path separates voice from channel evidence, while the two explicit ECAPA modes add a pinned in-process speaker representation either alone or fused with bounded channel evidence. Every native mode accepts hard or soft known-speaker intervals, projects an independent turn timeline onto DTW word boundaries, and makes no gender or person-identity claims.
+- **Rust-native acoustic and ECAPA speaker diarization.** The bounded-memory acoustic path separates voice from channel evidence, while the two explicit ECAPA modes add a pinned in-process speaker representation either alone or authorized to use bounded channel evidence when a selected consensus merge joins a compatible channel-valid pair. Every native mode accepts hard or soft known-speaker intervals, projects an independent turn timeline onto DTW word boundaries, and makes no gender or person-identity claims.
 - **Adaptive Bayesian backend routing.** Each `auto` request runs a formal decision contract with an explicit loss matrix, per-backend Beta posteriors, Brier-scored calibration, and deterministic fallback when the model is mis-calibrated.
 - **Real-time NDJSON streaming.** Every pipeline stage emits sequenced, timestamped events on stable schema `v1.0.0`. No fragile regex; agents parse JSON.
 - **Durable run history.** Every transcription persists to SQLite with full event logs, replay envelopes, and JSONL export/import, even when the process crashes mid-run.
@@ -514,9 +514,10 @@ canonical labels, and transcript projection:
 
 - `--diarization-engine ecapa` uses ECAPA embeddings for speaker identity and
   does not add acoustic channel evidence to pair scoring.
-- `--diarization-engine ecapa-fused` uses ECAPA speaker identity plus bounded
-  acoustic channel evidence and consensus. The library/JSON request spelling
-  is `ecapa_fused`.
+- `--diarization-engine ecapa-fused` authorizes ECAPA speaker identity plus
+  bounded acoustic channel evidence and consensus. If no selected consensus
+  merge joins a compatible pair with valid channel features, it conservatively reports generic consensus
+  provenance instead. The library/JSON request spelling is `ecapa_fused`.
 
 Both modes remain outside `auto`, and both are development-uncertified rather
 than production-accuracy claims. Neither downloads a model: the exact
@@ -540,10 +541,14 @@ artifacts remain outside Git. The
 project does not vendor weights or parse PyTorch checkpoints at runtime. The
 current provider identity is
 `ecapa-tdnn-voxceleb-cosine-v6-development`; the current clustering policy is
-`acoustic-clustering-probabilistic-v19-typed-fused-consensus-development`.
+`acoustic-clustering-probabilistic-v20-channel-evidence-bound-fused-consensus-development`.
 Reports distinguish the ECAPA-only `ecapa_spherical` partition from the
-channel-aware five-lane `ecapa_fused_consensus` partition; cross-mode method
-claims fail validation.
+channel-aware five-lane `ecapa_fused_consensus` partition. The fused method is
+  emitted only after at least one selected consensus merge joins a compatible
+  ECAPA pair with valid channel features; otherwise the fused engine conservatively reports
+generic `probabilistic_consensus` provenance and is ineligible for the
+supported-profile redecode experiment. Cross-mode method claims fail
+validation.
 Its equal-loss different-speaker boundary is cosine distance `0.80`, and robust
 final-assignment and held-out-validation separation begin at the same `0.80`.
 Lane consensus and temporal recurrence may require stricter evidence, never a
@@ -4051,7 +4056,7 @@ The `auto` router will normally pick the right backend, but explicit selection i
 Do you need speaker diarization?
 ├─ YES, waveform-derived and dependency-light  → --diarization-engine acoustic
 ├─ YES, ECAPA identity only and model installed → --diarization-engine ecapa
-├─ YES, ECAPA plus channel evidence installed   → --diarization-engine ecapa-fused
+├─ YES, authorize ECAPA plus usable channel evidence → --diarization-engine ecapa-fused
 ├─ YES, with an installed pyannote backend     → --diarization-engine external
 ├─ YES, turn hints only                        → whisper_cpp + --tiny-diarize
 └─ NO ──┐
@@ -4674,7 +4679,7 @@ The router is doing nothing exotic: it blends priors with empirical data via Bet
 | Aspect | Rust acoustic | Rust ECAPA-only | Rust ECAPA-fused | External | TinyDiarize |
 |--------|---------------|-----------------|-------------------|----------|-------------|
 | Selection | `--diarization-engine acoustic` | `--diarization-engine ecapa` | `--diarization-engine ecapa-fused` (JSON: `ecapa_fused`) | `--diarization-engine external` | `--tiny-diarize` |
-| Speaker identity evidence | Hand-authored waveform voice features | Pinned ECAPA embeddings; no acoustic channel evidence in pair scoring | Pinned ECAPA embeddings plus bounded acoustic channel evidence and consensus | Backend-defined, normalized only after provenance checks | Decoder turn tokens |
+| Speaker identity evidence | Hand-authored waveform voice features | Pinned ECAPA embeddings; no acoustic channel evidence in pair scoring | Pinned ECAPA embeddings plus bounded acoustic channel evidence when a selected consensus merge joins a compatible usable pair; otherwise generic consensus provenance | Backend-defined, normalized only after provenance checks | Decoder turn tokens |
 | Dependencies | Built-in Rust + normalized PCM | Built-in Rust + user-installed, hash-pinned ECAPA safetensors | Same pinned local ECAPA package | Typically Python, model files, and possibly an HF token | whisper-cli |
 | Output | Independent turns plus conservative projection to ASR segments | The common turn/report/projection contract | The common turn/report/projection contract | Timed backend labels normalized to the common report | Inline turn hints |
 | Known intervals | Hard must-link and soft enrollment | Hard must-link and soft enrollment | Hard must-link and soft enrollment | Backend-specific | No |
@@ -4685,7 +4690,10 @@ The router is doing nothing exotic: it blends priors with empirical data via Bet
 Use acoustic diarization for dependency-light waveform evidence and auditable
 known intervals. Use explicit `ecapa` when the pinned model is installed and
 speaker identity should come only from ECAPA; use `ecapa-fused` when bounded
-channel evidence is also appropriate. Both are development-uncertified. Use an
+channel evidence is also appropriate and may be available. The supported-profile
+redecode experiment additionally requires complete neural tracklet coverage;
+missing embeddings remain UNKNOWN except for immutable hard attribution. Both
+are development-uncertified. Use an
 external engine only when its model/deployment tradeoff is deliberate.
 TinyDiarize is a turn hint, not a speaker-profile substitute.
 
