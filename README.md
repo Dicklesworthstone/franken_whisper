@@ -886,8 +886,8 @@ operator-licensed diarization corpora. The registry does not download data or
 accept a license on the operator's behalf.
 
 `registry` is available on every supported CLI target. The artifact-writing
-`build`, `ablate`, and `sidecar-study` commands require Linux, Android, or an
-Apple platform; Windows and other targets return
+`build`, `ablate`, `sidecar-study`, and `compare-models` commands require Linux,
+Android, or an Apple platform; Windows and other targets return
 `public_corpus.output_platform` before reading corpus media or annotations.
 
 ```bash
@@ -918,7 +918,32 @@ franken_whisper diarization-corpus sidecar-study \
   --output /absolute/external/results/sidecar-development.json \
   --license-ack <REGISTRY_ACKNOWLEDGEMENT_ID> \
   --stage development
+
+# compare all native lanes with the pinned operator-installed Sortformer oracle
+RAYON_NUM_THREADS=8 franken_whisper diarization-corpus compare-models \
+  --input-root /absolute/external/corpus \
+  --descriptor /absolute/external/corpus/descriptor.json \
+  --bundle-output /absolute/external/results/model-comparison-bundle.json \
+  --output /absolute/external/results/model-comparison-development.json \
+  --license-ack <REGISTRY_ACKNOWLEDGEMENT_ID>
 ```
+
+`compare-models` is a development-only, diagnostic comparison of
+`native_acoustic`, `native_ecapa`, `native_ecapa_fused`, and
+`external_sortformer`. It infers speaker count, fixes native and Sortformer CPU
+worker counts at eight, and applies a frozen 1800-second timeout to each
+Sortformer oracle-run subprocess. The application downloads neither the ECAPA
+package nor the Sortformer adapter/model; absent operator-installed components
+become typed lane skips.
+
+The comparison evidence is aggregate-only and cannot authorize a superiority
+or production-routing claim. Its wall-time scopes are intentionally unlike and
+not cross-lane comparable: ECAPA model loading is shared and reported
+separately, while each Sortformer observation is a cold external process.
+Authoritative isolated peak RSS and cancellation-latency measurements are not
+yet available. The companion path-free public bundle is record-level scorer
+input and therefore retains opaque public recording/speaker IDs and reference
+timestamps, but no source path, filename, audio, or transcript.
 
 All path arguments must be absolute. Entire output file names must use lowercase
 ASCII letters, digits, period, underscore, and hyphen and end in the exact
