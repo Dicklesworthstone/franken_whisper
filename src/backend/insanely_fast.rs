@@ -201,7 +201,6 @@ fn validate_external_speaker_count(request: &TranscribeRequest) -> FwResult<()> 
                 ) && matches!(
                     diarization.engine,
                     crate::model::DiarizationEngine::External
-                        | crate::model::DiarizationEngine::Neural
                 )
             })
     {
