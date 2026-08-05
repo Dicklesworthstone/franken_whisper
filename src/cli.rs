@@ -774,7 +774,7 @@ pub struct TranscribeArgs {
     #[arg(long, default_value_t = 100)]
     pub enrollment_edge_guard_ms: u32,
 
-    /// Maximum global acoustic prototypes (hard ceiling: 512).
+    /// Maximum global native-diarization prototypes (hard ceiling: 512).
     #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u16).range(1..=512))]
     pub diarization_max_prototypes: u16,
 

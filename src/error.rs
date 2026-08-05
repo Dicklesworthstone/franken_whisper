@@ -35,6 +35,12 @@ pub enum FwError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    /// An in-process producer returned data that violates a FrankenWhisper
+    /// contract. This is deliberately distinct from caller input errors: a
+    /// fallback must never conceal an internal postcondition failure.
+    #[error("internal contract violation: {0}")]
+    ContractViolation(String),
+
     #[error("storage error: {0}")]
     Storage(String),
 
@@ -107,6 +113,7 @@ impl FwError {
             Self::CommandTimedOut { .. } => "FW-CMD-TIMEOUT",
             Self::BackendUnavailable(_) => "FW-BACKEND-UNAVAILABLE",
             Self::InvalidRequest(_) => "FW-INVALID-REQUEST",
+            Self::ContractViolation(_) => "FW-CONTRACT-VIOLATION",
             Self::Storage(_) => "FW-STORAGE",
             Self::Unsupported(_) => "FW-UNSUPPORTED",
             Self::MissingArtifact(_) => "FW-MISSING-ARTIFACT",
@@ -154,6 +161,10 @@ mod tests {
             (
                 FwError::InvalidRequest("bad request".to_owned()),
                 "FW-ROBOT-REQUEST",
+            ),
+            (
+                FwError::ContractViolation("bad producer output".to_owned()),
+                "FW-ROBOT-EXEC",
             ),
             (FwError::Storage("db fail".to_owned()), "FW-ROBOT-STORAGE"),
             (
@@ -357,6 +368,10 @@ mod tests {
                 "backend unavailable",
             ),
             (FwError::InvalidRequest("bad".to_owned()), "invalid request"),
+            (
+                FwError::ContractViolation("bad output".to_owned()),
+                "internal contract violation",
+            ),
             (FwError::Storage("db".to_owned()), "storage error"),
             (FwError::Unsupported("nope".to_owned()), "unsupported"),
             (
@@ -373,8 +388,8 @@ mod tests {
             ),
         ];
 
-        // Verify we cover all 12 variants.
-        assert_eq!(cases.len(), 12, "test should cover every FwError variant");
+        // Verify we cover all 13 variants.
+        assert_eq!(cases.len(), 13, "test should cover every FwError variant");
 
         for (error, expected_substring) in cases {
             let text = error.to_string();
@@ -544,6 +559,7 @@ mod tests {
             },
             FwError::BackendUnavailable("x".to_owned()),
             FwError::InvalidRequest("x".to_owned()),
+            FwError::ContractViolation("x".to_owned()),
             FwError::Storage("x".to_owned()),
             FwError::Unsupported("x".to_owned()),
             FwError::MissingArtifact(std::path::PathBuf::from("x")),
@@ -588,6 +604,7 @@ mod tests {
             },
             FwError::BackendUnavailable("x".to_owned()),
             FwError::InvalidRequest("x".to_owned()),
+            FwError::ContractViolation("x".to_owned()),
             FwError::Storage("x".to_owned()),
             FwError::Unsupported("x".to_owned()),
             FwError::MissingArtifact(std::path::PathBuf::from("x")),
@@ -598,10 +615,10 @@ mod tests {
             },
         ];
 
-        // Ensure we cover all 12 variants.
+        // Ensure we cover all 13 variants.
         assert_eq!(
             all_errors.len(),
-            12,
+            13,
             "test should cover every FwError variant"
         );
 
@@ -641,6 +658,7 @@ mod tests {
             },
             FwError::BackendUnavailable("x".to_owned()),
             FwError::InvalidRequest("x".to_owned()),
+            FwError::ContractViolation("x".to_owned()),
             FwError::Storage("x".to_owned()),
             FwError::Unsupported("x".to_owned()),
             FwError::MissingArtifact(std::path::PathBuf::from("x")),
@@ -679,6 +697,7 @@ mod tests {
             },
             FwError::BackendUnavailable("x".to_owned()),
             FwError::InvalidRequest("x".to_owned()),
+            FwError::ContractViolation("x".to_owned()),
             FwError::Storage("x".to_owned()),
             FwError::Unsupported("x".to_owned()),
             FwError::MissingArtifact(std::path::PathBuf::from("x")),
@@ -741,6 +760,10 @@ mod tests {
                 FwError::InvalidRequest("x".to_owned()),
                 "FW-INVALID-REQUEST",
             ),
+            (
+                FwError::ContractViolation("x".to_owned()),
+                "FW-CONTRACT-VIOLATION",
+            ),
             (FwError::Storage("x".to_owned()), "FW-STORAGE"),
             (FwError::Unsupported("x".to_owned()), "FW-UNSUPPORTED"),
             (
@@ -757,7 +780,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(matrix.len(), 12);
+        assert_eq!(matrix.len(), 13);
         for (error, expected_code) in matrix {
             assert_eq!(
                 error.error_code(),
@@ -835,6 +858,7 @@ mod tests {
             },
             FwError::BackendUnavailable("x".to_owned()),
             FwError::InvalidRequest("x".to_owned()),
+            FwError::ContractViolation("x".to_owned()),
             FwError::Storage("x".to_owned()),
             FwError::Unsupported("x".to_owned()),
             FwError::MissingArtifact(std::path::PathBuf::from("x")),
@@ -933,6 +957,8 @@ mod tests {
             },
             FwError::BackendUnavailable("x".to_owned()),
             FwError::InvalidRequest("x".to_owned()),
+            FwError::ContractViolation("x".to_owned()),
+            FwError::Storage("x".to_owned()),
             FwError::Unsupported("x".to_owned()),
             FwError::MissingArtifact(std::path::PathBuf::from("x")),
             FwError::Cancelled("x".to_owned()),
