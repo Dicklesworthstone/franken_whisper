@@ -26,7 +26,7 @@ use crate::model::{
     DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus,
     DiarizationOperationalPartitionMethod, DiarizationOperationalPartitionSummary,
     DiarizationReport, DiarizationRequest, DiarizationSpeakerEvidenceMode, DiarizationTurn,
-    KnownSpeakerPolicy, MAX_SPEAKER_COUNT, NeuralModelLoadSource,
+    KnownSpeakerInterval, KnownSpeakerPolicy, MAX_SPEAKER_COUNT, NeuralModelLoadSource,
     NeuralSpeakerRepresentationReason, NeuralSpeakerRepresentationStatus,
     NeuralSpeakerRepresentationSummary, SpeakerAttributionQuery, SpeakerAttributionQueryReason,
     SpeakerCountCalibrationStatus, SpeakerCountEstimate, SpeakerCountEvidenceLane,
@@ -14615,19 +14615,11 @@ fn finish_prepared_ecapa_diarization(
     };
     let mut hint_evidence = public_hint_evidence(&enrollment.evidence)?;
     if neural_identity_unavailable {
-        for evidence in &mut hint_evidence {
-            evidence.profile_accepted_tracklet_count = 0;
-            evidence.profile_downweighted_tracklet_count = 0;
-            evidence.profile_quarantined_tracklet_count = 0;
-            evidence.contradiction_score = None;
-            if evidence.policy == KnownSpeakerPolicy::SoftEnrollment {
-                evidence.disposition = SpeakerHintDisposition::NoUsableTracklets;
-                evidence.usable_tracklet_count = 0;
-                evidence.accepted_tracklet_count = 0;
-                evidence.rejected_tracklet_count = 0;
-                evidence.applied_weight = 0.0;
-            }
-        }
+        normalize_unavailable_neural_hint_evidence(
+            &mut hint_evidence,
+            &prepared.request.known_intervals,
+            report_assignments,
+        )?;
     }
     let diagnostics = neural_identity_unavailable
         .then(|| crate::model::DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE.to_owned())
@@ -15332,19 +15324,11 @@ where
     };
     let mut hint_evidence = public_hint_evidence(&enrollment.evidence)?;
     if neural_identity_unavailable {
-        for evidence in &mut hint_evidence {
-            evidence.profile_accepted_tracklet_count = 0;
-            evidence.profile_downweighted_tracklet_count = 0;
-            evidence.profile_quarantined_tracklet_count = 0;
-            evidence.contradiction_score = None;
-            if evidence.policy == KnownSpeakerPolicy::SoftEnrollment {
-                evidence.disposition = SpeakerHintDisposition::NoUsableTracklets;
-                evidence.usable_tracklet_count = 0;
-                evidence.accepted_tracklet_count = 0;
-                evidence.rejected_tracklet_count = 0;
-                evidence.applied_weight = 0.0;
-            }
-        }
+        normalize_unavailable_neural_hint_evidence(
+            &mut hint_evidence,
+            &request.known_intervals,
+            report_assignments,
+        )?;
     }
     // Public diagnostics are finite stable codes. Native acoustic metrics are
     // already represented by typed report and evaluation fields, so successful
@@ -15686,6 +15670,43 @@ fn unavailable_neural_speaker_count_outcome(
         reasons: vec![status_reason],
         speaker_evidence,
     })
+}
+
+fn normalize_unavailable_neural_hint_evidence(
+    evidence: &mut [SpeakerHintEvidenceSummary],
+    hints: &[KnownSpeakerInterval],
+    assignments: &[AcousticSpeakerAssignment],
+) -> FwResult<()> {
+    if evidence.len() != hints.len() {
+        return Err(FwError::ContractViolation(
+            "unavailable ECAPA hint evidence lost request correspondence".to_owned(),
+        ));
+    }
+    for (evidence, hint) in evidence.iter_mut().zip(hints) {
+        evidence.profile_accepted_tracklet_count = 0;
+        evidence.profile_downweighted_tracklet_count = 0;
+        evidence.profile_quarantined_tracklet_count = 0;
+        evidence.contradiction_score = None;
+        let hard_attributed = hint.policy == KnownSpeakerPolicy::HardMustLink
+            && assignments.iter().any(|assignment| {
+                assignment.hard_attribution
+                    && assignment.speaker_ref.as_deref() == Some(hint.speaker_ref.as_str())
+                    && assignment.start_ms < hint.end_ms
+                    && hint.start_ms < assignment.end_ms
+            });
+        if hard_attributed {
+            evidence.disposition = SpeakerHintDisposition::HardAttributed;
+            evidence.accepted_tracklet_count = evidence.usable_tracklet_count;
+            evidence.rejected_tracklet_count = 0;
+        } else {
+            evidence.disposition = SpeakerHintDisposition::NoUsableTracklets;
+            evidence.usable_tracklet_count = 0;
+            evidence.accepted_tracklet_count = 0;
+            evidence.rejected_tracklet_count = 0;
+            evidence.applied_weight = 0.0;
+        }
+    }
+    Ok(())
 }
 
 fn public_hint_evidence(
@@ -35076,6 +35097,11 @@ mod tests {
                     .as_deref()
                     .is_none_or(|speaker| speaker == "known")
             }));
+            assert_eq!(report.hint_evidence.len(), 1);
+            assert_eq!(
+                report.hint_evidence[0].disposition,
+                SpeakerHintDisposition::HardAttributed,
+            );
             if retained_embedding_indexes.is_empty() {
                 assert_eq!(report.implementation, "native-ecapa-unavailable-v1");
                 assert_eq!(
