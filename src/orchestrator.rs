@@ -5781,7 +5781,7 @@ fn unknown_neural_diarization_with_hard_hints(
     report.contract_version = diarization::NEURAL_DIARIZATION_CONTRACT_VERSION.to_owned();
     report.neural_representation = Some(neural_representation);
     report.hint_document_sha256 = (!request.known_intervals.is_empty())
-        .then(|| crate::model::speaker_hint_document_sha256(&request.known_intervals));
+        .then(|| crate::model::speaker_hint_document_sha256(request));
     report.turns = turns;
     report.hint_evidence = request
         .known_intervals
@@ -6075,10 +6075,15 @@ fn external_diarization_report(
         });
     let unknown_voiced_share = total_timed_speech_ms.saturating_sub(external_segment_count) as f64
         / total_timed_speech_ms as f64;
-    let count_request_satisfied = speaker_count_satisfies_request(detected_speakers, speaker_count);
+    let fully_attributed = total_timed_speech_ms == external_segment_count;
+    let count_request_satisfied =
+        fully_attributed && speaker_count_satisfies_request(detected_speakers, speaker_count);
     let status = match speaker_count {
-        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } => {
+        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } if fully_attributed => {
             SpeakerCountOutcomeStatus::Resolved
+        }
+        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } => {
+            SpeakerCountOutcomeStatus::Unresolved
         }
         SpeakerCountRequest::HardConstraint { .. } if count_request_satisfied => {
             SpeakerCountOutcomeStatus::Satisfied
@@ -6087,8 +6092,11 @@ fn external_diarization_report(
         SpeakerCountRequest::Prior { .. } => SpeakerCountOutcomeStatus::Unresolved,
     };
     let count_reason = match speaker_count {
-        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } => {
+        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } if fully_attributed => {
             SpeakerCountOutcomeReason::EvidenceSupportedCount
+        }
+        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } => {
+            SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved
         }
         SpeakerCountRequest::HardConstraint { .. } if count_request_satisfied => {
             SpeakerCountOutcomeReason::RequestedCountMatched
@@ -10754,6 +10762,39 @@ mod tests {
         .expect("partially labeled external result");
         assert!((partial_report.speaker_count.dominant_speaker_share - (2.0 / 3.0)).abs() < 1e-12);
         assert!((partial_report.speaker_count.unknown_voiced_share - (1.0 / 3.0)).abs() < 1e-12);
+        assert_eq!(
+            partial_report.speaker_count.status,
+            SpeakerCountOutcomeStatus::Unresolved
+        );
+        assert!(
+            partial_report
+                .speaker_count
+                .reasons
+                .contains(&SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved)
+        );
+
+        let partial_hard_request = DiarizationRequest {
+            engine: DiarizationEngine::External,
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
+            ..DiarizationRequest::default()
+        };
+        let partial_hard_report = external_diarization_report(
+            &partial,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &partial_hard_request,
+            None,
+        )
+        .expect("partial attribution must remain an explicit hard-count mismatch");
+        assert_eq!(
+            partial_hard_report.speaker_count.status,
+            SpeakerCountOutcomeStatus::Unsatisfied
+        );
+        assert!(
+            partial_hard_report
+                .speaker_count
+                .reasons
+                .contains(&SpeakerCountOutcomeReason::RequestedCountMismatch)
+        );
 
         let range_request = DiarizationRequest {
             engine: DiarizationEngine::External,

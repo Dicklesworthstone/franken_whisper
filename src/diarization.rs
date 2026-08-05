@@ -10588,7 +10588,7 @@ fn enroll_known_speaker_profiles_with_authority(
     }
 
     let hint_document_sha256 = (!request.known_intervals.is_empty())
-        .then(|| crate::model::speaker_hint_document_sha256(&request.known_intervals));
+        .then(|| crate::model::speaker_hint_document_sha256(request));
     let reserved_speaker_refs = request
         .known_intervals
         .iter()
@@ -12594,7 +12594,7 @@ fn public_speaker_count_outcome(
         SpeakerCountRequest::Infer
         | SpeakerCountRequest::Prior { .. }
         | SpeakerCountRequest::Range { .. } => SpeakerCountOutcomeStatus::Unresolved,
-        SpeakerCountRequest::HardConstraint { .. } if clustering.constraints_satisfied => {
+        SpeakerCountRequest::HardConstraint { count } if supported_speaker_count == *count => {
             SpeakerCountOutcomeStatus::Satisfied
         }
         SpeakerCountRequest::HardConstraint { .. } => SpeakerCountOutcomeStatus::Unsatisfied,
@@ -13150,7 +13150,6 @@ where
             ),
             ProbabilisticAgglomeration::Fallback {
                 reason,
-                count_estimate: _,
                 count_merge_steps,
             } => {
                 let unavailable_reason = match reason {
@@ -15353,7 +15352,6 @@ enum ProbabilisticAgglomeration {
     },
     Fallback {
         reason: AcousticClusteringFallbackReason,
-        count_estimate: Option<SpeakerCountEstimate>,
         count_merge_steps: Vec<AcousticCountMergeStepEvidence>,
     },
 }
@@ -15409,7 +15407,6 @@ where
         else {
             return Ok(ProbabilisticAgglomeration::Fallback {
                 reason: AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions,
-                count_estimate: None,
                 count_merge_steps: full_lane_merge_steps,
             });
         };
@@ -15452,7 +15449,6 @@ where
     ) else {
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::InvalidPosterior,
-            count_estimate: None,
             count_merge_steps: full_lane_merge_steps,
         });
     };
@@ -15479,7 +15475,6 @@ where
         let Some(neural_embeddings) = neural_embeddings else {
             return Ok(ProbabilisticAgglomeration::Fallback {
                 reason: AcousticClusteringFallbackReason::InvalidPosterior,
-                count_estimate: Some(count_estimate),
                 count_merge_steps: full_lane_merge_steps,
             });
         };
@@ -15498,7 +15493,6 @@ where
     let Some((selected_count, feature_stability)) = operational_partition else {
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::InvalidPosterior,
-            count_estimate: Some(count_estimate),
             count_merge_steps: full_lane_merge_steps,
         });
     };
@@ -15545,7 +15539,6 @@ where
     let Some((clusters, merge_trace)) = neural_partition.or(consensus_partition) else {
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::UnstableSpeakerCount,
-            count_estimate: Some(count_estimate),
             count_merge_steps: full_lane_merge_steps,
         });
     };
@@ -27942,6 +27935,47 @@ mod tests {
             outcome
                 .reasons
                 .contains(&SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved),
+            "{outcome:#?}"
+        );
+    }
+
+    #[test]
+    fn hard_count_outcome_depends_only_on_supported_count_equality() {
+        let request = SpeakerCountRequest::HardConstraint { count: 2 };
+        let tracklets = sequential_profile_tracklets(&[0.0, 0.0, 0.0, 4.0, 4.0, 4.0], 500, 50);
+        let mut result = cluster_with_hard_count(&tracklets, 2);
+        assert_eq!(result.detected_speakers, 2, "{result:#?}");
+
+        // These broad quality gates still control the pipeline fallback status,
+        // but they must not rewrite the narrower public count-equality claim.
+        result.constraints_satisfied = false;
+        result.dominant_speaker_share = 0.99;
+        result.speaker_separation_satisfied = false;
+
+        let outcome = super::public_speaker_count_outcome(&request, &result).expect("outcome");
+        assert_eq!(outcome.status, SpeakerCountOutcomeStatus::Satisfied);
+        assert!(
+            outcome
+                .reasons
+                .contains(&SpeakerCountOutcomeReason::RequestedCountMatched),
+            "{outcome:#?}"
+        );
+        assert!(
+            !outcome
+                .reasons
+                .contains(&SpeakerCountOutcomeReason::RequestedCountMismatch),
+            "{outcome:#?}"
+        );
+        assert!(
+            outcome
+                .reasons
+                .contains(&SpeakerCountOutcomeReason::DominantSpeakerShareExceeded),
+            "{outcome:#?}"
+        );
+        assert!(
+            outcome
+                .reasons
+                .contains(&SpeakerCountOutcomeReason::AmbiguousSpeakerSeparation),
             "{outcome:#?}"
         );
     }
