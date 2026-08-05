@@ -1,23 +1,45 @@
-# Acoustic Diarization Contract v2
+# Native Diarization Contract v3
 
 Status: implementation contract for `bd-odj7`
-Contract identifier: `acoustic-diarization-v2`
+Contract identifier: `acoustic-diarization-v3`
 
 ## 1. Purpose and authority
 
-The native acoustic diarizer answers “who spoke when?” from the normalized
-waveform. It does not infer speaker identity, gender, or legal identity. Its
-speaker references are opaque within-run cluster identifiers or references
-provided explicitly by the caller.
+The native diarization stack answers “who spoke when?” from the normalized
+waveform. It does not infer a name, gender, or legal identity. Its speaker
+references are opaque within-run cluster identifiers or references provided
+explicitly by the caller.
 
-This contract governs classical acoustic, later neural, and external
-implementations after output normalization. An implementation cannot call
-itself acoustic if it only examines timestamps, text, word counts, or segment
-position.
+This contract governs the native acoustic path, the explicit `ecapa` and
+`ecapa-fused` paths, and external implementations after output normalization.
+An implementation cannot call itself acoustic if it only examines timestamps,
+text, word counts, or segment position. ECAPA similarity is likewise acoustic
+speaker evidence, not biometric identification.
 
 The native engine contract remains authoritative for ASR text and timestamps.
 This document adds the permutation-invariant speaker, confidence, supervision,
 privacy, and bounded-resource contract that the ASR contract lacks.
+
+### 1.1 Runtime identity matrix
+
+These identities are distinct and must not be collapsed in reports, JSON, or
+evaluation evidence:
+
+| Requested path | CLI spelling | JSON/library spelling | Report implementation | Report contract | `speaker_evidence_mode` |
+|---|---|---|---|---|---|
+| Native acoustic v2 features | `acoustic` | `acoustic` | `native-acoustic-v2` | `acoustic-diarization-v3` | `acoustic_v2` |
+| ECAPA identity only | `ecapa` | `ecapa` | `native-ecapa-only-v1` | `neural-diarization-common-v2` | `ecapa_only` |
+| ECAPA plus bounded channel evidence | `ecapa-fused` | `ecapa_fused` | `native-ecapa-fused-v1` | `neural-diarization-common-v2` | `ecapa_with_acoustic_channel` |
+| Unavailable ECAPA with `unknown` fallback | n/a (result state) | n/a | `native-ecapa-unavailable-v1` | `neural-diarization-common-v2` | `none` |
+| Normalized external result | `external` | `external` | `external-backend` | `acoustic-diarization-v3` | `external` |
+
+The ECAPA provider identity is
+`ecapa-tdnn-voxceleb-cosine-v6-development`; the current native probabilistic
+clustering identity is
+`acoustic-clustering-probabilistic-v18-calibrated-separation-development`.
+The nested wire schemas remain `neural-speaker-representation-summary-v1` and
+`diarization-operational-partition-v1`. Their names are schema identities, not
+an accepted `neural` CLI or JSON engine value.
 
 ## 2. Canonical data flow
 
@@ -28,7 +50,9 @@ normalized 16 kHz mono PCM with finite samples in the closed [-1.0, 1.0] range
     -> separate voice and channel features
     -> multiscale acoustic change scores
     -> microturns and tracklets
-    -> robust sufficient-statistic speaker profiles
+    -> acoustic-v2 sufficient statistics OR ECAPA discovery/validation embeddings
+    -> bounded channel evidence only for acoustic and ecapa-fused identity scoring
+    -> robust within-call speaker profiles
     -> constrained deterministic clustering
     -> temporal smoothing and unknown rejection
     -> independent diarized-turn timeline
@@ -47,7 +71,8 @@ The decision state consists of:
 - hard and soft known-speaker intervals;
 - current robust profiles and channel subprofiles;
 - one typed speaker-count request: inference, caller prior, range, or hard
-  search constraint; probabilistic count evidence is v5 development-uncertified;
+  search constraint; the current probabilistic count/assignment identity is v18
+  and remains development-uncertified;
 - prior temporal assignment;
 - algorithm, feature-schema, weights, and calibration identities;
 - remaining time, memory, and prototype budgets.
@@ -635,12 +660,14 @@ process-level observation rather than an isolated per-lane footprint. Passing
 these bounds cannot establish a speed or memory win, and no such claim exists
 without a separately retained public probe.
 
-### 4.4 Probabilistic clustering v2 development status
+### 4.4 Historical probabilistic clustering evidence
 
-The current clustering evidence uses
+The measurements in this subsection are retained historical v2 development
+evidence. They used
 `public-diarization-acoustic-ablation-v7`,
 `public-diarization-acoustic-ablation-runner-v7`, and
-`diarization-scorer-v3`. It evaluates two public AMI development recordings,
+the historical `diarization-scorer-v3`, not the current scorer-v5 authority.
+The study evaluated two public AMI development recordings,
 each clipped to a deterministic 120-second prefix, with oracle VAD and without
 oracle speaker count. The public bundle hash is
 `34f405b6220d479f4d0d86937de77d51375ed39120abfd3a2f38e775a24e874e`;
@@ -671,12 +698,18 @@ lock was minted, and no held-out recording was read. These results establish
 real public development evidence and performance observations, not production
 promotion or held-out certification.
 
-The subsequent `acoustic-clustering-probabilistic-v5-development` count
-candidate adds a separately versioned `speaker-count-estimate-v2` report. It
-has not inherited the v2 evaluation authority: until a new frozen public
-development bundle passes the count, DER/JER, calibration, determinism, memory,
-and latency gates, the normal assignment path remains `fixed_safe_v1`. Native
-fixed-safe runs still emit the count-estimate object, but with
+The subsequent historical
+`acoustic-clustering-probabilistic-v5-development` count candidate added a
+separately versioned `speaker-count-estimate-v2` report. It did not inherit the
+v2 evaluation authority, and neither historical study confers authority on the
+current
+`acoustic-clustering-probabilistic-v18-calibrated-separation-development`
+identity. The current v18 identity remains `DevelopmentUncertified`; this
+subsection contains no retained promotion or production-accuracy evidence for
+it. The default acoustic assignment path therefore remains `fixed_safe_v1`;
+the explicit ECAPA development modes exercise v18 only because the caller opts
+into that uncertified path. Native fixed-safe runs still emit the
+count-estimate object, but with
 `fixed_safe_uncalibrated`, no concrete bins or selected count, and all
 probability mass assigned to `unresolved`.
 
@@ -699,6 +732,10 @@ no usable speech fails rather than creating an empty trusted profile.
 Soft hints contribute capped pseudo-counts and priors. They can be rejected
 when acoustically contradictory. Provenance is audit metadata and cannot
 increase confidence by itself.
+
+A request with nonempty `known_intervals` rejects both external execution and
+`fallback=external` before diarization. External labels cannot enforce the
+immutable hint identities, so silently discarding that constraint is forbidden.
 
 Profile training is independently audited from attribution. A hard interval
 remains an immutable assignment even when its acoustic observation is
@@ -925,7 +962,8 @@ does not invent speakers merely to satisfy a range minimum or exact count; it
 reports `unsatisfied_constraints`, reports `speaker_count_unresolved`, or
 returns a hard error according to typed fallback policy.
 
-The v5 probabilistic speaker-count candidate uses five deterministic semantic
+The bounded development speaker-count design, currently identified by the v18
+probabilistic clustering identity above, uses five deterministic semantic
 views: full evidence, no pitch, no dynamics, no formants, and no channel. It
 retains their complete bounded merge-risk curves, combines them with a
 symmetrized degree-bounded normalized-affinity eigengap proposal, applies hard
@@ -964,9 +1002,25 @@ denominator.
 The six-dimensional temporal/lexical heuristic is not an acoustic fallback.
 An explicit acoustic request cannot silently invoke external or lexical
 behavior. Soft count priors and ranges are consumed by the native acoustic and
-explicit neural engines and rejected by external engines instead of being
-silently hardened into backend min/max controls. Every fallback names its
-source and reason.
+explicit `ecapa` and `ecapa-fused` engines and rejected by external engines
+instead of being silently hardened into backend min/max controls. Every
+fallback names its source and reason.
+
+For either explicit ECAPA request, fallback depends on whether inference
+completed but the resulting speaker evidence was insufficient, or whether the
+representation could not be resolved, loaded, or inferred at all:
+
+| Policy | ECAPA evidence insufficient | ECAPA package/load/inference unavailable |
+|---|---|---|
+| `unknown` | Retain the native result, hard-hint assignments, and UNKNOWN assignments | Emit hard hints where possible and UNKNOWN elsewhere under `native-ecapa-unavailable-v1` |
+| `acoustic` | Rerun the common stack with acoustic-v2 speaker identity and retain ECAPA provenance | Rerun acoustic identity and attach an unavailable-ECAPA summary |
+| `external` | Use valid external labels when present; otherwise retain the insufficient ECAPA report | Use valid external labels when present; otherwise return an error |
+| `error` | Return an inner-diarizer error | Return an error |
+
+This asymmetry is intentional: an absent external result cannot be reported as
+successful external fallback. A completed but insufficient ECAPA run remains
+inspectable, whereas an unavailable representation cannot supply a native
+ECAPA result.
 
 ## 9. Scoring
 
@@ -1150,6 +1204,23 @@ speaker vectors, the CLI hint-document source path, or corpus metadata.
 `persist_profiles` records explicit consent but does not expand the v5 storage
 surface; reusable vectors require a separately reviewed schema and retention
 policy.
+
+Canonical result JSON, robot output, and persisted typed reports may expose
+only content-free ECAPA provenance: provider version, the public expected and
+loaded package digests, the stable in-process load source (`direct`),
+availability status, aggregate embedded/zero-padded/skipped tracklet counts,
+and stable reason codes. Cache warmth is deliberately excluded from the typed
+report so identical input, request, and model bytes do not produce different
+authoritative output. A separate external cache probe verifies miss, hit, and
+corrupt-package invalidation behavior without changing report bytes.
+They must never expose a model path, embedding coordinates, PCM, filterbank or
+other feature values, tensor values, or per-tracklet neural payloads.
+
+The privacy-safe `diarization-operational-partition-v1` summary may retain its
+method, selected count, confidence, calibration digest, and authority. Its
+confidence is operational evidence, not automatically a calibrated posterior:
+`FixedSafeUncalibrated` and `DevelopmentUncertified` authority remain explicit
+non-certification states.
 
 Private evaluation material must be read in place and must never be copied into
 the repository, fixtures, remote build inputs, JSONL snapshots, Beads, logs, or
@@ -1485,12 +1556,25 @@ files. A missing `--reference` is valid and produces
 
 `src/ecapa_conformance.rs` freezes the model/evidence contract and
 `src/ecapa_inference.rs` implements its bounded safe-Rust ECAPA-TDNN forward
-path. An explicit `neural` request uses the production PCM frontend and routes
-the normalized representation through the common segmentation, constraints,
-count, temporal UNKNOWN/overlap, label, and projection contracts. It does not
-enter `auto`, change the acoustic default, download a model, or parse a
-framework checkpoint at runtime. Public-corpus accuracy and calibration remain
+path. The orchestrator routes both explicit ECAPA engines through
+`diarize_ecapa_pcm` and the common segmentation, constraints, count, temporal
+UNKNOWN/overlap, label, and projection contracts. `ecapa` uses ECAPA
+coordinates for speaker identity without acoustic channel evidence in pair
+scoring. `ecapa-fused` adds separately bounded acoustic channel evidence and
+consensus to that ECAPA identity path and is not eligible for the
+`EcapaSpherical` operational partition. Neither mode enters `auto`, changes
+the acoustic default, downloads a model, or parses a framework checkpoint at
+runtime. Public-corpus accuracy and calibration remain
 development-uncertified.
+
+The ECAPA development decision policy places its equal-loss different-speaker
+boundary at cosine distance `0.80`. Robust final-assignment and held-out
+validation separation begin at that same `0.80` boundary. Lane consensus and
+temporal recurrence may require stricter evidence; they may never introduce a
+hidden, weaker `0.70` separation gate. This bound is part of
+`acoustic-clustering-probabilistic-v18-calibrated-separation-development`; it
+is a versioned conservative decision policy, not an accuracy-certification
+claim.
 
 The source is
 [`speechbrain/spkrec-ecapa-voxceleb`](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/tree/eac27266f68caa806381260bd44ace38b136c76a)
@@ -1542,6 +1626,14 @@ weights belong in Git, and the converted artifact is not yet published.
 hash, conversion command, and output hash without pretending that a download
 is available.
 
+Runtime resolution requires the exact filename
+`ecapa_tdnn_voxceleb.safetensors` under `$FRANKEN_WHISPER_MODEL_DIR/aux/` or,
+when that variable is unset, `~/.cache/franken_whisper/models/aux/`. Its
+required SHA-256 is
+`9276a840c52cdd2e9afb73cd87a38e15749e12bf494d3ca47b5bc162f237cbcc`.
+The fetch script does not install it; it prints the pinned local conversion
+procedure and expected digest.
+
 The shipped Rust verifier first streams the complete package through a bounded,
 cancel-aware exact-size and SHA-256 check. It then passes that same
 authenticated owned byte buffer—without reopening the path—to
@@ -1552,25 +1644,33 @@ truncation, corruption, and cancellation failures report stable `ecapa.*`
 reasons without printing paths, tensor contents, or source bytes. There is no
 second model-package format or sidecar manifest.
 
-The Rust PCM frontend in this bead is a bounded scalar conformance reference,
-not the later production kernel; it accepts at most 16,000 samples (one second).
-For exact 16 kHz mono finite PCM in `[-1, 1]`, it uses a 400-sample periodic
-Hamming window, 160-sample hop, centered zero padding, 400-point one-sided
-squared-magnitude spectrum, 80 SpeechBrain symmetric triangular HTK mel filters
-over 0–8 kHz, `amin=1e-10`, 80 dB clipping, and per-utterance feature-mean
-subtraction without standard-deviation normalization. The neural boundary
-separately rejects normalized feature windows below 51 frames. Resampling and
-downmixing must already have occurred at the normalized-audio boundary. Callers
-must apply `validate_ecapa_input_format` while sample-rate and channel metadata
-are still available; the raw-slice conformance frontend cannot detect
-mislabeled 8 kHz or interleaved PCM and never guesses their format. A
-production PCM-to-feature kernel and common-pipeline hookup remain integration
-gates.
+`ecapa_frontend_conformance` is the independent bounded scalar oracle and
+accepts at most 16,000 samples (one second). `ecapa_frontend_runtime` is the
+current product path: it accepts 8,000 through 48,000 samples (one half-second
+through three seconds), uses the safe-Rust fixed FFT shared with the native
+Whisper frontend, and checks cancellation while processing frames. Both use
+the same 400-sample periodic Hamming window, 160-sample hop, centered zero
+padding, 400-point one-sided squared-magnitude spectrum, 80 SpeechBrain
+symmetric triangular HTK mel filters over 0–8 kHz, `amin=1e-10`, 80 dB
+clipping, and per-utterance feature-mean subtraction without
+standard-deviation normalization. The model boundary admits 51 through 301
+normalized feature frames.
+
+Resampling and downmixing must already have occurred at the normalized-audio
+boundary. Callers must apply `validate_ecapa_input_format` while sample-rate
+and channel metadata are still available; neither raw-slice frontend can
+detect mislabeled 8 kHz or interleaved PCM, and neither guesses their format.
 
 The raw 192-value model output is the golden embedding stage. `EcapaModel`
 returns an L2-unit-normalized vector and rejects non-finite, wrong-shaped, or
-norm-below-`1e-6` output. Future common-diarizer integration will consume that
-normalized representation; it is not routed into production clustering yet.
+norm-below-`1e-6` output. The common diarizer consumes that normalized
+representation now. For an admitted tracklet of at least two seconds,
+`diarize_ecapa_pcm` uses disjoint first and last windows for discovery and
+held-out validation, with each window capped at three seconds. Tracklets from
+one half-second up to two seconds use a discovery window only. Shorter admitted
+tracklets are centered and zero-padded to one half-second. This is current
+runtime integration, not evidence that either ECAPA mode has passed its public
+accuracy-promotion gates.
 The public analytic fixture combines 173 Hz and 347 Hz harmonics, a chirp, and
 one impulse; it contains no speech or identity evidence.
 `franken-whisper-ecapa-golden-v1` binds full-array hashes and selected values
@@ -1607,9 +1707,9 @@ Attention is normalized over time independently for every channel, and both
 global-context and attentive standard deviations clamp variance at `1e-12`.
 Inference accepts 51 through 301 frames (one half-second through three seconds
 at the frozen hop) and features with absolute value at most 160. Longer
-tracklets must, once this representation is integrated, be deterministically
-windowed by the common diarization pipeline; the neural kernel never allocates
-or runs in proportion to a complete recording.
+tracklets are deterministically windowed by `diarize_ecapa_pcm` under the
+discovery/held-out policy above; the neural kernel never allocates or runs in
+proportion to a complete recording.
 
 The forward path preplans a checked conservative numeric-buffer ceiling before
 copying input. At 301 frames, the ECAPA-owned `f32` activation and kernel-band
