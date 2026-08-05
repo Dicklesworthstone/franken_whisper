@@ -15462,13 +15462,12 @@ mod tests {
             row.missed_speech_sec + row.false_alarm_sec + row.speaker_confusion_sec;
         let expected_der = (row.reference_speaker_time_sec > SCORE_EPSILON_SEC)
             .then_some(diarization_error_sec / row.reference_speaker_time_sec);
-        let expected_selective_risk =
-            (row.selective_covered_speaker_time_sec > SCORE_EPSILON_SEC).then_some(
+        let expected_selective_risk = (row.selective_covered_speaker_time_sec > SCORE_EPSILON_SEC)
+            .then_some(
                 row.selective_error_covered_speaker_time_sec
                     / row.selective_covered_speaker_time_sec,
             );
-        let occupancy_denominator =
-            row.labeled_speaker_time_sec + row.unknown_speaker_time_sec;
+        let occupancy_denominator = row.labeled_speaker_time_sec + row.unknown_speaker_time_sec;
         let expected_unknown_share = (occupancy_denominator > SCORE_EPSILON_SEC)
             .then_some(row.unknown_speaker_time_sec / occupancy_denominator);
         let expected_count_error = row.reference_speakers.abs_diff(row.hypothesis_speakers);
@@ -15505,30 +15504,23 @@ mod tests {
     fn public_ecapa_pair_comparison_is_internally_consistent(
         row: &PublicEcapaResidualBirthPairRow,
     ) -> bool {
-        let expected_count_delta = i64::try_from(
-            row.candidate.accuracy.absolute_speaker_count_error,
-        )
-        .unwrap_or(i64::MAX)
-        .saturating_sub(
-            i64::try_from(row.baseline.accuracy.absolute_speaker_count_error)
-                .unwrap_or(i64::MAX),
-        );
+        let expected_count_delta =
+            i64::try_from(row.candidate.accuracy.absolute_speaker_count_error)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(
+                    i64::try_from(row.baseline.accuracy.absolute_speaker_count_error)
+                        .unwrap_or(i64::MAX),
+                );
         row.comparison.absolute_speaker_count_error_delta == expected_count_delta
             && row.comparison.candidate_no_farther_from_reference_count
                 == (expected_count_delta <= 0)
             && public_ecapa_optional_metric_matches(
                 row.comparison.der_delta,
-                public_ecapa_accuracy_delta(
-                    row.candidate.accuracy.der,
-                    row.baseline.accuracy.der,
-                ),
+                public_ecapa_accuracy_delta(row.candidate.accuracy.der, row.baseline.accuracy.der),
             )
             && public_ecapa_optional_metric_matches(
                 row.comparison.jer_delta,
-                public_ecapa_accuracy_delta(
-                    row.candidate.accuracy.jer,
-                    row.baseline.accuracy.jer,
-                ),
+                public_ecapa_accuracy_delta(row.candidate.accuracy.jer, row.baseline.accuracy.jer),
             )
             && public_ecapa_optional_metric_matches(
                 row.comparison.selective_risk_delta,
@@ -15568,8 +15560,7 @@ mod tests {
             && super::is_sha256_hex(&row.common_observation.normalized_input_sha256)
             && row.common_observation.normalized_input_sha256
                 == row.baseline.normalized_input_sha256
-            && row.baseline.normalized_input_sha256
-                == row.candidate.normalized_input_sha256
+            && row.baseline.normalized_input_sha256 == row.candidate.normalized_input_sha256
             && row.common_observation.embedded_tracklet_count > 0
             && row.common_observation.embedded_tracklet_count
                 == row.baseline.embedded_tracklet_count
@@ -15646,6 +15637,13 @@ mod tests {
                 || !public_ecapa_accuracy_is_internally_consistent(&row.baseline.accuracy)
                 || !public_ecapa_accuracy_is_internally_consistent(&row.candidate.accuracy)
                 || !public_ecapa_pair_comparison_is_internally_consistent(row)
+                || !row.timing.candidate_replay_excluded_from_gate
+                || row.timing.execution_order
+                    != public_ecapa_execution_order(&row.recording_id, row.engine)
+                || row.timing.common_preparation_wall_ns == 0
+                || row.timing.baseline_partition_finish_wall_ns == 0
+                || row.timing.candidate_partition_finish_wall_ns == 0
+                || row.timing.candidate_replay_wall_ns == 0
             {
                 failures.push(PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch);
             }
@@ -15665,8 +15663,10 @@ mod tests {
                         .get(pair_index % gate_policy.required_engines.len()),
                 )
                 .zip(expected_common_observations.get(pair_index));
-            if let Some((((expected_reference, expected_recording), expected_engine), expected_common)) =
-                expected_pair
+            if let Some((
+                ((expected_reference, expected_recording), expected_engine),
+                expected_common,
+            )) = expected_pair
             {
                 let expected_reference_sha256 = super::canonical_sha256(expected_reference)
                     .expect("hash validated frozen ECAPA reference");
@@ -15745,17 +15745,15 @@ mod tests {
             if !baseline_contract_matches || !candidate_contract_matches {
                 failures.push(PublicEcapaResidualBirthGateFailure::IncumbentContractMismatch);
             }
-            let evidence_mode_matches_engine = match row.engine {
-                crate::model::DiarizationEngine::Ecapa => {
-                    row.evidence_mode
-                        == crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly
-                }
-                crate::model::DiarizationEngine::EcapaFused => {
-                    row.evidence_mode
-                        == crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
-                }
-                _ => false,
-            };
+            let evidence_mode_matches_engine =
+                match row.engine {
+                    crate::model::DiarizationEngine::Ecapa => {
+                        row.evidence_mode == crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly
+                    }
+                    crate::model::DiarizationEngine::EcapaFused => row.evidence_mode
+                        == crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+                    _ => false,
+                };
             let fused_candidate_is_exactly_ineligible =
                 row.engine != crate::model::DiarizationEngine::EcapaFused
                     || (!row.candidate.birth_applied
@@ -16224,9 +16222,7 @@ mod tests {
             9.0,
             1.0,
         );
-        assert!(public_ecapa_accuracy_is_internally_consistent(
-            &consistent
-        ));
+        assert!(public_ecapa_accuracy_is_internally_consistent(&consistent));
 
         let mut inconsistent_exact = consistent.clone();
         inconsistent_exact.exact_speaker_count = false;
@@ -16574,6 +16570,52 @@ mod tests {
                 .failures
                 .contains(&PublicEcapaResidualBirthGateFailure::PairAlignmentMismatch)
         );
+
+        let mut timing_tampered_rows = rows.clone();
+        timing_tampered_rows[0]
+            .timing
+            .candidate_replay_excluded_from_gate = false;
+        timing_tampered_rows[0].row_sha256 =
+            public_ecapa_pair_result_sha256(&timing_tampered_rows[0]);
+        let timing_tampered_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &timing_tampered_rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            paired_process_observed_rss_bytes,
+        );
+        assert!(!timing_tampered_gate.passed);
+        assert!(timing_tampered_gate
+            .failures
+            .contains(&PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch));
+
+        let mut metric_tampered_rows = rows.clone();
+        metric_tampered_rows[0].baseline.accuracy.exact_speaker_count =
+            !metric_tampered_rows[0]
+                .baseline
+                .accuracy
+                .exact_speaker_count;
+        metric_tampered_rows[0].deterministic_accuracy_sha256 =
+            public_ecapa_pair_accuracy_sha256(&metric_tampered_rows[0]);
+        metric_tampered_rows[0].row_sha256 =
+            public_ecapa_pair_result_sha256(&metric_tampered_rows[0]);
+        let metric_tampered_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &metric_tampered_rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            paired_process_observed_rss_bytes,
+        );
+        assert!(!metric_tampered_gate.passed);
+        assert!(metric_tampered_gate
+            .failures
+            .contains(&PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch));
 
         let mut weakened_policy = gate_policy.clone();
         weakened_policy.minimum_exact_match_gain = 0;

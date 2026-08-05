@@ -7922,6 +7922,9 @@ pub(crate) fn ecapa_residual_birth_policy_sha256() -> String {
     hasher.update(b"untouched-incumbents-cloned-byte-for-byte-v1");
     hasher.update(b"exact-raw-member-conservation-v1");
     hasher.update(b"conservative-checked-scratch-payload-accounting-v1");
+    hasher.update(b"accepted-birth-count-evidence-rebinding-v1");
+    hasher.update(b"accepted-birth-partition-confidence-zero-v1");
+    hasher.update(b"child-order-earliest-then-member-list-v1");
     hasher.update(b"route:development-only-no-env-no-default-flip-v1");
     for mode in EcapaResidualBirthMode::ALL {
         hasher.update(b"mode:");
@@ -16578,43 +16581,122 @@ fn residual_birth_evidence(
     }
 }
 
-fn residual_birth_scratch_payload_upper_bound(incumbent: &[AcousticCluster]) -> Option<u64> {
-    let total_members = incumbent.iter().try_fold(0usize, |total, cluster| {
-        total.checked_add(cluster.prototype_members.len())
-    })?;
-    let largest_parent = incumbent
-        .iter()
-        .map(|cluster| cluster.prototype_members.len())
-        .max()
-        .unwrap_or(0);
+fn residual_birth_count_evidence_sha256(
+    prior_evidence_sha256: &str,
+    prior_partition: &DiarizationOperationalPartitionSummary,
+    evidence: &EcapaResidualBirthEvaluationEvidence,
+) -> String {
+    let partition_method = match prior_partition.method {
+        DiarizationOperationalPartitionMethod::FixedSafeAgglomerative => {
+            "fixed_safe_agglomerative"
+        }
+        DiarizationOperationalPartitionMethod::ProbabilisticConsensus => {
+            "probabilistic_consensus"
+        }
+        DiarizationOperationalPartitionMethod::EcapaSpherical => "ecapa_spherical",
+    };
+    let partition_authority = match prior_partition.authority {
+        SpeakerCountCalibrationStatus::Certified => "certified",
+        SpeakerCountCalibrationStatus::DevelopmentUncertified => "development_uncertified",
+        SpeakerCountCalibrationStatus::FixedSafeUncalibrated => "fixed_safe_uncalibrated",
+        SpeakerCountCalibrationStatus::Unavailable => "unavailable",
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"speaker-count-residual-birth-rebinding-v1\0");
+    hasher.update(prior_evidence_sha256.as_bytes());
+    hasher.update(prior_partition.schema_version.as_bytes());
+    hasher.update(partition_method.as_bytes());
+    hasher.update(prior_partition.selected_count.to_le_bytes());
+    hasher.update(prior_partition.confidence.to_bits().to_le_bytes());
+    hasher.update(prior_partition.calibration_sha256.as_bytes());
+    hasher.update(partition_authority.as_bytes());
+    hasher.update(evidence.schema_version.as_bytes());
+    hasher.update(evidence.mode.id().as_bytes());
+    hasher.update(evidence.policy_sha256.as_bytes());
+    hasher.update(evidence.common_observation_sha256.as_bytes());
+    match evidence.proposal_kind {
+        Some(proposal) => {
+            hasher.update([1]);
+            hasher.update(proposal.id().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update([u8::from(evidence.birth_applied)]);
+    match evidence.fallback_reason {
+        Some(fallback) => {
+            hasher.update([1]);
+            hasher.update(fallback.id().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update(evidence.incumbent_cluster_count.to_le_bytes());
+    hasher.update(evidence.output_cluster_count.to_le_bytes());
+    for value in [
+        evidence.resources.parent_count_scanned,
+        evidence.resources.residual_observation_count,
+        evidence.resources.leave_pair_out_pair_count,
+        evidence.resources.candidate_split_count,
+        evidence.resources.committed_birth_count,
+        evidence.resources.lloyd_assignment_visits,
+        evidence.resources.robust_view_comparison_count,
+        evidence.resources.maximum_retained_residual_observations,
+        evidence.resources.peak_scratch_payload_bytes,
+        evidence.resources.operation_count,
+        evidence.resources.cancellation_check_count,
+    ] {
+        hasher.update(value.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn residual_birth_scratch_payload_upper_bound<C>(
+    incumbent: &[AcousticCluster],
+    budget: &mut EcapaResidualBirthBudget<'_, C>,
+) -> FwResult<Option<u64>>
+where
+    C: FnMut() -> bool,
+{
+    let mut total_members = 0usize;
+    let mut largest_parent = 0usize;
+    for cluster in incumbent {
+        budget.observe(1, "while bounding residual-speaker scratch payload")?;
+        let Some(next_total) = total_members.checked_add(cluster.prototype_members.len()) else {
+            return Ok(None);
+        };
+        total_members = next_total;
+        largest_parent = largest_parent.max(cluster.prototype_members.len());
+    }
     // Conservative simultaneous high-water bound for member-index vectors in
     // discovery, validation, two Lloyd generations, rebuilt child payloads,
     // output clusters, and conservation checks. Fixed payload covers retained
     // residuals/proposal plus eight live embedding centroids and cluster shells.
-    let member_slots = largest_parent.checked_mul(6)?.checked_add(
-        total_members
-            .checked_mul(3)?
-            .checked_add(ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS + 4)?,
-    )?;
-    let member_bytes = member_slots.checked_mul(std::mem::size_of::<usize>())?;
-    let cluster_bytes = incumbent
-        .len()
-        .checked_add(4)?
-        .checked_mul(std::mem::size_of::<AcousticCluster>())?;
-    let fixed_bytes = ECAPA_EMBEDDING_DIMENSIONS
-        .checked_mul(std::mem::size_of::<f32>())?
-        .checked_mul(8)?
-        .checked_add(
-            std::mem::size_of::<EcapaResidualObservation>()
-                .checked_mul(ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS)?,
-        )?
-        .checked_add(std::mem::size_of::<EcapaResidualBirthProposal>())?;
-    u64::try_from(
-        member_bytes
-            .checked_add(cluster_bytes)?
-            .checked_add(fixed_bytes)?,
-    )
-    .ok()
+    let payload = (|| {
+        let member_slots = largest_parent.checked_mul(6)?.checked_add(
+            total_members
+                .checked_mul(3)?
+                .checked_add(ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS + 4)?,
+        )?;
+        let member_bytes = member_slots.checked_mul(std::mem::size_of::<usize>())?;
+        let cluster_bytes = incumbent
+            .len()
+            .checked_add(4)?
+            .checked_mul(std::mem::size_of::<AcousticCluster>())?;
+        let fixed_bytes = ECAPA_EMBEDDING_DIMENSIONS
+            .checked_mul(std::mem::size_of::<f32>())?
+            .checked_mul(8)?
+            .checked_add(
+                std::mem::size_of::<EcapaResidualObservation>()
+                    .checked_mul(ECAPA_RESIDUAL_BIRTH_MAX_RANKED_MEMBERS)?,
+            )?
+            .checked_add(std::mem::size_of::<EcapaResidualBirthProposal>())?;
+        u64::try_from(
+            member_bytes
+                .checked_add(cluster_bytes)?
+                .checked_add(fixed_bytes)?,
+        )
+        .ok()
+    })();
+    Ok(payload)
 }
 
 fn tracklet_for_residual_member<'a, C>(
@@ -17425,7 +17507,6 @@ where
             return Ok(None);
         }
     }
-    cluster.prototype_members.sort_unstable();
     let Some(centroid) =
         equal_tracklet_discovery_centroid(&cluster.prototype_members, neural_embeddings, budget)?
     else {
@@ -17657,7 +17738,6 @@ where
     if children[0]
         .earliest_ms
         .cmp(&children[1].earliest_ms)
-        .then_with(|| compare_cluster_identity(&children[0], &children[1]))
         .then_with(|| {
             children[0]
                 .prototype_members
@@ -17744,11 +17824,7 @@ where
         return Ok((None, evidence));
     }
     let mut budget = EcapaResidualBirthBudget::new(is_cancelled)?;
-    budget.observe(
-        incumbent.len(),
-        "while bounding residual-speaker scratch payload",
-    )?;
-    let scratch_payload = residual_birth_scratch_payload_upper_bound(incumbent);
+    let scratch_payload = residual_birth_scratch_payload_upper_bound(incumbent, &mut budget)?;
     evidence.resources.peak_scratch_payload_bytes = scratch_payload.unwrap_or(u64::MAX);
     if scratch_payload
         .is_none_or(|payload| payload > ECAPA_RESIDUAL_BIRTH_MAX_SCRATCH_PAYLOAD_BYTES)
