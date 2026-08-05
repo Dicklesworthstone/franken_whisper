@@ -2778,7 +2778,7 @@ mod tests {
 
     fn attach_synthetic_diarization(report: &mut RunReport, persist_profiles: bool) {
         report.request.diarize = true;
-        report.request.backend_params.acoustic_diarization = Some(DiarizationRequest {
+        let diarization_request = DiarizationRequest {
             engine: DiarizationEngine::Acoustic,
             speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
             known_intervals: vec![KnownSpeakerInterval {
@@ -2791,7 +2791,11 @@ mod tests {
             }],
             persist_profiles,
             ..DiarizationRequest::default()
-        });
+        };
+        let hint_document_sha256 = crate::diarization::canonical_hint_document_sha256(
+            &diarization_request.known_intervals,
+        );
+        report.request.backend_params.acoustic_diarization = Some(diarization_request);
         report.result.diarization = Some(DiarizationReport {
             implementation: "native-acoustic-v2".to_owned(),
             contract_version: "acoustic-diarization-v3".to_owned(),
@@ -2799,9 +2803,7 @@ mod tests {
             speaker_evidence_mode: crate::model::DiarizationSpeakerEvidenceMode::AcousticV2,
             normalized_input_sha256:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            hint_document_sha256: Some(
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-            ),
+            hint_document_sha256: Some(hint_document_sha256),
             turns: vec![DiarizationTurn {
                 start_ms: 0,
                 end_ms: 1_000,
@@ -2892,7 +2894,7 @@ mod tests {
             constraint_lower_bound: 1,
             candidate_upper_bound: 1,
             calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
-            calibration_sha256: "a".repeat(64),
+            calibration_sha256: crate::diarization::acoustic_speaker_pair_calibration_sha256(),
             evidence_sha256: "b".repeat(64),
             lanes: vec![
                 SpeakerCountLaneEvidence {
