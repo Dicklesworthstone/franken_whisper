@@ -2792,9 +2792,8 @@ mod tests {
             persist_profiles,
             ..DiarizationRequest::default()
         };
-        let hint_document_sha256 = crate::diarization::canonical_hint_document_sha256(
-            &diarization_request.known_intervals,
-        );
+        let hint_document_sha256 =
+            crate::model::speaker_hint_document_sha256(&diarization_request.known_intervals);
         report.request.backend_params.acoustic_diarization = Some(diarization_request);
         report.result.diarization = Some(DiarizationReport {
             implementation: "native-acoustic-v2".to_owned(),
@@ -3207,7 +3206,9 @@ mod tests {
             .persist_report(&wrong_count)
             .expect_err("the report must bind the exact speaker-count request");
         assert!(
-            count_error.to_string().contains("speaker-count request differs"),
+            count_error
+                .to_string()
+                .contains("speaker-count request differs"),
             "{count_error}"
         );
 
@@ -3222,13 +3223,7 @@ mod tests {
         let store = RunStore::open(&db_path).expect("store");
         let mut report = minimal_report("run-effective-default", &db_path);
         report.request.diarize = true;
-        assert!(
-            report
-                .request
-                .backend_params
-                .acoustic_diarization
-                .is_none()
-        );
+        assert!(report.request.backend_params.acoustic_diarization.is_none());
 
         store
             .persist_report(&report)

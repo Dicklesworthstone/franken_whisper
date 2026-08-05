@@ -3365,9 +3365,8 @@ mod tests {
             }],
             ..DiarizationRequest::default()
         };
-        let hint_document_sha256 = crate::diarization::canonical_hint_document_sha256(
-            &diarization_request.known_intervals,
-        );
+        let hint_document_sha256 =
+            crate::model::speaker_hint_document_sha256(&diarization_request.known_intervals);
         report.request.backend_params.acoustic_diarization = Some(diarization_request);
         report.result.diarization = Some(DiarizationReport {
             implementation: "native-acoustic-v2".to_owned(),
@@ -3396,7 +3395,7 @@ mod tests {
                 training_accepted_count: 1,
                 training_downweighted_count: 0,
                 training_quarantined_count: 0,
-                anchored: true,
+                anchored: false,
                 soft_hint_contradiction: Some(0.04),
             }],
             hint_evidence: vec![SpeakerHintEvidenceSummary {

@@ -14268,7 +14268,9 @@ mod tests {
                     .unwrap_or(u64::MAX)
                     .max(1);
                 let peak_rss_bytes = super::sampled_process_rss_bytes();
-                report.validate().expect("valid native ECAPA report");
+                report
+                    .validate_against_request(&request, Some(reference.duration_ms))
+                    .expect("valid request-bound native ECAPA report");
                 assert_eq!(report.speaker_evidence_mode, expected_evidence_mode);
                 let representation = report
                     .neural_representation
