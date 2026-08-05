@@ -508,6 +508,23 @@ The Sortformer entry is narrower than the generic adapters: it pins
 at immutable revision `fafaab5faa1617a0ca52d38dd3dc4bd636800d3d`, requires
 canonical mono 16 kHz PCM16 WAV input, and freezes the documented high-latency
 340/40/40/300/188 streaming-cache profile plus untuned 0.5/0.5 post-processing.
+The `300` value is the configured cache-update period. Pinned NeMo only warns
+when it is shorter than the 340-frame chunk; its FIFO update computes
+`min(max(configured, chunk - fifo_capacity + current_fifo), current_fifo + chunk)`.
+That moves 300 frames on the first full chunk and 340 in the full-chunk steady
+state, while tail chunks remain state-dependent.
+The accepted v2 operator adapter fails closed unless installed package metadata
+binds NeMo to commit `40ace43c7cf151af78dc22027c02feeca7e06b6a` and the frozen
+Python/PyTorch/torchaudio/NumPy versions. It derives BLAS and CPU-feature facts
+from the installed runtimes and asserts the raw streaming profile plus the
+derived FIFO-pop schedule after NeMo validates it; those facts may not be
+supplied by literals alone.
+The operator-installed adapter remains an explicit trust boundary: the host
+validates its schema and self-consistent attestations and records the exact
+executable SHA-256, but it does not maintain an executable-digest allowlist.
+Consequently, a report from an unreviewed replacement that merely claims the v2
+adapter version is not certification that the runtime checks were implemented;
+qualified benchmark evidence must also name the reviewed executable digest.
 Its version probe must bind the frozen contract hash, independently verify that
 the 471,367,680-byte local artifact hashes to the pinned Hugging Face LFS
 SHA-256, and retain a path-free runtime fingerprint. The frozen evaluation row

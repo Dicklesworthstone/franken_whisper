@@ -1502,16 +1502,40 @@ before and after the adapter run. The adapter executable is resolved once and
 that exact absolute executable is used for both probes.
 
 The model emits four arrival-ordered activity slots on 80 ms frames. The
-high-latency streaming profile fixes chunk/right-context/FIFO/cache-update/cache
-lengths to 340/40/40/300/188 frames (30.4 seconds nominal input-buffer latency),
-batch size one, inferred count up to four, and untuned onset/offset 0.5 with
-zero padding and minimum-duration filtering. The canonical adapter labels are
+high-latency streaming profile fixes chunk/right-context/FIFO/configured-cache-update/cache
+lengths to 340/40/40/300/188 frames (30.4 seconds nominal input-buffer latency).
+At the pinned NeMo revision, parameter validation only warns that the configured
+300-frame cache-update period is shorter than the 340-frame chunk; it does not
+mutate the setting. FIFO updates use
+`min(max(configured, chunk - fifo_capacity + current_fifo), current_fifo + chunk)`.
+For full chunks starting with an empty 40-frame FIFO this moves 300 frames first,
+leaves 40 frames queued, and then moves 340 frames in steady state; tail behavior
+depends on the current chunk and FIFO lengths. The remaining profile fixes batch
+size one, inferred count up to four, and untuned onset/offset 0.5 with zero padding
+and minimum-duration filtering. The canonical adapter labels are
 `speaker_0` through `speaker_3`; arrival order is determined by each label's
 minimum onset and tied first onsets are allowed. Turns start and end on 80 ms
 frames, except that an end may equal the document duration. Sortformer overlap
 is represented only by concurrent labeled turns, never by
 `overlap_suspected`. Speech activity, overlap, and speaker-change boundaries
 must exactly equal the O(n log n) event-sweep derivation from the final turns.
+
+The accepted `franken-whisper-sortformer-oracle-v2` adapter must verify the
+installed `nemo-toolkit` distribution's `direct_url.json` commit and requested
+revision rather than repeating the expected tool revision as an unchecked
+constant. It also fails closed on drift from the qualified Python 3.12.12,
+NeMo `3.1.0+40ace43c7c`, PyTorch 2.7.1, torchaudio 2.7.1, and NumPy 2.4.6
+environment. BLAS and CPU-feature fields are derived from installed runtime
+configuration, and the adapter rechecks the raw 340/1/40/40/300/188 streaming
+profile plus the derived first/steady FIFO-pop schedule after NeMo's parameter
+validator runs. The host binds the
+resulting version document and exact adapter executable hash into evidence.
+This operator override is a declared trust boundary, not remote attestation.
+The host validates the version schema and internal hashes, but it does not
+allowlist executable digests or prove that an arbitrary replacement really ran
+the stated checks. A qualified row must therefore cite the reviewed adapter
+digest, and acceptance of a self-consistent v2 version document alone must not
+be inflated into certification of its implementation.
 
 The frozen execution profile is CPU-only float32, with autocast disabled,
 quantization disabled, deterministic algorithms enabled, batch size one, zero

@@ -50,14 +50,26 @@ pub const SORTFORMER_ORACLE_MAX_SPEAKERS: usize = 4;
 pub const SORTFORMER_ORACLE_OUTPUT_FRAME_MS: u32 = 80;
 /// Maximum end-of-file rounding difference accepted between PCM and stage duration.
 pub const SORTFORMER_AUDIO_DURATION_TOLERANCE_MS: u32 = 79;
-/// Exact operator adapter version accepted by the v1 contract.
-pub const SORTFORMER_ORACLE_ADAPTER_VERSION: &str = "franken-whisper-sortformer-oracle-v1";
+/// Exact operator adapter version accepted by the frozen contract.
+pub const SORTFORMER_ORACLE_ADAPTER_VERSION: &str = "franken-whisper-sortformer-oracle-v2";
 /// Pinned NeMo Speech source revision expected behind the operator adapter.
 pub const SORTFORMER_ORACLE_TOOL_VERSION: &str =
     "nemo-speech-40ace43c7cf151af78dc22027c02feeca7e06b6a";
+/// Exact Python version qualified for the external oracle runtime.
+pub const SORTFORMER_ORACLE_PYTHON_VERSION: &str = "3.12.12";
+/// Exact NeMo package version qualified for the external oracle runtime.
+pub const SORTFORMER_ORACLE_NEMO_VERSION: &str = "3.1.0+40ace43c7c";
+/// Git source revision that the installed NeMo distribution must attest.
+pub const SORTFORMER_ORACLE_NEMO_SOURCE_REVISION: &str = "40ace43c7cf151af78dc22027c02feeca7e06b6a";
+/// Exact PyTorch version qualified for the external oracle runtime.
+pub const SORTFORMER_ORACLE_TORCH_VERSION: &str = "2.7.1";
+/// Exact torchaudio version qualified for the external oracle runtime.
+pub const SORTFORMER_ORACLE_TORCHAUDIO_VERSION: &str = "2.7.1";
+/// Exact NumPy version qualified for the external oracle runtime.
+pub const SORTFORMER_ORACLE_NUMPY_VERSION: &str = "2.4.6";
 /// SHA-256 of the canonical JSON serialization of [`sortformer_oracle_contract`].
 pub const SORTFORMER_ORACLE_CONTRACT_SHA256: &str =
-    "77237f0457b8c9623056891e3c354c22eecd93a7824fb30909adc2c1733489f8";
+    "7ac048e3372fe4c622840beddfbeef42944d961408360324cb7276a69c8542c5";
 
 const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -176,6 +188,12 @@ pub struct DifferentialOracleModelContract {
     pub validate_all_pcm_samples: bool,
     pub runtime_fingerprint_schema: String,
     pub runtime_fingerprint_required_fields: Vec<String>,
+    pub python_version: String,
+    pub nemo_version: String,
+    pub nemo_source_revision: String,
+    pub torch_version: String,
+    pub torchaudio_version: String,
+    pub numpy_version: String,
     pub maximum_speakers: u16,
     pub speaker_count_mode: String,
     pub label_order: String,
@@ -189,10 +207,27 @@ pub struct DifferentialOracleModelContract {
     pub torch_interop_threads: u16,
     pub deterministic_algorithms: bool,
     pub chunk_frames: u32,
+    pub left_context_frames: u32,
     pub right_context_frames: u32,
     pub fifo_frames: u32,
     pub speaker_cache_update_period_frames: u32,
     pub speaker_cache_frames: u32,
+    pub speaker_cache_silence_frames_per_speaker: u32,
+    pub speaker_cache_pop_rule: String,
+    pub first_full_chunk_cache_pop_frames: u32,
+    pub steady_full_chunk_cache_pop_frames: u32,
+    pub subsampling_factor: u32,
+    pub prediction_score_threshold_millionths: u32,
+    pub score_noise_millionths: u32,
+    pub latest_score_boost_millionths: u32,
+    pub silence_threshold_millionths: u32,
+    pub strong_boost_rate_millionths: u32,
+    pub weak_boost_rate_millionths: u32,
+    pub minimum_positive_scores_rate_millionths: u32,
+    pub causal_attention_rate_millionths: u32,
+    pub causal_attention_right_context_frames: u32,
+    pub maximum_cache_index: u32,
+    pub frontend_window_stride_micros: u32,
     pub nominal_input_buffer_latency_ms: u32,
     pub postprocessing_onset_millionths: u32,
     pub postprocessing_offset_millionths: u32,
@@ -230,7 +265,7 @@ pub struct DifferentialOracleRuntimeFingerprint {
 #[must_use]
 pub fn sortformer_oracle_contract() -> DifferentialOracleModelContract {
     DifferentialOracleModelContract {
-        schema_version: "franken-whisper-sortformer-oracle-contract-v1".to_owned(),
+        schema_version: "franken-whisper-sortformer-oracle-contract-v2".to_owned(),
         canonical_json_version: DIFFERENTIAL_CANONICAL_JSON_VERSION.to_owned(),
         model_id: SORTFORMER_ORACLE_MODEL_ID.to_owned(),
         model_revision: SORTFORMER_ORACLE_MODEL_REVISION.to_owned(),
@@ -268,6 +303,12 @@ pub fn sortformer_oracle_contract() -> DifferentialOracleModelContract {
         .into_iter()
         .map(str::to_owned)
         .collect(),
+        python_version: SORTFORMER_ORACLE_PYTHON_VERSION.to_owned(),
+        nemo_version: SORTFORMER_ORACLE_NEMO_VERSION.to_owned(),
+        nemo_source_revision: SORTFORMER_ORACLE_NEMO_SOURCE_REVISION.to_owned(),
+        torch_version: SORTFORMER_ORACLE_TORCH_VERSION.to_owned(),
+        torchaudio_version: SORTFORMER_ORACLE_TORCHAUDIO_VERSION.to_owned(),
+        numpy_version: SORTFORMER_ORACLE_NUMPY_VERSION.to_owned(),
         maximum_speakers: 4,
         speaker_count_mode: "infer_up_to_four".to_owned(),
         label_order: "arrival_time_order".to_owned(),
@@ -281,10 +322,29 @@ pub fn sortformer_oracle_contract() -> DifferentialOracleModelContract {
         torch_interop_threads: 1,
         deterministic_algorithms: true,
         chunk_frames: 340,
+        left_context_frames: 1,
         right_context_frames: 40,
         fifo_frames: 40,
         speaker_cache_update_period_frames: 300,
         speaker_cache_frames: 188,
+        speaker_cache_silence_frames_per_speaker: 3,
+        speaker_cache_pop_rule:
+            "min(max(configured_update,chunk-fifo_capacity+current_fifo),current_fifo+chunk)-v1"
+                .to_owned(),
+        first_full_chunk_cache_pop_frames: 300,
+        steady_full_chunk_cache_pop_frames: 340,
+        subsampling_factor: 8,
+        prediction_score_threshold_millionths: 250_000,
+        score_noise_millionths: 0,
+        latest_score_boost_millionths: 50_000,
+        silence_threshold_millionths: 200_000,
+        strong_boost_rate_millionths: 750_000,
+        weak_boost_rate_millionths: 1_500_000,
+        minimum_positive_scores_rate_millionths: 500_000,
+        causal_attention_rate_millionths: 500_000,
+        causal_attention_right_context_frames: 7,
+        maximum_cache_index: 99_999,
+        frontend_window_stride_micros: 10_000,
         nominal_input_buffer_latency_ms: 30_400,
         postprocessing_onset_millionths: 500_000,
         postprocessing_offset_millionths: 500_000,
@@ -814,8 +874,7 @@ fn build_report(
         &prepared.audio_sha256,
         prepared.native.duration_ms,
         &prepared.native.recording_key,
-        hard_timeout,
-        token,
+        ExternalRunLimits::new(hard_timeout, token),
     );
     let comparison_config_sha256 = canonical_sha256(&comparison_config)?;
     match external {
@@ -1279,6 +1338,21 @@ enum ExternalRunError {
     Skipped(ExternalSkip),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExternalRunLimits<'a> {
+    hard_timeout: Duration,
+    token: &'a CancellationToken,
+}
+
+impl<'a> ExternalRunLimits<'a> {
+    const fn new(hard_timeout: Duration, token: &'a CancellationToken) -> Self {
+        Self {
+            hard_timeout,
+            token,
+        }
+    }
+}
+
 fn execute_external(
     tool: DifferentialOracleTool,
     program: &ProgramSpec,
@@ -1286,9 +1360,12 @@ fn execute_external(
     expected_audio_sha256: &str,
     expected_duration_ms: u64,
     recording_key: &str,
-    hard_timeout: Duration,
-    token: &CancellationToken,
+    limits: ExternalRunLimits<'_>,
 ) -> Result<ExternalSuccess, ExternalRunError> {
+    let ExternalRunLimits {
+        hard_timeout,
+        token,
+    } = limits;
     token.checkpoint().map_err(ExternalRunError::Cancelled)?;
     let executable_path = which::which(&program.program).map_err(|_| {
         ExternalRunError::Skipped(ExternalSkip::new(
@@ -1548,6 +1625,11 @@ fn validate_sortformer_runtime_fingerprint(
     ];
     fingerprint.schema_version == contract.runtime_fingerprint_schema
         && safe_tokens.into_iter().all(is_safe_version_token)
+        && fingerprint.python_version == contract.python_version
+        && fingerprint.nemo_version == contract.nemo_version
+        && fingerprint.torch_version == contract.torch_version
+        && fingerprint.torchaudio_version == contract.torchaudio_version
+        && fingerprint.numpy_version == contract.numpy_version
         && fingerprint.device == contract.device
         && fingerprint.compute_dtype == contract.compute_dtype
         && fingerprint.autocast == contract.autocast
@@ -3159,7 +3241,7 @@ fn write_lexicographic_json(value: &serde_json::Value, output: &mut Vec<u8>) -> 
         serde_json::Value::Object(values) => {
             output.push(b'{');
             let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by_key(|(key, _)| key.as_str());
             for (index, (key, item)) in entries.into_iter().enumerate() {
                 if index != 0 {
                     output.push(b',');
@@ -3304,6 +3386,24 @@ mod tests {
             contract.upstream_artifact_sha256,
             SORTFORMER_ORACLE_ARTIFACT_SHA256
         );
+        assert_eq!(contract.python_version, SORTFORMER_ORACLE_PYTHON_VERSION);
+        assert_eq!(contract.nemo_version, SORTFORMER_ORACLE_NEMO_VERSION);
+        assert_eq!(
+            contract.nemo_source_revision,
+            SORTFORMER_ORACLE_NEMO_SOURCE_REVISION
+        );
+        assert_eq!(contract.torch_version, SORTFORMER_ORACLE_TORCH_VERSION);
+        assert_eq!(
+            contract.torchaudio_version,
+            SORTFORMER_ORACLE_TORCHAUDIO_VERSION
+        );
+        assert_eq!(contract.numpy_version, SORTFORMER_ORACLE_NUMPY_VERSION);
+        assert_eq!(contract.speaker_cache_update_period_frames, 300);
+        assert_eq!(contract.first_full_chunk_cache_pop_frames, 300);
+        assert_eq!(contract.steady_full_chunk_cache_pop_frames, 340);
+        assert_eq!(contract.left_context_frames, 1);
+        assert_eq!(contract.speaker_cache_silence_frames_per_speaker, 3);
+        assert_eq!(contract.subsampling_factor, 8);
         assert_eq!(contract.nominal_input_buffer_latency_ms, 30_400);
     }
 
@@ -3936,11 +4036,11 @@ mod tests {
     fn sortformer_runtime_fingerprint() -> DifferentialOracleRuntimeFingerprint {
         DifferentialOracleRuntimeFingerprint {
             schema_version: "sortformer-runtime-fingerprint-v1".to_owned(),
-            python_version: "3.13.5".to_owned(),
-            nemo_version: "2.6.0".to_owned(),
-            torch_version: "2.8.0".to_owned(),
-            torchaudio_version: "2.8.0".to_owned(),
-            numpy_version: "2.3.1".to_owned(),
+            python_version: SORTFORMER_ORACLE_PYTHON_VERSION.to_owned(),
+            nemo_version: SORTFORMER_ORACLE_NEMO_VERSION.to_owned(),
+            torch_version: SORTFORMER_ORACLE_TORCH_VERSION.to_owned(),
+            torchaudio_version: SORTFORMER_ORACLE_TORCHAUDIO_VERSION.to_owned(),
+            numpy_version: SORTFORMER_ORACLE_NUMPY_VERSION.to_owned(),
             blas_backend: "accelerate".to_owned(),
             operating_system: "macos-15.5".to_owned(),
             machine_architecture: "aarch64".to_owned(),
@@ -4034,8 +4134,7 @@ mod tests {
             &bytes_sha256(b""),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect_err("invalid version");
         assert!(matches!(
@@ -4063,8 +4162,7 @@ mod tests {
             &bytes_sha256(b""),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect_err("version mismatch");
         assert!(matches!(
@@ -4089,8 +4187,7 @@ mod tests {
             &bytes_sha256(b""),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect_err("polluted non-Sortformer version");
         assert!(matches!(
@@ -4111,8 +4208,7 @@ mod tests {
             &bytes_sha256(b""),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect_err("input contract");
         assert!(matches!(
@@ -4157,8 +4253,7 @@ mod tests {
                 &test_audio_sha256(&audio),
                 2_000,
                 KEY,
-                Duration::from_secs(1),
-                &CancellationToken::no_deadline(),
+                ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
             )
             .expect_err("model contract mismatch");
             assert!(matches!(
@@ -4184,8 +4279,7 @@ mod tests {
             &test_audio_sha256(&audio),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect_err("missing runtime fingerprint");
         assert!(matches!(
@@ -4196,33 +4290,41 @@ mod tests {
             })
         ));
 
-        let mut wrong_runtime: serde_json::Value =
-            serde_json::from_str(&version_json(DifferentialOracleTool::Sortformer))
-                .expect("version JSON");
-        wrong_runtime["runtime_fingerprint"]["device"] = serde_json::json!("cuda");
-        let fingerprint: DifferentialOracleRuntimeFingerprint =
-            serde_json::from_value(wrong_runtime["runtime_fingerprint"].clone())
-                .expect("runtime fingerprint");
-        wrong_runtime["runtime_fingerprint_sha256"] =
-            serde_json::json!(canonical_sha256(&fingerprint).expect("runtime hash"));
-        let error = execute_external(
-            DifferentialOracleTool::Sortformer,
-            &shell_program(format!("printf '%s' '{wrong_runtime}'")),
-            &audio,
-            &test_audio_sha256(&audio),
-            2_000,
-            KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
-        )
-        .expect_err("runtime profile mismatch");
-        assert!(matches!(
-            error,
-            ExternalRunError::Skipped(ExternalSkip {
-                reason: DifferentialSkipReason::ModelContractMismatch,
-                ..
-            })
-        ));
+        for (field, wrong_value) in [
+            ("python_version", serde_json::json!("3.12.11")),
+            ("nemo_version", serde_json::json!("3.1.0")),
+            ("torch_version", serde_json::json!("2.7.0")),
+            ("torchaudio_version", serde_json::json!("2.7.0")),
+            ("numpy_version", serde_json::json!("2.4.5")),
+            ("device", serde_json::json!("cuda")),
+        ] {
+            let mut wrong_runtime: serde_json::Value =
+                serde_json::from_str(&version_json(DifferentialOracleTool::Sortformer))
+                    .expect("version JSON");
+            wrong_runtime["runtime_fingerprint"][field] = wrong_value;
+            let fingerprint: DifferentialOracleRuntimeFingerprint =
+                serde_json::from_value(wrong_runtime["runtime_fingerprint"].clone())
+                    .expect("runtime fingerprint");
+            wrong_runtime["runtime_fingerprint_sha256"] =
+                serde_json::json!(canonical_sha256(&fingerprint).expect("runtime hash"));
+            let error = execute_external(
+                DifferentialOracleTool::Sortformer,
+                &shell_program(format!("printf '%s' '{wrong_runtime}'")),
+                &audio,
+                &test_audio_sha256(&audio),
+                2_000,
+                KEY,
+                ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
+            )
+            .expect_err("runtime profile mismatch");
+            assert!(matches!(
+                error,
+                ExternalRunError::Skipped(ExternalSkip {
+                    reason: DifferentialSkipReason::ModelContractMismatch,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -4265,8 +4367,7 @@ mod tests {
             &bytes_sha256(b"different audio"),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect_err("audio identity mismatch");
         assert!(matches!(
@@ -4292,8 +4393,7 @@ mod tests {
             &expected_hash,
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect_err("post-run audio mutation");
         assert!(matches!(
@@ -4346,8 +4446,7 @@ mod tests {
             &test_audio_sha256(&audio),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect("first replay");
         let second = execute_external(
@@ -4357,8 +4456,7 @@ mod tests {
             &test_audio_sha256(&audio),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect("second replay");
         assert_eq!(first.oracle, second.oracle);
@@ -4378,8 +4476,10 @@ mod tests {
             &test_audio_sha256(&audio),
             2_000,
             KEY,
-            Duration::from_secs(10),
-            &CancellationToken::with_deadline_from_now(Duration::from_secs(2)),
+            ExternalRunLimits::new(
+                Duration::from_secs(10),
+                &CancellationToken::with_deadline_from_now(Duration::from_secs(2)),
+            ),
         )
         .expect_err("cancelled during oracle run");
         assert!(matches!(
@@ -4457,8 +4557,7 @@ mod tests {
             &bytes_sha256(b""),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect_err("invalid output");
         assert!(matches!(
@@ -4483,8 +4582,7 @@ mod tests {
             &bytes_sha256(b""),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline()),
         )
         .expect_err("nonzero");
         assert!(matches!(
@@ -4505,8 +4603,7 @@ mod tests {
             &bytes_sha256(b""),
             2_000,
             KEY,
-            Duration::from_millis(40),
-            &CancellationToken::no_deadline(),
+            ExternalRunLimits::new(Duration::from_millis(40), &CancellationToken::no_deadline()),
         )
         .expect_err("timeout");
         assert!(matches!(
@@ -4527,8 +4624,10 @@ mod tests {
             &bytes_sha256(b""),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::already_expired(),
+            ExternalRunLimits::new(
+                Duration::from_secs(1),
+                &CancellationToken::already_expired(),
+            ),
         )
         .expect_err("cancel");
         assert!(matches!(
