@@ -180,12 +180,10 @@ fn validate_speaker_count_capability(request: &TranscribeRequest) -> FwResult<Sp
     if matches!(
         speaker_count,
         SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
-    ) && matches!(
-        selected_engine,
-        crate::model::DiarizationEngine::External | crate::model::DiarizationEngine::Neural
-    ) {
+    ) && matches!(selected_engine, crate::model::DiarizationEngine::External)
+    {
         return Err(FwError::InvalidRequest(
-            "soft speaker-count priors and ranges require the native acoustic diarization engine"
+            "soft speaker-count priors and ranges require a native in-process diarization engine"
                 .to_owned(),
         ));
     }

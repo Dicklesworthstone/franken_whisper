@@ -24,17 +24,30 @@ use crate::ecapa_inference::EcapaModel;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus,
-    DiarizationReport, DiarizationRequest, DiarizationTurn, KnownSpeakerPolicy,
-    NeuralSpeakerRepresentationReason, NeuralSpeakerRepresentationStatus,
-    NeuralSpeakerRepresentationSummary, RunEvent, RunReport, SpeakerCountOutcome,
-    SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountRequest,
+    DiarizationReport, DiarizationRequest, DiarizationSpeakerEvidenceMode, DiarizationTurn,
+    KnownSpeakerPolicy, NeuralModelLoadSource, NeuralSpeakerRepresentationReason,
+    NeuralSpeakerRepresentationStatus, NeuralSpeakerRepresentationSummary, RunEvent, RunReport,
+    SpeakerCountOutcome, SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountRequest,
     SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerHintDisposition,
     SpeakerHintEvidenceSummary, SpeakerProfileSummary, StreamedRunEvent, TranscribeRequest,
 };
 use crate::storage::RunStore;
 
-static ECAPA_MODEL_CACHE: OnceLock<Arc<EcapaModel>> = OnceLock::new();
-static ECAPA_MODEL_LOAD_LOCK: Mutex<()> = Mutex::new(());
+struct EcapaModelCache {
+    model: OnceLock<Arc<EcapaModel>>,
+    load_lock: Mutex<()>,
+}
+
+impl EcapaModelCache {
+    const fn new() -> Self {
+        Self {
+            model: OnceLock::new(),
+            load_lock: Mutex::new(()),
+        }
+    }
+}
+
+static ECAPA_MODEL_CACHE: EcapaModelCache = EcapaModelCache::new();
 
 // ---------------------------------------------------------------------------
 // Composable pipeline stages (bd-qla.6)
@@ -1114,6 +1127,85 @@ fn load_cached_ecapa_model(
     model_path: &Path,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<(Arc<EcapaModel>, bool)> {
+    load_ecapa_model_from_cache(&ECAPA_MODEL_CACHE, model_path, checkpoint)
+}
+
+enum EcapaAttemptFailure {
+    /// A resolver, package, or model-execution failure for which the caller's
+    /// explicit fallback policy may be applied.
+    Operational {
+        reason: NeuralSpeakerRepresentationReason,
+        error: FwError,
+        model_load_source: Option<NeuralModelLoadSource>,
+    },
+    /// A successful model call returned an internally inconsistent report.
+    /// Falling back would conceal a programming or contract defect, so this
+    /// class must propagate fail-closed.
+    InvalidOutput(FwError),
+}
+
+/// Resolve, load, and execute one ECAPA attempt while preserving the exact
+/// failure stage and cache provenance. The injected operations are the same
+/// production boundaries used by the orchestrator and provide a narrow seam
+/// for exercising real resolver/load failures without mutating process-global
+/// model search state.
+fn run_ecapa_attempt<Model, Resolve, Load, Diarize>(
+    resolve: Resolve,
+    load: Load,
+    diarize: Diarize,
+) -> Result<(DiarizationReport, diarization::DiarizationProjection), EcapaAttemptFailure>
+where
+    Resolve: FnOnce() -> FwResult<PathBuf>,
+    Load: FnOnce(&Path) -> FwResult<(Model, bool)>,
+    Diarize: FnOnce(&Model) -> FwResult<(DiarizationReport, diarization::DiarizationProjection)>,
+{
+    let model_path = resolve().map_err(|error| EcapaAttemptFailure::Operational {
+        reason: NeuralSpeakerRepresentationReason::ModelUnavailable,
+        error,
+        model_load_source: None,
+    })?;
+    let (model, _model_cache_hit) =
+        load(&model_path).map_err(|error| EcapaAttemptFailure::Operational {
+            reason: NeuralSpeakerRepresentationReason::ModelInvalid,
+            error,
+            model_load_source: None,
+        })?;
+    // Cache warmth is operational telemetry, not diarization authority. Keep
+    // the typed report stable for identical input/request/model bytes; the
+    // package digest binds the actual model and the external cache test proves
+    // miss/hit behavior independently.
+    let model_load_source = NeuralModelLoadSource::Direct;
+    let (mut report, projection) = diarize(&model).map_err(|error| match error {
+        // The model executed, but an in-process producer violated its own
+        // postconditions. Treating this as model unavailability would let a
+        // fallback hide a code defect and incorrectly issue a usable report.
+        FwError::ContractViolation(_) => EcapaAttemptFailure::InvalidOutput(error),
+        _ => EcapaAttemptFailure::Operational {
+            reason: NeuralSpeakerRepresentationReason::InferenceFailed,
+            error,
+            model_load_source: Some(model_load_source),
+        },
+    })?;
+    let summary = report.neural_representation.as_mut().ok_or_else(|| {
+        EcapaAttemptFailure::InvalidOutput(FwError::ContractViolation(
+            "ECAPA execution omitted neural representation provenance".to_owned(),
+        ))
+    })?;
+    summary.model_load_source = Some(model_load_source);
+    summary
+        .validate()
+        .map_err(|error| EcapaAttemptFailure::InvalidOutput(FwError::ContractViolation(error)))?;
+    report
+        .validate()
+        .map_err(|error| EcapaAttemptFailure::InvalidOutput(FwError::ContractViolation(error)))?;
+    Ok((report, projection))
+}
+
+fn load_ecapa_model_from_cache(
+    cache: &EcapaModelCache,
+    model_path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<(Arc<EcapaModel>, bool)> {
     let observed_sha256 = sha256_file_with_checkpoint(model_path, checkpoint)?;
     if observed_sha256 != ECAPA_PACKAGE_SHA256 {
         return Err(FwError::InvalidRequest(
@@ -1121,20 +1213,22 @@ fn load_cached_ecapa_model(
                 .to_owned(),
         ));
     }
-    if let Some(model) = ECAPA_MODEL_CACHE.get() {
+    if let Some(model) = cache.model.get() {
         return Ok((Arc::clone(model), true));
     }
-    let _load_guard = ECAPA_MODEL_LOAD_LOCK
+    let _load_guard = cache
+        .load_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(model) = ECAPA_MODEL_CACHE.get() {
+    if let Some(model) = cache.model.get() {
         return Ok((Arc::clone(model), true));
     }
     checkpoint()?;
     let candidate = Arc::new(EcapaModel::load_with_checkpoint(model_path, checkpoint)?);
-    match ECAPA_MODEL_CACHE.set(Arc::clone(&candidate)) {
+    match cache.model.set(Arc::clone(&candidate)) {
         Ok(()) => Ok((candidate, false)),
-        Err(_) => ECAPA_MODEL_CACHE
+        Err(_) => cache
+            .model
             .get()
             .map(|model| (Arc::clone(model), true))
             .ok_or_else(|| {
@@ -4288,7 +4382,7 @@ pub(crate) fn diarize_segments(
     if !matches!(speaker_count, SpeakerCountRequest::Infer) {
         return Err(FwError::InvalidRequest(
             "heuristic diarization cannot faithfully execute explicit speaker-count inputs; use \
-             the native acoustic diarization engine"
+             a native in-process diarization engine"
                 .to_owned(),
         ));
     }
@@ -4589,17 +4683,18 @@ async fn execute_diarize(
                         word_boundaries_ms,
                         tiny_diarize_boundaries_ms,
                     };
-                    let (diarization_report, projection) = diarization::diarize_acoustic_pcm(
-                        diarization::AcousticDiarizationInput {
-                            samples: &samples,
-                            normalized_input_sha256: &normalized_input_sha256,
-                            segments: &result.segments,
-                            word_aligned,
-                            request: &acoustic_request,
-                            boundary_hints: &boundary_hints,
-                        },
-                        || diarize_token.checkpoint().is_err(),
-                    )?;
+                    let (diarization_report, projection) =
+                        diarization::diarize_acoustic_pcm_with_checkpoint(
+                            diarization::AcousticDiarizationInput {
+                                samples: &samples,
+                                normalized_input_sha256: &normalized_input_sha256,
+                                segments: &result.segments,
+                                word_aligned,
+                                request: &acoustic_request,
+                                boundary_hints: &boundary_hints,
+                            },
+                            &|| diarize_token.checkpoint(),
+                        )?;
                     if acoustic_request.fallback == DiarizationFallbackPolicy::External
                         && external_fallback_admitted
                         && matches!(
@@ -4716,11 +4811,13 @@ async fn execute_diarize(
                         for segment in &mut result.segments {
                             segment.speaker = None;
                         }
-                        result.diarization = Some(unknown_diarization_report(
+                        let report = unknown_diarization_report(
                             sha256_file(&normalized_wav)?,
                             &acoustic_request.speaker_count,
                             "external diarization was unavailable; emitted unknown speakers",
-                        ));
+                        );
+                        report.validate().map_err(FwError::InvalidRequest)?;
+                        result.diarization = Some(report);
                         Ok((
                             result,
                             DiarizeReport {
@@ -4742,50 +4839,57 @@ async fn execute_diarize(
                     ))
                     }
                 }
-                DiarizationEngine::Neural => {
+                DiarizationEngine::Ecapa | DiarizationEngine::EcapaFused => {
                     let segments_total = result.segments.len();
                     let wav_bytes = std::fs::read(&normalized_wav)?;
                     let normalized_input_sha256 = sha256_bytes_hex(&wav_bytes);
                     let word_aligned = has_canonical_word_alignment(&result.raw_output);
-                    let neural_attempt = match crate::native_engine::weights::resolve_aux_model(
-                        ECAPA_PACKAGE_FILENAME,
-                    ) {
-                        Err(error) => Err((
-                            NeuralSpeakerRepresentationReason::ModelUnavailable,
-                            error,
-                            None,
-                        )),
-                        Ok(model_path) => {
-                            match load_cached_ecapa_model(&model_path, &|| {
-                                diarize_token.checkpoint()
-                            }) {
-                                Err(error) => Err((
-                                    NeuralSpeakerRepresentationReason::ModelInvalid,
-                                    error,
-                                    None,
-                                )),
-                                Ok((model, model_cache_hit)) => {
-                                    let samples = crate::native_engine::decode::read_wav_16k_mono(
-                                        &wav_bytes,
-                                    )?;
-                                    let word_boundaries_ms = if word_aligned {
-                                        transcript_boundaries_ms(&result.segments)
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    let (tiny_diarize_boundaries_ms, tiny_diarize_hint_evidence) =
-                                        tiny_diarize_boundary_hints(
-                                            tiny_diarize_requested,
-                                            result.backend == BackendKind::WhisperCpp,
-                                            &result.raw_output,
-                                            normalized_duration_ms,
-                                        );
-                                    let boundary_hints = AcousticBoundaryHints {
-                                        speech_regions_ms,
-                                        word_boundaries_ms,
-                                        tiny_diarize_boundaries_ms,
-                                    };
-                                    match diarization::diarize_neural_pcm(
+                    let samples = crate::native_engine::decode::read_wav_16k_mono(&wav_bytes)?;
+                    let word_boundaries_ms = if word_aligned {
+                        transcript_boundaries_ms(&result.segments)
+                    } else {
+                        Vec::new()
+                    };
+                    let (tiny_diarize_boundaries_ms, tiny_diarize_hint_evidence) =
+                        tiny_diarize_boundary_hints(
+                            tiny_diarize_requested,
+                            result.backend == BackendKind::WhisperCpp,
+                            &result.raw_output,
+                            normalized_duration_ms,
+                        );
+                    let boundary_hints = AcousticBoundaryHints {
+                        speech_regions_ms,
+                        word_boundaries_ms,
+                        tiny_diarize_boundaries_ms,
+                    };
+                    let neural_attempt = run_ecapa_attempt(
+                        || crate::native_engine::weights::resolve_aux_model(ECAPA_PACKAGE_FILENAME),
+                        |model_path| {
+                            load_cached_ecapa_model(model_path, &|| diarize_token.checkpoint())
+                        },
+                        |model| {
+                            diarization::diarize_ecapa_pcm(
+                                diarization::AcousticDiarizationInput {
+                                    samples: &samples,
+                                    normalized_input_sha256: &normalized_input_sha256,
+                                    segments: &result.segments,
+                                    word_aligned,
+                                    request: &acoustic_request,
+                                    boundary_hints: &boundary_hints,
+                                },
+                                model,
+                                &|| diarize_token.checkpoint(),
+                            )
+                        },
+                    );
+                    match neural_attempt {
+                        Ok((diarization_report, projection)) => {
+                            if acoustic_request.fallback == DiarizationFallbackPolicy::Acoustic
+                                && diarization_report.fallback_status
+                                    != DiarizationFallbackStatus::NotNeeded
+                            {
+                                let (acoustic_report, acoustic_projection) =
+                                    run_native_acoustic_fallback(
                                         diarization::AcousticDiarizationInput {
                                             samples: &samples,
                                             normalized_input_sha256: &normalized_input_sha256,
@@ -4794,33 +4898,44 @@ async fn execute_diarize(
                                             request: &acoustic_request,
                                             boundary_hints: &boundary_hints,
                                         },
-                                        model.as_ref(),
+                                        diarization_report.neural_representation,
+                                        "neural speaker evidence was insufficient; reran the common stack with acoustic-v2 identity"
+                                            .to_owned(),
                                         &|| diarize_token.checkpoint(),
-                                    ) {
-                                        Ok((mut report, projection)) => {
-                                            report.diagnostics.push(format!(
-                                                "speaker_representation_model_cache={}",
-                                                if model_cache_hit { "hit" } else { "miss" }
-                                            ));
-                                            Ok((
-                                                report,
-                                                projection,
-                                                Some(tiny_diarize_hint_evidence),
-                                            ))
-                                        }
-                                        Err(error) => Err((
-                                            NeuralSpeakerRepresentationReason::InferenceFailed,
-                                            error,
-                                            Some(tiny_diarize_hint_evidence),
-                                        )),
-                                    }
-                                }
-                            }
-                        }
-                    };
-                    match neural_attempt {
-                        Ok((diarization_report, projection, hint_evidence)) => {
-                            if acoustic_request.fallback == DiarizationFallbackPolicy::External
+                                    )?;
+                                let notes = acoustic_report.diagnostics.clone();
+                                let speakers_detected = usize::try_from(
+                                    acoustic_report.speaker_count.supported_speaker_count,
+                                )
+                                .map_err(|_| {
+                                    FwError::InvalidRequest(
+                                        "acoustic fallback speaker count does not fit this platform"
+                                            .to_owned(),
+                                    )
+                                })?;
+                                apply_native_diarization_projection(
+                                    &mut result,
+                                    acoustic_projection,
+                                    acoustic_report,
+                                );
+                                let segments_labeled = result
+                                    .segments
+                                    .iter()
+                                    .filter(|segment| segment.speaker.is_some())
+                                    .count();
+                                Ok((
+                                    result,
+                                    DiarizeReport {
+                                        segments_total,
+                                        speakers_detected,
+                                        segments_labeled,
+                                        silhouette_score: None,
+                                        notes,
+                                    },
+                                    Some(tiny_diarize_hint_evidence),
+                                ))
+                            } else if acoustic_request.fallback
+                                == DiarizationFallbackPolicy::External
                                 && diarization_report.fallback_status
                                     != DiarizationFallbackStatus::NotNeeded
                                 && result_has_external_diarization(&result)
@@ -4836,6 +4951,9 @@ async fn execute_diarize(
                                     "neural speaker evidence was insufficient; accepted runtime-verified external diarization"
                                         .to_owned(),
                                 );
+                                external_report
+                                    .validate()
+                                    .map_err(FwError::InvalidRequest)?;
                                 let speakers_detected = usize::try_from(
                                     external_report.speaker_count.supported_speaker_count,
                                 )
@@ -4863,7 +4981,7 @@ async fn execute_diarize(
                                                 .to_owned(),
                                         ],
                                     },
-                                    hint_evidence,
+                                    Some(tiny_diarize_hint_evidence),
                                 ))
                             } else {
                                 let notes = diarization_report.diagnostics.clone();
@@ -4895,17 +5013,74 @@ async fn execute_diarize(
                                         silhouette_score: None,
                                         notes,
                                     },
-                                    hint_evidence,
+                                    Some(tiny_diarize_hint_evidence),
                                 ))
                             }
                         }
-                        Err((reason, error, hint_evidence)) => {
+                        Err(EcapaAttemptFailure::InvalidOutput(error)) => Err(error),
+                        Err(EcapaAttemptFailure::Operational {
+                            reason,
+                            error,
+                            model_load_source,
+                        }) => {
                             if matches!(error, FwError::Cancelled(_) | FwError::StageTimeout { .. })
                             {
                                 return Err(error);
                             }
                             let reason_code = neural_representation_reason_code(reason);
                             match acoustic_request.fallback {
+                                DiarizationFallbackPolicy::Acoustic => {
+                                    let (acoustic_report, acoustic_projection) =
+                                        run_native_acoustic_fallback(
+                                            diarization::AcousticDiarizationInput {
+                                                samples: &samples,
+                                                normalized_input_sha256: &normalized_input_sha256,
+                                                segments: &result.segments,
+                                                word_aligned,
+                                                request: &acoustic_request,
+                                                boundary_hints: &boundary_hints,
+                                            },
+                                            Some(unavailable_neural_representation_summary(
+                                                reason,
+                                                model_load_source,
+                                            )?),
+                                            format!(
+                                                "neural_representation_fallback={reason_code}; reran the common stack with acoustic-v2 identity"
+                                            ),
+                                            &|| diarize_token.checkpoint(),
+                                        )?;
+                                    let notes = acoustic_report.diagnostics.clone();
+                                    let speakers_detected = usize::try_from(
+                                        acoustic_report.speaker_count.supported_speaker_count,
+                                    )
+                                    .map_err(|_| {
+                                        FwError::InvalidRequest(
+                                            "acoustic fallback speaker count does not fit this platform"
+                                                .to_owned(),
+                                        )
+                                    })?;
+                                    apply_native_diarization_projection(
+                                        &mut result,
+                                        acoustic_projection,
+                                        acoustic_report,
+                                    );
+                                    let segments_labeled = result
+                                        .segments
+                                        .iter()
+                                        .filter(|segment| segment.speaker.is_some())
+                                        .count();
+                                    Ok((
+                                        result,
+                                        DiarizeReport {
+                                            segments_total,
+                                            speakers_detected,
+                                            segments_labeled,
+                                            silhouette_score: None,
+                                            notes,
+                                        },
+                                        Some(tiny_diarize_hint_evidence),
+                                    ))
+                                }
                                 DiarizationFallbackPolicy::External
                                     if result_has_external_diarization(&result) =>
                                 {
@@ -4915,10 +5090,16 @@ async fn execute_diarize(
                                         &acoustic_request.speaker_count,
                                     )?;
                                     external_report.neural_representation =
-                                        Some(unavailable_neural_representation_summary(reason));
+                                        Some(unavailable_neural_representation_summary(
+                                            reason,
+                                            model_load_source,
+                                        )?);
                                     external_report.diagnostics.push(format!(
                                         "neural_representation_fallback={reason_code}"
                                     ));
+                                    external_report
+                                        .validate()
+                                        .map_err(FwError::InvalidRequest)?;
                                     let speakers_detected = usize::try_from(
                                         external_report.speaker_count.supported_speaker_count,
                                     )
@@ -4945,29 +5126,27 @@ async fn execute_diarize(
                                                 "neural representation unavailable ({reason_code}); accepted runtime-verified external diarization"
                                             )],
                                         },
-                                        hint_evidence,
+                                        Some(tiny_diarize_hint_evidence),
                                     ))
                                 }
                                 DiarizationFallbackPolicy::Unknown => {
-                                    let (mut report, projection) =
+                                    let neural_representation =
+                                        unavailable_neural_representation_summary(
+                                            reason,
+                                            model_load_source,
+                                        )?;
+                                    let (report, projection) =
                                         unknown_neural_diarization_with_hard_hints(
                                             normalized_input_sha256,
                                             &acoustic_request,
                                             &result.segments,
                                             word_aligned,
+                                            normalized_duration_ms,
+                                            neural_representation,
                                             &format!(
                                                 "neural_representation_fallback={reason_code}; emitted unknown speakers"
                                             ),
                                         )?;
-                                    report.implementation =
-                                        "native-ecapa-unavailable-v1".to_owned();
-                                    report.contract_version =
-                                        diarization::NEURAL_DIARIZATION_CONTRACT_VERSION.to_owned();
-                                    report.feature_schema =
-                                        diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION
-                                            .to_owned();
-                                    report.neural_representation =
-                                        Some(unavailable_neural_representation_summary(reason));
                                     let speakers_detected = usize::try_from(
                                         report.speaker_count.supported_speaker_count,
                                     )
@@ -4998,7 +5177,7 @@ async fn execute_diarize(
                                                 "neural representation unavailable ({reason_code}); emitted unknown speakers"
                                             )],
                                         },
-                                        hint_evidence,
+                                        Some(tiny_diarize_hint_evidence),
                                     ))
                                 }
                                 DiarizationFallbackPolicy::External
@@ -5074,19 +5253,24 @@ fn validate_diarization_execution_request(
     request
         .validate(audio_duration_ms.unwrap_or(u64::MAX))
         .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
-    if !request.known_intervals.is_empty() && matches!(engine, DiarizationEngine::External) {
+    if !request.known_intervals.is_empty()
+        && (matches!(engine, DiarizationEngine::External)
+            || request.fallback == DiarizationFallbackPolicy::External)
+    {
         return Err(FwError::InvalidRequest(
-            "known speaker intervals require a native diarization engine".to_owned(),
+            "known speaker intervals require a native diarization result; external execution or fallback cannot enforce immutable hint identities"
+                .to_owned(),
         ));
     }
     if matches!(
         request.speaker_count,
         SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
-    ) && matches!(engine, DiarizationEngine::External)
+    ) && (matches!(engine, DiarizationEngine::External)
+        || request.fallback == DiarizationFallbackPolicy::External)
     {
         return Err(FwError::InvalidRequest(
-            "soft speaker-count priors and ranges require the native acoustic diarization engine; \
-             external engines cannot faithfully fuse soft count evidence"
+            "soft speaker-count priors and ranges require a native in-process diarization engine; \
+             external execution or fallback cannot faithfully fuse soft count evidence"
                 .to_owned(),
         ));
     }
@@ -5105,6 +5289,31 @@ fn apply_native_diarization_projection(
     result.diarization = Some(report);
 }
 
+fn run_native_acoustic_fallback(
+    input: diarization::AcousticDiarizationInput<'_>,
+    neural_representation: Option<NeuralSpeakerRepresentationSummary>,
+    diagnostic: String,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<(DiarizationReport, diarization::DiarizationProjection)> {
+    let mut request = input.request.clone();
+    request.engine = DiarizationEngine::Acoustic;
+    let (mut report, projection) = diarization::diarize_acoustic_pcm_with_checkpoint(
+        diarization::AcousticDiarizationInput {
+            samples: input.samples,
+            normalized_input_sha256: input.normalized_input_sha256,
+            segments: input.segments,
+            word_aligned: input.word_aligned,
+            request: &request,
+            boundary_hints: input.boundary_hints,
+        },
+        checkpoint,
+    )?;
+    report.neural_representation = neural_representation;
+    report.diagnostics.push(diagnostic);
+    report.validate().map_err(FwError::InvalidRequest)?;
+    Ok((report, projection))
+}
+
 fn emit_diarization_report_events(log: &mut EventLog, report: &DiarizationReport) {
     log.push(
         "diarize",
@@ -5114,10 +5323,13 @@ fn emit_diarization_report_events(log: &mut EventLog, report: &DiarizationReport
             "implementation": report.implementation,
             "contract_version": report.contract_version,
             "feature_schema": report.feature_schema,
+            "speaker_evidence_mode": report.speaker_evidence_mode,
             "turns": report.turns.len(),
             "profiles": report.profiles.len(),
             "speaker_count": report.speaker_count,
             "fallback_status": report.fallback_status,
+            "operational_partition": report.operational_partition,
+            "neural_representation": report.neural_representation,
         }),
     );
     for (turn_index, turn) in report.turns.iter().enumerate() {
@@ -5379,6 +5591,7 @@ const fn neural_representation_reason_code(
             "insufficient_identity_evidence"
         }
         NeuralSpeakerRepresentationReason::InsufficientTracklets => "insufficient_tracklets",
+        NeuralSpeakerRepresentationReason::ContradictoryEnrollment => "contradictory_enrollment",
         NeuralSpeakerRepresentationReason::ModelUnavailable => "model_unavailable",
         NeuralSpeakerRepresentationReason::ModelInvalid => "model_invalid",
         NeuralSpeakerRepresentationReason::InferenceFailed => "inference_failed",
@@ -5387,17 +5600,24 @@ const fn neural_representation_reason_code(
 
 fn unavailable_neural_representation_summary(
     reason: NeuralSpeakerRepresentationReason,
-) -> NeuralSpeakerRepresentationSummary {
-    NeuralSpeakerRepresentationSummary {
+    model_load_source: Option<NeuralModelLoadSource>,
+) -> FwResult<NeuralSpeakerRepresentationSummary> {
+    let summary = NeuralSpeakerRepresentationSummary {
         schema_version: "neural-speaker-representation-summary-v1".to_owned(),
         provider_version: diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
-        model_package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
+        expected_model_package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
+        loaded_model_package_sha256: model_load_source.map(|_| ECAPA_PACKAGE_SHA256.to_owned()),
+        model_load_source,
         status: NeuralSpeakerRepresentationStatus::Unavailable,
         embedded_tracklet_count: 0,
         zero_padded_tracklet_count: 0,
         skipped_tracklet_count: 0,
         reasons: vec![reason],
-    }
+    };
+    summary
+        .validate()
+        .map_err(|error| FwError::InvalidRequest(error.to_owned()))?;
+    Ok(summary)
 }
 
 fn unknown_diarization_report(
@@ -5416,6 +5636,7 @@ fn unknown_diarization_report(
         implementation: "fallback-unknown".to_owned(),
         contract_version: diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION.to_owned(),
         feature_schema: diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION.to_owned(),
+        speaker_evidence_mode: DiarizationSpeakerEvidenceMode::None,
         normalized_input_sha256,
         hint_document_sha256: None,
         turns: Vec::new(),
@@ -5453,6 +5674,7 @@ fn unknown_diarization_report(
         } else {
             DiarizationFallbackStatus::UnsatisfiedConstraints
         },
+        operational_partition: None,
         neural_representation: None,
         diagnostics: vec![reason.to_owned()],
     }
@@ -5463,6 +5685,8 @@ fn unknown_neural_diarization_with_hard_hints(
     request: &DiarizationRequest,
     segments: &[crate::model::TranscriptionSegment],
     word_aligned: bool,
+    audio_duration_ms: u64,
+    neural_representation: NeuralSpeakerRepresentationSummary,
     reason: &str,
 ) -> FwResult<(DiarizationReport, diarization::DiarizationProjection)> {
     let mut hard_hints = request
@@ -5499,6 +5723,9 @@ fn unknown_neural_diarization_with_hard_hints(
         diarization::project_diarization_onto_segments(segments, &turns, word_aligned)?;
     let mut report =
         unknown_diarization_report(normalized_input_sha256, &request.speaker_count, reason);
+    report.implementation = "native-ecapa-unavailable-v1".to_owned();
+    report.contract_version = diarization::NEURAL_DIARIZATION_CONTRACT_VERSION.to_owned();
+    report.neural_representation = Some(neural_representation);
     report.hint_document_sha256 = (!request.known_intervals.is_empty())
         .then(|| diarization::canonical_hint_document_sha256(&request.known_intervals));
     report.turns = turns;
@@ -5521,11 +5748,10 @@ fn unknown_neural_diarization_with_hard_hints(
             profile_accepted_tracklet_count: 0,
             profile_downweighted_tracklet_count: 0,
             profile_quarantined_tracklet_count: 0,
-            applied_weight: if hint.policy == KnownSpeakerPolicy::HardMustLink {
-                hint.confidence
-            } else {
-                0.0
-            },
+            // Hard attribution survives model failure through the immutable
+            // turn/disposition fields, but no acoustic or neural tracklet was
+            // actually enrolled in this fallback path.
+            applied_weight: 0.0,
             contradiction_score: None,
         })
         .collect();
@@ -5558,8 +5784,13 @@ fn unknown_neural_diarization_with_hard_hints(
         })
         .max()
         .map_or(0.0, |maximum| {
-            maximum as f64 / total_hard_duration_ms.max(1) as f64
+            maximum as f64 / audio_duration_ms.max(1) as f64
         });
+    let unknown_voiced_share = if audio_duration_ms == 0 {
+        1.0
+    } else {
+        1.0 - total_hard_duration_ms.min(audio_duration_ms) as f64 / audio_duration_ms as f64
+    };
     let hard_count_satisfied = matches!(
         request.speaker_count,
         SpeakerCountRequest::HardConstraint { count } if count == supported_speaker_count
@@ -5577,6 +5808,7 @@ fn unknown_neural_diarization_with_hard_hints(
     report.speaker_count.supported_speaker_count = supported_speaker_count;
     report.speaker_count.active_speaker_refs = active_speaker_refs.clone();
     report.speaker_count.dominant_speaker_share = dominant_speaker_share;
+    report.speaker_count.unknown_voiced_share = unknown_voiced_share;
     report.speaker_count.reasons = vec![if hard_count_satisfied {
         SpeakerCountOutcomeReason::RequestedCountMatched
     } else if supported_speaker_count > 0 {
@@ -5622,6 +5854,7 @@ fn unknown_neural_diarization_with_hard_hints(
     } else {
         DiarizationFallbackStatus::UnsatisfiedConstraints
     };
+    report.validate().map_err(FwError::InvalidRequest)?;
     Ok((report, projection))
 }
 
@@ -5787,10 +6020,11 @@ fn external_diarization_report(
             SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable
         }
     };
-    Ok(DiarizationReport {
+    let report = DiarizationReport {
         implementation: "external-backend".to_owned(),
         contract_version: diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION.to_owned(),
         feature_schema: "external-unreported".to_owned(),
+        speaker_evidence_mode: DiarizationSpeakerEvidenceMode::External,
         normalized_input_sha256: normalized_input_sha256.to_owned(),
         hint_document_sha256: None,
         turns,
@@ -5809,11 +6043,14 @@ fn external_diarization_report(
             speaker_evidence,
         },
         fallback_status: DiarizationFallbackStatus::ExternalBackend,
+        operational_partition: None,
         neural_representation: None,
         diagnostics: vec![format!(
             "accepted external speaker assignments covering {external_segment_count} ms; acoustic profile calibration unavailable"
         )],
-    })
+    };
+    report.validate().map_err(FwError::InvalidRequest)?;
+    Ok(report)
 }
 
 fn state_root() -> FwResult<PathBuf> {
@@ -5910,10 +6147,11 @@ mod tests {
     use crate::model::{
         AcousticDiarizationRolloutStage, BackendKind, BackendParams, DiarizationConfig,
         DiarizationEngine, DiarizationFallbackStatus, DiarizationReport, DiarizationRequest,
-        DiarizationTurn, InputSource, KnownSpeakerInterval, KnownSpeakerPolicy, RunEvent,
-        RunReport, SpeakerCountOutcome, SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus,
-        SpeakerCountRequest, SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerProfileSummary,
-        StreamedRunEvent, TranscribeRequest, TranscriptionResult, TranscriptionSegment, VadParams,
+        DiarizationSpeakerEvidenceMode, DiarizationTurn, InputSource, KnownSpeakerInterval,
+        KnownSpeakerPolicy, RunEvent, RunReport, SpeakerCountOutcome, SpeakerCountOutcomeReason,
+        SpeakerCountOutcomeStatus, SpeakerCountRequest, SpeakerEvidenceReason,
+        SpeakerEvidenceSummary, SpeakerProfileSummary, StreamedRunEvent, TranscribeRequest,
+        TranscriptionResult, TranscriptionSegment, VadParams,
     };
     use crate::storage::RunStore;
 
@@ -7231,6 +7469,221 @@ mod tests {
         assert!(
             !rendered.contains(path.to_string_lossy().as_ref()),
             "model errors must not retain local paths"
+        );
+    }
+
+    #[test]
+    fn ecapa_attempt_classifies_failures_without_leaking_cache_warmth_into_authority() {
+        let resolver_failure = super::run_ecapa_attempt(
+            || {
+                Err(FwError::BackendUnavailable(
+                    "injected missing model".to_owned(),
+                ))
+            },
+            |_| -> Result<((), bool), FwError> {
+                panic!("loader must not run after resolver failure")
+            },
+            |_| -> Result<_, FwError> { panic!("diarizer must not run after resolver failure") },
+        );
+        let Err(super::EcapaAttemptFailure::Operational {
+            reason,
+            error,
+            model_load_source: source,
+        }) = resolver_failure
+        else {
+            panic!("injected resolver failure must fail")
+        };
+        assert_eq!(
+            reason,
+            crate::model::NeuralSpeakerRepresentationReason::ModelUnavailable
+        );
+        assert!(matches!(error, FwError::BackendUnavailable(_)));
+        assert_eq!(source, None);
+
+        let dir = tempdir().expect("tempdir should be available");
+        let corrupt_path = dir.path().join("corrupt-ecapa.safetensors");
+        std::fs::write(&corrupt_path, b"not the pinned package")
+            .expect("corrupt fixture should write");
+        let cache = super::EcapaModelCache::new();
+        let loader_failure = super::run_ecapa_attempt(
+            || Ok(corrupt_path.clone()),
+            |path| super::load_ecapa_model_from_cache(&cache, path, &|| Ok(())),
+            |_| -> Result<_, FwError> { panic!("diarizer must not run after loader failure") },
+        );
+        let Err(super::EcapaAttemptFailure::Operational {
+            reason,
+            error,
+            model_load_source: source,
+        }) = loader_failure
+        else {
+            panic!("corrupt package must fail during loading")
+        };
+        assert_eq!(
+            reason,
+            crate::model::NeuralSpeakerRepresentationReason::ModelInvalid
+        );
+        assert!(error.to_string().contains("pinned package SHA-256"));
+        assert_eq!(source, None);
+
+        for cache_hit in [false, true] {
+            let inference_failure = super::run_ecapa_attempt(
+                || Ok(PathBuf::from("synthetic-model.safetensors")),
+                |_| Ok(((), cache_hit)),
+                |_| {
+                    Err(FwError::BackendUnavailable(
+                        "injected inference failure".to_owned(),
+                    ))
+                },
+            );
+            let Err(super::EcapaAttemptFailure::Operational {
+                reason,
+                error,
+                model_load_source: source,
+            }) = inference_failure
+            else {
+                panic!("injected inference failure must fail")
+            };
+            assert_eq!(
+                reason,
+                crate::model::NeuralSpeakerRepresentationReason::InferenceFailed
+            );
+            assert!(matches!(error, FwError::BackendUnavailable(_)));
+            assert_eq!(source, Some(crate::model::NeuralModelLoadSource::Direct));
+        }
+
+        let internal_contract_failure = super::run_ecapa_attempt(
+            || Ok(PathBuf::from("synthetic-model.safetensors")),
+            |_| Ok(((), false)),
+            |_| {
+                Err(FwError::ContractViolation(
+                    "injected malformed report".to_owned(),
+                ))
+            },
+        );
+        let Err(super::EcapaAttemptFailure::InvalidOutput(error)) = internal_contract_failure
+        else {
+            panic!("an in-process postcondition failure must not become fallback-eligible")
+        };
+        assert!(matches!(error, FwError::ContractViolation(_)));
+    }
+
+    #[test]
+    fn ecapa_attempt_success_report_is_identical_across_cache_miss_and_hit() {
+        let mut base = super::unknown_diarization_report(
+            "a".repeat(64),
+            &SpeakerCountRequest::Infer,
+            "insufficient ECAPA identity evidence",
+        );
+        base.implementation = "native-ecapa-unavailable-v1".to_owned();
+        base.contract_version = crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION.to_owned();
+        base.neural_representation = Some(
+            super::unavailable_neural_representation_summary(
+                crate::model::NeuralSpeakerRepresentationReason::InsufficientTracklets,
+                Some(crate::model::NeuralModelLoadSource::Direct),
+            )
+            .expect("loaded model with insufficient speech summary"),
+        );
+        base.validate().expect("valid neural-unavailable report");
+
+        let run = |cache_hit| {
+            let report = base.clone();
+            super::run_ecapa_attempt(
+                || Ok(PathBuf::from("synthetic-model.safetensors")),
+                |_| Ok(((), cache_hit)),
+                |_| {
+                    Ok((
+                        report,
+                        crate::diarization::DiarizationProjection {
+                            segments: Vec::new(),
+                            mixed_speaker_segment_indices: Vec::new(),
+                            overlap_suspected_segment_indices: Vec::new(),
+                        },
+                    ))
+                },
+            )
+        };
+        let Ok((miss_report, _)) = run(false) else {
+            panic!("synthetic cache miss should yield a valid report")
+        };
+        let Ok((hit_report, _)) = run(true) else {
+            panic!("synthetic cache hit should yield a valid report")
+        };
+        assert_eq!(miss_report, hit_report);
+        assert_eq!(
+            miss_report
+                .neural_representation
+                .as_ref()
+                .and_then(|summary| summary.model_load_source),
+            Some(crate::model::NeuralModelLoadSource::Direct)
+        );
+        assert!(
+            miss_report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.contains("cache="))
+        );
+    }
+
+    #[test]
+    fn ecapa_attempt_propagates_malformed_success_as_a_non_fallback_contract_error() {
+        let malformed = super::run_ecapa_attempt(
+            || Ok(PathBuf::from("synthetic-model.safetensors")),
+            |_| Ok(((), false)),
+            |_| {
+                Ok((
+                    synthetic_typed_diarization_report(),
+                    crate::diarization::DiarizationProjection {
+                        segments: Vec::new(),
+                        mixed_speaker_segment_indices: Vec::new(),
+                        overlap_suspected_segment_indices: Vec::new(),
+                    },
+                ))
+            },
+        );
+        let Err(super::EcapaAttemptFailure::InvalidOutput(error)) = malformed else {
+            panic!("missing ECAPA provenance must be a non-fallback contract error")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("omitted neural representation provenance"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the externally provisioned pinned public ECAPA package"]
+    fn external_ecapa_cache_miss_then_hit_and_corrupt_package_invalidation() {
+        let model_path = std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS")
+            .map(PathBuf::from)
+            .expect("set FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS");
+        let cache = super::EcapaModelCache::new();
+
+        let (first, first_hit) =
+            super::load_ecapa_model_from_cache(&cache, &model_path, &|| Ok(()))
+                .expect("first valid load");
+        assert!(!first_hit, "a private empty cache must report a miss");
+        let (second, second_hit) =
+            super::load_ecapa_model_from_cache(&cache, &model_path, &|| Ok(()))
+                .expect("second valid load");
+        assert!(second_hit, "the repeated pinned package must hit the cache");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "a cache hit must return the retained model instance"
+        );
+
+        let dir = tempdir().expect("tempdir should be available");
+        let corrupt_path = dir.path().join("corrupt-ecapa.safetensors");
+        std::fs::write(&corrupt_path, b"changed after the valid cache load")
+            .expect("corrupt fixture should write");
+        let error = super::load_ecapa_model_from_cache(&cache, &corrupt_path, &|| Ok(()))
+            .expect_err("a cached model must never bypass package validation");
+        assert!(error.to_string().contains("pinned package SHA-256"));
+        assert!(
+            !error
+                .to_string()
+                .contains(corrupt_path.to_string_lossy().as_ref()),
+            "cache invalidation errors must not disclose local paths"
         );
     }
 
@@ -9939,8 +10392,9 @@ mod tests {
     fn synthetic_typed_diarization_report() -> DiarizationReport {
         DiarizationReport {
             implementation: "native-acoustic-v2".to_owned(),
-            contract_version: "acoustic-diarization-v2".to_owned(),
+            contract_version: "acoustic-diarization-v3".to_owned(),
             feature_schema: crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION.to_owned(),
+            speaker_evidence_mode: DiarizationSpeakerEvidenceMode::AcousticV2,
             normalized_input_sha256:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             hint_document_sha256: None,
@@ -9994,6 +10448,7 @@ mod tests {
                 }],
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
+            operational_partition: None,
             neural_representation: None,
             diagnostics: Vec::new(),
         }
@@ -10041,7 +10496,15 @@ mod tests {
     #[test]
     fn diarization_details_emit_from_the_diarize_stage() {
         let mut log = EventLog::new("run".to_owned(), "trace".to_owned(), None);
-        emit_diarization_report_events(&mut log, &synthetic_typed_diarization_report());
+        let mut report = synthetic_typed_diarization_report();
+        report.neural_representation = Some(
+            super::unavailable_neural_representation_summary(
+                crate::model::NeuralSpeakerRepresentationReason::ModelUnavailable,
+                None,
+            )
+            .expect("valid unavailable summary"),
+        );
+        emit_diarization_report_events(&mut log, &report);
         assert_eq!(
             log.events
                 .iter()
@@ -10050,6 +10513,99 @@ mod tests {
             vec!["diarize.progress", "diarize.change", "diarize.profile"]
         );
         assert!(log.events.iter().all(|event| event.stage == "diarize"));
+        let progress = &log.events[0].payload;
+        assert_eq!(progress["neural_representation"]["status"], "unavailable");
+        assert!(progress.get("operational_partition").is_some());
+    }
+
+    #[test]
+    fn neural_robot_progress_payload_has_an_exact_privacy_safe_schema() {
+        let cases = [
+            (
+                crate::model::NeuralSpeakerRepresentationStatus::Ready,
+                crate::model::NeuralModelLoadSource::CacheHit,
+                Vec::new(),
+            ),
+            (
+                crate::model::NeuralSpeakerRepresentationStatus::Degraded,
+                crate::model::NeuralModelLoadSource::CacheMiss,
+                vec![crate::model::NeuralSpeakerRepresentationReason::ShortTracklet],
+            ),
+        ];
+        for (status, model_load_source, reasons) in cases {
+            let summary = crate::model::NeuralSpeakerRepresentationSummary {
+                schema_version: "neural-speaker-representation-summary-v1".to_owned(),
+                provider_version: crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION
+                    .to_owned(),
+                expected_model_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256
+                    .to_owned(),
+                loaded_model_package_sha256: Some(
+                    crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
+                ),
+                model_load_source: Some(model_load_source),
+                status,
+                embedded_tracklet_count: 2,
+                zero_padded_tracklet_count: u64::from(
+                    status == crate::model::NeuralSpeakerRepresentationStatus::Degraded,
+                ),
+                skipped_tracklet_count: 0,
+                reasons,
+            };
+            summary.validate().expect("valid neural summary");
+            let mut report = synthetic_typed_diarization_report();
+            report.neural_representation = Some(summary);
+            let mut log = EventLog::new("run".to_owned(), "trace".to_owned(), None);
+            emit_diarization_report_events(&mut log, &report);
+
+            let progress = log.events[0].payload.as_object().expect("progress object");
+            let mut outer_keys = progress.keys().map(String::as_str).collect::<Vec<_>>();
+            outer_keys.sort_unstable();
+            assert_eq!(
+                outer_keys,
+                [
+                    "contract_version",
+                    "fallback_status",
+                    "feature_schema",
+                    "implementation",
+                    "neural_representation",
+                    "operational_partition",
+                    "profiles",
+                    "speaker_count",
+                    "speaker_evidence_mode",
+                    "trace_id",
+                    "turns",
+                ]
+            );
+            let neural = progress["neural_representation"]
+                .as_object()
+                .expect("neural summary object");
+            let mut neural_keys = neural.keys().map(String::as_str).collect::<Vec<_>>();
+            neural_keys.sort_unstable();
+            let mut expected_neural_keys = vec![
+                "embedded_tracklet_count",
+                "expected_model_package_sha256",
+                "loaded_model_package_sha256",
+                "model_load_source",
+                "provider_version",
+                "schema_version",
+                "skipped_tracklet_count",
+                "status",
+                "zero_padded_tracklet_count",
+            ];
+            if status == crate::model::NeuralSpeakerRepresentationStatus::Degraded {
+                expected_neural_keys.push("reasons");
+                expected_neural_keys.sort_unstable();
+            }
+            assert_eq!(neural_keys, expected_neural_keys);
+            assert_eq!(
+                neural["model_load_source"],
+                match model_load_source {
+                    crate::model::NeuralModelLoadSource::CacheHit => json!("cache_hit"),
+                    crate::model::NeuralModelLoadSource::CacheMiss => json!("cache_miss"),
+                    crate::model::NeuralModelLoadSource::Direct => json!("direct"),
+                }
+            );
+        }
     }
 
     #[test]
@@ -10146,15 +10702,31 @@ mod tests {
         )
         .expect_err("external engine would silently ignore known intervals");
         assert!(error.to_string().contains("require a native"));
-        for engine in [DiarizationEngine::Acoustic, DiarizationEngine::Neural] {
+        for engine in [
+            DiarizationEngine::Acoustic,
+            DiarizationEngine::Ecapa,
+            DiarizationEngine::EcapaFused,
+        ] {
             assert!(validate_diarization_execution_request(engine, &request, Some(2_000)).is_ok());
+
+            let mut external_fallback = request.clone();
+            external_fallback.engine = engine;
+            external_fallback.fallback = DiarizationFallbackPolicy::External;
+            let fallback_error =
+                validate_diarization_execution_request(engine, &external_fallback, Some(2_000))
+                    .expect_err("external fallback would silently discard known identities");
+            assert!(
+                fallback_error
+                    .to_string()
+                    .contains("external execution or fallback")
+            );
         }
     }
 
     #[test]
     fn neural_unknown_fallback_preserves_only_hard_hint_attribution() {
         let request = DiarizationRequest {
-            engine: DiarizationEngine::Neural,
+            engine: DiarizationEngine::EcapaFused,
             known_intervals: vec![
                 KnownSpeakerInterval {
                     speaker_ref: "alice".to_owned(),
@@ -10197,14 +10769,31 @@ mod tests {
             make_segment(1.3, 1.5, "soft remains unknown"),
             make_segment(2.1, 2.3, "hard bob"),
         ];
+        let neural_representation = super::unavailable_neural_representation_summary(
+            crate::model::NeuralSpeakerRepresentationReason::ModelUnavailable,
+            None,
+        )
+        .expect("unavailable model summary");
         let (report, projection) = unknown_neural_diarization_with_hard_hints(
             "a".repeat(64),
             &request,
             &segments,
             true,
+            3_000,
+            neural_representation,
             "model unavailable",
         )
         .expect("hard-hint-preserving fallback");
+        assert_eq!(report.implementation, "native-ecapa-unavailable-v1");
+        assert_eq!(
+            report.contract_version,
+            crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION
+        );
+        assert_eq!(
+            report.speaker_evidence_mode,
+            crate::model::DiarizationSpeakerEvidenceMode::None
+        );
+        assert!(report.neural_representation.is_some());
         assert_eq!(report.turns.len(), 2, "adjacent alice hints must merge");
         assert_eq!(report.turns[0].speaker_ref.as_deref(), Some("alice"));
         assert_eq!(report.turns[0].end_ms, 1_200);
@@ -10217,9 +10806,135 @@ mod tests {
         );
         assert!(report.hint_document_sha256.is_some());
         assert_eq!(report.hint_evidence.len(), 4);
+        assert!(
+            report
+                .hint_evidence
+                .iter()
+                .all(|evidence| evidence.applied_weight == 0.0)
+        );
+        assert!(
+            report.speaker_count.dominant_speaker_share + report.speaker_count.unknown_voiced_share
+                <= 1.0 + 1.0e-9
+        );
         assert_eq!(projection.segments[0].speaker.as_deref(), Some("alice"));
         assert_eq!(projection.segments[1].speaker, None);
         assert_eq!(projection.segments[2].speaker.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn neural_model_failures_have_honest_provenance_and_native_acoustic_fallback() {
+        for (reason, model_load_source) in [
+            (
+                crate::model::NeuralSpeakerRepresentationReason::ModelUnavailable,
+                None,
+            ),
+            (
+                crate::model::NeuralSpeakerRepresentationReason::ModelInvalid,
+                None,
+            ),
+            (
+                crate::model::NeuralSpeakerRepresentationReason::InferenceFailed,
+                Some(crate::model::NeuralModelLoadSource::CacheMiss),
+            ),
+            (
+                crate::model::NeuralSpeakerRepresentationReason::InferenceFailed,
+                Some(crate::model::NeuralModelLoadSource::CacheHit),
+            ),
+        ] {
+            let summary =
+                super::unavailable_neural_representation_summary(reason, model_load_source)
+                    .expect("valid failure summary");
+            assert_eq!(
+                summary.status,
+                crate::model::NeuralSpeakerRepresentationStatus::Unavailable
+            );
+            assert_eq!(
+                summary.loaded_model_package_sha256.is_some(),
+                reason == crate::model::NeuralSpeakerRepresentationReason::InferenceFailed
+            );
+            assert_eq!(summary.model_load_source, model_load_source);
+        }
+
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::EcapaFused,
+            fallback: crate::model::DiarizationFallbackPolicy::Acoustic,
+            ..DiarizationRequest::default()
+        };
+        let samples = vec![0.0_f32; 32_000];
+        let boundary_hints = crate::diarization::AcousticBoundaryHints {
+            speech_regions_ms: vec![(0, 2_000)],
+            ..crate::diarization::AcousticBoundaryHints::default()
+        };
+        let summary = super::unavailable_neural_representation_summary(
+            crate::model::NeuralSpeakerRepresentationReason::ModelUnavailable,
+            None,
+        )
+        .expect("missing-model summary");
+        let repeated_summary = summary.clone();
+        let fallback_input = crate::diarization::AcousticDiarizationInput {
+            samples: &samples,
+            normalized_input_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            segments: &[],
+            word_aligned: false,
+            request: &request,
+            boundary_hints: &boundary_hints,
+        };
+        let (report, projection) = super::run_native_acoustic_fallback(
+            fallback_input,
+            Some(summary),
+            "neural_representation_fallback=model_unavailable".to_owned(),
+            &|| Ok(()),
+        )
+        .expect("native acoustic fallback");
+        let (repeated_report, repeated_projection) = super::run_native_acoustic_fallback(
+            fallback_input,
+            Some(repeated_summary),
+            "neural_representation_fallback=model_unavailable".to_owned(),
+            &|| Ok(()),
+        )
+        .expect("repeated native acoustic fallback");
+        assert_eq!(request.engine, DiarizationEngine::EcapaFused);
+        assert_eq!(report.implementation, "native-acoustic-v2");
+        assert_eq!(
+            report.speaker_evidence_mode,
+            DiarizationSpeakerEvidenceMode::AcousticV2
+        );
+        assert_eq!(
+            report.contract_version,
+            crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION
+        );
+        assert_eq!(
+            report.feature_schema,
+            crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            report
+                .neural_representation
+                .as_ref()
+                .map(|summary| summary.status),
+            Some(crate::model::NeuralSpeakerRepresentationStatus::Unavailable)
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("model_unavailable"))
+        );
+        assert_eq!(
+            serde_json::to_vec(&report).expect("serialize first fallback"),
+            serde_json::to_vec(&repeated_report).expect("serialize repeated fallback"),
+            "the zero-embedding fallback must be byte-deterministic"
+        );
+        assert!(projection.segments.is_empty());
+        assert!(repeated_projection.segments.is_empty());
+        assert_eq!(
+            projection.mixed_speaker_segment_indices,
+            repeated_projection.mixed_speaker_segment_indices
+        );
+        assert_eq!(
+            projection.overlap_suspected_segment_indices,
+            repeated_projection.overlap_suspected_segment_indices
+        );
     }
 
     #[test]
@@ -10254,6 +10969,19 @@ mod tests {
             )
             .is_ok()
         );
+        let mut prior_external_fallback = prior_request.clone();
+        prior_external_fallback.engine = DiarizationEngine::Acoustic;
+        prior_external_fallback.fallback = DiarizationFallbackPolicy::External;
+        assert!(
+            validate_diarization_execution_request(
+                DiarizationEngine::Acoustic,
+                &prior_external_fallback,
+                Some(2_000),
+            )
+            .expect_err("external fallback cannot silently discard a soft count prior")
+            .to_string()
+            .contains("external execution or fallback")
+        );
 
         let range_request = DiarizationRequest {
             speaker_count: SpeakerCountRequest::Range {
@@ -10264,11 +10992,24 @@ mod tests {
         };
         assert!(
             validate_diarization_execution_request(
-                DiarizationEngine::Neural,
+                DiarizationEngine::EcapaFused,
                 &range_request,
                 Some(2_000),
             )
             .is_ok()
+        );
+        let mut range_external_fallback = range_request;
+        range_external_fallback.engine = DiarizationEngine::EcapaFused;
+        range_external_fallback.fallback = DiarizationFallbackPolicy::External;
+        assert!(
+            validate_diarization_execution_request(
+                DiarizationEngine::EcapaFused,
+                &range_external_fallback,
+                Some(2_000),
+            )
+            .expect_err("external fallback cannot silently discard a soft count range")
+            .to_string()
+            .contains("external execution or fallback")
         );
     }
 
