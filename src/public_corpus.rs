@@ -14013,19 +14013,19 @@ mod tests {
     const PUBLIC_ECAPA_COMMON_OBSERVATION_BINDING_SCHEMA_VERSION: &str =
         "public-ecapa-common-observation-binding-v1";
     const PUBLIC_ECAPA_RESIDUAL_GATE_SCHEMA_VERSION: &str =
-        "public-ecapa-residual-birth-gate-row-v1";
+        "public-ecapa-residual-birth-gate-row-v3";
     const PUBLIC_ECAPA_RESIDUAL_GATE_RUNNER_VERSION: &str =
-        "public-ecapa-residual-birth-gate-runner-v1";
+        "public-ecapa-residual-birth-gate-runner-v3";
     const PUBLIC_ECAPA_RESIDUAL_GATE_POLICY_ID: &str =
-        "public-ecapa-residual-birth-development-policy-v1";
+        "public-ecapa-residual-birth-development-policy-v3";
     const PUBLIC_ECAPA_RESIDUAL_AGGREGATE_METRIC_ID: &str =
         "micro-der-summed-components-over-summed-reference-speaker-time-v1";
     const PUBLIC_ECAPA_RESIDUAL_UNKNOWN_METRIC_ID: &str =
         "unknown-hypothesis-speaker-time-over-labeled-plus-unknown-v1";
     const PUBLIC_ECAPA_RESIDUAL_TIMING_ID: &str =
-        "shared-preparation-plus-paired-partition-finish-monotonic-v1";
+        "shared-preparation-plus-engine-checkerboard-partition-finish-v2";
     const PUBLIC_ECAPA_RESIDUAL_RSS_ID: &str =
-        "one-paired-process-linux-vmhwm-otherwise-sampled-rss-v1";
+        "linux-proc-vmhwm-authoritative-plus-observed-stage-rss-v2";
     const PUBLIC_ECAPA_RESIDUAL_REQUIRED_RECORDINGS: u64 = 8;
     const PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS: u64 = 16;
     const PUBLIC_ECAPA_RESIDUAL_REQUIRED_SINGLE_SPEAKER_CONTROLS: u64 = 2;
@@ -14039,6 +14039,17 @@ mod tests {
     const PUBLIC_ECAPA_RESIDUAL_MAXIMUM_CANDIDATE_SPLITS: u64 = 1;
     const PUBLIC_ECAPA_RESIDUAL_LLOYD_ITERATIONS: u64 = 8;
     const PUBLIC_ECAPA_RESIDUAL_CANCELLATION_INTERVAL_OPERATIONS: u64 = 32;
+    // Independent, fail-closed ceiling for the frozen public dev8 gate. Its
+    // adequacy is demonstrated by every one of the 16 paired rows; it is not a
+    // global asymptotic bound on arbitrary-length recordings. The derived
+    // robust-view cap below is input-sensitive and substantially tighter.
+    const PUBLIC_ECAPA_RESIDUAL_MAXIMUM_OPERATION_COUNT_PER_PAIR: u64 = 100_000_000;
+    const PUBLIC_ECAPA_RESIDUAL_RANKING_SINGLETON_VIEW_FACTOR: u64 = 6;
+    const PUBLIC_ECAPA_RESIDUAL_PAIR_PROPOSAL_VIEW_FACTOR: u64 = 15;
+    const PUBLIC_ECAPA_RESIDUAL_VALIDATION_VIEW_ALLOWANCE: u64 = 20;
+    const PUBLIC_ECAPA_RESIDUAL_LLOYD_VIEW_FACTOR: u64 = 2;
+    const PUBLIC_ECAPA_RESIDUAL_REBUILD_VIEW_FACTOR: u64 = 1;
+    const PUBLIC_ECAPA_RESIDUAL_FINAL_CLUSTER_PAIR_VIEW_FACTOR: u64 = 5;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
     #[serde(rename_all = "snake_case")]
@@ -14047,6 +14058,7 @@ mod tests {
         PairAlignmentMismatch,
         PairIntegrityMismatch,
         PolicyHashMismatch,
+        ResidualPolicyMismatch,
         ProtocolMismatch,
         CommonObservationMismatch,
         IncumbentContractMismatch,
@@ -14085,6 +14097,10 @@ mod tests {
         required_recording_count: u64,
         required_pair_count: u64,
         required_engines: [crate::model::DiarizationEngine; 2],
+        required_baseline_first_pair_count: u64,
+        required_candidate_first_pair_count: u64,
+        required_baseline_first_pair_count_per_engine: u64,
+        required_candidate_first_pair_count_per_engine: u64,
         required_single_speaker_control_recording_count: u64,
         minimum_exact_match_gain: u64,
         require_strict_count_mae_improvement: bool,
@@ -14099,12 +14115,20 @@ mod tests {
         maximum_relative_partition_rtf_regression: f64,
         maximum_candidate_counterfactual_rtf: f64,
         maximum_paired_process_rss_bytes: u64,
+        required_successful_authoritative_peak_sample_count: u64,
         maximum_residual_scratch_payload_bytes: u64,
         maximum_retained_residual_observations: u64,
         maximum_pair_proposals_per_parent: u64,
         maximum_candidate_splits: u64,
         lloyd_iterations: u64,
         cancellation_check_interval_operations: u64,
+        maximum_operation_count_per_pair: u64,
+        ranking_singleton_view_factor: u64,
+        pair_proposal_view_factor: u64,
+        validation_view_allowance: u64,
+        lloyd_view_factor: u64,
+        rebuild_view_factor: u64,
+        final_cluster_pair_view_factor: u64,
         undefined_metric_behavior: String,
     }
 
@@ -14121,6 +14145,12 @@ mod tests {
                 crate::model::DiarizationEngine::Ecapa,
                 crate::model::DiarizationEngine::EcapaFused,
             ],
+            required_baseline_first_pair_count: PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS / 2,
+            required_candidate_first_pair_count: PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS / 2,
+            required_baseline_first_pair_count_per_engine: PUBLIC_ECAPA_RESIDUAL_REQUIRED_RECORDINGS
+                / 2,
+            required_candidate_first_pair_count_per_engine:
+                PUBLIC_ECAPA_RESIDUAL_REQUIRED_RECORDINGS / 2,
             required_single_speaker_control_recording_count:
                 PUBLIC_ECAPA_RESIDUAL_REQUIRED_SINGLE_SPEAKER_CONTROLS,
             minimum_exact_match_gain: PUBLIC_ECAPA_RESIDUAL_MINIMUM_EXACT_MATCH_GAIN,
@@ -14138,6 +14168,8 @@ mod tests {
             maximum_candidate_counterfactual_rtf: PUBLIC_ECAPA_RESIDUAL_MAXIMUM_COUNTERFACTUAL_RTF,
             maximum_paired_process_rss_bytes:
                 PUBLIC_ECAPA_RESIDUAL_MAXIMUM_PAIRED_PROCESS_RSS_BYTES,
+            required_successful_authoritative_peak_sample_count: 1 + 4
+                * PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS,
             maximum_residual_scratch_payload_bytes:
                 PUBLIC_ECAPA_RESIDUAL_MAXIMUM_SCRATCH_PAYLOAD_BYTES,
             maximum_retained_residual_observations:
@@ -14148,6 +14180,14 @@ mod tests {
             lloyd_iterations: PUBLIC_ECAPA_RESIDUAL_LLOYD_ITERATIONS,
             cancellation_check_interval_operations:
                 PUBLIC_ECAPA_RESIDUAL_CANCELLATION_INTERVAL_OPERATIONS,
+            maximum_operation_count_per_pair:
+                PUBLIC_ECAPA_RESIDUAL_MAXIMUM_OPERATION_COUNT_PER_PAIR,
+            ranking_singleton_view_factor: PUBLIC_ECAPA_RESIDUAL_RANKING_SINGLETON_VIEW_FACTOR,
+            pair_proposal_view_factor: PUBLIC_ECAPA_RESIDUAL_PAIR_PROPOSAL_VIEW_FACTOR,
+            validation_view_allowance: PUBLIC_ECAPA_RESIDUAL_VALIDATION_VIEW_ALLOWANCE,
+            lloyd_view_factor: PUBLIC_ECAPA_RESIDUAL_LLOYD_VIEW_FACTOR,
+            rebuild_view_factor: PUBLIC_ECAPA_RESIDUAL_REBUILD_VIEW_FACTOR,
+            final_cluster_pair_view_factor: PUBLIC_ECAPA_RESIDUAL_FINAL_CLUSTER_PAIR_VIEW_FACTOR,
             undefined_metric_behavior: "fail-closed-no-available-case-deletion-v1".to_owned(),
         }
     }
@@ -14428,9 +14468,9 @@ mod tests {
         candidate_replay_common_observation_sha256: String,
         candidate_replay_residual_birth_evidence_sha256: String,
         candidate_replay_score_sha256: String,
-        candidate_replay_full_output_matches: bool,
+        candidate_replay_structural_output_matches: bool,
         candidate_replay_matches: bool,
-        rejected_candidate_output_matches_incumbent: bool,
+        rejected_candidate_structural_output_matches_incumbent: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -14487,8 +14527,8 @@ mod tests {
         candidate_replay_common_observation_sha256: &'a str,
         candidate_replay_residual_birth_evidence_sha256: &'a str,
         candidate_replay_score_sha256: &'a str,
-        candidate_replay_full_output_matches: bool,
-        rejected_candidate_output_matches_incumbent: bool,
+        candidate_replay_structural_output_matches: bool,
+        rejected_candidate_structural_output_matches_incumbent: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -14530,6 +14570,94 @@ mod tests {
         passed_non_regression: bool,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum PublicEcapaResidualBirthRssObservationKind {
+        LinuxProcVmHwm,
+        ObservedStageRssOnly,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PublicEcapaResidualBirthMemoryObservation {
+        authoritative_peak_rss_bytes: Option<u64>,
+        observed_stage_max_rss_bytes: u64,
+        successful_observed_stage_sample_count: u64,
+        successful_authoritative_peak_sample_count: u64,
+        observation_kind: PublicEcapaResidualBirthRssObservationKind,
+    }
+
+    impl PublicEcapaResidualBirthMemoryObservation {
+        fn new() -> Self {
+            Self {
+                authoritative_peak_rss_bytes: None,
+                observed_stage_max_rss_bytes: 0,
+                successful_observed_stage_sample_count: 0,
+                successful_authoritative_peak_sample_count: 0,
+                observation_kind: PublicEcapaResidualBirthRssObservationKind::ObservedStageRssOnly,
+            }
+        }
+
+        fn observe_stage(&mut self) {
+            let observed_stage_rss_bytes = super::sampled_process_rss_bytes();
+            self.observe_values(observed_stage_rss_bytes, public_ecapa_linux_vm_hwm_bytes());
+        }
+
+        fn observe_values(
+            &mut self,
+            observed_stage_rss_bytes: u64,
+            authoritative_peak_rss_bytes: Option<u64>,
+        ) {
+            if observed_stage_rss_bytes > 0 {
+                self.observed_stage_max_rss_bytes = self
+                    .observed_stage_max_rss_bytes
+                    .max(observed_stage_rss_bytes);
+                self.successful_observed_stage_sample_count = self
+                    .successful_observed_stage_sample_count
+                    .saturating_add(1);
+            }
+            if let Some(authoritative_peak_rss_bytes) =
+                authoritative_peak_rss_bytes.filter(|bytes| *bytes > 0)
+            {
+                self.authoritative_peak_rss_bytes = Some(
+                    self.authoritative_peak_rss_bytes
+                        .unwrap_or(0)
+                        .max(authoritative_peak_rss_bytes),
+                );
+                self.successful_authoritative_peak_sample_count = self
+                    .successful_authoritative_peak_sample_count
+                    .saturating_add(1);
+                self.observation_kind = PublicEcapaResidualBirthRssObservationKind::LinuxProcVmHwm;
+            }
+        }
+
+        fn has_complete_authoritative_peak_evidence(&self, required_sample_count: u64) -> bool {
+            self.observation_kind == PublicEcapaResidualBirthRssObservationKind::LinuxProcVmHwm
+                && self.successful_authoritative_peak_sample_count >= required_sample_count
+                && self
+                    .authoritative_peak_rss_bytes
+                    .is_some_and(|bytes| bytes > 0)
+        }
+    }
+
+    fn public_ecapa_linux_vm_hwm_bytes() -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmHWM:")?
+                    .split_ascii_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+                    .map(|kibibytes| kibibytes.saturating_mul(1_024))
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, serde::Serialize)]
     #[serde(deny_unknown_fields)]
     struct PublicEcapaResidualBirthPerformance {
@@ -14543,8 +14671,11 @@ mod tests {
         baseline_counterfactual_rtf: Option<f64>,
         candidate_counterfactual_rtf: Option<f64>,
         relative_partition_rtf_regression: Option<f64>,
-        paired_process_observed_rss_bytes: u64,
-        rss_observation: String,
+        paired_process_authoritative_peak_rss_bytes: Option<u64>,
+        paired_process_observed_stage_max_rss_bytes: u64,
+        successful_observed_stage_sample_count: u64,
+        successful_authoritative_peak_sample_count: u64,
+        rss_observation: PublicEcapaResidualBirthRssObservationKind,
         per_arm_peak_rss_claimed: bool,
     }
 
@@ -15126,12 +15257,15 @@ mod tests {
     fn run_prepared_public_ecapa_arm(
         prepared: &crate::diarization::PreparedEcapaDiarizationEvaluation,
         mode: crate::diarization::EcapaResidualBirthMode,
+        memory_observation: &mut PublicEcapaResidualBirthMemoryObservation,
     ) -> (crate::diarization::EcapaResidualBirthEvaluationRun, u64) {
         let started = std::time::Instant::now();
         let run =
             crate::diarization::run_prepared_ecapa_diarization_evaluation(prepared, mode, || false)
                 .expect("run prepared ECAPA residual-birth arm");
-        (run, public_ecapa_duration_ns(started.elapsed()))
+        let wall_ns = public_ecapa_duration_ns(started.elapsed());
+        memory_observation.observe_stage();
+        (run, wall_ns)
     }
 
     fn public_ecapa_duration_ns(duration: std::time::Duration) -> u64 {
@@ -15140,16 +15274,10 @@ mod tests {
             .max(1)
     }
 
-    fn public_ecapa_execution_order(
-        recording_id: &str,
-        engine: crate::model::DiarizationEngine,
-    ) -> PublicEcapaResidualBirthExecutionOrder {
-        let digest = super::canonical_sha256(&(recording_id, engine))
-            .expect("hash deterministic paired execution order");
-        if matches!(
-            digest.as_bytes().last(),
-            Some(b'0' | b'2' | b'4' | b'6' | b'8' | b'a' | b'c' | b'e')
-        ) {
+    fn public_ecapa_execution_order(pair_index: usize) -> PublicEcapaResidualBirthExecutionOrder {
+        let recording_index = pair_index / 2;
+        let engine_index = pair_index % 2;
+        if (recording_index + engine_index).is_multiple_of(2) {
             PublicEcapaResidualBirthExecutionOrder::BaselineThenCandidate
         } else {
             PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline
@@ -15170,9 +15298,9 @@ mod tests {
         candidate_replay_common_observation_sha256: String,
         candidate_replay_residual_birth_evidence_sha256: String,
         candidate_replay_score_sha256: String,
-        candidate_replay_full_output_matches: bool,
+        candidate_replay_structural_output_matches: bool,
         candidate_replay_matches: bool,
-        rejected_candidate_output_matches_incumbent: bool,
+        rejected_candidate_structural_output_matches_incumbent: bool,
         pair_alignment_matches: bool,
         common_observation_matches: bool,
         incumbent_contract_matches: bool,
@@ -15204,9 +15332,9 @@ mod tests {
             candidate_replay_common_observation_sha256,
             candidate_replay_residual_birth_evidence_sha256,
             candidate_replay_score_sha256,
-            candidate_replay_full_output_matches,
+            candidate_replay_structural_output_matches,
             candidate_replay_matches,
-            rejected_candidate_output_matches_incumbent,
+            rejected_candidate_structural_output_matches_incumbent,
         }
     }
 
@@ -15247,12 +15375,12 @@ mod tests {
                 .comparison
                 .candidate_replay_residual_birth_evidence_sha256,
             candidate_replay_score_sha256: &row.comparison.candidate_replay_score_sha256,
-            candidate_replay_full_output_matches: row
+            candidate_replay_structural_output_matches: row
                 .comparison
-                .candidate_replay_full_output_matches,
-            rejected_candidate_output_matches_incumbent: row
+                .candidate_replay_structural_output_matches,
+            rejected_candidate_structural_output_matches_incumbent: row
                 .comparison
-                .rejected_candidate_output_matches_incumbent,
+                .rejected_candidate_structural_output_matches_incumbent,
         })
         .expect("hash paired ECAPA accuracy row")
     }
@@ -15334,7 +15462,7 @@ mod tests {
 
     fn public_ecapa_residual_birth_performance(
         rows: &[PublicEcapaResidualBirthPairRow],
-        paired_process_observed_rss_bytes: u64,
+        memory_observation: &PublicEcapaResidualBirthMemoryObservation,
     ) -> PublicEcapaResidualBirthPerformance {
         let mut audio_duration_sec = CompensatedSum::default();
         let mut common_preparation_wall_sec = CompensatedSum::default();
@@ -15392,8 +15520,15 @@ mod tests {
                         super::canonical_evidence_number((candidate - baseline) / baseline)
                     })
                 }),
-            paired_process_observed_rss_bytes,
-            rss_observation: PUBLIC_ECAPA_RESIDUAL_RSS_ID.to_owned(),
+            paired_process_authoritative_peak_rss_bytes: memory_observation
+                .authoritative_peak_rss_bytes,
+            paired_process_observed_stage_max_rss_bytes: memory_observation
+                .observed_stage_max_rss_bytes,
+            successful_observed_stage_sample_count: memory_observation
+                .successful_observed_stage_sample_count,
+            successful_authoritative_peak_sample_count: memory_observation
+                .successful_authoritative_peak_sample_count,
+            rss_observation: memory_observation.observation_kind,
             per_arm_peak_rss_claimed: false,
         }
     }
@@ -15415,6 +15550,53 @@ mod tests {
             crate::model::DiarizationEngine::EcapaFused => "ecapa_fused",
             _ => "unsupported",
         }
+    }
+
+    fn public_ecapa_robust_view_comparison_bound(
+        row: &PublicEcapaResidualBirthPairRow,
+        policy: &PublicEcapaResidualBirthGatePolicy,
+    ) -> Option<u64> {
+        let resources = &row.candidate.resources;
+        let candidate_cluster_count = row.candidate.incumbent_cluster_count.checked_add(1)?;
+        let final_cluster_pair_count = candidate_cluster_count
+            .checked_mul(candidate_cluster_count.checked_sub(1)?)?
+            .checked_div(2)?;
+        policy
+            .ranking_singleton_view_factor
+            .checked_mul(row.common_observation.embedded_tracklet_count)?
+            .checked_add(
+                policy
+                    .pair_proposal_view_factor
+                    .checked_mul(resources.leave_pair_out_pair_count)?,
+            )?
+            .checked_add(policy.validation_view_allowance)?
+            .checked_add(
+                policy
+                    .lloyd_view_factor
+                    .checked_mul(resources.lloyd_assignment_visits)?,
+            )?
+            .checked_add(
+                policy
+                    .rebuild_view_factor
+                    .checked_mul(row.common_observation.embedded_tracklet_count)?
+                    .checked_mul(resources.candidate_split_count)?,
+            )?
+            .checked_add(
+                policy
+                    .final_cluster_pair_view_factor
+                    .checked_mul(final_cluster_pair_count)?
+                    .checked_mul(resources.candidate_split_count)?,
+            )
+    }
+
+    fn public_ecapa_expected_cancellation_checks(
+        operation_count: u64,
+        cancellation_interval_operations: u64,
+    ) -> Option<u64> {
+        if operation_count == 0 {
+            return Some(0);
+        }
+        1_u64.checked_add(operation_count.checked_div(cancellation_interval_operations)?)
     }
 
     fn public_ecapa_accuracy_is_finite(row: &PublicEcapaResidualBirthAccuracyRow) -> bool {
@@ -15589,7 +15771,7 @@ mod tests {
         protocol_sha256: &str,
         gate_policy: PublicEcapaResidualBirthGatePolicy,
         gate_policy_sha256: String,
-        paired_process_observed_rss_bytes: u64,
+        memory_observation: &PublicEcapaResidualBirthMemoryObservation,
     ) -> PublicEcapaResidualBirthGateRow {
         let mut failures = Vec::new();
         let frozen_gate_policy = public_ecapa_residual_birth_gate_policy();
@@ -15600,6 +15782,9 @@ mod tests {
             || observed_gate_policy_sha256 != frozen_gate_policy_sha256
         {
             failures.push(PublicEcapaResidualBirthGateFailure::PolicyHashMismatch);
+        }
+        if residual_policy_sha256 != crate::diarization::ecapa_residual_birth_policy_sha256() {
+            failures.push(PublicEcapaResidualBirthGateFailure::ResidualPolicyMismatch);
         }
         if public_ecapa_residual_birth_protocol_sha256(
             fixture,
@@ -15620,6 +15805,10 @@ mod tests {
         let mut distinct_recordings = BTreeSet::new();
         let mut distinct_pairs = BTreeSet::new();
         let mut single_speaker_controls = BTreeSet::new();
+        let mut baseline_first_pair_count = 0_u64;
+        let mut candidate_first_pair_count = 0_u64;
+        let mut baseline_first_pair_count_by_engine = [0_u64; 2];
+        let mut candidate_first_pair_count_by_engine = [0_u64; 2];
         let mut combined_baseline = PublicEcapaResidualBirthAggregateAccumulator::default();
         let mut combined_candidate = PublicEcapaResidualBirthAggregateAccumulator::default();
         let mut resource_totals = PublicEcapaResidualBirthResources::default();
@@ -15638,14 +15827,37 @@ mod tests {
                 || !public_ecapa_accuracy_is_internally_consistent(&row.candidate.accuracy)
                 || !public_ecapa_pair_comparison_is_internally_consistent(row)
                 || !row.timing.candidate_replay_excluded_from_gate
-                || row.timing.execution_order
-                    != public_ecapa_execution_order(&row.recording_id, row.engine)
+                || row.timing.execution_order != public_ecapa_execution_order(pair_index)
                 || row.timing.common_preparation_wall_ns == 0
                 || row.timing.baseline_partition_finish_wall_ns == 0
                 || row.timing.candidate_partition_finish_wall_ns == 0
                 || row.timing.candidate_replay_wall_ns == 0
             {
                 failures.push(PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch);
+            }
+            match row.timing.execution_order {
+                PublicEcapaResidualBirthExecutionOrder::BaselineThenCandidate => {
+                    baseline_first_pair_count = baseline_first_pair_count.saturating_add(1);
+                    if let Some(engine_index) = gate_policy
+                        .required_engines
+                        .iter()
+                        .position(|engine| *engine == row.engine)
+                    {
+                        baseline_first_pair_count_by_engine[engine_index] =
+                            baseline_first_pair_count_by_engine[engine_index].saturating_add(1);
+                    }
+                }
+                PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline => {
+                    candidate_first_pair_count = candidate_first_pair_count.saturating_add(1);
+                    if let Some(engine_index) = gate_policy
+                        .required_engines
+                        .iter()
+                        .position(|engine| *engine == row.engine)
+                    {
+                        candidate_first_pair_count_by_engine[engine_index] =
+                            candidate_first_pair_count_by_engine[engine_index].saturating_add(1);
+                    }
+                }
             }
             let expected_pair = fixture
                 .bundle
@@ -15773,12 +15985,18 @@ mod tests {
                             == row.baseline.accuracy.score_sha256
                         && row
                             .comparison
-                            .rejected_candidate_output_matches_incumbent);
+                            .rejected_candidate_structural_output_matches_incumbent);
             let ecapa_candidate_is_eligible = row.engine != crate::model::DiarizationEngine::Ecapa
-                || row.candidate.fallback_reason
-                    != Some(
-                        crate::diarization::EcapaResidualBirthFallbackReason::EvidenceModeNotEcapaOnly,
-                    );
+                || !matches!(
+                    row.candidate.fallback_reason,
+                    Some(
+                        crate::diarization::EcapaResidualBirthFallbackReason::DisabledIncumbent
+                            | crate::diarization::EcapaResidualBirthFallbackReason::RequestNotInfer
+                            | crate::diarization::EcapaResidualBirthFallbackReason::EvidenceModeNotEcapaOnly
+                            | crate::diarization::EcapaResidualBirthFallbackReason::ConstrainedPartition
+                            | crate::diarization::EcapaResidualBirthFallbackReason::IncumbentNotEcapaSpherical
+                    )
+                );
             if !evidence_mode_matches_engine
                 || !fused_candidate_is_exactly_ineligible
                 || !ecapa_candidate_is_eligible
@@ -15789,7 +16007,7 @@ mod tests {
                 == row.candidate.report_sha256
                 && row.comparison.candidate_replay_common_observation_sha256
                     == row.candidate.common_observation_sha256
-                && row.comparison.candidate_replay_full_output_matches
+                && row.comparison.candidate_replay_structural_output_matches
                 && row
                     .comparison
                     .candidate_replay_residual_birth_evidence_sha256
@@ -15801,13 +16019,19 @@ mod tests {
             {
                 failures.push(PublicEcapaResidualBirthGateFailure::CandidateReplayMismatch);
             }
-            let rejected_candidate_output_matches_incumbent = row.candidate.birth_applied
-                || (row.comparison.rejected_candidate_output_matches_incumbent
+            let rejected_candidate_structural_output_matches_incumbent = row
+                .candidate
+                .birth_applied
+                || (row
+                    .comparison
+                    .rejected_candidate_structural_output_matches_incumbent
                     && row.candidate.report_sha256 == row.baseline.report_sha256
                     && row.candidate.accuracy.score_sha256 == row.baseline.accuracy.score_sha256);
             if !row.candidate.birth_applied
-                && (!row.comparison.rejected_candidate_output_matches_incumbent
-                    || !rejected_candidate_output_matches_incumbent)
+                && (!row
+                    .comparison
+                    .rejected_candidate_structural_output_matches_incumbent
+                    || !rejected_candidate_structural_output_matches_incumbent)
             {
                 failures.push(PublicEcapaResidualBirthGateFailure::RejectedCandidateOutputMismatch);
             }
@@ -15846,14 +16070,12 @@ mod tests {
                 .saturating_add(resources.leave_pair_out_pair_count)
                 .saturating_add(resources.lloyd_assignment_visits)
                 .saturating_add(resources.robust_view_comparison_count);
-            let minimum_cancellation_checks = (resources.operation_count > 0)
-                .then(|| {
-                    1_u64.saturating_add(
-                        resources.operation_count
-                            / gate_policy.cancellation_check_interval_operations.max(1),
-                    )
-                })
-                .unwrap_or(0);
+            let expected_cancellation_checks = public_ecapa_expected_cancellation_checks(
+                resources.operation_count,
+                gate_policy.cancellation_check_interval_operations,
+            );
+            let robust_view_comparison_bound =
+                public_ecapa_robust_view_comparison_bound(row, &gate_policy);
             if resources.parent_count_scanned > row.candidate.incumbent_cluster_count
                 || resources.residual_observation_count
                     > row.common_observation.embedded_tracklet_count
@@ -15867,7 +16089,11 @@ mod tests {
                 || resources.maximum_retained_residual_observations
                     > gate_policy.maximum_retained_residual_observations
                 || resources.operation_count < minimum_accounted_operations
-                || resources.cancellation_check_count < minimum_cancellation_checks
+                || resources.operation_count > gate_policy.maximum_operation_count_per_pair
+                || expected_cancellation_checks
+                    .is_none_or(|expected| resources.cancellation_check_count != expected)
+                || robust_view_comparison_bound
+                    .is_none_or(|bound| resources.robust_view_comparison_count > bound)
                 || resources.peak_scratch_payload_bytes
                     > gate_policy.maximum_residual_scratch_payload_bytes
             {
@@ -15880,6 +16106,17 @@ mod tests {
         let distinct_recording_count = u64::try_from(distinct_recordings.len()).unwrap_or(u64::MAX);
         if distinct_recording_count != gate_policy.required_recording_count {
             failures.push(PublicEcapaResidualBirthGateFailure::PairCountMismatch);
+        }
+        if baseline_first_pair_count != gate_policy.required_baseline_first_pair_count
+            || candidate_first_pair_count != gate_policy.required_candidate_first_pair_count
+            || baseline_first_pair_count_by_engine
+                .iter()
+                .any(|count| *count != gate_policy.required_baseline_first_pair_count_per_engine)
+            || candidate_first_pair_count_by_engine
+                .iter()
+                .any(|count| *count != gate_policy.required_candidate_first_pair_count_per_engine)
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch);
         }
         let single_speaker_control_recording_count =
             u64::try_from(single_speaker_controls.len()).unwrap_or(u64::MAX);
@@ -16005,8 +16242,7 @@ mod tests {
             }
         }
 
-        let performance =
-            public_ecapa_residual_birth_performance(rows, paired_process_observed_rss_bytes);
+        let performance = public_ecapa_residual_birth_performance(rows, memory_observation);
         if performance.common_preparation_rtf.is_none()
             || performance.baseline_partition_finish_rtf.is_none()
             || performance.candidate_partition_finish_rtf.is_none()
@@ -16030,10 +16266,13 @@ mod tests {
         {
             failures.push(PublicEcapaResidualBirthGateFailure::CounterfactualRtfExceeded);
         }
-        if performance.paired_process_observed_rss_bytes == 0 {
+        if !memory_observation.has_complete_authoritative_peak_evidence(
+            gate_policy.required_successful_authoritative_peak_sample_count,
+        ) {
             failures.push(PublicEcapaResidualBirthGateFailure::RssUnavailable);
-        } else if performance.paired_process_observed_rss_bytes
-            > gate_policy.maximum_paired_process_rss_bytes
+        } else if performance
+            .paired_process_authoritative_peak_rss_bytes
+            .is_some_and(|bytes| bytes > gate_policy.maximum_paired_process_rss_bytes)
         {
             failures.push(PublicEcapaResidualBirthGateFailure::ProcessRssExceeded);
         }
@@ -16238,6 +16477,66 @@ mod tests {
     }
 
     #[test]
+    fn paired_gate_execution_order_is_balanced_within_each_engine() {
+        let policy = public_ecapa_residual_birth_gate_policy();
+        assert_eq!(policy.required_baseline_first_pair_count, 8);
+        assert_eq!(policy.required_candidate_first_pair_count, 8);
+        assert_eq!(policy.required_baseline_first_pair_count_per_engine, 4);
+        assert_eq!(policy.required_candidate_first_pair_count_per_engine, 4);
+        let mut baseline_first_by_engine = [0_u64; 2];
+        let mut candidate_first_by_engine = [0_u64; 2];
+        for pair_index in 0..PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS as usize {
+            let engine_index = pair_index % 2;
+            match public_ecapa_execution_order(pair_index) {
+                PublicEcapaResidualBirthExecutionOrder::BaselineThenCandidate => {
+                    baseline_first_by_engine[engine_index] =
+                        baseline_first_by_engine[engine_index].saturating_add(1);
+                }
+                PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline => {
+                    candidate_first_by_engine[engine_index] =
+                        candidate_first_by_engine[engine_index].saturating_add(1);
+                }
+            }
+        }
+        assert_eq!(baseline_first_by_engine, [4, 4]);
+        assert_eq!(candidate_first_by_engine, [4, 4]);
+    }
+
+    #[test]
+    fn paired_gate_rss_authority_requires_every_frozen_stage_sample() {
+        let required_sample_count = public_ecapa_residual_birth_gate_policy()
+            .required_successful_authoritative_peak_sample_count;
+        assert_eq!(required_sample_count, 65);
+        let mut partial = PublicEcapaResidualBirthMemoryObservation::new();
+        partial.observe_values(100, Some(100));
+        for observed in 101..required_sample_count + 100 {
+            partial.observe_values(observed, None);
+        }
+        assert_eq!(
+            partial.successful_observed_stage_sample_count,
+            required_sample_count
+        );
+        assert_eq!(partial.successful_authoritative_peak_sample_count, 1);
+        assert!(!partial.has_complete_authoritative_peak_evidence(required_sample_count));
+
+        let mut complete = PublicEcapaResidualBirthMemoryObservation::new();
+        for sample in 1..=required_sample_count {
+            complete.observe_values(sample, Some(sample));
+        }
+        assert!(complete.has_complete_authoritative_peak_evidence(required_sample_count));
+        assert_eq!(
+            complete.authoritative_peak_rss_bytes,
+            Some(required_sample_count)
+        );
+
+        let mut diagnostic_only = PublicEcapaResidualBirthMemoryObservation::new();
+        for sample in 1..=required_sample_count {
+            diagnostic_only.observe_values(sample, None);
+        }
+        assert!(!diagnostic_only.has_complete_authoritative_peak_evidence(required_sample_count));
+    }
+
+    #[test]
     #[ignore = "requires the frozen public AMI dev8 corpus and converted ECAPA weights"]
     fn external_ecapa_residual_birth_same_invocation_development_gate() {
         let fixture = load_frozen_ecapa_dev8();
@@ -16260,10 +16559,12 @@ mod tests {
         let mut rows = Vec::with_capacity(PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS as usize);
         let mut expected_common_observations =
             Vec::with_capacity(PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS as usize);
+        let mut memory_observation = PublicEcapaResidualBirthMemoryObservation::new();
+        memory_observation.observe_stage();
 
         for recording_index in 0..fixture.bundle.references.len() {
             let recording = load_frozen_ecapa_recording(&fixture, recording_index);
-            for engine in engines {
+            for (engine_index, engine) in engines.iter().copied().enumerate() {
                 let (request, evidence_mode) = frozen_ecapa_request(engine);
                 let preparation_started = std::time::Instant::now();
                 let prepared = crate::diarization::prepare_ecapa_diarization_evaluation(
@@ -16281,8 +16582,11 @@ mod tests {
                 .expect("prepare one common ECAPA observation set");
                 let common_preparation_wall_ns =
                     public_ecapa_duration_ns(preparation_started.elapsed());
-                let execution_order =
-                    public_ecapa_execution_order(&recording.reference.recording_id, engine);
+                memory_observation.observe_stage();
+                let pair_index = recording_index
+                    .saturating_mul(engines.len())
+                    .saturating_add(engine_index);
+                let execution_order = public_ecapa_execution_order(pair_index);
                 let (
                     (baseline_run, baseline_partition_finish_wall_ns),
                     (candidate_run, candidate_partition_finish_wall_ns),
@@ -16291,20 +16595,24 @@ mod tests {
                         run_prepared_public_ecapa_arm(
                             &prepared,
                             crate::diarization::EcapaResidualBirthMode::DisabledIncumbent,
+                            &mut memory_observation,
                         ),
                         run_prepared_public_ecapa_arm(
                             &prepared,
                             crate::diarization::EcapaResidualBirthMode::DevelopmentCandidateV1,
+                            &mut memory_observation,
                         ),
                     ),
                     PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline => {
                         let candidate = run_prepared_public_ecapa_arm(
                             &prepared,
                             crate::diarization::EcapaResidualBirthMode::DevelopmentCandidateV1,
+                            &mut memory_observation,
                         );
                         let baseline = run_prepared_public_ecapa_arm(
                             &prepared,
                             crate::diarization::EcapaResidualBirthMode::DisabledIncumbent,
+                            &mut memory_observation,
                         );
                         (baseline, candidate)
                     }
@@ -16313,6 +16621,7 @@ mod tests {
                     run_prepared_public_ecapa_arm(
                         &prepared,
                         crate::diarization::EcapaResidualBirthMode::DevelopmentCandidateV1,
+                        &mut memory_observation,
                     );
 
                 let prepared_common_observation_sha256 = prepared.common_observation_sha256();
@@ -16424,19 +16733,19 @@ mod tests {
                 let candidate_replay_residual_birth_evidence_sha256 =
                     super::canonical_sha256(&candidate_replay_run.residual_birth)
                         .expect("hash candidate replay residual-birth evidence");
-                let candidate_replay_full_output_matches =
+                let candidate_replay_structural_output_matches =
                     crate::diarization::prepared_ecapa_evaluation_outputs_identical(
                         &candidate_run,
                         &candidate_replay_run,
                     );
-                let candidate_replay_matches = candidate_replay_full_output_matches
+                let candidate_replay_matches = candidate_replay_structural_output_matches
                     && candidate_replay_report_sha256 == candidate.report_sha256
                     && candidate_replay_residual_birth_evidence_sha256
                         == candidate.residual_birth_evidence_sha256
                     && candidate_replay_score.result_sha256 == candidate_score.result_sha256
                     && candidate_replay_run.common_observation_sha256
                         == candidate_run.common_observation_sha256;
-                let rejected_candidate_output_matches_incumbent =
+                let rejected_candidate_structural_output_matches_incumbent =
                     !candidate_run.residual_birth.birth_applied
                         && crate::diarization::prepared_ecapa_evaluation_outputs_identical(
                             &baseline_run,
@@ -16469,9 +16778,9 @@ mod tests {
                     candidate_replay_run.common_observation_sha256.clone(),
                     candidate_replay_residual_birth_evidence_sha256,
                     candidate_replay_score.result_sha256.clone(),
-                    candidate_replay_full_output_matches,
+                    candidate_replay_structural_output_matches,
                     candidate_replay_matches,
-                    rejected_candidate_output_matches_incumbent,
+                    rejected_candidate_structural_output_matches_incumbent,
                     pair_alignment_matches,
                     common_observation_matches,
                     incumbent_contract_matches,
@@ -16489,8 +16798,7 @@ mod tests {
                     ecapa_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
                     representation_provider_version:
                         crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
-                    embedded_tracklet_count: u64::try_from(prepared.embedded_tracklet_count())
-                        .unwrap_or(u64::MAX),
+                    embedded_tracklet_count: prepared.embedded_tracklet_count(),
                 };
                 expected_common_observations.push(common_observation.clone());
                 let mut row = PublicEcapaResidualBirthPairRow {
@@ -16534,7 +16842,6 @@ mod tests {
             }
         }
 
-        let paired_process_observed_rss_bytes = super::sampled_process_rss_bytes();
         let dropped_gate = public_ecapa_residual_birth_gate_row(
             &fixture,
             &rows[..rows.len().saturating_sub(1)],
@@ -16543,7 +16850,7 @@ mod tests {
             &protocol_sha256,
             gate_policy.clone(),
             gate_policy_sha256.clone(),
-            paired_process_observed_rss_bytes,
+            &memory_observation,
         );
         assert!(!dropped_gate.passed);
         assert!(
@@ -16562,7 +16869,7 @@ mod tests {
             &protocol_sha256,
             gate_policy.clone(),
             gate_policy_sha256.clone(),
-            paired_process_observed_rss_bytes,
+            &memory_observation,
         );
         assert!(!misaligned_gate.passed);
         assert!(
@@ -16585,7 +16892,7 @@ mod tests {
             &protocol_sha256,
             gate_policy.clone(),
             gate_policy_sha256.clone(),
-            paired_process_observed_rss_bytes,
+            &memory_observation,
         );
         assert!(!timing_tampered_gate.passed);
         assert!(
@@ -16614,7 +16921,7 @@ mod tests {
             &protocol_sha256,
             gate_policy.clone(),
             gate_policy_sha256.clone(),
-            paired_process_observed_rss_bytes,
+            &memory_observation,
         );
         assert!(!metric_tampered_gate.passed);
         assert!(
@@ -16642,13 +16949,228 @@ mod tests {
             &protocol_sha256,
             gate_policy.clone(),
             gate_policy_sha256.clone(),
-            paired_process_observed_rss_bytes,
+            &memory_observation,
         );
         assert!(!comparison_tampered_gate.passed);
         assert!(
             comparison_tampered_gate
                 .failures
                 .contains(&PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch)
+        );
+
+        let mut parity_tampered_rows = rows.clone();
+        parity_tampered_rows[0].timing.execution_order =
+            PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline;
+        parity_tampered_rows[1].timing.execution_order =
+            PublicEcapaResidualBirthExecutionOrder::BaselineThenCandidate;
+        for row in &mut parity_tampered_rows[..2] {
+            row.row_sha256 = public_ecapa_pair_result_sha256(row);
+        }
+        let parity_tampered_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &parity_tampered_rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            &memory_observation,
+        );
+        assert!(!parity_tampered_gate.passed);
+        assert!(
+            parity_tampered_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch)
+        );
+
+        let mut balance_tampered_rows = rows.clone();
+        balance_tampered_rows[0].timing.execution_order =
+            PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline;
+        balance_tampered_rows[0].row_sha256 =
+            public_ecapa_pair_result_sha256(&balance_tampered_rows[0]);
+        let balance_tampered_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &balance_tampered_rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            &memory_observation,
+        );
+        assert!(!balance_tampered_gate.passed);
+        assert!(
+            balance_tampered_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch)
+        );
+
+        let mut operation_tampered_rows = rows.clone();
+        operation_tampered_rows[0]
+            .candidate
+            .resources
+            .operation_count = gate_policy
+            .maximum_operation_count_per_pair
+            .saturating_add(1);
+        operation_tampered_rows[0]
+            .candidate
+            .resources
+            .cancellation_check_count = public_ecapa_expected_cancellation_checks(
+            operation_tampered_rows[0]
+                .candidate
+                .resources
+                .operation_count,
+            gate_policy.cancellation_check_interval_operations,
+        )
+        .expect("frozen cancellation cadence is defined");
+        operation_tampered_rows[0].row_sha256 =
+            public_ecapa_pair_result_sha256(&operation_tampered_rows[0]);
+        let operation_tampered_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &operation_tampered_rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            &memory_observation,
+        );
+        assert!(!operation_tampered_gate.passed);
+        assert!(
+            operation_tampered_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::ResourceBoundExceeded)
+        );
+
+        let mut cancellation_tampered_rows = rows.clone();
+        cancellation_tampered_rows[0]
+            .candidate
+            .resources
+            .cancellation_check_count = cancellation_tampered_rows[0]
+            .candidate
+            .resources
+            .cancellation_check_count
+            .saturating_add(1);
+        cancellation_tampered_rows[0].row_sha256 =
+            public_ecapa_pair_result_sha256(&cancellation_tampered_rows[0]);
+        let cancellation_tampered_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &cancellation_tampered_rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            &memory_observation,
+        );
+        assert!(!cancellation_tampered_gate.passed);
+        assert!(
+            cancellation_tampered_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::ResourceBoundExceeded)
+        );
+
+        let mut robust_view_tampered_rows = rows.clone();
+        let robust_view_bound =
+            public_ecapa_robust_view_comparison_bound(&robust_view_tampered_rows[0], &gate_policy)
+                .expect("frozen robust-view bound is defined");
+        robust_view_tampered_rows[0]
+            .candidate
+            .resources
+            .robust_view_comparison_count = robust_view_bound.saturating_add(1);
+        let resources = &mut robust_view_tampered_rows[0].candidate.resources;
+        resources.operation_count = resources.operation_count.max(
+            resources
+                .parent_count_scanned
+                .saturating_add(resources.residual_observation_count)
+                .saturating_add(resources.leave_pair_out_pair_count)
+                .saturating_add(resources.lloyd_assignment_visits)
+                .saturating_add(resources.robust_view_comparison_count),
+        );
+        resources.cancellation_check_count = public_ecapa_expected_cancellation_checks(
+            resources.operation_count,
+            gate_policy.cancellation_check_interval_operations,
+        )
+        .expect("frozen cancellation cadence is defined");
+        robust_view_tampered_rows[0].row_sha256 =
+            public_ecapa_pair_result_sha256(&robust_view_tampered_rows[0]);
+        let robust_view_tampered_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &robust_view_tampered_rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            &memory_observation,
+        );
+        assert!(!robust_view_tampered_gate.passed);
+        assert!(
+            robust_view_tampered_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::ResourceBoundExceeded)
+        );
+
+        let mut misrouted_ecapa_rows = rows.clone();
+        assert_eq!(
+            misrouted_ecapa_rows[0].engine,
+            crate::model::DiarizationEngine::Ecapa
+        );
+        misrouted_ecapa_rows[0].candidate.fallback_reason =
+            Some(crate::diarization::EcapaResidualBirthFallbackReason::IncumbentNotEcapaSpherical);
+        misrouted_ecapa_rows[0].deterministic_accuracy_sha256 =
+            public_ecapa_pair_accuracy_sha256(&misrouted_ecapa_rows[0]);
+        misrouted_ecapa_rows[0].row_sha256 =
+            public_ecapa_pair_result_sha256(&misrouted_ecapa_rows[0]);
+        let misrouted_ecapa_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &misrouted_ecapa_rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            &memory_observation,
+        );
+        assert!(!misrouted_ecapa_gate.passed);
+        assert!(
+            misrouted_ecapa_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::CandidateEligibilityMismatch)
+        );
+
+        let weakened_residual_policy_sha256 = "0".repeat(64);
+        assert_ne!(
+            weakened_residual_policy_sha256, residual_policy_sha256,
+            "adversarial residual policy must differ from the frozen runtime policy"
+        );
+        let weakened_residual_protocol_sha256 = public_ecapa_residual_birth_protocol_sha256(
+            &fixture,
+            &weakened_residual_policy_sha256,
+            &gate_policy_sha256,
+        );
+        let mut weakened_residual_rows = rows.clone();
+        for row in &mut weakened_residual_rows {
+            row.protocol_sha256 = weakened_residual_protocol_sha256.clone();
+            row.candidate.variant_configuration_sha256 = weakened_residual_policy_sha256.clone();
+            row.deterministic_accuracy_sha256 = public_ecapa_pair_accuracy_sha256(row);
+            row.row_sha256 = public_ecapa_pair_result_sha256(row);
+        }
+        let weakened_residual_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &weakened_residual_rows,
+            &expected_common_observations,
+            &weakened_residual_policy_sha256,
+            &weakened_residual_protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            &memory_observation,
+        );
+        assert!(!weakened_residual_gate.passed);
+        assert!(
+            weakened_residual_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::ResidualPolicyMismatch)
         );
 
         let mut weakened_policy = gate_policy.clone();
@@ -16669,7 +17191,7 @@ mod tests {
             &weakened_protocol_sha256,
             weakened_policy,
             weakened_policy_sha256,
-            paired_process_observed_rss_bytes,
+            &memory_observation,
         );
         assert!(!weakened_gate.passed);
         assert!(
@@ -16686,7 +17208,7 @@ mod tests {
             &protocol_sha256,
             gate_policy,
             gate_policy_sha256,
-            paired_process_observed_rss_bytes,
+            &memory_observation,
         );
         assert_eq!(gate.result_sha256, public_ecapa_gate_result_sha256(&gate));
         let serialized = serialize_path_free_public_ecapa_evidence(
