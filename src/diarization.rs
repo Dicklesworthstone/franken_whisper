@@ -7320,6 +7320,7 @@ fn public_speaker_count_outcome(
     }
     Ok(SpeakerCountOutcome {
         request: request.clone(),
+        estimate: None,
         status,
         supported_speaker_count,
         active_speaker_refs,
@@ -9271,11 +9272,13 @@ where
             scores.push((count, normalized_gap));
         }
     }
-    let &(count, best_score) = scores.iter().max_by(|left, right| {
+    let Some(&(count, best_score)) = scores.iter().max_by(|left, right| {
         left.1
             .total_cmp(&right.1)
             .then_with(|| right.0.cmp(&left.0))
-    })?;
+    }) else {
+        return Ok(None);
+    };
     let total_score = scores.iter().map(|(_, score)| *score).sum::<f64>();
     if best_score <= 0.0 || !total_score.is_finite() || total_score <= 0.0 {
         return Ok(None);
