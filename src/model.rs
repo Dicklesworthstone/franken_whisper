@@ -529,8 +529,6 @@ pub enum NeuralSpeakerRepresentationReason {
 #[serde(rename_all = "snake_case")]
 pub enum NeuralModelLoadSource {
     PackageVerified,
-    CacheHit,
-    CacheMiss,
 }
 
 /// Privacy-safe provenance and coverage for an optional ECAPA execution.
@@ -1337,6 +1335,7 @@ impl DiarizationReport {
         validate_speaker_queries(&self.normalized_input_sha256, &self.speaker_queries)?;
         validate_speaker_count_outcome(&self.speaker_count)?;
         validate_speaker_count_estimate_request_binding(&self.speaker_count)?;
+        validate_fallback_status_binding(self.fallback_status, &self.speaker_count)?;
         validate_diarization_references(self, report_kind)?;
 
         if self.hint_document_sha256.is_some() != !self.hint_evidence.is_empty() {
@@ -1429,6 +1428,8 @@ impl DiarizationReport {
         let report_kind = classify_diarization_report(self)?;
         validate_report_request_kind_binding(self, request, report_kind)?;
         validate_report_hint_binding(self, request, report_kind)?;
+        validate_report_request_resource_binding(self, request)?;
+        validate_error_fallback_policy_binding(self, request, report_kind)?;
         Ok(())
     }
 }
@@ -1723,6 +1724,51 @@ fn validate_external_request_semantics(request: &DiarizationRequest) -> Result<(
     Ok(())
 }
 
+fn validate_report_request_resource_binding(
+    report: &DiarizationReport,
+    request: &DiarizationRequest,
+) -> Result<(), String> {
+    if report
+        .speaker_count
+        .estimate
+        .as_ref()
+        .is_some_and(|estimate| {
+            estimate.resources.prototype_count > u32::from(request.max_prototypes)
+        })
+    {
+        return Err(
+            "speaker-count estimate exceeds the request's prototype resource cap".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_error_fallback_policy_binding(
+    report: &DiarizationReport,
+    request: &DiarizationRequest,
+    kind: DiarizationReportKind,
+) -> Result<(), String> {
+    if request.fallback != DiarizationFallbackPolicy::Error {
+        return Ok(());
+    }
+    if report.speaker_count.status == SpeakerCountOutcomeStatus::Unsatisfied {
+        return Err(
+            "error fallback policy cannot return unsatisfied speaker-count constraints".to_owned(),
+        );
+    }
+    if matches!(
+        kind,
+        DiarizationReportKind::NativeAcoustic
+            | DiarizationReportKind::NativeEcapaOnly
+            | DiarizationReportKind::NativeEcapaFused
+            | DiarizationReportKind::NativeEcapaUnavailable
+    ) && report.fallback_status != DiarizationFallbackStatus::NotNeeded
+    {
+        return Err("error fallback policy cannot return a native fallback report".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_report_hint_binding(
     report: &DiarizationReport,
     request: &DiarizationRequest,
@@ -1761,6 +1807,71 @@ fn validate_report_hint_binding(
                 "diarization hint evidence {index} does not identify its requested interval"
             ));
         }
+        if hint.policy == KnownSpeakerPolicy::HardMustLink {
+            match evidence.disposition {
+                SpeakerHintDisposition::HardAttributed => {
+                    validate_hard_hint_attribution(report, hint)?;
+                }
+                SpeakerHintDisposition::NoUsableTracklets => {}
+                _ => {
+                    return Err(format!(
+                        "hard diarization hint evidence {index} has an incompatible disposition"
+                    ));
+                }
+            }
+        }
+    }
+    for turn in &report.turns {
+        if turn.hard_hint_attributed
+            && !request
+                .known_intervals
+                .iter()
+                .zip(&report.hint_evidence)
+                .any(|(hint, evidence)| {
+                    hint.policy == KnownSpeakerPolicy::HardMustLink
+                        && evidence.disposition == SpeakerHintDisposition::HardAttributed
+                        && turn.speaker_ref.as_deref() == Some(hint.speaker_ref.as_str())
+                        && turn.start_ms < hint.end_ms
+                        && hint.start_ms < turn.end_ms
+                })
+        {
+            return Err(
+                "hard-attributed diarization turn is not bound to an overlapping hard hint"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_hard_hint_attribution(
+    report: &DiarizationReport,
+    hint: &KnownSpeakerInterval,
+) -> Result<(), String> {
+    let has_supported_anchor = report
+        .speaker_count
+        .speaker_evidence
+        .iter()
+        .any(|evidence| {
+            evidence.speaker_ref == hint.speaker_ref
+                && evidence.supported
+                && evidence.hard_anchored
+                && evidence
+                    .reasons
+                    .contains(&SpeakerEvidenceReason::SupportedByHardHint)
+        });
+    if !has_supported_anchor {
+        return Err("hard-attributed hint lacks active, supported hard-anchor evidence".to_owned());
+    }
+    if !report.turns.iter().any(|turn| {
+        turn.hard_hint_attributed
+            && turn.speaker_ref.as_deref() == Some(hint.speaker_ref.as_str())
+            && turn.start_ms < hint.end_ms
+            && hint.start_ms < turn.end_ms
+    }) {
+        return Err(
+            "hard-attributed hint lacks an overlapping hard-attributed speaker turn".to_owned(),
+        );
     }
     Ok(())
 }
@@ -1784,7 +1895,9 @@ fn validate_report_kind_invariants(
                         .contains(&SpeakerEvidenceReason::SupportedByExternalAttribution)
                 }))
     {
-        return Err("non-external diarization report claims external attribution evidence".to_owned());
+        return Err(
+            "non-external diarization report claims external attribution evidence".to_owned(),
+        );
     }
 
     let native_success = matches!(
@@ -1896,11 +2009,10 @@ fn validate_report_kind_invariants(
                         .to_owned(),
                 );
             }
-            if report.speaker_count.unknown_voiced_share.to_bits() != 0.0_f64.to_bits()
-                || !report
-                    .speaker_count
-                    .reasons
-                    .contains(&SpeakerCountOutcomeReason::ExternalAttribution)
+            if !report
+                .speaker_count
+                .reasons
+                .contains(&SpeakerCountOutcomeReason::ExternalAttribution)
                 || report
                     .speaker_count
                     .speaker_evidence
@@ -2054,9 +2166,11 @@ fn validate_hint_evidence(hints: &[SpeakerHintEvidenceSummary]) -> Result<(), St
         }
         match hint.disposition {
             SpeakerHintDisposition::HardAttributed
-                if hint.policy != KnownSpeakerPolicy::HardMustLink =>
+                if hint.policy != KnownSpeakerPolicy::HardMustLink
+                    || hint.accepted_tracklet_count != hint.usable_tracklet_count
+                    || hint.rejected_tracklet_count != 0 =>
             {
-                return Err("hard-attributed hint does not use hard-must-link policy".to_owned());
+                return Err("hard-attributed hint has inconsistent hard evidence".to_owned());
             }
             SpeakerHintDisposition::Accepted
                 if hint.policy != KnownSpeakerPolicy::SoftEnrollment
@@ -2146,8 +2260,7 @@ fn validate_speaker_queries(
                 "machine-generated speaker attribution query suggests a hard policy".to_owned(),
             );
         }
-        if query.query_id_sha256
-            != speaker_attribution_query_sha256(normalized_input_sha256, query)
+        if query.query_id_sha256 != speaker_attribution_query_sha256(normalized_input_sha256, query)
         {
             return Err(
                 "speaker attribution query ID does not bind its normalized input and fields"
@@ -2159,6 +2272,8 @@ fn validate_speaker_queries(
 }
 
 fn validate_speaker_count_outcome(outcome: &SpeakerCountOutcome) -> Result<(), String> {
+    const F32_OCCUPANCY_SUM_TOLERANCE: f64 = 2.0 * f32::EPSILON as f64;
+
     validate_speaker_count_request(&outcome.request)
         .map_err(|error| format!("invalid speaker-count request in report: {error}"))?;
     if outcome.supported_speaker_count > MAX_SPEAKER_COUNT {
@@ -2171,7 +2286,9 @@ fn validate_speaker_count_outcome(outcome: &SpeakerCountOutcome) -> Result<(), S
     {
         return Err("speaker occupancy shares are not finite in 0..=1".to_owned());
     }
-    if outcome.dominant_speaker_share + outcome.unknown_voiced_share > 1.0 + 1.0e-9 {
+    if outcome.dominant_speaker_share + outcome.unknown_voiced_share
+        > 1.0 + F32_OCCUPANCY_SUM_TOLERANCE
+    {
         return Err(
             "speaker occupancy shares exceed the common voiced-time denominator".to_owned(),
         );
@@ -2233,8 +2350,13 @@ fn validate_speaker_count_outcome(outcome: &SpeakerCountOutcome) -> Result<(), S
         if evidence.supported != has_support_reason {
             return Err("speaker evidence support flag disagrees with its reasons".to_owned());
         }
-        if evidence.hard_anchored && !evidence.supported {
-            return Err("hard-anchored speaker evidence is not supported".to_owned());
+        let has_hard_hint_reason = evidence
+            .reasons
+            .contains(&SpeakerEvidenceReason::SupportedByHardHint);
+        if evidence.hard_anchored != has_hard_hint_reason {
+            return Err(
+                "speaker evidence hard-anchor flag disagrees with its support reasons".to_owned(),
+            );
         }
         if evidence.supported && !evidence.separated_from_supported_speakers {
             return Err("supported speaker evidence is not robustly separated".to_owned());
@@ -2338,6 +2460,32 @@ fn validate_speaker_count_estimate_request_binding(
     Ok(())
 }
 
+fn validate_fallback_status_binding(
+    fallback_status: DiarizationFallbackStatus,
+    outcome: &SpeakerCountOutcome,
+) -> Result<(), String> {
+    let compatible = match fallback_status {
+        DiarizationFallbackStatus::NotNeeded => matches!(
+            outcome.status,
+            SpeakerCountOutcomeStatus::Resolved | SpeakerCountOutcomeStatus::Satisfied
+        ),
+        DiarizationFallbackStatus::SpeakerCountUnresolved => {
+            outcome.status == SpeakerCountOutcomeStatus::Unresolved
+        }
+        DiarizationFallbackStatus::UnsatisfiedConstraints => {
+            outcome.status == SpeakerCountOutcomeStatus::Unsatisfied
+        }
+        DiarizationFallbackStatus::InsufficientEvidence
+        | DiarizationFallbackStatus::CalibrationInvalid
+        | DiarizationFallbackStatus::ResourceLimit
+        | DiarizationFallbackStatus::ExternalBackend => true,
+    };
+    if !compatible {
+        return Err("diarization fallback status disagrees with speaker-count outcome".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_diarization_references(
     report: &DiarizationReport,
     kind: DiarizationReportKind,
@@ -2382,6 +2530,21 @@ fn validate_diarization_references(
             return Err(
                 "speaker profile references do not match active supported speakers".to_owned(),
             );
+        }
+        for profile in &report.profiles {
+            let evidence = report
+                .speaker_count
+                .speaker_evidence
+                .iter()
+                .find(|evidence| evidence.speaker_ref == profile.speaker_ref)
+                .ok_or_else(|| {
+                    "speaker profile has no matching supported speaker evidence".to_owned()
+                })?;
+            if profile.anchored != evidence.hard_anchored {
+                return Err(
+                    "speaker profile anchor flag disagrees with speaker evidence".to_owned(),
+                );
+            }
         }
     }
     Ok(())
@@ -5759,6 +5922,13 @@ mod tests {
             .validate()
             .expect("external fallback may retain valid neural attempt provenance");
 
+        let mut partial_external = external_diarization_report_fixture();
+        partial_external.speaker_count.dominant_speaker_share = 0.6;
+        partial_external.speaker_count.unknown_voiced_share = 0.4;
+        partial_external
+            .validate()
+            .expect("external attribution may honestly leave timed speech unknown");
+
         unknown_diarization_report_fixture()
             .validate()
             .expect("unknown fallback tuple");
@@ -5836,9 +6006,39 @@ mod tests {
         outcome["speaker_count"]["raw_audio"] = json!([0, 1]);
         assert!(serde_json::from_value::<DiarizationReport>(outcome).is_err());
 
-        let mut evidence = value;
+        let mut evidence = value.clone();
         evidence["speaker_count"]["speaker_evidence"][0]["embedding"] = json!([0.1]);
         assert!(serde_json::from_value::<DiarizationReport>(evidence).is_err());
+
+        let mut estimate = value.clone();
+        estimate["speaker_count"]["estimate"]["raw_audio"] = json!([0, 1]);
+        assert!(serde_json::from_value::<DiarizationReport>(estimate).is_err());
+
+        let mut range = value.clone();
+        range["speaker_count"]["estimate"]["supported_range"]["embedding"] = json!([0.1]);
+        assert!(serde_json::from_value::<DiarizationReport>(range).is_err());
+
+        let mut posterior = value.clone();
+        posterior["speaker_count"]["estimate"]["posterior"][0]["embedding"] = json!([0.1]);
+        assert!(serde_json::from_value::<DiarizationReport>(posterior).is_err());
+
+        let mut lane = value.clone();
+        lane["speaker_count"]["estimate"]["lanes"][0]["embedding"] = json!([0.1]);
+        assert!(serde_json::from_value::<DiarizationReport>(lane).is_err());
+
+        let mut resources = value.clone();
+        resources["speaker_count"]["estimate"]["resources"]["raw_audio"] = json!([0, 1]);
+        assert!(serde_json::from_value::<DiarizationReport>(resources).is_err());
+
+        let mut partition = value;
+        partition["operational_partition"]["embedding"] = json!([0.1]);
+        assert!(serde_json::from_value::<DiarizationReport>(partition).is_err());
+
+        let mut neural_report = typed_diarization_report_fixture();
+        neural_report.neural_representation = Some(ready_neural_summary());
+        let mut neural = serde_json::to_value(neural_report).expect("neural report JSON");
+        neural["neural_representation"]["embedding"] = json!([0.1]);
+        assert!(serde_json::from_value::<DiarizationReport>(neural).is_err());
     }
 
     #[test]
@@ -5858,7 +6058,6 @@ mod tests {
         );
 
         let mut report = typed_diarization_report_fixture();
-        use_infer_count_request(&mut report);
         report
             .operational_partition
             .as_mut()
@@ -5890,6 +6089,7 @@ mod tests {
             .expect("operational hierarchy count may differ from the posterior MAP");
 
         let mut report = typed_diarization_report_fixture();
+        use_infer_count_request(&mut report);
         report
             .speaker_count
             .estimate
@@ -6060,6 +6260,144 @@ mod tests {
     }
 
     #[test]
+    fn ordered_hint_digest_binds_positional_evidence_to_the_exact_interval_sequence() {
+        let mut report = typed_diarization_report_fixture();
+        let mut request = matching_acoustic_request(&mut report);
+        request.known_intervals.push(speaker_hint(
+            "near",
+            1_200,
+            1_400,
+            KnownSpeakerPolicy::HardMustLink,
+        ));
+        report.hint_evidence.push(SpeakerHintEvidenceSummary {
+            hint_index: 1,
+            speaker_ref: "near".to_owned(),
+            policy: KnownSpeakerPolicy::HardMustLink,
+            disposition: SpeakerHintDisposition::NoUsableTracklets,
+            usable_tracklet_count: 0,
+            accepted_tracklet_count: 0,
+            rejected_tracklet_count: 0,
+            profile_accepted_tracklet_count: 0,
+            profile_downweighted_tracklet_count: 0,
+            profile_quarantined_tracklet_count: 0,
+            applied_weight: 0.0,
+            contradiction_score: None,
+        });
+        report.hint_document_sha256 = Some(speaker_hint_document_sha256(&request.known_intervals));
+        report
+            .validate_against_request(&request, None)
+            .expect("ordered hard hints with honest no-usable evidence");
+
+        let mut reordered = request;
+        reordered.known_intervals.reverse();
+        let reordered_digest = speaker_hint_document_sha256(&reordered.known_intervals);
+        assert_ne!(
+            report.hint_document_sha256.as_deref(),
+            Some(reordered_digest.as_str())
+        );
+        assert!(
+            report
+                .validate_against_request(&reordered, None)
+                .expect_err("same-ref same-policy intervals cannot be silently reordered")
+                .contains("hint digest differs")
+        );
+    }
+
+    #[test]
+    fn hard_hint_attribution_requires_supported_anchor_and_overlapping_hard_turn() {
+        let mut report = typed_diarization_report_fixture();
+        let request = matching_acoustic_request(&mut report);
+
+        let mut missing_anchor = report.clone();
+        missing_anchor.profiles[0].anchored = false;
+        let speaker_evidence = &mut missing_anchor.speaker_count.speaker_evidence[0];
+        speaker_evidence.hard_anchored = false;
+        speaker_evidence.reasons = vec![SpeakerEvidenceReason::SupportedByIndependentRecurrence];
+        missing_anchor
+            .validate()
+            .expect("report-local evidence remains internally consistent");
+        assert!(
+            missing_anchor
+                .validate_against_request(&request, None)
+                .expect_err("hard attribution cannot omit hard-anchor evidence")
+                .contains("lacks active, supported hard-anchor evidence")
+        );
+
+        let mut missing_turn = report.clone();
+        missing_turn.turns[0].hard_hint_attributed = false;
+        assert!(
+            missing_turn
+                .validate_against_request(&request, None)
+                .expect_err("hard attribution must have an overlapping hard turn")
+                .contains("lacks an overlapping hard-attributed")
+        );
+
+        let mut trusted_timestamp_only = report.clone();
+        let hint_evidence = &mut trusted_timestamp_only.hint_evidence[0];
+        hint_evidence.usable_tracklet_count = 0;
+        hint_evidence.accepted_tracklet_count = 0;
+        hint_evidence.profile_accepted_tracklet_count = 0;
+        hint_evidence.applied_weight = 0.0;
+        trusted_timestamp_only
+            .validate_against_request(&request, None)
+            .expect("immutable timestamp label does not fabricate enrolled tracklets");
+
+        let mut no_usable_but_attributed = trusted_timestamp_only;
+        no_usable_but_attributed.hint_evidence[0].disposition =
+            SpeakerHintDisposition::NoUsableTracklets;
+        assert!(
+            no_usable_but_attributed
+                .validate_against_request(&request, None)
+                .expect_err("no-usable hard hint cannot authorize a hard-attributed turn")
+                .contains("not bound to an overlapping hard hint")
+        );
+
+        let mut forged_turn = report;
+        forged_turn.turns[0].start_ms = 1_100;
+        forged_turn.turns[0].end_ms = 1_200;
+        assert!(
+            forged_turn
+                .validate_against_request(&request, None)
+                .expect_err("hard turn outside its hint cannot claim hard attribution")
+                .contains("lacks an overlapping hard-attributed")
+        );
+    }
+
+    #[test]
+    fn no_usable_hard_hint_does_not_fabricate_an_active_speaker() {
+        let mut report = typed_diarization_report_fixture();
+        let request = matching_acoustic_request(&mut report);
+        report.turns.clear();
+        report.profiles.clear();
+        report.hint_evidence[0] = SpeakerHintEvidenceSummary {
+            hint_index: 0,
+            speaker_ref: "near".to_owned(),
+            policy: KnownSpeakerPolicy::HardMustLink,
+            disposition: SpeakerHintDisposition::NoUsableTracklets,
+            usable_tracklet_count: 0,
+            accepted_tracklet_count: 0,
+            rejected_tracklet_count: 0,
+            profile_accepted_tracklet_count: 0,
+            profile_downweighted_tracklet_count: 0,
+            profile_quarantined_tracklet_count: 0,
+            applied_weight: 0.0,
+            contradiction_score: None,
+        };
+        report.speaker_queries.clear();
+        report.speaker_count.status = SpeakerCountOutcomeStatus::Unsatisfied;
+        report.speaker_count.supported_speaker_count = 0;
+        report.speaker_count.active_speaker_refs.clear();
+        report.speaker_count.dominant_speaker_share = 0.0;
+        report.speaker_count.unknown_voiced_share = 1.0;
+        report.speaker_count.reasons = vec![SpeakerCountOutcomeReason::RequestedCountMismatch];
+        report.speaker_count.speaker_evidence.clear();
+        report.fallback_status = DiarizationFallbackStatus::UnsatisfiedConstraints;
+        report
+            .validate_against_request(&request, None)
+            .expect("no-usable hard hint remains explicit without fabricating identity");
+    }
+
+    #[test]
     fn report_request_binding_admits_only_honest_fallback_paths() {
         let mut acoustic_fallback = typed_diarization_report_fixture();
         let mut acoustic_fallback_request = matching_acoustic_request(&mut acoustic_fallback);
@@ -6132,6 +6470,50 @@ mod tests {
     }
 
     #[test]
+    fn request_resource_caps_and_error_fallback_policy_are_enforced() {
+        let mut report = typed_diarization_report_fixture();
+        let mut capped_request = matching_acoustic_request(&mut report);
+        capped_request.max_prototypes = 4;
+        assert!(
+            report
+                .validate_against_request(&capped_request, None)
+                .expect_err("report resource use cannot exceed the authorized prototype cap")
+                .contains("prototype resource cap")
+        );
+
+        let mut native_fallback = typed_diarization_report_fixture();
+        let mut error_request = matching_acoustic_request(&mut native_fallback);
+        error_request.fallback = DiarizationFallbackPolicy::Error;
+        native_fallback.fallback_status = DiarizationFallbackStatus::InsufficientEvidence;
+        assert!(
+            native_fallback
+                .validate_against_request(&error_request, None)
+                .expect_err("error policy cannot return a native fallback")
+                .contains("cannot return a native fallback")
+        );
+
+        let mut external = external_diarization_report_fixture();
+        external.speaker_count.request = SpeakerCountRequest::HardConstraint { count: 2 };
+        external.speaker_count.status = SpeakerCountOutcomeStatus::Unsatisfied;
+        external.speaker_count.reasons = vec![
+            SpeakerCountOutcomeReason::ExternalAttribution,
+            SpeakerCountOutcomeReason::RequestedCountMismatch,
+        ];
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::External,
+            fallback: DiarizationFallbackPolicy::Error,
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 2 },
+            ..DiarizationRequest::default()
+        };
+        assert!(
+            external
+                .validate_against_request(&request, None)
+                .expect_err("error policy cannot return unsatisfied external constraints")
+                .contains("cannot return unsatisfied")
+        );
+    }
+
+    #[test]
     fn diarization_report_validation_rejects_cross_object_inconsistency() {
         let mut report = typed_diarization_report_fixture();
         report.normalized_input_sha256 = "A".repeat(64);
@@ -6158,6 +6540,15 @@ mod tests {
         let mut report = typed_diarization_report_fixture();
         report.hint_evidence[0].accepted_tracklet_count = 0;
         assert!(report.validate().unwrap_err().contains("do not cover"));
+
+        let mut report = typed_diarization_report_fixture();
+        report.hint_evidence[0].hint_index = 1;
+        assert!(
+            report
+                .validate()
+                .unwrap_err()
+                .contains("not contiguous from zero")
+        );
 
         let mut report = typed_diarization_report_fixture();
         report.speaker_queries[0].query_id_sha256 = "invalid".to_owned();
@@ -6204,6 +6595,166 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .contains("ECAPA-only spherical")
+        );
+    }
+
+    #[test]
+    fn attribution_queries_are_content_bound_and_reason_cardinality_is_exact() {
+        let mut report = typed_diarization_report_fixture();
+        report.speaker_queries[0].end_ms = 1_400;
+        assert!(
+            report
+                .validate()
+                .expect_err("query interval mutation must invalidate its ID")
+                .contains("does not bind")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report.speaker_queries[0]
+            .candidate_speaker_refs
+            .push("other".to_owned());
+        assert!(
+            report
+                .validate()
+                .expect_err("low-confidence query must name exactly one candidate")
+                .contains("candidate count")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report.speaker_queries[0].suggested_policy = KnownSpeakerPolicy::HardMustLink;
+        assert!(
+            report
+                .validate()
+                .expect_err("machine query cannot suggest immutable attribution")
+                .contains("suggests a hard policy")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report.speaker_queries[0].reason = SpeakerAttributionQueryReason::OverlapAmbiguity;
+        assert!(
+            report
+                .validate()
+                .expect_err("overlap query must name exactly two candidates")
+                .contains("candidate count")
+        );
+    }
+
+    #[test]
+    fn report_reference_sets_and_anchor_flags_are_exact() {
+        let mut missing_profile = typed_diarization_report_fixture();
+        missing_profile.profiles.clear();
+        assert!(
+            missing_profile
+                .validate()
+                .expect_err("every active speaker requires exactly one profile")
+                .contains("profile references do not match")
+        );
+
+        let mut extra_profile = typed_diarization_report_fixture();
+        let mut profile = extra_profile.profiles[0].clone();
+        profile.speaker_ref = "other".to_owned();
+        profile.anchored = false;
+        extra_profile.profiles.push(profile);
+        assert!(
+            extra_profile
+                .validate()
+                .expect_err("inactive speaker cannot retain a public profile")
+                .contains("profile references do not match")
+        );
+
+        let mut wrong_anchor = typed_diarization_report_fixture();
+        wrong_anchor.profiles[0].anchored = false;
+        assert!(
+            wrong_anchor
+                .validate()
+                .expect_err("profile anchor must match speaker evidence")
+                .contains("anchor flag disagrees")
+        );
+
+        let mut wrong_evidence_anchor = typed_diarization_report_fixture();
+        wrong_evidence_anchor.speaker_count.speaker_evidence[0].hard_anchored = false;
+        assert!(
+            wrong_evidence_anchor
+                .validate()
+                .expect_err("hard-anchor evidence flag must match its reason")
+                .contains("hard-anchor flag disagrees")
+        );
+    }
+
+    #[test]
+    fn report_rejects_external_evidence_on_native_implementations() {
+        let mut report = typed_diarization_report_fixture();
+        report
+            .speaker_count
+            .reasons
+            .push(SpeakerCountOutcomeReason::ExternalAttribution);
+        assert!(
+            report
+                .validate()
+                .expect_err("native outcome cannot claim external attribution")
+                .contains("claims external attribution")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report.speaker_count.speaker_evidence[0]
+            .reasons
+            .push(SpeakerEvidenceReason::SupportedByExternalAttribution);
+        assert!(
+            report
+                .validate()
+                .expect_err("native speaker evidence cannot claim external support")
+                .contains("claims external attribution")
+        );
+    }
+
+    #[test]
+    fn speaker_count_status_reason_bounds_and_fallback_status_are_consistent() {
+        let mut rounded_occupancy = typed_diarization_report_fixture();
+        rounded_occupancy.speaker_count.dominant_speaker_share = f64::from(1.0_f32 / 3.0);
+        rounded_occupancy.speaker_count.unknown_voiced_share = f64::from(2.0_f32 / 3.0);
+        rounded_occupancy
+            .validate()
+            .expect("f32 producer rounding cannot invalidate a unit occupancy sum");
+
+        let mut report = typed_diarization_report_fixture();
+        report.speaker_count.reasons = vec![SpeakerCountOutcomeReason::EvidenceSupportedCount];
+        assert!(
+            report
+                .validate()
+                .expect_err("satisfied hard count requires requested-count-matched")
+                .contains("status disagrees")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report
+            .speaker_count
+            .reasons
+            .push(SpeakerCountOutcomeReason::EvidenceSupportedCount);
+        assert!(
+            report
+                .validate()
+                .expect_err("outcome cannot carry two primary status reasons")
+                .contains("exactly one status reason")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        report.fallback_status = DiarizationFallbackStatus::SpeakerCountUnresolved;
+        assert!(
+            report
+                .validate()
+                .expect_err("resolved hard count cannot claim unresolved fallback")
+                .contains("fallback status disagrees")
+        );
+
+        let mut report = typed_diarization_report_fixture();
+        let estimate = report.speaker_count.estimate.as_mut().expect("estimate");
+        estimate.candidate_upper_bound = 2;
+        estimate.lanes = complete_speaker_count_lanes();
+        assert!(
+            report
+                .validate()
+                .expect_err("satisfied hard count must constrain the estimate domain exactly")
+                .contains("estimate candidate bounds")
         );
     }
 
@@ -6300,6 +6851,19 @@ mod tests {
             serde_json::from_value::<NeuralSpeakerRepresentationSummary>(value).is_err(),
             "unknown biometric fields must fail closed"
         );
+    }
+
+    #[test]
+    fn neural_model_source_rejects_obsolete_cache_claims() {
+        let value = serde_json::to_value(ready_neural_summary()).expect("neural summary JSON");
+        for obsolete in ["cache_hit", "cache_miss", "direct"] {
+            let mut value = value.clone();
+            value["model_load_source"] = json!(obsolete);
+            assert!(
+                serde_json::from_value::<NeuralSpeakerRepresentationSummary>(value).is_err(),
+                "obsolete model source {obsolete} must fail closed"
+            );
+        }
     }
 
     #[test]

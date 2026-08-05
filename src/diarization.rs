@@ -26,7 +26,7 @@ use crate::model::{
     DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus,
     DiarizationOperationalPartitionMethod, DiarizationOperationalPartitionSummary,
     DiarizationReport, DiarizationRequest, DiarizationSpeakerEvidenceMode, DiarizationTurn,
-    KnownSpeakerInterval, KnownSpeakerPolicy, MAX_SPEAKER_COUNT, NeuralModelLoadSource,
+    KnownSpeakerPolicy, MAX_SPEAKER_COUNT, NeuralModelLoadSource,
     NeuralSpeakerRepresentationReason, NeuralSpeakerRepresentationStatus,
     NeuralSpeakerRepresentationSummary, SpeakerAttributionQuery, SpeakerAttributionQueryReason,
     SpeakerCountCalibrationStatus, SpeakerCountEstimate, SpeakerCountEvidenceLane,
@@ -61,6 +61,9 @@ const ECAPA_ROBUST_SEPARATION_COSINE_DISTANCE: f32 =
 const ECAPA_PAIR_DIFFERENT_LOGIT_INTERCEPT: f32 = -10.484_906;
 const ECAPA_PAIR_COSINE_DISTANCE_WEIGHT: f32 = 10.0;
 const ECAPA_SEGMENT_LOG_LIKELIHOOD_MAX_WEIGHT: f32 = 4.0;
+const ECAPA_PROFILE_RELIABILITY_FULL_SUPPORT_FRAMES: f32 = 100.0;
+const ECAPA_PROFILE_RELIABILITY_COHERENCE_DISTANCE: f32 =
+    ECAPA_DIFFERENT_SPEAKER_COSINE_DISTANCE_OPERATING_POINT;
 type EcapaSpeakerEmbedding = [f32; ECAPA_EMBEDDING_DIMENSIONS];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,10 +90,12 @@ impl EcapaTrackletRepresentation {
 
 type EcapaTrackletEmbeddings = BTreeMap<usize, EcapaTrackletRepresentation>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct EcapaSpeakerProfile {
     embedding: EcapaSpeakerEmbedding,
     weight: f32,
+    reliability: f32,
+    observation_count: usize,
 }
 
 type EcapaSpeakerProfiles = BTreeMap<String, EcapaSpeakerProfile>;
@@ -7795,6 +7800,8 @@ pub fn ecapa_speaker_pair_calibration_sha256(
         ECAPA_PAIR_DIFFERENT_LOGIT_INTERCEPT,
         ECAPA_PAIR_COSINE_DISTANCE_WEIGHT,
         ECAPA_SEGMENT_LOG_LIKELIHOOD_MAX_WEIGHT,
+        ECAPA_PROFILE_RELIABILITY_FULL_SUPPORT_FRAMES,
+        ECAPA_PROFILE_RELIABILITY_COHERENCE_DISTANCE,
         if evidence_mode == DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel {
             shared.channel_distance_weight
         } else {
@@ -7813,6 +7820,7 @@ pub fn ecapa_speaker_pair_calibration_sha256(
     hasher.update((ECAPA_SAMPLE_RATE_HZ as u64).to_le_bytes());
     hasher.update((ECAPA_MINIMUM_RUNTIME_SAMPLES as u64).to_le_bytes());
     hasher.update((ECAPA_MAXIMUM_RUNTIME_SAMPLES as u64).to_le_bytes());
+    hasher.update((MIN_ECAPA_TRACKLET_VOICED_FRAMES as u64).to_le_bytes());
     hasher.update((ECAPA_HELDOUT_MINIMUM_SOURCE_SAMPLES as u64).to_le_bytes());
     hasher.update(
         ECAPA_HELDOUT_SINGLETON_MIN_TOTAL_WEIGHT
@@ -7826,6 +7834,7 @@ pub fn ecapa_speaker_pair_calibration_sha256(
     );
     hasher.update(b"disjoint-first-last-heldout-windows-v1");
     hasher.update(b"coordinate-jackknife-modulo-four-v1");
+    hasher.update(b"provider-aware-ecapa-enrollment-reliability-v1");
     hasher.update(match evidence_mode {
         DiarizationSpeakerEvidenceMode::EcapaOnly => {
             b"robust-separation-cosine-threshold-v1".as_slice()
@@ -10529,11 +10538,31 @@ struct EnrollmentObservation {
     hard: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum EnrollmentIdentityAuthority<'a> {
+    AcousticV2,
+    Ecapa(&'a EcapaTrackletEmbeddings),
+}
+
 /// Validate and apply `speaker-hints-v1` intervals to tracklet statistics.
 pub fn enroll_known_speaker_profiles(
     tracklets: &[AcousticTracklet],
     request: &DiarizationRequest,
     audio_duration_ms: u64,
+) -> Result<SpeakerEnrollment, ProfileEnrollmentError> {
+    enroll_known_speaker_profiles_with_authority(
+        tracklets,
+        request,
+        audio_duration_ms,
+        EnrollmentIdentityAuthority::AcousticV2,
+    )
+}
+
+fn enroll_known_speaker_profiles_with_authority(
+    tracklets: &[AcousticTracklet],
+    request: &DiarizationRequest,
+    audio_duration_ms: u64,
+    identity_authority: EnrollmentIdentityAuthority<'_>,
 ) -> Result<SpeakerEnrollment, ProfileEnrollmentError> {
     request
         .validate(audio_duration_ms)
@@ -10559,7 +10588,7 @@ pub fn enroll_known_speaker_profiles(
     }
 
     let hint_document_sha256 = (!request.known_intervals.is_empty())
-        .then(|| canonical_hint_document_sha256(&request.known_intervals));
+        .then(|| crate::model::speaker_hint_document_sha256(&request.known_intervals));
     let reserved_speaker_refs = request
         .known_intervals
         .iter()
@@ -10579,12 +10608,23 @@ pub fn enroll_known_speaker_profiles(
             tracklets
                 .iter()
                 .filter(|tracklet| {
-                    tracklet.start_ms >= guarded_start
+                    let common_candidate = tracklet.start_ms >= guarded_start
                         && tracklet.end_ms <= guarded_end
                         && tracklet.frame_count >= 3
-                        && tracklet.identity_frame_count.saturating_mul(4) >= tracklet.frame_count
-                        && tracklet.voice_valid.iter().any(|valid| *valid)
-                        && !tracklet.overlap_suspected
+                        && tracklet.voiced_frame_count.saturating_mul(4) >= tracklet.frame_count
+                        && !tracklet.overlap_suspected;
+                    common_candidate
+                        && match identity_authority {
+                            EnrollmentIdentityAuthority::AcousticV2 => {
+                                tracklet.identity_frame_count.saturating_mul(4)
+                                    >= tracklet.frame_count
+                                    && tracklet.voice_valid.iter().any(|valid| *valid)
+                            }
+                            EnrollmentIdentityAuthority::Ecapa(embeddings) => {
+                                hint.policy == KnownSpeakerPolicy::HardMustLink
+                                    || embeddings.contains_key(&tracklet.tracklet_index)
+                            }
+                        }
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -10603,10 +10643,20 @@ pub fn enroll_known_speaker_profiles(
         let mut applied_weight = 0.0_f32;
         for tracklet in &candidates {
             let hard = hint.policy == KnownSpeakerPolicy::HardMustLink;
+            let identity_weight = match identity_authority {
+                EnrollmentIdentityAuthority::AcousticV2 => {
+                    tracklet.identity_frame_count.max(1) as f32
+                }
+                EnrollmentIdentityAuthority::Ecapa(embeddings) => embeddings
+                    .get(&tracklet.tracklet_index)
+                    .map_or(tracklet.voiced_frame_count.max(1) as f32, |representation| {
+                        representation.discovery_weight.max(1.0)
+                    }),
+            };
             let weight = if hard {
-                tracklet.identity_frame_count.max(1) as f32
+                identity_weight
             } else {
-                ((hint.confidence as f32) * tracklet.identity_frame_count.min(50) as f32).min(20.0)
+                ((hint.confidence as f32) * identity_weight.min(50.0)).min(20.0)
             };
             if hard
                 && let Some(existing) =
@@ -10662,57 +10712,23 @@ pub fn enroll_known_speaker_profiles(
     let mut profiles = BTreeMap::new();
     let mut profile_training_observations = BTreeMap::<String, Vec<EnrollmentObservation>>::new();
     for (speaker_ref, observations) in by_speaker {
-        let hard_observations = deduplicate_profile_observations(
-            observations
-                .iter()
-                .filter(|observation| observation.hard)
-                .cloned()
-                .collect(),
-        );
-        let provisional_source = if hard_observations.is_empty() {
-            deduplicate_profile_observations(observations.clone())
-        } else {
-            hard_observations
-        };
-        let (provisional, provisional_valid) =
-            robust_location(&provisional_source, |observation| {
-                (observation.voice, observation.voice_valid)
-            });
-        let mut accepted = Vec::new();
-        let mut maximum_contradiction = 0.0_f32;
-        for observation in observations {
-            let contradiction = masked_euclidean_distance(
-                &observation.voice,
-                &observation.voice_valid,
-                &provisional,
-                &provisional_valid,
-            )
-            .unwrap_or(f32::INFINITY);
-            let accept = observation.hard || contradiction <= 0.65;
-            let hint_evidence = &mut evidence[observation.hint_index];
-            if observation.hard {
-                accepted.push(observation);
-            } else if accept {
-                hint_evidence.accepted_tracklet_count += 1;
-                accepted.push(observation);
-            } else {
-                hint_evidence.rejected_tracklet_count += 1;
-                hint_evidence.applied_weight =
-                    (hint_evidence.applied_weight - observation.weight).max(0.0);
-                maximum_contradiction = maximum_contradiction.max(contradiction);
-                hint_evidence.contradiction_score = Some(
-                    hint_evidence
-                        .contradiction_score
-                        .map_or(contradiction, |current| current.max(contradiction)),
-                );
-            }
-        }
-        if accepted.is_empty() {
-            continue;
-        }
-        let accepted = deduplicate_profile_observations(accepted);
-        let (accepted, speaker_training_evidence) =
-            apply_profile_training_hygiene(&speaker_ref, accepted, &mut evidence);
+        let (accepted, speaker_training_evidence, maximum_contradiction) =
+            match identity_authority {
+                EnrollmentIdentityAuthority::AcousticV2 => {
+                    admit_acoustic_enrollment_observations(
+                        &speaker_ref,
+                        observations,
+                        &mut evidence,
+                    )
+                }
+                EnrollmentIdentityAuthority::Ecapa(_) => {
+                    admit_ecapa_enrollment_observations(
+                        &speaker_ref,
+                        observations,
+                        &mut evidence,
+                    )
+                }
+            };
         if accepted.is_empty() {
             continue;
         }
@@ -10740,7 +10756,7 @@ pub fn enroll_known_speaker_profiles(
         let profile = build_speaker_profile(
             speaker_ref.clone(),
             &accepted,
-            (maximum_contradiction > 0.0).then_some(maximum_contradiction),
+            maximum_contradiction,
             training_accepted_count,
             training_downweighted_count,
             training_quarantined_count,
@@ -10785,6 +10801,115 @@ fn deduplicate_profile_observations(
             .or_insert(observation);
     }
     by_tracklet.into_values().collect()
+}
+
+fn admit_acoustic_enrollment_observations(
+    speaker_ref: &str,
+    observations: Vec<EnrollmentObservation>,
+    hint_evidence: &mut [HintEnrollmentEvidence],
+) -> (
+    Vec<EnrollmentObservation>,
+    Vec<ProfileTrainingEvidence>,
+    Option<f32>,
+) {
+    let hard_observations = deduplicate_profile_observations(
+        observations
+            .iter()
+            .filter(|observation| observation.hard)
+            .cloned()
+            .collect(),
+    );
+    let provisional_source = if hard_observations.is_empty() {
+        deduplicate_profile_observations(observations.clone())
+    } else {
+        hard_observations
+    };
+    let (provisional, provisional_valid) =
+        robust_location(&provisional_source, |observation| {
+            (observation.voice, observation.voice_valid)
+        });
+    let mut accepted = Vec::new();
+    let mut maximum_contradiction = 0.0_f32;
+    for observation in observations {
+        let contradiction = masked_euclidean_distance(
+            &observation.voice,
+            &observation.voice_valid,
+            &provisional,
+            &provisional_valid,
+        )
+        .unwrap_or(f32::INFINITY);
+        let accept = observation.hard || contradiction <= 0.65;
+        let evidence = &mut hint_evidence[observation.hint_index];
+        if observation.hard {
+            accepted.push(observation);
+        } else if accept {
+            evidence.accepted_tracklet_count += 1;
+            accepted.push(observation);
+        } else {
+            evidence.rejected_tracklet_count += 1;
+            evidence.applied_weight =
+                (evidence.applied_weight - observation.weight).max(0.0);
+            maximum_contradiction = maximum_contradiction.max(contradiction);
+            evidence.contradiction_score = Some(
+                evidence
+                    .contradiction_score
+                    .map_or(contradiction, |current| current.max(contradiction)),
+            );
+        }
+    }
+    if accepted.is_empty() {
+        return (
+            Vec::new(),
+            Vec::new(),
+            (maximum_contradiction > 0.0).then_some(maximum_contradiction),
+        );
+    }
+    let (accepted, training_evidence) = apply_profile_training_hygiene(
+        speaker_ref,
+        deduplicate_profile_observations(accepted),
+        hint_evidence,
+    );
+    (
+        accepted,
+        training_evidence,
+        (maximum_contradiction > 0.0).then_some(maximum_contradiction),
+    )
+}
+
+fn admit_ecapa_enrollment_observations(
+    speaker_ref: &str,
+    observations: Vec<EnrollmentObservation>,
+    hint_evidence: &mut [HintEnrollmentEvidence],
+) -> (
+    Vec<EnrollmentObservation>,
+    Vec<ProfileTrainingEvidence>,
+    Option<f32>,
+) {
+    // ECAPA is the identity authority in both neural modes. Do not let the
+    // classical voice coordinates reject or downweight a provider-backed soft
+    // observation before the neural leave-one-out hygiene pass can inspect it.
+    for observation in &observations {
+        if !observation.hard {
+            hint_evidence[observation.hint_index].accepted_tracklet_count += 1;
+        }
+    }
+    let accepted = deduplicate_profile_observations(observations);
+    let training_evidence = accepted
+        .iter()
+        .map(|observation| {
+            hint_evidence[observation.hint_index].profile_accepted_tracklet_count += 1;
+            ProfileTrainingEvidence {
+                tracklet_index: observation.tracklet_index,
+                hint_index: observation.hint_index,
+                speaker_ref: speaker_ref.to_owned(),
+                hard_attribution: observation.hard,
+                disposition: ProfileTrainingDisposition::Accepted,
+                reason: ProfileTrainingReason::Consistent,
+                applied_weight: observation.weight,
+            }
+        })
+        .collect();
+    (accepted, training_evidence, None)
 }
 
 fn apply_profile_training_hygiene(
@@ -10938,45 +11063,6 @@ fn apply_profile_training_hygiene(
         }
     }
     (retained, decisions)
-}
-
-pub(crate) fn canonical_hint_document_sha256(hints: &[KnownSpeakerInterval]) -> String {
-    let mut canonical = hints.to_vec();
-    canonical.sort_by(|left, right| {
-        left.speaker_ref
-            .cmp(&right.speaker_ref)
-            .then(left.start_ms.cmp(&right.start_ms))
-            .then(left.end_ms.cmp(&right.end_ms))
-            .then(policy_rank(left.policy).cmp(&policy_rank(right.policy)))
-            .then(left.confidence.total_cmp(&right.confidence))
-            .then(left.provenance.cmp(&right.provenance))
-    });
-    let mut hasher = Sha256::new();
-    hasher.update(b"speaker-hints-v1\0");
-    for hint in canonical {
-        hash_field(&mut hasher, hint.speaker_ref.as_bytes());
-        hasher.update(hint.start_ms.to_le_bytes());
-        hasher.update(hint.end_ms.to_le_bytes());
-        hasher.update([policy_rank(hint.policy)]);
-        hasher.update(hint.confidence.to_bits().to_le_bytes());
-        hash_field(
-            &mut hasher,
-            hint.provenance.as_deref().unwrap_or_default().as_bytes(),
-        );
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u64).to_le_bytes());
-    hasher.update(bytes);
-}
-
-const fn policy_rank(policy: KnownSpeakerPolicy) -> u8 {
-    match policy {
-        KnownSpeakerPolicy::HardMustLink => 0,
-        KnownSpeakerPolicy::SoftEnrollment => 1,
-    }
 }
 
 fn hard_speaker_cannot_links(request: &DiarizationRequest) -> BTreeSet<(String, String)> {
@@ -11582,7 +11668,7 @@ pub fn diarize_ecapa_pcm(
     Ok((report, projection))
 }
 
-const MIN_ECAPA_TRACKLET_IDENTITY_FRAMES: usize = 20;
+const MIN_ECAPA_TRACKLET_VOICED_FRAMES: usize = 20;
 const ECAPA_HELDOUT_MINIMUM_SOURCE_SAMPLES: usize = ECAPA_SAMPLE_RATE_HZ * 2;
 const ECAPA_HELDOUT_SINGLETON_MIN_TOTAL_WEIGHT: f32 = 200.0;
 const ECAPA_HELDOUT_COMPETITOR_DISTANCE_MARGIN: f32 = 0.05;
@@ -11623,16 +11709,16 @@ fn prepare_ecapa_tracklet_windows(source: &[f32]) -> Option<EcapaTrackletWindows
 }
 
 fn represented_ecapa_weight(
-    identity_frame_count: usize,
+    voiced_frame_count: usize,
     represented_samples: usize,
     source_samples: usize,
 ) -> f32 {
-    if identity_frame_count == 0 || source_samples == 0 {
+    if voiced_frame_count == 0 || source_samples == 0 {
         return 0.0;
     }
     let observed_samples = represented_samples.min(source_samples);
-    ((identity_frame_count as f64 * observed_samples as f64 / source_samples as f64) as f32)
-        .clamp(1.0, identity_frame_count as f32)
+    ((voiced_frame_count as f64 * observed_samples as f64 / source_samples as f64) as f32)
+        .clamp(1.0, voiced_frame_count as f32)
 }
 
 fn clamp_ecapa_pcm(window: &mut [f32]) {
@@ -11665,7 +11751,7 @@ fn apply_ecapa_speaker_representations(
     let mut embeddings = BTreeMap::new();
     for tracklet in tracklets {
         checkpoint()?;
-        if tracklet.identity_frame_count < MIN_ECAPA_TRACKLET_IDENTITY_FRAMES {
+        if tracklet.voiced_frame_count < MIN_ECAPA_TRACKLET_VOICED_FRAMES {
             skipped_tracklet_count = skipped_tracklet_count.saturating_add(1);
             saw_insufficient_identity = true;
             continue;
@@ -11719,13 +11805,13 @@ fn apply_ecapa_speaker_representations(
             None
         };
         let discovery_weight = represented_ecapa_weight(
-            tracklet.identity_frame_count,
+            tracklet.voiced_frame_count,
             windows.discovery.len(),
             source.len(),
         );
         let validation_weight = windows.validation.as_ref().map_or(0.0, |validation| {
             represented_ecapa_weight(
-                tracklet.identity_frame_count,
+                tracklet.voiced_frame_count,
                 validation.len(),
                 source.len(),
             )
@@ -12094,8 +12180,19 @@ where
                 (Some(summary), embeddings, evidence_mode)
             }
         };
-    let mut enrollment = enroll_known_speaker_profiles(&tracklets, request, audio_duration_ms)
-        .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
+    let enrollment_identity_authority = match representation_provider {
+        SpeakerRepresentationProvider::AcousticV2 => EnrollmentIdentityAuthority::AcousticV2,
+        SpeakerRepresentationProvider::EcapaTdnnV1 { .. } => {
+            EnrollmentIdentityAuthority::Ecapa(&neural_embeddings)
+        }
+    };
+    let mut enrollment = enroll_known_speaker_profiles_with_authority(
+        &tracklets,
+        request,
+        audio_duration_ms,
+        enrollment_identity_authority,
+    )
+    .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
     if neural_representation.is_some() {
         let (quarantined, contradictory) =
             apply_neural_enrollment_hygiene(&tracklets, &mut enrollment, &neural_embeddings);
@@ -12127,25 +12224,72 @@ where
         evidence_mode,
         is_cancelled,
     )?;
-    let turns = diarization_turns_from_assignments(&clustering.assignments, audio_duration_ms)?;
-    let speaker_queries =
-        speaker_attribution_queries(&clustering.assignments, normalized_input_sha256);
-    let projection = project_diarization_onto_segments(segments, &turns, word_aligned)?;
     let neural_identity_unavailable = neural_representation
         .as_ref()
         .is_some_and(|summary| summary.status == NeuralSpeakerRepresentationStatus::Unavailable);
+    // A loaded ECAPA model can legitimately yield zero embeddings for short or
+    // non-identity-bearing speech. Preserve only immutable hard attribution in
+    // that case; acoustic-only clusters are not evidence produced by the
+    // requested ECAPA identity representation.
+    let unavailable_assignments = neural_identity_unavailable.then(|| {
+        tracklets
+            .iter()
+            .map(|tracklet| {
+                enrollment
+                    .hard_assignments
+                    .get(&tracklet.tracklet_index)
+                    .map_or_else(
+                        || unknown_assignment(tracklet),
+                        |speaker_ref| AcousticSpeakerAssignment {
+                            tracklet_index: tracklet.tracklet_index,
+                            start_ms: tracklet.start_ms,
+                            end_ms: tracklet.end_ms,
+                            speaker_ref: Some(speaker_ref.clone()),
+                            speaker_confidence: 1.0,
+                            secondary_speaker_ref: None,
+                            secondary_speaker_confidence: None,
+                            change_confidence: tracklet.change_confidence,
+                            overlap_suspected: false,
+                            hard_attribution: true,
+                        },
+                    )
+            })
+            .collect::<Vec<_>>()
+    });
+    let report_assignments = unavailable_assignments
+        .as_deref()
+        .unwrap_or(&clustering.assignments);
+    let turns = diarization_turns_from_assignments(report_assignments, audio_duration_ms)?;
+    let speaker_queries = if neural_identity_unavailable {
+        Vec::new()
+    } else {
+        speaker_attribution_queries(report_assignments, normalized_input_sha256)
+    };
+    let projection = project_diarization_onto_segments(segments, &turns, word_aligned)?;
     let fallback_status = if neural_identity_unavailable {
-        if matches!(
-            request.speaker_count,
+        match request.speaker_count {
             SpeakerCountRequest::Infer
-                | SpeakerCountRequest::Prior { .. }
-                | SpeakerCountRequest::Range { .. }
-        ) {
-            DiarizationFallbackStatus::SpeakerCountUnresolved
-        } else if !clustering.constraints_satisfied {
-            DiarizationFallbackStatus::UnsatisfiedConstraints
-        } else {
-            DiarizationFallbackStatus::InsufficientEvidence
+            | SpeakerCountRequest::Prior { .. }
+            | SpeakerCountRequest::Range { .. } => {
+                DiarizationFallbackStatus::SpeakerCountUnresolved
+            }
+            SpeakerCountRequest::HardConstraint { count } => {
+                let attributed_count = report_assignments
+                    .iter()
+                    .filter_map(|assignment| {
+                        assignment
+                            .hard_attribution
+                            .then_some(assignment.speaker_ref.as_deref())
+                            .flatten()
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .len();
+                if attributed_count == count as usize {
+                    DiarizationFallbackStatus::InsufficientEvidence
+                } else {
+                    DiarizationFallbackStatus::UnsatisfiedConstraints
+                }
+            }
         }
     } else if matches!(
         request.speaker_count,
@@ -12173,8 +12317,31 @@ where
             "native acoustic diarization fallback triggered: {fallback_status:?}"
         )));
     }
-    let speaker_count = public_speaker_count_outcome(&request.speaker_count, &clustering)?;
-    let hint_evidence = public_hint_evidence(&enrollment.evidence)?;
+    let speaker_count = if neural_identity_unavailable {
+        unavailable_neural_speaker_count_outcome(
+            &request.speaker_count,
+            &tracklets,
+            report_assignments,
+        )?
+    } else {
+        public_speaker_count_outcome(&request.speaker_count, &clustering)?
+    };
+    let mut hint_evidence = public_hint_evidence(&enrollment.evidence)?;
+    if neural_identity_unavailable {
+        for evidence in &mut hint_evidence {
+            evidence.profile_accepted_tracklet_count = 0;
+            evidence.profile_downweighted_tracklet_count = 0;
+            evidence.profile_quarantined_tracklet_count = 0;
+            evidence.contradiction_score = None;
+            if evidence.policy == KnownSpeakerPolicy::SoftEnrollment {
+                evidence.disposition = SpeakerHintDisposition::NoUsableTracklets;
+                evidence.usable_tracklet_count = 0;
+                evidence.accepted_tracklet_count = 0;
+                evidence.rejected_tracklet_count = 0;
+                evidence.applied_weight = 0.0;
+            }
+        }
+    }
     let mut diagnostics = vec![
         format!(
             "feature_schema={} schema_sha256={} ablation={} extraction_schema={} features={} voiced={} reliable_pitch={} high_information={} missing_pitch={} retained_dsp_bytes<={}",
@@ -12319,7 +12486,11 @@ where
         normalized_input_sha256: normalized_input_sha256.to_owned(),
         hint_document_sha256: enrollment.hint_document_sha256,
         turns,
-        profiles: clustering.profiles,
+        profiles: if neural_identity_unavailable {
+            Vec::new()
+        } else {
+            clustering.profiles
+        },
         hint_evidence,
         speaker_queries,
         speaker_count,
@@ -12332,9 +12503,12 @@ where
         neural_representation,
         diagnostics,
     };
-    report
-        .validate_against_request(request, Some(audio_duration_ms))
-        .map_err(FwError::ContractViolation)?;
+    validate_native_diarization_report(
+        &report,
+        request,
+        audio_duration_ms,
+        neural_identity_unavailable,
+    )?;
     Ok((
         report,
         projection,
@@ -12342,6 +12516,29 @@ where
         clustering_evaluation,
         sidecar_evaluation,
     ))
+}
+
+fn validate_native_diarization_report(
+    report: &DiarizationReport,
+    request: &DiarizationRequest,
+    audio_duration_ms: u64,
+    neural_identity_unavailable: bool,
+) -> FwResult<()> {
+    let defer_request_binding_to_fallback_orchestrator = neural_identity_unavailable
+        && matches!(
+            request.fallback,
+            DiarizationFallbackPolicy::Acoustic | DiarizationFallbackPolicy::External
+        );
+    if defer_request_binding_to_fallback_orchestrator {
+        // This is an intermediate native-attempt result, not the final result
+        // authorized by the caller's fallback policy. It must still satisfy the
+        // complete generic report contract before the orchestrator consumes it.
+        report.validate().map_err(FwError::ContractViolation)
+    } else {
+        report
+            .validate_against_request(request, Some(audio_duration_ms))
+            .map_err(FwError::ContractViolation)
+    }
 }
 
 fn public_speaker_count_outcome(
@@ -12455,6 +12652,117 @@ fn public_speaker_count_outcome(
         dominant_speaker_share: f64::from(clustering.dominant_speaker_share),
         unknown_voiced_share: f64::from(clustering.unknown_voiced_share),
         reasons,
+        speaker_evidence,
+    })
+}
+
+fn unavailable_neural_speaker_count_outcome(
+    request: &SpeakerCountRequest,
+    tracklets: &[AcousticTracklet],
+    assignments: &[AcousticSpeakerAssignment],
+) -> FwResult<SpeakerCountOutcome> {
+    if tracklets.len() != assignments.len() {
+        return Err(FwError::ContractViolation(
+            "unavailable ECAPA attribution lost acoustic tracklet correspondence".to_owned(),
+        ));
+    }
+    let active_speaker_refs = assignments
+        .iter()
+        .filter(|assignment| assignment.hard_attribution)
+        .filter_map(|assignment| assignment.speaker_ref.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let supported_speaker_count = u32::try_from(active_speaker_refs.len()).map_err(|_| {
+        FwError::ContractViolation(
+            "hard-attributed ECAPA fallback speaker count exceeds the report schema".to_owned(),
+        )
+    })?;
+    let (dominant_speaker_share, unknown_voiced_share) =
+        assignment_voiced_shares(tracklets, assignments)?;
+    let speaker_evidence = active_speaker_refs
+        .iter()
+        .map(|speaker_ref| {
+            let mut assigned_tracklet_count = 0usize;
+            let mut voiced_frame_count = 0usize;
+            let mut voiced_duration_ms = 0u64;
+            for (tracklet, assignment) in tracklets.iter().zip(assignments) {
+                if assignment.hard_attribution
+                    && assignment.speaker_ref.as_ref() == Some(speaker_ref)
+                {
+                    assigned_tracklet_count = assigned_tracklet_count.saturating_add(1);
+                    voiced_frame_count =
+                        voiced_frame_count.saturating_add(tracklet.voiced_frame_count);
+                    voiced_duration_ms = voiced_duration_ms
+                        .saturating_add(tracklet.end_ms.saturating_sub(tracklet.start_ms));
+                }
+            }
+            Ok(SpeakerEvidenceSummary {
+                speaker_ref: speaker_ref.clone(),
+                assigned_tracklet_count: report_count(
+                    assigned_tracklet_count,
+                    "hard-attributed tracklet count",
+                )?,
+                independent_tracklet_count: report_count(
+                    assigned_tracklet_count,
+                    "hard-attributed independent tracklet count",
+                )?,
+                recurrence_episode_count: u64::from(assigned_tracklet_count > 0),
+                voiced_frame_count: report_count(
+                    voiced_frame_count,
+                    "hard-attributed voiced frame count",
+                )?,
+                independent_voiced_frame_count: report_count(
+                    voiced_frame_count,
+                    "hard-attributed independent voiced frame count",
+                )?,
+                voiced_duration_ms,
+                mean_assignment_confidence: 1.0,
+                profile_reliability: 0.0,
+                hard_anchored: true,
+                separated_from_supported_speakers: true,
+                reasons: vec![SpeakerEvidenceReason::SupportedByHardHint],
+                supported: true,
+            })
+        })
+        .collect::<FwResult<Vec<_>>>()?;
+    let status = match request {
+        SpeakerCountRequest::HardConstraint { count }
+            if *count == supported_speaker_count =>
+        {
+            SpeakerCountOutcomeStatus::Satisfied
+        }
+        SpeakerCountRequest::HardConstraint { .. } => SpeakerCountOutcomeStatus::Unsatisfied,
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => SpeakerCountOutcomeStatus::Unresolved,
+    };
+    let status_reason = match status {
+        SpeakerCountOutcomeStatus::Satisfied => SpeakerCountOutcomeReason::RequestedCountMatched,
+        SpeakerCountOutcomeStatus::Unsatisfied => {
+            SpeakerCountOutcomeReason::RequestedCountMismatch
+        }
+        SpeakerCountOutcomeStatus::Unresolved if supported_speaker_count == 0 => {
+            SpeakerCountOutcomeReason::NoSupportedSpeakers
+        }
+        SpeakerCountOutcomeStatus::Unresolved
+            if matches!(request, SpeakerCountRequest::Prior { .. }) =>
+        {
+            SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable
+        }
+        SpeakerCountOutcomeStatus::Unresolved | SpeakerCountOutcomeStatus::Resolved => {
+            SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved
+        }
+    };
+    Ok(SpeakerCountOutcome {
+        request: request.clone(),
+        estimate: None,
+        status,
+        supported_speaker_count,
+        active_speaker_refs,
+        dominant_speaker_share: f64::from(dominant_speaker_share),
+        unknown_voiced_share: f64::from(unknown_voiced_share),
+        reasons: vec![status_reason],
         speaker_evidence,
     })
 }
@@ -12715,7 +13023,7 @@ where
         return Ok((
             AcousticClusteringResult {
                 assignments,
-                profiles: enrollment.summaries.clone(),
+                profiles: Vec::new(),
                 count_estimate: unavailable_speaker_count_estimate(
                     speaker_count,
                     constraint_lower_bound,
@@ -12761,7 +13069,7 @@ where
         return Ok((
             AcousticClusteringResult {
                 assignments,
-                profiles: enrollment.summaries.clone(),
+                profiles: Vec::new(),
                 count_estimate: unavailable_speaker_count_estimate(
                     speaker_count,
                     constraint_lower_bound,
@@ -13009,7 +13317,14 @@ where
         .filter(|evidence| evidence.supported)
         .map(|evidence| evidence.speaker_ref.as_str())
         .collect::<BTreeSet<_>>();
-    let profiles = clustering_profile_summaries(&clusters, &labels, enrollment, &supported_labels);
+    let profiles = clustering_profile_summaries(
+        &clusters,
+        &labels,
+        enrollment,
+        neural_profiles.as_ref(),
+        evidence_mode,
+        &supported_labels,
+    );
     Ok((
         AcousticClusteringResult {
             assignments,
@@ -13231,30 +13546,10 @@ fn speaker_attribution_queries(
         });
     }
     for query in &mut queries {
-        query.query_id_sha256 = speaker_attribution_query_sha256(normalized_input_sha256, query);
+        query.query_id_sha256 =
+            crate::model::speaker_attribution_query_sha256(normalized_input_sha256, query);
     }
     queries
-}
-
-fn speaker_attribution_query_sha256(
-    normalized_input_sha256: &str,
-    query: &SpeakerAttributionQuery,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"speaker-attribution-query-v1\0");
-    hash_field(&mut hasher, normalized_input_sha256.as_bytes());
-    hasher.update(query.start_ms.to_le_bytes());
-    hasher.update(query.end_ms.to_le_bytes());
-    hasher.update([match query.reason {
-        SpeakerAttributionQueryReason::UnknownAttribution => 0,
-        SpeakerAttributionQueryReason::LowConfidence => 1,
-        SpeakerAttributionQueryReason::OverlapAmbiguity => 2,
-    }]);
-    for speaker_ref in &query.candidate_speaker_refs {
-        hash_field(&mut hasher, speaker_ref.as_bytes());
-    }
-    hasher.update([policy_rank(query.suggested_policy)]);
-    format!("{:x}", hasher.finalize())
 }
 
 fn minimum_optional_confidence(left: Option<f64>, right: Option<f64>) -> Option<f64> {
@@ -13617,23 +13912,69 @@ fn build_ecapa_speaker_profiles(
             .or_insert(evidence.applied_weight);
     }
 
-    let mut centroids = BTreeMap::<String, (Option<EcapaSpeakerEmbedding>, f32)>::new();
+    let mut admitted_count = BTreeMap::<String, usize>::new();
+    let mut observations = BTreeMap::<String, Vec<(EcapaSpeakerEmbedding, f32)>>::new();
     for ((speaker_ref, tracklet_index), weight) in admitted_weights {
+        *admitted_count.entry(speaker_ref.clone()).or_default() += 1;
         let Some(representation) = embeddings.get(&tracklet_index) else {
             continue;
         };
-        let entry = centroids.entry(speaker_ref).or_insert((None, 0.0));
-        merge_ecapa_centroid(
-            &mut entry.0,
-            &mut entry.1,
-            Some(&representation.discovery),
-            weight.min(representation.discovery_weight),
-        );
+        let represented_weight = weight.min(representation.discovery_weight).max(0.0);
+        if represented_weight > 0.0 {
+            observations
+                .entry(speaker_ref)
+                .or_default()
+                .push((representation.discovery, represented_weight));
+        }
     }
-    centroids
+
+    observations
         .into_iter()
-        .filter_map(|(speaker_ref, (embedding, weight))| {
-            embedding.map(|embedding| (speaker_ref, EcapaSpeakerProfile { embedding, weight }))
+        .filter_map(|(speaker_ref, observations)| {
+            let mut embedding = None;
+            let mut weight = 0.0_f32;
+            for (observation, observation_weight) in &observations {
+                merge_ecapa_centroid(
+                    &mut embedding,
+                    &mut weight,
+                    Some(observation),
+                    *observation_weight,
+                );
+            }
+            let embedding = embedding?;
+            let weighted_distance_sum = observations
+                .iter()
+                .filter_map(|(observation, observation_weight)| {
+                    ecapa_cosine_distance(
+                        observation,
+                        &embedding,
+                        SpeakerPairPerturbation::Full,
+                    )
+                    .map(|distance| distance * observation_weight)
+                })
+                .sum::<f32>();
+            let mean_distance = weighted_distance_sum / weight.max(f32::EPSILON);
+            let coherence = (1.0
+                - mean_distance / ECAPA_PROFILE_RELIABILITY_COHERENCE_DISTANCE)
+                .clamp(0.0, 1.0);
+            let support = (weight / ECAPA_PROFILE_RELIABILITY_FULL_SUPPORT_FRAMES).clamp(0.0, 1.0);
+            let represented_count = observations.len();
+            let coverage = represented_count as f32
+                / admitted_count
+                    .get(&speaker_ref)
+                    .copied()
+                    .unwrap_or(represented_count)
+                    .max(1) as f32;
+            let reliability = (support * coherence * coverage).clamp(0.0, 1.0);
+            Some((
+                speaker_ref,
+                EcapaSpeakerProfile {
+                    embedding,
+                    weight,
+                    reliability,
+                    observation_count: represented_count,
+                },
+            ))
         })
         .collect()
 }
@@ -13889,7 +14230,17 @@ where
         left.start_ms
             .cmp(&right.start_ms)
             .then(left.end_ms.cmp(&right.end_ms))
-            .then_with(|| compare_float_vectors(&left.voice_mean, &right.voice_mean))
+            .then_with(|| match neural_embeddings {
+                Some(embeddings) => compare_optional_float_vectors(
+                    embeddings
+                        .get(&left.tracklet_index)
+                        .map(|representation| &representation.discovery),
+                    embeddings
+                        .get(&right.tracklet_index)
+                        .map(|representation| &representation.discovery),
+                ),
+                None => compare_float_vectors(&left.voice_mean, &right.voice_mean),
+            })
             .then(left.tracklet_index.cmp(&right.tracklet_index))
     });
     let distinct_hard_references = ordered
@@ -14009,6 +14360,38 @@ fn compare_float_vectors<const N: usize>(left: &[f32; N], right: &[f32; N]) -> s
         }
     }
     std::cmp::Ordering::Equal
+}
+
+fn compare_optional_float_vectors<const N: usize>(
+    left: Option<&[f32; N]>,
+    right: Option<&[f32; N]>,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => compare_float_vectors(left, right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_cluster_identity(
+    left: &AcousticCluster,
+    right: &AcousticCluster,
+) -> std::cmp::Ordering {
+    debug_assert_eq!(left.evidence_mode, right.evidence_mode);
+    match left.evidence_mode {
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => compare_optional_float_vectors(
+            left.neural_voice.as_ref(),
+            right.neural_voice.as_ref(),
+        ),
+        DiarizationSpeakerEvidenceMode::AcousticV2 => {
+            compare_float_vectors(&left.voice, &right.voice)
+        }
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => {
+            std::cmp::Ordering::Equal
+        }
+    }
 }
 
 fn prototype_distance(left: &AcousticPrototype, right: &AcousticPrototype) -> f32 {
@@ -14178,14 +14561,24 @@ fn initial_clusters(
         }
     }
     for (speaker_ref, mut cluster) in anchored {
-        if let Some(profile) = enrollment.profiles.get(&speaker_ref) {
+        if let Some(profile_reliability) = match evidence_mode {
+            DiarizationSpeakerEvidenceMode::AcousticV2 => enrollment
+                .profiles
+                .get(&speaker_ref)
+                .map(|profile| profile.reliability),
+            DiarizationSpeakerEvidenceMode::EcapaOnly
+            | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => neural_profiles
+                .and_then(|profiles| profiles.get(&speaker_ref))
+                .map(|profile| profile.reliability),
+            DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => None,
+        } {
             // The anchored cluster already contains the hard-hint observations
             // used to construct this profile. Merging that profile back into
             // the cluster would count the same evidence twice (including the
             // neural centroid and its duration). Reliability is metadata, not
             // another observation, so it may still strengthen the quality
             // gate without changing the centroid or weight.
-            cluster.reliability = cluster.reliability.max(profile.reliability);
+            cluster.reliability = cluster.reliability.max(profile_reliability);
         }
         cluster.hard_anchor = Some(speaker_ref.clone());
         cluster.label_hint = Some(speaker_ref);
@@ -14213,12 +14606,24 @@ fn initial_clusters(
             .is_none()
             .cmp(&right.hard_anchor.is_none())
             .then(left.earliest_ms.cmp(&right.earliest_ms))
-            .then_with(|| compare_float_vectors(&left.voice, &right.voice))
+            .then_with(|| compare_cluster_identity(left, right))
+            .then_with(|| left.label_hint.cmp(&right.label_hint))
     });
     clusters
 }
 
 fn cluster_from_prototype(prototype: &AcousticPrototype) -> AcousticCluster {
+    let reliability = match prototype.evidence_mode {
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+        | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+            (prototype.neural_weight / ECAPA_PROFILE_RELIABILITY_FULL_SUPPORT_FRAMES)
+                .clamp(0.0, 1.0)
+        }
+        DiarizationSpeakerEvidenceMode::AcousticV2 => {
+            (prototype.frame_count as f32 / 100.0).min(1.0)
+        }
+        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 0.0,
+    };
     AcousticCluster {
         prototype_members: prototype.members.clone(),
         evidence_mode: prototype.evidence_mode,
@@ -14235,7 +14640,7 @@ fn cluster_from_prototype(prototype: &AcousticPrototype) -> AcousticCluster {
         earliest_ms: prototype.earliest_ms,
         hard_anchor: prototype.hard_anchor.clone(),
         label_hint: prototype.hard_anchor.clone(),
-        reliability: (prototype.frame_count as f32 / 100.0).min(1.0),
+        reliability,
     }
 }
 
@@ -14249,27 +14654,61 @@ fn cluster_from_profile(
         let iqr = (profile.voice_q75[dimension] - profile.voice_q25[dimension]).abs() / 1.349;
         *scale_value = profile.voice_mad[dimension].max(iqr).max(0.025);
     }
+    let neural_identity = matches!(
+        evidence_mode,
+        DiarizationSpeakerEvidenceMode::EcapaOnly
+            | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+    );
+    let fused_channel = evidence_mode == DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel;
+    let neural_profile = neural_identity.then_some(neural_profile).flatten();
     AcousticCluster {
         prototype_members: Vec::new(),
         evidence_mode,
         neural_voice: neural_profile.map(|profile| profile.embedding),
         neural_weight: neural_profile.map_or(0.0, |profile| profile.weight),
-        voice: profile.voice_median,
-        voice_valid: profile.voice_valid,
-        scale,
-        channel: profile
-            .channel_subprofiles
-            .first()
-            .copied()
-            .unwrap_or([0.0; CHANNEL_VECTOR_DIMENSIONS]),
-        channel_valid: !profile.channel_subprofiles.is_empty(),
-        channel_dimensions: profile.channel_dimensions,
-        weight: (profile.frame_count as f32).clamp(1.0, 100.0),
+        voice: if neural_identity {
+            [0.0; VOICE_VECTOR_DIMENSIONS]
+        } else {
+            profile.voice_median
+        },
+        voice_valid: if neural_identity {
+            [false; VOICE_VECTOR_DIMENSIONS]
+        } else {
+            profile.voice_valid
+        },
+        scale: if neural_identity {
+            [0.025; VOICE_VECTOR_DIMENSIONS]
+        } else {
+            scale
+        },
+        channel: if !neural_identity || fused_channel {
+            profile
+                .channel_subprofiles
+                .first()
+                .copied()
+                .unwrap_or([0.0; CHANNEL_VECTOR_DIMENSIONS])
+        } else {
+            [0.0; CHANNEL_VECTOR_DIMENSIONS]
+        },
+        channel_valid: (!neural_identity || fused_channel) && !profile.channel_subprofiles.is_empty(),
+        channel_dimensions: if !neural_identity || fused_channel {
+            profile.channel_dimensions
+        } else {
+            0
+        },
+        weight: neural_profile.map_or_else(
+            || (profile.frame_count as f32).clamp(1.0, 100.0),
+            |profile| profile.weight.max(1.0),
+        ),
         sse: 0.0,
         earliest_ms: u64::MAX,
         hard_anchor: profile.anchored.then(|| profile.speaker_ref.clone()),
         label_hint: Some(profile.speaker_ref.clone()),
-        reliability: profile.reliability,
+        reliability: if neural_identity {
+            neural_profile.map_or(0.0, |profile| profile.reliability)
+        } else {
+            profile.reliability
+        },
     }
 }
 
@@ -16046,8 +16485,20 @@ fn fused_speaker_count_estimate(
         .map(|bin| count_entropy_term(bin.probability))
         .sum::<f64>()
         + count_entropy_term(unresolved_probability);
-    let constraint_lower_bound = u32::try_from(constraint_lower_bound).ok()?;
-    let candidate_upper_bound = u32::try_from(policy.max).ok()?;
+    let (constraint_lower_bound, candidate_upper_bound) = match request {
+        SpeakerCountRequest::HardConstraint { count }
+            if policy.exact == Some(*count as usize) =>
+        {
+            (*count, *count)
+        }
+        SpeakerCountRequest::HardConstraint { .. } => return None,
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => (
+            u32::try_from(constraint_lower_bound).ok()?,
+            u32::try_from(policy.max).ok()?,
+        ),
+    };
     let evidence_sha256 = speaker_count_evidence_sha256(
         lanes,
         spectral,
@@ -16219,7 +16670,14 @@ fn unavailable_speaker_count_estimate(
     unavailable_reason: SpeakerCountLaneUnavailableReason,
     calibration_sha256: &str,
 ) -> Option<SpeakerCountEstimate> {
-    let constraint_lower_bound = u32::try_from(constraint_lower_bound).ok()?;
+    let constraint_lower_bound = match request {
+        SpeakerCountRequest::HardConstraint { count } => *count,
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => {
+            u32::try_from(constraint_lower_bound).ok()?
+        }
+    };
     let available_candidates = u32::try_from(available_candidates)
         .ok()?
         .clamp(1, MAX_SPEAKER_COUNT);
@@ -16229,7 +16687,12 @@ fn unavailable_speaker_count_estimate(
         SpeakerCountRequest::Range { maximum, .. } => (*maximum).max(available_candidates),
         SpeakerCountRequest::HardConstraint { count } => *count,
     };
-    let candidate_upper_bound = requested_upper_bound.max(constraint_lower_bound);
+    let candidate_upper_bound = match request {
+        SpeakerCountRequest::HardConstraint { count } => *count,
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => requested_upper_bound.max(constraint_lower_bound),
+    };
     let prior_lane =
         speaker_count_prior_lane(request, constraint_lower_bound, candidate_upper_bound)?;
     let mut hasher = Sha256::new();
@@ -17818,7 +18281,7 @@ fn canonical_cluster_labels(
             .is_none()
             .cmp(&right.label_hint.is_none())
             .then(left.earliest_ms.cmp(&right.earliest_ms))
-            .then_with(|| compare_float_vectors(&left.voice, &right.voice))
+            .then_with(|| compare_cluster_identity(left, right))
             .then(left_index.cmp(right_index))
     });
     let reserved = clusters
@@ -18970,6 +19433,8 @@ fn clustering_profile_summaries(
     clusters: &[AcousticCluster],
     labels: &[String],
     enrollment: &SpeakerEnrollment,
+    neural_profiles: Option<&EcapaSpeakerProfiles>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
     supported_labels: &BTreeSet<&str>,
 ) -> Vec<SpeakerProfileSummary> {
     clusters
@@ -18977,7 +19442,7 @@ fn clustering_profile_summaries(
         .enumerate()
         .filter(|(index, _)| supported_labels.contains(labels[*index].as_str()))
         .map(|(index, cluster)| {
-            enrollment
+            let mut summary = enrollment
                 .summaries
                 .iter()
                 .find(|summary| summary.speaker_ref == labels[index])
@@ -18994,7 +19459,26 @@ fn clustering_profile_summaries(
                     training_quarantined_count: 0,
                     anchored: cluster.hard_anchor.is_some(),
                     soft_hint_contradiction: None,
-                })
+                });
+            if matches!(
+                evidence_mode,
+                DiarizationSpeakerEvidenceMode::EcapaOnly
+                    | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+            ) {
+                let neural_profile = neural_profiles
+                    .and_then(|profiles| profiles.get(labels[index].as_str()));
+                summary.reliability = f64::from(
+                    neural_profile.map_or(cluster.reliability, |profile| profile.reliability),
+                );
+                summary.voice_profile_count = neural_profile.map_or_else(
+                    || u32::from(cluster.neural_voice.is_some()),
+                    |profile| u32::try_from(profile.observation_count).unwrap_or(u32::MAX),
+                );
+                if evidence_mode == DiarizationSpeakerEvidenceMode::EcapaOnly {
+                    summary.channel_profile_count = 0;
+                }
+            }
+            summary
         })
         .collect()
 }
@@ -26339,7 +26823,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_hint_hash_is_order_independent_and_provenance_is_not_weight() {
+    fn hint_hash_binds_positional_order_and_provenance_is_not_weight() {
         let first = known_interval("alice", 0, 900, KnownSpeakerPolicy::SoftEnrollment);
         let mut second = known_interval("bob", 1_000, 1_900, KnownSpeakerPolicy::SoftEnrollment);
         second.provenance = Some("untrusted free form".to_owned());
@@ -26370,9 +26854,10 @@ mod tests {
             enroll_known_speaker_profiles(&tracklets, &request_b, 2_000).expect("enrollment b");
         let enrollment_c =
             enroll_known_speaker_profiles(&tracklets, &request_c, 2_000).expect("enrollment c");
-        assert_eq!(
+        assert_ne!(
             enrollment_a.hint_document_sha256,
-            enrollment_b.hint_document_sha256
+            enrollment_b.hint_document_sha256,
+            "hint_index is positional, so request order must be digest-bound"
         );
         assert_eq!(enrollment_a.summaries, enrollment_b.summaries);
         assert_ne!(
@@ -26790,6 +27275,30 @@ mod tests {
                     .reasons
                     .contains(&SpeakerEvidenceReason::SupportedByRepeatedTracklets)
         }));
+    }
+
+    #[test]
+    fn satisfied_hard_count_without_named_anchors_reports_exact_candidate_bounds() {
+        let tracklets = sequential_profile_tracklets(&[0.0, 0.0, 0.0, 4.0, 4.0, 4.0], 500, 50);
+        let result = cluster_with_hard_count(&tracklets, 2);
+
+        assert!(result.constraints_satisfied, "{result:#?}");
+        assert_eq!(result.detected_speakers, 2);
+        let estimate = result
+            .count_estimate
+            .as_ref()
+            .expect("fixed-safe hard-count estimate");
+        assert_eq!(estimate.constraint_lower_bound, 2);
+        assert_eq!(estimate.candidate_upper_bound, 2);
+        assert_eq!(
+            estimate
+                .lanes
+                .iter()
+                .find(|lane| lane.lane == SpeakerCountEvidenceLane::ConstraintGraph)
+                .and_then(|lane| lane.proposed_count),
+            Some(2)
+        );
+        estimate.validate().expect("exact bounded estimate");
     }
 
     #[test]
@@ -29713,6 +30222,12 @@ mod tests {
                 result.constraints_satisfied,
                 "{evidence_mode:?}: {result:#?}"
             );
+            let estimate = result
+                .count_estimate
+                .as_ref()
+                .expect("hard-constrained neural count estimate");
+            assert_eq!(estimate.constraint_lower_bound, 2);
+            assert_eq!(estimate.candidate_upper_bound, 2);
             assert_eq!(
                 result
                     .operational_partition
@@ -29779,6 +30294,107 @@ mod tests {
     }
 
     #[test]
+    fn ecapa_only_soft_enrollment_is_invariant_to_acoustic_identity_coordinates() {
+        let tracklets = sequential_profile_tracklets(&[0.0; 6], 500, 50);
+        let mut acoustically_unusable = tracklets.clone();
+        for (index, tracklet) in acoustically_unusable.iter_mut().enumerate() {
+            tracklet.voice_mean.fill(if index.is_multiple_of(2) { -9.0 } else { 9.0 });
+            tracklet.voice_variance.fill(81.0);
+            tracklet.voice_valid.fill(false);
+            tracklet.voice_support.fill(0);
+            tracklet.identity_frame_count = 0;
+        }
+        let request = DiarizationRequest {
+            known_intervals: vec![known_interval(
+                "alice",
+                0,
+                2_000,
+                KnownSpeakerPolicy::SoftEnrollment,
+            )],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        embedding[7] = 1.0;
+        let embeddings = (0usize..6)
+            .map(|index| {
+                (
+                    index,
+                    ecapa_representation(embedding, None, 50.0, 0.0),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let enroll_for_ecapa = |input_tracklets: &[super::AcousticTracklet]| {
+            let mut enrollment = super::enroll_known_speaker_profiles_with_authority(
+                input_tracklets,
+                &request,
+                3_000,
+                super::EnrollmentIdentityAuthority::Ecapa(&embeddings),
+            )
+            .expect("provider-aware soft enrollment");
+            assert_eq!(
+                super::apply_neural_enrollment_hygiene(
+                    input_tracklets,
+                    &mut enrollment,
+                    &embeddings,
+                ),
+                (0, false)
+            );
+            enrollment
+        };
+        let baseline_enrollment = enroll_for_ecapa(&tracklets);
+        let perturbed_enrollment = enroll_for_ecapa(&acoustically_unusable);
+        assert_eq!(baseline_enrollment.evidence, perturbed_enrollment.evidence);
+        assert_eq!(
+            baseline_enrollment.training_evidence,
+            perturbed_enrollment.training_evidence
+        );
+        assert_eq!(baseline_enrollment.evidence[0].usable_tracklet_count, 4);
+        assert_eq!(baseline_enrollment.evidence[0].accepted_tracklet_count, 4);
+
+        let baseline_profiles =
+            super::build_ecapa_speaker_profiles(&baseline_enrollment, &embeddings);
+        let perturbed_profiles =
+            super::build_ecapa_speaker_profiles(&perturbed_enrollment, &embeddings);
+        assert_eq!(baseline_profiles, perturbed_profiles);
+        assert!(
+            baseline_profiles
+                .get("alice")
+                .is_some_and(|profile| profile.reliability > 0.0)
+        );
+
+        let run = |input_tracklets: &[super::AcousticTracklet],
+                   enrollment: &super::SpeakerEnrollment| {
+            super::cluster_acoustic_tracklets_with_mode_internal(
+                input_tracklets,
+                enrollment,
+                &request.speaker_count,
+                512,
+                super::AcousticClusteringMode::ProbabilisticV1,
+                Some(&embeddings),
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+                || false,
+            )
+            .expect("provider-aware ECAPA-only clustering")
+            .0
+        };
+        let baseline = run(&tracklets, &baseline_enrollment);
+        let perturbed = run(&acoustically_unusable, &perturbed_enrollment);
+        assert_eq!(baseline, perturbed);
+
+        let baseline_acoustic = enroll_known_speaker_profiles(&tracklets, &request, 3_000)
+            .expect("baseline acoustic enrollment");
+        let perturbed_acoustic =
+            enroll_known_speaker_profiles(&acoustically_unusable, &request, 3_000)
+                .expect("perturbed acoustic enrollment");
+        assert_eq!(baseline_acoustic.evidence[0].usable_tracklet_count, 4);
+        assert_eq!(perturbed_acoustic.evidence[0].usable_tracklet_count, 0);
+        assert!(baseline_acoustic.profiles.contains_key("alice"));
+        assert!(!perturbed_acoustic.profiles.contains_key("alice"));
+    }
+
+    #[test]
     fn accepted_known_intervals_build_neural_speaker_profiles() {
         let tracklets = sequential_profile_tracklets(&[0.0, 0.0], 500, 50);
         let request = DiarizationRequest {
@@ -29821,21 +30437,24 @@ mod tests {
             enrollment_edge_guard_ms: 0,
             ..DiarizationRequest::default()
         };
-        let mut soft_enrollment = enroll_known_speaker_profiles(&tracklets, &soft_request, 1_000)
-            .expect("soft enrollment");
         let embeddings = BTreeMap::new();
+        let mut soft_enrollment = super::enroll_known_speaker_profiles_with_authority(
+            &tracklets,
+            &soft_request,
+            1_000,
+            super::EnrollmentIdentityAuthority::Ecapa(&embeddings),
+        )
+        .expect("provider-aware soft enrollment");
+        assert_eq!(soft_enrollment.evidence[0].usable_tracklet_count, 0);
+        assert_eq!(soft_enrollment.evidence[0].accepted_tracklet_count, 0);
         assert_eq!(
             super::apply_neural_enrollment_hygiene(&tracklets, &mut soft_enrollment, &embeddings,),
-            (2, false)
+            (0, false)
         );
         assert!(soft_enrollment.soft_priors.is_empty());
         assert!(soft_enrollment.profiles.is_empty());
         assert!(soft_enrollment.summaries.is_empty());
-        assert!(soft_enrollment.training_evidence.iter().all(|evidence| {
-            evidence.disposition == super::ProfileTrainingDisposition::Quarantined
-                && evidence.reason == super::ProfileTrainingReason::MissingRepresentation
-                && evidence.applied_weight == 0.0
-        }));
+        assert!(soft_enrollment.training_evidence.is_empty());
         let neural_profiles = super::build_ecapa_speaker_profiles(&soft_enrollment, &embeddings);
         assert!(neural_profiles.is_empty());
         assert!(
@@ -29858,8 +30477,13 @@ mod tests {
             enrollment_edge_guard_ms: 0,
             ..DiarizationRequest::default()
         };
-        let mut hard_enrollment = enroll_known_speaker_profiles(&tracklets, &hard_request, 1_000)
-            .expect("hard enrollment");
+        let mut hard_enrollment = super::enroll_known_speaker_profiles_with_authority(
+            &tracklets,
+            &hard_request,
+            1_000,
+            super::EnrollmentIdentityAuthority::Ecapa(&embeddings),
+        )
+        .expect("provider-aware hard enrollment");
         assert_eq!(
             super::apply_neural_enrollment_hygiene(&tracklets, &mut hard_enrollment, &embeddings,),
             (0, false)
