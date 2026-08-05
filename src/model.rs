@@ -2383,9 +2383,13 @@ fn validate_report_kind_invariants(
                 );
             }
             if report.turns.iter().any(|turn| {
-                !turn.hard_hint_attributed
-                    || turn.speaker_ref.is_none()
-                    || turn.speaker_confidence.map(f64::to_bits) != Some(1.0_f64.to_bits())
+                match (turn.speaker_ref.as_ref(), turn.speaker_confidence) {
+                    (None, None) => turn.hard_hint_attributed,
+                    (Some(_), Some(confidence)) => {
+                        !turn.hard_hint_attributed || confidence.to_bits() != 1.0_f64.to_bits()
+                    }
+                    _ => true,
+                }
             }) || report
                 .speaker_count
                 .speaker_evidence
@@ -7222,6 +7226,21 @@ mod tests {
         unavailable
             .validate()
             .expect("multiple hard-attributed tracklets may form one recurrence episode");
+
+        unavailable.turns.push(DiarizationTurn {
+            start_ms: 1_000,
+            end_ms: 1_500,
+            speaker_ref: None,
+            speaker_confidence: None,
+            change_confidence: Some(0.2),
+            overlap_suspected: false,
+            hard_hint_attributed: false,
+        });
+        unavailable.speaker_count.dominant_speaker_share = f64::from(2.0_f32 / 3.0);
+        unavailable.speaker_count.unknown_voiced_share = f64::from(1.0_f32 / 3.0);
+        unavailable
+            .validate()
+            .expect("unavailable ECAPA may retain explicitly unknown timed speech");
 
         unavailable.turns[0].hard_hint_attributed = false;
         assert!(
