@@ -500,8 +500,11 @@ fn model_artifact_magic(bytes: &[u8]) -> bool {
     let Some(header_end) = 8usize.checked_add(header_length) else {
         return false;
     };
-    if header_length == 0 || header_length > 100 * 1024 * 1024 || header_end > bytes.len() {
+    if header_length == 0 || header_length > 100 * 1024 * 1024 {
         return false;
+    }
+    if header_end > bytes.len() {
+        return bytes.len() == CONTENT_MAGIC_PREFIX_BYTES && bytes[8] == b'{';
     }
     let header = &bytes[8..header_end];
     header.starts_with(b"{")
@@ -770,6 +773,11 @@ mod tests {
         safetensors.extend_from_slice(safetensors_header);
         safetensors.extend_from_slice(&[0_u8; 4]);
         assert!(model_artifact_magic(&safetensors));
+
+        let mut large_safetensors_prefix = vec![b' '; super::CONTENT_MAGIC_PREFIX_BYTES];
+        large_safetensors_prefix[..8].copy_from_slice(&9_000_u64.to_le_bytes());
+        large_safetensors_prefix[8] = b'{';
+        assert!(model_artifact_magic(&large_safetensors_prefix));
 
         assert!(!model_artifact_magic(b"PK\x03\x04ordinary-archive"));
         assert!(!model_artifact_magic(b"\x80\x04ordinary-pickle"));
