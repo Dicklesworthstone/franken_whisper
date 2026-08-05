@@ -16588,16 +16588,20 @@ mod tests {
             paired_process_observed_rss_bytes,
         );
         assert!(!timing_tampered_gate.passed);
-        assert!(timing_tampered_gate
-            .failures
-            .contains(&PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch));
+        assert!(
+            timing_tampered_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch)
+        );
 
         let mut metric_tampered_rows = rows.clone();
-        metric_tampered_rows[0].baseline.accuracy.exact_speaker_count =
-            !metric_tampered_rows[0]
-                .baseline
-                .accuracy
-                .exact_speaker_count;
+        metric_tampered_rows[0]
+            .baseline
+            .accuracy
+            .exact_speaker_count = !metric_tampered_rows[0]
+            .baseline
+            .accuracy
+            .exact_speaker_count;
         metric_tampered_rows[0].deterministic_accuracy_sha256 =
             public_ecapa_pair_accuracy_sha256(&metric_tampered_rows[0]);
         metric_tampered_rows[0].row_sha256 =
@@ -16613,9 +16617,39 @@ mod tests {
             paired_process_observed_rss_bytes,
         );
         assert!(!metric_tampered_gate.passed);
-        assert!(metric_tampered_gate
-            .failures
-            .contains(&PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch));
+        assert!(
+            metric_tampered_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch)
+        );
+
+        let mut comparison_tampered_rows = rows.clone();
+        let tampered_der_delta = comparison_tampered_rows[0]
+            .comparison
+            .der_delta
+            .unwrap_or(0.0)
+            + 1.0;
+        comparison_tampered_rows[0].comparison.der_delta = Some(tampered_der_delta);
+        comparison_tampered_rows[0].deterministic_accuracy_sha256 =
+            public_ecapa_pair_accuracy_sha256(&comparison_tampered_rows[0]);
+        comparison_tampered_rows[0].row_sha256 =
+            public_ecapa_pair_result_sha256(&comparison_tampered_rows[0]);
+        let comparison_tampered_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &comparison_tampered_rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            paired_process_observed_rss_bytes,
+        );
+        assert!(!comparison_tampered_gate.passed);
+        assert!(
+            comparison_tampered_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch)
+        );
 
         let mut weakened_policy = gate_policy.clone();
         weakened_policy.minimum_exact_match_gain = 0;
