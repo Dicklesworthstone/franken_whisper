@@ -36,9 +36,9 @@ evaluation evidence:
 The ECAPA provider identity is
 `ecapa-tdnn-voxceleb-cosine-v6-development`; the current native probabilistic
 clustering identity is
-`acoustic-clustering-probabilistic-v18-calibrated-separation-development`.
+`acoustic-clustering-probabilistic-v20-channel-evidence-bound-fused-consensus-development`.
 The nested wire schemas remain `neural-speaker-representation-summary-v1` and
-`diarization-operational-partition-v1`. Their names are schema identities, not
+`diarization-operational-partition-v2`. Their names are schema identities, not
 an accepted `neural` CLI or JSON engine value.
 
 ## 2. Canonical data flow
@@ -71,7 +71,7 @@ The decision state consists of:
 - hard and soft known-speaker intervals;
 - current robust profiles and channel subprofiles;
 - one typed speaker-count request: inference, caller prior, range, or hard
-  search constraint; the current probabilistic count/assignment identity is v18
+  search constraint; the current probabilistic count/assignment identity is v20
   and remains development-uncertified;
 - prior temporal assignment;
 - algorithm, feature-schema, weights, and calibration identities;
@@ -703,11 +703,11 @@ The subsequent historical
 separately versioned `speaker-count-estimate-v2` report. It did not inherit the
 v2 evaluation authority, and neither historical study confers authority on the
 current
-`acoustic-clustering-probabilistic-v18-calibrated-separation-development`
-identity. The current v18 identity remains `DevelopmentUncertified`; this
+`acoustic-clustering-probabilistic-v20-channel-evidence-bound-fused-consensus-development`
+identity. The current v20 identity remains `DevelopmentUncertified`; this
 subsection contains no retained promotion or production-accuracy evidence for
 it. The default acoustic assignment path therefore remains `fixed_safe_v1`;
-the explicit ECAPA development modes exercise v18 only because the caller opts
+the explicit ECAPA development modes exercise v20 only because the caller opts
 into that uncertified path. Native fixed-safe runs still emit the
 count-estimate object, but with
 `fixed_safe_uncalibrated`, no concrete bins or selected count, and all
@@ -965,7 +965,7 @@ does not invent speakers merely to satisfy a range minimum or exact count; it
 reports `unsatisfied_constraints`, reports `speaker_count_unresolved`, or
 returns a hard error according to typed fallback policy.
 
-The bounded development speaker-count design, currently identified by the v18
+The bounded development speaker-count design, currently identified by the v20
 probabilistic clustering identity above, uses five deterministic semantic
 views: full evidence, no pitch, no dynamics, no formants, and no channel. It
 retains their complete bounded merge-risk curves, combines them with a
@@ -1220,7 +1220,7 @@ corrupt-package invalidation behavior without changing report bytes.
 They must never expose a model path, embedding coordinates, PCM, filterbank or
 other feature values, tensor values, or per-tracklet neural payloads.
 
-The privacy-safe `diarization-operational-partition-v1` summary may retain its
+The privacy-safe `diarization-operational-partition-v2` summary may retain its
 method, selected count, confidence, calibration digest, and authority. Its
 confidence is operational evidence, not automatically a calibrated posterior:
 `FixedSafeUncalibrated` and `DevelopmentUncertified` authority remain explicit
@@ -1480,13 +1480,79 @@ Each registry entry names a dedicated
 `FRANKEN_WHISPER_*_ORACLE_BIN` override and a default adapter executable. The
 operator supplies that adapter. A version probe receives
 `--franken-whisper-diarization-oracle-version --protocol
-franken-whisper-diarization-oracle-protocol-v1` and must emit one strict
-`franken-whisper-diarization-oracle-version-v1` JSON object on stdout. A run
+franken-whisper-diarization-oracle-protocol-v2` and must emit one strict
+`franken-whisper-diarization-oracle-version-v2` JSON object on stdout. A run
 receives `--franken-whisper-diarization-oracle-run`, the same protocol flag,
 an external `--audio` path, and a lowercase SHA-256 `--recording-key`. It must
 emit one strict `franken-whisper-diarization-stage-document-v1` object on
 stdout. Arguments are never retained, and neither stdout nor stderr content is
 copied into the report.
+
+The Sortformer adapter has an additional fail-closed model contract. It is
+exactly `nvidia/diar_streaming_sortformer_4spk-v2.1` at repository revision
+`fafaab5faa1617a0ca52d38dd3dc4bd636800d3d`, with the operator-installed
+artifact independently hashed locally. Hugging Face LFS metadata pins the
+471,367,680-byte `.nemo` artifact to SHA-256
+`8abd32832159c6ac1148c926b7276f35ba34582c444e559dce1f1253fea42ef8`.
+The locally computed hash must equal that exact value; size plus an arbitrary
+well-formed digest is not accepted. The frozen input is mono 16 kHz PCM16 WAV.
+Every PCM sample is decoded during validation, the sample-derived duration must
+be within 79 ms of the stage-document duration, and the audio hash is checked
+before and after the adapter run. The adapter executable is resolved once and
+that exact absolute executable is used for both probes.
+
+The model emits four arrival-ordered activity slots on 80 ms frames. The
+high-latency streaming profile fixes chunk/right-context/FIFO/cache-update/cache
+lengths to 340/40/40/300/188 frames (30.4 seconds nominal input-buffer latency),
+batch size one, inferred count up to four, and untuned onset/offset 0.5 with
+zero padding and minimum-duration filtering. The canonical adapter labels are
+`speaker_0` through `speaker_3`; arrival order is determined by each label's
+minimum onset and tied first onsets are allowed. Turns start and end on 80 ms
+frames, except that an end may equal the document duration. Sortformer overlap
+is represented only by concurrent labeled turns, never by
+`overlap_suspected`. Speech activity, overlap, and speaker-change boundaries
+must exactly equal the O(n log n) event-sweep derivation from the final turns.
+
+The frozen execution profile is CPU-only float32, with autocast disabled,
+quantization disabled, deterministic algorithms enabled, batch size one, zero
+data-loader workers, eight PyTorch intra-op threads, and one inter-op thread.
+Changing any of those values requires a different contract hash and evidence
+row. The adapter also computes a path-free
+`sortformer-runtime-fingerprint-v1` object containing the schema, Python, NeMo,
+PyTorch, torchaudio and NumPy versions, BLAS backend, operating system, machine
+architecture, CPU feature tier, device, dtype, autocast, quantization, thread
+counts, data-loader worker count, and deterministic-algorithm state. The v2
+version response carries that strict deny-unknown-fields object plus its
+SHA-256. The host validates the frozen profile and normalized path-free tokens,
+recomputes the digest, and retains only the digest in the report, so benchmark
+rows with silent runtime drift cannot be treated as matched.
+
+The v2 version document adds `model_contract_sha256`,
+`model_artifact_sha256`, `model_artifact_bytes`, and
+the structured `runtime_fingerprint` plus `runtime_fingerprint_sha256`. All are
+mandatory for a successfully validated Sortformer probe. The retained report separately records
+`expected_model_contract_sha256` even when no adapter is available and records
+the observed contract/artifact/runtime attestations only after a valid version
+probe. Non-Sortformer tools must omit all model-contract fields. The tool and
+adapter versions are exact pins, so a model, NeMo source, runtime profile, or
+adapter revision change is a new evidence row rather than an in-place
+substitution. A non-PCM input, changed input bytes, mismatched contract,
+malformed/nonfinite or cross-stage-inconsistent output, a fifth output slot, or
+noncanonical label fails closed with a typed skip. A reference with five or
+more labeled speakers is retained as `reference_model_capacity_exceeded`; it
+is never removed from the declared comparison population or collapsed to four
+speakers.
+
+Contract and report hashes use `lexicographic-canonical-json-v1`: recursively
+sort every object by key, emit compact JSON with no insignificant whitespace,
+preserve array order, and use JSON scalar rendering. This is a deliberately
+small cross-language encoding contract for the ASCII keys and integer/Boolean
+model contract; it is not claimed to implement RFC 8785. The encoding version
+is itself included in the hashed Sortformer contract, and the runtime
+fingerprint uses the same encoding. Cancellation terminates the directly
+invoked adapter and zero data-loader workers are part of the profile; full
+descendant-process teardown and timing comparability remain qualification gates
+for the same-invocation benchmark rather than claims made by this seam.
 
 The canonical stage document has a duration and optional outputs for:
 
@@ -1518,6 +1584,16 @@ use the frozen Hungarian speaker mapping and retain only label-free DER/JER
 components. Missing stages remain explicitly missing; they are not converted
 into errors or fabricated values. `earliest_divergence` is the first present
 stage whose frozen diagnostic threshold is exceeded.
+
+Parsing caps and comparison caps are intentionally distinct. A stage document
+may be retained for diagnosis at the general safety limits, but the current
+quadratic change-point/final-turn scorers refuse to compare any single native,
+oracle, or reference document with more than 2,048 change points, 2,048 final
+turns, or 32 distinct speaker labels (counting UNKNOWN as one label). This
+prevents a schema-valid diagnostic from turning dynamic programming, atomic
+interval construction, or Hungarian assignment into an unbounded CPU or memory
+request. Larger rows require a future sweep/banded scorer with cancellation
+inside the algorithm; they are not silently sampled or truncated.
 
 An optional third stage document can help interpret a disagreement. Its only
 categories are `reference_favors_native`, `reference_favors_oracle`,
@@ -1564,11 +1640,20 @@ path. The orchestrator routes both explicit ECAPA engines through
 `diarize_ecapa_pcm` and the common segmentation, constraints, count, temporal
 UNKNOWN/overlap, label, and projection contracts. `ecapa` uses ECAPA
 coordinates for speaker identity without acoustic channel evidence in pair
-scoring. `ecapa-fused` adds separately bounded acoustic channel evidence and
-consensus to that ECAPA identity path and is not eligible for the
-`EcapaSpherical` operational partition. Neither mode enters `auto`, changes
-the acoustic default, downloads a model, or parses a framework checkpoint at
-runtime. Public-corpus accuracy and calibration remain
+scoring. `ecapa-fused` authorizes separately bounded acoustic channel evidence
+and five-lane coassociation consensus on that ECAPA identity path. It reports the
+typed `EcapaFusedConsensus` operational method only when at least one selected
+consensus merge joins a compatible ECAPA pair with valid channel dimensions. With missing
+or mutually constrained channel evidence it underclaims generic
+`ProbabilisticConsensus` provenance and the supported-profile redecode route is
+ineligible. It can never claim the ECAPA-only `EcapaSpherical` method. The
+evaluation-only supported-profile redecode route accepts only the exact
+ECAPA-only/spherical or channel-proven fused/consensus pairs, and only when
+every acoustic tracklet has a neural representation. Partial neural coverage
+therefore leaves missing speech UNKNOWN except for immutable hard attribution
+and makes the redecode candidate a deterministic no-op. Neither mode enters
+`auto`, changes the acoustic default, downloads a model, or parses a framework
+checkpoint at runtime. Public-corpus accuracy and calibration remain
 development-uncertified.
 
 The ECAPA development decision policy places its equal-loss different-speaker
@@ -1576,7 +1661,7 @@ boundary at cosine distance `0.80`. Robust final-assignment and held-out
 validation separation begin at that same `0.80` boundary. Lane consensus and
 temporal recurrence may require stricter evidence; they may never introduce a
 hidden, weaker `0.70` separation gate. This bound is part of
-`acoustic-clustering-probabilistic-v18-calibrated-separation-development`; it
+`acoustic-clustering-probabilistic-v20-channel-evidence-bound-fused-consensus-development`; it
 is a versioned conservative decision policy, not an accuracy-certification
 claim.
 

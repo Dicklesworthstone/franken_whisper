@@ -423,6 +423,7 @@ impl RunStore {
         let result: TranscriptionResult = serde_json::from_str(&result_json).map_err(|error| {
             FwError::Storage(format!("invalid result_json for run {run_id}: {error}"))
         })?;
+        validate_stored_result_contracts(&run_id, &result)?;
 
         let warnings =
             parse_required_json_field::<Vec<String>>("warnings_json", &run_id, &warnings_json)?;
@@ -2200,6 +2201,20 @@ fn batch_history_enabled() -> bool {
     std::env::var("FW_STORAGE_BATCH_HISTORY").ok().as_deref() != Some("0")
 }
 
+/// Re-authenticate nested typed contracts after deserializing canonical run
+/// JSON. Serde enforces shape, but version strings and cross-field provenance
+/// remain semantic claims and must fail closed at every durable read boundary.
+fn validate_stored_result_contracts(run_id: &str, result: &TranscriptionResult) -> FwResult<()> {
+    if let Some(report) = result.diarization.as_ref() {
+        report.validate().map_err(|error| {
+            FwError::Storage(format!(
+                "invalid diarization report in result_json for run {run_id}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Assemble a [`StoredRunDetails`] from a batched `runs` row (9 cols: id,
 /// started_at, finished_at, backend, result_json, warnings_json, transcript,
 /// replay_json, acceleration_json) and its batched `events` rows (7 cols: run_id,
@@ -2223,6 +2238,7 @@ fn assemble_run_details_batched(
     let result: TranscriptionResult = serde_json::from_str(&result_json).map_err(|error| {
         FwError::Storage(format!("invalid result_json for run {run_id}: {error}"))
     })?;
+    validate_stored_result_contracts(&run_id, &result)?;
     let warnings =
         parse_required_json_field::<Vec<String>>("warnings_json", &run_id, &warnings_json)?;
     let replay = parse_required_json_field::<ReplayEnvelope>("replay_json", &run_id, &replay_json)?;
@@ -2902,7 +2918,7 @@ mod tests {
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             operational_partition: Some(DiarizationOperationalPartitionSummary {
-                schema_version: "diarization-operational-partition-v1".to_owned(),
+                schema_version: "diarization-operational-partition-v2".to_owned(),
                 method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
                 selected_count: 1,
                 confidence: 0.85,
@@ -3291,7 +3307,7 @@ mod tests {
             .as_mut()
             .expect("diarization")
             .operational_partition = Some(DiarizationOperationalPartitionSummary {
-            schema_version: "diarization-operational-partition-v1".to_owned(),
+            schema_version: "diarization-operational-partition-v2".to_owned(),
             method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
             selected_count: 0,
             confidence: 0.5,
@@ -3365,7 +3381,7 @@ mod tests {
             .as_mut()
             .expect("diarization")
             .operational_partition = Some(DiarizationOperationalPartitionSummary {
-            schema_version: "diarization-operational-partition-v1".to_owned(),
+            schema_version: "diarization-operational-partition-v2".to_owned(),
             method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
             selected_count: 1,
             confidence: 0.5,
@@ -4917,6 +4933,82 @@ mod tests {
             text.contains("run-corrupt"),
             "error should contain run_id: {text}"
         );
+    }
+
+    #[test]
+    fn durable_loaders_reject_invalid_nested_diarization_contracts_in_current_schema() {
+        for (case, field, forged_value, expected_error) in [
+            (
+                "obsolete-partition-schema",
+                "schema_version",
+                json!("diarization-operational-partition-v1"),
+                "operational partition schema version is unsupported",
+            ),
+            (
+                "cross-mode-partition-method",
+                "method",
+                json!("ecapa_fused_consensus"),
+                "native acoustic evidence cannot claim an ECAPA partition",
+            ),
+        ] {
+            let dir = tempdir().expect("tempdir");
+            let db_path = dir.path().join(format!("{case}.sqlite3"));
+            let store = RunStore::open(&db_path).expect("store");
+            let run_id = format!("run-{case}");
+            let mut report = minimal_report(&run_id, &db_path);
+            attach_synthetic_diarization(&mut report, false);
+            store.persist_report(&report).expect("persist valid report");
+
+            let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
+            let schema_rows = conn
+                .query("SELECT value FROM _meta WHERE key = 'schema_version'")
+                .expect("query schema version");
+            assert_eq!(
+                value_to_string(schema_rows[0].get(0)),
+                RunStore::SCHEMA_VERSION.to_string(),
+                "the regression must exercise a current-schema database",
+            );
+            let result_rows = conn
+                .query_with_params(
+                    "SELECT result_json FROM runs WHERE id = ?1 LIMIT 1",
+                    &[SqliteValue::Text(run_id.clone().into())],
+                )
+                .expect("query canonical result JSON");
+            let mut result_value: serde_json::Value =
+                serde_json::from_str(&value_to_string(result_rows[0].get(0)))
+                    .expect("parse canonical result JSON");
+            result_value
+                .pointer_mut("/diarization/operational_partition")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("synthetic operational partition")
+                .insert(field.to_owned(), forged_value);
+            conn.execute_with_params(
+                "UPDATE runs SET result_json = ?1 WHERE id = ?2",
+                &[
+                    SqliteValue::Text(
+                        serde_json::to_string(&result_value)
+                            .expect("serialize forged result JSON")
+                            .into(),
+                    ),
+                    SqliteValue::Text(run_id.clone().into()),
+                ],
+            )
+            .expect("forge nested durable contract");
+
+            let single_error = store
+                .load_run_details(&run_id)
+                .expect_err("single-run loader must reject invalid nested diarization");
+            let single_text = single_error.to_string();
+            assert!(single_text.contains(&run_id), "{single_text}");
+            assert!(single_text.contains(expected_error), "{single_text}");
+
+            let batch_error = store
+                .load_run_details_batch(std::slice::from_ref(&run_id))
+                .expect_err("batch loader must reject invalid nested diarization");
+            let batch_text = batch_error.to_string();
+            assert!(batch_text.contains(&run_id), "{batch_text}");
+            assert!(batch_text.contains(expected_error), "{batch_text}");
+        }
     }
 
     #[test]
