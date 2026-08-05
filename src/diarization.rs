@@ -12748,6 +12748,11 @@ impl PreparedSupportedProfileRedecodeEvaluation {
     }
 
     #[must_use]
+    pub(crate) fn tracklet_count(&self) -> u64 {
+        u64::try_from(self.incumbent.assignments.len()).unwrap_or(u64::MAX)
+    }
+
+    #[must_use]
     pub(crate) fn forced_tracklet_count(&self) -> u64 {
         self.forced_tracklet_count
     }
