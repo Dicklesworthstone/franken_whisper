@@ -315,6 +315,7 @@ const PIPE_CAPTURE_FALLBACK_GRACE: Duration = Duration::from_secs(1);
 struct PipeCapture {
     bytes: Vec<u8>,
     limit_exceeded: bool,
+    drain_incomplete: bool,
 }
 
 struct PipeReader {
@@ -425,6 +426,7 @@ fn read_pipe_with_limit<R: Read>(mut pipe: R) -> std::io::Result<PipeCapture> {
     Ok(PipeCapture {
         bytes,
         limit_exceeded,
+        drain_incomplete: false,
     })
 }
 
@@ -441,12 +443,22 @@ fn errno_to_io_error(error: rustix::io::Errno) -> std::io::Error {
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn read_pipe_with_limit_until_stopped<R: Read>(
+    pipe: R,
+    stop: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<PipeCapture> {
+    read_pipe_with_limit_until_stopped_with_grace(pipe, stop, PIPE_CAPTURE_STOP_DRAIN_GRACE)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn read_pipe_with_limit_until_stopped_with_grace<R: Read>(
     mut pipe: R,
     stop: &std::sync::atomic::AtomicBool,
+    stop_drain_grace: Duration,
 ) -> std::io::Result<PipeCapture> {
     let mut buf = [0u8; 8192];
     let mut bytes = Vec::new();
     let mut limit_exceeded = false;
+    let mut drain_incomplete = false;
     let mut stop_observed_at = None;
 
     loop {
@@ -461,7 +473,8 @@ fn read_pipe_with_limit_until_stopped<R: Read>(
                 }
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     let observed_at = stop_observed_at.get_or_insert_with(Instant::now);
-                    if observed_at.elapsed() >= PIPE_CAPTURE_STOP_DRAIN_GRACE {
+                    if observed_at.elapsed() >= stop_drain_grace {
+                        drain_incomplete = true;
                         break;
                     }
                 }
@@ -480,6 +493,7 @@ fn read_pipe_with_limit_until_stopped<R: Read>(
     Ok(PipeCapture {
         bytes,
         limit_exceeded,
+        drain_incomplete,
     })
 }
 
@@ -497,6 +511,12 @@ fn validate_captured_command_output(
     stdout: PipeCapture,
     stderr: PipeCapture,
 ) -> FwResult<Output> {
+    if stdout.drain_incomplete || stderr.drain_incomplete {
+        return Err(FwError::ContractViolation(
+            "subprocess output capture did not drain completely after the child terminated"
+                .to_owned(),
+        ));
+    }
     if stdout.limit_exceeded || stderr.limit_exceeded {
         let stream = match (stdout.limit_exceeded, stderr.limit_exceeded) {
             (true, true) => "stdout and stderr",
@@ -651,7 +671,21 @@ mod tests {
             .expect("finish reader with open writer");
         assert_eq!(capture.bytes, b"complete output");
         assert!(!capture.limit_exceeded);
+        assert!(!capture.drain_incomplete);
         assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn stopped_reader_reports_incomplete_continuous_drain() {
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let capture = super::read_pipe_with_limit_until_stopped_with_grace(
+            std::io::repeat(b'x'),
+            &stop,
+            Duration::ZERO,
+        )
+        .expect("bounded continuous drain");
+        assert!(capture.drain_incomplete);
     }
 
     #[test]
@@ -661,6 +695,7 @@ mod tests {
         let capture = read_pipe_with_limit(std::io::Cursor::new(input)).expect("capture pipe");
         assert_eq!(capture.bytes.len(), MAX_CAPTURED_OUTPUT_BYTES);
         assert!(capture.limit_exceeded);
+        assert!(!capture.drain_incomplete);
     }
 
     #[test]
