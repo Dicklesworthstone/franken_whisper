@@ -11765,7 +11765,7 @@ fn apply_ecapa_speaker_representations(
         provider_version: ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
         expected_model_package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
         loaded_model_package_sha256: Some(model.info().package_sha256.clone()),
-        model_load_source: Some(NeuralModelLoadSource::Direct),
+        model_load_source: Some(NeuralModelLoadSource::PackageVerified),
         status,
         embedded_tracklet_count: report_count(embedded_tracklet_count, "embedded tracklet count")?,
         zero_padded_tracklet_count: report_count(

@@ -14289,7 +14289,7 @@ mod tests {
                 );
                 assert_eq!(
                     representation.model_load_source,
-                    Some(crate::model::NeuralModelLoadSource::Direct)
+                    Some(crate::model::NeuralModelLoadSource::PackageVerified)
                 );
                 assert_eq!(report.normalized_input_sha256, normalized_input_sha256);
                 let speaker_pair_calibration_sha256 =

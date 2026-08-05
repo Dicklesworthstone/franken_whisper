@@ -13,6 +13,21 @@ use crate::model::{
     TranscriptionResult,
 };
 
+/// Resolve the request that actually governed diarization. The CLI's compact
+/// `diarize=true` form intentionally means the typed default request, while a
+/// nested request is inert when diarization itself was not enabled.
+fn effective_diarization_request(
+    request: &crate::model::TranscribeRequest,
+) -> Option<crate::model::DiarizationRequest> {
+    request.diarize.then(|| {
+        request
+            .backend_params
+            .acoustic_diarization
+            .clone()
+            .unwrap_or_default()
+    })
+}
+
 /// Drive `future` to completion on this thread's runtime.
 ///
 /// The runtime is built once per thread rather than once per statement: a
