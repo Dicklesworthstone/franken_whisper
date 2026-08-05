@@ -48,7 +48,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 `franken_whisper` is a single Rust binary that wraps every major Whisper backend behind a unified, agent-first interface — and ships its own engine:
 
 - **A real in-process Whisper engine, in pure Rust.** ggml model parsing, log-mel frontend, encoder/decoder transformer inference on FrankenTorch CPU kernels, greedy decoding with whisper.cpp's full timestamp-rule suite, and cross-attention DTW word timestamps. No FFI, no Python, no subprocess — drop a ggml model file in place and transcribe.
-- **Rust-native acoustic speaker diarization.** A bounded-memory waveform path separates voice from channel evidence, detects multiscale regime changes, builds robust within-call profiles, accepts hard or soft known-speaker intervals, and projects an independent turn timeline onto DTW word boundaries. It makes no gender or identity claims.
+- **Rust-native acoustic and ECAPA speaker diarization.** The bounded-memory acoustic path separates voice from channel evidence, while the two explicit ECAPA modes add a pinned in-process speaker representation either alone or fused with bounded channel evidence. Every native mode accepts hard or soft known-speaker intervals, projects an independent turn timeline onto DTW word boundaries, and makes no gender or person-identity claims.
 - **Adaptive Bayesian backend routing.** Each `auto` request runs a formal decision contract with an explicit loss matrix, per-backend Beta posteriors, Brier-scored calibration, and deterministic fallback when the model is mis-calibrated.
 - **Real-time NDJSON streaming.** Every pipeline stage emits sequenced, timestamped events on stable schema `v1.0.0`. No fragile regex; agents parse JSON.
 - **Durable run history.** Every transcription persists to SQLite with full event logs, replay envelopes, and JSONL export/import, even when the process crashes mid-run.
@@ -66,7 +66,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 | Machine-readable errors | exit code only | exceptions | exceptions | **12 structured `FW-*` error codes** |
 | Adaptive backend selection | — | — | — | **Bayesian decision contract** |
 | Run persistence | — | — | — | **SQLite + JSONL replay packs** |
-| Diarization | TinyDiarize hints | yes (HF token) | yes | **Rust acoustic + normalized external evidence** |
+| Diarization | TinyDiarize hints | yes (HF token) | yes | **Rust acoustic + explicit ECAPA + normalized external evidence** |
 | GPU acceleration | CUDA / Metal | CUDA / MPS | CUDA | **`frankentorch` / `frankenjax`** |
 | Cancellation | `SIGKILL` | `KeyboardInterrupt` | `SIGKILL` | **cooperative `CancellationToken`** |
 | TTY audio relay | — | — | — | **mulaw + zlib + base64 NDJSON** |
@@ -94,6 +94,11 @@ franken_whisper robot run --input meeting.mp3 --speculative \
 # Built-in acoustic speaker diarization (no Python or HF token)
 franken_whisper transcribe --input meeting.mp3 --diarize \
   --diarization-engine acoustic --json
+
+# Explicit ECAPA identity fused with bounded acoustic channel evidence
+# (requires the pinned local ECAPA package, but no Python or HF token)
+franken_whisper transcribe --input meeting.mp3 --diarize \
+  --diarization-engine ecapa-fused --json
 
 # TinyDiarize: whisper.cpp's built-in speaker-turn detection (no HF token needed)
 franken_whisper transcribe --input meeting.mp3 --tiny-diarize --json
@@ -292,11 +297,12 @@ The release profile is aggressively optimized for distribution: `opt-level = "z"
 - **Rust nightly** (2024 edition; pinned via `rust-toolchain.toml`)
 - **ffmpeg** (optional): only needed for video files, exotic codecs `symphonia` cannot decode, and live microphone capture. On Linux x86_64 it is auto-provisioned on first use unless `FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0`.
 - **A Whisper model file** for the built-in native engine (e.g. `ggml-tiny.en.bin` / `ggml-large-v3-turbo.bin` from [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp)); place it in `$FRANKEN_WHISPER_MODEL_DIR`, `~/.cache/franken_whisper/models`, or `~/models/whisper` — `scripts/fetch_test_models.sh` fetches a pinned `tiny.en`. With a model present, **no external backend binaries are required**: set `FRANKEN_WHISPER_NATIVE_EXECUTION=1` to prefer the native engine; even without that flag, the default-on recovery path runs it automatically whenever no bridge binary is usable.
+- **The pinned ECAPA package** (only for `ecapa` or `ecapa-fused`): `ecapa_tdnn_voxceleb.safetensors`, SHA-256 `9276a840c52cdd2e9afb73cd87a38e15749e12bf494d3ca47b5bc162f237cbcc`, under `$FRANKEN_WHISPER_MODEL_DIR/aux/` or `~/.cache/franken_whisper/models/aux/`. The converted artifact is not published, so `scripts/fetch_aux_models.sh` prints the pinned conversion instructions and expected digest instead of downloading it.
 - **Bridge backend binaries** (optional alternates; the Bayesian router arbitrates):
   - `whisper-cli` (from whisper.cpp); override via `FRANKEN_WHISPER_WHISPER_CPP_BIN`
   - `insanely-fast-whisper` (Python entry point); override via `FRANKEN_WHISPER_INSANELY_FAST_BIN`
   - `python3` with `pyannote.audio` installed (only for the optional external diarization backend); override via `FRANKEN_WHISPER_PYTHON_BIN`
-- **HuggingFace token** (external diarization only): `--hf-token`, `FRANKEN_WHISPER_HF_TOKEN`, or `HF_TOKEN`. The built-in acoustic engine needs neither Python nor a token.
+- **HuggingFace token** (external diarization only): `--hf-token`, `FRANKEN_WHISPER_HF_TOKEN`, or `HF_TOKEN`. Native acoustic and ECAPA diarization need neither Python nor a token; the ECAPA modes do require the local package above.
 
 ### Sibling Crate Dependencies
 
@@ -370,8 +376,8 @@ evidence and occupancy gates pass. A soft preference can be added with
 `--speaker-count-prior 2=0.25,3=0.75`. Use
 `--speaker-count-hard 3` only when the caller intentionally wants a hard search
 constraint; it never fabricates occupancy or removes UNKNOWN. Soft count
-options are supported by the native acoustic and explicit neural engines;
-external backends reject them rather than silently hardening them.
+options are supported by the native acoustic, `ecapa`, and `ecapa-fused`
+engines; external backends reject them rather than silently hardening them.
 
 Known intervals can enroll an opaque speaker reference without retaining the
 hint document's source path or raw source bytes:
@@ -389,10 +395,17 @@ contradictory. Parsed hint fields are part of the typed request and are
 persisted with the run unless `--no-persist` is used. Labels remain within-run
 references, not biometric identities.
 
+When `known_intervals` is nonempty, execution rejects both an external engine
+and `--diarization-fallback external`: external labels cannot enforce immutable
+hint identities, so this combination fails closed instead of discarding them.
+
 Evaluation uses the frozen `diarization-scorer-v5` contract. In addition to
-DER/JER, it reports a calibrated speaker-count posterior, explicit unresolved
-and zero-probability outcomes, effective occupancy, dominant/reference
-collapse, phantom labels, and optional transcript-free aligned-word WDER.
+DER/JER, it reports typed speaker-count evidence with explicit authority,
+unresolved and zero-probability outcomes, effective occupancy,
+dominant/reference collapse, phantom labels, and optional transcript-free
+aligned-word WDER. Fixed-safe results are explicitly uncalibrated, and current
+probabilistic results are development-uncertified; neither is described as a
+calibrated posterior unless a future certified authority says so.
 This prevents a nominally correct label count from hiding a run where one
 label received nearly all speech. Public ablations aggregate these metrics by
 reference count and duration; `diarization-eval` emits the same evidence only
@@ -405,7 +418,9 @@ The multiscale acoustic sidecar is exposed only through the separate public
 evaluation command `diarization-corpus sidecar-study`, using
 `public-diarization-acoustic-sidecar-study-v3` and its v3 runner. It is not a
 `transcribe` option: normal segmentation, clustering, robot output,
-persistence, and acoustic-v2 report bytes remain unchanged. The command runs a
+persistence, and the normal transcription route are not mutated by the
+sidecar study. This is a routing guarantee, not a claim that current reports
+are byte-identical to historical acoustic-v2 reports. The command runs a
 frozen full-v2 baseline plus twelve ordered sidecar lanes, retains only
 aggregate path-free and transcript-free evidence, and creates both outputs in
 external directories on Linux, Android, and Apple platforms. Other targets
@@ -492,17 +507,25 @@ The full adapter protocol, environment overrides, privacy rules, and authority
 boundary are in the
 [`acoustic diarization contract`](docs/acoustic_diarization_contract.md#114-stage-aware-external-differential-oracles).
 
-An explicit `--diarization-engine neural` request now runs the pinned ECAPA-TDNN
-speaker representation in process through the same segmentation, known-speaker
+The two explicit Rust-native ECAPA modes run the pinned ECAPA-TDNN speaker
+representation in process through the common segmentation, known-speaker
 constraints, profile/count machinery, temporal UNKNOWN/overlap handling,
-canonical labels, and transcript projection as the acoustic engine. It remains
-outside `auto` while public-corpus accuracy and calibration are development-only,
-and it never downloads a model: the exact converted package must already resolve
-through the auxiliary model search path. The library freezes and verifies the
+canonical labels, and transcript projection:
+
+- `--diarization-engine ecapa` uses ECAPA embeddings for speaker identity and
+  does not add acoustic channel evidence to pair scoring.
+- `--diarization-engine ecapa-fused` uses ECAPA speaker identity plus bounded
+  acoustic channel evidence and consensus. The library/JSON request spelling
+  is `ecapa_fused`.
+
+Both modes remain outside `auto`, and both are development-uncertified rather
+than production-accuracy claims. Neither downloads a model: the exact
+converted package must already resolve through the auxiliary model search
+path. The library freezes and verifies the
 license-compatible source revision, deterministic 200-tensor safetensors
 package, exact package hash and metadata, a scalar conformance oracle, public
 analytic golden stages, and fail-closed numerical tolerances. The bounded
-safe-Rust forward path implements the production periodic-Hamming PCM frontend,
+safe-Rust runtime path implements a fixed-FFT periodic-Hamming PCM frontend,
 TDNN/SE-Res2 aggregation, attentive statistics pooling, projection, and
 embedding normalization on explicit FrankenTorch CPU kernels, with cooperative
 cancellation, content-hash-validated process caching, and content-redacted
@@ -514,8 +537,19 @@ then recheck all 523,456 neural values through the composed Rust frontend, not
 only selected checkpoints. Safe RAII logical-buffer leases enforce and report
 the preplanned ECAPA-owned logical `f32` scratch-payload bound. Both generated
 artifacts remain outside Git. The
-project does not vendor weights or parse PyTorch checkpoints at runtime. Direct
-192-dimensional cosine evidence is currently marked development-uncertified;
+project does not vendor weights or parse PyTorch checkpoints at runtime. The
+current provider identity is
+`ecapa-tdnn-voxceleb-cosine-v6-development`; the current clustering policy is
+`acoustic-clustering-probabilistic-v18-calibrated-separation-development`.
+Its equal-loss different-speaker boundary is cosine distance `0.80`, and robust
+final-assignment and held-out-validation separation begin at the same `0.80`.
+Lane consensus and temporal recurrence may require stricter evidence, never a
+hidden `0.70` gate. This is a versioned development decision bound, not an
+accuracy-certification claim. Tracklets of at least two seconds use disjoint
+discovery and held-out validation windows, each capped at three seconds;
+shorter admitted tracklets use a discovery window, with sub-half-second input
+zero-padded to the runtime minimum. Direct 192-dimensional cosine evidence is
+marked development-uncertified;
 failed public-development candidates remain negative evidence rather than
 rollout authority. See the
 [`ECAPA conformance boundary`](docs/acoustic_diarization_contract.md#115-optional-ecapa-model-and-numerical-conformance-boundary).
@@ -769,18 +803,28 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--diarization-engine <ENGINE>` | `auto` | `auto`, `acoustic`, `external`, or explicit `neural`; neural requires the pinned converted ECAPA package and remains outside automatic routing |
-| `--diarization-fallback <POLICY>` | `unknown` | `unknown`, `external`, or `error` when evidence is insufficient |
+| `--diarization-engine <ENGINE>` | `auto` | `auto`, `acoustic`, `external`, `ecapa`, or `ecapa-fused`; both ECAPA modes require the pinned converted package and remain outside automatic routing |
+| `--diarization-fallback <POLICY>` | `unknown` | `unknown`, `acoustic`, `external`, or `error`; ECAPA fallback behavior depends on whether inference ran but evidence was insufficient, or the model was unavailable |
 | `--speaker-hints <PATH>` | — | Read a `speaker-hints-v1` document in place; the path is not retained, but parsed fields persist with the run unless `--no-persist` is used |
 | `--enrollment-edge-guard-ms <N>` | `100` | Remove boundary-adjacent audio before enrolling a known interval |
-| `--diarization-max-prototypes <N>` | `512` | Bounded global prototype cap (`1..=512`) |
+| `--diarization-max-prototypes <N>` | `512` | Bounded global native-diarization prototype cap (`1..=512`) |
 | `--persist-speaker-profiles` | `false` | Record explicit persistence consent; schema v5 still stores privacy-safe summaries rather than reusable acoustic vectors |
 | `--speaker-count-hard <K>` | — | Explicit hard search constraint; success still requires independent evidence for every speaker and uncertain speech remains UNKNOWN |
-| `--speaker-count-range <MIN..MAX>` | — | Soft bounded count preference; acoustic evidence may disagree or remain unresolved |
+| `--speaker-count-range <MIN..MAX>` | — | Soft bounded count preference; native evidence may disagree or remain unresolved |
 | `--speaker-count-prior <PRIOR>` | — | Soft point prior (`K`) or normalized distribution (`K=P,K=P`); never forces occupancy |
 | `--no-stem` | `false` | Disable external-backend vocal isolation |
 | `--suppress-numerals` | `false` | Spell out numbers for external alignment stability |
 | `--diarization-model <MODEL>` | — | Override the external diarization model |
+
+ECAPA fallback is deliberately asymmetric so a missing external result is not
+mistaken for successful fallback:
+
+| Policy | ECAPA ran, but evidence is insufficient | ECAPA package/load/inference unavailable |
+|---|---|---|
+| `unknown` | Retain the native result, hard-hint assignments, and UNKNOWN where evidence is insufficient | Emit hard hints where possible and UNKNOWN elsewhere under `native-ecapa-unavailable-v1` |
+| `acoustic` | Rerun the common stack with acoustic-v2 speaker identity while retaining ECAPA provenance | Rerun acoustic identity and attach an unavailable-ECAPA summary |
+| `external` | Use valid external labels when present; otherwise retain the insufficient ECAPA result | Use valid external labels when present; otherwise return an error |
+| `error` | Return an inner-diarizer error | Return an error |
 
 **Speculative Streaming:**
 
@@ -1395,7 +1439,7 @@ Set `FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE=1` to bypass the built-in decoder an
 
 The storage layer uses `fsqlite` (from the FrankenSQLite project) with three
 canonical run tables, four derived diarization index tables, and a key-value
-metadata table. The schema is at version **4** at HEAD.
+metadata table. The schema is at version **5** at HEAD.
 
 ```sql
 runs     (id PK, started_at, finished_at, backend, input_path,
@@ -2527,7 +2571,7 @@ franken_whisper transcribe --input audio.mp3 \
   --json
 ```
 
-**Highest accuracy with diarization:**
+**Dependency-light native diarization:**
 
 ```bash
 franken_whisper transcribe --input meeting.mp3 \
@@ -2648,7 +2692,7 @@ This produces the smallest possible binary while retaining full optimization. Th
 |  No network calls during transcription                         |
 |  No telemetry or analytics                                     |
 |  No cloud sync                                                 |
-|  No API keys required for native ASR or acoustic diarization  |
+|  No API keys required for native ASR, acoustic, or ECAPA     |
 +----------------------------------------------------------------+
 ```
 
@@ -4003,7 +4047,8 @@ The `auto` router will normally pick the right backend, but explicit selection i
 ```
 Do you need speaker diarization?
 ├─ YES, waveform-derived and dependency-light  → --diarization-engine acoustic
-├─ YES, Rust-native ECAPA and model is installed → --diarization-engine neural
+├─ YES, ECAPA identity only and model installed → --diarization-engine ecapa
+├─ YES, ECAPA plus channel evidence installed   → --diarization-engine ecapa-fused
 ├─ YES, with an installed pyannote backend     → --diarization-engine external
 ├─ YES, turn hints only                        → whisper_cpp + --tiny-diarize
 └─ NO ──┐
@@ -4623,22 +4668,23 @@ The router is doing nothing exotic: it blends priors with empirical data via Bet
 
 ## Speaker Diarization Paths
 
-| Aspect | Rust acoustic | Rust neural | External | TinyDiarize |
-|--------|---------------|-------------|----------|-------------|
-| Selection | `--diarization-engine acoustic` | `--diarization-engine neural` | `--diarization-engine external` | `--tiny-diarize` |
-| Evidence | Hand-authored waveform voice/channel features and multiscale changes | Pinned ECAPA embeddings plus separately retained channel evidence | Backend-defined, normalized only after provenance checks | Decoder turn tokens |
-| Dependencies | Built-in Rust + normalized PCM | Built-in Rust + user-installed, hash-pinned ECAPA safetensors | Typically Python, model files, and possibly an HF token | whisper-cli |
-| Output | Independent turns plus conservative projection to ASR segments | The same common turn/report/projection contract | Timed backend labels normalized to the common report | Inline turn hints |
-| Known intervals | Hard must-link and soft enrollment | Hard must-link and soft enrollment | Backend-specific | No |
-| Speaker count | Infer by default; optional soft range/prior or exact search constraint | Same bounded inference and constraint contract | Backend-specific | No |
-| Unknown/overlap | Explicit unknown and overlap suspicion | Same common handling | Backend-specific | No calibrated assignment |
-| Accuracy authority | Public-development evidence exists; rollout remains uncertified | Public-development candidates exist but currently fail promotion gates | Depends on the installed backend and corpus | No project accuracy certification |
+| Aspect | Rust acoustic | Rust ECAPA-only | Rust ECAPA-fused | External | TinyDiarize |
+|--------|---------------|-----------------|-------------------|----------|-------------|
+| Selection | `--diarization-engine acoustic` | `--diarization-engine ecapa` | `--diarization-engine ecapa-fused` (JSON: `ecapa_fused`) | `--diarization-engine external` | `--tiny-diarize` |
+| Speaker identity evidence | Hand-authored waveform voice features | Pinned ECAPA embeddings; no acoustic channel evidence in pair scoring | Pinned ECAPA embeddings plus bounded acoustic channel evidence and consensus | Backend-defined, normalized only after provenance checks | Decoder turn tokens |
+| Dependencies | Built-in Rust + normalized PCM | Built-in Rust + user-installed, hash-pinned ECAPA safetensors | Same pinned local ECAPA package | Typically Python, model files, and possibly an HF token | whisper-cli |
+| Output | Independent turns plus conservative projection to ASR segments | The common turn/report/projection contract | The common turn/report/projection contract | Timed backend labels normalized to the common report | Inline turn hints |
+| Known intervals | Hard must-link and soft enrollment | Hard must-link and soft enrollment | Hard must-link and soft enrollment | Backend-specific | No |
+| Speaker count | Infer by default; optional soft range/prior or exact search constraint | Same bounded inference and constraint contract | Same bounded inference and constraint contract | Backend-specific | No |
+| Unknown/overlap | Explicit unknown and overlap suspicion | Same common handling | Same common handling | Backend-specific | No calibrated assignment |
+| Accuracy authority | Public-development evidence exists; rollout remains uncertified | `DevelopmentUncertified`; outside `auto` | `DevelopmentUncertified`; outside `auto` | Depends on the installed backend and corpus | No project accuracy certification |
 
 Use acoustic diarization for dependency-light waveform evidence and auditable
-known intervals. Use explicit neural diarization when the pinned model is
-installed and development-uncertified accuracy is acceptable. Use an external
-engine only when its model/deployment tradeoff is deliberate. TinyDiarize is a
-turn hint, not a speaker-profile substitute.
+known intervals. Use explicit `ecapa` when the pinned model is installed and
+speaker identity should come only from ECAPA; use `ecapa-fused` when bounded
+channel evidence is also appropriate. Both are development-uncertified. Use an
+external engine only when its model/deployment tradeoff is deliberate.
+TinyDiarize is a turn hint, not a speaker-profile substitute.
 
 ---
 
@@ -4668,7 +4714,8 @@ The Source Separate stage has its own budget (`FRANKEN_WHISPER_STAGE_BUDGET_SEPA
 Before deploying `franken_whisper` to a production workflow, walk through:
 
 - [ ] **Backend(s) installed.** `franken_whisper robot health` returns `overall_status=ok`. At least one backend's `available=true`.
-- [ ] **HuggingFace token configured** (if using `--diarize`). Set via `FRANKEN_WHISPER_HF_TOKEN`. Verify redaction works by triggering a diarization run with `RUST_LOG=debug` and confirming the token does not appear in logs.
+- [ ] **HuggingFace token configured** (only if using the external pyannote diarization backend). Set via `FRANKEN_WHISPER_HF_TOKEN`. Verify redaction works by triggering an external diarization run with `RUST_LOG=debug` and confirming the token does not appear in logs.
+- [ ] **Pinned ECAPA package installed** (only if using `ecapa` or `ecapa-fused`). Verify the filename, auxiliary-model directory, and SHA-256 from Prerequisites; no HF token is needed.
 - [ ] **ffmpeg accessible** (if you'll transcribe video or use mic capture). Either system-installed, manually placed, or auto-provisioned. Verify with `franken_whisper robot health` → `ffmpeg.available=true`.
 - [ ] **State directory writable.** `FRANKEN_WHISPER_STATE_DIR` (or default `.franken_whisper/`) is on a partition with enough free space for your expected DB growth.
 - [ ] **Stage budgets sized.** If you'll transcribe audio longer than 15 minutes, raise `FRANKEN_WHISPER_STAGE_BUDGET_BACKEND_MS`. If you'll diarize multi-hour content, raise `DIARIZE_MS`.
