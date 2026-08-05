@@ -57,7 +57,7 @@ pub const SORTFORMER_ORACLE_TOOL_VERSION: &str =
     "nemo-speech-40ace43c7cf151af78dc22027c02feeca7e06b6a";
 /// SHA-256 of the canonical JSON serialization of [`sortformer_oracle_contract`].
 pub const SORTFORMER_ORACLE_CONTRACT_SHA256: &str =
-    "029d412377e05c7d7cbb01a8a0f7b2544aec9d85c56879a09c7306d2d385a6c4";
+    "77237f0457b8c9623056891e3c354c22eecd93a7824fb30909adc2c1733489f8";
 
 const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -836,11 +836,12 @@ fn build_report(
                     result_sha256: String::new(),
                 });
             }
-            let comparisons = compare_documents(
+            let comparisons = compare_documents_with_token(
                 &prepared.native,
                 &success.oracle,
                 prepared.reference.as_ref(),
                 &comparison_config,
+                token,
             )?;
             let earliest_divergence = comparisons
                 .iter()
@@ -1209,8 +1210,7 @@ fn validate_skipped_report_provenance(report: &DifferentialOracleReport) -> FwRe
         | DifferentialSkipReason::ModelContractMismatch => {
             stage == DifferentialExecutionStage::VersionValidation
         }
-        DifferentialSkipReason::OracleRunFailed
-        | DifferentialSkipReason::OracleRunTimedOut => {
+        DifferentialSkipReason::OracleRunFailed | DifferentialSkipReason::OracleRunTimedOut => {
             stage == DifferentialExecutionStage::OracleRun
         }
         DifferentialSkipReason::InvalidOracleOutput
@@ -1312,7 +1312,7 @@ fn execute_external(
         DifferentialExecutionStage::InputValidation,
         token,
     )
-        .map_err(|error| enrich_skip_with_executable(error, &executable_sha256))?;
+    .map_err(|error| enrich_skip_with_executable(error, &executable_sha256))?;
 
     let mut version_args = program.prefix_args.clone();
     version_args.extend([
@@ -1503,13 +1503,15 @@ fn validate_version_document(
             DifferentialExecutionStage::VersionValidation,
         )));
     }
-    let runtime_fingerprint_valid = version.runtime_fingerprint.as_ref().is_some_and(|fingerprint| {
-        validate_sortformer_runtime_fingerprint(fingerprint)
-            && canonical_sha256(fingerprint)
-                .ok()
-                .as_deref()
-                == version.runtime_fingerprint_sha256.as_deref()
-    });
+    let runtime_fingerprint_valid =
+        version
+            .runtime_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| {
+                validate_sortformer_runtime_fingerprint(fingerprint)
+                    && canonical_sha256(fingerprint).ok().as_deref()
+                        == version.runtime_fingerprint_sha256.as_deref()
+            });
     if expected_tool == DifferentialOracleTool::Sortformer
         && (version.tool_version != SORTFORMER_ORACLE_TOOL_VERSION
             || version.adapter_version != SORTFORMER_ORACLE_ADAPTER_VERSION
@@ -1742,10 +1744,10 @@ fn prepare_inputs(
         .map(|path| canonical_external_file(project_root, path, "reference_document"))
         .transpose()?;
     let native_bytes = read_capped(&native_path, MAX_DOCUMENT_BYTES, "native_document")?;
-    let native = parse_stage_document(&native_bytes)?;
+    let native = parse_stage_document_with_token(&native_bytes, token)?;
     let (reference, reference_sha256) = if let Some(path) = reference_path {
         let bytes = read_capped(&path, MAX_DOCUMENT_BYTES, "reference_document")?;
-        let document = parse_stage_document(&bytes)?;
+        let document = parse_stage_document_with_token(&bytes, token)?;
         if document.recording_key != native.recording_key
             || document.duration_ms != native.duration_ms
         {
@@ -2159,8 +2161,24 @@ pub fn compare_documents(
     reference: Option<&DifferentialStageDocument>,
     config: &DifferentialComparisonConfig,
 ) -> FwResult<Vec<DifferentialStageComparison>> {
-    validate_stage_document(native)?;
-    validate_stage_document(oracle)?;
+    compare_documents_with_token(
+        native,
+        oracle,
+        reference,
+        config,
+        &CancellationToken::unbounded(),
+    )
+}
+
+fn compare_documents_with_token(
+    native: &DifferentialStageDocument,
+    oracle: &DifferentialStageDocument,
+    reference: Option<&DifferentialStageDocument>,
+    config: &DifferentialComparisonConfig,
+    token: &CancellationToken,
+) -> FwResult<Vec<DifferentialStageComparison>> {
+    validate_stage_document_with_token(native, token)?;
+    validate_stage_document_with_token(oracle, token)?;
     validate_comparison_config(config)?;
     if native.recording_key != oracle.recording_key || native.duration_ms != oracle.duration_ms {
         return Err(oracle_request_error(
@@ -2169,7 +2187,7 @@ pub fn compare_documents(
         ));
     }
     if let Some(reference) = reference {
-        validate_stage_document(reference)?;
+        validate_stage_document_with_token(reference, token)?;
         if reference.recording_key != native.recording_key
             || reference.duration_ms != native.duration_ms
         {
@@ -2180,53 +2198,60 @@ pub fn compare_documents(
         }
     }
 
-    let comparisons = vec![
-        compare_interval_stage(
-            DifferentialStage::SpeechActivity,
-            native.speech_activity.as_deref(),
-            oracle.speech_activity.as_deref(),
-            reference.and_then(|value| value.speech_activity.as_deref()),
-            reference.is_some(),
-            config,
-        ),
-        compare_word_stage(
-            native.word_timing.as_deref(),
-            oracle.word_timing.as_deref(),
-            reference.and_then(|value| value.word_timing.as_deref()),
-            reference.is_some(),
-            config,
-        ),
-        compare_change_stage(
-            native.change_boundaries_ms.as_deref(),
-            oracle.change_boundaries_ms.as_deref(),
-            reference.and_then(|value| value.change_boundaries_ms.as_deref()),
-            reference.is_some(),
-            config,
-        )?,
-        compare_cluster_stage(
-            native.cluster_assignments.as_deref(),
-            oracle.cluster_assignments.as_deref(),
-            reference.and_then(|value| value.cluster_assignments.as_deref()),
-            reference.is_some(),
-            config,
-        ),
-        compare_interval_stage(
-            DifferentialStage::Overlap,
-            native.overlap.as_deref(),
-            oracle.overlap.as_deref(),
-            reference.and_then(|value| value.overlap.as_deref()),
-            reference.is_some(),
-            config,
-        ),
-        compare_projection_stage(
-            native.final_projection.as_deref(),
-            oracle.final_projection.as_deref(),
-            reference.and_then(|value| value.final_projection.as_deref()),
-            native.duration_ms,
-            reference.is_some(),
-            config,
-        )?,
-    ];
+    let mut comparisons = Vec::with_capacity(6);
+    token.checkpoint()?;
+    comparisons.push(compare_interval_stage(
+        DifferentialStage::SpeechActivity,
+        native.speech_activity.as_deref(),
+        oracle.speech_activity.as_deref(),
+        reference.and_then(|value| value.speech_activity.as_deref()),
+        reference.is_some(),
+        config,
+    ));
+    token.checkpoint()?;
+    comparisons.push(compare_word_stage(
+        native.word_timing.as_deref(),
+        oracle.word_timing.as_deref(),
+        reference.and_then(|value| value.word_timing.as_deref()),
+        reference.is_some(),
+        config,
+    ));
+    token.checkpoint()?;
+    comparisons.push(compare_change_stage(
+        native.change_boundaries_ms.as_deref(),
+        oracle.change_boundaries_ms.as_deref(),
+        reference.and_then(|value| value.change_boundaries_ms.as_deref()),
+        reference.is_some(),
+        config,
+    )?);
+    token.checkpoint()?;
+    comparisons.push(compare_cluster_stage(
+        native.cluster_assignments.as_deref(),
+        oracle.cluster_assignments.as_deref(),
+        reference.and_then(|value| value.cluster_assignments.as_deref()),
+        reference.is_some(),
+        config,
+    ));
+    token.checkpoint()?;
+    comparisons.push(compare_interval_stage(
+        DifferentialStage::Overlap,
+        native.overlap.as_deref(),
+        oracle.overlap.as_deref(),
+        reference.and_then(|value| value.overlap.as_deref()),
+        reference.is_some(),
+        config,
+    ));
+    token.checkpoint()?;
+    comparisons.push(compare_projection_stage(
+        native.final_projection.as_deref(),
+        oracle.final_projection.as_deref(),
+        reference.and_then(|value| value.final_projection.as_deref()),
+        native.duration_ms,
+        reference.is_some(),
+        config,
+        token,
+    )?);
+    token.checkpoint()?;
     Ok(comparisons)
 }
 
@@ -2372,6 +2397,7 @@ fn compare_projection_stage(
     duration_ms: u64,
     reference_document_present: bool,
     config: &DifferentialComparisonConfig,
+    token: &CancellationToken,
 ) -> FwResult<DifferentialStageComparison> {
     compare_optional_stage_fallible(
         DifferentialStage::FinalProjection,
@@ -2381,9 +2407,11 @@ fn compare_projection_stage(
         reference_document_present,
         config,
         |left, right| {
-            let left_scoring = turns_to_scoring(left, duration_ms, true)?;
-            let right_scoring = turns_to_scoring(right, duration_ms, true)?;
+            token.checkpoint()?;
+            let left_scoring = turns_to_scoring(left, duration_ms, true, token)?;
+            let right_scoring = turns_to_scoring(right, duration_ms, true, token)?;
             let score = score_diarization(&left_scoring, &right_scoring)?;
+            token.checkpoint()?;
             let native_unknown = merged_turn_intervals(left, true);
             let oracle_unknown = merged_turn_intervals(right, true);
             let unknown_score = score_intervals(&native_unknown, &oracle_unknown);
@@ -2801,10 +2829,15 @@ fn turns_to_scoring(
     turns: &[EvaluationTurn],
     duration_ms: u64,
     materialize_unknown: bool,
+    token: &CancellationToken,
 ) -> FwResult<Vec<ScoringTurn>> {
     turns
         .iter()
-        .map(|turn| {
+        .enumerate()
+        .map(|(index, turn)| {
+            if index.is_multiple_of(4_096) {
+                token.checkpoint()?;
+            }
             validate_geometry(turn.start_ms, turn.end_ms, duration_ms, "final_projection")?;
             if let Some(label) = &turn.speaker
                 && !is_safe_label(label)
@@ -2887,6 +2920,7 @@ fn validate_disjoint_intervals(
     duration_ms: u64,
     field: &str,
     maximum: usize,
+    token: &CancellationToken,
 ) -> FwResult<()> {
     if intervals.len() > maximum {
         return Err(oracle_request_error(
@@ -2896,6 +2930,9 @@ fn validate_disjoint_intervals(
     }
     let mut prior_end = 0u64;
     for (index, interval) in intervals.iter().enumerate() {
+        if index.is_multiple_of(4_096) {
+            token.checkpoint()?;
+        }
         validate_geometry(interval.start_ms, interval.end_ms, duration_ms, field)?;
         if index > 0 && interval.start_ms < prior_end {
             return Err(oracle_request_error(
@@ -4156,8 +4193,10 @@ mod tests {
         assert_eq!(first.version_stdout_sha256, second.version_stdout_sha256);
 
         let version = version_json(DifferentialOracleTool::Sortformer);
+        let run_marker = directory.path().join("oracle-run-entered");
         let slow = shell_program(format!(
-            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else sleep 60; fi"
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else printf '%s' entered > '{}'; sleep 60; fi",
+            run_marker.display()
         ));
         let cancelled = execute_external(
             DifferentialOracleTool::Sortformer,
@@ -4166,14 +4205,15 @@ mod tests {
             &test_audio_sha256(&audio),
             2_000,
             KEY,
-            Duration::from_secs(1),
-            &CancellationToken::with_deadline_from_now(Duration::from_millis(40)),
+            Duration::from_secs(10),
+            &CancellationToken::with_deadline_from_now(Duration::from_secs(2)),
         )
         .expect_err("cancelled during oracle run");
         assert!(matches!(
             cancelled,
             ExternalRunError::Cancelled(FwError::Cancelled(_))
         ));
+        assert!(run_marker.is_file(), "oracle run branch was not entered");
     }
 
     #[test]
