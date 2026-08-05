@@ -13980,7 +13980,7 @@ fn public_corpus_error(code: &str, message: &str) -> FwError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     use serde_json::json;
@@ -14003,9 +14003,2631 @@ mod tests {
     };
     use crate::FwResult;
     use crate::diarization::{
-        AcousticFeatureAblation, DIARIZATION_REFERENCE_SCHEMA_VERSION,
-        DiarizationReferenceDocument, EvaluationRegion, EvaluationSplit, EvaluationTurn,
+        AcousticFeatureAblation, AuthoritativeDiarizationScore,
+        DIARIZATION_REFERENCE_SCHEMA_VERSION, DiarizationReferenceDocument,
+        DiarizationScorerConfig, EvaluationRegion, EvaluationSplit, EvaluationTurn,
     };
+
+    const PUBLIC_ECAPA_RESIDUAL_PAIR_SCHEMA_VERSION: &str =
+        "public-ecapa-residual-birth-pair-row-v1";
+    const PUBLIC_ECAPA_COMMON_OBSERVATION_BINDING_SCHEMA_VERSION: &str =
+        "public-ecapa-common-observation-binding-v1";
+    const PUBLIC_ECAPA_RESIDUAL_GATE_SCHEMA_VERSION: &str =
+        "public-ecapa-residual-birth-gate-row-v1";
+    const PUBLIC_ECAPA_RESIDUAL_GATE_RUNNER_VERSION: &str =
+        "public-ecapa-residual-birth-gate-runner-v1";
+    const PUBLIC_ECAPA_RESIDUAL_GATE_POLICY_ID: &str =
+        "public-ecapa-residual-birth-development-policy-v1";
+    const PUBLIC_ECAPA_RESIDUAL_AGGREGATE_METRIC_ID: &str =
+        "micro-der-summed-components-over-summed-reference-speaker-time-v1";
+    const PUBLIC_ECAPA_RESIDUAL_UNKNOWN_METRIC_ID: &str =
+        "unknown-hypothesis-speaker-time-over-labeled-plus-unknown-v1";
+    const PUBLIC_ECAPA_RESIDUAL_TIMING_ID: &str =
+        "shared-preparation-plus-paired-partition-finish-monotonic-v1";
+    const PUBLIC_ECAPA_RESIDUAL_RSS_ID: &str =
+        "one-paired-process-linux-vmhwm-otherwise-sampled-rss-v1";
+    const PUBLIC_ECAPA_RESIDUAL_REQUIRED_RECORDINGS: u64 = 8;
+    const PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS: u64 = 16;
+    const PUBLIC_ECAPA_RESIDUAL_REQUIRED_SINGLE_SPEAKER_CONTROLS: u64 = 2;
+    const PUBLIC_ECAPA_RESIDUAL_MINIMUM_EXACT_MATCH_GAIN: u64 = 1;
+    const PUBLIC_ECAPA_RESIDUAL_MAXIMUM_RELATIVE_PARTITION_RTF_REGRESSION: f64 = 0.25;
+    const PUBLIC_ECAPA_RESIDUAL_MAXIMUM_COUNTERFACTUAL_RTF: f64 = 1.0;
+    const PUBLIC_ECAPA_RESIDUAL_MAXIMUM_PAIRED_PROCESS_RSS_BYTES: u64 = 512 * 1024 * 1024;
+    const PUBLIC_ECAPA_RESIDUAL_MAXIMUM_SCRATCH_PAYLOAD_BYTES: u64 = 64 * 1024;
+    const PUBLIC_ECAPA_RESIDUAL_MAXIMUM_RETAINED_OBSERVATIONS: u64 = 8;
+    const PUBLIC_ECAPA_RESIDUAL_MAXIMUM_PAIR_PROPOSALS_PER_PARENT: u64 = 28;
+    const PUBLIC_ECAPA_RESIDUAL_MAXIMUM_CANDIDATE_SPLITS: u64 = 1;
+    const PUBLIC_ECAPA_RESIDUAL_LLOYD_ITERATIONS: u64 = 8;
+    const PUBLIC_ECAPA_RESIDUAL_CANCELLATION_INTERVAL_OPERATIONS: u64 = 32;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum PublicEcapaResidualBirthGateFailure {
+        PairCountMismatch,
+        PairAlignmentMismatch,
+        PairIntegrityMismatch,
+        PolicyHashMismatch,
+        ProtocolMismatch,
+        CommonObservationMismatch,
+        IncumbentContractMismatch,
+        CandidateEligibilityMismatch,
+        CandidateReplayMismatch,
+        RejectedCandidateOutputMismatch,
+        MissingAccuracyMetric,
+        NonFiniteMetric,
+        CountMaeNotImproved,
+        TotalCountErrorNotImproved,
+        ExactMatchGainInsufficient,
+        MicroDerNotImproved,
+        MacroDerRegression,
+        MacroJerRegression,
+        PerRecordingCountRegression,
+        MissingSingleSpeakerControls,
+        SingleSpeakerControlFailure,
+        SelectiveRiskRegression,
+        UnknownShareRegression,
+        RuntimeUnavailable,
+        PartitionRtfRegression,
+        CounterfactualRtfExceeded,
+        RssUnavailable,
+        ProcessRssExceeded,
+        ResourceBoundExceeded,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthGatePolicy {
+        policy_id: String,
+        aggregate_metric_id: String,
+        unknown_metric_id: String,
+        timing_id: String,
+        rss_id: String,
+        required_recording_count: u64,
+        required_pair_count: u64,
+        required_engines: [crate::model::DiarizationEngine; 2],
+        required_single_speaker_control_recording_count: u64,
+        minimum_exact_match_gain: u64,
+        require_strict_count_mae_improvement: bool,
+        require_strict_total_absolute_count_error_improvement: bool,
+        require_strict_micro_der_improvement: bool,
+        require_no_record_farther_from_reference_count: bool,
+        require_candidate_replay_hash_match: bool,
+        maximum_macro_der_regression: f64,
+        maximum_macro_jer_regression: f64,
+        maximum_selective_risk_regression: f64,
+        maximum_unknown_share_regression: f64,
+        maximum_relative_partition_rtf_regression: f64,
+        maximum_candidate_counterfactual_rtf: f64,
+        maximum_paired_process_rss_bytes: u64,
+        maximum_residual_scratch_payload_bytes: u64,
+        maximum_retained_residual_observations: u64,
+        maximum_pair_proposals_per_parent: u64,
+        maximum_candidate_splits: u64,
+        lloyd_iterations: u64,
+        cancellation_check_interval_operations: u64,
+        undefined_metric_behavior: String,
+    }
+
+    fn public_ecapa_residual_birth_gate_policy() -> PublicEcapaResidualBirthGatePolicy {
+        PublicEcapaResidualBirthGatePolicy {
+            policy_id: PUBLIC_ECAPA_RESIDUAL_GATE_POLICY_ID.to_owned(),
+            aggregate_metric_id: PUBLIC_ECAPA_RESIDUAL_AGGREGATE_METRIC_ID.to_owned(),
+            unknown_metric_id: PUBLIC_ECAPA_RESIDUAL_UNKNOWN_METRIC_ID.to_owned(),
+            timing_id: PUBLIC_ECAPA_RESIDUAL_TIMING_ID.to_owned(),
+            rss_id: PUBLIC_ECAPA_RESIDUAL_RSS_ID.to_owned(),
+            required_recording_count: PUBLIC_ECAPA_RESIDUAL_REQUIRED_RECORDINGS,
+            required_pair_count: PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS,
+            required_engines: [
+                crate::model::DiarizationEngine::Ecapa,
+                crate::model::DiarizationEngine::EcapaFused,
+            ],
+            required_single_speaker_control_recording_count:
+                PUBLIC_ECAPA_RESIDUAL_REQUIRED_SINGLE_SPEAKER_CONTROLS,
+            minimum_exact_match_gain: PUBLIC_ECAPA_RESIDUAL_MINIMUM_EXACT_MATCH_GAIN,
+            require_strict_count_mae_improvement: true,
+            require_strict_total_absolute_count_error_improvement: true,
+            require_strict_micro_der_improvement: true,
+            require_no_record_farther_from_reference_count: true,
+            require_candidate_replay_hash_match: true,
+            maximum_macro_der_regression: 0.0,
+            maximum_macro_jer_regression: 0.0,
+            maximum_selective_risk_regression: 0.0,
+            maximum_unknown_share_regression: 0.0,
+            maximum_relative_partition_rtf_regression:
+                PUBLIC_ECAPA_RESIDUAL_MAXIMUM_RELATIVE_PARTITION_RTF_REGRESSION,
+            maximum_candidate_counterfactual_rtf: PUBLIC_ECAPA_RESIDUAL_MAXIMUM_COUNTERFACTUAL_RTF,
+            maximum_paired_process_rss_bytes:
+                PUBLIC_ECAPA_RESIDUAL_MAXIMUM_PAIRED_PROCESS_RSS_BYTES,
+            maximum_residual_scratch_payload_bytes:
+                PUBLIC_ECAPA_RESIDUAL_MAXIMUM_SCRATCH_PAYLOAD_BYTES,
+            maximum_retained_residual_observations:
+                PUBLIC_ECAPA_RESIDUAL_MAXIMUM_RETAINED_OBSERVATIONS,
+            maximum_pair_proposals_per_parent:
+                PUBLIC_ECAPA_RESIDUAL_MAXIMUM_PAIR_PROPOSALS_PER_PARENT,
+            maximum_candidate_splits: PUBLIC_ECAPA_RESIDUAL_MAXIMUM_CANDIDATE_SPLITS,
+            lloyd_iterations: PUBLIC_ECAPA_RESIDUAL_LLOYD_ITERATIONS,
+            cancellation_check_interval_operations:
+                PUBLIC_ECAPA_RESIDUAL_CANCELLATION_INTERVAL_OPERATIONS,
+            undefined_metric_behavior: "fail-closed-no-available-case-deletion-v1".to_owned(),
+        }
+    }
+
+    fn serialize_path_free_public_ecapa_evidence<T: serde::Serialize>(
+        value: &T,
+        local_paths: &[&Path],
+    ) -> String {
+        fn assert_schema_is_content_free(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (field, nested) in fields {
+                        let field = field.to_ascii_lowercase();
+                        assert!(
+                            !field.contains("path")
+                                && !field.contains("transcript")
+                                && !field.contains("speaker_label")
+                                && field != "text"
+                                && field != "turns"
+                                && field != "segments"
+                                && field != "samples"
+                                && field != "audio_bytes"
+                                && field != "embedding"
+                                && field != "embeddings"
+                                && field != "features"
+                                && field != "error"
+                                && field != "error_message",
+                            "public ECAPA evidence contains forbidden field {field}"
+                        );
+                        assert_schema_is_content_free(nested);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for nested in values {
+                        assert_schema_is_content_free(nested);
+                    }
+                }
+                serde_json::Value::String(text) => {
+                    let lower = text.to_ascii_lowercase();
+                    assert!(
+                        !text.starts_with('/')
+                            && !lower.contains("/users/")
+                            && !lower.contains("/home/")
+                            && !lower.contains("downloads")
+                            && !lower.contains("transcript")
+                            && !lower.ends_with(".m4a")
+                            && !lower.ends_with(".mp3")
+                            && !lower.ends_with(".wav")
+                            && !lower.ends_with(".flac")
+                            && !lower.ends_with(".ogg")
+                            && !lower.ends_with(".aac")
+                            && !lower.ends_with(".wma")
+                            && !lower.ends_with(".mp4")
+                            && !lower.ends_with(".srt")
+                            && !lower.ends_with(".md"),
+                        "public ECAPA evidence contains a path or content marker"
+                    );
+                }
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_) => {}
+            }
+        }
+
+        let serialized = serde_json::to_string(value).expect("serialize public ECAPA evidence");
+        for local_path in local_paths {
+            let local_path = local_path.to_string_lossy();
+            assert!(
+                local_path.is_empty() || !serialized.contains(local_path.as_ref()),
+                "public ECAPA evidence retained a local path"
+            );
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("parse serialized public ECAPA evidence");
+        assert_schema_is_content_free(&parsed);
+        serialized
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaCommonObservationBinding {
+        common_observation_schema: String,
+        common_observation_sha256: String,
+        source_audio_sha256: String,
+        normalized_input_sha256: String,
+        feature_schema_version: String,
+        ecapa_contract_sha256: String,
+        ecapa_package_sha256: String,
+        representation_provider_version: String,
+        embedded_tracklet_count: u64,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthResources {
+        parent_count_scanned: u64,
+        residual_observation_count: u64,
+        leave_pair_out_pair_count: u64,
+        candidate_split_count: u64,
+        committed_birth_count: u64,
+        lloyd_assignment_visits: u64,
+        robust_view_comparison_count: u64,
+        maximum_retained_residual_observations: u64,
+        peak_scratch_payload_bytes: u64,
+        operation_count: u64,
+        cancellation_check_count: u64,
+    }
+
+    impl PublicEcapaResidualBirthResources {
+        fn saturating_add_assign(&mut self, other: &Self) {
+            self.parent_count_scanned = self
+                .parent_count_scanned
+                .saturating_add(other.parent_count_scanned);
+            self.residual_observation_count = self
+                .residual_observation_count
+                .saturating_add(other.residual_observation_count);
+            self.leave_pair_out_pair_count = self
+                .leave_pair_out_pair_count
+                .saturating_add(other.leave_pair_out_pair_count);
+            self.candidate_split_count = self
+                .candidate_split_count
+                .saturating_add(other.candidate_split_count);
+            self.committed_birth_count = self
+                .committed_birth_count
+                .saturating_add(other.committed_birth_count);
+            self.lloyd_assignment_visits = self
+                .lloyd_assignment_visits
+                .saturating_add(other.lloyd_assignment_visits);
+            self.robust_view_comparison_count = self
+                .robust_view_comparison_count
+                .saturating_add(other.robust_view_comparison_count);
+            self.maximum_retained_residual_observations = self
+                .maximum_retained_residual_observations
+                .max(other.maximum_retained_residual_observations);
+            self.peak_scratch_payload_bytes = self
+                .peak_scratch_payload_bytes
+                .max(other.peak_scratch_payload_bytes);
+            self.operation_count = self.operation_count.saturating_add(other.operation_count);
+            self.cancellation_check_count = self
+                .cancellation_check_count
+                .saturating_add(other.cancellation_check_count);
+        }
+    }
+
+    impl From<crate::diarization::EcapaResidualBirthResourceSummary>
+        for PublicEcapaResidualBirthResources
+    {
+        fn from(summary: crate::diarization::EcapaResidualBirthResourceSummary) -> Self {
+            Self {
+                parent_count_scanned: summary.parent_count_scanned,
+                residual_observation_count: summary.residual_observation_count,
+                leave_pair_out_pair_count: summary.leave_pair_out_pair_count,
+                candidate_split_count: summary.candidate_split_count,
+                committed_birth_count: summary.committed_birth_count,
+                lloyd_assignment_visits: summary.lloyd_assignment_visits,
+                robust_view_comparison_count: summary.robust_view_comparison_count,
+                maximum_retained_residual_observations: summary
+                    .maximum_retained_residual_observations,
+                peak_scratch_payload_bytes: summary.peak_scratch_payload_bytes,
+                operation_count: summary.operation_count,
+                cancellation_check_count: summary.cancellation_check_count,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthAccuracyRow {
+        reference_speaker_time_sec: f64,
+        missed_speech_sec: f64,
+        false_alarm_sec: f64,
+        speaker_confusion_sec: f64,
+        der: Option<f64>,
+        jer: Option<f64>,
+        reference_speakers: u64,
+        hypothesis_speakers: u64,
+        absolute_speaker_count_error: u64,
+        exact_speaker_count: bool,
+        selective_reference_speaker_time_sec: f64,
+        selective_covered_speaker_time_sec: f64,
+        selective_error_covered_speaker_time_sec: f64,
+        selective_risk: Option<f64>,
+        labeled_speaker_time_sec: f64,
+        unknown_speaker_time_sec: f64,
+        unknown_speaker_share: Option<f64>,
+        reference_sha256: String,
+        hypothesis_sha256: String,
+        scorer_config_sha256: String,
+        score_sha256: String,
+    }
+
+    impl PublicEcapaResidualBirthAccuracyRow {
+        fn from_score(score: &AuthoritativeDiarizationScore) -> Self {
+            Self {
+                reference_speaker_time_sec: score.diarization.reference_speaker_time_sec,
+                missed_speech_sec: score.diarization.missed_speech_sec,
+                false_alarm_sec: score.diarization.false_alarm_sec,
+                speaker_confusion_sec: score.diarization.speaker_confusion_sec,
+                der: score.diarization.der,
+                jer: score.diarization.jer,
+                reference_speakers: u64::try_from(score.speaker_count.reference_speakers)
+                    .unwrap_or(u64::MAX),
+                hypothesis_speakers: u64::try_from(score.speaker_count.hypothesis_speakers)
+                    .unwrap_or(u64::MAX),
+                absolute_speaker_count_error: score.speaker_count.absolute_error,
+                exact_speaker_count: score.speaker_count.absolute_error == 0,
+                selective_reference_speaker_time_sec: score
+                    .selective_attribution
+                    .reference_speaker_time_sec,
+                selective_covered_speaker_time_sec: score
+                    .selective_attribution
+                    .covered_speaker_time_sec,
+                selective_error_covered_speaker_time_sec: score
+                    .selective_attribution
+                    .error_covered_speaker_time_sec,
+                selective_risk: score.selective_attribution.selective_risk,
+                labeled_speaker_time_sec: score.speaker_occupancy.labeled_speaker_time_sec,
+                unknown_speaker_time_sec: score.speaker_occupancy.unknown_speaker_time_sec,
+                unknown_speaker_share: score.speaker_occupancy.unknown_speaker_share,
+                reference_sha256: score.reference_sha256.clone(),
+                hypothesis_sha256: score.hypothesis_sha256.clone(),
+                scorer_config_sha256: score.config_sha256.clone(),
+                score_sha256: score.result_sha256.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthArmRow {
+        mode_id: String,
+        variant_configuration_sha256: String,
+        common_observation_sha256: String,
+        normalized_input_sha256: String,
+        embedded_tracklet_count: u64,
+        report_sha256: String,
+        residual_birth_evidence_sha256: String,
+        proposal_kind: Option<crate::diarization::EcapaResidualBirthProposalKind>,
+        birth_applied: bool,
+        fallback_reason: Option<crate::diarization::EcapaResidualBirthFallbackReason>,
+        incumbent_cluster_count: u64,
+        output_cluster_count: u64,
+        accuracy: PublicEcapaResidualBirthAccuracyRow,
+        resources: PublicEcapaResidualBirthResources,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum PublicEcapaResidualBirthExecutionOrder {
+        BaselineThenCandidate,
+        CandidateThenBaseline,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthPairTiming {
+        common_preparation_wall_ns: u64,
+        baseline_partition_finish_wall_ns: u64,
+        candidate_partition_finish_wall_ns: u64,
+        candidate_replay_wall_ns: u64,
+        execution_order: PublicEcapaResidualBirthExecutionOrder,
+        candidate_replay_excluded_from_gate: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthPairComparison {
+        absolute_speaker_count_error_delta: i64,
+        candidate_no_farther_from_reference_count: bool,
+        pair_alignment_matches: bool,
+        common_observation_matches: bool,
+        incumbent_contract_matches: bool,
+        der_delta: Option<f64>,
+        jer_delta: Option<f64>,
+        selective_risk_delta: Option<f64>,
+        unknown_speaker_share_delta: Option<f64>,
+        candidate_replay_report_sha256: String,
+        candidate_replay_common_observation_sha256: String,
+        candidate_replay_residual_birth_evidence_sha256: String,
+        candidate_replay_score_sha256: String,
+        candidate_replay_full_output_matches: bool,
+        candidate_replay_matches: bool,
+        rejected_candidate_output_matches_incumbent: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthPairRow {
+        schema_version: String,
+        protocol_sha256: String,
+        corpus_key: String,
+        source_version: String,
+        evaluation_split: EvaluationSplit,
+        recording_id: String,
+        audio_duration_ms: u64,
+        engine: crate::model::DiarizationEngine,
+        evidence_mode: crate::model::DiarizationSpeakerEvidenceMode,
+        common_observation: PublicEcapaCommonObservationBinding,
+        baseline: PublicEcapaResidualBirthArmRow,
+        candidate: PublicEcapaResidualBirthArmRow,
+        comparison: PublicEcapaResidualBirthPairComparison,
+        timing: PublicEcapaResidualBirthPairTiming,
+        deterministic_accuracy_sha256: String,
+        row_sha256: String,
+    }
+
+    #[derive(serde::Serialize)]
+    struct PublicEcapaResidualBirthPairAccuracyFingerprint<'a> {
+        schema_version: &'static str,
+        protocol_sha256: &'a str,
+        recording_id: &'a str,
+        engine: crate::model::DiarizationEngine,
+        evidence_mode: crate::model::DiarizationSpeakerEvidenceMode,
+        common_observation: &'a PublicEcapaCommonObservationBinding,
+        baseline_variant_configuration_sha256: &'a str,
+        candidate_variant_configuration_sha256: &'a str,
+        baseline_common_observation_sha256: &'a str,
+        candidate_common_observation_sha256: &'a str,
+        baseline_normalized_input_sha256: &'a str,
+        candidate_normalized_input_sha256: &'a str,
+        baseline_embedded_tracklet_count: u64,
+        candidate_embedded_tracklet_count: u64,
+        baseline_report_sha256: &'a str,
+        baseline_residual_birth_evidence_sha256: &'a str,
+        candidate_report_sha256: &'a str,
+        candidate_residual_birth_evidence_sha256: &'a str,
+        candidate_proposal_kind: Option<crate::diarization::EcapaResidualBirthProposalKind>,
+        candidate_birth_applied: bool,
+        candidate_fallback_reason: Option<crate::diarization::EcapaResidualBirthFallbackReason>,
+        baseline_score_sha256: &'a str,
+        baseline_reference_sha256: &'a str,
+        baseline_hypothesis_sha256: &'a str,
+        candidate_score_sha256: &'a str,
+        candidate_reference_sha256: &'a str,
+        candidate_hypothesis_sha256: &'a str,
+        candidate_replay_report_sha256: &'a str,
+        candidate_replay_common_observation_sha256: &'a str,
+        candidate_replay_residual_birth_evidence_sha256: &'a str,
+        candidate_replay_score_sha256: &'a str,
+        candidate_replay_full_output_matches: bool,
+        rejected_candidate_output_matches_incumbent: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthAggregateMetrics {
+        pair_count: u64,
+        reference_speaker_time_sec: f64,
+        diarization_error_sec: f64,
+        micro_der: Option<f64>,
+        macro_der: Option<f64>,
+        macro_jer: Option<f64>,
+        total_absolute_speaker_count_error: u64,
+        mean_absolute_speaker_count_error: Option<f64>,
+        exact_speaker_count: u64,
+        exact_speaker_count_rate: Option<f64>,
+        selective_reference_speaker_time_sec: f64,
+        selective_covered_speaker_time_sec: f64,
+        selective_error_covered_speaker_time_sec: f64,
+        selective_risk: Option<f64>,
+        labeled_speaker_time_sec: f64,
+        unknown_speaker_time_sec: f64,
+        unknown_speaker_share: Option<f64>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthAggregateComparison {
+        engine: Option<crate::model::DiarizationEngine>,
+        baseline: PublicEcapaResidualBirthAggregateMetrics,
+        candidate: PublicEcapaResidualBirthAggregateMetrics,
+        micro_der_delta: Option<f64>,
+        macro_der_delta: Option<f64>,
+        macro_jer_delta: Option<f64>,
+        count_mae_delta: Option<f64>,
+        total_absolute_speaker_count_error_delta: i64,
+        exact_speaker_count_gain: i64,
+        selective_risk_delta: Option<f64>,
+        unknown_speaker_share_delta: Option<f64>,
+        passed_non_regression: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthPerformance {
+        audio_duration_sec: f64,
+        common_preparation_wall_sec: f64,
+        baseline_partition_finish_wall_sec: f64,
+        candidate_partition_finish_wall_sec: f64,
+        common_preparation_rtf: Option<f64>,
+        baseline_partition_finish_rtf: Option<f64>,
+        candidate_partition_finish_rtf: Option<f64>,
+        baseline_counterfactual_rtf: Option<f64>,
+        candidate_counterfactual_rtf: Option<f64>,
+        relative_partition_rtf_regression: Option<f64>,
+        paired_process_observed_rss_bytes: u64,
+        rss_observation: String,
+        per_arm_peak_rss_claimed: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaResidualBirthGateRow {
+        schema_version: String,
+        runner_version: String,
+        protocol_sha256: String,
+        descriptor_sha256: String,
+        bundle_sha256: String,
+        scorer_config_sha256: String,
+        ecapa_contract_sha256: String,
+        ecapa_package_sha256: String,
+        residual_policy_sha256: String,
+        gate_policy: PublicEcapaResidualBirthGatePolicy,
+        gate_policy_sha256: String,
+        paired_row_count: u64,
+        distinct_recording_count: u64,
+        single_speaker_control_recording_count: u64,
+        combined: PublicEcapaResidualBirthAggregateComparison,
+        by_engine: Vec<PublicEcapaResidualBirthAggregateComparison>,
+        performance: PublicEcapaResidualBirthPerformance,
+        resource_totals: PublicEcapaResidualBirthResources,
+        failures: Vec<PublicEcapaResidualBirthGateFailure>,
+        passed: bool,
+        deterministic_accuracy_sha256: String,
+        result_sha256: String,
+    }
+
+    fn public_ecapa_gate_result_sha256(row: &PublicEcapaResidualBirthGateRow) -> String {
+        let mut unhashed = row.clone();
+        unhashed.result_sha256.clear();
+        super::canonical_sha256(&unhashed).expect("hash complete paired ECAPA gate row")
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct CompensatedSum {
+        sum: f64,
+        correction: f64,
+        initialized: bool,
+        invalid: bool,
+    }
+
+    impl CompensatedSum {
+        fn add(&mut self, value: f64) {
+            if !value.is_finite() {
+                self.invalid = true;
+                return;
+            }
+            self.initialized = true;
+            let next = self.sum + value;
+            if self.sum.abs() >= value.abs() {
+                self.correction += (self.sum - next) + value;
+            } else {
+                self.correction += (value - next) + self.sum;
+            }
+            self.sum = next;
+        }
+
+        fn finish(self) -> Option<f64> {
+            let total = self.sum + self.correction;
+            (self.initialized && !self.invalid && total.is_finite()).then_some(total)
+        }
+    }
+
+    #[derive(Default)]
+    struct PublicEcapaResidualBirthAggregateAccumulator {
+        pair_count: u64,
+        pair_count_valid: bool,
+        reference_speaker_time_sec: CompensatedSum,
+        diarization_error_sec: CompensatedSum,
+        macro_der_sum: CompensatedSum,
+        macro_der_count: u64,
+        macro_der_count_valid: bool,
+        macro_jer_sum: CompensatedSum,
+        macro_jer_count: u64,
+        macro_jer_count_valid: bool,
+        total_absolute_speaker_count_error: u64,
+        total_absolute_speaker_count_error_valid: bool,
+        exact_speaker_count: u64,
+        exact_speaker_count_valid: bool,
+        selective_reference_speaker_time_sec: CompensatedSum,
+        selective_covered_speaker_time_sec: CompensatedSum,
+        selective_error_covered_speaker_time_sec: CompensatedSum,
+        labeled_speaker_time_sec: CompensatedSum,
+        unknown_speaker_time_sec: CompensatedSum,
+    }
+
+    impl PublicEcapaResidualBirthAggregateAccumulator {
+        fn push(&mut self, score: &PublicEcapaResidualBirthAccuracyRow) {
+            if self.pair_count == 0 {
+                self.pair_count_valid = true;
+                self.macro_der_count_valid = true;
+                self.macro_jer_count_valid = true;
+                self.total_absolute_speaker_count_error_valid = true;
+                self.exact_speaker_count_valid = true;
+            }
+            match self.pair_count.checked_add(1) {
+                Some(pair_count) => self.pair_count = pair_count,
+                None => {
+                    self.pair_count = u64::MAX;
+                    self.pair_count_valid = false;
+                }
+            }
+            self.reference_speaker_time_sec
+                .add(score.reference_speaker_time_sec);
+            self.diarization_error_sec
+                .add(score.missed_speech_sec + score.false_alarm_sec + score.speaker_confusion_sec);
+            match score.der {
+                Some(value) if value.is_finite() => {
+                    self.macro_der_sum.add(value);
+                    match self.macro_der_count.checked_add(1) {
+                        Some(count) => self.macro_der_count = count,
+                        None => {
+                            self.macro_der_count = u64::MAX;
+                            self.macro_der_count_valid = false;
+                        }
+                    }
+                }
+                Some(value) => self.macro_der_sum.add(value),
+                None => {}
+            }
+            match score.jer {
+                Some(value) if value.is_finite() => {
+                    self.macro_jer_sum.add(value);
+                    match self.macro_jer_count.checked_add(1) {
+                        Some(count) => self.macro_jer_count = count,
+                        None => {
+                            self.macro_jer_count = u64::MAX;
+                            self.macro_jer_count_valid = false;
+                        }
+                    }
+                }
+                Some(value) => self.macro_jer_sum.add(value),
+                None => {}
+            }
+            match self
+                .total_absolute_speaker_count_error
+                .checked_add(score.absolute_speaker_count_error)
+            {
+                Some(total_error) => self.total_absolute_speaker_count_error = total_error,
+                None => {
+                    self.total_absolute_speaker_count_error = u64::MAX;
+                    self.total_absolute_speaker_count_error_valid = false;
+                }
+            }
+            match self
+                .exact_speaker_count
+                .checked_add(u64::from(score.exact_speaker_count))
+            {
+                Some(exact_count) => self.exact_speaker_count = exact_count,
+                None => {
+                    self.exact_speaker_count = u64::MAX;
+                    self.exact_speaker_count_valid = false;
+                }
+            }
+            self.selective_reference_speaker_time_sec
+                .add(score.selective_reference_speaker_time_sec);
+            self.selective_covered_speaker_time_sec
+                .add(score.selective_covered_speaker_time_sec);
+            self.selective_error_covered_speaker_time_sec
+                .add(score.selective_error_covered_speaker_time_sec);
+            self.labeled_speaker_time_sec
+                .add(score.labeled_speaker_time_sec);
+            self.unknown_speaker_time_sec
+                .add(score.unknown_speaker_time_sec);
+        }
+
+        fn finish(self) -> PublicEcapaResidualBirthAggregateMetrics {
+            let reference_speaker_time_sec = self.reference_speaker_time_sec.finish();
+            let diarization_error_sec = self.diarization_error_sec.finish();
+            let macro_der_sum = self.macro_der_sum.finish();
+            let macro_jer_sum = self.macro_jer_sum.finish();
+            let selective_reference_speaker_time_sec =
+                self.selective_reference_speaker_time_sec.finish();
+            let selective_covered_speaker_time_sec =
+                self.selective_covered_speaker_time_sec.finish();
+            let selective_error_covered_speaker_time_sec =
+                self.selective_error_covered_speaker_time_sec.finish();
+            let labeled_speaker_time_sec = self.labeled_speaker_time_sec.finish();
+            let unknown_speaker_time_sec = self.unknown_speaker_time_sec.finish();
+            let finite_ratio = |numerator: Option<f64>, denominator: Option<f64>| {
+                numerator
+                    .zip(denominator)
+                    .and_then(|(numerator, denominator)| {
+                        (denominator > 0.0 && numerator.is_finite() && denominator.is_finite())
+                            .then(|| super::canonical_evidence_number(numerator / denominator))
+                    })
+            };
+            PublicEcapaResidualBirthAggregateMetrics {
+                pair_count: self.pair_count,
+                reference_speaker_time_sec: super::canonical_evidence_number(
+                    reference_speaker_time_sec.unwrap_or(0.0),
+                ),
+                diarization_error_sec: super::canonical_evidence_number(
+                    diarization_error_sec.unwrap_or(0.0),
+                ),
+                micro_der: finite_ratio(diarization_error_sec, reference_speaker_time_sec),
+                macro_der: (self.pair_count_valid
+                    && self.macro_der_count_valid
+                    && self.macro_der_count == self.pair_count)
+                    .then(|| finite_ratio(macro_der_sum, Some(self.macro_der_count as f64)))
+                    .flatten(),
+                macro_jer: (self.pair_count_valid
+                    && self.macro_jer_count_valid
+                    && self.macro_jer_count == self.pair_count)
+                    .then(|| finite_ratio(macro_jer_sum, Some(self.macro_jer_count as f64)))
+                    .flatten(),
+                total_absolute_speaker_count_error: self.total_absolute_speaker_count_error,
+                mean_absolute_speaker_count_error: (self.pair_count_valid
+                    && self.total_absolute_speaker_count_error_valid
+                    && self.pair_count > 0)
+                    .then(|| {
+                        super::canonical_evidence_number(
+                            self.total_absolute_speaker_count_error as f64 / self.pair_count as f64,
+                        )
+                    }),
+                exact_speaker_count: self.exact_speaker_count,
+                exact_speaker_count_rate: (self.pair_count_valid
+                    && self.exact_speaker_count_valid
+                    && self.pair_count > 0)
+                    .then(|| {
+                        super::canonical_evidence_number(
+                            self.exact_speaker_count as f64 / self.pair_count as f64,
+                        )
+                    }),
+                selective_reference_speaker_time_sec: super::canonical_evidence_number(
+                    selective_reference_speaker_time_sec.unwrap_or(0.0),
+                ),
+                selective_covered_speaker_time_sec: super::canonical_evidence_number(
+                    selective_covered_speaker_time_sec.unwrap_or(0.0),
+                ),
+                selective_error_covered_speaker_time_sec: super::canonical_evidence_number(
+                    selective_error_covered_speaker_time_sec.unwrap_or(0.0),
+                ),
+                selective_risk: finite_ratio(
+                    selective_error_covered_speaker_time_sec,
+                    selective_covered_speaker_time_sec,
+                ),
+                labeled_speaker_time_sec: super::canonical_evidence_number(
+                    labeled_speaker_time_sec.unwrap_or(0.0),
+                ),
+                unknown_speaker_time_sec: super::canonical_evidence_number(
+                    unknown_speaker_time_sec.unwrap_or(0.0),
+                ),
+                unknown_speaker_share: finite_ratio(
+                    unknown_speaker_time_sec,
+                    labeled_speaker_time_sec
+                        .zip(unknown_speaker_time_sec)
+                        .map(|(labeled, unknown)| labeled + unknown),
+                ),
+            }
+        }
+    }
+
+    fn public_ecapa_residual_birth_aggregate_comparison(
+        engine: Option<crate::model::DiarizationEngine>,
+        baseline: PublicEcapaResidualBirthAggregateMetrics,
+        candidate: PublicEcapaResidualBirthAggregateMetrics,
+        policy: &PublicEcapaResidualBirthGatePolicy,
+    ) -> PublicEcapaResidualBirthAggregateComparison {
+        let delta = |candidate: Option<f64>, baseline: Option<f64>| {
+            candidate
+                .zip(baseline)
+                .map(|(candidate, baseline)| super::canonical_evidence_number(candidate - baseline))
+        };
+        let micro_der_delta = delta(candidate.micro_der, baseline.micro_der);
+        let macro_der_delta = delta(candidate.macro_der, baseline.macro_der);
+        let macro_jer_delta = delta(candidate.macro_jer, baseline.macro_jer);
+        let count_mae_delta = delta(
+            candidate.mean_absolute_speaker_count_error,
+            baseline.mean_absolute_speaker_count_error,
+        );
+        let selective_risk_delta = delta(candidate.selective_risk, baseline.selective_risk);
+        let unknown_speaker_share_delta = delta(
+            candidate.unknown_speaker_share,
+            baseline.unknown_speaker_share,
+        );
+        let total_absolute_speaker_count_error_delta =
+            i64::try_from(candidate.total_absolute_speaker_count_error)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(
+                    i64::try_from(baseline.total_absolute_speaker_count_error).unwrap_or(i64::MAX),
+                );
+        let exact_speaker_count_gain = i64::try_from(candidate.exact_speaker_count)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(baseline.exact_speaker_count).unwrap_or(i64::MAX));
+        let passed_non_regression = baseline.pair_count == candidate.pair_count
+            && baseline.pair_count > 0
+            && micro_der_delta.is_some_and(|value| value <= 0.0)
+            && macro_der_delta.is_some_and(|value| value <= policy.maximum_macro_der_regression)
+            && macro_jer_delta.is_some_and(|value| value <= policy.maximum_macro_jer_regression)
+            && count_mae_delta.is_some_and(|value| value <= 0.0)
+            && total_absolute_speaker_count_error_delta <= 0
+            && exact_speaker_count_gain >= 0
+            && selective_risk_delta
+                .is_some_and(|value| value <= policy.maximum_selective_risk_regression)
+            && unknown_speaker_share_delta
+                .is_some_and(|value| value <= policy.maximum_unknown_share_regression);
+        PublicEcapaResidualBirthAggregateComparison {
+            engine,
+            baseline,
+            candidate,
+            micro_der_delta,
+            macro_der_delta,
+            macro_jer_delta,
+            count_mae_delta,
+            total_absolute_speaker_count_error_delta,
+            exact_speaker_count_gain,
+            selective_risk_delta,
+            unknown_speaker_share_delta,
+            passed_non_regression,
+        }
+    }
+
+    struct FrozenEcapaDev8 {
+        descriptor_path: PathBuf,
+        weight_path: PathBuf,
+        input_root: PathBuf,
+        bundle: super::PublicCorpusBundle,
+        input_recordings: BTreeMap<String, super::PublicCorpusInputRecording>,
+        model: crate::ecapa_inference::EcapaModel,
+        scorer_config: DiarizationScorerConfig,
+        scorer_config_sha256: String,
+    }
+
+    struct LoadedFrozenEcapaRecording<'a> {
+        reference: &'a DiarizationReferenceDocument,
+        source_audio_sha256: String,
+        samples: Vec<f32>,
+        normalized_input_sha256: String,
+        boundary_hints: crate::diarization::AcousticBoundaryHints,
+        audio_path: PathBuf,
+    }
+
+    fn frozen_ecapa_scorer_config() -> DiarizationScorerConfig {
+        DiarizationScorerConfig {
+            schema_version: crate::diarization::DIARIZATION_SCORER_CONFIG_SCHEMA_VERSION.to_owned(),
+            speaker_boundary_collar_ms: 250,
+            change_boundary_collar_ms: 250,
+            overlap_policy: crate::diarization::EvaluationOverlapPolicy::Exclude,
+            calibration_bins: 10,
+            count_top_k: 3,
+            count_credible_mass_millionths: 900_000,
+            dominant_speaker_collapse_share_millionths: 990_000,
+            minimum_reference_speaker_recall_millionths: 100_000,
+            minimum_effective_occupancy_ms: 250,
+        }
+    }
+
+    fn load_frozen_ecapa_dev8() -> FrozenEcapaDev8 {
+        const EXPECTED_DEV8_DESCRIPTOR_SHA256: &str =
+            "f99734dfe2d7441853acaa2beba6c1c3fb37e38c0593db2013d1f6c7661cd53b";
+        const EXPECTED_DEV8_BUNDLE_SHA256: &str =
+            "3ee85a279661b3766aaefc16de78ab0877c21ee97e7e922032bf584ade02ba79";
+        const EXPECTED_SCORER_CONFIG_SHA256: &str =
+            "a86fbe8d0e5fed9aff0a301857fd0d64ce9ffea49008b894818997b0c553781b";
+
+        let descriptor_path = std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_DESCRIPTOR")
+            .map(PathBuf::from)
+            .expect("set FRANKEN_WHISPER_ECAPA_TEST_DESCRIPTOR")
+            .canonicalize()
+            .expect("canonical public descriptor");
+        let weight_path = std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS")
+            .map(PathBuf::from)
+            .expect("set FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS");
+        let project_root = std::env::current_dir()
+            .expect("project root")
+            .canonicalize()
+            .expect("canonical project root");
+        let input_root = descriptor_path
+            .parent()
+            .expect("descriptor parent")
+            .canonicalize()
+            .expect("canonical public input root");
+        let bundle = super::materialize_public_corpus_bundle_for_split_with_cancel(
+            &project_root,
+            &input_root,
+            &descriptor_path,
+            "accept-ami-cc-by-4.0",
+            Some(EvaluationSplit::Development),
+            Some(EXPECTED_DEV8_DESCRIPTOR_SHA256),
+            || false,
+        )
+        .expect("validated public corpus bundle");
+        assert_eq!(bundle.descriptor_sha256, EXPECTED_DEV8_DESCRIPTOR_SHA256);
+        assert_eq!(bundle.bundle_sha256, EXPECTED_DEV8_BUNDLE_SHA256);
+        assert_eq!(bundle.references.len(), 8, "frozen dev8 recording count");
+        assert_eq!(bundle.recordings.len(), bundle.references.len());
+        assert_eq!(bundle.manifest.recordings.len(), bundle.references.len());
+
+        let descriptor_bytes = std::fs::read(&descriptor_path).expect("read public descriptor");
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&descriptor_bytes)),
+            bundle.descriptor_sha256
+        );
+        let descriptor: super::PublicCorpusInput =
+            serde_json::from_slice(&descriptor_bytes).expect("parse validated public descriptor");
+        let input_recordings = descriptor
+            .recordings
+            .into_iter()
+            .map(|recording| (recording.recording_id.clone(), recording))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(input_recordings.len(), bundle.references.len());
+
+        let model = crate::ecapa_inference::EcapaModel::load(&weight_path).expect("load model");
+        assert_eq!(
+            model.info().contract_sha256,
+            crate::ecapa_conformance::ECAPA_CONTRACT_SHA256
+        );
+        assert_eq!(
+            model.info().package_sha256,
+            crate::ecapa_conformance::ECAPA_PACKAGE_SHA256
+        );
+        let scorer_config = frozen_ecapa_scorer_config();
+        let scorer_config_sha256 =
+            super::canonical_sha256(&scorer_config).expect("hash frozen scorer configuration");
+        assert_eq!(scorer_config_sha256, EXPECTED_SCORER_CONFIG_SHA256);
+        FrozenEcapaDev8 {
+            descriptor_path,
+            weight_path,
+            input_root,
+            bundle,
+            input_recordings,
+            model,
+            scorer_config,
+            scorer_config_sha256,
+        }
+    }
+
+    fn load_frozen_ecapa_recording(
+        fixture: &FrozenEcapaDev8,
+        index: usize,
+    ) -> LoadedFrozenEcapaRecording<'_> {
+        let reference = &fixture.bundle.references[index];
+        let evidence = &fixture.bundle.recordings[index];
+        let manifest = &fixture.bundle.manifest.recordings[index];
+        assert_eq!(reference.recording_id, evidence.recording_id);
+        assert_eq!(reference.recording_id, manifest.recording_id);
+        assert_eq!(manifest.split, EvaluationSplit::Development);
+        let input_recording = fixture
+            .input_recordings
+            .get(&reference.recording_id)
+            .expect("validated recording remains in descriptor lookup");
+        let audio_path = super::canonical_relative_file(
+            &fixture.input_root,
+            &input_recording.audio_path,
+            "ecapa_public_audio",
+        )
+        .expect("resolve validated public audio");
+        let audio_bytes = super::read_bounded(
+            &audio_path,
+            super::MAX_EVALUATION_AUDIO_BYTES,
+            "ecapa_public_audio",
+        )
+        .expect("read bounded public WAV");
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&audio_bytes)),
+            evidence.audio_sha256,
+            "audio changed after bundle validation"
+        );
+        let samples = crate::native_engine::decode::read_wav_16k_mono(&audio_bytes)
+            .expect("decode public WAV");
+        let decoded_duration_ms = u64::try_from(samples.len()).expect("sample count fits") / 16;
+        assert!(reference.duration_ms > 0, "public recording is empty");
+        assert!(
+            decoded_duration_ms.abs_diff(reference.duration_ms) <= 1,
+            "decoded and reference durations differ by more than one millisecond"
+        );
+        let normalized_input_sha256 = super::hash_pcm_prefix(&samples);
+        let boundary_hints = crate::diarization::AcousticBoundaryHints {
+            speech_regions_ms: super::merged_scored_speech_regions(
+                &reference.turns,
+                &reference.ignored_regions,
+            ),
+            ..crate::diarization::AcousticBoundaryHints::default()
+        };
+        LoadedFrozenEcapaRecording {
+            reference,
+            source_audio_sha256: evidence.audio_sha256.clone(),
+            samples,
+            normalized_input_sha256,
+            boundary_hints,
+            audio_path,
+        }
+    }
+
+    fn frozen_ecapa_request(
+        engine: crate::model::DiarizationEngine,
+    ) -> (
+        crate::model::DiarizationRequest,
+        crate::model::DiarizationSpeakerEvidenceMode,
+    ) {
+        let evidence_mode = match engine {
+            crate::model::DiarizationEngine::Ecapa => {
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly
+            }
+            crate::model::DiarizationEngine::EcapaFused => {
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+            }
+            _ => panic!("frozen ECAPA request requires an ECAPA engine"),
+        };
+        (
+            crate::model::DiarizationRequest {
+                engine,
+                fallback: crate::model::DiarizationFallbackPolicy::Unknown,
+                speaker_count: crate::model::SpeakerCountRequest::Infer,
+                ..crate::model::DiarizationRequest::default()
+            },
+            evidence_mode,
+        )
+    }
+
+    fn score_path_free_ecapa_report(
+        reference: &DiarizationReferenceDocument,
+        report: &crate::model::DiarizationReport,
+        scorer_config: &DiarizationScorerConfig,
+    ) -> AuthoritativeDiarizationScore {
+        let hypothesis = crate::diarization::DiarizationHypothesisDocument {
+            schema_version: crate::diarization::DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
+            recording_id: reference.recording_id.clone(),
+            duration_ms: reference.duration_ms,
+            turns: report
+                .turns
+                .iter()
+                .map(|turn| crate::diarization::EvaluationTurn {
+                    start_ms: turn.start_ms,
+                    end_ms: turn.end_ms,
+                    speaker: turn.speaker_ref.clone(),
+                    speaker_confidence: turn.speaker_confidence,
+                    overlap_suspected: turn.overlap_suspected,
+                })
+                .collect(),
+            speaker_count_estimate: report.speaker_count.estimate.clone(),
+            performance: None,
+        };
+        let score =
+            crate::diarization::score_diarization_documents(reference, &hypothesis, scorer_config)
+                .expect("authoritative public-corpus score");
+        crate::diarization::verify_authoritative_score_hash(&score)
+            .expect("valid authoritative score hash");
+        assert!(score.performance.is_none());
+        score
+    }
+
+    fn public_ecapa_residual_birth_arm_row(
+        run: &crate::diarization::EcapaResidualBirthEvaluationRun,
+        score: &AuthoritativeDiarizationScore,
+        mode_id: &str,
+        variant_configuration_sha256: &str,
+    ) -> PublicEcapaResidualBirthArmRow {
+        let embedded_tracklet_count = run
+            .report
+            .neural_representation
+            .as_ref()
+            .expect("paired ECAPA arm retains representation provenance")
+            .embedded_tracklet_count;
+        PublicEcapaResidualBirthArmRow {
+            mode_id: mode_id.to_owned(),
+            variant_configuration_sha256: variant_configuration_sha256.to_owned(),
+            common_observation_sha256: run.common_observation_sha256.clone(),
+            normalized_input_sha256: run.report.normalized_input_sha256.clone(),
+            embedded_tracklet_count,
+            report_sha256: super::canonical_sha256(&run.report)
+                .expect("hash path-free ECAPA report"),
+            residual_birth_evidence_sha256: super::canonical_sha256(&run.residual_birth)
+                .expect("hash feature-free residual-birth evidence"),
+            proposal_kind: run.residual_birth.proposal_kind,
+            birth_applied: run.residual_birth.birth_applied,
+            fallback_reason: run.residual_birth.fallback_reason,
+            incumbent_cluster_count: run.residual_birth.incumbent_cluster_count,
+            output_cluster_count: run.residual_birth.output_cluster_count,
+            accuracy: PublicEcapaResidualBirthAccuracyRow::from_score(score),
+            resources: run.residual_birth.resources.into(),
+        }
+    }
+
+    fn run_prepared_public_ecapa_arm(
+        prepared: &crate::diarization::PreparedEcapaDiarizationEvaluation,
+        mode: crate::diarization::EcapaResidualBirthMode,
+    ) -> (crate::diarization::EcapaResidualBirthEvaluationRun, u64) {
+        let started = std::time::Instant::now();
+        let run =
+            crate::diarization::run_prepared_ecapa_diarization_evaluation(prepared, mode, || false)
+                .expect("run prepared ECAPA residual-birth arm");
+        (run, public_ecapa_duration_ns(started.elapsed()))
+    }
+
+    fn public_ecapa_duration_ns(duration: std::time::Duration) -> u64 {
+        u64::try_from(duration.as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    fn public_ecapa_execution_order(
+        recording_id: &str,
+        engine: crate::model::DiarizationEngine,
+    ) -> PublicEcapaResidualBirthExecutionOrder {
+        let digest = super::canonical_sha256(&(recording_id, engine))
+            .expect("hash deterministic paired execution order");
+        if matches!(
+            digest.as_bytes().last(),
+            Some(b'0' | b'2' | b'4' | b'6' | b'8' | b'a' | b'c' | b'e')
+        ) {
+            PublicEcapaResidualBirthExecutionOrder::BaselineThenCandidate
+        } else {
+            PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline
+        }
+    }
+
+    fn public_ecapa_accuracy_delta(candidate: Option<f64>, baseline: Option<f64>) -> Option<f64> {
+        candidate
+            .zip(baseline)
+            .filter(|(candidate, baseline)| candidate.is_finite() && baseline.is_finite())
+            .map(|(candidate, baseline)| super::canonical_evidence_number(candidate - baseline))
+    }
+
+    fn public_ecapa_pair_comparison(
+        baseline: &PublicEcapaResidualBirthArmRow,
+        candidate: &PublicEcapaResidualBirthArmRow,
+        candidate_replay_report_sha256: String,
+        candidate_replay_common_observation_sha256: String,
+        candidate_replay_residual_birth_evidence_sha256: String,
+        candidate_replay_score_sha256: String,
+        candidate_replay_full_output_matches: bool,
+        candidate_replay_matches: bool,
+        rejected_candidate_output_matches_incumbent: bool,
+        pair_alignment_matches: bool,
+        common_observation_matches: bool,
+        incumbent_contract_matches: bool,
+    ) -> PublicEcapaResidualBirthPairComparison {
+        let absolute_speaker_count_error_delta =
+            i64::try_from(candidate.accuracy.absolute_speaker_count_error)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(
+                    i64::try_from(baseline.accuracy.absolute_speaker_count_error)
+                        .unwrap_or(i64::MAX),
+                );
+        PublicEcapaResidualBirthPairComparison {
+            absolute_speaker_count_error_delta,
+            candidate_no_farther_from_reference_count: absolute_speaker_count_error_delta <= 0,
+            pair_alignment_matches,
+            common_observation_matches,
+            incumbent_contract_matches,
+            der_delta: public_ecapa_accuracy_delta(candidate.accuracy.der, baseline.accuracy.der),
+            jer_delta: public_ecapa_accuracy_delta(candidate.accuracy.jer, baseline.accuracy.jer),
+            selective_risk_delta: public_ecapa_accuracy_delta(
+                candidate.accuracy.selective_risk,
+                baseline.accuracy.selective_risk,
+            ),
+            unknown_speaker_share_delta: public_ecapa_accuracy_delta(
+                candidate.accuracy.unknown_speaker_share,
+                baseline.accuracy.unknown_speaker_share,
+            ),
+            candidate_replay_report_sha256,
+            candidate_replay_common_observation_sha256,
+            candidate_replay_residual_birth_evidence_sha256,
+            candidate_replay_score_sha256,
+            candidate_replay_full_output_matches,
+            candidate_replay_matches,
+            rejected_candidate_output_matches_incumbent,
+        }
+    }
+
+    fn public_ecapa_pair_accuracy_sha256(row: &PublicEcapaResidualBirthPairRow) -> String {
+        super::canonical_sha256(&PublicEcapaResidualBirthPairAccuracyFingerprint {
+            schema_version: PUBLIC_ECAPA_RESIDUAL_PAIR_SCHEMA_VERSION,
+            protocol_sha256: &row.protocol_sha256,
+            recording_id: &row.recording_id,
+            engine: row.engine,
+            evidence_mode: row.evidence_mode,
+            common_observation: &row.common_observation,
+            baseline_variant_configuration_sha256: &row.baseline.variant_configuration_sha256,
+            candidate_variant_configuration_sha256: &row.candidate.variant_configuration_sha256,
+            baseline_common_observation_sha256: &row.baseline.common_observation_sha256,
+            candidate_common_observation_sha256: &row.candidate.common_observation_sha256,
+            baseline_normalized_input_sha256: &row.baseline.normalized_input_sha256,
+            candidate_normalized_input_sha256: &row.candidate.normalized_input_sha256,
+            baseline_embedded_tracklet_count: row.baseline.embedded_tracklet_count,
+            candidate_embedded_tracklet_count: row.candidate.embedded_tracklet_count,
+            baseline_report_sha256: &row.baseline.report_sha256,
+            baseline_residual_birth_evidence_sha256: &row.baseline.residual_birth_evidence_sha256,
+            candidate_report_sha256: &row.candidate.report_sha256,
+            candidate_residual_birth_evidence_sha256: &row.candidate.residual_birth_evidence_sha256,
+            candidate_proposal_kind: row.candidate.proposal_kind,
+            candidate_birth_applied: row.candidate.birth_applied,
+            candidate_fallback_reason: row.candidate.fallback_reason,
+            baseline_score_sha256: &row.baseline.accuracy.score_sha256,
+            baseline_reference_sha256: &row.baseline.accuracy.reference_sha256,
+            baseline_hypothesis_sha256: &row.baseline.accuracy.hypothesis_sha256,
+            candidate_score_sha256: &row.candidate.accuracy.score_sha256,
+            candidate_reference_sha256: &row.candidate.accuracy.reference_sha256,
+            candidate_hypothesis_sha256: &row.candidate.accuracy.hypothesis_sha256,
+            candidate_replay_report_sha256: &row.comparison.candidate_replay_report_sha256,
+            candidate_replay_common_observation_sha256: &row
+                .comparison
+                .candidate_replay_common_observation_sha256,
+            candidate_replay_residual_birth_evidence_sha256: &row
+                .comparison
+                .candidate_replay_residual_birth_evidence_sha256,
+            candidate_replay_score_sha256: &row.comparison.candidate_replay_score_sha256,
+            candidate_replay_full_output_matches: row
+                .comparison
+                .candidate_replay_full_output_matches,
+            rejected_candidate_output_matches_incumbent: row
+                .comparison
+                .rejected_candidate_output_matches_incumbent,
+        })
+        .expect("hash paired ECAPA accuracy row")
+    }
+
+    fn public_ecapa_pair_result_sha256(row: &PublicEcapaResidualBirthPairRow) -> String {
+        let mut unhashed = row.clone();
+        unhashed.row_sha256.clear();
+        super::canonical_sha256(&unhashed).expect("hash complete paired ECAPA row")
+    }
+
+    #[derive(serde::Serialize)]
+    struct PublicEcapaResidualBirthProtocolFingerprint<'a> {
+        runner_version: &'static str,
+        descriptor_sha256: &'a str,
+        bundle_sha256: &'a str,
+        scorer_config_sha256: &'a str,
+        ecapa_contract_sha256: &'static str,
+        ecapa_package_sha256: &'static str,
+        residual_policy_sha256: &'a str,
+        gate_policy_sha256: &'a str,
+        request_sha256_by_engine: &'a [(crate::model::DiarizationEngine, String); 2],
+        calibration_sha256_by_engine: &'a [(crate::model::DiarizationEngine, String); 2],
+        engine_order: [crate::model::DiarizationEngine; 2],
+    }
+
+    fn public_ecapa_residual_birth_protocol_sha256(
+        fixture: &FrozenEcapaDev8,
+        residual_policy_sha256: &str,
+        gate_policy_sha256: &str,
+    ) -> String {
+        let request_sha256_by_engine = [
+            (
+                crate::model::DiarizationEngine::Ecapa,
+                super::canonical_sha256(
+                    &frozen_ecapa_request(crate::model::DiarizationEngine::Ecapa).0,
+                )
+                .expect("hash ECAPA request"),
+            ),
+            (
+                crate::model::DiarizationEngine::EcapaFused,
+                super::canonical_sha256(
+                    &frozen_ecapa_request(crate::model::DiarizationEngine::EcapaFused).0,
+                )
+                .expect("hash fused ECAPA request"),
+            ),
+        ];
+        let calibration_sha256_by_engine = [
+            (
+                crate::model::DiarizationEngine::Ecapa,
+                crate::diarization::ecapa_speaker_pair_calibration_sha256(
+                    crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+                ),
+            ),
+            (
+                crate::model::DiarizationEngine::EcapaFused,
+                crate::diarization::ecapa_speaker_pair_calibration_sha256(
+                    crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+                ),
+            ),
+        ];
+        super::canonical_sha256(&PublicEcapaResidualBirthProtocolFingerprint {
+            runner_version: PUBLIC_ECAPA_RESIDUAL_GATE_RUNNER_VERSION,
+            descriptor_sha256: &fixture.bundle.descriptor_sha256,
+            bundle_sha256: &fixture.bundle.bundle_sha256,
+            scorer_config_sha256: &fixture.scorer_config_sha256,
+            ecapa_contract_sha256: crate::ecapa_conformance::ECAPA_CONTRACT_SHA256,
+            ecapa_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256,
+            residual_policy_sha256,
+            gate_policy_sha256,
+            request_sha256_by_engine: &request_sha256_by_engine,
+            calibration_sha256_by_engine: &calibration_sha256_by_engine,
+            engine_order: [
+                crate::model::DiarizationEngine::Ecapa,
+                crate::model::DiarizationEngine::EcapaFused,
+            ],
+        })
+        .expect("hash paired ECAPA protocol")
+    }
+
+    fn public_ecapa_residual_birth_performance(
+        rows: &[PublicEcapaResidualBirthPairRow],
+        paired_process_observed_rss_bytes: u64,
+    ) -> PublicEcapaResidualBirthPerformance {
+        let mut audio_duration_sec = CompensatedSum::default();
+        let mut common_preparation_wall_sec = CompensatedSum::default();
+        let mut baseline_partition_finish_wall_sec = CompensatedSum::default();
+        let mut candidate_partition_finish_wall_sec = CompensatedSum::default();
+        for row in rows {
+            audio_duration_sec.add(row.audio_duration_ms as f64 / 1_000.0);
+            common_preparation_wall_sec
+                .add(row.timing.common_preparation_wall_ns as f64 / 1_000_000_000.0);
+            baseline_partition_finish_wall_sec
+                .add(row.timing.baseline_partition_finish_wall_ns as f64 / 1_000_000_000.0);
+            candidate_partition_finish_wall_sec
+                .add(row.timing.candidate_partition_finish_wall_ns as f64 / 1_000_000_000.0);
+        }
+        let audio_duration_sec = audio_duration_sec.finish().unwrap_or(0.0);
+        let common_preparation_wall_sec = common_preparation_wall_sec.finish().unwrap_or(0.0);
+        let baseline_partition_finish_wall_sec =
+            baseline_partition_finish_wall_sec.finish().unwrap_or(0.0);
+        let candidate_partition_finish_wall_sec =
+            candidate_partition_finish_wall_sec.finish().unwrap_or(0.0);
+        let ratio = |numerator: f64, denominator: f64| {
+            (numerator.is_finite() && denominator.is_finite() && denominator > 0.0)
+                .then(|| super::canonical_evidence_number(numerator / denominator))
+        };
+        let baseline_partition_finish_rtf =
+            ratio(baseline_partition_finish_wall_sec, audio_duration_sec);
+        let candidate_partition_finish_rtf =
+            ratio(candidate_partition_finish_wall_sec, audio_duration_sec);
+        PublicEcapaResidualBirthPerformance {
+            audio_duration_sec: super::canonical_evidence_number(audio_duration_sec),
+            common_preparation_wall_sec: super::canonical_evidence_number(
+                common_preparation_wall_sec,
+            ),
+            baseline_partition_finish_wall_sec: super::canonical_evidence_number(
+                baseline_partition_finish_wall_sec,
+            ),
+            candidate_partition_finish_wall_sec: super::canonical_evidence_number(
+                candidate_partition_finish_wall_sec,
+            ),
+            common_preparation_rtf: ratio(common_preparation_wall_sec, audio_duration_sec),
+            baseline_partition_finish_rtf,
+            candidate_partition_finish_rtf,
+            baseline_counterfactual_rtf: ratio(
+                common_preparation_wall_sec + baseline_partition_finish_wall_sec,
+                audio_duration_sec,
+            ),
+            candidate_counterfactual_rtf: ratio(
+                common_preparation_wall_sec + candidate_partition_finish_wall_sec,
+                audio_duration_sec,
+            ),
+            relative_partition_rtf_regression: candidate_partition_finish_rtf
+                .zip(baseline_partition_finish_rtf)
+                .and_then(|(candidate, baseline)| {
+                    (baseline > 0.0).then(|| {
+                        super::canonical_evidence_number((candidate - baseline) / baseline)
+                    })
+                }),
+            paired_process_observed_rss_bytes,
+            rss_observation: PUBLIC_ECAPA_RESIDUAL_RSS_ID.to_owned(),
+            per_arm_peak_rss_claimed: false,
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct PublicEcapaResidualBirthAccuracySetFingerprint<'a> {
+        schema_version: &'static str,
+        runner_version: &'static str,
+        protocol_sha256: &'a str,
+        gate_policy_sha256: &'a str,
+        pair_accuracy_sha256s: &'a [String],
+        combined: &'a PublicEcapaResidualBirthAggregateComparison,
+        by_engine: &'a [PublicEcapaResidualBirthAggregateComparison],
+    }
+
+    fn public_ecapa_engine_id(engine: crate::model::DiarizationEngine) -> &'static str {
+        match engine {
+            crate::model::DiarizationEngine::Ecapa => "ecapa",
+            crate::model::DiarizationEngine::EcapaFused => "ecapa_fused",
+            _ => "unsupported",
+        }
+    }
+
+    fn public_ecapa_accuracy_is_finite(row: &PublicEcapaResidualBirthAccuracyRow) -> bool {
+        [
+            row.reference_speaker_time_sec,
+            row.missed_speech_sec,
+            row.false_alarm_sec,
+            row.speaker_confusion_sec,
+            row.selective_reference_speaker_time_sec,
+            row.selective_covered_speaker_time_sec,
+            row.selective_error_covered_speaker_time_sec,
+            row.labeled_speaker_time_sec,
+            row.unknown_speaker_time_sec,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+            && [
+                row.der,
+                row.jer,
+                row.selective_risk,
+                row.unknown_speaker_share,
+            ]
+            .into_iter()
+            .flatten()
+            .all(|value| value.is_finite() && value >= 0.0)
+    }
+
+    fn public_ecapa_metric_matches(left: f64, right: f64) -> bool {
+        super::canonical_evidence_number(left) == super::canonical_evidence_number(right)
+    }
+
+    fn public_ecapa_optional_metric_matches(left: Option<f64>, right: Option<f64>) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => public_ecapa_metric_matches(left, right),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+
+    fn public_ecapa_accuracy_is_internally_consistent(
+        row: &PublicEcapaResidualBirthAccuracyRow,
+    ) -> bool {
+        const SCORE_EPSILON_SEC: f64 = 1e-9;
+        let diarization_error_sec =
+            row.missed_speech_sec + row.false_alarm_sec + row.speaker_confusion_sec;
+        let expected_der = (row.reference_speaker_time_sec > SCORE_EPSILON_SEC)
+            .then_some(diarization_error_sec / row.reference_speaker_time_sec);
+        let expected_selective_risk =
+            (row.selective_covered_speaker_time_sec > SCORE_EPSILON_SEC).then_some(
+                row.selective_error_covered_speaker_time_sec
+                    / row.selective_covered_speaker_time_sec,
+            );
+        let occupancy_denominator =
+            row.labeled_speaker_time_sec + row.unknown_speaker_time_sec;
+        let expected_unknown_share = (occupancy_denominator > SCORE_EPSILON_SEC)
+            .then_some(row.unknown_speaker_time_sec / occupancy_denominator);
+        let expected_count_error = row.reference_speakers.abs_diff(row.hypothesis_speakers);
+        row.reference_speakers > 0
+            && row.absolute_speaker_count_error == expected_count_error
+            && row.exact_speaker_count == (expected_count_error == 0)
+            && public_ecapa_optional_metric_matches(row.der, expected_der)
+            && row.jer.is_some_and(|jer| (0.0..=1.0).contains(&jer))
+            && row.selective_covered_speaker_time_sec
+                <= row.selective_reference_speaker_time_sec + SCORE_EPSILON_SEC
+            && row.selective_error_covered_speaker_time_sec
+                <= row.selective_covered_speaker_time_sec + SCORE_EPSILON_SEC
+            && public_ecapa_metric_matches(
+                row.reference_speaker_time_sec,
+                row.selective_reference_speaker_time_sec,
+            )
+            && public_ecapa_optional_metric_matches(row.selective_risk, expected_selective_risk)
+            && row
+                .selective_risk
+                .is_some_and(|risk| (0.0..=1.0).contains(&risk))
+            && public_ecapa_optional_metric_matches(
+                row.unknown_speaker_share,
+                expected_unknown_share,
+            )
+            && row
+                .unknown_speaker_share
+                .is_some_and(|share| (0.0..=1.0).contains(&share))
+            && super::is_sha256_hex(&row.reference_sha256)
+            && super::is_sha256_hex(&row.hypothesis_sha256)
+            && super::is_sha256_hex(&row.scorer_config_sha256)
+            && super::is_sha256_hex(&row.score_sha256)
+    }
+
+    fn public_ecapa_pair_comparison_is_internally_consistent(
+        row: &PublicEcapaResidualBirthPairRow,
+    ) -> bool {
+        let expected_count_delta = i64::try_from(
+            row.candidate.accuracy.absolute_speaker_count_error,
+        )
+        .unwrap_or(i64::MAX)
+        .saturating_sub(
+            i64::try_from(row.baseline.accuracy.absolute_speaker_count_error)
+                .unwrap_or(i64::MAX),
+        );
+        row.comparison.absolute_speaker_count_error_delta == expected_count_delta
+            && row.comparison.candidate_no_farther_from_reference_count
+                == (expected_count_delta <= 0)
+            && public_ecapa_optional_metric_matches(
+                row.comparison.der_delta,
+                public_ecapa_accuracy_delta(
+                    row.candidate.accuracy.der,
+                    row.baseline.accuracy.der,
+                ),
+            )
+            && public_ecapa_optional_metric_matches(
+                row.comparison.jer_delta,
+                public_ecapa_accuracy_delta(
+                    row.candidate.accuracy.jer,
+                    row.baseline.accuracy.jer,
+                ),
+            )
+            && public_ecapa_optional_metric_matches(
+                row.comparison.selective_risk_delta,
+                public_ecapa_accuracy_delta(
+                    row.candidate.accuracy.selective_risk,
+                    row.baseline.accuracy.selective_risk,
+                ),
+            )
+            && public_ecapa_optional_metric_matches(
+                row.comparison.unknown_speaker_share_delta,
+                public_ecapa_accuracy_delta(
+                    row.candidate.accuracy.unknown_speaker_share,
+                    row.baseline.accuracy.unknown_speaker_share,
+                ),
+            )
+    }
+
+    fn public_ecapa_common_binding_is_internally_consistent(
+        row: &PublicEcapaResidualBirthPairRow,
+        expected: &PublicEcapaCommonObservationBinding,
+        expected_source_audio_sha256: &str,
+    ) -> bool {
+        &row.common_observation == expected
+            && row.common_observation.common_observation_schema
+                == PUBLIC_ECAPA_COMMON_OBSERVATION_BINDING_SCHEMA_VERSION
+            && row.common_observation.source_audio_sha256 == expected_source_audio_sha256
+            && row.common_observation.feature_schema_version
+                == crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION
+            && row.common_observation.ecapa_contract_sha256
+                == crate::ecapa_conformance::ECAPA_CONTRACT_SHA256
+            && row.common_observation.ecapa_package_sha256
+                == crate::ecapa_conformance::ECAPA_PACKAGE_SHA256
+            && row.common_observation.representation_provider_version
+                == crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION
+            && super::is_sha256_hex(&row.common_observation.common_observation_sha256)
+            && super::is_sha256_hex(&row.common_observation.source_audio_sha256)
+            && super::is_sha256_hex(&row.common_observation.normalized_input_sha256)
+            && row.common_observation.normalized_input_sha256
+                == row.baseline.normalized_input_sha256
+            && row.baseline.normalized_input_sha256
+                == row.candidate.normalized_input_sha256
+            && row.common_observation.embedded_tracklet_count > 0
+            && row.common_observation.embedded_tracklet_count
+                == row.baseline.embedded_tracklet_count
+            && row.baseline.embedded_tracklet_count == row.candidate.embedded_tracklet_count
+            && super::is_sha256_hex(&row.baseline.report_sha256)
+            && super::is_sha256_hex(&row.baseline.residual_birth_evidence_sha256)
+            && super::is_sha256_hex(&row.candidate.report_sha256)
+            && super::is_sha256_hex(&row.candidate.residual_birth_evidence_sha256)
+    }
+
+    fn public_ecapa_required_accuracy_is_defined(
+        row: &PublicEcapaResidualBirthAccuracyRow,
+    ) -> bool {
+        row.der.is_some()
+            && row.jer.is_some()
+            && row.selective_risk.is_some()
+            && row.unknown_speaker_share.is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn public_ecapa_residual_birth_gate_row(
+        fixture: &FrozenEcapaDev8,
+        rows: &[PublicEcapaResidualBirthPairRow],
+        expected_common_observations: &[PublicEcapaCommonObservationBinding],
+        residual_policy_sha256: &str,
+        protocol_sha256: &str,
+        gate_policy: PublicEcapaResidualBirthGatePolicy,
+        gate_policy_sha256: String,
+        paired_process_observed_rss_bytes: u64,
+    ) -> PublicEcapaResidualBirthGateRow {
+        let mut failures = Vec::new();
+        let frozen_gate_policy = public_ecapa_residual_birth_gate_policy();
+        let observed_gate_policy_sha256 = super::canonical_sha256(&gate_policy).ok();
+        let frozen_gate_policy_sha256 = super::canonical_sha256(&frozen_gate_policy).ok();
+        if gate_policy != frozen_gate_policy
+            || observed_gate_policy_sha256.as_deref() != Some(gate_policy_sha256.as_str())
+            || observed_gate_policy_sha256 != frozen_gate_policy_sha256
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::PolicyHashMismatch);
+        }
+        if public_ecapa_residual_birth_protocol_sha256(
+            fixture,
+            residual_policy_sha256,
+            &gate_policy_sha256,
+        ) != protocol_sha256
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::ProtocolMismatch);
+        }
+        let paired_row_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        if paired_row_count != gate_policy.required_pair_count {
+            failures.push(PublicEcapaResidualBirthGateFailure::PairCountMismatch);
+        }
+        if expected_common_observations.len() != gate_policy.required_pair_count as usize {
+            failures.push(PublicEcapaResidualBirthGateFailure::PairCountMismatch);
+        }
+
+        let mut distinct_recordings = BTreeSet::new();
+        let mut distinct_pairs = BTreeSet::new();
+        let mut single_speaker_controls = BTreeSet::new();
+        let mut combined_baseline = PublicEcapaResidualBirthAggregateAccumulator::default();
+        let mut combined_candidate = PublicEcapaResidualBirthAggregateAccumulator::default();
+        let mut resource_totals = PublicEcapaResidualBirthResources::default();
+        let expected_baseline_variant_sha256 =
+            super::canonical_sha256(&crate::diarization::ECAPA_RESIDUAL_BIRTH_BASELINE_VERSION)
+                .expect("hash frozen ECAPA incumbent identity");
+        for (pair_index, row) in rows.iter().enumerate() {
+            if row.protocol_sha256 != protocol_sha256
+                || row.schema_version != PUBLIC_ECAPA_RESIDUAL_PAIR_SCHEMA_VERSION
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::ProtocolMismatch);
+            }
+            if row.deterministic_accuracy_sha256 != public_ecapa_pair_accuracy_sha256(row)
+                || row.row_sha256 != public_ecapa_pair_result_sha256(row)
+                || !public_ecapa_accuracy_is_internally_consistent(&row.baseline.accuracy)
+                || !public_ecapa_accuracy_is_internally_consistent(&row.candidate.accuracy)
+                || !public_ecapa_pair_comparison_is_internally_consistent(row)
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::PairIntegrityMismatch);
+            }
+            let expected_pair = fixture
+                .bundle
+                .references
+                .get(pair_index / gate_policy.required_engines.len())
+                .zip(
+                    fixture
+                        .bundle
+                        .recordings
+                        .get(pair_index / gate_policy.required_engines.len()),
+                )
+                .zip(
+                    gate_policy
+                        .required_engines
+                        .get(pair_index % gate_policy.required_engines.len()),
+                )
+                .zip(expected_common_observations.get(pair_index));
+            if let Some((((expected_reference, expected_recording), expected_engine), expected_common)) =
+                expected_pair
+            {
+                let expected_reference_sha256 = super::canonical_sha256(expected_reference)
+                    .expect("hash validated frozen ECAPA reference");
+                if row.recording_id != expected_reference.recording_id
+                    || row.audio_duration_ms != expected_reference.duration_ms
+                    || row.engine != *expected_engine
+                    || row.corpus_key != fixture.bundle.corpus_key
+                    || row.source_version != fixture.bundle.source_version
+                    || row.baseline.accuracy.reference_sha256 != expected_reference_sha256
+                    || row.candidate.accuracy.reference_sha256 != expected_reference_sha256
+                    || row.baseline.accuracy.scorer_config_sha256 != fixture.scorer_config_sha256
+                    || row.candidate.accuracy.scorer_config_sha256 != fixture.scorer_config_sha256
+                    || !public_ecapa_common_binding_is_internally_consistent(
+                        row,
+                        expected_common,
+                        &expected_recording.audio_sha256,
+                    )
+                {
+                    failures.push(PublicEcapaResidualBirthGateFailure::PairAlignmentMismatch);
+                }
+            } else {
+                failures.push(PublicEcapaResidualBirthGateFailure::PairAlignmentMismatch);
+            }
+            distinct_recordings.insert(row.recording_id.clone());
+            if !distinct_pairs
+                .insert((row.recording_id.clone(), public_ecapa_engine_id(row.engine)))
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::PairAlignmentMismatch);
+            }
+            if row.evaluation_split != EvaluationSplit::Development
+                || !gate_policy.required_engines.contains(&row.engine)
+                || row.baseline.accuracy.reference_speakers
+                    != row.candidate.accuracy.reference_speakers
+                || row.baseline.accuracy.reference_speaker_time_sec
+                    != row.candidate.accuracy.reference_speaker_time_sec
+                || !row.comparison.pair_alignment_matches
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::PairAlignmentMismatch);
+            }
+            let common_observation_matches = row.common_observation.common_observation_sha256
+                == row.baseline.common_observation_sha256
+                && row.baseline.common_observation_sha256
+                    == row.candidate.common_observation_sha256
+                && row.candidate.common_observation_sha256
+                    == row.comparison.candidate_replay_common_observation_sha256;
+            if !row.comparison.common_observation_matches || !common_observation_matches {
+                failures.push(PublicEcapaResidualBirthGateFailure::CommonObservationMismatch);
+            }
+            if !row.comparison.incumbent_contract_matches {
+                failures.push(PublicEcapaResidualBirthGateFailure::IncumbentContractMismatch);
+            }
+            let baseline_contract_matches = row.baseline.mode_id == "disabled_incumbent"
+                && row.baseline.variant_configuration_sha256 == expected_baseline_variant_sha256
+                && !row.baseline.birth_applied
+                && row.baseline.proposal_kind.is_none()
+                && row.baseline.fallback_reason
+                    == Some(
+                        crate::diarization::EcapaResidualBirthFallbackReason::DisabledIncumbent,
+                    )
+                && row.baseline.incumbent_cluster_count == row.baseline.output_cluster_count
+                && row.baseline.resources == PublicEcapaResidualBirthResources::default();
+            let candidate_contract_matches = row.candidate.mode_id == "development_candidate_v1"
+                && row.candidate.variant_configuration_sha256 == residual_policy_sha256
+                && row.candidate.resources.committed_birth_count
+                    == u64::from(row.candidate.birth_applied)
+                && if row.candidate.birth_applied {
+                    row.candidate.proposal_kind.is_some()
+                        && row.candidate.fallback_reason.is_none()
+                        && row.candidate.output_cluster_count
+                            == row.candidate.incumbent_cluster_count.saturating_add(1)
+                } else {
+                    row.candidate.fallback_reason.is_some()
+                        && row.candidate.output_cluster_count
+                            == row.candidate.incumbent_cluster_count
+                };
+            if !baseline_contract_matches || !candidate_contract_matches {
+                failures.push(PublicEcapaResidualBirthGateFailure::IncumbentContractMismatch);
+            }
+            let evidence_mode_matches_engine = match row.engine {
+                crate::model::DiarizationEngine::Ecapa => {
+                    row.evidence_mode
+                        == crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly
+                }
+                crate::model::DiarizationEngine::EcapaFused => {
+                    row.evidence_mode
+                        == crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+                }
+                _ => false,
+            };
+            let fused_candidate_is_exactly_ineligible =
+                row.engine != crate::model::DiarizationEngine::EcapaFused
+                    || (!row.candidate.birth_applied
+                        && row.candidate.proposal_kind.is_none()
+                        && row.candidate.fallback_reason
+                            == Some(
+                                crate::diarization::EcapaResidualBirthFallbackReason::EvidenceModeNotEcapaOnly,
+                            )
+                        && row.candidate.resources
+                            == PublicEcapaResidualBirthResources::default()
+                        && row.candidate.incumbent_cluster_count
+                            == row.baseline.incumbent_cluster_count
+                        && row.candidate.output_cluster_count
+                            == row.baseline.output_cluster_count
+                        && row.candidate.report_sha256 == row.baseline.report_sha256
+                        && row.candidate.accuracy.score_sha256
+                            == row.baseline.accuracy.score_sha256
+                        && row
+                            .comparison
+                            .rejected_candidate_output_matches_incumbent);
+            let ecapa_candidate_is_eligible = row.engine != crate::model::DiarizationEngine::Ecapa
+                || row.candidate.fallback_reason
+                    != Some(
+                        crate::diarization::EcapaResidualBirthFallbackReason::EvidenceModeNotEcapaOnly,
+                    );
+            if !evidence_mode_matches_engine
+                || !fused_candidate_is_exactly_ineligible
+                || !ecapa_candidate_is_eligible
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::CandidateEligibilityMismatch);
+            }
+            let candidate_replay_matches = row.comparison.candidate_replay_report_sha256
+                == row.candidate.report_sha256
+                && row.comparison.candidate_replay_common_observation_sha256
+                    == row.candidate.common_observation_sha256
+                && row.comparison.candidate_replay_full_output_matches
+                && row
+                    .comparison
+                    .candidate_replay_residual_birth_evidence_sha256
+                    == row.candidate.residual_birth_evidence_sha256
+                && row.comparison.candidate_replay_score_sha256
+                    == row.candidate.accuracy.score_sha256;
+            if gate_policy.require_candidate_replay_hash_match
+                && (!row.comparison.candidate_replay_matches || !candidate_replay_matches)
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::CandidateReplayMismatch);
+            }
+            let rejected_candidate_output_matches_incumbent = row.candidate.birth_applied
+                || (row.comparison.rejected_candidate_output_matches_incumbent
+                    && row.candidate.report_sha256 == row.baseline.report_sha256
+                    && row.candidate.accuracy.score_sha256 == row.baseline.accuracy.score_sha256);
+            if !row.candidate.birth_applied
+                && (!row.comparison.rejected_candidate_output_matches_incumbent
+                    || !rejected_candidate_output_matches_incumbent)
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::RejectedCandidateOutputMismatch);
+            }
+            if !public_ecapa_required_accuracy_is_defined(&row.baseline.accuracy)
+                || !public_ecapa_required_accuracy_is_defined(&row.candidate.accuracy)
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::MissingAccuracyMetric);
+            }
+            if !public_ecapa_accuracy_is_finite(&row.baseline.accuracy)
+                || !public_ecapa_accuracy_is_finite(&row.candidate.accuracy)
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::NonFiniteMetric);
+            }
+            if gate_policy.require_no_record_farther_from_reference_count
+                && !row.comparison.candidate_no_farther_from_reference_count
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::PerRecordingCountRegression);
+            }
+            if row.baseline.accuracy.reference_speakers == 1 {
+                single_speaker_controls.insert(row.recording_id.clone());
+                if row.candidate.accuracy.absolute_speaker_count_error != 0 {
+                    failures.push(PublicEcapaResidualBirthGateFailure::SingleSpeakerControlFailure);
+                }
+            }
+            let resources = &row.candidate.resources;
+            let pair_bound = resources
+                .parent_count_scanned
+                .saturating_mul(gate_policy.maximum_pair_proposals_per_parent);
+            let lloyd_visit_bound = resources
+                .candidate_split_count
+                .saturating_mul(gate_policy.lloyd_iterations)
+                .saturating_mul(row.common_observation.embedded_tracklet_count);
+            let minimum_accounted_operations = resources
+                .parent_count_scanned
+                .saturating_add(resources.residual_observation_count)
+                .saturating_add(resources.leave_pair_out_pair_count)
+                .saturating_add(resources.lloyd_assignment_visits)
+                .saturating_add(resources.robust_view_comparison_count);
+            let minimum_cancellation_checks = (resources.operation_count > 0)
+                .then(|| {
+                    1_u64.saturating_add(
+                        resources.operation_count
+                            / gate_policy.cancellation_check_interval_operations.max(1),
+                    )
+                })
+                .unwrap_or(0);
+            if resources.parent_count_scanned > row.candidate.incumbent_cluster_count
+                || resources.residual_observation_count
+                    > row.common_observation.embedded_tracklet_count
+                || resources.residual_observation_count
+                    < resources.maximum_retained_residual_observations
+                || resources.leave_pair_out_pair_count > pair_bound
+                || resources.candidate_split_count > gate_policy.maximum_candidate_splits
+                || resources.committed_birth_count > gate_policy.maximum_candidate_splits
+                || resources.committed_birth_count > resources.candidate_split_count
+                || resources.lloyd_assignment_visits > lloyd_visit_bound
+                || resources.maximum_retained_residual_observations
+                    > gate_policy.maximum_retained_residual_observations
+                || resources.operation_count < minimum_accounted_operations
+                || resources.cancellation_check_count < minimum_cancellation_checks
+                || resources.peak_scratch_payload_bytes
+                    > gate_policy.maximum_residual_scratch_payload_bytes
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::ResourceBoundExceeded);
+            }
+            resource_totals.saturating_add_assign(resources);
+            combined_baseline.push(&row.baseline.accuracy);
+            combined_candidate.push(&row.candidate.accuracy);
+        }
+        let distinct_recording_count = u64::try_from(distinct_recordings.len()).unwrap_or(u64::MAX);
+        if distinct_recording_count != gate_policy.required_recording_count {
+            failures.push(PublicEcapaResidualBirthGateFailure::PairCountMismatch);
+        }
+        let single_speaker_control_recording_count =
+            u64::try_from(single_speaker_controls.len()).unwrap_or(u64::MAX);
+        if single_speaker_control_recording_count
+            < gate_policy.required_single_speaker_control_recording_count
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::MissingSingleSpeakerControls);
+        }
+
+        let combined = public_ecapa_residual_birth_aggregate_comparison(
+            None,
+            combined_baseline.finish(),
+            combined_candidate.finish(),
+            &gate_policy,
+        );
+        if !combined
+            .count_mae_delta
+            .is_some_and(|delta| !gate_policy.require_strict_count_mae_improvement || delta < 0.0)
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::CountMaeNotImproved);
+        }
+        if gate_policy.require_strict_total_absolute_count_error_improvement
+            && combined.total_absolute_speaker_count_error_delta >= 0
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::TotalCountErrorNotImproved);
+        }
+        if combined.exact_speaker_count_gain
+            < i64::try_from(gate_policy.minimum_exact_match_gain).unwrap_or(i64::MAX)
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::ExactMatchGainInsufficient);
+        }
+        if !combined
+            .micro_der_delta
+            .is_some_and(|delta| !gate_policy.require_strict_micro_der_improvement || delta < 0.0)
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::MicroDerNotImproved);
+        }
+        if !combined
+            .macro_der_delta
+            .is_some_and(|delta| delta <= gate_policy.maximum_macro_der_regression)
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::MacroDerRegression);
+        }
+        if !combined
+            .macro_jer_delta
+            .is_some_and(|delta| delta <= gate_policy.maximum_macro_jer_regression)
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::MacroJerRegression);
+        }
+        if !combined
+            .selective_risk_delta
+            .is_some_and(|delta| delta <= gate_policy.maximum_selective_risk_regression)
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::SelectiveRiskRegression);
+        }
+        if !combined
+            .unknown_speaker_share_delta
+            .is_some_and(|delta| delta <= gate_policy.maximum_unknown_share_regression)
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::UnknownShareRegression);
+        }
+
+        let by_engine = gate_policy
+            .required_engines
+            .into_iter()
+            .map(|engine| {
+                let mut baseline = PublicEcapaResidualBirthAggregateAccumulator::default();
+                let mut candidate = PublicEcapaResidualBirthAggregateAccumulator::default();
+                for row in rows.iter().filter(|row| row.engine == engine) {
+                    baseline.push(&row.baseline.accuracy);
+                    candidate.push(&row.candidate.accuracy);
+                }
+                public_ecapa_residual_birth_aggregate_comparison(
+                    Some(engine),
+                    baseline.finish(),
+                    candidate.finish(),
+                    &gate_policy,
+                )
+            })
+            .collect::<Vec<_>>();
+        for comparison in &by_engine {
+            if comparison.baseline.pair_count != gate_policy.required_recording_count
+                || comparison.candidate.pair_count != gate_policy.required_recording_count
+            {
+                failures.push(PublicEcapaResidualBirthGateFailure::PairCountMismatch);
+            }
+            if !comparison.passed_non_regression {
+                if !comparison.micro_der_delta.is_some_and(|delta| delta <= 0.0) {
+                    failures.push(PublicEcapaResidualBirthGateFailure::MicroDerNotImproved);
+                }
+                if !comparison
+                    .macro_der_delta
+                    .is_some_and(|delta| delta <= gate_policy.maximum_macro_der_regression)
+                {
+                    failures.push(PublicEcapaResidualBirthGateFailure::MacroDerRegression);
+                }
+                if !comparison
+                    .macro_jer_delta
+                    .is_some_and(|delta| delta <= gate_policy.maximum_macro_jer_regression)
+                {
+                    failures.push(PublicEcapaResidualBirthGateFailure::MacroJerRegression);
+                }
+                if !comparison
+                    .selective_risk_delta
+                    .is_some_and(|delta| delta <= gate_policy.maximum_selective_risk_regression)
+                {
+                    failures.push(PublicEcapaResidualBirthGateFailure::SelectiveRiskRegression);
+                }
+                if !comparison
+                    .unknown_speaker_share_delta
+                    .is_some_and(|delta| delta <= gate_policy.maximum_unknown_share_regression)
+                {
+                    failures.push(PublicEcapaResidualBirthGateFailure::UnknownShareRegression);
+                }
+                if !comparison.count_mae_delta.is_some_and(|delta| delta <= 0.0) {
+                    failures.push(PublicEcapaResidualBirthGateFailure::CountMaeNotImproved);
+                }
+                if comparison.total_absolute_speaker_count_error_delta > 0
+                    || comparison.exact_speaker_count_gain < 0
+                {
+                    failures.push(PublicEcapaResidualBirthGateFailure::PerRecordingCountRegression);
+                }
+            }
+        }
+
+        let performance =
+            public_ecapa_residual_birth_performance(rows, paired_process_observed_rss_bytes);
+        if performance.common_preparation_rtf.is_none()
+            || performance.baseline_partition_finish_rtf.is_none()
+            || performance.candidate_partition_finish_rtf.is_none()
+            || performance.baseline_counterfactual_rtf.is_none()
+            || performance.candidate_counterfactual_rtf.is_none()
+            || performance.relative_partition_rtf_regression.is_none()
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::RuntimeUnavailable);
+        }
+        if !performance
+            .relative_partition_rtf_regression
+            .is_some_and(|regression| {
+                regression <= gate_policy.maximum_relative_partition_rtf_regression
+            })
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::PartitionRtfRegression);
+        }
+        if !performance
+            .candidate_counterfactual_rtf
+            .is_some_and(|rtf| rtf <= gate_policy.maximum_candidate_counterfactual_rtf)
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::CounterfactualRtfExceeded);
+        }
+        if performance.paired_process_observed_rss_bytes == 0 {
+            failures.push(PublicEcapaResidualBirthGateFailure::RssUnavailable);
+        } else if performance.paired_process_observed_rss_bytes
+            > gate_policy.maximum_paired_process_rss_bytes
+        {
+            failures.push(PublicEcapaResidualBirthGateFailure::ProcessRssExceeded);
+        }
+
+        failures.sort();
+        failures.dedup();
+        let pair_accuracy_sha256s = rows
+            .iter()
+            .map(|row| row.deterministic_accuracy_sha256.clone())
+            .collect::<Vec<_>>();
+        let deterministic_accuracy_sha256 =
+            super::canonical_sha256(&PublicEcapaResidualBirthAccuracySetFingerprint {
+                schema_version: PUBLIC_ECAPA_RESIDUAL_GATE_SCHEMA_VERSION,
+                runner_version: PUBLIC_ECAPA_RESIDUAL_GATE_RUNNER_VERSION,
+                protocol_sha256,
+                gate_policy_sha256: &gate_policy_sha256,
+                pair_accuracy_sha256s: &pair_accuracy_sha256s,
+                combined: &combined,
+                by_engine: &by_engine,
+            })
+            .expect("hash paired ECAPA accuracy set");
+        let mut row = PublicEcapaResidualBirthGateRow {
+            schema_version: PUBLIC_ECAPA_RESIDUAL_GATE_SCHEMA_VERSION.to_owned(),
+            runner_version: PUBLIC_ECAPA_RESIDUAL_GATE_RUNNER_VERSION.to_owned(),
+            protocol_sha256: protocol_sha256.to_owned(),
+            descriptor_sha256: fixture.bundle.descriptor_sha256.clone(),
+            bundle_sha256: fixture.bundle.bundle_sha256.clone(),
+            scorer_config_sha256: fixture.scorer_config_sha256.clone(),
+            ecapa_contract_sha256: crate::ecapa_conformance::ECAPA_CONTRACT_SHA256.to_owned(),
+            ecapa_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
+            residual_policy_sha256: residual_policy_sha256.to_owned(),
+            gate_policy,
+            gate_policy_sha256,
+            paired_row_count,
+            distinct_recording_count,
+            single_speaker_control_recording_count,
+            combined,
+            by_engine,
+            performance,
+            resource_totals,
+            passed: failures.is_empty(),
+            failures,
+            deterministic_accuracy_sha256,
+            result_sha256: String::new(),
+        };
+        row.result_sha256 = public_ecapa_gate_result_sha256(&row);
+        row
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paired_gate_accuracy_fixture(
+        reference_speaker_time_sec: f64,
+        diarization_error_sec: f64,
+        der: Option<f64>,
+        jer: Option<f64>,
+        absolute_speaker_count_error: u64,
+        selective_reference_speaker_time_sec: f64,
+        selective_covered_speaker_time_sec: f64,
+        selective_error_covered_speaker_time_sec: f64,
+        labeled_speaker_time_sec: f64,
+        unknown_speaker_time_sec: f64,
+    ) -> PublicEcapaResidualBirthAccuracyRow {
+        PublicEcapaResidualBirthAccuracyRow {
+            reference_speaker_time_sec,
+            missed_speech_sec: diarization_error_sec,
+            false_alarm_sec: 0.0,
+            speaker_confusion_sec: 0.0,
+            der,
+            jer,
+            reference_speakers: 2,
+            hypothesis_speakers: 2_u64.saturating_add(absolute_speaker_count_error),
+            absolute_speaker_count_error,
+            exact_speaker_count: absolute_speaker_count_error == 0,
+            selective_reference_speaker_time_sec,
+            selective_covered_speaker_time_sec,
+            selective_error_covered_speaker_time_sec,
+            selective_risk: (selective_covered_speaker_time_sec > 0.0).then_some(
+                selective_error_covered_speaker_time_sec / selective_covered_speaker_time_sec,
+            ),
+            labeled_speaker_time_sec,
+            unknown_speaker_time_sec,
+            unknown_speaker_share: (labeled_speaker_time_sec + unknown_speaker_time_sec > 0.0)
+                .then_some(
+                    unknown_speaker_time_sec
+                        / (labeled_speaker_time_sec + unknown_speaker_time_sec),
+                ),
+            reference_sha256: "1".repeat(64),
+            hypothesis_sha256: "2".repeat(64),
+            scorer_config_sha256: "3".repeat(64),
+            score_sha256: "0".repeat(64),
+        }
+    }
+
+    #[test]
+    fn paired_gate_aggregate_uses_global_denominators_and_complete_macros() {
+        let first = paired_gate_accuracy_fixture(
+            10.0,
+            1.0,
+            Some(0.1),
+            Some(0.2),
+            1,
+            10.0,
+            10.0,
+            1.0,
+            9.0,
+            1.0,
+        );
+        let second = paired_gate_accuracy_fixture(
+            90.0,
+            18.0,
+            Some(0.2),
+            Some(0.4),
+            0,
+            90.0,
+            90.0,
+            9.0,
+            80.0,
+            20.0,
+        );
+        let mut aggregate = PublicEcapaResidualBirthAggregateAccumulator::default();
+        aggregate.push(&first);
+        aggregate.push(&second);
+        let aggregate = aggregate.finish();
+        assert_eq!(aggregate.pair_count, 2);
+        assert_eq!(aggregate.micro_der, Some(0.19));
+        assert_eq!(aggregate.macro_der, Some(0.15));
+        assert_eq!(aggregate.macro_jer, Some(0.3));
+        assert_eq!(aggregate.mean_absolute_speaker_count_error, Some(0.5));
+        assert_eq!(aggregate.exact_speaker_count_rate, Some(0.5));
+        assert_eq!(aggregate.selective_risk, Some(0.1));
+        assert_eq!(
+            aggregate.unknown_speaker_share,
+            Some(super::canonical_evidence_number(21.0 / 110.0))
+        );
+    }
+
+    #[test]
+    fn paired_gate_aggregate_retains_micro_metric_but_fails_closed_missing_macro() {
+        let missing_macro =
+            paired_gate_accuracy_fixture(10.0, 1.0, None, Some(0.2), 0, 10.0, 10.0, 1.0, 9.0, 1.0);
+        let mut aggregate = PublicEcapaResidualBirthAggregateAccumulator::default();
+        aggregate.push(&missing_macro);
+        let aggregate = aggregate.finish();
+        assert_eq!(aggregate.micro_der, Some(0.1));
+        assert_eq!(aggregate.macro_der, None);
+        assert_eq!(aggregate.macro_jer, Some(0.2));
+    }
+
+    #[test]
+    fn paired_gate_aggregate_invalidity_is_metric_local() {
+        let mut invalid_macro = paired_gate_accuracy_fixture(
+            10.0,
+            1.0,
+            Some(f64::INFINITY),
+            Some(0.2),
+            0,
+            10.0,
+            10.0,
+            1.0,
+            9.0,
+            1.0,
+        );
+        invalid_macro.score_sha256 = "1".repeat(64);
+        let mut aggregate = PublicEcapaResidualBirthAggregateAccumulator::default();
+        aggregate.push(&invalid_macro);
+        let aggregate = aggregate.finish();
+        assert_eq!(aggregate.micro_der, Some(0.1));
+        assert_eq!(aggregate.macro_der, None);
+        assert_eq!(aggregate.macro_jer, Some(0.2));
+        assert_eq!(aggregate.mean_absolute_speaker_count_error, Some(0.0));
+        assert_eq!(aggregate.selective_risk, Some(0.1));
+        assert_eq!(aggregate.unknown_speaker_share, Some(0.1));
+    }
+
+    #[test]
+    fn paired_gate_accuracy_row_rejects_rehashed_internal_inconsistency() {
+        let consistent = paired_gate_accuracy_fixture(
+            10.0,
+            1.0,
+            Some(0.1),
+            Some(0.2),
+            0,
+            10.0,
+            10.0,
+            1.0,
+            9.0,
+            1.0,
+        );
+        assert!(public_ecapa_accuracy_is_internally_consistent(
+            &consistent
+        ));
+
+        let mut inconsistent_exact = consistent.clone();
+        inconsistent_exact.exact_speaker_count = false;
+        assert!(!public_ecapa_accuracy_is_internally_consistent(
+            &inconsistent_exact
+        ));
+
+        let mut inconsistent_der = consistent;
+        inconsistent_der.der = Some(0.2);
+        assert!(!public_ecapa_accuracy_is_internally_consistent(
+            &inconsistent_der
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires the frozen public AMI dev8 corpus and converted ECAPA weights"]
+    fn external_ecapa_residual_birth_same_invocation_development_gate() {
+        let fixture = load_frozen_ecapa_dev8();
+        let gate_policy = public_ecapa_residual_birth_gate_policy();
+        let gate_policy_sha256 =
+            super::canonical_sha256(&gate_policy).expect("hash residual-birth gate policy");
+        let residual_policy_sha256 = crate::diarization::ecapa_residual_birth_policy_sha256();
+        let protocol_sha256 = public_ecapa_residual_birth_protocol_sha256(
+            &fixture,
+            &residual_policy_sha256,
+            &gate_policy_sha256,
+        );
+        let baseline_variant_configuration_sha256 =
+            super::canonical_sha256(&crate::diarization::ECAPA_RESIDUAL_BIRTH_BASELINE_VERSION)
+                .expect("hash incumbent ECAPA variant");
+        let engines = [
+            crate::model::DiarizationEngine::Ecapa,
+            crate::model::DiarizationEngine::EcapaFused,
+        ];
+        let mut rows = Vec::with_capacity(PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS as usize);
+        let mut expected_common_observations =
+            Vec::with_capacity(PUBLIC_ECAPA_RESIDUAL_REQUIRED_PAIR_ROWS as usize);
+
+        for recording_index in 0..fixture.bundle.references.len() {
+            let recording = load_frozen_ecapa_recording(&fixture, recording_index);
+            for engine in engines {
+                let (request, evidence_mode) = frozen_ecapa_request(engine);
+                let preparation_started = std::time::Instant::now();
+                let prepared = crate::diarization::prepare_ecapa_diarization_evaluation(
+                    crate::diarization::AcousticDiarizationInput {
+                        samples: &recording.samples,
+                        normalized_input_sha256: &recording.normalized_input_sha256,
+                        segments: &[],
+                        word_aligned: false,
+                        request: &request,
+                        boundary_hints: &recording.boundary_hints,
+                    },
+                    &fixture.model,
+                    &|| Ok(()),
+                )
+                .expect("prepare one common ECAPA observation set");
+                let common_preparation_wall_ns =
+                    public_ecapa_duration_ns(preparation_started.elapsed());
+                let execution_order =
+                    public_ecapa_execution_order(&recording.reference.recording_id, engine);
+                let (
+                    (baseline_run, baseline_partition_finish_wall_ns),
+                    (candidate_run, candidate_partition_finish_wall_ns),
+                ) = match execution_order {
+                    PublicEcapaResidualBirthExecutionOrder::BaselineThenCandidate => (
+                        run_prepared_public_ecapa_arm(
+                            &prepared,
+                            crate::diarization::EcapaResidualBirthMode::DisabledIncumbent,
+                        ),
+                        run_prepared_public_ecapa_arm(
+                            &prepared,
+                            crate::diarization::EcapaResidualBirthMode::DevelopmentCandidateV1,
+                        ),
+                    ),
+                    PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline => {
+                        let candidate = run_prepared_public_ecapa_arm(
+                            &prepared,
+                            crate::diarization::EcapaResidualBirthMode::DevelopmentCandidateV1,
+                        );
+                        let baseline = run_prepared_public_ecapa_arm(
+                            &prepared,
+                            crate::diarization::EcapaResidualBirthMode::DisabledIncumbent,
+                        );
+                        (baseline, candidate)
+                    }
+                };
+                let (candidate_replay_run, candidate_replay_wall_ns) =
+                    run_prepared_public_ecapa_arm(
+                        &prepared,
+                        crate::diarization::EcapaResidualBirthMode::DevelopmentCandidateV1,
+                    );
+
+                let prepared_common_observation_sha256 = prepared.common_observation_sha256();
+                for (run, expected_mode) in [
+                    (
+                        &baseline_run,
+                        crate::diarization::EcapaResidualBirthMode::DisabledIncumbent,
+                    ),
+                    (
+                        &candidate_run,
+                        crate::diarization::EcapaResidualBirthMode::DevelopmentCandidateV1,
+                    ),
+                    (
+                        &candidate_replay_run,
+                        crate::diarization::EcapaResidualBirthMode::DevelopmentCandidateV1,
+                    ),
+                ] {
+                    run.report
+                        .validate_against_request(&request, Some(recording.reference.duration_ms))
+                        .expect("valid request-bound paired ECAPA report");
+                    assert_eq!(run.report.speaker_evidence_mode, evidence_mode);
+                    assert_eq!(
+                        run.report.normalized_input_sha256,
+                        recording.normalized_input_sha256
+                    );
+                    assert_eq!(
+                        run.common_observation_sha256,
+                        prepared_common_observation_sha256
+                    );
+                    assert_eq!(
+                        run.residual_birth.common_observation_sha256,
+                        prepared_common_observation_sha256
+                    );
+                    assert_eq!(run.policy_sha256, residual_policy_sha256);
+                    assert_eq!(run.residual_birth.policy_sha256, residual_policy_sha256);
+                    assert_eq!(run.residual_birth.mode, expected_mode);
+                    assert_eq!(
+                        run.residual_birth.schema_version,
+                        crate::diarization::ECAPA_RESIDUAL_BIRTH_EVIDENCE_SCHEMA_VERSION
+                    );
+                    let representation = run
+                        .report
+                        .neural_representation
+                        .as_ref()
+                        .expect("paired ECAPA report retains neural representation provenance");
+                    assert_eq!(
+                        representation.provider_version,
+                        crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION
+                    );
+                    assert_eq!(
+                        representation.loaded_model_package_sha256.as_deref(),
+                        Some(crate::ecapa_conformance::ECAPA_PACKAGE_SHA256)
+                    );
+                    assert_eq!(
+                        representation.expected_model_package_sha256,
+                        crate::ecapa_conformance::ECAPA_PACKAGE_SHA256
+                    );
+                    assert_eq!(
+                        representation.embedded_tracklet_count,
+                        prepared.embedded_tracklet_count()
+                    );
+                    let count_estimate = run
+                        .report
+                        .speaker_count
+                        .estimate
+                        .as_ref()
+                        .expect("paired ECAPA report retains count evidence");
+                    assert_eq!(
+                        count_estimate.calibration_sha256,
+                        crate::diarization::ecapa_speaker_pair_calibration_sha256(evidence_mode)
+                    );
+                }
+
+                let baseline_score = score_path_free_ecapa_report(
+                    recording.reference,
+                    &baseline_run.report,
+                    &fixture.scorer_config,
+                );
+                let candidate_score = score_path_free_ecapa_report(
+                    recording.reference,
+                    &candidate_run.report,
+                    &fixture.scorer_config,
+                );
+                let candidate_replay_score = score_path_free_ecapa_report(
+                    recording.reference,
+                    &candidate_replay_run.report,
+                    &fixture.scorer_config,
+                );
+                for score in [&baseline_score, &candidate_score, &candidate_replay_score] {
+                    assert_eq!(score.recording_id, recording.reference.recording_id);
+                    assert_eq!(score.config_sha256, fixture.scorer_config_sha256);
+                }
+
+                let baseline = public_ecapa_residual_birth_arm_row(
+                    &baseline_run,
+                    &baseline_score,
+                    "disabled_incumbent",
+                    &baseline_variant_configuration_sha256,
+                );
+                let candidate = public_ecapa_residual_birth_arm_row(
+                    &candidate_run,
+                    &candidate_score,
+                    "development_candidate_v1",
+                    &residual_policy_sha256,
+                );
+                let candidate_replay_report_sha256 =
+                    super::canonical_sha256(&candidate_replay_run.report)
+                        .expect("hash candidate replay report");
+                let candidate_replay_residual_birth_evidence_sha256 =
+                    super::canonical_sha256(&candidate_replay_run.residual_birth)
+                        .expect("hash candidate replay residual-birth evidence");
+                let candidate_replay_full_output_matches =
+                    crate::diarization::prepared_ecapa_evaluation_outputs_identical(
+                        &candidate_run,
+                        &candidate_replay_run,
+                    );
+                let candidate_replay_matches = candidate_replay_full_output_matches
+                    && candidate_replay_report_sha256 == candidate.report_sha256
+                    && candidate_replay_residual_birth_evidence_sha256
+                        == candidate.residual_birth_evidence_sha256
+                    && candidate_replay_score.result_sha256 == candidate_score.result_sha256
+                    && candidate_replay_run.common_observation_sha256
+                        == candidate_run.common_observation_sha256;
+                let rejected_candidate_output_matches_incumbent =
+                    !candidate_run.residual_birth.birth_applied
+                        && crate::diarization::prepared_ecapa_evaluation_outputs_identical(
+                            &baseline_run,
+                            &candidate_run,
+                        );
+                let pair_alignment_matches = baseline_score.recording_id
+                    == candidate_score.recording_id
+                    && baseline_score.reference_sha256 == candidate_score.reference_sha256
+                    && baseline_score.config_sha256 == candidate_score.config_sha256;
+                let common_observation_matches = baseline_run.common_observation_sha256
+                    == candidate_run.common_observation_sha256
+                    && candidate_run.common_observation_sha256
+                        == candidate_replay_run.common_observation_sha256
+                    && candidate_replay_run.common_observation_sha256
+                        == prepared_common_observation_sha256;
+                let incumbent_contract_matches = baseline_run.residual_birth.mode
+                    == crate::diarization::EcapaResidualBirthMode::DisabledIncumbent
+                    && !baseline_run.residual_birth.birth_applied
+                    && baseline_run.residual_birth.proposal_kind.is_none()
+                    && baseline_run.residual_birth.fallback_reason
+                        == Some(
+                            crate::diarization::EcapaResidualBirthFallbackReason::DisabledIncumbent,
+                        )
+                    && baseline_run.residual_birth.incumbent_cluster_count
+                        == baseline_run.residual_birth.output_cluster_count;
+                let comparison = public_ecapa_pair_comparison(
+                    &baseline,
+                    &candidate,
+                    candidate_replay_report_sha256,
+                    candidate_replay_run.common_observation_sha256.clone(),
+                    candidate_replay_residual_birth_evidence_sha256,
+                    candidate_replay_score.result_sha256.clone(),
+                    candidate_replay_full_output_matches,
+                    candidate_replay_matches,
+                    rejected_candidate_output_matches_incumbent,
+                    pair_alignment_matches,
+                    common_observation_matches,
+                    incumbent_contract_matches,
+                );
+                let common_observation = PublicEcapaCommonObservationBinding {
+                    common_observation_schema:
+                        PUBLIC_ECAPA_COMMON_OBSERVATION_BINDING_SCHEMA_VERSION.to_owned(),
+                    common_observation_sha256: prepared_common_observation_sha256.to_owned(),
+                    source_audio_sha256: recording.source_audio_sha256.clone(),
+                    normalized_input_sha256: recording.normalized_input_sha256.clone(),
+                    feature_schema_version: crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION
+                        .to_owned(),
+                    ecapa_contract_sha256: crate::ecapa_conformance::ECAPA_CONTRACT_SHA256
+                        .to_owned(),
+                    ecapa_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
+                    representation_provider_version:
+                        crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
+                    embedded_tracklet_count: u64::try_from(prepared.embedded_tracklet_count())
+                        .unwrap_or(u64::MAX),
+                };
+                expected_common_observations.push(common_observation.clone());
+                let mut row = PublicEcapaResidualBirthPairRow {
+                    schema_version: PUBLIC_ECAPA_RESIDUAL_PAIR_SCHEMA_VERSION.to_owned(),
+                    protocol_sha256: protocol_sha256.clone(),
+                    corpus_key: fixture.bundle.corpus_key.clone(),
+                    source_version: fixture.bundle.source_version.clone(),
+                    evaluation_split: EvaluationSplit::Development,
+                    recording_id: recording.reference.recording_id.clone(),
+                    audio_duration_ms: recording.reference.duration_ms,
+                    engine,
+                    evidence_mode,
+                    common_observation,
+                    baseline,
+                    candidate,
+                    comparison,
+                    timing: PublicEcapaResidualBirthPairTiming {
+                        common_preparation_wall_ns,
+                        baseline_partition_finish_wall_ns,
+                        candidate_partition_finish_wall_ns,
+                        candidate_replay_wall_ns,
+                        execution_order,
+                        candidate_replay_excluded_from_gate: true,
+                    },
+                    deterministic_accuracy_sha256: String::new(),
+                    row_sha256: String::new(),
+                };
+                row.deterministic_accuracy_sha256 = public_ecapa_pair_accuracy_sha256(&row);
+                row.row_sha256 = public_ecapa_pair_result_sha256(&row);
+                let serialized = serialize_path_free_public_ecapa_evidence(
+                    &row,
+                    &[
+                        &fixture.descriptor_path,
+                        &fixture.weight_path,
+                        &fixture.input_root,
+                        &recording.audio_path,
+                    ],
+                );
+                println!("{serialized}");
+                rows.push(row);
+            }
+        }
+
+        let paired_process_observed_rss_bytes = super::sampled_process_rss_bytes();
+        let dropped_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &rows[..rows.len().saturating_sub(1)],
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            paired_process_observed_rss_bytes,
+        );
+        assert!(!dropped_gate.passed);
+        assert!(
+            dropped_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::PairCountMismatch)
+        );
+
+        let mut misaligned_rows = rows.clone();
+        misaligned_rows.swap(0, 1);
+        let misaligned_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &misaligned_rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy.clone(),
+            gate_policy_sha256.clone(),
+            paired_process_observed_rss_bytes,
+        );
+        assert!(!misaligned_gate.passed);
+        assert!(
+            misaligned_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::PairAlignmentMismatch)
+        );
+
+        let mut weakened_policy = gate_policy.clone();
+        weakened_policy.minimum_exact_match_gain = 0;
+        weakened_policy.require_strict_micro_der_improvement = false;
+        let weakened_policy_sha256 =
+            super::canonical_sha256(&weakened_policy).expect("hash weakened gate probe");
+        let weakened_protocol_sha256 = public_ecapa_residual_birth_protocol_sha256(
+            &fixture,
+            &residual_policy_sha256,
+            &weakened_policy_sha256,
+        );
+        let weakened_gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &weakened_protocol_sha256,
+            weakened_policy,
+            weakened_policy_sha256,
+            paired_process_observed_rss_bytes,
+        );
+        assert!(!weakened_gate.passed);
+        assert!(
+            weakened_gate
+                .failures
+                .contains(&PublicEcapaResidualBirthGateFailure::PolicyHashMismatch)
+        );
+
+        let gate = public_ecapa_residual_birth_gate_row(
+            &fixture,
+            &rows,
+            &expected_common_observations,
+            &residual_policy_sha256,
+            &protocol_sha256,
+            gate_policy,
+            gate_policy_sha256,
+            paired_process_observed_rss_bytes,
+        );
+        assert_eq!(gate.result_sha256, public_ecapa_gate_result_sha256(&gate));
+        let serialized = serialize_path_free_public_ecapa_evidence(
+            &gate,
+            &[
+                &fixture.descriptor_path,
+                &fixture.weight_path,
+                &fixture.input_root,
+            ],
+        );
+        println!("{serialized}");
+        assert!(
+            gate.passed,
+            "residual-birth candidate did not pass its frozen public-development gate: {:?}",
+            gate.failures
+        );
+    }
 
     #[test]
     #[ignore = "requires external public AMI descriptor/audio and converted ECAPA weights"]
