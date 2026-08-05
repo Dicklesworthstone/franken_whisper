@@ -1977,10 +1977,13 @@ fn validate_tool_stage_document(
         return Err(DifferentialSkipReason::InvalidOracleOutput);
     }
     if !turns.windows(2).all(|window| {
-        window.first().zip(window.get(1)).is_some_and(|(left, right)| {
-            (left.start_ms, left.end_ms, left.speaker.as_deref())
-                <= (right.start_ms, right.end_ms, right.speaker.as_deref())
-        })
+        window
+            .first()
+            .zip(window.get(1))
+            .is_some_and(|(left, right)| {
+                (left.start_ms, left.end_ms, left.speaker.as_deref())
+                    <= (right.start_ms, right.end_ms, right.speaker.as_deref())
+            })
     }) {
         return Err(DifferentialSkipReason::InvalidOracleOutput);
     }
@@ -3481,8 +3484,7 @@ mod tests {
         let mut excessive_changes = document();
         excessive_changes.duration_ms = 10_000;
         excessive_changes.change_boundaries_ms = Some(
-            (1..=u64::try_from(MAX_COMPARISON_CHANGE_POINTS + 1).expect("change cap"))
-                .collect(),
+            (1..=u64::try_from(MAX_COMPARISON_CHANGE_POINTS + 1).expect("change cap")).collect(),
         );
         assert!(
             compare_documents(
