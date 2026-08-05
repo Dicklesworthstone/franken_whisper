@@ -3172,6 +3172,75 @@ mod tests {
     }
 
     #[test]
+    fn live_persistence_rejects_diarization_request_report_mismatches_atomically() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("request-report-binding.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+
+        let mut wrong_engine = minimal_report("run-wrong-engine", &db_path);
+        attach_synthetic_diarization(&mut wrong_engine, false);
+        wrong_engine
+            .request
+            .backend_params
+            .acoustic_diarization
+            .as_mut()
+            .expect("diarization request")
+            .engine = DiarizationEngine::EcapaFused;
+        let engine_error = store
+            .persist_report(&wrong_engine)
+            .expect_err("an acoustic report must not authenticate an ECAPA-fused request");
+        assert!(
+            engine_error.to_string().contains("request/report pair"),
+            "{engine_error}"
+        );
+
+        let mut wrong_count = minimal_report("run-wrong-count", &db_path);
+        attach_synthetic_diarization(&mut wrong_count, false);
+        wrong_count
+            .request
+            .backend_params
+            .acoustic_diarization
+            .as_mut()
+            .expect("diarization request")
+            .speaker_count = SpeakerCountRequest::HardConstraint { count: 2 };
+        let count_error = store
+            .persist_report(&wrong_count)
+            .expect_err("the report must bind the exact speaker-count request");
+        assert!(
+            count_error.to_string().contains("speaker-count request differs"),
+            "{count_error}"
+        );
+
+        assert!(store.list_recent_runs(10).expect("runs").is_empty());
+        assert_eq!(table_row_count(&store, "diarization_reports"), 0);
+    }
+
+    #[test]
+    fn enabled_diarization_without_nested_parameters_uses_the_typed_default_request() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("effective-default-request.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-effective-default", &db_path);
+        report.request.diarize = true;
+        assert!(
+            report
+                .request
+                .backend_params
+                .acoustic_diarization
+                .is_none()
+        );
+
+        store
+            .persist_report(&report)
+            .expect("the compact diarize flag must resolve to a valid default request");
+        store
+            .rebuild_diarization_index()
+            .expect("the same effective default must be used during rebuild");
+        assert_eq!(store.list_recent_runs(10).expect("runs").len(), 1);
+        assert_eq!(table_row_count(&store, "diarization_reports"), 0);
+    }
+
+    #[test]
     fn malformed_nested_diarization_summaries_roll_back_live_persistence() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("invalid-nested-diarization.sqlite3");
@@ -3245,6 +3314,14 @@ mod tests {
         let store = RunStore::open(&db_path).expect("store");
         let mut report = minimal_report("run-invalid-nested-rebuild", &db_path);
         attach_synthetic_diarization(&mut report, false);
+        let calibration_sha256 = report
+            .result
+            .diarization
+            .as_ref()
+            .and_then(|report| report.speaker_count.estimate.as_ref())
+            .expect("speaker-count estimate")
+            .calibration_sha256
+            .clone();
         report
             .result
             .diarization
@@ -3255,7 +3332,7 @@ mod tests {
             method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
             selected_count: 1,
             confidence: 0.5,
-            calibration_sha256: "c".repeat(64),
+            calibration_sha256,
             authority: SpeakerCountCalibrationStatus::DevelopmentUncertified,
         });
         store.persist_report(&report).expect("valid report");
@@ -3368,6 +3445,48 @@ mod tests {
             table_row_count(&store, "diarization_reports"),
             1,
             "failed request rebuild must preserve the prior derived index"
+        );
+    }
+
+    #[test]
+    fn canonical_request_report_mismatch_cannot_replace_a_valid_derived_index() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("request-report-rebuild-binding.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-request-report-rebuild", &db_path);
+        attach_synthetic_diarization(&mut report, false);
+        store.persist_report(&report).expect("valid report");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+
+        let rows = store
+            .connection
+            .query(
+                "SELECT request_json FROM runs \
+                 WHERE id = 'run-request-report-rebuild' LIMIT 1;",
+            )
+            .expect("canonical request");
+        let mut request: serde_json::Value =
+            serde_json::from_str(&value_to_string(rows[0].get(0))).expect("request JSON");
+        request["backend_params"]["acoustic_diarization"]["engine"] = json!("ecapa_fused");
+        store
+            .connection
+            .execute_with_params(
+                "UPDATE runs SET request_json = ?1 WHERE id = ?2;",
+                &[
+                    SqliteValue::Text(request.to_string().into()),
+                    SqliteValue::Text("run-request-report-rebuild".to_owned().into()),
+                ],
+            )
+            .expect("mutate canonical request");
+
+        let error = store
+            .rebuild_diarization_index()
+            .expect_err("request/report mismatch must fail closed");
+        assert!(error.to_string().contains("request/report pair"), "{error}");
+        assert_eq!(
+            table_row_count(&store, "diarization_reports"),
+            1,
+            "failed rebuild must preserve the prior derived index"
         );
     }
 
