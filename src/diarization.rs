@@ -12190,6 +12190,276 @@ pub(crate) struct EcapaResidualBirthEvaluationEvidence {
     pub resources: EcapaResidualBirthResourceSummary,
 }
 
+/// Immutable, single-preparation input shared by both residual-birth arms.
+///
+/// This test/evaluation-only value owns the acoustic tracklets, ECAPA
+/// embeddings, and enrollment state so arm order cannot change observations.
+/// It deliberately retains transcript text only in memory for final projection;
+/// neither the common-observation digest nor residual evidence serializes it.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedEcapaDiarizationEvaluation {
+    tracklets: Vec<AcousticTracklet>,
+    neural_representation: NeuralSpeakerRepresentationSummary,
+    neural_embeddings: EcapaTrackletEmbeddings,
+    enrollment: SpeakerEnrollment,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
+    request: DiarizationRequest,
+    normalized_input_sha256: String,
+    segments: Vec<TranscriptionSegment>,
+    word_aligned: bool,
+    audio_duration_ms: u64,
+    common_observation_sha256: String,
+}
+
+#[cfg(test)]
+impl PreparedEcapaDiarizationEvaluation {
+    #[must_use]
+    pub(crate) fn common_observation_sha256(&self) -> &str {
+        &self.common_observation_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn embedded_tracklet_count(&self) -> usize {
+        self.neural_embeddings.len()
+    }
+}
+
+/// One arm of the paired development evaluation.
+///
+/// Raw embeddings and transcript-derived fingerprints are intentionally absent.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct EcapaResidualBirthEvaluationRun {
+    pub report: DiarizationReport,
+    pub projection: DiarizationProjection,
+    pub clustering: AcousticClusteringResult,
+    pub residual_birth: EcapaResidualBirthEvaluationEvidence,
+    pub common_observation_sha256: String,
+    pub policy_sha256: String,
+}
+
+#[cfg(test)]
+fn ecapa_residual_common_observation_sha256(
+    tracklets: &[AcousticTracklet],
+    neural_embeddings: &EcapaTrackletEmbeddings,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ecapa-residual-common-observation\0");
+    hasher.update(ECAPA_RESIDUAL_BIRTH_COMMON_OBSERVATION_VERSION.as_bytes());
+    hasher.update(ACOUSTIC_FEATURE_SCHEMA_VERSION.as_bytes());
+    hasher.update(ACOUSTIC_CHANGE_FIXED_SAFE_VERSION.as_bytes());
+    hasher.update(ECAPA_SPEAKER_REPRESENTATION_VERSION.as_bytes());
+    hasher.update(ECAPA_CONTRACT_SHA256.as_bytes());
+    hasher.update(ECAPA_PACKAGE_SHA256.as_bytes());
+    hasher.update((tracklets.len() as u64).to_le_bytes());
+    for tracklet in tracklets {
+        for value in [
+            tracklet.tracklet_index as u64,
+            tracklet.start_ms,
+            tracklet.end_ms,
+            tracklet.frame_count as u64,
+            tracklet.voiced_frame_count as u64,
+            tracklet.identity_frame_count as u64,
+            tracklet.channel_frame_count as u64,
+            tracklet.channel_dimensions as u64,
+        ] {
+            hasher.update(value.to_le_bytes());
+        }
+        for value in tracklet.voice_mean {
+            hasher.update(value.to_bits().to_le_bytes());
+        }
+        for value in tracklet.voice_variance {
+            hasher.update(value.to_bits().to_le_bytes());
+        }
+        for valid in tracklet.voice_valid {
+            hasher.update([u8::from(valid)]);
+        }
+        for support in tracklet.voice_support {
+            hasher.update(support.to_le_bytes());
+        }
+        for value in tracklet.channel_mean {
+            hasher.update(value.to_bits().to_le_bytes());
+        }
+        for value in tracklet.channel_variance {
+            hasher.update(value.to_bits().to_le_bytes());
+        }
+        hasher.update([u8::from(tracklet.channel_valid)]);
+        hasher.update(tracklet.change_confidence.to_bits().to_le_bytes());
+        hasher.update(tracklet.overlap_probability.to_bits().to_le_bytes());
+        hasher.update([u8::from(tracklet.overlap_suspected)]);
+        match neural_embeddings.get(&tracklet.tracklet_index) {
+            Some(representation) => {
+                hasher.update([1]);
+                for value in representation.discovery {
+                    hasher.update(value.to_bits().to_le_bytes());
+                }
+                hasher.update(representation.discovery_weight.to_bits().to_le_bytes());
+                match representation.validation {
+                    Some(validation) => {
+                        hasher.update([1]);
+                        for value in validation {
+                            hasher.update(value.to_bits().to_le_bytes());
+                        }
+                    }
+                    None => hasher.update([0]),
+                }
+                hasher.update(representation.validation_weight.to_bits().to_le_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Extract and embed ECAPA observations once for a paired development run.
+#[cfg(test)]
+pub(crate) fn prepare_ecapa_diarization_evaluation(
+    input: AcousticDiarizationInput<'_>,
+    model: &EcapaModel,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<PreparedEcapaDiarizationEvaluation> {
+    let evidence_mode = match input.request.engine {
+        DiarizationEngine::Ecapa => DiarizationSpeakerEvidenceMode::EcapaOnly,
+        DiarizationEngine::EcapaFused => DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        engine => {
+            return Err(FwError::InvalidRequest(format!(
+                "paired ECAPA evaluation requires the ecapa or ecapa_fused engine, not {engine:?}"
+            )));
+        }
+    };
+    if input.normalized_input_sha256.len() != 64
+        || !input
+            .normalized_input_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(FwError::InvalidRequest(
+            "normalized_input_sha256 must be exactly 64 lowercase hexadecimal characters"
+                .to_owned(),
+        ));
+    }
+    let audio_duration_ms = samples_to_ms(input.samples.len());
+    input
+        .request
+        .validate(audio_duration_ms)
+        .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
+
+    let cancellation = CheckpointCancellationAdapter::new(checkpoint);
+    let prepared = (|| {
+        let supervised_boundaries_ms = supervised_enrollment_boundaries_ms(input.request);
+        let mut segmenter = AcousticSegmenter::new_with_supervised_boundaries(
+            input.boundary_hints,
+            &supervised_boundaries_ms,
+            AcousticFeatureAblation::FullV2,
+            AcousticChangeDetectorMode::FixedSafeV1,
+        )?;
+        let mut is_cancelled = || cancellation.is_cancelled();
+        extract_acoustic_features(input.samples, &mut is_cancelled, |frame| {
+            segmenter.push(frame)
+        })?;
+        checkpoint()?;
+        let (tracklets, _, _, _) = segmenter.finish()?;
+        let (mut neural_representation, neural_embeddings) =
+            apply_ecapa_speaker_representations(input.samples, &tracklets, model, checkpoint)?;
+        let mut enrollment = enroll_known_speaker_profiles_with_authority(
+            &tracklets,
+            input.request,
+            audio_duration_ms,
+            EnrollmentIdentityAuthority::Ecapa(&neural_embeddings),
+        )
+        .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
+        let (quarantined, contradictory) =
+            apply_neural_enrollment_hygiene(&tracklets, &mut enrollment, &neural_embeddings);
+        if quarantined > 0 {
+            neural_representation.status = NeuralSpeakerRepresentationStatus::Degraded;
+            if contradictory
+                && !neural_representation
+                    .reasons
+                    .contains(&NeuralSpeakerRepresentationReason::ContradictoryEnrollment)
+            {
+                neural_representation
+                    .reasons
+                    .push(NeuralSpeakerRepresentationReason::ContradictoryEnrollment);
+            }
+            neural_representation
+                .validate()
+                .map_err(FwError::ContractViolation)?;
+        }
+        let common_observation_sha256 =
+            ecapa_residual_common_observation_sha256(&tracklets, &neural_embeddings);
+        Ok(PreparedEcapaDiarizationEvaluation {
+            tracklets,
+            neural_representation,
+            neural_embeddings,
+            enrollment,
+            evidence_mode,
+            request: input.request.clone(),
+            normalized_input_sha256: input.normalized_input_sha256.to_owned(),
+            segments: input.segments.to_vec(),
+            word_aligned: input.word_aligned,
+            audio_duration_ms,
+            common_observation_sha256,
+        })
+    })();
+    cancellation.restore(prepared)
+}
+
+/// Run one partition arm over a previously prepared immutable observation set.
+#[cfg(test)]
+pub(crate) fn run_prepared_ecapa_diarization_evaluation<C>(
+    prepared: &PreparedEcapaDiarizationEvaluation,
+    mode: EcapaResidualBirthMode,
+    is_cancelled: C,
+) -> FwResult<EcapaResidualBirthEvaluationRun>
+where
+    C: FnMut() -> bool,
+{
+    let mut enrollment = prepared.enrollment.clone();
+    let (clustering, _, residual_birth) =
+        cluster_acoustic_tracklets_with_budgeted_enrollment_and_residual_birth(
+            &prepared.tracklets,
+            &mut enrollment,
+            &prepared.request.speaker_count,
+            usize::from(prepared.request.max_prototypes),
+            AcousticClusteringMode::ProbabilisticV1,
+            Some(&prepared.neural_embeddings),
+            prepared.evidence_mode,
+            mode,
+            &prepared.common_observation_sha256,
+            is_cancelled,
+        )?;
+    let (report, projection) = finish_prepared_ecapa_diarization(
+        prepared,
+        &enrollment,
+        &clustering,
+    )?;
+    Ok(EcapaResidualBirthEvaluationRun {
+        report,
+        projection,
+        clustering,
+        common_observation_sha256: prepared.common_observation_sha256.clone(),
+        policy_sha256: ecapa_residual_birth_policy_sha256(),
+        residual_birth,
+    })
+}
+
+/// Structural equality for paired-arm and replay checks. No transcript-bearing
+/// digest or serializable projection wrapper is created.
+#[cfg(test)]
+pub(crate) fn prepared_ecapa_evaluation_outputs_identical(
+    left: &EcapaResidualBirthEvaluationRun,
+    right: &EcapaResidualBirthEvaluationRun,
+) -> bool {
+    left.report == right.report
+        && left.projection.segments == right.projection.segments
+        && left.projection.mixed_speaker_segment_indices
+            == right.projection.mixed_speaker_segment_indices
+        && left.projection.overlap_suspected_segment_indices
+            == right.projection.overlap_suspected_segment_indices
+        && left.clustering == right.clustering
+}
+
 struct EcapaTrackletWindows {
     discovery: Vec<f32>,
     validation: Option<Vec<f32>>,
@@ -16587,12 +16857,8 @@ fn residual_birth_count_evidence_sha256(
     evidence: &EcapaResidualBirthEvaluationEvidence,
 ) -> String {
     let partition_method = match prior_partition.method {
-        DiarizationOperationalPartitionMethod::FixedSafeAgglomerative => {
-            "fixed_safe_agglomerative"
-        }
-        DiarizationOperationalPartitionMethod::ProbabilisticConsensus => {
-            "probabilistic_consensus"
-        }
+        DiarizationOperationalPartitionMethod::FixedSafeAgglomerative => "fixed_safe_agglomerative",
+        DiarizationOperationalPartitionMethod::ProbabilisticConsensus => "probabilistic_consensus",
         DiarizationOperationalPartitionMethod::EcapaSpherical => "ecapa_spherical",
     };
     let partition_authority = match prior_partition.authority {
