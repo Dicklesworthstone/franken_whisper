@@ -202,7 +202,8 @@ pub struct DiarizationRequest {
     pub known_intervals: Vec<KnownSpeakerInterval>,
     /// Samples removed from each enrollment edge to avoid boundary bleed.
     pub enrollment_edge_guard_ms: u32,
-    /// Maximum number of global clustering prototypes.
+    /// Maximum number of global clustering prototypes, including any
+    /// enrollment-profile nodes admitted into the affinity graph.
     pub max_prototypes: u16,
     /// Record explicit consent for reusable-profile persistence. Default-off.
     /// Schema v5 deliberately persists only privacy-safe summaries; raw
@@ -664,9 +665,7 @@ impl NeuralSpeakerRepresentationSummary {
                 .reasons
                 .contains(&NeuralSpeakerRepresentationReason::ShortTracklet)
         {
-            return Err(
-                "zero-padded neural tracklets lack short-tracklet provenance".to_owned(),
-            );
+            return Err("zero-padded neural tracklets lack short-tracklet provenance".to_owned());
         }
         if self.skipped_tracklet_count > 0
             && !self.reasons.iter().any(|reason| {
@@ -678,7 +677,8 @@ impl NeuralSpeakerRepresentationSummary {
             })
         {
             return Err(
-                "skipped neural tracklets lack short-or-insufficient-identity provenance".to_owned(),
+                "skipped neural tracklets lack short-or-insufficient-identity provenance"
+                    .to_owned(),
             );
         }
         Ok(())
@@ -1091,6 +1091,13 @@ impl SpeakerCountEstimate {
                 "speaker-count resource accounting claims work without prototypes".to_owned(),
             );
         }
+        if self.resources.prototype_count == 0
+            && self.calibration_status != SpeakerCountCalibrationStatus::Unavailable
+        {
+            return Err(
+                "zero-prototype speaker-count estimate must be explicitly unavailable".to_owned(),
+            );
+        }
 
         let mut previous_count = None;
         let mut concrete_mass = 0.0;
@@ -1334,6 +1341,27 @@ pub struct SpeakerCountOutcome {
     pub speaker_evidence: Vec<SpeakerEvidenceSummary>,
 }
 
+/// Stable, payload-free report code for a neural-to-acoustic fallback.
+pub const DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK: &str = "native_acoustic_fallback";
+/// Stable, payload-free report code for a fallback into an external backend.
+pub const DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_FALLBACK: &str = "external_backend_fallback";
+/// Stable, payload-free report code for an unavailable external backend.
+pub const DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_UNAVAILABLE: &str =
+    "external_backend_unavailable";
+/// Stable, payload-free report code for unavailable neural identity evidence.
+pub const DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE: &str = "neural_identity_unavailable";
+/// Stable, payload-free report code for accepted external speaker attribution.
+pub const DIARIZATION_DIAGNOSTIC_EXTERNAL_ATTRIBUTION_ACCEPTED: &str =
+    "external_backend_attribution_accepted";
+
+const DIARIZATION_DIAGNOSTIC_CODES: [&str; 5] = [
+    DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK,
+    DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_FALLBACK,
+    DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_UNAVAILABLE,
+    DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE,
+    DIARIZATION_DIAGNOSTIC_EXTERNAL_ATTRIBUTION_ACCEPTED,
+];
+
 /// Complete typed diarization result attached to [`TranscriptionResult`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1391,7 +1419,7 @@ impl DiarizationReport {
             summary
                 .validate()
                 .map_err(|error| format!("invalid neural representation: {error}"))?;
-            validate_neural_provider_binding(summary, report_kind)?;
+            validate_neural_provider_binding(summary)?;
         }
 
         validate_diarization_turns(&self.turns)?;
@@ -1516,7 +1544,9 @@ impl DiarizationReport {
 
         let report_kind = classify_diarization_report(self)?;
         validate_report_request_kind_binding(self, request, report_kind)?;
+        validate_report_request_diagnostic_binding(self, request, report_kind)?;
         validate_report_hint_binding(self, request, report_kind)?;
+        validate_report_request_resource_binding(self, request)?;
         validate_error_fallback_policy_binding(self, request, report_kind)?;
         Ok(())
     }
@@ -1603,21 +1633,7 @@ fn classify_diarization_report(
 
 fn validate_neural_provider_binding(
     summary: &NeuralSpeakerRepresentationSummary,
-    kind: DiarizationReportKind,
 ) -> Result<(), String> {
-    let native_ecapa_report = matches!(
-        kind,
-        DiarizationReportKind::NativeEcapaOnly
-            | DiarizationReportKind::NativeEcapaFused
-            | DiarizationReportKind::NativeEcapaUnavailable
-    );
-    if native_ecapa_report {
-        return validate_current_ecapa_provider(summary);
-    }
-    if summary.provider_version != crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION {
-        return Ok(());
-    }
-
     validate_current_ecapa_provider(summary)
 }
 
@@ -1795,6 +1811,52 @@ fn validate_report_request_kind_binding(
     Ok(())
 }
 
+fn validate_report_request_diagnostic_binding(
+    report: &DiarizationReport,
+    request: &DiarizationRequest,
+    kind: DiarizationReportKind,
+) -> Result<(), String> {
+    let expected: &[&str] = match kind {
+        DiarizationReportKind::NativeAcoustic
+            if matches!(
+                request.engine,
+                DiarizationEngine::Ecapa | DiarizationEngine::EcapaFused
+            ) =>
+        {
+            &[DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK]
+        }
+        DiarizationReportKind::NativeAcoustic
+        | DiarizationReportKind::NativeEcapaOnly
+        | DiarizationReportKind::NativeEcapaFused => &[],
+        DiarizationReportKind::NativeEcapaUnavailable => {
+            &[DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE]
+        }
+        DiarizationReportKind::External
+            if matches!(
+                request.engine,
+                DiarizationEngine::Acoustic
+                    | DiarizationEngine::Ecapa
+                    | DiarizationEngine::EcapaFused
+            ) =>
+        {
+            &[
+                DIARIZATION_DIAGNOSTIC_EXTERNAL_ATTRIBUTION_ACCEPTED,
+                DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_FALLBACK,
+            ]
+        }
+        DiarizationReportKind::External => &[DIARIZATION_DIAGNOSTIC_EXTERNAL_ATTRIBUTION_ACCEPTED],
+        DiarizationReportKind::FallbackUnknown => {
+            &[DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_UNAVAILABLE]
+        }
+    };
+    if !diagnostic_codes_equal(&report.diagnostics, expected) {
+        return Err(
+            "diarization diagnostic codes disagree with the authorized execution path".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_external_request_semantics(request: &DiarizationRequest) -> Result<(), String> {
     if !request.known_intervals.is_empty() {
         return Err(
@@ -1812,6 +1874,97 @@ fn validate_external_request_semantics(request: &DiarizationRequest) -> Result<(
     Ok(())
 }
 
+fn validate_report_request_resource_binding(
+    report: &DiarizationReport,
+    request: &DiarizationRequest,
+) -> Result<(), String> {
+    if let Some(estimate) = report.speaker_count.estimate.as_ref() {
+        if estimate.resources.prototype_count > u32::from(request.max_prototypes) {
+            return Err(
+                "speaker-count estimate exceeds the request's global prototype resource cap"
+                    .to_owned(),
+            );
+        }
+        let hard_speaker_count = request
+            .known_intervals
+            .iter()
+            .filter(|hint| hint.policy == KnownSpeakerPolicy::HardMustLink)
+            .map(|hint| hint.speaker_ref.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let expected_constraint_lower_bound = match &request.speaker_count {
+            SpeakerCountRequest::HardConstraint { count } => *count,
+            SpeakerCountRequest::Infer
+            | SpeakerCountRequest::Prior { .. }
+            | SpeakerCountRequest::Range { .. } => u32::try_from(hard_speaker_count.max(1))
+                .map_err(|_| "hard speaker count exceeds the report schema".to_owned())?,
+        };
+        if estimate.constraint_lower_bound != expected_constraint_lower_bound {
+            return Err(
+                "speaker-count estimate constraint lower bound disagrees with the execution request"
+                    .to_owned(),
+            );
+        }
+        let expected_candidate_upper_bound = canonical_speaker_count_candidate_upper_bound(
+            &request.speaker_count,
+            expected_constraint_lower_bound,
+            estimate,
+        )?;
+        if estimate.candidate_upper_bound != expected_candidate_upper_bound {
+            return Err(
+                "speaker-count estimate candidate upper bound disagrees with the execution request and observed resources"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn canonical_speaker_count_candidate_upper_bound(
+    request: &SpeakerCountRequest,
+    constraint_lower_bound: u32,
+    estimate: &SpeakerCountEstimate,
+) -> Result<u32, String> {
+    if let SpeakerCountRequest::HardConstraint { count } = request {
+        return Ok(*count);
+    }
+
+    let prototype_count = estimate.resources.prototype_count;
+    let candidate_upper_bound = match estimate.calibration_status {
+        SpeakerCountCalibrationStatus::DevelopmentUncertified => match request {
+            SpeakerCountRequest::Infer => prototype_count.min(8),
+            SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. } => {
+                prototype_count.min(MAX_SPEAKER_COUNT)
+            }
+            SpeakerCountRequest::HardConstraint { .. } => {
+                return Err("hard speaker-count policy was not finalized exactly".to_owned());
+            }
+        },
+        SpeakerCountCalibrationStatus::FixedSafeUncalibrated
+        | SpeakerCountCalibrationStatus::Unavailable => {
+            let available_candidates = prototype_count.max(1).min(MAX_SPEAKER_COUNT);
+            match request {
+                SpeakerCountRequest::Infer => available_candidates,
+                SpeakerCountRequest::Prior { bins } => bins
+                    .last()
+                    .ok_or_else(|| "speaker-count prior is empty".to_owned())?
+                    .count
+                    .max(available_candidates),
+                SpeakerCountRequest::Range { maximum, .. } => (*maximum).max(available_candidates),
+                SpeakerCountRequest::HardConstraint { .. } => {
+                    return Err("hard speaker-count policy was not finalized exactly".to_owned());
+                }
+            }
+        }
+        SpeakerCountCalibrationStatus::Certified => {
+            return Err(
+                "certified speaker-count estimates lack an admitted candidate policy".to_owned(),
+            );
+        }
+    };
+    Ok(candidate_upper_bound.max(constraint_lower_bound))
+}
+
 fn validate_error_fallback_policy_binding(
     report: &DiarizationReport,
     request: &DiarizationRequest,
@@ -1823,6 +1976,11 @@ fn validate_error_fallback_policy_binding(
     if report.speaker_count.status == SpeakerCountOutcomeStatus::Unsatisfied {
         return Err(
             "error fallback policy cannot return unsatisfied speaker-count constraints".to_owned(),
+        );
+    }
+    if report.speaker_count.status == SpeakerCountOutcomeStatus::Unresolved {
+        return Err(
+            "error fallback policy cannot return unresolved speaker-count evidence".to_owned(),
         );
     }
     if matches!(
@@ -1970,6 +2128,48 @@ fn validate_report_kind_invariants(
     report: &DiarizationReport,
     kind: DiarizationReportKind,
 ) -> Result<(), String> {
+    let diagnostic_shape_is_admitted = match kind {
+        DiarizationReportKind::NativeAcoustic => {
+            (report.neural_representation.is_none() && report.diagnostics.is_empty())
+                || (report.neural_representation.is_some()
+                    && diagnostic_codes_equal(
+                        &report.diagnostics,
+                        &[DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK],
+                    ))
+        }
+        DiarizationReportKind::NativeEcapaOnly | DiarizationReportKind::NativeEcapaFused => {
+            report.diagnostics.is_empty()
+        }
+        DiarizationReportKind::NativeEcapaUnavailable => diagnostic_codes_equal(
+            &report.diagnostics,
+            &[DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE],
+        ),
+        DiarizationReportKind::External => {
+            (report.neural_representation.is_none()
+                && diagnostic_codes_equal(
+                    &report.diagnostics,
+                    &[DIARIZATION_DIAGNOSTIC_EXTERNAL_ATTRIBUTION_ACCEPTED],
+                ))
+                || diagnostic_codes_equal(
+                    &report.diagnostics,
+                    &[
+                        DIARIZATION_DIAGNOSTIC_EXTERNAL_ATTRIBUTION_ACCEPTED,
+                        DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_FALLBACK,
+                    ],
+                )
+        }
+        DiarizationReportKind::FallbackUnknown => diagnostic_codes_equal(
+            &report.diagnostics,
+            &[DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_UNAVAILABLE],
+        ),
+    };
+    if !diagnostic_shape_is_admitted {
+        return Err(
+            "diarization diagnostic codes are not canonical for the report implementation"
+                .to_owned(),
+        );
+    }
+
     if kind != DiarizationReportKind::External
         && (report
             .speaker_count
@@ -2002,17 +2202,31 @@ fn validate_report_kind_invariants(
     if native_success && report.fallback_status == DiarizationFallbackStatus::ExternalBackend {
         return Err("native diarization cannot claim external-backend fallback status".to_owned());
     }
+    if native_success
+        && matches!(
+            report.fallback_status,
+            DiarizationFallbackStatus::CalibrationInvalid
+                | DiarizationFallbackStatus::ResourceLimit
+        )
+    {
+        return Err(
+            "native diarization claims a fallback cause that no current producer emits".to_owned(),
+        );
+    }
     if native_success {
-        let estimate = report
-            .speaker_count
-            .estimate
-            .as_ref()
-            .expect("native estimate presence was validated");
+        let estimate = report.speaker_count.estimate.as_ref().ok_or_else(|| {
+            "native diarization reports require a speaker-count estimate".to_owned()
+        })?;
         if (estimate.resources.prototype_count > 0) != report.operational_partition.is_some() {
             return Err(
                 "native operational partition presence disagrees with observed prototypes"
                     .to_owned(),
             );
+        }
+        if estimate.resources.prototype_count == 0
+            && report.speaker_count.supported_speaker_count != 0
+        {
+            return Err("zero-prototype native report claims supported speakers".to_owned());
         }
         if report
             .operational_partition
@@ -2045,7 +2259,7 @@ fn validate_report_kind_invariants(
             }
         }
         let dominance_breached = report.speaker_count.supported_speaker_count > 1
-            && report.speaker_count.dominant_speaker_share > 0.98;
+            && report.speaker_count.dominant_speaker_share > f64::from(0.98_f32);
         if report
             .speaker_count
             .reasons
@@ -2143,18 +2357,22 @@ fn validate_report_kind_invariants(
             if report.turns.iter().any(|turn| {
                 !turn.hard_hint_attributed
                     || turn.speaker_ref.is_none()
-                    || turn.speaker_confidence.map(f64::to_bits)
-                        != Some(1.0_f64.to_bits())
-            }) || report.speaker_count.speaker_evidence.iter().any(|evidence| {
-                !evidence.supported
-                    || !evidence.hard_anchored
-                    || evidence.reasons != vec![SpeakerEvidenceReason::SupportedByHardHint]
-                    || !report.hint_evidence.iter().any(|hint| {
-                        hint.speaker_ref == evidence.speaker_ref
-                            && hint.policy == KnownSpeakerPolicy::HardMustLink
-                            && hint.disposition == SpeakerHintDisposition::HardAttributed
-                    })
-            }) {
+                    || turn.speaker_confidence.map(f64::to_bits) != Some(1.0_f64.to_bits())
+            }) || report
+                .speaker_count
+                .speaker_evidence
+                .iter()
+                .any(|evidence| {
+                    !evidence.supported
+                        || !evidence.hard_anchored
+                        || evidence.reasons != vec![SpeakerEvidenceReason::SupportedByHardHint]
+                        || !report.hint_evidence.iter().any(|hint| {
+                            hint.speaker_ref == evidence.speaker_ref
+                                && hint.policy == KnownSpeakerPolicy::HardMustLink
+                                && hint.disposition == SpeakerHintDisposition::HardAttributed
+                        })
+                })
+            {
                 return Err(
                     "unavailable ECAPA report claims non-hard speaker identity evidence".to_owned(),
                 );
@@ -2181,6 +2399,29 @@ fn validate_report_kind_invariants(
             }
         }
         DiarizationReportKind::External => {
+            if matches!(
+                &report.speaker_count.request,
+                SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+            ) {
+                return Err(
+                    "external diarization cannot preserve soft speaker-count request semantics"
+                        .to_owned(),
+                );
+            }
+            if matches!(&report.speaker_count.request, SpeakerCountRequest::Infer) {
+                let expected_status =
+                    if report.speaker_count.unknown_voiced_share.to_bits() == 0.0_f64.to_bits() {
+                        SpeakerCountOutcomeStatus::Resolved
+                    } else {
+                        SpeakerCountOutcomeStatus::Unresolved
+                    };
+                if report.speaker_count.status != expected_status {
+                    return Err(
+                        "external inferred speaker-count status disagrees with attribution coverage"
+                            .to_owned(),
+                    );
+                }
+            }
             if report.fallback_status != DiarizationFallbackStatus::ExternalBackend
                 || report.speaker_count.estimate.is_some()
                 || report.operational_partition.is_some()
@@ -2236,15 +2477,13 @@ fn validate_report_kind_invariants(
                     .any(|evidence| {
                         evidence.voiced_frame_count != 0
                             || evidence.independent_voiced_frame_count != 0
-                            || evidence.mean_assignment_confidence.to_bits()
-                                != 0.0_f64.to_bits()
+                            || evidence.mean_assignment_confidence.to_bits() != 0.0_f64.to_bits()
                             || evidence.profile_reliability.to_bits() != 0.0_f64.to_bits()
                             || evidence.hard_anchored
                             || !evidence.separated_from_supported_speakers
                             || evidence.independent_tracklet_count
                                 != evidence.assigned_tracklet_count
-                            || evidence.recurrence_episode_count
-                                != evidence.assigned_tracklet_count
+                            || evidence.recurrence_episode_count != evidence.assigned_tracklet_count
                     })
             {
                 return Err(
@@ -2257,7 +2496,9 @@ fn validate_report_kind_invariants(
                     .speaker_evidence
                     .iter()
                     .find(|evidence| evidence.speaker_ref == profile.speaker_ref)
-                    .expect("external profile/evidence references were validated");
+                    .ok_or_else(|| {
+                        "external profile has no matching speaker evidence".to_owned()
+                    })?;
                 let matching_turns = report
                     .turns
                     .iter()
@@ -2284,9 +2525,7 @@ fn validate_report_kind_invariants(
                     }
                     SpeakerCountRequest::Infer
                     | SpeakerCountRequest::Prior { .. }
-                    | SpeakerCountRequest::Range { .. } => {
-                        SpeakerCountOutcomeStatus::Unresolved
-                    }
+                    | SpeakerCountRequest::Range { .. } => SpeakerCountOutcomeStatus::Unresolved,
                 };
                 if report.speaker_count.status != expected_status {
                     return Err(
@@ -2296,6 +2535,35 @@ fn validate_report_kind_invariants(
             }
         }
         DiarizationReportKind::FallbackUnknown => {
+            let exact_fallback = match &report.speaker_count.request {
+                SpeakerCountRequest::Infer
+                    if report.speaker_count.status == SpeakerCountOutcomeStatus::Unresolved =>
+                {
+                    DiarizationFallbackStatus::InsufficientEvidence
+                }
+                SpeakerCountRequest::HardConstraint { .. }
+                    if report.speaker_count.status == SpeakerCountOutcomeStatus::Unsatisfied =>
+                {
+                    DiarizationFallbackStatus::UnsatisfiedConstraints
+                }
+                SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. } => {
+                    return Err(
+                        "unknown fallback cannot preserve soft speaker-count request semantics"
+                            .to_owned(),
+                    );
+                }
+                SpeakerCountRequest::Infer | SpeakerCountRequest::HardConstraint { .. } => {
+                    return Err(
+                        "unknown fallback speaker-count status disagrees with its request"
+                            .to_owned(),
+                    );
+                }
+            };
+            if report.fallback_status != exact_fallback {
+                return Err(
+                    "unknown fallback cause disagrees with its speaker-count request".to_owned(),
+                );
+            }
             if report.neural_representation.is_some()
                 || report.speaker_count.estimate.is_some()
                 || report.operational_partition.is_some()
@@ -2307,6 +2575,7 @@ fn validate_report_kind_invariants(
                 || report.speaker_count.supported_speaker_count != 0
                 || !report.speaker_count.active_speaker_refs.is_empty()
                 || !report.speaker_count.speaker_evidence.is_empty()
+                || report.speaker_count.unknown_voiced_share.to_bits() != 1.0_f64.to_bits()
                 || matches!(
                     report.fallback_status,
                     DiarizationFallbackStatus::NotNeeded
@@ -2314,7 +2583,7 @@ fn validate_report_kind_invariants(
                 )
             {
                 return Err(
-                    "unknown fallback report claims speaker or model evidence that it cannot produce"
+                    "unknown fallback report claims speaker/model evidence or known voiced occupancy that it cannot produce"
                         .to_owned(),
                 );
             }
@@ -2349,8 +2618,7 @@ fn validate_diarization_turns(turns: &[DiarizationTurn]) -> Result<(), String> {
         }
         if turn.hard_hint_attributed
             && (turn.speaker_ref.is_none()
-                || turn.speaker_confidence.map(f64::to_bits) != Some(1.0_f64.to_bits())
-                || turn.overlap_suspected)
+                || turn.speaker_confidence.map(f64::to_bits) != Some(1.0_f64.to_bits()))
         {
             return Err(format!(
                 "diarization turn {index} has inconsistent hard-hint attribution"
@@ -2379,7 +2647,7 @@ fn validate_diarization_turns(turns: &[DiarizationTurn]) -> Result<(), String> {
             if left.start_ms < right.end_ms && right.start_ms < left.end_ms {
                 if left.speaker_ref == right.speaker_ref {
                     return Err(
-                        "overlapping diarization turns duplicate the same speaker".to_owned(),
+                        "overlapping diarization turns duplicate the same speaker".to_owned()
                     );
                 }
                 if left.speaker_ref.is_none()
@@ -2399,32 +2667,25 @@ fn validate_diarization_turns(turns: &[DiarizationTurn]) -> Result<(), String> {
 }
 
 fn validate_diarization_diagnostics(diagnostics: &[String]) -> Result<(), String> {
-    const MAX_DIAGNOSTIC_ENTRIES: usize = 256;
-    const MAX_DIAGNOSTIC_ENTRY_BYTES: usize = 16 * 1024;
-    const MAX_DIAGNOSTIC_TOTAL_BYTES: usize = 256 * 1024;
-
-    if diagnostics.len() > MAX_DIAGNOSTIC_ENTRIES {
-        return Err(format!(
-            "diarization diagnostics exceed the limit of {MAX_DIAGNOSTIC_ENTRIES} entries"
-        ));
-    }
-    let mut total_bytes = 0usize;
+    let mut seen = BTreeSet::new();
     for diagnostic in diagnostics {
-        if diagnostic.len() > MAX_DIAGNOSTIC_ENTRY_BYTES {
+        if !DIARIZATION_DIAGNOSTIC_CODES.contains(&diagnostic.as_str()) {
             return Err(format!(
-                "diarization diagnostic exceeds the {MAX_DIAGNOSTIC_ENTRY_BYTES}-byte limit"
+                "diarization diagnostic {diagnostic:?} is not an admitted stable code"
             ));
         }
-        total_bytes = total_bytes
-            .checked_add(diagnostic.len())
-            .ok_or_else(|| "diarization diagnostic byte count overflows".to_owned())?;
-        if total_bytes > MAX_DIAGNOSTIC_TOTAL_BYTES {
-            return Err(format!(
-                "diarization diagnostics exceed the {MAX_DIAGNOSTIC_TOTAL_BYTES}-byte aggregate limit"
-            ));
+        if !seen.insert(diagnostic.as_str()) {
+            return Err("diarization diagnostics contain a duplicate stable code".to_owned());
         }
     }
     Ok(())
+}
+
+fn diagnostic_codes_equal(actual: &[String], expected: &[&str]) -> bool {
+    actual
+        .iter()
+        .map(String::as_str)
+        .eq(expected.iter().copied())
 }
 
 fn validate_speaker_profiles(profiles: &[SpeakerProfileSummary]) -> Result<(), String> {
@@ -2597,6 +2858,8 @@ fn validate_speaker_count_outcome(
     kind: DiarizationReportKind,
 ) -> Result<(), String> {
     const F32_OCCUPANCY_SUM_TOLERANCE: f64 = 2.0 * f32::EPSILON as f64;
+    let minimum_recurrence_episodes =
+        crate::diarization::MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES as u64;
 
     validate_speaker_count_request(&outcome.request)
         .map_err(|error| format!("invalid speaker-count request in report: {error}"))?;
@@ -2676,7 +2939,7 @@ fn validate_speaker_count_outcome(
         if evidence
             .reasons
             .contains(&SpeakerEvidenceReason::SupportedByIndependentRecurrence)
-            && evidence.recurrence_episode_count < 2
+            && evidence.recurrence_episode_count < minimum_recurrence_episodes
         {
             return Err(
                 "independent-recurrence support lacks repeated recurrence episodes".to_owned(),
@@ -2735,6 +2998,14 @@ fn validate_speaker_count_outcome(
                 "native non-hard speaker support lacks observable identity evidence".to_owned(),
             );
         }
+        if matches!(
+            kind,
+            DiarizationReportKind::NativeAcoustic
+                | DiarizationReportKind::NativeEcapaOnly
+                | DiarizationReportKind::NativeEcapaFused
+        ) {
+            validate_native_speaker_evidence(evidence, kind)?;
+        }
         if evidence.supported {
             supported_evidence_refs.insert(evidence.speaker_ref.as_str());
         }
@@ -2747,7 +3018,8 @@ fn validate_speaker_count_outcome(
         && outcome.unknown_voiced_share.to_bits() != 0.0_f64.to_bits();
     match &outcome.request {
         SpeakerCountRequest::HardConstraint { count } => {
-            let expected_status = if outcome.supported_speaker_count == *count && !partial_external {
+            let expected_status = if outcome.supported_speaker_count == *count && !partial_external
+            {
                 SpeakerCountOutcomeStatus::Satisfied
             } else {
                 SpeakerCountOutcomeStatus::Unsatisfied
@@ -2844,9 +3116,161 @@ fn validate_speaker_count_outcome(
         .reasons
         .contains(&SpeakerCountOutcomeReason::DominantSpeakerShareExceeded);
     if has_dominance_reason
-        && (outcome.supported_speaker_count <= 1 || outcome.dominant_speaker_share <= 0.98)
+        && (outcome.supported_speaker_count <= 1
+            || outcome.dominant_speaker_share <= f64::from(0.98_f32))
     {
         return Err("dominant-speaker reason lacks a multi-speaker dominance breach".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_native_speaker_evidence(
+    evidence: &SpeakerEvidenceSummary,
+    kind: DiarizationReportKind,
+) -> Result<(), String> {
+    let minimum_voiced_frames = crate::diarization::MIN_SPEAKER_EVIDENCE_VOICED_FRAMES as u64;
+    let minimum_recurrence_episodes =
+        crate::diarization::MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES as u64;
+    let minimum_assignment_confidence =
+        f64::from(crate::diarization::MIN_SPEAKER_EVIDENCE_CONFIDENCE);
+    let minimum_profile_reliability =
+        f64::from(crate::diarization::MIN_SPEAKER_EVIDENCE_RELIABILITY);
+
+    if evidence.hard_anchored {
+        let mut expected_reasons = Vec::with_capacity(2);
+        if evidence.assigned_tracklet_count == 0 {
+            expected_reasons.push(SpeakerEvidenceReason::NoAssignedSpeech);
+        }
+        expected_reasons.push(SpeakerEvidenceReason::SupportedByHardHint);
+        if evidence.reasons != expected_reasons {
+            return Err(
+                "native hard-anchor evidence does not carry its exact canonical reasons".to_owned(),
+            );
+        }
+        return Ok(());
+    }
+
+    let insufficient_voiced_frames =
+        evidence.independent_voiced_frame_count < minimum_voiced_frames;
+    let insufficient_assignment_confidence =
+        evidence.mean_assignment_confidence < minimum_assignment_confidence;
+    let insufficient_profile_reliability =
+        evidence.profile_reliability < minimum_profile_reliability;
+    if evidence
+        .reasons
+        .contains(&SpeakerEvidenceReason::InsufficientVoicedFrames)
+        != insufficient_voiced_frames
+        || evidence
+            .reasons
+            .contains(&SpeakerEvidenceReason::InsufficientAssignmentConfidence)
+            != insufficient_assignment_confidence
+        || evidence
+            .reasons
+            .contains(&SpeakerEvidenceReason::InsufficientProfileReliability)
+            != insufficient_profile_reliability
+    {
+        return Err(
+            "native speaker evidence rejection reasons disagree with the exact support thresholds"
+                .to_owned(),
+        );
+    }
+
+    let has_merge_compatible_reason = evidence
+        .reasons
+        .contains(&SpeakerEvidenceReason::MergeCompatibleWithSupportedSpeaker);
+    if has_merge_compatible_reason {
+        if kind == DiarizationReportKind::NativeAcoustic
+            && evidence.recurrence_episode_count < minimum_recurrence_episodes
+            && evidence.independent_tracklet_count < 2
+        {
+            return Err(
+                "native acoustic evidence cannot claim a singleton held-out candidate".to_owned(),
+            );
+        }
+        if evidence.separated_from_supported_speakers
+            || evidence.reasons != vec![SpeakerEvidenceReason::MergeCompatibleWithSupportedSpeaker]
+        {
+            return Err(
+                "merge-compatible native speaker evidence is not a canonical rejected candidate"
+                    .to_owned(),
+            );
+        }
+        return Ok(());
+    }
+    if !evidence.separated_from_supported_speakers {
+        return Err(
+            "native speaker evidence lacks robust separation without a merge-compatible reason"
+                .to_owned(),
+        );
+    }
+
+    if evidence.supported {
+        if insufficient_voiced_frames
+            || insufficient_assignment_confidence
+            || insufficient_profile_reliability
+            || evidence.assigned_tracklet_count == 0
+            || evidence.independent_tracklet_count == 0
+        {
+            return Err(
+                "native non-hard speaker support does not meet the exact identity evidence gates"
+                    .to_owned(),
+            );
+        }
+        let expected_support_reason = if evidence.independent_tracklet_count == 1 {
+            if kind == DiarizationReportKind::NativeAcoustic {
+                return Err(
+                    "native acoustic evidence cannot claim held-out neural speaker support"
+                        .to_owned(),
+                );
+            }
+            SpeakerEvidenceReason::SupportedByHeldoutObservation
+        } else if evidence.recurrence_episode_count < minimum_recurrence_episodes {
+            SpeakerEvidenceReason::SupportedByRepeatedTracklets
+        } else {
+            SpeakerEvidenceReason::SupportedByIndependentRecurrence
+        };
+        if evidence.reasons != vec![expected_support_reason] {
+            return Err(
+                "native non-hard speaker support does not carry its exact canonical reason"
+                    .to_owned(),
+            );
+        }
+        return Ok(());
+    }
+
+    let has_insufficient_recurrence = evidence
+        .reasons
+        .contains(&SpeakerEvidenceReason::InsufficientIndependentRecurrence);
+    if has_insufficient_recurrence
+        && (evidence.recurrence_episode_count >= minimum_recurrence_episodes
+            || evidence.independent_tracklet_count >= 2)
+    {
+        return Err(
+            "native recurrence rejection contradicts independently repeated evidence".to_owned(),
+        );
+    }
+    if (evidence.independent_tracklet_count == 0
+        || (kind == DiarizationReportKind::NativeAcoustic
+            && evidence.recurrence_episode_count < minimum_recurrence_episodes
+            && evidence.independent_tracklet_count < 2))
+        && !has_insufficient_recurrence
+    {
+        return Err(
+            "native speaker evidence omits its required independent-recurrence rejection"
+                .to_owned(),
+        );
+    }
+    if !evidence.reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            SpeakerEvidenceReason::NoAssignedSpeech
+                | SpeakerEvidenceReason::InsufficientIndependentRecurrence
+                | SpeakerEvidenceReason::InsufficientVoicedFrames
+                | SpeakerEvidenceReason::InsufficientAssignmentConfidence
+                | SpeakerEvidenceReason::InsufficientProfileReliability
+        )
+    }) {
+        return Err("unsupported native speaker evidence has no rejection reason".to_owned());
     }
     Ok(())
 }
@@ -2878,30 +3302,87 @@ fn validate_speaker_count_estimate_request_binding(
         .iter()
         .find(|lane| lane.lane == SpeakerCountEvidenceLane::CallerPrior)
         .ok_or_else(|| "speaker-count estimate is missing its caller-prior lane".to_owned())?;
-    match &outcome.request {
-        SpeakerCountRequest::Infer | SpeakerCountRequest::HardConstraint { .. } => {
-            if caller_prior.available
-                || caller_prior.proposed_count.is_some()
-                || caller_prior.confidence.to_bits() != 0.0_f64.to_bits()
-                || caller_prior.unavailable_reason
-                    != Some(SpeakerCountLaneUnavailableReason::NotRequested)
-            {
-                return Err(
-                    "caller-prior lane claims evidence for a request without a prior".to_owned(),
-                );
-            }
-        }
-        SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. } => {
-            if caller_prior.unavailable_reason
-                == Some(SpeakerCountLaneUnavailableReason::NotRequested)
-            {
-                return Err(
-                    "caller-prior lane claims a requested prior was not requested".to_owned(),
-                );
-            }
-        }
+    let expected_caller_prior = canonical_caller_prior_lane(
+        &outcome.request,
+        estimate.constraint_lower_bound,
+        estimate.candidate_upper_bound,
+    )?;
+    if caller_prior != &expected_caller_prior {
+        return Err(
+            "caller-prior lane disagrees with the exact authorized request and count bounds"
+                .to_owned(),
+        );
     }
     Ok(())
+}
+
+fn canonical_caller_prior_lane(
+    request: &SpeakerCountRequest,
+    constraint_lower_bound: u32,
+    candidate_upper_bound: u32,
+) -> Result<SpeakerCountLaneEvidence, String> {
+    let unavailable = |reason| SpeakerCountLaneEvidence {
+        lane: SpeakerCountEvidenceLane::CallerPrior,
+        available: false,
+        proposed_count: None,
+        confidence: 0.0,
+        unavailable_reason: Some(reason),
+    };
+    match request {
+        SpeakerCountRequest::Infer | SpeakerCountRequest::HardConstraint { .. } => {
+            Ok(unavailable(SpeakerCountLaneUnavailableReason::NotRequested))
+        }
+        SpeakerCountRequest::Prior { bins } => {
+            let feasible = bins.iter().filter(|bin| {
+                bin.count >= constraint_lower_bound && bin.count <= candidate_upper_bound
+            });
+            let retained_feasible_mass = feasible.clone().map(|bin| bin.probability).sum::<f64>();
+            let proposed = feasible.max_by(|left, right| {
+                left.probability
+                    .total_cmp(&right.probability)
+                    .then_with(|| right.count.cmp(&left.count))
+            });
+            if !retained_feasible_mass.is_finite() || retained_feasible_mass <= 0.0 {
+                return Ok(unavailable(
+                    SpeakerCountLaneUnavailableReason::ContradictoryConstraints,
+                ));
+            }
+            let proposed = proposed.ok_or_else(|| {
+                "positive caller-prior mass has no feasible proposed count".to_owned()
+            })?;
+            Ok(SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::CallerPrior,
+                available: true,
+                proposed_count: Some(proposed.count),
+                confidence: retained_feasible_mass,
+                unavailable_reason: None,
+            })
+        }
+        SpeakerCountRequest::Range { minimum, maximum } => {
+            let declared_width = maximum
+                .checked_sub(*minimum)
+                .and_then(|width| width.checked_add(1))
+                .ok_or_else(|| "speaker-count range width overflows".to_owned())?;
+            let feasible_minimum = (*minimum).max(constraint_lower_bound);
+            let feasible_maximum = (*maximum).min(candidate_upper_bound);
+            if feasible_minimum > feasible_maximum {
+                return Ok(unavailable(
+                    SpeakerCountLaneUnavailableReason::ContradictoryConstraints,
+                ));
+            }
+            let feasible_width = feasible_maximum
+                .checked_sub(feasible_minimum)
+                .and_then(|width| width.checked_add(1))
+                .ok_or_else(|| "feasible speaker-count range width overflows".to_owned())?;
+            Ok(SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::CallerPrior,
+                available: true,
+                proposed_count: Some(feasible_minimum),
+                confidence: f64::from(feasible_width) / f64::from(declared_width),
+                unavailable_reason: None,
+            })
+        }
+    }
 }
 
 fn validate_fallback_status_binding(
@@ -2965,35 +3446,45 @@ fn validate_diarization_references(
         {
             return Err("speaker query references a non-active candidate".to_owned());
         }
-        let overlaps = |turn: &&DiarizationTurn| {
-            turn.start_ms < query.end_ms && query.start_ms < turn.end_ms
-        };
+        let overlaps =
+            |turn: &&DiarizationTurn| turn.start_ms < query.end_ms && query.start_ms < turn.end_ms;
         let query_is_grounded = match query.reason {
             SpeakerAttributionQueryReason::UnknownAttribution => report
                 .turns
                 .iter()
                 .filter(overlaps)
                 .any(|turn| turn.speaker_ref.is_none()),
-            SpeakerAttributionQueryReason::LowConfidence => {
-                let candidate = query
-                    .candidate_speaker_refs
-                    .first()
-                    .expect("query cardinality was validated");
-                report.turns.iter().filter(overlaps).any(|turn| {
-                    !turn.hard_hint_attributed
-                        && turn.speaker_ref.as_ref() == Some(candidate)
-                        && turn.speaker_confidence.is_some_and(|confidence| confidence < 0.60)
-                })
-            }
-            SpeakerAttributionQueryReason::OverlapAmbiguity => query
+            SpeakerAttributionQueryReason::LowConfidence => query
                 .candidate_speaker_refs
-                .iter()
-                .all(|candidate| {
+                .first()
+                .is_some_and(|candidate| {
                     report.turns.iter().filter(overlaps).any(|turn| {
-                        turn.overlap_suspected
+                        !turn.hard_hint_attributed
                             && turn.speaker_ref.as_ref() == Some(candidate)
+                            && turn
+                                .speaker_confidence
+                                .is_some_and(|confidence| confidence < 0.60)
                     })
                 }),
+            SpeakerAttributionQueryReason::OverlapAmbiguity => {
+                match query.candidate_speaker_refs.as_slice() {
+                    [left_candidate, right_candidate] => report.turns.iter().any(|left| {
+                        left.overlap_suspected
+                            && left.speaker_ref.as_ref() == Some(left_candidate)
+                            && left.start_ms < query.end_ms
+                            && query.start_ms < left.end_ms
+                            && report.turns.iter().any(|right| {
+                                right.overlap_suspected
+                                    && right.speaker_ref.as_ref() == Some(right_candidate)
+                                    && right.start_ms < query.end_ms
+                                    && query.start_ms < right.end_ms
+                                    && left.start_ms.max(right.start_ms).max(query.start_ms)
+                                        < left.end_ms.min(right.end_ms).min(query.end_ms)
+                            })
+                    }),
+                    _ => false,
+                }
+            }
         };
         if !query_is_grounded {
             return Err(
@@ -3010,9 +3501,10 @@ fn validate_diarization_references(
             | DiarizationReportKind::NativeEcapaUnavailable
     );
     if native_kind
-        && report.turns.iter().any(|turn| {
-            turn.speaker_ref.is_some() && turn.speaker_confidence.is_none()
-        })
+        && report
+            .turns
+            .iter()
+            .any(|turn| turn.speaker_ref.is_some() && turn.speaker_confidence.is_none())
     {
         return Err("native labeled diarization turn omits speaker confidence".to_owned());
     }
@@ -3980,6 +4472,42 @@ mod tests {
         assert_eq!(
             estimate.validate().unwrap_err(),
             "uncalibrated or unavailable speaker-count evidence claims authority"
+        );
+
+        let mut missing_range = unresolved.clone();
+        missing_range.supported_range = None;
+        assert!(
+            missing_range
+                .validate()
+                .expect_err("posterior authority requires an explicit supported range")
+                .contains("omits its supported range")
+        );
+
+        let mut reordered_lanes = unresolved.clone();
+        reordered_lanes.lanes.swap(0, 1);
+        assert!(
+            reordered_lanes
+                .validate()
+                .expect_err("evidence lanes have one deterministic durable ordering")
+                .contains("not canonically ordered")
+        );
+
+        let mut zero_prototypes = unresolved;
+        zero_prototypes.resources = SpeakerCountResourceSummary {
+            prototype_count: 0,
+            affinity_pair_evaluations: 0,
+            retained_sparse_edges: 0,
+            estimated_peak_buffer_bytes: 0,
+            stability_replicates: 0,
+            solver_iterations: 0,
+            solver_sparse_matvec_terms: 0,
+            solver_residual: None,
+        };
+        assert!(
+            zero_prototypes
+                .validate()
+                .expect_err("zero prototypes cannot carry development authority")
+                .contains("explicitly unavailable")
         );
     }
 
@@ -5896,6 +6424,23 @@ mod tests {
     }
 
     #[test]
+    fn prototype_cap_cannot_drop_distinct_hard_references() {
+        let request = DiarizationRequest {
+            max_prototypes: 1,
+            known_intervals: vec![
+                speaker_hint("near", 0, 400, KnownSpeakerPolicy::HardMustLink),
+                speaker_hint("remote", 600, 1_000, KnownSpeakerPolicy::HardMustLink),
+            ],
+            ..DiarizationRequest::default()
+        };
+        let error = request
+            .validate(1_000)
+            .expect_err("prototype cap cannot discard immutable speaker identities");
+        assert_eq!(error.code, DiarizationValidationCode::InvalidPrototypeCap);
+        assert!(error.message.contains("2 distinct hard speaker references"));
+    }
+
+    #[test]
     fn soft_count_range_cannot_override_hard_anchor_lower_bound() {
         let request = DiarizationRequest {
             speaker_count: SpeakerCountRequest::Range {
@@ -6044,15 +6589,26 @@ mod tests {
             hint_document_sha256: Some(
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             ),
-            turns: vec![DiarizationTurn {
-                start_ms: 0,
-                end_ms: 1_000,
-                speaker_ref: Some("near".to_owned()),
-                speaker_confidence: Some(1.0),
-                change_confidence: Some(0.84),
-                overlap_suspected: false,
-                hard_hint_attributed: true,
-            }],
+            turns: vec![
+                DiarizationTurn {
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    speaker_ref: Some("near".to_owned()),
+                    speaker_confidence: Some(1.0),
+                    change_confidence: Some(0.84),
+                    overlap_suspected: false,
+                    hard_hint_attributed: true,
+                },
+                DiarizationTurn {
+                    start_ms: 1_000,
+                    end_ms: 1_500,
+                    speaker_ref: Some("near".to_owned()),
+                    speaker_confidence: Some(0.5),
+                    change_confidence: Some(0.2),
+                    overlap_suspected: false,
+                    hard_hint_attributed: false,
+                },
+            ],
             profiles: vec![SpeakerProfileSummary {
                 speaker_ref: "near".to_owned(),
                 frame_count: 72,
@@ -6172,7 +6728,7 @@ mod tests {
             ),
             model_load_source: Some(NeuralModelLoadSource::PackageVerified),
             status: NeuralSpeakerRepresentationStatus::Ready,
-            embedded_tracklet_count: 1,
+            embedded_tracklet_count: 2,
             zero_padded_tracklet_count: 0,
             skipped_tracklet_count: 0,
             reasons: Vec::new(),
@@ -6234,6 +6790,7 @@ mod tests {
         report.hint_document_sha256 = None;
         report.hint_evidence.clear();
         report.speaker_queries.clear();
+        report.turns.truncate(1);
         report.speaker_count.estimate = None;
         report.speaker_count.reasons = vec![
             SpeakerCountOutcomeReason::ExternalAttribution,
@@ -6272,6 +6829,7 @@ mod tests {
         };
         report.fallback_status = DiarizationFallbackStatus::ExternalBackend;
         report.operational_partition = None;
+        report.diagnostics = vec![DIARIZATION_DIAGNOSTIC_EXTERNAL_ATTRIBUTION_ACCEPTED.to_owned()];
         report
     }
 
@@ -6299,6 +6857,7 @@ mod tests {
         report.fallback_status = DiarizationFallbackStatus::InsufficientEvidence;
         report.operational_partition = None;
         report.neural_representation = None;
+        report.diagnostics = vec![DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_UNAVAILABLE.to_owned()];
         report
     }
 
@@ -6384,9 +6943,30 @@ mod tests {
 
         let mut acoustic_fallback = typed_diarization_report_fixture();
         acoustic_fallback.neural_representation = Some(ready_neural_summary());
+        acoustic_fallback.diagnostics =
+            vec![DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK.to_owned()];
         acoustic_fallback
             .validate()
             .expect("acoustic fallback may retain valid neural attempt provenance");
+
+        let mut missing_fallback_code = acoustic_fallback.clone();
+        missing_fallback_code.diagnostics.clear();
+        assert!(
+            missing_fallback_code
+                .validate()
+                .expect_err("neural provenance requires the acoustic-fallback code")
+                .contains("not canonical for the report implementation")
+        );
+
+        let mut forged_fallback_code = typed_diarization_report_fixture();
+        forged_fallback_code.diagnostics =
+            vec![DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK.to_owned()];
+        assert!(
+            forged_fallback_code
+                .validate()
+                .expect_err("an acoustic-fallback code requires neural attempt provenance")
+                .contains("not canonical for the report implementation")
+        );
 
         let mut ecapa_only = typed_diarization_report_fixture();
         ecapa_only.implementation = "native-ecapa-only-v1".to_owned();
@@ -6421,12 +7001,29 @@ mod tests {
         let mut external = external_diarization_report_fixture();
         external.neural_representation = Some(ready_neural_summary());
         external
+            .diagnostics
+            .push(DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_FALLBACK.to_owned());
+        external
             .validate()
             .expect("external fallback may retain valid neural attempt provenance");
+
+        let mut missing_external_fallback_code = external.clone();
+        missing_external_fallback_code.diagnostics.pop();
+        assert!(
+            missing_external_fallback_code
+                .validate()
+                .expect_err("external neural provenance requires fallback routing")
+                .contains("not canonical for the report implementation")
+        );
 
         let mut partial_external = external_diarization_report_fixture();
         partial_external.speaker_count.dominant_speaker_share = 0.6;
         partial_external.speaker_count.unknown_voiced_share = 0.4;
+        partial_external.speaker_count.status = SpeakerCountOutcomeStatus::Unsatisfied;
+        partial_external.speaker_count.reasons = vec![
+            SpeakerCountOutcomeReason::ExternalAttribution,
+            SpeakerCountOutcomeReason::RequestedCountMismatch,
+        ];
         partial_external
             .validate()
             .expect("external attribution may honestly leave timed speech unknown");
@@ -6435,13 +7032,159 @@ mod tests {
             .validate()
             .expect("unknown fallback tuple");
 
+        let mut forged_unknown_cause = unknown_diarization_report_fixture();
+        forged_unknown_cause.fallback_status = DiarizationFallbackStatus::ResourceLimit;
+        assert!(
+            forged_unknown_cause
+                .validate()
+                .expect_err("unknown fallback cannot invent an unproduced resource cause")
+                .contains("cause disagrees")
+        );
+
+        let mut hard_unknown = unknown_diarization_report_fixture();
+        hard_unknown.speaker_count.request = SpeakerCountRequest::HardConstraint { count: 2 };
+        hard_unknown.speaker_count.status = SpeakerCountOutcomeStatus::Unsatisfied;
+        hard_unknown.speaker_count.reasons =
+            vec![SpeakerCountOutcomeReason::RequestedCountMismatch];
+        hard_unknown.fallback_status = DiarizationFallbackStatus::UnsatisfiedConstraints;
+        hard_unknown
+            .validate()
+            .expect("unknown hard-count fallback carries the exact unsatisfied cause");
+        hard_unknown.fallback_status = DiarizationFallbackStatus::InsufficientEvidence;
+        assert!(
+            hard_unknown
+                .validate()
+                .expect_err("unknown hard-count mismatch cannot claim mere insufficiency")
+                .contains("cause disagrees")
+        );
+
+        let mut prior_unknown = unknown_diarization_report_fixture();
+        prior_unknown.speaker_count.request = SpeakerCountRequest::Prior {
+            bins: vec![SpeakerCountPriorMass {
+                count: 1,
+                probability: 1.0,
+            }],
+        };
+        prior_unknown.speaker_count.reasons =
+            vec![SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable];
+        prior_unknown.fallback_status = DiarizationFallbackStatus::SpeakerCountUnresolved;
+        assert!(
+            prior_unknown
+                .validate()
+                .expect_err("unknown fallback cannot embed a soft prior")
+                .contains("cannot preserve soft speaker-count")
+        );
+
         let mut unavailable = unknown_diarization_report_fixture();
         unavailable.implementation = "native-ecapa-unavailable-v1".to_owned();
         unavailable.contract_version = "neural-diarization-common-v2".to_owned();
         unavailable.neural_representation = Some(unavailable_neural_summary());
+        unavailable.fallback_status = DiarizationFallbackStatus::SpeakerCountUnresolved;
+        unavailable.diagnostics =
+            vec![DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE.to_owned()];
         unavailable
             .validate()
             .expect("unavailable ECAPA tuple with honest provenance");
+    }
+
+    #[test]
+    fn external_and_unavailable_reports_cannot_claim_native_authority() {
+        let mut external_native_profile = external_diarization_report_fixture();
+        external_native_profile.profiles[0].reliability = 0.1;
+        assert!(
+            external_native_profile
+                .validate()
+                .expect_err("external profile cannot claim native reliability")
+                .contains("unavailable native evidence")
+        );
+
+        let mut partial_resolved = external_diarization_report_fixture();
+        partial_resolved.speaker_count.request = SpeakerCountRequest::Infer;
+        partial_resolved.speaker_count.status = SpeakerCountOutcomeStatus::Resolved;
+        partial_resolved.speaker_count.dominant_speaker_share = 0.6;
+        partial_resolved.speaker_count.unknown_voiced_share = 0.4;
+        partial_resolved.speaker_count.reasons = vec![
+            SpeakerCountOutcomeReason::ExternalAttribution,
+            SpeakerCountOutcomeReason::EvidenceSupportedCount,
+        ];
+        assert!(
+            partial_resolved
+                .validate()
+                .expect_err("partial external labels cannot resolve the total speaker count")
+                .contains("attribution coverage")
+        );
+
+        let mut fully_attributed_unresolved = external_diarization_report_fixture();
+        fully_attributed_unresolved.speaker_count.request = SpeakerCountRequest::Infer;
+        fully_attributed_unresolved.speaker_count.status = SpeakerCountOutcomeStatus::Unresolved;
+        fully_attributed_unresolved.speaker_count.reasons = vec![
+            SpeakerCountOutcomeReason::ExternalAttribution,
+            SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved,
+        ];
+        assert!(
+            fully_attributed_unresolved
+                .validate()
+                .expect_err("complete external attribution resolves an inferred count")
+                .contains("attribution coverage")
+        );
+
+        let mut fully_attributed_infer = external_diarization_report_fixture();
+        fully_attributed_infer.speaker_count.request = SpeakerCountRequest::Infer;
+        fully_attributed_infer.speaker_count.status = SpeakerCountOutcomeStatus::Resolved;
+        fully_attributed_infer.speaker_count.reasons = vec![
+            SpeakerCountOutcomeReason::ExternalAttribution,
+            SpeakerCountOutcomeReason::EvidenceSupportedCount,
+        ];
+        fully_attributed_infer
+            .validate()
+            .expect("complete external attribution resolves an inferred count");
+
+        let mut external_prior = external_diarization_report_fixture();
+        external_prior.speaker_count.request = SpeakerCountRequest::Prior {
+            bins: vec![SpeakerCountPriorMass {
+                count: 1,
+                probability: 1.0,
+            }],
+        };
+        external_prior.speaker_count.status = SpeakerCountOutcomeStatus::Unresolved;
+        external_prior.speaker_count.reasons = vec![
+            SpeakerCountOutcomeReason::ExternalAttribution,
+            SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable,
+        ];
+        assert!(
+            external_prior
+                .validate()
+                .expect_err("external standalone reports cannot embed a soft prior")
+                .contains("cannot preserve soft speaker-count")
+        );
+
+        let mut unavailable = typed_diarization_report_fixture();
+        unavailable.implementation = "native-ecapa-unavailable-v1".to_owned();
+        unavailable.contract_version = "neural-diarization-common-v2".to_owned();
+        unavailable.speaker_evidence_mode = DiarizationSpeakerEvidenceMode::None;
+        unavailable.neural_representation = Some(unavailable_neural_summary());
+        unavailable.speaker_count.estimate = None;
+        unavailable.operational_partition = None;
+        unavailable.profiles.clear();
+        unavailable.speaker_queries.clear();
+        unavailable.diagnostics =
+            vec![DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE.to_owned()];
+        unavailable.turns.truncate(1);
+        unavailable.fallback_status = DiarizationFallbackStatus::InsufficientEvidence;
+        unavailable.speaker_count.speaker_evidence[0].assigned_tracklet_count = 3;
+        unavailable.speaker_count.speaker_evidence[0].independent_tracklet_count = 3;
+        unavailable.speaker_count.speaker_evidence[0].recurrence_episode_count = 1;
+        unavailable
+            .validate()
+            .expect("multiple hard-attributed tracklets may form one recurrence episode");
+
+        unavailable.turns[0].hard_hint_attributed = false;
+        assert!(
+            unavailable
+                .validate()
+                .expect_err("unavailable ECAPA cannot invent non-hard identity evidence")
+                .contains("non-hard speaker identity evidence")
+        );
     }
 
     #[test]
@@ -6495,6 +7238,22 @@ mod tests {
         let mut profile = value.clone();
         profile["profiles"][0]["embedding"] = json!([0.1]);
         assert!(serde_json::from_value::<DiarizationReport>(profile).is_err());
+        for required_field in [
+            "voice_profile_count",
+            "training_accepted_count",
+            "training_downweighted_count",
+            "training_quarantined_count",
+        ] {
+            let mut missing_profile_field = value.clone();
+            missing_profile_field["profiles"][0]
+                .as_object_mut()
+                .expect("profile JSON object")
+                .remove(required_field);
+            assert!(
+                serde_json::from_value::<DiarizationReport>(missing_profile_field).is_err(),
+                "missing authority field {required_field} must fail closed"
+            );
+        }
 
         let mut hint = value.clone();
         hint["hint_evidence"][0]["raw_audio"] = json!([0, 1]);
@@ -6598,6 +7357,10 @@ mod tests {
             .as_mut()
             .expect("estimate")
             .selected_count = None;
+        report.speaker_count.status = SpeakerCountOutcomeStatus::Unresolved;
+        report.speaker_count.reasons =
+            vec![SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved];
+        report.fallback_status = DiarizationFallbackStatus::SpeakerCountUnresolved;
         report
             .validate()
             .expect("finalization may clear a posterior selection without erasing the partition");
@@ -6629,7 +7392,20 @@ mod tests {
             estimate
                 .validate()
                 .expect_err("fixed-safe estimates cannot claim posterior stability")
-                .contains("claims authority")
+                .contains("range or stability")
+        );
+
+        let mut false_fixed_confidence = fixed_safe_diarization_report_fixture();
+        false_fixed_confidence
+            .operational_partition
+            .as_mut()
+            .expect("partition")
+            .confidence = 0.9;
+        assert!(
+            false_fixed_confidence
+                .validate()
+                .expect_err("fixed-safe action cannot claim calibrated confidence")
+                .contains("must have zero confidence")
         );
     }
 
@@ -6698,6 +7474,9 @@ mod tests {
         summary.loaded_model_package_sha256 =
             Some(crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned());
         report.neural_representation = Some(summary);
+        report
+            .diagnostics
+            .push(DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_FALLBACK.to_owned());
         report
             .validate()
             .expect("known provider with the admitted package digest");
@@ -6805,6 +7584,28 @@ mod tests {
     }
 
     #[test]
+    fn hint_digest_binds_edge_guard_and_provenance_presence() {
+        let mut request = DiarizationRequest {
+            known_intervals: vec![speaker_hint(
+                "near",
+                0,
+                1_000,
+                KnownSpeakerPolicy::HardMustLink,
+            )],
+            ..DiarizationRequest::default()
+        };
+        request.known_intervals[0].provenance = None;
+        let without_provenance = speaker_hint_document_sha256(&request);
+
+        request.known_intervals[0].provenance = Some(String::new());
+        assert_ne!(without_provenance, speaker_hint_document_sha256(&request));
+
+        let before_edge_guard = speaker_hint_document_sha256(&request);
+        request.enrollment_edge_guard_ms = request.enrollment_edge_guard_ms.saturating_add(1);
+        assert_ne!(before_edge_guard, speaker_hint_document_sha256(&request));
+    }
+
+    #[test]
     fn hard_hint_attribution_requires_supported_anchor_and_overlapping_hard_turn() {
         let mut report = typed_diarization_report_fixture();
         let request = matching_acoustic_request(&mut report);
@@ -6813,7 +7614,10 @@ mod tests {
         missing_anchor.profiles[0].anchored = false;
         let speaker_evidence = &mut missing_anchor.speaker_count.speaker_evidence[0];
         speaker_evidence.hard_anchored = false;
-        speaker_evidence.reasons = vec![SpeakerEvidenceReason::SupportedByIndependentRecurrence];
+        speaker_evidence.assigned_tracklet_count = 2;
+        speaker_evidence.independent_tracklet_count = 2;
+        speaker_evidence.recurrence_episode_count = 1;
+        speaker_evidence.reasons = vec![SpeakerEvidenceReason::SupportedByRepeatedTracklets];
         missing_anchor
             .validate()
             .expect("report-local evidence remains internally consistent");
@@ -6851,6 +7655,15 @@ mod tests {
                 .validate_against_request(&request, None)
                 .expect_err("no-usable hard hint cannot authorize a hard-attributed turn")
                 .contains("not bound to an overlapping hard hint")
+        );
+
+        let mut no_usable_but_anchored = no_usable_but_attributed.clone();
+        no_usable_but_anchored.turns[0].hard_hint_attributed = false;
+        assert!(
+            no_usable_but_anchored
+                .validate_against_request(&request, None)
+                .expect_err("hard anchor cannot survive without hard-attributed hint evidence")
+                .contains("hard-anchored speaker evidence lacks")
         );
 
         let mut forged_turn = report;
@@ -6892,6 +7705,12 @@ mod tests {
         report.speaker_count.unknown_voiced_share = 1.0;
         report.speaker_count.reasons = vec![SpeakerCountOutcomeReason::RequestedCountMismatch];
         report.speaker_count.speaker_evidence.clear();
+        report
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("estimate")
+            .selected_count = None;
         report.fallback_status = DiarizationFallbackStatus::UnsatisfiedConstraints;
         report
             .validate_against_request(&request, None)
@@ -6905,9 +7724,22 @@ mod tests {
         acoustic_fallback_request.engine = DiarizationEngine::EcapaFused;
         acoustic_fallback_request.fallback = DiarizationFallbackPolicy::Acoustic;
         acoustic_fallback.neural_representation = Some(unavailable_neural_summary());
+        acoustic_fallback.diagnostics =
+            vec![DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK.to_owned()];
         acoustic_fallback
             .validate_against_request(&acoustic_fallback_request, None)
             .expect("neural request may fall back to acoustic with attempt provenance");
+
+        let mut forged_direct_acoustic = typed_diarization_report_fixture();
+        let direct_acoustic_request = matching_acoustic_request(&mut forged_direct_acoustic);
+        forged_direct_acoustic.diagnostics =
+            vec![DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK.to_owned()];
+        assert!(
+            forged_direct_acoustic
+                .validate_against_request(&direct_acoustic_request, None)
+                .expect_err("direct acoustic execution cannot claim a neural fallback")
+                .contains("not canonical for the report implementation")
+        );
 
         let mut forged_acoustic_fallback = acoustic_fallback.clone();
         forged_acoustic_fallback
@@ -6935,6 +7767,9 @@ mod tests {
 
         let mut external_fallback = external.clone();
         external_fallback.neural_representation = Some(unavailable_neural_summary());
+        external_fallback
+            .diagnostics
+            .push(DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_FALLBACK.to_owned());
         let neural_external_request = DiarizationRequest {
             engine: DiarizationEngine::Ecapa,
             fallback: DiarizationFallbackPolicy::External,
@@ -6944,6 +7779,17 @@ mod tests {
         external_fallback
             .validate_against_request(&neural_external_request, None)
             .expect("neural request may fall back externally with attempt provenance");
+
+        let mut forged_direct_external = external.clone();
+        forged_direct_external
+            .diagnostics
+            .push(DIARIZATION_DIAGNOSTIC_EXTERNAL_BACKEND_FALLBACK.to_owned());
+        assert!(
+            forged_direct_external
+                .validate_against_request(&external_request, None)
+                .expect_err("direct external execution cannot claim fallback routing")
+                .contains("authorized execution path")
+        );
 
         let mut lossy_external_request = external_request.clone();
         lossy_external_request.known_intervals = vec![speaker_hint(
@@ -6968,6 +7814,15 @@ mod tests {
         unknown
             .validate_against_request(&unknown_request, None)
             .expect("external unavailability may conservatively emit unknown");
+
+        let mut forged_unknown_occupancy = unknown;
+        forged_unknown_occupancy.speaker_count.unknown_voiced_share = 0.0;
+        assert!(
+            forged_unknown_occupancy
+                .validate()
+                .expect_err("unknown fallback must attribute all voiced occupancy to unknown")
+                .contains("known voiced occupancy")
+        );
     }
 
     #[test]
@@ -6979,7 +7834,82 @@ mod tests {
             report
                 .validate_against_request(&capped_request, None)
                 .expect_err("report resource use cannot exceed the authorized prototype cap")
-                .contains("prototype resource cap")
+                .contains("global prototype resource cap")
+        );
+
+        let mut forged_constraint_floor = typed_diarization_report_fixture();
+        use_infer_count_request(&mut forged_constraint_floor);
+        let hard_identity_request = DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            fallback: DiarizationFallbackPolicy::Unknown,
+            speaker_count: SpeakerCountRequest::Infer,
+            known_intervals: vec![
+                speaker_hint("speaker-1", 0, 100, KnownSpeakerPolicy::HardMustLink),
+                speaker_hint("speaker-2", 200, 300, KnownSpeakerPolicy::HardMustLink),
+                speaker_hint("speaker-3", 400, 500, KnownSpeakerPolicy::HardMustLink),
+            ],
+            ..DiarizationRequest::default()
+        };
+        assert!(
+            validate_report_request_resource_binding(
+                &forged_constraint_floor,
+                &hard_identity_request,
+            )
+            .expect_err("three hard identities require a lower bound of three")
+            .contains("constraint lower bound")
+        );
+
+        let mut forged_infer_ceiling = typed_diarization_report_fixture();
+        use_infer_count_request(&mut forged_infer_ceiling);
+        let mut infer_request = matching_acoustic_request(&mut forged_infer_ceiling);
+        infer_request.speaker_count = SpeakerCountRequest::Infer;
+        let estimate = forged_infer_ceiling
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("estimate");
+        estimate.resources.prototype_count = 10;
+        estimate.candidate_upper_bound = 10;
+        assert!(
+            forged_infer_ceiling
+                .validate_against_request(&infer_request, None)
+                .expect_err("automatic development inference is capped at eight candidates")
+                .contains("candidate upper bound")
+        );
+
+        let mut policy_estimate = forged_infer_ceiling
+            .speaker_count
+            .estimate
+            .clone()
+            .expect("estimate");
+        policy_estimate.calibration_status = SpeakerCountCalibrationStatus::FixedSafeUncalibrated;
+        assert_eq!(
+            canonical_speaker_count_candidate_upper_bound(
+                &SpeakerCountRequest::Prior {
+                    bins: vec![SpeakerCountPriorMass {
+                        count: 12,
+                        probability: 1.0,
+                    }],
+                },
+                1,
+                &policy_estimate,
+            )
+            .expect("fixed-safe prior ceiling"),
+            12,
+        );
+        policy_estimate.calibration_status = SpeakerCountCalibrationStatus::Unavailable;
+        policy_estimate.resources.prototype_count = 0;
+        assert_eq!(
+            canonical_speaker_count_candidate_upper_bound(
+                &SpeakerCountRequest::Range {
+                    minimum: 2,
+                    maximum: 4,
+                },
+                1,
+                &policy_estimate,
+            )
+            .expect("unavailable range ceiling"),
+            4,
         );
 
         let mut native_fallback = typed_diarization_report_fixture();
@@ -7012,6 +7942,42 @@ mod tests {
                 .expect_err("error policy cannot return unsatisfied external constraints")
                 .contains("cannot return unsatisfied")
         );
+
+        let mut partial_external = external_diarization_report_fixture();
+        partial_external.speaker_count.request = SpeakerCountRequest::Infer;
+        partial_external.speaker_count.status = SpeakerCountOutcomeStatus::Unresolved;
+        partial_external.speaker_count.dominant_speaker_share = 0.6;
+        partial_external.speaker_count.unknown_voiced_share = 0.4;
+        partial_external.speaker_count.reasons = vec![
+            SpeakerCountOutcomeReason::ExternalAttribution,
+            SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved,
+        ];
+        let partial_external_request = DiarizationRequest {
+            engine: DiarizationEngine::External,
+            fallback: DiarizationFallbackPolicy::Error,
+            speaker_count: SpeakerCountRequest::Infer,
+            ..DiarizationRequest::default()
+        };
+        assert!(
+            partial_external
+                .validate_against_request(&partial_external_request, None)
+                .expect_err("error policy cannot return unresolved partial attribution")
+                .contains("cannot return unresolved")
+        );
+
+        for unproduced_cause in [
+            DiarizationFallbackStatus::CalibrationInvalid,
+            DiarizationFallbackStatus::ResourceLimit,
+        ] {
+            let mut forged_native_cause = typed_diarization_report_fixture();
+            forged_native_cause.fallback_status = unproduced_cause;
+            assert!(
+                forged_native_cause
+                    .validate()
+                    .expect_err("native reports cannot claim an unproduced fallback cause")
+                    .contains("no current producer emits")
+            );
+        }
     }
 
     #[test]
@@ -7097,6 +8063,38 @@ mod tests {
                 .unwrap_err()
                 .contains("ECAPA-only spherical")
         );
+
+        let mut private_diagnostic = typed_diarization_report_fixture();
+        private_diagnostic.diagnostics = vec![
+            "input_path=/Users/example/Downloads/private-call.m4a transcript=secret".to_owned(),
+        ];
+        assert!(
+            private_diagnostic
+                .validate()
+                .expect_err("diagnostics cannot carry free-form or private payloads")
+                .contains("not an admitted stable code")
+        );
+        let mut duplicate_diagnostic = typed_diarization_report_fixture();
+        duplicate_diagnostic.diagnostics = vec![
+            DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK.to_owned(),
+            DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK.to_owned(),
+        ];
+        assert!(
+            duplicate_diagnostic
+                .validate()
+                .expect_err("stable diagnostic codes are set-like")
+                .contains("duplicate stable code")
+        );
+
+        let mut excessive_duration = typed_diarization_report_fixture();
+        let request = matching_acoustic_request(&mut excessive_duration);
+        excessive_duration.profiles[0].voiced_duration_ms = 1_501;
+        assert!(
+            excessive_duration
+                .validate_against_request(&request, Some(1_500))
+                .expect_err("per-speaker evidence cannot exceed the whole recording")
+                .contains("evidence duration exceeds")
+        );
     }
 
     #[test]
@@ -7137,6 +8135,116 @@ mod tests {
                 .validate()
                 .expect_err("overlap query must name exactly two candidates")
                 .contains("candidate count")
+        );
+
+        let mut ungrounded_low_confidence = typed_diarization_report_fixture();
+        ungrounded_low_confidence.speaker_queries[0].start_ms = 0;
+        ungrounded_low_confidence.speaker_queries[0].end_ms = 500;
+        ungrounded_low_confidence.speaker_queries[0].query_id_sha256 =
+            speaker_attribution_query_sha256(
+                &ungrounded_low_confidence.normalized_input_sha256,
+                &ungrounded_low_confidence.speaker_queries[0],
+            );
+        assert!(
+            ungrounded_low_confidence
+                .validate()
+                .expect_err("self-hashed query must still be grounded in low-confidence speech")
+                .contains("not grounded")
+        );
+
+        let mut forged_unknown = typed_diarization_report_fixture();
+        forged_unknown.speaker_queries[0].reason =
+            SpeakerAttributionQueryReason::UnknownAttribution;
+        forged_unknown.speaker_queries[0]
+            .candidate_speaker_refs
+            .clear();
+        forged_unknown.speaker_queries[0].query_id_sha256 = speaker_attribution_query_sha256(
+            &forged_unknown.normalized_input_sha256,
+            &forged_unknown.speaker_queries[0],
+        );
+        assert!(
+            forged_unknown
+                .validate()
+                .expect_err("self-hashed unknown query requires an overlapping unknown turn")
+                .contains("not grounded")
+        );
+
+        let mut disjoint_overlap_query = typed_diarization_report_fixture();
+        disjoint_overlap_query.turns = vec![
+            DiarizationTurn {
+                start_ms: 0,
+                end_ms: 500,
+                speaker_ref: Some("near".to_owned()),
+                speaker_confidence: Some(0.5),
+                change_confidence: None,
+                overlap_suspected: true,
+                hard_hint_attributed: false,
+            },
+            DiarizationTurn {
+                start_ms: 1_000,
+                end_ms: 1_500,
+                speaker_ref: Some("other".to_owned()),
+                speaker_confidence: Some(0.5),
+                change_confidence: None,
+                overlap_suspected: true,
+                hard_hint_attributed: false,
+            },
+        ];
+        let mut other_profile = disjoint_overlap_query.profiles[0].clone();
+        other_profile.speaker_ref = "other".to_owned();
+        disjoint_overlap_query.profiles.push(other_profile);
+        let mut other_evidence = disjoint_overlap_query.speaker_count.speaker_evidence[0].clone();
+        other_evidence.speaker_ref = "other".to_owned();
+        disjoint_overlap_query
+            .speaker_count
+            .speaker_evidence
+            .push(other_evidence);
+        disjoint_overlap_query.speaker_count.supported_speaker_count = 2;
+        disjoint_overlap_query.speaker_count.active_speaker_refs =
+            vec!["near".to_owned(), "other".to_owned()];
+        disjoint_overlap_query.speaker_queries = vec![SpeakerAttributionQuery {
+            query_id_sha256: "f".repeat(64),
+            start_ms: 0,
+            end_ms: 1_500,
+            reason: SpeakerAttributionQueryReason::OverlapAmbiguity,
+            candidate_speaker_refs: vec!["near".to_owned(), "other".to_owned()],
+            suggested_policy: KnownSpeakerPolicy::SoftEnrollment,
+        }];
+        assert!(
+            validate_diarization_references(
+                &disjoint_overlap_query,
+                DiarizationReportKind::NativeAcoustic,
+            )
+            .expect_err("disjoint candidates cannot ground an overlap query")
+            .contains("not grounded")
+        );
+    }
+
+    #[test]
+    fn turn_overlap_and_native_confidence_semantics_fail_closed() {
+        let mut hard_overlap = typed_diarization_report_fixture();
+        hard_overlap.turns[0].overlap_suspected = true;
+        hard_overlap
+            .validate()
+            .expect("hard identity attribution remains valid during suspected overlap");
+
+        let mut same_speaker_overlap = typed_diarization_report_fixture();
+        same_speaker_overlap.turns[1].start_ms = 900;
+        assert!(
+            same_speaker_overlap
+                .validate()
+                .expect_err("same-speaker duplicate overlap is not a second voice")
+                .contains("duplicate the same speaker")
+        );
+
+        let mut missing_confidence = typed_diarization_report_fixture();
+        missing_confidence.turns[1].speaker_confidence = None;
+        missing_confidence.speaker_queries.clear();
+        assert!(
+            missing_confidence
+                .validate()
+                .expect_err("native labeled turn must carry assignment confidence")
+                .contains("omits speaker confidence")
         );
     }
 
@@ -7255,8 +8363,206 @@ mod tests {
             report
                 .validate()
                 .expect_err("satisfied hard count must constrain the estimate domain exactly")
-                .contains("estimate candidate bounds")
+                .contains("estimate candidate upper bound")
         );
+
+        let mut hard_with_caller_prior = typed_diarization_report_fixture();
+        let caller_prior = hard_with_caller_prior
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("estimate")
+            .lanes
+            .last_mut()
+            .expect("caller-prior lane");
+        caller_prior.available = true;
+        caller_prior.proposed_count = Some(1);
+        caller_prior.confidence = 1.0;
+        caller_prior.unavailable_reason = None;
+        assert!(
+            hard_with_caller_prior
+                .validate()
+                .expect_err("hard request did not authorize caller-prior evidence")
+                .contains("exact authorized request")
+        );
+
+        let mut prior_report = typed_diarization_report_fixture();
+        use_infer_count_request(&mut prior_report);
+        prior_report.speaker_count.request = SpeakerCountRequest::Prior {
+            bins: vec![
+                SpeakerCountPriorMass {
+                    count: 1,
+                    probability: 0.4,
+                },
+                SpeakerCountPriorMass {
+                    count: 2,
+                    probability: 0.6,
+                },
+            ],
+        };
+        let caller_prior = prior_report
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("estimate")
+            .lanes
+            .last_mut()
+            .expect("caller-prior lane");
+        caller_prior.available = true;
+        caller_prior.proposed_count = Some(2);
+        caller_prior.confidence = 1.0;
+        caller_prior.unavailable_reason = None;
+        prior_report
+            .validate()
+            .expect("caller-prior lane exactly reflects the authorized prior");
+        prior_report
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("estimate")
+            .lanes
+            .last_mut()
+            .expect("caller-prior lane")
+            .confidence = 0.9;
+        assert!(
+            prior_report
+                .validate()
+                .expect_err("caller-prior confidence cannot be self-asserted")
+                .contains("exact authorized request")
+        );
+
+        let mut infer_with_prior_failure = typed_diarization_report_fixture();
+        use_infer_count_request(&mut infer_with_prior_failure);
+        infer_with_prior_failure
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("estimate")
+            .selected_count = None;
+        infer_with_prior_failure.speaker_count.status = SpeakerCountOutcomeStatus::Unresolved;
+        infer_with_prior_failure.speaker_count.reasons =
+            vec![SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable];
+        infer_with_prior_failure.fallback_status =
+            DiarizationFallbackStatus::SpeakerCountUnresolved;
+        assert!(
+            infer_with_prior_failure
+                .validate()
+                .expect_err("Infer cannot claim that unrequested prior fusion failed")
+                .contains("lacks a prior request")
+        );
+    }
+
+    #[test]
+    fn native_speaker_support_uses_exact_producer_thresholds_and_provenance() {
+        let minimum_voiced_frames = crate::diarization::MIN_SPEAKER_EVIDENCE_VOICED_FRAMES as u64;
+        let minimum_assignment_confidence =
+            f64::from(crate::diarization::MIN_SPEAKER_EVIDENCE_CONFIDENCE);
+        let minimum_profile_reliability =
+            f64::from(crate::diarization::MIN_SPEAKER_EVIDENCE_RELIABILITY);
+        let evidence = SpeakerEvidenceSummary {
+            speaker_ref: "speaker-1".to_owned(),
+            assigned_tracklet_count: 2,
+            independent_tracklet_count: 2,
+            recurrence_episode_count: 1,
+            voiced_frame_count: minimum_voiced_frames,
+            independent_voiced_frame_count: minimum_voiced_frames,
+            voiced_duration_ms: minimum_voiced_frames * 10,
+            mean_assignment_confidence: minimum_assignment_confidence,
+            profile_reliability: minimum_profile_reliability,
+            hard_anchored: false,
+            separated_from_supported_speakers: true,
+            reasons: vec![SpeakerEvidenceReason::SupportedByRepeatedTracklets],
+            supported: true,
+        };
+        let outcome = SpeakerCountOutcome {
+            request: SpeakerCountRequest::Infer,
+            estimate: None,
+            status: SpeakerCountOutcomeStatus::Resolved,
+            supported_speaker_count: 1,
+            active_speaker_refs: vec!["speaker-1".to_owned()],
+            dominant_speaker_share: 1.0,
+            unknown_voiced_share: 0.0,
+            reasons: vec![SpeakerCountOutcomeReason::EvidenceSupportedCount],
+            speaker_evidence: vec![evidence],
+        };
+        validate_speaker_count_outcome(&outcome, DiarizationReportKind::NativeAcoustic)
+            .expect("evidence exactly at every native producer threshold is supported");
+
+        let mut forged_acoustic_heldout = outcome.clone();
+        let heldout_evidence = &mut forged_acoustic_heldout.speaker_evidence[0];
+        heldout_evidence.assigned_tracklet_count = 1;
+        heldout_evidence.independent_tracklet_count = 1;
+        heldout_evidence.recurrence_episode_count = 1;
+        heldout_evidence.reasons = vec![SpeakerEvidenceReason::SupportedByHeldoutObservation];
+        assert!(
+            validate_speaker_count_outcome(
+                &forged_acoustic_heldout,
+                DiarizationReportKind::NativeAcoustic,
+            )
+            .expect_err("acoustic evidence cannot invent neural held-out support")
+            .contains("held-out neural")
+        );
+
+        let mut below_frames = outcome.clone();
+        below_frames.speaker_evidence[0].independent_voiced_frame_count -= 1;
+        assert!(
+            validate_speaker_count_outcome(&below_frames, DiarizationReportKind::NativeAcoustic,)
+                .expect_err("sub-threshold voiced evidence cannot remain supported")
+                .contains("exact support thresholds")
+        );
+
+        let mut below_confidence = outcome.clone();
+        below_confidence.speaker_evidence[0].mean_assignment_confidence = f64::from(
+            f32::from_bits(crate::diarization::MIN_SPEAKER_EVIDENCE_CONFIDENCE.to_bits() - 1),
+        );
+        assert!(
+            validate_speaker_count_outcome(
+                &below_confidence,
+                DiarizationReportKind::NativeAcoustic,
+            )
+            .expect_err("sub-threshold assignment confidence cannot remain supported")
+            .contains("exact support thresholds")
+        );
+
+        let mut below_reliability = outcome.clone();
+        below_reliability.speaker_evidence[0].profile_reliability = f64::from(f32::from_bits(
+            crate::diarization::MIN_SPEAKER_EVIDENCE_RELIABILITY.to_bits() - 1,
+        ));
+        assert!(
+            validate_speaker_count_outcome(
+                &below_reliability,
+                DiarizationReportKind::NativeAcoustic,
+            )
+            .expect_err("sub-threshold profile reliability cannot remain supported")
+            .contains("exact support thresholds")
+        );
+
+        let mut wrong_provenance = outcome.clone();
+        wrong_provenance.speaker_evidence[0].recurrence_episode_count =
+            crate::diarization::MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES as u64;
+        assert!(
+            validate_speaker_count_outcome(
+                &wrong_provenance,
+                DiarizationReportKind::NativeAcoustic,
+            )
+            .expect_err("recurrence evidence cannot claim repeated-tracklet provenance")
+            .contains("exact canonical reason")
+        );
+
+        let mut rejected = outcome;
+        let rejected_evidence = &mut rejected.speaker_evidence[0];
+        rejected_evidence.mean_assignment_confidence = f64::from(f32::from_bits(
+            crate::diarization::MIN_SPEAKER_EVIDENCE_CONFIDENCE.to_bits() - 1,
+        ));
+        rejected_evidence.reasons = vec![SpeakerEvidenceReason::InsufficientAssignmentConfidence];
+        rejected_evidence.supported = false;
+        rejected.status = SpeakerCountOutcomeStatus::Unresolved;
+        rejected.supported_speaker_count = 0;
+        rejected.active_speaker_refs.clear();
+        rejected.dominant_speaker_share = 0.0;
+        rejected.reasons = vec![SpeakerCountOutcomeReason::NoSupportedSpeakers];
+        validate_speaker_count_outcome(&rejected, DiarizationReportKind::NativeAcoustic)
+            .expect("a rejected candidate carries the exact below-threshold reason");
     }
 
     #[test]
@@ -7391,6 +8697,30 @@ mod tests {
                 .validate()
                 .expect_err("missing model cannot claim a loaded digest")
                 .contains("claims a loaded package")
+        );
+
+        let mut padded_without_reason = ready_neural_summary();
+        padded_without_reason.status = NeuralSpeakerRepresentationStatus::Degraded;
+        padded_without_reason.zero_padded_tracklet_count = 1;
+        padded_without_reason.reasons =
+            vec![NeuralSpeakerRepresentationReason::InsufficientTracklets];
+        assert!(
+            padded_without_reason
+                .validate()
+                .expect_err("zero-padding requires typed short-tracklet provenance")
+                .contains("short-tracklet provenance")
+        );
+
+        let mut duplicate_reasons = padded_without_reason;
+        duplicate_reasons.reasons = vec![
+            NeuralSpeakerRepresentationReason::ShortTracklet,
+            NeuralSpeakerRepresentationReason::ShortTracklet,
+        ];
+        assert!(
+            duplicate_reasons
+                .validate()
+                .expect_err("neural reasons must have one canonical set")
+                .contains("duplicated")
         );
     }
 }
