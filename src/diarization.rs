@@ -2823,6 +2823,11 @@ pub const ACOUSTIC_FRAME_SAMPLES: usize = crate::native_engine::mel::N_FFT;
 pub const ACOUSTIC_HOP_SAMPLES: usize = crate::native_engine::mel::HOP;
 /// Maximum number of frames between cancellation checks.
 pub const ACOUSTIC_CANCELLATION_INTERVAL_FRAMES: usize = 32;
+/// Maximum number of inner-loop probabilistic clustering operations between
+/// cancellation checks. Pair construction, candidate refresh, and consensus
+/// support can all grow quadratically with the prototype count, so merge-count
+/// polling alone is not a bounded response.
+const PROBABILISTIC_CLUSTERING_CANCELLATION_INTERVAL_OPERATIONS: u64 = 1_024;
 
 const ENVELOPE_BANDS: usize = 12;
 const CEPSTRAL_COEFFICIENTS: usize = 12;
@@ -7628,7 +7633,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v19-typed-fused-consensus-development";
+    "acoustic-clustering-probabilistic-v20-channel-evidence-bound-fused-consensus-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -7973,7 +7978,8 @@ pub(crate) fn supported_profile_redecode_policy_sha256() -> String {
         "route:ecapa-only",
         "route:ecapa-with-acoustic-channel",
         "partition:ecapa-only=ecapa-spherical",
-        "partition:ecapa-with-acoustic-channel=ecapa-fused-consensus",
+        "partition:ecapa-with-acoustic-channel=ecapa-fused-consensus-requires-selected-usable-channel-merge",
+        "route:complete-neural-tracklet-coverage",
     ] {
         hasher.update(identity.as_bytes());
         hasher.update([0]);
@@ -8075,7 +8081,7 @@ pub(crate) fn supported_profile_redecode_policy_sha256() -> String {
         b"packed-backpointers-bounded-scratch-v1",
         b"zero-profile-updates-zero-model-calls-v1",
         b"fail-closed-original-incumbent-v1",
-        b"route-eligibility-binds-exact-evidence-partition-pair-count-and-constraints-v2",
+        b"route-eligibility-binds-exact-evidence-partition-pair-complete-neural-coverage-count-and-constraints-v3",
         b"ineligible-candidate-is-deterministic-noop-with-default-resources-v1",
         b"route:development-only-no-env-no-default-flip-v1",
     ] {
@@ -12291,8 +12297,7 @@ const ECAPA_RESIDUAL_BIRTH_LLOYD_ITERATIONS: usize = 8;
 const ECAPA_RESIDUAL_BIRTH_MAX_SCRATCH_PAYLOAD_BYTES: u64 = 64 * 1024;
 
 /// Frozen identity for the evaluation-only supported-profile redecode policy.
-pub(crate) const SUPPORTED_PROFILE_REDECODE_VERSION: &str =
-    "supported-profile-constrained-redecode-v3-development";
+pub(crate) const SUPPORTED_PROFILE_REDECODE_VERSION: &str = "supported-profile-constrained-redecode-v4-channel-evidence-and-complete-coverage-bound-development";
 pub(crate) const SUPPORTED_PROFILE_REDECODE_BASELINE_VERSION: &str = "post-retention-incumbent-v1";
 pub(crate) const SUPPORTED_PROFILE_REDECODE_EVIDENCE_SCHEMA_VERSION: &str =
     "supported-profile-redecode-evidence-v1";
@@ -14208,6 +14213,7 @@ where
         frozen_executed_clustering_mode,
         prepared.evidence_mode,
         frozen_operational_partition_method,
+        prepared.neural_embeddings.len() == prepared.tracklets.len(),
         frozen_count_estimate_present,
         incumbent.count_constraints_feasible,
     );
@@ -14278,6 +14284,7 @@ where
         frozen.clustering.executed_mode,
         prepared.evidence_mode,
         current_operational_partition_method,
+        prepared.neural_embeddings.len() == prepared.tracklets.len(),
         current_count_estimate_present,
         frozen.incumbent.count_constraints_feasible,
     );
@@ -16436,6 +16443,7 @@ where
         operational_partition
             .as_ref()
             .map(|partition| partition.method),
+        neural_embeddings.is_some_and(|embeddings| embeddings.len() == tracklets.len()),
         count_estimate.is_some(),
         count_constraints_feasible,
     );
@@ -18426,6 +18434,19 @@ fn cluster_pair_evidence(
     }
 }
 
+fn cluster_pair_has_usable_channel_evidence(
+    left: &AcousticCluster,
+    right: &AcousticCluster,
+    perturbation: SpeakerPairPerturbation,
+) -> bool {
+    perturbation.includes_channel()
+        && left.evidence_mode == DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+        && right.evidence_mode == DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+        && left.channel_valid
+        && right.channel_valid
+        && left.channel_dimensions.min(right.channel_dimensions) > 0
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ecapa_speaker_pair_evidence(
     left: &EcapaSpeakerEmbedding,
@@ -18960,19 +18981,25 @@ where
     } else {
         None
     };
-    let consensus_partition = if neural_partition.is_none() {
-        coassociation_consensus_clusters(
-            initial,
-            cannot_links,
-            &lane_results,
-            selected_count,
-            is_cancelled,
-        )?
-    } else {
-        None
-    };
     let used_neural_spherical_partition = neural_partition.is_some();
-    let Some((clusters, merge_trace)) = neural_partition.or(consensus_partition) else {
+    let (selected_partition, used_fused_channel_evidence) =
+        if let Some(partition) = neural_partition {
+            (Some(partition), false)
+        } else {
+            match coassociation_consensus_clusters(
+                initial,
+                cannot_links,
+                &lane_results,
+                selected_count,
+                is_cancelled,
+            )? {
+                Some((clusters, merge_trace, used_channel_evidence)) => {
+                    (Some((clusters, merge_trace)), used_channel_evidence)
+                }
+                None => (None, false),
+            }
+        };
+    let Some((clusters, merge_trace)) = selected_partition else {
         return Ok(ProbabilisticAgglomeration::Fallback {
             reason: AcousticClusteringFallbackReason::UnstableSpeakerCount,
             count_merge_steps: full_lane_merge_steps,
@@ -18987,7 +19014,9 @@ where
                 "neural spherical partition crossed its ECAPA-only evidence boundary".to_owned(),
             ));
         }
-        (false, DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel) => {
+        (false, DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel)
+            if used_fused_channel_evidence =>
+        {
             DiarizationOperationalPartitionMethod::EcapaFusedConsensus
         }
         (false, _) => DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
@@ -19165,6 +19194,7 @@ fn supported_profile_redecode_route_eligible(
     executed_mode: AcousticClusteringMode,
     evidence_mode: DiarizationSpeakerEvidenceMode,
     operational_partition_method: Option<DiarizationOperationalPartitionMethod>,
+    complete_neural_tracklet_coverage: bool,
     count_estimate_present: bool,
     count_constraints_feasible: bool,
 ) -> bool {
@@ -19179,6 +19209,7 @@ fn supported_profile_redecode_route_eligible(
                 Some(DiarizationOperationalPartitionMethod::EcapaFusedConsensus),
             )
         )
+        && complete_neural_tracklet_coverage
         && count_estimate_present
         && count_constraints_feasible
 }
@@ -22728,12 +22759,24 @@ fn probabilistic_agglomeration_lane<C>(
 where
     C: FnMut() -> bool,
 {
+    if is_cancelled() {
+        return Err(FwError::Cancelled(
+            "probabilistic acoustic clustering cancelled before initial candidate construction"
+                .to_owned(),
+        ));
+    }
     let mut clusters = initial.iter().cloned().map(Some).collect::<Vec<_>>();
     let mut generations = vec![0u32; clusters.len()];
     let mut heap = BinaryHeap::new();
     let mut compatible_pairs = 0usize;
+    let mut operations = 0_u64;
     for left in 0..clusters.len() {
         for right in left + 1..clusters.len() {
+            observe_probabilistic_clustering_operation(
+                &mut operations,
+                is_cancelled,
+                "initial candidate construction",
+            )?;
             let Some(left_cluster) = clusters[left].as_ref() else {
                 continue;
             };
@@ -22774,22 +22817,17 @@ where
                 steps.len()
             )));
         }
-        let candidate = loop {
-            let Some(candidate) = heap.pop() else {
-                if active > policy.max {
-                    return Ok(None);
-                }
-                break None;
-            };
-            let valid = clusters[candidate.left].is_some()
-                && clusters[candidate.right].is_some()
-                && generations[candidate.left] == candidate.left_generation
-                && generations[candidate.right] == candidate.right_generation;
-            if valid {
-                break Some(candidate);
-            }
-        };
+        let candidate = pop_current_merge_candidate(
+            &mut heap,
+            &clusters,
+            &generations,
+            &mut operations,
+            is_cancelled,
+        )?;
         let Some(candidate) = candidate else {
+            if active > policy.max {
+                return Ok(None);
+            }
             break;
         };
         let left_before = clusters[candidate.left].as_ref().ok_or_else(|| {
@@ -22826,6 +22864,11 @@ where
             same_speaker_probability: evidence.same_speaker_probability,
         });
         for other in 0..clusters.len() {
+            observe_probabilistic_clustering_operation(
+                &mut operations,
+                is_cancelled,
+                "merged-candidate refresh",
+            )?;
             if other == candidate.left || clusters[other].is_none() {
                 continue;
             }
@@ -22895,6 +22938,35 @@ where
     }))
 }
 
+fn pop_current_merge_candidate<C>(
+    heap: &mut BinaryHeap<MergeCandidate>,
+    clusters: &[Option<AcousticCluster>],
+    generations: &[u32],
+    operations: &mut u64,
+    is_cancelled: &mut C,
+) -> FwResult<Option<MergeCandidate>>
+where
+    C: FnMut() -> bool,
+{
+    loop {
+        observe_probabilistic_clustering_operation(
+            operations,
+            is_cancelled,
+            "candidate heap search",
+        )?;
+        let Some(candidate) = heap.pop() else {
+            return Ok(None);
+        };
+        let valid = clusters[candidate.left].is_some()
+            && clusters[candidate.right].is_some()
+            && generations[candidate.left] == candidate.left_generation
+            && generations[candidate.right] == candidate.right_generation;
+        if valid {
+            return Ok(Some(candidate));
+        }
+    }
+}
+
 fn probabilistic_lane_groups_at_count(
     lane: &ProbabilisticLaneResult,
     initial_count: usize,
@@ -22924,17 +22996,42 @@ fn probabilistic_lane_groups_at_count(
     (groups.len() == selected_count).then_some(groups)
 }
 
+fn observe_probabilistic_clustering_operation<C>(
+    operations: &mut u64,
+    is_cancelled: &mut C,
+    stage: &str,
+) -> FwResult<()>
+where
+    C: FnMut() -> bool,
+{
+    *operations = operations.saturating_add(1);
+    if operations.is_multiple_of(PROBABILISTIC_CLUSTERING_CANCELLATION_INTERVAL_OPERATIONS)
+        && is_cancelled()
+    {
+        return Err(FwError::Cancelled(format!(
+            "probabilistic clustering cancelled during {stage}"
+        )));
+    }
+    Ok(())
+}
+
 fn coassociation_consensus_clusters<C>(
     initial: &[AcousticCluster],
     cannot_links: &BTreeSet<(String, String)>,
     lanes: &[ProbabilisticLaneResult],
     selected_count: usize,
     is_cancelled: &mut C,
-) -> FwResult<Option<(Vec<AcousticCluster>, Vec<ClusterMergeTrace>)>>
+) -> FwResult<Option<(Vec<AcousticCluster>, Vec<ClusterMergeTrace>, bool)>>
 where
     C: FnMut() -> bool,
 {
+    if is_cancelled() {
+        return Err(FwError::Cancelled(
+            "co-association clustering cancelled before support matrix construction".to_owned(),
+        ));
+    }
     let initial_count = initial.len();
+    let mut operations = 0_u64;
     let mut coassociation = vec![vec![0u8; initial_count]; initial_count];
     for lane in lanes {
         let Some(groups) = probabilistic_lane_groups_at_count(lane, initial_count, selected_count)
@@ -22945,6 +23042,11 @@ where
             for &left in group {
                 for &right in group {
                     coassociation[left][right] = coassociation[left][right].saturating_add(1);
+                    observe_probabilistic_clustering_operation(
+                        &mut operations,
+                        is_cancelled,
+                        "support matrix construction",
+                    )?;
                 }
             }
         }
@@ -22955,10 +23057,12 @@ where
         .collect::<Vec<_>>();
     let mut active = initial_count;
     let mut merge_trace = Vec::with_capacity(initial_count.saturating_sub(selected_count));
+    let mut used_fused_channel_evidence = false;
     while active > selected_count {
-        if merge_trace
-            .len()
-            .is_multiple_of(ACOUSTIC_CANCELLATION_INTERVAL_FRAMES)
+        if !merge_trace.is_empty()
+            && merge_trace
+                .len()
+                .is_multiple_of(ACOUSTIC_CANCELLATION_INTERVAL_FRAMES)
             && is_cancelled()
         {
             return Err(FwError::Cancelled(format!(
@@ -22974,6 +23078,11 @@ where
                 continue;
             };
             for right in left + 1..clusters.len() {
+                observe_probabilistic_clustering_operation(
+                    &mut operations,
+                    is_cancelled,
+                    "candidate search",
+                )?;
                 let (Some(right_cluster), Some(right_members)) =
                     (clusters[right].as_ref(), members[right].as_ref())
                 else {
@@ -22985,6 +23094,11 @@ where
                 let mut support_sum = 0u64;
                 for &left_member in left_members {
                     for &right_member in right_members {
+                        observe_probabilistic_clustering_operation(
+                            &mut operations,
+                            is_cancelled,
+                            "candidate support accumulation",
+                        )?;
                         support_sum = support_sum
                             .saturating_add(u64::from(coassociation[left_member][right_member]));
                     }
@@ -23025,6 +23139,12 @@ where
         })?;
         let pair_evidence =
             cluster_pair_evidence(left_before, right_before, SpeakerPairPerturbation::Full);
+        used_fused_channel_evidence |= pair_evidence.is_some()
+            && cluster_pair_has_usable_channel_evidence(
+                left_before,
+                right_before,
+                SpeakerPairPerturbation::Full,
+            );
         let left_anchor = left_before.hard_anchor.clone();
         let right_anchor = right_before.hard_anchor.clone();
         let right_cluster = clusters[right_index].take().ok_or_else(|| {
@@ -23056,6 +23176,7 @@ where
     Ok(Some((
         clusters.into_iter().flatten().collect(),
         merge_trace,
+        used_fused_channel_evidence,
     )))
 }
 
@@ -25608,7 +25729,7 @@ fn clustering_profile_summaries(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
     use super::{
         ACOUSTIC_CANCELLATION_INTERVAL_FRAMES, ACOUSTIC_FRAME_SAMPLES, ACOUSTIC_HOP_SAMPLES,
@@ -34451,24 +34572,28 @@ mod tests {
             DiarizationSpeakerEvidenceMode as Evidence,
         };
 
-        let eligible = |evidence, method, count_present, constraints_feasible| {
-            super::supported_profile_redecode_route_eligible(
-                super::AcousticClusteringMode::ProbabilisticV1,
-                evidence,
-                method,
-                count_present,
-                constraints_feasible,
-            )
-        };
+        let eligible =
+            |evidence, method, complete_neural_coverage, count_present, constraints_feasible| {
+                super::supported_profile_redecode_route_eligible(
+                    super::AcousticClusteringMode::ProbabilisticV1,
+                    evidence,
+                    method,
+                    complete_neural_coverage,
+                    count_present,
+                    constraints_feasible,
+                )
+            };
         assert!(eligible(
             Evidence::EcapaOnly,
             Some(Method::EcapaSpherical),
+            true,
             true,
             true,
         ));
         assert!(eligible(
             Evidence::EcapaWithAcousticChannel,
             Some(Method::EcapaFusedConsensus),
+            true,
             true,
             true,
         ));
@@ -34487,11 +34612,12 @@ mod tests {
             (Evidence::External, Some(Method::EcapaFusedConsensus)),
             (Evidence::None, None),
         ] {
-            assert!(!eligible(evidence, method, true, true));
+            assert!(!eligible(evidence, method, true, true, true));
         }
         assert!(!eligible(
             Evidence::EcapaOnly,
             Some(Method::EcapaSpherical),
+            true,
             false,
             true,
         ));
@@ -34499,12 +34625,21 @@ mod tests {
             Evidence::EcapaWithAcousticChannel,
             Some(Method::EcapaFusedConsensus),
             true,
+            true,
             false,
+        ));
+        assert!(!eligible(
+            Evidence::EcapaWithAcousticChannel,
+            Some(Method::EcapaFusedConsensus),
+            false,
+            true,
+            true,
         ));
         assert!(!super::supported_profile_redecode_route_eligible(
             super::AcousticClusteringMode::FixedSafeV1,
             Evidence::EcapaWithAcousticChannel,
             Some(Method::EcapaFusedConsensus),
+            true,
             true,
             true,
         ));
@@ -34621,6 +34756,75 @@ mod tests {
             common_observation_sha256,
             private_integrity_sha256: [0; 32],
         };
+        prepared.private_integrity_sha256 =
+            super::prepared_ecapa_private_integrity_sha256(&prepared);
+        prepared
+    }
+
+    fn prepared_fused_coverage_fixture(
+        retained_embedding_indexes: &[usize],
+    ) -> super::PreparedEcapaDiarizationEvaluation {
+        let mut prepared = prepared_ecapa_hash_fixture();
+        prepared.request.engine = DiarizationEngine::EcapaFused;
+        prepared.request.known_intervals = vec![KnownSpeakerInterval {
+            speaker_ref: "known".to_owned(),
+            start_ms: 4_000,
+            end_ms: 5_000,
+            confidence: 1.0,
+            policy: KnownSpeakerPolicy::HardMustLink,
+            provenance: Some("fixture-hard-attribution".to_owned()),
+        }];
+        prepared.request.enrollment_edge_guard_ms = 0;
+        prepared.evidence_mode = DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel;
+        let retained = retained_embedding_indexes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        prepared
+            .neural_embeddings
+            .retain(|tracklet_index, _| retained.contains(tracklet_index));
+        for tracklet in &mut prepared.tracklets {
+            if retained.contains(&tracklet.tracklet_index) {
+                continue;
+            }
+            tracklet.frame_count = 50;
+            tracklet.voiced_frame_count = 19;
+            tracklet.identity_frame_count = 19;
+            tracklet.channel_frame_count = 50;
+            tracklet.voice_support.fill(19);
+        }
+        let embedded = prepared.neural_embeddings.len() as u64;
+        let skipped = prepared.tracklets.len() as u64 - embedded;
+        prepared.neural_representation.status = if embedded == 0 {
+            NeuralSpeakerRepresentationStatus::Unavailable
+        } else {
+            NeuralSpeakerRepresentationStatus::Degraded
+        };
+        prepared.neural_representation.embedded_tracklet_count = embedded;
+        prepared.neural_representation.zero_padded_tracklet_count = 0;
+        prepared.neural_representation.skipped_tracklet_count = skipped;
+        prepared.neural_representation.reasons =
+            vec![NeuralSpeakerRepresentationReason::InsufficientIdentityEvidence];
+        if embedded < 2 {
+            prepared
+                .neural_representation
+                .reasons
+                .push(NeuralSpeakerRepresentationReason::InsufficientTracklets);
+        }
+        prepared
+            .neural_representation
+            .validate()
+            .expect("coverage fixture neural summary");
+        prepared.enrollment = super::enroll_known_speaker_profiles_with_authority(
+            &prepared.tracklets,
+            &prepared.request,
+            prepared.audio_duration_ms,
+            super::EnrollmentIdentityAuthority::Ecapa(&prepared.neural_embeddings),
+        )
+        .expect("coverage fixture enrollment");
+        prepared.common_observation_sha256 =
+            super::recompute_prepared_ecapa_common_observation_sha256(&prepared)
+                .expect("rebind coverage fixture common observation");
         prepared.private_integrity_sha256 =
             super::prepared_ecapa_private_integrity_sha256(&prepared);
         prepared
@@ -34819,6 +35023,80 @@ mod tests {
         assert!(super::prepared_supported_profile_redecode_runs_identical(
             &candidate, &replay,
         ));
+    }
+
+    #[test]
+    fn diarization_hardening_incomplete_ecapa_coverage_cannot_unlock_redecode_or_label_missing_speech()
+     {
+        for retained_embedding_indexes in [&[][..], &[0, 1, 2][..]] {
+            let prepared = prepared_fused_coverage_fixture(retained_embedding_indexes);
+            let frozen = super::prepare_supported_profile_redecode_evaluation(&prepared, || false)
+                .expect("freeze incomplete-coverage incumbent");
+            assert!(!frozen.frozen_route_eligible());
+            let candidate = super::run_prepared_supported_profile_redecode_evaluation(
+                &prepared,
+                &frozen,
+                super::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+                || false,
+            )
+            .expect("incomplete-coverage candidate remains a deterministic no-op");
+            assert!(!candidate.frozen_route_eligible);
+            assert!(!candidate.profile_redecode.applied);
+            assert_eq!(
+                candidate.profile_redecode.fallback_reason,
+                Some(super::SupportedProfileRedecodeFallbackReason::IneligibleRoute),
+            );
+            assert_eq!(candidate.new_inference_count, 0);
+            assert_eq!(
+                candidate.clustering.assignments.len(),
+                prepared.tracklets.len()
+            );
+            assert_eq!(candidate.clustering.assignments[3].speaker_ref, None);
+            assert!(!candidate.clustering.assignments[3].hard_attribution);
+            assert_eq!(
+                candidate.clustering.assignments[4].speaker_ref.as_deref(),
+                Some("known")
+            );
+            assert!(candidate.clustering.assignments[4].hard_attribution);
+
+            let (report, _) = super::finish_prepared_ecapa_diarization(
+                &prepared,
+                &frozen.enrollment,
+                &candidate.clustering,
+            )
+            .expect("finish incomplete-coverage common report path");
+            report.validate().expect("valid incomplete-coverage report");
+            assert!(report.turns.iter().all(|turn| {
+                turn.speaker_ref
+                    .as_deref()
+                    .is_none_or(|speaker| speaker == "known")
+            }));
+            if retained_embedding_indexes.is_empty() {
+                assert_eq!(report.implementation, "native-ecapa-unavailable-v1");
+                assert_eq!(
+                    report.speaker_evidence_mode,
+                    DiarizationSpeakerEvidenceMode::None
+                );
+                assert!(report.profiles.is_empty());
+                assert!(report.speaker_queries.is_empty());
+                assert!(report.operational_partition.is_none());
+                assert!(report.speaker_count.estimate.is_none());
+                assert_eq!(
+                    report.diagnostics,
+                    [crate::model::DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE]
+                );
+            } else {
+                assert_eq!(report.implementation, "native-ecapa-fused-v1");
+                assert_eq!(
+                    report
+                        .neural_representation
+                        .as_ref()
+                        .expect("neural summary")
+                        .status,
+                    NeuralSpeakerRepresentationStatus::Degraded
+                );
+            }
+        }
     }
 
     #[test]
@@ -36673,6 +36951,164 @@ mod tests {
             Some(vec![vec![0, 1, 2, 3]])
         );
         assert_eq!(super::probabilistic_lane_groups_at_count(&lane, 4, 5), None);
+    }
+
+    #[test]
+    fn diarization_hardening_unselected_channel_pair_cannot_upgrade_consensus_provenance() {
+        let mut initial = (0..4)
+            .map(|index| residual_birth_cluster(vec![index], residual_birth_basis(0)))
+            .collect::<Vec<_>>();
+        for cluster in &mut initial {
+            cluster.evidence_mode = DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel;
+        }
+        for cluster in &mut initial[..2] {
+            cluster.channel_valid = false;
+            cluster.channel_dimensions = 0;
+        }
+        assert!(super::cluster_pair_has_usable_channel_evidence(
+            &initial[2],
+            &initial[3],
+            super::SpeakerPairPerturbation::Full,
+        ));
+
+        let lane = super::ProbabilisticLaneResult {
+            selected_count: 3,
+            groups: vec![vec![0, 1], vec![2], vec![3]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count: 3,
+                points: vec![super::SpeakerCountRiskPoint {
+                    count: 3,
+                    expected_loss: 0.0,
+                }],
+            },
+            merge_steps: Vec::new(),
+            merge_replay: vec![(0, 1)],
+        };
+        let lanes = vec![lane; super::SPEAKER_COUNT_PERTURBATION_LANES];
+        let (clusters, merge_trace, used_channel_evidence) =
+            super::coassociation_consensus_clusters(
+                &initial,
+                &BTreeSet::new(),
+                &lanes,
+                3,
+                &mut || false,
+            )
+            .expect("consensus clustering")
+            .expect("stable selected partition");
+        assert_eq!(clusters.len(), 3);
+        assert_eq!(merge_trace.len(), 1);
+        assert!(
+            !used_channel_evidence,
+            "an unrelated usable candidate must not upgrade the selected partition"
+        );
+    }
+
+    #[test]
+    fn diarization_hardening_initial_pair_construction_observes_bounded_cancellation() {
+        let initial = (0..48)
+            .map(|index| residual_birth_cluster(vec![index], residual_birth_basis(0)))
+            .collect::<Vec<_>>();
+        let policy = super::SpeakerCountPolicy {
+            min: 1,
+            max: initial.len(),
+            exact: None,
+        };
+        let mut polls = 0_u64;
+        let error = super::probabilistic_agglomeration_lane(
+            &initial,
+            &BTreeSet::new(),
+            policy,
+            super::SpeakerPairPerturbation::Full,
+            &mut || {
+                polls = polls.saturating_add(1);
+                polls == 2
+            },
+        )
+        .expect_err("initial all-pairs construction must poll within its operation bound");
+        assert!(
+            matches!(&error, FwError::Cancelled(message) if message.contains("initial candidate construction")),
+            "{error}"
+        );
+        assert_eq!(polls, 2);
+    }
+
+    #[test]
+    fn diarization_hardening_stale_heap_search_observes_bounded_cancellation() {
+        let clusters = vec![
+            Some(residual_birth_cluster(vec![0], residual_birth_basis(0))),
+            None,
+        ];
+        let generations = vec![1_u32, 1_u32];
+        let mut heap = BinaryHeap::new();
+        for _ in 0..super::PROBABILISTIC_CLUSTERING_CANCELLATION_INTERVAL_OPERATIONS {
+            heap.push(super::MergeCandidate {
+                distance: 0.0,
+                left: 0,
+                right: 1,
+                left_generation: 0,
+                right_generation: 0,
+            });
+        }
+        let mut operations = 0_u64;
+        let mut polls = 0_u64;
+        let error = super::pop_current_merge_candidate(
+            &mut heap,
+            &clusters,
+            &generations,
+            &mut operations,
+            &mut || {
+                polls = polls.saturating_add(1);
+                true
+            },
+        )
+        .expect_err("stale heap search must poll within its operation bound");
+        assert!(
+            matches!(&error, FwError::Cancelled(message) if message.contains("candidate heap search")),
+            "{error}"
+        );
+        assert_eq!(polls, 1);
+        assert_eq!(
+            operations,
+            super::PROBABILISTIC_CLUSTERING_CANCELLATION_INTERVAL_OPERATIONS
+        );
+    }
+
+    #[test]
+    fn diarization_hardening_coassociation_matrix_construction_observes_bounded_cancellation() {
+        let initial = (0..16)
+            .map(|index| residual_birth_cluster(vec![index], residual_birth_basis(0)))
+            .collect::<Vec<_>>();
+        let lane = super::ProbabilisticLaneResult {
+            selected_count: 1,
+            groups: vec![(0..initial.len()).collect()],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count: 1,
+                points: vec![super::SpeakerCountRiskPoint {
+                    count: 1,
+                    expected_loss: 0.0,
+                }],
+            },
+            merge_steps: Vec::new(),
+            merge_replay: Vec::new(),
+        };
+        let lanes = vec![lane; super::SPEAKER_COUNT_PERTURBATION_LANES];
+        let mut polls = 0_u64;
+        let error = super::coassociation_consensus_clusters(
+            &initial,
+            &BTreeSet::new(),
+            &lanes,
+            1,
+            &mut || {
+                polls = polls.saturating_add(1);
+                polls == 2
+            },
+        )
+        .expect_err("support-matrix construction must poll within its operation bound");
+        assert!(
+            matches!(&error, FwError::Cancelled(message) if message.contains("support matrix construction")),
+            "{error}"
+        );
+        assert_eq!(polls, 2);
     }
 
     #[test]
@@ -39108,7 +39544,7 @@ mod tests {
     }
 
     #[test]
-    fn fused_channel_evidence_survives_the_final_robust_separation_gate() {
+    fn diarization_hardening_fused_channel_evidence_survives_the_final_robust_separation_gate() {
         let component = (1.0_f32 / 8.0).sqrt();
         let mut first = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
         let mut orthogonal = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
@@ -39145,11 +39581,11 @@ mod tests {
         };
         let enrollment =
             enroll_known_speaker_profiles(&tracklets, &request, 20_000).expect("enrollment");
-        let run = |evidence_mode| {
+        let run = |evidence_mode, speaker_count: &SpeakerCountRequest| {
             super::cluster_acoustic_tracklets_with_mode_internal(
                 &tracklets,
                 &enrollment,
-                &request.speaker_count,
+                speaker_count,
                 512,
                 super::AcousticClusteringMode::ProbabilisticV1,
                 Some(&embeddings),
@@ -39159,8 +39595,14 @@ mod tests {
             .expect("near-threshold ECAPA clustering")
             .0
         };
-        let ecapa_only = run(crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly);
-        let fused = run(crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel);
+        let ecapa_only = run(
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            &request.speaker_count,
+        );
+        let fused = run(
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+            &request.speaker_count,
+        );
         assert_eq!(ecapa_only.detected_speakers, 1, "{ecapa_only:#?}");
         assert!(!ecapa_only.constraints_satisfied);
         assert_eq!(fused.detected_speakers, 2, "{fused:#?}");
@@ -39180,6 +39622,7 @@ mod tests {
                 .operational_partition
                 .as_ref()
                 .map(|partition| partition.method),
+            embeddings.len() == tracklets.len(),
             fused.count_estimate.is_some(),
             fused.constraints_satisfied,
         ));
@@ -39191,6 +39634,89 @@ mod tests {
                 .count(),
             2
         );
+
+        let inferred_ecapa_only = run(
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+            &SpeakerCountRequest::Infer,
+        );
+        let inferred_fused = run(
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+            &SpeakerCountRequest::Infer,
+        );
+        assert_eq!(
+            inferred_ecapa_only.detected_speakers, 1,
+            "{inferred_ecapa_only:#?}"
+        );
+        assert_eq!(
+            inferred_fused.detected_speakers, 2,
+            "channel-causal inference must recover the second speaker without a supplied count: {inferred_fused:#?}"
+        );
+        assert_eq!(
+            inferred_fused
+                .operational_partition
+                .as_ref()
+                .expect("inferred typed fused partition")
+                .method,
+            crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus,
+        );
+    }
+
+    #[test]
+    fn diarization_hardening_fused_mode_without_a_usable_channel_pair_underclaims_generic_consensus()
+     {
+        let mut tracklets = sequential_profile_tracklets(&[0.0, 0.0, 4.0, 4.0], 5_000, 500);
+        for tracklet in &mut tracklets {
+            tracklet.channel_mean.fill(0.0);
+            tracklet.channel_variance.fill(0.0);
+            tracklet.channel_valid = false;
+            tracklet.channel_dimensions = 0;
+            tracklet.channel_frame_count = 0;
+        }
+        let first = residual_birth_basis(0);
+        let second = residual_birth_basis(1);
+        let embeddings = BTreeMap::from([
+            (0usize, ecapa_representation(first, None, 500.0, 0.0)),
+            (1usize, ecapa_representation(first, None, 500.0, 0.0)),
+            (2usize, ecapa_representation(second, None, 500.0, 0.0)),
+            (3usize, ecapa_representation(second, None, 500.0, 0.0)),
+        ]);
+        let request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 2 },
+            ..DiarizationRequest::default()
+        };
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, 20_000).expect("enrollment");
+        let (result, _) = super::cluster_acoustic_tracklets_with_mode_internal(
+            &tracklets,
+            &enrollment,
+            &request.speaker_count,
+            512,
+            super::AcousticClusteringMode::ProbabilisticV1,
+            Some(&embeddings),
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+            || false,
+        )
+        .expect("degraded fused clustering");
+        assert_eq!(
+            result
+                .operational_partition
+                .as_ref()
+                .expect("generic consensus partition")
+                .method,
+            crate::model::DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
+            "{result:#?}"
+        );
+        assert!(!super::supported_profile_redecode_route_eligible(
+            result.executed_mode,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+            result
+                .operational_partition
+                .as_ref()
+                .map(|partition| partition.method),
+            embeddings.len() == tracklets.len(),
+            result.count_estimate.is_some(),
+            result.constraints_satisfied,
+        ));
     }
 
     #[test]
@@ -39421,31 +39947,21 @@ mod tests {
                 .expect("hard-constrained neural count estimate");
             assert_eq!(estimate.constraint_lower_bound, 2);
             assert_eq!(estimate.candidate_upper_bound, 2);
-            let expected_method = match evidence_mode {
-                crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly => {
-                    crate::model::DiarizationOperationalPartitionMethod::ProbabilisticConsensus
-                }
-                crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
-                    crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus
-                }
-                _ => unreachable!("test covers only the two ECAPA evidence modes"),
-            };
+            let expected_method =
+                crate::model::DiarizationOperationalPartitionMethod::ProbabilisticConsensus;
             let operational_method = result
                 .operational_partition
                 .as_ref()
                 .map(|partition| partition.method);
             assert_eq!(operational_method, Some(expected_method));
-            assert_eq!(
-                super::supported_profile_redecode_route_eligible(
-                    result.executed_mode,
-                    evidence_mode,
-                    operational_method,
-                    result.count_estimate.is_some(),
-                    result.constraints_satisfied,
-                ),
-                evidence_mode
-                    == crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
-            );
+            assert!(!super::supported_profile_redecode_route_eligible(
+                result.executed_mode,
+                evidence_mode,
+                operational_method,
+                embeddings.len() == tracklets.len(),
+                result.count_estimate.is_some(),
+                result.constraints_satisfied,
+            ));
         }
     }
 
@@ -40224,9 +40740,10 @@ mod tests {
             if let Some(operational) = report.operational_partition.as_ref() {
                 operational.validate().expect("valid partition provenance");
                 if engine == crate::model::DiarizationEngine::EcapaFused {
-                    assert_eq!(
+                    assert_ne!(
                         operational.method,
-                        crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus
+                        crate::model::DiarizationOperationalPartitionMethod::EcapaSpherical,
+                        "fused ECAPA must never claim ECAPA-only spherical provenance"
                     );
                 }
             }
