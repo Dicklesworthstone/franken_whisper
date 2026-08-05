@@ -57,6 +57,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::sync::Arc;
+
 use rayon::prelude::*;
 
 use ft_core::Float16;
@@ -816,7 +818,17 @@ impl DecoderWeights {
 /// One [`DecoderState`] is built per audio window from that window's encoder
 /// output (which fixes the cross-attention keys/values for the whole window)
 /// and is then advanced token-by-token via [`forward_step`].
-#[derive(Debug)]
+///
+/// `Clone` is the beam-search hypothesis-fork primitive (bd-6goy): a surviving
+/// beam that expands into several children needs its self-attention KV state
+/// duplicated. A clone is a faithful fork — a cloned state forwards the same
+/// token to bit-identical logits (pinned by `clone_forwards_identically`).
+/// The window-constant cross-K/V fields are `Arc`-shared (immutable after
+/// `new`), so a beam fork bumps a refcount instead of deep-copying ~18 MB of
+/// cross-K/V per hypothesis — only the growing self-attention `kv` is deep-cloned
+/// (bd-6goy beam perf; NEGATIVE_EVIDENCE 2026-07-23). Greedy never clones, so its
+/// behavior is byte-identical (`Arc<Vec<T>>` derefs to `[T]` exactly like `Vec`).
+#[derive(Debug, Clone)]
 pub struct DecoderState {
     /// One self-attention KV cache per layer.
     kv: Vec<KvCache>,
@@ -826,10 +838,10 @@ pub struct DecoderState {
     /// gather are hoisted here once at construction instead of being rebuilt
     /// every decode step (a large per-step scatter on wide models — `enc_frames`
     /// is ~1500). Byte-for-byte the per-step gather the old path produced.
-    cross_kh_t: Vec<Mat>,
+    cross_kh_t: Arc<Vec<Mat>>,
     /// Per-`(layer, head)` gathered cross-value head `[enc_frames, d_head]`
     /// (in `layer * n_head + head` order). See [`Self::cross_kh_t`].
-    cross_vh: Vec<Mat>,
+    cross_vh: Arc<Vec<Mat>>,
     /// f16 cross-attention K/V (bd-b4hp): natural cross-key `[enc_frames, d_head]`
     /// and transposed cross-value `[d_head, enc_frames]`, per `(layer, head)`.
     /// These layouts let the per-step cross path run the existing `nn::gemv_f16`
@@ -837,18 +849,18 @@ pub struct DecoderState {
     /// f32 `nn::matmul` path AND no dead scores zero-init (the f32 m=1 matmul
     /// `vec![0.0; enc_frames]`s a ~1500-elt buffer per head/token). Default path;
     /// `FW_CROSS_F16=0` falls back to the f32 `cross_kh_t`/`cross_vh` above.
-    cross_kh_f16: Vec<Vec<Float16>>,
-    cross_vh_f16: Vec<Vec<Float16>>,
+    cross_kh_f16: Arc<Vec<Vec<Float16>>>,
+    cross_vh_f16: Arc<Vec<Vec<Float16>>>,
     /// int8/Q8 copies of `cross_kh_f16`/`cross_vh_f16` (same layout, per head),
     /// built when [`int8_cross_kv_enabled`] is on. Empty ⇒ f16 path. Halves the
     /// per-token DRAM read of the encoder K/V. See [`int8_cross_kv_enabled`].
-    cross_kh_i8: Vec<nn::I8Mat>,
-    cross_vh_i8: Vec<nn::I8Mat>,
+    cross_kh_i8: Arc<Vec<nn::I8Mat>>,
+    cross_vh_i8: Arc<Vec<nn::I8Mat>>,
     /// BLOCK-WISE int8 copy of `cross_vh_f16` (per head), built when
     /// [`cross_v_block_enabled`] is on. Empty ⇒ the per-row `cross_vh_i8` (or f16)
     /// V path runs. Finer enc-frames scales than `cross_vh_i8` + f32 activation via
     /// [`nn::gemv_i8w_f32a_blocked`]. See [`cross_v_block_enabled`].
-    cross_vh_i8_block: Vec<nn::I8BlockMat>,
+    cross_vh_i8_block: Arc<Vec<nn::I8BlockMat>>,
     /// Number of tokens currently in the self-attention cache.
     len: usize,
     /// Number of encoder frames (cross-attention key/value length).
@@ -1102,13 +1114,15 @@ impl DecoderState {
 
         Ok(Self {
             kv,
-            cross_kh_t,
-            cross_vh,
-            cross_kh_f16,
-            cross_vh_f16,
-            cross_kh_i8,
-            cross_vh_i8,
-            cross_vh_i8_block,
+            // Window-constant + immutable after construction ⇒ Arc-shared so beam
+            // forks bump a refcount instead of deep-copying the cross-K/V.
+            cross_kh_t: Arc::new(cross_kh_t),
+            cross_vh: Arc::new(cross_vh),
+            cross_kh_f16: Arc::new(cross_kh_f16),
+            cross_vh_f16: Arc::new(cross_vh_f16),
+            cross_kh_i8: Arc::new(cross_kh_i8),
+            cross_vh_i8: Arc::new(cross_vh_i8),
+            cross_vh_i8_block: Arc::new(cross_vh_i8_block),
             len: 0,
             enc_frames,
             n_state: w.n_state,
@@ -1582,12 +1596,18 @@ fn cross_attention(
 /// [`FwError::InvalidRequest`] on an empty batch, an out-of-range token id,
 /// a decode position past `n_text_ctx`, or a width mismatch; propagates the
 /// checkpoint closure's error and any kernel error.
-pub fn forward_step(
+/// The transformer forward for one decode step, returning the final-LN'd
+/// last-position hidden state `[1, n_state]` (and the self-draft accept probe
+/// argmax when `FW_DRAFT_ACCEPT_LAYERS` is set) WITHOUT the tied logits
+/// projection. [`forward_step`] appends `logits_last`; beam search collects
+/// these hidden states across hypotheses and projects them in one batched
+/// `logits_all` (one tied-output weight read instead of per-hypothesis).
+pub fn forward_step_hidden(
     w: &DecoderWeights,
     st: &mut DecoderState,
     tokens: &[i32],
     checkpoint: &dyn Fn() -> FwResult<()>,
-) -> FwResult<Vec<f32>> {
+) -> FwResult<(Mat, Option<u32>)> {
     if tokens.is_empty() {
         return Err(FwError::InvalidRequest(
             "forward_step: empty token batch".into(),
@@ -1711,11 +1731,38 @@ pub fn forward_step(
     // Advance the logical cache length once (all layers appended in lockstep).
     st.len += tokens.len();
 
-    // Final layer norm, then logits for the last position only.
+    // Final layer norm; return the last-position hidden state. The caller
+    // projects it to logits (batched across a beam when applicable) — see
+    // [`forward_step`] and `beam_decode_window`.
     timed!(Sub::FinalLn, w.ln.apply(&mut x));
     let last = x.rows - 1;
     let x_last = Mat::from_vec(1, w.n_state, x.row(last).to_vec());
-    let logits = timed!(Sub::Logits, logits_last(w, &x_last))?;
+    Ok((x_last, draft_arg))
+}
+
+/// Single decode step: the transformer forward ([`forward_step_hidden`]) plus the
+/// tied logits projection for the last position and the self-draft accept
+/// diagnostic. Byte-identical to the pre-split monolithic step (the jfk golden
+/// pins it). Beam search calls `forward_step_hidden` directly and batches the
+/// per-hypothesis logits through one `logits_all` (reads the tied-output weight
+/// once instead of once per hypothesis).
+pub fn forward_step(
+    w: &DecoderWeights,
+    st: &mut DecoderState,
+    tokens: &[i32],
+    checkpoint: &dyn Fn() -> FwResult<()>,
+) -> FwResult<Vec<f32>> {
+    let (x_last, draft_arg) = forward_step_hidden(w, st, tokens, checkpoint)?;
+    // Logits timing (measurement-only; `timed!` is local to `forward_step_hidden`,
+    // so inline the same span here). Default-off ⇒ a direct `logits_last` call.
+    let logits = if super::perf_spans_enabled() {
+        let t = std::time::Instant::now();
+        let r = logits_last(w, &x_last)?;
+        sub_add(Sub::Logits, t.elapsed().as_nanos());
+        r
+    } else {
+        logits_last(w, &x_last)?
+    };
     // Record the self-draft accept comparison (early-exit vs full argmax).
     if let Some(da) = draft_arg {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2222,6 +2269,52 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
         assert!(max < 1e-4, "incremental vs batch last-logit diff {max}");
+    }
+
+    #[test]
+    fn clone_forwards_identically() {
+        // Beam-search fork primitive (bd-6goy): a cloned DecoderState must be a
+        // faithful copy — forwarding the same continuation through the original
+        // and its clone yields BIT-IDENTICAL logits, and the clone advancing does
+        // not disturb the original (independent KV caches). This is the exact
+        // invariant per-hypothesis KV forking depends on.
+        let w = synthetic_weights(3);
+        let mut rng = Lcg::new(2024);
+        let enc = rng.mat(6, N_STATE);
+
+        // Prefill a shared prefix, then fork.
+        let mut original = DecoderState::new(&w, &enc).unwrap();
+        let _ = forward_step(&w, &mut original, &[1, 2, 3], &noop_checkpoint).unwrap();
+        let mut forked = original.clone();
+        assert_eq!(forked.len(), original.len());
+        assert_eq!(forked.enc_frames(), original.enc_frames());
+
+        // Same continuation token → bit-identical logits from both.
+        let a = forward_step(&w, &mut original, &[4], &noop_checkpoint).unwrap();
+        let b = forward_step(&w, &mut forked, &[4], &noop_checkpoint).unwrap();
+        assert_eq!(
+            a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "cloned state must forward bit-identically"
+        );
+
+        // Clone independence: clones are DEEP (independent KV caches), so a third
+        // clone diverging on a different token must not perturb two sibling
+        // clones that take the same step. Fork the shared len-3 prefix three ways;
+        // diverge one; the other two, fed the same token, stay bit-identical.
+        let mut base = DecoderState::new(&w, &enc).unwrap();
+        let _ = forward_step(&w, &mut base, &[1, 2, 3], &noop_checkpoint).unwrap();
+        let mut sib1 = base.clone();
+        let mut sib2 = base.clone();
+        let mut diverge = base.clone();
+        let _ = forward_step(&w, &mut diverge, &[7], &noop_checkpoint).unwrap();
+        let s1 = forward_step(&w, &mut sib1, &[5], &noop_checkpoint).unwrap();
+        let s2 = forward_step(&w, &mut sib2, &[5], &noop_checkpoint).unwrap();
+        assert_eq!(
+            s1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            s2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "a diverging sibling clone must not corrupt the others (deep KV copy)"
+        );
     }
 
     #[test]
