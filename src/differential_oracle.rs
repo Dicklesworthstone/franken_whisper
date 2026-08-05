@@ -4132,6 +4132,34 @@ mod tests {
             })
         ));
 
+        let mutating_audio = directory.path().join("mutating.wav");
+        write_sortformer_audio(&mutating_audio);
+        let expected_hash = test_audio_sha256(&mutating_audio);
+        let version = version_json(DifferentialOracleTool::Sortformer);
+        let output = serde_json::to_string(&sortformer_document()).expect("oracle JSON");
+        let mutating_program = shell_program(format!(
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else printf x >> \"$5\"; printf '%s' '{output}'; fi"
+        ));
+        let mutation_error = execute_external(
+            DifferentialOracleTool::Sortformer,
+            &mutating_program,
+            &mutating_audio,
+            &expected_hash,
+            2_000,
+            KEY,
+            Duration::from_secs(1),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("post-run audio mutation");
+        assert!(matches!(
+            mutation_error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::InputIdentityMismatch,
+                stage: DifferentialExecutionStage::InputPostRunValidation,
+                ..
+            })
+        ));
+
         let truncated = directory.path().join("truncated.wav");
         write_sortformer_audio(&truncated);
         let truncated_len = std::fs::metadata(&truncated)
