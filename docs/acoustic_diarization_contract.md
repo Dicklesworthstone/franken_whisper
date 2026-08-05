@@ -1423,11 +1423,13 @@ The aggregate comparison evidence is `diagnostic_only`,
 scorer and must not be compared directly with published md-eval numbers without
 an explicit scorer-equivalence probe. Timing is retained for deployment
 observation only: native acoustic includes pipeline plus scorer; ECAPA lanes
-exclude one shared model load; Sortformer includes one cold external process
-plus scorer per recording. Those scopes are not cross-lane comparable, and the
-current artifact intentionally reports isolated peak RSS and cancellation
-latency as unavailable. Neither ECAPA nor Sortformer weights are downloaded or
-vendored by this command; unavailable operator components produce typed skips.
+exclude one shared model load; Sortformer includes executable and input
+attestation, a version-probe subprocess, a cold oracle subprocess, output
+validation, and scoring per recording. Those scopes are not cross-lane
+comparable, and the current artifact intentionally reports isolated peak RSS
+and cancellation latency as unavailable. Neither ECAPA nor Sortformer weights
+are downloaded or vendored by this command; unavailable operator components
+produce typed skips.
 The command does not alter transcription routing or the default-off acoustic
 sidecar.
 
