@@ -1171,11 +1171,14 @@ Internal decision evidence can contain:
 - assignment margins, confidence, unknown/overlap decisions, and fallback;
 - stage duration, RTF, allocations or peak memory, cancellation, and errors.
 
-Retained public corpus artifacts are stricter: they contain only path-free
+Retained public evaluation evidence is stricter: it contains only path-free
 aggregate counts, metrics, reliability bins, threshold/collar summaries,
-configuration hashes, stage locks, and performance totals. They never retain a
+configuration hashes, stage locks, and performance totals. It never retains a
 per-recording boundary, score, feature, identifier, filename, transcript, or
-audio excerpt.
+audio excerpt. A separately retained path-free public bundle is record-level
+scorer input and may contain validated opaque public recording/speaker IDs and
+reference timestamps; it contains no source path, filename, audio, transcript,
+or acoustic feature.
 
 Focused unit/e2e proof, corpus DER/JER proof, broad Cargo proof, and performance
 certification are separate authority states. Rollout follows
@@ -1398,6 +1401,35 @@ or sidecar feature values. Cancellation is checked throughout preparation and
 evaluation, and evidence is written only after canonical verification.
 None of these CLI or artifact paths construct a sidecar during transcription or
 change the default-off acoustic-v2 path.
+
+`diarization-corpus compare-models` is a separate development-only diagnostic.
+One invocation runs the same validated mono signed-PCM 16 kHz WAV bytes and the
+same frozen scorer over `native_acoustic`, `native_ecapa`,
+`native_ecapa_fused`, and the pinned operator-installed `external_sortformer`
+oracle. The headline uses inferred speaker count; a reference count above the
+Sortformer four-speaker contract is declared capacity-ineligible and is never
+passed to the model. Consecutive sorted observations follow a four-row Williams
+schedule, and `order_balance_complete` is true only after a complete schedule.
+Every declared lane is retained as completed, skipped, or failed with a stable
+reason. The command requires eight native Rayon workers to match the pinned
+Sortformer intra-op thread count and applies a frozen 1800-second limit to each
+Sortformer `OracleRun` subprocess. That value is not a whole-observation cap:
+hashing, WAV validation, version probing, and output validation are separately
+bounded or cancellation-aware.
+
+The aggregate comparison evidence is `diagnostic_only`,
+`development_uncertified`, forbids a superiority claim, and records
+`production_route_changed=false`. Absolute DER/JER values use the project
+scorer and must not be compared directly with published md-eval numbers without
+an explicit scorer-equivalence probe. Timing is retained for deployment
+observation only: native acoustic includes pipeline plus scorer; ECAPA lanes
+exclude one shared model load; Sortformer includes one cold external process
+plus scorer per recording. Those scopes are not cross-lane comparable, and the
+current artifact intentionally reports isolated peak RSS and cancellation
+latency as unavailable. Neither ECAPA nor Sortformer weights are downloaded or
+vendored by this command; unavailable operator components produce typed skips.
+The command does not alter transcription routing or the default-off acoustic
+sidecar.
 
 The AMI adapter enforces the corpus site's scenario-only training,
 development, and unseen-test meeting-family split. Other corpora use an

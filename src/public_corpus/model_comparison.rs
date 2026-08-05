@@ -258,10 +258,7 @@ impl ModelComparisonOutcomeCounts {
                     .unwrap_or(0)
                     .checked_add(1)
                     .ok_or_else(|| {
-                        model_comparison_error(
-                            "outcome_overflow",
-                            "failed reason count overflowed",
-                        )
+                        model_comparison_error("outcome_overflow", "failed reason count overflowed")
                     })?;
                 self.declared = declared;
                 self.failed = failed;
