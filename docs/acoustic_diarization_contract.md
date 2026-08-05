@@ -722,16 +722,19 @@ probability mass assigned to `unresolved`.
 - confidence in `[0, 1]`;
 - `hard_must_link` or `soft_enrollment`;
 - optional provenance metadata;
-- canonical document hash.
+- ordered document hash; request order is semantic because `hint_index` is
+  positional.
 
 Hard intervals with different references may not overlap after sample
 quantization. Hard intervals are immutable assignments, but enrollment still
 removes boundary guards, non-speech, and low-quality frames. An interval with
 no usable speech fails rather than creating an empty trusted profile.
 
-Soft hints contribute capped pseudo-counts and priors. They can be rejected
-when acoustically contradictory. Provenance is audit metadata and cannot
-increase confidence by itself.
+Soft hints contribute capped pseudo-counts and priors. Contradiction checks use
+the selected identity representation: acoustic-v2 for the acoustic engine and
+ECAPA embeddings for either ECAPA engine. Channel and classical voice
+coordinates cannot veto ECAPA-only enrollment. Provenance is audit metadata
+and cannot increase confidence by itself.
 
 A request with nonempty `known_intervals` rejects both external execution and
 `fallback=external` before diarization. External labels cannot enforce the
