@@ -1337,7 +1337,7 @@ impl DiarizationReport {
         validate_speaker_queries(&self.normalized_input_sha256, &self.speaker_queries)?;
         validate_speaker_count_outcome(&self.speaker_count)?;
         validate_speaker_count_estimate_request_binding(&self.speaker_count)?;
-        validate_diarization_references(self)?;
+        validate_diarization_references(self, report_kind)?;
 
         if self.hint_document_sha256.is_some() != !self.hint_evidence.is_empty() {
             return Err(
@@ -1769,6 +1769,24 @@ fn validate_report_kind_invariants(
     report: &DiarizationReport,
     kind: DiarizationReportKind,
 ) -> Result<(), String> {
+    if kind != DiarizationReportKind::External
+        && (report
+            .speaker_count
+            .reasons
+            .contains(&SpeakerCountOutcomeReason::ExternalAttribution)
+            || report
+                .speaker_count
+                .speaker_evidence
+                .iter()
+                .any(|evidence| {
+                    evidence
+                        .reasons
+                        .contains(&SpeakerEvidenceReason::SupportedByExternalAttribution)
+                }))
+    {
+        return Err("non-external diarization report claims external attribution evidence".to_owned());
+    }
+
     let native_success = matches!(
         kind,
         DiarizationReportKind::NativeAcoustic
@@ -2256,30 +2274,50 @@ fn validate_speaker_count_outcome(outcome: &SpeakerCountOutcome) -> Result<(), S
         | SpeakerCountRequest::Prior { .. }
         | SpeakerCountRequest::Range { .. } => {}
     }
-    let required_reason = match outcome.status {
+    let status_reason_count = outcome
+        .reasons
+        .iter()
+        .filter(|reason| {
+            matches!(
+                reason,
+                SpeakerCountOutcomeReason::EvidenceSupportedCount
+                    | SpeakerCountOutcomeReason::RequestedCountMatched
+                    | SpeakerCountOutcomeReason::RequestedCountMismatch
+                    | SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable
+                    | SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved
+                    | SpeakerCountOutcomeReason::NoSupportedSpeakers
+            )
+        })
+        .count();
+    if status_reason_count != 1 {
+        return Err("speaker-count outcome must carry exactly one status reason".to_owned());
+    }
+
+    let status_reason_matches = match outcome.status {
         SpeakerCountOutcomeStatus::Resolved if outcome.supported_speaker_count == 0 => {
             return Err("resolved speaker-count outcome has no supported speakers".to_owned());
         }
-        SpeakerCountOutcomeStatus::Resolved => SpeakerCountOutcomeReason::EvidenceSupportedCount,
-        SpeakerCountOutcomeStatus::Satisfied => SpeakerCountOutcomeReason::RequestedCountMatched,
-        SpeakerCountOutcomeStatus::Unsatisfied => SpeakerCountOutcomeReason::RequestedCountMismatch,
-        SpeakerCountOutcomeStatus::Unresolved => {
-            if !outcome.reasons.iter().any(|reason| {
-                matches!(
-                    reason,
-                    SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable
-                        | SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved
-                        | SpeakerCountOutcomeReason::NoSupportedSpeakers
-                )
-            }) {
-                return Err(
-                    "unresolved speaker-count outcome lacks an unresolved reason".to_owned(),
-                );
-            }
-            return Ok(());
-        }
+        SpeakerCountOutcomeStatus::Resolved => outcome
+            .reasons
+            .contains(&SpeakerCountOutcomeReason::EvidenceSupportedCount),
+        SpeakerCountOutcomeStatus::Satisfied => outcome
+            .reasons
+            .contains(&SpeakerCountOutcomeReason::RequestedCountMatched),
+        SpeakerCountOutcomeStatus::Unsatisfied => outcome
+            .reasons
+            .contains(&SpeakerCountOutcomeReason::RequestedCountMismatch),
+        SpeakerCountOutcomeStatus::Unresolved if outcome.supported_speaker_count == 0 => outcome
+            .reasons
+            .contains(&SpeakerCountOutcomeReason::NoSupportedSpeakers),
+        SpeakerCountOutcomeStatus::Unresolved => outcome.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable
+                    | SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved
+            )
+        }),
     };
-    if !outcome.reasons.contains(&required_reason) {
+    if !status_reason_matches {
         return Err("speaker-count outcome status disagrees with its reasons".to_owned());
     }
     Ok(())
@@ -2300,7 +2338,10 @@ fn validate_speaker_count_estimate_request_binding(
     Ok(())
 }
 
-fn validate_diarization_references(report: &DiarizationReport) -> Result<(), String> {
+fn validate_diarization_references(
+    report: &DiarizationReport,
+    kind: DiarizationReportKind,
+) -> Result<(), String> {
     let active_refs = report
         .speaker_count
         .active_speaker_refs
@@ -2323,6 +2364,24 @@ fn validate_diarization_references(report: &DiarizationReport) -> Result<(), Str
             .any(|speaker_ref| !active_refs.contains(speaker_ref.as_str()))
         {
             return Err("speaker query references a non-active candidate".to_owned());
+        }
+    }
+    if matches!(
+        kind,
+        DiarizationReportKind::NativeAcoustic
+            | DiarizationReportKind::NativeEcapaOnly
+            | DiarizationReportKind::NativeEcapaFused
+            | DiarizationReportKind::External
+    ) {
+        let profile_refs = report
+            .profiles
+            .iter()
+            .map(|profile| profile.speaker_ref.as_str())
+            .collect::<BTreeSet<_>>();
+        if profile_refs != active_refs {
+            return Err(
+                "speaker profile references do not match active supported speakers".to_owned(),
+            );
         }
     }
     Ok(())
@@ -5310,7 +5369,7 @@ mod tests {
         let unresolved_probability = 0.2_f64;
         let concrete_probability = 0.8_f64;
         let calibration_sha256 = crate::diarization::acoustic_speaker_pair_calibration_sha256();
-        DiarizationReport {
+        let mut report = DiarizationReport {
             implementation: "native-acoustic-v2".to_owned(),
             contract_version: "acoustic-diarization-v3".to_owned(),
             feature_schema: "acoustic-feature-v2".to_owned(),
@@ -5357,8 +5416,7 @@ mod tests {
                 contradiction_score: None,
             }],
             speaker_queries: vec![SpeakerAttributionQuery {
-                query_id_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-                    .to_owned(),
+                query_id_sha256: String::new(),
                 start_ms: 1_000,
                 end_ms: 1_500,
                 reason: SpeakerAttributionQueryReason::LowConfidence,
@@ -5425,7 +5483,17 @@ mod tests {
             }),
             neural_representation: None,
             diagnostics: Vec::new(),
-        }
+        };
+        let query_id_sha256 = speaker_attribution_query_sha256(
+            &report.normalized_input_sha256,
+            report.speaker_queries.first().expect("query fixture"),
+        );
+        report
+            .speaker_queries
+            .first_mut()
+            .expect("query fixture")
+            .query_id_sha256 = query_id_sha256;
+        report
     }
 
     fn ready_neural_summary() -> NeuralSpeakerRepresentationSummary {

@@ -3349,7 +3349,7 @@ mod tests {
 
     fn attach_fixture_diarization(report: &mut RunReport) {
         report.request.diarize = true;
-        report.request.backend_params.acoustic_diarization = Some(DiarizationRequest {
+        let diarization_request = DiarizationRequest {
             engine: DiarizationEngine::Acoustic,
             speaker_count: SpeakerCountRequest::Range {
                 minimum: 1,
@@ -3364,7 +3364,11 @@ mod tests {
                 provenance: Some("synthetic_sync_fixture".to_owned()),
             }],
             ..DiarizationRequest::default()
-        });
+        };
+        let hint_document_sha256 = crate::diarization::canonical_hint_document_sha256(
+            &diarization_request.known_intervals,
+        );
+        report.request.backend_params.acoustic_diarization = Some(diarization_request);
         report.result.diarization = Some(DiarizationReport {
             implementation: "native-acoustic-v2".to_owned(),
             contract_version: "acoustic-diarization-v3".to_owned(),
@@ -3372,9 +3376,7 @@ mod tests {
             speaker_evidence_mode: crate::model::DiarizationSpeakerEvidenceMode::AcousticV2,
             normalized_input_sha256:
                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
-            hint_document_sha256: Some(
-                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
-            ),
+            hint_document_sha256: Some(hint_document_sha256),
             turns: vec![DiarizationTurn {
                 start_ms: 0,
                 end_ms: 2_000,
@@ -3421,7 +3423,7 @@ mod tests {
                 status: SpeakerCountOutcomeStatus::Resolved,
                 supported_speaker_count: 1,
                 active_speaker_refs: vec!["speaker_a".to_owned()],
-                dominant_speaker_share: 1.0,
+                dominant_speaker_share: 0.9,
                 unknown_voiced_share: 0.1,
                 reasons: vec![SpeakerCountOutcomeReason::EvidenceSupportedCount],
                 speaker_evidence: vec![SpeakerEvidenceSummary {
@@ -3495,11 +3497,23 @@ mod tests {
         diarization.feature_schema = "acoustic-feature-v2".to_owned();
         diarization.speaker_evidence_mode =
             crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel;
+        let fused_calibration_sha256 = crate::diarization::ecapa_speaker_pair_calibration_sha256(
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        );
+        diarization
+            .speaker_count
+            .estimate
+            .as_mut()
+            .expect("fixture speaker count estimate")
+            .calibration_sha256 = fused_calibration_sha256;
         diarization.neural_representation = Some(NeuralSpeakerRepresentationSummary {
             schema_version: "neural-speaker-representation-summary-v1".to_owned(),
             provider_version: crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
-            expected_model_package_sha256: "e".repeat(64),
-            loaded_model_package_sha256: Some("e".repeat(64)),
+            expected_model_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256
+                .to_owned(),
+            loaded_model_package_sha256: Some(
+                crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
+            ),
             model_load_source: Some(crate::model::NeuralModelLoadSource::PackageVerified),
             status: NeuralSpeakerRepresentationStatus::Degraded,
             embedded_tracklet_count: 3,
@@ -3538,7 +3552,7 @@ mod tests {
             constraint_lower_bound: 1,
             candidate_upper_bound: 2,
             calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
-            calibration_sha256: "c".repeat(64),
+            calibration_sha256: crate::diarization::acoustic_speaker_pair_calibration_sha256(),
             evidence_sha256: "d".repeat(64),
             lanes: vec![
                 SpeakerCountLaneEvidence {
