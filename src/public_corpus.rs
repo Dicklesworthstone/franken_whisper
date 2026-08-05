@@ -9515,7 +9515,7 @@ fn change_candidate_development_gate(
                 } else if candidate > 0.0 {
                     Some(1.0)
                 } else {
-                    None
+                    Some(0.0)
                 }
             });
     let mean_absolute_timing_error_delta_sec = candidate
@@ -14052,13 +14052,13 @@ mod tests {
     const PUBLIC_ECAPA_RESIDUAL_FINAL_CLUSTER_PAIR_VIEW_FACTOR: u64 = 5;
 
     const PUBLIC_SUPPORTED_PROFILE_REDECODE_PAIR_SCHEMA_VERSION: &str =
-        "public-supported-profile-redecode-pair-row-v1";
+        "public-supported-profile-redecode-pair-row-v3";
     const PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_SCHEMA_VERSION: &str =
-        "public-supported-profile-redecode-gate-row-v1";
+        "public-supported-profile-redecode-gate-row-v3";
     const PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_RUNNER_VERSION: &str =
-        "public-supported-profile-redecode-gate-runner-v1";
+        "public-supported-profile-redecode-gate-runner-v3";
     const PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_POLICY_ID: &str =
-        "public-supported-profile-redecode-development-policy-v1";
+        "public-supported-profile-redecode-development-policy-v3";
     const PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_RECORDINGS: u64 = 8;
     const PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_PAIR_ROWS: u64 = 16;
     const PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_SINGLE_SPEAKER_CONTROLS: u64 = 2;
@@ -14092,6 +14092,360 @@ mod tests {
     const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_OUTPUT_LABEL_BYTES_PER_ASSIGNMENT: u64 = 256;
     const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_PERSISTENT_OUTPUT_LABEL_BYTES: u64 = 524_288;
     const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_MULTI_SPEAKER_DOMINANT_SHARE: f64 = 0.98;
+
+    const PUBLIC_ECAPA_CHANGE_PAIR_SCHEMA_VERSION: &str =
+        "public-ecapa-change-detector-pair-row-v1";
+    const PUBLIC_ECAPA_CHANGE_GATE_SCHEMA_VERSION: &str =
+        "public-ecapa-change-detector-gate-row-v1";
+    const PUBLIC_ECAPA_CHANGE_GATE_RUNNER_VERSION: &str =
+        "public-ecapa-change-detector-gate-runner-v1";
+    const PUBLIC_ECAPA_CHANGE_GATE_POLICY_ID: &str =
+        "public-ecapa-change-detector-development-policy-v1";
+    const PUBLIC_ECAPA_CHANGE_INPUT_BINDING_VERSION: &str =
+        "public-ecapa-change-detector-input-binding-v1";
+    const PUBLIC_ECAPA_CHANGE_REQUIRED_RECORDINGS: u64 = 8;
+    const PUBLIC_ECAPA_CHANGE_REQUIRED_PAIR_ROWS: u64 = 16;
+    const PUBLIC_ECAPA_CHANGE_REQUIRED_SINGLE_SPEAKER_CONTROLS: u64 = 2;
+    const PUBLIC_ECAPA_CHANGE_MINIMUM_RELATIVE_F1_IMPROVEMENT: f64 = 0.20;
+    const PUBLIC_ECAPA_CHANGE_MAXIMUM_DER_JER_REGRESSION: f64 = 0.01;
+    const PUBLIC_ECAPA_CHANGE_MAXIMUM_BRIER_SCORE: f64 = 0.25;
+    const PUBLIC_ECAPA_CHANGE_MAXIMUM_ECE: f64 = 0.10;
+    const PUBLIC_ECAPA_CHANGE_MAXIMUM_FALLBACK_SHARE: f64 = 0.05;
+    const PUBLIC_ECAPA_CHANGE_MAXIMUM_RELATIVE_RTF_REGRESSION: f64 = 0.25;
+    const PUBLIC_ECAPA_CHANGE_MAXIMUM_CANDIDATE_RTF: f64 = 1.0;
+    const PUBLIC_ECAPA_CHANGE_MAXIMUM_PROCESS_RSS_BYTES: u64 = 512 * 1024 * 1024;
+    const PUBLIC_ECAPA_CHANGE_MAXIMUM_TRACKLET_COUNT: u64 = 2_048;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum PublicEcapaChangeGateFailure {
+        PolicyHashMismatch,
+        ProtocolMismatch,
+        PairCountMismatch,
+        PairAlignmentMismatch,
+        PairIntegrityMismatch,
+        InputBindingMismatch,
+        OutputAuthorityMismatch,
+        DetectorEvidenceMismatchAcrossEngines,
+        CandidateReplayMismatch,
+        MissingAccuracyMetric,
+        NonFiniteMetric,
+        DetectorF1GainInsufficient,
+        DetectorTimingRegression,
+        DetectorCalibrationRegression,
+        DetectorCalibrationGridMismatch,
+        DetectorCalibrationCeilingExceeded,
+        DetectorFallbackShareExceeded,
+        ReportBoundaryRegression,
+        DerRegression,
+        JerRegression,
+        SpeakerCountRegression,
+        ExactSpeakerCountRegression,
+        SelectiveRiskRegression,
+        SelectiveCoverageRegression,
+        UnknownShareRegression,
+        OverlapRegression,
+        AssignmentCalibrationRegression,
+        SpeakerCollapseRegression,
+        ClusteringFallbackRegression,
+        MissingSingleSpeakerControls,
+        SingleSpeakerControlFailure,
+        TopologyResourceExceeded,
+        RtfRegression,
+        CandidateRtfExceeded,
+        MissingAuthoritativeRss,
+        ProcessRssExceeded,
+        ArmExecutionFailure,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangeGatePolicy {
+        policy_id: String,
+        evaluation_split: EvaluationSplit,
+        baseline: crate::diarization::AcousticChangeDetectorMode,
+        candidate: crate::diarization::AcousticChangeDetectorMode,
+        engines: Vec<crate::model::DiarizationEngine>,
+        required_recordings: u64,
+        required_pair_rows: u64,
+        required_single_speaker_controls: u64,
+        minimum_relative_detector_f1_improvement: f64,
+        zero_baseline_f1_rule: String,
+        require_detector_timing_non_regression: bool,
+        maximum_der_jer_regression: f64,
+        maximum_candidate_brier_score: f64,
+        maximum_candidate_expected_calibration_error: f64,
+        require_calibration_non_regression: bool,
+        maximum_candidate_fallback_share: f64,
+        require_report_boundary_non_regression: bool,
+        require_per_recording_count_non_regression: bool,
+        require_selective_risk_non_regression: bool,
+        require_selective_coverage_non_regression: bool,
+        require_unknown_share_non_regression: bool,
+        require_overlap_non_regression: bool,
+        require_assignment_calibration_non_regression: bool,
+        require_collapse_non_regression: bool,
+        require_clustering_fallback_non_regression: bool,
+        maximum_relative_candidate_rtf_regression: f64,
+        maximum_candidate_rtf: f64,
+        maximum_process_rss_bytes: u64,
+        maximum_tracklet_count: u64,
+        candidate_replay_timing_excluded: bool,
+        per_arm_peak_rss_claimed: bool,
+        held_out_data_opened: bool,
+        production_route_changed: bool,
+        reference_derived_oracle_speech_regions: bool,
+        detector_uses_ecapa_features: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangeInputBinding {
+        schema_version: String,
+        recording_id: String,
+        audio_duration_ms: u64,
+        engine: crate::model::DiarizationEngine,
+        source_audio_sha256: String,
+        normalized_input_sha256: String,
+        request_sha256: String,
+        boundary_hints_sha256: String,
+        speech_region_authority: String,
+        scorer_config_sha256: String,
+        feature_schema_version: String,
+        clustering_mode: crate::diarization::AcousticClusteringMode,
+        ecapa_contract_sha256: String,
+        ecapa_package_sha256: String,
+        representation_provider_version: String,
+        speaker_pair_calibration_sha256: String,
+        change_calibration_sha256: String,
+        binding_sha256: String,
+    }
+
+    /// Non-serialized mutation canary retained from one completed pair.
+    ///
+    /// Public rows are self-hashable, so their hashes alone cannot establish
+    /// that a coherently rehashed row still matches the scorer/replay reduction
+    /// observed by the runner. The semantic gate below independently
+    /// recomputes all safety predicates; this canary is not a substitute for
+    /// those checks and is never presented as a second computation.
+    #[derive(Clone, PartialEq)]
+    struct PublicEcapaChangeExpectedOutputBinding {
+        recording_id: String,
+        engine: crate::model::DiarizationEngine,
+        paired_calibration_grid_sha256: String,
+        baseline: PublicEcapaChangeArmRow,
+        candidate: PublicEcapaChangeArmRow,
+        comparison: PublicEcapaChangePairComparison,
+        timing: PublicEcapaChangePairTiming,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangeMetricRow {
+        reference_count: u64,
+        hypothesis_count: u64,
+        matched_count: u64,
+        precision: Option<f64>,
+        recall: Option<f64>,
+        f1: Option<f64>,
+        absolute_error_sum_sec: f64,
+        mean_absolute_error_sec: Option<f64>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangeCalibrationBinRow {
+        observation_count: u64,
+        positive_count: u64,
+        probability_sum: f64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangeCalibrationRow {
+        observation_count: u64,
+        positive_count: u64,
+        brier_sum: f64,
+        brier_score: Option<f64>,
+        expected_calibration_error: Option<f64>,
+        bins: Vec<PublicEcapaChangeCalibrationBinRow>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangeQualityRow {
+        overlap_reference_sec: f64,
+        overlap_hypothesis_sec: f64,
+        overlap_false_positive_sec: f64,
+        overlap_false_negative_sec: f64,
+        overlap_f1: Option<f64>,
+        selective_coverage: Option<f64>,
+        assignment_coverage: Option<f64>,
+        assignment_brier_score: Option<f64>,
+        assignment_expected_calibration_error: Option<f64>,
+        dominant_collapse_detected: bool,
+        collapsed_reference_speaker_count: u64,
+        phantom_speaker_count: u64,
+        minority_reference_recall: Option<f64>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangeArmRow {
+        detector_mode: crate::diarization::AcousticChangeDetectorMode,
+        detector_configuration_sha256: String,
+        normalized_input_sha256: String,
+        report_sha256: String,
+        change_evidence_sha256: String,
+        topology_sha256: String,
+        tracklet_count: u64,
+        embedded_tracklet_count: u64,
+        zero_padded_tracklet_count: u64,
+        skipped_tracklet_count: u64,
+        fallback_evaluation_count: u64,
+        evaluated_change_count: u64,
+        requested_clustering_mode: crate::diarization::AcousticClusteringMode,
+        executed_clustering_mode: crate::diarization::AcousticClusteringMode,
+        clustering_fallback_reason: Option<String>,
+        detector_change: PublicEcapaChangeMetricRow,
+        report_change: PublicEcapaChangeMetricRow,
+        calibration: PublicEcapaChangeCalibrationRow,
+        accuracy: PublicEcapaResidualBirthAccuracyRow,
+        quality: PublicEcapaChangeQualityRow,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangePairComparison {
+        input_binding_matches: bool,
+        score_alignment_matches: bool,
+        candidate_replay_report_sha256: String,
+        candidate_replay_change_evidence_sha256: String,
+        candidate_replay_topology_sha256: String,
+        candidate_replay_score_sha256: String,
+        candidate_replay_structural_output_matches: bool,
+        candidate_replay_change_evidence_matches: bool,
+        candidate_replay_clustering_evidence_matches: bool,
+        calibration_grid_matches: bool,
+        candidate_replay_matches: bool,
+        candidate_no_farther_from_reference_count: bool,
+        selective_risk_non_regression: bool,
+        selective_coverage_non_regression: bool,
+        unknown_share_non_regression: bool,
+        overlap_non_regression: bool,
+        assignment_calibration_non_regression: bool,
+        collapse_non_regression: bool,
+        clustering_fallback_non_regression: bool,
+        single_speaker_control_passed: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangePairTiming {
+        baseline_wall_ns: u64,
+        candidate_wall_ns: u64,
+        candidate_replay_wall_ns: u64,
+        execution_order: PublicEcapaResidualBirthExecutionOrder,
+        candidate_replay_excluded_from_gate: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangePairRow {
+        schema_version: String,
+        protocol_sha256: String,
+        corpus_key: String,
+        source_version: String,
+        evaluation_split: EvaluationSplit,
+        recording_id: String,
+        audio_duration_ms: u64,
+        engine: crate::model::DiarizationEngine,
+        input_binding: PublicEcapaChangeInputBinding,
+        paired_calibration_grid_sha256: String,
+        baseline: PublicEcapaChangeArmRow,
+        candidate: PublicEcapaChangeArmRow,
+        comparison: PublicEcapaChangePairComparison,
+        timing: PublicEcapaChangePairTiming,
+        deterministic_accuracy_sha256: String,
+        row_sha256: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangeMetricComparison {
+        engine: Option<crate::model::DiarizationEngine>,
+        baseline: PublicEcapaChangeMetricRow,
+        candidate: PublicEcapaChangeMetricRow,
+        relative_f1_improvement: Option<f64>,
+        mean_absolute_error_delta_sec: Option<f64>,
+        passed: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangeAggregateComparison {
+        engine: Option<crate::model::DiarizationEngine>,
+        baseline: PublicEcapaResidualBirthAggregateMetrics,
+        candidate: PublicEcapaResidualBirthAggregateMetrics,
+        micro_der_delta: Option<f64>,
+        macro_der_delta: Option<f64>,
+        macro_jer_delta: Option<f64>,
+        count_mae_delta: Option<f64>,
+        total_absolute_speaker_count_error_delta: i64,
+        exact_speaker_count_gain: i64,
+        selective_risk_delta: Option<f64>,
+        unknown_speaker_share_delta: Option<f64>,
+        passed: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangePerformance {
+        audio_duration_sec: f64,
+        baseline_wall_sec: f64,
+        candidate_wall_sec: f64,
+        baseline_rtf: Option<f64>,
+        candidate_rtf: Option<f64>,
+        relative_candidate_rtf_regression: Option<f64>,
+        process_authoritative_peak_rss_bytes: Option<u64>,
+        process_observed_stage_max_rss_bytes: u64,
+        successful_observed_stage_sample_count: u64,
+        successful_authoritative_peak_sample_count: u64,
+        rss_observation: PublicEcapaResidualBirthRssObservationKind,
+        per_arm_peak_rss_claimed: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicEcapaChangeGateRow {
+        schema_version: String,
+        runner_version: String,
+        protocol_sha256: String,
+        descriptor_sha256: String,
+        bundle_sha256: String,
+        scorer_config_sha256: String,
+        ecapa_contract_sha256: String,
+        ecapa_package_sha256: String,
+        policy: PublicEcapaChangeGatePolicy,
+        policy_sha256: String,
+        pair_count: u64,
+        recording_count: u64,
+        arm_execution_failure_count: u64,
+        detector_change: PublicEcapaChangeMetricComparison,
+        detector_calibration_baseline: PublicEcapaChangeCalibrationRow,
+        detector_calibration_candidate: PublicEcapaChangeCalibrationRow,
+        report_change_by_engine: Vec<PublicEcapaChangeMetricComparison>,
+        accuracy_combined: PublicEcapaChangeAggregateComparison,
+        accuracy_by_engine: Vec<PublicEcapaChangeAggregateComparison>,
+        single_speaker_control_count: u64,
+        performance: PublicEcapaChangePerformance,
+        failures: Vec<PublicEcapaChangeGateFailure>,
+        development_uncertified: bool,
+        held_out_opened: bool,
+        production_route_changed: bool,
+        passed: bool,
+        result_sha256: String,
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
     #[serde(rename_all = "snake_case")]
@@ -14246,9 +14600,11 @@ mod tests {
         FrozenReferenceMismatch,
         FrozenRecordingMismatch,
         ScoreAuthorityMismatch,
+        OutputAuthorityMismatch,
         CommonObservationMismatch,
         FrozenIncumbentMismatch,
         IncumbentContractMismatch,
+        CandidateRouteIneligible,
         CandidateContractMismatch,
         CandidateReplayMismatch,
         RejectedCandidateOutputMismatch,
@@ -14287,6 +14643,7 @@ mod tests {
         required_baseline_first_pair_count_per_engine: u64,
         required_candidate_first_pair_count_per_engine: u64,
         required_single_speaker_control_recording_count: u64,
+        require_candidate_route_eligible: bool,
         require_strict_micro_der_improvement: bool,
         require_strict_micro_confusion_improvement: bool,
         require_per_record_der_non_regression: bool,
@@ -14428,6 +14785,7 @@ mod tests {
                 PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_RECORDINGS / 2,
             required_single_speaker_control_recording_count:
                 PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_SINGLE_SPEAKER_CONTROLS,
+            require_candidate_route_eligible: true,
             require_strict_micro_der_improvement: true,
             require_strict_micro_confusion_improvement: true,
             require_per_record_der_non_regression: true,
@@ -15226,21 +15584,42 @@ mod tests {
         }
     }
 
-    /// Exact verified scorer reductions retained independently of rehashable rows.
+    /// Exact verified scorer, output, replay, and timing reductions retained
+    /// independently of rehashable public rows.
     #[derive(Clone, PartialEq)]
     struct PublicSupportedProfileRedecodeExpectedPairBinding {
         recording_id: String,
         audio_duration_ms: u64,
         source_audio_sha256: String,
+        incumbent_partition_sha256: String,
+        supported_profile_topology_sha256: String,
+        frozen_support_summary_sha256: String,
+        speaker_count_estimate_sha256: String,
+        speaker_count_evidence_sha256: String,
+        frozen_count_estimate_present: bool,
+        hard_hint_input_topology_sha256: String,
+        overlap_input_topology_sha256: String,
+        final_forced_row_output_sha256: String,
+        frozen_total_profile_row_count: u64,
+        frozen_forced_tracklet_count: u64,
+        frozen_count_constraints_feasible: bool,
+        frozen_executed_clustering_mode: crate::diarization::AcousticClusteringMode,
+        frozen_operational_partition_method:
+            Option<crate::model::DiarizationOperationalPartitionMethod>,
+        frozen_route_eligible: bool,
         baseline_accuracy: PublicSupportedProfileRedecodeAccuracyRow,
         candidate_accuracy: PublicSupportedProfileRedecodeAccuracyRow,
         candidate_replay_accuracy: PublicSupportedProfileRedecodeAccuracyRow,
+        baseline_output: PublicSupportedProfileRedecodeArmRow,
+        candidate_output: PublicSupportedProfileRedecodeArmRow,
+        comparison_output: PublicSupportedProfileRedecodePairComparison,
+        timing_output: PublicSupportedProfileRedecodeTiming,
     }
 
     fn public_supported_profile_redecode_expected_pair_binding(
-        recording_id: &str,
-        audio_duration_ms: u64,
+        row: &PublicSupportedProfileRedecodePairRow,
         source_audio_sha256: &str,
+        frozen: &crate::diarization::PreparedSupportedProfileRedecodeEvaluation,
         baseline_score: &AuthoritativeDiarizationScore,
         candidate_score: &AuthoritativeDiarizationScore,
         candidate_replay_score: &AuthoritativeDiarizationScore,
@@ -15248,12 +15627,29 @@ mod tests {
         for score in [baseline_score, candidate_score, candidate_replay_score] {
             crate::diarization::verify_authoritative_score_hash(score)
                 .expect("verify independently retained authoritative score");
-            assert_eq!(score.recording_id, recording_id);
+            assert_eq!(score.recording_id, row.recording_id);
         }
         PublicSupportedProfileRedecodeExpectedPairBinding {
-            recording_id: recording_id.to_owned(),
-            audio_duration_ms,
+            recording_id: row.recording_id.clone(),
+            audio_duration_ms: row.audio_duration_ms,
             source_audio_sha256: source_audio_sha256.to_owned(),
+            incumbent_partition_sha256: frozen.incumbent_partition_sha256().to_owned(),
+            supported_profile_topology_sha256: frozen
+                .supported_profile_topology_sha256()
+                .to_owned(),
+            frozen_support_summary_sha256: frozen.frozen_support_summary_sha256().to_owned(),
+            speaker_count_estimate_sha256: frozen.speaker_count_estimate_sha256().to_owned(),
+            speaker_count_evidence_sha256: frozen.speaker_count_evidence_sha256().to_owned(),
+            frozen_count_estimate_present: frozen.frozen_count_estimate_present(),
+            hard_hint_input_topology_sha256: frozen.hard_hint_input_topology_sha256().to_owned(),
+            overlap_input_topology_sha256: frozen.overlap_input_topology_sha256().to_owned(),
+            final_forced_row_output_sha256: frozen.final_forced_row_output_sha256().to_owned(),
+            frozen_total_profile_row_count: frozen.profile_row_count(),
+            frozen_forced_tracklet_count: frozen.forced_tracklet_count(),
+            frozen_count_constraints_feasible: frozen.count_constraints_feasible(),
+            frozen_executed_clustering_mode: frozen.frozen_executed_clustering_mode(),
+            frozen_operational_partition_method: frozen.frozen_operational_partition_method(),
+            frozen_route_eligible: frozen.frozen_route_eligible(),
             baseline_accuracy: PublicSupportedProfileRedecodeAccuracyRow::from_score(
                 baseline_score,
             ),
@@ -15263,6 +15659,10 @@ mod tests {
             candidate_replay_accuracy: PublicSupportedProfileRedecodeAccuracyRow::from_score(
                 candidate_replay_score,
             ),
+            baseline_output: row.baseline.clone(),
+            candidate_output: row.candidate.clone(),
+            comparison_output: row.comparison.clone(),
+            timing_output: row.timing.clone(),
         }
     }
 
@@ -15278,11 +15678,16 @@ mod tests {
         support_evidence_frozen_from_incumbent: bool,
         speaker_count_estimate_sha256: String,
         speaker_count_evidence_sha256: String,
+        frozen_count_estimate_present: bool,
         hard_hint_input_topology_sha256: String,
         overlap_input_topology_sha256: String,
         evaluation_only_final_forced_row_output_sha256: String,
         new_inference_count: u64,
         frozen_count_constraints_feasible: bool,
+        frozen_executed_clustering_mode: crate::diarization::AcousticClusteringMode,
+        frozen_operational_partition_method:
+            Option<crate::model::DiarizationOperationalPartitionMethod>,
+        frozen_route_eligible: bool,
         output_constraints_satisfied: bool,
         report_sha256: String,
         evidence_sha256: String,
@@ -15341,15 +15746,23 @@ mod tests {
         candidate_replay_evidence_sha256: String,
         candidate_replay_score_sha256: String,
         candidate_replay_structural_sha256: Option<String>,
+        candidate_replay_incumbent_partition_sha256: String,
+        candidate_replay_supported_profile_topology_sha256: String,
         candidate_replay_frozen_support_summary_sha256: String,
         candidate_replay_support_evidence_frozen_from_incumbent: bool,
         candidate_replay_speaker_count_estimate_sha256: String,
         candidate_replay_speaker_count_evidence_sha256: String,
+        candidate_replay_frozen_count_estimate_present: bool,
         candidate_replay_hard_hint_input_topology_sha256: String,
         candidate_replay_overlap_input_topology_sha256: String,
         candidate_replay_evaluation_only_final_forced_row_output_sha256: String,
         candidate_replay_new_inference_count: u64,
         candidate_replay_frozen_count_constraints_feasible: bool,
+        candidate_replay_frozen_executed_clustering_mode:
+            crate::diarization::AcousticClusteringMode,
+        candidate_replay_frozen_operational_partition_method:
+            Option<crate::model::DiarizationOperationalPartitionMethod>,
+        candidate_replay_frozen_route_eligible: bool,
         candidate_replay_output_constraints_satisfied: bool,
         candidate_replay_profile_row_count: u64,
         candidate_replay_forced_tracklet_count: u64,
@@ -16241,6 +16654,8 @@ mod tests {
                 == candidate.speaker_count_estimate_sha256
             && candidate_replay.speaker_count_evidence_sha256
                 == candidate.speaker_count_evidence_sha256
+            && candidate_replay.frozen_count_estimate_present
+                == candidate.frozen_count_estimate_present
             && candidate_replay.hard_hint_input_topology_sha256
                 == candidate.hard_hint_input_topology_sha256
             && candidate_replay.overlap_input_topology_sha256
@@ -16250,6 +16665,11 @@ mod tests {
             && candidate_replay.new_inference_count == candidate.new_inference_count
             && candidate_replay.frozen_count_constraints_feasible
                 == candidate.frozen_count_constraints_feasible
+            && candidate_replay.frozen_executed_clustering_mode
+                == candidate.frozen_executed_clustering_mode
+            && candidate_replay.frozen_operational_partition_method
+                == candidate.frozen_operational_partition_method
+            && candidate_replay.frozen_route_eligible == candidate.frozen_route_eligible
             && candidate_replay.output_constraints_satisfied
                 == candidate.output_constraints_satisfied
             && candidate_replay.report_sha256 == candidate.report_sha256
@@ -16321,6 +16741,12 @@ mod tests {
             candidate_replay_evidence_sha256: candidate_replay.evidence_sha256.clone(),
             candidate_replay_score_sha256: candidate_replay.accuracy.score_sha256.clone(),
             candidate_replay_structural_sha256: candidate_replay.structural_output_sha256.clone(),
+            candidate_replay_incumbent_partition_sha256: candidate_replay
+                .incumbent_partition_sha256
+                .clone(),
+            candidate_replay_supported_profile_topology_sha256: candidate_replay
+                .supported_profile_topology_sha256
+                .clone(),
             candidate_replay_frozen_support_summary_sha256: candidate_replay
                 .frozen_support_summary_sha256
                 .clone(),
@@ -16332,6 +16758,8 @@ mod tests {
             candidate_replay_speaker_count_evidence_sha256: candidate_replay
                 .speaker_count_evidence_sha256
                 .clone(),
+            candidate_replay_frozen_count_estimate_present: candidate_replay
+                .frozen_count_estimate_present,
             candidate_replay_hard_hint_input_topology_sha256: candidate_replay
                 .hard_hint_input_topology_sha256
                 .clone(),
@@ -16344,6 +16772,11 @@ mod tests {
             candidate_replay_new_inference_count: candidate_replay.new_inference_count,
             candidate_replay_frozen_count_constraints_feasible: candidate_replay
                 .frozen_count_constraints_feasible,
+            candidate_replay_frozen_executed_clustering_mode: candidate_replay
+                .frozen_executed_clustering_mode,
+            candidate_replay_frozen_operational_partition_method: candidate_replay
+                .frozen_operational_partition_method,
+            candidate_replay_frozen_route_eligible: candidate_replay.frozen_route_eligible,
             candidate_replay_output_constraints_satisfied: candidate_replay
                 .output_constraints_satisfied,
             candidate_replay_profile_row_count: candidate_replay.profile_row_count,
@@ -16559,11 +16992,11 @@ mod tests {
         )
     }
 
-    fn score_path_free_ecapa_report(
+    fn try_score_path_free_ecapa_report(
         reference: &DiarizationReferenceDocument,
         report: &crate::model::DiarizationReport,
         scorer_config: &DiarizationScorerConfig,
-    ) -> AuthoritativeDiarizationScore {
+    ) -> FwResult<AuthoritativeDiarizationScore> {
         let hypothesis = crate::diarization::DiarizationHypothesisDocument {
             schema_version: crate::diarization::DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
             recording_id: reference.recording_id.clone(),
@@ -16583,12 +17016,24 @@ mod tests {
             performance: None,
         };
         let score =
-            crate::diarization::score_diarization_documents(reference, &hypothesis, scorer_config)
-                .expect("authoritative public-corpus score");
-        crate::diarization::verify_authoritative_score_hash(&score)
-            .expect("valid authoritative score hash");
-        assert!(score.performance.is_none());
-        score
+            crate::diarization::score_diarization_documents(reference, &hypothesis, scorer_config)?;
+        crate::diarization::verify_authoritative_score_hash(&score)?;
+        if score.performance.is_some() {
+            return Err(crate::FwError::ContractViolation(
+                "path-free public ECAPA score unexpectedly contains performance evidence"
+                    .to_owned(),
+            ));
+        }
+        Ok(score)
+    }
+
+    fn score_path_free_ecapa_report(
+        reference: &DiarizationReferenceDocument,
+        report: &crate::model::DiarizationReport,
+        scorer_config: &DiarizationScorerConfig,
+    ) -> AuthoritativeDiarizationScore {
+        try_score_path_free_ecapa_report(reference, report, scorer_config)
+            .expect("authoritative path-free public-corpus score")
     }
 
     fn public_ecapa_residual_birth_arm_row(
@@ -16654,6 +17099,7 @@ mod tests {
                 .support_evidence_frozen_from_incumbent,
             speaker_count_estimate_sha256: run.speaker_count_estimate_sha256.clone(),
             speaker_count_evidence_sha256: run.speaker_count_evidence_sha256.clone(),
+            frozen_count_estimate_present: run.frozen_count_estimate_present,
             hard_hint_input_topology_sha256: run.hard_hint_input_topology_sha256.clone(),
             overlap_input_topology_sha256: run.overlap_input_topology_sha256.clone(),
             evaluation_only_final_forced_row_output_sha256: run
@@ -16661,6 +17107,9 @@ mod tests {
                 .clone(),
             new_inference_count: run.new_inference_count,
             frozen_count_constraints_feasible: run.frozen_count_constraints_feasible,
+            frozen_executed_clustering_mode: run.frozen_executed_clustering_mode,
+            frozen_operational_partition_method: run.frozen_operational_partition_method,
+            frozen_route_eligible: run.frozen_route_eligible,
             output_constraints_satisfied: run.clustering.constraints_satisfied,
             report_sha256: super::canonical_sha256(&run.report)
                 .expect("hash supported-profile path-free report"),
@@ -16720,6 +17169,1995 @@ mod tests {
         } else {
             PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline
         }
+    }
+
+    fn public_ecapa_change_gate_policy() -> PublicEcapaChangeGatePolicy {
+        PublicEcapaChangeGatePolicy {
+            policy_id: PUBLIC_ECAPA_CHANGE_GATE_POLICY_ID.to_owned(),
+            evaluation_split: EvaluationSplit::Development,
+            baseline: crate::diarization::AcousticChangeDetectorMode::FixedSafeV1,
+            candidate: crate::diarization::AcousticChangeDetectorMode::CalibratedPosterior,
+            engines: vec![
+                crate::model::DiarizationEngine::Ecapa,
+                crate::model::DiarizationEngine::EcapaFused,
+            ],
+            required_recordings: PUBLIC_ECAPA_CHANGE_REQUIRED_RECORDINGS,
+            required_pair_rows: PUBLIC_ECAPA_CHANGE_REQUIRED_PAIR_ROWS,
+            required_single_speaker_controls: PUBLIC_ECAPA_CHANGE_REQUIRED_SINGLE_SPEAKER_CONTROLS,
+            minimum_relative_detector_f1_improvement:
+                PUBLIC_ECAPA_CHANGE_MINIMUM_RELATIVE_F1_IMPROVEMENT,
+            zero_baseline_f1_rule: "use-absolute-candidate-f1-v1".to_owned(),
+            require_detector_timing_non_regression: true,
+            maximum_der_jer_regression: PUBLIC_ECAPA_CHANGE_MAXIMUM_DER_JER_REGRESSION,
+            maximum_candidate_brier_score: PUBLIC_ECAPA_CHANGE_MAXIMUM_BRIER_SCORE,
+            maximum_candidate_expected_calibration_error: PUBLIC_ECAPA_CHANGE_MAXIMUM_ECE,
+            require_calibration_non_regression: true,
+            maximum_candidate_fallback_share: PUBLIC_ECAPA_CHANGE_MAXIMUM_FALLBACK_SHARE,
+            require_report_boundary_non_regression: true,
+            require_per_recording_count_non_regression: true,
+            require_selective_risk_non_regression: true,
+            require_selective_coverage_non_regression: true,
+            require_unknown_share_non_regression: true,
+            require_overlap_non_regression: true,
+            require_assignment_calibration_non_regression: true,
+            require_collapse_non_regression: true,
+            require_clustering_fallback_non_regression: true,
+            maximum_relative_candidate_rtf_regression:
+                PUBLIC_ECAPA_CHANGE_MAXIMUM_RELATIVE_RTF_REGRESSION,
+            maximum_candidate_rtf: PUBLIC_ECAPA_CHANGE_MAXIMUM_CANDIDATE_RTF,
+            maximum_process_rss_bytes: PUBLIC_ECAPA_CHANGE_MAXIMUM_PROCESS_RSS_BYTES,
+            maximum_tracklet_count: PUBLIC_ECAPA_CHANGE_MAXIMUM_TRACKLET_COUNT,
+            candidate_replay_timing_excluded: true,
+            per_arm_peak_rss_claimed: false,
+            held_out_data_opened: false,
+            production_route_changed: false,
+            reference_derived_oracle_speech_regions: true,
+            detector_uses_ecapa_features: false,
+        }
+    }
+
+    fn public_ecapa_change_engine_id(engine: crate::model::DiarizationEngine) -> &'static str {
+        match engine {
+            crate::model::DiarizationEngine::Auto => "auto",
+            crate::model::DiarizationEngine::Acoustic => "acoustic",
+            crate::model::DiarizationEngine::External => "external",
+            crate::model::DiarizationEngine::Ecapa => "ecapa",
+            crate::model::DiarizationEngine::EcapaFused => "ecapa_fused",
+        }
+    }
+
+    fn public_ecapa_change_detector_configuration_sha256(
+        mode: crate::diarization::AcousticChangeDetectorMode,
+    ) -> String {
+        crate::diarization::acoustic_change_detector_configuration_sha256(mode)
+    }
+
+    fn public_ecapa_change_boundary_hints_sha256(
+        hints: &crate::diarization::AcousticBoundaryHints,
+    ) -> String {
+        #[derive(serde::Serialize)]
+        struct BoundaryHintsFingerprint<'a> {
+            schema_version: &'static str,
+            speech_regions_ms: &'a [(u64, u64)],
+            word_boundaries_ms: &'a [u64],
+            tiny_diarize_boundaries_ms: &'a [u64],
+        }
+
+        super::canonical_sha256(&BoundaryHintsFingerprint {
+            schema_version: "public-ecapa-change-boundary-hints-v1",
+            speech_regions_ms: &hints.speech_regions_ms,
+            word_boundaries_ms: &hints.word_boundaries_ms,
+            tiny_diarize_boundaries_ms: &hints.tiny_diarize_boundaries_ms,
+        })
+        .expect("hash boundary-hint topology")
+    }
+
+    fn public_ecapa_change_input_binding(
+        fixture: &FrozenEcapaDev8,
+        recording: &LoadedFrozenEcapaRecording<'_>,
+        request: &crate::model::DiarizationRequest,
+        evidence_mode: crate::model::DiarizationSpeakerEvidenceMode,
+    ) -> PublicEcapaChangeInputBinding {
+        let mut binding = PublicEcapaChangeInputBinding {
+            schema_version: PUBLIC_ECAPA_CHANGE_INPUT_BINDING_VERSION.to_owned(),
+            recording_id: recording.reference.recording_id.clone(),
+            audio_duration_ms: recording.reference.duration_ms,
+            engine: request.engine,
+            source_audio_sha256: recording.source_audio_sha256.clone(),
+            normalized_input_sha256: recording.normalized_input_sha256.clone(),
+            request_sha256: super::canonical_sha256(request).expect("hash ECAPA request"),
+            boundary_hints_sha256: public_ecapa_change_boundary_hints_sha256(
+                &recording.boundary_hints,
+            ),
+            speech_region_authority: "reference-derived-oracle-speech-regions-development-only-v1"
+                .to_owned(),
+            scorer_config_sha256: fixture.scorer_config_sha256.clone(),
+            feature_schema_version: crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION.to_owned(),
+            clustering_mode: crate::diarization::AcousticClusteringMode::ProbabilisticV1,
+            ecapa_contract_sha256: fixture.model.info().contract_sha256.clone(),
+            ecapa_package_sha256: fixture.model.info().package_sha256.clone(),
+            representation_provider_version:
+                crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
+            speaker_pair_calibration_sha256:
+                crate::diarization::ecapa_speaker_pair_calibration_sha256(evidence_mode),
+            change_calibration_sha256: crate::diarization::acoustic_change_calibration_sha256(),
+            binding_sha256: String::new(),
+        };
+        binding.binding_sha256 =
+            super::canonical_sha256(&binding).expect("hash pre-topology ECAPA input binding");
+        binding
+    }
+
+    fn public_ecapa_change_evidence_sha256(
+        evidence: &crate::diarization::AcousticChangeEvaluationEvidence,
+    ) -> String {
+        fn hash_event(hasher: &mut sha2::Sha256, event: &crate::diarization::ChangePointEvidence) {
+            hasher.update(event.boundary_ms.to_le_bytes());
+            for value in [
+                event.voice_distance,
+                event.channel_distance,
+                event.raw_log_odds,
+                event.change_probability,
+            ] {
+                hasher.update(value.to_bits().to_le_bytes());
+            }
+            for value in event.multiscale_scores {
+                hasher.update(value.to_bits().to_le_bytes());
+            }
+            hasher.update([event.supporting_scale_mask]);
+            hasher.update(event.refinement_offset_frames.to_le_bytes());
+            hasher.update([match event.action {
+                crate::diarization::AcousticChangeAction::NoBoundary => 0,
+                crate::diarization::AcousticChangeAction::Defer => 1,
+                crate::diarization::AcousticChangeAction::EmitBoundary => 2,
+                crate::diarization::AcousticChangeAction::ConservativeFallback => 3,
+            }]);
+            hasher.update([match event.fallback_reason {
+                None => 0,
+                Some(
+                    crate::diarization::AcousticChangeFallbackReason::InsufficientVoiceSupport,
+                ) => 1,
+                Some(crate::diarization::AcousticChangeFallbackReason::InvalidCovariance) => 2,
+            }]);
+            hasher.update(event.detector_mode.id().as_bytes());
+            hasher.update([0]);
+            hasher.update(event.calibration_id.as_bytes());
+            hasher.update([0]);
+            for flag in [
+                event.silence_gap,
+                event.snapped_to_word,
+                event.tiny_diarize_support,
+                event.vad_boundary,
+                event.supervised_boundary,
+            ] {
+                hasher.update([u8::from(flag)]);
+            }
+        }
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"public-ecapa-change-evidence-v1\0");
+        hasher.update((evidence.emitted.len() as u64).to_le_bytes());
+        for event in &evidence.emitted {
+            hash_event(&mut hasher, event);
+        }
+        hasher.update((evidence.evaluated.len() as u64).to_le_bytes());
+        for evaluated in &evidence.evaluated {
+            hasher.update(evaluated.evaluation_center_ms.to_le_bytes());
+            hash_event(&mut hasher, &evaluated.evidence);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn public_ecapa_change_topology_sha256(
+        evidence: &crate::diarization::AcousticClusteringEvaluationEvidence,
+    ) -> String {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"public-ecapa-change-tracklet-topology-v1\0");
+        hasher.update((evidence.calibration_tracklets.len() as u64).to_le_bytes());
+        for tracklet in &evidence.calibration_tracklets {
+            for value in [
+                tracklet.tracklet_index as u64,
+                tracklet.start_ms,
+                tracklet.end_ms,
+                tracklet.frame_count as u64,
+                tracklet.voiced_frame_count as u64,
+                tracklet.identity_frame_count as u64,
+                tracklet.channel_frame_count as u64,
+            ] {
+                hasher.update(value.to_le_bytes());
+            }
+            hasher.update(tracklet.change_confidence.to_bits().to_le_bytes());
+            hasher.update(tracklet.overlap_probability.to_bits().to_le_bytes());
+            match tracklet.boundary_evidence.as_ref() {
+                Some(boundary) => {
+                    hasher.update([1]);
+                    hasher.update(boundary.boundary_ms.to_le_bytes());
+                    hasher.update(boundary.change_probability.to_bits().to_le_bytes());
+                    hasher.update(boundary.detector_mode.id().as_bytes());
+                    hasher.update([0]);
+                }
+                None => hasher.update([0]),
+            }
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn public_ecapa_change_metric_row(
+        reference_ms: &[u64],
+        hypothesis_ms: &[u64],
+        collar_ms: u64,
+    ) -> PublicEcapaChangeMetricRow {
+        let observation = super::score_change_metric_observation(
+            reference_ms,
+            hypothesis_ms,
+            collar_ms,
+            collar_ms as f64,
+        )
+        .expect("score public ECAPA change points");
+        let absolute_error_sum_sec =
+            super::canonical_evidence_number(observation.absolute_errors_sec.iter().sum::<f64>());
+        let reference_count = u64::try_from(observation.score.reference_count).unwrap_or(u64::MAX);
+        let hypothesis_count =
+            u64::try_from(observation.score.hypothesis_count).unwrap_or(u64::MAX);
+        let matched_count = u64::try_from(observation.score.matched_count).unwrap_or(u64::MAX);
+        PublicEcapaChangeMetricRow {
+            reference_count,
+            hypothesis_count,
+            matched_count,
+            precision: observation.score.precision,
+            recall: observation.score.recall,
+            f1: public_ecapa_change_boundary_f1(reference_count, hypothesis_count, matched_count),
+            absolute_error_sum_sec,
+            mean_absolute_error_sec: (!observation.absolute_errors_sec.is_empty()).then(|| {
+                super::canonical_evidence_number(
+                    absolute_error_sum_sec / observation.absolute_errors_sec.len() as f64,
+                )
+            }),
+        }
+    }
+
+    fn public_ecapa_change_boundary_f1(
+        reference_count: u64,
+        hypothesis_count: u64,
+        matched_count: u64,
+    ) -> Option<f64> {
+        let denominator = reference_count.saturating_add(hypothesis_count);
+        (denominator > 0).then(|| {
+            super::canonical_evidence_number(2.0 * matched_count as f64 / denominator as f64)
+        })
+    }
+
+    fn public_ecapa_change_calibration_row(
+        aggregate: &super::ChangeEventCalibrationAggregate,
+    ) -> PublicEcapaChangeCalibrationRow {
+        let expected_calibration_error = (aggregate.observation_count > 0).then(|| {
+            super::canonical_evidence_number(
+                aggregate
+                    .bins
+                    .iter()
+                    .filter(|bin| bin.observation_count > 0)
+                    .map(|bin| {
+                        let observations = bin.observation_count as f64;
+                        (observations / aggregate.observation_count as f64)
+                            * ((bin.probability_sum / observations)
+                                - (bin.positive_count as f64 / observations))
+                                .abs()
+                    })
+                    .sum::<f64>(),
+            )
+        });
+        PublicEcapaChangeCalibrationRow {
+            observation_count: aggregate.observation_count,
+            positive_count: aggregate.positive_count,
+            brier_sum: super::canonical_evidence_number(aggregate.brier_sum),
+            brier_score: super::positive_ratio(
+                aggregate.brier_sum,
+                aggregate.observation_count as f64,
+            ),
+            expected_calibration_error,
+            bins: aggregate
+                .bins
+                .iter()
+                .map(|bin| PublicEcapaChangeCalibrationBinRow {
+                    observation_count: bin.observation_count,
+                    positive_count: bin.positive_count,
+                    probability_sum: super::canonical_evidence_number(bin.probability_sum),
+                })
+                .collect(),
+        }
+    }
+
+    fn public_ecapa_change_evaluated_probability_grid(
+        evidence: &crate::diarization::AcousticChangeEvaluationEvidence,
+        audio_duration_ms: u64,
+    ) -> BTreeMap<u64, f64> {
+        let mut grid = BTreeMap::<u64, f64>::new();
+        for evaluated in &evidence.evaluated {
+            let event = &evaluated.evidence;
+            if event.vad_boundary
+                || event.supervised_boundary
+                || evaluated.evaluation_center_ms == 0
+                || evaluated.evaluation_center_ms >= audio_duration_ms
+            {
+                continue;
+            }
+            let probability = f64::from(event.change_probability);
+            grid.entry(evaluated.evaluation_center_ms)
+                .and_modify(|retained| *retained = retained.max(probability))
+                .or_insert(probability);
+        }
+        grid
+    }
+
+    fn public_ecapa_change_calibration_on_grid(
+        reference_changes_ms: &[u64],
+        probability_grid: &BTreeMap<u64, f64>,
+        common_grid_ms: &[u64],
+        collar_ms: u64,
+        bins: usize,
+    ) -> PublicEcapaChangeCalibrationRow {
+        let observations = common_grid_ms
+            .iter()
+            .filter_map(|boundary_ms| {
+                probability_grid.get(boundary_ms).map(|probability| {
+                    super::ChangeProbabilityObservation {
+                        boundary_ms: *boundary_ms,
+                        probability: *probability,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        public_ecapa_change_calibration_row(
+            &public_ecapa_change_frame_calibration(
+                reference_changes_ms,
+                &observations,
+                collar_ms,
+                bins,
+            )
+            .expect("score paired ECAPA detector calibration grid"),
+        )
+    }
+
+    fn public_ecapa_change_frame_calibration(
+        reference_ms: &[u64],
+        observations: &[super::ChangeProbabilityObservation],
+        collar_ms: u64,
+        bins: usize,
+    ) -> FwResult<super::ChangeEventCalibrationAggregate> {
+        if bins == 0 || bins > 100 {
+            return Err(super::public_corpus_error(
+                "ecapa_change_calibration_bins",
+                "frame-calibration bins must be within 1..=100",
+            ));
+        }
+        if reference_ms.windows(2).any(|window| window[0] >= window[1])
+            || observations
+                .windows(2)
+                .any(|window| window[0].boundary_ms >= window[1].boundary_ms)
+        {
+            return Err(super::public_corpus_error(
+                "ecapa_change_calibration_order",
+                "frame-calibration inputs must be strictly increasing",
+            ));
+        }
+        if observations.iter().any(|observation| {
+            !observation.probability.is_finite() || !(0.0..=1.0).contains(&observation.probability)
+        }) {
+            return Err(super::public_corpus_error(
+                "ecapa_change_calibration_probability",
+                "frame-calibration probabilities must be finite and within [0, 1]",
+            ));
+        }
+
+        let mut aggregate = super::ChangeEventCalibrationAggregate {
+            observation_count: 0,
+            positive_count: 0,
+            brier_sum: 0.0,
+            bins: vec![super::ChangeReliabilityAccumulator::default(); bins],
+        };
+        let mut reference_index = 0usize;
+        for observation in observations {
+            while reference_ms.get(reference_index).is_some_and(|reference| {
+                reference.saturating_add(collar_ms) < observation.boundary_ms
+            }) {
+                reference_index = reference_index.saturating_add(1);
+            }
+            let positive = reference_ms
+                .get(reference_index)
+                .is_some_and(|reference| reference.abs_diff(observation.boundary_ms) <= collar_ms);
+            let outcome = f64::from(positive);
+            let bin = ((observation.probability * bins as f64).floor() as usize).min(bins - 1);
+            aggregate.observation_count = aggregate.observation_count.saturating_add(1);
+            aggregate.positive_count = aggregate.positive_count.saturating_add(u64::from(positive));
+            aggregate.brier_sum += (observation.probability - outcome).powi(2);
+            aggregate.bins[bin].observation_count =
+                aggregate.bins[bin].observation_count.saturating_add(1);
+            aggregate.bins[bin].positive_count = aggregate.bins[bin]
+                .positive_count
+                .saturating_add(u64::from(positive));
+            aggregate.bins[bin].probability_sum += observation.probability;
+        }
+        Ok(aggregate)
+    }
+
+    fn public_ecapa_change_probability_grids_match(
+        baseline: &BTreeMap<u64, f64>,
+        candidate: &BTreeMap<u64, f64>,
+        candidate_replay: &BTreeMap<u64, f64>,
+    ) -> bool {
+        baseline.keys().eq(candidate.keys()) && candidate.keys().eq(candidate_replay.keys())
+    }
+
+    fn public_ecapa_change_fallback_evaluation_count(
+        evidence: &crate::diarization::AcousticChangeEvaluationEvidence,
+    ) -> u64 {
+        u64::try_from(
+            evidence
+                .evaluated
+                .iter()
+                .filter(|evaluated| evaluated.evidence.fallback_reason.is_some())
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    fn public_ecapa_change_detector_metric_defined_or_empty(
+        metric: &PublicEcapaChangeMetricRow,
+    ) -> bool {
+        metric.f1.is_some()
+            || (metric.reference_count == 0
+                && metric.hypothesis_count == 0
+                && metric.matched_count == 0)
+    }
+
+    fn public_ecapa_change_detector_timing_non_regression(
+        candidate: Option<f64>,
+        baseline: Option<f64>,
+    ) -> bool {
+        match (candidate, baseline) {
+            (Some(candidate), Some(baseline)) => candidate <= baseline + 1e-12,
+            (Some(_), None) | (None, None) => true,
+            (None, Some(_)) => false,
+        }
+    }
+
+    fn public_ecapa_change_clustering_fallback_id(
+        fallback: Option<crate::diarization::AcousticClusteringFallbackReason>,
+    ) -> Option<String> {
+        fallback.map(|fallback| {
+            match fallback {
+                crate::diarization::AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions =>
+                    "insufficient_shared_voice_dimensions",
+                crate::diarization::AcousticClusteringFallbackReason::InvalidPosterior =>
+                    "invalid_posterior",
+                crate::diarization::AcousticClusteringFallbackReason::UnstableSpeakerCount =>
+                    "unstable_speaker_count",
+                crate::diarization::AcousticClusteringFallbackReason::SpeakerCountPriorUnresolved =>
+                    "speaker_count_prior_unresolved",
+            }
+            .to_owned()
+        })
+    }
+
+    fn public_ecapa_change_optional_lower_non_regression(
+        candidate: Option<f64>,
+        baseline: Option<f64>,
+    ) -> bool {
+        match (candidate, baseline) {
+            (Some(candidate), Some(baseline)) => {
+                candidate.is_finite() && baseline.is_finite() && candidate <= baseline + 1e-12
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn public_ecapa_change_optional_higher_non_regression(
+        candidate: Option<f64>,
+        baseline: Option<f64>,
+    ) -> bool {
+        match (candidate, baseline) {
+            (Some(candidate), Some(baseline)) => {
+                candidate.is_finite() && baseline.is_finite() && candidate + 1e-12 >= baseline
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn public_ecapa_change_quality_row(
+        score: &AuthoritativeDiarizationScore,
+    ) -> PublicEcapaChangeQualityRow {
+        PublicEcapaChangeQualityRow {
+            overlap_reference_sec: score.overlap.reference_overlap_sec,
+            overlap_hypothesis_sec: score.overlap.hypothesis_overlap_sec,
+            overlap_false_positive_sec: score.overlap.false_positive_sec,
+            overlap_false_negative_sec: score.overlap.false_negative_sec,
+            overlap_f1: score.overlap.f1,
+            selective_coverage: score.selective_attribution.coverage,
+            assignment_coverage: score.calibration.coverage,
+            assignment_brier_score: score.calibration.brier_score,
+            assignment_expected_calibration_error: score.calibration.expected_calibration_error,
+            dominant_collapse_detected: score.speaker_occupancy.dominant_collapse_detected,
+            collapsed_reference_speaker_count: u64::try_from(
+                score.speaker_occupancy.collapsed_reference_speaker_count,
+            )
+            .unwrap_or(u64::MAX),
+            phantom_speaker_count: u64::try_from(score.speaker_occupancy.phantom_speaker_count)
+                .unwrap_or(u64::MAX),
+            minority_reference_recall: score.speaker_occupancy.minority_reference_recall,
+        }
+    }
+
+    fn public_ecapa_change_selective_risk_non_regression(
+        candidate: &PublicEcapaChangeArmRow,
+        baseline: &PublicEcapaChangeArmRow,
+    ) -> bool {
+        public_ecapa_change_optional_lower_non_regression(
+            candidate.accuracy.selective_risk,
+            baseline.accuracy.selective_risk,
+        )
+    }
+
+    fn public_ecapa_change_selective_coverage_non_regression(
+        candidate: &PublicEcapaChangeArmRow,
+        baseline: &PublicEcapaChangeArmRow,
+    ) -> bool {
+        public_ecapa_change_optional_higher_non_regression(
+            candidate.quality.selective_coverage,
+            baseline.quality.selective_coverage,
+        )
+    }
+
+    fn public_ecapa_change_unknown_non_regression(
+        candidate: &PublicEcapaChangeArmRow,
+        baseline: &PublicEcapaChangeArmRow,
+    ) -> bool {
+        public_ecapa_change_optional_lower_non_regression(
+            candidate.accuracy.unknown_speaker_share,
+            baseline.accuracy.unknown_speaker_share,
+        )
+    }
+
+    fn public_ecapa_change_overlap_non_regression(
+        candidate: &PublicEcapaChangeArmRow,
+        baseline: &PublicEcapaChangeArmRow,
+    ) -> bool {
+        candidate.quality.overlap_false_positive_sec
+            <= baseline.quality.overlap_false_positive_sec + 1e-12
+            && candidate.quality.overlap_false_negative_sec
+                <= baseline.quality.overlap_false_negative_sec + 1e-12
+            && public_ecapa_change_optional_higher_non_regression(
+                candidate.quality.overlap_f1,
+                baseline.quality.overlap_f1,
+            )
+    }
+
+    fn public_ecapa_change_assignment_non_regression(
+        candidate: &PublicEcapaChangeArmRow,
+        baseline: &PublicEcapaChangeArmRow,
+    ) -> bool {
+        public_ecapa_change_optional_higher_non_regression(
+            candidate.quality.assignment_coverage,
+            baseline.quality.assignment_coverage,
+        ) && public_ecapa_change_optional_lower_non_regression(
+            candidate.quality.assignment_brier_score,
+            baseline.quality.assignment_brier_score,
+        ) && public_ecapa_change_optional_lower_non_regression(
+            candidate.quality.assignment_expected_calibration_error,
+            baseline.quality.assignment_expected_calibration_error,
+        )
+    }
+
+    fn public_ecapa_change_collapse_non_regression(
+        candidate: &PublicEcapaChangeArmRow,
+        baseline: &PublicEcapaChangeArmRow,
+    ) -> bool {
+        (!candidate.quality.dominant_collapse_detected
+            || baseline.quality.dominant_collapse_detected)
+            && candidate.quality.collapsed_reference_speaker_count
+                <= baseline.quality.collapsed_reference_speaker_count
+            && candidate.quality.phantom_speaker_count <= baseline.quality.phantom_speaker_count
+            && public_ecapa_change_optional_higher_non_regression(
+                candidate.quality.minority_reference_recall,
+                baseline.quality.minority_reference_recall,
+            )
+    }
+
+    struct PublicEcapaChangeArmExecution {
+        report: crate::model::DiarizationReport,
+        projection: crate::diarization::DiarizationProjection,
+        change_evidence: crate::diarization::AcousticChangeEvaluationEvidence,
+        clustering_evidence: crate::diarization::AcousticClusteringEvaluationEvidence,
+        score: AuthoritativeDiarizationScore,
+        arm: PublicEcapaChangeArmRow,
+        wall_ns: u64,
+    }
+
+    fn run_public_ecapa_change_arm(
+        fixture: &FrozenEcapaDev8,
+        recording: &LoadedFrozenEcapaRecording<'_>,
+        request: &crate::model::DiarizationRequest,
+        detector_mode: crate::diarization::AcousticChangeDetectorMode,
+        memory_observation: &mut PublicEcapaResidualBirthMemoryObservation,
+    ) -> FwResult<PublicEcapaChangeArmExecution> {
+        let started = std::time::Instant::now();
+        let (report, projection, change_evidence, clustering_evidence) =
+            crate::diarization::diarize_ecapa_pcm_with_detector_evidence(
+                crate::diarization::AcousticDiarizationInput {
+                    samples: &recording.samples,
+                    normalized_input_sha256: &recording.normalized_input_sha256,
+                    segments: &[],
+                    word_aligned: false,
+                    request,
+                    boundary_hints: &recording.boundary_hints,
+                },
+                &fixture.model,
+                detector_mode,
+                &|| Ok(()),
+            )?;
+        let wall_ns = public_ecapa_duration_ns(started.elapsed());
+        memory_observation.observe_stage();
+
+        report
+            .validate_against_request(request, Some(recording.reference.duration_ms))
+            .map_err(crate::FwError::ContractViolation)?;
+        let score =
+            try_score_path_free_ecapa_report(recording.reference, &report, &fixture.scorer_config)?;
+        let reference_changes = crate::diarization::speaker_change_points_ms(
+            &recording.reference.turns,
+            recording.reference.duration_ms,
+            true,
+        )?;
+        let detector_hypothesis_observations = change_evidence
+            .emitted
+            .iter()
+            .filter(|evidence| {
+                !evidence.vad_boundary
+                    && !evidence.supervised_boundary
+                    && evidence.boundary_ms > 0
+                    && evidence.boundary_ms < recording.reference.duration_ms
+            })
+            .map(|evidence| super::ChangeProbabilityObservation {
+                boundary_ms: evidence.boundary_ms,
+                probability: f64::from(evidence.change_probability),
+            })
+            .collect::<Vec<_>>();
+        let detector_change_ms = detector_hypothesis_observations
+            .iter()
+            .map(|observation| observation.boundary_ms)
+            .collect::<Vec<_>>();
+        let report_observations = super::report_change_observations(&report.turns);
+        let report_change_ms = report_observations
+            .iter()
+            .map(|observation| observation.boundary_ms)
+            .collect::<Vec<_>>();
+        let detector_change = public_ecapa_change_metric_row(
+            &reference_changes,
+            &detector_change_ms,
+            fixture.scorer_config.change_boundary_collar_ms,
+        );
+        let report_change = public_ecapa_change_metric_row(
+            &reference_changes,
+            &report_change_ms,
+            fixture.scorer_config.change_boundary_collar_ms,
+        );
+        let calibration_grid = public_ecapa_change_evaluated_probability_grid(
+            &change_evidence,
+            recording.reference.duration_ms,
+        );
+        let calibration_grid_ms = calibration_grid.keys().copied().collect::<Vec<_>>();
+        let calibration = public_ecapa_change_calibration_on_grid(
+            &reference_changes,
+            &calibration_grid,
+            &calibration_grid_ms,
+            fixture.scorer_config.change_boundary_collar_ms,
+            fixture.scorer_config.calibration_bins,
+        );
+        let representation = report.neural_representation.as_ref().ok_or_else(|| {
+            crate::FwError::ContractViolation(
+                "full ECAPA detector arm omitted representation provenance".to_owned(),
+            )
+        })?;
+        let tracklet_count =
+            u64::try_from(clustering_evidence.calibration_tracklets.len()).unwrap_or(u64::MAX);
+        let fallback_evaluation_count =
+            public_ecapa_change_fallback_evaluation_count(&change_evidence);
+        let evaluated_change_count =
+            u64::try_from(change_evidence.evaluated.len()).unwrap_or(u64::MAX);
+        let arm = PublicEcapaChangeArmRow {
+            detector_mode,
+            detector_configuration_sha256: public_ecapa_change_detector_configuration_sha256(
+                detector_mode,
+            ),
+            normalized_input_sha256: report.normalized_input_sha256.clone(),
+            report_sha256: super::canonical_sha256(&report)?,
+            change_evidence_sha256: public_ecapa_change_evidence_sha256(&change_evidence),
+            topology_sha256: public_ecapa_change_topology_sha256(&clustering_evidence),
+            tracklet_count,
+            embedded_tracklet_count: representation.embedded_tracklet_count,
+            zero_padded_tracklet_count: representation.zero_padded_tracklet_count,
+            skipped_tracklet_count: representation.skipped_tracklet_count,
+            fallback_evaluation_count,
+            evaluated_change_count,
+            requested_clustering_mode: clustering_evidence.requested_mode,
+            executed_clustering_mode: clustering_evidence.executed_mode,
+            clustering_fallback_reason: public_ecapa_change_clustering_fallback_id(
+                clustering_evidence.fallback_reason,
+            ),
+            detector_change,
+            report_change,
+            calibration,
+            accuracy: PublicEcapaResidualBirthAccuracyRow::from_score(&score),
+            quality: public_ecapa_change_quality_row(&score),
+        };
+        Ok(PublicEcapaChangeArmExecution {
+            report,
+            projection,
+            change_evidence,
+            clustering_evidence,
+            score,
+            arm,
+            wall_ns,
+        })
+    }
+
+    fn catch_public_ecapa_change_arm_failure(
+        fixture: &FrozenEcapaDev8,
+        recording: &LoadedFrozenEcapaRecording<'_>,
+        request: &crate::model::DiarizationRequest,
+        detector_mode: crate::diarization::AcousticChangeDetectorMode,
+        memory_observation: &mut PublicEcapaResidualBirthMemoryObservation,
+        arm_execution_failure_count: &mut u64,
+    ) -> Option<PublicEcapaChangeArmExecution> {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_public_ecapa_change_arm(
+                fixture,
+                recording,
+                request,
+                detector_mode,
+                memory_observation,
+            )
+        }));
+        match outcome {
+            Ok(Ok(execution)) => Some(execution),
+            Ok(Err(_)) | Err(_) => {
+                *arm_execution_failure_count = (*arm_execution_failure_count).saturating_add(1);
+                None
+            }
+        }
+    }
+
+    fn public_ecapa_change_pair_accuracy_sha256(row: &PublicEcapaChangePairRow) -> String {
+        let mut normalized = row.clone();
+        normalized.timing.baseline_wall_ns = 0;
+        normalized.timing.candidate_wall_ns = 0;
+        normalized.timing.candidate_replay_wall_ns = 0;
+        normalized.deterministic_accuracy_sha256.clear();
+        normalized.row_sha256.clear();
+        super::canonical_sha256(&normalized).expect("hash deterministic ECAPA change accuracy")
+    }
+
+    fn public_ecapa_change_pair_result_sha256(row: &PublicEcapaChangePairRow) -> String {
+        let mut normalized = row.clone();
+        normalized.row_sha256.clear();
+        super::canonical_sha256(&normalized).expect("hash ECAPA change pair row")
+    }
+
+    fn public_ecapa_change_projections_identical(
+        left: &crate::diarization::DiarizationProjection,
+        right: &crate::diarization::DiarizationProjection,
+    ) -> bool {
+        left.mixed_speaker_segment_indices == right.mixed_speaker_segment_indices
+            && left.overlap_suspected_segment_indices == right.overlap_suspected_segment_indices
+            && left.segments.len() == right.segments.len()
+            && left
+                .segments
+                .iter()
+                .zip(&right.segments)
+                .all(|(left, right)| {
+                    left.start_sec.map(f64::to_bits) == right.start_sec.map(f64::to_bits)
+                        && left.end_sec.map(f64::to_bits) == right.end_sec.map(f64::to_bits)
+                        && left.text == right.text
+                        && left.speaker == right.speaker
+                        && left.confidence.map(f64::to_bits) == right.confidence.map(f64::to_bits)
+                })
+    }
+
+    fn public_ecapa_change_pair_row(
+        fixture: &FrozenEcapaDev8,
+        recording: &LoadedFrozenEcapaRecording<'_>,
+        engine: crate::model::DiarizationEngine,
+        input_binding: PublicEcapaChangeInputBinding,
+        protocol_sha256: &str,
+        execution_order: PublicEcapaResidualBirthExecutionOrder,
+        mut baseline: PublicEcapaChangeArmExecution,
+        mut candidate: PublicEcapaChangeArmExecution,
+        mut candidate_replay: PublicEcapaChangeArmExecution,
+    ) -> (
+        PublicEcapaChangePairRow,
+        PublicEcapaChangeExpectedOutputBinding,
+    ) {
+        let baseline_grid = public_ecapa_change_evaluated_probability_grid(
+            &baseline.change_evidence,
+            recording.reference.duration_ms,
+        );
+        let candidate_grid = public_ecapa_change_evaluated_probability_grid(
+            &candidate.change_evidence,
+            recording.reference.duration_ms,
+        );
+        let candidate_replay_grid = public_ecapa_change_evaluated_probability_grid(
+            &candidate_replay.change_evidence,
+            recording.reference.duration_ms,
+        );
+        let calibration_grid_matches = public_ecapa_change_probability_grids_match(
+            &baseline_grid,
+            &candidate_grid,
+            &candidate_replay_grid,
+        );
+        let common_calibration_grid_ms = calibration_grid_matches
+            .then(|| baseline_grid.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let reference_changes = crate::diarization::speaker_change_points_ms(
+            &recording.reference.turns,
+            recording.reference.duration_ms,
+            true,
+        )
+        .expect("derive paired calibration reference changes");
+        for (arm, probability_grid) in [
+            (&mut baseline.arm, &baseline_grid),
+            (&mut candidate.arm, &candidate_grid),
+            (&mut candidate_replay.arm, &candidate_replay_grid),
+        ] {
+            arm.calibration = public_ecapa_change_calibration_on_grid(
+                &reference_changes,
+                probability_grid,
+                &common_calibration_grid_ms,
+                fixture.scorer_config.change_boundary_collar_ms,
+                fixture.scorer_config.calibration_bins,
+            );
+        }
+        let mut calibration_grid_hasher = sha2::Sha256::new();
+        calibration_grid_hasher.update(b"public-ecapa-change-paired-calibration-grid-v1\0");
+        calibration_grid_hasher.update((common_calibration_grid_ms.len() as u64).to_le_bytes());
+        for boundary_ms in &common_calibration_grid_ms {
+            calibration_grid_hasher.update(boundary_ms.to_le_bytes());
+        }
+        let paired_calibration_grid_sha256 = format!("{:x}", calibration_grid_hasher.finalize());
+
+        let candidate_replay_structural_output_matches = candidate.report
+            == candidate_replay.report
+            && public_ecapa_change_projections_identical(
+                &candidate.projection,
+                &candidate_replay.projection,
+            );
+        let candidate_replay_change_evidence_matches =
+            candidate.change_evidence == candidate_replay.change_evidence;
+        let candidate_replay_clustering_evidence_matches =
+            candidate.clustering_evidence == candidate_replay.clustering_evidence;
+        let candidate_replay_matches = candidate_replay_structural_output_matches
+            && candidate_replay_change_evidence_matches
+            && candidate_replay_clustering_evidence_matches
+            && candidate.arm == candidate_replay.arm
+            && candidate.score.result_sha256 == candidate_replay.score.result_sha256;
+        let input_binding_matches = baseline.arm.normalized_input_sha256
+            == input_binding.normalized_input_sha256
+            && candidate.arm.normalized_input_sha256 == input_binding.normalized_input_sha256
+            && candidate_replay.arm.normalized_input_sha256
+                == input_binding.normalized_input_sha256;
+        let score_alignment_matches = baseline.score.recording_id
+            == recording.reference.recording_id
+            && candidate.score.recording_id == recording.reference.recording_id
+            && candidate_replay.score.recording_id == recording.reference.recording_id
+            && baseline.score.reference_sha256 == candidate.score.reference_sha256
+            && candidate.score.reference_sha256 == candidate_replay.score.reference_sha256
+            && baseline.score.config_sha256 == fixture.scorer_config_sha256
+            && candidate.score.config_sha256 == fixture.scorer_config_sha256
+            && candidate_replay.score.config_sha256 == fixture.scorer_config_sha256;
+        let candidate_no_farther_from_reference_count =
+            candidate.arm.accuracy.absolute_speaker_count_error
+                <= baseline.arm.accuracy.absolute_speaker_count_error;
+        let selective_risk_non_regression =
+            public_ecapa_change_selective_risk_non_regression(&candidate.arm, &baseline.arm);
+        let selective_coverage_non_regression =
+            public_ecapa_change_selective_coverage_non_regression(&candidate.arm, &baseline.arm);
+        let unknown_share_non_regression =
+            public_ecapa_change_unknown_non_regression(&candidate.arm, &baseline.arm);
+        let overlap_non_regression =
+            public_ecapa_change_overlap_non_regression(&candidate.arm, &baseline.arm);
+        let assignment_calibration_non_regression =
+            public_ecapa_change_assignment_non_regression(&candidate.arm, &baseline.arm);
+        let collapse_non_regression =
+            public_ecapa_change_collapse_non_regression(&candidate.arm, &baseline.arm);
+        let clustering_fallback_non_regression = candidate.arm.clustering_fallback_reason.is_none()
+            || baseline.arm.clustering_fallback_reason.is_some();
+        let single_speaker_control_passed =
+            (baseline.arm.accuracy.reference_speakers == 1).then(|| {
+                baseline.arm.accuracy.hypothesis_speakers == 1
+                    && candidate.arm.accuracy.hypothesis_speakers == 1
+                    && candidate.arm.accuracy.absolute_speaker_count_error == 0
+                    && candidate.arm.detector_change.hypothesis_count == 0
+                    && candidate_no_farther_from_reference_count
+                    && selective_risk_non_regression
+                    && selective_coverage_non_regression
+                    && unknown_share_non_regression
+                    && overlap_non_regression
+                    && assignment_calibration_non_regression
+                    && collapse_non_regression
+            });
+        let comparison = PublicEcapaChangePairComparison {
+            input_binding_matches,
+            score_alignment_matches,
+            candidate_replay_report_sha256: candidate_replay.arm.report_sha256.clone(),
+            candidate_replay_change_evidence_sha256: candidate_replay
+                .arm
+                .change_evidence_sha256
+                .clone(),
+            candidate_replay_topology_sha256: candidate_replay.arm.topology_sha256.clone(),
+            candidate_replay_score_sha256: candidate_replay.score.result_sha256.clone(),
+            candidate_replay_structural_output_matches,
+            candidate_replay_change_evidence_matches,
+            candidate_replay_clustering_evidence_matches,
+            calibration_grid_matches,
+            candidate_replay_matches,
+            candidate_no_farther_from_reference_count,
+            selective_risk_non_regression,
+            selective_coverage_non_regression,
+            unknown_share_non_regression,
+            overlap_non_regression,
+            assignment_calibration_non_regression,
+            collapse_non_regression,
+            clustering_fallback_non_regression,
+            single_speaker_control_passed,
+        };
+        let timing = PublicEcapaChangePairTiming {
+            baseline_wall_ns: baseline.wall_ns,
+            candidate_wall_ns: candidate.wall_ns,
+            candidate_replay_wall_ns: candidate_replay.wall_ns,
+            execution_order,
+            candidate_replay_excluded_from_gate: true,
+        };
+        let expected_output = PublicEcapaChangeExpectedOutputBinding {
+            recording_id: recording.reference.recording_id.clone(),
+            engine,
+            paired_calibration_grid_sha256: paired_calibration_grid_sha256.clone(),
+            baseline: baseline.arm.clone(),
+            candidate: candidate.arm.clone(),
+            comparison: comparison.clone(),
+            timing: timing.clone(),
+        };
+        let mut row = PublicEcapaChangePairRow {
+            schema_version: PUBLIC_ECAPA_CHANGE_PAIR_SCHEMA_VERSION.to_owned(),
+            protocol_sha256: protocol_sha256.to_owned(),
+            corpus_key: fixture.bundle.corpus_key.clone(),
+            source_version: fixture.bundle.source_version.clone(),
+            evaluation_split: EvaluationSplit::Development,
+            recording_id: recording.reference.recording_id.clone(),
+            audio_duration_ms: recording.reference.duration_ms,
+            engine,
+            input_binding,
+            paired_calibration_grid_sha256,
+            baseline: baseline.arm,
+            candidate: candidate.arm,
+            comparison,
+            timing,
+            deterministic_accuracy_sha256: String::new(),
+            row_sha256: String::new(),
+        };
+        row.deterministic_accuracy_sha256 = public_ecapa_change_pair_accuracy_sha256(&row);
+        row.row_sha256 = public_ecapa_change_pair_result_sha256(&row);
+        (row, expected_output)
+    }
+
+    #[derive(Default)]
+    struct PublicEcapaChangeMetricAccumulator {
+        reference_count: u64,
+        hypothesis_count: u64,
+        matched_count: u64,
+        absolute_error_sum_sec: f64,
+    }
+
+    impl PublicEcapaChangeMetricAccumulator {
+        fn push(&mut self, row: &PublicEcapaChangeMetricRow) {
+            self.reference_count = self.reference_count.saturating_add(row.reference_count);
+            self.hypothesis_count = self.hypothesis_count.saturating_add(row.hypothesis_count);
+            self.matched_count = self.matched_count.saturating_add(row.matched_count);
+            self.absolute_error_sum_sec += row.absolute_error_sum_sec;
+        }
+
+        fn finish(self) -> PublicEcapaChangeMetricRow {
+            let precision = super::ratio(self.matched_count, self.hypothesis_count);
+            let recall = super::ratio(self.matched_count, self.reference_count);
+            let f1 = public_ecapa_change_boundary_f1(
+                self.reference_count,
+                self.hypothesis_count,
+                self.matched_count,
+            );
+            PublicEcapaChangeMetricRow {
+                reference_count: self.reference_count,
+                hypothesis_count: self.hypothesis_count,
+                matched_count: self.matched_count,
+                precision,
+                recall,
+                f1,
+                absolute_error_sum_sec: super::canonical_evidence_number(
+                    self.absolute_error_sum_sec,
+                ),
+                mean_absolute_error_sec: super::positive_ratio(
+                    self.absolute_error_sum_sec,
+                    self.matched_count as f64,
+                ),
+            }
+        }
+    }
+
+    fn public_ecapa_change_aggregate_metric<'a>(
+        metrics: impl Iterator<Item = &'a PublicEcapaChangeMetricRow>,
+    ) -> PublicEcapaChangeMetricRow {
+        let mut aggregate = PublicEcapaChangeMetricAccumulator::default();
+        for metric in metrics {
+            aggregate.push(metric);
+        }
+        aggregate.finish()
+    }
+
+    fn public_ecapa_change_metric_comparison(
+        engine: Option<crate::model::DiarizationEngine>,
+        baseline: PublicEcapaChangeMetricRow,
+        candidate: PublicEcapaChangeMetricRow,
+        minimum_relative_f1_improvement: f64,
+    ) -> PublicEcapaChangeMetricComparison {
+        let relative_f1_improvement = match (candidate.f1, baseline.f1) {
+            (Some(candidate), Some(baseline)) => {
+                if baseline > 0.0 {
+                    Some(super::canonical_evidence_number(
+                        (candidate - baseline) / baseline,
+                    ))
+                } else if candidate > 0.0 {
+                    Some(super::canonical_evidence_number(candidate))
+                } else {
+                    Some(0.0)
+                }
+            }
+            (None, None)
+                if candidate.reference_count == 0
+                    && candidate.hypothesis_count == 0
+                    && baseline.reference_count == 0
+                    && baseline.hypothesis_count == 0 =>
+            {
+                Some(0.0)
+            }
+            _ => None,
+        };
+        let mean_absolute_error_delta_sec = candidate
+            .mean_absolute_error_sec
+            .zip(baseline.mean_absolute_error_sec)
+            .map(|(candidate, baseline)| super::canonical_evidence_number(candidate - baseline));
+        let passed = relative_f1_improvement
+            .is_some_and(|gain| gain >= minimum_relative_f1_improvement)
+            && match (
+                candidate.mean_absolute_error_sec,
+                baseline.mean_absolute_error_sec,
+            ) {
+                (Some(candidate), Some(baseline)) => candidate <= baseline + 1e-12,
+                (Some(_), None) => true,
+                (None, None) => minimum_relative_f1_improvement <= 0.0,
+                (None, Some(_)) => false,
+            };
+        PublicEcapaChangeMetricComparison {
+            engine,
+            baseline,
+            candidate,
+            relative_f1_improvement,
+            mean_absolute_error_delta_sec,
+            passed,
+        }
+    }
+
+    fn public_ecapa_change_aggregate_calibration<'a>(
+        rows: impl Iterator<Item = &'a PublicEcapaChangeCalibrationRow>,
+        bins: usize,
+    ) -> PublicEcapaChangeCalibrationRow {
+        let mut observation_count = 0_u64;
+        let mut positive_count = 0_u64;
+        let mut brier_sum = 0.0;
+        let mut aggregate_bins = vec![
+            PublicEcapaChangeCalibrationBinRow {
+                observation_count: 0,
+                positive_count: 0,
+                probability_sum: 0.0,
+            };
+            bins
+        ];
+        for row in rows {
+            if row.bins.len() != bins {
+                continue;
+            }
+            observation_count = observation_count.saturating_add(row.observation_count);
+            positive_count = positive_count.saturating_add(row.positive_count);
+            brier_sum += row.brier_sum;
+            for (aggregate, row) in aggregate_bins.iter_mut().zip(&row.bins) {
+                aggregate.observation_count = aggregate
+                    .observation_count
+                    .saturating_add(row.observation_count);
+                aggregate.positive_count =
+                    aggregate.positive_count.saturating_add(row.positive_count);
+                aggregate.probability_sum += row.probability_sum;
+            }
+        }
+        let expected_calibration_error = (observation_count > 0).then(|| {
+            super::canonical_evidence_number(
+                aggregate_bins
+                    .iter()
+                    .filter(|bin| bin.observation_count > 0)
+                    .map(|bin| {
+                        let observations = bin.observation_count as f64;
+                        (observations / observation_count as f64)
+                            * ((bin.probability_sum / observations)
+                                - (bin.positive_count as f64 / observations))
+                                .abs()
+                    })
+                    .sum::<f64>(),
+            )
+        });
+        for bin in &mut aggregate_bins {
+            bin.probability_sum = super::canonical_evidence_number(bin.probability_sum);
+        }
+        PublicEcapaChangeCalibrationRow {
+            observation_count,
+            positive_count,
+            brier_sum: super::canonical_evidence_number(brier_sum),
+            brier_score: super::positive_ratio(brier_sum, observation_count as f64),
+            expected_calibration_error,
+            bins: aggregate_bins,
+        }
+    }
+
+    fn public_ecapa_change_accuracy_comparison<'a>(
+        engine: Option<crate::model::DiarizationEngine>,
+        rows: impl Iterator<Item = &'a PublicEcapaChangePairRow>,
+        maximum_der_jer_regression: f64,
+    ) -> PublicEcapaChangeAggregateComparison {
+        let mut baseline = PublicEcapaResidualBirthAggregateAccumulator::default();
+        let mut candidate = PublicEcapaResidualBirthAggregateAccumulator::default();
+        for row in rows {
+            baseline.push(&row.baseline.accuracy);
+            candidate.push(&row.candidate.accuracy);
+        }
+        let baseline = baseline.finish();
+        let candidate = candidate.finish();
+        let micro_der_delta = public_ecapa_accuracy_delta(candidate.micro_der, baseline.micro_der);
+        let macro_der_delta = public_ecapa_accuracy_delta(candidate.macro_der, baseline.macro_der);
+        let macro_jer_delta = public_ecapa_accuracy_delta(candidate.macro_jer, baseline.macro_jer);
+        let count_mae_delta = public_ecapa_accuracy_delta(
+            candidate.mean_absolute_speaker_count_error,
+            baseline.mean_absolute_speaker_count_error,
+        );
+        let total_absolute_speaker_count_error_delta =
+            i64::try_from(candidate.total_absolute_speaker_count_error)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(
+                    i64::try_from(baseline.total_absolute_speaker_count_error).unwrap_or(i64::MAX),
+                );
+        let exact_speaker_count_gain = i64::try_from(candidate.exact_speaker_count)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(baseline.exact_speaker_count).unwrap_or(i64::MAX));
+        let selective_risk_delta =
+            public_ecapa_accuracy_delta(candidate.selective_risk, baseline.selective_risk);
+        let unknown_speaker_share_delta = public_ecapa_accuracy_delta(
+            candidate.unknown_speaker_share,
+            baseline.unknown_speaker_share,
+        );
+        let passed = micro_der_delta
+            .is_some_and(|delta| delta <= maximum_der_jer_regression + 1e-12)
+            && macro_der_delta.is_some_and(|delta| delta <= maximum_der_jer_regression + 1e-12)
+            && macro_jer_delta.is_some_and(|delta| delta <= maximum_der_jer_regression + 1e-12)
+            && count_mae_delta.is_some_and(|delta| delta <= 1e-12)
+            && total_absolute_speaker_count_error_delta <= 0
+            && exact_speaker_count_gain >= 0
+            && selective_risk_delta.is_some_and(|delta| delta <= 1e-12)
+            && unknown_speaker_share_delta.is_some_and(|delta| delta <= 1e-12);
+        PublicEcapaChangeAggregateComparison {
+            engine,
+            baseline,
+            candidate,
+            micro_der_delta,
+            macro_der_delta,
+            macro_jer_delta,
+            count_mae_delta,
+            total_absolute_speaker_count_error_delta,
+            exact_speaker_count_gain,
+            selective_risk_delta,
+            unknown_speaker_share_delta,
+            passed,
+        }
+    }
+
+    fn public_ecapa_change_protocol_sha256(
+        fixture: &FrozenEcapaDev8,
+        policy_sha256: &str,
+    ) -> String {
+        #[derive(serde::Serialize)]
+        struct EngineFingerprint {
+            engine: crate::model::DiarizationEngine,
+            request_sha256: String,
+            evidence_mode: crate::model::DiarizationSpeakerEvidenceMode,
+            speaker_pair_calibration_sha256: String,
+        }
+
+        #[derive(serde::Serialize)]
+        struct ProtocolFingerprint<'a> {
+            schema_version: &'static str,
+            runner_version: &'static str,
+            policy_sha256: &'a str,
+            descriptor_sha256: &'a str,
+            bundle_sha256: &'a str,
+            corpus_key: &'a str,
+            source_version: &'a str,
+            scorer_config_sha256: &'a str,
+            ecapa_contract_sha256: &'a str,
+            ecapa_package_sha256: &'a str,
+            representation_provider_version: &'static str,
+            feature_schema_version: &'static str,
+            clustering_mode: crate::diarization::AcousticClusteringMode,
+            baseline: crate::diarization::AcousticChangeDetectorMode,
+            baseline_configuration_sha256: String,
+            candidate: crate::diarization::AcousticChangeDetectorMode,
+            candidate_configuration_sha256: String,
+            engine_fingerprints: Vec<EngineFingerprint>,
+            calibration_grid_contract: &'static str,
+            speech_region_authority: &'static str,
+            detector_feature_authority: &'static str,
+        }
+
+        let engine_fingerprints = [
+            crate::model::DiarizationEngine::Ecapa,
+            crate::model::DiarizationEngine::EcapaFused,
+        ]
+        .into_iter()
+        .map(|engine| {
+            let (request, evidence_mode) = frozen_ecapa_request(engine);
+            EngineFingerprint {
+                engine,
+                request_sha256: super::canonical_sha256(&request)
+                    .expect("hash frozen detector request"),
+                evidence_mode,
+                speaker_pair_calibration_sha256:
+                    crate::diarization::ecapa_speaker_pair_calibration_sha256(evidence_mode),
+            }
+        })
+        .collect();
+        super::canonical_sha256(&ProtocolFingerprint {
+            schema_version: PUBLIC_ECAPA_CHANGE_GATE_SCHEMA_VERSION,
+            runner_version: PUBLIC_ECAPA_CHANGE_GATE_RUNNER_VERSION,
+            policy_sha256,
+            descriptor_sha256: &fixture.bundle.descriptor_sha256,
+            bundle_sha256: &fixture.bundle.bundle_sha256,
+            corpus_key: &fixture.bundle.corpus_key,
+            source_version: &fixture.bundle.source_version,
+            scorer_config_sha256: &fixture.scorer_config_sha256,
+            ecapa_contract_sha256: &fixture.model.info().contract_sha256,
+            ecapa_package_sha256: &fixture.model.info().package_sha256,
+            representation_provider_version:
+                crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION,
+            feature_schema_version: crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION,
+            clustering_mode: crate::diarization::AcousticClusteringMode::ProbabilisticV1,
+            baseline: crate::diarization::AcousticChangeDetectorMode::FixedSafeV1,
+            baseline_configuration_sha256: public_ecapa_change_detector_configuration_sha256(
+                crate::diarization::AcousticChangeDetectorMode::FixedSafeV1,
+            ),
+            candidate: crate::diarization::AcousticChangeDetectorMode::CalibratedPosterior,
+            candidate_configuration_sha256: public_ecapa_change_detector_configuration_sha256(
+                crate::diarization::AcousticChangeDetectorMode::CalibratedPosterior,
+            ),
+            engine_fingerprints,
+            calibration_grid_contract:
+                "exact-shared-deduplicated-evaluated-boundary-centers-max-probability-v1",
+            speech_region_authority:
+                "reference-derived-oracle-speech-regions-development-only-v1",
+            detector_feature_authority:
+                "acoustic-full-v2-upstream-of-ecapa-speaker-representation-v1",
+        })
+        .expect("hash ECAPA change-detector protocol")
+    }
+
+    fn public_ecapa_change_gate_result_sha256(row: &PublicEcapaChangeGateRow) -> String {
+        let mut normalized = row.clone();
+        normalized.result_sha256.clear();
+        super::canonical_sha256(&normalized).expect("hash ECAPA change-detector gate row")
+    }
+
+    fn public_ecapa_change_arm_metrics_are_finite(arm: &PublicEcapaChangeArmRow) -> bool {
+        let metric_is_finite = |metric: &PublicEcapaChangeMetricRow| {
+            metric.absolute_error_sum_sec.is_finite()
+                && [
+                    metric.precision,
+                    metric.recall,
+                    metric.f1,
+                    metric.mean_absolute_error_sec,
+                ]
+                .into_iter()
+                .flatten()
+                .all(f64::is_finite)
+        };
+        metric_is_finite(&arm.detector_change)
+            && metric_is_finite(&arm.report_change)
+            && arm.calibration.brier_sum.is_finite()
+            && [
+                arm.calibration.brier_score,
+                arm.calibration.expected_calibration_error,
+                arm.accuracy.der,
+                arm.accuracy.jer,
+                arm.accuracy.selective_risk,
+                arm.accuracy.unknown_speaker_share,
+                arm.quality.overlap_f1,
+                arm.quality.selective_coverage,
+                arm.quality.assignment_coverage,
+                arm.quality.assignment_brier_score,
+                arm.quality.assignment_expected_calibration_error,
+                arm.quality.minority_reference_recall,
+            ]
+            .into_iter()
+            .flatten()
+            .all(f64::is_finite)
+            && arm
+                .calibration
+                .bins
+                .iter()
+                .all(|bin| bin.probability_sum.is_finite())
+            && [
+                arm.accuracy.reference_speaker_time_sec,
+                arm.accuracy.missed_speech_sec,
+                arm.accuracy.false_alarm_sec,
+                arm.accuracy.speaker_confusion_sec,
+                arm.accuracy.selective_reference_speaker_time_sec,
+                arm.accuracy.selective_covered_speaker_time_sec,
+                arm.accuracy.selective_error_covered_speaker_time_sec,
+                arm.accuracy.labeled_speaker_time_sec,
+                arm.accuracy.unknown_speaker_time_sec,
+                arm.quality.overlap_reference_sec,
+                arm.quality.overlap_hypothesis_sec,
+                arm.quality.overlap_false_positive_sec,
+                arm.quality.overlap_false_negative_sec,
+            ]
+            .into_iter()
+            .all(f64::is_finite)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn public_ecapa_change_gate_row(
+        fixture: &FrozenEcapaDev8,
+        rows: &[PublicEcapaChangePairRow],
+        expected_bindings: &[PublicEcapaChangeInputBinding],
+        expected_outputs: &[PublicEcapaChangeExpectedOutputBinding],
+        policy: PublicEcapaChangeGatePolicy,
+        policy_sha256: String,
+        protocol_sha256: String,
+        arm_execution_failure_count: u64,
+        memory_observation: &PublicEcapaResidualBirthMemoryObservation,
+    ) -> PublicEcapaChangeGateRow {
+        let expected_policy = public_ecapa_change_gate_policy();
+        let expected_policy_sha256 =
+            super::canonical_sha256(&expected_policy).expect("hash frozen ECAPA change policy");
+        let expected_protocol_sha256 =
+            public_ecapa_change_protocol_sha256(fixture, &expected_policy_sha256);
+        let mut failures = BTreeSet::new();
+        if policy != expected_policy || policy_sha256 != expected_policy_sha256 {
+            failures.insert(PublicEcapaChangeGateFailure::PolicyHashMismatch);
+        }
+        if protocol_sha256 != expected_protocol_sha256 {
+            failures.insert(PublicEcapaChangeGateFailure::ProtocolMismatch);
+        }
+        if arm_execution_failure_count > 0 {
+            failures.insert(PublicEcapaChangeGateFailure::ArmExecutionFailure);
+        }
+        if rows.len() as u64 != policy.required_pair_rows
+            || expected_bindings.len() as u64 != policy.required_pair_rows
+        {
+            failures.insert(PublicEcapaChangeGateFailure::PairCountMismatch);
+        }
+        if expected_outputs.len() as u64 != policy.required_pair_rows {
+            failures.insert(PublicEcapaChangeGateFailure::OutputAuthorityMismatch);
+        }
+
+        let expected_binding_map = expected_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    (
+                        binding.recording_id.as_str(),
+                        public_ecapa_change_engine_id(binding.engine),
+                    ),
+                    binding,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected_output_map = expected_outputs
+            .iter()
+            .map(|binding| {
+                (
+                    (
+                        binding.recording_id.as_str(),
+                        public_ecapa_change_engine_id(binding.engine),
+                    ),
+                    binding,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if expected_output_map.len() != expected_outputs.len() {
+            failures.insert(PublicEcapaChangeGateFailure::OutputAuthorityMismatch);
+        }
+        let mut seen_pairs = BTreeSet::new();
+        let mut recording_ids = BTreeSet::new();
+        let mut baseline_first = 0_u64;
+        let mut candidate_first = 0_u64;
+        let mut per_engine_order = BTreeMap::<&'static str, (u64, u64)>::new();
+        for (row_index, row) in rows.iter().enumerate() {
+            recording_ids.insert(row.recording_id.as_str());
+            if !seen_pairs.insert((
+                row.recording_id.as_str(),
+                public_ecapa_change_engine_id(row.engine),
+            )) {
+                failures.insert(PublicEcapaChangeGateFailure::PairAlignmentMismatch);
+            }
+            let Some(expected_binding) = expected_binding_map.get(&(
+                row.recording_id.as_str(),
+                public_ecapa_change_engine_id(row.engine),
+            )) else {
+                failures.insert(PublicEcapaChangeGateFailure::InputBindingMismatch);
+                continue;
+            };
+            let mut unhashed_binding = row.input_binding.clone();
+            let binding_sha256 = unhashed_binding.binding_sha256.clone();
+            unhashed_binding.binding_sha256.clear();
+            let binding_hash_matches = super::canonical_sha256(&unhashed_binding)
+                .is_ok_and(|digest| digest == binding_sha256);
+            if &row.input_binding != *expected_binding
+                || !binding_hash_matches
+                || !super::is_sha256_hex(&binding_sha256)
+                || !row.comparison.input_binding_matches
+            {
+                failures.insert(PublicEcapaChangeGateFailure::InputBindingMismatch);
+            }
+            if expected_output_map
+                .get(&(
+                    row.recording_id.as_str(),
+                    public_ecapa_change_engine_id(row.engine),
+                ))
+                .is_none_or(|expected| {
+                    row.baseline != expected.baseline
+                        || row.candidate != expected.candidate
+                        || row.comparison != expected.comparison
+                        || row.timing != expected.timing
+                        || row.paired_calibration_grid_sha256
+                            != expected.paired_calibration_grid_sha256
+                })
+            {
+                failures.insert(PublicEcapaChangeGateFailure::OutputAuthorityMismatch);
+            }
+            let expected_reference_sha256 = fixture
+                .bundle
+                .references
+                .get(row_index / expected_policy.engines.len())
+                .and_then(|reference| super::canonical_sha256(reference).ok());
+            if expected_reference_sha256.as_deref().is_none_or(|expected| {
+                row.baseline.accuracy.reference_sha256 != expected
+                    || row.candidate.accuracy.reference_sha256 != expected
+                    || row.baseline.accuracy.scorer_config_sha256 != fixture.scorer_config_sha256
+                    || row.candidate.accuracy.scorer_config_sha256 != fixture.scorer_config_sha256
+            }) {
+                failures.insert(PublicEcapaChangeGateFailure::PairAlignmentMismatch);
+            }
+            if row.schema_version != PUBLIC_ECAPA_CHANGE_PAIR_SCHEMA_VERSION
+                || row.protocol_sha256 != expected_protocol_sha256
+                || row.corpus_key != fixture.bundle.corpus_key
+                || row.source_version != fixture.bundle.source_version
+                || row.evaluation_split != EvaluationSplit::Development
+                || row.audio_duration_ms != expected_binding.audio_duration_ms
+                || row.engine != expected_binding.engine
+                || row.baseline.detector_mode != policy.baseline
+                || row.candidate.detector_mode != policy.candidate
+                || row.baseline.detector_configuration_sha256
+                    != public_ecapa_change_detector_configuration_sha256(policy.baseline)
+                || row.candidate.detector_configuration_sha256
+                    != public_ecapa_change_detector_configuration_sha256(policy.candidate)
+                || fixture
+                    .bundle
+                    .references
+                    .get(row_index / expected_policy.engines.len())
+                    .is_none_or(|reference| reference.recording_id != row.recording_id)
+                || expected_policy
+                    .engines
+                    .get(row_index % expected_policy.engines.len())
+                    .copied()
+                    != Some(row.engine)
+                || row.timing.execution_order != public_ecapa_execution_order(row_index)
+            {
+                failures.insert(PublicEcapaChangeGateFailure::PairIntegrityMismatch);
+            }
+            if row.deterministic_accuracy_sha256 != public_ecapa_change_pair_accuracy_sha256(row)
+                || row.row_sha256 != public_ecapa_change_pair_result_sha256(row)
+                || !row.comparison.score_alignment_matches
+                || !super::is_sha256_hex(&row.paired_calibration_grid_sha256)
+            {
+                failures.insert(PublicEcapaChangeGateFailure::PairIntegrityMismatch);
+            }
+            if !row.comparison.candidate_replay_matches
+                || !row.comparison.candidate_replay_structural_output_matches
+                || !row.comparison.candidate_replay_change_evidence_matches
+                || !row.comparison.candidate_replay_clustering_evidence_matches
+                || row.comparison.candidate_replay_report_sha256 != row.candidate.report_sha256
+                || row.comparison.candidate_replay_change_evidence_sha256
+                    != row.candidate.change_evidence_sha256
+                || row.comparison.candidate_replay_topology_sha256 != row.candidate.topology_sha256
+                || row.comparison.candidate_replay_score_sha256
+                    != row.candidate.accuracy.score_sha256
+            {
+                failures.insert(PublicEcapaChangeGateFailure::CandidateReplayMismatch);
+            }
+            if !row.comparison.calibration_grid_matches {
+                failures.insert(PublicEcapaChangeGateFailure::DetectorCalibrationGridMismatch);
+            }
+            if !public_ecapa_change_arm_metrics_are_finite(&row.baseline)
+                || !public_ecapa_change_arm_metrics_are_finite(&row.candidate)
+                || !public_ecapa_accuracy_is_internally_consistent(&row.baseline.accuracy)
+                || !public_ecapa_accuracy_is_internally_consistent(&row.candidate.accuracy)
+            {
+                failures.insert(PublicEcapaChangeGateFailure::NonFiniteMetric);
+            }
+            if row.baseline.accuracy.der.is_none()
+                || row.baseline.accuracy.jer.is_none()
+                || row.candidate.accuracy.der.is_none()
+                || row.candidate.accuracy.jer.is_none()
+                || !public_ecapa_change_detector_metric_defined_or_empty(
+                    &row.baseline.detector_change,
+                )
+                || !public_ecapa_change_detector_metric_defined_or_empty(
+                    &row.candidate.detector_change,
+                )
+            {
+                failures.insert(PublicEcapaChangeGateFailure::MissingAccuracyMetric);
+            }
+            let candidate_no_farther_from_reference_count =
+                row.candidate.accuracy.absolute_speaker_count_error
+                    <= row.baseline.accuracy.absolute_speaker_count_error;
+            let selective_risk_non_regression =
+                public_ecapa_change_selective_risk_non_regression(&row.candidate, &row.baseline);
+            let selective_coverage_non_regression =
+                public_ecapa_change_selective_coverage_non_regression(
+                    &row.candidate,
+                    &row.baseline,
+                );
+            let unknown_share_non_regression =
+                public_ecapa_change_unknown_non_regression(&row.candidate, &row.baseline);
+            let overlap_non_regression =
+                public_ecapa_change_overlap_non_regression(&row.candidate, &row.baseline);
+            let assignment_calibration_non_regression =
+                public_ecapa_change_assignment_non_regression(&row.candidate, &row.baseline);
+            let collapse_non_regression =
+                public_ecapa_change_collapse_non_regression(&row.candidate, &row.baseline);
+            let clustering_fallback_non_regression =
+                row.candidate.clustering_fallback_reason.is_none()
+                    || row.baseline.clustering_fallback_reason.is_some();
+            let single_speaker_control_passed = (row.baseline.accuracy.reference_speakers == 1)
+                .then(|| {
+                    row.baseline.accuracy.hypothesis_speakers == 1
+                        && row.candidate.accuracy.hypothesis_speakers == 1
+                        && row.candidate.accuracy.absolute_speaker_count_error == 0
+                        && row.candidate.detector_change.reference_count == 0
+                        && row.candidate.detector_change.hypothesis_count == 0
+                        && candidate_no_farther_from_reference_count
+                        && selective_risk_non_regression
+                        && selective_coverage_non_regression
+                        && unknown_share_non_regression
+                        && overlap_non_regression
+                        && assignment_calibration_non_regression
+                        && collapse_non_regression
+                });
+            if row.comparison.candidate_no_farther_from_reference_count
+                != candidate_no_farther_from_reference_count
+                || row.comparison.selective_risk_non_regression != selective_risk_non_regression
+                || row.comparison.selective_coverage_non_regression
+                    != selective_coverage_non_regression
+                || row.comparison.unknown_share_non_regression != unknown_share_non_regression
+                || row.comparison.overlap_non_regression != overlap_non_regression
+                || row.comparison.assignment_calibration_non_regression
+                    != assignment_calibration_non_regression
+                || row.comparison.collapse_non_regression != collapse_non_regression
+                || row.comparison.clustering_fallback_non_regression
+                    != clustering_fallback_non_regression
+                || row.comparison.single_speaker_control_passed != single_speaker_control_passed
+            {
+                failures.insert(PublicEcapaChangeGateFailure::PairIntegrityMismatch);
+            }
+            if policy.require_per_recording_count_non_regression
+                && !candidate_no_farther_from_reference_count
+            {
+                failures.insert(PublicEcapaChangeGateFailure::SpeakerCountRegression);
+            }
+            if policy.require_selective_risk_non_regression && !selective_risk_non_regression {
+                failures.insert(PublicEcapaChangeGateFailure::SelectiveRiskRegression);
+            }
+            if policy.require_selective_coverage_non_regression
+                && !selective_coverage_non_regression
+            {
+                failures.insert(PublicEcapaChangeGateFailure::SelectiveCoverageRegression);
+            }
+            if policy.require_unknown_share_non_regression && !unknown_share_non_regression {
+                failures.insert(PublicEcapaChangeGateFailure::UnknownShareRegression);
+            }
+            if policy.require_overlap_non_regression && !overlap_non_regression {
+                failures.insert(PublicEcapaChangeGateFailure::OverlapRegression);
+            }
+            if policy.require_assignment_calibration_non_regression
+                && !assignment_calibration_non_regression
+            {
+                failures.insert(PublicEcapaChangeGateFailure::AssignmentCalibrationRegression);
+            }
+            if policy.require_collapse_non_regression && !collapse_non_regression {
+                failures.insert(PublicEcapaChangeGateFailure::SpeakerCollapseRegression);
+            }
+            if policy.require_clustering_fallback_non_regression
+                && !clustering_fallback_non_regression
+            {
+                failures.insert(PublicEcapaChangeGateFailure::ClusteringFallbackRegression);
+            }
+            if let Some(passed) = single_speaker_control_passed {
+                if !passed {
+                    failures.insert(PublicEcapaChangeGateFailure::SingleSpeakerControlFailure);
+                }
+            }
+            for arm in [&row.baseline, &row.candidate] {
+                if arm.tracklet_count > policy.maximum_tracklet_count
+                    || arm
+                        .embedded_tracklet_count
+                        .saturating_add(arm.skipped_tracklet_count)
+                        != arm.tracklet_count
+                    || arm.embedded_tracklet_count == 0
+                    || arm.evaluated_change_count == 0
+                    || arm.requested_clustering_mode
+                        != crate::diarization::AcousticClusteringMode::ProbabilisticV1
+                    || arm.zero_padded_tracklet_count > arm.embedded_tracklet_count
+                    || arm.calibration.bins.len() != fixture.scorer_config.calibration_bins
+                    || arm.calibration.observation_count == 0
+                    || arm.calibration.observation_count
+                        != row.baseline.calibration.observation_count
+                    || !matches!(
+                        (
+                            arm.executed_clustering_mode,
+                            arm.clustering_fallback_reason.as_deref(),
+                        ),
+                        (
+                            crate::diarization::AcousticClusteringMode::ProbabilisticV1,
+                            None,
+                        ) | (
+                            crate::diarization::AcousticClusteringMode::FixedSafeV1,
+                            Some(_),
+                        )
+                    )
+                {
+                    failures.insert(PublicEcapaChangeGateFailure::TopologyResourceExceeded);
+                }
+            }
+            let order_counts = per_engine_order
+                .entry(public_ecapa_change_engine_id(row.engine))
+                .or_default();
+            match row.timing.execution_order {
+                PublicEcapaResidualBirthExecutionOrder::BaselineThenCandidate => {
+                    baseline_first = baseline_first.saturating_add(1);
+                    order_counts.0 = order_counts.0.saturating_add(1);
+                }
+                PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline => {
+                    candidate_first = candidate_first.saturating_add(1);
+                    order_counts.1 = order_counts.1.saturating_add(1);
+                }
+            }
+            if !row.timing.candidate_replay_excluded_from_gate
+                || row.timing.baseline_wall_ns == 0
+                || row.timing.candidate_wall_ns == 0
+                || row.timing.candidate_replay_wall_ns == 0
+            {
+                failures.insert(PublicEcapaChangeGateFailure::PairIntegrityMismatch);
+            }
+        }
+
+        if recording_ids.len() as u64 != policy.required_recordings
+            || seen_pairs.len() as u64 != policy.required_pair_rows
+            || baseline_first != candidate_first
+            || policy.engines.iter().any(|engine| {
+                per_engine_order
+                    .get(public_ecapa_change_engine_id(*engine))
+                    .is_none_or(|(baseline, candidate)| baseline != candidate || *baseline != 4)
+            })
+        {
+            failures.insert(PublicEcapaChangeGateFailure::PairCountMismatch);
+        }
+        let mut rows_by_recording = BTreeMap::<&str, Vec<&PublicEcapaChangePairRow>>::new();
+        for row in rows {
+            rows_by_recording
+                .entry(row.recording_id.as_str())
+                .or_default()
+                .push(row);
+        }
+        for recording_rows in rows_by_recording.values() {
+            if recording_rows.len() != expected_policy.engines.len() {
+                failures.insert(PublicEcapaChangeGateFailure::PairCountMismatch);
+                continue;
+            }
+            let left = recording_rows[0];
+            let right = recording_rows[1];
+            if left.baseline.change_evidence_sha256 != right.baseline.change_evidence_sha256
+                || left.candidate.change_evidence_sha256 != right.candidate.change_evidence_sha256
+                || left.paired_calibration_grid_sha256 != right.paired_calibration_grid_sha256
+                || left.baseline.topology_sha256 != right.baseline.topology_sha256
+                || left.candidate.topology_sha256 != right.candidate.topology_sha256
+                || left.baseline.detector_change != right.baseline.detector_change
+                || left.candidate.detector_change != right.candidate.detector_change
+                || left.baseline.calibration != right.baseline.calibration
+                || left.candidate.calibration != right.candidate.calibration
+            {
+                failures
+                    .insert(PublicEcapaChangeGateFailure::DetectorEvidenceMismatchAcrossEngines);
+            }
+        }
+        let single_speaker_control_count = rows_by_recording
+            .values()
+            .filter(|recording_rows| {
+                recording_rows.len() == expected_policy.engines.len()
+                    && recording_rows
+                        .iter()
+                        .all(|row| row.comparison.single_speaker_control_passed == Some(true))
+            })
+            .count() as u64;
+        if single_speaker_control_count != policy.required_single_speaker_controls {
+            failures.insert(PublicEcapaChangeGateFailure::MissingSingleSpeakerControls);
+        }
+
+        let detector_rows = rows
+            .iter()
+            .filter(|row| row.engine == crate::model::DiarizationEngine::Ecapa)
+            .collect::<Vec<_>>();
+        let detector_change = public_ecapa_change_metric_comparison(
+            None,
+            public_ecapa_change_aggregate_metric(
+                detector_rows
+                    .iter()
+                    .map(|row| &row.baseline.detector_change),
+            ),
+            public_ecapa_change_aggregate_metric(
+                detector_rows
+                    .iter()
+                    .map(|row| &row.candidate.detector_change),
+            ),
+            policy.minimum_relative_detector_f1_improvement,
+        );
+        if detector_change
+            .relative_f1_improvement
+            .is_none_or(|gain| gain < policy.minimum_relative_detector_f1_improvement)
+        {
+            failures.insert(PublicEcapaChangeGateFailure::DetectorF1GainInsufficient);
+        }
+        let detector_timing_non_regression = public_ecapa_change_detector_timing_non_regression(
+            detector_change.candidate.mean_absolute_error_sec,
+            detector_change.baseline.mean_absolute_error_sec,
+        );
+        if policy.require_detector_timing_non_regression && !detector_timing_non_regression {
+            failures.insert(PublicEcapaChangeGateFailure::DetectorTimingRegression);
+        }
+        let detector_calibration_baseline = public_ecapa_change_aggregate_calibration(
+            detector_rows.iter().map(|row| &row.baseline.calibration),
+            fixture.scorer_config.calibration_bins,
+        );
+        let detector_calibration_candidate = public_ecapa_change_aggregate_calibration(
+            detector_rows.iter().map(|row| &row.candidate.calibration),
+            fixture.scorer_config.calibration_bins,
+        );
+        let candidate_calibration_within_ceiling = detector_calibration_candidate
+            .brier_score
+            .is_some_and(|score| score <= policy.maximum_candidate_brier_score + 1e-12)
+            && detector_calibration_candidate
+                .expected_calibration_error
+                .is_some_and(|error| {
+                    error <= policy.maximum_candidate_expected_calibration_error + 1e-12
+                });
+        if !candidate_calibration_within_ceiling {
+            failures.insert(PublicEcapaChangeGateFailure::DetectorCalibrationCeilingExceeded);
+        }
+        if policy.require_calibration_non_regression
+            && (!public_ecapa_change_optional_lower_non_regression(
+                detector_calibration_candidate.brier_score,
+                detector_calibration_baseline.brier_score,
+            ) || !public_ecapa_change_optional_lower_non_regression(
+                detector_calibration_candidate.expected_calibration_error,
+                detector_calibration_baseline.expected_calibration_error,
+            ))
+        {
+            failures.insert(PublicEcapaChangeGateFailure::DetectorCalibrationRegression);
+        }
+        let candidate_fallback_count = detector_rows.iter().fold(0_u64, |total, row| {
+            total.saturating_add(row.candidate.fallback_evaluation_count)
+        });
+        let candidate_evaluated_count = detector_rows.iter().fold(0_u64, |total, row| {
+            total.saturating_add(row.candidate.evaluated_change_count)
+        });
+        let candidate_fallback_share =
+            super::ratio(candidate_fallback_count, candidate_evaluated_count);
+        if candidate_fallback_share
+            .is_none_or(|share| share > policy.maximum_candidate_fallback_share + 1e-12)
+        {
+            failures.insert(PublicEcapaChangeGateFailure::DetectorFallbackShareExceeded);
+        }
+
+        let report_change_by_engine = policy
+            .engines
+            .iter()
+            .copied()
+            .map(|engine| {
+                let engine_rows = rows.iter().filter(|row| row.engine == engine);
+                let baseline = public_ecapa_change_aggregate_metric(
+                    engine_rows.clone().map(|row| &row.baseline.report_change),
+                );
+                let candidate = public_ecapa_change_aggregate_metric(
+                    engine_rows.map(|row| &row.candidate.report_change),
+                );
+                public_ecapa_change_metric_comparison(Some(engine), baseline, candidate, 0.0)
+            })
+            .collect::<Vec<_>>();
+        if policy.require_report_boundary_non_regression
+            && report_change_by_engine
+                .iter()
+                .any(|comparison| !comparison.passed)
+        {
+            failures.insert(PublicEcapaChangeGateFailure::ReportBoundaryRegression);
+        }
+
+        let accuracy_combined = public_ecapa_change_accuracy_comparison(
+            None,
+            rows.iter(),
+            policy.maximum_der_jer_regression,
+        );
+        let accuracy_by_engine = policy
+            .engines
+            .iter()
+            .copied()
+            .map(|engine| {
+                public_ecapa_change_accuracy_comparison(
+                    Some(engine),
+                    rows.iter().filter(|row| row.engine == engine),
+                    policy.maximum_der_jer_regression,
+                )
+            })
+            .collect::<Vec<_>>();
+        for comparison in std::iter::once(&accuracy_combined).chain(&accuracy_by_engine) {
+            if comparison
+                .micro_der_delta
+                .is_none_or(|delta| delta > policy.maximum_der_jer_regression + 1e-12)
+                || comparison
+                    .macro_der_delta
+                    .is_none_or(|delta| delta > policy.maximum_der_jer_regression + 1e-12)
+            {
+                failures.insert(PublicEcapaChangeGateFailure::DerRegression);
+            }
+            if comparison
+                .macro_jer_delta
+                .is_none_or(|delta| delta > policy.maximum_der_jer_regression + 1e-12)
+            {
+                failures.insert(PublicEcapaChangeGateFailure::JerRegression);
+            }
+            if comparison.count_mae_delta.is_none_or(|delta| delta > 1e-12)
+                || comparison.total_absolute_speaker_count_error_delta > 0
+            {
+                failures.insert(PublicEcapaChangeGateFailure::SpeakerCountRegression);
+            }
+            if comparison.exact_speaker_count_gain < 0 {
+                failures.insert(PublicEcapaChangeGateFailure::ExactSpeakerCountRegression);
+            }
+            if comparison
+                .selective_risk_delta
+                .is_none_or(|delta| delta > 1e-12)
+            {
+                failures.insert(PublicEcapaChangeGateFailure::SelectiveRiskRegression);
+            }
+            if comparison
+                .unknown_speaker_share_delta
+                .is_none_or(|delta| delta > 1e-12)
+            {
+                failures.insert(PublicEcapaChangeGateFailure::UnknownShareRegression);
+            }
+        }
+
+        let audio_duration_sec = rows
+            .iter()
+            .map(|row| row.audio_duration_ms as f64 / 1_000.0)
+            .sum::<f64>();
+        let baseline_wall_sec = rows
+            .iter()
+            .map(|row| row.timing.baseline_wall_ns as f64 / 1_000_000_000.0)
+            .sum::<f64>();
+        let candidate_wall_sec = rows
+            .iter()
+            .map(|row| row.timing.candidate_wall_ns as f64 / 1_000_000_000.0)
+            .sum::<f64>();
+        let baseline_rtf = super::positive_ratio(baseline_wall_sec, audio_duration_sec);
+        let candidate_rtf = super::positive_ratio(candidate_wall_sec, audio_duration_sec);
+        let relative_candidate_rtf_regression =
+            candidate_rtf
+                .zip(baseline_rtf)
+                .and_then(|(candidate, baseline)| {
+                    (baseline > 0.0).then(|| {
+                        super::canonical_evidence_number((candidate - baseline) / baseline)
+                    })
+                });
+        if relative_candidate_rtf_regression.is_none_or(|regression| {
+            regression > policy.maximum_relative_candidate_rtf_regression + 1e-12
+        }) {
+            failures.insert(PublicEcapaChangeGateFailure::RtfRegression);
+        }
+        if candidate_rtf.is_none_or(|rtf| rtf > policy.maximum_candidate_rtf + 1e-12) {
+            failures.insert(PublicEcapaChangeGateFailure::CandidateRtfExceeded);
+        }
+        let required_memory_samples = policy
+            .required_pair_rows
+            .saturating_mul(3)
+            .saturating_add(1);
+        if !memory_observation.has_complete_authoritative_peak_evidence(required_memory_samples) {
+            failures.insert(PublicEcapaChangeGateFailure::MissingAuthoritativeRss);
+        }
+        if memory_observation
+            .authoritative_peak_rss_bytes
+            .is_none_or(|bytes| bytes > policy.maximum_process_rss_bytes)
+        {
+            failures.insert(PublicEcapaChangeGateFailure::ProcessRssExceeded);
+        }
+        let performance = PublicEcapaChangePerformance {
+            audio_duration_sec: super::canonical_evidence_number(audio_duration_sec),
+            baseline_wall_sec: super::canonical_evidence_number(baseline_wall_sec),
+            candidate_wall_sec: super::canonical_evidence_number(candidate_wall_sec),
+            baseline_rtf,
+            candidate_rtf,
+            relative_candidate_rtf_regression,
+            process_authoritative_peak_rss_bytes: memory_observation.authoritative_peak_rss_bytes,
+            process_observed_stage_max_rss_bytes: memory_observation.observed_stage_max_rss_bytes,
+            successful_observed_stage_sample_count: memory_observation
+                .successful_observed_stage_sample_count,
+            successful_authoritative_peak_sample_count: memory_observation
+                .successful_authoritative_peak_sample_count,
+            rss_observation: memory_observation.observation_kind,
+            per_arm_peak_rss_claimed: false,
+        };
+        let failures = failures.into_iter().collect::<Vec<_>>();
+        let passed = failures.is_empty();
+        let mut gate = PublicEcapaChangeGateRow {
+            schema_version: PUBLIC_ECAPA_CHANGE_GATE_SCHEMA_VERSION.to_owned(),
+            runner_version: PUBLIC_ECAPA_CHANGE_GATE_RUNNER_VERSION.to_owned(),
+            protocol_sha256: expected_protocol_sha256,
+            descriptor_sha256: fixture.bundle.descriptor_sha256.clone(),
+            bundle_sha256: fixture.bundle.bundle_sha256.clone(),
+            scorer_config_sha256: fixture.scorer_config_sha256.clone(),
+            ecapa_contract_sha256: fixture.model.info().contract_sha256.clone(),
+            ecapa_package_sha256: fixture.model.info().package_sha256.clone(),
+            policy,
+            policy_sha256,
+            pair_count: rows.len() as u64,
+            recording_count: recording_ids.len() as u64,
+            arm_execution_failure_count,
+            detector_change,
+            detector_calibration_baseline,
+            detector_calibration_candidate,
+            report_change_by_engine,
+            accuracy_combined,
+            accuracy_by_engine,
+            single_speaker_control_count,
+            performance,
+            failures,
+            development_uncertified: true,
+            held_out_opened: false,
+            production_route_changed: false,
+            passed,
+            result_sha256: String::new(),
+        };
+        gate.result_sha256 = public_ecapa_change_gate_result_sha256(&gate);
+        gate
     }
 
     fn public_ecapa_accuracy_delta(candidate: Option<f64>, baseline: Option<f64>) -> Option<f64> {
@@ -16991,7 +19429,7 @@ mod tests {
                 crate::model::DiarizationEngine::EcapaFused,
             ],
             preparation_contract:
-                "one-observation-one-incumbent-partition-one-privacy-safe-supported-profile-topology-three-arms-v1",
+                "one-observation-one-incumbent-partition-one-privacy-safe-supported-profile-topology-three-arms-exact-typed-route-retain-ineligible-noop-v3",
             recurrence_contract:
                 "bounded-label-state-viterbi-duration-summary-path-history-approximation-not-global-optimum-v1",
             accuracy_authority_contract:
@@ -17458,6 +19896,19 @@ mod tests {
         policy: &PublicSupportedProfileRedecodeGatePolicy,
     ) -> bool {
         let resources = &row.candidate.resources;
+        if !row.candidate.frozen_route_eligible {
+            return row.candidate.tracklet_count > 0
+                && !row.candidate.applied
+                && row.candidate.fallback_reason
+                    == Some(
+                        crate::diarization::SupportedProfileRedecodeFallbackReason::IneligibleRoute,
+                    )
+                && row.candidate.profile_row_count == 0
+                && row.candidate.supported_speaker_count == 0
+                && row.candidate.changed_assignment_count == 0
+                && row.candidate.structural_output_sha256.is_none()
+                && *resources == PublicSupportedProfileRedecodeResources::default();
+        }
         let state_count = row.candidate.supported_speaker_count.saturating_add(1);
         let expected_preflight_validation_visits = row
             .candidate
@@ -17619,6 +20070,85 @@ mod tests {
         }
     }
 
+    fn public_supported_profile_redecode_frozen_binding_matches(
+        row: &PublicSupportedProfileRedecodePairRow,
+        expected: &PublicSupportedProfileRedecodeExpectedPairBinding,
+    ) -> bool {
+        let arm_matches = |arm: &PublicSupportedProfileRedecodeArmRow| {
+            arm.incumbent_partition_sha256 == expected.incumbent_partition_sha256
+                && arm.supported_profile_topology_sha256
+                    == expected.supported_profile_topology_sha256
+                && arm.frozen_support_summary_sha256 == expected.frozen_support_summary_sha256
+                && arm.speaker_count_estimate_sha256 == expected.speaker_count_estimate_sha256
+                && arm.speaker_count_evidence_sha256 == expected.speaker_count_evidence_sha256
+                && arm.frozen_count_estimate_present == expected.frozen_count_estimate_present
+                && arm.hard_hint_input_topology_sha256 == expected.hard_hint_input_topology_sha256
+                && arm.overlap_input_topology_sha256 == expected.overlap_input_topology_sha256
+                && arm.evaluation_only_final_forced_row_output_sha256
+                    == expected.final_forced_row_output_sha256
+                && arm.frozen_count_constraints_feasible
+                    == expected.frozen_count_constraints_feasible
+                && arm.frozen_executed_clustering_mode == expected.frozen_executed_clustering_mode
+                && arm.frozen_operational_partition_method
+                    == expected.frozen_operational_partition_method
+                && arm.frozen_route_eligible == expected.frozen_route_eligible
+        };
+        row.frozen_total_profile_row_count == expected.frozen_total_profile_row_count
+            && row.frozen_forced_tracklet_count == expected.frozen_forced_tracklet_count
+            && row.evaluation_only_frozen_forced_row_output_sha256
+                == expected.final_forced_row_output_sha256
+            && arm_matches(&row.baseline)
+            && arm_matches(&row.candidate)
+            && row.comparison.candidate_replay_incumbent_partition_sha256
+                == expected.incumbent_partition_sha256
+            && row
+                .comparison
+                .candidate_replay_supported_profile_topology_sha256
+                == expected.supported_profile_topology_sha256
+            && row
+                .comparison
+                .candidate_replay_frozen_support_summary_sha256
+                == expected.frozen_support_summary_sha256
+            && row
+                .comparison
+                .candidate_replay_speaker_count_estimate_sha256
+                == expected.speaker_count_estimate_sha256
+            && row
+                .comparison
+                .candidate_replay_speaker_count_evidence_sha256
+                == expected.speaker_count_evidence_sha256
+            && row
+                .comparison
+                .candidate_replay_frozen_count_estimate_present
+                == expected.frozen_count_estimate_present
+            && row
+                .comparison
+                .candidate_replay_hard_hint_input_topology_sha256
+                == expected.hard_hint_input_topology_sha256
+            && row
+                .comparison
+                .candidate_replay_overlap_input_topology_sha256
+                == expected.overlap_input_topology_sha256
+            && row
+                .comparison
+                .candidate_replay_evaluation_only_final_forced_row_output_sha256
+                == expected.final_forced_row_output_sha256
+            && row
+                .comparison
+                .candidate_replay_frozen_count_constraints_feasible
+                == expected.frozen_count_constraints_feasible
+            && row
+                .comparison
+                .candidate_replay_frozen_executed_clustering_mode
+                == expected.frozen_executed_clustering_mode
+            && row
+                .comparison
+                .candidate_replay_frozen_operational_partition_method
+                == expected.frozen_operational_partition_method
+            && row.comparison.candidate_replay_frozen_route_eligible
+                == expected.frozen_route_eligible
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn public_supported_profile_redecode_gate_row(
         frozen_reference: &PublicSupportedProfileRedecodeFrozenReference,
@@ -17752,6 +20282,14 @@ mod tests {
             }) {
                 failures.push(PublicSupportedProfileRedecodeGateFailure::ScoreAuthorityMismatch);
             }
+            if expected_pair_bindings.get(index).is_none_or(|expected| {
+                row.baseline != expected.baseline_output
+                    || row.candidate != expected.candidate_output
+                    || row.comparison != expected.comparison_output
+                    || row.timing != expected.timing_output
+            }) {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::OutputAuthorityMismatch);
+            }
             if row.timing.execution_order != expected_order
                 || !row.timing.candidate_replay_excluded_from_gate
                 || row.timing.common_preparation_wall_ns == 0
@@ -17824,8 +20362,52 @@ mod tests {
             {
                 failures.push(PublicSupportedProfileRedecodeGateFailure::CommonObservationMismatch);
             }
-            let frozen_incumbent_matches = row.baseline.incumbent_partition_sha256
-                == row.candidate.incumbent_partition_sha256
+            let route_metadata_matches = row.baseline.frozen_executed_clustering_mode
+                == row.candidate.frozen_executed_clustering_mode
+                && row.baseline.frozen_operational_partition_method
+                    == row.candidate.frozen_operational_partition_method
+                && row.baseline.frozen_route_eligible == row.candidate.frozen_route_eligible
+                && row.baseline.frozen_count_estimate_present
+                    == row.candidate.frozen_count_estimate_present
+                && row.baseline.frozen_count_constraints_feasible
+                    == row.candidate.frozen_count_constraints_feasible;
+            let recomputed_route_eligible = row.baseline.frozen_executed_clustering_mode
+                == crate::diarization::AcousticClusteringMode::ProbabilisticV1
+                && matches!(
+                    (
+                        row.evidence_mode,
+                        row.baseline.frozen_operational_partition_method,
+                    ),
+                    (
+                        crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+                        Some(
+                            crate::model::DiarizationOperationalPartitionMethod::EcapaSpherical,
+                        ),
+                    ) | (
+                        crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+                        Some(
+                            crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus,
+                        ),
+                    )
+                )
+                && row.baseline.frozen_count_estimate_present
+                && row.baseline.frozen_count_constraints_feasible
+                && super::is_sha256_hex(&row.baseline.speaker_count_estimate_sha256)
+                && super::is_sha256_hex(&row.baseline.speaker_count_evidence_sha256);
+            if gate_policy.require_candidate_route_eligible
+                && (!recomputed_route_eligible
+                    || !row.baseline.frozen_route_eligible
+                    || !row.candidate.frozen_route_eligible)
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::CandidateRouteIneligible);
+            }
+            let expected_frozen_binding_matches =
+                expected_pair_bindings.get(index).is_some_and(|expected| {
+                    public_supported_profile_redecode_frozen_binding_matches(row, expected)
+                });
+            let frozen_incumbent_matches = expected_frozen_binding_matches
+                && row.baseline.incumbent_partition_sha256
+                    == row.candidate.incumbent_partition_sha256
                 && row.frozen_total_profile_row_count > 0
                 && row.frozen_total_profile_row_count
                     <= gate_policy.maximum_total_profile_row_count
@@ -17839,8 +20421,7 @@ mod tests {
                     == row.candidate.frozen_support_summary_sha256
                 && row.baseline.support_evidence_frozen_from_incumbent
                 && row.candidate.support_evidence_frozen_from_incumbent
-                && row.baseline.frozen_count_constraints_feasible
-                && row.candidate.frozen_count_constraints_feasible
+                && route_metadata_matches
                 && row.baseline.speaker_count_estimate_sha256
                     == row.candidate.speaker_count_estimate_sha256
                 && row.baseline.speaker_count_evidence_sha256
@@ -17897,34 +20478,36 @@ mod tests {
             if !row.comparison.incumbent_contract_matches || !incumbent_contract_matches {
                 failures.push(PublicSupportedProfileRedecodeGateFailure::IncumbentContractMismatch);
             }
-            let candidate_contract_matches = row.candidate.mode
+            let candidate_common_contract = row.candidate.mode
                 == crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1
                 && row.candidate.variant_configuration_sha256 == redecode_policy_sha256
                 && row.candidate.tracklet_count == row.common_observation.embedded_tracklet_count
-                && row.candidate.profile_row_count == row.frozen_total_profile_row_count
-                && row.candidate.supported_speaker_count <= row.candidate.profile_row_count
                 && row.candidate.output_detected_speaker_count
                     <= row.frozen_total_profile_row_count
                 && row.candidate.changed_assignment_count <= row.candidate.tracklet_count
                 && row.candidate.new_inference_count == 0
                 && row.candidate.output_dominant_speaker_share.is_finite()
-                && (0.0..=1.0).contains(&row.candidate.output_dominant_speaker_share)
-                && (!row.candidate.applied || row.candidate.output_constraints_satisfied)
-                && if row.candidate.applied {
-                    row.candidate.fallback_reason.is_none()
-                        && row.candidate.changed_assignment_count > 0
-                        && row
-                            .candidate
-                            .structural_output_sha256
-                            .as_deref()
-                            .is_some_and(super::is_sha256_hex)
-                        && row.candidate.output_detected_speaker_count
-                            == row.candidate.supported_speaker_count
-                        && (row.candidate.output_detected_speaker_count <= 1
-                            || row.candidate.output_dominant_speaker_share
-                                <= gate_policy.maximum_multi_speaker_dominant_share)
-                } else {
-                    matches!(
+                && (0.0..=1.0).contains(&row.candidate.output_dominant_speaker_share);
+            let candidate_contract_matches = candidate_common_contract
+                && if recomputed_route_eligible && row.candidate.frozen_route_eligible {
+                    row.candidate.profile_row_count == row.frozen_total_profile_row_count
+                        && row.candidate.supported_speaker_count <= row.candidate.profile_row_count
+                        && (!row.candidate.applied || row.candidate.output_constraints_satisfied)
+                        && if row.candidate.applied {
+                            row.candidate.fallback_reason.is_none()
+                                && row.candidate.changed_assignment_count > 0
+                                && row
+                                    .candidate
+                                    .structural_output_sha256
+                                    .as_deref()
+                                    .is_some_and(super::is_sha256_hex)
+                                && row.candidate.output_detected_speaker_count
+                                    == row.candidate.supported_speaker_count
+                                && (row.candidate.output_detected_speaker_count <= 1
+                                    || row.candidate.output_dominant_speaker_share
+                                        <= gate_policy.maximum_multi_speaker_dominant_share)
+                        } else {
+                            matches!(
                         row.candidate.fallback_reason,
                         Some(
                             crate::diarization::SupportedProfileRedecodeFallbackReason::NoStrictImprovement
@@ -17933,6 +20516,19 @@ mod tests {
                     )
                         && row.candidate.changed_assignment_count == 0
                         && row.candidate.structural_output_sha256.is_none()
+                        }
+                } else {
+                    !row.candidate.applied
+                        && row.candidate.fallback_reason
+                            == Some(
+                                crate::diarization::SupportedProfileRedecodeFallbackReason::IneligibleRoute,
+                            )
+                        && row.candidate.profile_row_count == 0
+                        && row.candidate.supported_speaker_count == 0
+                        && row.candidate.changed_assignment_count == 0
+                        && row.candidate.structural_output_sha256.is_none()
+                        && row.candidate.resources
+                            == PublicSupportedProfileRedecodeResources::default()
                 };
             if !candidate_contract_matches {
                 failures.push(PublicSupportedProfileRedecodeGateFailure::CandidateContractMismatch);
@@ -17944,6 +20540,12 @@ mod tests {
                     == row.candidate.accuracy.score_sha256
                 && row.comparison.candidate_replay_structural_sha256
                     == row.candidate.structural_output_sha256
+                && row.comparison.candidate_replay_incumbent_partition_sha256
+                    == row.candidate.incumbent_partition_sha256
+                && row
+                    .comparison
+                    .candidate_replay_supported_profile_topology_sha256
+                    == row.candidate.supported_profile_topology_sha256
                 && row
                     .comparison
                     .candidate_replay_frozen_support_summary_sha256
@@ -17965,6 +20567,10 @@ mod tests {
                     == row.candidate.speaker_count_evidence_sha256
                 && row
                     .comparison
+                    .candidate_replay_frozen_count_estimate_present
+                    == row.candidate.frozen_count_estimate_present
+                && row
+                    .comparison
                     .candidate_replay_hard_hint_input_topology_sha256
                     == row.candidate.hard_hint_input_topology_sha256
                 && row
@@ -17980,8 +20586,19 @@ mod tests {
                 && row
                     .comparison
                     .candidate_replay_frozen_count_constraints_feasible
-                && (!row.candidate.applied
-                    || row.comparison.candidate_replay_output_constraints_satisfied);
+                    == row.candidate.frozen_count_constraints_feasible
+                && row
+                    .comparison
+                    .candidate_replay_frozen_executed_clustering_mode
+                    == row.candidate.frozen_executed_clustering_mode
+                && row
+                    .comparison
+                    .candidate_replay_frozen_operational_partition_method
+                    == row.candidate.frozen_operational_partition_method
+                && row.comparison.candidate_replay_frozen_route_eligible
+                    == row.candidate.frozen_route_eligible
+                && row.comparison.candidate_replay_output_constraints_satisfied
+                    == row.candidate.output_constraints_satisfied;
             if !row.comparison.candidate_replay_matches || !replay_hashes_match {
                 failures.push(PublicSupportedProfileRedecodeGateFailure::CandidateReplayMismatch);
             }
@@ -18920,6 +21537,11 @@ mod tests {
         } else {
             crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
         };
+        let operational_partition_method = if engine == crate::model::DiarizationEngine::Ecapa {
+            crate::model::DiarizationOperationalPartitionMethod::EcapaSpherical
+        } else {
+            crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus
+        };
         let reference_speakers = if recording_index < 2 { 1 } else { 2 };
         let baseline_accuracy = supported_profile_redecode_gate_accuracy_fixture(
             reference_speakers,
@@ -18971,11 +21593,16 @@ mod tests {
             support_evidence_frozen_from_incumbent: true,
             speaker_count_estimate_sha256: "c".repeat(64),
             speaker_count_evidence_sha256: "d".repeat(64),
+            frozen_count_estimate_present: true,
             hard_hint_input_topology_sha256: "e".repeat(64),
             overlap_input_topology_sha256: "f".repeat(64),
             evaluation_only_final_forced_row_output_sha256: "0".repeat(64),
             new_inference_count: 0,
             frozen_count_constraints_feasible: true,
+            frozen_executed_clustering_mode:
+                crate::diarization::AcousticClusteringMode::ProbabilisticV1,
+            frozen_operational_partition_method: Some(operational_partition_method),
+            frozen_route_eligible: true,
             output_constraints_satisfied: false,
             report_sha256: "1".repeat(64),
             evidence_sha256: "2".repeat(64),
@@ -19004,6 +21631,7 @@ mod tests {
             support_evidence_frozen_from_incumbent: true,
             speaker_count_estimate_sha256: baseline.speaker_count_estimate_sha256.clone(),
             speaker_count_evidence_sha256: baseline.speaker_count_evidence_sha256.clone(),
+            frozen_count_estimate_present: true,
             hard_hint_input_topology_sha256: baseline.hard_hint_input_topology_sha256.clone(),
             overlap_input_topology_sha256: baseline.overlap_input_topology_sha256.clone(),
             evaluation_only_final_forced_row_output_sha256: baseline
@@ -19011,6 +21639,10 @@ mod tests {
                 .clone(),
             new_inference_count: 0,
             frozen_count_constraints_feasible: true,
+            frozen_executed_clustering_mode:
+                crate::diarization::AcousticClusteringMode::ProbabilisticV1,
+            frozen_operational_partition_method: Some(operational_partition_method),
+            frozen_route_eligible: true,
             output_constraints_satisfied: true,
             report_sha256: "4".repeat(64),
             evidence_sha256: "5".repeat(64),
@@ -19080,9 +21712,33 @@ mod tests {
             recording_id: row.recording_id.clone(),
             audio_duration_ms: row.audio_duration_ms,
             source_audio_sha256: common_observation.source_audio_sha256.clone(),
+            incumbent_partition_sha256: row.baseline.incumbent_partition_sha256.clone(),
+            supported_profile_topology_sha256: row
+                .baseline
+                .supported_profile_topology_sha256
+                .clone(),
+            frozen_support_summary_sha256: row.baseline.frozen_support_summary_sha256.clone(),
+            speaker_count_estimate_sha256: row.baseline.speaker_count_estimate_sha256.clone(),
+            speaker_count_evidence_sha256: row.baseline.speaker_count_evidence_sha256.clone(),
+            frozen_count_estimate_present: row.baseline.frozen_count_estimate_present,
+            hard_hint_input_topology_sha256: row.baseline.hard_hint_input_topology_sha256.clone(),
+            overlap_input_topology_sha256: row.baseline.overlap_input_topology_sha256.clone(),
+            final_forced_row_output_sha256: row
+                .evaluation_only_frozen_forced_row_output_sha256
+                .clone(),
+            frozen_total_profile_row_count: row.frozen_total_profile_row_count,
+            frozen_forced_tracklet_count: row.frozen_forced_tracklet_count,
+            frozen_count_constraints_feasible: row.baseline.frozen_count_constraints_feasible,
+            frozen_executed_clustering_mode: row.baseline.frozen_executed_clustering_mode,
+            frozen_operational_partition_method: row.baseline.frozen_operational_partition_method,
+            frozen_route_eligible: row.baseline.frozen_route_eligible,
             baseline_accuracy: row.baseline.accuracy.clone(),
             candidate_accuracy: row.candidate.accuracy.clone(),
             candidate_replay_accuracy: row.candidate.accuracy.clone(),
+            baseline_output: row.baseline.clone(),
+            candidate_output: row.candidate.clone(),
+            comparison_output: row.comparison.clone(),
+            timing_output: row.timing.clone(),
         };
         (row, common_observation, expected_pair_binding)
     }
@@ -19138,6 +21794,19 @@ mod tests {
         )
     }
 
+    fn supported_profile_redecode_gate_refresh_expected_output(
+        row: &PublicSupportedProfileRedecodePairRow,
+        expected: &mut PublicSupportedProfileRedecodeExpectedPairBinding,
+    ) {
+        expected.baseline_accuracy = row.baseline.accuracy.clone();
+        expected.candidate_accuracy = row.candidate.accuracy.clone();
+        expected.candidate_replay_accuracy = row.candidate.accuracy.clone();
+        expected.baseline_output = row.baseline.clone();
+        expected.candidate_output = row.candidate.clone();
+        expected.comparison_output = row.comparison.clone();
+        expected.timing_output = row.timing.clone();
+    }
+
     fn supported_profile_redecode_gate_make_rejected_pair(
         row: &mut PublicSupportedProfileRedecodePairRow,
         expected: &mut PublicSupportedProfileRedecodeExpectedPairBinding,
@@ -19178,8 +21847,76 @@ mod tests {
         row.deterministic_accuracy_sha256 =
             public_supported_profile_redecode_pair_accuracy_sha256(row);
         row.row_sha256 = public_supported_profile_redecode_pair_result_sha256(row);
-        expected.candidate_accuracy = row.baseline.accuracy.clone();
-        expected.candidate_replay_accuracy = row.baseline.accuracy.clone();
+        supported_profile_redecode_gate_refresh_expected_output(row, expected);
+    }
+
+    fn supported_profile_redecode_gate_finalize_ineligible_pair(
+        row: &mut PublicSupportedProfileRedecodePairRow,
+        expected: &mut PublicSupportedProfileRedecodeExpectedPairBinding,
+    ) {
+        row.candidate.output_constraints_satisfied = row.baseline.output_constraints_satisfied;
+        row.candidate.report_sha256 = row.baseline.report_sha256.clone();
+        row.candidate.applied = false;
+        row.candidate.fallback_reason =
+            Some(crate::diarization::SupportedProfileRedecodeFallbackReason::IneligibleRoute);
+        row.candidate.profile_row_count = 0;
+        row.candidate.supported_speaker_count = 0;
+        row.candidate.changed_assignment_count = 0;
+        row.candidate.structural_output_sha256 = None;
+        row.candidate.output_detected_speaker_count = row.baseline.output_detected_speaker_count;
+        row.candidate.output_dominant_speaker_share = row.baseline.output_dominant_speaker_share;
+        row.candidate.accuracy = row.baseline.accuracy.clone();
+        row.candidate.resources = PublicSupportedProfileRedecodeResources::default();
+        let candidate_replay = row.candidate.clone();
+        row.comparison = public_supported_profile_redecode_pair_comparison(
+            &row.baseline,
+            &row.candidate,
+            &candidate_replay,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        row.deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(row);
+        row.row_sha256 = public_supported_profile_redecode_pair_result_sha256(row);
+        supported_profile_redecode_gate_refresh_expected_output(row, expected);
+    }
+
+    fn supported_profile_redecode_gate_make_route_ineligible_pair(
+        row: &mut PublicSupportedProfileRedecodePairRow,
+        expected: &mut PublicSupportedProfileRedecodeExpectedPairBinding,
+    ) {
+        for arm in [&mut row.baseline, &mut row.candidate] {
+            arm.frozen_executed_clustering_mode =
+                crate::diarization::AcousticClusteringMode::FixedSafeV1;
+            arm.frozen_operational_partition_method =
+                Some(crate::model::DiarizationOperationalPartitionMethod::FixedSafeAgglomerative);
+            arm.frozen_route_eligible = false;
+        }
+        expected.frozen_executed_clustering_mode = row.baseline.frozen_executed_clustering_mode;
+        expected.frozen_operational_partition_method =
+            row.baseline.frozen_operational_partition_method;
+        expected.frozen_route_eligible = row.baseline.frozen_route_eligible;
+        supported_profile_redecode_gate_finalize_ineligible_pair(row, expected);
+    }
+
+    fn supported_profile_redecode_gate_make_count_missing_pair(
+        row: &mut PublicSupportedProfileRedecodePairRow,
+        expected: &mut PublicSupportedProfileRedecodeExpectedPairBinding,
+    ) {
+        for arm in [&mut row.baseline, &mut row.candidate] {
+            arm.speaker_count_estimate_sha256 = "b".repeat(64);
+            arm.speaker_count_evidence_sha256 = "c".repeat(64);
+            arm.frozen_count_estimate_present = false;
+            arm.frozen_route_eligible = false;
+        }
+        expected.speaker_count_estimate_sha256 = row.baseline.speaker_count_estimate_sha256.clone();
+        expected.speaker_count_evidence_sha256 = row.baseline.speaker_count_evidence_sha256.clone();
+        expected.frozen_count_estimate_present = false;
+        expected.frozen_route_eligible = false;
+        supported_profile_redecode_gate_finalize_ineligible_pair(row, expected);
     }
 
     #[test]
@@ -19348,6 +22085,304 @@ mod tests {
             &persistent_limit_rejection,
             &policy,
         ));
+    }
+
+    #[test]
+    fn supported_profile_redecode_gate_retains_but_rejects_ineligible_route_rows() {
+        let (
+            frozen_reference,
+            mut rows,
+            common,
+            mut expected_pair_bindings,
+            memory,
+            policy,
+            policy_sha256,
+        ) = supported_profile_redecode_gate_fixture();
+        let redecode_policy_sha256 = crate::diarization::supported_profile_redecode_policy_sha256();
+        supported_profile_redecode_gate_make_route_ineligible_pair(
+            &mut rows[0],
+            &mut expected_pair_bindings[0],
+        );
+        supported_profile_redecode_gate_make_count_missing_pair(
+            &mut rows[1],
+            &mut expected_pair_bindings[1],
+        );
+
+        let gate = public_supported_profile_redecode_gate_row(
+            &frozen_reference,
+            &rows,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert_eq!(gate.paired_row_count, policy.required_pair_count);
+        assert!(!gate.passed);
+        assert!(
+            gate.failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::CandidateRouteIneligible)
+        );
+        for unexpected in [
+            PublicSupportedProfileRedecodeGateFailure::CandidateContractMismatch,
+            PublicSupportedProfileRedecodeGateFailure::CandidateReplayMismatch,
+            PublicSupportedProfileRedecodeGateFailure::RejectedCandidateOutputMismatch,
+            PublicSupportedProfileRedecodeGateFailure::OutputAuthorityMismatch,
+            PublicSupportedProfileRedecodeGateFailure::ResourceBoundExceeded,
+        ] {
+            assert!(!gate.failures.contains(&unexpected), "{unexpected:?}");
+        }
+
+        let mut route_boolean_tamper = rows.clone();
+        route_boolean_tamper[0].candidate.frozen_route_eligible = true;
+        let candidate_replay = route_boolean_tamper[0].candidate.clone();
+        route_boolean_tamper[0].comparison = public_supported_profile_redecode_pair_comparison(
+            &route_boolean_tamper[0].baseline,
+            &route_boolean_tamper[0].candidate,
+            &candidate_replay,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        route_boolean_tamper[0].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(&route_boolean_tamper[0]);
+        route_boolean_tamper[0].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(&route_boolean_tamper[0]);
+        let route_boolean_gate = public_supported_profile_redecode_gate_row(
+            &frozen_reference,
+            &route_boolean_tamper,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!route_boolean_gate.passed);
+        assert!(
+            route_boolean_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::FrozenIncumbentMismatch)
+        );
+
+        let mut coherent_route_metadata_tamper = rows.clone();
+        coherent_route_metadata_tamper[0]
+            .baseline
+            .frozen_operational_partition_method = None;
+        coherent_route_metadata_tamper[0]
+            .candidate
+            .frozen_operational_partition_method = None;
+        let candidate_replay = coherent_route_metadata_tamper[0].candidate.clone();
+        coherent_route_metadata_tamper[0].comparison =
+            public_supported_profile_redecode_pair_comparison(
+                &coherent_route_metadata_tamper[0].baseline,
+                &coherent_route_metadata_tamper[0].candidate,
+                &candidate_replay,
+                true,
+                true,
+                true,
+                true,
+                true,
+            );
+        coherent_route_metadata_tamper[0].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(
+                &coherent_route_metadata_tamper[0],
+            );
+        coherent_route_metadata_tamper[0].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(
+                &coherent_route_metadata_tamper[0],
+            );
+        let coherent_route_metadata_gate = public_supported_profile_redecode_gate_row(
+            &frozen_reference,
+            &coherent_route_metadata_tamper,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!coherent_route_metadata_gate.passed);
+        assert!(
+            coherent_route_metadata_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::FrozenIncumbentMismatch)
+        );
+
+        let mut cross_mode_method_tamper = rows.clone();
+        let mut cross_mode_expected = expected_pair_bindings.clone();
+        for (index, forged_method) in [
+            (
+                2usize,
+                crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus,
+            ),
+            (
+                3usize,
+                crate::model::DiarizationOperationalPartitionMethod::EcapaSpherical,
+            ),
+        ] {
+            let row = &mut cross_mode_method_tamper[index];
+            row.baseline.frozen_operational_partition_method = Some(forged_method);
+            row.candidate.frozen_operational_partition_method = Some(forged_method);
+            let candidate_replay = row.candidate.clone();
+            row.comparison = public_supported_profile_redecode_pair_comparison(
+                &row.baseline,
+                &row.candidate,
+                &candidate_replay,
+                true,
+                true,
+                true,
+                true,
+                true,
+            );
+            row.deterministic_accuracy_sha256 =
+                public_supported_profile_redecode_pair_accuracy_sha256(row);
+            row.row_sha256 = public_supported_profile_redecode_pair_result_sha256(row);
+            cross_mode_expected[index].frozen_operational_partition_method = Some(forged_method);
+            supported_profile_redecode_gate_refresh_expected_output(
+                row,
+                &mut cross_mode_expected[index],
+            );
+        }
+        let cross_mode_gate = public_supported_profile_redecode_gate_row(
+            &frozen_reference,
+            &cross_mode_method_tamper,
+            &common,
+            &cross_mode_expected,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!cross_mode_gate.passed);
+        assert!(
+            cross_mode_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::CandidateRouteIneligible),
+            "cross-mode method forgery must fail the independently recomputed route: {cross_mode_gate:#?}",
+        );
+
+        let mut coherent_count_presence_tamper = rows.clone();
+        let coherent_count_presence_row = &mut coherent_count_presence_tamper[1];
+        for arm in [
+            &mut coherent_count_presence_row.baseline,
+            &mut coherent_count_presence_row.candidate,
+        ] {
+            arm.frozen_count_estimate_present = true;
+        }
+        let candidate_replay = coherent_count_presence_tamper[1].candidate.clone();
+        coherent_count_presence_tamper[1].comparison =
+            public_supported_profile_redecode_pair_comparison(
+                &coherent_count_presence_tamper[1].baseline,
+                &coherent_count_presence_tamper[1].candidate,
+                &candidate_replay,
+                true,
+                true,
+                true,
+                true,
+                true,
+            );
+        coherent_count_presence_tamper[1].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(
+                &coherent_count_presence_tamper[1],
+            );
+        coherent_count_presence_tamper[1].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(
+                &coherent_count_presence_tamper[1],
+            );
+        let coherent_count_presence_gate = public_supported_profile_redecode_gate_row(
+            &frozen_reference,
+            &coherent_count_presence_tamper,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!coherent_count_presence_gate.passed);
+        assert!(
+            coherent_count_presence_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::FrozenIncumbentMismatch)
+        );
+        assert!(
+            coherent_count_presence_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::OutputAuthorityMismatch)
+        );
+
+        let mut coherent_output_tamper = rows.clone();
+        coherent_output_tamper[0].baseline.report_sha256 = "d".repeat(64);
+        coherent_output_tamper[0].candidate.report_sha256 = "d".repeat(64);
+        let candidate_replay = coherent_output_tamper[0].candidate.clone();
+        coherent_output_tamper[0].comparison = public_supported_profile_redecode_pair_comparison(
+            &coherent_output_tamper[0].baseline,
+            &coherent_output_tamper[0].candidate,
+            &candidate_replay,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        coherent_output_tamper[0].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(&coherent_output_tamper[0]);
+        coherent_output_tamper[0].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(&coherent_output_tamper[0]);
+        let coherent_output_gate = public_supported_profile_redecode_gate_row(
+            &frozen_reference,
+            &coherent_output_tamper,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!coherent_output_gate.passed);
+        assert!(
+            coherent_output_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::OutputAuthorityMismatch)
+        );
+
+        let mut nondefault_resources = rows;
+        nondefault_resources[0].candidate.resources.model_call_count = 1;
+        let candidate_replay = nondefault_resources[0].candidate.clone();
+        nondefault_resources[0].comparison = public_supported_profile_redecode_pair_comparison(
+            &nondefault_resources[0].baseline,
+            &nondefault_resources[0].candidate,
+            &candidate_replay,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        nondefault_resources[0].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(&nondefault_resources[0]);
+        nondefault_resources[0].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(&nondefault_resources[0]);
+        let resource_gate = public_supported_profile_redecode_gate_row(
+            &frozen_reference,
+            &nondefault_resources,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy,
+            policy_sha256,
+            &memory,
+        );
+        assert!(!resource_gate.passed);
+        assert!(
+            resource_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::ResourceBoundExceeded)
+        );
     }
 
     #[test]
@@ -20114,6 +23149,518 @@ mod tests {
     }
 
     #[test]
+    fn ecapa_change_gate_accepts_empty_controls_and_consistent_timing_semantics() {
+        let empty = public_ecapa_change_metric_row(&[], &[], 250);
+        assert!(public_ecapa_change_detector_metric_defined_or_empty(&empty));
+        assert_eq!(empty.f1, None);
+        let comparison = public_ecapa_change_metric_comparison(None, empty.clone(), empty, 0.0);
+        assert_eq!(comparison.relative_f1_improvement, Some(0.0));
+        assert!(comparison.passed);
+        assert!(public_ecapa_change_detector_timing_non_regression(
+            Some(0.1),
+            None,
+        ));
+        assert!(!public_ecapa_change_detector_timing_non_regression(
+            None,
+            Some(0.1),
+        ));
+        assert!(public_ecapa_change_detector_timing_non_regression(
+            None, None,
+        ));
+
+        let zero_baseline = public_ecapa_change_metric_row(&[1_000], &[], 250);
+        assert_eq!(zero_baseline.f1, Some(0.0));
+        assert!(public_ecapa_change_detector_metric_defined_or_empty(
+            &zero_baseline,
+        ));
+        let perfect_candidate = public_ecapa_change_metric_row(&[1_000], &[1_000], 250);
+        let recovered = public_ecapa_change_metric_comparison(
+            None,
+            zero_baseline.clone(),
+            perfect_candidate,
+            PUBLIC_ECAPA_CHANGE_MINIMUM_RELATIVE_F1_IMPROVEMENT,
+        );
+        assert_eq!(recovered.relative_f1_improvement, Some(1.0));
+        assert!(recovered.passed);
+
+        let false_positive_only = public_ecapa_change_metric_row(&[], &[1_000], 250);
+        assert_eq!(false_positive_only.f1, Some(0.0));
+        assert!(public_ecapa_change_detector_metric_defined_or_empty(
+            &false_positive_only,
+        ));
+
+        let noisy_hypotheses = (0..20)
+            .map(|index| 1_000_u64.saturating_add(index * 1_000))
+            .collect::<Vec<_>>();
+        let below_absolute_floor = public_ecapa_change_metric_row(&[1_000], &noisy_hypotheses, 250);
+        let comparison = public_ecapa_change_metric_comparison(
+            None,
+            zero_baseline,
+            below_absolute_floor,
+            PUBLIC_ECAPA_CHANGE_MINIMUM_RELATIVE_F1_IMPROVEMENT,
+        );
+        assert!(comparison.relative_f1_improvement.is_some());
+        assert!(!comparison.passed);
+    }
+
+    #[test]
+    fn ecapa_change_gate_counts_precapture_fallback_reasons() {
+        let fallback = crate::diarization::ChangePointEvidence {
+            boundary_ms: 1_000,
+            voice_distance: 0.0,
+            channel_distance: 0.0,
+            multiscale_scores: [0.0; 5],
+            raw_log_odds: 0.0,
+            change_probability: 0.5,
+            supporting_scale_mask: 0,
+            refinement_offset_frames: 0,
+            action: crate::diarization::AcousticChangeAction::NoBoundary,
+            fallback_reason: Some(
+                crate::diarization::AcousticChangeFallbackReason::InvalidCovariance,
+            ),
+            detector_mode: crate::diarization::AcousticChangeDetectorMode::CalibratedPosterior,
+            calibration_id: "test-calibration",
+            silence_gap: false,
+            snapped_to_word: false,
+            tiny_diarize_support: false,
+            vad_boundary: false,
+            supervised_boundary: false,
+        };
+        let evidence = crate::diarization::AcousticChangeEvaluationEvidence {
+            emitted: Vec::new(),
+            evaluated: vec![crate::diarization::AcousticChangeEvaluationPoint {
+                evaluation_center_ms: 1_000,
+                evidence: fallback,
+            }],
+        };
+        assert_eq!(public_ecapa_change_fallback_evaluation_count(&evidence), 1);
+    }
+
+    #[test]
+    fn ecapa_change_gate_requires_complete_grids_and_labels_framewise_peaks() {
+        let baseline = BTreeMap::from([(800, 0.1), (900, 0.2), (1_000, 0.9), (1_100, 0.1)]);
+        let replay = baseline.clone();
+        let mut missing_center = baseline.clone();
+        missing_center.remove(&1_000);
+        assert!(!public_ecapa_change_probability_grids_match(
+            &baseline,
+            &missing_center,
+            &replay,
+        ));
+        assert!(public_ecapa_change_probability_grids_match(
+            &baseline, &replay, &replay,
+        ));
+
+        let evaluated_point = |boundary_ms| crate::diarization::AcousticChangeEvaluationPoint {
+            evaluation_center_ms: 1_000,
+            evidence: crate::diarization::ChangePointEvidence {
+                boundary_ms,
+                voice_distance: 1.0,
+                channel_distance: 0.0,
+                multiscale_scores: [1.0; 5],
+                raw_log_odds: 1.0,
+                change_probability: 0.75,
+                supporting_scale_mask: 0b1_1111,
+                refinement_offset_frames: 0,
+                action: crate::diarization::AcousticChangeAction::NoBoundary,
+                fallback_reason: None,
+                detector_mode: crate::diarization::AcousticChangeDetectorMode::CalibratedPosterior,
+                calibration_id: "test-calibration",
+                silence_gap: false,
+                snapped_to_word: false,
+                tiny_diarize_support: false,
+                vad_boundary: false,
+                supervised_boundary: false,
+            },
+        };
+        let refined_left = crate::diarization::AcousticChangeEvaluationEvidence {
+            emitted: Vec::new(),
+            evaluated: vec![evaluated_point(950)],
+        };
+        let refined_right = crate::diarization::AcousticChangeEvaluationEvidence {
+            emitted: Vec::new(),
+            evaluated: vec![evaluated_point(1_050)],
+        };
+        let refined_left_grid =
+            public_ecapa_change_evaluated_probability_grid(&refined_left, 2_000);
+        let refined_right_grid =
+            public_ecapa_change_evaluated_probability_grid(&refined_right, 2_000);
+        assert_ne!(
+            refined_left.evaluated[0].evidence.boundary_ms,
+            refined_right.evaluated[0].evidence.boundary_ms,
+        );
+        assert!(public_ecapa_change_probability_grids_match(
+            &refined_left_grid,
+            &refined_right_grid,
+            &refined_right_grid,
+        ));
+        assert_eq!(
+            refined_left_grid.keys().copied().collect::<Vec<_>>(),
+            vec![1_000],
+        );
+
+        let observations = baseline
+            .iter()
+            .map(
+                |(boundary_ms, probability)| super::ChangeProbabilityObservation {
+                    boundary_ms: *boundary_ms,
+                    probability: *probability,
+                },
+            )
+            .collect::<Vec<_>>();
+        let calibration = public_ecapa_change_frame_calibration(&[1_000], &observations, 50, 10)
+            .expect("score framewise posterior calibration");
+        assert_eq!(calibration.observation_count, 4);
+        assert_eq!(calibration.positive_count, 1);
+        assert!((calibration.brier_sum - 0.07).abs() < 1e-12);
+    }
+
+    #[test]
+    #[ignore = "requires the frozen public AMI dev8 corpus and converted ECAPA weights"]
+    fn external_ecapa_change_detector_same_invocation_development_gate() {
+        let fixture = load_frozen_ecapa_dev8();
+        let policy = public_ecapa_change_gate_policy();
+        let policy_sha256 =
+            super::canonical_sha256(&policy).expect("hash frozen ECAPA change gate policy");
+        let protocol_sha256 = public_ecapa_change_protocol_sha256(&fixture, &policy_sha256);
+        let engines = [
+            crate::model::DiarizationEngine::Ecapa,
+            crate::model::DiarizationEngine::EcapaFused,
+        ];
+        let mut rows = Vec::with_capacity(
+            usize::try_from(PUBLIC_ECAPA_CHANGE_REQUIRED_PAIR_ROWS).expect("pair count fits usize"),
+        );
+        let mut expected_bindings = Vec::with_capacity(rows.capacity());
+        let mut expected_outputs = Vec::with_capacity(rows.capacity());
+        let mut memory_observation = PublicEcapaResidualBirthMemoryObservation::new();
+        let mut arm_execution_failure_count = 0_u64;
+        memory_observation.observe_stage();
+
+        for recording_index in 0..fixture.bundle.references.len() {
+            let recording = load_frozen_ecapa_recording(&fixture, recording_index);
+            for (engine_index, engine) in engines.iter().copied().enumerate() {
+                let (request, evidence_mode) = frozen_ecapa_request(engine);
+                let input_binding = public_ecapa_change_input_binding(
+                    &fixture,
+                    &recording,
+                    &request,
+                    evidence_mode,
+                );
+                expected_bindings.push(input_binding.clone());
+                let pair_index = recording_index
+                    .saturating_mul(engines.len())
+                    .saturating_add(engine_index);
+                let execution_order = public_ecapa_execution_order(pair_index);
+                let (baseline, candidate) = match execution_order {
+                    PublicEcapaResidualBirthExecutionOrder::BaselineThenCandidate => (
+                        catch_public_ecapa_change_arm_failure(
+                            &fixture,
+                            &recording,
+                            &request,
+                            crate::diarization::AcousticChangeDetectorMode::FixedSafeV1,
+                            &mut memory_observation,
+                            &mut arm_execution_failure_count,
+                        ),
+                        catch_public_ecapa_change_arm_failure(
+                            &fixture,
+                            &recording,
+                            &request,
+                            crate::diarization::AcousticChangeDetectorMode::CalibratedPosterior,
+                            &mut memory_observation,
+                            &mut arm_execution_failure_count,
+                        ),
+                    ),
+                    PublicEcapaResidualBirthExecutionOrder::CandidateThenBaseline => {
+                        let candidate = catch_public_ecapa_change_arm_failure(
+                            &fixture,
+                            &recording,
+                            &request,
+                            crate::diarization::AcousticChangeDetectorMode::CalibratedPosterior,
+                            &mut memory_observation,
+                            &mut arm_execution_failure_count,
+                        );
+                        let baseline = catch_public_ecapa_change_arm_failure(
+                            &fixture,
+                            &recording,
+                            &request,
+                            crate::diarization::AcousticChangeDetectorMode::FixedSafeV1,
+                            &mut memory_observation,
+                            &mut arm_execution_failure_count,
+                        );
+                        (baseline, candidate)
+                    }
+                };
+                let candidate_replay = catch_public_ecapa_change_arm_failure(
+                    &fixture,
+                    &recording,
+                    &request,
+                    crate::diarization::AcousticChangeDetectorMode::CalibratedPosterior,
+                    &mut memory_observation,
+                    &mut arm_execution_failure_count,
+                );
+                let (Some(baseline), Some(candidate), Some(candidate_replay)) =
+                    (baseline, candidate, candidate_replay)
+                else {
+                    continue;
+                };
+                let (row, expected_output) = public_ecapa_change_pair_row(
+                    &fixture,
+                    &recording,
+                    engine,
+                    input_binding,
+                    &protocol_sha256,
+                    execution_order,
+                    baseline,
+                    candidate,
+                    candidate_replay,
+                );
+                expected_outputs.push(expected_output);
+                let serialized = serialize_path_free_public_ecapa_evidence(
+                    &row,
+                    &[
+                        &fixture.descriptor_path,
+                        &fixture.weight_path,
+                        &fixture.input_root,
+                        &recording.audio_path,
+                    ],
+                );
+                println!("{serialized}");
+                rows.push(row);
+            }
+        }
+
+        if arm_execution_failure_count == 0 {
+            assert_eq!(rows.len() as u64, PUBLIC_ECAPA_CHANGE_REQUIRED_PAIR_ROWS);
+        }
+        let gate = public_ecapa_change_gate_row(
+            &fixture,
+            &rows,
+            &expected_bindings,
+            &expected_outputs,
+            policy.clone(),
+            policy_sha256.clone(),
+            protocol_sha256.clone(),
+            arm_execution_failure_count,
+            &memory_observation,
+        );
+        assert_eq!(
+            gate.result_sha256,
+            public_ecapa_change_gate_result_sha256(&gate)
+        );
+        let serialized = serialize_path_free_public_ecapa_evidence(
+            &gate,
+            &[
+                &fixture.descriptor_path,
+                &fixture.weight_path,
+                &fixture.input_root,
+            ],
+        );
+        println!("{serialized}");
+
+        if arm_execution_failure_count == 0
+            && rows.len() as u64 == PUBLIC_ECAPA_CHANGE_REQUIRED_PAIR_ROWS
+        {
+            let mut weakened_policy = policy.clone();
+            weakened_policy.minimum_relative_detector_f1_improvement = 0.0;
+            let weakened_policy_sha256 = super::canonical_sha256(&weakened_policy)
+                .expect("hash weakened ECAPA change policy");
+            let weakened_protocol_sha256 =
+                public_ecapa_change_protocol_sha256(&fixture, &weakened_policy_sha256);
+            let weakened_gate = public_ecapa_change_gate_row(
+                &fixture,
+                &rows,
+                &expected_bindings,
+                &expected_outputs,
+                weakened_policy,
+                weakened_policy_sha256,
+                weakened_protocol_sha256,
+                arm_execution_failure_count,
+                &memory_observation,
+            );
+            assert!(!weakened_gate.passed);
+            assert!(
+                weakened_gate
+                    .failures
+                    .contains(&PublicEcapaChangeGateFailure::PolicyHashMismatch)
+            );
+
+            let dropped_row_gate = public_ecapa_change_gate_row(
+                &fixture,
+                &rows[..rows.len() - 1],
+                &expected_bindings,
+                &expected_outputs,
+                policy.clone(),
+                policy_sha256.clone(),
+                protocol_sha256.clone(),
+                arm_execution_failure_count,
+                &memory_observation,
+            );
+            assert!(!dropped_row_gate.passed);
+            assert!(
+                dropped_row_gate
+                    .failures
+                    .contains(&PublicEcapaChangeGateFailure::PairCountMismatch)
+            );
+
+            let mut balanced_order_tamper = rows.clone();
+            let first_order = balanced_order_tamper[0].timing.execution_order;
+            let second_order = balanced_order_tamper[2].timing.execution_order;
+            balanced_order_tamper[0].timing.execution_order = second_order;
+            balanced_order_tamper[2].timing.execution_order = first_order;
+            balanced_order_tamper[0].deterministic_accuracy_sha256 =
+                public_ecapa_change_pair_accuracy_sha256(&balanced_order_tamper[0]);
+            balanced_order_tamper[0].row_sha256 =
+                public_ecapa_change_pair_result_sha256(&balanced_order_tamper[0]);
+            balanced_order_tamper[2].deterministic_accuracy_sha256 =
+                public_ecapa_change_pair_accuracy_sha256(&balanced_order_tamper[2]);
+            balanced_order_tamper[2].row_sha256 =
+                public_ecapa_change_pair_result_sha256(&balanced_order_tamper[2]);
+            let balanced_order_gate = public_ecapa_change_gate_row(
+                &fixture,
+                &balanced_order_tamper,
+                &expected_bindings,
+                &expected_outputs,
+                policy.clone(),
+                policy_sha256.clone(),
+                protocol_sha256.clone(),
+                arm_execution_failure_count,
+                &memory_observation,
+            );
+            assert!(!balanced_order_gate.passed);
+            assert!(
+                balanced_order_gate
+                    .failures
+                    .contains(&PublicEcapaChangeGateFailure::PairIntegrityMismatch)
+            );
+
+            let mut timing_authority_tamper = rows.clone();
+            timing_authority_tamper[0].timing.baseline_wall_ns = u64::MAX / 2;
+            timing_authority_tamper[0].timing.candidate_wall_ns = 1;
+            timing_authority_tamper[0].deterministic_accuracy_sha256 =
+                public_ecapa_change_pair_accuracy_sha256(&timing_authority_tamper[0]);
+            timing_authority_tamper[0].row_sha256 =
+                public_ecapa_change_pair_result_sha256(&timing_authority_tamper[0]);
+            let timing_authority_gate = public_ecapa_change_gate_row(
+                &fixture,
+                &timing_authority_tamper,
+                &expected_bindings,
+                &expected_outputs,
+                policy.clone(),
+                policy_sha256.clone(),
+                protocol_sha256.clone(),
+                arm_execution_failure_count,
+                &memory_observation,
+            );
+            assert!(!timing_authority_gate.passed);
+            assert!(
+                timing_authority_gate
+                    .failures
+                    .contains(&PublicEcapaChangeGateFailure::OutputAuthorityMismatch)
+            );
+
+            let mut output_authority_tamper = rows.clone();
+            output_authority_tamper[0].candidate.report_sha256 = "f".repeat(64);
+            output_authority_tamper[0]
+                .comparison
+                .candidate_replay_report_sha256 = "f".repeat(64);
+            output_authority_tamper[0].deterministic_accuracy_sha256 =
+                public_ecapa_change_pair_accuracy_sha256(&output_authority_tamper[0]);
+            output_authority_tamper[0].row_sha256 =
+                public_ecapa_change_pair_result_sha256(&output_authority_tamper[0]);
+            let output_authority_gate = public_ecapa_change_gate_row(
+                &fixture,
+                &output_authority_tamper,
+                &expected_bindings,
+                &expected_outputs,
+                policy.clone(),
+                policy_sha256.clone(),
+                protocol_sha256.clone(),
+                arm_execution_failure_count,
+                &memory_observation,
+            );
+            assert!(!output_authority_gate.passed);
+            assert!(
+                output_authority_gate
+                    .failures
+                    .contains(&PublicEcapaChangeGateFailure::OutputAuthorityMismatch)
+            );
+
+            let mut comparison_tamper = rows.clone();
+            comparison_tamper[0].comparison.unknown_share_non_regression =
+                !comparison_tamper[0].comparison.unknown_share_non_regression;
+            comparison_tamper[0].deterministic_accuracy_sha256 =
+                public_ecapa_change_pair_accuracy_sha256(&comparison_tamper[0]);
+            comparison_tamper[0].row_sha256 =
+                public_ecapa_change_pair_result_sha256(&comparison_tamper[0]);
+            let comparison_gate = public_ecapa_change_gate_row(
+                &fixture,
+                &comparison_tamper,
+                &expected_bindings,
+                &expected_outputs,
+                policy.clone(),
+                policy_sha256.clone(),
+                protocol_sha256.clone(),
+                arm_execution_failure_count,
+                &memory_observation,
+            );
+            assert!(!comparison_gate.passed);
+            assert!(
+                comparison_gate
+                    .failures
+                    .contains(&PublicEcapaChangeGateFailure::PairIntegrityMismatch)
+            );
+
+            let mut malformed_calibration = rows.clone();
+            malformed_calibration[0].candidate.calibration.bins.pop();
+            malformed_calibration[0].deterministic_accuracy_sha256 =
+                public_ecapa_change_pair_accuracy_sha256(&malformed_calibration[0]);
+            malformed_calibration[0].row_sha256 =
+                public_ecapa_change_pair_result_sha256(&malformed_calibration[0]);
+            let malformed_calibration_gate = public_ecapa_change_gate_row(
+                &fixture,
+                &malformed_calibration,
+                &expected_bindings,
+                &expected_outputs,
+                policy.clone(),
+                policy_sha256.clone(),
+                protocol_sha256.clone(),
+                arm_execution_failure_count,
+                &memory_observation,
+            );
+            assert!(!malformed_calibration_gate.passed);
+            assert!(
+                malformed_calibration_gate
+                    .failures
+                    .contains(&PublicEcapaChangeGateFailure::TopologyResourceExceeded)
+            );
+
+            let incomplete_memory = PublicEcapaResidualBirthMemoryObservation::new();
+            let incomplete_memory_gate = public_ecapa_change_gate_row(
+                &fixture,
+                &rows,
+                &expected_bindings,
+                &expected_outputs,
+                policy.clone(),
+                policy_sha256.clone(),
+                protocol_sha256.clone(),
+                arm_execution_failure_count,
+                &incomplete_memory,
+            );
+            assert!(!incomplete_memory_gate.passed);
+            assert!(
+                incomplete_memory_gate
+                    .failures
+                    .contains(&PublicEcapaChangeGateFailure::MissingAuthoritativeRss)
+            );
+        }
+        assert!(
+            gate.passed,
+            "ECAPA change-detector candidate did not pass its frozen public-development gate: {:?}",
+            gate.failures
+        );
+    }
+
+    #[test]
     #[ignore = "requires the frozen public AMI dev8 corpus and converted ECAPA weights"]
     fn external_ecapa_residual_birth_same_invocation_development_gate() {
         let fixture = load_frozen_ecapa_dev8();
@@ -20867,7 +24414,6 @@ mod tests {
                     frozen.common_observation_sha256(),
                     prepared.common_observation_sha256()
                 );
-                assert!(frozen.count_constraints_feasible());
                 assert!(frozen.profile_row_count() > 0);
                 assert!(frozen.profile_row_count() <= gate_policy.maximum_total_profile_row_count);
                 assert!(
@@ -20984,6 +24530,10 @@ mod tests {
                         frozen.speaker_count_evidence_sha256()
                     );
                     assert_eq!(
+                        run.frozen_count_estimate_present,
+                        frozen.frozen_count_estimate_present(),
+                    );
+                    assert_eq!(
                         run.hard_hint_input_topology_sha256,
                         frozen.hard_hint_input_topology_sha256()
                     );
@@ -20997,9 +24547,19 @@ mod tests {
                     );
                     assert_eq!(run.forced_tracklet_count, frozen.forced_tracklet_count());
                     assert_eq!(
+                        run.frozen_executed_clustering_mode,
+                        frozen.frozen_executed_clustering_mode(),
+                    );
+                    assert_eq!(
+                        run.frozen_operational_partition_method,
+                        frozen.frozen_operational_partition_method(),
+                    );
+                    assert_eq!(run.frozen_route_eligible, frozen.frozen_route_eligible());
+                    assert_eq!(
                         run.profile_redecode.profile_row_count,
                         if expected_mode
                             == crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1
+                            && frozen.frozen_route_eligible()
                         {
                             frozen.profile_row_count()
                         } else {
@@ -21007,13 +24567,39 @@ mod tests {
                         }
                     );
                     assert_eq!(run.new_inference_count, 0);
-                    assert!(run.frozen_count_constraints_feasible);
+                    assert_eq!(
+                        run.frozen_count_constraints_feasible,
+                        frozen.count_constraints_feasible(),
+                    );
                 }
                 for run in [&candidate_run, &candidate_replay_run] {
                     assert!(
                         !run.profile_redecode.applied || run.clustering.constraints_satisfied,
                         "only an applied candidate must satisfy output constraints"
                     );
+                    if !frozen.frozen_route_eligible() {
+                        assert!(!run.profile_redecode.applied);
+                        assert_eq!(
+                            run.profile_redecode.fallback_reason,
+                            Some(
+                                crate::diarization::SupportedProfileRedecodeFallbackReason::IneligibleRoute,
+                            ),
+                        );
+                        assert_eq!(run.profile_redecode.profile_row_count, 0);
+                        assert_eq!(run.profile_redecode.supported_speaker_count, 0);
+                        assert_eq!(run.profile_redecode.changed_assignment_count, 0);
+                        assert!(run.profile_redecode.structural_output_sha256.is_none());
+                        assert_eq!(
+                            run.profile_redecode.resources,
+                            crate::diarization::SupportedProfileRedecodeResourceSummary::default(),
+                        );
+                        assert!(
+                            crate::diarization::prepared_supported_profile_redecode_outputs_identical(
+                                &baseline_run,
+                                run,
+                            ),
+                        );
+                    }
                 }
 
                 let baseline_score = score_path_free_ecapa_report(
@@ -21030,16 +24616,6 @@ mod tests {
                     recording.reference,
                     &candidate_replay_run.report,
                     &fixture.scorer_config,
-                );
-                expected_pair_bindings.push(
-                    public_supported_profile_redecode_expected_pair_binding(
-                        &recording.reference.recording_id,
-                        recording.reference.duration_ms,
-                        &recording.source_audio_sha256,
-                        &baseline_score,
-                        &candidate_score,
-                        &candidate_replay_score,
-                    ),
                 );
                 let baseline = public_supported_profile_redecode_arm_row(
                     &baseline_run,
@@ -21154,6 +24730,16 @@ mod tests {
                 row.deterministic_accuracy_sha256 =
                     public_supported_profile_redecode_pair_accuracy_sha256(&row);
                 row.row_sha256 = public_supported_profile_redecode_pair_result_sha256(&row);
+                expected_pair_bindings.push(
+                    public_supported_profile_redecode_expected_pair_binding(
+                        &row,
+                        &recording.source_audio_sha256,
+                        &frozen,
+                        &baseline_score,
+                        &candidate_score,
+                        &candidate_replay_score,
+                    ),
+                );
                 let serialized = serialize_path_free_public_ecapa_evidence(
                     &row,
                     &[

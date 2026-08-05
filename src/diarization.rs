@@ -7628,7 +7628,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v18-calibrated-separation-development";
+    "acoustic-clustering-probabilistic-v19-typed-fused-consensus-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -7972,6 +7972,8 @@ pub(crate) fn supported_profile_redecode_policy_sha256() -> String {
         ACOUSTIC_ASSIGNMENT_CONFIDENCE_CALIBRATION_VERSION,
         "route:ecapa-only",
         "route:ecapa-with-acoustic-channel",
+        "partition:ecapa-only=ecapa-spherical",
+        "partition:ecapa-with-acoustic-channel=ecapa-fused-consensus",
     ] {
         hasher.update(identity.as_bytes());
         hasher.update([0]);
@@ -8073,6 +8075,8 @@ pub(crate) fn supported_profile_redecode_policy_sha256() -> String {
         b"packed-backpointers-bounded-scratch-v1",
         b"zero-profile-updates-zero-model-calls-v1",
         b"fail-closed-original-incumbent-v1",
+        b"route-eligibility-binds-exact-evidence-partition-pair-count-and-constraints-v2",
+        b"ineligible-candidate-is-deterministic-noop-with-default-resources-v1",
         b"route:development-only-no-env-no-default-flip-v1",
     ] {
         hasher.update(rule);
@@ -8249,6 +8253,35 @@ pub fn acoustic_change_calibration_sha256() -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Stable identity of every behavior-defining selector input for one detector.
+///
+/// The public development gates use this instead of hashing only an enum tag:
+/// the fixed-safe route also depends on its distance mapping and suppression
+/// horizon, while the variance-aware routes depend on the complete calibrated
+/// posterior contract.
+#[cfg(test)]
+pub(crate) fn acoustic_change_detector_configuration_sha256(
+    mode: AcousticChangeDetectorMode,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"acoustic-change-detector-configuration-v1\0");
+    hasher.update(mode.id().as_bytes());
+    hasher.update([0]);
+    hasher.update(ACOUSTIC_FEATURE_SCHEMA_VERSION.as_bytes());
+    hasher.update(acoustic_change_calibration_sha256().as_bytes());
+    for scale in CHANGE_SCALES_FRAMES {
+        hasher.update((scale as u64).to_le_bytes());
+    }
+    hasher.update((CHANGE_RING_FRAMES as u64).to_le_bytes());
+    if mode == AcousticChangeDetectorMode::FixedSafeV1 {
+        hasher.update(ACOUSTIC_CHANGE_FIXED_SAFE_VERSION.as_bytes());
+        hasher.update(CHANGE_FALLBACK_DISTANCE_THRESHOLD.to_bits().to_le_bytes());
+        hasher.update(10.0_f32.to_bits().to_le_bytes());
+        hasher.update((CHANGE_FIXED_SAFE_SUPPRESSION_FRAMES as u64).to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// Deterministic action selected by the acoustic change controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcousticChangeAction {
@@ -8305,10 +8338,18 @@ pub struct ChangePointEvidence {
 /// opts in so it can reduce the complete score stream to aggregate threshold
 /// and calibration diagnostics. The evaluator's existing audio-byte cap gives
 /// this duration-proportional diagnostic state a fixed upper bound.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AcousticChangeEvaluationPoint {
+    /// Detector-independent center of the analysis window. Unlike
+    /// `evidence.boundary_ms`, this is not refined or snapped by an arm.
+    pub evaluation_center_ms: u64,
+    pub evidence: ChangePointEvidence,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct AcousticChangeEvaluationEvidence {
     pub emitted: Vec<ChangePointEvidence>,
-    pub evaluated: Vec<ChangePointEvidence>,
+    pub evaluated: Vec<AcousticChangeEvaluationPoint>,
 }
 
 /// Aggregate-safe clustering diagnostics returned only to evaluators.
@@ -8544,7 +8585,7 @@ struct AcousticSegmenter<'a> {
     detected_boundaries: BTreeMap<usize, ChangePointEvidence>,
     emitted_boundaries: BTreeMap<usize, ChangePointEvidence>,
     capture_evaluation_evidence: bool,
-    evaluated_change_evidence: Vec<ChangePointEvidence>,
+    evaluated_change_evidence: Vec<AcousticChangeEvaluationPoint>,
     peak_selector: ChangePeakSelector,
     ring: VecDeque<AcousticFrameFeatures>,
     sidecar_signal_ring: Option<VecDeque<AcousticSidecarBoundarySignal>>,
@@ -8948,7 +8989,11 @@ impl<'a> AcousticSegmenter<'a> {
             }
         }
         if self.capture_evaluation_evidence {
-            self.evaluated_change_evidence.push(evidence.clone());
+            self.evaluated_change_evidence
+                .push(AcousticChangeEvaluationPoint {
+                    evaluation_center_ms: self.ring[center].start_ms,
+                    evidence: evidence.clone(),
+                });
         }
         let decision_threshold = acoustic_change_calibration().decision_probability;
         if evidence.change_probability >= decision_threshold {
@@ -10320,7 +10365,7 @@ fn fixed_change_score_probability(score: f32) -> f32 {
 /// consumes the bounded public-corpus score stream and returns acoustic
 /// candidates only; it never changes the production operating point.
 pub(crate) fn select_acoustic_change_evidence_at_threshold(
-    evaluated: &[ChangePointEvidence],
+    evaluated: &[AcousticChangeEvaluationPoint],
     threshold: f32,
 ) -> FwResult<Vec<ChangePointEvidence>> {
     if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
@@ -10331,18 +10376,19 @@ pub(crate) fn select_acoustic_change_evidence_at_threshold(
     let mut selected = BTreeMap::<usize, ChangePointEvidence>::new();
     let detector_mode = evaluated.first().map_or(
         AcousticChangeDetectorMode::CalibratedPosterior,
-        |evidence| evidence.detector_mode,
+        |evaluated| evaluated.evidence.detector_mode,
     );
     if evaluated
         .iter()
-        .any(|evidence| evidence.detector_mode != detector_mode)
+        .any(|evaluated| evaluated.evidence.detector_mode != detector_mode)
     {
         return Err(FwError::InvalidRequest(
             "speaker-change evaluation stream mixes detector modes".to_owned(),
         ));
     }
     let mut selector = ChangePeakSelector::new(detector_mode, threshold);
-    for (frame_index, evidence) in evaluated.iter().enumerate() {
+    for (frame_index, evaluated) in evaluated.iter().enumerate() {
+        let evidence = &evaluated.evidence;
         if !evidence.change_probability.is_finite() {
             return Err(FwError::InvalidRequest(
                 "speaker-change evaluation probability must be finite".to_owned(),
@@ -12175,6 +12221,53 @@ pub fn diarize_ecapa_pcm(
     Ok((report, projection))
 }
 
+/// Run one explicit change-detector arm through the complete ECAPA pipeline.
+///
+/// This seam is deliberately test-only. Unlike the residual-birth evaluator,
+/// detector arms must prepare their own tracklet topology: sharing a prepared
+/// observation would freeze the very boundaries under evaluation. Production
+/// remains hard-routed through [`diarize_ecapa_pcm`] and `FixedSafeV1`.
+#[cfg(test)]
+pub(crate) fn diarize_ecapa_pcm_with_detector_evidence(
+    input: AcousticDiarizationInput<'_>,
+    model: &EcapaModel,
+    detector_mode: AcousticChangeDetectorMode,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<(
+    DiarizationReport,
+    DiarizationProjection,
+    AcousticChangeEvaluationEvidence,
+    AcousticClusteringEvaluationEvidence,
+)> {
+    let evidence_mode = match input.request.engine {
+        DiarizationEngine::Ecapa => DiarizationSpeakerEvidenceMode::EcapaOnly,
+        DiarizationEngine::EcapaFused => DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+        engine => {
+            return Err(FwError::InvalidRequest(format!(
+                "ECAPA detector evaluation requires the ecapa or ecapa_fused engine, not {engine:?}"
+            )));
+        }
+    };
+    let cancellation = CheckpointCancellationAdapter::new(checkpoint);
+    let outcome = diarize_acoustic_pcm_with_detector_evidence_internal(
+        input,
+        AcousticFeatureAblation::FullV2,
+        detector_mode,
+        AcousticClusteringMode::ProbabilisticV1,
+        None,
+        true,
+        SpeakerRepresentationProvider::EcapaTdnnV1 {
+            model,
+            checkpoint,
+            evidence_mode,
+        },
+        || cancellation.is_cancelled(),
+    );
+    let (report, projection, change_evidence, clustering_evidence, _) =
+        cancellation.restore(outcome)?;
+    Ok((report, projection, change_evidence, clustering_evidence))
+}
+
 const MIN_ECAPA_TRACKLET_VOICED_FRAMES: usize = 20;
 const ECAPA_HELDOUT_MINIMUM_SOURCE_SAMPLES: usize = ECAPA_SAMPLE_RATE_HZ * 2;
 const ECAPA_HELDOUT_SINGLETON_MIN_TOTAL_WEIGHT: f32 = 200.0;
@@ -12199,7 +12292,7 @@ const ECAPA_RESIDUAL_BIRTH_MAX_SCRATCH_PAYLOAD_BYTES: u64 = 64 * 1024;
 
 /// Frozen identity for the evaluation-only supported-profile redecode policy.
 pub(crate) const SUPPORTED_PROFILE_REDECODE_VERSION: &str =
-    "supported-profile-constrained-redecode-v1-development";
+    "supported-profile-constrained-redecode-v3-development";
 pub(crate) const SUPPORTED_PROFILE_REDECODE_BASELINE_VERSION: &str = "post-retention-incumbent-v1";
 pub(crate) const SUPPORTED_PROFILE_REDECODE_EVIDENCE_SCHEMA_VERSION: &str =
     "supported-profile-redecode-evidence-v1";
@@ -12577,10 +12670,14 @@ pub(crate) struct PreparedSupportedProfileRedecodeEvaluation {
     frozen_support_summary_sha256: String,
     speaker_count_estimate_sha256: String,
     speaker_count_evidence_sha256: String,
+    frozen_count_estimate_present: bool,
     hard_hint_input_topology_sha256: String,
     overlap_input_topology_sha256: String,
     final_forced_row_output_sha256: String,
     forced_tracklet_count: u64,
+    frozen_executed_clustering_mode: AcousticClusteringMode,
+    frozen_operational_partition_method: Option<DiarizationOperationalPartitionMethod>,
+    frozen_route_eligible: bool,
 }
 
 #[cfg(test)]
@@ -12616,6 +12713,11 @@ impl PreparedSupportedProfileRedecodeEvaluation {
     }
 
     #[must_use]
+    pub(crate) fn frozen_count_estimate_present(&self) -> bool {
+        self.frozen_count_estimate_present
+    }
+
+    #[must_use]
     pub(crate) fn hard_hint_input_topology_sha256(&self) -> &str {
         &self.hard_hint_input_topology_sha256
     }
@@ -12644,6 +12746,23 @@ impl PreparedSupportedProfileRedecodeEvaluation {
     pub(crate) fn forced_tracklet_count(&self) -> u64 {
         self.forced_tracklet_count
     }
+
+    #[must_use]
+    pub(crate) fn frozen_executed_clustering_mode(&self) -> AcousticClusteringMode {
+        self.frozen_executed_clustering_mode
+    }
+
+    #[must_use]
+    pub(crate) fn frozen_operational_partition_method(
+        &self,
+    ) -> Option<DiarizationOperationalPartitionMethod> {
+        self.frozen_operational_partition_method
+    }
+
+    #[must_use]
+    pub(crate) fn frozen_route_eligible(&self) -> bool {
+        self.frozen_route_eligible
+    }
 }
 
 /// One arm of the paired supported-profile redecode experiment.
@@ -12659,11 +12778,15 @@ pub(crate) struct SupportedProfileRedecodeEvaluationRun {
     pub frozen_support_summary_sha256: String,
     pub speaker_count_estimate_sha256: String,
     pub speaker_count_evidence_sha256: String,
+    pub frozen_count_estimate_present: bool,
     pub hard_hint_input_topology_sha256: String,
     pub overlap_input_topology_sha256: String,
     pub final_forced_row_output_sha256: String,
     pub frozen_count_constraints_feasible: bool,
     pub forced_tracklet_count: u64,
+    pub frozen_executed_clustering_mode: AcousticClusteringMode,
+    pub frozen_operational_partition_method: Option<DiarizationOperationalPartitionMethod>,
+    pub frozen_route_eligible: bool,
     pub new_inference_count: u64,
     pub policy_sha256: String,
 }
@@ -13714,9 +13837,33 @@ fn supported_profile_redecode_profile_topology_sha256(
     clustering: &AcousticClusteringResult,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"supported-profile-redecode-profile-set-v1\0");
+    hasher.update(b"supported-profile-redecode-profile-set-v3\0");
     hasher.update(supported_profile_redecode_policy_sha256().as_bytes());
     hasher.update(common_observation_sha256.as_bytes());
+    hasher.update(clustering.requested_mode.id().as_bytes());
+    hasher.update([0]);
+    hasher.update(clustering.executed_mode.id().as_bytes());
+    hasher.update([0]);
+    match clustering
+        .operational_partition
+        .as_ref()
+        .map(|partition| partition.method)
+    {
+        Some(DiarizationOperationalPartitionMethod::FixedSafeAgglomerative) => {
+            hasher.update(b"fixed_safe_agglomerative")
+        }
+        Some(DiarizationOperationalPartitionMethod::ProbabilisticConsensus) => {
+            hasher.update(b"probabilistic_consensus")
+        }
+        Some(DiarizationOperationalPartitionMethod::EcapaSpherical) => {
+            hasher.update(b"ecapa_spherical")
+        }
+        Some(DiarizationOperationalPartitionMethod::EcapaFusedConsensus) => {
+            hasher.update(b"ecapa_fused_consensus")
+        }
+        None => hasher.update(b"none"),
+    }
+    hasher.update([0]);
     hasher.update((clustering.profiles.len() as u64).to_le_bytes());
     for (ordinal, profile) in clustering.profiles.iter().enumerate() {
         for value in [
@@ -13805,17 +13952,39 @@ fn supported_profile_redecode_frozen_support_summary_sha256(
 
 #[cfg(test)]
 fn supported_profile_redecode_count_estimate_sha256(
-    estimate: &SpeakerCountEstimate,
+    estimate: Option<&SpeakerCountEstimate>,
 ) -> FwResult<String> {
-    let encoded = serde_json::to_vec(estimate).map_err(|error| {
-        FwError::ContractViolation(format!(
-            "failed to encode privacy-safe speaker-count estimate: {error}"
-        ))
-    })?;
     let mut hasher = Sha256::new();
-    hasher.update(b"supported-profile-redecode-count-estimate-v1\0");
-    hasher.update(encoded);
+    hasher.update(b"supported-profile-redecode-count-estimate-v2\0");
+    match estimate {
+        Some(estimate) => {
+            let encoded = serde_json::to_vec(estimate).map_err(|error| {
+                FwError::ContractViolation(format!(
+                    "failed to encode privacy-safe speaker-count estimate: {error}"
+                ))
+            })?;
+            hasher.update([1]);
+            hasher.update(encoded);
+        }
+        None => hasher.update([0]),
+    }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+fn supported_profile_redecode_count_evidence_sha256(
+    common_observation_sha256: &str,
+    estimate: Option<&SpeakerCountEstimate>,
+) -> String {
+    match estimate {
+        Some(estimate) => estimate.evidence_sha256.clone(),
+        None => {
+            let mut hasher = Sha256::new();
+            hasher.update(b"supported-profile-redecode-count-evidence-absent-v1\0");
+            hasher.update(common_observation_sha256.as_bytes());
+            format!("{:x}", hasher.finalize())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -14003,26 +14172,6 @@ where
             "supported-profile redecode did not capture its post-retention incumbent".to_owned(),
         )
     })?;
-    if clustering.executed_mode != AcousticClusteringMode::ProbabilisticV1
-        || !matches!(
-            prepared.evidence_mode,
-            DiarizationSpeakerEvidenceMode::EcapaOnly
-                | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
-        )
-        || clustering
-            .operational_partition
-            .as_ref()
-            .is_none_or(|partition| {
-                partition.method != DiarizationOperationalPartitionMethod::EcapaSpherical
-            })
-        || clustering.count_estimate.is_none()
-        || !incumbent.count_constraints_feasible
-    {
-        return Err(FwError::ContractViolation(
-            "supported-profile redecode requires an authoritative ECAPA probabilistic incumbent"
-                .to_owned(),
-        ));
-    }
     if incumbent.assignments != clustering.assignments
         || incumbent.speaker_evidence != clustering.speaker_evidence
     {
@@ -14042,14 +14191,26 @@ where
         &prepared.common_observation_sha256,
         &incumbent.speaker_evidence,
     );
-    let count_estimate = clustering.count_estimate.as_ref().ok_or_else(|| {
-        FwError::ContractViolation(
-            "frozen redecode incumbent lost speaker-count evidence".to_owned(),
-        )
-    })?;
+    let count_estimate = clustering.count_estimate.as_ref();
+    let frozen_count_estimate_present = count_estimate.is_some();
     let speaker_count_estimate_sha256 =
         supported_profile_redecode_count_estimate_sha256(count_estimate)?;
-    let speaker_count_evidence_sha256 = count_estimate.evidence_sha256.clone();
+    let speaker_count_evidence_sha256 = supported_profile_redecode_count_evidence_sha256(
+        &prepared.common_observation_sha256,
+        count_estimate,
+    );
+    let frozen_executed_clustering_mode = clustering.executed_mode;
+    let frozen_operational_partition_method = clustering
+        .operational_partition
+        .as_ref()
+        .map(|partition| partition.method);
+    let frozen_route_eligible = supported_profile_redecode_route_eligible(
+        frozen_executed_clustering_mode,
+        prepared.evidence_mode,
+        frozen_operational_partition_method,
+        frozen_count_estimate_present,
+        incumbent.count_constraints_feasible,
+    );
     let (hard_hint_input_topology_sha256, overlap_input_topology_sha256) =
         supported_profile_redecode_constraint_topology_sha256(
             &prepared.common_observation_sha256,
@@ -14076,10 +14237,14 @@ where
         frozen_support_summary_sha256,
         speaker_count_estimate_sha256,
         speaker_count_evidence_sha256,
+        frozen_count_estimate_present,
         hard_hint_input_topology_sha256,
         overlap_input_topology_sha256,
         final_forced_row_output_sha256,
         forced_tracklet_count,
+        frozen_executed_clustering_mode,
+        frozen_operational_partition_method,
+        frozen_route_eligible,
     })
 }
 
@@ -14095,9 +14260,8 @@ where
     C: FnMut() -> bool,
 {
     validate_prepared_ecapa_evaluation_integrity(prepared)?;
-    let count_estimate = frozen.clustering.count_estimate.as_ref().ok_or_else(|| {
-        FwError::ContractViolation("frozen redecode state lost speaker-count evidence".to_owned())
-    })?;
+    let count_estimate = frozen.clustering.count_estimate.as_ref();
+    let current_count_estimate_present = count_estimate.is_some();
     let (hard_hint_input_topology_sha256, overlap_input_topology_sha256) =
         supported_profile_redecode_constraint_topology_sha256(
             &frozen.common_observation_sha256,
@@ -14105,6 +14269,18 @@ where
             &frozen.enrollment,
             &frozen.incumbent,
         );
+    let current_operational_partition_method = frozen
+        .clustering
+        .operational_partition
+        .as_ref()
+        .map(|partition| partition.method);
+    let current_route_eligible = supported_profile_redecode_route_eligible(
+        frozen.clustering.executed_mode,
+        prepared.evidence_mode,
+        current_operational_partition_method,
+        current_count_estimate_present,
+        frozen.incumbent.count_constraints_feasible,
+    );
     if frozen.common_observation_sha256 != prepared.common_observation_sha256
         || supported_profile_redecode_incumbent_partition_sha256(
             &frozen.common_observation_sha256,
@@ -14120,7 +14296,11 @@ where
         ) != frozen.frozen_support_summary_sha256
         || supported_profile_redecode_count_estimate_sha256(count_estimate)?
             != frozen.speaker_count_estimate_sha256
-        || count_estimate.evidence_sha256 != frozen.speaker_count_evidence_sha256
+        || supported_profile_redecode_count_evidence_sha256(
+            &frozen.common_observation_sha256,
+            count_estimate,
+        ) != frozen.speaker_count_evidence_sha256
+        || current_count_estimate_present != frozen.frozen_count_estimate_present
         || hard_hint_input_topology_sha256 != frozen.hard_hint_input_topology_sha256
         || overlap_input_topology_sha256 != frozen.overlap_input_topology_sha256
         || supported_profile_redecode_final_forced_row_output_sha256(
@@ -14132,6 +14312,9 @@ where
         )? != frozen.final_forced_row_output_sha256
         || supported_profile_redecode_forced_tracklet_count(&frozen.incumbent.assignments)
             != frozen.forced_tracklet_count
+        || frozen.clustering.executed_mode != frozen.frozen_executed_clustering_mode
+        || current_operational_partition_method != frozen.frozen_operational_partition_method
+        || current_route_eligible != frozen.frozen_route_eligible
     {
         return Err(FwError::ContractViolation(
             "frozen supported-profile redecode state changed between paired arms".to_owned(),
@@ -14145,18 +14328,30 @@ where
             &frozen.common_observation_sha256,
             prepared.tracklets.len(),
         ),
-        SupportedProfileRedecodeMode::DevelopmentCandidateV1 => apply_supported_profile_redecode(
-            &prepared.tracklets,
-            &frozen.incumbent.clusters,
-            &frozen.incumbent.labels,
-            &frozen.enrollment,
-            &frozen.incumbent.speaker_evidence,
-            &prepared.request.speaker_count,
-            &mut clustering.assignments,
-            Some(&prepared.neural_embeddings),
-            &frozen.common_observation_sha256,
-            &mut is_cancelled,
-        ),
+        SupportedProfileRedecodeMode::DevelopmentCandidateV1 if frozen.frozen_route_eligible => {
+            apply_supported_profile_redecode(
+                &prepared.tracklets,
+                &frozen.incumbent.clusters,
+                &frozen.incumbent.labels,
+                &frozen.enrollment,
+                &frozen.incumbent.speaker_evidence,
+                &prepared.request.speaker_count,
+                &mut clustering.assignments,
+                Some(&prepared.neural_embeddings),
+                &frozen.common_observation_sha256,
+                &mut is_cancelled,
+            )
+        }
+        SupportedProfileRedecodeMode::DevelopmentCandidateV1 => {
+            let mut evidence = supported_profile_redecode_evidence(
+                mode,
+                &frozen.common_observation_sha256,
+                prepared.tracklets.len(),
+            );
+            evidence.fallback_reason =
+                Some(SupportedProfileRedecodeFallbackReason::IneligibleRoute);
+            evidence
+        }
     };
     let detected_speakers = clustering
         .assignments
@@ -14218,11 +14413,15 @@ where
         frozen_support_summary_sha256: frozen.frozen_support_summary_sha256.clone(),
         speaker_count_estimate_sha256: frozen.speaker_count_estimate_sha256.clone(),
         speaker_count_evidence_sha256: frozen.speaker_count_evidence_sha256.clone(),
+        frozen_count_estimate_present: frozen.frozen_count_estimate_present,
         hard_hint_input_topology_sha256: frozen.hard_hint_input_topology_sha256.clone(),
         overlap_input_topology_sha256: frozen.overlap_input_topology_sha256.clone(),
         final_forced_row_output_sha256,
         frozen_count_constraints_feasible: frozen.incumbent.count_constraints_feasible,
         forced_tracklet_count: frozen.forced_tracklet_count,
+        frozen_executed_clustering_mode: frozen.frozen_executed_clustering_mode,
+        frozen_operational_partition_method: frozen.frozen_operational_partition_method,
+        frozen_route_eligible: frozen.frozen_route_eligible,
         new_inference_count: 0,
         policy_sha256: supported_profile_redecode_policy_sha256(),
     })
@@ -14255,11 +14454,15 @@ pub(crate) fn prepared_supported_profile_redecode_runs_identical(
         && left.frozen_support_summary_sha256 == right.frozen_support_summary_sha256
         && left.speaker_count_estimate_sha256 == right.speaker_count_estimate_sha256
         && left.speaker_count_evidence_sha256 == right.speaker_count_evidence_sha256
+        && left.frozen_count_estimate_present == right.frozen_count_estimate_present
         && left.hard_hint_input_topology_sha256 == right.hard_hint_input_topology_sha256
         && left.overlap_input_topology_sha256 == right.overlap_input_topology_sha256
         && left.final_forced_row_output_sha256 == right.final_forced_row_output_sha256
         && left.frozen_count_constraints_feasible == right.frozen_count_constraints_feasible
         && left.forced_tracklet_count == right.forced_tracklet_count
+        && left.frozen_executed_clustering_mode == right.frozen_executed_clustering_mode
+        && left.frozen_operational_partition_method == right.frozen_operational_partition_method
+        && left.frozen_route_eligible == right.frozen_route_eligible
         && left.new_inference_count == right.new_inference_count
         && left.policy_sha256 == right.policy_sha256
 }
@@ -16227,17 +16430,15 @@ where
         common_observation_sha256,
         tracklets.len(),
     );
-    let profile_redecode_route_eligible = executed_mode == AcousticClusteringMode::ProbabilisticV1
-        && matches!(
-            evidence_mode,
-            DiarizationSpeakerEvidenceMode::EcapaOnly
-                | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
-        )
-        && operational_partition.as_ref().is_some_and(|partition| {
-            partition.method == DiarizationOperationalPartitionMethod::EcapaSpherical
-        })
-        && count_constraints_feasible
-        && count_estimate.is_some();
+    let profile_redecode_route_eligible = supported_profile_redecode_route_eligible(
+        executed_mode,
+        evidence_mode,
+        operational_partition
+            .as_ref()
+            .map(|partition| partition.method),
+        count_estimate.is_some(),
+        count_constraints_feasible,
+    );
     if profile_redecode_mode == SupportedProfileRedecodeMode::DevelopmentCandidateV1
         && profile_redecode_route_eligible
     {
@@ -18599,7 +18800,7 @@ fn operational_partition_summary(
     authority: SpeakerCountCalibrationStatus,
 ) -> FwResult<DiarizationOperationalPartitionSummary> {
     let summary = DiarizationOperationalPartitionSummary {
-        schema_version: "diarization-operational-partition-v1".to_owned(),
+        schema_version: "diarization-operational-partition-v2".to_owned(),
         method,
         selected_count: u32::try_from(selected_count).map_err(|_| {
             FwError::InvalidRequest(
@@ -18777,12 +18978,22 @@ where
             count_merge_steps: full_lane_merge_steps,
         });
     };
-    let operational_partition = operational_partition_summary(
-        if used_neural_spherical_partition {
+    let operational_partition_method = match (used_neural_spherical_partition, evidence_mode) {
+        (true, DiarizationSpeakerEvidenceMode::EcapaOnly) => {
             DiarizationOperationalPartitionMethod::EcapaSpherical
-        } else {
-            DiarizationOperationalPartitionMethod::ProbabilisticConsensus
-        },
+        }
+        (true, _) => {
+            return Err(FwError::ContractViolation(
+                "neural spherical partition crossed its ECAPA-only evidence boundary".to_owned(),
+            ));
+        }
+        (false, DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel) => {
+            DiarizationOperationalPartitionMethod::EcapaFusedConsensus
+        }
+        (false, _) => DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
+    };
+    let operational_partition = operational_partition_summary(
+        operational_partition_method,
         selected_count,
         feature_stability,
         pair_calibration_sha256.to_owned(),
@@ -18950,6 +19161,28 @@ fn residual_birth_evidence(
     }
 }
 
+fn supported_profile_redecode_route_eligible(
+    executed_mode: AcousticClusteringMode,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
+    operational_partition_method: Option<DiarizationOperationalPartitionMethod>,
+    count_estimate_present: bool,
+    count_constraints_feasible: bool,
+) -> bool {
+    executed_mode == AcousticClusteringMode::ProbabilisticV1
+        && matches!(
+            (evidence_mode, operational_partition_method),
+            (
+                DiarizationSpeakerEvidenceMode::EcapaOnly,
+                Some(DiarizationOperationalPartitionMethod::EcapaSpherical),
+            ) | (
+                DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+                Some(DiarizationOperationalPartitionMethod::EcapaFusedConsensus),
+            )
+        )
+        && count_estimate_present
+        && count_constraints_feasible
+}
+
 fn supported_profile_redecode_evidence(
     mode: SupportedProfileRedecodeMode,
     common_observation_sha256: &str,
@@ -18988,6 +19221,7 @@ fn residual_birth_count_evidence_sha256(
         DiarizationOperationalPartitionMethod::FixedSafeAgglomerative => "fixed_safe_agglomerative",
         DiarizationOperationalPartitionMethod::ProbabilisticConsensus => "probabilistic_consensus",
         DiarizationOperationalPartitionMethod::EcapaSpherical => "ecapa_spherical",
+        DiarizationOperationalPartitionMethod::EcapaFusedConsensus => "ecapa_fused_consensus",
     };
     let partition_authority = match prior_partition.authority {
         SpeakerCountCalibrationStatus::Certified => "certified",
@@ -31171,15 +31405,15 @@ mod tests {
         assert_eq!(fused_evidence.submitted_frame_count, frame_count);
         assert!(fused_evidence.calibrated_signal_count < frame_count);
         assert!(
-            fused_changes
-                .evaluated
-                .iter()
-                .all(|evidence| evidence.raw_log_odds.is_finite()
-                    && evidence.change_probability.is_finite())
+            fused_changes.evaluated.iter().all(|evaluated| evaluated
+                .evidence
+                .raw_log_odds
+                .is_finite()
+                && evaluated.evidence.change_probability.is_finite())
         );
-        assert!(fused_changes.evaluated.iter().any(|evidence| {
-            evidence.calibration_id == super::ACOUSTIC_SIDECAR_FUSION_VERSION
-                && evidence.raw_log_odds == f32::MAX
+        assert!(fused_changes.evaluated.iter().any(|evaluated| {
+            evaluated.evidence.calibration_id == super::ACOUSTIC_SIDECAR_FUSION_VERSION
+                && evaluated.evidence.raw_log_odds == f32::MAX
         }));
         let debug = format!("{fused_evidence:?}");
         assert!(!debug.contains("AcousticSidecarStudyObservation"));
@@ -31584,6 +31818,22 @@ mod tests {
         assert_eq!(hash.len(), 64);
         assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(hash, super::acoustic_change_calibration_sha256());
+
+        let fixed_safe = super::acoustic_change_detector_configuration_sha256(
+            super::AcousticChangeDetectorMode::FixedSafeV1,
+        );
+        let calibrated = super::acoustic_change_detector_configuration_sha256(
+            super::AcousticChangeDetectorMode::CalibratedPosterior,
+        );
+        assert_eq!(fixed_safe.len(), 64);
+        assert!(fixed_safe.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            fixed_safe,
+            super::acoustic_change_detector_configuration_sha256(
+                super::AcousticChangeDetectorMode::FixedSafeV1,
+            )
+        );
+        assert_ne!(fixed_safe, calibrated);
     }
 
     #[test]
@@ -34194,6 +34444,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn supported_profile_redecode_route_requires_exact_typed_partition_pair() {
+        use crate::model::{
+            DiarizationOperationalPartitionMethod as Method,
+            DiarizationSpeakerEvidenceMode as Evidence,
+        };
+
+        let eligible = |evidence, method, count_present, constraints_feasible| {
+            super::supported_profile_redecode_route_eligible(
+                super::AcousticClusteringMode::ProbabilisticV1,
+                evidence,
+                method,
+                count_present,
+                constraints_feasible,
+            )
+        };
+        assert!(eligible(
+            Evidence::EcapaOnly,
+            Some(Method::EcapaSpherical),
+            true,
+            true,
+        ));
+        assert!(eligible(
+            Evidence::EcapaWithAcousticChannel,
+            Some(Method::EcapaFusedConsensus),
+            true,
+            true,
+        ));
+        for (evidence, method) in [
+            (Evidence::EcapaOnly, Some(Method::EcapaFusedConsensus)),
+            (
+                Evidence::EcapaWithAcousticChannel,
+                Some(Method::EcapaSpherical),
+            ),
+            (Evidence::EcapaOnly, Some(Method::ProbabilisticConsensus)),
+            (
+                Evidence::EcapaWithAcousticChannel,
+                Some(Method::ProbabilisticConsensus),
+            ),
+            (Evidence::AcousticV2, Some(Method::EcapaFusedConsensus)),
+            (Evidence::External, Some(Method::EcapaFusedConsensus)),
+            (Evidence::None, None),
+        ] {
+            assert!(!eligible(evidence, method, true, true));
+        }
+        assert!(!eligible(
+            Evidence::EcapaOnly,
+            Some(Method::EcapaSpherical),
+            false,
+            true,
+        ));
+        assert!(!eligible(
+            Evidence::EcapaWithAcousticChannel,
+            Some(Method::EcapaFusedConsensus),
+            true,
+            false,
+        ));
+        assert!(!super::supported_profile_redecode_route_eligible(
+            super::AcousticClusteringMode::FixedSafeV1,
+            Evidence::EcapaWithAcousticChannel,
+            Some(Method::EcapaFusedConsensus),
+            true,
+            true,
+        ));
+        assert_eq!(
+            DiarizationRequest::default().engine,
+            DiarizationEngine::Auto,
+            "the development-only redecode route must not change the production default",
+        );
+    }
+
     fn prepared_ecapa_hash_fixture() -> super::PreparedEcapaDiarizationEvaluation {
         let (tracklets, neural_embeddings, _) = residual_birth_fixture();
         let request = DiarizationRequest {
@@ -34332,6 +34653,16 @@ mod tests {
         )
         .expect("independent frozen candidate replay");
         assert!(frozen.count_constraints_feasible());
+        assert!(frozen.frozen_count_estimate_present());
+        assert!(frozen.frozen_route_eligible());
+        assert_eq!(
+            frozen.frozen_executed_clustering_mode(),
+            super::AcousticClusteringMode::ProbabilisticV1,
+        );
+        assert_eq!(
+            frozen.frozen_operational_partition_method(),
+            Some(crate::model::DiarizationOperationalPartitionMethod::EcapaSpherical),
+        );
         assert_eq!(
             candidate.frozen_count_constraints_feasible,
             frozen.count_constraints_feasible()
@@ -34385,6 +34716,7 @@ mod tests {
             candidate.final_forced_row_output_sha256
         );
         assert_eq!(candidate.new_inference_count, 0);
+        assert!(candidate.frozen_route_eligible);
         assert!(
             candidate
                 .profile_redecode
@@ -34407,6 +34739,15 @@ mod tests {
             .expect("count")
             .evidence_sha256
             .clone();
+        count_tamper.frozen_route_eligible = false;
+        let rejected = super::run_prepared_supported_profile_redecode_evaluation(
+            &prepared,
+            &count_tamper,
+            super::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+            || false,
+        );
+        assert!(matches!(rejected, Err(FwError::ContractViolation(_))));
+        count_tamper.frozen_route_eligible = true;
         count_tamper.final_forced_row_output_sha256 = "1".repeat(64);
         let rejected = super::run_prepared_supported_profile_redecode_evaluation(
             &prepared,
@@ -34415,6 +34756,113 @@ mod tests {
             || false,
         );
         assert!(matches!(rejected, Err(FwError::ContractViolation(_))));
+    }
+
+    #[test]
+    fn prepared_supported_profile_redecode_executes_and_replays_typed_fused_route() {
+        let mut prepared = prepared_ecapa_hash_fixture();
+        prepared.request.engine = DiarizationEngine::EcapaFused;
+        prepared.evidence_mode = DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel;
+        prepared.common_observation_sha256 =
+            super::recompute_prepared_ecapa_common_observation_sha256(&prepared)
+                .expect("rebind fused common observation");
+        prepared.private_integrity_sha256 =
+            super::prepared_ecapa_private_integrity_sha256(&prepared);
+
+        let frozen = super::prepare_supported_profile_redecode_evaluation(&prepared, || false)
+            .expect("retain typed fused incumbent for supported-profile redecode");
+        assert!(frozen.frozen_route_eligible());
+        assert_eq!(
+            frozen.frozen_operational_partition_method(),
+            Some(crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus),
+        );
+
+        let baseline = super::run_prepared_supported_profile_redecode_evaluation(
+            &prepared,
+            &frozen,
+            super::SupportedProfileRedecodeMode::DisabledIncumbent,
+            || false,
+        )
+        .expect("fused incumbent baseline");
+        let candidate = super::run_prepared_supported_profile_redecode_evaluation(
+            &prepared,
+            &frozen,
+            super::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+            || false,
+        )
+        .expect("typed fused candidate");
+        let replay = super::run_prepared_supported_profile_redecode_evaluation(
+            &prepared,
+            &frozen,
+            super::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+            || false,
+        )
+        .expect("typed fused candidate replay");
+
+        assert!(candidate.frozen_route_eligible);
+        assert_eq!(
+            candidate.profile_redecode.profile_row_count,
+            frozen.profile_row_count()
+        );
+        assert!(candidate.profile_redecode.supported_speaker_count > 0);
+        assert_eq!(candidate.profile_redecode.resources.redecode_count, 1);
+        assert_eq!(candidate.profile_redecode.resources.model_call_count, 0);
+        assert_eq!(candidate.new_inference_count, 0);
+        assert_ne!(
+            candidate.profile_redecode.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::IneligibleRoute),
+        );
+        assert_eq!(
+            baseline.common_observation_sha256,
+            candidate.common_observation_sha256
+        );
+        assert!(super::prepared_supported_profile_redecode_runs_identical(
+            &candidate, &replay,
+        ));
+    }
+
+    #[test]
+    fn prepared_supported_profile_redecode_rejects_impossible_missing_count_state() {
+        let prepared = prepared_ecapa_hash_fixture();
+        let mut frozen = super::prepare_supported_profile_redecode_evaluation(&prepared, || false)
+            .expect("freeze supported-profile incumbent once");
+        frozen.clustering.count_estimate = None;
+        frozen.clustering.operational_partition = None;
+        frozen.supported_profile_topology_sha256 =
+            super::supported_profile_redecode_profile_topology_sha256(
+                frozen.common_observation_sha256(),
+                &frozen.clustering,
+            );
+        frozen.speaker_count_estimate_sha256 =
+            super::supported_profile_redecode_count_estimate_sha256(None)
+                .expect("hash absent count estimate");
+        frozen.speaker_count_evidence_sha256 =
+            super::supported_profile_redecode_count_evidence_sha256(
+                frozen.common_observation_sha256(),
+                None,
+            );
+        frozen.frozen_count_estimate_present = false;
+        frozen.frozen_operational_partition_method = None;
+        frozen.frozen_route_eligible = false;
+
+        assert!(!frozen.frozen_count_estimate_present);
+        assert!(!frozen.frozen_route_eligible);
+        for mode in [
+            super::SupportedProfileRedecodeMode::DisabledIncumbent,
+            super::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+        ] {
+            let rejected = super::run_prepared_supported_profile_redecode_evaluation(
+                &prepared,
+                &frozen,
+                mode,
+                || false,
+            );
+            assert!(matches!(
+                rejected,
+                Err(FwError::ContractViolation(message))
+                    if message.contains("require a speaker-count estimate")
+            ));
+        }
     }
 
     #[test]
@@ -34537,12 +34985,29 @@ mod tests {
         let public_digest = original.common_observation_sha256.clone();
         let private_digest = original.private_integrity_sha256;
 
+        let mut inconsistent_identity = prepared_ecapa_hash_fixture();
+        inconsistent_identity.request.known_intervals[0].speaker_ref = "speaker-renamed".to_owned();
+        assert!(matches!(
+            super::recompute_prepared_ecapa_common_observation_sha256(&inconsistent_identity),
+            Err(FwError::ContractViolation(_))
+        ));
+
         let mut lexical_substitution = prepared_ecapa_hash_fixture();
         lexical_substitution.request.known_intervals[0].speaker_ref = "speaker-renamed".to_owned();
         lexical_substitution.request.known_intervals[0].provenance =
             Some("different private context".to_owned());
         lexical_substitution.segments[0].text = "different confidential transcript".to_owned();
         lexical_substitution.segments[0].speaker = Some("speaker-renamed".to_owned());
+        lexical_substitution.enrollment = enroll_known_speaker_profiles(
+            &lexical_substitution.tracklets,
+            &lexical_substitution.request,
+            lexical_substitution
+                .tracklets
+                .last()
+                .expect("tracklet")
+                .end_ms,
+        )
+        .expect("consistently label-substituted enrollment");
         assert_eq!(
             super::recompute_prepared_ecapa_common_observation_sha256(&lexical_substitution)
                 .expect("label-stripped public digest"),
@@ -38483,6 +38948,43 @@ mod tests {
     }
 
     #[test]
+    fn ecapa_embedding_validation_rejects_corruption_deterministically() {
+        let tracklets = sequential_profile_tracklets(&[0.0], 500, 50);
+        let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        embedding[3] = 1.0;
+        let valid = ecapa_representation(embedding, None, 50.0, 0.0);
+
+        let mut zero_norm = valid.clone();
+        zero_norm.discovery.fill(0.0);
+        let mut non_finite = valid.clone();
+        non_finite.discovery[7] = f32::NAN;
+        let mut non_finite_weight = valid.clone();
+        non_finite_weight.discovery_weight = f32::INFINITY;
+        let invalid_validation_weight = ecapa_representation(embedding, Some(embedding), 50.0, 0.0);
+        let invalid_absent_validation_weight = ecapa_representation(embedding, None, 50.0, 1.0);
+        let cases = [
+            BTreeMap::from([(0usize, zero_norm)]),
+            BTreeMap::from([(0usize, non_finite)]),
+            BTreeMap::from([(0usize, non_finite_weight)]),
+            BTreeMap::from([(0usize, invalid_validation_weight)]),
+            BTreeMap::from([(0usize, invalid_absent_validation_weight)]),
+            BTreeMap::from([(99usize, valid)]),
+        ];
+        for embeddings in cases {
+            let first = super::validate_ecapa_tracklet_embeddings(&tracklets, &embeddings)
+                .expect_err("corrupt ECAPA evidence must fail closed")
+                .to_string();
+            let replay = super::validate_ecapa_tracklet_embeddings(&tracklets, &embeddings)
+                .expect_err("corrupt ECAPA replay must fail closed")
+                .to_string();
+            assert_eq!(first, replay);
+            assert!(first.contains(
+                "ECAPA tracklet embeddings must be finite, non-zero, and reference an existing tracklet"
+            ));
+        }
+    }
+
+    #[test]
     fn ecapa_pair_evidence_separates_identical_and_opposite_embeddings() {
         let mut first = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
         first[3] = 1.0;
@@ -38663,6 +39165,24 @@ mod tests {
         assert!(!ecapa_only.constraints_satisfied);
         assert_eq!(fused.detected_speakers, 2, "{fused:#?}");
         assert!(fused.constraints_satisfied, "{fused:#?}");
+        assert_eq!(
+            fused
+                .operational_partition
+                .as_ref()
+                .expect("typed fused partition")
+                .method,
+            crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus,
+        );
+        assert!(super::supported_profile_redecode_route_eligible(
+            fused.executed_mode,
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+            fused
+                .operational_partition
+                .as_ref()
+                .map(|partition| partition.method),
+            fused.count_estimate.is_some(),
+            fused.constraints_satisfied,
+        ));
         assert_eq!(
             fused
                 .speaker_evidence
@@ -38901,13 +39421,30 @@ mod tests {
                 .expect("hard-constrained neural count estimate");
             assert_eq!(estimate.constraint_lower_bound, 2);
             assert_eq!(estimate.candidate_upper_bound, 2);
+            let expected_method = match evidence_mode {
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly => {
+                    crate::model::DiarizationOperationalPartitionMethod::ProbabilisticConsensus
+                }
+                crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
+                    crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus
+                }
+                _ => unreachable!("test covers only the two ECAPA evidence modes"),
+            };
+            let operational_method = result
+                .operational_partition
+                .as_ref()
+                .map(|partition| partition.method);
+            assert_eq!(operational_method, Some(expected_method));
             assert_eq!(
-                result
-                    .operational_partition
-                    .as_ref()
-                    .expect("typed constrained partition")
-                    .method,
-                crate::model::DiarizationOperationalPartitionMethod::ProbabilisticConsensus
+                super::supported_profile_redecode_route_eligible(
+                    result.executed_mode,
+                    evidence_mode,
+                    operational_method,
+                    result.count_estimate.is_some(),
+                    result.constraints_satisfied,
+                ),
+                evidence_mode
+                    == crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
             );
         }
     }
@@ -39342,7 +39879,7 @@ mod tests {
             .expect("typed fused operational partition");
         assert_eq!(
             fused_operational.method,
-            crate::model::DiarizationOperationalPartitionMethod::ProbabilisticConsensus
+            crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus
         );
         assert_eq!(
             fused_operational.calibration_sha256,
@@ -39687,9 +40224,9 @@ mod tests {
             if let Some(operational) = report.operational_partition.as_ref() {
                 operational.validate().expect("valid partition provenance");
                 if engine == crate::model::DiarizationEngine::EcapaFused {
-                    assert_ne!(
+                    assert_eq!(
                         operational.method,
-                        crate::model::DiarizationOperationalPartitionMethod::EcapaSpherical
+                        crate::model::DiarizationOperationalPartitionMethod::EcapaFusedConsensus
                     );
                 }
             }
