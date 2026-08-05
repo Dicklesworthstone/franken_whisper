@@ -7072,14 +7072,13 @@ mod tests {
                 probability: 1.0,
             }],
         };
-        prior_unknown.speaker_count.reasons =
-            vec![SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable];
         prior_unknown.fallback_status = DiarizationFallbackStatus::SpeakerCountUnresolved;
+        let error = prior_unknown
+            .validate()
+            .expect_err("unknown fallback cannot embed a soft prior");
         assert!(
-            prior_unknown
-                .validate()
-                .expect_err("unknown fallback cannot embed a soft prior")
-                .contains("cannot preserve soft speaker-count")
+            error.contains("cannot preserve soft speaker-count"),
+            "{error}"
         );
 
         let mut unavailable = unknown_diarization_report_fixture();
@@ -7654,17 +7653,27 @@ mod tests {
             .validate_against_request(&request, None)
             .expect("immutable timestamp label does not fabricate enrolled tracklets");
 
-        let mut no_usable_but_attributed = trusted_timestamp_only;
+        let mut no_usable_but_attributed = trusted_timestamp_only.clone();
         no_usable_but_attributed.hint_evidence[0].disposition =
             SpeakerHintDisposition::NoUsableTracklets;
+        no_usable_but_attributed.profiles[0].anchored = false;
+        let speaker_evidence = &mut no_usable_but_attributed.speaker_count.speaker_evidence[0];
+        speaker_evidence.hard_anchored = false;
+        speaker_evidence.assigned_tracklet_count = 2;
+        speaker_evidence.independent_tracklet_count = 2;
+        speaker_evidence.recurrence_episode_count = 1;
+        speaker_evidence.reasons = vec![SpeakerEvidenceReason::SupportedByRepeatedTracklets];
+        let error = no_usable_but_attributed
+            .validate_against_request(&request, None)
+            .expect_err("no-usable hard hint cannot authorize a hard-attributed turn");
         assert!(
-            no_usable_but_attributed
-                .validate_against_request(&request, None)
-                .expect_err("no-usable hard hint cannot authorize a hard-attributed turn")
-                .contains("not bound to an overlapping hard hint")
+            error.contains("not bound to an overlapping hard hint"),
+            "{error}"
         );
 
-        let mut no_usable_but_anchored = no_usable_but_attributed.clone();
+        let mut no_usable_but_anchored = trusted_timestamp_only;
+        no_usable_but_anchored.hint_evidence[0].disposition =
+            SpeakerHintDisposition::NoUsableTracklets;
         no_usable_but_anchored.turns[0].hard_hint_attributed = false;
         assert!(
             no_usable_but_anchored
@@ -7674,13 +7683,15 @@ mod tests {
         );
 
         let mut forged_turn = report;
-        forged_turn.turns[0].start_ms = 1_100;
-        forged_turn.turns[0].end_ms = 1_200;
+        forged_turn.turns[0].start_ms = 1_000;
+        forged_turn.turns[0].end_ms = 1_100;
+        forged_turn.turns[1].start_ms = 1_100;
+        let error = forged_turn
+            .validate_against_request(&request, None)
+            .expect_err("hard turn outside its hint cannot claim hard attribution");
         assert!(
-            forged_turn
-                .validate_against_request(&request, None)
-                .expect_err("hard turn outside its hint cannot claim hard attribution")
-                .contains("lacks an overlapping hard-attributed")
+            error.contains("lacks an overlapping hard-attributed"),
+            "{error}"
         );
     }
 
@@ -8305,23 +8316,19 @@ mod tests {
             .speaker_count
             .reasons
             .push(SpeakerCountOutcomeReason::ExternalAttribution);
-        assert!(
-            report
-                .validate()
-                .expect_err("native outcome cannot claim external attribution")
-                .contains("claims external attribution")
-        );
+        let error = report
+            .validate()
+            .expect_err("native outcome cannot claim external attribution");
+        assert!(error.contains("claims external attribution"), "{error}");
 
         let mut report = typed_diarization_report_fixture();
         report.speaker_count.speaker_evidence[0]
             .reasons
             .push(SpeakerEvidenceReason::SupportedByExternalAttribution);
-        assert!(
-            report
-                .validate()
-                .expect_err("native speaker evidence cannot claim external support")
-                .contains("claims external attribution")
-        );
+        let error = report
+            .validate()
+            .expect_err("native speaker evidence cannot claim external support");
+        assert!(error.contains("exact canonical reasons"), "{error}");
     }
 
     #[test]

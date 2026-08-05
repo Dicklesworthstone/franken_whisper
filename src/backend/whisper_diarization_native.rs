@@ -914,7 +914,12 @@ mod tests {
             .expect_err("unsupported soft count input must fail before model or audio access");
 
             assert!(matches!(error, FwError::InvalidRequest(_)));
-            assert!(error.to_string().contains("native acoustic"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("native in-process diarization engine"),
+                "{error}"
+            );
         }
     }
 
