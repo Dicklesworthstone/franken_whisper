@@ -502,14 +502,11 @@ pub fn expand_playlist(
     ];
     let output = match run_ytdlp(info, &args, token, EXPAND_TIMEOUT) {
         Ok(output) => output,
-        // A failure with NO stderr and an abnormal/signal-style exit is the
-        // signature of our own 4 MiB capture cap closing the read end of the
-        // pipe while yt-dlp is still streaming: yt-dlp dies on SIGPIPE (exit
-        // ~141, or signal-killed → no exit code) without writing anything to
-        // stderr. Real yt-dlp errors (private/geo/429/etc.) always print to
-        // stderr, so an empty-stderr abnormal exit on THIS command means the
-        // playlist's flat-JSON overran the cap. Surface the actionable
-        // too-large error rather than a confusing CommandFailed.
+        // The process layer reports output overflow explicitly. Retain the
+        // legacy SIGPIPE signature as well for older or platform-specific
+        // writers that terminate when their output pipe closes. On THIS
+        // command both cases mean that flat-playlist JSON overran the capture
+        // cap, so surface an actionable request error rather than losing rows.
         Err(err) if is_capture_truncation_failure(&err) => {
             return Err(playlist_too_large_error(url));
         }
@@ -571,13 +568,13 @@ fn playlist_too_large_error(url: &str) -> FwError {
     ))
 }
 
-/// Heuristic: does this command failure carry the signature of the 4 MiB capture
-/// cap closing the pipe mid-stream (yt-dlp dying on SIGPIPE)? That manifests as
-/// an abnormal/signal-style exit with an EMPTY stderr — genuine yt-dlp errors
-/// always write to stderr, so empty-stderr + abnormal exit on the expand command
-/// means our reader truncated the capture.
+/// Whether this error says that the flat-playlist stdout exceeded the capture
+/// cap, either explicitly or through the legacy SIGPIPE failure signature.
 fn is_capture_truncation_failure(err: &FwError) -> bool {
     match err {
+        FwError::ContractViolation(message) => {
+            message.starts_with("subprocess stdout") && message.ends_with("-byte capture limit")
+        }
         FwError::CommandFailed {
             status,
             stderr_suffix,
@@ -1649,6 +1646,14 @@ mod tests {
 
     #[test]
     fn capture_truncation_failure_signature() {
+        let explicit = FwError::ContractViolation(
+            "subprocess stdout exceeded the 4194304-byte capture limit".to_owned(),
+        );
+        assert!(is_capture_truncation_failure(&explicit));
+        let stderr_only = FwError::ContractViolation(
+            "subprocess stderr exceeded the 4194304-byte capture limit".to_owned(),
+        );
+        assert!(!is_capture_truncation_failure(&stderr_only));
         // SIGPIPE-style death with empty stderr (our cap closed the pipe).
         let sigpipe = FwError::from_command_failure("yt-dlp ...".to_owned(), 141, String::new());
         assert!(is_capture_truncation_failure(&sigpipe));

@@ -125,35 +125,23 @@ pub fn run_command_with_timeout(
             )))
         })?;
 
-        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
-        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
-
-        thread::spawn(move || {
-            read_pipe_with_limit_streaming(stdout_pipe, stdout_tx);
-        });
-
-        thread::spawn(move || {
-            read_pipe_with_limit_streaming(stderr_pipe, stderr_tx);
-        });
+        let stdout_rx = spawn_pipe_reader(stdout_pipe);
+        let stderr_rx = spawn_pipe_reader(stderr_pipe);
 
         loop {
             if let Some(status) = child.try_wait()? {
-                let stdout = recv_pipe_output(stdout_rx);
-                let stderr = recv_pipe_output(stderr_rx);
-                return validate_command_output(
-                    &rendered,
-                    Output {
-                        status,
-                        stdout,
-                        stderr,
-                    },
-                );
+                let stdout = recv_pipe_output(stdout_rx)?;
+                let stderr = recv_pipe_output(stderr_rx)?;
+                return validate_captured_command_output(&rendered, status, stdout, stderr);
             }
 
             if started_at.elapsed() >= limit {
                 let _ = child.kill();
                 let _ = child.wait();
-                let stderr = recv_pipe_output(stderr_rx);
+                let _ = recv_pipe_output_after_termination(stdout_rx);
+                let stderr = recv_pipe_output_after_termination(stderr_rx)
+                    .map(|capture| capture.bytes)
+                    .unwrap_or_default();
                 let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
                 return Err(FwError::from_command_timeout(
                     rendered,
@@ -247,44 +235,29 @@ pub(crate) fn run_command_cancellable_with_probe(
         )))
     })?;
 
-    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
-    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
-
-    thread::spawn(move || {
-        read_pipe_with_limit_streaming(stdout_pipe, stdout_tx);
-    });
-
-    thread::spawn(move || {
-        read_pipe_with_limit_streaming(stderr_pipe, stderr_tx);
-    });
+    let stdout_rx = spawn_pipe_reader(stdout_pipe);
+    let stderr_rx = spawn_pipe_reader(stderr_pipe);
 
     loop {
         if let Some(status) = child.try_wait()? {
-            let stdout = recv_pipe_output(stdout_rx);
-            let stderr = recv_pipe_output(stderr_rx);
-            return validate_command_output(
-                &rendered,
-                Output {
-                    status,
-                    stdout,
-                    stderr,
-                },
-            );
+            let stdout = recv_pipe_output(stdout_rx)?;
+            let stderr = recv_pipe_output(stderr_rx)?;
+            return validate_captured_command_output(&rendered, status, stdout, stderr);
         }
 
         // Check pipeline deadline via cancellation token.
         if let Err(err) = token.checkpoint() {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = recv_pipe_output(stdout_rx);
-            let _ = recv_pipe_output(stderr_rx);
+            let _ = recv_pipe_output_after_termination(stdout_rx);
+            let _ = recv_pipe_output_after_termination(stderr_rx);
             return Err(err);
         }
         if additional_cancel.is_some_and(|probe| probe()) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = recv_pipe_output(stdout_rx);
-            let _ = recv_pipe_output(stderr_rx);
+            let _ = recv_pipe_output_after_termination(stdout_rx);
+            let _ = recv_pipe_output_after_termination(stderr_rx);
             return Err(FwError::Cancelled(
                 "subprocess cancelled by caller predicate".to_owned(),
             ));
@@ -296,7 +269,10 @@ pub(crate) fn run_command_cancellable_with_probe(
         {
             let _ = child.kill();
             let _ = child.wait();
-            let stderr = recv_pipe_output(stderr_rx);
+            let _ = recv_pipe_output_after_termination(stdout_rx);
+            let stderr = recv_pipe_output_after_termination(stderr_rx)
+                .map(|capture| capture.bytes)
+                .unwrap_or_default();
             let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
             return Err(FwError::from_command_timeout(
                 rendered,
@@ -329,43 +305,102 @@ fn saturating_duration_ms(duration: Duration) -> u64 {
 }
 
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const PIPE_CAPTURE_COMPLETION_GRACE: Duration = Duration::from_secs(1);
+const PIPE_CAPTURE_TERMINATION_GRACE: Duration = Duration::from_millis(100);
 
-fn read_pipe_with_limit_streaming<R: Read>(mut pipe: R, tx: std::sync::mpsc::Sender<Vec<u8>>) {
+#[derive(Debug)]
+struct PipeCapture {
+    bytes: Vec<u8>,
+    limit_exceeded: bool,
+}
+
+fn spawn_pipe_reader<R>(pipe: R) -> std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>
+where
+    R: Read + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(read_pipe_with_limit(pipe));
+    });
+    rx
+}
+
+fn read_pipe_with_limit<R: Read>(mut pipe: R) -> std::io::Result<PipeCapture> {
     let mut buf = [0u8; 8192];
-    let mut total_read = 0;
+    let mut bytes = Vec::new();
+    let mut limit_exceeded = false;
 
     loop {
-        let read = match pipe.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-
-        if total_read >= MAX_CAPTURED_OUTPUT_BYTES {
+        let read = pipe.read(&mut buf)?;
+        if read == 0 {
             break;
         }
-
-        let remaining = MAX_CAPTURED_OUTPUT_BYTES - total_read;
-        let take = remaining.min(read);
-        if tx.send(buf[..take].to_vec()).is_err() {
-            break; // Receiver disconnected
+        let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let retained = remaining.min(read);
+        bytes.extend_from_slice(&buf[..retained]);
+        if retained < read {
+            limit_exceeded = true;
         }
-        total_read += take;
+    }
+
+    Ok(PipeCapture {
+        bytes,
+        limit_exceeded,
+    })
+}
+
+fn recv_pipe_output(
+    rx: std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>,
+) -> FwResult<PipeCapture> {
+    recv_pipe_output_with_timeout(rx, PIPE_CAPTURE_COMPLETION_GRACE)
+}
+
+fn recv_pipe_output_after_termination(
+    rx: std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>,
+) -> FwResult<PipeCapture> {
+    recv_pipe_output_with_timeout(rx, PIPE_CAPTURE_TERMINATION_GRACE)
+}
+
+fn recv_pipe_output_with_timeout(
+    rx: std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>,
+    timeout: Duration,
+) -> FwResult<PipeCapture> {
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result.map_err(FwError::Io),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(FwError::ContractViolation(
+            "subprocess output pipe remained open after the child terminated".to_owned(),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(FwError::Io(
+            std::io::Error::other("subprocess pipe reader terminated"),
+        )),
     }
 }
 
-fn recv_pipe_output(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
-    use std::sync::mpsc::RecvTimeoutError;
-
-    let mut output = Vec::new();
-    loop {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(mut chunk) => output.append(&mut chunk),
-            Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => break,
-        }
+fn validate_captured_command_output(
+    rendered: &str,
+    status: std::process::ExitStatus,
+    stdout: PipeCapture,
+    stderr: PipeCapture,
+) -> FwResult<Output> {
+    if stdout.limit_exceeded || stderr.limit_exceeded {
+        let stream = match (stdout.limit_exceeded, stderr.limit_exceeded) {
+            (true, true) => "stdout and stderr",
+            (true, false) => "stdout",
+            (false, true) => "stderr",
+            (false, false) => unreachable!("validated output has no exceeded stream"),
+        };
+        return Err(FwError::ContractViolation(format!(
+            "subprocess {stream} exceeded the {MAX_CAPTURED_OUTPUT_BYTES}-byte capture limit"
+        )));
     }
-    output
+    validate_command_output(
+        rendered,
+        Output {
+            status,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -481,15 +516,34 @@ mod tests {
     }
 
     #[test]
-    fn recv_pipe_output_returns_on_disconnect() {
-        use super::recv_pipe_output;
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    fn recv_pipe_output_reports_disconnect() {
+        use super::{PipeCapture, recv_pipe_output};
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<PipeCapture>>();
         drop(tx);
-        let output = recv_pipe_output(rx);
-        assert!(
-            output.is_empty(),
-            "no data should be captured after sender disconnects"
-        );
+        assert!(recv_pipe_output(rx).is_err());
+    }
+
+    #[test]
+    fn recv_pipe_output_is_bounded_when_pipe_stays_open() {
+        use super::{PipeCapture, recv_pipe_output_with_timeout};
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<PipeCapture>>();
+        let started_at = std::time::Instant::now();
+        let result = recv_pipe_output_with_timeout(rx, Duration::from_millis(5));
+        assert!(matches!(
+            result,
+            Err(crate::error::FwError::ContractViolation(_))
+        ));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        drop(tx);
+    }
+
+    #[test]
+    fn pipe_capture_drains_and_reports_output_over_limit() {
+        use super::{MAX_CAPTURED_OUTPUT_BYTES, read_pipe_with_limit};
+        let input = vec![b'x'; MAX_CAPTURED_OUTPUT_BYTES + 8_193];
+        let capture = read_pipe_with_limit(std::io::Cursor::new(input)).expect("capture pipe");
+        assert_eq!(capture.bytes.len(), MAX_CAPTURED_OUTPUT_BYTES);
+        assert!(capture.limit_exceeded);
     }
 
     #[test]
