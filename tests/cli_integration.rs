@@ -3198,7 +3198,7 @@ fn robot_tiny_diarize_emits_redacted_hint_evidence_and_native_acoustic_report() 
         "run_complete diarization must identify the native acoustic implementation"
     );
     assert!(
-        run_complete["diarization"]["contract_version"] == "acoustic-diarization-v2",
+        run_complete["diarization"]["contract_version"] == "acoustic-diarization-v3",
         "run_complete diarization must use the acoustic contract"
     );
     assert!(
