@@ -20412,8 +20412,8 @@ mod tests {
                 && row.frozen_total_profile_row_count > 0
                 && row.frozen_total_profile_row_count
                     <= gate_policy.maximum_total_profile_row_count
-                && row.frozen_forced_tracklet_count
-                    <= row.common_observation.embedded_tracklet_count
+                && row.frozen_forced_tracklet_count <= row.baseline.tracklet_count
+                && row.frozen_forced_tracklet_count <= row.candidate.tracklet_count
                 && row.baseline.forced_tracklet_count == row.frozen_forced_tracklet_count
                 && row.candidate.forced_tracklet_count == row.frozen_forced_tracklet_count
                 && row.baseline.supported_profile_topology_sha256
@@ -21933,9 +21933,12 @@ mod tests {
         row.common_observation.embedded_tracklet_count =
             row.baseline.tracklet_count.saturating_sub(1);
         expected_common.embedded_tracklet_count = row.common_observation.embedded_tracklet_count;
+        row.frozen_forced_tracklet_count = row.baseline.tracklet_count;
         for arm in [&mut row.baseline, &mut row.candidate] {
             arm.frozen_route_eligible = false;
+            arm.forced_tracklet_count = row.frozen_forced_tracklet_count;
         }
+        expected.frozen_forced_tracklet_count = row.frozen_forced_tracklet_count;
         expected.frozen_route_eligible = false;
         supported_profile_redecode_gate_finalize_ineligible_pair(row, expected);
     }
@@ -24466,8 +24469,8 @@ mod tests {
                 assert!(frozen.profile_row_count() > 0);
                 assert!(frozen.profile_row_count() <= gate_policy.maximum_total_profile_row_count);
                 assert!(
-                    frozen.forced_tracklet_count() <= prepared.embedded_tracklet_count(),
-                    "forced tracklets must be a subset of the common observation"
+                    frozen.forced_tracklet_count() <= frozen.tracklet_count(),
+                    "forced tracklets must be a subset of all acoustic tracklets"
                 );
                 for digest in [
                     frozen.incumbent_partition_sha256(),
