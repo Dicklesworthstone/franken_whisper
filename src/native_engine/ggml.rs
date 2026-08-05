@@ -60,6 +60,50 @@ const GGML_MAGIC: u32 = 0x6767_6d6c;
 /// fixed `ne[4]`). Any `n_dims` outside `1..=GGML_MAX_DIMS` is malformed.
 const GGML_MAX_DIMS: usize = 4;
 
+/// ggml `Q8_0` block: 32 quantized values per block.
+const QK8_0: usize = 32;
+/// `Q8_0` on-disk block size: one `f16` scale (2 bytes) + 32 `int8` quants.
+const Q8_0_BLOCK_BYTES: usize = 2 + QK8_0;
+
+/// On-disk byte length of a tensor payload for `dtype` × `n_elements`. `Q8_0`
+/// is block-based (34 bytes per 32 values) and requires a multiple-of-32 count.
+fn ggml_byte_len(dtype: GgmlDType, n_elements: usize, name: &str) -> FwResult<usize> {
+    let len = match dtype {
+        GgmlDType::F32 => n_elements.checked_mul(4),
+        GgmlDType::F16 => n_elements.checked_mul(2),
+        GgmlDType::Q8_0 => {
+            if !n_elements.is_multiple_of(QK8_0) {
+                return Err(FwError::InvalidRequest(format!(
+                    "tensor '{name}' q8_0 element count {n_elements} is not a multiple of {QK8_0}"
+                )));
+            }
+            (n_elements / QK8_0).checked_mul(Q8_0_BLOCK_BYTES)
+        }
+    };
+    len.ok_or_else(|| FwError::InvalidRequest(format!("tensor '{name}' byte length overflow")))
+}
+
+/// Dequantize a `Q8_0` tensor payload (`n_elements` values, `n_elements / 32`
+/// blocks of `[f16 scale, 32×int8]`) to `f32`: `x = q * scale`. `raw.len()` must
+/// equal `(n_elements / 32) * 34` (validated by the caller). Mirrors ggml's
+/// `dequantize_row_q8_0`.
+fn dequant_q8_0(raw: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / QK8_0;
+    let mut out = Vec::with_capacity(n_elements);
+    for b in 0..n_blocks {
+        let base = b * Q8_0_BLOCK_BYTES;
+        let scale = f32::from(Float16::from_bits(u16::from_le_bytes([
+            raw[base],
+            raw[base + 1],
+        ])));
+        let qs = &raw[base + 2..base + 2 + QK8_0];
+        for &q in qs {
+            out.push((q as i8) as f32 * scale);
+        }
+    }
+    out
+}
+
 /// A single tensor's location and metadata within the model file.
 ///
 /// `shape` is stored in **row-major (PyTorch) logical order**: the ggml file
@@ -191,13 +235,13 @@ impl GgmlModel {
             ftype: cur.read_i32()?,
         };
 
-        // ftype gates the "big tensor" storage type. whisper.cpp strips a
-        // quantization-version factor before mapping; for the formats we
-        // support (f32 / f16) ftype is exactly 0 or 1. Anything else is a
-        // quantized format we don't decode yet.
-        if hparams.ftype != 0 && hparams.ftype != 1 {
+        // ftype gates the "big tensor" storage type. whisper.cpp's WHISPER_FTYPE:
+        // 0=f32, 1=f16, 7=q8_0 (dequantized to f32 on load). Any other value is a
+        // quantized format we don't decode yet; the per-tensor parse is the real
+        // gate (it rejects any unsupported per-tensor GGML_TYPE).
+        if !matches!(hparams.ftype, 0 | 1 | 7) {
             return Err(FwError::Unsupported(format!(
-                "quantized ggml ftype {} is not supported (only ftype 0=f32, 1=f16)",
+                "quantized ggml ftype {} is not supported (only 0=f32, 1=f16, 7=q8_0)",
                 hparams.ftype
             )));
         }
@@ -262,9 +306,11 @@ impl GgmlModel {
             let dtype = match ttype {
                 0 => GgmlDType::F32,
                 1 => GgmlDType::F16,
+                8 => GgmlDType::Q8_0,
                 other => {
                     return Err(FwError::Unsupported(format!(
-                        "tensor element type {other} is not supported (only 0=f32, 1=f16)"
+                        "tensor element type {other} is not supported \
+                         (only 0=f32, 1=f16, 8=q8_0)"
                     )));
                 }
             };
@@ -291,13 +337,7 @@ impl GgmlModel {
                 .ok_or_else(|| {
                     FwError::InvalidRequest(format!("tensor '{name}' element count overflow"))
                 })?;
-            let bpe = match dtype {
-                GgmlDType::F32 => 4usize,
-                GgmlDType::F16 => 2usize,
-            };
-            let byte_len = n_elements.checked_mul(bpe).ok_or_else(|| {
-                FwError::InvalidRequest(format!("tensor '{name}' byte length overflow"))
-            })?;
+            let byte_len = ggml_byte_len(dtype, n_elements, &name)?;
 
             let byte_offset = cur.pos();
             cur.skip(byte_len)?;
@@ -422,9 +462,11 @@ impl GgmlModel {
             let dtype = match ttype {
                 0 => GgmlDType::F32,
                 1 => GgmlDType::F16,
+                8 => GgmlDType::Q8_0,
                 other => {
                     return Err(FwError::Unsupported(format!(
-                        "tensor element type {other} is not supported (only 0=f32, 1=f16)"
+                        "tensor element type {other} is not supported \
+                         (only 0=f32, 1=f16, 8=q8_0)"
                     )));
                 }
             };
@@ -449,13 +491,7 @@ impl GgmlModel {
                 .ok_or_else(|| {
                     FwError::InvalidRequest(format!("tensor '{name}' element count overflow"))
                 })?;
-            let bpe = match dtype {
-                GgmlDType::F32 => 4usize,
-                GgmlDType::F16 => 2usize,
-            };
-            let byte_len = n_elements.checked_mul(bpe).ok_or_else(|| {
-                FwError::InvalidRequest(format!("tensor '{name}' byte length overflow"))
-            })?;
+            let byte_len = ggml_byte_len(dtype, n_elements, &name)?;
 
             let byte_offset = cur.pos();
             cur.skip(byte_len)?;
@@ -581,6 +617,16 @@ impl GgmlModel {
                     )));
                 }
                 dequant_f16_parallel(&raw, n_elements)
+            }
+            GgmlDType::Q8_0 => {
+                let expect = ggml_byte_len(GgmlDType::Q8_0, n_elements, name)?;
+                if raw.len() != expect {
+                    return Err(FwError::InvalidRequest(format!(
+                        "tensor '{name}' q8_0 byte length {} != {expect}",
+                        raw.len()
+                    )));
+                }
+                dequant_q8_0(&raw, n_elements)
             }
         };
 
@@ -1034,6 +1080,42 @@ impl<R: std::io::Read + std::io::Seek> StreamCursor<R> {
 mod tests {
     use super::*;
     use crate::native_engine::find_model_file;
+
+    #[test]
+    fn q8_0_byte_len_and_dequant_math() {
+        // Q8_0 layout: 34 bytes/block (f16 scale + 32 int8). 64 values = 2 blocks.
+        assert_eq!(
+            ggml_byte_len(GgmlDType::Q8_0, 64, "t").unwrap(),
+            2 * Q8_0_BLOCK_BYTES
+        );
+        // Non-multiple-of-32 element counts are rejected.
+        assert!(ggml_byte_len(GgmlDType::Q8_0, 40, "t").is_err());
+
+        // One block: scale = 0.5 (f16), quants 0,1,2,-1,-128,127, rest 0 →
+        // x = q * 0.5.
+        let scale = Float16::from_f32(0.5);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&scale.to_bits().to_le_bytes());
+        let mut qs = [0i8; QK8_0];
+        qs[0] = 0;
+        qs[1] = 1;
+        qs[2] = 2;
+        qs[3] = -1;
+        qs[4] = -128;
+        qs[5] = 127;
+        raw.extend(qs.iter().map(|&q| q as u8));
+        let out = dequant_q8_0(&raw, QK8_0);
+        assert_eq!(out.len(), QK8_0);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[1], 0.5);
+        assert_eq!(out[2], 1.0);
+        assert_eq!(out[3], -0.5);
+        assert_eq!(out[4], -64.0);
+        assert_eq!(out[5], 63.5);
+        for &v in &out[6..] {
+            assert_eq!(v, 0.0);
+        }
+    }
 
     /// `read_blob_parallel` (the multi-thread banded blob reader tuned by
     /// `FW_BLOB_READ_WORKERS`, `5fc0707`) must be byte-identical to a serial

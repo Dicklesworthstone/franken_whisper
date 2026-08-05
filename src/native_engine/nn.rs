@@ -3994,6 +3994,10 @@ fn simd_exp_softmax_enabled() -> bool {
     target_feature = "fma"
 ))]
 #[allow(unsafe_code)]
+// `log2e`/`ln2` are tuned range-reduction literals of this poly-exp kernel, not
+// free-standing math constants; replacing them with `f32::consts` would perturb
+// the kernel's numerics, so `approx_constant` is suppressed deliberately.
+#[allow(clippy::approx_constant)]
 fn softmax_row_poly_numer(row: &mut [f32], max: f32) -> f32 {
     use core::arch::x86_64::*;
     let n = row.len();

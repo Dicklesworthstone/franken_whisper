@@ -79,6 +79,11 @@ impl WhisperHParams {
 pub enum GgmlDType {
     F32,
     F16,
+    /// ggml `Q8_0` (per-tensor GGML_TYPE 8): blocks of 32 `int8` quants with one
+    /// `f16` scale each (34 bytes/block, `x = q * scale`). Dequantized to f32 at
+    /// load — lets the engine run whisper.cpp-quantized `q8_0` models on the
+    /// existing f32 path.
+    Q8_0,
 }
 
 /// Mel filterbank embedded in the ggml model file (`n_mel x n_fft_bins`,
@@ -2227,8 +2232,20 @@ mod tests {
         assert_eq!(c.model_path, path.canonicalize().expect("canon"));
     }
 
+    /// The resident cache is deliberately a SINGLE global slot
+    /// (`ModelCache::resident`), so the two resident tests below evict each
+    /// other's slot when the harness schedules them on concurrent threads —
+    /// the bd-0ivd secondary flap (remote workers, 2026-07-22: `drop(a)` →
+    /// sibling's resident load lands → `weak.upgrade()` finds the slot gone).
+    /// The engine is behaving as designed; the tests assume slot exclusivity,
+    /// so they serialize on this lock.
+    static RESIDENT_SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resident_cache_keeps_one_model_alive_after_drop() {
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("resident_cache");
         let path = write_file(dir.path(), "ggml-resident.bin", synthetic_model_bytes());
 
@@ -2249,6 +2266,9 @@ mod tests {
 
     #[test]
     fn resident_canonical_path_reuses_resident_slot_without_recanonicalizing() {
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("resident_canonical");
         let path = write_file(
             dir.path(),
