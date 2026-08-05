@@ -198,7 +198,25 @@ pub(crate) fn run_command_cancellable(
     token: &crate::orchestrator::CancellationToken,
     hard_timeout: Option<Duration>,
 ) -> FwResult<Output> {
+    run_command_cancellable_with_probe(program, args, cwd, token, hard_timeout, None)
+}
+
+/// Run a subprocess while honoring both the structured pipeline token and an
+/// optional caller-owned cancellation predicate.
+pub(crate) fn run_command_cancellable_with_probe(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    token: &crate::orchestrator::CancellationToken,
+    hard_timeout: Option<Duration>,
+    additional_cancel: Option<&(dyn Fn() -> bool + Sync)>,
+) -> FwResult<Output> {
     token.checkpoint()?;
+    if additional_cancel.is_some_and(|probe| probe()) {
+        return Err(FwError::Cancelled(
+            "subprocess cancelled by caller predicate".to_owned(),
+        ));
+    }
     if !command_exists(program) {
         return Err(FwError::CommandMissing {
             command: program.to_owned(),
@@ -261,6 +279,15 @@ pub(crate) fn run_command_cancellable(
             let _ = recv_pipe_output(stdout_rx);
             let _ = recv_pipe_output(stderr_rx);
             return Err(err);
+        }
+        if additional_cancel.is_some_and(|probe| probe()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = recv_pipe_output(stdout_rx);
+            let _ = recv_pipe_output(stderr_rx);
+            return Err(FwError::Cancelled(
+                "subprocess cancelled by caller predicate".to_owned(),
+            ));
         }
 
         // Hard timeout safety net.
@@ -347,7 +374,10 @@ mod tests {
 
     use crate::orchestrator::CancellationToken;
 
-    use super::{cancellable_poll_delay, render_command_for_log, run_command_cancellable};
+    use super::{
+        cancellable_poll_delay, render_command_for_log, run_command_cancellable,
+        run_command_cancellable_with_probe,
+    };
 
     #[test]
     fn cancellable_poll_schedule_rejoins_fixed_cadence() {
@@ -387,6 +417,25 @@ mod tests {
         assert!(
             matches!(err, crate::error::FwError::Cancelled(_)),
             "expected Cancelled error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn cancellable_kills_on_additional_caller_predicate() {
+        let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let caller_cancelled = || polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2;
+        let result = run_command_cancellable_with_probe(
+            "sleep",
+            &["60".to_owned()],
+            None,
+            &cancel,
+            Some(Duration::from_secs(120)),
+            Some(&caller_cancelled),
+        );
+        assert!(
+            matches!(&result, Err(crate::error::FwError::Cancelled(_))),
+            "caller predicate must cancel and reap the subprocess: {result:?}"
         );
     }
 
