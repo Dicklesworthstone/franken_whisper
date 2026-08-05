@@ -3500,7 +3500,7 @@ mod tests {
             provider_version: crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
             expected_model_package_sha256: "e".repeat(64),
             loaded_model_package_sha256: Some("e".repeat(64)),
-            model_load_source: Some(crate::model::NeuralModelLoadSource::Direct),
+            model_load_source: Some(crate::model::NeuralModelLoadSource::PackageVerified),
             status: NeuralSpeakerRepresentationStatus::Degraded,
             embedded_tracklet_count: 3,
             zero_padded_tracklet_count: 1,

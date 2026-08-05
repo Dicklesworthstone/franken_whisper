@@ -1207,7 +1207,8 @@ policy.
 
 Canonical result JSON, robot output, and persisted typed reports may expose
 only content-free ECAPA provenance: provider version, the public expected and
-loaded package digests, the stable in-process load source (`direct`),
+loaded package digests, the stable verified-package load source
+(`package_verified`),
 availability status, aggregate embedded/zero-padded/skipped tracklet counts,
 and stable reason codes. Cache warmth is deliberately excluded from the typed
 report so identical input, request, and model bytes do not produce different

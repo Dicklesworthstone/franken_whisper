@@ -1174,7 +1174,7 @@ where
     // the typed report stable for identical input/request/model bytes; the
     // package digest binds the actual model and the external cache test proves
     // miss/hit behavior independently.
-    let model_load_source = NeuralModelLoadSource::Direct;
+    let model_load_source = NeuralModelLoadSource::PackageVerified;
     let (mut report, projection) = diarize(&model).map_err(|error| match error {
         // The model executed, but an in-process producer violated its own
         // postconditions. Treating this as model unavailability would let a
@@ -4708,7 +4708,8 @@ async fn execute_diarize(
                         let external_report = external_diarization_report(
                             &result,
                             &normalized_input_sha256,
-                            &acoustic_request.speaker_count,
+                            &acoustic_request,
+                            None,
                         )?;
                         let speakers_detected =
                             usize::try_from(external_report.speaker_count.supported_speaker_count)
@@ -4777,7 +4778,8 @@ async fn execute_diarize(
                         let diarization_report = external_diarization_report(
                             &result,
                             &sha256_file(&normalized_wav)?,
-                            &acoustic_request.speaker_count,
+                            &acoustic_request,
+                            None,
                         )?;
                         let speakers_detected = usize::try_from(
                             diarization_report.speaker_count.supported_speaker_count,
@@ -4816,7 +4818,9 @@ async fn execute_diarize(
                             &acoustic_request.speaker_count,
                             "external diarization was unavailable; emitted unknown speakers",
                         );
-                        report.validate().map_err(FwError::InvalidRequest)?;
+                        report
+                            .validate_against_request(&acoustic_request, normalized_duration_ms)
+                            .map_err(FwError::ContractViolation)?;
                         result.diarization = Some(report);
                         Ok((
                             result,
@@ -4943,17 +4947,19 @@ async fn execute_diarize(
                                 let mut external_report = external_diarization_report(
                                     &result,
                                     &normalized_input_sha256,
-                                    &acoustic_request.speaker_count,
+                                    &acoustic_request,
+                                    diarization_report.neural_representation,
                                 )?;
-                                external_report.neural_representation =
-                                    diarization_report.neural_representation;
                                 external_report.diagnostics.push(
                                     "neural speaker evidence was insufficient; accepted runtime-verified external diarization"
                                         .to_owned(),
                                 );
                                 external_report
-                                    .validate()
-                                    .map_err(FwError::InvalidRequest)?;
+                                    .validate_against_request(
+                                        &acoustic_request,
+                                        Some(normalized_pcm_duration_ms(samples.len())?),
+                                    )
+                                    .map_err(FwError::ContractViolation)?;
                                 let speakers_detected = usize::try_from(
                                     external_report.speaker_count.supported_speaker_count,
                                 )
@@ -5084,22 +5090,26 @@ async fn execute_diarize(
                                 DiarizationFallbackPolicy::External
                                     if result_has_external_diarization(&result) =>
                                 {
+                                    let neural_representation =
+                                        unavailable_neural_representation_summary(
+                                            reason,
+                                            model_load_source,
+                                        )?;
                                     let mut external_report = external_diarization_report(
                                         &result,
                                         &normalized_input_sha256,
-                                        &acoustic_request.speaker_count,
+                                        &acoustic_request,
+                                        Some(neural_representation),
                                     )?;
-                                    external_report.neural_representation =
-                                        Some(unavailable_neural_representation_summary(
-                                            reason,
-                                            model_load_source,
-                                        )?);
                                     external_report.diagnostics.push(format!(
                                         "neural_representation_fallback={reason_code}"
                                     ));
                                     external_report
-                                        .validate()
-                                        .map_err(FwError::InvalidRequest)?;
+                                        .validate_against_request(
+                                            &acoustic_request,
+                                            Some(normalized_pcm_duration_ms(samples.len())?),
+                                        )
+                                        .map_err(FwError::ContractViolation)?;
                                     let speakers_detected = usize::try_from(
                                         external_report.speaker_count.supported_speaker_count,
                                     )
@@ -5141,7 +5151,7 @@ async fn execute_diarize(
                                             &acoustic_request,
                                             &result.segments,
                                             word_aligned,
-                                            normalized_duration_ms,
+                                            normalized_pcm_duration_ms(samples.len())?,
                                             neural_representation,
                                             &format!(
                                                 "neural_representation_fallback={reason_code}; emitted unknown speakers"
@@ -5310,7 +5320,9 @@ fn run_native_acoustic_fallback(
     )?;
     report.neural_representation = neural_representation;
     report.diagnostics.push(diagnostic);
-    report.validate().map_err(FwError::InvalidRequest)?;
+    report
+        .validate_against_request(input.request, Some(normalized_pcm_duration_ms(input.samples.len())?))
+        .map_err(FwError::ContractViolation)?;
     Ok((report, projection))
 }
 
@@ -5379,6 +5391,16 @@ fn finite_seconds_interval_to_ms(start_sec: f64, end_sec: f64) -> Option<(u64, u
     let start_ms = start_ms as u64;
     let end_ms = end_ms as u64;
     (end_ms > start_ms).then_some((start_ms, end_ms))
+}
+
+fn normalized_pcm_duration_ms(sample_count: usize) -> FwResult<u64> {
+    let duration_ms = (sample_count as u128)
+        .checked_mul(1_000)
+        .ok_or_else(|| FwError::InvalidRequest("normalized sample count overflow".to_owned()))?
+        / 16_000;
+    u64::try_from(duration_ms).map_err(|_| {
+        FwError::InvalidRequest("normalized audio duration exceeds the report schema".to_owned())
+    })
 }
 
 fn transcript_boundaries_ms(segments: &[crate::model::TranscriptionSegment]) -> Vec<u64> {
@@ -5854,15 +5876,19 @@ fn unknown_neural_diarization_with_hard_hints(
     } else {
         DiarizationFallbackStatus::UnsatisfiedConstraints
     };
-    report.validate().map_err(FwError::InvalidRequest)?;
+    report
+        .validate_against_request(request, Some(audio_duration_ms))
+        .map_err(FwError::ContractViolation)?;
     Ok((report, projection))
 }
 
 fn external_diarization_report(
     result: &crate::model::TranscriptionResult,
     normalized_input_sha256: &str,
-    speaker_count: &SpeakerCountRequest,
+    request: &DiarizationRequest,
+    neural_representation: Option<NeuralSpeakerRepresentationSummary>,
 ) -> FwResult<DiarizationReport> {
+    let speaker_count = &request.speaker_count;
     if matches!(
         speaker_count,
         SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
@@ -6044,12 +6070,14 @@ fn external_diarization_report(
         },
         fallback_status: DiarizationFallbackStatus::ExternalBackend,
         operational_partition: None,
-        neural_representation: None,
+        neural_representation,
         diagnostics: vec![format!(
             "accepted external speaker assignments covering {external_segment_count} ms; acoustic profile calibration unavailable"
         )],
     };
-    report.validate().map_err(FwError::InvalidRequest)?;
+    report
+        .validate_against_request(request, None)
+        .map_err(FwError::ContractViolation)?;
     Ok(report)
 }
 
@@ -7548,7 +7576,10 @@ mod tests {
                 crate::model::NeuralSpeakerRepresentationReason::InferenceFailed
             );
             assert!(matches!(error, FwError::BackendUnavailable(_)));
-            assert_eq!(source, Some(crate::model::NeuralModelLoadSource::Direct));
+            assert_eq!(
+                source,
+                Some(crate::model::NeuralModelLoadSource::PackageVerified)
+            );
         }
 
         let internal_contract_failure = super::run_ecapa_attempt(
@@ -7579,7 +7610,7 @@ mod tests {
         base.neural_representation = Some(
             super::unavailable_neural_representation_summary(
                 crate::model::NeuralSpeakerRepresentationReason::InsufficientTracklets,
-                Some(crate::model::NeuralModelLoadSource::Direct),
+                Some(crate::model::NeuralModelLoadSource::PackageVerified),
             )
             .expect("loaded model with insufficient speech summary"),
         );
@@ -7614,7 +7645,7 @@ mod tests {
                 .neural_representation
                 .as_ref()
                 .and_then(|summary| summary.model_load_source),
-            Some(crate::model::NeuralModelLoadSource::Direct)
+            Some(crate::model::NeuralModelLoadSource::PackageVerified)
         );
         assert!(
             miss_report
@@ -10602,7 +10633,9 @@ mod tests {
                 match model_load_source {
                     crate::model::NeuralModelLoadSource::CacheHit => json!("cache_hit"),
                     crate::model::NeuralModelLoadSource::CacheMiss => json!("cache_miss"),
-                    crate::model::NeuralModelLoadSource::Direct => json!("direct"),
+                    crate::model::NeuralModelLoadSource::PackageVerified => {
+                        json!("package_verified")
+                    }
                 }
             );
         }
@@ -10642,10 +10675,15 @@ mod tests {
             raw_output: json!({}),
             artifact_paths: Vec::new(),
         };
+        let infer_request = DiarizationRequest {
+            engine: DiarizationEngine::External,
+            speaker_count: SpeakerCountRequest::Infer,
+            ..DiarizationRequest::default()
+        };
         let report = external_diarization_report(
             &result,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            &SpeakerCountRequest::Infer,
+            &infer_request,
         )
         .expect("valid external report");
         assert_eq!(report.turns.len(), 2);
@@ -10656,13 +10694,18 @@ mod tests {
         assert_eq!(report.turns[0].speaker_ref.as_deref(), Some("speaker_a"));
         assert_eq!(report.turns[1].speaker_ref.as_deref(), Some("speaker_b"));
 
-        let soft_error = external_diarization_report(
-            &result,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            &SpeakerCountRequest::Range {
+        let range_request = DiarizationRequest {
+            engine: DiarizationEngine::External,
+            speaker_count: SpeakerCountRequest::Range {
                 minimum: 1,
                 maximum: 3,
             },
+            ..DiarizationRequest::default()
+        };
+        let soft_error = external_diarization_report(
+            &result,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &range_request,
         )
         .expect_err("external report must not discard soft count semantics");
         assert!(soft_error.to_string().contains("cannot faithfully fuse"));
@@ -10673,7 +10716,7 @@ mod tests {
             external_diarization_report(
                 &overlapping,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                &SpeakerCountRequest::Infer,
+                &infer_request,
             )
             .expect_err("different external speakers may not overlap")
             .to_string()

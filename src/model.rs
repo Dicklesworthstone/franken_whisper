@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Phase 3: backend-specific parameter types
@@ -521,12 +522,13 @@ pub enum NeuralSpeakerRepresentationReason {
     InferenceFailed,
 }
 
-/// Typed origin of the loaded ECAPA model instance. `Direct` is used by the
-/// embedding library API; orchestrated CLI runs refine it to a cache hit/miss.
+/// Typed provenance for a loaded ECAPA model package. `PackageVerified`
+/// records only that the admitted package digest was verified; it makes no
+/// claim about whether a process-local cache was hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NeuralModelLoadSource {
-    Direct,
+    PackageVerified,
     CacheHit,
     CacheMiss,
 }
@@ -1187,6 +1189,62 @@ fn lowercase_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Content digest for the ordered `speaker-hints-v1` request sequence.
+///
+/// Request order is intentionally part of the digest because public hint
+/// evidence uses positional `hint_index` identities.
+pub(crate) fn speaker_hint_document_sha256(hints: &[KnownSpeakerInterval]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"speaker-hints-v1\0");
+    for hint in hints {
+        hash_diarization_field(&mut hasher, hint.speaker_ref.as_bytes());
+        hasher.update(hint.start_ms.to_le_bytes());
+        hasher.update(hint.end_ms.to_le_bytes());
+        hasher.update([known_speaker_policy_rank(hint.policy)]);
+        hasher.update(hint.confidence.to_bits().to_le_bytes());
+        hash_diarization_field(
+            &mut hasher,
+            hint.provenance.as_deref().unwrap_or_default().as_bytes(),
+        );
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Content digest binding an attribution query to its normalized input and
+/// complete privacy-safe query fields.
+pub(crate) fn speaker_attribution_query_sha256(
+    normalized_input_sha256: &str,
+    query: &SpeakerAttributionQuery,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"speaker-attribution-query-v1\0");
+    hash_diarization_field(&mut hasher, normalized_input_sha256.as_bytes());
+    hasher.update(query.start_ms.to_le_bytes());
+    hasher.update(query.end_ms.to_le_bytes());
+    hasher.update([match query.reason {
+        SpeakerAttributionQueryReason::UnknownAttribution => 0,
+        SpeakerAttributionQueryReason::LowConfidence => 1,
+        SpeakerAttributionQueryReason::OverlapAmbiguity => 2,
+    }]);
+    for speaker_ref in &query.candidate_speaker_refs {
+        hash_diarization_field(&mut hasher, speaker_ref.as_bytes());
+    }
+    hasher.update([known_speaker_policy_rank(query.suggested_policy)]);
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_diarization_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
+}
+
+const fn known_speaker_policy_rank(policy: KnownSpeakerPolicy) -> u8 {
+    match policy {
+        KnownSpeakerPolicy::HardMustLink => 0,
+        KnownSpeakerPolicy::SoftEnrollment => 1,
+    }
 }
 
 fn entropy_term(probability: f64) -> f64 {
@@ -5357,7 +5415,7 @@ mod tests {
             loaded_model_package_sha256: Some(
                 crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
             ),
-            model_load_source: Some(NeuralModelLoadSource::Direct),
+            model_load_source: Some(NeuralModelLoadSource::PackageVerified),
             status: NeuralSpeakerRepresentationStatus::Ready,
             embedded_tracklet_count: 1,
             zero_padded_tracklet_count: 0,
