@@ -1170,10 +1170,9 @@ where
             error,
             model_load_source: None,
         })?;
-    // Cache warmth is operational telemetry, not diarization authority. Keep
-    // the typed report stable for identical input/request/model bytes; the
-    // package digest binds the actual model and the external cache test proves
-    // miss/hit behavior independently.
+    // Cache warmth is operational telemetry, not diarization authority. The
+    // stable source records that the pinned package was verified and loaded,
+    // while the external cache test proves miss/hit behavior independently.
     let model_load_source = NeuralModelLoadSource::PackageVerified;
     let (mut report, projection) = diarize(&model).map_err(|error| match error {
         // The model executed, but an in-process producer violated its own
@@ -10684,6 +10683,7 @@ mod tests {
             &result,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &infer_request,
+            None,
         )
         .expect("valid external report");
         assert_eq!(report.turns.len(), 2);
@@ -10706,6 +10706,7 @@ mod tests {
             &result,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &range_request,
+            None,
         )
         .expect_err("external report must not discard soft count semantics");
         assert!(soft_error.to_string().contains("cannot faithfully fuse"));
@@ -10717,6 +10718,7 @@ mod tests {
                 &overlapping,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &infer_request,
+                None,
             )
             .expect_err("different external speakers may not overlap")
             .to_string()
