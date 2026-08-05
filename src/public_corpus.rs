@@ -14051,6 +14051,48 @@ mod tests {
     const PUBLIC_ECAPA_RESIDUAL_REBUILD_VIEW_FACTOR: u64 = 1;
     const PUBLIC_ECAPA_RESIDUAL_FINAL_CLUSTER_PAIR_VIEW_FACTOR: u64 = 5;
 
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_PAIR_SCHEMA_VERSION: &str =
+        "public-supported-profile-redecode-pair-row-v1";
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_SCHEMA_VERSION: &str =
+        "public-supported-profile-redecode-gate-row-v1";
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_RUNNER_VERSION: &str =
+        "public-supported-profile-redecode-gate-runner-v1";
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_POLICY_ID: &str =
+        "public-supported-profile-redecode-development-policy-v1";
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_RECORDINGS: u64 = 8;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_PAIR_ROWS: u64 = 16;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_SINGLE_SPEAKER_CONTROLS: u64 = 2;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_RELATIVE_RTF_REGRESSION: f64 = 0.25;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_COUNTERFACTUAL_RTF: f64 = 1.0;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_PROCESS_RSS_BYTES: u64 = 512 * 1024 * 1024;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_DEV8_DESCRIPTOR_SHA256: &str =
+        "f99734dfe2d7441853acaa2beba6c1c3fb37e38c0593db2013d1f6c7661cd53b";
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_DEV8_BUNDLE_SHA256: &str =
+        "3ee85a279661b3766aaefc16de78ab0877c21ee97e7e922032bf584ade02ba79";
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_SCORER_CONFIG_SHA256: &str =
+        "a86fbe8d0e5fed9aff0a301857fd0d64ce9ffea49008b894818997b0c553781b";
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_CORPUS_KEY: &str = "ami-scenario-v1";
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_SOURCE_VERSION: &str =
+        "ami-manual-v1.6.2-pyannote-only-words-main";
+    // Independent frozen gate ceilings. Candidate/core constants are checked
+    // against these values below but never define or weaken the gate policy.
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_TRACKLET_COUNT: u64 = 2_048;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_TOTAL_PROFILE_ROW_COUNT: u64 = 512;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_SUPPORTED_SPEAKER_COUNT: u64 = 8;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_STATE_COUNT: u64 = 9;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_PREFLIGHT_VALIDATION_VISITS: u64 = 2_560;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_EMISSION_EVALUATIONS: u64 = 16_384;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_TRANSITION_EVALUATIONS: u64 = 165_807;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_LOCAL_SCORE_VISITS: u64 = 147_456;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_BACKPOINTER_COUNT: u64 = 18_432;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_STAGED_STATE_COUNT: u64 = 2_048;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_ATOMIC_COMMIT_ROW_COUNT: u64 = 2_048;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_CANCELLATION_CHECK_INTERVAL_OPERATIONS: u64 = 32;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_SCRATCH_PAYLOAD_BYTES: u64 = 131_072;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_OUTPUT_LABEL_BYTES_PER_ASSIGNMENT: u64 = 256;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_PERSISTENT_OUTPUT_LABEL_BYTES: u64 = 524_288;
+    const PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_MULTI_SPEAKER_DOMINANT_SHARE: f64 = 0.98;
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
     #[serde(rename_all = "snake_case")]
     enum PublicEcapaResidualBirthGateFailure {
@@ -14192,6 +14234,286 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum PublicSupportedProfileRedecodeGateFailure {
+        PairCountMismatch,
+        PairAlignmentMismatch,
+        PairIntegrityMismatch,
+        PolicyHashMismatch,
+        RedecodePolicyMismatch,
+        ProtocolMismatch,
+        FrozenReferenceMismatch,
+        FrozenRecordingMismatch,
+        ScoreAuthorityMismatch,
+        CommonObservationMismatch,
+        FrozenIncumbentMismatch,
+        IncumbentContractMismatch,
+        CandidateContractMismatch,
+        CandidateReplayMismatch,
+        RejectedCandidateOutputMismatch,
+        MissingAccuracyMetric,
+        NonFiniteMetric,
+        MicroDerNotImproved,
+        MicroConfusionNotImproved,
+        MacroDerRegression,
+        MacroJerRegression,
+        ChangeF1Regression,
+        BoundaryMaeRegression,
+        SelectiveRiskRegression,
+        SelectiveCoverageRegression,
+        CalibrationRegression,
+        MissingStrictAuxiliaryGain,
+        PerRecordingDerRegression,
+        PerRecordingCountRegression,
+        MissingSingleSpeakerControls,
+        SingleSpeakerControlFailure,
+        RuntimeUnavailable,
+        RuntimeRegression,
+        RssUnavailable,
+        ProcessRssExceeded,
+        ResourceBoundExceeded,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodeGatePolicy {
+        policy_id: String,
+        required_recording_count: u64,
+        required_pair_count: u64,
+        required_engines: [crate::model::DiarizationEngine; 2],
+        required_baseline_first_pair_count: u64,
+        required_candidate_first_pair_count: u64,
+        required_baseline_first_pair_count_per_engine: u64,
+        required_candidate_first_pair_count_per_engine: u64,
+        required_single_speaker_control_recording_count: u64,
+        require_strict_micro_der_improvement: bool,
+        require_strict_micro_confusion_improvement: bool,
+        require_per_record_der_non_regression: bool,
+        require_per_record_count_non_regression: bool,
+        require_strict_auxiliary_gain: bool,
+        maximum_macro_der_regression: f64,
+        maximum_macro_jer_regression: f64,
+        maximum_change_f1_regression: f64,
+        maximum_boundary_mae_regression_sec: f64,
+        maximum_selective_risk_regression: f64,
+        maximum_selective_coverage_regression: f64,
+        maximum_assignment_ece_regression: f64,
+        maximum_assignment_brier_regression: f64,
+        maximum_tracklet_count: u64,
+        maximum_total_profile_row_count: u64,
+        maximum_supported_speaker_count: u64,
+        maximum_state_count: u64,
+        maximum_preflight_validation_visits: u64,
+        maximum_emission_evaluations: u64,
+        maximum_transition_evaluations: u64,
+        maximum_local_score_visits: u64,
+        maximum_backpointer_count: u64,
+        maximum_staged_state_count: u64,
+        maximum_atomic_commit_row_count: u64,
+        required_candidate_redecode_count: u64,
+        required_profile_update_count: u64,
+        required_model_call_count: u64,
+        cancellation_check_interval_operations: u64,
+        maximum_scratch_payload_bytes: u64,
+        maximum_output_label_bytes_per_assignment: u64,
+        maximum_persistent_output_label_bytes: u64,
+        maximum_multi_speaker_dominant_share: f64,
+        maximum_relative_partition_rtf_regression: f64,
+        maximum_candidate_counterfactual_rtf: f64,
+        maximum_paired_process_rss_bytes: u64,
+        required_successful_authoritative_peak_sample_count: u64,
+        search_contract: String,
+        preflight_validation_contract: String,
+        local_score_visit_contract: String,
+        multi_speaker_dominant_share_contract: String,
+        atomic_commit_contract: String,
+        persistent_output_label_diagnostic_contract: String,
+        persistent_output_label_static_safety_contract: String,
+        scratch_payload_contract: String,
+        forced_row_digest_authority: String,
+        accuracy_authority_contract: String,
+        undefined_metric_behavior: String,
+    }
+
+    fn assert_supported_profile_redecode_core_within_frozen_gate() {
+        let usize_within =
+            |value: usize, maximum: u64| u64::try_from(value).is_ok_and(|value| value <= maximum);
+        assert!(usize_within(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_TRACKLETS,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_TRACKLET_COUNT,
+        ));
+        assert!(usize_within(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_PROFILE_ROWS,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_TOTAL_PROFILE_ROW_COUNT,
+        ));
+        assert!(usize_within(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_SPEAKERS,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_SUPPORTED_SPEAKER_COUNT,
+        ));
+        assert!(usize_within(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_STATES,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_STATE_COUNT,
+        ));
+        assert!(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_PREFLIGHT_VALIDATIONS
+                <= PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_PREFLIGHT_VALIDATION_VISITS
+        );
+        assert!(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_EMISSION_EVALUATIONS
+                <= PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_EMISSION_EVALUATIONS
+        );
+        assert!(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_TRANSITIONS
+                <= PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_TRANSITION_EVALUATIONS
+        );
+        assert!(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_LOCAL_SCORE_VISITS
+                <= PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_LOCAL_SCORE_VISITS
+        );
+        assert!(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_BACKPOINTERS
+                <= PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_BACKPOINTER_COUNT
+        );
+        assert!(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_STAGED_STATES
+                <= PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_STAGED_STATE_COUNT
+        );
+        assert!(usize_within(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_ATOMIC_COMMIT_ROWS,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_ATOMIC_COMMIT_ROW_COUNT,
+        ));
+        assert_eq!(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_CANCELLATION_INTERVAL,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_CANCELLATION_CHECK_INTERVAL_OPERATIONS,
+        );
+        assert!(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_SCRATCH_BYTES
+                <= PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_SCRATCH_PAYLOAD_BYTES
+        );
+        assert!(usize_within(
+            crate::model::MAX_SPEAKER_REF_BYTES,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_OUTPUT_LABEL_BYTES_PER_ASSIGNMENT,
+        ));
+        assert!(
+            crate::diarization::SUPPORTED_PROFILE_REDECODE_MAX_PERSISTENT_OUTPUT_LABEL_BYTES
+                <= PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_PERSISTENT_OUTPUT_LABEL_BYTES
+        );
+        assert!(
+            (f64::from(crate::diarization::MAX_MULTI_SPEAKER_DOMINANT_SHARE)
+                - PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_MULTI_SPEAKER_DOMINANT_SHARE)
+                .abs()
+                <= f64::from(f32::EPSILON),
+            "candidate dominant-share threshold drifted from the independent frozen gate"
+        );
+    }
+
+    fn public_supported_profile_redecode_gate_policy() -> PublicSupportedProfileRedecodeGatePolicy {
+        assert_supported_profile_redecode_core_within_frozen_gate();
+        PublicSupportedProfileRedecodeGatePolicy {
+            policy_id: PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_POLICY_ID.to_owned(),
+            required_recording_count: PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_RECORDINGS,
+            required_pair_count: PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_PAIR_ROWS,
+            required_engines: [
+                crate::model::DiarizationEngine::Ecapa,
+                crate::model::DiarizationEngine::EcapaFused,
+            ],
+            required_baseline_first_pair_count: PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_PAIR_ROWS
+                / 2,
+            required_candidate_first_pair_count:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_PAIR_ROWS / 2,
+            required_baseline_first_pair_count_per_engine:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_RECORDINGS / 2,
+            required_candidate_first_pair_count_per_engine:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_RECORDINGS / 2,
+            required_single_speaker_control_recording_count:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_SINGLE_SPEAKER_CONTROLS,
+            require_strict_micro_der_improvement: true,
+            require_strict_micro_confusion_improvement: true,
+            require_per_record_der_non_regression: true,
+            require_per_record_count_non_regression: true,
+            require_strict_auxiliary_gain: true,
+            maximum_macro_der_regression: 0.0,
+            maximum_macro_jer_regression: 0.0,
+            maximum_change_f1_regression: 0.0,
+            maximum_boundary_mae_regression_sec: 0.0,
+            maximum_selective_risk_regression: 0.0,
+            maximum_selective_coverage_regression: 0.0,
+            maximum_assignment_ece_regression: 0.0,
+            maximum_assignment_brier_regression: 0.0,
+            maximum_tracklet_count: PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_TRACKLET_COUNT,
+            maximum_total_profile_row_count:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_TOTAL_PROFILE_ROW_COUNT,
+            maximum_supported_speaker_count:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_SUPPORTED_SPEAKER_COUNT,
+            maximum_state_count: PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_STATE_COUNT,
+            maximum_preflight_validation_visits:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_PREFLIGHT_VALIDATION_VISITS,
+            maximum_emission_evaluations:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_EMISSION_EVALUATIONS,
+            maximum_transition_evaluations:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_TRANSITION_EVALUATIONS,
+            maximum_local_score_visits:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_LOCAL_SCORE_VISITS,
+            maximum_backpointer_count:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_BACKPOINTER_COUNT,
+            maximum_staged_state_count:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_STAGED_STATE_COUNT,
+            maximum_atomic_commit_row_count:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_ATOMIC_COMMIT_ROW_COUNT,
+            required_candidate_redecode_count: 1,
+            required_profile_update_count: 0,
+            required_model_call_count: 0,
+            cancellation_check_interval_operations:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_CANCELLATION_CHECK_INTERVAL_OPERATIONS,
+            maximum_scratch_payload_bytes:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_SCRATCH_PAYLOAD_BYTES,
+            maximum_output_label_bytes_per_assignment:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_OUTPUT_LABEL_BYTES_PER_ASSIGNMENT,
+            maximum_persistent_output_label_bytes:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_PERSISTENT_OUTPUT_LABEL_BYTES,
+            maximum_multi_speaker_dominant_share:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_MULTI_SPEAKER_DOMINANT_SHARE,
+            maximum_relative_partition_rtf_regression:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_RELATIVE_RTF_REGRESSION,
+            maximum_candidate_counterfactual_rtf:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_COUNTERFACTUAL_RTF,
+            maximum_paired_process_rss_bytes:
+                PUBLIC_SUPPORTED_PROFILE_REDECODE_MAXIMUM_PROCESS_RSS_BYTES,
+            required_successful_authoritative_peak_sample_count: 1 + 4
+                * PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_PAIR_ROWS,
+            search_contract:
+                "bounded-label-state-viterbi-duration-summary-path-history-approximation-not-global-optimum-v1"
+                    .to_owned(),
+            preflight_validation_contract:
+                "tracklet-count-plus-total-profile-row-count-exact-v1".to_owned(),
+            local_score_visit_contract:
+                "unforced-tracklet-count-times-supported-speaker-count-times-state-count-exact-v1"
+                    .to_owned(),
+            multi_speaker_dominant_share_contract:
+                "applied-output-with-more-than-one-detected-speaker-at-or-below-frozen-threshold-v1"
+                    .to_owned(),
+            atomic_commit_contract:
+                "single-final-cancellation-check-then-noninterruptible-at-most-2048-row-commit-v1"
+                    .to_owned(),
+            persistent_output_label_diagnostic_contract:
+                "bounded-self-reported-replay-diagnostic-not-exact-public-payload-authority-v1"
+                    .to_owned(),
+            persistent_output_label_static_safety_contract:
+                "core-validates-label-at-most-256-bytes-and-atomic-rows-at-most-2048-implying-at-most-524288-bytes-v1"
+                    .to_owned(),
+            scratch_payload_contract:
+                "tracklet-state-lattice-u8-plus-f32-and-tracklet-u8-plus-f32-plus-1024-exact-v1"
+                    .to_owned(),
+            forced_row_digest_authority:
+                "public-corpus-evaluation-only-derived-float-fingerprint-v1".to_owned(),
+            accuracy_authority_contract:
+                "exact-verified-authoritative-score-to-reduced-row-three-arm-recording-bound-v1"
+                    .to_owned(),
+            undefined_metric_behavior: "fail-closed-no-case-deletion-v1".to_owned(),
+        }
+    }
+
     fn serialize_path_free_public_ecapa_evidence<T: serde::Serialize>(
         value: &T,
         local_paths: &[&Path],
@@ -14205,6 +14527,8 @@ mod tests {
                             !field.contains("path")
                                 && !field.contains("transcript")
                                 && !field.contains("speaker_label")
+                                && field != "speaker_ref"
+                                && field != "secondary_speaker_ref"
                                 && field != "text"
                                 && field != "turns"
                                 && field != "segments"
@@ -14706,6 +15030,455 @@ mod tests {
         result_sha256: String,
     }
 
+    #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodeResources {
+        preflight_validation_visits: u64,
+        emission_evaluations: u64,
+        transition_evaluations: u64,
+        local_score_visits: u64,
+        backpointer_count: u64,
+        staged_state_count: u64,
+        redecode_count: u64,
+        profile_update_count: u64,
+        model_call_count: u64,
+        cancellation_check_count: u64,
+        peak_scratch_payload_bytes: u64,
+        persistent_output_label_bytes: u64,
+    }
+
+    impl From<crate::diarization::SupportedProfileRedecodeResourceSummary>
+        for PublicSupportedProfileRedecodeResources
+    {
+        fn from(summary: crate::diarization::SupportedProfileRedecodeResourceSummary) -> Self {
+            Self {
+                preflight_validation_visits: summary.preflight_validation_visits,
+                emission_evaluations: summary.emission_evaluations,
+                transition_evaluations: summary.transition_evaluations,
+                local_score_visits: summary.local_score_visits,
+                backpointer_count: summary.backpointer_count,
+                staged_state_count: summary.staged_state_count,
+                redecode_count: summary.redecode_count,
+                profile_update_count: summary.profile_update_count,
+                model_call_count: summary.model_call_count,
+                cancellation_check_count: summary.cancellation_check_count,
+                peak_scratch_payload_bytes: summary.peak_scratch_payload_bytes,
+                persistent_output_label_bytes: summary.persistent_output_label_bytes,
+            }
+        }
+    }
+
+    impl PublicSupportedProfileRedecodeResources {
+        fn saturating_add_assign(&mut self, other: &Self) {
+            self.preflight_validation_visits = self
+                .preflight_validation_visits
+                .saturating_add(other.preflight_validation_visits);
+            self.emission_evaluations = self
+                .emission_evaluations
+                .saturating_add(other.emission_evaluations);
+            self.transition_evaluations = self
+                .transition_evaluations
+                .saturating_add(other.transition_evaluations);
+            self.local_score_visits = self
+                .local_score_visits
+                .saturating_add(other.local_score_visits);
+            self.backpointer_count = self
+                .backpointer_count
+                .saturating_add(other.backpointer_count);
+            self.staged_state_count = self
+                .staged_state_count
+                .saturating_add(other.staged_state_count);
+            self.redecode_count = self.redecode_count.saturating_add(other.redecode_count);
+            self.profile_update_count = self
+                .profile_update_count
+                .saturating_add(other.profile_update_count);
+            self.model_call_count = self.model_call_count.saturating_add(other.model_call_count);
+            self.cancellation_check_count = self
+                .cancellation_check_count
+                .saturating_add(other.cancellation_check_count);
+            self.peak_scratch_payload_bytes = self
+                .peak_scratch_payload_bytes
+                .max(other.peak_scratch_payload_bytes);
+            self.persistent_output_label_bytes = self
+                .persistent_output_label_bytes
+                .saturating_add(other.persistent_output_label_bytes);
+        }
+
+        fn total_polled_operations(&self) -> Option<u64> {
+            self.preflight_validation_visits
+                .checked_add(self.emission_evaluations)?
+                .checked_add(self.transition_evaluations)?
+                .checked_add(self.local_score_visits)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodeAccuracyRow {
+        reference_speaker_time_sec: f64,
+        missed_speech_sec: f64,
+        false_alarm_sec: f64,
+        speaker_confusion_sec: f64,
+        der: Option<f64>,
+        jer: Option<f64>,
+        reference_speakers: u64,
+        hypothesis_speakers: u64,
+        absolute_speaker_count_error: u64,
+        change_reference_count: u64,
+        change_hypothesis_count: u64,
+        change_matched_count: u64,
+        change_f1: Option<f64>,
+        boundary_matched_count: u64,
+        boundary_absolute_error_sec: f64,
+        boundary_mean_absolute_error_sec: Option<f64>,
+        selective_reference_speaker_time_sec: f64,
+        selective_covered_speaker_time_sec: f64,
+        selective_error_covered_speaker_time_sec: f64,
+        selective_coverage: Option<f64>,
+        selective_risk: Option<f64>,
+        calibration_observed_duration_sec: f64,
+        calibration_opportunity_duration_sec: f64,
+        assignment_brier_score: Option<f64>,
+        assignment_expected_calibration_error: Option<f64>,
+        reference_sha256: String,
+        hypothesis_sha256: String,
+        scorer_config_sha256: String,
+        score_sha256: String,
+    }
+
+    impl PublicSupportedProfileRedecodeAccuracyRow {
+        fn from_score(score: &AuthoritativeDiarizationScore) -> Self {
+            let boundary_matched_count =
+                u64::try_from(score.change_points.matched_count).unwrap_or(u64::MAX);
+            let boundary_absolute_error_sec = score
+                .change_points
+                .mean_absolute_error_sec
+                .map(|mean| mean * boundary_matched_count as f64)
+                .unwrap_or(0.0);
+            Self {
+                reference_speaker_time_sec: score.diarization.reference_speaker_time_sec,
+                missed_speech_sec: score.diarization.missed_speech_sec,
+                false_alarm_sec: score.diarization.false_alarm_sec,
+                speaker_confusion_sec: score.diarization.speaker_confusion_sec,
+                der: score.diarization.der,
+                jer: score.diarization.jer,
+                reference_speakers: u64::try_from(score.speaker_count.reference_speakers)
+                    .unwrap_or(u64::MAX),
+                hypothesis_speakers: u64::try_from(score.speaker_count.hypothesis_speakers)
+                    .unwrap_or(u64::MAX),
+                absolute_speaker_count_error: score.speaker_count.absolute_error,
+                change_reference_count: u64::try_from(score.change_points.reference_count)
+                    .unwrap_or(u64::MAX),
+                change_hypothesis_count: u64::try_from(score.change_points.hypothesis_count)
+                    .unwrap_or(u64::MAX),
+                change_matched_count: boundary_matched_count,
+                change_f1: score.change_points.f1,
+                boundary_matched_count,
+                boundary_absolute_error_sec,
+                boundary_mean_absolute_error_sec: score.change_points.mean_absolute_error_sec,
+                selective_reference_speaker_time_sec: score
+                    .selective_attribution
+                    .reference_speaker_time_sec,
+                selective_covered_speaker_time_sec: score
+                    .selective_attribution
+                    .covered_speaker_time_sec,
+                selective_error_covered_speaker_time_sec: score
+                    .selective_attribution
+                    .error_covered_speaker_time_sec,
+                selective_coverage: score.selective_attribution.coverage,
+                selective_risk: score.selective_attribution.selective_risk,
+                calibration_observed_duration_sec: score.calibration.observed_duration_sec,
+                calibration_opportunity_duration_sec: score.calibration.opportunity_duration_sec,
+                assignment_brier_score: score.calibration.brier_score,
+                assignment_expected_calibration_error: score.calibration.expected_calibration_error,
+                reference_sha256: score.reference_sha256.clone(),
+                hypothesis_sha256: score.hypothesis_sha256.clone(),
+                scorer_config_sha256: score.config_sha256.clone(),
+                score_sha256: score.result_sha256.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodeFrozenCorpusIdentity {
+        descriptor_sha256: String,
+        bundle_sha256: String,
+        scorer_config_sha256: String,
+        corpus_key: String,
+        source_version: String,
+    }
+
+    /// Non-serialized authority token retained outside the public evidence row.
+    #[derive(Clone, PartialEq)]
+    struct PublicSupportedProfileRedecodeFrozenReference {
+        identity: PublicSupportedProfileRedecodeFrozenCorpusIdentity,
+    }
+
+    fn public_supported_profile_redecode_expected_frozen_corpus_identity()
+    -> PublicSupportedProfileRedecodeFrozenCorpusIdentity {
+        PublicSupportedProfileRedecodeFrozenCorpusIdentity {
+            descriptor_sha256: PUBLIC_SUPPORTED_PROFILE_REDECODE_DEV8_DESCRIPTOR_SHA256.to_owned(),
+            bundle_sha256: PUBLIC_SUPPORTED_PROFILE_REDECODE_DEV8_BUNDLE_SHA256.to_owned(),
+            scorer_config_sha256: PUBLIC_SUPPORTED_PROFILE_REDECODE_SCORER_CONFIG_SHA256.to_owned(),
+            corpus_key: PUBLIC_SUPPORTED_PROFILE_REDECODE_CORPUS_KEY.to_owned(),
+            source_version: PUBLIC_SUPPORTED_PROFILE_REDECODE_SOURCE_VERSION.to_owned(),
+        }
+    }
+
+    /// Exact verified scorer reductions retained independently of rehashable rows.
+    #[derive(Clone, PartialEq)]
+    struct PublicSupportedProfileRedecodeExpectedPairBinding {
+        recording_id: String,
+        audio_duration_ms: u64,
+        source_audio_sha256: String,
+        baseline_accuracy: PublicSupportedProfileRedecodeAccuracyRow,
+        candidate_accuracy: PublicSupportedProfileRedecodeAccuracyRow,
+        candidate_replay_accuracy: PublicSupportedProfileRedecodeAccuracyRow,
+    }
+
+    fn public_supported_profile_redecode_expected_pair_binding(
+        recording_id: &str,
+        audio_duration_ms: u64,
+        source_audio_sha256: &str,
+        baseline_score: &AuthoritativeDiarizationScore,
+        candidate_score: &AuthoritativeDiarizationScore,
+        candidate_replay_score: &AuthoritativeDiarizationScore,
+    ) -> PublicSupportedProfileRedecodeExpectedPairBinding {
+        for score in [baseline_score, candidate_score, candidate_replay_score] {
+            crate::diarization::verify_authoritative_score_hash(score)
+                .expect("verify independently retained authoritative score");
+            assert_eq!(score.recording_id, recording_id);
+        }
+        PublicSupportedProfileRedecodeExpectedPairBinding {
+            recording_id: recording_id.to_owned(),
+            audio_duration_ms,
+            source_audio_sha256: source_audio_sha256.to_owned(),
+            baseline_accuracy: PublicSupportedProfileRedecodeAccuracyRow::from_score(
+                baseline_score,
+            ),
+            candidate_accuracy: PublicSupportedProfileRedecodeAccuracyRow::from_score(
+                candidate_score,
+            ),
+            candidate_replay_accuracy: PublicSupportedProfileRedecodeAccuracyRow::from_score(
+                candidate_replay_score,
+            ),
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodeArmRow {
+        mode: crate::diarization::SupportedProfileRedecodeMode,
+        variant_configuration_sha256: String,
+        common_observation_sha256: String,
+        incumbent_partition_sha256: String,
+        supported_profile_topology_sha256: String,
+        frozen_support_summary_sha256: String,
+        support_evidence_frozen_from_incumbent: bool,
+        speaker_count_estimate_sha256: String,
+        speaker_count_evidence_sha256: String,
+        hard_hint_input_topology_sha256: String,
+        overlap_input_topology_sha256: String,
+        evaluation_only_final_forced_row_output_sha256: String,
+        new_inference_count: u64,
+        frozen_count_constraints_feasible: bool,
+        output_constraints_satisfied: bool,
+        report_sha256: String,
+        evidence_sha256: String,
+        applied: bool,
+        fallback_reason: Option<crate::diarization::SupportedProfileRedecodeFallbackReason>,
+        tracklet_count: u64,
+        profile_row_count: u64,
+        supported_speaker_count: u64,
+        forced_tracklet_count: u64,
+        changed_assignment_count: u64,
+        output_detected_speaker_count: u64,
+        output_dominant_speaker_share: f64,
+        structural_output_sha256: Option<String>,
+        accuracy: PublicSupportedProfileRedecodeAccuracyRow,
+        resources: PublicSupportedProfileRedecodeResources,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum PublicSupportedProfileRedecodeExecutionOrder {
+        BaselineThenCandidate,
+        CandidateThenBaseline,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodeTiming {
+        common_preparation_wall_ns: u64,
+        baseline_partition_finish_wall_ns: u64,
+        candidate_partition_finish_wall_ns: u64,
+        candidate_replay_wall_ns: u64,
+        execution_order: PublicSupportedProfileRedecodeExecutionOrder,
+        candidate_replay_excluded_from_gate: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodePairComparison {
+        pair_alignment_matches: bool,
+        common_observation_matches: bool,
+        frozen_incumbent_matches: bool,
+        final_forced_rows_match: bool,
+        incumbent_contract_matches: bool,
+        candidate_replay_matches: bool,
+        rejected_candidate_structural_output_matches_incumbent: bool,
+        der_delta: Option<f64>,
+        speaker_confusion_sec_delta: f64,
+        absolute_speaker_count_error_delta: i64,
+        change_f1_delta: Option<f64>,
+        boundary_mae_delta_sec: Option<f64>,
+        selective_risk_delta: Option<f64>,
+        selective_coverage_delta: Option<f64>,
+        assignment_brier_delta: Option<f64>,
+        assignment_ece_delta: Option<f64>,
+        candidate_replay_report_sha256: String,
+        candidate_replay_evidence_sha256: String,
+        candidate_replay_score_sha256: String,
+        candidate_replay_structural_sha256: Option<String>,
+        candidate_replay_frozen_support_summary_sha256: String,
+        candidate_replay_support_evidence_frozen_from_incumbent: bool,
+        candidate_replay_speaker_count_estimate_sha256: String,
+        candidate_replay_speaker_count_evidence_sha256: String,
+        candidate_replay_hard_hint_input_topology_sha256: String,
+        candidate_replay_overlap_input_topology_sha256: String,
+        candidate_replay_evaluation_only_final_forced_row_output_sha256: String,
+        candidate_replay_new_inference_count: u64,
+        candidate_replay_frozen_count_constraints_feasible: bool,
+        candidate_replay_output_constraints_satisfied: bool,
+        candidate_replay_profile_row_count: u64,
+        candidate_replay_forced_tracklet_count: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodePairRow {
+        schema_version: String,
+        protocol_sha256: String,
+        corpus_key: String,
+        source_version: String,
+        evaluation_split: EvaluationSplit,
+        recording_id: String,
+        audio_duration_ms: u64,
+        engine: crate::model::DiarizationEngine,
+        evidence_mode: crate::model::DiarizationSpeakerEvidenceMode,
+        common_observation: PublicEcapaCommonObservationBinding,
+        frozen_total_profile_row_count: u64,
+        frozen_forced_tracklet_count: u64,
+        evaluation_only_frozen_forced_row_output_sha256: String,
+        baseline: PublicSupportedProfileRedecodeArmRow,
+        candidate: PublicSupportedProfileRedecodeArmRow,
+        comparison: PublicSupportedProfileRedecodePairComparison,
+        timing: PublicSupportedProfileRedecodeTiming,
+        deterministic_accuracy_sha256: String,
+        row_sha256: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodeAggregateMetrics {
+        pair_count: u64,
+        reference_speaker_time_sec: f64,
+        diarization_error_sec: f64,
+        speaker_confusion_sec: f64,
+        micro_der: Option<f64>,
+        micro_confusion_rate: Option<f64>,
+        macro_der: Option<f64>,
+        macro_jer: Option<f64>,
+        change_reference_count: u64,
+        change_hypothesis_count: u64,
+        change_matched_count: u64,
+        change_f1: Option<f64>,
+        boundary_matched_count: u64,
+        boundary_absolute_error_sec: f64,
+        boundary_mean_absolute_error_sec: Option<f64>,
+        selective_reference_speaker_time_sec: f64,
+        selective_covered_speaker_time_sec: f64,
+        selective_error_covered_speaker_time_sec: f64,
+        selective_coverage: Option<f64>,
+        selective_risk: Option<f64>,
+        calibration_observed_duration_sec: f64,
+        calibration_opportunity_duration_sec: f64,
+        assignment_brier_score: Option<f64>,
+        assignment_expected_calibration_error: Option<f64>,
+        total_absolute_speaker_count_error: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodeAggregateComparison {
+        engine: Option<crate::model::DiarizationEngine>,
+        baseline: PublicSupportedProfileRedecodeAggregateMetrics,
+        candidate: PublicSupportedProfileRedecodeAggregateMetrics,
+        micro_der_delta: Option<f64>,
+        micro_confusion_rate_delta: Option<f64>,
+        macro_der_delta: Option<f64>,
+        macro_jer_delta: Option<f64>,
+        change_f1_delta: Option<f64>,
+        boundary_mae_delta_sec: Option<f64>,
+        selective_risk_delta: Option<f64>,
+        selective_coverage_delta: Option<f64>,
+        assignment_brier_delta: Option<f64>,
+        assignment_ece_delta: Option<f64>,
+        total_absolute_speaker_count_error_delta: i64,
+        strict_auxiliary_gain: bool,
+        passed_non_regression: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodePerformance {
+        audio_duration_sec: f64,
+        common_preparation_wall_sec: f64,
+        baseline_partition_finish_wall_sec: f64,
+        candidate_partition_finish_wall_sec: f64,
+        common_preparation_rtf: Option<f64>,
+        baseline_partition_finish_rtf: Option<f64>,
+        candidate_partition_finish_rtf: Option<f64>,
+        baseline_counterfactual_rtf: Option<f64>,
+        candidate_counterfactual_rtf: Option<f64>,
+        relative_partition_rtf_regression: Option<f64>,
+        paired_process_authoritative_peak_rss_bytes: Option<u64>,
+        paired_process_observed_stage_max_rss_bytes: u64,
+        successful_observed_stage_sample_count: u64,
+        successful_authoritative_peak_sample_count: u64,
+        rss_observation: PublicEcapaResidualBirthRssObservationKind,
+        per_arm_peak_rss_claimed: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct PublicSupportedProfileRedecodeGateRow {
+        schema_version: String,
+        runner_version: String,
+        protocol_sha256: String,
+        descriptor_sha256: String,
+        bundle_sha256: String,
+        scorer_config_sha256: String,
+        frozen_corpus_identity_sha256: String,
+        ecapa_contract_sha256: String,
+        ecapa_package_sha256: String,
+        redecode_policy_sha256: String,
+        gate_policy: PublicSupportedProfileRedecodeGatePolicy,
+        gate_policy_sha256: String,
+        paired_row_count: u64,
+        distinct_recording_count: u64,
+        single_speaker_control_recording_count: u64,
+        combined: Option<PublicSupportedProfileRedecodeAggregateComparison>,
+        by_engine: Vec<PublicSupportedProfileRedecodeAggregateComparison>,
+        performance: PublicSupportedProfileRedecodePerformance,
+        resource_totals: PublicSupportedProfileRedecodeResources,
+        failures: Vec<PublicSupportedProfileRedecodeGateFailure>,
+        passed: bool,
+        deterministic_accuracy_sha256: String,
+        result_sha256: String,
+    }
+
     fn public_ecapa_gate_result_sha256(row: &PublicEcapaResidualBirthGateRow) -> String {
         let mut unhashed = row.clone();
         unhashed.result_sha256.clear();
@@ -14992,6 +15765,592 @@ mod tests {
         }
     }
 
+    fn public_supported_profile_redecode_change_f1(
+        reference_count: u64,
+        hypothesis_count: u64,
+        matched_count: u64,
+    ) -> Option<f64> {
+        let denominator = reference_count.checked_add(hypothesis_count)?;
+        (denominator > 0 && matched_count <= reference_count && matched_count <= hypothesis_count)
+            .then(|| {
+                super::canonical_evidence_number(2.0 * matched_count as f64 / denominator as f64)
+            })
+    }
+
+    fn public_supported_profile_redecode_finite_ratio(
+        numerator: f64,
+        denominator: f64,
+    ) -> Option<f64> {
+        (numerator.is_finite() && denominator.is_finite() && denominator > 0.0)
+            .then(|| super::canonical_evidence_number(numerator / denominator))
+    }
+
+    fn public_supported_profile_redecode_accuracy_is_valid(
+        row: &PublicSupportedProfileRedecodeAccuracyRow,
+    ) -> bool {
+        let required_nonnegative = [
+            row.reference_speaker_time_sec,
+            row.missed_speech_sec,
+            row.false_alarm_sec,
+            row.speaker_confusion_sec,
+            row.boundary_absolute_error_sec,
+            row.selective_reference_speaker_time_sec,
+            row.selective_covered_speaker_time_sec,
+            row.selective_error_covered_speaker_time_sec,
+            row.calibration_observed_duration_sec,
+            row.calibration_opportunity_duration_sec,
+        ];
+        let diarization_error_sec =
+            row.missed_speech_sec + row.false_alarm_sec + row.speaker_confusion_sec;
+        let expected_der = public_supported_profile_redecode_finite_ratio(
+            diarization_error_sec,
+            row.reference_speaker_time_sec,
+        );
+        let expected_change_f1 = public_supported_profile_redecode_change_f1(
+            row.change_reference_count,
+            row.change_hypothesis_count,
+            row.change_matched_count,
+        );
+        let expected_boundary_mae = public_supported_profile_redecode_finite_ratio(
+            row.boundary_absolute_error_sec,
+            row.boundary_matched_count as f64,
+        );
+        let expected_selective_coverage = public_supported_profile_redecode_finite_ratio(
+            row.selective_covered_speaker_time_sec,
+            row.selective_reference_speaker_time_sec,
+        );
+        let expected_selective_risk = public_supported_profile_redecode_finite_ratio(
+            row.selective_error_covered_speaker_time_sec,
+            row.selective_covered_speaker_time_sec,
+        );
+        required_nonnegative
+            .into_iter()
+            .all(|value| value.is_finite() && value >= 0.0)
+            && row.reference_speaker_time_sec > 0.0
+            && row
+                .der
+                .is_some_and(|value| value.is_finite() && value >= 0.0)
+            && row
+                .jer
+                .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+            && public_ecapa_optional_metric_matches(row.der, expected_der)
+            && row.change_matched_count <= row.change_reference_count
+            && row.change_matched_count <= row.change_hypothesis_count
+            && row.boundary_matched_count == row.change_matched_count
+            && public_ecapa_optional_metric_matches(row.change_f1, expected_change_f1)
+            && public_ecapa_optional_metric_matches(
+                row.boundary_mean_absolute_error_sec,
+                expected_boundary_mae,
+            )
+            && row.selective_covered_speaker_time_sec <= row.selective_reference_speaker_time_sec
+            && row.selective_error_covered_speaker_time_sec
+                <= row.selective_covered_speaker_time_sec
+            && public_ecapa_optional_metric_matches(
+                row.selective_coverage,
+                expected_selective_coverage,
+            )
+            && public_ecapa_optional_metric_matches(row.selective_risk, expected_selective_risk)
+            && row.calibration_observed_duration_sec <= row.calibration_opportunity_duration_sec
+            && row.calibration_observed_duration_sec > 0.0
+            && row.calibration_opportunity_duration_sec > 0.0
+            && row
+                .assignment_brier_score
+                .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+            && row
+                .assignment_expected_calibration_error
+                .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+            && row.absolute_speaker_count_error
+                == row.reference_speakers.abs_diff(row.hypothesis_speakers)
+            && super::is_sha256_hex(&row.reference_sha256)
+            && super::is_sha256_hex(&row.hypothesis_sha256)
+            && super::is_sha256_hex(&row.scorer_config_sha256)
+            && super::is_sha256_hex(&row.score_sha256)
+    }
+
+    #[derive(Default)]
+    struct PublicSupportedProfileRedecodeAggregateAccumulator {
+        valid: bool,
+        pair_count: u64,
+        reference_speaker_time_sec: CompensatedSum,
+        diarization_error_sec: CompensatedSum,
+        speaker_confusion_sec: CompensatedSum,
+        macro_der_sum: CompensatedSum,
+        macro_jer_sum: CompensatedSum,
+        change_reference_count: u64,
+        change_hypothesis_count: u64,
+        change_matched_count: u64,
+        boundary_matched_count: u64,
+        boundary_absolute_error_sec: CompensatedSum,
+        selective_reference_speaker_time_sec: CompensatedSum,
+        selective_covered_speaker_time_sec: CompensatedSum,
+        selective_error_covered_speaker_time_sec: CompensatedSum,
+        calibration_observed_duration_sec: CompensatedSum,
+        calibration_opportunity_duration_sec: CompensatedSum,
+        calibration_weighted_brier: CompensatedSum,
+        calibration_macro_ece: CompensatedSum,
+        total_absolute_speaker_count_error: u64,
+    }
+
+    impl PublicSupportedProfileRedecodeAggregateAccumulator {
+        fn push(&mut self, row: &PublicSupportedProfileRedecodeAccuracyRow) {
+            if self.pair_count == 0 {
+                self.valid = true;
+            }
+            if !public_supported_profile_redecode_accuracy_is_valid(row) {
+                self.valid = false;
+            }
+            let checked_add = |accumulator: &mut u64, value: u64, valid: &mut bool| {
+                if let Some(total) = accumulator.checked_add(value) {
+                    *accumulator = total;
+                } else {
+                    *accumulator = u64::MAX;
+                    *valid = false;
+                }
+            };
+            checked_add(&mut self.pair_count, 1, &mut self.valid);
+            checked_add(
+                &mut self.change_reference_count,
+                row.change_reference_count,
+                &mut self.valid,
+            );
+            checked_add(
+                &mut self.change_hypothesis_count,
+                row.change_hypothesis_count,
+                &mut self.valid,
+            );
+            checked_add(
+                &mut self.change_matched_count,
+                row.change_matched_count,
+                &mut self.valid,
+            );
+            checked_add(
+                &mut self.boundary_matched_count,
+                row.boundary_matched_count,
+                &mut self.valid,
+            );
+            checked_add(
+                &mut self.total_absolute_speaker_count_error,
+                row.absolute_speaker_count_error,
+                &mut self.valid,
+            );
+            self.reference_speaker_time_sec
+                .add(row.reference_speaker_time_sec);
+            self.diarization_error_sec
+                .add(row.missed_speech_sec + row.false_alarm_sec + row.speaker_confusion_sec);
+            self.speaker_confusion_sec.add(row.speaker_confusion_sec);
+            self.macro_der_sum.add(row.der.unwrap_or(f64::NAN));
+            self.macro_jer_sum.add(row.jer.unwrap_or(f64::NAN));
+            self.boundary_absolute_error_sec
+                .add(row.boundary_absolute_error_sec);
+            self.selective_reference_speaker_time_sec
+                .add(row.selective_reference_speaker_time_sec);
+            self.selective_covered_speaker_time_sec
+                .add(row.selective_covered_speaker_time_sec);
+            self.selective_error_covered_speaker_time_sec
+                .add(row.selective_error_covered_speaker_time_sec);
+            self.calibration_observed_duration_sec
+                .add(row.calibration_observed_duration_sec);
+            self.calibration_opportunity_duration_sec
+                .add(row.calibration_opportunity_duration_sec);
+            self.calibration_weighted_brier.add(
+                row.assignment_brier_score.unwrap_or(f64::NAN)
+                    * row.calibration_observed_duration_sec,
+            );
+            self.calibration_macro_ece.add(
+                row.assignment_expected_calibration_error
+                    .unwrap_or(f64::NAN),
+            );
+        }
+
+        fn finish(self) -> Option<PublicSupportedProfileRedecodeAggregateMetrics> {
+            let reference_speaker_time_sec = self.reference_speaker_time_sec.finish()?;
+            let diarization_error_sec = self.diarization_error_sec.finish()?;
+            let speaker_confusion_sec = self.speaker_confusion_sec.finish()?;
+            let macro_der_sum = self.macro_der_sum.finish()?;
+            let macro_jer_sum = self.macro_jer_sum.finish()?;
+            let boundary_absolute_error_sec = self.boundary_absolute_error_sec.finish()?;
+            let selective_reference_speaker_time_sec =
+                self.selective_reference_speaker_time_sec.finish()?;
+            let selective_covered_speaker_time_sec =
+                self.selective_covered_speaker_time_sec.finish()?;
+            let selective_error_covered_speaker_time_sec =
+                self.selective_error_covered_speaker_time_sec.finish()?;
+            let calibration_observed_duration_sec =
+                self.calibration_observed_duration_sec.finish()?;
+            let calibration_opportunity_duration_sec =
+                self.calibration_opportunity_duration_sec.finish()?;
+            let calibration_weighted_brier = self.calibration_weighted_brier.finish()?;
+            let calibration_macro_ece = self.calibration_macro_ece.finish()?;
+            if !self.valid || self.pair_count == 0 {
+                return None;
+            }
+            Some(PublicSupportedProfileRedecodeAggregateMetrics {
+                pair_count: self.pair_count,
+                reference_speaker_time_sec: super::canonical_evidence_number(
+                    reference_speaker_time_sec,
+                ),
+                diarization_error_sec: super::canonical_evidence_number(diarization_error_sec),
+                speaker_confusion_sec: super::canonical_evidence_number(speaker_confusion_sec),
+                micro_der: public_supported_profile_redecode_finite_ratio(
+                    diarization_error_sec,
+                    reference_speaker_time_sec,
+                ),
+                micro_confusion_rate: public_supported_profile_redecode_finite_ratio(
+                    speaker_confusion_sec,
+                    reference_speaker_time_sec,
+                ),
+                macro_der: public_supported_profile_redecode_finite_ratio(
+                    macro_der_sum,
+                    self.pair_count as f64,
+                ),
+                macro_jer: public_supported_profile_redecode_finite_ratio(
+                    macro_jer_sum,
+                    self.pair_count as f64,
+                ),
+                change_reference_count: self.change_reference_count,
+                change_hypothesis_count: self.change_hypothesis_count,
+                change_matched_count: self.change_matched_count,
+                change_f1: public_supported_profile_redecode_change_f1(
+                    self.change_reference_count,
+                    self.change_hypothesis_count,
+                    self.change_matched_count,
+                ),
+                boundary_matched_count: self.boundary_matched_count,
+                boundary_absolute_error_sec: super::canonical_evidence_number(
+                    boundary_absolute_error_sec,
+                ),
+                boundary_mean_absolute_error_sec: public_supported_profile_redecode_finite_ratio(
+                    boundary_absolute_error_sec,
+                    self.boundary_matched_count as f64,
+                ),
+                selective_reference_speaker_time_sec: super::canonical_evidence_number(
+                    selective_reference_speaker_time_sec,
+                ),
+                selective_covered_speaker_time_sec: super::canonical_evidence_number(
+                    selective_covered_speaker_time_sec,
+                ),
+                selective_error_covered_speaker_time_sec: super::canonical_evidence_number(
+                    selective_error_covered_speaker_time_sec,
+                ),
+                selective_coverage: public_supported_profile_redecode_finite_ratio(
+                    selective_covered_speaker_time_sec,
+                    selective_reference_speaker_time_sec,
+                ),
+                selective_risk: public_supported_profile_redecode_finite_ratio(
+                    selective_error_covered_speaker_time_sec,
+                    selective_covered_speaker_time_sec,
+                ),
+                calibration_observed_duration_sec: super::canonical_evidence_number(
+                    calibration_observed_duration_sec,
+                ),
+                calibration_opportunity_duration_sec: super::canonical_evidence_number(
+                    calibration_opportunity_duration_sec,
+                ),
+                assignment_brier_score: public_supported_profile_redecode_finite_ratio(
+                    calibration_weighted_brier,
+                    calibration_observed_duration_sec,
+                ),
+                assignment_expected_calibration_error:
+                    public_supported_profile_redecode_finite_ratio(
+                        calibration_macro_ece,
+                        self.pair_count as f64,
+                    ),
+                total_absolute_speaker_count_error: self.total_absolute_speaker_count_error,
+            })
+        }
+    }
+
+    fn public_supported_profile_redecode_delta(
+        candidate: Option<f64>,
+        baseline: Option<f64>,
+    ) -> Option<f64> {
+        candidate
+            .zip(baseline)
+            .filter(|(candidate, baseline)| candidate.is_finite() && baseline.is_finite())
+            .map(|(candidate, baseline)| super::canonical_evidence_number(candidate - baseline))
+    }
+
+    fn public_supported_profile_redecode_aggregate_comparison(
+        engine: Option<crate::model::DiarizationEngine>,
+        baseline: PublicSupportedProfileRedecodeAggregateMetrics,
+        candidate: PublicSupportedProfileRedecodeAggregateMetrics,
+        policy: &PublicSupportedProfileRedecodeGatePolicy,
+    ) -> PublicSupportedProfileRedecodeAggregateComparison {
+        let micro_der_delta =
+            public_supported_profile_redecode_delta(candidate.micro_der, baseline.micro_der);
+        let micro_confusion_rate_delta = public_supported_profile_redecode_delta(
+            candidate.micro_confusion_rate,
+            baseline.micro_confusion_rate,
+        );
+        let macro_der_delta =
+            public_supported_profile_redecode_delta(candidate.macro_der, baseline.macro_der);
+        let macro_jer_delta =
+            public_supported_profile_redecode_delta(candidate.macro_jer, baseline.macro_jer);
+        let change_f1_delta =
+            public_supported_profile_redecode_delta(candidate.change_f1, baseline.change_f1);
+        let boundary_mae_delta_sec = public_supported_profile_redecode_delta(
+            candidate.boundary_mean_absolute_error_sec,
+            baseline.boundary_mean_absolute_error_sec,
+        );
+        let selective_risk_delta = public_supported_profile_redecode_delta(
+            candidate.selective_risk,
+            baseline.selective_risk,
+        );
+        let selective_coverage_delta = public_supported_profile_redecode_delta(
+            candidate.selective_coverage,
+            baseline.selective_coverage,
+        );
+        let assignment_ece_delta = public_supported_profile_redecode_delta(
+            candidate.assignment_expected_calibration_error,
+            baseline.assignment_expected_calibration_error,
+        );
+        let assignment_brier_delta = public_supported_profile_redecode_delta(
+            candidate.assignment_brier_score,
+            baseline.assignment_brier_score,
+        );
+        let strict_auxiliary_gain = change_f1_delta.is_some_and(|delta| delta > 0.0)
+            || boundary_mae_delta_sec.is_some_and(|delta| delta < 0.0)
+            || selective_risk_delta.is_some_and(|delta| delta < 0.0)
+            || selective_coverage_delta.is_some_and(|delta| delta > 0.0)
+            || assignment_brier_delta.is_some_and(|delta| delta < 0.0)
+            || assignment_ece_delta.is_some_and(|delta| delta < 0.0);
+        let total_absolute_speaker_count_error_delta =
+            i64::try_from(candidate.total_absolute_speaker_count_error)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(
+                    i64::try_from(baseline.total_absolute_speaker_count_error).unwrap_or(i64::MAX),
+                );
+        let passed_non_regression = baseline.pair_count == candidate.pair_count
+            && baseline.pair_count > 0
+            && micro_der_delta.is_some_and(|delta| delta <= 0.0)
+            && micro_confusion_rate_delta.is_some_and(|delta| delta <= 0.0)
+            && macro_der_delta.is_some_and(|delta| delta <= policy.maximum_macro_der_regression)
+            && macro_jer_delta.is_some_and(|delta| delta <= policy.maximum_macro_jer_regression)
+            && change_f1_delta.is_some_and(|delta| delta >= -policy.maximum_change_f1_regression)
+            && boundary_mae_delta_sec
+                .is_some_and(|delta| delta <= policy.maximum_boundary_mae_regression_sec)
+            && selective_risk_delta
+                .is_some_and(|delta| delta <= policy.maximum_selective_risk_regression)
+            && selective_coverage_delta
+                .is_some_and(|delta| delta >= -policy.maximum_selective_coverage_regression)
+            && assignment_ece_delta
+                .is_some_and(|delta| delta <= policy.maximum_assignment_ece_regression)
+            && assignment_brier_delta
+                .is_some_and(|delta| delta <= policy.maximum_assignment_brier_regression)
+            && total_absolute_speaker_count_error_delta <= 0;
+        PublicSupportedProfileRedecodeAggregateComparison {
+            engine,
+            baseline,
+            candidate,
+            micro_der_delta,
+            micro_confusion_rate_delta,
+            macro_der_delta,
+            macro_jer_delta,
+            change_f1_delta,
+            boundary_mae_delta_sec,
+            selective_risk_delta,
+            selective_coverage_delta,
+            assignment_brier_delta,
+            assignment_ece_delta,
+            total_absolute_speaker_count_error_delta,
+            strict_auxiliary_gain,
+            passed_non_regression,
+        }
+    }
+
+    fn public_supported_profile_redecode_execution_order(
+        pair_index: usize,
+    ) -> PublicSupportedProfileRedecodeExecutionOrder {
+        let recording_index = pair_index / 2;
+        let engine_index = pair_index % 2;
+        if (recording_index + engine_index).is_multiple_of(2) {
+            PublicSupportedProfileRedecodeExecutionOrder::BaselineThenCandidate
+        } else {
+            PublicSupportedProfileRedecodeExecutionOrder::CandidateThenBaseline
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct PublicSupportedProfileRedecodeAccuracyFingerprint<'a> {
+        schema_version: &'static str,
+        protocol_sha256: &'a str,
+        recording_id: &'a str,
+        engine: crate::model::DiarizationEngine,
+        evidence_mode: crate::model::DiarizationSpeakerEvidenceMode,
+        common_observation: &'a PublicEcapaCommonObservationBinding,
+        baseline: &'a PublicSupportedProfileRedecodeArmRow,
+        candidate: &'a PublicSupportedProfileRedecodeArmRow,
+        comparison: &'a PublicSupportedProfileRedecodePairComparison,
+    }
+
+    fn public_supported_profile_redecode_pair_accuracy_sha256(
+        row: &PublicSupportedProfileRedecodePairRow,
+    ) -> String {
+        super::canonical_sha256(&PublicSupportedProfileRedecodeAccuracyFingerprint {
+            schema_version: PUBLIC_SUPPORTED_PROFILE_REDECODE_PAIR_SCHEMA_VERSION,
+            protocol_sha256: &row.protocol_sha256,
+            recording_id: &row.recording_id,
+            engine: row.engine,
+            evidence_mode: row.evidence_mode,
+            common_observation: &row.common_observation,
+            baseline: &row.baseline,
+            candidate: &row.candidate,
+            comparison: &row.comparison,
+        })
+        .expect("hash supported-profile paired accuracy row")
+    }
+
+    fn public_supported_profile_redecode_pair_result_sha256(
+        row: &PublicSupportedProfileRedecodePairRow,
+    ) -> String {
+        let mut unhashed = row.clone();
+        unhashed.row_sha256.clear();
+        super::canonical_sha256(&unhashed).expect("hash supported-profile complete paired row")
+    }
+
+    fn public_supported_profile_redecode_gate_result_sha256(
+        row: &PublicSupportedProfileRedecodeGateRow,
+    ) -> String {
+        let mut unhashed = row.clone();
+        unhashed.result_sha256.clear();
+        super::canonical_sha256(&unhashed).expect("hash complete supported-profile gate row")
+    }
+
+    fn public_supported_profile_redecode_pair_comparison(
+        baseline: &PublicSupportedProfileRedecodeArmRow,
+        candidate: &PublicSupportedProfileRedecodeArmRow,
+        candidate_replay: &PublicSupportedProfileRedecodeArmRow,
+        pair_alignment_matches: bool,
+        common_observation_matches: bool,
+        frozen_incumbent_matches: bool,
+        incumbent_contract_matches: bool,
+        rejected_candidate_structural_output_matches_incumbent: bool,
+    ) -> PublicSupportedProfileRedecodePairComparison {
+        let candidate_replay_matches = candidate_replay.mode == candidate.mode
+            && candidate_replay.variant_configuration_sha256
+                == candidate.variant_configuration_sha256
+            && candidate_replay.common_observation_sha256 == candidate.common_observation_sha256
+            && candidate_replay.incumbent_partition_sha256 == candidate.incumbent_partition_sha256
+            && candidate_replay.supported_profile_topology_sha256
+                == candidate.supported_profile_topology_sha256
+            && candidate_replay.frozen_support_summary_sha256
+                == candidate.frozen_support_summary_sha256
+            && candidate_replay.support_evidence_frozen_from_incumbent
+                == candidate.support_evidence_frozen_from_incumbent
+            && candidate_replay.speaker_count_estimate_sha256
+                == candidate.speaker_count_estimate_sha256
+            && candidate_replay.speaker_count_evidence_sha256
+                == candidate.speaker_count_evidence_sha256
+            && candidate_replay.hard_hint_input_topology_sha256
+                == candidate.hard_hint_input_topology_sha256
+            && candidate_replay.overlap_input_topology_sha256
+                == candidate.overlap_input_topology_sha256
+            && candidate_replay.evaluation_only_final_forced_row_output_sha256
+                == candidate.evaluation_only_final_forced_row_output_sha256
+            && candidate_replay.new_inference_count == candidate.new_inference_count
+            && candidate_replay.frozen_count_constraints_feasible
+                == candidate.frozen_count_constraints_feasible
+            && candidate_replay.output_constraints_satisfied
+                == candidate.output_constraints_satisfied
+            && candidate_replay.report_sha256 == candidate.report_sha256
+            && candidate_replay.evidence_sha256 == candidate.evidence_sha256
+            && candidate_replay.applied == candidate.applied
+            && candidate_replay.fallback_reason == candidate.fallback_reason
+            && candidate_replay.tracklet_count == candidate.tracklet_count
+            && candidate_replay.profile_row_count == candidate.profile_row_count
+            && candidate_replay.supported_speaker_count == candidate.supported_speaker_count
+            && candidate_replay.forced_tracklet_count == candidate.forced_tracklet_count
+            && candidate_replay.changed_assignment_count == candidate.changed_assignment_count
+            && candidate_replay.output_detected_speaker_count
+                == candidate.output_detected_speaker_count
+            && candidate_replay.output_dominant_speaker_share
+                == candidate.output_dominant_speaker_share
+            && candidate_replay.structural_output_sha256 == candidate.structural_output_sha256
+            && candidate_replay.accuracy.score_sha256 == candidate.accuracy.score_sha256
+            && candidate_replay.resources == candidate.resources;
+        PublicSupportedProfileRedecodePairComparison {
+            pair_alignment_matches,
+            common_observation_matches,
+            frozen_incumbent_matches,
+            final_forced_rows_match: baseline.evaluation_only_final_forced_row_output_sha256
+                == candidate.evaluation_only_final_forced_row_output_sha256
+                && candidate_replay.evaluation_only_final_forced_row_output_sha256
+                    == candidate.evaluation_only_final_forced_row_output_sha256,
+            incumbent_contract_matches,
+            candidate_replay_matches,
+            rejected_candidate_structural_output_matches_incumbent,
+            der_delta: public_supported_profile_redecode_delta(
+                candidate.accuracy.der,
+                baseline.accuracy.der,
+            ),
+            speaker_confusion_sec_delta: super::canonical_evidence_number(
+                candidate.accuracy.speaker_confusion_sec - baseline.accuracy.speaker_confusion_sec,
+            ),
+            absolute_speaker_count_error_delta: i64::try_from(
+                candidate.accuracy.absolute_speaker_count_error,
+            )
+            .unwrap_or(i64::MAX)
+            .saturating_sub(
+                i64::try_from(baseline.accuracy.absolute_speaker_count_error).unwrap_or(i64::MAX),
+            ),
+            change_f1_delta: public_supported_profile_redecode_delta(
+                candidate.accuracy.change_f1,
+                baseline.accuracy.change_f1,
+            ),
+            boundary_mae_delta_sec: public_supported_profile_redecode_delta(
+                candidate.accuracy.boundary_mean_absolute_error_sec,
+                baseline.accuracy.boundary_mean_absolute_error_sec,
+            ),
+            selective_risk_delta: public_supported_profile_redecode_delta(
+                candidate.accuracy.selective_risk,
+                baseline.accuracy.selective_risk,
+            ),
+            selective_coverage_delta: public_supported_profile_redecode_delta(
+                candidate.accuracy.selective_coverage,
+                baseline.accuracy.selective_coverage,
+            ),
+            assignment_brier_delta: public_supported_profile_redecode_delta(
+                candidate.accuracy.assignment_brier_score,
+                baseline.accuracy.assignment_brier_score,
+            ),
+            assignment_ece_delta: public_supported_profile_redecode_delta(
+                candidate.accuracy.assignment_expected_calibration_error,
+                baseline.accuracy.assignment_expected_calibration_error,
+            ),
+            candidate_replay_report_sha256: candidate_replay.report_sha256.clone(),
+            candidate_replay_evidence_sha256: candidate_replay.evidence_sha256.clone(),
+            candidate_replay_score_sha256: candidate_replay.accuracy.score_sha256.clone(),
+            candidate_replay_structural_sha256: candidate_replay.structural_output_sha256.clone(),
+            candidate_replay_frozen_support_summary_sha256: candidate_replay
+                .frozen_support_summary_sha256
+                .clone(),
+            candidate_replay_support_evidence_frozen_from_incumbent: candidate_replay
+                .support_evidence_frozen_from_incumbent,
+            candidate_replay_speaker_count_estimate_sha256: candidate_replay
+                .speaker_count_estimate_sha256
+                .clone(),
+            candidate_replay_speaker_count_evidence_sha256: candidate_replay
+                .speaker_count_evidence_sha256
+                .clone(),
+            candidate_replay_hard_hint_input_topology_sha256: candidate_replay
+                .hard_hint_input_topology_sha256
+                .clone(),
+            candidate_replay_overlap_input_topology_sha256: candidate_replay
+                .overlap_input_topology_sha256
+                .clone(),
+            candidate_replay_evaluation_only_final_forced_row_output_sha256: candidate_replay
+                .evaluation_only_final_forced_row_output_sha256
+                .clone(),
+            candidate_replay_new_inference_count: candidate_replay.new_inference_count,
+            candidate_replay_frozen_count_constraints_feasible: candidate_replay
+                .frozen_count_constraints_feasible,
+            candidate_replay_output_constraints_satisfied: candidate_replay
+                .output_constraints_satisfied,
+            candidate_replay_profile_row_count: candidate_replay.profile_row_count,
+            candidate_replay_forced_tracklet_count: candidate_replay.forced_tracklet_count,
+        }
+    }
+
     struct FrozenEcapaDev8 {
         descriptor_path: PathBuf,
         weight_path: PathBuf,
@@ -15028,13 +16387,6 @@ mod tests {
     }
 
     fn load_frozen_ecapa_dev8() -> FrozenEcapaDev8 {
-        const EXPECTED_DEV8_DESCRIPTOR_SHA256: &str =
-            "f99734dfe2d7441853acaa2beba6c1c3fb37e38c0593db2013d1f6c7661cd53b";
-        const EXPECTED_DEV8_BUNDLE_SHA256: &str =
-            "3ee85a279661b3766aaefc16de78ab0877c21ee97e7e922032bf584ade02ba79";
-        const EXPECTED_SCORER_CONFIG_SHA256: &str =
-            "a86fbe8d0e5fed9aff0a301857fd0d64ce9ffea49008b894818997b0c553781b";
-
         let descriptor_path = std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_DESCRIPTOR")
             .map(PathBuf::from)
             .expect("set FRANKEN_WHISPER_ECAPA_TEST_DESCRIPTOR")
@@ -15058,12 +16410,26 @@ mod tests {
             &descriptor_path,
             "accept-ami-cc-by-4.0",
             Some(EvaluationSplit::Development),
-            Some(EXPECTED_DEV8_DESCRIPTOR_SHA256),
+            Some(PUBLIC_SUPPORTED_PROFILE_REDECODE_DEV8_DESCRIPTOR_SHA256),
             || false,
         )
         .expect("validated public corpus bundle");
-        assert_eq!(bundle.descriptor_sha256, EXPECTED_DEV8_DESCRIPTOR_SHA256);
-        assert_eq!(bundle.bundle_sha256, EXPECTED_DEV8_BUNDLE_SHA256);
+        assert_eq!(
+            bundle.descriptor_sha256,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_DEV8_DESCRIPTOR_SHA256
+        );
+        assert_eq!(
+            bundle.bundle_sha256,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_DEV8_BUNDLE_SHA256
+        );
+        assert_eq!(
+            bundle.corpus_key,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_CORPUS_KEY
+        );
+        assert_eq!(
+            bundle.source_version,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_SOURCE_VERSION
+        );
         assert_eq!(bundle.references.len(), 8, "frozen dev8 recording count");
         assert_eq!(bundle.recordings.len(), bundle.references.len());
         assert_eq!(bundle.manifest.recordings.len(), bundle.references.len());
@@ -15094,7 +16460,10 @@ mod tests {
         let scorer_config = frozen_ecapa_scorer_config();
         let scorer_config_sha256 =
             super::canonical_sha256(&scorer_config).expect("hash frozen scorer configuration");
-        assert_eq!(scorer_config_sha256, EXPECTED_SCORER_CONFIG_SHA256);
+        assert_eq!(
+            scorer_config_sha256,
+            PUBLIC_SUPPORTED_PROFILE_REDECODE_SCORER_CONFIG_SHA256
+        );
         FrozenEcapaDev8 {
             descriptor_path,
             weight_path,
@@ -15263,6 +16632,75 @@ mod tests {
         let run =
             crate::diarization::run_prepared_ecapa_diarization_evaluation(prepared, mode, || false)
                 .expect("run prepared ECAPA residual-birth arm");
+        let wall_ns = public_ecapa_duration_ns(started.elapsed());
+        memory_observation.observe_stage();
+        (run, wall_ns)
+    }
+
+    fn public_supported_profile_redecode_arm_row(
+        run: &crate::diarization::SupportedProfileRedecodeEvaluationRun,
+        score: &AuthoritativeDiarizationScore,
+        variant_configuration_sha256: &str,
+    ) -> PublicSupportedProfileRedecodeArmRow {
+        PublicSupportedProfileRedecodeArmRow {
+            mode: run.profile_redecode.mode,
+            variant_configuration_sha256: variant_configuration_sha256.to_owned(),
+            common_observation_sha256: run.common_observation_sha256.clone(),
+            incumbent_partition_sha256: run.incumbent_partition_sha256.clone(),
+            supported_profile_topology_sha256: run.supported_profile_topology_sha256.clone(),
+            frozen_support_summary_sha256: run.frozen_support_summary_sha256.clone(),
+            support_evidence_frozen_from_incumbent: run
+                .profile_redecode
+                .support_evidence_frozen_from_incumbent,
+            speaker_count_estimate_sha256: run.speaker_count_estimate_sha256.clone(),
+            speaker_count_evidence_sha256: run.speaker_count_evidence_sha256.clone(),
+            hard_hint_input_topology_sha256: run.hard_hint_input_topology_sha256.clone(),
+            overlap_input_topology_sha256: run.overlap_input_topology_sha256.clone(),
+            evaluation_only_final_forced_row_output_sha256: run
+                .final_forced_row_output_sha256
+                .clone(),
+            new_inference_count: run.new_inference_count,
+            frozen_count_constraints_feasible: run.frozen_count_constraints_feasible,
+            output_constraints_satisfied: run.clustering.constraints_satisfied,
+            report_sha256: super::canonical_sha256(&run.report)
+                .expect("hash supported-profile path-free report"),
+            evidence_sha256: super::canonical_sha256(&run.profile_redecode)
+                .expect("hash supported-profile feature-free evidence"),
+            applied: run.profile_redecode.applied,
+            fallback_reason: run.profile_redecode.fallback_reason,
+            tracklet_count: run.profile_redecode.tracklet_count,
+            profile_row_count: run.profile_redecode.profile_row_count,
+            supported_speaker_count: run.profile_redecode.supported_speaker_count,
+            forced_tracklet_count: run.forced_tracklet_count,
+            changed_assignment_count: run.profile_redecode.changed_assignment_count,
+            output_detected_speaker_count: u64::try_from(run.clustering.detected_speakers)
+                .unwrap_or(u64::MAX),
+            output_dominant_speaker_share: super::canonical_evidence_number(f64::from(
+                run.clustering.dominant_speaker_share,
+            )),
+            structural_output_sha256: run.profile_redecode.structural_output_sha256.clone(),
+            accuracy: PublicSupportedProfileRedecodeAccuracyRow::from_score(score),
+            resources: run.profile_redecode.resources.into(),
+        }
+    }
+
+    fn run_prepared_public_supported_profile_redecode_arm(
+        prepared: &crate::diarization::PreparedEcapaDiarizationEvaluation,
+        frozen: &crate::diarization::PreparedSupportedProfileRedecodeEvaluation,
+        mode: crate::diarization::SupportedProfileRedecodeMode,
+        memory_observation: &mut PublicEcapaResidualBirthMemoryObservation,
+    ) -> (
+        crate::diarization::SupportedProfileRedecodeEvaluationRun,
+        u64,
+    ) {
+        let started = std::time::Instant::now();
+        let run = crate::diarization::run_prepared_supported_profile_redecode_evaluation(
+            prepared,
+            frozen,
+            mode,
+            || false,
+        )
+        .expect("run prepared supported-profile redecode arm");
         let wall_ns = public_ecapa_duration_ns(started.elapsed());
         memory_observation.observe_stage();
         (run, wall_ns)
@@ -15460,6 +16898,120 @@ mod tests {
         .expect("hash paired ECAPA protocol")
     }
 
+    #[derive(serde::Serialize)]
+    struct PublicSupportedProfileRedecodeProtocolFingerprint<'a> {
+        runner_version: &'static str,
+        descriptor_sha256: &'a str,
+        bundle_sha256: &'a str,
+        scorer_config_sha256: &'a str,
+        ecapa_contract_sha256: &'static str,
+        ecapa_package_sha256: &'static str,
+        redecode_policy_sha256: &'a str,
+        gate_policy_sha256: &'a str,
+        request_sha256_by_engine: &'a [(crate::model::DiarizationEngine, String); 2],
+        calibration_sha256_by_engine: &'a [(crate::model::DiarizationEngine, String); 2],
+        engine_order: [crate::model::DiarizationEngine; 2],
+        preparation_contract: &'static str,
+        recurrence_contract: &'static str,
+        accuracy_authority_contract: &'static str,
+    }
+
+    fn public_supported_profile_redecode_frozen_corpus_identity(
+        fixture: &FrozenEcapaDev8,
+    ) -> PublicSupportedProfileRedecodeFrozenCorpusIdentity {
+        PublicSupportedProfileRedecodeFrozenCorpusIdentity {
+            descriptor_sha256: fixture.bundle.descriptor_sha256.clone(),
+            bundle_sha256: fixture.bundle.bundle_sha256.clone(),
+            scorer_config_sha256: fixture.scorer_config_sha256.clone(),
+            corpus_key: fixture.bundle.corpus_key.clone(),
+            source_version: fixture.bundle.source_version.clone(),
+        }
+    }
+
+    fn public_supported_profile_redecode_validated_frozen_reference(
+        fixture: &FrozenEcapaDev8,
+    ) -> PublicSupportedProfileRedecodeFrozenReference {
+        let identity = public_supported_profile_redecode_frozen_corpus_identity(fixture);
+        assert_eq!(
+            identity,
+            public_supported_profile_redecode_expected_frozen_corpus_identity(),
+            "public supported-profile gate requires the exact frozen AMI dev8 authority"
+        );
+        PublicSupportedProfileRedecodeFrozenReference { identity }
+    }
+
+    fn public_supported_profile_redecode_protocol_sha256_for_identity(
+        identity: &PublicSupportedProfileRedecodeFrozenCorpusIdentity,
+        redecode_policy_sha256: &str,
+        gate_policy_sha256: &str,
+    ) -> String {
+        let request_sha256_by_engine = [
+            (
+                crate::model::DiarizationEngine::Ecapa,
+                super::canonical_sha256(
+                    &frozen_ecapa_request(crate::model::DiarizationEngine::Ecapa).0,
+                )
+                .expect("hash ECAPA request"),
+            ),
+            (
+                crate::model::DiarizationEngine::EcapaFused,
+                super::canonical_sha256(
+                    &frozen_ecapa_request(crate::model::DiarizationEngine::EcapaFused).0,
+                )
+                .expect("hash fused ECAPA request"),
+            ),
+        ];
+        let calibration_sha256_by_engine = [
+            (
+                crate::model::DiarizationEngine::Ecapa,
+                crate::diarization::ecapa_speaker_pair_calibration_sha256(
+                    crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly,
+                ),
+            ),
+            (
+                crate::model::DiarizationEngine::EcapaFused,
+                crate::diarization::ecapa_speaker_pair_calibration_sha256(
+                    crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+                ),
+            ),
+        ];
+        super::canonical_sha256(&PublicSupportedProfileRedecodeProtocolFingerprint {
+            runner_version: PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_RUNNER_VERSION,
+            descriptor_sha256: &identity.descriptor_sha256,
+            bundle_sha256: &identity.bundle_sha256,
+            scorer_config_sha256: &identity.scorer_config_sha256,
+            ecapa_contract_sha256: crate::ecapa_conformance::ECAPA_CONTRACT_SHA256,
+            ecapa_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256,
+            redecode_policy_sha256,
+            gate_policy_sha256,
+            request_sha256_by_engine: &request_sha256_by_engine,
+            calibration_sha256_by_engine: &calibration_sha256_by_engine,
+            engine_order: [
+                crate::model::DiarizationEngine::Ecapa,
+                crate::model::DiarizationEngine::EcapaFused,
+            ],
+            preparation_contract:
+                "one-observation-one-incumbent-partition-one-privacy-safe-supported-profile-topology-three-arms-v1",
+            recurrence_contract:
+                "bounded-label-state-viterbi-duration-summary-path-history-approximation-not-global-optimum-v1",
+            accuracy_authority_contract:
+                "exact-verified-authoritative-score-to-reduced-row-three-arm-recording-bound-v1",
+        })
+        .expect("hash supported-profile paired protocol")
+    }
+
+    fn public_supported_profile_redecode_protocol_sha256(
+        fixture: &FrozenEcapaDev8,
+        redecode_policy_sha256: &str,
+        gate_policy_sha256: &str,
+    ) -> String {
+        public_supported_profile_redecode_protocol_sha256_for_identity(
+            &public_supported_profile_redecode_frozen_corpus_identity(fixture),
+            redecode_policy_sha256,
+            gate_policy_sha256,
+        )
+    }
+
     fn public_ecapa_residual_birth_performance(
         rows: &[PublicEcapaResidualBirthPairRow],
         memory_observation: &PublicEcapaResidualBirthMemoryObservation,
@@ -15531,6 +17083,93 @@ mod tests {
             rss_observation: memory_observation.observation_kind,
             per_arm_peak_rss_claimed: false,
         }
+    }
+
+    fn public_supported_profile_redecode_performance(
+        rows: &[PublicSupportedProfileRedecodePairRow],
+        memory_observation: &PublicEcapaResidualBirthMemoryObservation,
+    ) -> PublicSupportedProfileRedecodePerformance {
+        let mut audio_duration_sec = CompensatedSum::default();
+        let mut common_preparation_wall_sec = CompensatedSum::default();
+        let mut baseline_partition_finish_wall_sec = CompensatedSum::default();
+        let mut candidate_partition_finish_wall_sec = CompensatedSum::default();
+        for row in rows {
+            audio_duration_sec.add(row.audio_duration_ms as f64 / 1_000.0);
+            common_preparation_wall_sec
+                .add(row.timing.common_preparation_wall_ns as f64 / 1_000_000_000.0);
+            baseline_partition_finish_wall_sec
+                .add(row.timing.baseline_partition_finish_wall_ns as f64 / 1_000_000_000.0);
+            candidate_partition_finish_wall_sec
+                .add(row.timing.candidate_partition_finish_wall_ns as f64 / 1_000_000_000.0);
+        }
+        let audio_duration_sec = audio_duration_sec.finish().unwrap_or(0.0);
+        let common_preparation_wall_sec = common_preparation_wall_sec.finish().unwrap_or(0.0);
+        let baseline_partition_finish_wall_sec =
+            baseline_partition_finish_wall_sec.finish().unwrap_or(0.0);
+        let candidate_partition_finish_wall_sec =
+            candidate_partition_finish_wall_sec.finish().unwrap_or(0.0);
+        let baseline_partition_finish_rtf = public_supported_profile_redecode_finite_ratio(
+            baseline_partition_finish_wall_sec,
+            audio_duration_sec,
+        );
+        let candidate_partition_finish_rtf = public_supported_profile_redecode_finite_ratio(
+            candidate_partition_finish_wall_sec,
+            audio_duration_sec,
+        );
+        PublicSupportedProfileRedecodePerformance {
+            audio_duration_sec: super::canonical_evidence_number(audio_duration_sec),
+            common_preparation_wall_sec: super::canonical_evidence_number(
+                common_preparation_wall_sec,
+            ),
+            baseline_partition_finish_wall_sec: super::canonical_evidence_number(
+                baseline_partition_finish_wall_sec,
+            ),
+            candidate_partition_finish_wall_sec: super::canonical_evidence_number(
+                candidate_partition_finish_wall_sec,
+            ),
+            common_preparation_rtf: public_supported_profile_redecode_finite_ratio(
+                common_preparation_wall_sec,
+                audio_duration_sec,
+            ),
+            baseline_partition_finish_rtf,
+            candidate_partition_finish_rtf,
+            baseline_counterfactual_rtf: public_supported_profile_redecode_finite_ratio(
+                common_preparation_wall_sec + baseline_partition_finish_wall_sec,
+                audio_duration_sec,
+            ),
+            candidate_counterfactual_rtf: public_supported_profile_redecode_finite_ratio(
+                common_preparation_wall_sec + candidate_partition_finish_wall_sec,
+                audio_duration_sec,
+            ),
+            relative_partition_rtf_regression: candidate_partition_finish_rtf
+                .zip(baseline_partition_finish_rtf)
+                .and_then(|(candidate, baseline)| {
+                    (baseline > 0.0).then(|| {
+                        super::canonical_evidence_number((candidate - baseline) / baseline)
+                    })
+                }),
+            paired_process_authoritative_peak_rss_bytes: memory_observation
+                .authoritative_peak_rss_bytes,
+            paired_process_observed_stage_max_rss_bytes: memory_observation
+                .observed_stage_max_rss_bytes,
+            successful_observed_stage_sample_count: memory_observation
+                .successful_observed_stage_sample_count,
+            successful_authoritative_peak_sample_count: memory_observation
+                .successful_authoritative_peak_sample_count,
+            rss_observation: memory_observation.observation_kind,
+            per_arm_peak_rss_claimed: false,
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct PublicSupportedProfileRedecodeAccuracySetFingerprint<'a> {
+        schema_version: &'static str,
+        runner_version: &'static str,
+        protocol_sha256: &'a str,
+        gate_policy_sha256: &'a str,
+        pair_accuracy_sha256s: &'a [String],
+        combined: &'a Option<PublicSupportedProfileRedecodeAggregateComparison>,
+        by_engine: &'a [PublicSupportedProfileRedecodeAggregateComparison],
     }
 
     #[derive(serde::Serialize)]
@@ -15760,6 +17399,837 @@ mod tests {
             && row.jer.is_some()
             && row.selective_risk.is_some()
             && row.unknown_speaker_share.is_some()
+    }
+
+    fn public_supported_profile_redecode_pair_metrics_match(
+        row: &PublicSupportedProfileRedecodePairRow,
+    ) -> bool {
+        row.comparison.der_delta
+            == public_supported_profile_redecode_delta(
+                row.candidate.accuracy.der,
+                row.baseline.accuracy.der,
+            )
+            && row.comparison.speaker_confusion_sec_delta
+                == super::canonical_evidence_number(
+                    row.candidate.accuracy.speaker_confusion_sec
+                        - row.baseline.accuracy.speaker_confusion_sec,
+                )
+            && row.comparison.absolute_speaker_count_error_delta
+                == i64::try_from(row.candidate.accuracy.absolute_speaker_count_error)
+                    .unwrap_or(i64::MAX)
+                    .saturating_sub(
+                        i64::try_from(row.baseline.accuracy.absolute_speaker_count_error)
+                            .unwrap_or(i64::MAX),
+                    )
+            && row.comparison.change_f1_delta
+                == public_supported_profile_redecode_delta(
+                    row.candidate.accuracy.change_f1,
+                    row.baseline.accuracy.change_f1,
+                )
+            && row.comparison.boundary_mae_delta_sec
+                == public_supported_profile_redecode_delta(
+                    row.candidate.accuracy.boundary_mean_absolute_error_sec,
+                    row.baseline.accuracy.boundary_mean_absolute_error_sec,
+                )
+            && row.comparison.selective_risk_delta
+                == public_supported_profile_redecode_delta(
+                    row.candidate.accuracy.selective_risk,
+                    row.baseline.accuracy.selective_risk,
+                )
+            && row.comparison.selective_coverage_delta
+                == public_supported_profile_redecode_delta(
+                    row.candidate.accuracy.selective_coverage,
+                    row.baseline.accuracy.selective_coverage,
+                )
+            && row.comparison.assignment_brier_delta
+                == public_supported_profile_redecode_delta(
+                    row.candidate.accuracy.assignment_brier_score,
+                    row.baseline.accuracy.assignment_brier_score,
+                )
+            && row.comparison.assignment_ece_delta
+                == public_supported_profile_redecode_delta(
+                    row.candidate.accuracy.assignment_expected_calibration_error,
+                    row.baseline.accuracy.assignment_expected_calibration_error,
+                )
+    }
+
+    fn public_supported_profile_redecode_resources_are_valid(
+        row: &PublicSupportedProfileRedecodePairRow,
+        policy: &PublicSupportedProfileRedecodeGatePolicy,
+    ) -> bool {
+        let resources = &row.candidate.resources;
+        let state_count = row.candidate.supported_speaker_count.saturating_add(1);
+        let expected_preflight_validation_visits = row
+            .candidate
+            .tracklet_count
+            .checked_add(row.candidate.profile_row_count);
+        let expected_emissions = row
+            .candidate
+            .tracklet_count
+            .checked_mul(row.candidate.supported_speaker_count);
+        let expected_transitions = row
+            .candidate
+            .tracklet_count
+            .checked_sub(1)
+            .and_then(|steps| steps.checked_mul(state_count))
+            .and_then(|visits| visits.checked_mul(state_count));
+        let expected_local_score_visits = row
+            .candidate
+            .tracklet_count
+            .checked_sub(row.candidate.forced_tracklet_count)
+            .and_then(|unforced| unforced.checked_mul(row.candidate.supported_speaker_count))
+            .and_then(|visits| visits.checked_mul(state_count));
+        let expected_backpointers = row.candidate.tracklet_count.checked_mul(state_count);
+        let scratch_element_bytes =
+            u64::try_from(std::mem::size_of::<u8>().saturating_add(std::mem::size_of::<f32>()))
+                .expect("supported-profile scratch element width fits u64");
+        let expected_scratch_payload_bytes = row
+            .candidate
+            .tracklet_count
+            .checked_mul(state_count)
+            .and_then(|entries| entries.checked_mul(scratch_element_bytes))
+            .and_then(|lattice_bytes| {
+                row.candidate
+                    .tracklet_count
+                    .checked_mul(scratch_element_bytes)
+                    .and_then(|tracklet_bytes| lattice_bytes.checked_add(tracklet_bytes))
+            })
+            .and_then(|bytes| bytes.checked_add(1_024));
+        let changed_label_byte_bound = row
+            .candidate
+            .changed_assignment_count
+            .checked_mul(policy.maximum_output_label_bytes_per_assignment);
+        let tracklet_label_byte_bound = row
+            .candidate
+            .tracklet_count
+            .checked_mul(policy.maximum_output_label_bytes_per_assignment);
+        let expected_cancellation_checks = resources
+            .total_polled_operations()
+            .and_then(|operations| {
+                operations
+                    .checked_div(policy.cancellation_check_interval_operations)
+                    .and_then(|cadence| cadence.checked_add(1))
+            })
+            .and_then(|checks| checks.checked_add(u64::from(row.candidate.applied)));
+        let fallback_staging_matches = match row.candidate.fallback_reason {
+            Some(
+                crate::diarization::SupportedProfileRedecodeFallbackReason::ConstraintViolation
+                | crate::diarization::SupportedProfileRedecodeFallbackReason::PersistentOutputLimitExceeded,
+            ) => resources.staged_state_count == row.candidate.tracklet_count,
+            Some(
+                crate::diarization::SupportedProfileRedecodeFallbackReason::NoStrictImprovement
+                | crate::diarization::SupportedProfileRedecodeFallbackReason::NoFinitePath,
+            ) => resources.staged_state_count == 0,
+            _ => {
+                resources.staged_state_count == 0
+                    || resources.staged_state_count == row.candidate.tracklet_count
+            }
+        };
+        row.candidate.tracklet_count > 0
+            && row.candidate.tracklet_count <= policy.maximum_tracklet_count
+            && row.candidate.profile_row_count > 0
+            && row.candidate.profile_row_count <= policy.maximum_total_profile_row_count
+            && row.candidate.forced_tracklet_count <= row.candidate.tracklet_count
+            && row.candidate.supported_speaker_count > 0
+            && row.candidate.supported_speaker_count <= policy.maximum_supported_speaker_count
+            && state_count <= policy.maximum_state_count
+            && expected_preflight_validation_visits == Some(resources.preflight_validation_visits)
+            && resources.preflight_validation_visits <= policy.maximum_preflight_validation_visits
+            && expected_emissions == Some(resources.emission_evaluations)
+            && expected_transitions == Some(resources.transition_evaluations)
+            && expected_local_score_visits == Some(resources.local_score_visits)
+            && expected_backpointers == Some(resources.backpointer_count)
+            && fallback_staging_matches
+            && (!row.candidate.applied
+                || resources.staged_state_count == row.candidate.tracklet_count)
+            && resources.emission_evaluations <= policy.maximum_emission_evaluations
+            && resources.transition_evaluations <= policy.maximum_transition_evaluations
+            && resources.local_score_visits <= policy.maximum_local_score_visits
+            && resources.backpointer_count <= policy.maximum_backpointer_count
+            && resources.staged_state_count <= policy.maximum_staged_state_count
+            && resources.staged_state_count <= policy.maximum_atomic_commit_row_count
+            && resources.redecode_count == policy.required_candidate_redecode_count
+            && resources.profile_update_count == policy.required_profile_update_count
+            && resources.model_call_count == policy.required_model_call_count
+            && expected_cancellation_checks
+                .is_some_and(|expected| expected == resources.cancellation_check_count)
+            && expected_scratch_payload_bytes == Some(resources.peak_scratch_payload_bytes)
+            && resources.peak_scratch_payload_bytes <= policy.maximum_scratch_payload_bytes
+            && changed_label_byte_bound
+                .is_some_and(|bound| resources.persistent_output_label_bytes <= bound)
+            && tracklet_label_byte_bound
+                .is_some_and(|bound| resources.persistent_output_label_bytes <= bound)
+            && resources.persistent_output_label_bytes
+                <= policy.maximum_persistent_output_label_bytes
+            && (row.candidate.applied || resources.persistent_output_label_bytes == 0)
+    }
+
+    fn public_supported_profile_redecode_push_non_regression_failures(
+        comparison: &PublicSupportedProfileRedecodeAggregateComparison,
+        policy: &PublicSupportedProfileRedecodeGatePolicy,
+        failures: &mut Vec<PublicSupportedProfileRedecodeGateFailure>,
+    ) {
+        if !comparison
+            .macro_der_delta
+            .is_some_and(|delta| delta <= policy.maximum_macro_der_regression)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::MacroDerRegression);
+        }
+        if !comparison
+            .macro_jer_delta
+            .is_some_and(|delta| delta <= policy.maximum_macro_jer_regression)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::MacroJerRegression);
+        }
+        if !comparison
+            .change_f1_delta
+            .is_some_and(|delta| delta >= -policy.maximum_change_f1_regression)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::ChangeF1Regression);
+        }
+        if !comparison
+            .boundary_mae_delta_sec
+            .is_some_and(|delta| delta <= policy.maximum_boundary_mae_regression_sec)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::BoundaryMaeRegression);
+        }
+        if !comparison
+            .selective_risk_delta
+            .is_some_and(|delta| delta <= policy.maximum_selective_risk_regression)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::SelectiveRiskRegression);
+        }
+        if !comparison
+            .selective_coverage_delta
+            .is_some_and(|delta| delta >= -policy.maximum_selective_coverage_regression)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::SelectiveCoverageRegression);
+        }
+        if !comparison
+            .assignment_ece_delta
+            .is_some_and(|delta| delta <= policy.maximum_assignment_ece_regression)
+            || !comparison
+                .assignment_brier_delta
+                .is_some_and(|delta| delta <= policy.maximum_assignment_brier_regression)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::CalibrationRegression);
+        }
+        if comparison.total_absolute_speaker_count_error_delta > 0 {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::PerRecordingCountRegression);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn public_supported_profile_redecode_gate_row(
+        frozen_reference: &PublicSupportedProfileRedecodeFrozenReference,
+        rows: &[PublicSupportedProfileRedecodePairRow],
+        expected_common_observations: &[PublicEcapaCommonObservationBinding],
+        expected_pair_bindings: &[PublicSupportedProfileRedecodeExpectedPairBinding],
+        redecode_policy_sha256: &str,
+        gate_policy: PublicSupportedProfileRedecodeGatePolicy,
+        gate_policy_sha256: String,
+        memory_observation: &PublicEcapaResidualBirthMemoryObservation,
+    ) -> PublicSupportedProfileRedecodeGateRow {
+        let mut failures = Vec::new();
+        let frozen_corpus_identity = &frozen_reference.identity;
+        if frozen_corpus_identity
+            != &public_supported_profile_redecode_expected_frozen_corpus_identity()
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::FrozenReferenceMismatch);
+        }
+        let protocol_sha256 = public_supported_profile_redecode_protocol_sha256_for_identity(
+            frozen_corpus_identity,
+            redecode_policy_sha256,
+            &gate_policy_sha256,
+        );
+        let frozen_corpus_identity_sha256 = super::canonical_sha256(frozen_corpus_identity)
+            .expect("hash frozen supported-profile corpus identity");
+        let frozen_gate_policy = public_supported_profile_redecode_gate_policy();
+        let observed_gate_policy_sha256 = super::canonical_sha256(&gate_policy).ok();
+        let frozen_gate_policy_sha256 = super::canonical_sha256(&frozen_gate_policy).ok();
+        if gate_policy != frozen_gate_policy
+            || observed_gate_policy_sha256.as_deref() != Some(gate_policy_sha256.as_str())
+            || observed_gate_policy_sha256 != frozen_gate_policy_sha256
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::PolicyHashMismatch);
+        }
+        if redecode_policy_sha256 != crate::diarization::supported_profile_redecode_policy_sha256()
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::RedecodePolicyMismatch);
+        }
+        if !super::is_sha256_hex(&frozen_corpus_identity.descriptor_sha256)
+            || !super::is_sha256_hex(&frozen_corpus_identity.bundle_sha256)
+            || !super::is_sha256_hex(&frozen_corpus_identity.scorer_config_sha256)
+            || frozen_corpus_identity.corpus_key.is_empty()
+            || frozen_corpus_identity.source_version.is_empty()
+            || frozen_corpus_identity.corpus_key.contains('/')
+            || frozen_corpus_identity.source_version.contains('/')
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::FrozenReferenceMismatch);
+        }
+        if !super::is_sha256_hex(redecode_policy_sha256) || !super::is_sha256_hex(&protocol_sha256)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::ProtocolMismatch);
+        }
+        let paired_row_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        if paired_row_count != gate_policy.required_pair_count
+            || expected_common_observations.len() != rows.len()
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::PairCountMismatch);
+        }
+        if expected_pair_bindings.len() != rows.len() {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::ScoreAuthorityMismatch);
+        }
+
+        let baseline_variant_sha256 = super::canonical_sha256(
+            &crate::diarization::SUPPORTED_PROFILE_REDECODE_BASELINE_VERSION,
+        )
+        .expect("hash supported-profile incumbent identity");
+        let mut distinct_recordings = BTreeSet::new();
+        let mut single_speaker_controls = BTreeSet::new();
+        let mut baseline_first_pair_count = 0_u64;
+        let mut candidate_first_pair_count = 0_u64;
+        let mut baseline_first_by_engine = [0_u64; 2];
+        let mut candidate_first_by_engine = [0_u64; 2];
+        let mut combined_baseline = PublicSupportedProfileRedecodeAggregateAccumulator::default();
+        let mut combined_candidate = PublicSupportedProfileRedecodeAggregateAccumulator::default();
+        let mut resource_totals = PublicSupportedProfileRedecodeResources::default();
+
+        for (index, row) in rows.iter().enumerate() {
+            let engine_slot = gate_policy
+                .required_engines
+                .iter()
+                .position(|engine| *engine == row.engine);
+            let expected_evidence_mode = match row.engine {
+                crate::model::DiarizationEngine::Ecapa => {
+                    Some(crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly)
+                }
+                crate::model::DiarizationEngine::EcapaFused => {
+                    Some(crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel)
+                }
+                _ => None,
+            };
+            let expected_order = public_supported_profile_redecode_execution_order(index);
+            if row.schema_version != PUBLIC_SUPPORTED_PROFILE_REDECODE_PAIR_SCHEMA_VERSION
+                || row.protocol_sha256 != protocol_sha256
+                || row.evaluation_split != EvaluationSplit::Development
+                || row.engine != gate_policy.required_engines[index % 2]
+                || expected_evidence_mode != Some(row.evidence_mode)
+                || !super::is_sha256_hex(&row.protocol_sha256)
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::ProtocolMismatch);
+            }
+            if row.corpus_key != frozen_corpus_identity.corpus_key
+                || row.source_version != frozen_corpus_identity.source_version
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::FrozenReferenceMismatch);
+            }
+            if public_supported_profile_redecode_pair_accuracy_sha256(row)
+                != row.deterministic_accuracy_sha256
+                || public_supported_profile_redecode_pair_result_sha256(row) != row.row_sha256
+                || !super::is_sha256_hex(&row.deterministic_accuracy_sha256)
+                || !super::is_sha256_hex(&row.row_sha256)
+                || !public_supported_profile_redecode_pair_metrics_match(row)
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::PairIntegrityMismatch);
+            }
+            if expected_pair_bindings.get(index).is_none_or(|expected| {
+                expected.recording_id.is_empty()
+                    || expected.audio_duration_ms == 0
+                    || !super::is_sha256_hex(&expected.source_audio_sha256)
+                    || row.recording_id != expected.recording_id
+                    || row.audio_duration_ms != expected.audio_duration_ms
+                    || row.common_observation.source_audio_sha256 != expected.source_audio_sha256
+            }) {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::FrozenRecordingMismatch);
+            }
+            if expected_pair_bindings.get(index).is_none_or(|expected| {
+                row.baseline.accuracy != expected.baseline_accuracy
+                    || row.candidate.accuracy != expected.candidate_accuracy
+                    || expected.candidate_replay_accuracy != expected.candidate_accuracy
+                    || row.comparison.candidate_replay_score_sha256
+                        != expected.candidate_replay_accuracy.score_sha256
+            }) {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::ScoreAuthorityMismatch);
+            }
+            if row.timing.execution_order != expected_order
+                || !row.timing.candidate_replay_excluded_from_gate
+                || row.timing.common_preparation_wall_ns == 0
+                || row.timing.baseline_partition_finish_wall_ns == 0
+                || row.timing.candidate_partition_finish_wall_ns == 0
+                || row.timing.candidate_replay_wall_ns == 0
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::PairIntegrityMismatch);
+            }
+            match (row.timing.execution_order, engine_slot) {
+                (
+                    PublicSupportedProfileRedecodeExecutionOrder::BaselineThenCandidate,
+                    Some(slot),
+                ) => {
+                    baseline_first_pair_count = baseline_first_pair_count.saturating_add(1);
+                    baseline_first_by_engine[slot] =
+                        baseline_first_by_engine[slot].saturating_add(1);
+                }
+                (
+                    PublicSupportedProfileRedecodeExecutionOrder::CandidateThenBaseline,
+                    Some(slot),
+                ) => {
+                    candidate_first_pair_count = candidate_first_pair_count.saturating_add(1);
+                    candidate_first_by_engine[slot] =
+                        candidate_first_by_engine[slot].saturating_add(1);
+                }
+                (_, None) => {
+                    failures.push(PublicSupportedProfileRedecodeGateFailure::PairAlignmentMismatch);
+                }
+            }
+            if index % 2 == 0 {
+                distinct_recordings.insert(row.recording_id.clone());
+            } else if rows
+                .get(index.saturating_sub(1))
+                .is_none_or(|previous| previous.recording_id != row.recording_id)
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::PairAlignmentMismatch);
+            }
+            if !row.comparison.pair_alignment_matches
+                || row.baseline.accuracy.reference_sha256 != row.candidate.accuracy.reference_sha256
+                || row.baseline.accuracy.scorer_config_sha256
+                    != row.candidate.accuracy.scorer_config_sha256
+                || row.baseline.accuracy.scorer_config_sha256
+                    != frozen_corpus_identity.scorer_config_sha256
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::PairAlignmentMismatch);
+            }
+            if expected_common_observations
+                .get(index)
+                .is_none_or(|expected| expected != &row.common_observation)
+                || !row.comparison.common_observation_matches
+                || row.baseline.common_observation_sha256
+                    != row.common_observation.common_observation_sha256
+                || row.candidate.common_observation_sha256
+                    != row.common_observation.common_observation_sha256
+                || row.common_observation.common_observation_schema
+                    != PUBLIC_ECAPA_COMMON_OBSERVATION_BINDING_SCHEMA_VERSION
+                || row.common_observation.feature_schema_version
+                    != crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION
+                || row.common_observation.ecapa_contract_sha256
+                    != crate::ecapa_conformance::ECAPA_CONTRACT_SHA256
+                || row.common_observation.ecapa_package_sha256
+                    != crate::ecapa_conformance::ECAPA_PACKAGE_SHA256
+                || row.common_observation.representation_provider_version
+                    != crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION
+                || !super::is_sha256_hex(&row.common_observation.common_observation_sha256)
+                || !super::is_sha256_hex(&row.common_observation.source_audio_sha256)
+                || !super::is_sha256_hex(&row.common_observation.normalized_input_sha256)
+                || row.common_observation.embedded_tracklet_count == 0
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::CommonObservationMismatch);
+            }
+            let frozen_incumbent_matches = row.baseline.incumbent_partition_sha256
+                == row.candidate.incumbent_partition_sha256
+                && row.frozen_total_profile_row_count > 0
+                && row.frozen_total_profile_row_count
+                    <= gate_policy.maximum_total_profile_row_count
+                && row.frozen_forced_tracklet_count
+                    <= row.common_observation.embedded_tracklet_count
+                && row.baseline.forced_tracklet_count == row.frozen_forced_tracklet_count
+                && row.candidate.forced_tracklet_count == row.frozen_forced_tracklet_count
+                && row.baseline.supported_profile_topology_sha256
+                    == row.candidate.supported_profile_topology_sha256
+                && row.baseline.frozen_support_summary_sha256
+                    == row.candidate.frozen_support_summary_sha256
+                && row.baseline.support_evidence_frozen_from_incumbent
+                && row.candidate.support_evidence_frozen_from_incumbent
+                && row.baseline.frozen_count_constraints_feasible
+                && row.candidate.frozen_count_constraints_feasible
+                && row.baseline.speaker_count_estimate_sha256
+                    == row.candidate.speaker_count_estimate_sha256
+                && row.baseline.speaker_count_evidence_sha256
+                    == row.candidate.speaker_count_evidence_sha256
+                && row.baseline.hard_hint_input_topology_sha256
+                    == row.candidate.hard_hint_input_topology_sha256
+                && row.baseline.overlap_input_topology_sha256
+                    == row.candidate.overlap_input_topology_sha256
+                && super::is_sha256_hex(&row.baseline.incumbent_partition_sha256)
+                && super::is_sha256_hex(&row.baseline.supported_profile_topology_sha256)
+                && super::is_sha256_hex(&row.baseline.frozen_support_summary_sha256)
+                && super::is_sha256_hex(&row.baseline.speaker_count_estimate_sha256)
+                && super::is_sha256_hex(&row.baseline.speaker_count_evidence_sha256)
+                && super::is_sha256_hex(&row.baseline.hard_hint_input_topology_sha256)
+                && super::is_sha256_hex(&row.baseline.overlap_input_topology_sha256)
+                && super::is_sha256_hex(
+                    &row.baseline.evaluation_only_final_forced_row_output_sha256,
+                )
+                && super::is_sha256_hex(&row.baseline.report_sha256)
+                && super::is_sha256_hex(&row.baseline.evidence_sha256)
+                && super::is_sha256_hex(&row.candidate.report_sha256)
+                && super::is_sha256_hex(&row.candidate.evidence_sha256);
+            if !row.comparison.frozen_incumbent_matches || !frozen_incumbent_matches {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::FrozenIncumbentMismatch);
+            }
+            let final_forced_rows_match = row.comparison.final_forced_rows_match
+                && super::is_sha256_hex(&row.evaluation_only_frozen_forced_row_output_sha256)
+                && row.baseline.evaluation_only_final_forced_row_output_sha256
+                    == row.evaluation_only_frozen_forced_row_output_sha256
+                && row.candidate.evaluation_only_final_forced_row_output_sha256
+                    == row.evaluation_only_frozen_forced_row_output_sha256;
+            if !final_forced_rows_match {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::FrozenIncumbentMismatch);
+            }
+            let incumbent_contract_matches = row.baseline.mode
+                == crate::diarization::SupportedProfileRedecodeMode::DisabledIncumbent
+                && row.baseline.variant_configuration_sha256 == baseline_variant_sha256
+                && row.baseline.tracklet_count == row.common_observation.embedded_tracklet_count
+                && row.baseline.profile_row_count == 0
+                && row.baseline.supported_speaker_count == 0
+                && row.baseline.output_detected_speaker_count
+                    <= row.frozen_total_profile_row_count
+                && row.baseline.output_dominant_speaker_share.is_finite()
+                && (0.0..=1.0).contains(&row.baseline.output_dominant_speaker_share)
+                && !row.baseline.applied
+                && row.baseline.fallback_reason
+                    == Some(
+                        crate::diarization::SupportedProfileRedecodeFallbackReason::DisabledIncumbent,
+                    )
+                && row.baseline.changed_assignment_count == 0
+                && row.baseline.structural_output_sha256.is_none()
+                && row.baseline.new_inference_count == 0
+                && row.baseline.resources == PublicSupportedProfileRedecodeResources::default();
+            if !row.comparison.incumbent_contract_matches || !incumbent_contract_matches {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::IncumbentContractMismatch);
+            }
+            let candidate_contract_matches = row.candidate.mode
+                == crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1
+                && row.candidate.variant_configuration_sha256 == redecode_policy_sha256
+                && row.candidate.tracklet_count == row.common_observation.embedded_tracklet_count
+                && row.candidate.profile_row_count == row.frozen_total_profile_row_count
+                && row.candidate.supported_speaker_count <= row.candidate.profile_row_count
+                && row.candidate.output_detected_speaker_count
+                    <= row.frozen_total_profile_row_count
+                && row.candidate.changed_assignment_count <= row.candidate.tracklet_count
+                && row.candidate.new_inference_count == 0
+                && row.candidate.output_dominant_speaker_share.is_finite()
+                && (0.0..=1.0).contains(&row.candidate.output_dominant_speaker_share)
+                && (!row.candidate.applied || row.candidate.output_constraints_satisfied)
+                && if row.candidate.applied {
+                    row.candidate.fallback_reason.is_none()
+                        && row.candidate.changed_assignment_count > 0
+                        && row
+                            .candidate
+                            .structural_output_sha256
+                            .as_deref()
+                            .is_some_and(super::is_sha256_hex)
+                        && row.candidate.output_detected_speaker_count
+                            == row.candidate.supported_speaker_count
+                        && (row.candidate.output_detected_speaker_count <= 1
+                            || row.candidate.output_dominant_speaker_share
+                                <= gate_policy.maximum_multi_speaker_dominant_share)
+                } else {
+                    matches!(
+                        row.candidate.fallback_reason,
+                        Some(
+                            crate::diarization::SupportedProfileRedecodeFallbackReason::NoStrictImprovement
+                                | crate::diarization::SupportedProfileRedecodeFallbackReason::ConstraintViolation
+                        )
+                    )
+                        && row.candidate.changed_assignment_count == 0
+                        && row.candidate.structural_output_sha256.is_none()
+                };
+            if !candidate_contract_matches {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::CandidateContractMismatch);
+            }
+            let replay_hashes_match = row.comparison.candidate_replay_report_sha256
+                == row.candidate.report_sha256
+                && row.comparison.candidate_replay_evidence_sha256 == row.candidate.evidence_sha256
+                && row.comparison.candidate_replay_score_sha256
+                    == row.candidate.accuracy.score_sha256
+                && row.comparison.candidate_replay_structural_sha256
+                    == row.candidate.structural_output_sha256
+                && row
+                    .comparison
+                    .candidate_replay_frozen_support_summary_sha256
+                    == row.candidate.frozen_support_summary_sha256
+                && row
+                    .comparison
+                    .candidate_replay_support_evidence_frozen_from_incumbent
+                && row
+                    .comparison
+                    .candidate_replay_evaluation_only_final_forced_row_output_sha256
+                    == row.candidate.evaluation_only_final_forced_row_output_sha256
+                && row
+                    .comparison
+                    .candidate_replay_speaker_count_estimate_sha256
+                    == row.candidate.speaker_count_estimate_sha256
+                && row
+                    .comparison
+                    .candidate_replay_speaker_count_evidence_sha256
+                    == row.candidate.speaker_count_evidence_sha256
+                && row
+                    .comparison
+                    .candidate_replay_hard_hint_input_topology_sha256
+                    == row.candidate.hard_hint_input_topology_sha256
+                && row
+                    .comparison
+                    .candidate_replay_overlap_input_topology_sha256
+                    == row.candidate.overlap_input_topology_sha256
+                && row.comparison.candidate_replay_new_inference_count
+                    == row.candidate.new_inference_count
+                && row.comparison.candidate_replay_profile_row_count
+                    == row.candidate.profile_row_count
+                && row.comparison.candidate_replay_forced_tracklet_count
+                    == row.candidate.forced_tracklet_count
+                && row
+                    .comparison
+                    .candidate_replay_frozen_count_constraints_feasible
+                && (!row.candidate.applied
+                    || row.comparison.candidate_replay_output_constraints_satisfied);
+            if !row.comparison.candidate_replay_matches || !replay_hashes_match {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::CandidateReplayMismatch);
+            }
+            if !row.candidate.applied
+                && (!row
+                    .comparison
+                    .rejected_candidate_structural_output_matches_incumbent
+                    || row.candidate.report_sha256 != row.baseline.report_sha256
+                    || row.candidate.accuracy != row.baseline.accuracy
+                    || row.candidate.output_detected_speaker_count
+                        != row.baseline.output_detected_speaker_count
+                    || row.candidate.output_dominant_speaker_share
+                        != row.baseline.output_dominant_speaker_share
+                    || row.candidate.output_constraints_satisfied
+                        != row.baseline.output_constraints_satisfied
+                    || expected_pair_bindings.get(index).is_none_or(|expected| {
+                        expected.candidate_accuracy != expected.baseline_accuracy
+                            || expected.candidate_replay_accuracy != expected.baseline_accuracy
+                    }))
+            {
+                failures.push(
+                    PublicSupportedProfileRedecodeGateFailure::RejectedCandidateOutputMismatch,
+                );
+            }
+            if !public_supported_profile_redecode_accuracy_is_valid(&row.baseline.accuracy)
+                || !public_supported_profile_redecode_accuracy_is_valid(&row.candidate.accuracy)
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::MissingAccuracyMetric);
+            }
+            if !row.comparison.speaker_confusion_sec_delta.is_finite()
+                || row
+                    .comparison
+                    .der_delta
+                    .is_none_or(|delta| !delta.is_finite())
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::NonFiniteMetric);
+            }
+            if gate_policy.require_per_record_der_non_regression
+                && !row.comparison.der_delta.is_some_and(|delta| delta <= 0.0)
+            {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::PerRecordingDerRegression);
+            }
+            if gate_policy.require_per_record_count_non_regression
+                && row.comparison.absolute_speaker_count_error_delta > 0
+            {
+                failures
+                    .push(PublicSupportedProfileRedecodeGateFailure::PerRecordingCountRegression);
+            }
+            if row.baseline.accuracy.reference_speakers == 1 {
+                single_speaker_controls.insert(row.recording_id.clone());
+                if row.candidate.accuracy.absolute_speaker_count_error != 0
+                    || !row.comparison.der_delta.is_some_and(|delta| delta <= 0.0)
+                {
+                    failures.push(
+                        PublicSupportedProfileRedecodeGateFailure::SingleSpeakerControlFailure,
+                    );
+                }
+            }
+            if !public_supported_profile_redecode_resources_are_valid(row, &gate_policy) {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::ResourceBoundExceeded);
+            }
+            resource_totals.saturating_add_assign(&row.candidate.resources);
+            combined_baseline.push(&row.baseline.accuracy);
+            combined_candidate.push(&row.candidate.accuracy);
+        }
+
+        let distinct_recording_count = u64::try_from(distinct_recordings.len()).unwrap_or(u64::MAX);
+        if distinct_recording_count != gate_policy.required_recording_count {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::PairCountMismatch);
+        }
+        if baseline_first_pair_count != gate_policy.required_baseline_first_pair_count
+            || candidate_first_pair_count != gate_policy.required_candidate_first_pair_count
+            || baseline_first_by_engine
+                .iter()
+                .any(|count| *count != gate_policy.required_baseline_first_pair_count_per_engine)
+            || candidate_first_by_engine
+                .iter()
+                .any(|count| *count != gate_policy.required_candidate_first_pair_count_per_engine)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::PairIntegrityMismatch);
+        }
+        let single_speaker_control_recording_count =
+            u64::try_from(single_speaker_controls.len()).unwrap_or(u64::MAX);
+        if single_speaker_control_recording_count
+            < gate_policy.required_single_speaker_control_recording_count
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::MissingSingleSpeakerControls);
+        }
+
+        let combined = combined_baseline
+            .finish()
+            .zip(combined_candidate.finish())
+            .map(|(baseline, candidate)| {
+                public_supported_profile_redecode_aggregate_comparison(
+                    None,
+                    baseline,
+                    candidate,
+                    &gate_policy,
+                )
+            });
+        if combined.is_none() {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::MissingAccuracyMetric);
+        }
+        if !combined
+            .as_ref()
+            .and_then(|comparison| comparison.micro_der_delta)
+            .is_some_and(|delta| !gate_policy.require_strict_micro_der_improvement || delta < 0.0)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::MicroDerNotImproved);
+        }
+        if !combined
+            .as_ref()
+            .and_then(|comparison| comparison.micro_confusion_rate_delta)
+            .is_some_and(|delta| {
+                !gate_policy.require_strict_micro_confusion_improvement || delta < 0.0
+            })
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::MicroConfusionNotImproved);
+        }
+        if gate_policy.require_strict_auxiliary_gain
+            && !combined
+                .as_ref()
+                .is_some_and(|comparison| comparison.strict_auxiliary_gain)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::MissingStrictAuxiliaryGain);
+        }
+        if let Some(comparison) = &combined {
+            public_supported_profile_redecode_push_non_regression_failures(
+                comparison,
+                &gate_policy,
+                &mut failures,
+            );
+        }
+
+        let mut by_engine = Vec::with_capacity(gate_policy.required_engines.len());
+        for engine in gate_policy.required_engines {
+            let mut baseline = PublicSupportedProfileRedecodeAggregateAccumulator::default();
+            let mut candidate = PublicSupportedProfileRedecodeAggregateAccumulator::default();
+            for row in rows.iter().filter(|row| row.engine == engine) {
+                baseline.push(&row.baseline.accuracy);
+                candidate.push(&row.candidate.accuracy);
+            }
+            if let Some(comparison) =
+                baseline
+                    .finish()
+                    .zip(candidate.finish())
+                    .map(|(baseline, candidate)| {
+                        public_supported_profile_redecode_aggregate_comparison(
+                            Some(engine),
+                            baseline,
+                            candidate,
+                            &gate_policy,
+                        )
+                    })
+            {
+                if comparison.baseline.pair_count != gate_policy.required_recording_count
+                    || comparison.candidate.pair_count != gate_policy.required_recording_count
+                {
+                    failures.push(PublicSupportedProfileRedecodeGateFailure::PairCountMismatch);
+                }
+                public_supported_profile_redecode_push_non_regression_failures(
+                    &comparison,
+                    &gate_policy,
+                    &mut failures,
+                );
+                by_engine.push(comparison);
+            } else {
+                failures.push(PublicSupportedProfileRedecodeGateFailure::MissingAccuracyMetric);
+            }
+        }
+
+        let performance = public_supported_profile_redecode_performance(rows, memory_observation);
+        if performance.common_preparation_rtf.is_none()
+            || performance.baseline_partition_finish_rtf.is_none()
+            || performance.candidate_partition_finish_rtf.is_none()
+            || performance.baseline_counterfactual_rtf.is_none()
+            || performance.candidate_counterfactual_rtf.is_none()
+            || performance.relative_partition_rtf_regression.is_none()
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::RuntimeUnavailable);
+        }
+        if !performance
+            .relative_partition_rtf_regression
+            .is_some_and(|regression| {
+                regression <= gate_policy.maximum_relative_partition_rtf_regression
+            })
+            || !performance
+                .candidate_counterfactual_rtf
+                .is_some_and(|rtf| rtf <= gate_policy.maximum_candidate_counterfactual_rtf)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::RuntimeRegression);
+        }
+        if !memory_observation.has_complete_authoritative_peak_evidence(
+            gate_policy.required_successful_authoritative_peak_sample_count,
+        ) {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::RssUnavailable);
+        } else if performance
+            .paired_process_authoritative_peak_rss_bytes
+            .is_some_and(|bytes| bytes > gate_policy.maximum_paired_process_rss_bytes)
+        {
+            failures.push(PublicSupportedProfileRedecodeGateFailure::ProcessRssExceeded);
+        }
+
+        failures.sort();
+        failures.dedup();
+        let pair_accuracy_sha256s = rows
+            .iter()
+            .map(|row| row.deterministic_accuracy_sha256.clone())
+            .collect::<Vec<_>>();
+        let deterministic_accuracy_sha256 =
+            super::canonical_sha256(&PublicSupportedProfileRedecodeAccuracySetFingerprint {
+                schema_version: PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_SCHEMA_VERSION,
+                runner_version: PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_RUNNER_VERSION,
+                protocol_sha256: &protocol_sha256,
+                gate_policy_sha256: &gate_policy_sha256,
+                pair_accuracy_sha256s: &pair_accuracy_sha256s,
+                combined: &combined,
+                by_engine: &by_engine,
+            })
+            .expect("hash supported-profile accuracy set");
+        let mut gate = PublicSupportedProfileRedecodeGateRow {
+            schema_version: PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_SCHEMA_VERSION.to_owned(),
+            runner_version: PUBLIC_SUPPORTED_PROFILE_REDECODE_GATE_RUNNER_VERSION.to_owned(),
+            protocol_sha256,
+            descriptor_sha256: frozen_corpus_identity.descriptor_sha256.clone(),
+            bundle_sha256: frozen_corpus_identity.bundle_sha256.clone(),
+            scorer_config_sha256: frozen_corpus_identity.scorer_config_sha256.clone(),
+            frozen_corpus_identity_sha256,
+            ecapa_contract_sha256: crate::ecapa_conformance::ECAPA_CONTRACT_SHA256.to_owned(),
+            ecapa_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
+            redecode_policy_sha256: redecode_policy_sha256.to_owned(),
+            gate_policy,
+            gate_policy_sha256,
+            paired_row_count,
+            distinct_recording_count,
+            single_speaker_control_recording_count,
+            combined,
+            by_engine,
+            performance,
+            resource_totals,
+            failures,
+            passed: false,
+            deterministic_accuracy_sha256,
+            result_sha256: String::new(),
+        };
+        gate.passed = gate.failures.is_empty();
+        gate.result_sha256 = public_supported_profile_redecode_gate_result_sha256(&gate);
+        gate
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -16320,6 +18790,1113 @@ mod tests {
         };
         row.result_sha256 = public_ecapa_gate_result_sha256(&row);
         row
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn supported_profile_redecode_gate_accuracy_fixture(
+        reference_speakers: u64,
+        reference_speaker_time_sec: f64,
+        confusion_sec: f64,
+        change_matched_count: u64,
+        boundary_mae_sec: f64,
+        selective_coverage: f64,
+        selective_risk: f64,
+        assignment_brier: f64,
+        assignment_ece: f64,
+        hypothesis_sha_digit: &str,
+    ) -> PublicSupportedProfileRedecodeAccuracyRow {
+        let change_reference_count = if reference_speakers == 1 { 0 } else { 4 };
+        let change_hypothesis_count = change_reference_count;
+        let selective_covered_speaker_time_sec = reference_speaker_time_sec * selective_coverage;
+        PublicSupportedProfileRedecodeAccuracyRow {
+            reference_speaker_time_sec,
+            missed_speech_sec: 0.0,
+            false_alarm_sec: 0.0,
+            speaker_confusion_sec: confusion_sec,
+            der: Some(super::canonical_evidence_number(
+                confusion_sec / reference_speaker_time_sec,
+            )),
+            jer: Some(super::canonical_evidence_number(
+                confusion_sec / reference_speaker_time_sec,
+            )),
+            reference_speakers,
+            hypothesis_speakers: reference_speakers,
+            absolute_speaker_count_error: 0,
+            change_reference_count,
+            change_hypothesis_count,
+            change_matched_count,
+            change_f1: public_supported_profile_redecode_change_f1(
+                change_reference_count,
+                change_hypothesis_count,
+                change_matched_count,
+            ),
+            boundary_matched_count: change_matched_count,
+            boundary_absolute_error_sec: super::canonical_evidence_number(
+                boundary_mae_sec * change_matched_count as f64,
+            ),
+            boundary_mean_absolute_error_sec: (change_matched_count > 0)
+                .then_some(super::canonical_evidence_number(boundary_mae_sec)),
+            selective_reference_speaker_time_sec: reference_speaker_time_sec,
+            selective_covered_speaker_time_sec: super::canonical_evidence_number(
+                selective_covered_speaker_time_sec,
+            ),
+            selective_error_covered_speaker_time_sec: super::canonical_evidence_number(
+                selective_covered_speaker_time_sec * selective_risk,
+            ),
+            selective_coverage: Some(super::canonical_evidence_number(selective_coverage)),
+            selective_risk: Some(super::canonical_evidence_number(selective_risk)),
+            calibration_observed_duration_sec: reference_speaker_time_sec,
+            calibration_opportunity_duration_sec: reference_speaker_time_sec,
+            assignment_brier_score: Some(super::canonical_evidence_number(assignment_brier)),
+            assignment_expected_calibration_error: Some(super::canonical_evidence_number(
+                assignment_ece,
+            )),
+            reference_sha256: "1".repeat(64),
+            hypothesis_sha256: hypothesis_sha_digit.repeat(64),
+            scorer_config_sha256: PUBLIC_SUPPORTED_PROFILE_REDECODE_SCORER_CONFIG_SHA256.to_owned(),
+            score_sha256: hypothesis_sha_digit.repeat(64),
+        }
+    }
+
+    fn supported_profile_redecode_gate_resources_fixture(
+        tracklet_count: u64,
+        total_profile_row_count: u64,
+        supported_speaker_count: u64,
+        forced_tracklet_count: u64,
+        applied: bool,
+    ) -> PublicSupportedProfileRedecodeResources {
+        let state_count = supported_speaker_count + 1;
+        let preflight_validation_visits = tracklet_count + total_profile_row_count;
+        let emission_evaluations = tracklet_count * supported_speaker_count;
+        let transition_evaluations = (tracklet_count - 1) * state_count * state_count;
+        let local_score_visits =
+            (tracklet_count - forced_tracklet_count) * supported_speaker_count * state_count;
+        let scratch_element_bytes =
+            u64::try_from(std::mem::size_of::<u8>() + std::mem::size_of::<f32>())
+                .expect("fixture scratch element width");
+        let peak_scratch_payload_bytes = tracklet_count * state_count * scratch_element_bytes
+            + tracklet_count * scratch_element_bytes
+            + 1_024;
+        let scored_blocks = preflight_validation_visits
+            + emission_evaluations
+            + transition_evaluations
+            + local_score_visits;
+        PublicSupportedProfileRedecodeResources {
+            preflight_validation_visits,
+            emission_evaluations,
+            transition_evaluations,
+            local_score_visits,
+            backpointer_count: tracklet_count * state_count,
+            staged_state_count: if applied { tracklet_count } else { 0 },
+            redecode_count: 1,
+            profile_update_count: 0,
+            model_call_count: 0,
+            cancellation_check_count: 1
+                + scored_blocks
+                    / crate::diarization::SUPPORTED_PROFILE_REDECODE_CANCELLATION_INTERVAL
+                + u64::from(applied),
+            peak_scratch_payload_bytes,
+            persistent_output_label_bytes: u64::from(applied),
+        }
+    }
+
+    fn supported_profile_redecode_gate_pair_fixture(
+        pair_index: usize,
+        policy_sha256: &str,
+        protocol_sha256: &str,
+    ) -> (
+        PublicSupportedProfileRedecodePairRow,
+        PublicEcapaCommonObservationBinding,
+        PublicSupportedProfileRedecodeExpectedPairBinding,
+    ) {
+        let recording_index = pair_index / 2;
+        let engine = if pair_index.is_multiple_of(2) {
+            crate::model::DiarizationEngine::Ecapa
+        } else {
+            crate::model::DiarizationEngine::EcapaFused
+        };
+        let evidence_mode = if engine == crate::model::DiarizationEngine::Ecapa {
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaOnly
+        } else {
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+        };
+        let reference_speakers = if recording_index < 2 { 1 } else { 2 };
+        let baseline_accuracy = supported_profile_redecode_gate_accuracy_fixture(
+            reference_speakers,
+            10.0,
+            1.0,
+            u64::from(reference_speakers > 1) * 3,
+            0.2,
+            0.9,
+            0.1,
+            0.1,
+            0.1,
+            "4",
+        );
+        let candidate_accuracy = supported_profile_redecode_gate_accuracy_fixture(
+            reference_speakers,
+            10.0,
+            0.5,
+            u64::from(reference_speakers > 1) * 4,
+            0.1,
+            0.95,
+            0.05,
+            0.05,
+            0.05,
+            "5",
+        );
+        let common_observation = PublicEcapaCommonObservationBinding {
+            common_observation_schema: PUBLIC_ECAPA_COMMON_OBSERVATION_BINDING_SCHEMA_VERSION
+                .to_owned(),
+            common_observation_sha256: "6".repeat(64),
+            source_audio_sha256: "7".repeat(64),
+            normalized_input_sha256: "8".repeat(64),
+            feature_schema_version: crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION.to_owned(),
+            ecapa_contract_sha256: crate::ecapa_conformance::ECAPA_CONTRACT_SHA256.to_owned(),
+            ecapa_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
+            representation_provider_version:
+                crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
+            embedded_tracklet_count: 10,
+        };
+        let baseline = PublicSupportedProfileRedecodeArmRow {
+            mode: crate::diarization::SupportedProfileRedecodeMode::DisabledIncumbent,
+            variant_configuration_sha256: super::canonical_sha256(
+                &crate::diarization::SUPPORTED_PROFILE_REDECODE_BASELINE_VERSION,
+            )
+            .expect("hash fixture incumbent"),
+            common_observation_sha256: common_observation.common_observation_sha256.clone(),
+            incumbent_partition_sha256: "9".repeat(64),
+            supported_profile_topology_sha256: "a".repeat(64),
+            frozen_support_summary_sha256: "b".repeat(64),
+            support_evidence_frozen_from_incumbent: true,
+            speaker_count_estimate_sha256: "c".repeat(64),
+            speaker_count_evidence_sha256: "d".repeat(64),
+            hard_hint_input_topology_sha256: "e".repeat(64),
+            overlap_input_topology_sha256: "f".repeat(64),
+            evaluation_only_final_forced_row_output_sha256: "0".repeat(64),
+            new_inference_count: 0,
+            frozen_count_constraints_feasible: true,
+            output_constraints_satisfied: false,
+            report_sha256: "1".repeat(64),
+            evidence_sha256: "2".repeat(64),
+            applied: false,
+            fallback_reason: Some(
+                crate::diarization::SupportedProfileRedecodeFallbackReason::DisabledIncumbent,
+            ),
+            tracklet_count: 10,
+            profile_row_count: 0,
+            supported_speaker_count: 0,
+            forced_tracklet_count: 0,
+            changed_assignment_count: 0,
+            output_detected_speaker_count: reference_speakers,
+            output_dominant_speaker_share: if reference_speakers == 1 { 1.0 } else { 0.6 },
+            structural_output_sha256: None,
+            accuracy: baseline_accuracy,
+            resources: PublicSupportedProfileRedecodeResources::default(),
+        };
+        let candidate = PublicSupportedProfileRedecodeArmRow {
+            mode: crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+            variant_configuration_sha256: policy_sha256.to_owned(),
+            common_observation_sha256: common_observation.common_observation_sha256.clone(),
+            incumbent_partition_sha256: baseline.incumbent_partition_sha256.clone(),
+            supported_profile_topology_sha256: baseline.supported_profile_topology_sha256.clone(),
+            frozen_support_summary_sha256: baseline.frozen_support_summary_sha256.clone(),
+            support_evidence_frozen_from_incumbent: true,
+            speaker_count_estimate_sha256: baseline.speaker_count_estimate_sha256.clone(),
+            speaker_count_evidence_sha256: baseline.speaker_count_evidence_sha256.clone(),
+            hard_hint_input_topology_sha256: baseline.hard_hint_input_topology_sha256.clone(),
+            overlap_input_topology_sha256: baseline.overlap_input_topology_sha256.clone(),
+            evaluation_only_final_forced_row_output_sha256: baseline
+                .evaluation_only_final_forced_row_output_sha256
+                .clone(),
+            new_inference_count: 0,
+            frozen_count_constraints_feasible: true,
+            output_constraints_satisfied: true,
+            report_sha256: "4".repeat(64),
+            evidence_sha256: "5".repeat(64),
+            applied: true,
+            fallback_reason: None,
+            tracklet_count: 10,
+            profile_row_count: 3,
+            supported_speaker_count: reference_speakers,
+            forced_tracklet_count: 0,
+            changed_assignment_count: 1,
+            output_detected_speaker_count: reference_speakers,
+            output_dominant_speaker_share: if reference_speakers == 1 { 1.0 } else { 0.6 },
+            structural_output_sha256: Some("6".repeat(64)),
+            accuracy: candidate_accuracy,
+            resources: supported_profile_redecode_gate_resources_fixture(
+                10,
+                3,
+                reference_speakers,
+                0,
+                true,
+            ),
+        };
+        let comparison = public_supported_profile_redecode_pair_comparison(
+            &baseline,
+            &candidate,
+            &candidate.clone(),
+            true,
+            true,
+            true,
+            true,
+            false,
+        );
+        let mut row = PublicSupportedProfileRedecodePairRow {
+            schema_version: PUBLIC_SUPPORTED_PROFILE_REDECODE_PAIR_SCHEMA_VERSION.to_owned(),
+            protocol_sha256: protocol_sha256.to_owned(),
+            corpus_key: PUBLIC_SUPPORTED_PROFILE_REDECODE_CORPUS_KEY.to_owned(),
+            source_version: PUBLIC_SUPPORTED_PROFILE_REDECODE_SOURCE_VERSION.to_owned(),
+            evaluation_split: EvaluationSplit::Development,
+            recording_id: format!("synthetic-recording-{recording_index}"),
+            audio_duration_ms: 100_000,
+            engine,
+            evidence_mode,
+            common_observation: common_observation.clone(),
+            frozen_total_profile_row_count: 3,
+            frozen_forced_tracklet_count: 0,
+            evaluation_only_frozen_forced_row_output_sha256: baseline
+                .evaluation_only_final_forced_row_output_sha256
+                .clone(),
+            baseline,
+            candidate,
+            comparison,
+            timing: PublicSupportedProfileRedecodeTiming {
+                common_preparation_wall_ns: 1,
+                baseline_partition_finish_wall_ns: 1,
+                candidate_partition_finish_wall_ns: 1,
+                candidate_replay_wall_ns: 1,
+                execution_order: public_supported_profile_redecode_execution_order(pair_index),
+                candidate_replay_excluded_from_gate: true,
+            },
+            deterministic_accuracy_sha256: String::new(),
+            row_sha256: String::new(),
+        };
+        row.deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(&row);
+        row.row_sha256 = public_supported_profile_redecode_pair_result_sha256(&row);
+        let expected_pair_binding = PublicSupportedProfileRedecodeExpectedPairBinding {
+            recording_id: row.recording_id.clone(),
+            audio_duration_ms: row.audio_duration_ms,
+            source_audio_sha256: common_observation.source_audio_sha256.clone(),
+            baseline_accuracy: row.baseline.accuracy.clone(),
+            candidate_accuracy: row.candidate.accuracy.clone(),
+            candidate_replay_accuracy: row.candidate.accuracy.clone(),
+        };
+        (row, common_observation, expected_pair_binding)
+    }
+
+    fn supported_profile_redecode_gate_fixture() -> (
+        PublicSupportedProfileRedecodeFrozenReference,
+        Vec<PublicSupportedProfileRedecodePairRow>,
+        Vec<PublicEcapaCommonObservationBinding>,
+        Vec<PublicSupportedProfileRedecodeExpectedPairBinding>,
+        PublicEcapaResidualBirthMemoryObservation,
+        PublicSupportedProfileRedecodeGatePolicy,
+        String,
+    ) {
+        let gate_policy = public_supported_profile_redecode_gate_policy();
+        let gate_policy_sha256 =
+            super::canonical_sha256(&gate_policy).expect("hash supported-profile gate policy");
+        let redecode_policy_sha256 = crate::diarization::supported_profile_redecode_policy_sha256();
+        let frozen_reference = PublicSupportedProfileRedecodeFrozenReference {
+            identity: public_supported_profile_redecode_expected_frozen_corpus_identity(),
+        };
+        let protocol_sha256 = public_supported_profile_redecode_protocol_sha256_for_identity(
+            &frozen_reference.identity,
+            &redecode_policy_sha256,
+            &gate_policy_sha256,
+        );
+        let mut rows = Vec::new();
+        let mut common = Vec::new();
+        let mut expected_pair_bindings = Vec::new();
+        for pair_index in 0..usize::try_from(PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_PAIR_ROWS)
+            .expect("pair count fits usize")
+        {
+            let (row, observation, binding) = supported_profile_redecode_gate_pair_fixture(
+                pair_index,
+                &redecode_policy_sha256,
+                &protocol_sha256,
+            );
+            rows.push(row);
+            common.push(observation);
+            expected_pair_bindings.push(binding);
+        }
+        let mut memory = PublicEcapaResidualBirthMemoryObservation::new();
+        for sample in 1..=gate_policy.required_successful_authoritative_peak_sample_count {
+            memory.observe_values(sample, Some(sample));
+        }
+        (
+            frozen_reference,
+            rows,
+            common,
+            expected_pair_bindings,
+            memory,
+            gate_policy,
+            gate_policy_sha256,
+        )
+    }
+
+    fn supported_profile_redecode_gate_make_rejected_pair(
+        row: &mut PublicSupportedProfileRedecodePairRow,
+        expected: &mut PublicSupportedProfileRedecodeExpectedPairBinding,
+        fallback_reason: crate::diarization::SupportedProfileRedecodeFallbackReason,
+    ) {
+        row.candidate.output_constraints_satisfied = row.baseline.output_constraints_satisfied;
+        row.candidate.report_sha256 = row.baseline.report_sha256.clone();
+        row.candidate.applied = false;
+        row.candidate.fallback_reason = Some(fallback_reason);
+        row.candidate.changed_assignment_count = 0;
+        row.candidate.structural_output_sha256 = None;
+        row.candidate.output_detected_speaker_count = row.baseline.output_detected_speaker_count;
+        row.candidate.output_dominant_speaker_share = row.baseline.output_dominant_speaker_share;
+        row.candidate.accuracy = row.baseline.accuracy.clone();
+        row.candidate.resources = supported_profile_redecode_gate_resources_fixture(
+            row.candidate.tracklet_count,
+            row.candidate.profile_row_count,
+            row.candidate.supported_speaker_count,
+            row.candidate.forced_tracklet_count,
+            false,
+        );
+        if fallback_reason
+            == crate::diarization::SupportedProfileRedecodeFallbackReason::ConstraintViolation
+        {
+            row.candidate.resources.staged_state_count = row.candidate.tracklet_count;
+        }
+        let candidate_replay = row.candidate.clone();
+        row.comparison = public_supported_profile_redecode_pair_comparison(
+            &row.baseline,
+            &row.candidate,
+            &candidate_replay,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        row.deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(row);
+        row.row_sha256 = public_supported_profile_redecode_pair_result_sha256(row);
+        expected.candidate_accuracy = row.baseline.accuracy.clone();
+        expected.candidate_replay_accuracy = row.baseline.accuracy.clone();
+    }
+
+    #[test]
+    fn supported_profile_redecode_gate_aggregate_uses_declared_denominators() {
+        let first = supported_profile_redecode_gate_accuracy_fixture(
+            2, 10.0, 1.0, 3, 0.2, 0.8, 0.1, 0.2, 0.1, "4",
+        );
+        let second = supported_profile_redecode_gate_accuracy_fixture(
+            2, 90.0, 0.0, 4, 0.1, 1.0, 0.0, 0.0, 0.3, "5",
+        );
+        let mut aggregate = PublicSupportedProfileRedecodeAggregateAccumulator::default();
+        aggregate.push(&first);
+        aggregate.push(&second);
+        let aggregate = aggregate.finish().expect("complete aggregate");
+        assert_eq!(aggregate.micro_der, Some(0.01));
+        assert_eq!(aggregate.micro_confusion_rate, Some(0.01));
+        assert_eq!(aggregate.assignment_brier_score, Some(0.02));
+        assert_eq!(aggregate.assignment_expected_calibration_error, Some(0.2));
+        assert_eq!(aggregate.change_f1, Some(0.875));
+
+        let mut missing = first.clone();
+        missing.assignment_expected_calibration_error = None;
+        let mut invalid = PublicSupportedProfileRedecodeAggregateAccumulator::default();
+        invalid.push(&missing);
+        assert!(invalid.finish().is_none());
+    }
+
+    #[test]
+    fn supported_profile_redecode_gate_resource_contract_is_exact() {
+        let policy_sha256 = crate::diarization::supported_profile_redecode_policy_sha256();
+        let (row, _, _) =
+            supported_profile_redecode_gate_pair_fixture(4, &policy_sha256, &"a".repeat(64));
+        let policy = public_supported_profile_redecode_gate_policy();
+        assert!(public_supported_profile_redecode_resources_are_valid(
+            &row, &policy
+        ));
+        let mut tampered = row.clone();
+        tampered.candidate.resources.cancellation_check_count = tampered
+            .candidate
+            .resources
+            .cancellation_check_count
+            .saturating_add(1);
+        assert!(!public_supported_profile_redecode_resources_are_valid(
+            &tampered, &policy
+        ));
+        let mut preflight_tampered = row.clone();
+        preflight_tampered
+            .candidate
+            .resources
+            .preflight_validation_visits = preflight_tampered
+            .candidate
+            .resources
+            .preflight_validation_visits
+            .saturating_add(1);
+        assert!(!public_supported_profile_redecode_resources_are_valid(
+            &preflight_tampered,
+            &policy,
+        ));
+        let mut persistent_label_tampered = row.clone();
+        persistent_label_tampered
+            .candidate
+            .resources
+            .persistent_output_label_bytes = policy
+            .maximum_output_label_bytes_per_assignment
+            .saturating_add(1);
+        assert!(!public_supported_profile_redecode_resources_are_valid(
+            &persistent_label_tampered,
+            &policy,
+        ));
+        let mut scratch_underreported = row.clone();
+        scratch_underreported
+            .candidate
+            .resources
+            .peak_scratch_payload_bytes = scratch_underreported
+            .candidate
+            .resources
+            .peak_scratch_payload_bytes
+            .saturating_sub(1);
+        assert!(!public_supported_profile_redecode_resources_are_valid(
+            &scratch_underreported,
+            &policy,
+        ));
+        let mut scratch_overreported = row.clone();
+        scratch_overreported
+            .candidate
+            .resources
+            .peak_scratch_payload_bytes = scratch_overreported
+            .candidate
+            .resources
+            .peak_scratch_payload_bytes
+            .saturating_add(1);
+        assert!(!public_supported_profile_redecode_resources_are_valid(
+            &scratch_overreported,
+            &policy,
+        ));
+        let mut forced = row;
+        let stride = forced.candidate.supported_speaker_count
+            * (forced.candidate.supported_speaker_count + 1);
+        forced.candidate.forced_tracklet_count = 1;
+        forced.candidate.resources.local_score_visits = forced
+            .candidate
+            .resources
+            .local_score_visits
+            .saturating_sub(stride);
+        let operations = forced
+            .candidate
+            .resources
+            .total_polled_operations()
+            .expect("bounded operation sum");
+        forced.candidate.resources.cancellation_check_count =
+            1 + operations / policy.cancellation_check_interval_operations + 1;
+        assert!(public_supported_profile_redecode_resources_are_valid(
+            &forced, &policy
+        ));
+        let mut rejected_after_staging = forced;
+        rejected_after_staging.candidate.applied = false;
+        rejected_after_staging.candidate.fallback_reason =
+            Some(crate::diarization::SupportedProfileRedecodeFallbackReason::ConstraintViolation);
+        rejected_after_staging.candidate.changed_assignment_count = 0;
+        rejected_after_staging.candidate.structural_output_sha256 = None;
+        rejected_after_staging
+            .candidate
+            .resources
+            .persistent_output_label_bytes = 0;
+        rejected_after_staging
+            .candidate
+            .resources
+            .cancellation_check_count = rejected_after_staging
+            .candidate
+            .resources
+            .cancellation_check_count
+            .saturating_sub(1);
+        assert!(public_supported_profile_redecode_resources_are_valid(
+            &rejected_after_staging,
+            &policy
+        ));
+        let mut missing_staged_constraint_path = rejected_after_staging.clone();
+        missing_staged_constraint_path
+            .candidate
+            .resources
+            .staged_state_count = 0;
+        assert!(!public_supported_profile_redecode_resources_are_valid(
+            &missing_staged_constraint_path,
+            &policy,
+        ));
+        let mut no_strict_gain_with_staged_path = rejected_after_staging.clone();
+        no_strict_gain_with_staged_path.candidate.fallback_reason =
+            Some(crate::diarization::SupportedProfileRedecodeFallbackReason::NoStrictImprovement);
+        assert!(!public_supported_profile_redecode_resources_are_valid(
+            &no_strict_gain_with_staged_path,
+            &policy,
+        ));
+        no_strict_gain_with_staged_path
+            .candidate
+            .resources
+            .staged_state_count = 0;
+        assert!(public_supported_profile_redecode_resources_are_valid(
+            &no_strict_gain_with_staged_path,
+            &policy,
+        ));
+        let mut persistent_limit_rejection = rejected_after_staging;
+        persistent_limit_rejection.candidate.fallback_reason = Some(
+            crate::diarization::SupportedProfileRedecodeFallbackReason::PersistentOutputLimitExceeded,
+        );
+        assert!(public_supported_profile_redecode_resources_are_valid(
+            &persistent_limit_rejection,
+            &policy,
+        ));
+    }
+
+    #[test]
+    fn supported_profile_redecode_gate_checkerboard_and_rss_are_fail_closed() {
+        let policy = public_supported_profile_redecode_gate_policy();
+        let mut by_engine = [[0_u64; 2]; 2];
+        for pair_index in 0..usize::try_from(policy.required_pair_count).expect("pair count") {
+            let engine = pair_index % 2;
+            let order = match public_supported_profile_redecode_execution_order(pair_index) {
+                PublicSupportedProfileRedecodeExecutionOrder::BaselineThenCandidate => 0,
+                PublicSupportedProfileRedecodeExecutionOrder::CandidateThenBaseline => 1,
+            };
+            by_engine[engine][order] += 1;
+        }
+        assert_eq!(by_engine, [[4, 4], [4, 4]]);
+
+        let mut partial = PublicEcapaResidualBirthMemoryObservation::new();
+        for sample in 1..policy.required_successful_authoritative_peak_sample_count {
+            partial.observe_values(sample, Some(sample));
+        }
+        assert!(!partial.has_complete_authoritative_peak_evidence(
+            policy.required_successful_authoritative_peak_sample_count
+        ));
+        partial.observe_values(1, None);
+        assert!(!partial.has_complete_authoritative_peak_evidence(
+            policy.required_successful_authoritative_peak_sample_count
+        ));
+        partial.observe_values(
+            policy.required_successful_authoritative_peak_sample_count,
+            Some(policy.required_successful_authoritative_peak_sample_count),
+        );
+        assert!(partial.has_complete_authoritative_peak_evidence(
+            policy.required_successful_authoritative_peak_sample_count
+        ));
+    }
+
+    #[test]
+    fn supported_profile_redecode_gate_privacy_barrier_rejects_speaker_refs() {
+        #[derive(serde::Serialize)]
+        struct ForbiddenPrimarySpeakerReference {
+            speaker_ref: String,
+        }
+
+        #[derive(serde::Serialize)]
+        struct ForbiddenSecondarySpeakerReference {
+            secondary_speaker_ref: String,
+        }
+
+        assert!(
+            std::panic::catch_unwind(|| {
+                serialize_path_free_public_ecapa_evidence(
+                    &ForbiddenPrimarySpeakerReference {
+                        speaker_ref: "forbidden".to_owned(),
+                    },
+                    &[],
+                )
+            })
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                serialize_path_free_public_ecapa_evidence(
+                    &ForbiddenSecondarySpeakerReference {
+                        secondary_speaker_ref: "forbidden".to_owned(),
+                    },
+                    &[],
+                )
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn supported_profile_redecode_gate_binds_corpus_duration_and_accuracy_authority() {
+        let (
+            frozen_corpus_identity,
+            rows,
+            common,
+            expected_pair_bindings,
+            memory,
+            policy,
+            policy_sha256,
+        ) = supported_profile_redecode_gate_fixture();
+        let redecode_policy_sha256 = crate::diarization::supported_profile_redecode_policy_sha256();
+
+        let mut duration_tampered = rows.clone();
+        duration_tampered[0].audio_duration_ms =
+            duration_tampered[0].audio_duration_ms.saturating_add(1);
+        duration_tampered[0].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(&duration_tampered[0]);
+        let duration_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &duration_tampered,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!duration_gate.passed);
+        assert!(
+            duration_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::FrozenRecordingMismatch)
+        );
+
+        let mut accuracy_tampered = rows.clone();
+        let accuracy_row = &mut accuracy_tampered[0];
+        accuracy_row.candidate.accuracy.speaker_confusion_sec = 0.25;
+        accuracy_row.candidate.accuracy.der = Some(0.025);
+        accuracy_row.candidate.accuracy.jer = Some(0.025);
+        accuracy_row.candidate.accuracy.score_sha256 = "f".repeat(64);
+        let candidate_replay = accuracy_row.candidate.clone();
+        accuracy_row.comparison = public_supported_profile_redecode_pair_comparison(
+            &accuracy_row.baseline,
+            &accuracy_row.candidate,
+            &candidate_replay,
+            true,
+            true,
+            true,
+            true,
+            false,
+        );
+        accuracy_row.deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(accuracy_row);
+        accuracy_row.row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(accuracy_row);
+        let accuracy_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &accuracy_tampered,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!accuracy_gate.passed);
+        assert!(
+            accuracy_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::ScoreAuthorityMismatch)
+        );
+
+        let mut source_tampered = rows.clone();
+        let mut source_common = common.clone();
+        source_tampered[0].common_observation.source_audio_sha256 = "f".repeat(64);
+        source_common[0] = source_tampered[0].common_observation.clone();
+        source_tampered[0].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(&source_tampered[0]);
+        source_tampered[0].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(&source_tampered[0]);
+        let source_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &source_tampered,
+            &source_common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!source_gate.passed);
+        assert!(
+            source_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::FrozenRecordingMismatch)
+        );
+
+        let mut descriptor_tampered = frozen_corpus_identity.clone();
+        descriptor_tampered.identity.descriptor_sha256 = "f".repeat(64);
+        let mut bundle_tampered = frozen_corpus_identity.clone();
+        bundle_tampered.identity.bundle_sha256 = "e".repeat(64);
+        let mut scorer_tampered = frozen_corpus_identity.clone();
+        scorer_tampered.identity.scorer_config_sha256 = "d".repeat(64);
+        let mut corpus_identity_tampered = frozen_corpus_identity.clone();
+        corpus_identity_tampered.identity.corpus_key = "forged-public-corpus".to_owned();
+        let mut source_identity_tampered = frozen_corpus_identity.clone();
+        source_identity_tampered.identity.source_version = "synthetic-v2".to_owned();
+        for tampered_identity in [
+            &descriptor_tampered,
+            &bundle_tampered,
+            &scorer_tampered,
+            &corpus_identity_tampered,
+            &source_identity_tampered,
+        ] {
+            let tampered_protocol = public_supported_profile_redecode_protocol_sha256_for_identity(
+                &tampered_identity.identity,
+                &redecode_policy_sha256,
+                &policy_sha256,
+            );
+            let mut coherently_rehashed_rows = rows.clone();
+            for row in &mut coherently_rehashed_rows {
+                row.protocol_sha256 = tampered_protocol.clone();
+                row.corpus_key = tampered_identity.identity.corpus_key.clone();
+                row.source_version = tampered_identity.identity.source_version.clone();
+                row.deterministic_accuracy_sha256 =
+                    public_supported_profile_redecode_pair_accuracy_sha256(row);
+                row.row_sha256 = public_supported_profile_redecode_pair_result_sha256(row);
+            }
+            let identity_gate = public_supported_profile_redecode_gate_row(
+                tampered_identity,
+                &coherently_rehashed_rows,
+                &common,
+                &expected_pair_bindings,
+                &redecode_policy_sha256,
+                policy.clone(),
+                policy_sha256.clone(),
+                &memory,
+            );
+            assert!(!identity_gate.passed);
+            assert!(
+                identity_gate
+                    .failures
+                    .contains(&PublicSupportedProfileRedecodeGateFailure::FrozenReferenceMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn supported_profile_redecode_gate_rejects_non_benign_fallbacks_and_forged_outputs() {
+        let (
+            frozen_corpus_identity,
+            rows,
+            common,
+            expected_pair_bindings,
+            memory,
+            policy,
+            policy_sha256,
+        ) = supported_profile_redecode_gate_fixture();
+        let redecode_policy_sha256 = crate::diarization::supported_profile_redecode_policy_sha256();
+
+        for fallback_reason in [
+            crate::diarization::SupportedProfileRedecodeFallbackReason::ValidationFailed,
+            crate::diarization::SupportedProfileRedecodeFallbackReason::ReplayMismatch,
+            crate::diarization::SupportedProfileRedecodeFallbackReason::DisabledIncumbent,
+            crate::diarization::SupportedProfileRedecodeFallbackReason::NoFinitePath,
+            crate::diarization::SupportedProfileRedecodeFallbackReason::PersistentOutputLimitExceeded,
+        ] {
+            let mut fallback_rows = rows.clone();
+            let mut fallback_bindings = expected_pair_bindings.clone();
+            supported_profile_redecode_gate_make_rejected_pair(
+                &mut fallback_rows[0],
+                &mut fallback_bindings[0],
+                fallback_reason,
+            );
+            let fallback_gate = public_supported_profile_redecode_gate_row(
+                &frozen_corpus_identity,
+                &fallback_rows,
+                &common,
+                &fallback_bindings,
+                &redecode_policy_sha256,
+                policy.clone(),
+                policy_sha256.clone(),
+                &memory,
+            );
+            assert!(!fallback_gate.passed);
+            assert!(
+                fallback_gate.failures.contains(
+                    &PublicSupportedProfileRedecodeGateFailure::CandidateContractMismatch
+                )
+            );
+        }
+
+        let mut malformed_structural = rows.clone();
+        malformed_structural[0].candidate.structural_output_sha256 = Some("A".repeat(64));
+        malformed_structural[0]
+            .comparison
+            .candidate_replay_structural_sha256 = Some("A".repeat(64));
+        malformed_structural[0].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(&malformed_structural[0]);
+        malformed_structural[0].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(&malformed_structural[0]);
+        let malformed_structural_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &malformed_structural,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!malformed_structural_gate.passed);
+        assert!(
+            malformed_structural_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::CandidateContractMismatch)
+        );
+
+        let mut rejected_metric_rows = rows.clone();
+        let mut rejected_metric_bindings = expected_pair_bindings.clone();
+        supported_profile_redecode_gate_make_rejected_pair(
+            &mut rejected_metric_rows[0],
+            &mut rejected_metric_bindings[0],
+            crate::diarization::SupportedProfileRedecodeFallbackReason::NoStrictImprovement,
+        );
+        let rejected_metric = &mut rejected_metric_rows[0];
+        rejected_metric.candidate.accuracy.speaker_confusion_sec = 0.9;
+        rejected_metric.candidate.accuracy.der = Some(0.09);
+        rejected_metric.candidate.accuracy.jer = Some(0.09);
+        rejected_metric.candidate.accuracy.score_sha256 = "f".repeat(64);
+        let rejected_metric_replay = rejected_metric.candidate.clone();
+        rejected_metric.comparison = public_supported_profile_redecode_pair_comparison(
+            &rejected_metric.baseline,
+            &rejected_metric.candidate,
+            &rejected_metric_replay,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        rejected_metric.deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(rejected_metric);
+        rejected_metric.row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(rejected_metric);
+        let rejected_metric_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &rejected_metric_rows,
+            &common,
+            &rejected_metric_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!rejected_metric_gate.passed);
+        assert!(
+            rejected_metric_gate.failures.contains(
+                &PublicSupportedProfileRedecodeGateFailure::RejectedCandidateOutputMismatch
+            )
+        );
+        assert!(
+            rejected_metric_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::ScoreAuthorityMismatch)
+        );
+
+        let mut resource_tampered = rows;
+        resource_tampered[0]
+            .candidate
+            .resources
+            .emission_evaluations = policy.maximum_emission_evaluations.saturating_add(1);
+        resource_tampered[0].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(&resource_tampered[0]);
+        resource_tampered[0].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(&resource_tampered[0]);
+        let resource_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &resource_tampered,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy,
+            policy_sha256,
+            &memory,
+        );
+        assert!(!resource_gate.passed);
+        assert!(
+            resource_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::ResourceBoundExceeded)
+        );
+    }
+
+    #[test]
+    fn supported_profile_redecode_gate_detects_tamper_and_policy_weakening() {
+        let (
+            frozen_corpus_identity,
+            rows,
+            common,
+            expected_pair_bindings,
+            memory,
+            policy,
+            policy_sha256,
+        ) = supported_profile_redecode_gate_fixture();
+        let redecode_policy_sha256 = crate::diarization::supported_profile_redecode_policy_sha256();
+        let gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &rows,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(gate.passed, "fixture failures: {:?}", gate.failures);
+        assert_eq!(
+            gate.result_sha256,
+            public_supported_profile_redecode_gate_result_sha256(&gate)
+        );
+        let serialized = serialize_path_free_public_ecapa_evidence(&gate, &[]);
+        assert!(!serialized.contains("speaker_ref"));
+
+        let mut rejected_rows = rows.clone();
+        let mut rejected_pair_bindings = expected_pair_bindings.clone();
+        supported_profile_redecode_gate_make_rejected_pair(
+            &mut rejected_rows[0],
+            &mut rejected_pair_bindings[0],
+            crate::diarization::SupportedProfileRedecodeFallbackReason::ConstraintViolation,
+        );
+        let rejected_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &rejected_rows,
+            &common,
+            &rejected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(
+            rejected_gate.passed,
+            "constraint-false rejected incumbent must remain gate-valid: {:?}",
+            rejected_gate.failures
+        );
+
+        let mut no_strict_rows = rows.clone();
+        let mut no_strict_bindings = expected_pair_bindings.clone();
+        supported_profile_redecode_gate_make_rejected_pair(
+            &mut no_strict_rows[0],
+            &mut no_strict_bindings[0],
+            crate::diarization::SupportedProfileRedecodeFallbackReason::NoStrictImprovement,
+        );
+        let no_strict_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &no_strict_rows,
+            &common,
+            &no_strict_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(
+            no_strict_gate.passed,
+            "no-strict-improvement incumbent rollback must remain gate-valid: {:?}",
+            no_strict_gate.failures
+        );
+
+        let mut replay_tampered = rows.clone();
+        replay_tampered[0]
+            .comparison
+            .candidate_replay_evaluation_only_final_forced_row_output_sha256 = "f".repeat(64);
+        replay_tampered[0].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(&replay_tampered[0]);
+        replay_tampered[0].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(&replay_tampered[0]);
+        let replay_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &replay_tampered,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!replay_gate.passed);
+        assert!(
+            replay_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::CandidateReplayMismatch)
+        );
+
+        let mut profile_count_tampered = rows.clone();
+        profile_count_tampered[0].candidate.profile_row_count = 2;
+        profile_count_tampered[0].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(&profile_count_tampered[0]);
+        profile_count_tampered[0].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(&profile_count_tampered[0]);
+        let profile_count_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &profile_count_tampered,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!profile_count_gate.passed);
+        assert!(
+            profile_count_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::CandidateContractMismatch)
+        );
+
+        let mut dominant_share_tampered = rows.clone();
+        dominant_share_tampered[4]
+            .candidate
+            .output_dominant_speaker_share = 0.99;
+        dominant_share_tampered[4].deterministic_accuracy_sha256 =
+            public_supported_profile_redecode_pair_accuracy_sha256(&dominant_share_tampered[4]);
+        dominant_share_tampered[4].row_sha256 =
+            public_supported_profile_redecode_pair_result_sha256(&dominant_share_tampered[4]);
+        let dominant_share_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &dominant_share_tampered,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256.clone(),
+            &memory,
+        );
+        assert!(!dominant_share_gate.passed);
+        assert!(
+            dominant_share_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::CandidateContractMismatch)
+        );
+
+        let mut reordered = rows.clone();
+        reordered.swap(0, 1);
+        let reordered_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &reordered,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            policy.clone(),
+            policy_sha256,
+            &memory,
+        );
+        assert!(!reordered_gate.passed);
+
+        let mut weakened = policy;
+        weakened.require_strict_micro_der_improvement = false;
+        let weakened_sha = super::canonical_sha256(&weakened).expect("hash weakened policy");
+        let weakened_gate = public_supported_profile_redecode_gate_row(
+            &frozen_corpus_identity,
+            &rows,
+            &common,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            weakened,
+            weakened_sha,
+            &memory,
+        );
+        assert!(!weakened_gate.passed);
+        assert!(
+            weakened_gate
+                .failures
+                .contains(&PublicSupportedProfileRedecodeGateFailure::PolicyHashMismatch)
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -17223,6 +20800,400 @@ mod tests {
         assert!(
             gate.passed,
             "residual-birth candidate did not pass its frozen public-development gate: {:?}",
+            gate.failures
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the frozen public AMI dev8 corpus and converted ECAPA weights"]
+    fn external_supported_profile_redecode_same_invocation_development_gate() {
+        let fixture = load_frozen_ecapa_dev8();
+        let frozen_reference =
+            public_supported_profile_redecode_validated_frozen_reference(&fixture);
+        let gate_policy = public_supported_profile_redecode_gate_policy();
+        let gate_policy_sha256 =
+            super::canonical_sha256(&gate_policy).expect("hash supported-profile gate policy");
+        let redecode_policy_sha256 = crate::diarization::supported_profile_redecode_policy_sha256();
+        let protocol_sha256 = public_supported_profile_redecode_protocol_sha256(
+            &fixture,
+            &redecode_policy_sha256,
+            &gate_policy_sha256,
+        );
+        let baseline_variant_sha256 = super::canonical_sha256(
+            &crate::diarization::SUPPORTED_PROFILE_REDECODE_BASELINE_VERSION,
+        )
+        .expect("hash supported-profile baseline identity");
+        let engines = [
+            crate::model::DiarizationEngine::Ecapa,
+            crate::model::DiarizationEngine::EcapaFused,
+        ];
+        let mut rows = Vec::with_capacity(
+            usize::try_from(PUBLIC_SUPPORTED_PROFILE_REDECODE_REQUIRED_PAIR_ROWS)
+                .expect("pair count fits usize"),
+        );
+        let mut expected_common_observations = Vec::with_capacity(rows.capacity());
+        let mut expected_pair_bindings = Vec::with_capacity(rows.capacity());
+        let mut memory_observation = PublicEcapaResidualBirthMemoryObservation::new();
+        memory_observation.observe_stage();
+
+        for recording_index in 0..fixture.bundle.references.len() {
+            let recording = load_frozen_ecapa_recording(&fixture, recording_index);
+            for (engine_index, engine) in engines.iter().copied().enumerate() {
+                let (request, evidence_mode) = frozen_ecapa_request(engine);
+                let preparation_started = std::time::Instant::now();
+                let prepared = crate::diarization::prepare_ecapa_diarization_evaluation(
+                    crate::diarization::AcousticDiarizationInput {
+                        samples: &recording.samples,
+                        normalized_input_sha256: &recording.normalized_input_sha256,
+                        segments: &[],
+                        word_aligned: false,
+                        request: &request,
+                        boundary_hints: &recording.boundary_hints,
+                    },
+                    &fixture.model,
+                    &|| Ok(()),
+                )
+                .expect("prepare one common ECAPA observation set");
+                let frozen = crate::diarization::prepare_supported_profile_redecode_evaluation(
+                    &prepared,
+                    || false,
+                )
+                .expect("freeze one incumbent partition and supported-profile topology");
+                let common_preparation_wall_ns =
+                    public_ecapa_duration_ns(preparation_started.elapsed());
+                memory_observation.observe_stage();
+
+                assert_eq!(
+                    frozen.common_observation_sha256(),
+                    prepared.common_observation_sha256()
+                );
+                assert!(frozen.count_constraints_feasible());
+                assert!(frozen.profile_row_count() > 0);
+                assert!(frozen.profile_row_count() <= gate_policy.maximum_total_profile_row_count);
+                assert!(
+                    frozen.forced_tracklet_count() <= prepared.embedded_tracklet_count(),
+                    "forced tracklets must be a subset of the common observation"
+                );
+                for digest in [
+                    frozen.incumbent_partition_sha256(),
+                    frozen.supported_profile_topology_sha256(),
+                    frozen.frozen_support_summary_sha256(),
+                    frozen.speaker_count_estimate_sha256(),
+                    frozen.speaker_count_evidence_sha256(),
+                    frozen.hard_hint_input_topology_sha256(),
+                    frozen.overlap_input_topology_sha256(),
+                    frozen.final_forced_row_output_sha256(),
+                ] {
+                    assert!(super::is_sha256_hex(digest));
+                }
+
+                let pair_index = recording_index
+                    .saturating_mul(engines.len())
+                    .saturating_add(engine_index);
+                let execution_order = public_supported_profile_redecode_execution_order(pair_index);
+                let (
+                    (baseline_run, baseline_partition_finish_wall_ns),
+                    (candidate_run, candidate_partition_finish_wall_ns),
+                ) = match execution_order {
+                    PublicSupportedProfileRedecodeExecutionOrder::BaselineThenCandidate => (
+                        run_prepared_public_supported_profile_redecode_arm(
+                            &prepared,
+                            &frozen,
+                            crate::diarization::SupportedProfileRedecodeMode::DisabledIncumbent,
+                            &mut memory_observation,
+                        ),
+                        run_prepared_public_supported_profile_redecode_arm(
+                            &prepared,
+                            &frozen,
+                            crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+                            &mut memory_observation,
+                        ),
+                    ),
+                    PublicSupportedProfileRedecodeExecutionOrder::CandidateThenBaseline => {
+                        let candidate = run_prepared_public_supported_profile_redecode_arm(
+                            &prepared,
+                            &frozen,
+                            crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+                            &mut memory_observation,
+                        );
+                        let baseline = run_prepared_public_supported_profile_redecode_arm(
+                            &prepared,
+                            &frozen,
+                            crate::diarization::SupportedProfileRedecodeMode::DisabledIncumbent,
+                            &mut memory_observation,
+                        );
+                        (baseline, candidate)
+                    }
+                };
+                let (candidate_replay_run, candidate_replay_wall_ns) =
+                    run_prepared_public_supported_profile_redecode_arm(
+                        &prepared,
+                        &frozen,
+                        crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+                        &mut memory_observation,
+                    );
+
+                for (run, expected_mode) in [
+                    (
+                        &baseline_run,
+                        crate::diarization::SupportedProfileRedecodeMode::DisabledIncumbent,
+                    ),
+                    (
+                        &candidate_run,
+                        crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+                    ),
+                    (
+                        &candidate_replay_run,
+                        crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+                    ),
+                ] {
+                    run.report
+                        .validate_against_request(&request, Some(recording.reference.duration_ms))
+                        .expect("valid request-bound supported-profile report");
+                    assert_eq!(run.report.speaker_evidence_mode, evidence_mode);
+                    assert_eq!(
+                        run.report.normalized_input_sha256,
+                        recording.normalized_input_sha256
+                    );
+                    assert_eq!(run.profile_redecode.mode, expected_mode);
+                    assert_eq!(run.profile_redecode.policy_sha256, redecode_policy_sha256);
+                    assert_eq!(run.policy_sha256, redecode_policy_sha256);
+                    assert_eq!(
+                        run.common_observation_sha256,
+                        frozen.common_observation_sha256()
+                    );
+                    assert_eq!(
+                        run.incumbent_partition_sha256,
+                        frozen.incumbent_partition_sha256()
+                    );
+                    assert_eq!(
+                        run.supported_profile_topology_sha256,
+                        frozen.supported_profile_topology_sha256()
+                    );
+                    assert_eq!(
+                        run.frozen_support_summary_sha256,
+                        frozen.frozen_support_summary_sha256()
+                    );
+                    assert!(run.profile_redecode.support_evidence_frozen_from_incumbent);
+                    assert_eq!(
+                        run.speaker_count_estimate_sha256,
+                        frozen.speaker_count_estimate_sha256()
+                    );
+                    assert_eq!(
+                        run.speaker_count_evidence_sha256,
+                        frozen.speaker_count_evidence_sha256()
+                    );
+                    assert_eq!(
+                        run.hard_hint_input_topology_sha256,
+                        frozen.hard_hint_input_topology_sha256()
+                    );
+                    assert_eq!(
+                        run.overlap_input_topology_sha256,
+                        frozen.overlap_input_topology_sha256()
+                    );
+                    assert_eq!(
+                        run.final_forced_row_output_sha256,
+                        frozen.final_forced_row_output_sha256()
+                    );
+                    assert_eq!(run.forced_tracklet_count, frozen.forced_tracklet_count());
+                    assert_eq!(
+                        run.profile_redecode.profile_row_count,
+                        if expected_mode
+                            == crate::diarization::SupportedProfileRedecodeMode::DevelopmentCandidateV1
+                        {
+                            frozen.profile_row_count()
+                        } else {
+                            0
+                        }
+                    );
+                    assert_eq!(run.new_inference_count, 0);
+                    assert!(run.frozen_count_constraints_feasible);
+                }
+                for run in [&candidate_run, &candidate_replay_run] {
+                    assert!(
+                        !run.profile_redecode.applied || run.clustering.constraints_satisfied,
+                        "only an applied candidate must satisfy output constraints"
+                    );
+                }
+
+                let baseline_score = score_path_free_ecapa_report(
+                    recording.reference,
+                    &baseline_run.report,
+                    &fixture.scorer_config,
+                );
+                let candidate_score = score_path_free_ecapa_report(
+                    recording.reference,
+                    &candidate_run.report,
+                    &fixture.scorer_config,
+                );
+                let candidate_replay_score = score_path_free_ecapa_report(
+                    recording.reference,
+                    &candidate_replay_run.report,
+                    &fixture.scorer_config,
+                );
+                expected_pair_bindings.push(
+                    public_supported_profile_redecode_expected_pair_binding(
+                        &recording.reference.recording_id,
+                        recording.reference.duration_ms,
+                        &recording.source_audio_sha256,
+                        &baseline_score,
+                        &candidate_score,
+                        &candidate_replay_score,
+                    ),
+                );
+                let baseline = public_supported_profile_redecode_arm_row(
+                    &baseline_run,
+                    &baseline_score,
+                    &baseline_variant_sha256,
+                );
+                let candidate = public_supported_profile_redecode_arm_row(
+                    &candidate_run,
+                    &candidate_score,
+                    &redecode_policy_sha256,
+                );
+                let candidate_replay = public_supported_profile_redecode_arm_row(
+                    &candidate_replay_run,
+                    &candidate_replay_score,
+                    &redecode_policy_sha256,
+                );
+                let independent_replay_matches =
+                    crate::diarization::prepared_supported_profile_redecode_runs_identical(
+                        &candidate_run,
+                        &candidate_replay_run,
+                    );
+                let pair_alignment_matches = baseline_score.recording_id
+                    == candidate_score.recording_id
+                    && baseline_score.reference_sha256 == candidate_score.reference_sha256
+                    && baseline_score.config_sha256 == candidate_score.config_sha256;
+                let common_observation_matches = baseline_run.common_observation_sha256
+                    == candidate_run.common_observation_sha256
+                    && candidate_run.common_observation_sha256
+                        == candidate_replay_run.common_observation_sha256
+                    && candidate_replay_run.common_observation_sha256
+                        == frozen.common_observation_sha256();
+                let frozen_incumbent_matches = baseline_run.incumbent_partition_sha256
+                    == candidate_run.incumbent_partition_sha256
+                    && candidate_run.incumbent_partition_sha256
+                        == candidate_replay_run.incumbent_partition_sha256
+                    && baseline_run.supported_profile_topology_sha256
+                        == candidate_run.supported_profile_topology_sha256
+                    && candidate_run.supported_profile_topology_sha256
+                        == candidate_replay_run.supported_profile_topology_sha256;
+                let incumbent_contract_matches = !baseline_run.profile_redecode.applied
+                    && baseline_run.profile_redecode.fallback_reason
+                        == Some(
+                            crate::diarization::SupportedProfileRedecodeFallbackReason::DisabledIncumbent,
+                        )
+                    && baseline_run.profile_redecode.resources
+                        == crate::diarization::SupportedProfileRedecodeResourceSummary::default();
+                let rejected_candidate_structural_output_matches_incumbent = !candidate_run
+                    .profile_redecode
+                    .applied
+                    && crate::diarization::prepared_supported_profile_redecode_outputs_identical(
+                        &baseline_run,
+                        &candidate_run,
+                    );
+                let mut comparison = public_supported_profile_redecode_pair_comparison(
+                    &baseline,
+                    &candidate,
+                    &candidate_replay,
+                    pair_alignment_matches,
+                    common_observation_matches,
+                    frozen_incumbent_matches,
+                    incumbent_contract_matches,
+                    rejected_candidate_structural_output_matches_incumbent,
+                );
+                comparison.candidate_replay_matches &= independent_replay_matches;
+                let common_observation = PublicEcapaCommonObservationBinding {
+                    common_observation_schema:
+                        PUBLIC_ECAPA_COMMON_OBSERVATION_BINDING_SCHEMA_VERSION.to_owned(),
+                    common_observation_sha256: frozen.common_observation_sha256().to_owned(),
+                    source_audio_sha256: recording.source_audio_sha256.clone(),
+                    normalized_input_sha256: recording.normalized_input_sha256.clone(),
+                    feature_schema_version: crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION
+                        .to_owned(),
+                    ecapa_contract_sha256: crate::ecapa_conformance::ECAPA_CONTRACT_SHA256
+                        .to_owned(),
+                    ecapa_package_sha256: crate::ecapa_conformance::ECAPA_PACKAGE_SHA256.to_owned(),
+                    representation_provider_version:
+                        crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
+                    embedded_tracklet_count: prepared.embedded_tracklet_count(),
+                };
+                expected_common_observations.push(common_observation.clone());
+                let mut row = PublicSupportedProfileRedecodePairRow {
+                    schema_version: PUBLIC_SUPPORTED_PROFILE_REDECODE_PAIR_SCHEMA_VERSION
+                        .to_owned(),
+                    protocol_sha256: protocol_sha256.clone(),
+                    corpus_key: fixture.bundle.corpus_key.clone(),
+                    source_version: fixture.bundle.source_version.clone(),
+                    evaluation_split: EvaluationSplit::Development,
+                    recording_id: recording.reference.recording_id.clone(),
+                    audio_duration_ms: recording.reference.duration_ms,
+                    engine,
+                    evidence_mode,
+                    common_observation,
+                    frozen_total_profile_row_count: frozen.profile_row_count(),
+                    frozen_forced_tracklet_count: frozen.forced_tracklet_count(),
+                    evaluation_only_frozen_forced_row_output_sha256: frozen
+                        .final_forced_row_output_sha256()
+                        .to_owned(),
+                    baseline,
+                    candidate,
+                    comparison,
+                    timing: PublicSupportedProfileRedecodeTiming {
+                        common_preparation_wall_ns,
+                        baseline_partition_finish_wall_ns,
+                        candidate_partition_finish_wall_ns,
+                        candidate_replay_wall_ns,
+                        execution_order,
+                        candidate_replay_excluded_from_gate: true,
+                    },
+                    deterministic_accuracy_sha256: String::new(),
+                    row_sha256: String::new(),
+                };
+                row.deterministic_accuracy_sha256 =
+                    public_supported_profile_redecode_pair_accuracy_sha256(&row);
+                row.row_sha256 = public_supported_profile_redecode_pair_result_sha256(&row);
+                let serialized = serialize_path_free_public_ecapa_evidence(
+                    &row,
+                    &[
+                        &fixture.descriptor_path,
+                        &fixture.weight_path,
+                        &fixture.input_root,
+                        &recording.audio_path,
+                    ],
+                );
+                println!("{serialized}");
+                rows.push(row);
+            }
+        }
+
+        let gate = public_supported_profile_redecode_gate_row(
+            &frozen_reference,
+            &rows,
+            &expected_common_observations,
+            &expected_pair_bindings,
+            &redecode_policy_sha256,
+            gate_policy,
+            gate_policy_sha256,
+            &memory_observation,
+        );
+        assert_eq!(
+            gate.result_sha256,
+            public_supported_profile_redecode_gate_result_sha256(&gate)
+        );
+        let serialized = serialize_path_free_public_ecapa_evidence(
+            &gate,
+            &[
+                &fixture.descriptor_path,
+                &fixture.weight_path,
+                &fixture.input_root,
+            ],
+        );
+        println!("{serialized}");
+        assert!(
+            gate.passed,
+            "supported-profile candidate did not pass its frozen public-development gate: {:?}",
             gate.failures
         );
     }
