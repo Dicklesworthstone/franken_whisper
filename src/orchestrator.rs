@@ -6070,10 +6070,10 @@ fn external_diarization_report(
         .iter()
         .map(|profile| profile.voiced_duration_ms)
         .max()
-        .map_or(0.0, |duration| duration as f64 / total_timed_speech_ms as f64);
-    let unknown_voiced_share = total_timed_speech_ms
-        .saturating_sub(external_segment_count)
-        as f64
+        .map_or(0.0, |duration| {
+            duration as f64 / total_timed_speech_ms as f64
+        });
+    let unknown_voiced_share = total_timed_speech_ms.saturating_sub(external_segment_count) as f64
         / total_timed_speech_ms as f64;
     let count_request_satisfied = speaker_count_satisfies_request(detected_speakers, speaker_count);
     let status = match speaker_count {
@@ -6228,12 +6228,12 @@ mod tests {
     use crate::error::FwError;
     use crate::model::{
         AcousticDiarizationRolloutStage, BackendKind, BackendParams, DiarizationConfig,
-        DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus,
-        DiarizationReport, DiarizationRequest, DiarizationSpeakerEvidenceMode, DiarizationTurn,
-        InputSource, KnownSpeakerInterval, KnownSpeakerPolicy, RunEvent, RunReport,
-        SpeakerCountOutcome, SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus,
-        SpeakerCountRequest, SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerProfileSummary,
-        StreamedRunEvent, TranscribeRequest, TranscriptionResult, TranscriptionSegment, VadParams,
+        DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus, DiarizationReport,
+        DiarizationRequest, DiarizationSpeakerEvidenceMode, DiarizationTurn, InputSource,
+        KnownSpeakerInterval, KnownSpeakerPolicy, RunEvent, RunReport, SpeakerCountOutcome,
+        SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountRequest,
+        SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerProfileSummary, StreamedRunEvent,
+        TranscribeRequest, TranscriptionResult, TranscriptionSegment, VadParams,
     };
     use crate::storage::RunStore;
 
