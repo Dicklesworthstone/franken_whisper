@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 const MAX_TEXT_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+const CONTENT_MAGIC_PREFIX_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanMode {
@@ -121,6 +122,11 @@ fn inspect_path(path: &Path) -> Option<Finding> {
     if extension.is_some_and(is_media_extension) {
         return Some(finding(path, "FW-PRIVACY-MEDIA-PATH"));
     }
+    if extension.is_some_and(is_model_artifact_extension)
+        || is_model_artifact_name(file_name, extension)
+    {
+        return Some(finding(path, "FW-PRIVACY-MODEL-PATH"));
+    }
     if file_name.contains("transcript")
         && extension.is_some_and(|extension| {
             matches!(
@@ -162,11 +168,13 @@ fn inspect_content(path: &Path, mode: ScanMode) -> io::Result<Option<Finding>> {
         return Ok(None);
     }
 
-    let mut prefix = [0_u8; 32];
     let mut file = File::open(path)?;
-    let prefix_len = file.read(&mut prefix)?;
-    if media_magic(&prefix[..prefix_len]) {
+    let prefix = read_bounded_prefix(&mut file)?;
+    if media_magic(&prefix) {
         return Ok(Some(finding(path, "FW-PRIVACY-MEDIA-CONTENT")));
+    }
+    if model_artifact_magic(&prefix) {
+        return Ok(Some(finding(path, "FW-PRIVACY-MODEL-CONTENT")));
     }
     if is_reviewed_source_or_report(path) {
         return Ok(None);
@@ -232,6 +240,9 @@ fn inspect_staged_content(path: &Path) -> io::Result<Option<Finding>> {
     if media_magic(&prefix) {
         return Ok(Some(finding(path, "FW-PRIVACY-MEDIA-CONTENT")));
     }
+    if model_artifact_magic(&prefix) {
+        return Ok(Some(finding(path, "FW-PRIVACY-MODEL-CONTENT")));
+    }
     if size > MAX_TEXT_SCAN_BYTES {
         if is_reviewed_binary(path) || is_reviewed_source_or_report(path) {
             return Ok(None);
@@ -261,6 +272,20 @@ fn inspect_staged_content(path: &Path) -> io::Result<Option<Finding>> {
     }
 }
 
+fn read_bounded_prefix(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut prefix = vec![0_u8; CONTENT_MAGIC_PREFIX_BYTES];
+    let mut read = 0;
+    while read < prefix.len() {
+        let count = reader.read(&mut prefix[read..])?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+    }
+    prefix.truncate(read);
+    Ok(prefix)
+}
+
 fn staged_prefix(object_spec: &str) -> io::Result<Vec<u8>> {
     let mut child = Command::new("git")
         .arg("show")
@@ -268,7 +293,7 @@ fn staged_prefix(object_spec: &str) -> io::Result<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let mut prefix = [0_u8; 32];
+    let mut prefix = [0_u8; CONTENT_MAGIC_PREFIX_BYTES];
     let mut read = 0;
     if let Some(stdout) = child.stdout.as_mut() {
         while read < prefix.len() {
@@ -341,6 +366,18 @@ fn is_media_extension(extension: &str) -> bool {
     )
 }
 
+fn is_model_artifact_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "nemo" | "pt" | "pth" | "ckpt" | "safetensors" | "onnx" | "npy" | "npz" | "gguf" | "ggml"
+    )
+}
+
+fn is_model_artifact_name(file_name: &str, extension: Option<&str>) -> bool {
+    extension == Some("bin")
+        && (file_name.starts_with("ggml-") || file_name.starts_with("pytorch_model"))
+}
+
 fn is_risky_root(path: &Path) -> bool {
     let lower = normalized_path(path).to_ascii_lowercase();
     lower.starts_with("tests/artifacts/")
@@ -411,6 +448,69 @@ fn media_magic(bytes: &[u8]) -> bool {
             && (&bytes[8..12] == b"AIFF" || &bytes[8..12] == b"AIFC"))
         || (bytes.len() >= 8 && &bytes[4..8] == b"ftyp")
         || (bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0)
+}
+
+fn model_artifact_magic(bytes: &[u8]) -> bool {
+    if bytes.starts_with(b"\x93NUMPY")
+        || bytes.starts_with(b"GGUF")
+        || bytes.starts_with(b"ggml")
+        || bytes.starts_with(b"lmgg")
+        || bytes.starts_with(b"ggmf")
+        || bytes.starts_with(b"fmgg")
+        || bytes.starts_with(b"ggjt")
+        || bytes.starts_with(b"tjgg")
+    {
+        return true;
+    }
+    if bytes.len() >= 265
+        && &bytes[257..262] == b"ustar"
+        && bytes[..100]
+            .windows(b"model_config.yaml".len())
+            .any(|window| window == b"model_config.yaml")
+    {
+        return true;
+    }
+    if bytes.starts_with(b"PK\x03\x04")
+        && (bytes
+            .windows(b"data.pkl".len())
+            .any(|window| window == b"data.pkl")
+            || bytes.windows(b".npy".len()).any(|window| window == b".npy"))
+    {
+        return true;
+    }
+    if bytes.first() == Some(&0x80)
+        && bytes
+            .windows(b"torch".len())
+            .any(|window| window == b"torch")
+        && bytes
+            .windows(b"storage".len())
+            .any(|window| window == b"storage")
+    {
+        return true;
+    }
+    if bytes.len() < 9 {
+        return false;
+    }
+    let Ok(header_length_bytes) = <[u8; 8]>::try_from(&bytes[..8]) else {
+        return false;
+    };
+    let Ok(header_length) = usize::try_from(u64::from_le_bytes(header_length_bytes)) else {
+        return false;
+    };
+    let Some(header_end) = 8usize.checked_add(header_length) else {
+        return false;
+    };
+    if header_length == 0 || header_length > 100 * 1024 * 1024 || header_end > bytes.len() {
+        return false;
+    }
+    let header = &bytes[8..header_end];
+    header.starts_with(b"{")
+        && header
+            .windows(b"\"dtype\"".len())
+            .any(|window| window == b"\"dtype\"")
+        && header
+            .windows(b"\"data_offsets\"".len())
+            .any(|window| window == b"\"data_offsets\"")
 }
 
 fn looks_like_transcript(text: &str) -> bool {
@@ -508,9 +608,12 @@ fn json_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Read};
     use std::path::Path;
 
-    use super::{inspect_path, looks_like_transcript, media_magic};
+    use super::{
+        inspect_path, looks_like_transcript, media_magic, model_artifact_magic, read_bounded_prefix,
+    };
 
     #[test]
     fn path_rules_are_case_insensitive_and_cover_raw_perf_shapes() {
@@ -544,6 +647,27 @@ mod tests {
                 .code,
             "FW-PRIVACY-TRANSCRIPT-PATH"
         );
+        for path in [
+            "models/ORACLE.NeMo",
+            "models/weights.PT",
+            "models/weights.PtH",
+            "models/checkpoint.CKPT",
+            "models/weights.SafeTensors",
+            "models/graph.ONNX",
+            "models/features.NPY",
+            "models/features.NPZ",
+            "models/weights.GGUF",
+            "models/weights.GGML",
+            "models/ggml-tiny.BIN",
+            "models/PyTorch_Model-00001-of-00002.BIN",
+        ] {
+            assert_eq!(
+                inspect_path(Path::new(path))
+                    .expect("model-artifact finding")
+                    .code,
+                "FW-PRIVACY-MODEL-PATH"
+            );
+        }
         assert_eq!(
             inspect_path(Path::new("tests/artifacts/perf/run/innocent_name_seq.txt"))
                 .expect("raw perf finding")
@@ -618,5 +742,65 @@ mod tests {
         ]));
         assert!(!media_magic(b".ra\xfcsynthetic"));
         assert!(!media_magic(&[0x7f, 0xfe, 0x80, 0x00]));
+    }
+
+    #[test]
+    fn model_magic_detects_known_tensor_containers_without_generic_archive_false_positives() {
+        assert!(model_artifact_magic(b"\x93NUMPY\x01\x00synthetic"));
+        assert!(model_artifact_magic(b"GGUFsynthetic"));
+        assert!(model_artifact_magic(b"ggmlsynthetic"));
+        assert!(model_artifact_magic(
+            b"PK\x03\x04synthetic-prefix/data.pkl-synthetic"
+        ));
+        assert!(model_artifact_magic(
+            b"PK\x03\x04synthetic-prefix/array.npy-synthetic"
+        ));
+        assert!(model_artifact_magic(
+            b"\x80\x04synthetic-torch-storage-payload"
+        ));
+
+        let mut nemo_header = vec![0_u8; 512];
+        nemo_header[..17].copy_from_slice(b"model_config.yaml");
+        nemo_header[257..262].copy_from_slice(b"ustar");
+        assert!(model_artifact_magic(&nemo_header));
+
+        let safetensors_header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut safetensors = Vec::new();
+        safetensors.extend_from_slice(&(safetensors_header.len() as u64).to_le_bytes());
+        safetensors.extend_from_slice(safetensors_header);
+        safetensors.extend_from_slice(&[0_u8; 4]);
+        assert!(model_artifact_magic(&safetensors));
+
+        assert!(!model_artifact_magic(b"PK\x03\x04ordinary-archive"));
+        assert!(!model_artifact_magic(b"\x80\x04ordinary-pickle"));
+        assert!(!model_artifact_magic(
+            b"\x40\x00\x00\x00\x00\x00\x00\x00{\"dtype\":\"F32\",\"data_offsets\":[0,4]}"
+        ));
+        assert!(!model_artifact_magic(b"plain text"));
+    }
+
+    #[test]
+    fn bounded_prefix_reader_retries_short_reads() {
+        struct ShortReader<'a> {
+            bytes: &'a [u8],
+            offset: usize,
+        }
+
+        impl Read for ShortReader<'_> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let remaining = &self.bytes[self.offset..];
+                let count = remaining.len().min(output.len()).min(3);
+                output[..count].copy_from_slice(&remaining[..count]);
+                self.offset += count;
+                Ok(count)
+            }
+        }
+
+        let expected = b"model_config.yaml followed by enough bytes for a tar header";
+        let mut reader = ShortReader {
+            bytes: expected,
+            offset: 0,
+        };
+        assert_eq!(read_bounded_prefix(&mut reader).expect("prefix"), expected);
     }
 }
