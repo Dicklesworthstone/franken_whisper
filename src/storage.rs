@@ -1055,26 +1055,26 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                     ))
                 })?;
 
-            let diarization_request = request_value
+            if request_value
                 .pointer("/backend_params/acoustic_diarization")
-                .filter(|value| !value.is_null())
-                .map(|value| {
-                    if value.get("speaker_count").is_none() {
-                        return Err(FwError::Storage(format!(
-                            "cannot rebuild acoustic diarization request for run {run_id}: \
-                             legacy speaker-count encoding is unsupported by \
-                             acoustic-diarization-v2; export or recover the canonical run JSON \
-                             with a matching franken_whisper version before migrating"
-                        )));
-                    }
-                    serde_json::from_value::<crate::model::DiarizationRequest>(value.clone())
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "cannot rebuild acoustic diarization request for run {run_id}: {error}"
-                            ))
-                        })
-                })
-                .transpose()?;
+                .is_some_and(|value| !value.is_null() && value.get("speaker_count").is_none())
+            {
+                return Err(FwError::Storage(format!(
+                    "cannot rebuild acoustic diarization request for run {run_id}: \
+                     legacy speaker-count encoding is unsupported by acoustic-diarization-v3; \
+                     export or recover the canonical run JSON with a matching \
+                     franken_whisper version before migrating"
+                )));
+            }
+            // Deserialize the canonical request as a whole so nested strict
+            // DTOs are enforced before any derived index can authenticate it.
+            let request: crate::model::TranscribeRequest = serde_json::from_value(request_value)
+                .map_err(|error| {
+                    FwError::Storage(format!(
+                        "cannot rebuild diarization request for run {run_id}: {error}"
+                    ))
+                })?;
+            let diarization_request = effective_diarization_request(&request);
             let diarization_report = result_value
                 .get("diarization")
                 .filter(|value| !value.is_null())
@@ -1082,16 +1082,20 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                     let contract_version = value
                         .get("contract_version")
                         .and_then(serde_json::Value::as_str);
-                    if contract_version
-                        != Some(crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION)
-                        || value.get("speaker_count").is_none()
-                    {
+                    let contract_supported = matches!(
+                        contract_version,
+                        Some(crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION)
+                            | Some(crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION)
+                    );
+                    if !contract_supported || value.get("speaker_count").is_none() {
                         return Err(FwError::Storage(format!(
                             "cannot rebuild diarization report for run {run_id}: contract {:?} \
-                             is unsupported by {}; export or recover the canonical run JSON with \
-                             a matching franken_whisper version before migrating",
+                             is unsupported; expected exactly {} or {}; export or recover the \
+                             canonical run JSON with a matching franken_whisper version before \
+                             migrating",
                             contract_version,
-                            crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION
+                            crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION,
+                            crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION,
                         )));
                     }
                     serde_json::from_value::<crate::model::DiarizationReport>(value.clone())
@@ -1642,6 +1646,38 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
         report: Option<&crate::model::DiarizationReport>,
         skip_sp: bool,
     ) -> FwResult<()> {
+        match (diarization_request, report) {
+            (Some(request), Some(report)) => {
+                report
+                    .validate_against_request(request, None)
+                    .map_err(|error| {
+                        FwError::Storage(format!(
+                            "cannot index invalid diarization request/report pair for run {run_id}: {error}"
+                        ))
+                    })?;
+            }
+            (None, Some(_)) => {
+                return Err(FwError::Storage(format!(
+                    "cannot index diarization report for run {run_id} without an enabled canonical diarization request"
+                )));
+            }
+            (Some(request), None) => {
+                let observed_duration_lower_bound = request
+                    .known_intervals
+                    .iter()
+                    .map(|hint| hint.end_ms)
+                    .max()
+                    .unwrap_or(0);
+                request
+                    .validate(observed_duration_lower_bound)
+                    .map_err(|error| {
+                        FwError::Storage(format!(
+                            "cannot index invalid diarization request for run {run_id}: {error}"
+                        ))
+                    })?;
+            }
+            (None, None) => {}
+        }
         if report.is_some_and(|report| {
             report.implementation.starts_with("native-acoustic")
                 && report.speaker_count.estimate.is_none()
@@ -1650,13 +1686,6 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                 "cannot persist native acoustic diarization for run {run_id}: \
                  speaker-count-estimate-v2 is required by the current report contract"
             )));
-        }
-        if let Some(estimate) = report.and_then(|report| report.speaker_count.estimate.as_ref()) {
-            estimate.validate().map_err(|error| {
-                FwError::Storage(format!(
-                    "cannot persist invalid speaker-count estimate for run {run_id}: {error}"
-                ))
-            })?;
         }
         let run_id_value = text_value(run_id.to_owned());
         for table in [
@@ -1835,9 +1864,10 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
         // The typed request/result JSON remains the canonical recovery payload.
         // These normalized rows make turns and privacy-safe summaries directly
         // queryable without persisting raw acoustic vectors.
+        let diarization_request = effective_diarization_request(&report.request);
         self.replace_diarization_records(
             &report.run_id,
-            report.request.backend_params.acoustic_diarization.as_ref(),
+            diarization_request.as_ref(),
             report.result.diarization.as_ref(),
             skip_sp,
         )?;
@@ -2556,12 +2586,15 @@ mod tests {
     use crate::error::FwError;
     use crate::model::{
         AccelerationBackend, AccelerationReport, BackendKind, BackendParams, DiarizationEngine,
-        DiarizationFallbackStatus, DiarizationReport, DiarizationRequest, DiarizationTurn,
-        InputSource, KnownSpeakerInterval, KnownSpeakerPolicy, RunEvent, RunReport,
-        SpeakerCountCalibrationStatus, SpeakerCountEstimate, SpeakerCountEvidenceLane,
-        SpeakerCountLaneEvidence, SpeakerCountLaneUnavailableReason, SpeakerCountOutcome,
-        SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin,
-        SpeakerCountRange, SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
+        DiarizationFallbackStatus, DiarizationOperationalPartitionMethod,
+        DiarizationOperationalPartitionSummary, DiarizationReport, DiarizationRequest,
+        DiarizationTurn, InputSource, KnownSpeakerInterval, KnownSpeakerPolicy,
+        NeuralSpeakerRepresentationReason, NeuralSpeakerRepresentationStatus,
+        NeuralSpeakerRepresentationSummary, RunEvent, RunReport, SpeakerCountCalibrationStatus,
+        SpeakerCountEstimate, SpeakerCountEvidenceLane, SpeakerCountLaneEvidence,
+        SpeakerCountLaneUnavailableReason, SpeakerCountOutcome, SpeakerCountOutcomeReason,
+        SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange,
+        SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
         SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
         SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
     };
@@ -2746,8 +2779,9 @@ mod tests {
         });
         report.result.diarization = Some(DiarizationReport {
             implementation: "native-acoustic-v2".to_owned(),
-            contract_version: "acoustic-diarization-v2".to_owned(),
-            feature_schema: "acoustic-feature-v1".to_owned(),
+            contract_version: "acoustic-diarization-v3".to_owned(),
+            feature_schema: "acoustic-feature-v2".to_owned(),
+            speaker_evidence_mode: crate::model::DiarizationSpeakerEvidenceMode::AcousticV2,
             normalized_input_sha256:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             hint_document_sha256: Some(
@@ -2816,6 +2850,7 @@ mod tests {
                 }],
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
+            operational_partition: None,
             neural_representation: None,
             diagnostics: vec!["synthetic persistence fixture".to_owned()],
         });
@@ -3117,6 +3152,206 @@ mod tests {
             "{error}"
         );
         assert_eq!(table_row_count(&store, "diarization_reports"), 0);
+    }
+
+    #[test]
+    fn malformed_nested_diarization_summaries_roll_back_live_persistence() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("invalid-nested-diarization.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+
+        let mut invalid_partition = minimal_report("run-invalid-partition", &db_path);
+        attach_synthetic_diarization(&mut invalid_partition, false);
+        invalid_partition
+            .result
+            .diarization
+            .as_mut()
+            .expect("diarization")
+            .operational_partition = Some(DiarizationOperationalPartitionSummary {
+            schema_version: "diarization-operational-partition-v1".to_owned(),
+            method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
+            selected_count: 0,
+            confidence: 0.5,
+            calibration_sha256: "c".repeat(64),
+            authority: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+        });
+        assert!(
+            store
+                .persist_report(&invalid_partition)
+                .expect_err("invalid operational partition must fail closed")
+                .to_string()
+                .contains("invalid operational partition")
+        );
+
+        let mut invalid_neural = minimal_report("run-invalid-neural", &db_path);
+        attach_synthetic_diarization(&mut invalid_neural, false);
+        invalid_neural
+            .result
+            .diarization
+            .as_mut()
+            .expect("diarization")
+            .neural_representation = Some(NeuralSpeakerRepresentationSummary {
+            schema_version: "unsupported".to_owned(),
+            provider_version: "ecapa-test-v1".to_owned(),
+            expected_model_package_sha256: "d".repeat(64),
+            loaded_model_package_sha256: None,
+            model_load_source: None,
+            status: NeuralSpeakerRepresentationStatus::Unavailable,
+            embedded_tracklet_count: 0,
+            zero_padded_tracklet_count: 0,
+            skipped_tracklet_count: 0,
+            reasons: vec![NeuralSpeakerRepresentationReason::ModelUnavailable],
+        });
+        assert!(
+            store
+                .persist_report(&invalid_neural)
+                .expect_err("invalid neural summary must fail closed")
+                .to_string()
+                .contains("invalid neural representation")
+        );
+
+        assert!(store.list_recent_runs(10).expect("runs").is_empty());
+        for table in [
+            "diarization_reports",
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+        ] {
+            assert_eq!(table_row_count(&store, table), 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn malformed_nested_canonical_report_cannot_replace_a_valid_derived_index() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("invalid-nested-rebuild.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-invalid-nested-rebuild", &db_path);
+        attach_synthetic_diarization(&mut report, false);
+        report
+            .result
+            .diarization
+            .as_mut()
+            .expect("diarization")
+            .operational_partition = Some(DiarizationOperationalPartitionSummary {
+            schema_version: "diarization-operational-partition-v1".to_owned(),
+            method: DiarizationOperationalPartitionMethod::ProbabilisticConsensus,
+            selected_count: 1,
+            confidence: 0.5,
+            calibration_sha256: "c".repeat(64),
+            authority: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+        });
+        store.persist_report(&report).expect("valid report");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+
+        let rows = store
+            .connection
+            .query("SELECT result_json FROM runs WHERE id = 'run-invalid-nested-rebuild' LIMIT 1;")
+            .expect("canonical result");
+        let mut canonical: serde_json::Value =
+            serde_json::from_str(&value_to_string(rows[0].get(0))).expect("canonical JSON");
+        canonical["diarization"]["operational_partition"]["selected_count"] = json!(0);
+        store
+            .connection
+            .execute_with_params(
+                "UPDATE runs SET result_json = ?1 WHERE id = ?2;",
+                &[
+                    SqliteValue::Text(canonical.to_string().into()),
+                    SqliteValue::Text("run-invalid-nested-rebuild".to_owned().into()),
+                ],
+            )
+            .expect("corrupt canonical nested summary");
+
+        assert!(
+            store
+                .rebuild_diarization_index()
+                .expect_err("malformed canonical report must fail closed")
+                .to_string()
+                .contains("invalid operational partition")
+        );
+        assert_eq!(
+            table_row_count(&store, "diarization_reports"),
+            1,
+            "failed rebuild must preserve the prior derived index"
+        );
+    }
+
+    #[test]
+    fn unknown_biometric_fields_in_canonical_diarization_json_fail_closed() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("unknown-biometric-rebuild.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-unknown-biometric-rebuild", &db_path);
+        attach_synthetic_diarization(&mut report, false);
+        store.persist_report(&report).expect("valid report");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+
+        let rows = store
+            .connection
+            .query(
+                "SELECT request_json, result_json FROM runs \
+                 WHERE id = 'run-unknown-biometric-rebuild' LIMIT 1;",
+            )
+            .expect("canonical JSON");
+        let original_request = value_to_string(rows[0].get(0));
+        let original_result = value_to_string(rows[0].get(1));
+
+        let mut result: serde_json::Value =
+            serde_json::from_str(&original_result).expect("typed result JSON");
+        result["diarization"]["profiles"][0]["embedding"] = json!([0.1, 0.2]);
+        store
+            .connection
+            .execute_with_params(
+                "UPDATE runs SET result_json = ?1 WHERE id = ?2;",
+                &[
+                    SqliteValue::Text(result.to_string().into()),
+                    SqliteValue::Text("run-unknown-biometric-rebuild".to_owned().into()),
+                ],
+            )
+            .expect("inject forbidden report field");
+        let report_error = store
+            .rebuild_diarization_index()
+            .expect_err("unknown report field must fail closed");
+        assert!(
+            report_error
+                .to_string()
+                .contains("cannot rebuild diarization report"),
+            "{report_error}"
+        );
+        assert_eq!(
+            table_row_count(&store, "diarization_reports"),
+            1,
+            "failed report rebuild must preserve the prior derived index"
+        );
+
+        let mut request: serde_json::Value =
+            serde_json::from_str(&original_request).expect("typed request JSON");
+        request["backend_params"]["acoustic_diarization"]["embedding"] = json!([0.3, 0.4]);
+        store
+            .connection
+            .execute_with_params(
+                "UPDATE runs SET request_json = ?1, result_json = ?2 WHERE id = ?3;",
+                &[
+                    SqliteValue::Text(request.to_string().into()),
+                    SqliteValue::Text(original_result.into()),
+                    SqliteValue::Text("run-unknown-biometric-rebuild".to_owned().into()),
+                ],
+            )
+            .expect("inject forbidden request field");
+        let request_error = store
+            .rebuild_diarization_index()
+            .expect_err("unknown request field must fail closed");
+        assert!(
+            request_error
+                .to_string()
+                .contains("cannot rebuild diarization request"),
+            "{request_error}"
+        );
+        assert_eq!(
+            table_row_count(&store, "diarization_reports"),
+            1,
+            "failed request rebuild must preserve the prior derived index"
+        );
     }
 
     #[test]

@@ -3178,7 +3178,8 @@ mod tests {
     use crate::model::{
         BackendKind, BackendParams, DiarizationEngine, DiarizationFallbackStatus,
         DiarizationReport, DiarizationRequest, DiarizationTurn, InputSource, KnownSpeakerInterval,
-        KnownSpeakerPolicy, RunEvent, RunReport, SpeakerCountCalibrationStatus,
+        KnownSpeakerPolicy, NeuralSpeakerRepresentationReason, NeuralSpeakerRepresentationStatus,
+        NeuralSpeakerRepresentationSummary, RunEvent, RunReport, SpeakerCountCalibrationStatus,
         SpeakerCountEstimate, SpeakerCountEvidenceLane, SpeakerCountLaneEvidence,
         SpeakerCountLaneUnavailableReason, SpeakerCountOutcome, SpeakerCountOutcomeReason,
         SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange,
@@ -3366,8 +3367,9 @@ mod tests {
         });
         report.result.diarization = Some(DiarizationReport {
             implementation: "native-acoustic-v2".to_owned(),
-            contract_version: "acoustic-diarization-v2".to_owned(),
-            feature_schema: "acoustic-feature-v1".to_owned(),
+            contract_version: "acoustic-diarization-v3".to_owned(),
+            feature_schema: "acoustic-feature-v2".to_owned(),
+            speaker_evidence_mode: crate::model::DiarizationSpeakerEvidenceMode::AcousticV2,
             normalized_input_sha256:
                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
             hint_document_sha256: Some(
@@ -3439,6 +3441,7 @@ mod tests {
                 }],
             },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
+            operational_partition: None,
             neural_representation: None,
             diagnostics: vec!["synthetic sync fixture".to_owned()],
         });
@@ -3469,6 +3472,40 @@ mod tests {
                     "segment_geometry_fallback"
                 ]
             }
+        });
+    }
+
+    fn attach_fixture_neural_diarization(report: &mut RunReport) {
+        attach_fixture_diarization(report);
+        report
+            .request
+            .backend_params
+            .acoustic_diarization
+            .as_mut()
+            .expect("fixture diarization request")
+            .engine = DiarizationEngine::EcapaFused;
+        let diarization = report
+            .result
+            .diarization
+            .as_mut()
+            .expect("fixture diarization report");
+        diarization.implementation = "native-ecapa-fused-v1".to_owned();
+        diarization.contract_version =
+            crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION.to_owned();
+        diarization.feature_schema = "acoustic-feature-v2".to_owned();
+        diarization.speaker_evidence_mode =
+            crate::model::DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel;
+        diarization.neural_representation = Some(NeuralSpeakerRepresentationSummary {
+            schema_version: "neural-speaker-representation-summary-v1".to_owned(),
+            provider_version: crate::diarization::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
+            expected_model_package_sha256: "e".repeat(64),
+            loaded_model_package_sha256: Some("e".repeat(64)),
+            model_load_source: Some(crate::model::NeuralModelLoadSource::Direct),
+            status: NeuralSpeakerRepresentationStatus::Degraded,
+            embedded_tracklet_count: 3,
+            zero_padded_tracklet_count: 1,
+            skipped_tracklet_count: 1,
+            reasons: vec![NeuralSpeakerRepresentationReason::ShortTracklet],
         });
     }
 
@@ -3824,6 +3861,123 @@ mod tests {
     }
 
     #[test]
+    fn neural_diarization_round_trip_rebuilds_normalized_index() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("neural-source.sqlite3");
+        let target_db = dir.path().join("neural-target.sqlite3");
+        let export_dir = dir.path().join("neural-export");
+        let state_root = dir.path().join("neural-state");
+
+        let source_store = RunStore::open(&source_db).expect("source store");
+        let mut report = fixture_report("run-neural-diarization-sync", &source_db);
+        attach_fixture_neural_diarization(&mut report);
+        source_store
+            .persist_report(&report)
+            .expect("neural diarization report should persist");
+
+        export(&source_db, &export_dir, &state_root).expect("export");
+        import(&target_db, &export_dir, &state_root, ConflictPolicy::Reject).expect("import");
+
+        let target =
+            BlockingConnection::open(target_db.display().to_string()).expect("target connection");
+        let derived = target
+            .query(
+                "SELECT implementation, contract_version, feature_schema, \
+                 supported_speaker_count FROM diarization_reports \
+                 WHERE run_id = 'run-neural-diarization-sync';",
+            )
+            .expect("normalized neural report");
+        assert_eq!(derived.len(), 1);
+        assert_eq!(
+            value_to_string_sqlite(derived[0].get(0)),
+            "native-ecapa-fused-v1"
+        );
+        assert_eq!(
+            value_to_string_sqlite(derived[0].get(1)),
+            crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION
+        );
+        assert_eq!(
+            value_to_string_sqlite(derived[0].get(2)),
+            "acoustic-feature-v2"
+        );
+        assert_eq!(value_to_string_sqlite(derived[0].get(3)), "1");
+        for table in [
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+        ] {
+            let rows = target
+                .query(&format!(
+                    "SELECT COUNT(*) FROM {table} \
+                     WHERE run_id = 'run-neural-diarization-sync';"
+                ))
+                .expect("normalized neural index count");
+            assert_eq!(
+                value_to_string_sqlite(rows[0].get(0)),
+                "1",
+                "{table} should be rebuilt for the neural contract"
+            );
+        }
+
+        let canonical = target
+            .query(
+                "SELECT request_json, result_json FROM runs \
+                 WHERE id = 'run-neural-diarization-sync';",
+            )
+            .expect("canonical neural run row");
+        let request: TranscribeRequest =
+            serde_json::from_str(&value_to_string_sqlite(canonical[0].get(0)))
+                .expect("typed neural request should survive JSONL");
+        let result: TranscriptionResult =
+            serde_json::from_str(&value_to_string_sqlite(canonical[0].get(1)))
+                .expect("typed neural result should survive JSONL");
+        assert_eq!(
+            request
+                .backend_params
+                .acoustic_diarization
+                .as_ref()
+                .map(|request| request.engine),
+            Some(DiarizationEngine::EcapaFused)
+        );
+        let neural_summary = result
+            .diarization
+            .as_ref()
+            .and_then(|diarization| diarization.neural_representation.as_ref())
+            .expect("neural provenance should survive JSONL");
+        assert_eq!(
+            neural_summary.status,
+            NeuralSpeakerRepresentationStatus::Degraded
+        );
+        assert_eq!(neural_summary.embedded_tracklet_count, 3);
+        assert_eq!(
+            neural_summary.reasons,
+            vec![NeuralSpeakerRepresentationReason::ShortTracklet]
+        );
+        assert!(
+            !value_to_string_sqlite(canonical[0].get(1)).contains("feature_vector"),
+            "canonical neural JSONL must not contain reusable biometric vectors"
+        );
+
+        let recovered = RunStore::open(&target_db)
+            .expect("recovered neural store")
+            .load_run_details("run-neural-diarization-sync")
+            .expect("recovered neural details query")
+            .expect("recovered neural details");
+        assert_eq!(
+            recovered
+                .diarization
+                .as_ref()
+                .and_then(|diarization| diarization.neural_representation.as_ref()),
+            report
+                .result
+                .diarization
+                .as_ref()
+                .and_then(|diarization| diarization.neural_representation.as_ref()),
+            "typed neural provenance must survive SQLite -> JSONL -> fresh SQLite"
+        );
+    }
+
+    #[test]
     fn diarization_rebuild_failure_rolls_back_canonical_import() {
         let dir = tempdir().expect("tempdir");
         let source_db = dir.path().join("source.sqlite3");
@@ -3847,7 +4001,7 @@ mod tests {
                 .expect("embedded result JSON string"),
         )
         .expect("embedded result JSON");
-        result["diarization"] = json!({"invalid": true});
+        result["diarization"]["contract_version"] = json!("acoustic-diarization-v999");
         row["result_json"] = json!(serde_json::to_string(&result).expect("serialize result"));
         fs::write(
             &runs_path,
@@ -3873,6 +4027,12 @@ mod tests {
             error
                 .to_string()
                 .contains("cannot rebuild diarization report")
+        );
+        assert!(
+            error.to_string().contains(
+                "expected exactly acoustic-diarization-v3 or neural-diarization-common-v2"
+            ),
+            "unknown acoustic contract versions must remain fail-closed: {error}"
         );
 
         let target =
