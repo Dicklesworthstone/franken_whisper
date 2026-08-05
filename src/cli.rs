@@ -276,7 +276,7 @@ pub enum PublicCorpusCommand {
     Ablate(PublicCorpusAblationArgs),
     /// Run the sidecar study (artifact writing requires Linux/Android/Apple).
     SidecarStudy(PublicCorpusSidecarStudyArgs),
-    /// Compare native and learned diarizers in one aggregate-only invocation.
+    /// Compare diarizers (artifact writing requires Linux/Android/Apple).
     CompareModels(PublicCorpusModelComparisonArgs),
 }
 

@@ -1699,10 +1699,7 @@ fn classify_sortformer_skip(
         ),
         DifferentialSkipReason::ProtocolVersionMismatch
         | DifferentialSkipReason::ToolIdentityMismatch
-        | DifferentialSkipReason::ModelContractMismatch
-        | DifferentialSkipReason::VersionProbeFailed
-        | DifferentialSkipReason::VersionProbeTimedOut
-        | DifferentialSkipReason::InvalidVersionOutput => (
+        | DifferentialSkipReason::ModelContractMismatch => (
             ModelComparisonOutcomeStatus::Skipped,
             ModelComparisonOutcomeCode::SortformerRuntimeIneligible,
         ),
@@ -1719,6 +1716,9 @@ fn classify_sortformer_skip(
             ));
         }
         DifferentialSkipReason::ModelCapacityExceeded
+        | DifferentialSkipReason::VersionProbeFailed
+        | DifferentialSkipReason::VersionProbeTimedOut
+        | DifferentialSkipReason::InvalidVersionOutput
         | DifferentialSkipReason::OracleRunFailed
         | DifferentialSkipReason::OracleRunTimedOut
         | DifferentialSkipReason::InvalidOracleOutput
@@ -2624,6 +2624,32 @@ mod tests {
             model_comparison_schedule_row(4),
             MODEL_COMPARISON_WILLIAMS_SCHEDULE[0]
         );
+        let mut directed_adjacencies = BTreeMap::new();
+        for row in MODEL_COMPARISON_WILLIAMS_SCHEDULE {
+            for pair in row.windows(2) {
+                *directed_adjacencies.entry((pair[0], pair[1])).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(directed_adjacencies.len(), 12);
+        assert!(directed_adjacencies.values().all(|count| *count == 1));
+    }
+
+    #[test]
+    fn installed_broken_sortformer_is_a_failure_not_a_capability_skip() {
+        for reason in [
+            DifferentialSkipReason::VersionProbeFailed,
+            DifferentialSkipReason::VersionProbeTimedOut,
+            DifferentialSkipReason::InvalidVersionOutput,
+        ] {
+            assert_eq!(
+                classify_sortformer_skip(reason, DifferentialExecutionStage::VersionProbe)
+                    .expect("classification"),
+                (
+                    ModelComparisonOutcomeStatus::Failed,
+                    ModelComparisonOutcomeCode::SortformerExecutionFailed,
+                )
+            );
+        }
     }
 
     #[test]
