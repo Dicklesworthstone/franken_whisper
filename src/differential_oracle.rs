@@ -65,6 +65,9 @@ const MAX_INTERVALS: usize = 200_000;
 const MAX_WORDS: usize = 500_000;
 const MAX_CLUSTERS: usize = 200_000;
 const MAX_TURNS: usize = 200_000;
+const MAX_COMPARISON_CHANGE_POINTS: usize = 2_048;
+const MAX_COMPARISON_TURNS: usize = 2_048;
+const MAX_COMPARISON_SPEAKERS: usize = 32;
 const MAX_SAFE_TOKEN_LEN: usize = 128;
 const HASH_HEX_LEN: usize = 64;
 
@@ -714,8 +717,8 @@ impl ExternalSkip {
 pub fn run_differential_oracle(
     request: DifferentialOracleRequest<'_>,
 ) -> FwResult<DifferentialOracleReport> {
-    let token = CancellationToken::unbounded();
-    run_differential_oracle_with_token(request, &token)
+    let cancellation = CancellationToken::unbounded();
+    run_differential_oracle_with_token(request, &cancellation)
 }
 
 fn run_differential_oracle_with_token(
@@ -1642,8 +1645,12 @@ fn classify_command_error(error: FwError, stage: DifferentialExecutionStage) -> 
     match error {
         FwError::Cancelled(_) => ExternalRunError::Cancelled(error),
         FwError::CommandMissing { .. } => ExternalRunError::Skipped(ExternalSkip::new(
-            DifferentialSkipReason::MissingExecutable,
-            DifferentialExecutionStage::ResolveExecutable,
+            if stage == DifferentialExecutionStage::VersionProbe {
+                DifferentialSkipReason::VersionProbeFailed
+            } else {
+                DifferentialSkipReason::OracleRunFailed
+            },
+            stage,
         )),
         FwError::CommandTimedOut { .. } => ExternalRunError::Skipped(ExternalSkip::new(
             if stage == DifferentialExecutionStage::VersionProbe {
@@ -1970,10 +1977,10 @@ fn validate_tool_stage_document(
         return Err(DifferentialSkipReason::InvalidOracleOutput);
     }
     if !turns.windows(2).all(|window| {
-        let left = &window[0];
-        let right = &window[1];
-        (left.start_ms, left.end_ms, left.speaker.as_deref())
-            <= (right.start_ms, right.end_ms, right.speaker.as_deref())
+        window.first().zip(window.get(1)).is_some_and(|(left, right)| {
+            (left.start_ms, left.end_ms, left.speaker.as_deref())
+                <= (right.start_ms, right.end_ms, right.speaker.as_deref())
+        })
     }) {
         return Err(DifferentialSkipReason::InvalidOracleOutput);
     }
@@ -2005,13 +2012,13 @@ fn validate_tool_stage_document(
             return Err(DifferentialSkipReason::InvalidOracleOutput);
         }
     }
-    if !first_onset_by_speaker_index
-        .values()
-        .copied()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .all(|window| window[0] <= window[1])
-    {
+    let mut onsets = first_onset_by_speaker_index.values().copied();
+    let mut prior_onset = onsets.next();
+    if onsets.any(|onset| {
+        let out_of_order = prior_onset.is_some_and(|prior| prior > onset);
+        prior_onset = Some(onset);
+        out_of_order
+    }) {
         return Err(DifferentialSkipReason::InvalidOracleOutput);
     }
     if document
@@ -2179,6 +2186,8 @@ fn compare_documents_with_token(
 ) -> FwResult<Vec<DifferentialStageComparison>> {
     validate_stage_document_with_token(native, token)?;
     validate_stage_document_with_token(oracle, token)?;
+    validate_comparison_complexity(native, "native")?;
+    validate_comparison_complexity(oracle, "oracle")?;
     validate_comparison_config(config)?;
     if native.recording_key != oracle.recording_key || native.duration_ms != oracle.duration_ms {
         return Err(oracle_request_error(
@@ -2188,6 +2197,7 @@ fn compare_documents_with_token(
     }
     if let Some(reference) = reference {
         validate_stage_document_with_token(reference, token)?;
+        validate_comparison_complexity(reference, "reference")?;
         if reference.recording_key != native.recording_key
             || reference.duration_ms != native.duration_ms
         {
@@ -2253,6 +2263,43 @@ fn compare_documents_with_token(
     )?);
     token.checkpoint()?;
     Ok(comparisons)
+}
+
+fn validate_comparison_complexity(
+    document: &DifferentialStageDocument,
+    role: &str,
+) -> FwResult<()> {
+    if document
+        .change_boundaries_ms
+        .as_ref()
+        .is_some_and(|changes| changes.len() > MAX_COMPARISON_CHANGE_POINTS)
+    {
+        return Err(oracle_request_error(
+            "comparison_change_count",
+            &format!("{role} change-point count exceeds the safe comparison cap"),
+        ));
+    }
+    if let Some(turns) = &document.final_projection {
+        if turns.len() > MAX_COMPARISON_TURNS {
+            return Err(oracle_request_error(
+                "comparison_turn_count",
+                &format!("{role} turn count exceeds the safe comparison cap"),
+            ));
+        }
+        let mut speakers = turns
+            .iter()
+            .filter_map(|turn| turn.speaker.as_deref())
+            .collect::<BTreeSet<_>>()
+            .len();
+        speakers += usize::from(turns.iter().any(|turn| turn.speaker.is_none()));
+        if speakers > MAX_COMPARISON_SPEAKERS {
+            return Err(oracle_request_error(
+                "comparison_speaker_count",
+                &format!("{role} speaker count exceeds the safe comparison cap"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn compare_interval_stage(
@@ -3427,6 +3474,102 @@ mod tests {
         assert_eq!(score.intersection_ms, 50);
         assert_eq!(score.union_ms, 150);
         assert!((score.iou.expect("iou") - 1.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn comparison_rejects_quadratic_workloads_before_scoring() {
+        let mut excessive_changes = document();
+        excessive_changes.duration_ms = 10_000;
+        excessive_changes.change_boundaries_ms = Some(
+            (1..=u64::try_from(MAX_COMPARISON_CHANGE_POINTS + 1).expect("change cap"))
+                .collect(),
+        );
+        assert!(
+            compare_documents(
+                &excessive_changes,
+                &excessive_changes,
+                None,
+                &DifferentialComparisonConfig::default()
+            )
+            .is_err()
+        );
+
+        let mut excessive_speakers = document();
+        excessive_speakers.final_projection = Some(
+            (0..=MAX_COMPARISON_SPEAKERS)
+                .map(|index| {
+                    EvaluationTurn::labeled(
+                        u64::try_from(index).expect("index") * 10,
+                        u64::try_from(index + 1).expect("index") * 10,
+                        format!("speaker_{index}"),
+                    )
+                })
+                .collect(),
+        );
+        assert!(
+            compare_documents(
+                &excessive_speakers,
+                &excessive_speakers,
+                None,
+                &DifferentialComparisonConfig::default()
+            )
+            .is_err()
+        );
+
+        let mut excessive_turns = document();
+        excessive_turns.duration_ms = 10_000;
+        excessive_turns.final_projection = Some(
+            (0..=MAX_COMPARISON_TURNS)
+                .map(|index| {
+                    EvaluationTurn::labeled(
+                        u64::try_from(index).expect("index"),
+                        u64::try_from(index + 1).expect("index"),
+                        "speaker_0",
+                    )
+                })
+                .collect(),
+        );
+        assert!(
+            compare_documents(
+                &excessive_turns,
+                &excessive_turns,
+                None,
+                &DifferentialComparisonConfig::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn command_disappearance_is_attributed_to_the_attempted_stage() {
+        let version_error = classify_command_error(
+            FwError::CommandMissing {
+                command: "disappeared".to_owned(),
+            },
+            DifferentialExecutionStage::VersionProbe,
+        );
+        assert!(matches!(
+            version_error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::VersionProbeFailed,
+                stage: DifferentialExecutionStage::VersionProbe,
+                ..
+            })
+        ));
+        let run_error = classify_command_error(
+            FwError::CommandMissing {
+                command: "disappeared".to_owned(),
+            },
+            DifferentialExecutionStage::OracleRun,
+        );
+        assert!(matches!(
+            run_error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::OracleRunFailed,
+                stage: DifferentialExecutionStage::OracleRun,
+                ..
+            })
+        ));
     }
 
     #[test]
