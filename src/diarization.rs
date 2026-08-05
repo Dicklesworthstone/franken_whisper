@@ -7563,7 +7563,7 @@ pub(crate) const MIN_SPEAKER_EVIDENCE_RELIABILITY: f32 = 0.30;
 const MIN_SPEAKER_SEPARATION_SUPPORT: f32 = 0.40;
 pub(crate) const MAX_SAME_SPEAKER_PROBABILITY_FOR_SEPARATION: f32 = 0.45;
 const MIN_SPEAKER_SEPARATION_LANES: usize = 3;
-const MAX_MULTI_SPEAKER_DOMINANT_SHARE: f32 = 0.98;
+pub(crate) const MAX_MULTI_SPEAKER_DOMINANT_SHARE: f32 = 0.98;
 // Channel conditions are useful within a recording, but must remain secondary:
 // the same vocal source may legitimately appear through both a nearby
 // microphone and a distant loudspeaker.
@@ -7950,6 +7950,140 @@ pub(crate) fn ecapa_residual_birth_policy_sha256() -> String {
         hasher.update([0]);
     }
     for fallback in EcapaResidualBirthFallbackReason::ALL {
+        hasher.update(b"fallback:");
+        hasher.update(fallback.id().as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Stable identity of the frozen supported-profile redecode experiment.
+#[must_use]
+pub(crate) fn supported_profile_redecode_policy_sha256() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"supported-profile-constrained-redecode-policy\0");
+    for identity in [
+        SUPPORTED_PROFILE_REDECODE_VERSION,
+        SUPPORTED_PROFILE_REDECODE_BASELINE_VERSION,
+        SUPPORTED_PROFILE_REDECODE_EVIDENCE_SCHEMA_VERSION,
+        ECAPA_SPEAKER_REPRESENTATION_VERSION,
+        NEURAL_DIARIZATION_CONTRACT_VERSION,
+        ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION,
+        ACOUSTIC_ASSIGNMENT_CONFIDENCE_CALIBRATION_VERSION,
+        "route:ecapa-only",
+        "route:ecapa-with-acoustic-channel",
+    ] {
+        hasher.update(identity.as_bytes());
+        hasher.update([0]);
+    }
+    for evidence_mode in [
+        DiarizationSpeakerEvidenceMode::EcapaOnly,
+        DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel,
+    ] {
+        hasher.update(speaker_pair_calibration_sha256_for_mode(evidence_mode).as_bytes());
+        hasher.update([0]);
+    }
+    hasher.update(acoustic_feature_schema_sha256(AcousticFeatureSchemaVersion::V2).as_bytes());
+    hasher.update([0]);
+    for value in [
+        SUPPORTED_PROFILE_REDECODE_MAX_TRACKLETS,
+        SUPPORTED_PROFILE_REDECODE_MAX_PROFILE_ROWS,
+        SUPPORTED_PROFILE_REDECODE_MAX_SPEAKERS,
+        SUPPORTED_PROFILE_REDECODE_MAX_STATES,
+        SUPPORTED_PROFILE_REDECODE_MAX_ATOMIC_COMMIT_ROWS,
+        crate::model::MAX_SPEAKER_REF_BYTES,
+    ] {
+        hasher.update((value as u64).to_le_bytes());
+    }
+    for value in [
+        SUPPORTED_PROFILE_REDECODE_MAX_PREFLIGHT_VALIDATIONS,
+        SUPPORTED_PROFILE_REDECODE_MAX_EMISSION_EVALUATIONS,
+        SUPPORTED_PROFILE_REDECODE_MAX_TRANSITIONS,
+        SUPPORTED_PROFILE_REDECODE_MAX_LOCAL_SCORE_VISITS,
+        SUPPORTED_PROFILE_REDECODE_MAX_BACKPOINTERS,
+        SUPPORTED_PROFILE_REDECODE_MAX_STAGED_STATES,
+        SUPPORTED_PROFILE_REDECODE_MAX_SCRATCH_BYTES,
+        SUPPORTED_PROFILE_REDECODE_MAX_PERSISTENT_OUTPUT_LABEL_BYTES,
+        SUPPORTED_PROFILE_REDECODE_CANCELLATION_INTERVAL,
+    ] {
+        hasher.update(value.to_le_bytes());
+    }
+    for value in [
+        DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE,
+        ACOUSTIC_ASSIGNMENT_CONFIDENCE_FLOOR,
+        ACOUSTIC_ASSIGNMENT_CONFIDENCE_SCALE,
+        ECAPA_SEGMENT_LOG_LIKELIHOOD_MAX_WEIGHT,
+        TEMPORAL_KNOWN_SWITCH_BASE,
+        TEMPORAL_UNKNOWN_SWITCH_BASE,
+        TEMPORAL_KNOWN_BOUNDARY_CREDIT,
+        TEMPORAL_UNKNOWN_BOUNDARY_CREDIT,
+        TEMPORAL_MAX_GAP_CREDIT,
+        TEMPORAL_PREMATURE_SWITCH_PENALTY,
+        TEMPORAL_FRAGMENT_PENALTY,
+        MAX_MULTI_SPEAKER_DOMINANT_SHARE,
+        MAX_ABS_ACOUSTIC_FEATURE,
+    ] {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    for value in [
+        SUPPORTED_PROFILE_REDECODE_MISSING_EVIDENCE_COST,
+        SUPPORTED_PROFILE_REDECODE_PROBABILITY_FLOOR,
+        SUPPORTED_PROFILE_REDECODE_SOFT_PRIOR_WEIGHT,
+        SUPPORTED_PROFILE_REDECODE_SHORT_TRACKLET_COST,
+        SUPPORTED_PROFILE_REDECODE_OVERLAP_COST,
+        SUPPORTED_PROFILE_REDECODE_UNKNOWN_PROBABILITY_FLOOR,
+        SUPPORTED_PROFILE_REDECODE_EVIDENCE_WEIGHT_FLOOR,
+        SUPPORTED_PROFILE_REDECODE_SWITCH_PENALTY_MIN,
+        SUPPORTED_PROFILE_REDECODE_SWITCH_PENALTY_MAX,
+    ] {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    for value in [
+        MIN_TRACKLET_FRAMES as u64,
+        TEMPORAL_FULL_GAP_MS,
+        TEMPORAL_SHORT_RUN_MS,
+        TEMPORAL_FRAGMENT_MS,
+        SUPPORTED_PROFILE_REDECODE_SCRATCH_OVERHEAD_BYTES as u64,
+        SUPPORTED_PROFILE_REDECODE_LOW_VOICED_FRAME_DIVISOR as u64,
+    ] {
+        hasher.update(value.to_le_bytes());
+    }
+    for rule in [
+        b"one-whole-recording-label-state-viterbi-supported-plus-unknown-v1".as_slice(),
+        b"duration-summary-path-history-approximation-not-global-optimum-v1",
+        b"fixed-supported-set-and-count-posterior-v1",
+        b"count-request-infer-prior-range-retained-soft-hard-exact-supported-k-v1",
+        b"forced-hard-and-overlap-rows-preserve-complete-incumbent-v1",
+        b"forced-incumbent-primary-only-finite-and-bypasses-local-rejection-v1",
+        b"existing-tracklet-edges-only-v1",
+        b"profile-cluster-emissions-soft-prior-once-v1",
+        b"ecapa-duration-evidence-once-v1",
+        b"authorized-channel-evidence-only-v1",
+        b"uniform-supported-ecapa-evidence-mode-v1",
+        b"supported-competitor-unknown-recompute-v1",
+        b"local-rejection-inside-emission-lattice-v1",
+        b"finite-fixed-order-f64-total-cmp-v1",
+        b"strict-objective-improvement-tie-retains-incumbent-v1",
+        b"retained-supported-count-and-dominant-share-constraints-before-commit-v1",
+        b"missing-supported-coverage-constraint-rollback-changed-zero-validation-failure-v1",
+        b"preflight-validations-equal-tracklets-plus-total-profile-rows-v1",
+        b"bounded-label-bytes-and-accounted-persistent-output-clones-v1",
+        b"single-final-cancellation-check-then-bounded-noninterruptible-atomic-commit-v1",
+        b"binary-logistic-competitor-score-stable-branches-clamped-zero-to-one-v1",
+        b"packed-backpointers-bounded-scratch-v1",
+        b"zero-profile-updates-zero-model-calls-v1",
+        b"fail-closed-original-incumbent-v1",
+        b"route:development-only-no-env-no-default-flip-v1",
+    ] {
+        hasher.update(rule);
+        hasher.update([0]);
+    }
+    for mode in SupportedProfileRedecodeMode::ALL {
+        hasher.update(b"mode:");
+        hasher.update(mode.id().as_bytes());
+        hasher.update([0]);
+    }
+    for fallback in SupportedProfileRedecodeFallbackReason::ALL {
         hasher.update(b"fallback:");
         hasher.update(fallback.id().as_bytes());
         hasher.update([0]);
@@ -12063,6 +12197,185 @@ const ECAPA_RESIDUAL_BIRTH_LONG_SINGLETON_MIN_TOTAL_SUPPORT: f32 = 200.0;
 const ECAPA_RESIDUAL_BIRTH_LLOYD_ITERATIONS: usize = 8;
 const ECAPA_RESIDUAL_BIRTH_MAX_SCRATCH_PAYLOAD_BYTES: u64 = 64 * 1024;
 
+/// Frozen identity for the evaluation-only supported-profile redecode policy.
+pub(crate) const SUPPORTED_PROFILE_REDECODE_VERSION: &str =
+    "supported-profile-constrained-redecode-v1-development";
+pub(crate) const SUPPORTED_PROFILE_REDECODE_BASELINE_VERSION: &str = "post-retention-incumbent-v1";
+pub(crate) const SUPPORTED_PROFILE_REDECODE_EVIDENCE_SCHEMA_VERSION: &str =
+    "supported-profile-redecode-evidence-v1";
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_TRACKLETS: usize = 2_048;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_PROFILE_ROWS: usize = 512;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_SPEAKERS: usize = 8;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_STATES: usize = 9;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_PREFLIGHT_VALIDATIONS: u64 = 2_560;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_EMISSION_EVALUATIONS: u64 = 16_384;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_TRANSITIONS: u64 = 165_807;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_LOCAL_SCORE_VISITS: u64 = 147_456;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_BACKPOINTERS: u64 = 18_432;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_STAGED_STATES: u64 = 2_048;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_SCRATCH_BYTES: u64 = 128 * 1_024;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_ATOMIC_COMMIT_ROWS: usize = 2_048;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_MAX_PERSISTENT_OUTPUT_LABEL_BYTES: u64 =
+    (SUPPORTED_PROFILE_REDECODE_MAX_ATOMIC_COMMIT_ROWS * crate::model::MAX_SPEAKER_REF_BYTES)
+        as u64;
+pub(crate) const SUPPORTED_PROFILE_REDECODE_CANCELLATION_INTERVAL: u64 = 32;
+const SUPPORTED_PROFILE_REDECODE_MISSING_EVIDENCE_COST: f64 = 1_000_000.0;
+const SUPPORTED_PROFILE_REDECODE_PROBABILITY_FLOOR: f64 = 1e-6;
+const SUPPORTED_PROFILE_REDECODE_SOFT_PRIOR_WEIGHT: f64 = 0.015;
+const SUPPORTED_PROFILE_REDECODE_SHORT_TRACKLET_COST: f64 = 0.35;
+const SUPPORTED_PROFILE_REDECODE_OVERLAP_COST: f64 = 0.20;
+const SUPPORTED_PROFILE_REDECODE_UNKNOWN_PROBABILITY_FLOOR: f64 = 0.05;
+const SUPPORTED_PROFILE_REDECODE_EVIDENCE_WEIGHT_FLOOR: f64 = 0.25;
+const SUPPORTED_PROFILE_REDECODE_SWITCH_PENALTY_MIN: f64 = 0.01;
+const SUPPORTED_PROFILE_REDECODE_SWITCH_PENALTY_MAX: f64 = 0.45;
+const SUPPORTED_PROFILE_REDECODE_SCRATCH_OVERHEAD_BYTES: usize = 1_024;
+const SUPPORTED_PROFILE_REDECODE_LOW_VOICED_FRAME_DIVISOR: usize = 4;
+
+/// Explicit routing for the supported-profile redecode experiment.
+///
+/// Production entry points always supply [`Self::DisabledIncumbent`]. The
+/// candidate is reachable only through the `cfg(test)` prepared-evaluation
+/// seam; there is intentionally no environment variable or default flip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SupportedProfileRedecodeMode {
+    DisabledIncumbent,
+    DevelopmentCandidateV1,
+}
+
+impl SupportedProfileRedecodeMode {
+    const ALL: [Self; 2] = [Self::DisabledIncumbent, Self::DevelopmentCandidateV1];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::DisabledIncumbent => "disabled_incumbent",
+            Self::DevelopmentCandidateV1 => "development_candidate_v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SupportedProfileRedecodeFallbackReason {
+    DisabledIncumbent,
+    IncumbentUnavailable,
+    IneligibleRoute,
+    NoSupportedProfiles,
+    TrackletLimitExceeded,
+    ProfileRowLimitExceeded,
+    SpeakerLimitExceeded,
+    StateLimitExceeded,
+    EmissionLimitExceeded,
+    TransitionLimitExceeded,
+    LocalScoreLimitExceeded,
+    BackpointerLimitExceeded,
+    StagedStateLimitExceeded,
+    ScratchLimitExceeded,
+    PersistentOutputLimitExceeded,
+    Cancelled,
+    InvalidInput,
+    NonFiniteScore,
+    NoFinitePath,
+    NoStrictImprovement,
+    ConstraintViolation,
+    ValidationFailed,
+    ReplayMismatch,
+}
+
+impl SupportedProfileRedecodeFallbackReason {
+    const ALL: [Self; 23] = [
+        Self::DisabledIncumbent,
+        Self::IncumbentUnavailable,
+        Self::IneligibleRoute,
+        Self::NoSupportedProfiles,
+        Self::TrackletLimitExceeded,
+        Self::ProfileRowLimitExceeded,
+        Self::SpeakerLimitExceeded,
+        Self::StateLimitExceeded,
+        Self::EmissionLimitExceeded,
+        Self::TransitionLimitExceeded,
+        Self::LocalScoreLimitExceeded,
+        Self::BackpointerLimitExceeded,
+        Self::StagedStateLimitExceeded,
+        Self::ScratchLimitExceeded,
+        Self::PersistentOutputLimitExceeded,
+        Self::Cancelled,
+        Self::InvalidInput,
+        Self::NonFiniteScore,
+        Self::NoFinitePath,
+        Self::NoStrictImprovement,
+        Self::ConstraintViolation,
+        Self::ValidationFailed,
+        Self::ReplayMismatch,
+    ];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::DisabledIncumbent => "disabled_incumbent",
+            Self::IncumbentUnavailable => "incumbent_unavailable",
+            Self::IneligibleRoute => "ineligible_route",
+            Self::NoSupportedProfiles => "no_supported_profiles",
+            Self::TrackletLimitExceeded => "tracklet_limit_exceeded",
+            Self::ProfileRowLimitExceeded => "profile_row_limit_exceeded",
+            Self::SpeakerLimitExceeded => "speaker_limit_exceeded",
+            Self::StateLimitExceeded => "state_limit_exceeded",
+            Self::EmissionLimitExceeded => "emission_limit_exceeded",
+            Self::TransitionLimitExceeded => "transition_limit_exceeded",
+            Self::LocalScoreLimitExceeded => "local_score_limit_exceeded",
+            Self::BackpointerLimitExceeded => "backpointer_limit_exceeded",
+            Self::StagedStateLimitExceeded => "staged_state_limit_exceeded",
+            Self::ScratchLimitExceeded => "scratch_limit_exceeded",
+            Self::PersistentOutputLimitExceeded => "persistent_output_limit_exceeded",
+            Self::Cancelled => "cancelled",
+            Self::InvalidInput => "invalid_input",
+            Self::NonFiniteScore => "non_finite_score",
+            Self::NoFinitePath => "no_finite_path",
+            Self::NoStrictImprovement => "no_strict_improvement",
+            Self::ConstraintViolation => "constraint_violation",
+            Self::ValidationFailed => "validation_failed",
+            Self::ReplayMismatch => "replay_mismatch",
+        }
+    }
+}
+
+/// Bounded work counters for one evaluation-only redecode attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct SupportedProfileRedecodeResourceSummary {
+    pub preflight_validation_visits: u64,
+    pub emission_evaluations: u64,
+    pub transition_evaluations: u64,
+    pub local_score_visits: u64,
+    pub backpointer_count: u64,
+    pub staged_state_count: u64,
+    pub redecode_count: u64,
+    pub profile_update_count: u64,
+    pub model_call_count: u64,
+    pub cancellation_check_count: u64,
+    pub peak_scratch_payload_bytes: u64,
+    /// Self-reported committed label payload bytes for deterministic replay
+    /// diagnostics. The authoritative safety bound is the policy's maximum
+    /// label length multiplied by its maximum atomic commit rows.
+    pub persistent_output_label_bytes: u64,
+}
+
+/// Feature-free evidence kept outside every production report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SupportedProfileRedecodeEvaluationEvidence {
+    pub schema_version: String,
+    pub mode: SupportedProfileRedecodeMode,
+    pub policy_sha256: String,
+    pub common_observation_sha256: String,
+    pub applied: bool,
+    pub fallback_reason: Option<SupportedProfileRedecodeFallbackReason>,
+    pub tracklet_count: u64,
+    pub profile_row_count: u64,
+    pub supported_speaker_count: u64,
+    pub changed_assignment_count: u64,
+    pub support_evidence_frozen_from_incumbent: bool,
+    pub structural_output_sha256: Option<String>,
+    pub resources: SupportedProfileRedecodeResourceSummary,
+}
+
 /// Explicit routing for the residual-speaker birth experiment.
 ///
 /// Every production entry point supplies [`Self::DisabledIncumbent`]. The
@@ -12239,6 +12552,119 @@ pub(crate) struct EcapaResidualBirthEvaluationRun {
     pub clustering: AcousticClusteringResult,
     pub residual_birth: EcapaResidualBirthEvaluationEvidence,
     pub common_observation_sha256: String,
+    pub policy_sha256: String,
+}
+
+/// Frozen post-retention state captured once for paired redecode evaluation.
+#[cfg(test)]
+struct SupportedProfileRedecodeIncumbent {
+    clusters: Vec<AcousticCluster>,
+    labels: Vec<String>,
+    assignments: Vec<AcousticSpeakerAssignment>,
+    speaker_evidence: Vec<AcousticSpeakerEvidenceSummary>,
+    count_constraints_feasible: bool,
+}
+
+/// One immutable incumbent partition/profile set shared by both redecode arms.
+#[cfg(test)]
+pub(crate) struct PreparedSupportedProfileRedecodeEvaluation {
+    enrollment: SpeakerEnrollment,
+    clustering: AcousticClusteringResult,
+    incumbent: SupportedProfileRedecodeIncumbent,
+    common_observation_sha256: String,
+    incumbent_partition_sha256: String,
+    supported_profile_topology_sha256: String,
+    frozen_support_summary_sha256: String,
+    speaker_count_estimate_sha256: String,
+    speaker_count_evidence_sha256: String,
+    hard_hint_input_topology_sha256: String,
+    overlap_input_topology_sha256: String,
+    final_forced_row_output_sha256: String,
+    forced_tracklet_count: u64,
+}
+
+#[cfg(test)]
+impl PreparedSupportedProfileRedecodeEvaluation {
+    #[must_use]
+    pub(crate) fn common_observation_sha256(&self) -> &str {
+        &self.common_observation_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn incumbent_partition_sha256(&self) -> &str {
+        &self.incumbent_partition_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn supported_profile_topology_sha256(&self) -> &str {
+        &self.supported_profile_topology_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn frozen_support_summary_sha256(&self) -> &str {
+        &self.frozen_support_summary_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn speaker_count_estimate_sha256(&self) -> &str {
+        &self.speaker_count_estimate_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn speaker_count_evidence_sha256(&self) -> &str {
+        &self.speaker_count_evidence_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn hard_hint_input_topology_sha256(&self) -> &str {
+        &self.hard_hint_input_topology_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn overlap_input_topology_sha256(&self) -> &str {
+        &self.overlap_input_topology_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn final_forced_row_output_sha256(&self) -> &str {
+        &self.final_forced_row_output_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn count_constraints_feasible(&self) -> bool {
+        self.incumbent.count_constraints_feasible
+    }
+
+    #[must_use]
+    pub(crate) fn profile_row_count(&self) -> u64 {
+        self.incumbent.clusters.len() as u64
+    }
+
+    #[must_use]
+    pub(crate) fn forced_tracklet_count(&self) -> u64 {
+        self.forced_tracklet_count
+    }
+}
+
+/// One arm of the paired supported-profile redecode experiment.
+#[cfg(test)]
+pub(crate) struct SupportedProfileRedecodeEvaluationRun {
+    pub report: DiarizationReport,
+    pub projection: DiarizationProjection,
+    pub clustering: AcousticClusteringResult,
+    pub profile_redecode: SupportedProfileRedecodeEvaluationEvidence,
+    pub common_observation_sha256: String,
+    pub incumbent_partition_sha256: String,
+    pub supported_profile_topology_sha256: String,
+    pub frozen_support_summary_sha256: String,
+    pub speaker_count_estimate_sha256: String,
+    pub speaker_count_evidence_sha256: String,
+    pub hard_hint_input_topology_sha256: String,
+    pub overlap_input_topology_sha256: String,
+    pub final_forced_row_output_sha256: String,
+    pub frozen_count_constraints_feasible: bool,
+    pub forced_tracklet_count: u64,
+    pub new_inference_count: u64,
     pub policy_sha256: String,
 }
 
@@ -13202,6 +13628,640 @@ where
         policy_sha256: ecapa_residual_birth_policy_sha256(),
         residual_birth,
     })
+}
+
+#[cfg(test)]
+fn validate_prepared_ecapa_evaluation_integrity(
+    prepared: &PreparedEcapaDiarizationEvaluation,
+) -> FwResult<()> {
+    if recompute_prepared_ecapa_common_observation_sha256(prepared)?
+        != prepared.common_observation_sha256
+    {
+        return Err(FwError::ContractViolation(
+            "prepared ECAPA public observation topology changed between paired arms".to_owned(),
+        ));
+    }
+    if prepared_ecapa_private_integrity_sha256(prepared) != prepared.private_integrity_sha256 {
+        return Err(FwError::ContractViolation(
+            "prepared ECAPA observations changed between paired arms".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn supported_profile_redecode_incumbent_partition_sha256(
+    common_observation_sha256: &str,
+    incumbent: &SupportedProfileRedecodeIncumbent,
+) -> FwResult<String> {
+    if incumbent.assignments.is_empty() {
+        return Err(FwError::ContractViolation(
+            "supported-profile redecode requires a non-empty incumbent partition".to_owned(),
+        ));
+    }
+    let supported_labels = incumbent
+        .speaker_evidence
+        .iter()
+        .filter(|speaker| speaker.supported)
+        .map(|speaker| speaker.speaker_ref.as_str())
+        .collect::<Vec<_>>();
+    let mut hasher = Sha256::new();
+    hasher.update(b"supported-profile-redecode-incumbent-partition-v1\0");
+    hasher.update(supported_profile_redecode_policy_sha256().as_bytes());
+    hasher.update(common_observation_sha256.as_bytes());
+    hasher.update((incumbent.assignments.len() as u64).to_le_bytes());
+    hasher.update((supported_labels.len() as u64).to_le_bytes());
+    hasher.update([u8::from(incumbent.count_constraints_feasible)]);
+    for assignment in &incumbent.assignments {
+        let primary = assignment
+            .speaker_ref
+            .as_deref()
+            .and_then(|label| {
+                supported_labels
+                    .iter()
+                    .position(|candidate| *candidate == label)
+            })
+            .map_or(u64::MAX, |ordinal| ordinal as u64);
+        let secondary = assignment
+            .secondary_speaker_ref
+            .as_deref()
+            .and_then(|label| {
+                supported_labels
+                    .iter()
+                    .position(|candidate| *candidate == label)
+            })
+            .map_or(u64::MAX, |ordinal| ordinal as u64);
+        for value in [
+            assignment.tracklet_index as u64,
+            assignment.start_ms,
+            assignment.end_ms,
+            primary,
+            secondary,
+        ] {
+            hasher.update(value.to_le_bytes());
+        }
+        hasher.update([
+            u8::from(assignment.overlap_suspected),
+            u8::from(assignment.hard_attribution),
+        ]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+fn supported_profile_redecode_profile_topology_sha256(
+    common_observation_sha256: &str,
+    clustering: &AcousticClusteringResult,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"supported-profile-redecode-profile-set-v1\0");
+    hasher.update(supported_profile_redecode_policy_sha256().as_bytes());
+    hasher.update(common_observation_sha256.as_bytes());
+    hasher.update((clustering.profiles.len() as u64).to_le_bytes());
+    for (ordinal, profile) in clustering.profiles.iter().enumerate() {
+        for value in [
+            ordinal as u64,
+            profile.frame_count,
+            profile.voiced_duration_ms,
+            u64::from(profile.voice_profile_count),
+            u64::from(profile.channel_profile_count),
+            u64::from(profile.training_accepted_count),
+            u64::from(profile.training_downweighted_count),
+            u64::from(profile.training_quarantined_count),
+        ] {
+            hasher.update(value.to_le_bytes());
+        }
+        hasher.update([u8::from(profile.anchored)]);
+    }
+    hasher.update((clustering.speaker_evidence.len() as u64).to_le_bytes());
+    for (ordinal, speaker) in clustering.speaker_evidence.iter().enumerate() {
+        for value in [
+            ordinal as u64,
+            speaker.assigned_tracklet_count as u64,
+            speaker.independent_tracklet_count as u64,
+            speaker.recurrence_episode_count as u64,
+            speaker.voiced_frame_count as u64,
+            speaker.independent_voiced_frame_count as u64,
+            speaker.voiced_duration_ms,
+        ] {
+            hasher.update(value.to_le_bytes());
+        }
+        hasher.update([
+            u8::from(speaker.hard_anchored),
+            u8::from(speaker.separated_from_supported_speakers),
+            u8::from(speaker.supported),
+        ]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+fn supported_profile_redecode_frozen_support_summary_sha256(
+    common_observation_sha256: &str,
+    speaker_evidence: &[AcousticSpeakerEvidenceSummary],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"supported-profile-redecode-frozen-support-summary-v1\0");
+    hasher.update(SUPPORTED_PROFILE_REDECODE_EVIDENCE_SCHEMA_VERSION.as_bytes());
+    hasher.update(supported_profile_redecode_policy_sha256().as_bytes());
+    hasher.update(common_observation_sha256.as_bytes());
+    hasher.update((speaker_evidence.len() as u64).to_le_bytes());
+    for (ordinal, speaker) in speaker_evidence.iter().enumerate() {
+        for value in [
+            ordinal as u64,
+            speaker.assigned_tracklet_count as u64,
+            speaker.independent_tracklet_count as u64,
+            speaker.recurrence_episode_count as u64,
+            speaker.voiced_frame_count as u64,
+            speaker.independent_voiced_frame_count as u64,
+            speaker.voiced_duration_ms,
+            speaker.reasons.len() as u64,
+        ] {
+            hasher.update(value.to_le_bytes());
+        }
+        hasher.update([
+            u8::from(speaker.hard_anchored),
+            u8::from(speaker.separated_from_supported_speakers),
+            u8::from(speaker.supported),
+        ]);
+        for reason in &speaker.reasons {
+            hasher.update([match reason {
+                SpeakerEvidenceReason::SupportedByHardHint => 0,
+                SpeakerEvidenceReason::SupportedByIndependentRecurrence => 1,
+                SpeakerEvidenceReason::SupportedByRepeatedTracklets => 2,
+                SpeakerEvidenceReason::SupportedByHeldoutObservation => 3,
+                SpeakerEvidenceReason::SupportedByExternalAttribution => 4,
+                SpeakerEvidenceReason::NoAssignedSpeech => 5,
+                SpeakerEvidenceReason::InsufficientIndependentRecurrence => 6,
+                SpeakerEvidenceReason::InsufficientVoicedFrames => 7,
+                SpeakerEvidenceReason::InsufficientAssignmentConfidence => 8,
+                SpeakerEvidenceReason::InsufficientProfileReliability => 9,
+                SpeakerEvidenceReason::MergeCompatibleWithSupportedSpeaker => 10,
+            }]);
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+fn supported_profile_redecode_count_estimate_sha256(
+    estimate: &SpeakerCountEstimate,
+) -> FwResult<String> {
+    let encoded = serde_json::to_vec(estimate).map_err(|error| {
+        FwError::ContractViolation(format!(
+            "failed to encode privacy-safe speaker-count estimate: {error}"
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"supported-profile-redecode-count-estimate-v1\0");
+    hasher.update(encoded);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+fn supported_profile_redecode_constraint_topology_sha256(
+    common_observation_sha256: &str,
+    tracklets: &[AcousticTracklet],
+    enrollment: &SpeakerEnrollment,
+    incumbent: &SupportedProfileRedecodeIncumbent,
+) -> (String, String) {
+    let supported_labels = incumbent
+        .speaker_evidence
+        .iter()
+        .filter(|speaker| speaker.supported)
+        .map(|speaker| speaker.speaker_ref.as_str())
+        .collect::<Vec<_>>();
+    let mut hard = Sha256::new();
+    hard.update(b"supported-profile-redecode-hard-hint-topology-v1\0");
+    hard.update(common_observation_sha256.as_bytes());
+    hard.update((enrollment.hard_assignments.len() as u64).to_le_bytes());
+    for tracklet in tracklets {
+        if let Some(label) = enrollment.hard_assignments.get(&tracklet.tracklet_index) {
+            let ordinal = supported_labels
+                .iter()
+                .position(|candidate| *candidate == label)
+                .map_or(u64::MAX, |value| value as u64);
+            hard.update((tracklet.tracklet_index as u64).to_le_bytes());
+            hard.update(tracklet.start_ms.to_le_bytes());
+            hard.update(tracklet.end_ms.to_le_bytes());
+            hard.update(ordinal.to_le_bytes());
+        }
+    }
+    let mut overlap = Sha256::new();
+    overlap.update(b"supported-profile-redecode-overlap-topology-v1\0");
+    overlap.update(common_observation_sha256.as_bytes());
+    let overlap_count = tracklets
+        .iter()
+        .filter(|tracklet| tracklet.overlap_suspected)
+        .count();
+    overlap.update((overlap_count as u64).to_le_bytes());
+    for (tracklet, assignment) in tracklets.iter().zip(&incumbent.assignments) {
+        if tracklet.overlap_suspected {
+            overlap.update((tracklet.tracklet_index as u64).to_le_bytes());
+            overlap.update(tracklet.start_ms.to_le_bytes());
+            overlap.update(tracklet.end_ms.to_le_bytes());
+            overlap.update([u8::from(assignment.secondary_speaker_ref.is_some())]);
+        }
+    }
+    (
+        format!("{:x}", hard.finalize()),
+        format!("{:x}", overlap.finalize()),
+    )
+}
+
+#[cfg(test)]
+fn supported_profile_redecode_forced_tracklet_count(
+    assignments: &[AcousticSpeakerAssignment],
+) -> u64 {
+    assignments
+        .iter()
+        .filter(|assignment| assignment.hard_attribution || assignment.overlap_suspected)
+        .count() as u64
+}
+
+#[cfg(test)]
+/// Exact forced-row canary for the synthetic/public-corpus paired gate only.
+///
+/// It binds confidence bits and must never enter a production report or an
+/// artifact derived from a private recording.
+fn supported_profile_redecode_final_forced_row_output_sha256(
+    common_observation_sha256: &str,
+    tracklets: &[AcousticTracklet],
+    enrollment: &SpeakerEnrollment,
+    speaker_evidence: &[AcousticSpeakerEvidenceSummary],
+    assignments: &[AcousticSpeakerAssignment],
+) -> FwResult<String> {
+    if tracklets.len() != assignments.len() {
+        return Err(FwError::ContractViolation(
+            "forced-row output digest requires one assignment per tracklet".to_owned(),
+        ));
+    }
+    let supported_labels = speaker_evidence
+        .iter()
+        .filter(|speaker| speaker.supported)
+        .map(|speaker| speaker.speaker_ref.as_str())
+        .collect::<Vec<_>>();
+    let forced_count = tracklets
+        .iter()
+        .filter(|tracklet| {
+            tracklet.overlap_suspected
+                || enrollment
+                    .hard_assignments
+                    .contains_key(&tracklet.tracklet_index)
+        })
+        .count();
+    let mut hasher = Sha256::new();
+    hasher.update(b"supported-profile-redecode-final-forced-row-output-v1\0");
+    hasher.update(supported_profile_redecode_policy_sha256().as_bytes());
+    hasher.update(common_observation_sha256.as_bytes());
+    hasher.update((forced_count as u64).to_le_bytes());
+    for (tracklet, assignment) in tracklets.iter().zip(assignments) {
+        let hard_input = enrollment
+            .hard_assignments
+            .contains_key(&tracklet.tracklet_index);
+        if !tracklet.overlap_suspected && !hard_input {
+            continue;
+        }
+        let label_ordinal = |label: Option<&str>| -> FwResult<u64> {
+            match label {
+                None => Ok(u64::MAX),
+                Some(label) => supported_labels
+                    .iter()
+                    .position(|candidate| *candidate == label)
+                    .map(|ordinal| ordinal as u64)
+                    .ok_or_else(|| {
+                        FwError::ContractViolation(
+                            "forced-row output references an unsupported speaker".to_owned(),
+                        )
+                    }),
+            }
+        };
+        let primary = label_ordinal(assignment.speaker_ref.as_deref())?;
+        let secondary = label_ordinal(assignment.secondary_speaker_ref.as_deref())?;
+        for value in [
+            assignment.tracklet_index as u64,
+            assignment.start_ms,
+            assignment.end_ms,
+            primary,
+            secondary,
+        ] {
+            hasher.update(value.to_le_bytes());
+        }
+        hasher.update(assignment.speaker_confidence.to_bits().to_le_bytes());
+        match assignment.secondary_speaker_confidence {
+            Some(confidence) => {
+                hasher.update([1]);
+                hasher.update(confidence.to_bits().to_le_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update(assignment.change_confidence.to_bits().to_le_bytes());
+        hasher.update([
+            u8::from(hard_input),
+            u8::from(tracklet.overlap_suspected),
+            u8::from(assignment.hard_attribution),
+            u8::from(assignment.overlap_suspected),
+        ]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Freeze the incumbent partition/profile set once before either redecode arm.
+#[cfg(test)]
+pub(crate) fn prepare_supported_profile_redecode_evaluation<C>(
+    prepared: &PreparedEcapaDiarizationEvaluation,
+    is_cancelled: C,
+) -> FwResult<PreparedSupportedProfileRedecodeEvaluation>
+where
+    C: FnMut() -> bool,
+{
+    validate_prepared_ecapa_evaluation_integrity(prepared)?;
+    let mut enrollment = prepared.enrollment.clone();
+    let mut incumbent_capture = None;
+    let mut profile_redecode = supported_profile_redecode_evidence(
+        SupportedProfileRedecodeMode::DisabledIncumbent,
+        &prepared.common_observation_sha256,
+        prepared.tracklets.len(),
+    );
+    let (clustering, _, _) = cluster_acoustic_tracklets_with_evaluation_levers(
+        &prepared.tracklets,
+        &mut enrollment,
+        &prepared.request.speaker_count,
+        usize::from(prepared.request.max_prototypes),
+        AcousticClusteringMode::ProbabilisticV1,
+        Some(&prepared.neural_embeddings),
+        prepared.evidence_mode,
+        EcapaResidualBirthMode::DisabledIncumbent,
+        SupportedProfileRedecodeMode::DisabledIncumbent,
+        &prepared.common_observation_sha256,
+        &mut profile_redecode,
+        Some(&mut incumbent_capture),
+        is_cancelled,
+    )?;
+    let incumbent = incumbent_capture.ok_or_else(|| {
+        FwError::ContractViolation(
+            "supported-profile redecode did not capture its post-retention incumbent".to_owned(),
+        )
+    })?;
+    if clustering.executed_mode != AcousticClusteringMode::ProbabilisticV1
+        || !matches!(
+            prepared.evidence_mode,
+            DiarizationSpeakerEvidenceMode::EcapaOnly
+                | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+        )
+        || clustering
+            .operational_partition
+            .as_ref()
+            .is_none_or(|partition| {
+                partition.method != DiarizationOperationalPartitionMethod::EcapaSpherical
+            })
+        || clustering.count_estimate.is_none()
+        || !incumbent.count_constraints_feasible
+    {
+        return Err(FwError::ContractViolation(
+            "supported-profile redecode requires an authoritative ECAPA probabilistic incumbent"
+                .to_owned(),
+        ));
+    }
+    if incumbent.assignments != clustering.assignments
+        || incumbent.speaker_evidence != clustering.speaker_evidence
+    {
+        return Err(FwError::ContractViolation(
+            "frozen redecode incumbent changed during count/profile finalization".to_owned(),
+        ));
+    }
+    let incumbent_partition_sha256 = supported_profile_redecode_incumbent_partition_sha256(
+        &prepared.common_observation_sha256,
+        &incumbent,
+    )?;
+    let supported_profile_topology_sha256 = supported_profile_redecode_profile_topology_sha256(
+        &prepared.common_observation_sha256,
+        &clustering,
+    );
+    let frozen_support_summary_sha256 = supported_profile_redecode_frozen_support_summary_sha256(
+        &prepared.common_observation_sha256,
+        &incumbent.speaker_evidence,
+    );
+    let count_estimate = clustering.count_estimate.as_ref().ok_or_else(|| {
+        FwError::ContractViolation(
+            "frozen redecode incumbent lost speaker-count evidence".to_owned(),
+        )
+    })?;
+    let speaker_count_estimate_sha256 =
+        supported_profile_redecode_count_estimate_sha256(count_estimate)?;
+    let speaker_count_evidence_sha256 = count_estimate.evidence_sha256.clone();
+    let (hard_hint_input_topology_sha256, overlap_input_topology_sha256) =
+        supported_profile_redecode_constraint_topology_sha256(
+            &prepared.common_observation_sha256,
+            &prepared.tracklets,
+            &enrollment,
+            &incumbent,
+        );
+    let final_forced_row_output_sha256 = supported_profile_redecode_final_forced_row_output_sha256(
+        &prepared.common_observation_sha256,
+        &prepared.tracklets,
+        &enrollment,
+        &incumbent.speaker_evidence,
+        &incumbent.assignments,
+    )?;
+    let forced_tracklet_count =
+        supported_profile_redecode_forced_tracklet_count(&incumbent.assignments);
+    Ok(PreparedSupportedProfileRedecodeEvaluation {
+        enrollment,
+        clustering,
+        incumbent,
+        common_observation_sha256: prepared.common_observation_sha256.clone(),
+        incumbent_partition_sha256,
+        supported_profile_topology_sha256,
+        frozen_support_summary_sha256,
+        speaker_count_estimate_sha256,
+        speaker_count_evidence_sha256,
+        hard_hint_input_topology_sha256,
+        overlap_input_topology_sha256,
+        final_forced_row_output_sha256,
+        forced_tracklet_count,
+    })
+}
+
+/// Run one arm from the exact frozen incumbent without rerunning clustering.
+#[cfg(test)]
+pub(crate) fn run_prepared_supported_profile_redecode_evaluation<C>(
+    prepared: &PreparedEcapaDiarizationEvaluation,
+    frozen: &PreparedSupportedProfileRedecodeEvaluation,
+    mode: SupportedProfileRedecodeMode,
+    mut is_cancelled: C,
+) -> FwResult<SupportedProfileRedecodeEvaluationRun>
+where
+    C: FnMut() -> bool,
+{
+    validate_prepared_ecapa_evaluation_integrity(prepared)?;
+    let count_estimate = frozen.clustering.count_estimate.as_ref().ok_or_else(|| {
+        FwError::ContractViolation("frozen redecode state lost speaker-count evidence".to_owned())
+    })?;
+    let (hard_hint_input_topology_sha256, overlap_input_topology_sha256) =
+        supported_profile_redecode_constraint_topology_sha256(
+            &frozen.common_observation_sha256,
+            &prepared.tracklets,
+            &frozen.enrollment,
+            &frozen.incumbent,
+        );
+    if frozen.common_observation_sha256 != prepared.common_observation_sha256
+        || supported_profile_redecode_incumbent_partition_sha256(
+            &frozen.common_observation_sha256,
+            &frozen.incumbent,
+        )? != frozen.incumbent_partition_sha256
+        || supported_profile_redecode_profile_topology_sha256(
+            &frozen.common_observation_sha256,
+            &frozen.clustering,
+        ) != frozen.supported_profile_topology_sha256
+        || supported_profile_redecode_frozen_support_summary_sha256(
+            &frozen.common_observation_sha256,
+            &frozen.incumbent.speaker_evidence,
+        ) != frozen.frozen_support_summary_sha256
+        || supported_profile_redecode_count_estimate_sha256(count_estimate)?
+            != frozen.speaker_count_estimate_sha256
+        || count_estimate.evidence_sha256 != frozen.speaker_count_evidence_sha256
+        || hard_hint_input_topology_sha256 != frozen.hard_hint_input_topology_sha256
+        || overlap_input_topology_sha256 != frozen.overlap_input_topology_sha256
+        || supported_profile_redecode_final_forced_row_output_sha256(
+            &frozen.common_observation_sha256,
+            &prepared.tracklets,
+            &frozen.enrollment,
+            &frozen.incumbent.speaker_evidence,
+            &frozen.incumbent.assignments,
+        )? != frozen.final_forced_row_output_sha256
+        || supported_profile_redecode_forced_tracklet_count(&frozen.incumbent.assignments)
+            != frozen.forced_tracklet_count
+    {
+        return Err(FwError::ContractViolation(
+            "frozen supported-profile redecode state changed between paired arms".to_owned(),
+        ));
+    }
+    let mut clustering = frozen.clustering.clone();
+    clustering.assignments = frozen.incumbent.assignments.clone();
+    let profile_redecode = match mode {
+        SupportedProfileRedecodeMode::DisabledIncumbent => supported_profile_redecode_evidence(
+            mode,
+            &frozen.common_observation_sha256,
+            prepared.tracklets.len(),
+        ),
+        SupportedProfileRedecodeMode::DevelopmentCandidateV1 => apply_supported_profile_redecode(
+            &prepared.tracklets,
+            &frozen.incumbent.clusters,
+            &frozen.incumbent.labels,
+            &frozen.enrollment,
+            &frozen.incumbent.speaker_evidence,
+            &prepared.request.speaker_count,
+            &mut clustering.assignments,
+            Some(&prepared.neural_embeddings),
+            &frozen.common_observation_sha256,
+            &mut is_cancelled,
+        ),
+    };
+    let detected_speakers = clustering
+        .assignments
+        .iter()
+        .flat_map(|assignment| {
+            [
+                assignment.speaker_ref.as_ref(),
+                assignment.secondary_speaker_ref.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .collect::<BTreeSet<_>>()
+        .len();
+    let supported_speakers = clustering
+        .speaker_evidence
+        .iter()
+        .filter(|speaker| speaker.supported)
+        .count();
+    let (dominant_speaker_share, unknown_voiced_share) =
+        assignment_voiced_shares(&prepared.tracklets, &clustering.assignments)?;
+    let hard_constraints_satisfied = hard_assignments_satisfied(
+        &prepared.tracklets,
+        &frozen.enrollment,
+        &clustering.assignments,
+    );
+    let dominant_share_satisfied =
+        detected_speakers <= 1 || dominant_speaker_share <= MAX_MULTI_SPEAKER_DOMINANT_SHARE;
+    clustering.detected_speakers = detected_speakers;
+    clustering.dominant_speaker_share = dominant_speaker_share;
+    clustering.unknown_voiced_share = unknown_voiced_share;
+    clustering.constraints_satisfied = frozen.incumbent.count_constraints_feasible
+        && hard_constraints_satisfied
+        && dominant_share_satisfied
+        && detected_speakers == supported_speakers
+        && speaker_count_satisfies(detected_speakers, &prepared.request.speaker_count);
+    let final_forced_row_output_sha256 = supported_profile_redecode_final_forced_row_output_sha256(
+        &frozen.common_observation_sha256,
+        &prepared.tracklets,
+        &frozen.enrollment,
+        &frozen.incumbent.speaker_evidence,
+        &clustering.assignments,
+    )?;
+    if final_forced_row_output_sha256 != frozen.final_forced_row_output_sha256 {
+        return Err(FwError::ContractViolation(
+            "supported-profile redecode changed a forced hard/overlap output row".to_owned(),
+        ));
+    }
+    let (report, projection) =
+        finish_prepared_ecapa_diarization(prepared, &frozen.enrollment, &clustering)?;
+    Ok(SupportedProfileRedecodeEvaluationRun {
+        report,
+        projection,
+        clustering,
+        profile_redecode,
+        common_observation_sha256: frozen.common_observation_sha256.clone(),
+        incumbent_partition_sha256: frozen.incumbent_partition_sha256.clone(),
+        supported_profile_topology_sha256: frozen.supported_profile_topology_sha256.clone(),
+        frozen_support_summary_sha256: frozen.frozen_support_summary_sha256.clone(),
+        speaker_count_estimate_sha256: frozen.speaker_count_estimate_sha256.clone(),
+        speaker_count_evidence_sha256: frozen.speaker_count_evidence_sha256.clone(),
+        hard_hint_input_topology_sha256: frozen.hard_hint_input_topology_sha256.clone(),
+        overlap_input_topology_sha256: frozen.overlap_input_topology_sha256.clone(),
+        final_forced_row_output_sha256,
+        frozen_count_constraints_feasible: frozen.incumbent.count_constraints_feasible,
+        forced_tracklet_count: frozen.forced_tracklet_count,
+        new_inference_count: 0,
+        policy_sha256: supported_profile_redecode_policy_sha256(),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_supported_profile_redecode_outputs_identical(
+    left: &SupportedProfileRedecodeEvaluationRun,
+    right: &SupportedProfileRedecodeEvaluationRun,
+) -> bool {
+    left.report == right.report
+        && transcription_segments_identical(&left.projection.segments, &right.projection.segments)
+        && left.projection.mixed_speaker_segment_indices
+            == right.projection.mixed_speaker_segment_indices
+        && left.projection.overlap_suspected_segment_indices
+            == right.projection.overlap_suspected_segment_indices
+        && left.clustering == right.clustering
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_supported_profile_redecode_runs_identical(
+    left: &SupportedProfileRedecodeEvaluationRun,
+    right: &SupportedProfileRedecodeEvaluationRun,
+) -> bool {
+    prepared_supported_profile_redecode_outputs_identical(left, right)
+        && left.profile_redecode == right.profile_redecode
+        && left.common_observation_sha256 == right.common_observation_sha256
+        && left.incumbent_partition_sha256 == right.incumbent_partition_sha256
+        && left.supported_profile_topology_sha256 == right.supported_profile_topology_sha256
+        && left.frozen_support_summary_sha256 == right.frozen_support_summary_sha256
+        && left.speaker_count_estimate_sha256 == right.speaker_count_estimate_sha256
+        && left.speaker_count_evidence_sha256 == right.speaker_count_evidence_sha256
+        && left.hard_hint_input_topology_sha256 == right.hard_hint_input_topology_sha256
+        && left.overlap_input_topology_sha256 == right.overlap_input_topology_sha256
+        && left.final_forced_row_output_sha256 == right.final_forced_row_output_sha256
+        && left.frozen_count_constraints_feasible == right.frozen_count_constraints_feasible
+        && left.forced_tracklet_count == right.forced_tracklet_count
+        && left.new_inference_count == right.new_inference_count
+        && left.policy_sha256 == right.policy_sha256
 }
 
 /// Structural equality for paired-arm and replay checks. No transcript-bearing
@@ -14670,6 +15730,52 @@ fn cluster_acoustic_tracklets_with_budgeted_enrollment_and_residual_birth<C>(
     evidence_mode: DiarizationSpeakerEvidenceMode,
     residual_birth_mode: EcapaResidualBirthMode,
     common_observation_sha256: &str,
+    is_cancelled: C,
+) -> FwResult<(
+    AcousticClusteringResult,
+    Vec<AcousticCountMergeStepEvidence>,
+    EcapaResidualBirthEvaluationEvidence,
+)>
+where
+    C: FnMut() -> bool,
+{
+    let mut profile_redecode = supported_profile_redecode_evidence(
+        SupportedProfileRedecodeMode::DisabledIncumbent,
+        common_observation_sha256,
+        tracklets.len(),
+    );
+    cluster_acoustic_tracklets_with_evaluation_levers(
+        tracklets,
+        enrollment,
+        speaker_count,
+        requested_prototype_cap,
+        requested_mode,
+        neural_embeddings,
+        evidence_mode,
+        residual_birth_mode,
+        SupportedProfileRedecodeMode::DisabledIncumbent,
+        common_observation_sha256,
+        &mut profile_redecode,
+        None,
+        is_cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cluster_acoustic_tracklets_with_evaluation_levers<C>(
+    tracklets: &[AcousticTracklet],
+    enrollment: &mut SpeakerEnrollment,
+    speaker_count: &SpeakerCountRequest,
+    requested_prototype_cap: usize,
+    requested_mode: AcousticClusteringMode,
+    neural_embeddings: Option<&EcapaTrackletEmbeddings>,
+    evidence_mode: DiarizationSpeakerEvidenceMode,
+    residual_birth_mode: EcapaResidualBirthMode,
+    profile_redecode_mode: SupportedProfileRedecodeMode,
+    common_observation_sha256: &str,
+    profile_redecode: &mut SupportedProfileRedecodeEvaluationEvidence,
+    #[cfg(test)] mut incumbent_capture: Option<&mut Option<SupportedProfileRedecodeIncumbent>>,
+    #[cfg(not(test))] _incumbent_capture: Option<&mut ()>,
     mut is_cancelled: C,
 ) -> FwResult<(
     AcousticClusteringResult,
@@ -15106,6 +16212,51 @@ where
         neural_embeddings,
     )?;
     retain_supported_assignments(&speaker_evidence, &mut assignments);
+    #[cfg(test)]
+    if let Some(capture) = incumbent_capture.as_deref_mut() {
+        *capture = Some(SupportedProfileRedecodeIncumbent {
+            clusters: clusters.clone(),
+            labels: labels.clone(),
+            assignments: assignments.clone(),
+            speaker_evidence: speaker_evidence.clone(),
+            count_constraints_feasible,
+        });
+    }
+    *profile_redecode = supported_profile_redecode_evidence(
+        profile_redecode_mode,
+        common_observation_sha256,
+        tracklets.len(),
+    );
+    let profile_redecode_route_eligible = executed_mode == AcousticClusteringMode::ProbabilisticV1
+        && matches!(
+            evidence_mode,
+            DiarizationSpeakerEvidenceMode::EcapaOnly
+                | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+        )
+        && operational_partition.as_ref().is_some_and(|partition| {
+            partition.method == DiarizationOperationalPartitionMethod::EcapaSpherical
+        })
+        && count_constraints_feasible
+        && count_estimate.is_some();
+    if profile_redecode_mode == SupportedProfileRedecodeMode::DevelopmentCandidateV1
+        && profile_redecode_route_eligible
+    {
+        *profile_redecode = apply_supported_profile_redecode(
+            tracklets,
+            &clusters,
+            &labels,
+            enrollment,
+            &speaker_evidence,
+            speaker_count,
+            &mut assignments,
+            neural_embeddings,
+            common_observation_sha256,
+            &mut is_cancelled,
+        );
+    } else if profile_redecode_mode == SupportedProfileRedecodeMode::DevelopmentCandidateV1 {
+        profile_redecode.fallback_reason =
+            Some(SupportedProfileRedecodeFallbackReason::IneligibleRoute);
+    }
     let detected_speakers = assignments
         .iter()
         .flat_map(|assignment| {
@@ -17796,6 +18947,35 @@ fn residual_birth_evidence(
         incumbent_cluster_count: incumbent_cluster_count as u64,
         output_cluster_count: incumbent_cluster_count as u64,
         resources: EcapaResidualBirthResourceSummary::default(),
+    }
+}
+
+fn supported_profile_redecode_evidence(
+    mode: SupportedProfileRedecodeMode,
+    common_observation_sha256: &str,
+    tracklet_count: usize,
+) -> SupportedProfileRedecodeEvaluationEvidence {
+    SupportedProfileRedecodeEvaluationEvidence {
+        schema_version: SUPPORTED_PROFILE_REDECODE_EVIDENCE_SCHEMA_VERSION.to_owned(),
+        mode,
+        policy_sha256: supported_profile_redecode_policy_sha256(),
+        common_observation_sha256: common_observation_sha256.to_owned(),
+        applied: false,
+        fallback_reason: Some(match mode {
+            SupportedProfileRedecodeMode::DisabledIncumbent => {
+                SupportedProfileRedecodeFallbackReason::DisabledIncumbent
+            }
+            SupportedProfileRedecodeMode::DevelopmentCandidateV1 => {
+                SupportedProfileRedecodeFallbackReason::IncumbentUnavailable
+            }
+        }),
+        tracklet_count: tracklet_count as u64,
+        profile_row_count: 0,
+        supported_speaker_count: 0,
+        changed_assignment_count: 0,
+        support_evidence_frozen_from_incumbent: true,
+        structural_output_sha256: None,
+        resources: SupportedProfileRedecodeResourceSummary::default(),
     }
 }
 
@@ -22829,6 +24009,1233 @@ fn retain_supported_assignments(
             assignment.secondary_speaker_confidence = None;
         }
     }
+}
+
+struct SupportedProfileRedecodeBudget<'a, C>
+where
+    C: FnMut() -> bool,
+{
+    is_cancelled: &'a mut C,
+    scored_blocks: u64,
+}
+
+impl<'a, C> SupportedProfileRedecodeBudget<'a, C>
+where
+    C: FnMut() -> bool,
+{
+    fn new(is_cancelled: &'a mut C) -> Self {
+        Self {
+            is_cancelled,
+            scored_blocks: 0,
+        }
+    }
+
+    fn check(&mut self, resources: &mut SupportedProfileRedecodeResourceSummary) -> bool {
+        resources.cancellation_check_count = resources.cancellation_check_count.saturating_add(1);
+        (self.is_cancelled)()
+    }
+
+    fn observe(
+        &mut self,
+        count: u64,
+        resources: &mut SupportedProfileRedecodeResourceSummary,
+    ) -> bool {
+        for _ in 0..count {
+            self.scored_blocks = self.scored_blocks.saturating_add(1);
+            if self
+                .scored_blocks
+                .is_multiple_of(SUPPORTED_PROFILE_REDECODE_CANCELLATION_INTERVAL)
+                && self.check(resources)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn supported_profile_redecode_fallback(
+    mut evidence: SupportedProfileRedecodeEvaluationEvidence,
+    reason: SupportedProfileRedecodeFallbackReason,
+) -> SupportedProfileRedecodeEvaluationEvidence {
+    evidence.applied = false;
+    evidence.fallback_reason = Some(reason);
+    evidence.changed_assignment_count = 0;
+    evidence.structural_output_sha256 = None;
+    evidence
+}
+
+fn supported_profile_redecode_scratch_bytes(
+    tracklet_count: usize,
+    state_count: usize,
+) -> Option<u64> {
+    let lattice_entries = tracklet_count.checked_mul(state_count)?;
+    let bytes = lattice_entries
+        .checked_mul(std::mem::size_of::<u8>())?
+        .checked_add(lattice_entries.checked_mul(std::mem::size_of::<f32>())?)?
+        .checked_add(tracklet_count.checked_mul(std::mem::size_of::<u8>())?)?
+        .checked_add(tracklet_count.checked_mul(std::mem::size_of::<f32>())?)?
+        // Fixed forward costs, run durations, one emission row, and digests.
+        .checked_add(SUPPORTED_PROFILE_REDECODE_SCRATCH_OVERHEAD_BYTES)?;
+    u64::try_from(bytes).ok()
+}
+
+fn duration_aware_switch_penalty_f64(
+    previous_run_duration_ms: u64,
+    current_tracklet_duration_ms: u64,
+    gap_ms: u64,
+    boundary_confidence: f32,
+    touches_unknown: bool,
+) -> Option<f64> {
+    let boundary_confidence = f64::from(boundary_confidence);
+    if !boundary_confidence.is_finite() {
+        return None;
+    }
+    let boundary_confidence = boundary_confidence.clamp(0.0, 1.0);
+    let base = f64::from(if touches_unknown {
+        TEMPORAL_UNKNOWN_SWITCH_BASE
+    } else {
+        TEMPORAL_KNOWN_SWITCH_BASE
+    });
+    let boundary_credit = f64::from(if touches_unknown {
+        TEMPORAL_UNKNOWN_BOUNDARY_CREDIT
+    } else {
+        TEMPORAL_KNOWN_BOUNDARY_CREDIT
+    }) * boundary_confidence;
+    let gap_credit = f64::from(TEMPORAL_MAX_GAP_CREDIT)
+        * (gap_ms.min(TEMPORAL_FULL_GAP_MS) as f64 / TEMPORAL_FULL_GAP_MS as f64);
+    let premature_switch_penalty = if previous_run_duration_ms < TEMPORAL_SHORT_RUN_MS {
+        f64::from(TEMPORAL_PREMATURE_SWITCH_PENALTY)
+            * (1.0 - previous_run_duration_ms as f64 / TEMPORAL_SHORT_RUN_MS as f64)
+            * (1.0 - boundary_confidence)
+    } else {
+        0.0
+    };
+    let fragment_penalty = if current_tracklet_duration_ms < TEMPORAL_FRAGMENT_MS {
+        f64::from(TEMPORAL_FRAGMENT_PENALTY)
+            * (1.0 - current_tracklet_duration_ms as f64 / TEMPORAL_FRAGMENT_MS as f64)
+            * (1.0 - boundary_confidence)
+    } else {
+        0.0
+    };
+    let penalty =
+        (base - boundary_credit - gap_credit + premature_switch_penalty + fragment_penalty).clamp(
+            SUPPORTED_PROFILE_REDECODE_SWITCH_PENALTY_MIN,
+            SUPPORTED_PROFILE_REDECODE_SWITCH_PENALTY_MAX,
+        );
+    penalty.is_finite().then_some(penalty)
+}
+
+fn redecode_binary_local_score(chosen_cost: f64, competitor_cost: f64) -> Option<f64> {
+    if !chosen_cost.is_finite() || !competitor_cost.is_finite() {
+        return None;
+    }
+    let delta = competitor_cost - chosen_cost;
+    let score = if delta >= 0.0 {
+        1.0 / (1.0 + (-delta).exp())
+    } else {
+        let exp = delta.exp();
+        exp / (1.0 + exp)
+    };
+    score.is_finite().then_some(score.clamp(0.0, 1.0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn supported_profile_redecode_emissions<C>(
+    tracklet: &AcousticTracklet,
+    clusters: &[AcousticCluster],
+    labels: &[String],
+    supported_cluster_indices: &[usize],
+    enrollment: &SpeakerEnrollment,
+    neural_embeddings: Option<&EcapaTrackletEmbeddings>,
+    forced_state: Option<usize>,
+    budget: &mut SupportedProfileRedecodeBudget<'_, C>,
+    resources: &mut SupportedProfileRedecodeResourceSummary,
+) -> Result<
+    (
+        [f64; SUPPORTED_PROFILE_REDECODE_MAX_STATES],
+        [f32; SUPPORTED_PROFILE_REDECODE_MAX_STATES],
+    ),
+    SupportedProfileRedecodeFallbackReason,
+>
+where
+    C: FnMut() -> bool,
+{
+    let supported_count = supported_cluster_indices.len();
+    let state_count = supported_count + 1;
+    let unknown_state = supported_count;
+    let mut costs = [f64::INFINITY; SUPPORTED_PROFILE_REDECODE_MAX_STATES];
+    let mut confidences = [0.0_f32; SUPPORTED_PROFILE_REDECODE_MAX_STATES];
+
+    for (state, &cluster_index) in supported_cluster_indices.iter().enumerate() {
+        resources.emission_evaluations = resources.emission_evaluations.saturating_add(1);
+        if budget.observe(1, resources) {
+            return Err(SupportedProfileRedecodeFallbackReason::Cancelled);
+        }
+        let cluster = clusters
+            .get(cluster_index)
+            .ok_or(SupportedProfileRedecodeFallbackReason::InvalidInput)?;
+        let label = labels
+            .get(cluster_index)
+            .ok_or(SupportedProfileRedecodeFallbackReason::InvalidInput)?;
+        if let Some(representation) =
+            neural_embeddings.and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
+        {
+            if representation
+                .assignment_embedding()
+                .iter()
+                .any(|coordinate| !coordinate.is_finite())
+                || !representation.assignment_weight().is_finite()
+            {
+                return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
+            }
+        }
+        if cluster.neural_voice.as_ref().is_some_and(|centroid| {
+            centroid.iter().any(|coordinate| !coordinate.is_finite())
+                || !cluster.neural_weight.is_finite()
+        }) {
+            return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
+        }
+        if let Some(hard) = enrollment.hard_assignments.get(&tracklet.tracklet_index) {
+            costs[state] = if label == hard { 0.0 } else { f64::INFINITY };
+            continue;
+        }
+        let cluster_evidence = tracklet_cluster_pair_evidence(tracklet, cluster, neural_embeddings);
+        let selected_evidence = if matches!(
+            cluster.evidence_mode,
+            DiarizationSpeakerEvidenceMode::EcapaOnly
+                | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+        ) {
+            cluster_evidence
+        } else {
+            let profile_evidence = enrollment.profiles.get(label).and_then(|profile| {
+                tracklet_profile_pair_evidence(
+                    tracklet,
+                    profile,
+                    &enrollment.voice_dimension_weights,
+                )
+            });
+            cluster_evidence
+                .into_iter()
+                .chain(profile_evidence)
+                .max_by(|left, right| {
+                    left.same_speaker_probability
+                        .total_cmp(&right.same_speaker_probability)
+                })
+        };
+        let mut cost = selected_evidence.map_or(
+            SUPPORTED_PROFILE_REDECODE_MISSING_EVIDENCE_COST,
+            |evidence| {
+                let probability = f64::from(evidence.same_speaker_probability);
+                if probability.is_finite() {
+                    -probability
+                        .max(SUPPORTED_PROFILE_REDECODE_PROBABILITY_FLOOR)
+                        .ln()
+                } else {
+                    f64::NAN
+                }
+            },
+        );
+        if let Some(prior) = enrollment
+            .soft_priors
+            .get(&(tracklet.tracklet_index, label.clone()))
+        {
+            let prior = f64::from(*prior);
+            if !prior.is_finite() {
+                return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
+            }
+            cost = (cost - SUPPORTED_PROFILE_REDECODE_SOFT_PRIOR_WEIGHT * prior).max(0.0);
+        }
+        if tracklet.frame_count < MIN_TRACKLET_FRAMES {
+            cost += SUPPORTED_PROFILE_REDECODE_SHORT_TRACKLET_COST;
+        }
+        if tracklet.overlap_suspected {
+            cost += SUPPORTED_PROFILE_REDECODE_OVERLAP_COST;
+        }
+        if !cost.is_finite() {
+            return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
+        }
+        costs[state] = cost;
+    }
+
+    let calibration = acoustic_speaker_pair_calibration();
+    let unknown_cost = if enrollment
+        .hard_assignments
+        .contains_key(&tracklet.tracklet_index)
+    {
+        f64::INFINITY
+    } else {
+        let best_same_probability = costs[..supported_count]
+            .iter()
+            .copied()
+            .filter(|cost| cost.is_finite())
+            .map(|cost| (-cost).exp())
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0);
+        let maximum_unknown_prior = f64::from(calibration.maximum_unknown_prior);
+        let unknown_probability = if tracklet.frame_count < MIN_TRACKLET_FRAMES
+            || tracklet
+                .voiced_frame_count
+                .saturating_mul(SUPPORTED_PROFILE_REDECODE_LOW_VOICED_FRAME_DIVISOR)
+                < tracklet.frame_count
+        {
+            maximum_unknown_prior
+        } else {
+            (1.0 - best_same_probability).clamp(
+                SUPPORTED_PROFILE_REDECODE_UNKNOWN_PROBABILITY_FLOOR,
+                maximum_unknown_prior,
+            )
+        };
+        if !unknown_probability.is_finite() || unknown_probability <= 0.0 {
+            return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
+        }
+        -unknown_probability.ln()
+    };
+    if unknown_cost.is_nan() || unknown_cost == f64::NEG_INFINITY {
+        return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
+    }
+    costs[unknown_state] = unknown_cost;
+
+    if let Some(representation) =
+        neural_embeddings.and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
+    {
+        let represented_identity_frames = f64::from(representation.assignment_weight());
+        if !represented_identity_frames.is_finite() {
+            return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
+        }
+        let evidence_weight = (represented_identity_frames.max(0.0)
+            / f64::from(calibration.full_support_frames))
+        .clamp(
+            SUPPORTED_PROFILE_REDECODE_EVIDENCE_WEIGHT_FLOOR,
+            f64::from(ECAPA_SEGMENT_LOG_LIKELIHOOD_MAX_WEIGHT),
+        );
+        if !evidence_weight.is_finite() {
+            return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
+        }
+        for cost in &mut costs[..state_count] {
+            if cost.is_finite() {
+                *cost *= evidence_weight;
+            }
+        }
+    }
+
+    if let Some(forced_state) = forced_state {
+        if forced_state >= state_count || !costs[forced_state].is_finite() {
+            return Err(SupportedProfileRedecodeFallbackReason::ValidationFailed);
+        }
+        for (state, cost) in costs[..state_count].iter_mut().enumerate() {
+            if state != forced_state {
+                *cost = f64::INFINITY;
+            }
+        }
+        return Ok((costs, confidences));
+    }
+
+    let original_costs = costs;
+    for state in 0..supported_count {
+        let mut strongest_competitor = None::<f64>;
+        for (candidate, cost) in original_costs[..state_count].iter().copied().enumerate() {
+            resources.local_score_visits = resources.local_score_visits.saturating_add(1);
+            if budget.observe(1, resources) {
+                return Err(SupportedProfileRedecodeFallbackReason::Cancelled);
+            }
+            if candidate != state && cost.is_finite() {
+                strongest_competitor = Some(strongest_competitor.map_or(cost, |current| {
+                    if cost.total_cmp(&current).is_lt() {
+                        cost
+                    } else {
+                        current
+                    }
+                }));
+            }
+        }
+        let score = strongest_competitor.map_or(Some(1.0), |competitor| {
+            redecode_binary_local_score(original_costs[state], competitor)
+        });
+        let score = score.ok_or(SupportedProfileRedecodeFallbackReason::NonFiniteScore)?;
+        confidences[state] = calibrate_assignment_confidence(score as f32);
+        if score < f64::from(DEVELOPMENT_LOCAL_EMISSION_REJECTION_SCORE) {
+            costs[state] = f64::INFINITY;
+        }
+    }
+    if !costs[..state_count].iter().any(|cost| cost.is_finite()) {
+        return Err(SupportedProfileRedecodeFallbackReason::NoFinitePath);
+    }
+    Ok((costs, confidences))
+}
+
+fn supported_profile_redecode_assignment_state(
+    assignment: &AcousticSpeakerAssignment,
+    labels: &[String],
+    supported_cluster_indices: &[usize],
+) -> Option<usize> {
+    let Some(speaker_ref) = assignment.speaker_ref.as_deref() else {
+        return Some(supported_cluster_indices.len());
+    };
+    supported_cluster_indices.iter().position(|&cluster_index| {
+        labels
+            .get(cluster_index)
+            .is_some_and(|label| label == speaker_ref)
+    })
+}
+
+/// Bit-exact assignment equality used by rollback and independent replay
+/// proofs. `PartialEq` is insufficient because it conflates signed zero and
+/// cannot establish equality for identical NaN payloads.
+#[cfg(test)]
+pub(crate) fn supported_profile_redecode_assignments_bit_identical(
+    left: &[AcousticSpeakerAssignment],
+    right: &[AcousticSpeakerAssignment],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.tracklet_index == right.tracklet_index
+                && left.start_ms == right.start_ms
+                && left.end_ms == right.end_ms
+                && left.speaker_ref == right.speaker_ref
+                && left.speaker_confidence.to_bits() == right.speaker_confidence.to_bits()
+                && left.secondary_speaker_ref == right.secondary_speaker_ref
+                && left.secondary_speaker_confidence.map(f32::to_bits)
+                    == right.secondary_speaker_confidence.map(f32::to_bits)
+                && left.change_confidence.to_bits() == right.change_confidence.to_bits()
+                && left.overlap_suspected == right.overlap_suspected
+                && left.hard_attribution == right.hard_attribution
+        })
+}
+
+fn backtrack_supported_profile_redecode(
+    backpointers: &[u8],
+    tracklet_count: usize,
+    state_count: usize,
+    terminal_state: usize,
+) -> Option<Vec<u8>> {
+    if tracklet_count == 0 || terminal_state >= state_count {
+        return None;
+    }
+    let mut path = vec![0_u8; tracklet_count];
+    let mut state = terminal_state;
+    for time in (0..tracklet_count).rev() {
+        path[time] = u8::try_from(state).ok()?;
+        if time > 0 {
+            state = usize::from(*backpointers.get(time.checked_mul(state_count)? + state)?);
+            if state >= state_count {
+                return None;
+            }
+        }
+    }
+    Some(path)
+}
+
+fn supported_profile_redecode_structural_sha256(
+    common_observation_sha256: &str,
+    supported_cluster_indices: &[usize],
+    tracklets: &[AcousticTracklet],
+    path: &[u8],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"supported-profile-redecode-structural-output-v1\0");
+    hasher.update(supported_profile_redecode_policy_sha256().as_bytes());
+    hasher.update(common_observation_sha256.as_bytes());
+    hasher.update((supported_cluster_indices.len() as u64).to_le_bytes());
+    for (ordinal, _) in supported_cluster_indices.iter().enumerate() {
+        hasher.update((ordinal as u64).to_le_bytes());
+    }
+    hasher.update((tracklets.len() as u64).to_le_bytes());
+    for (tracklet, &state) in tracklets.iter().zip(path) {
+        hasher.update((tracklet.tracklet_index as u64).to_le_bytes());
+        hasher.update(tracklet.start_ms.to_le_bytes());
+        hasher.update(tracklet.end_ms.to_le_bytes());
+        hasher.update([state]);
+        hasher.update([
+            u8::from(tracklet.overlap_suspected),
+            u8::from(tracklet.boundary_evidence.is_some()),
+        ]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_supported_profile_redecode<C>(
+    tracklets: &[AcousticTracklet],
+    clusters: &[AcousticCluster],
+    labels: &[String],
+    enrollment: &SpeakerEnrollment,
+    speaker_evidence: &[AcousticSpeakerEvidenceSummary],
+    speaker_count: &SpeakerCountRequest,
+    assignments: &mut [AcousticSpeakerAssignment],
+    neural_embeddings: Option<&EcapaTrackletEmbeddings>,
+    common_observation_sha256: &str,
+    is_cancelled: &mut C,
+) -> SupportedProfileRedecodeEvaluationEvidence
+where
+    C: FnMut() -> bool,
+{
+    let mut evidence = supported_profile_redecode_evidence(
+        SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+        common_observation_sha256,
+        tracklets.len(),
+    );
+    if tracklets.len() > SUPPORTED_PROFILE_REDECODE_MAX_TRACKLETS {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::TrackletLimitExceeded,
+        );
+    }
+    if tracklets.len() > SUPPORTED_PROFILE_REDECODE_MAX_ATOMIC_COMMIT_ROWS {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::StagedStateLimitExceeded,
+        );
+    }
+    if clusters.len() != labels.len() || labels.len() != speaker_evidence.len() {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::InvalidInput,
+        );
+    }
+    evidence.profile_row_count = clusters.len() as u64;
+    if clusters.len() > SUPPORTED_PROFILE_REDECODE_MAX_PROFILE_ROWS {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::ProfileRowLimitExceeded,
+        );
+    }
+    let tracklet_count = tracklets.len();
+    let preflight_validation_limit = tracklet_count
+        .checked_add(clusters.len())
+        .and_then(|value| u64::try_from(value).ok());
+    if preflight_validation_limit
+        .is_none_or(|value| value > SUPPORTED_PROFILE_REDECODE_MAX_PREFLIGHT_VALIDATIONS)
+        || tracklet_count == 0
+        || assignments.len() != tracklet_count
+        || common_observation_sha256.len() != 64
+        || !common_observation_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::InvalidInput,
+        );
+    }
+    let mut budget = SupportedProfileRedecodeBudget::new(is_cancelled);
+    if budget.check(&mut evidence.resources) {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::Cancelled,
+        );
+    }
+    let mut supported_cluster_storage = [0_usize; SUPPORTED_PROFILE_REDECODE_MAX_SPEAKERS];
+    let mut supported_count = 0_usize;
+    let mut supported_evidence_mode = None::<DiarizationSpeakerEvidenceMode>;
+    let mut fused_channel_evidence = false;
+    for (cluster_index, ((cluster, label), speaker)) in clusters
+        .iter()
+        .zip(labels)
+        .zip(speaker_evidence)
+        .enumerate()
+    {
+        evidence.resources.preflight_validation_visits = evidence
+            .resources
+            .preflight_validation_visits
+            .saturating_add(1);
+        if budget.observe(1, &mut evidence.resources) {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::Cancelled,
+            );
+        }
+        if label.len() > crate::model::MAX_SPEAKER_REF_BYTES
+            || speaker.speaker_ref.len() > crate::model::MAX_SPEAKER_REF_BYTES
+            || label != &speaker.speaker_ref
+        {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::InvalidInput,
+            );
+        }
+        if !speaker.supported {
+            continue;
+        }
+        if supported_count == SUPPORTED_PROFILE_REDECODE_MAX_SPEAKERS {
+            evidence.supported_speaker_count = (supported_count as u64).saturating_add(1);
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::SpeakerLimitExceeded,
+            );
+        }
+        if supported_cluster_storage[..supported_count]
+            .iter()
+            .any(|&prior| labels[prior].as_str() == label.as_str())
+        {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::InvalidInput,
+            );
+        }
+        if !matches!(
+            cluster.evidence_mode,
+            DiarizationSpeakerEvidenceMode::EcapaOnly
+                | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel
+        ) {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::InvalidInput,
+            );
+        }
+        if supported_evidence_mode.is_some_and(|mode| mode != cluster.evidence_mode) {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::InvalidInput,
+            );
+        }
+        supported_evidence_mode = Some(cluster.evidence_mode);
+        let Some(neural_voice) = cluster.neural_voice.as_ref() else {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::ValidationFailed,
+            );
+        };
+        if neural_voice
+            .iter()
+            .any(|coordinate| !coordinate.is_finite())
+            || !cluster.neural_weight.is_finite()
+        {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::NonFiniteScore,
+            );
+        }
+        if ecapa_embedding_norm(neural_voice).is_none() || cluster.neural_weight <= 0.0 {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::ValidationFailed,
+            );
+        }
+        if cluster.evidence_mode == DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel {
+            fused_channel_evidence = true;
+            if cluster.channel_dimensions > CHANNEL_VECTOR_DIMENSIONS {
+                return supported_profile_redecode_fallback(
+                    evidence,
+                    SupportedProfileRedecodeFallbackReason::InvalidInput,
+                );
+            }
+            if cluster
+                .channel
+                .iter()
+                .any(|value| !value.is_finite() || value.abs() > MAX_ABS_ACOUSTIC_FEATURE)
+            {
+                return supported_profile_redecode_fallback(
+                    evidence,
+                    SupportedProfileRedecodeFallbackReason::NonFiniteScore,
+                );
+            }
+        }
+        supported_cluster_storage[supported_count] = cluster_index;
+        supported_count += 1;
+    }
+    evidence.supported_speaker_count = supported_count as u64;
+    let supported_cluster_indices = &supported_cluster_storage[..supported_count];
+    if supported_cluster_indices.is_empty() {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::NoSupportedProfiles,
+        );
+    }
+    if !speaker_count_satisfies(supported_count, speaker_count) {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::ConstraintViolation,
+        );
+    }
+    let state_count = supported_cluster_indices.len() + 1;
+    if state_count > SUPPORTED_PROFILE_REDECODE_MAX_STATES {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::StateLimitExceeded,
+        );
+    }
+    let emission_limit = tracklet_count
+        .checked_mul(supported_cluster_indices.len())
+        .and_then(|value| u64::try_from(value).ok());
+    if emission_limit
+        .is_none_or(|value| value > SUPPORTED_PROFILE_REDECODE_MAX_EMISSION_EVALUATIONS)
+    {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::EmissionLimitExceeded,
+        );
+    }
+    let transition_limit = tracklet_count
+        .saturating_sub(1)
+        .checked_mul(state_count)
+        .and_then(|value| value.checked_mul(state_count))
+        .and_then(|value| u64::try_from(value).ok());
+    if transition_limit.is_none_or(|value| value > SUPPORTED_PROFILE_REDECODE_MAX_TRANSITIONS) {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::TransitionLimitExceeded,
+        );
+    }
+    let local_visit_limit = tracklet_count
+        .checked_mul(supported_cluster_indices.len())
+        .and_then(|value| value.checked_mul(state_count))
+        .and_then(|value| u64::try_from(value).ok());
+    if local_visit_limit
+        .is_none_or(|value| value > SUPPORTED_PROFILE_REDECODE_MAX_LOCAL_SCORE_VISITS)
+    {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::LocalScoreLimitExceeded,
+        );
+    }
+    let backpointer_count = tracklet_count
+        .checked_mul(state_count)
+        .and_then(|value| u64::try_from(value).ok());
+    if backpointer_count.is_none_or(|value| value > SUPPORTED_PROFILE_REDECODE_MAX_BACKPOINTERS) {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::BackpointerLimitExceeded,
+        );
+    }
+    if tracklet_count as u64 > SUPPORTED_PROFILE_REDECODE_MAX_STAGED_STATES {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::StagedStateLimitExceeded,
+        );
+    }
+    let scratch_bytes = supported_profile_redecode_scratch_bytes(tracklet_count, state_count);
+    if scratch_bytes.is_none_or(|bytes| bytes > SUPPORTED_PROFILE_REDECODE_MAX_SCRATCH_BYTES) {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::ScratchLimitExceeded,
+        );
+    }
+    for (tracklet, assignment) in tracklets.iter().zip(assignments.iter()) {
+        evidence.resources.preflight_validation_visits = evidence
+            .resources
+            .preflight_validation_visits
+            .saturating_add(1);
+        if budget.observe(1, &mut evidence.resources) {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::Cancelled,
+            );
+        }
+        if !tracklet.change_confidence.is_finite()
+            || !(0.0..=1.0).contains(&tracklet.change_confidence)
+            || !assignment.speaker_confidence.is_finite()
+            || !(0.0..=1.0).contains(&assignment.speaker_confidence)
+            || !assignment.change_confidence.is_finite()
+            || !(0.0..=1.0).contains(&assignment.change_confidence)
+        {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::NonFiniteScore,
+            );
+        }
+        if let Some(representation) =
+            neural_embeddings.and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
+        {
+            let validation_coordinates_finite = representation
+                .validation
+                .as_ref()
+                .is_none_or(|validation| validation.iter().all(|value| value.is_finite()));
+            if representation
+                .discovery
+                .iter()
+                .any(|value| !value.is_finite())
+                || !validation_coordinates_finite
+                || !representation.discovery_weight.is_finite()
+                || !representation.validation_weight.is_finite()
+            {
+                return supported_profile_redecode_fallback(
+                    evidence,
+                    SupportedProfileRedecodeFallbackReason::NonFiniteScore,
+                );
+            }
+            let validation_valid = representation.validation.as_ref().map_or_else(
+                || representation.validation_weight == 0.0,
+                |validation| {
+                    ecapa_embedding_norm(validation).is_some()
+                        && representation.validation_weight > 0.0
+                },
+            );
+            if ecapa_embedding_norm(&representation.discovery).is_none()
+                || representation.discovery_weight <= 0.0
+                || !validation_valid
+            {
+                return supported_profile_redecode_fallback(
+                    evidence,
+                    SupportedProfileRedecodeFallbackReason::ValidationFailed,
+                );
+            }
+        }
+        if fused_channel_evidence {
+            if tracklet.channel_dimensions > CHANNEL_VECTOR_DIMENSIONS {
+                return supported_profile_redecode_fallback(
+                    evidence,
+                    SupportedProfileRedecodeFallbackReason::InvalidInput,
+                );
+            }
+            if tracklet
+                .channel_mean
+                .iter()
+                .any(|value| !value.is_finite() || value.abs() > MAX_ABS_ACOUSTIC_FEATURE)
+            {
+                return supported_profile_redecode_fallback(
+                    evidence,
+                    SupportedProfileRedecodeFallbackReason::NonFiniteScore,
+                );
+            }
+        }
+        let secondary_presence_paired = assignment.secondary_speaker_ref.is_some()
+            == assignment.secondary_speaker_confidence.is_some();
+        let secondary_confidence_valid = assignment
+            .secondary_speaker_confidence
+            .is_none_or(|confidence| confidence.is_finite() && (0.0..=1.0).contains(&confidence));
+        if assignment.tracklet_index != tracklet.tracklet_index
+            || assignment.start_ms != tracklet.start_ms
+            || assignment.end_ms != tracklet.end_ms
+            || assignment.overlap_suspected != tracklet.overlap_suspected
+            || assignment.change_confidence.to_bits() != tracklet.change_confidence.to_bits()
+            || assignment
+                .speaker_ref
+                .as_ref()
+                .is_some_and(|speaker| speaker.len() > crate::model::MAX_SPEAKER_REF_BYTES)
+            || assignment
+                .secondary_speaker_ref
+                .as_ref()
+                .is_some_and(|speaker| speaker.len() > crate::model::MAX_SPEAKER_REF_BYTES)
+            || supported_profile_redecode_assignment_state(
+                assignment,
+                labels,
+                &supported_cluster_indices,
+            )
+            .is_none()
+            || enrollment
+                .hard_assignments
+                .get(&tracklet.tracklet_index)
+                .is_some_and(|speaker| {
+                    speaker.len() > crate::model::MAX_SPEAKER_REF_BYTES
+                        || !assignment.hard_attribution
+                        || assignment.speaker_ref.as_ref() != Some(speaker)
+                })
+            || (assignment.hard_attribution
+                && !enrollment
+                    .hard_assignments
+                    .contains_key(&tracklet.tracklet_index))
+            || assignment
+                .secondary_speaker_ref
+                .as_ref()
+                .is_some_and(|secondary| {
+                    assignment.speaker_ref.as_ref() == Some(secondary)
+                        || !supported_cluster_indices.iter().any(|&cluster_index| {
+                            labels
+                                .get(cluster_index)
+                                .is_some_and(|label| label == secondary)
+                        })
+                })
+            || !secondary_presence_paired
+            || !secondary_confidence_valid
+            || (assignment.speaker_ref.is_none() && assignment.secondary_speaker_ref.is_some())
+            || (!assignment.overlap_suspected
+                && (assignment.secondary_speaker_ref.is_some()
+                    || assignment.secondary_speaker_confidence.is_some()))
+        {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::ValidationFailed,
+            );
+        }
+    }
+    if evidence.resources.preflight_validation_visits
+        != preflight_validation_limit.unwrap_or_default()
+    {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::ValidationFailed,
+        );
+    }
+    evidence.resources.redecode_count = 1;
+    evidence.resources.backpointer_count = backpointer_count.unwrap_or_default();
+    evidence.resources.peak_scratch_payload_bytes = evidence
+        .resources
+        .peak_scratch_payload_bytes
+        .max(scratch_bytes.unwrap_or_default());
+    let mut backpointers = vec![0_u8; tracklet_count * state_count];
+    let mut confidence_lattice = vec![0.0_f32; tracklet_count * state_count];
+    let mut previous = [f64::INFINITY; SUPPORTED_PROFILE_REDECODE_MAX_STATES];
+    let mut previous_run_duration_ms = [0_u64; SUPPORTED_PROFILE_REDECODE_MAX_STATES];
+    let first_incumbent_state = supported_profile_redecode_assignment_state(
+        &assignments[0],
+        labels,
+        &supported_cluster_indices,
+    )
+    .unwrap_or(state_count);
+    let first_forced = (assignments[0].hard_attribution || assignments[0].overlap_suspected)
+        .then_some(first_incumbent_state);
+    let (first_emissions, first_confidences) = match supported_profile_redecode_emissions(
+        &tracklets[0],
+        clusters,
+        labels,
+        &supported_cluster_indices,
+        enrollment,
+        neural_embeddings,
+        first_forced,
+        &mut budget,
+        &mut evidence.resources,
+    ) {
+        Ok(value) => value,
+        Err(reason) => return supported_profile_redecode_fallback(evidence, reason),
+    };
+    previous[..state_count].copy_from_slice(&first_emissions[..state_count]);
+    confidence_lattice[..state_count].copy_from_slice(&first_confidences[..state_count]);
+    let first_duration_ms = tracklets[0].end_ms.saturating_sub(tracklets[0].start_ms);
+    previous_run_duration_ms[..state_count].fill(first_duration_ms);
+    let mut incumbent_total = first_emissions[first_incumbent_state];
+    if !incumbent_total.is_finite() {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::ValidationFailed,
+        );
+    }
+    let mut incumbent_run_duration_ms = first_duration_ms;
+
+    for time in 1..tracklet_count {
+        let incumbent_previous_state = supported_profile_redecode_assignment_state(
+            &assignments[time - 1],
+            labels,
+            &supported_cluster_indices,
+        )
+        .unwrap_or(state_count);
+        let incumbent_state = supported_profile_redecode_assignment_state(
+            &assignments[time],
+            labels,
+            &supported_cluster_indices,
+        )
+        .unwrap_or(state_count);
+        let forced = (assignments[time].hard_attribution || assignments[time].overlap_suspected)
+            .then_some(incumbent_state);
+        let (emissions, confidences) = match supported_profile_redecode_emissions(
+            &tracklets[time],
+            clusters,
+            labels,
+            &supported_cluster_indices,
+            enrollment,
+            neural_embeddings,
+            forced,
+            &mut budget,
+            &mut evidence.resources,
+        ) {
+            Ok(value) => value,
+            Err(reason) => return supported_profile_redecode_fallback(evidence, reason),
+        };
+        let lattice_offset = time * state_count;
+        confidence_lattice[lattice_offset..lattice_offset + state_count]
+            .copy_from_slice(&confidences[..state_count]);
+        let current_duration_ms = tracklets[time]
+            .end_ms
+            .saturating_sub(tracklets[time].start_ms);
+        let gap_ms = tracklets[time]
+            .start_ms
+            .saturating_sub(tracklets[time - 1].end_ms);
+        let mut current = [f64::INFINITY; SUPPORTED_PROFILE_REDECODE_MAX_STATES];
+        let mut current_run_duration_ms = [0_u64; SUPPORTED_PROFILE_REDECODE_MAX_STATES];
+        let mut next_incumbent = None::<(f64, u64)>;
+        for state in 0..state_count {
+            for previous_state in 0..state_count {
+                evidence.resources.transition_evaluations =
+                    evidence.resources.transition_evaluations.saturating_add(1);
+                if budget.observe(1, &mut evidence.resources) {
+                    return supported_profile_redecode_fallback(
+                        evidence,
+                        SupportedProfileRedecodeFallbackReason::Cancelled,
+                    );
+                }
+                if state == incumbent_state && previous_state == incumbent_previous_state {
+                    let transition = if state == previous_state {
+                        0.0
+                    } else {
+                        match duration_aware_switch_penalty_f64(
+                            incumbent_run_duration_ms,
+                            current_duration_ms,
+                            gap_ms,
+                            tracklets[time].change_confidence,
+                            state == supported_cluster_indices.len()
+                                || previous_state == supported_cluster_indices.len(),
+                        ) {
+                            Some(value) => value,
+                            None => {
+                                return supported_profile_redecode_fallback(
+                                    evidence,
+                                    SupportedProfileRedecodeFallbackReason::NonFiniteScore,
+                                );
+                            }
+                        }
+                    };
+                    let total = incumbent_total + transition + emissions[state];
+                    if !total.is_finite() {
+                        return supported_profile_redecode_fallback(
+                            evidence,
+                            SupportedProfileRedecodeFallbackReason::ValidationFailed,
+                        );
+                    }
+                    let duration = if state == previous_state {
+                        incumbent_run_duration_ms.saturating_add(current_duration_ms)
+                    } else {
+                        current_duration_ms
+                    };
+                    next_incumbent = Some((total, duration));
+                }
+                if !previous[previous_state].is_finite() || !emissions[state].is_finite() {
+                    continue;
+                }
+                let transition = if state == previous_state {
+                    0.0
+                } else {
+                    match duration_aware_switch_penalty_f64(
+                        previous_run_duration_ms[previous_state],
+                        current_duration_ms,
+                        gap_ms,
+                        tracklets[time].change_confidence,
+                        state == supported_cluster_indices.len()
+                            || previous_state == supported_cluster_indices.len(),
+                    ) {
+                        Some(value) => value,
+                        None => {
+                            return supported_profile_redecode_fallback(
+                                evidence,
+                                SupportedProfileRedecodeFallbackReason::NonFiniteScore,
+                            );
+                        }
+                    }
+                };
+                let candidate = previous[previous_state] + transition + emissions[state];
+                if !candidate.is_finite() {
+                    return supported_profile_redecode_fallback(
+                        evidence,
+                        SupportedProfileRedecodeFallbackReason::NonFiniteScore,
+                    );
+                }
+                if candidate.total_cmp(&current[state]).is_lt() {
+                    current[state] = candidate;
+                    backpointers[lattice_offset + state] = previous_state as u8;
+                    current_run_duration_ms[state] = if state == previous_state {
+                        previous_run_duration_ms[previous_state].saturating_add(current_duration_ms)
+                    } else {
+                        current_duration_ms
+                    };
+                }
+            }
+        }
+        let Some((next_total, next_duration)) = next_incumbent else {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::ValidationFailed,
+            );
+        };
+        incumbent_total = next_total;
+        incumbent_run_duration_ms = next_duration;
+        previous = current;
+        previous_run_duration_ms = current_run_duration_ms;
+    }
+    if evidence.resources.emission_evaluations > SUPPORTED_PROFILE_REDECODE_MAX_EMISSION_EVALUATIONS
+        || evidence.resources.transition_evaluations > SUPPORTED_PROFILE_REDECODE_MAX_TRANSITIONS
+        || evidence.resources.local_score_visits > SUPPORTED_PROFILE_REDECODE_MAX_LOCAL_SCORE_VISITS
+    {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::ValidationFailed,
+        );
+    }
+    let terminal = previous[..state_count]
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, total)| total.is_finite())
+        .min_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
+    let Some((terminal_state, candidate_total)) = terminal else {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::NoFinitePath,
+        );
+    };
+    if !candidate_total.total_cmp(&incumbent_total).is_lt() {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::NoStrictImprovement,
+        );
+    }
+    let Some(candidate_states) = backtrack_supported_profile_redecode(
+        &backpointers,
+        tracklet_count,
+        state_count,
+        terminal_state,
+    ) else {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::ValidationFailed,
+        );
+    };
+    evidence.resources.staged_state_count = candidate_states.len() as u64;
+    let mut supported_coverage = [false; SUPPORTED_PROFILE_REDECODE_MAX_SPEAKERS];
+    let mut supported_voiced_frames = [0_u64; SUPPORTED_PROFILE_REDECODE_MAX_SPEAKERS];
+    let mut total_voiced_frames = 0_u64;
+    let mut staged_confidences = vec![0.0_f32; tracklet_count];
+    let mut changed_assignment_count = 0_u64;
+    for (time, (&state, (tracklet, incumbent))) in candidate_states
+        .iter()
+        .zip(tracklets.iter().zip(assignments.iter()))
+        .enumerate()
+    {
+        let state = usize::from(state);
+        if state >= state_count {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::ValidationFailed,
+            );
+        }
+        let incumbent_state = supported_profile_redecode_assignment_state(
+            incumbent,
+            labels,
+            &supported_cluster_indices,
+        )
+        .unwrap_or(state_count);
+        if (incumbent.hard_attribution || incumbent.overlap_suspected) && state != incumbent_state {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::ValidationFailed,
+            );
+        }
+        if state < supported_cluster_indices.len() {
+            supported_coverage[state] = true;
+            supported_voiced_frames[state] = supported_voiced_frames[state]
+                .saturating_add(u64::try_from(tracklet.voiced_frame_count).unwrap_or(u64::MAX));
+            staged_confidences[time] = confidence_lattice[time * state_count + state];
+            if !staged_confidences[time].is_finite()
+                || !(0.0..=1.0).contains(&staged_confidences[time])
+            {
+                return supported_profile_redecode_fallback(
+                    evidence,
+                    SupportedProfileRedecodeFallbackReason::NonFiniteScore,
+                );
+            }
+        }
+        total_voiced_frames = total_voiced_frames
+            .saturating_add(u64::try_from(tracklet.voiced_frame_count).unwrap_or(u64::MAX));
+        if state != incumbent_state {
+            changed_assignment_count = changed_assignment_count.saturating_add(1);
+        }
+        if tracklet.tracklet_index != incumbent.tracklet_index
+            || tracklet.start_ms != incumbent.start_ms
+            || tracklet.end_ms != incumbent.end_ms
+        {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::ValidationFailed,
+            );
+        }
+    }
+    if supported_coverage[..supported_cluster_indices.len()]
+        .iter()
+        .any(|covered| !covered)
+    {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::ConstraintViolation,
+        );
+    }
+    if changed_assignment_count == 0 {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::ValidationFailed,
+        );
+    }
+    let dominant_voiced_frames = supported_voiced_frames[..supported_cluster_indices.len()]
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    if supported_cluster_indices.len() > 1
+        && total_voiced_frames > 0
+        && dominant_voiced_frames as f32 / total_voiced_frames as f32
+            > MAX_MULTI_SPEAKER_DOMINANT_SHARE
+    {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::ConstraintViolation,
+        );
+    }
+    let mut persistent_output_label_bytes = 0_u64;
+    for (time, (&state, incumbent)) in candidate_states.iter().zip(assignments.iter()).enumerate() {
+        if incumbent.hard_attribution || incumbent.overlap_suspected {
+            continue;
+        }
+        let state = usize::from(state);
+        if state < supported_cluster_indices.len() {
+            let target = &labels[supported_cluster_indices[state]];
+            if incumbent.speaker_ref.as_deref() != Some(target.as_str()) {
+                persistent_output_label_bytes = persistent_output_label_bytes
+                    .saturating_add(u64::try_from(target.len()).unwrap_or(u64::MAX));
+            }
+        }
+        if time >= SUPPORTED_PROFILE_REDECODE_MAX_ATOMIC_COMMIT_ROWS {
+            return supported_profile_redecode_fallback(
+                evidence,
+                SupportedProfileRedecodeFallbackReason::StagedStateLimitExceeded,
+            );
+        }
+    }
+    let changed_label_byte_cap = changed_assignment_count
+        .checked_mul(crate::model::MAX_SPEAKER_REF_BYTES as u64)
+        .unwrap_or(u64::MAX);
+    if persistent_output_label_bytes > changed_label_byte_cap
+        || persistent_output_label_bytes
+            > SUPPORTED_PROFILE_REDECODE_MAX_PERSISTENT_OUTPUT_LABEL_BYTES
+    {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::PersistentOutputLimitExceeded,
+        );
+    }
+    let structural_output_sha256 = supported_profile_redecode_structural_sha256(
+        common_observation_sha256,
+        &supported_cluster_indices,
+        tracklets,
+        &candidate_states,
+    );
+    if budget.check(&mut evidence.resources) {
+        return supported_profile_redecode_fallback(
+            evidence,
+            SupportedProfileRedecodeFallbackReason::Cancelled,
+        );
+    }
+
+    for (time, assignment) in assignments.iter_mut().enumerate() {
+        if assignment.hard_attribution || assignment.overlap_suspected {
+            continue;
+        }
+        let state = usize::from(candidate_states[time]);
+        if state == supported_cluster_indices.len() {
+            assignment.speaker_ref = None;
+            assignment.speaker_confidence = 0.0;
+        } else {
+            let target = &labels[supported_cluster_indices[state]];
+            if assignment.speaker_ref.as_deref() != Some(target.as_str()) {
+                assignment.speaker_ref = Some(target.clone());
+            }
+            assignment.speaker_confidence = staged_confidences[time];
+        }
+        assignment.secondary_speaker_ref = None;
+        assignment.secondary_speaker_confidence = None;
+    }
+    evidence.resources.persistent_output_label_bytes = persistent_output_label_bytes;
+    evidence.applied = true;
+    evidence.fallback_reason = None;
+    evidence.changed_assignment_count = changed_assignment_count;
+    evidence.structural_output_sha256 = Some(structural_output_sha256);
+    evidence
 }
 
 fn hard_assignments_satisfied(
@@ -30962,15 +33369,833 @@ mod tests {
         assert_eq!(resources.lloyd_assignment_visits, 3 * 8);
     }
 
+    fn profile_redecode_evidence(
+        speaker_ref: &str,
+        supported: bool,
+    ) -> super::AcousticSpeakerEvidenceSummary {
+        super::AcousticSpeakerEvidenceSummary {
+            speaker_ref: speaker_ref.to_owned(),
+            assigned_tracklet_count: usize::from(supported),
+            independent_tracklet_count: usize::from(supported),
+            recurrence_episode_count: usize::from(supported),
+            voiced_frame_count: 100 * usize::from(supported),
+            independent_voiced_frame_count: 100 * usize::from(supported),
+            voiced_duration_ms: 1_000 * usize::from(supported) as u64,
+            mean_assignment_confidence: if supported { 0.9 } else { 0.0 },
+            cluster_reliability: if supported { 0.9 } else { 0.0 },
+            hard_anchored: false,
+            separated_from_supported_speakers: true,
+            reasons: vec![if supported {
+                crate::model::SpeakerEvidenceReason::SupportedByIndependentRecurrence
+            } else {
+                crate::model::SpeakerEvidenceReason::NoAssignedSpeech
+            }],
+            supported,
+        }
+    }
+
+    fn profile_redecode_assignment(
+        tracklet: &AcousticTracklet,
+        speaker_ref: Option<&str>,
+    ) -> AcousticSpeakerAssignment {
+        AcousticSpeakerAssignment {
+            tracklet_index: tracklet.tracklet_index,
+            start_ms: tracklet.start_ms,
+            end_ms: tracklet.end_ms,
+            speaker_ref: speaker_ref.map(str::to_owned),
+            speaker_confidence: if speaker_ref.is_some() { 0.8 } else { 0.0 },
+            secondary_speaker_ref: None,
+            secondary_speaker_confidence: None,
+            change_confidence: tracklet.change_confidence,
+            overlap_suspected: tracklet.overlap_suspected,
+            hard_attribution: false,
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn profile_redecode_fixture() -> (
+        Vec<AcousticTracklet>,
+        super::EcapaTrackletEmbeddings,
+        Vec<super::AcousticCluster>,
+        Vec<String>,
+        super::SpeakerEnrollment,
+        Vec<super::AcousticSpeakerEvidenceSummary>,
+        Vec<AcousticSpeakerAssignment>,
+    ) {
+        let speaker_a = residual_birth_basis(0);
+        let speaker_b = residual_birth_basis(1);
+        let unsupported = residual_birth_basis(2);
+        let mut tracklets = (0..4)
+            .map(|index| {
+                profile_tracklet(
+                    index,
+                    index as u64 * 1_000,
+                    (index as u64 + 1) * 1_000,
+                    index as f32,
+                    0.0,
+                    100,
+                )
+            })
+            .collect::<Vec<_>>();
+        tracklets[2].overlap_suspected = true;
+        let embeddings = [speaker_a, speaker_a, speaker_b, speaker_b]
+            .into_iter()
+            .enumerate()
+            .map(|(index, embedding)| {
+                (
+                    index,
+                    ecapa_representation(embedding, Some(embedding), 100.0, 100.0),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let clusters = vec![
+            residual_birth_cluster(vec![0, 1], speaker_a),
+            residual_birth_cluster(vec![2, 3], speaker_b),
+            residual_birth_cluster(vec![0], unsupported),
+        ];
+        let labels = vec![
+            "SPEAKER_00".to_owned(),
+            "SPEAKER_01".to_owned(),
+            "UNSUPPORTED".to_owned(),
+        ];
+        let request = DiarizationRequest::default();
+        let mut enrollment = enroll_known_speaker_profiles(&tracklets, &request, 4_000)
+            .expect("profile-redecode enrollment");
+        enrollment.hard_assignments.insert(0, labels[0].clone());
+        let evidence = vec![
+            profile_redecode_evidence(&labels[0], true),
+            profile_redecode_evidence(&labels[1], true),
+            profile_redecode_evidence(&labels[2], false),
+        ];
+        let mut assignments = vec![
+            profile_redecode_assignment(&tracklets[0], Some(&labels[0])),
+            profile_redecode_assignment(&tracklets[1], None),
+            profile_redecode_assignment(&tracklets[2], Some(&labels[1])),
+            profile_redecode_assignment(&tracklets[3], Some(&labels[1])),
+        ];
+        assignments[0].hard_attribution = true;
+        assignments[0].speaker_confidence = 1.0;
+        assignments[2].secondary_speaker_ref = Some(labels[0].clone());
+        assignments[2].secondary_speaker_confidence = Some(0.3);
+        (
+            tracklets,
+            embeddings,
+            clusters,
+            labels,
+            enrollment,
+            evidence,
+            assignments,
+        )
+    }
+
+    #[test]
+    fn supported_profile_redecode_accepts_strict_gain_and_preserves_forced_rows() {
+        let (tracklets, embeddings, clusters, labels, enrollment, evidence, assignments) =
+            profile_redecode_fixture();
+        let incumbent = assignments.clone();
+        let hard_row = incumbent[0].clone();
+        let overlap_row = incumbent[2].clone();
+        let forced_digest = super::supported_profile_redecode_final_forced_row_output_sha256(
+            &"a".repeat(64),
+            &tracklets,
+            &enrollment,
+            &evidence,
+            &incumbent,
+        )
+        .expect("forced-row digest");
+        let mut forced_tamper = incumbent.clone();
+        forced_tamper[0].change_confidence =
+            f32::from_bits(forced_tamper[0].change_confidence.to_bits() ^ 1);
+        assert_ne!(
+            super::supported_profile_redecode_final_forced_row_output_sha256(
+                &"a".repeat(64),
+                &tracklets,
+                &enrollment,
+                &evidence,
+                &forced_tamper,
+            )
+            .expect("tampered forced-row digest"),
+            forced_digest
+        );
+        let mut candidate = assignments;
+        let outcome = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut candidate,
+            Some(&embeddings),
+            &"a".repeat(64),
+            &mut || false,
+        );
+        assert!(outcome.applied, "{outcome:?}");
+        assert_eq!(outcome.fallback_reason, None);
+        assert!(outcome.support_evidence_frozen_from_incumbent);
+        assert_eq!(candidate[0], hard_row);
+        assert_eq!(candidate[2], overlap_row);
+        assert_eq!(candidate[1].speaker_ref.as_deref(), Some("SPEAKER_00"));
+        assert!(candidate.iter().all(|assignment| {
+            assignment.speaker_ref.as_deref() != Some("UNSUPPORTED")
+                && assignment.secondary_speaker_ref.as_deref() != Some("UNSUPPORTED")
+        }));
+        let represented = candidate
+            .iter()
+            .filter_map(|assignment| assignment.speaker_ref.as_deref())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(represented, BTreeSet::from(["SPEAKER_00", "SPEAKER_01"]));
+        assert_eq!(outcome.resources.emission_evaluations, 8);
+        assert_eq!(outcome.profile_row_count, 3);
+        assert_eq!(outcome.resources.preflight_validation_visits, 7);
+        assert_eq!(outcome.resources.transition_evaluations, 27);
+        assert_eq!(outcome.resources.local_score_visits, 12);
+        assert_eq!(outcome.resources.backpointer_count, 12);
+        assert_eq!(outcome.resources.staged_state_count, 4);
+        assert_eq!(
+            outcome.resources.persistent_output_label_bytes,
+            "SPEAKER_00".len() as u64
+        );
+        assert_eq!(outcome.resources.redecode_count, 1);
+        assert_eq!(outcome.resources.profile_update_count, 0);
+        assert_eq!(outcome.resources.model_call_count, 0);
+        assert_eq!(outcome.resources.cancellation_check_count, 3);
+        assert!(
+            outcome.resources.peak_scratch_payload_bytes
+                <= super::SUPPORTED_PROFILE_REDECODE_MAX_SCRATCH_BYTES
+        );
+
+        let mut replay = incumbent;
+        let replay_outcome = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut replay,
+            Some(&embeddings),
+            &"a".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &replay, &candidate
+        ));
+        assert_eq!(replay_outcome, outcome);
+    }
+
+    #[test]
+    fn supported_profile_redecode_disabled_and_tie_paths_are_exact_identity() {
+        let disabled = super::supported_profile_redecode_evidence(
+            super::SupportedProfileRedecodeMode::DisabledIncumbent,
+            &"b".repeat(64),
+            4,
+        );
+        assert!(!disabled.applied);
+        assert_eq!(
+            disabled.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::DisabledIncumbent)
+        );
+        assert_eq!(
+            disabled.resources,
+            super::SupportedProfileRedecodeResourceSummary::default()
+        );
+
+        let (tracklets, embeddings, clusters, labels, enrollment, evidence, mut assignments) =
+            profile_redecode_fixture();
+        let first = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut assignments,
+            Some(&embeddings),
+            &"b".repeat(64),
+            &mut || false,
+        );
+        assert!(first.applied, "{first:?}");
+        let snapshot = assignments.clone();
+        let tied = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut assignments,
+            Some(&embeddings),
+            &"b".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &assignments,
+            &snapshot,
+        ));
+        assert!(!tied.applied);
+        assert_eq!(
+            tied.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::NoStrictImprovement)
+        );
+        assert_eq!(tied.resources.staged_state_count, 0);
+    }
+
+    #[test]
+    fn supported_profile_redecode_cancellation_and_caps_roll_back_bit_exactly() {
+        let (tracklets, embeddings, clusters, labels, enrollment, evidence, assignments) =
+            profile_redecode_fixture();
+        let mut before = assignments.clone();
+        let cancelled_before = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut before,
+            Some(&embeddings),
+            &"c".repeat(64),
+            &mut || true,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &before,
+            &assignments,
+        ));
+        assert_eq!(
+            cancelled_before.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::Cancelled)
+        );
+        assert_eq!(cancelled_before.resources.cancellation_check_count, 1);
+        assert_eq!(cancelled_before.resources.redecode_count, 0);
+
+        let mut during = assignments.clone();
+        let mut polls = 0_u64;
+        let cancelled_during = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut during,
+            Some(&embeddings),
+            &"c".repeat(64),
+            &mut || {
+                polls += 1;
+                polls == 2
+            },
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &during,
+            &assignments,
+        ));
+        assert_eq!(
+            cancelled_during.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::Cancelled)
+        );
+        assert_eq!(cancelled_during.resources.cancellation_check_count, 2);
+        assert_eq!(cancelled_during.resources.redecode_count, 1);
+
+        let mut before_commit = assignments.clone();
+        let mut precommit_polls = 0_u64;
+        let cancelled_before_commit = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut before_commit,
+            Some(&embeddings),
+            &"c".repeat(64),
+            &mut || {
+                precommit_polls += 1;
+                precommit_polls == 3
+            },
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &before_commit,
+            &assignments,
+        ));
+        assert_eq!(
+            cancelled_before_commit.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::Cancelled)
+        );
+        assert_eq!(
+            cancelled_before_commit.resources.cancellation_check_count,
+            3
+        );
+        assert_eq!(cancelled_before_commit.resources.staged_state_count, 4);
+        assert_eq!(
+            cancelled_before_commit
+                .resources
+                .persistent_output_label_bytes,
+            0,
+            "a final cancellation must occur before any persistent label clone is committed",
+        );
+
+        let oversized = (0..=super::SUPPORTED_PROFILE_REDECODE_MAX_TRACKLETS)
+            .map(|index| {
+                profile_tracklet(
+                    index,
+                    index as u64 * 100,
+                    (index as u64 + 1) * 100,
+                    0.0,
+                    0.0,
+                    10,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut capped = assignments.clone();
+        let capped_outcome = super::apply_supported_profile_redecode(
+            &oversized,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut capped,
+            Some(&embeddings),
+            &"c".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &capped,
+            &assignments,
+        ));
+        assert_eq!(
+            capped_outcome.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::TrackletLimitExceeded)
+        );
+        assert_eq!(capped_outcome.resources.redecode_count, 0);
+        assert_eq!(capped_outcome.resources.peak_scratch_payload_bytes, 0);
+
+        let profile_row_count = super::SUPPORTED_PROFILE_REDECODE_MAX_PROFILE_ROWS + 1;
+        let profile_clusters = vec![clusters[2].clone(); profile_row_count];
+        let profile_labels = vec![labels[2].clone(); profile_row_count];
+        let profile_evidence = vec![evidence[2].clone(); profile_row_count];
+        let mut profile_capped = assignments.clone();
+        let profile_cap = super::apply_supported_profile_redecode(
+            &tracklets,
+            &profile_clusters,
+            &profile_labels,
+            &enrollment,
+            &profile_evidence,
+            &SpeakerCountRequest::Infer,
+            &mut profile_capped,
+            Some(&embeddings),
+            &"c".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &profile_capped,
+            &assignments,
+        ));
+        assert_eq!(
+            profile_cap.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::ProfileRowLimitExceeded)
+        );
+        assert_eq!(profile_cap.resources.preflight_validation_visits, 0);
+
+        let speaker_count = super::SUPPORTED_PROFILE_REDECODE_MAX_SPEAKERS + 1;
+        let speaker_clusters = vec![clusters[0].clone(); speaker_count];
+        let speaker_labels = (0..speaker_count)
+            .map(|index| format!("S{index}"))
+            .collect::<Vec<_>>();
+        let speaker_evidence = speaker_labels
+            .iter()
+            .map(|label| profile_redecode_evidence(label, true))
+            .collect::<Vec<_>>();
+        let mut speaker_capped = assignments.clone();
+        let speaker_cap = super::apply_supported_profile_redecode(
+            &tracklets,
+            &speaker_clusters,
+            &speaker_labels,
+            &enrollment,
+            &speaker_evidence,
+            &SpeakerCountRequest::Infer,
+            &mut speaker_capped,
+            Some(&embeddings),
+            &"c".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &speaker_capped,
+            &assignments,
+        ));
+        assert_eq!(
+            speaker_cap.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::SpeakerLimitExceeded)
+        );
+        assert_eq!(
+            speaker_cap.resources.preflight_validation_visits,
+            speaker_count as u64
+        );
+    }
+
+    #[test]
+    fn supported_profile_redecode_invalid_and_nonfinite_inputs_fail_closed() {
+        let (tracklets, mut embeddings, clusters, labels, enrollment, evidence, assignments) =
+            profile_redecode_fixture();
+        let mut invalid = assignments.clone();
+        let invalid_outcome = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut invalid,
+            Some(&embeddings),
+            "invalid",
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &invalid,
+            &assignments,
+        ));
+        assert_eq!(
+            invalid_outcome.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::InvalidInput)
+        );
+        assert_eq!(invalid_outcome.resources.peak_scratch_payload_bytes, 0);
+
+        embeddings
+            .get_mut(&1)
+            .and_then(|representation| representation.validation.as_mut())
+            .expect("represented validation embedding")[0] = f32::NAN;
+        let mut nonfinite_coordinate = assignments.clone();
+        let nonfinite_coordinate_outcome = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut nonfinite_coordinate,
+            Some(&embeddings),
+            &"d".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &nonfinite_coordinate,
+            &assignments,
+        ));
+        assert_eq!(
+            nonfinite_coordinate_outcome.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::NonFiniteScore)
+        );
+        embeddings
+            .get_mut(&1)
+            .and_then(|representation| representation.validation.as_mut())
+            .expect("represented validation embedding")[0] = 0.5;
+
+        let mut nonfinite_clusters = clusters.clone();
+        nonfinite_clusters[0]
+            .neural_voice
+            .as_mut()
+            .expect("supported neural centroid")[0] = f32::NAN;
+        let mut nonfinite_centroid = assignments.clone();
+        let nonfinite_centroid_outcome = super::apply_supported_profile_redecode(
+            &tracklets,
+            &nonfinite_clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut nonfinite_centroid,
+            Some(&embeddings),
+            &"d".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &nonfinite_centroid,
+            &assignments,
+        ));
+        assert_eq!(
+            nonfinite_centroid_outcome.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::NonFiniteScore)
+        );
+
+        embeddings
+            .get_mut(&1)
+            .expect("represented tracklet")
+            .validation_weight = f32::NAN;
+        let mut nonfinite = assignments.clone();
+        let nonfinite_outcome = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut nonfinite,
+            Some(&embeddings),
+            &"d".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &nonfinite,
+            &assignments,
+        ));
+        assert_eq!(
+            nonfinite_outcome.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::NonFiniteScore)
+        );
+        assert_eq!(nonfinite_outcome.resources.redecode_count, 0);
+    }
+
+    #[test]
+    fn supported_profile_redecode_constraints_and_identity_validation_roll_back() {
+        let (mut tracklets, embeddings, clusters, labels, enrollment, evidence, assignments) =
+            profile_redecode_fixture();
+
+        let mut uncovered_evidence = evidence.clone();
+        uncovered_evidence[2] = profile_redecode_evidence(&labels[2], true);
+        let mut uncovered_candidate = assignments.clone();
+        let uncovered = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &uncovered_evidence,
+            &SpeakerCountRequest::Infer,
+            &mut uncovered_candidate,
+            Some(&embeddings),
+            &"e".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &uncovered_candidate,
+            &assignments,
+        ));
+        assert_eq!(
+            uncovered.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::ConstraintViolation)
+        );
+        assert_eq!(
+            uncovered.resources.staged_state_count,
+            tracklets.len() as u64
+        );
+
+        tracklets[2].voiced_frame_count = 1;
+        tracklets[2].identity_frame_count = 1;
+        tracklets[3].voiced_frame_count = 1;
+        tracklets[3].identity_frame_count = 1;
+        let mut dominant_candidate = assignments.clone();
+        let dominant = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut dominant_candidate,
+            Some(&embeddings),
+            &"e".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &dominant_candidate,
+            &assignments,
+        ));
+        assert_eq!(
+            dominant.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::ConstraintViolation)
+        );
+        // Reaching a complete staged path proves that its objective strictly
+        // improved before the dominant-share acceptance constraint rejected it.
+        assert_eq!(
+            dominant.resources.staged_state_count,
+            tracklets.len() as u64
+        );
+
+        let mut count_mismatch = assignments.clone();
+        let count = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::HardConstraint { count: 3 },
+            &mut count_mismatch,
+            Some(&embeddings),
+            &"e".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &count_mismatch,
+            &assignments,
+        ));
+        assert_eq!(
+            count.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::ConstraintViolation)
+        );
+        assert_eq!(count.resources.redecode_count, 0);
+
+        let mut duplicate_labels = labels.clone();
+        let mut duplicate_evidence = evidence.clone();
+        duplicate_labels[1] = duplicate_labels[0].clone();
+        duplicate_evidence[1].speaker_ref = duplicate_labels[0].clone();
+        let mut duplicate_candidate = assignments.clone();
+        let duplicate = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &duplicate_labels,
+            &enrollment,
+            &duplicate_evidence,
+            &SpeakerCountRequest::Infer,
+            &mut duplicate_candidate,
+            Some(&embeddings),
+            &"e".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &duplicate_candidate,
+            &assignments,
+        ));
+        assert_eq!(
+            duplicate.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::InvalidInput)
+        );
+
+        let mut secondary_without_primary = assignments.clone();
+        secondary_without_primary[2].speaker_ref = None;
+        secondary_without_primary[2].speaker_confidence = 0.0;
+        let malformed_incumbent = secondary_without_primary.clone();
+        let malformed = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut secondary_without_primary,
+            Some(&embeddings),
+            &"e".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &secondary_without_primary,
+            &malformed_incumbent,
+        ));
+        assert_eq!(
+            malformed.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::ValidationFailed)
+        );
+        assert_eq!(malformed.resources.redecode_count, 0);
+
+        let mut overlong_labels = labels.clone();
+        let mut overlong_evidence = evidence.clone();
+        overlong_labels[0] = "s".repeat(crate::model::MAX_SPEAKER_REF_BYTES + 1);
+        overlong_evidence[0].speaker_ref = overlong_labels[0].clone();
+        let mut overlong_candidate = assignments.clone();
+        let overlong = super::apply_supported_profile_redecode(
+            &tracklets,
+            &clusters,
+            &overlong_labels,
+            &enrollment,
+            &overlong_evidence,
+            &SpeakerCountRequest::Infer,
+            &mut overlong_candidate,
+            Some(&embeddings),
+            &"e".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &overlong_candidate,
+            &assignments,
+        ));
+        assert_eq!(
+            overlong.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::InvalidInput)
+        );
+
+        let mut mixed_clusters = clusters.clone();
+        mixed_clusters[1].evidence_mode = DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel;
+        let mut mixed_candidate = assignments.clone();
+        let mixed = super::apply_supported_profile_redecode(
+            &tracklets,
+            &mixed_clusters,
+            &labels,
+            &enrollment,
+            &evidence,
+            &SpeakerCountRequest::Infer,
+            &mut mixed_candidate,
+            Some(&embeddings),
+            &"e".repeat(64),
+            &mut || false,
+        );
+        assert!(super::supported_profile_redecode_assignments_bit_identical(
+            &mixed_candidate,
+            &assignments,
+        ));
+        assert_eq!(
+            mixed.fallback_reason,
+            Some(super::SupportedProfileRedecodeFallbackReason::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn supported_profile_redecode_resource_boundaries_are_exact() {
+        let tracklets = super::SUPPORTED_PROFILE_REDECODE_MAX_TRACKLETS;
+        let profile_rows = super::SUPPORTED_PROFILE_REDECODE_MAX_PROFILE_ROWS;
+        let speakers = super::SUPPORTED_PROFILE_REDECODE_MAX_SPEAKERS;
+        let states = speakers + 1;
+        assert_eq!(states, super::SUPPORTED_PROFILE_REDECODE_MAX_STATES);
+        assert_eq!(
+            tracklets,
+            super::SUPPORTED_PROFILE_REDECODE_MAX_ATOMIC_COMMIT_ROWS
+        );
+        assert_eq!(
+            (tracklets + profile_rows) as u64,
+            super::SUPPORTED_PROFILE_REDECODE_MAX_PREFLIGHT_VALIDATIONS
+        );
+        assert_eq!(
+            (tracklets * speakers) as u64,
+            super::SUPPORTED_PROFILE_REDECODE_MAX_EMISSION_EVALUATIONS
+        );
+        assert_eq!(
+            ((tracklets - 1) * states * states) as u64,
+            super::SUPPORTED_PROFILE_REDECODE_MAX_TRANSITIONS
+        );
+        assert_eq!(
+            (tracklets * speakers * states) as u64,
+            super::SUPPORTED_PROFILE_REDECODE_MAX_LOCAL_SCORE_VISITS
+        );
+        assert_eq!(
+            (tracklets * states) as u64,
+            super::SUPPORTED_PROFILE_REDECODE_MAX_BACKPOINTERS
+        );
+        assert_eq!(
+            tracklets as u64,
+            super::SUPPORTED_PROFILE_REDECODE_MAX_STAGED_STATES
+        );
+        assert_eq!(
+            (tracklets * crate::model::MAX_SPEAKER_REF_BYTES) as u64,
+            super::SUPPORTED_PROFILE_REDECODE_MAX_PERSISTENT_OUTPUT_LABEL_BYTES
+        );
+        assert!(
+            super::supported_profile_redecode_scratch_bytes(tracklets, states)
+                .is_some_and(|bytes| bytes <= super::SUPPORTED_PROFILE_REDECODE_MAX_SCRATCH_BYTES)
+        );
+        assert!(
+            ((tracklets + 1) * speakers) as u64
+                > super::SUPPORTED_PROFILE_REDECODE_MAX_EMISSION_EVALUATIONS
+        );
+        assert!(
+            (tracklets * (speakers + 1) * (states + 1)) as u64
+                > super::SUPPORTED_PROFILE_REDECODE_MAX_LOCAL_SCORE_VISITS
+        );
+        assert_eq!(
+            speakers + 2,
+            super::SUPPORTED_PROFILE_REDECODE_MAX_STATES + 1
+        );
+    }
+
     fn prepared_ecapa_hash_fixture() -> super::PreparedEcapaDiarizationEvaluation {
         let (tracklets, neural_embeddings, _) = residual_birth_fixture();
-        let empty_request = DiarizationRequest::default();
-        let enrollment = enroll_known_speaker_profiles(
-            &tracklets,
-            &empty_request,
-            tracklets.last().expect("tracklet").end_ms,
-        )
-        .expect("empty enrollment");
         let request = DiarizationRequest {
             engine: DiarizationEngine::Ecapa,
             known_intervals: vec![KnownSpeakerInterval {
@@ -30983,6 +34208,12 @@ mod tests {
             }],
             ..DiarizationRequest::default()
         };
+        let enrollment = enroll_known_speaker_profiles(
+            &tracklets,
+            &request,
+            tracklets.last().expect("tracklet").end_ms,
+        )
+        .expect("fixture enrollment");
         let neural_representation = NeuralSpeakerRepresentationSummary {
             schema_version: "neural-speaker-representation-summary-v1".to_owned(),
             provider_version: super::ECAPA_SPEAKER_REPRESENTATION_VERSION.to_owned(),
@@ -31072,6 +34303,118 @@ mod tests {
         prepared.private_integrity_sha256 =
             super::prepared_ecapa_private_integrity_sha256(&prepared);
         prepared
+    }
+
+    #[test]
+    fn prepared_supported_profile_redecode_replays_and_rejects_hash_tampering() {
+        let prepared = prepared_ecapa_hash_fixture();
+        let frozen = super::prepare_supported_profile_redecode_evaluation(&prepared, || false)
+            .expect("freeze supported-profile incumbent once");
+        let baseline = super::run_prepared_supported_profile_redecode_evaluation(
+            &prepared,
+            &frozen,
+            super::SupportedProfileRedecodeMode::DisabledIncumbent,
+            || false,
+        )
+        .expect("frozen baseline arm");
+        let candidate = super::run_prepared_supported_profile_redecode_evaluation(
+            &prepared,
+            &frozen,
+            super::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+            || false,
+        )
+        .expect("first frozen candidate arm");
+        let replay = super::run_prepared_supported_profile_redecode_evaluation(
+            &prepared,
+            &frozen,
+            super::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+            || false,
+        )
+        .expect("independent frozen candidate replay");
+        assert!(frozen.count_constraints_feasible());
+        assert_eq!(
+            candidate.frozen_count_constraints_feasible,
+            frozen.count_constraints_feasible()
+        );
+        assert_eq!(
+            candidate.profile_redecode.profile_row_count,
+            frozen.profile_row_count()
+        );
+        assert_eq!(
+            candidate.forced_tracklet_count,
+            frozen.forced_tracklet_count()
+        );
+        assert!(candidate.clustering.constraints_satisfied);
+        assert!(super::prepared_supported_profile_redecode_runs_identical(
+            &candidate, &replay
+        ));
+        assert_eq!(
+            baseline.common_observation_sha256,
+            candidate.common_observation_sha256
+        );
+        assert_eq!(
+            baseline.incumbent_partition_sha256,
+            candidate.incumbent_partition_sha256
+        );
+        assert_eq!(
+            baseline.supported_profile_topology_sha256,
+            candidate.supported_profile_topology_sha256
+        );
+        assert_eq!(
+            baseline.frozen_support_summary_sha256,
+            candidate.frozen_support_summary_sha256
+        );
+        assert_eq!(
+            baseline.speaker_count_estimate_sha256,
+            candidate.speaker_count_estimate_sha256
+        );
+        assert_eq!(
+            baseline.speaker_count_evidence_sha256,
+            candidate.speaker_count_evidence_sha256
+        );
+        assert_eq!(
+            baseline.hard_hint_input_topology_sha256,
+            candidate.hard_hint_input_topology_sha256
+        );
+        assert_eq!(
+            baseline.overlap_input_topology_sha256,
+            candidate.overlap_input_topology_sha256
+        );
+        assert_eq!(
+            baseline.final_forced_row_output_sha256,
+            candidate.final_forced_row_output_sha256
+        );
+        assert_eq!(candidate.new_inference_count, 0);
+        assert!(
+            candidate
+                .profile_redecode
+                .support_evidence_frozen_from_incumbent
+        );
+
+        let mut count_tamper = frozen;
+        count_tamper.speaker_count_evidence_sha256 = "0".repeat(64);
+        let rejected = super::run_prepared_supported_profile_redecode_evaluation(
+            &prepared,
+            &count_tamper,
+            super::SupportedProfileRedecodeMode::DisabledIncumbent,
+            || false,
+        );
+        assert!(matches!(rejected, Err(FwError::ContractViolation(_))));
+        count_tamper.speaker_count_evidence_sha256 = count_tamper
+            .clustering
+            .count_estimate
+            .as_ref()
+            .expect("count")
+            .evidence_sha256
+            .clone();
+        count_tamper.final_forced_row_output_sha256 = "1".repeat(64);
+        let rejected = super::run_prepared_supported_profile_redecode_evaluation(
+            &prepared,
+            &count_tamper,
+            super::SupportedProfileRedecodeMode::DevelopmentCandidateV1,
+            || false,
+        );
+        assert!(matches!(rejected, Err(FwError::ContractViolation(_))));
     }
 
     #[test]
