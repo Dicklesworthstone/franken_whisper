@@ -1175,7 +1175,7 @@ impl SpeakerCountEstimate {
         }
 
         let mut seen_lanes = [false; 6];
-        for lane in &self.lanes {
+        for (expected_lane_index, lane) in self.lanes.iter().enumerate() {
             if !unit_interval(lane.confidence) {
                 return Err("speaker-count lane confidence is not finite in 0..=1".to_owned());
             }
@@ -1187,6 +1187,9 @@ impl SpeakerCountEstimate {
                 SpeakerCountEvidenceLane::ConstraintGraph => 4,
                 SpeakerCountEvidenceLane::CallerPrior => 5,
             };
+            if lane_index != expected_lane_index {
+                return Err("speaker-count evidence lanes are not canonically ordered".to_owned());
+            }
             if std::mem::replace(&mut seen_lanes[lane_index], true) {
                 return Err("speaker-count evidence lane is duplicated".to_owned());
             }
@@ -1428,6 +1431,12 @@ impl DiarizationReport {
             {
                 return Err(
                     "operational partition count lies outside speaker-count candidate bounds"
+                        .to_owned(),
+                );
+            }
+            if partition.selected_count > estimate.resources.prototype_count {
+                return Err(
+                    "operational partition count exceeds the reported affinity-node count"
                         .to_owned(),
                 );
             }
