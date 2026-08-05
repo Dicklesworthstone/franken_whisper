@@ -1480,13 +1480,79 @@ Each registry entry names a dedicated
 `FRANKEN_WHISPER_*_ORACLE_BIN` override and a default adapter executable. The
 operator supplies that adapter. A version probe receives
 `--franken-whisper-diarization-oracle-version --protocol
-franken-whisper-diarization-oracle-protocol-v1` and must emit one strict
-`franken-whisper-diarization-oracle-version-v1` JSON object on stdout. A run
+franken-whisper-diarization-oracle-protocol-v2` and must emit one strict
+`franken-whisper-diarization-oracle-version-v2` JSON object on stdout. A run
 receives `--franken-whisper-diarization-oracle-run`, the same protocol flag,
 an external `--audio` path, and a lowercase SHA-256 `--recording-key`. It must
 emit one strict `franken-whisper-diarization-stage-document-v1` object on
 stdout. Arguments are never retained, and neither stdout nor stderr content is
 copied into the report.
+
+The Sortformer adapter has an additional fail-closed model contract. It is
+exactly `nvidia/diar_streaming_sortformer_4spk-v2.1` at repository revision
+`fafaab5faa1617a0ca52d38dd3dc4bd636800d3d`, with the operator-installed
+artifact independently hashed locally. Hugging Face LFS metadata pins the
+471,367,680-byte `.nemo` artifact to SHA-256
+`8abd32832159c6ac1148c926b7276f35ba34582c444e559dce1f1253fea42ef8`.
+The locally computed hash must equal that exact value; size plus an arbitrary
+well-formed digest is not accepted. The frozen input is mono 16 kHz PCM16 WAV.
+Every PCM sample is decoded during validation, the sample-derived duration must
+be within 79 ms of the stage-document duration, and the audio hash is checked
+before and after the adapter run. The adapter executable is resolved once and
+that exact absolute executable is used for both probes.
+
+The model emits four arrival-ordered activity slots on 80 ms frames. The
+high-latency streaming profile fixes chunk/right-context/FIFO/cache-update/cache
+lengths to 340/40/40/300/188 frames (30.4 seconds nominal input-buffer latency),
+batch size one, inferred count up to four, and untuned onset/offset 0.5 with
+zero padding and minimum-duration filtering. The canonical adapter labels are
+`speaker_0` through `speaker_3`; arrival order is determined by each label's
+minimum onset and tied first onsets are allowed. Turns start and end on 80 ms
+frames, except that an end may equal the document duration. Sortformer overlap
+is represented only by concurrent labeled turns, never by
+`overlap_suspected`. Speech activity, overlap, and speaker-change boundaries
+must exactly equal the O(n log n) event-sweep derivation from the final turns.
+
+The frozen execution profile is CPU-only float32, with autocast disabled,
+quantization disabled, deterministic algorithms enabled, batch size one, zero
+data-loader workers, eight PyTorch intra-op threads, and one inter-op thread.
+Changing any of those values requires a different contract hash and evidence
+row. The adapter also computes a path-free
+`sortformer-runtime-fingerprint-v1` object containing the schema, Python, NeMo,
+PyTorch, torchaudio and NumPy versions, BLAS backend, operating system, machine
+architecture, CPU feature tier, device, dtype, autocast, quantization, thread
+counts, data-loader worker count, and deterministic-algorithm state. The v2
+version response carries that strict deny-unknown-fields object plus its
+SHA-256. The host validates the frozen profile and normalized path-free tokens,
+recomputes the digest, and retains only the digest in the report, so benchmark
+rows with silent runtime drift cannot be treated as matched.
+
+The v2 version document adds `model_contract_sha256`,
+`model_artifact_sha256`, `model_artifact_bytes`, and
+`runtime_fingerprint_sha256`. All are mandatory for a successfully validated
+Sortformer probe. The retained report separately records
+`expected_model_contract_sha256` even when no adapter is available and records
+the observed contract/artifact/runtime attestations only after a valid version
+probe. Non-Sortformer tools must omit all model-contract fields. The tool and
+adapter versions are exact pins, so a model, NeMo source, runtime profile, or
+adapter revision change is a new evidence row rather than an in-place
+substitution. A non-PCM input, changed input bytes, mismatched contract,
+malformed/nonfinite or cross-stage-inconsistent output, a fifth output slot, or
+noncanonical label fails closed with a typed skip. A reference with five or
+more labeled speakers is retained as `reference_model_capacity_exceeded`; it
+is never removed from the declared comparison population or collapsed to four
+speakers.
+
+Contract and report hashes use `lexicographic-canonical-json-v1`: recursively
+sort every object by key, emit compact JSON with no insignificant whitespace,
+preserve array order, and use JSON scalar rendering. This is a deliberately
+small cross-language encoding contract for the ASCII keys and integer/Boolean
+model contract; it is not claimed to implement RFC 8785. The encoding version
+is itself included in the hashed Sortformer contract, and the runtime
+fingerprint uses the same encoding. Cancellation terminates the directly
+invoked adapter and zero data-loader workers are part of the profile; full
+descendant-process teardown and timing comparability remain qualification gates
+for the same-invocation benchmark rather than claims made by this seam.
 
 The canonical stage document has a duration and optional outputs for:
 

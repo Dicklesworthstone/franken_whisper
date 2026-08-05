@@ -503,6 +503,21 @@ label-permutation-invariant clusters, overlap, and final projection. Missing
 or failing tools produce a path-free skipped report; disagreements are
 diagnostic only and can never certify that the native path is wrong. External
 tools remain optional subprocesses with no normal runtime or Cargo dependency.
+The Sortformer entry is narrower than the generic adapters: it pins
+[`nvidia/diar_streaming_sortformer_4spk-v2.1`](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1)
+at immutable revision `fafaab5faa1617a0ca52d38dd3dc4bd636800d3d`, requires
+canonical mono 16 kHz PCM16 WAV input, and freezes the documented high-latency
+340/40/40/300/188 streaming-cache profile plus untuned 0.5/0.5 post-processing.
+Its version probe must bind the frozen contract hash, independently verify that
+the 471,367,680-byte local artifact hashes to the pinned Hugging Face LFS
+SHA-256, and retain a path-free runtime fingerprint. The frozen evaluation row
+is CPU-only float32 with autocast and quantization disabled, deterministic
+algorithms enabled, zero data-loader workers, eight PyTorch intra-op threads,
+and one inter-op thread. Output labels are arrival-ordered `speaker_0` through
+`speaker_3`; a reference containing five or more speakers is retained as an
+explicit model-capacity skip rather than being dropped or forced into four
+labels. The model and NeMo runtime remain operator-installed and no weights are
+downloaded by `franken_whisper`.
 The full adapter protocol, environment overrides, privacy rules, and authority
 boundary are in the
 [`acoustic diarization contract`](docs/acoustic_diarization_contract.md#114-stage-aware-external-differential-oracles).
