@@ -23,8 +23,8 @@ The port is a conditional fit rather than an unconditional fit because:
 
 - the 117.7-million-parameter graph is a tier-2 port with a substantial
   FastConformer front end and stateful streaming overlay;
-- the custom speaker-cache compression, top-k selection, FIFO update, and
-  permutation semantics still require seam fixtures before implementation;
+- the custom speaker-cache compression, top-k selection, and FIFO update
+  semantics still require seam fixtures before implementation;
 - the custom NVIDIA Open Model License requires an explicit distribution
   policy; and
 - the current one-record nondeterminism pilot is not a complete oracle floor.
@@ -42,6 +42,9 @@ current production behavior unchanged.
 | `.nemo` bytes | `471367680` |
 | `.nemo` SHA-256 | `8abd32832159c6ac1148c926b7276f35ba34582c444e559dce1f1253fea42ef8` |
 | `model_config.yaml` SHA-256 | `2865d469c4d2aac54aa5b8a956b2423c053806dd20d5bf5d08675942a1acface` |
+| `model_weights.ckpt` bytes | `471352898` |
+| `model_weights.ckpt` SHA-256 | `eca9773c2dab91dd41fbaa4473cebb9d00811d67788ce2de609dadc6e499cdf4` |
+| Canonical 990-entry state inventory SHA-256 | `f4f219cf4ac6f755247b56d19e425db3d6a7c23c4509176549b363b63abdf532` |
 | NeMo source revision | `40ace43c7cf151af78dc22027c02feeca7e06b6a` |
 | Python | `3.12.12` |
 | NeMo package | `3.1.0+40ace43c7c` |
@@ -70,9 +73,20 @@ hashed:
 | `parts/submodules/conformer_modules.py` | `99bb846c51db028d6d30b3d844af22826068aeaa0e48eb586489a31a9cbacf9d` |
 | `parts/submodules/multi_head_attention.py` | `4999fd0d679fd7315ba275f7311fe6608c48e492bd337f2e220c99b8b9729c69` |
 | `parts/submodules/subsampling.py` | `4fbc689f3f66e4630b286196315a02b315ad53e8049c164fe40dd11168cf0834` |
+| `parts/submodules/causal_convs.py` | `7cf505c8caef44a37a7dec10b51eb2d60ec2f1efc3a2badc3c20c37e427cbd42` |
+| `parts/utils/vad_utils.py` | `7beb57efff5e08407f9f16afe9c0da7d0e2ddb9bd62e2a37424693e48c5f0437` |
+| `parts/mixins/diarization.py` | `5365e416ecab192cf59f1b9d6554ebce0ed3bdb2fee7575966ac1e3fca1a1408` |
+| `modules/transformer/transformer_utils.py` | `0af8d73b225bc3ebd58541a1e1cece468e79aac42590836803a8cbc765da7691` |
 
 These hashes identify the source semantics inspected for the port. They do not
 prove that arbitrary Python code or model bytes are trustworthy.
+
+The current oracle hard-pins only Python, NeMo, PyTorch, torchaudio, and NumPy.
+The observed transitive runtime also includes librosa 0.11.0, Lhotse 1.33.0,
+SoundFile 0.14.0, SciPy 1.18.0, OmegaConf 2.3.0, Hydra 1.3.2, and Lightning
+2.4.0. `bd-y4ip.10` must either bind all packages that influence an accepted
+seam or eliminate them from seam authority by exporting the exact intermediate
+tensors. A repeated version document alone does not close that gap.
 
 ## 3. License and artifact-distribution boundary
 
@@ -104,15 +118,19 @@ Pinned live-model introspection produced:
 | Census | Value |
 |---|---:|
 | Trainable parameters | 117,693,960 |
+| Parameter tensors | 937 |
 | State tensors | 990 |
 | State elements | 117,744,681 |
 | Float32 state tensors | 973 |
 | Int64 state tensors | 17 |
-| Float32 state bytes | 470,978,792 |
+| Float32 state elements | 117,744,664 |
+| Float32 state bytes | 470,978,656 |
+| Total state payload bytes | 470,978,792 |
 | Conformer layers | 17 |
 | Transformer blocks | 18 |
 | Linear modules | 266 |
 | Layer-normalization modules | 121 |
+| Dropout modules | 124 |
 | Conv1d modules | 34 |
 | Conv2d modules | 5 |
 | BatchNorm1d modules | 17 |
@@ -122,6 +140,12 @@ encoder elements, 8,007,552 transformer elements, 137,864 Sortformer-module
 elements, and 33,296 preprocessor elements. The f32 weights alone are about
 449 MiB. Peak process RSS and activation high-water marks are not inferred
 from that number; they remain measurement gates.
+
+The encoder also regenerates a non-persistent positional buffer
+`encoder.pos_enc.pe` with shape `[1, 9999, 512]`: 5,119,488 f32 values, about
+19.5 MiB. It is absent from `state_dict`. The converted package must either
+export its exact values or bind and test a deterministic Rust regeneration
+algorithm; silently omitting it from the census is not acceptable.
 
 The conversion receipt must enumerate every tensor and record, at minimum:
 
@@ -143,15 +167,26 @@ sufficient.
 ### 5.1 Input and frontend
 
 - mono 16 kHz finite PCM;
-- 25 ms Hann window, 10 ms hop, 512-point FFT;
+- signed 16-bit WAV decoding maps each sample to `sample / 32768.0`;
+- pre-emphasis preserves the first sample and then uses
+  `x[t] - 0.97 * x[t - 1]`;
+- constant center padding for STFT;
+- 400-sample non-periodic Hann window centered in a 512-point FFT, 160-sample
+  hop, 257 one-sided bins, and squared magnitude;
 - 128 log-mel features, frame splicing 1, no feature normalization;
-- archive dither value `1e-5`, but NeMo evaluation disables dither; and
+- the exact stored Slaney mel buffer with shape `[1, 128, 257]`;
+- natural logarithm after adding `2^-24`;
+- archive dither value `1e-5`, but diarization evaluation sets dither to zero
+  and `pad_to` to zero; and
 - batch size one, CPU float32, no autocast, no quantization.
 
 The first oracle seam is the exact framed log-mel tensor and its valid length.
-Window generation, padding, FFT normalization, mel-filter construction, log
-floor, and length rounding must be captured numerically rather than inferred
-from similarly named Whisper helpers.
+The effective valid-frame count is `floor(samples / 160)`: centered STFT
+creates one extra frame, but NeMo marks it invalid and the model crops to the
+declared length. The existing Whisper frontend is not reusable as-is because
+its window periodicity, padding, transform length, logarithm, clamping, and
+normalization semantics differ. Every frontend fact must still be captured by
+numeric fixtures rather than accepted from source inspection alone.
 
 ### 5.2 FastConformer encoder
 
@@ -162,6 +197,18 @@ from similarly named Whisper helpers.
 - convolution kernel 9 with batch normalization; and
 - evaluation-mode dropout and stochastic-depth behavior.
 
+Subsampling is three symmetric stride-2 stages: a `1 -> 256` 3-by-3 Conv2d,
+then two grouped depthwise 3-by-3 stages with pointwise `256 -> 256`
+convolutions and ReLU after each stage. The result flattens `256 * 16 = 4096`
+coordinates before the `4096 -> 512` affine.
+
+Each Conformer block has two half-residual feed-forward modules,
+Transformer-XL relative attention, and a Swish convolution module. Despite its
+class name, the kernel-9 `CausalConv1D` receives integer padding 4 and is
+symmetric four-left/four-right in this graph. Relative attention uses learned
+`pos_bias_u` and `pos_bias_v`, a bias-free positional affine, relative shift,
+and division by `sqrt(64)`. The pinned graph does not use PyTorch SDPA.
+
 The port must reproduce the NeMo ordering of feed-forward, attention,
 convolution, residual, scaling, and normalization operations. Existing Whisper
 attention helpers are not accepted as evidence of equivalent conventions.
@@ -171,13 +218,17 @@ attention helpers are not accepted as evidence of equivalent conventions.
 - learned projection from 512 FastConformer coordinates to width 192;
 - 18 transformer blocks at width 192, inner width 768, eight heads;
 - ReLU feed-forward activation;
-- post-layer-normalization configuration with final layer normalization; and
+- post-layer-normalization inside each block, with no final transformer layer
+  normalization operation; and
 - four sigmoid speaker-activity outputs.
 
-The state contains the 512-to-192 `encoder_proj`, 192-to-192
-`first_hidden_to_hidden`, 192-to-4 `single_hidden_to_spks`, and 384-to-4
-`hidden_to_spks` affine parameters. Exact selection and concatenation behavior
-must be bound by the head seam fixtures before Rust code claims parity.
+Transformer attention uses eight 24-dimensional heads, divides both Q and K
+by `sqrt(sqrt(24))`, and adds `-10000` for padded positions rather than
+negative infinity. The inference head is exactly ReLU, evaluation-identity
+dropout, `192 -> 192`, ReLU, evaluation-identity dropout, `192 -> 4`, then
+sigmoid. The checkpoint's `384 -> 4` `hidden_to_spks` tensor is dead in the
+accepted inference path. It remains in the complete conversion receipt but
+must not be wired into the Rust graph by name intuition.
 
 ### 5.4 Streaming state machine
 
@@ -204,31 +255,53 @@ min(max(configured_update, chunk - fifo_capacity + current_fifo),
 ```
 
 This moves 300 frames for the first full chunk with an empty FIFO, leaves 40
-queued, and moves 340 frames in steady state. Tail behavior is a required seam,
-not an extrapolation.
+queued, immediately compresses the 300-frame cache to 188, and moves 340 frames
+in steady state. An interior chunk includes 381 pre-encoding frames; with a
+full cache and FIFO, the recurrent encoder sequence can reach
+`188 + 40 + 381 = 609` frames. Tail behavior is a required seam, not an
+extrapolation.
 
 The Rust state must explicitly own speaker-cache embeddings and predictions,
 their lengths, FIFO embeddings and predictions, FIFO lengths, mean-silence
-embedding, silence-frame count, and the active speaker permutation. Cache
+embedding, silence-frame count, and the optional permutation field. Cache
 compression uses prediction-derived scores, speaker-specific score boosts,
 reserved silence frames, top-k selection, chronological reordering, disabled
-placeholder handling, gathering, and permutation propagation. Top-k ties and
-sort stability are oracle questions until frozen fixtures answer them.
+placeholder handling, and gathering. Top-k ties and sort stability are oracle
+questions until frozen fixtures answer them.
+
+The state type includes an optional speaker-permutation field. Speaker
+permutation is training-only in the pinned path. Evaluation passes
+`permute_spk = false`, so the accepted inference state has no active
+`spk_perm`. The Rust reference must reproduce that absence; later training or
+adaptation support would be a different contract.
 
 ### 5.5 Post-processing and capacity
 
 - at most four contiguous arrival-ordered labels `speaker_0` through
   `speaker_3`;
-- activity threshold, onset, and offset are 0.5 for the final turn path;
+- each 80 ms probability is repeated eight times onto a 10 ms grid;
+- onset and offset are 0.5; onset uses strict `>` and offset strict `<`, so an
+  exact equality preserves the current state;
 - onset/offset padding and minimum on/off durations are zero;
-- turns are aligned to 80 ms, except the final end may equal document duration;
+- an activity lane still open at the end uses the final 10 ms sample index as
+  its endpoint, creating a one-frame-short source convention before adapter
+  clipping and validation;
+- the adapter relabels non-empty lanes by first onset and clips a terminal end
+  that exceeds document duration by at most the accepted 79 ms tolerance;
+- accepted turns are aligned to 80 ms, except the final end may equal document
+  duration;
 - overlap is represented by concurrent labeled turns, not an overlap flag; and
 - speech, overlap, and speaker-change stages are derived exactly from the final
   turns.
 
-A request or reference requiring more than four speakers is capacity-ineligible
-for this model. Product routing must select the existing native path rather
-than clamp, drop, or merge speakers to satisfy the model.
+A request or reference known to require more than four speakers is
+capacity-ineligible for this model. Product routing must select the existing
+native path rather than clamp, drop, or merge speakers to satisfy the model.
+The model itself cannot determine that an otherwise unconstrained recording
+actually contains five or more speakers: it can only activate zero through
+four lanes. Unknown-capacity production inputs therefore require a separate
+capacity sentinel or a candid capped-output status before this route can be
+certified.
 
 Known timestamp intervals do not change the neural forward pass during parity
 work. A later product adapter may use them as hard or soft constraints when
@@ -253,7 +326,7 @@ mask contract is proven at a seam.
 | Transformer attention | safe model-specific composition first | per-block Q/K/V and output seams |
 | ReLU / Swish / sigmoid | safe reference, then general kernel | special values and full-tensor drift |
 | Softmax and masks | FrankenTorch only after mask equivalence | fully masked, tail, and long-context cases |
-| Top-k, stable sort, gather, permutation | safe Rust model logic | tie, placeholder, disabled, and permutation fixtures |
+| Top-k, stable sort, gather, optional permutation | safe Rust model logic | tie, placeholder, disabled, and eval-absence fixtures |
 | Cache/FIFO mutation | safe Rust bounded state machine | empty, first-full, steady, tail, and cancellation fixtures |
 | Log-mel frontend | exact Sortformer-specific reference | frame count plus per-stage tensor parity |
 
@@ -263,6 +336,12 @@ hot path. Quantization and fusion belong to `bd-y4ip.12`, not the reference
 implementation.
 
 ## 7. Oracle floor pilot
+
+The current external adapter emits only the final discrete stage document. It
+does not expose probabilities or intermediate activations and is therefore not
+an L1-L6 parity oracle. `bd-y4ip.10` needs a separate identity-bound,
+public-input activation exporter whose tensor names, shapes, dtypes, and bytes
+are included in the conversion and evidence contract.
 
 The pinned f32 CPU model was run twice with one PyTorch intra-op thread and
 twice with eight intra-op threads on one public 53.603313-second input whose
@@ -298,7 +377,7 @@ or excuse a failed earlier level.
 | L3 FastConformer | Input/output and selected internals for all 17 blocks |
 | L4 Projection and transformer | Projection plus all 18 transformer blocks |
 | L5 Head | Four sigmoid activity probabilities before streaming mutation |
-| L6 Streaming state | Every cache/FIFO tensor, length, selection, and permutation transition |
+| L6 Streaming state | Every cache/FIFO tensor, length, selection, and proof that permutation remains absent in eval |
 | L7 Discrete activity | Thresholded speaker activity under the frozen output geometry |
 | L8 Final document | Arrival labels, turns, speech, overlap, and changes pass the strict existing validator |
 | L9 Public task behavior | DER/JER/count/overlap/calibration on frozen development and sealed test rows |
@@ -318,20 +397,24 @@ insufficient.
 | OQ-02 | Exact STFT padding, mel floor, and length rounding | Open for numeric fixture | L1 |
 | OQ-03 | Depthwise subsampling padding and layout at tails | Open for numeric fixture | L2 |
 | OQ-04 | Exact relative-position attention equations, masks, and scaling | Open for numeric fixture | L3 |
-| OQ-05 | Exact head branch/concatenation selection | Open for numeric fixture | L5 |
+| OQ-05 | Exact inference head branch | Resolved from pinned source; numeric fixture required | L5 |
 | OQ-06 | Top-k tie behavior and chronological reordering | Open for numeric fixture | L6 |
 | OQ-07 | First, steady, and partial-tail cache mutation | Partially source-resolved; fixtures required | L6 |
-| OQ-08 | Speaker permutation propagation across cache refresh | Open for numeric fixture | L6 |
+| OQ-08 | Speaker permutation during accepted inference | Resolved: disabled and absent in eval | L6 |
 | OQ-09 | Converted package tensor map and transforms | Open until conversion receipt | L0 |
 | OQ-10 | Cross-input and cross-thread oracle variability | Pilot only | L1-L8 |
 | OQ-11 | Model bytes in repository or releases | Resolved: forbidden for initial route | L0 |
-| OQ-12 | More than four speakers | Resolved: deterministic native fallback | L8-L9 |
+| OQ-12 | Known requirement above four speakers | Resolved: deterministic native fallback | L8-L9 |
 | OQ-13 | Known timestamp intervals during parity | Resolved: post-forward mapping only | L9 |
 | OQ-14 | Other operating systems and CPU feature tiers | Open; require separate runtime rows | L10 |
+| OQ-15 | Frontend/postprocessing transitive runtime identity | Open: pin it or remove it from seam authority | L0-L1 |
+| OQ-16 | Unknown recording actually contains more than four speakers | Open: capacity sentinel or capped status | L9 |
+| OQ-17 | Activity still open at the final 10 ms sample versus strict 80 ms output validation | Open: tail fixtures and one canonical rule | L7-L8 |
 
-OQ-02 through OQ-10 can invalidate graph correctness and block the f32
-implementation gate. OQ-14 does not block same-host parity but blocks a broad
-cross-platform support claim.
+OQ-02 through OQ-07, OQ-09, OQ-10, and OQ-15 can invalidate graph correctness
+and block the f32 implementation gate. OQ-17 blocks final discrete parity.
+OQ-14 does not block same-host parity but blocks a broad cross-platform support
+claim.
 
 ## 10. Implementation slices
 
