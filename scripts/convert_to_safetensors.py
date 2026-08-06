@@ -580,11 +580,18 @@ def _build_sortformer_state(
         weights_only=True,
     )
     checkpoint_bytes = b""
-    if not isinstance(checkpoint, dict) or not isinstance(
-        checkpoint.get("state_dict"), dict
-    ):
+    if not isinstance(checkpoint, dict):
         raise RuntimeError(f"{SORTFORMER_PROFILE} checkpoint state_dict is absent")
-    state_source = checkpoint["state_dict"]
+    nested_state = checkpoint.get("state_dict")
+    if isinstance(nested_state, dict):
+        state_source = nested_state
+    elif checkpoint and all(
+        isinstance(name, str) and isinstance(tensor, torch.Tensor)
+        for name, tensor in checkpoint.items()
+    ):
+        state_source = checkpoint
+    else:
+        raise RuntimeError(f"{SORTFORMER_PROFILE} checkpoint state_dict is absent")
     model.load_state_dict(state_source, strict=True, assign=True)
     checkpoint = None
     state_source = None
@@ -1011,8 +1018,13 @@ def main() -> int:
         args.profile in (ECAPA_PROFILE, SORTFORMER_PROFILE)
         and sys.version_info[:3] != REQUIRED_PYTHON_VERSION
     ):
+        frozen_profile = (
+            SORTFORMER_PROFILE
+            if args.profile == SORTFORMER_PROFILE
+            else ECAPA_PROFILE
+        )
         print(
-            f"error: {ECAPA_PROFILE} requires Python {REQUIRED_PYTHON_VERSION_TEXT} "
+            f"error: {frozen_profile} requires Python {REQUIRED_PYTHON_VERSION_TEXT} "
             f"(got {sys.version_info.major}.{sys.version_info.minor}."
             f"{sys.version_info.micro})",
             file=sys.stderr,

@@ -2,9 +2,9 @@
 //!
 //! This module does not run the model and does not admit a production route.
 //! It authenticates an operator-local, non-executable safetensors conversion
-//! against an independently reviewed canonical receipt. The caller supplies
-//! the expected receipt SHA-256 as the trust root; a digest computed from the
-//! same untrusted receipt is not authority.
+//! against an independently reviewed canonical receipt. Production admission
+//! uses compiled converter, topology-manifest, receipt, and package trust
+//! roots; arbitrary caller-supplied digests are not an admissible authority.
 
 #![forbid(unsafe_code)]
 
@@ -23,11 +23,16 @@ use crate::native_engine::weights::SafetensorsFile;
 pub use crate::differential_oracle::SORTFORMER_ORACLE_ADAPTER_SHA256;
 
 pub const SORTFORMER_RECEIPT_SCHEMA: &str = "franken-whisper-sortformer-conversion-receipt-v1";
-/// Receipt schema label only. It is not a code identity; converter code is
-/// bound by the receipt's source digest and the independently reviewed receipt
-/// digest supplied to the loader.
+pub const SORTFORMER_TENSOR_MANIFEST_SCHEMA: &str =
+    "franken-whisper-sortformer-tensor-manifest-v1";
+/// Receipt schema label only. The compiled converter-source and canonical
+/// receipt digests below are the executable and instance trust roots.
 pub const SORTFORMER_CONVERTER_ID: &str = "franken-whisper-native-sortformer-converter";
 pub const SORTFORMER_CONVERTER_VERSION: &str = "1";
+pub const SORTFORMER_CONVERTER_SOURCE_SHA256: &str =
+    "a85431fa6d609c6a8bc5607e108326fcd9b0dd280370302f9064f5c68fce0357";
+pub const SORTFORMER_CONVERSION_RECEIPT_SHA256: &str =
+    "1f4129f65d846647a25dca16590c1fc39e466ca317a6bad39cd5428809fbf052";
 pub const SORTFORMER_MODEL_ID: &str = "nvidia/diar_streaming_sortformer_4spk-v2.1";
 pub const SORTFORMER_MODEL_REVISION: &str = "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d";
 pub const SORTFORMER_NEMO_BYTES: u64 = 471_367_680;
@@ -40,6 +45,8 @@ pub const SORTFORMER_CHECKPOINT_SHA256: &str =
     "eca9773c2dab91dd41fbaa4473cebb9d00811d67788ce2de609dadc6e499cdf4";
 pub const SORTFORMER_STATE_INVENTORY_SHA256: &str =
     "f4f219cf4ac6f755247b56d19e425db3d6a7c23c4509176549b363b63abdf532";
+pub const SORTFORMER_TENSOR_MANIFEST_SHA256: &str =
+    "2c32b0b9e48bb296e66615b038827d0fdde4b4fda2ce044a6c30cd317456c8d7";
 pub const SORTFORMER_NEMO_SOURCE_REVISION: &str = "40ace43c7cf151af78dc22027c02feeca7e06b6a";
 pub const SORTFORMER_EXTERNAL_CONTRACT_SHA256: &str =
     "7ac048e3372fe4c622840beddfbeef42944d961408360324cb7276a69c8542c5";
@@ -59,6 +66,9 @@ pub const SORTFORMER_EXPORTED_TENSORS: u64 = 974;
 pub const SORTFORMER_DROPPED_TENSORS: u64 = 18;
 pub const SORTFORMER_PACKAGE_F32_ELEMENTS: u64 = 122_864_152;
 pub const SORTFORMER_PACKAGE_PAYLOAD_BYTES: u64 = 491_456_608;
+pub const SORTFORMER_PACKAGE_BYTES: u64 = 491_570_584;
+pub const SORTFORMER_PACKAGE_SHA256: &str =
+    "487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a";
 
 pub const SORTFORMER_POSITION_TENSOR: &str = "encoder.pos_enc.pe";
 pub const SORTFORMER_DTYPE_SENTINEL: &str = "preprocessor.dtype_sentinel_tensor";
@@ -128,6 +138,7 @@ pub struct SortformerModelIdentity {
     pub checkpoint_bytes: u64,
     pub checkpoint_sha256: String,
     pub state_inventory_sha256: String,
+    pub tensor_manifest_sha256: String,
     pub nemo_source_revision: String,
     pub external_contract_sha256: String,
     pub runtime_fingerprint_sha256: String,
@@ -301,22 +312,15 @@ impl VerifiedSortformerPackage {
     }
 }
 
-/// Authenticate the frozen pinned-model census using an independently supplied
-/// canonical-receipt digest.
-///
-/// `expected_receipt_sha256` must come from independent conversion review. A
-/// caller that hashes the untrusted `receipt_path` and passes that result here
-/// has not established authenticity. There is deliberately no production
-/// overload that omits this required trust root.
+/// Authenticate the frozen pinned-model census using the compiled, independently
+/// reviewed canonical-receipt digest.
 pub fn load_verified_sortformer_package(
     receipt_path: &Path,
     package_path: &Path,
-    expected_receipt_sha256: &str,
 ) -> FwResult<VerifiedSortformerPackage> {
     load_verified_sortformer_package_with_checkpoint(
         receipt_path,
         package_path,
-        expected_receipt_sha256,
         &|| Ok(()),
     )
 }
@@ -327,13 +331,12 @@ pub fn load_verified_sortformer_package(
 pub fn load_verified_sortformer_package_with_checkpoint(
     receipt_path: &Path,
     package_path: &Path,
-    expected_receipt_sha256: &str,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<VerifiedSortformerPackage> {
     load_verified_sortformer_package_against(
         receipt_path,
         package_path,
-        expected_receipt_sha256,
+        SORTFORMER_CONVERSION_RECEIPT_SHA256,
         checkpoint,
         &pinned_model_expectations(),
     )
@@ -343,10 +346,9 @@ pub fn load_verified_sortformer_package_with_checkpoint(
 struct ReceiptExpectations {
     model: SortformerModelIdentity,
     execution: SortformerExecutionConfig,
-    /// `None` until a real converter implementation receives an independent
-    /// source review. The mandatory reviewed receipt digest still binds the
-    /// converter-source digest in every accepted receipt.
-    converter_source_sha256: Option<String>,
+    converter_source_sha256: String,
+    package_sha256: String,
+    package_bytes: u64,
     source_files: Vec<SortformerSourceFileIdentity>,
     runtime: SortformerRuntimeIdentity,
     license: SortformerLicenseIdentity,
@@ -373,7 +375,9 @@ fn pinned_model_expectations() -> ReceiptExpectations {
     ReceiptExpectations {
         model: frozen_model_identity(),
         execution: frozen_execution_config(),
-        converter_source_sha256: None,
+        converter_source_sha256: SORTFORMER_CONVERTER_SOURCE_SHA256.to_owned(),
+        package_sha256: SORTFORMER_PACKAGE_SHA256.to_owned(),
+        package_bytes: SORTFORMER_PACKAGE_BYTES,
         source_files: frozen_source_files(),
         runtime: frozen_runtime_identity(),
         license: frozen_license_identity(),
@@ -416,6 +420,7 @@ fn frozen_model_identity() -> SortformerModelIdentity {
         checkpoint_bytes: SORTFORMER_CHECKPOINT_BYTES,
         checkpoint_sha256: SORTFORMER_CHECKPOINT_SHA256.to_owned(),
         state_inventory_sha256: SORTFORMER_STATE_INVENTORY_SHA256.to_owned(),
+        tensor_manifest_sha256: SORTFORMER_TENSOR_MANIFEST_SHA256.to_owned(),
         nemo_source_revision: SORTFORMER_NEMO_SOURCE_REVISION.to_owned(),
         external_contract_sha256: SORTFORMER_EXTERNAL_CONTRACT_SHA256.to_owned(),
         runtime_fingerprint_sha256: SORTFORMER_RUNTIME_FINGERPRINT_SHA256.to_owned(),
@@ -766,9 +771,7 @@ fn verify_receipt(
         ));
     }
     require_sha256("converter_identity", &receipt.converter.source_sha256)?;
-    if let Some(expected_converter_sha256) = &expected.converter_source_sha256
-        && receipt.converter.source_sha256 != *expected_converter_sha256
-    {
+    if receipt.converter.source_sha256 != expected.converter_source_sha256 {
         return Err(sortformer_error(
             "converter_identity",
             "converter source checksum does not match the independently frozen converter",
@@ -795,7 +798,9 @@ fn verify_package_identity(
     expected: &ReceiptExpectations,
 ) -> FwResult<()> {
     require_sha256("package_identity", &package.sha256)?;
-    if package.format != PACKAGE_FORMAT
+    if package.sha256 != expected.package_sha256
+        || package.bytes != expected.package_bytes
+        || package.format != PACKAGE_FORMAT
         || package.payload_bytes != expected.package_payload_bytes
         || package.f32_elements != expected.package_f32_elements
         || package.tensor_count != expected.exported_tensors
@@ -969,6 +974,13 @@ fn verify_records(
         return Err(sortformer_error(
             "destination_census",
             "exported destination names are not a unique complete census",
+        ));
+    }
+    let observed_manifest_sha256 = tensor_manifest_sha256(&expected.model, records)?;
+    if observed_manifest_sha256 != expected.model.tensor_manifest_sha256 {
+        return Err(sortformer_error(
+            "tensor_manifest",
+            "conversion records do not match the frozen exact tensor topology",
         ));
     }
     Ok(())
