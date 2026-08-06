@@ -20,11 +20,12 @@ use crate::diarization::{
 };
 use crate::differential_oracle::{
     DifferentialAuthority, DifferentialExecutionStage, DifferentialOracleFamily,
-    DifferentialOracleTool, DifferentialSkipReason, SORTFORMER_ORACLE_ADAPTER_VERSION,
-    SORTFORMER_ORACLE_CONTRACT_SHA256, SORTFORMER_ORACLE_MAX_SPEAKERS,
-    SORTFORMER_ORACLE_OUTPUT_FRAME_MS, SORTFORMER_ORACLE_TOOL_VERSION,
-    SortformerObservationOutcome, SortformerObservationProvenance, SortformerObservationRequest,
-    run_sortformer_observation_with_cancel, sortformer_oracle_contract,
+    DifferentialOracleTool, DifferentialSkipReason, SORTFORMER_ORACLE_ADAPTER_SHA256,
+    SORTFORMER_ORACLE_ADAPTER_VERSION, SORTFORMER_ORACLE_CONTRACT_SHA256,
+    SORTFORMER_ORACLE_MAX_SPEAKERS, SORTFORMER_ORACLE_OUTPUT_FRAME_MS,
+    SORTFORMER_ORACLE_TOOL_VERSION, SortformerObservationOutcome, SortformerObservationProvenance,
+    SortformerObservationRequest, run_sortformer_observation_with_cancel,
+    sortformer_oracle_contract,
 };
 use crate::ecapa_conformance::{
     ECAPA_CONTRACT_SHA256, ECAPA_PACKAGE_FILENAME, ECAPA_PACKAGE_SHA256,
@@ -1506,7 +1507,7 @@ where
                 ));
             }
             cancellation_checkpoint(is_cancelled)?;
-            let token = CancellationToken::unbounded();
+            let cancellation = CancellationToken::unbounded();
             let observation = run_sortformer_observation_with_cancel(
                 SortformerObservationRequest {
                     audio_path,
@@ -1515,7 +1516,7 @@ where
                     recording_key: audio_sha256,
                     hard_timeout: sortformer_hard_timeout,
                 },
-                &token,
+                &cancellation,
                 is_cancelled,
             );
             cancellation_checkpoint(is_cancelled)?;
@@ -1702,6 +1703,10 @@ fn sortformer_runtime_identity(
             .model_contract_sha256
             .as_deref()
             .is_some_and(|value| value != SORTFORMER_ORACLE_CONTRACT_SHA256)
+        || provenance
+            .executable_sha256
+            .as_deref()
+            .is_some_and(|value| value != SORTFORMER_ORACLE_ADAPTER_SHA256)
     {
         return Err(model_comparison_error(
             "sortformer_runtime_identity",
@@ -2018,6 +2023,7 @@ fn validate_sortformer_runtime_identity(
         || identity.model_contract_sha256 != SORTFORMER_ORACLE_CONTRACT_SHA256
         || identity.model_artifact_sha256 != contract.upstream_artifact_sha256
         || identity.model_artifact_bytes != contract.upstream_artifact_bytes
+        || identity.executable_sha256 != SORTFORMER_ORACLE_ADAPTER_SHA256
         || hash_fields
             .into_iter()
             .any(|value| !super::is_sha256_hex(value))
@@ -3127,6 +3133,33 @@ mod tests {
             .failed_by_code
             .insert(ModelComparisonOutcomeCode::SortformerExecutionFailed, 1);
         assert!(!sortformer_runtime_identity_required(&execution_failed));
+    }
+
+    #[test]
+    fn retained_sortformer_identity_requires_the_frozen_adapter_executable() {
+        let contract = sortformer_oracle_contract();
+        let mut identity = ModelComparisonExternalRuntimeIdentity {
+            protocol_version: crate::differential_oracle::DIFFERENTIAL_ORACLE_PROTOCOL_VERSION
+                .to_owned(),
+            authority: "diagnostic_only".to_owned(),
+            tool_version: SORTFORMER_ORACLE_TOOL_VERSION.to_owned(),
+            adapter_version: SORTFORMER_ORACLE_ADAPTER_VERSION.to_owned(),
+            model_id: contract.model_id,
+            model_revision: contract.model_revision,
+            upstream_license: contract.upstream_license,
+            model_contract_sha256: SORTFORMER_ORACLE_CONTRACT_SHA256.to_owned(),
+            model_artifact_sha256: contract.upstream_artifact_sha256,
+            model_artifact_bytes: contract.upstream_artifact_bytes,
+            runtime_fingerprint_sha256: "11".repeat(32),
+            executable_sha256: SORTFORMER_ORACLE_ADAPTER_SHA256.to_owned(),
+            version_stdout_sha256: "22".repeat(32),
+        };
+        validate_sortformer_runtime_identity(&identity).expect("pinned runtime identity");
+
+        identity.executable_sha256 = "33".repeat(32);
+        let error = validate_sortformer_runtime_identity(&identity)
+            .expect_err("syntactically valid but unfrozen adapter digest must fail");
+        assert!(error.to_string().contains("sortformer_runtime_identity"));
     }
 
     #[test]

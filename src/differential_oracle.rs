@@ -52,6 +52,11 @@ pub const SORTFORMER_ORACLE_OUTPUT_FRAME_MS: u32 = 80;
 pub const SORTFORMER_AUDIO_DURATION_TOLERANCE_MS: u32 = 79;
 /// Exact operator adapter version accepted by the frozen contract.
 pub const SORTFORMER_ORACLE_ADAPTER_VERSION: &str = "franken-whisper-sortformer-oracle-v2";
+/// SHA-256 of the exact operator adapter executable admitted to oracle-floor
+/// and activation-seam evidence. Self-reported version strings are not an
+/// executable identity.
+pub const SORTFORMER_ORACLE_ADAPTER_SHA256: &str =
+    "8f376c979b7eaca41dc0a438d9aaa41c1c723052b97c45eb2acc59b6d6f00bde";
 /// Pinned NeMo Speech source revision expected behind the operator adapter.
 pub const SORTFORMER_ORACLE_TOOL_VERSION: &str =
     "nemo-speech-40ace43c7cf151af78dc22027c02feeca7e06b6a";
@@ -760,7 +765,6 @@ struct ProgramSpec {
     prefix_args: Vec<String>,
 }
 
-#[derive(Debug)]
 struct PreparedInputs {
     audio_path: PathBuf,
     native: DifferentialStageDocument,
@@ -839,7 +843,13 @@ pub(crate) fn run_sortformer_observation_with_cancel(
     is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> FwResult<SortformerObservationOutcome> {
     let program = resolve_program(DifferentialOracleTool::Sortformer);
-    run_sortformer_observation_with_program_and_probe(request, &program, token, Some(is_cancelled))
+    run_sortformer_observation_with_program_and_probe(
+        request,
+        &program,
+        token,
+        Some(is_cancelled),
+        Some(SORTFORMER_ORACLE_ADAPTER_SHA256),
+    )
 }
 
 #[cfg(test)]
@@ -848,7 +858,7 @@ fn run_sortformer_observation_with_program(
     program: &ProgramSpec,
     token: &CancellationToken,
 ) -> FwResult<SortformerObservationOutcome> {
-    run_sortformer_observation_with_program_and_probe(request, program, token, None)
+    run_sortformer_observation_with_program_and_probe(request, program, token, None, None)
 }
 
 fn run_sortformer_observation_with_program_and_probe(
@@ -856,6 +866,7 @@ fn run_sortformer_observation_with_program_and_probe(
     program: &ProgramSpec,
     token: &CancellationToken,
     additional_cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    expected_executable_sha256: Option<&str>,
 ) -> FwResult<SortformerObservationOutcome> {
     validate_sortformer_observation_request(&request, token)?;
     let external = execute_external(
@@ -866,7 +877,8 @@ fn run_sortformer_observation_with_program_and_probe(
         request.expected_duration_ms,
         request.recording_key,
         ExternalRunLimits::new(request.hard_timeout, token)
-            .with_additional_cancel(additional_cancel),
+            .with_additional_cancel(additional_cancel)
+            .with_expected_executable_sha256(expected_executable_sha256),
     );
     match external {
         Ok(success) => {
@@ -1102,6 +1114,9 @@ fn build_report(
             result_sha256: String::new(),
         });
     }
+    let limits = ExternalRunLimits::new(hard_timeout, token).with_expected_executable_sha256(
+        (tool == DifferentialOracleTool::Sortformer).then_some(SORTFORMER_ORACLE_ADAPTER_SHA256),
+    );
     let external = execute_external(
         tool,
         program,
@@ -1109,7 +1124,7 @@ fn build_report(
         &prepared.audio_sha256,
         prepared.native.duration_ms,
         &prepared.native.recording_key,
-        ExternalRunLimits::new(hard_timeout, token),
+        limits,
     );
     let comparison_config_sha256 = canonical_sha256(&comparison_config)?;
     match external {
@@ -1314,6 +1329,15 @@ pub fn verify_differential_report(report: &DifferentialOracleReport) -> FwResult
         return Err(oracle_request_error(
             "report_provenance",
             "tool and adapter version attestations must appear together",
+        ));
+    }
+    if report.provenance.tool == DifferentialOracleTool::Sortformer
+        && has_version_attestation
+        && report.provenance.executable_sha256.as_deref() != Some(SORTFORMER_ORACLE_ADAPTER_SHA256)
+    {
+        return Err(oracle_request_error(
+            "report_executable_identity",
+            "version-attested Sortformer provenance is not bound to the frozen adapter executable",
         ));
     }
     let has_model_attestation = report.provenance.model_contract_sha256.is_some()
@@ -1542,7 +1566,10 @@ fn validate_skipped_report_provenance(report: &DifferentialOracleReport) -> FwRe
                 && !has_oracle_stdout
         }
         DifferentialExecutionStage::HashExecutable => {
-            !has_executable && !has_version && !has_version_stdout && !has_oracle_stdout
+            has_executable == (reason == DifferentialSkipReason::ExecutableIdentityMismatch)
+                && !has_version
+                && !has_version_stdout
+                && !has_oracle_stdout
         }
         DifferentialExecutionStage::InputValidation => {
             has_executable && !has_version && !has_version_stdout && !has_oracle_stdout
@@ -1581,6 +1608,7 @@ struct ExternalRunLimits<'a> {
     hard_timeout: Duration,
     token: &'a CancellationToken,
     additional_cancel: Option<&'a (dyn Fn() -> bool + Sync)>,
+    expected_executable_sha256: Option<&'a str>,
 }
 
 impl<'a> ExternalRunLimits<'a> {
@@ -1589,6 +1617,7 @@ impl<'a> ExternalRunLimits<'a> {
             hard_timeout,
             token,
             additional_cancel: None,
+            expected_executable_sha256: None,
         }
     }
 
@@ -1597,6 +1626,14 @@ impl<'a> ExternalRunLimits<'a> {
         additional_cancel: Option<&'a (dyn Fn() -> bool + Sync)>,
     ) -> Self {
         self.additional_cancel = additional_cancel;
+        self
+    }
+
+    const fn with_expected_executable_sha256(
+        mut self,
+        expected_executable_sha256: Option<&'a str>,
+    ) -> Self {
+        self.expected_executable_sha256 = expected_executable_sha256;
         self
     }
 }
@@ -1614,6 +1651,7 @@ fn execute_external(
         hard_timeout,
         token,
         additional_cancel,
+        expected_executable_sha256,
     } = limits;
     token.checkpoint().map_err(ExternalRunError::Cancelled)?;
     let executable_path = which::which(&program.program).map_err(|_| {
@@ -1624,6 +1662,15 @@ fn execute_external(
     })?;
     let executable_sha256 = hash_file(&executable_path, token)
         .map_err(|error| classify_hash_error(error, DifferentialExecutionStage::HashExecutable))?;
+    if expected_executable_sha256.is_some_and(|expected| expected != executable_sha256) {
+        return Err(ExternalRunError::Skipped(
+            ExternalSkip::new(
+                DifferentialSkipReason::ExecutableIdentityMismatch,
+                DifferentialExecutionStage::HashExecutable,
+            )
+            .with_executable(&executable_sha256),
+        ));
+    }
     let executable_program = executable_path.to_str().ok_or_else(|| {
         ExternalRunError::Skipped(
             ExternalSkip::new(
@@ -1975,16 +2022,19 @@ fn validate_executable_identity(
         Err(error @ FwError::Cancelled(_)) => return Err(ExternalRunError::Cancelled(error)),
         Err(_) => {
             return Err(ExternalRunError::Skipped(ExternalSkip::new(
-                DifferentialSkipReason::ExecutableIdentityMismatch,
+                DifferentialSkipReason::UnreadableExecutable,
                 DifferentialExecutionStage::HashExecutable,
             )));
         }
     };
     if observed != expected_sha256 {
-        return Err(ExternalRunError::Skipped(ExternalSkip::new(
-            DifferentialSkipReason::ExecutableIdentityMismatch,
-            DifferentialExecutionStage::HashExecutable,
-        )));
+        return Err(ExternalRunError::Skipped(
+            ExternalSkip::new(
+                DifferentialSkipReason::ExecutableIdentityMismatch,
+                DifferentialExecutionStage::HashExecutable,
+            )
+            .with_executable(&observed),
+        ));
     }
     Ok(())
 }
@@ -4461,16 +4511,16 @@ mod tests {
         let audio = audio.canonicalize().expect("canonical audio path");
         let audio_sha256 = test_audio_sha256(&audio);
         let outcome = run_sortformer_observation_with_program(
-            sortformer_observation_request(&audio, &audio_sha256, Duration::from_secs(1)),
+            sortformer_observation_request(&audio, &audio_sha256, Duration::from_secs(5)),
             &successful_shell_program(DifferentialOracleTool::Sortformer, &sortformer_document()),
             &CancellationToken::no_deadline(),
         )
         .expect("completed observation");
 
-        assert!(matches!(
-            &outcome,
-            SortformerObservationOutcome::Completed { .. }
-        ));
+        assert!(
+            matches!(&outcome, SortformerObservationOutcome::Completed { .. }),
+            "unexpected observation outcome: {outcome:?}"
+        );
         let path_text = audio.to_string_lossy();
         if let SortformerObservationOutcome::Completed {
             document,
@@ -4559,7 +4609,7 @@ mod tests {
         ));
 
         let slow_program = shell_program(format!(
-            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else sleep 2; fi"
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else while :; do :; done; fi"
         ));
         let timed_out = run_sortformer_observation_with_program(
             sortformer_observation_request(&audio, &audio_sha256, Duration::from_millis(20)),
@@ -4567,14 +4617,17 @@ mod tests {
             &CancellationToken::no_deadline(),
         )
         .expect("timeout is a skip");
-        assert!(matches!(
-            timed_out,
-            SortformerObservationOutcome::Skipped {
-                reason: DifferentialSkipReason::OracleRunTimedOut,
-                stage: DifferentialExecutionStage::OracleRun,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                &timed_out,
+                SortformerObservationOutcome::Skipped {
+                    reason: DifferentialSkipReason::OracleRunTimedOut,
+                    stage: DifferentialExecutionStage::OracleRun,
+                    ..
+                }
+            ),
+            "unexpected timeout outcome: {timed_out:?}"
+        );
     }
 
     #[test]
@@ -4663,6 +4716,71 @@ mod tests {
             error,
             ExternalRunError::Skipped(ExternalSkip {
                 reason: DifferentialSkipReason::InvalidVersionOutput,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn expected_executable_digest_fails_closed_before_adapter_self_report() {
+        let expected = "0000000000000000000000000000000000000000000000000000000000000000";
+        let error = execute_external(
+            DifferentialOracleTool::Sortformer,
+            &shell_program("exit 0".to_owned()),
+            Path::new("/dev/null"),
+            &bytes_sha256(b""),
+            2_000,
+            KEY,
+            ExternalRunLimits::new(Duration::from_secs(1), &CancellationToken::no_deadline())
+                .with_expected_executable_sha256(Some(expected)),
+        )
+        .expect_err("an unpinned adapter executable must be rejected before version probing");
+
+        assert!(matches!(
+            error,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::ExecutableIdentityMismatch,
+                stage: DifferentialExecutionStage::HashExecutable,
+                executable_sha256: Some(observed),
+                ..
+            }) if observed != expected
+        ));
+    }
+
+    #[test]
+    fn executable_recheck_retains_observed_mismatch_and_classifies_read_failure() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let executable = directory.path().join("adapter");
+        std::fs::write(&executable, b"changed adapter").expect("write adapter fixture");
+        let observed = bytes_sha256(b"changed adapter");
+        let mismatch = validate_executable_identity(
+            &executable,
+            &bytes_sha256(b"original adapter"),
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("changed executable must fail closed");
+        assert!(matches!(
+            mismatch,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::ExecutableIdentityMismatch,
+                stage: DifferentialExecutionStage::HashExecutable,
+                executable_sha256: Some(retained),
+                ..
+            }) if retained == observed
+        ));
+
+        let unreadable = validate_executable_identity(
+            &directory.path().join("missing-adapter"),
+            &observed,
+            &CancellationToken::no_deadline(),
+        )
+        .expect_err("missing executable cannot be rehashed");
+        assert!(matches!(
+            unreadable,
+            ExternalRunError::Skipped(ExternalSkip {
+                reason: DifferentialSkipReason::UnreadableExecutable,
+                stage: DifferentialExecutionStage::HashExecutable,
+                executable_sha256: None,
                 ..
             })
         ));
@@ -5013,28 +5131,45 @@ mod tests {
 
     #[test]
     fn sortformer_report_distinguishes_expected_and_validated_attestations() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let audio = directory.path().join("canonical.wav");
-        write_sortformer_audio(&audio);
-        let version = version_json(DifferentialOracleTool::Sortformer);
+        let version_json = version_json(DifferentialOracleTool::Sortformer);
+        let version: OracleVersionDocument =
+            serde_json::from_str(&version_json).expect("pinned version document");
         let prepared = PreparedInputs {
-            audio_path: audio.clone(),
+            audio_path: PathBuf::from("/not-retained-in-the-report.wav"),
             native: sortformer_document(),
             reference: None,
-            audio_sha256: test_audio_sha256(&audio),
+            audio_sha256: bytes_sha256(b"audio"),
             native_sha256: bytes_sha256(b"native"),
             reference_sha256: None,
         };
-        let report = build_report(
-            DifferentialOracleTool::Sortformer,
-            &shell_program(format!(
-                "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else exit 9; fi"
-            )),
-            &prepared,
-            Duration::from_secs(1),
-            DifferentialComparisonConfig::default(),
-            &CancellationToken::no_deadline(),
+        let skipped = ExternalSkip::new(
+            DifferentialSkipReason::OracleRunFailed,
+            DifferentialExecutionStage::OracleRun,
         )
+        .with_executable(SORTFORMER_ORACLE_ADAPTER_SHA256)
+        .with_valid_version(&version, &bytes_sha256(version_json.as_bytes()));
+        let comparison_config = DifferentialComparisonConfig::default();
+        let comparison_config_sha256 =
+            canonical_sha256(&comparison_config).expect("comparison configuration hash");
+        let report = finalize_report(DifferentialOracleReport {
+            schema_version: DIFFERENTIAL_REPORT_SCHEMA.to_owned(),
+            comparator_version: DIFFERENTIAL_COMPARATOR_VERSION.to_owned(),
+            authority: DifferentialAuthority::DiagnosticOnly,
+            native_incorrectness_claim_permitted: false,
+            status: DifferentialRunStatus::Skipped,
+            skip_reason: Some(skipped.reason),
+            failure_stage: Some(skipped.stage),
+            provenance: provenance_from_skip(
+                DifferentialOracleTool::Sortformer,
+                &prepared,
+                &skipped,
+            ),
+            comparison_config,
+            comparison_config_sha256,
+            comparisons: Vec::new(),
+            earliest_divergence: None,
+            result_sha256: String::new(),
+        })
         .expect("validated-version skip report");
         assert_eq!(
             report.skip_reason,
@@ -5061,9 +5196,54 @@ mod tests {
         );
         verify_differential_report(&report).expect("verified report");
 
-        let mut forged = report;
+        let mut forged = report.clone();
         forged.provenance.model_artifact_sha256 = Some(bytes_sha256(b"forged artifact"));
-        assert!(verify_differential_report(&forged).is_err());
+        forged.result_sha256.clear();
+        assert!(finalize_report(forged).is_err());
+
+        let mut forged = report;
+        forged.provenance.executable_sha256 = Some(bytes_sha256(b"unfrozen adapter"));
+        forged.result_sha256.clear();
+        assert!(finalize_report(forged).is_err());
+    }
+
+    #[test]
+    fn production_sortformer_report_retains_adapter_digest_mismatch() {
+        let prepared = PreparedInputs {
+            audio_path: PathBuf::from("/not-opened-before-adapter-admission.wav"),
+            native: sortformer_document(),
+            reference: None,
+            audio_sha256: bytes_sha256(b"audio"),
+            native_sha256: bytes_sha256(b"native"),
+            reference_sha256: None,
+        };
+        let report = build_report(
+            DifferentialOracleTool::Sortformer,
+            &shell_program("exit 0".to_owned()),
+            &prepared,
+            Duration::from_secs(1),
+            DifferentialComparisonConfig::default(),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("adapter mismatch must be retained as a stable skipped report");
+
+        assert_eq!(report.status, DifferentialRunStatus::Skipped);
+        assert_eq!(
+            report.skip_reason,
+            Some(DifferentialSkipReason::ExecutableIdentityMismatch)
+        );
+        assert_eq!(
+            report.failure_stage,
+            Some(DifferentialExecutionStage::HashExecutable)
+        );
+        assert!(
+            report
+                .provenance
+                .executable_sha256
+                .as_deref()
+                .is_some_and(|observed| observed != SORTFORMER_ORACLE_ADAPTER_SHA256)
+        );
+        verify_differential_report(&report).expect("verified mismatch report");
     }
 
     #[test]
@@ -5116,7 +5296,7 @@ mod tests {
         ));
 
         let slow = shell_program(format!(
-            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else sleep 60; fi"
+            "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else while :; do :; done; fi"
         ));
         let error = execute_external(
             DifferentialOracleTool::Pyannote,
@@ -5128,13 +5308,16 @@ mod tests {
             ExternalRunLimits::new(Duration::from_millis(40), &CancellationToken::no_deadline()),
         )
         .expect_err("timeout");
-        assert!(matches!(
-            error,
-            ExternalRunError::Skipped(ExternalSkip {
-                reason: DifferentialSkipReason::OracleRunTimedOut,
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                &error,
+                ExternalRunError::Skipped(ExternalSkip {
+                    reason: DifferentialSkipReason::OracleRunTimedOut,
+                    ..
+                })
+            ),
+            "unexpected timeout classification: {error:?}"
+        );
     }
 
     #[test]
