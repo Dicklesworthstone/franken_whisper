@@ -29,9 +29,9 @@ pub const SORTFORMER_TENSOR_MANIFEST_SCHEMA: &str = "franken-whisper-sortformer-
 pub const SORTFORMER_CONVERTER_ID: &str = "franken-whisper-native-sortformer-converter";
 pub const SORTFORMER_CONVERTER_VERSION: &str = "1";
 pub const SORTFORMER_CONVERTER_SOURCE_SHA256: &str =
-    "c954480a39a9daa0e161be3bd7cbd42f29cf4a44edee82dde674b0afb46c1bc4";
+    "6a946cc6647bf52244d0eaad89db834bdc52cc61fd08d9563632dd1f9d239c1e";
 pub const SORTFORMER_CONVERSION_RECEIPT_SHA256: &str =
-    "167ffd94b455b9c0737e0b21ada56af9a4fbbfbd9d3d4c0d8bc9721e698b9a97";
+    "a1c6dce95ef4fd715965951bdaaa136e55e2219f93cf78122f8b462fbd07cbbe";
 pub const SORTFORMER_MODEL_ID: &str = "nvidia/diar_streaming_sortformer_4spk-v2.1";
 pub const SORTFORMER_MODEL_REVISION: &str = "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d";
 pub const SORTFORMER_NEMO_BYTES: u64 = 471_367_680;
@@ -1594,6 +1594,9 @@ mod tests {
 
     use super::*;
 
+    const TINY_TENSOR_MANIFEST_SHA256: &str =
+        "f408e382179658671178ba767d2c27737f551c426543fea14e2cbddac53abfc8";
+
     struct TinyBundle {
         receipt: SortformerConversionReceipt,
         package_bytes: Vec<u8>,
@@ -1645,6 +1648,64 @@ mod tests {
         assert!(rendered.contains("<authenticated model bytes redacted>"));
         assert!(!rendered.contains("SafetensorsFile"));
         assert!(!rendered.contains("package_bytes"));
+    }
+
+    #[test]
+    fn missing_package_tensor_is_rejected() {
+        let mut bundle = tiny_bundle();
+        let position_values = [0.25f32, 0.5, 0.75, 1.0];
+        bundle.package_bytes = make_safetensors(&[(
+            SORTFORMER_POSITION_TENSOR,
+            vec![1, 2, 2],
+            position_values.as_slice(),
+        )]);
+        bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("a package missing one receipt tensor must fail");
+        assert_error(&error, "sortformer_conversion.package_layout");
+    }
+
+    #[test]
+    fn extra_package_tensor_is_rejected() {
+        let mut bundle = tiny_bundle();
+        let position_values = [0.25f32, 0.5, 0.75, 1.0];
+        let weight_values = [1.5f32, -2.0];
+        let extra_values = [3.0f32];
+        bundle.package_bytes = make_safetensors(&[
+            (
+                SORTFORMER_POSITION_TENSOR,
+                vec![1, 2, 2],
+                position_values.as_slice(),
+            ),
+            ("encoder.weight", vec![2], weight_values.as_slice()),
+            ("encoder.zzz", vec![1], extra_values.as_slice()),
+        ]);
+        bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("a package with an extra tensor must fail");
+        assert_error(&error, "sortformer_conversion.package_layout");
     }
 
     #[test]
@@ -2177,6 +2238,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checked_in_converter_matches_the_compiled_trust_root() {
+        assert_eq!(
+            sha256_bytes(include_bytes!("../scripts/convert_to_safetensors.py")),
+            SORTFORMER_CONVERTER_SOURCE_SHA256
+        );
+    }
+
     fn tiny_bundle() -> TinyBundle {
         let position_values = [0.25f32, 0.5, 0.75, 1.0];
         let weight_values = [1.5f32, -2.0];
@@ -2256,6 +2325,7 @@ mod tests {
         };
         let tiny_manifest_sha256 =
             tensor_manifest_sha256(&model, &receipt.records).expect("tiny tensor manifest");
+        assert_eq!(tiny_manifest_sha256, TINY_TENSOR_MANIFEST_SHA256);
         model
             .tensor_manifest_sha256
             .clone_from(&tiny_manifest_sha256);
