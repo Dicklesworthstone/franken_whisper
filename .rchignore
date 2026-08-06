@@ -41,6 +41,10 @@
 **/*.[rR][aA][wW]
 **/*.[pP][cC][mM]
 
+# Performance evidence is not a compilation input. Never copy local decoder
+# outputs or evaluation corpora from this tree to remote build workers.
+tests/artifacts/perf/**
+
 # Licensed model packages, converted tensors, and path-bearing receipts are
 # operator-local proof inputs, never remote-build inputs.
 **/*.[nN][eE][mM][oO]

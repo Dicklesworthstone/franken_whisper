@@ -136,6 +136,9 @@ tests/artifacts/perf/**/*_seq.txt
 tests/artifacts/perf/**/*sample*.txt
 tests/artifacts/perf/**/*spans*.txt
 tests/artifacts/perf/**/*spans*.jsonl
+# Permanently keep the retired local scale evaluation corpus out of Git,
+# including aliases whose names do not reveal that they contain decoded text.
+tests/artifacts/perf/20260606T2341Z-scale-baseline/
 
 # Images (keep .webp for README illustration, .png for GitHub social preview)
 *.png
