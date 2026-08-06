@@ -53,8 +53,8 @@ pub const SORTFORMER_AUDIO_DURATION_TOLERANCE_MS: u32 = 79;
 /// Exact operator adapter version accepted by the frozen contract.
 pub const SORTFORMER_ORACLE_ADAPTER_VERSION: &str = "franken-whisper-sortformer-oracle-v2";
 /// SHA-256 of the exact operator adapter executable admitted to oracle-floor
-/// and activation-seam evidence. Self-reported version strings are not an
-/// executable identity.
+/// evidence. Activation-seam evidence requires a separately reviewed exporter
+/// identity; self-reported version strings are not executable identities.
 pub const SORTFORMER_ORACLE_ADAPTER_SHA256: &str =
     "8f376c979b7eaca41dc0a438d9aaa41c1c723052b97c45eb2acc59b6d6f00bde";
 /// Pinned NeMo Speech source revision expected behind the operator adapter.

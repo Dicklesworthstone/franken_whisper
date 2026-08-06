@@ -23,16 +23,15 @@ use crate::native_engine::weights::SafetensorsFile;
 pub use crate::differential_oracle::SORTFORMER_ORACLE_ADAPTER_SHA256;
 
 pub const SORTFORMER_RECEIPT_SCHEMA: &str = "franken-whisper-sortformer-conversion-receipt-v1";
-pub const SORTFORMER_TENSOR_MANIFEST_SCHEMA: &str =
-    "franken-whisper-sortformer-tensor-manifest-v1";
+pub const SORTFORMER_TENSOR_MANIFEST_SCHEMA: &str = "franken-whisper-sortformer-tensor-manifest-v1";
 /// Receipt schema label only. The compiled converter-source and canonical
 /// receipt digests below are the executable and instance trust roots.
 pub const SORTFORMER_CONVERTER_ID: &str = "franken-whisper-native-sortformer-converter";
 pub const SORTFORMER_CONVERTER_VERSION: &str = "1";
 pub const SORTFORMER_CONVERTER_SOURCE_SHA256: &str =
-    "a85431fa6d609c6a8bc5607e108326fcd9b0dd280370302f9064f5c68fce0357";
+    "c954480a39a9daa0e161be3bd7cbd42f29cf4a44edee82dde674b0afb46c1bc4";
 pub const SORTFORMER_CONVERSION_RECEIPT_SHA256: &str =
-    "1f4129f65d846647a25dca16590c1fc39e466ca317a6bad39cd5428809fbf052";
+    "167ffd94b455b9c0737e0b21ada56af9a4fbbfbd9d3d4c0d8bc9721e698b9a97";
 pub const SORTFORMER_MODEL_ID: &str = "nvidia/diar_streaming_sortformer_4spk-v2.1";
 pub const SORTFORMER_MODEL_REVISION: &str = "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d";
 pub const SORTFORMER_NEMO_BYTES: u64 = 471_367_680;
@@ -318,11 +317,7 @@ pub fn load_verified_sortformer_package(
     receipt_path: &Path,
     package_path: &Path,
 ) -> FwResult<VerifiedSortformerPackage> {
-    load_verified_sortformer_package_with_checkpoint(
-        receipt_path,
-        package_path,
-        &|| Ok(()),
-    )
+    load_verified_sortformer_package_with_checkpoint(receipt_path, package_path, &|| Ok(()))
 }
 
 /// Authenticate the frozen pinned-model census with cooperative cancellation.
@@ -1400,11 +1395,95 @@ fn checked_add(left: u64, right: u64, code: &str) -> FwResult<u64> {
         .ok_or_else(|| sortformer_error(code, "tensor census sum overflows"))
 }
 
+fn tensor_manifest_sha256(
+    model: &SortformerModelIdentity,
+    records: &[SortformerTensorRecord],
+) -> FwResult<String> {
+    let projected_records = records
+        .iter()
+        .map(tensor_manifest_record)
+        .collect::<Vec<_>>();
+    let manifest = serde_json::json!({
+        "schema_version": SORTFORMER_TENSOR_MANIFEST_SCHEMA,
+        "model_id": model.model_id.as_str(),
+        "model_revision": model.model_revision.as_str(),
+        "nemo_sha256": model.nemo_sha256.as_str(),
+        "config_sha256": model.config_sha256.as_str(),
+        "checkpoint_sha256": model.checkpoint_sha256.as_str(),
+        "records": projected_records,
+    });
+    canonical_json_bytes(&manifest)
+        .map(|bytes| sha256_bytes(&bytes))
+        .map_err(|_| {
+            sortformer_error(
+                "tensor_manifest",
+                "tensor topology could not be encoded canonically",
+            )
+        })
+}
+
+fn tensor_manifest_record(record: &SortformerTensorRecord) -> serde_json::Value {
+    let disposition = match &record.disposition {
+        SortformerTensorDisposition::Exported {
+            transform,
+            destination,
+        } => serde_json::json!({
+            "kind": "exported",
+            "transform": tensor_transform_name(*transform),
+            "destination": {
+                "name": destination.name.as_str(),
+                "dtype": tensor_dtype_name(destination.dtype),
+                "shape": &destination.shape,
+                "logical_layout": destination.logical_layout.as_str(),
+                "elements": destination.elements,
+                "bytes": destination.bytes,
+            },
+        }),
+        SortformerTensorDisposition::DroppedTrainOnly => {
+            serde_json::json!({"kind": "dropped_train_only"})
+        }
+        SortformerTensorDisposition::DroppedRuntimeSentinel => {
+            serde_json::json!({"kind": "dropped_runtime_sentinel"})
+        }
+    };
+    serde_json::json!({
+        "source_name": record.source_name.as_str(),
+        "source_origin": tensor_origin_name(record.source_origin),
+        "source_dtype": tensor_dtype_name(record.source_dtype),
+        "source_shape": &record.source_shape,
+        "source_logical_layout": record.source_logical_layout.as_str(),
+        "source_elements": record.source_elements,
+        "source_bytes": record.source_bytes,
+        "disposition": disposition,
+    })
+}
+
+const fn tensor_origin_name(origin: SortformerTensorOrigin) -> &'static str {
+    match origin {
+        SortformerTensorOrigin::StateDict => "state_dict",
+        SortformerTensorOrigin::NonpersistentBuffer => "nonpersistent_buffer",
+    }
+}
+
+const fn tensor_dtype_name(dtype: SortformerTensorDtype) -> &'static str {
+    match dtype {
+        SortformerTensorDtype::F32 => "f32",
+        SortformerTensorDtype::I64 => "i64",
+    }
+}
+
+const fn tensor_transform_name(transform: SortformerTensorTransform) -> &'static str {
+    match transform {
+        SortformerTensorTransform::IdentityContiguousF32 => "identity_contiguous_f32",
+    }
+}
+
 fn validate_tensor_name(name: &str) -> FwResult<()> {
     if name.is_empty()
         || name.len() > 512
         || name.starts_with('.')
         || name.ends_with('.')
+        || name.contains("..")
         || name
             .bytes()
             .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_')))
@@ -1725,6 +1804,133 @@ mod tests {
     }
 
     #[test]
+    fn renamed_f32_tensor_cannot_hide_behind_aggregate_census() {
+        let mut bundle = tiny_bundle();
+        let record = bundle
+            .receipt
+            .records
+            .iter_mut()
+            .find(|record| record.source_name == "encoder.weight")
+            .expect("tiny weight record");
+        record.source_name = "encoder.xeight".to_owned();
+        let SortformerTensorDisposition::Exported { destination, .. } = &mut record.disposition
+        else {
+            panic!("tiny weight must be exported");
+        };
+        destination.name = "encoder.xeight".to_owned();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("renamed tensor must not inherit the topology trust root");
+        assert_error(&error, "sortformer_conversion.tensor_manifest");
+    }
+
+    #[test]
+    fn reshaped_f32_tensor_cannot_hide_behind_aggregate_census() {
+        let mut bundle = tiny_bundle();
+        let record = bundle
+            .receipt
+            .records
+            .iter_mut()
+            .find(|record| record.source_name == "encoder.weight")
+            .expect("tiny weight record");
+        record.source_shape = vec![1, 2];
+        let SortformerTensorDisposition::Exported { destination, .. } = &mut record.disposition
+        else {
+            panic!("tiny weight must be exported");
+        };
+        destination.shape = vec![1, 2];
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("reshaped tensor must not inherit the topology trust root");
+        assert_error(&error, "sortformer_conversion.tensor_manifest");
+    }
+
+    #[test]
+    fn consecutive_dot_tensor_name_is_rejected() {
+        let mut bundle = tiny_bundle();
+        let record = bundle
+            .receipt
+            .records
+            .iter_mut()
+            .find(|record| record.source_name == "encoder.weight")
+            .expect("tiny weight record");
+        record.source_name = "encoder..weight".to_owned();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("empty tensor-name component must fail");
+        assert_error(&error, "sortformer_conversion.record_name");
+    }
+
+    #[test]
+    fn reviewed_converter_source_digest_is_mandatory() {
+        let mut bundle = tiny_bundle();
+        bundle.receipt.converter.source_sha256 = sha256_bytes(b"unreviewed converter source");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("unreviewed converter source must fail");
+        assert_error(&error, "sortformer_conversion.converter_identity");
+    }
+
+    #[test]
+    fn production_loader_exposes_no_caller_supplied_trust_root() {
+        let _: fn(&Path, &Path) -> FwResult<VerifiedSortformerPackage> =
+            load_verified_sortformer_package;
+    }
+
+    #[test]
+    #[ignore = "requires operator-local licensed Sortformer package and receipt"]
+    fn operator_local_real_sortformer_package_is_admitted() {
+        let receipt = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_RECEIPT")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_RECEIPT");
+        let package = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PACKAGE")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_PACKAGE");
+        let verified = load_verified_sortformer_package(Path::new(&receipt), Path::new(&package))
+            .expect("operator-local frozen package must pass exact admission");
+        assert_eq!(verified.receipt().records.len(), 992);
+        assert_eq!(verified.safetensors().len(), 974);
+        assert_eq!(
+            verified.receipt().model.tensor_manifest_sha256,
+            SORTFORMER_TENSOR_MANIFEST_SHA256
+        );
+    }
+
+    #[test]
     fn package_payload_swap_fails_against_unchanged_trust_root() {
         let mut bundle = tiny_bundle();
         let data_start = safetensors_data_start(&bundle.package_bytes);
@@ -1758,6 +1964,7 @@ mod tests {
         let data_start = safetensors_data_start(&bundle.package_bytes);
         bundle.package_bytes[data_start] ^= 1;
         bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
         let directory = tempfile::tempdir().expect("temporary directory");
         let (receipt_path, package_path, receipt_sha256) =
             write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
@@ -1778,6 +1985,7 @@ mod tests {
         let mut bundle = tiny_bundle();
         bundle.package_bytes = duplicate_header_package();
         bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
         let directory = tempfile::tempdir().expect("temporary directory");
         let (receipt_path, package_path, receipt_sha256) =
             write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
@@ -1799,6 +2007,7 @@ mod tests {
             let mut bundle = tiny_bundle();
             bundle.package_bytes = ambiguous_tensor_entry_package(violation);
             bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+            trust_test_package_identity(&mut bundle);
             let directory = tempfile::tempdir().expect("temporary directory");
             let (receipt_path, package_path, receipt_sha256) =
                 write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
@@ -1820,6 +2029,7 @@ mod tests {
         let mut bundle = tiny_bundle();
         bundle.package_bytes = nonlexicographic_payload_package();
         bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
         let directory = tempfile::tempdir().expect("temporary directory");
         let (receipt_path, package_path, receipt_sha256) =
             write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
@@ -1858,6 +2068,7 @@ mod tests {
         .expect("tiny position fixture must be exported");
         destination.value_sha256 = position_sha256;
         bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
         let directory = tempfile::tempdir().expect("temporary directory");
         let (receipt_path, package_path, receipt_sha256) =
             write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
@@ -1912,7 +2123,16 @@ mod tests {
     #[test]
     fn production_census_constants_are_internally_consistent() {
         let expected = pinned_model_expectations();
-        assert!(expected.converter_source_sha256.is_none());
+        assert_eq!(
+            expected.converter_source_sha256,
+            SORTFORMER_CONVERTER_SOURCE_SHA256
+        );
+        assert_eq!(expected.package_sha256, SORTFORMER_PACKAGE_SHA256);
+        assert_eq!(expected.package_bytes, SORTFORMER_PACKAGE_BYTES);
+        assert_eq!(
+            expected.model.tensor_manifest_sha256,
+            SORTFORMER_TENSOR_MANIFEST_SHA256
+        );
         assert_eq!(expected.source_files.len(), 17);
         assert!(
             expected
@@ -2034,11 +2254,22 @@ mod tests {
                 },
             ],
         };
+        let tiny_manifest_sha256 =
+            tensor_manifest_sha256(&model, &receipt.records).expect("tiny tensor manifest");
+        model
+            .tensor_manifest_sha256
+            .clone_from(&tiny_manifest_sha256);
+        receipt
+            .model
+            .tensor_manifest_sha256
+            .clone_from(&tiny_manifest_sha256);
         bind_package_file_identity(&mut receipt, &package_bytes);
         let expected = ReceiptExpectations {
             model,
             execution: frozen_execution_config(),
-            converter_source_sha256: Some(receipt.converter.source_sha256.clone()),
+            converter_source_sha256: receipt.converter.source_sha256.clone(),
+            package_sha256: receipt.package.sha256.clone(),
+            package_bytes: receipt.package.bytes,
             source_files: frozen_source_files(),
             runtime: frozen_runtime_identity(),
             license: frozen_license_identity(),
@@ -2213,6 +2444,14 @@ mod tests {
     fn bind_package_file_identity(receipt: &mut SortformerConversionReceipt, package_bytes: &[u8]) {
         receipt.package.bytes = u64::try_from(package_bytes.len()).expect("tiny package");
         receipt.package.sha256 = sha256_bytes(package_bytes);
+    }
+
+    fn trust_test_package_identity(bundle: &mut TinyBundle) {
+        bundle
+            .expected
+            .package_sha256
+            .clone_from(&bundle.receipt.package.sha256);
+        bundle.expected.package_bytes = bundle.receipt.package.bytes;
     }
 
     fn safetensors_data_start(bytes: &[u8]) -> usize {
