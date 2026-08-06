@@ -883,6 +883,7 @@ fn run_sortformer_observation_with_program_and_probe(
                     provenance,
                 });
             }
+            validate_sortformer_stage_document(&success.oracle)?;
             Ok(SortformerObservationOutcome::Completed {
                 document: success.oracle,
                 provenance,
