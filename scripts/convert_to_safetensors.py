@@ -154,8 +154,15 @@ SORTFORMER_STATE_PAYLOAD_BYTES = 470_978_792
 SORTFORMER_SOURCE_RECORDS = 992
 SORTFORMER_EXPORTED_TENSORS = 974
 SORTFORMER_DROPPED_TENSORS = 18
+SORTFORMER_TENSOR_MANIFEST_SHA256 = (
+    "2c32b0b9e48bb296e66615b038827d0fdde4b4fda2ce044a6c30cd317456c8d7"
+)
 SORTFORMER_PACKAGE_F32_ELEMENTS = 122_864_152
 SORTFORMER_PACKAGE_PAYLOAD_BYTES = 491_456_608
+SORTFORMER_PACKAGE_BYTES = 491_570_584
+SORTFORMER_PACKAGE_SHA256 = (
+    "487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a"
+)
 SORTFORMER_POSITION_TENSOR = "encoder.pos_enc.pe"
 SORTFORMER_DTYPE_SENTINEL = "preprocessor.dtype_sentinel_tensor"
 SORTFORMER_SOURCE_LAYOUT = "pytorch_contiguous_row_major"
@@ -203,6 +210,25 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _stable_file_identity(path: Path) -> tuple[int, int, int, int, int, str]:
+    """Hash one regular file and bind the digest to its stable open inode."""
+    with path.open("rb") as source:
+        initial = os.fstat(source.fileno())
+        hasher = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            hasher.update(chunk)
+        final = os.fstat(source.fileno())
+    path_final = path.stat()
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    initial_fields = tuple(getattr(initial, field) for field in fields)
+    if (
+        tuple(getattr(final, field) for field in fields) != initial_fields
+        or tuple(getattr(path_final, field) for field in fields) != initial_fields
+    ):
+        raise RuntimeError("file identity changed while it was hashed")
+    return (*initial_fields, hasher.hexdigest())
+
+
 def _read_exact_ecapa_source(path: Path) -> bytes:
     """Read the frozen checkpoint once into an exact, bounded owned buffer."""
     source_bytes = bytearray()
@@ -238,7 +264,8 @@ def _read_exact_member(archive: tarfile.TarFile, name: str, expected_bytes: int)
 
 
 def _read_exact_sortformer_archive(path: Path) -> tuple[bytes, bytes]:
-    """Authenticate one open archive inode and retain only its two members."""
+    """Authenticate one owned archive byte stream and retain only its members."""
+    archive_buffer = io.BytesIO()
     with path.open("rb") as source:
         initial = os.fstat(source.fileno())
         if initial.st_size != SORTFORMER_NEMO_BYTES:
@@ -246,28 +273,24 @@ def _read_exact_sortformer_archive(path: Path) -> tuple[bytes, bytes]:
                 f"{SORTFORMER_PROFILE} input size mismatch "
                 f"(got {initial.st_size}, want {SORTFORMER_NEMO_BYTES})"
             )
-        archive_hasher = hashlib.sha256()
-        for chunk in iter(lambda: source.read(1 << 20), b""):
-            archive_hasher.update(chunk)
-        if not hmac.compare_digest(
-            archive_hasher.hexdigest(), SORTFORMER_NEMO_SHA256
-        ):
-            raise RuntimeError(f"{SORTFORMER_PROFILE} input sha256 mismatch")
-        source.seek(0)
-        with tarfile.open(fileobj=source, mode="r:*") as archive:
-            if sorted(member.name for member in archive.getmembers()) != [
-                "model_config.yaml",
-                "model_weights.ckpt",
-            ]:
-                raise RuntimeError(
-                    f"{SORTFORMER_PROFILE} archive member set is not frozen"
-                )
-            config_bytes = _read_exact_member(
-                archive, "model_config.yaml", SORTFORMER_CONFIG_BYTES
-            )
-            checkpoint_bytes = _read_exact_member(
-                archive, "model_weights.ckpt", SORTFORMER_CHECKPOINT_BYTES
-            )
+        archive_bytes = 0
+        maximum_bytes = SORTFORMER_NEMO_BYTES + 1
+        while archive_bytes < maximum_bytes:
+            chunk = source.read(min(1 << 20, maximum_bytes - archive_bytes))
+            if not chunk:
+                break
+            archive_buffer.write(chunk)
+            archive_bytes += len(chunk)
+        if archive_bytes != SORTFORMER_NEMO_BYTES:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} input size changed during read")
+        archive_view = archive_buffer.getbuffer()
+        try:
+            if not hmac.compare_digest(
+                hashlib.sha256(archive_view).hexdigest(), SORTFORMER_NEMO_SHA256
+            ):
+                raise RuntimeError(f"{SORTFORMER_PROFILE} input sha256 mismatch")
+        finally:
+            archive_view.release()
         final = os.fstat(source.fileno())
         if (
             final.st_dev != initial.st_dev
@@ -276,6 +299,20 @@ def _read_exact_sortformer_archive(path: Path) -> tuple[bytes, bytes]:
             or final.st_mtime_ns != initial.st_mtime_ns
         ):
             raise RuntimeError(f"{SORTFORMER_PROFILE} input inode changed during read")
+    archive_buffer.seek(0)
+    with tarfile.open(fileobj=archive_buffer, mode="r:*") as archive:
+        if sorted(member.name for member in archive.getmembers()) != [
+            "model_config.yaml",
+            "model_weights.ckpt",
+        ]:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} archive member set is not frozen")
+        config_bytes = _read_exact_member(
+            archive, "model_config.yaml", SORTFORMER_CONFIG_BYTES
+        )
+        checkpoint_bytes = _read_exact_member(
+            archive, "model_weights.ckpt", SORTFORMER_CHECKPOINT_BYTES
+        )
+    archive_buffer.close()
     if not hmac.compare_digest(
         hashlib.sha256(config_bytes).hexdigest(), SORTFORMER_CONFIG_SHA256
     ):
@@ -293,36 +330,41 @@ def _build_deterministic_safetensors(
 ) -> bytes:
     """Build canonical F32 safetensors and validate the complete byte stream."""
     import torch
-    from safetensors.torch import load
+    from safetensors.torch import load, save
 
-    header: dict[str, object] = {}
-    if metadata is not None:
-        header["__metadata__"] = metadata
-    offset = 0
-    for name in sorted(tensors):
-        tensor = tensors[name]
-        byte_length = tensor.numel() * 4
-        header[name] = {
-            "dtype": "F32",
-            "shape": list(tensor.shape),
-            "data_offsets": [offset, offset + byte_length],
-        }
-        offset += byte_length
+    if metadata is None:
+        # The native serializer owns the output allocation, avoiding the
+        # bytearray-to-bytes duplication of the roughly 491 MB Sortformer
+        # package. Its result is still checked against the frozen whole-file
+        # identity below.
+        file_bytes = save({name: tensors[name] for name in sorted(tensors)})
+    else:
+        header: dict[str, object] = {"__metadata__": metadata}
+        offset = 0
+        for name in sorted(tensors):
+            tensor = tensors[name]
+            byte_length = tensor.numel() * 4
+            header[name] = {
+                "dtype": "F32",
+                "shape": list(tensor.shape),
+                "data_offsets": [offset, offset + byte_length],
+            }
+            offset += byte_length
 
-    header_json = json.dumps(
-        header,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    header_json += b" " * (-len(header_json) % 8)
+        header_json = json.dumps(
+            header,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        header_json += b" " * (-len(header_json) % 8)
 
-    serialized = bytearray(struct.pack("<Q", len(header_json)))
-    serialized.extend(header_json)
-    for name in sorted(tensors):
-        array = tensors[name].numpy().astype("<f4", copy=False)
-        serialized.extend(array.tobytes(order="C"))
-    file_bytes = bytes(serialized)
+        serialized = bytearray(struct.pack("<Q", len(header_json)))
+        serialized.extend(header_json)
+        for name in sorted(tensors):
+            array = tensors[name].numpy().astype("<f4", copy=False)
+            serialized.extend(array.tobytes(order="C"))
+        file_bytes = bytes(serialized)
 
     # Exercise an independent safetensors parser before any output is
     # published. The Rust runtime repeats stricter model-specific checks.
@@ -340,8 +382,11 @@ def _build_deterministic_safetensors(
             _f32_tensor_sha256(expected),
         ):
             raise RuntimeError("serialized safetensors tensor payload changed")
+    if len(file_bytes) < 8:
+        raise RuntimeError("serialized safetensors header is absent")
+    header_bytes = struct.unpack("<Q", file_bytes[:8])[0]
     try:
-        decoded_header = json.loads(file_bytes[8 : 8 + len(header_json)])
+        decoded_header = json.loads(file_bytes[8 : 8 + header_bytes])
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("serialized safetensors header could not be decoded") from exc
     if metadata is None:
