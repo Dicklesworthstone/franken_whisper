@@ -2293,6 +2293,32 @@ fn validate_tool_stage_document(
     if tool != DifferentialOracleTool::Sortformer {
         return Ok(());
     }
+
+    validate_sortformer_stage_contract(document)
+}
+
+/// Validate the complete output boundary for the future native Rust
+/// Sortformer engine, including generic geometry and model-specific semantics.
+pub(crate) fn validate_sortformer_stage_document(
+    document: &DifferentialStageDocument,
+) -> FwResult<()> {
+    validate_stage_document(document).map_err(|_| {
+        FwError::ContractViolation(
+            "native_sortformer.invalid_generic_stage_document".to_owned(),
+        )
+    })?;
+    validate_sortformer_stage_contract(document).map_err(|reason| {
+        let code = match reason {
+            DifferentialSkipReason::ModelCapacityExceeded => "model_capacity_exceeded",
+            _ => "invalid_model_stage_document",
+        };
+        FwError::ContractViolation(format!("native_sortformer.{code}"))
+    })
+}
+
+fn validate_sortformer_stage_contract(
+    document: &DifferentialStageDocument,
+) -> Result<(), DifferentialSkipReason> {
     let Some(turns) = document.final_projection.as_deref() else {
         return Err(DifferentialSkipReason::InvalidOracleOutput);
     };
@@ -3726,7 +3752,7 @@ mod tests {
         unknown.final_projection.as_mut().expect("projection")[0] =
             EvaluationTurn::unknown(100, 1_000);
         assert_eq!(
-            validate_tool_stage_document(DifferentialOracleTool::Sortformer, &unknown),
+            validate_sortformer_stage_contract(&unknown),
             Err(DifferentialSkipReason::InvalidOracleOutput)
         );
 
@@ -3743,7 +3769,7 @@ mod tests {
                 .collect(),
         );
         assert_eq!(
-            validate_tool_stage_document(DifferentialOracleTool::Sortformer, &over_capacity),
+            validate_sortformer_stage_contract(&over_capacity),
             Err(DifferentialSkipReason::ModelCapacityExceeded)
         );
     }
@@ -3820,10 +3846,8 @@ mod tests {
             EvaluationTurn::labeled(160, 960, "speaker_0"),
         ]);
         validate_stage_document(&document).expect("valid generic geometry");
-        assert_eq!(
-            validate_tool_stage_document(DifferentialOracleTool::Sortformer, &document),
-            Ok(())
-        );
+        validate_sortformer_stage_document(&document)
+            .expect("native Sortformer output boundary accepts canonical document");
     }
 
     #[test]
