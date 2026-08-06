@@ -281,3 +281,8 @@ __pycache__/
 /rust_out
 # br doctor per-run artifacts
 .doctor/
+
+# === multi-repo ephemeral hygiene 2026-08-06 ===
+# br recovery intermediate / failed rebuild artifacts
+.beads/.br_recovery/
+*.rebuild-failed
