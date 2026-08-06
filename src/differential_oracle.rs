@@ -2303,9 +2303,7 @@ pub(crate) fn validate_sortformer_stage_document(
     document: &DifferentialStageDocument,
 ) -> FwResult<()> {
     validate_stage_document(document).map_err(|_| {
-        FwError::ContractViolation(
-            "native_sortformer.invalid_generic_stage_document".to_owned(),
-        )
+        FwError::ContractViolation("native_sortformer.invalid_generic_stage_document".to_owned())
     })?;
     validate_sortformer_stage_contract(document).map_err(|reason| {
         let code = match reason {
@@ -3747,6 +3745,11 @@ mod tests {
         nonfinite.final_projection.as_mut().expect("projection")[0].speaker_confidence =
             Some(f64::NAN);
         assert!(validate_stage_document(&nonfinite).is_err());
+        assert!(matches!(
+            validate_sortformer_stage_document(&nonfinite),
+            Err(FwError::ContractViolation(message))
+                if message == "native_sortformer.invalid_generic_stage_document"
+        ));
 
         let mut unknown = sortformer_document();
         unknown.final_projection.as_mut().expect("projection")[0] =
@@ -3755,6 +3758,11 @@ mod tests {
             validate_sortformer_stage_contract(&unknown),
             Err(DifferentialSkipReason::InvalidOracleOutput)
         );
+        assert!(matches!(
+            validate_sortformer_stage_document(&unknown),
+            Err(FwError::ContractViolation(message))
+                if message == "native_sortformer.invalid_model_stage_document"
+        ));
 
         let mut over_capacity = sortformer_document();
         over_capacity.final_projection = Some(
@@ -3772,6 +3780,11 @@ mod tests {
             validate_sortformer_stage_contract(&over_capacity),
             Err(DifferentialSkipReason::ModelCapacityExceeded)
         );
+        assert!(matches!(
+            validate_sortformer_stage_document(&over_capacity),
+            Err(FwError::ContractViolation(message))
+                if message == "native_sortformer.model_capacity_exceeded"
+        ));
     }
 
     #[test]
