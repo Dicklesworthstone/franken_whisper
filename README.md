@@ -520,11 +520,13 @@ from the installed runtimes and asserts the raw streaming profile plus the
 derived FIFO-pop schedule after NeMo validates it; those facts may not be
 supplied by literals alone.
 The operator-installed adapter remains an explicit trust boundary. The host
-hashes it before execution and rejects any executable other than the exact
-compiled SHA-256 pin, then validates its schema and attestations. A replacement
-that merely claims the v2 adapter version therefore cannot enter a Sortformer
-comparison. Activation-seam capture uses a separately reviewed exporter and
-digest; the final-output adapter pin does not authorize intermediate values.
+hashes its resolved path before execution, rejects an initial mismatch against
+the compiled SHA-256 pin, and rechecks the path after the version probe and
+oracle run before validating schema and attestations. This catches ordinary
+drift, but a swap-and-restore inside the remaining hash-to-exec window is still
+an open oracle-authority gate. Activation-seam capture therefore uses a
+separately reviewed exporter and digest; the final-output adapter pin does not
+authorize intermediate values.
 Its version probe must bind the frozen contract hash, independently verify that
 the 471,367,680-byte local artifact hashes to the pinned Hugging Face LFS
 SHA-256, and retain a path-free runtime fingerprint. The frozen evaluation row

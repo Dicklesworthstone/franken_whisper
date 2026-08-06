@@ -1266,6 +1266,78 @@ fn finite_f32_sha256(
     Ok(hex_digest(hasher.finalize()))
 }
 
+fn open_regular_artifact(path: &Path, kind: &str) -> FwResult<(File, u64)> {
+    let before = std::fs::symlink_metadata(path).map_err(|_| {
+        sortformer_error(
+            &format!("{kind}_open"),
+            &format!("{kind} artifact could not be opened"),
+        )
+    })?;
+    if !before.file_type().is_file() {
+        return Err(sortformer_error(
+            &format!("{kind}_type"),
+            &format!("{kind} artifact must be a regular file"),
+        ));
+    }
+    open_prechecked_regular_artifact(path, kind, &before)
+}
+
+fn open_prechecked_regular_artifact(
+    path: &Path,
+    kind: &str,
+    before: &std::fs::Metadata,
+) -> FwResult<(File, u64)> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+
+        let descriptor = open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| {
+            sortformer_error(
+                &format!("{kind}_open"),
+                &format!("{kind} artifact could not be opened"),
+            )
+        })?;
+        File::from(descriptor)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    let file = File::open(path).map_err(|_| {
+        sortformer_error(
+            &format!("{kind}_open"),
+            &format!("{kind} artifact could not be opened"),
+        )
+    })?;
+
+    let after = file.metadata().map_err(|_| {
+        sortformer_error(
+            &format!("{kind}_metadata"),
+            &format!("{kind} artifact metadata is unavailable"),
+        )
+    })?;
+    if !after.file_type().is_file() {
+        return Err(sortformer_error(
+            &format!("{kind}_type"),
+            &format!("{kind} artifact must be a regular file"),
+        ));
+    }
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(sortformer_error(
+                &format!("{kind}_identity"),
+                &format!("{kind} artifact identity changed while it was opened"),
+            ));
+        }
+    }
+    Ok((file, after.len()))
+}
+
 fn read_bounded_file(
     path: &Path,
     kind: &str,
@@ -1274,21 +1346,7 @@ fn read_bounded_file(
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<Vec<u8>> {
     sortformer_checkpoint(checkpoint)?;
-    let file = File::open(path).map_err(|_| {
-        sortformer_error(
-            &format!("{kind}_open"),
-            &format!("{kind} artifact could not be opened"),
-        )
-    })?;
-    let metadata_bytes = file
-        .metadata()
-        .map_err(|_| {
-            sortformer_error(
-                &format!("{kind}_metadata"),
-                &format!("{kind} artifact metadata is unavailable"),
-            )
-        })?
-        .len();
+    let (file, metadata_bytes) = open_regular_artifact(path, kind)?;
     if metadata_bytes == 0 || metadata_bytes > maximum_bytes {
         return Err(sortformer_error(
             &format!("{kind}_size"),
@@ -1603,6 +1661,9 @@ mod tests {
         expected: ReceiptExpectations,
     }
 
+    type CheckpointLoader =
+        fn(&Path, &Path, &(dyn Fn() -> FwResult<()> + Sync)) -> FwResult<VerifiedSortformerPackage>;
+
     #[test]
     fn bounded_file_buffer_allocation_fails_closed() {
         let error = reserved_byte_buffer(usize::MAX, "package", &|| Ok(()))
@@ -1624,6 +1685,122 @@ mod tests {
         assert_eq!(checkpoints.load(Ordering::SeqCst), 2);
         assert!(matches!(error, FwError::Cancelled(_)));
         assert!(!error.to_string().contains("sensitive test reason"));
+    }
+
+    #[test]
+    fn bounded_file_rejects_directory_artifact() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let error = read_bounded_file(
+            directory.path(),
+            "receipt",
+            MAX_RECEIPT_BYTES,
+            None,
+            &|| Ok(()),
+        )
+        .expect_err("a directory must not be admitted as an artifact");
+        assert_error(&error, "sortformer_conversion.receipt_type");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn bounded_file_rejects_symlink_artifact() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("receipt.json");
+        let link = directory.path().join("receipt-link.json");
+        std::fs::write(&target, b"{}").expect("write symlink target");
+        symlink(&target, &link).expect("create artifact symlink");
+
+        let error = read_bounded_file(&link, "receipt", MAX_RECEIPT_BYTES, None, &|| Ok(()))
+            .expect_err("a symlink must not be admitted as an artifact");
+        assert_error(&error, "sortformer_conversion.receipt_type");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn prechecked_open_rejects_fifo_swap_without_blocking() -> Result<(), String> {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let sentinel = directory.path().join("receipt-before.json");
+        let fifo = directory.path().join("receipt.fifo");
+        std::fs::write(&sentinel, b"{}").expect("write regular sentinel");
+        let before = std::fs::symlink_metadata(&sentinel).expect("sentinel metadata");
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use rustix::fs::{Mode, mkfifoat};
+
+            let directory_handle = File::open(directory.path()).expect("directory handle");
+            mkfifoat(&directory_handle, "receipt.fifo", Mode::RUSR | Mode::WUSR)
+                .expect("create FIFO fixture");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let status = std::process::Command::new("/usr/bin/mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .expect("run system mkfifo for fixture");
+            assert!(status.success(), "system mkfifo failed: {status}");
+        }
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let fifo_for_reader = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            let outcome = open_prechecked_regular_artifact(&fifo_for_reader, "receipt", &before)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let _ = sender.send(outcome);
+        });
+        let outcome = match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                use rustix::fs::{Mode, OFlags, open};
+
+                let rescue = open(
+                    &fifo,
+                    OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .expect("rescue a reader blocked by a regressed open flag");
+                let _ = receiver.recv_timeout(std::time::Duration::from_secs(1));
+                reader.join().expect("join rescued FIFO reader");
+                drop(rescue);
+                return Err(
+                    "prechecked FIFO open blocked instead of failing immediately".to_owned(),
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                reader.join().expect("join failed FIFO reader");
+                return Err("prechecked FIFO reader exited without reporting an outcome".to_owned());
+            }
+        };
+        reader.join().expect("join FIFO reader");
+        let error = outcome
+            .err()
+            .ok_or_else(|| "a FIFO path swap was accepted".to_owned())?;
+        assert!(
+            error.contains("sortformer_conversion.receipt_type"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn prechecked_open_rejects_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let original = directory.path().join("receipt.json");
+        let held = directory.path().join("receipt-held.json");
+        std::fs::write(&original, b"{}").expect("write regular artifact");
+        let before = std::fs::symlink_metadata(&original).expect("artifact metadata");
+        std::fs::rename(&original, &held).expect("hold original artifact inode");
+        symlink(&held, &original).expect("replace artifact path with symlink");
+
+        let error = open_prechecked_regular_artifact(&original, "receipt", &before)
+            .expect_err("a symlink path swap must not follow the held original inode");
+        assert_error(&error, "sortformer_conversion.receipt_open");
     }
 
     #[test]
@@ -1653,11 +1830,11 @@ mod tests {
     #[test]
     fn missing_package_tensor_is_rejected() {
         let mut bundle = tiny_bundle();
-        let position_values = [0.25f32, 0.5, 0.75, 1.0];
+        let merged_values = [0.25f32, 0.5, 0.75, 1.0, 1.5, -2.0];
         bundle.package_bytes = make_safetensors(&[(
             SORTFORMER_POSITION_TENSOR,
-            vec![1, 2, 2],
-            position_values.as_slice(),
+            vec![1, 3, 2],
+            merged_values.as_slice(),
         )]);
         bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
         trust_test_package_identity(&mut bundle);
@@ -1673,22 +1850,22 @@ mod tests {
             &bundle.expected,
         )
         .expect_err("a package missing one receipt tensor must fail");
-        assert_error(&error, "sortformer_conversion.package_layout");
+        assert_error(&error, "sortformer_conversion.package_census");
     }
 
     #[test]
     fn extra_package_tensor_is_rejected() {
         let mut bundle = tiny_bundle();
         let position_values = [0.25f32, 0.5, 0.75, 1.0];
-        let weight_values = [1.5f32, -2.0];
-        let extra_values = [3.0f32];
+        let weight_values = [1.5f32];
+        let extra_values = [-2.0f32];
         bundle.package_bytes = make_safetensors(&[
             (
                 SORTFORMER_POSITION_TENSOR,
                 vec![1, 2, 2],
                 position_values.as_slice(),
             ),
-            ("encoder.weight", vec![2], weight_values.as_slice()),
+            ("encoder.weight", vec![1], weight_values.as_slice()),
             ("encoder.zzz", vec![1], extra_values.as_slice()),
         ]);
         bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
@@ -1705,7 +1882,7 @@ mod tests {
             &bundle.expected,
         )
         .expect_err("a package with an extra tensor must fail");
-        assert_error(&error, "sortformer_conversion.package_layout");
+        assert_error(&error, "sortformer_conversion.package_census");
     }
 
     #[test]
@@ -1865,7 +2042,7 @@ mod tests {
     }
 
     #[test]
-    fn renamed_f32_tensor_cannot_hide_behind_aggregate_census() {
+    fn renamed_f32_tensor_cannot_hide_behind_aggregate_census() -> Result<(), String> {
         let mut bundle = tiny_bundle();
         let record = bundle
             .receipt
@@ -1874,9 +2051,9 @@ mod tests {
             .find(|record| record.source_name == "encoder.weight")
             .expect("tiny weight record");
         record.source_name = "encoder.xeight".to_owned();
-        let SortformerTensorDisposition::Exported { destination, .. } = &mut record.disposition
-        else {
-            panic!("tiny weight must be exported");
+        let destination = match &mut record.disposition {
+            SortformerTensorDisposition::Exported { destination, .. } => destination,
+            _ => return Err("tiny weight must be exported".to_owned()),
         };
         destination.name = "encoder.xeight".to_owned();
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1892,10 +2069,11 @@ mod tests {
         )
         .expect_err("renamed tensor must not inherit the topology trust root");
         assert_error(&error, "sortformer_conversion.tensor_manifest");
+        Ok(())
     }
 
     #[test]
-    fn reshaped_f32_tensor_cannot_hide_behind_aggregate_census() {
+    fn reshaped_f32_tensor_cannot_hide_behind_aggregate_census() -> Result<(), String> {
         let mut bundle = tiny_bundle();
         let record = bundle
             .receipt
@@ -1904,9 +2082,9 @@ mod tests {
             .find(|record| record.source_name == "encoder.weight")
             .expect("tiny weight record");
         record.source_shape = vec![1, 2];
-        let SortformerTensorDisposition::Exported { destination, .. } = &mut record.disposition
-        else {
-            panic!("tiny weight must be exported");
+        let destination = match &mut record.disposition {
+            SortformerTensorDisposition::Exported { destination, .. } => destination,
+            _ => return Err("tiny weight must be exported".to_owned()),
         };
         destination.shape = vec![1, 2];
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1922,6 +2100,7 @@ mod tests {
         )
         .expect_err("reshaped tensor must not inherit the topology trust root");
         assert_error(&error, "sortformer_conversion.tensor_manifest");
+        Ok(())
     }
 
     #[test]
@@ -1972,6 +2151,7 @@ mod tests {
     fn production_loader_exposes_no_caller_supplied_trust_root() {
         let _: fn(&Path, &Path) -> FwResult<VerifiedSortformerPackage> =
             load_verified_sortformer_package;
+        let _: CheckpointLoader = load_verified_sortformer_package_with_checkpoint;
     }
 
     #[test]

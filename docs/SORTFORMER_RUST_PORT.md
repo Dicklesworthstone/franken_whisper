@@ -72,11 +72,14 @@ On 2026-08-05, the frozen converter completed both an initial publication and
 an exact-artifact retry on Darwin 25.2.0 arm64. Each exited zero with 974
 tensors and the converter, topology-projection, receipt, and package identities
 listed above; the resulting directory was mode `0700` and both files were mode
-`0600`. The focused Rust verifier run passed 27 tests with only the deliberately
-operator-local test ignored. That exact ignored test was then run locally
-against the admitted receipt/package pair and passed 1/1. This proves L0
-converted-weight admission only; it is not a model-forward or diarization
-accuracy result.
+`0600`. The final focused Rust verifier run passed 31 tests with only the
+deliberately operator-local test ignored. That exact ignored test was then run
+locally against the admitted receipt/package pair and passed 1/1. The loader
+rejects directories and symlinks before opening; on Linux, Android, and Apple
+targets its post-precheck open is nonblocking, does not follow the final
+symlink, rechecks the regular-file type, and binds the opened device/inode to
+the precheck. This proves L0 converted-weight admission only; it is not a
+model-forward or diarization accuracy result.
 
 The archive configuration says `nemo_version: 2.6.0rc0`; that string is not
 the executable reference. The intended oracle behavior is the pinned NeMo
@@ -763,7 +766,8 @@ Completed here:
 - a cycle-free, dependency-wired implementation and proof ladder;
 - a safe conversion-receipt/package verifier with compiled trust roots, exact
   topology recomputation, strict safetensors parsing, fallible allocation,
-  synthetic tamper tests, and operator-local real-package admission proof; and
+  regular-file and path-swap defenses, synthetic tamper tests, and
+  operator-local real-package admission proof; and
 - a pinned-buffer, source-derived bounded whole-file Rust log-mel frontend
   candidate with fallible allocation and synthetic mathematical/unit tests.
 
