@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Reject tracked private media and transcript-like artifacts
+        env:
+          FRANKEN_WHISPER_REVIEWED_LEGACY_ARTIFACTS: ${{ vars.FRANKEN_WHISPER_REVIEWED_LEGACY_ARTIFACTS }}
         run: |
           set -euo pipefail
           guard_bin="${RUNNER_TEMP}/franken-whisper-repository-privacy-guard"

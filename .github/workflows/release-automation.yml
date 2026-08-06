@@ -5,6 +5,8 @@ name: release-automation
 # destructive_command_guard release-automation pattern.
 
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
@@ -21,6 +23,8 @@ jobs:
           fetch-depth: 0
 
       - name: Reject tracked private media and transcript-like artifacts
+        env:
+          FRANKEN_WHISPER_REVIEWED_LEGACY_ARTIFACTS: ${{ vars.FRANKEN_WHISPER_REVIEWED_LEGACY_ARTIFACTS }}
         run: |
           set -euo pipefail
           guard_bin="${RUNNER_TEMP}/franken-whisper-repository-privacy-guard"
@@ -28,6 +32,7 @@ jobs:
           "$guard_bin" --tracked
 
       - name: Read version from Cargo.toml
+        if: github.event_name != 'pull_request'
         id: version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -38,13 +43,14 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Read latest tag
+        if: github.event_name != 'pull_request'
         id: latest
         run: |
           latest=$(git tag --list 'v*' --sort=-v:refname | head -1)
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
 
       - name: Create tag
-        if: steps.latest.outputs.latest != format('v{0}', steps.version.outputs.version)
+        if: github.event_name != 'pull_request' && steps.latest.outputs.latest != format('v{0}', steps.version.outputs.version)
         run: |
           tag="v${{ steps.version.outputs.version }}"
           echo "Creating release tag $tag"
@@ -54,6 +60,6 @@ jobs:
           git push origin "$tag"
 
       - name: Skip (already tagged)
-        if: steps.latest.outputs.latest == format('v{0}', steps.version.outputs.version)
+        if: github.event_name != 'pull_request' && steps.latest.outputs.latest == format('v{0}', steps.version.outputs.version)
         run: |
           echo "Latest tag matches Cargo.toml version; nothing to do."
