@@ -29,6 +29,8 @@ pub mod process;
 pub mod public_corpus;
 pub mod replay_pack;
 pub mod robot;
+pub mod sortformer_conformance;
+pub mod sortformer_inference;
 pub mod speculation;
 pub mod storage;
 pub mod streaming;

@@ -39,9 +39,12 @@
 //! missing model is a hard, actionable error from [`resolve_aux_model`].
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use ft_core::{BFloat16, Float16};
+use serde::Deserialize;
+use serde::de::{DeserializeSeed, Error as _, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::error::{FwError, FwResult};
@@ -109,12 +112,106 @@ struct TensorEntry {
     end: usize,
 }
 
+struct UniqueTensorEntry(BTreeMap<String, Value>);
+
+struct TensorEntrySeed<'a> {
+    name: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for TensorEntrySeed<'_> {
+    type Value = UniqueTensorEntry;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UniqueTensorEntryVisitor<'a> {
+            name: &'a str,
+        }
+
+        impl<'de> Visitor<'de> for UniqueTensorEntryVisitor<'_> {
+            type Value = UniqueTensorEntry;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a safetensors tensor directory entry with unique fields")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut fields = BTreeMap::new();
+                while let Some(field) = map.next_key::<String>()? {
+                    if fields.contains_key(&field) {
+                        return Err(A::Error::custom(format!(
+                            "safetensors tensor `{}`: duplicate field `{field}`",
+                            self.name
+                        )));
+                    }
+                    fields.insert(field, map.next_value::<Value>()?);
+                }
+                Ok(UniqueTensorEntry(fields))
+            }
+        }
+
+        deserializer.deserialize_map(UniqueTensorEntryVisitor { name: self.name })
+    }
+}
+
+enum HeaderEntry {
+    Metadata(Value),
+    Tensor(UniqueTensorEntry),
+}
+
+/// A safetensors header that rejects duplicate top-level and tensor-entry keys
+/// instead of inheriting `serde_json::Map`'s lossy last-value-wins behavior.
+struct UniqueHeader(BTreeMap<String, HeaderEntry>);
+
+impl<'de> Deserialize<'de> for UniqueHeader {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UniqueHeaderVisitor;
+
+        impl<'de> Visitor<'de> for UniqueHeaderVisitor {
+            type Value = UniqueHeader;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a safetensors JSON header object with unique keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = BTreeMap::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    if entries.contains_key(&name) {
+                        return Err(A::Error::custom(format!(
+                            "duplicate safetensors header key `{name}`"
+                        )));
+                    }
+                    let value = if name == METADATA_KEY {
+                        HeaderEntry::Metadata(map.next_value::<Value>()?)
+                    } else {
+                        HeaderEntry::Tensor(map.next_value_seed(TensorEntrySeed { name: &name })?)
+                    };
+                    entries.insert(name, value);
+                }
+                Ok(UniqueHeader(entries))
+            }
+        }
+
+        deserializer.deserialize_map(UniqueHeaderVisitor)
+    }
+}
+
 /// A loaded safetensors file: the parsed tensor directory plus the raw data
 /// section bytes, ready to materialize any tensor as `f32` on demand.
 ///
 /// Tensors are stored sorted by name (a [`BTreeMap`]) so [`names`](Self::names)
 /// yields a stable, sorted order. Construct via [`load`](Self::load).
-#[derive(Debug)]
 pub struct SafetensorsFile {
     /// Tensor directory, keyed by name (sorted).
     tensors: BTreeMap<String, TensorEntry>,
@@ -131,7 +228,38 @@ pub struct SafetensorsFile {
     data_offset: usize,
 }
 
+impl fmt::Debug for SafetensorsFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SafetensorsFile")
+            .field("tensor_count", &self.tensors.len())
+            .field("metadata", &self.metadata.as_ref().map(|_| "<redacted>"))
+            .field(
+                "data",
+                &format_args!("<{} bytes redacted>", self.data.len()),
+            )
+            .field("data_offset", &self.data_offset)
+            .finish()
+    }
+}
+
 impl SafetensorsFile {
+    fn tensor_entry(&self, name: &str) -> FwResult<&TensorEntry> {
+        self.tensors.get(name).ok_or_else(|| {
+            let available = self.tensors.keys().map(String::as_str).collect::<Vec<_>>();
+            let preview = available.iter().take(8).copied().collect::<Vec<_>>();
+            let suffix = if available.len() > preview.len() {
+                format!(", … ({} total)", available.len())
+            } else {
+                String::new()
+            };
+            FwError::InvalidRequest(format!(
+                "safetensors tensor `{name}` not found; available: [{}]{suffix}",
+                preview.join(", ")
+            ))
+        })
+    }
+
     /// Load and strictly validate the safetensors file at `path`.
     ///
     /// Validation performed (each failure is an [`FwError::InvalidRequest`]
@@ -147,15 +275,8 @@ impl SafetensorsFile {
     /// Overlapping spans are *not* rejected (the format permits aliasing); only
     /// in-bounds and exact-width are required.
     ///
-    /// # Duplicate tensor names
-    ///
-    /// The safetensors spec disallows duplicate keys in the JSON header, but we
-    /// do not reject them: the header is parsed with [`serde_json`], whose
-    /// object [`Map`](serde_json::Map) keeps the **last** value for a repeated
-    /// key. A header containing the same tensor name twice therefore resolves
-    /// *last-wins* — the final occurrence's `dtype`/`shape`/`data_offsets` are
-    /// the ones validated and exposed; earlier duplicates are silently dropped
-    /// before this function ever sees them.
+    /// Duplicate tensor names or metadata keys are rejected before any tensor
+    /// directory entry is accepted.
     ///
     /// # Errors
     ///
@@ -193,11 +314,6 @@ impl SafetensorsFile {
 
     /// Parse from an in-memory safetensors byte buffer (the testable core of
     /// [`load`](Self::load)).
-    ///
-    /// Duplicate tensor names in the JSON header resolve *last-wins* via
-    /// [`serde_json::Map`] semantics — the spec disallows duplicate keys, but we
-    /// accept them and keep the final occurrence. See [`load`](Self::load) for
-    /// the full contract.
     ///
     /// # Errors
     ///
@@ -257,22 +373,20 @@ impl SafetensorsFile {
         }
 
         let header_bytes = &bytes[8..header_end];
-        let header: Value = serde_json::from_slice(header_bytes)?;
-        let obj = header.as_object().ok_or_else(|| {
-            FwError::InvalidRequest("safetensors header is not a JSON object".to_owned())
-        })?;
+        let header: UniqueHeader = serde_json::from_slice(header_bytes)?;
 
         let data_len = bytes.len() - header_end;
 
         let mut metadata = None;
         let mut tensors = BTreeMap::new();
-        for (name, value) in obj {
-            if name == METADATA_KEY {
-                metadata = Some(value.clone());
-                continue;
+        for (name, value) in header.0 {
+            match value {
+                HeaderEntry::Metadata(value) => metadata = Some(value),
+                HeaderEntry::Tensor(value) => {
+                    let entry = parse_tensor_entry(&name, &value, data_len)?;
+                    tensors.insert(name, entry);
+                }
             }
-            let entry = parse_tensor_entry(name, value, data_len)?;
-            tensors.insert(name.clone(), entry);
         }
 
         Ok((tensors, metadata, header_end))
@@ -291,21 +405,42 @@ impl SafetensorsFile {
     /// matches the element count (should be impossible post-[`load`](Self::load),
     /// but checked rather than panicking on a slice).
     pub fn tensor_f32(&self, name: &str) -> FwResult<(Vec<usize>, Vec<f32>)> {
-        let entry = self.tensors.get(name).ok_or_else(|| {
-            let mut available: Vec<&str> = self.tensors.keys().map(String::as_str).collect();
-            available.sort_unstable();
-            let preview: Vec<&str> = available.iter().take(8).copied().collect();
-            let suffix = if available.len() > preview.len() {
-                format!(", … ({} total)", available.len())
-            } else {
-                String::new()
-            };
-            FwError::InvalidRequest(format!(
-                "safetensors tensor `{name}` not found; available: [{}]{suffix}",
-                preview.join(", ")
-            ))
-        })?;
+        let entry = self.tensor_entry(name)?;
 
+        let (n_elements, _) = checked_tensor_layout(name, &entry.shape, entry.dtype)?;
+        let raw = self.tensor_raw_bytes(name)?;
+        let width = entry.dtype.byte_width();
+
+        let mut out = Vec::with_capacity(n_elements);
+        match entry.dtype {
+            StDType::F32 => {
+                for chunk in raw.as_chunks::<4>().0 {
+                    out.push(f32::from_le_bytes(*chunk));
+                }
+            }
+            StDType::F16 => {
+                for chunk in raw.as_chunks::<2>().0 {
+                    out.push(Float16::from_le_bytes(*chunk).to_f32());
+                }
+            }
+            StDType::Bf16 => {
+                for chunk in raw.as_chunks::<2>().0 {
+                    out.push(BFloat16::from_le_bytes(*chunk).to_f32());
+                }
+            }
+        }
+        debug_assert_eq!(out.len() * width, raw.len());
+        Ok((entry.shape.clone(), out))
+    }
+
+    /// Borrow the exact little-endian payload bytes for `name`.
+    ///
+    /// This crate-private seam lets identity-bound model-package verifiers hash
+    /// the bytes that were authenticated and parsed, without materializing a
+    /// second `Vec<f32>` or reopening a path. The tensor's declared shape and
+    /// dtype width are rechecked before the slice is returned.
+    pub(crate) fn tensor_raw_bytes(&self, name: &str) -> FwResult<&[u8]> {
+        let entry = self.tensor_entry(name)?;
         let (n_elements, expected_bytes) = checked_tensor_layout(name, &entry.shape, entry.dtype)?;
         let raw_begin = self.data_offset.checked_add(entry.begin).ok_or_else(|| {
             FwError::InvalidRequest(format!(
@@ -333,26 +468,7 @@ impl SafetensorsFile {
                 width
             )));
         }
-
-        let mut out = Vec::with_capacity(n_elements);
-        match entry.dtype {
-            StDType::F32 => {
-                for chunk in raw.as_chunks::<4>().0 {
-                    out.push(f32::from_le_bytes(*chunk));
-                }
-            }
-            StDType::F16 => {
-                for chunk in raw.as_chunks::<2>().0 {
-                    out.push(Float16::from_le_bytes(*chunk).to_f32());
-                }
-            }
-            StDType::Bf16 => {
-                for chunk in raw.as_chunks::<2>().0 {
-                    out.push(BFloat16::from_le_bytes(*chunk).to_f32());
-                }
-            }
-        }
-        Ok((entry.shape.clone(), out))
+        Ok(raw)
     }
 
     /// The shape of tensor `name`, without materializing its data.
@@ -431,40 +547,51 @@ fn checked_tensor_layout(name: &str, shape: &[usize], dtype: StDType) -> FwResul
 }
 
 /// Parse and validate one tensor directory entry against the data section length.
-fn parse_tensor_entry(name: &str, value: &Value, data_len: usize) -> FwResult<TensorEntry> {
-    let obj = value.as_object().ok_or_else(|| {
-        FwError::InvalidRequest(format!(
-            "safetensors tensor `{name}`: entry is not a JSON object"
-        ))
-    })?;
+fn parse_tensor_entry(
+    name: &str,
+    value: &UniqueTensorEntry,
+    data_len: usize,
+) -> FwResult<TensorEntry> {
+    let fields = &value.0;
+    if let Some(unknown) = fields
+        .keys()
+        .find(|field| !matches!(field.as_str(), "dtype" | "shape" | "data_offsets"))
+    {
+        return Err(FwError::InvalidRequest(format!(
+            "safetensors tensor `{name}`: unknown field `{unknown}`"
+        )));
+    }
 
-    let dtype_str = obj.get("dtype").and_then(Value::as_str).ok_or_else(|| {
+    let dtype_str = fields.get("dtype").and_then(Value::as_str).ok_or_else(|| {
         FwError::InvalidRequest(format!(
             "safetensors tensor `{name}`: missing or non-string `dtype`"
         ))
     })?;
     let dtype = StDType::parse(dtype_str, name)?;
 
-    let shape_arr = obj.get("shape").and_then(Value::as_array).ok_or_else(|| {
-        FwError::InvalidRequest(format!(
-            "safetensors tensor `{name}`: missing or non-array `shape`"
-        ))
-    })?;
-    let mut shape = Vec::with_capacity(shape_arr.len());
-    for dim in shape_arr {
-        let d = dim.as_u64().ok_or_else(|| {
+    let shape_values = fields
+        .get("shape")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
             FwError::InvalidRequest(format!(
-                "safetensors tensor `{name}`: shape dimension `{dim}` is not a non-negative integer"
+                "safetensors tensor `{name}`: missing or non-array `shape`"
             ))
         })?;
-        shape.push(usize::try_from(d).map_err(|_| {
+    let mut shape = Vec::with_capacity(shape_values.len());
+    for dimension in shape_values {
+        let dimension = dimension.as_u64().ok_or_else(|| {
             FwError::InvalidRequest(format!(
-                "safetensors tensor `{name}`: shape dimension {d} does not fit in usize"
+                "safetensors tensor `{name}`: shape dimension `{dimension}` is not a non-negative integer"
+            ))
+        })?;
+        shape.push(usize::try_from(dimension).map_err(|_| {
+            FwError::InvalidRequest(format!(
+                "safetensors tensor `{name}`: shape dimension {dimension} does not fit in usize"
             ))
         })?);
     }
 
-    let offsets = obj
+    let offsets = fields
         .get("data_offsets")
         .and_then(Value::as_array)
         .ok_or_else(|| {
@@ -512,14 +639,14 @@ fn parse_tensor_entry(name: &str, value: &Value, data_len: usize) -> FwResult<Te
 
 /// Parse one `data_offsets` element as a `usize` byte offset.
 fn offset_value(name: &str, value: &Value, which: &str) -> FwResult<usize> {
-    let n = value.as_u64().ok_or_else(|| {
+    let offset = value.as_u64().ok_or_else(|| {
         FwError::InvalidRequest(format!(
             "safetensors tensor `{name}`: data_offsets {which} `{value}` is not a non-negative integer"
         ))
     })?;
-    usize::try_from(n).map_err(|_| {
+    usize::try_from(offset).map_err(|_| {
         FwError::InvalidRequest(format!(
-            "safetensors tensor `{name}`: data_offsets {which} {n} does not fit in usize"
+            "safetensors tensor `{name}`: data_offsets {which} {offset} does not fit in usize"
         ))
     })
 }
@@ -898,6 +1025,10 @@ mod tests {
         let (shape, vals) = file.tensor_f32("w_f32").expect("decode f32");
         assert_eq!(shape, vec![2, 3]);
         assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            file.tensor_raw_bytes("w_f32").expect("raw f32 bytes"),
+            f32_payload(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        );
 
         let (shape, vals) = file.tensor_f32("a_f16").expect("decode f16");
         assert_eq!(shape, vec![2, 2]);
@@ -907,6 +1038,10 @@ mod tests {
         assert_eq!(file.shape("w_f32").expect("shape"), &[2, 3]);
         assert_eq!(file.dtype_name("w_f32").expect("dtype"), "F32");
         assert_eq!(file.dtype_name("a_f16").expect("dtype"), "F16");
+        let rendered = format!("{file:?}");
+        assert!(rendered.contains("bytes redacted"));
+        assert!(!rendered.contains("synthetic"));
+        assert!(!rendered.contains("data: ["));
     }
 
     #[test]
@@ -981,6 +1116,85 @@ mod tests {
         let err = SafetensorsFile::from_bytes(&bytes).expect_err("over cap");
         let msg = err.to_string();
         assert!(msg.contains("sanity cap"), "msg: {msg}");
+    }
+
+    #[test]
+    fn duplicate_header_keys_fail_closed() {
+        for (header_json, duplicate) in [
+            (
+                br#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.as_slice(),
+                "tensor",
+            ),
+            (
+                br#"{"__metadata__":{"source":"first"},"__metadata__":{"source":"second"}}"#.as_slice(),
+                "__metadata__",
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header_json);
+            if duplicate == "tensor" {
+                bytes.extend_from_slice(&0.0f32.to_le_bytes());
+            }
+
+            let error = SafetensorsFile::from_bytes(&bytes).expect_err("duplicate key must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("duplicate safetensors header key `{duplicate}`")),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_tensor_entry_fields_fail_closed() {
+        for (field, entry) in [
+            (
+                "dtype",
+                r#"{"dtype":"F32","dtype":"F32","shape":[1],"data_offsets":[0,4]}"#,
+            ),
+            (
+                "shape",
+                r#"{"dtype":"F32","shape":[1],"shape":[1],"data_offsets":[0,4]}"#,
+            ),
+            (
+                "data_offsets",
+                r#"{"dtype":"F32","shape":[1],"data_offsets":[0,4],"data_offsets":[0,4]}"#,
+            ),
+        ] {
+            let header = format!(r#"{{"tensor":{entry}}}"#);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+
+            let error = SafetensorsFile::from_bytes(&bytes)
+                .expect_err("duplicate tensor-entry field must fail");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("duplicate field"),
+                "unexpected error: {error}"
+            );
+            assert!(rendered.contains(field), "unexpected error: {error}");
+            assert!(rendered.contains("tensor"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn unknown_tensor_entry_fields_fail_closed() {
+        let header =
+            r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"unexpected":true}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+
+        let error =
+            SafetensorsFile::from_bytes(&bytes).expect_err("unknown tensor-entry field must fail");
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("unexpected"));
+        assert!(error.to_string().contains("tensor"));
     }
 
     #[test]

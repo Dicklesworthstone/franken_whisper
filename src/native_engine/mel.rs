@@ -52,6 +52,95 @@ pub const FRAMES_PER_CHUNK: usize = N_SAMPLES_30S / HOP; // 3000
 /// One-sided FFT bin count: `N_FFT/2 + 1`, i.e. bin_0 .. bin_nyquist.
 pub const N_FREQ_BINS: usize = N_FFT / 2 + 1; // 201
 
+/// Transform width used by model frontends whose stored analysis window is
+/// shorter than the FFT (for example, a centered 400-sample window in a
+/// 512-point transform).
+pub(crate) const REAL_FFT_512_LEN: usize = 512;
+/// One-sided complex-bin count for a 512-point real transform.
+pub(crate) const REAL_FFT_512_BINS: usize = REAL_FFT_512_LEN / 2 + 1;
+
+#[derive(Clone, Copy)]
+struct Complex32 {
+    re: f32,
+    im: f32,
+}
+
+impl Complex32 {
+    const ZERO: Self = Self { re: 0.0, im: 0.0 };
+}
+
+/// Compute the one-sided complex spectrum of one real 512-sample frame.
+///
+/// This deliberately exposes complex bins rather than power so each consumer
+/// can preserve its model's exact magnitude/power arithmetic. The transform is
+/// a safe, deterministic radix-2 decimation-in-time FFT with cached f32 roots;
+/// it does not inherit Whisper's 400-point FFT or frontend normalization.
+///
+/// This is a numerical primitive, not an oracle-parity claim. Model-specific
+/// parity remains gated on separately captured activation seams.
+pub(crate) fn real_fft_512(
+    input: &[f32; REAL_FFT_512_LEN],
+    output: &mut [(f32, f32); REAL_FFT_512_BINS],
+) -> FwResult<()> {
+    if input.iter().any(|sample| !sample.is_finite()) {
+        return Err(FwError::InvalidRequest(
+            "real FFT input contains a non-finite sample".to_owned(),
+        ));
+    }
+
+    static ROOTS: std::sync::OnceLock<[Complex32; REAL_FFT_512_LEN / 2]> =
+        std::sync::OnceLock::new();
+    let roots = ROOTS.get_or_init(|| {
+        let mut roots = [Complex32::ZERO; REAL_FFT_512_LEN / 2];
+        for (index, root) in roots.iter_mut().enumerate() {
+            let theta = -(2.0 * PI * index as f64) / REAL_FFT_512_LEN as f64;
+            *root = Complex32 {
+                re: theta.cos() as f32,
+                im: theta.sin() as f32,
+            };
+        }
+        roots
+    });
+
+    // Nine-bit reversal places the real samples in the order required by the
+    // iterative radix-2 butterflies. The high-bit shift is portable across
+    // 32- and 64-bit targets because usize::BITS is part of the expression.
+    let mut work = [Complex32::ZERO; REAL_FFT_512_LEN];
+    for (index, &sample) in input.iter().enumerate() {
+        let reversed = index.reverse_bits() >> (usize::BITS - 9);
+        work[reversed].re = sample;
+    }
+
+    let mut span = 2usize;
+    while span <= REAL_FFT_512_LEN {
+        let half = span / 2;
+        let root_stride = REAL_FFT_512_LEN / span;
+        for block_start in (0..REAL_FFT_512_LEN).step_by(span) {
+            for offset in 0..half {
+                let even = work[block_start + offset];
+                let odd = work[block_start + offset + half];
+                let root = roots[offset * root_stride];
+                let odd_re = odd.re * root.re - odd.im * root.im;
+                let odd_im = odd.re * root.im + odd.im * root.re;
+                work[block_start + offset] = Complex32 {
+                    re: even.re + odd_re,
+                    im: even.im + odd_im,
+                };
+                work[block_start + offset + half] = Complex32 {
+                    re: even.re - odd_re,
+                    im: even.im - odd_im,
+                };
+            }
+        }
+        span *= 2;
+    }
+
+    for (destination, bin) in output.iter_mut().zip(work.iter()) {
+        *destination = (bin.re, bin.im);
+    }
+    Ok(())
+}
+
 /// Compute one Hann-windowed, one-sided power spectrum with the exact FFT
 /// geometry used by the native Whisper frontend.
 ///
@@ -1631,6 +1720,111 @@ mod tests {
         (0..input.len())
             .map(|k| (f64::from(out[2 * k]), f64::from(out[2 * k + 1])))
             .collect()
+    }
+
+    #[test]
+    fn real_fft_512_matches_independent_naive_dft() {
+        // `naive_dft` is an independent O(N^2), f64 reference. This establishes
+        // mathematical correctness of the reusable primitive; it intentionally
+        // does not borrow a tolerance from any model-oracle pilot.
+        for seed in [0x0512_FF71_u64, 0xDEAD_BEEF, 0x1234_5678] {
+            let mut lcg = Lcg::new(seed);
+            let mut input = [0.0_f32; REAL_FFT_512_LEN];
+            for sample in &mut input {
+                *sample = lcg.next_f32();
+            }
+
+            let mut got = [(0.0_f32, 0.0_f32); REAL_FFT_512_BINS];
+            real_fft_512(&input, &mut got).expect("512-point FFT");
+            let want = naive_dft(&input);
+            for (bin, (&(got_re, got_im), &(want_re, want_im))) in
+                got.iter().zip(want[..REAL_FFT_512_BINS].iter()).enumerate()
+            {
+                let error = (f64::from(got_re) - want_re)
+                    .abs()
+                    .max((f64::from(got_im) - want_im).abs());
+                let bin_scale = want_re.abs().max(want_im.abs());
+                let tolerance = 2e-5 + 5e-6 * bin_scale;
+                assert!(
+                    error <= tolerance,
+                    "512-point FFT bin {bin} error {error} exceeds per-bin tolerance {tolerance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_fft_512_resolves_dc_nyquist_tone_and_near_cancellation() {
+        let mut spectrum = [(0.0_f32, 0.0_f32); REAL_FFT_512_BINS];
+
+        let dc = [0.25_f32; REAL_FFT_512_LEN];
+        real_fft_512(&dc, &mut spectrum).expect("DC FFT");
+        assert_eq!(spectrum[0], (128.0, 0.0));
+        assert!(spectrum[1..].iter().all(|&(re, im)| re == 0.0 && im == 0.0));
+
+        let nyquist = std::array::from_fn(|index| if index % 2 == 0 { 0.25 } else { -0.25 });
+        real_fft_512(&nyquist, &mut spectrum).expect("Nyquist FFT");
+        assert_eq!(spectrum[REAL_FFT_512_BINS - 1], (128.0, 0.0));
+        assert!(
+            spectrum[..REAL_FFT_512_BINS - 1]
+                .iter()
+                .all(|&(re, im)| re == 0.0 && im == 0.0)
+        );
+
+        const TONE_BIN: usize = 37;
+        let tone = std::array::from_fn(|sample| {
+            (2.0 * PI * TONE_BIN as f64 * sample as f64 / REAL_FFT_512_LEN as f64).cos() as f32
+        });
+        real_fft_512(&tone, &mut spectrum).expect("single-bin tone FFT");
+        let reference = naive_dft(&tone);
+        for (bin, (&(got_re, got_im), &(want_re, want_im))) in spectrum
+            .iter()
+            .zip(reference[..REAL_FFT_512_BINS].iter())
+            .enumerate()
+        {
+            let error = (f64::from(got_re) - want_re)
+                .abs()
+                .max((f64::from(got_im) - want_im).abs());
+            let tolerance = if bin == TONE_BIN { 1.5e-3 } else { 3e-5 };
+            assert!(
+                error <= tolerance,
+                "single-tone bin {bin} error {error} exceeds absolute tolerance {tolerance}"
+            );
+        }
+
+        let mut cancellation = [0.0_f32; REAL_FFT_512_LEN];
+        for (index, sample) in cancellation.iter_mut().enumerate() {
+            *sample = if index.is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0 + f32::EPSILON
+            };
+        }
+        real_fft_512(&cancellation, &mut spectrum).expect("near-cancelling FFT");
+        let reference = naive_dft(&cancellation);
+        for bin in [0, 1, 127, 255] {
+            let error = (f64::from(spectrum[bin].0) - reference[bin].0)
+                .abs()
+                .max((f64::from(spectrum[bin].1) - reference[bin].1).abs());
+            assert!(
+                error <= 3e-5,
+                "near-cancellation bin {bin} absolute error {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_fft_512_handles_impulse_and_rejects_nonfinite_input() {
+        let mut impulse = [0.0_f32; REAL_FFT_512_LEN];
+        impulse[0] = 1.0;
+        let mut spectrum = [(0.0_f32, 0.0_f32); REAL_FFT_512_BINS];
+        real_fft_512(&impulse, &mut spectrum).expect("impulse FFT");
+        assert!(spectrum.iter().all(|&(re, im)| re == 1.0 && im == 0.0));
+
+        impulse[17] = f32::NAN;
+        let error = real_fft_512(&impulse, &mut spectrum)
+            .expect_err("non-finite FFT input must fail closed");
+        assert!(error.to_string().contains("non-finite"));
     }
 
     /// Inline-transcendental copy of the PRE-optimization recursive FFT/DFT,
