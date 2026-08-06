@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a PyTorch checkpoint (.ckpt / .pt state dict) to safetensors.
+"""Convert a pinned PyTorch/NeMo checkpoint to deterministic safetensors.
 
 OFFLINE TOOLING ONLY. FrankenWhisper's Rust engine NEVER invokes this script and
 NEVER unpickles anything — reading a PyTorch pickle can execute arbitrary code,
@@ -20,9 +20,16 @@ Generating the full ECAPA oracle additionally requires exactly:
     torchaudio==2.7.1
     speechbrain==0.5.16
 
+The frozen Streaming Sortformer profile requires exactly the runtime recorded
+in ``SORTFORMER_REQUIRED_PACKAGES`` below. It reads the two members of the
+identity-bound ``.nemo`` archive through one already-hashed file descriptor,
+instantiates the pinned NeMo graph without ``restore_from`` temporary files,
+and emits both a metadata-free package and a canonical conversion receipt.
+
 Usage:
     python3 convert_to_safetensors.py INPUT.ckpt OUTPUT.safetensors
         [--key KEY] [--profile PROFILE] [--full-oracle-output PATH]
+        [--receipt-output PATH]
 
     --key KEY  if the checkpoint is a dict wrapping the state dict under a key
                (e.g. "state_dict" / "model"), unwrap that key first.
@@ -31,6 +38,9 @@ Usage:
     --full-oracle-output
                 with the frozen ECAPA profile, also emit the transcript-free
                 seven-stage public conformance oracle after exact hash checks.
+    --receipt-output
+                required by the frozen Streaming Sortformer profile; emit the
+                canonical source-to-destination tensor receipt at this path.
 
 On success the output path and its sha256 are printed (pin this in
 fetch_aux_models.sh).
@@ -48,9 +58,9 @@ import math
 import os
 import struct
 import sys
-import tempfile
+import tarfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as numpy_types
@@ -114,6 +124,76 @@ REQUIRED_SPEECHBRAIN_VERSION = "0.5.16"
 REQUIRED_PYTHON_VERSION = (3, 12, 12)
 REQUIRED_PYTHON_VERSION_TEXT = "3.12.12"
 
+SORTFORMER_PROFILE = "sortformer-streaming-4spk-v2.1"
+SORTFORMER_RECEIPT_SCHEMA = "franken-whisper-sortformer-conversion-receipt-v1"
+SORTFORMER_TENSOR_MANIFEST_SCHEMA = "franken-whisper-sortformer-tensor-manifest-v1"
+SORTFORMER_CONVERTER_ID = "franken-whisper-native-sortformer-converter"
+SORTFORMER_CONVERTER_VERSION = "1"
+SORTFORMER_MODEL_ID = "nvidia/diar_streaming_sortformer_4spk-v2.1"
+SORTFORMER_MODEL_REVISION = "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d"
+SORTFORMER_NEMO_BYTES = 471_367_680
+SORTFORMER_NEMO_SHA256 = "8abd32832159c6ac1148c926b7276f35ba34582c444e559dce1f1253fea42ef8"
+SORTFORMER_CONFIG_BYTES = 3_567
+SORTFORMER_CONFIG_SHA256 = "2865d469c4d2aac54aa5b8a956b2423c053806dd20d5bf5d08675942a1acface"
+SORTFORMER_CHECKPOINT_BYTES = 471_352_898
+SORTFORMER_CHECKPOINT_SHA256 = "eca9773c2dab91dd41fbaa4473cebb9d00811d67788ce2de609dadc6e499cdf4"
+SORTFORMER_STATE_INVENTORY_SHA256 = "f4f219cf4ac6f755247b56d19e425db3d6a7c23c4509176549b363b63abdf532"
+SORTFORMER_NEMO_SOURCE_REVISION = "40ace43c7cf151af78dc22027c02feeca7e06b6a"
+SORTFORMER_EXTERNAL_CONTRACT_SHA256 = "7ac048e3372fe4c622840beddfbeef42944d961408360324cb7276a69c8542c5"
+SORTFORMER_RUNTIME_FINGERPRINT_SHA256 = "3713fd3f024c1cef7d860706baf0dbaaf18058c03c26331da6254687693d564c"
+SORTFORMER_ORACLE_ADAPTER_SHA256 = "8f376c979b7eaca41dc0a438d9aaa41c1c723052b97c45eb2acc59b6d6f00bde"
+SORTFORMER_PARAMETER_TENSORS = 937
+SORTFORMER_TRAINABLE_PARAMETERS = 117_693_960
+SORTFORMER_STATE_TENSORS = 990
+SORTFORMER_STATE_ELEMENTS = 117_744_681
+SORTFORMER_STATE_F32_TENSORS = 973
+SORTFORMER_STATE_F32_ELEMENTS = 117_744_664
+SORTFORMER_STATE_F32_BYTES = 470_978_656
+SORTFORMER_STATE_I64_TENSORS = 17
+SORTFORMER_STATE_PAYLOAD_BYTES = 470_978_792
+SORTFORMER_SOURCE_RECORDS = 992
+SORTFORMER_EXPORTED_TENSORS = 974
+SORTFORMER_DROPPED_TENSORS = 18
+SORTFORMER_PACKAGE_F32_ELEMENTS = 122_864_152
+SORTFORMER_PACKAGE_PAYLOAD_BYTES = 491_456_608
+SORTFORMER_POSITION_TENSOR = "encoder.pos_enc.pe"
+SORTFORMER_DTYPE_SENTINEL = "preprocessor.dtype_sentinel_tensor"
+SORTFORMER_SOURCE_LAYOUT = "pytorch_contiguous_row_major"
+SORTFORMER_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+SORTFORMER_REQUIRED_PACKAGES = {
+    "nemo-toolkit": "3.1.0+40ace43c7c",
+    "torch": "2.7.1",
+    "torchaudio": "2.7.1",
+    "numpy": "2.4.6",
+    "safetensors": "0.8.0",
+    "librosa": "0.11.0",
+    "lhotse": "1.33.0",
+    "soundfile": "0.14.0",
+    "scipy": "1.18.0",
+    "omegaconf": "2.3.0",
+    "hydra-core": "1.3.2",
+    "lightning": "2.4.0",
+}
+SORTFORMER_SOURCE_FILES = (
+    ("nemo/collections/asr/data/audio_to_diar_label.py", "f9b0d23bd52da417ac18418ea1c83aa1119f59e6b37d3b2b3159c8cb2f036234"),
+    ("nemo/collections/asr/models/sortformer_diar_models.py", "4978dba1a02b414893123f66905a1e523d5bb65766903269b325746c67f6920a"),
+    ("nemo/collections/asr/modules/audio_preprocessing.py", "c061f521e14978d22ad57fa5ddf08f1103c2d1f1a4e01aca6698bfad007e8e7c"),
+    ("nemo/collections/asr/modules/conformer_encoder.py", "a8b6f712cdf75a3be768848e8242ea9412ca7ff31ba2dda6b9602bcefc627cec"),
+    ("nemo/collections/asr/modules/sortformer_modules.py", "3d136c245e3bf7a88c47fdd2eae1edb9189bbeddc3ff779cb5679a29d890b7eb"),
+    ("nemo/collections/asr/modules/transformer/transformer_encoders.py", "a2859c86c8389f1954d5c8be04dc2bc422452517ef15e069cf42bfab5d304759"),
+    ("nemo/collections/asr/modules/transformer/transformer_modules.py", "2564d95365cfafd486b1a3d10e2e2f438702907076f3716dd4c42d568b3bcc72"),
+    ("nemo/collections/asr/parts/mixins/diarization.py", "5365e416ecab192cf59f1b9d6554ebce0ed3bdb2fee7575966ac1e3fca1a1408"),
+    ("nemo/collections/asr/parts/preprocessing/features.py", "4290ed2d697362a68a6158fb8b7b8d1e2306b223b83172c63fc6b5d31b28ee69"),
+    ("nemo/collections/asr/parts/preprocessing/segment.py", "a598d91b94110e0c12a1ba4a57894ce89109e597fa8e909cf7b5b6e7bb9369af"),
+    ("nemo/collections/asr/parts/submodules/causal_convs.py", "7cf505c8caef44a37a7dec10b51eb2d60ec2f1efc3a2badc3c20c37e427cbd42"),
+    ("nemo/collections/asr/parts/submodules/conformer_modules.py", "99bb846c51db028d6d30b3d844af22826068aeaa0e48eb586489a31a9cbacf9d"),
+    ("nemo/collections/asr/parts/submodules/multi_head_attention.py", "4999fd0d679fd7315ba275f7311fe6608c48e492bd337f2e220c99b8b9729c69"),
+    ("nemo/collections/asr/parts/submodules/subsampling.py", "4fbc689f3f66e4630b286196315a02b315ad53e8049c164fe40dd11168cf0834"),
+    ("nemo/collections/asr/parts/utils/speaker_utils.py", "6c247bdda26fd010190e1c96f8399f77a5265a180086e134d9b167b3c8019dc0"),
+    ("nemo/collections/asr/parts/utils/vad_utils.py", "7beb57efff5e08407f9f16afe9c0da7d0e2ddb9bd62e2a37424693e48c5f0437"),
+    ("nemo/collections/common/parts/transformer_utils.py", "47f5e337230e7b4e176877f01c2ae85f75c024942dc567f27d8429c3e60e67c0"),
+)
+
 
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
@@ -141,15 +221,83 @@ def _read_exact_ecapa_source(path: Path) -> bytes:
     return bytes(source_bytes)
 
 
+def _read_exact_member(archive: tarfile.TarFile, name: str, expected_bytes: int) -> bytes:
+    members = [member for member in archive.getmembers() if member.name == name]
+    if len(members) != 1:
+        raise RuntimeError(f"{SORTFORMER_PROFILE} archive member census is invalid")
+    member = members[0]
+    if not member.isfile() or member.size != expected_bytes:
+        raise RuntimeError(f"{SORTFORMER_PROFILE} archive member identity is invalid")
+    source = archive.extractfile(member)
+    if source is None:
+        raise RuntimeError(f"{SORTFORMER_PROFILE} archive member is unreadable")
+    payload = source.read(expected_bytes + 1)
+    if len(payload) != expected_bytes:
+        raise RuntimeError(f"{SORTFORMER_PROFILE} archive member size changed")
+    return payload
+
+
+def _read_exact_sortformer_archive(path: Path) -> tuple[bytes, bytes]:
+    """Authenticate one open archive inode and retain only its two members."""
+    with path.open("rb") as source:
+        initial = os.fstat(source.fileno())
+        if initial.st_size != SORTFORMER_NEMO_BYTES:
+            raise RuntimeError(
+                f"{SORTFORMER_PROFILE} input size mismatch "
+                f"(got {initial.st_size}, want {SORTFORMER_NEMO_BYTES})"
+            )
+        archive_hasher = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            archive_hasher.update(chunk)
+        if not hmac.compare_digest(
+            archive_hasher.hexdigest(), SORTFORMER_NEMO_SHA256
+        ):
+            raise RuntimeError(f"{SORTFORMER_PROFILE} input sha256 mismatch")
+        source.seek(0)
+        with tarfile.open(fileobj=source, mode="r:*") as archive:
+            if sorted(member.name for member in archive.getmembers()) != [
+                "model_config.yaml",
+                "model_weights.ckpt",
+            ]:
+                raise RuntimeError(
+                    f"{SORTFORMER_PROFILE} archive member set is not frozen"
+                )
+            config_bytes = _read_exact_member(
+                archive, "model_config.yaml", SORTFORMER_CONFIG_BYTES
+            )
+            checkpoint_bytes = _read_exact_member(
+                archive, "model_weights.ckpt", SORTFORMER_CHECKPOINT_BYTES
+            )
+        final = os.fstat(source.fileno())
+        if (
+            final.st_dev != initial.st_dev
+            or final.st_ino != initial.st_ino
+            or final.st_size != initial.st_size
+            or final.st_mtime_ns != initial.st_mtime_ns
+        ):
+            raise RuntimeError(f"{SORTFORMER_PROFILE} input inode changed during read")
+    if not hmac.compare_digest(
+        hashlib.sha256(config_bytes).hexdigest(), SORTFORMER_CONFIG_SHA256
+    ):
+        raise RuntimeError(f"{SORTFORMER_PROFILE} config sha256 mismatch")
+    if not hmac.compare_digest(
+        hashlib.sha256(checkpoint_bytes).hexdigest(), SORTFORMER_CHECKPOINT_SHA256
+    ):
+        raise RuntimeError(f"{SORTFORMER_PROFILE} checkpoint sha256 mismatch")
+    return config_bytes, checkpoint_bytes
+
+
 def _build_deterministic_safetensors(
     tensors: dict[str, torch_types.Tensor],
-    metadata: dict[str, str],
+    metadata: dict[str, str] | None,
 ) -> bytes:
     """Build canonical F32 safetensors and validate the complete byte stream."""
     import torch
     from safetensors.torch import load
 
-    header: dict[str, object] = {"__metadata__": metadata}
+    header: dict[str, object] = {}
+    if metadata is not None:
+        header["__metadata__"] = metadata
     offset = 0
     for name in sorted(tensors):
         tensor = tensors[name]
@@ -196,64 +344,31 @@ def _build_deterministic_safetensors(
         decoded_header = json.loads(file_bytes[8 : 8 + len(header_json)])
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("serialized safetensors header could not be decoded") from exc
-    if decoded_header.get("__metadata__") != metadata:
+    if metadata is None:
+        if "__metadata__" in decoded_header:
+            raise RuntimeError("serialized safetensors unexpectedly contains metadata")
+    elif decoded_header.get("__metadata__") != metadata:
         raise RuntimeError("serialized safetensors metadata changed")
     return file_bytes
 
 
 def _publish_new_file(output: Path, file_bytes: bytes) -> None:
-    """Atomically publish validated bytes without replacing an existing path."""
+    """Publish validated bytes through an exclusive-create final path."""
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary_fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{output.name}.",
-        suffix=".tmp",
-        dir=output.parent,
-    )
-    temporary_path = Path(temporary_name)
-    primary_error = None
-    published = False
-    try:
-        try:
-            destination = os.fdopen(temporary_fd, "w+b")
-        except BaseException:
-            try:
-                os.close(temporary_fd)
-            except OSError:
-                pass
-            raise
-        with destination:
-            written = destination.write(file_bytes)
-            if written != len(file_bytes):
-                raise OSError("short safetensors write")
-            destination.flush()
-            os.fsync(destination.fileno())
-            destination.seek(0)
-            written_hasher = hashlib.sha256()
-            for chunk in iter(lambda: destination.read(1 << 20), b""):
-                written_hasher.update(chunk)
-            if not hmac.compare_digest(
-                written_hasher.hexdigest(),
-                hashlib.sha256(file_bytes).hexdigest(),
-            ):
-                raise OSError("written safetensors checksum changed")
-        # A same-directory hard link installs the verified inode atomically and
-        # fails rather than replacing a path created by another process.
-        os.link(temporary_path, output)
-        published = True
-    except BaseException as exc:
-        primary_error = exc
-        raise
-    finally:
-        try:
-            temporary_path.unlink(missing_ok=True)
-        except OSError:
-            if primary_error is None and published:
-                print(
-                    "warning: output published but temporary-file cleanup failed",
-                    file=sys.stderr,
-                )
-            elif primary_error is None:
-                raise
+    with output.open("x+b") as destination:
+        written = destination.write(file_bytes)
+        if written != len(file_bytes):
+            raise OSError("short exclusive output write")
+        destination.flush()
+        os.fsync(destination.fileno())
+        destination.seek(0)
+        written_hasher = hashlib.sha256()
+        for chunk in iter(lambda: destination.read(1 << 20), b""):
+            written_hasher.update(chunk)
+        if not hmac.compare_digest(
+            written_hasher.hexdigest(), hashlib.sha256(file_bytes).hexdigest()
+        ):
+            raise OSError("written output checksum changed")
 
 
 def _base_version(version: str) -> str:
@@ -263,6 +378,384 @@ def _base_version(version: str) -> str:
 def _f32_tensor_sha256(tensor: torch_types.Tensor) -> str:
     array = tensor.detach().cpu().contiguous().numpy().astype("<f4", copy=False)
     return hashlib.sha256(array.tobytes(order="C")).hexdigest()
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _require_sortformer_runtime() -> tuple[dict[str, str], Path]:
+    if sys.version_info[:3] != REQUIRED_PYTHON_VERSION:
+        raise RuntimeError(
+            f"{SORTFORMER_PROFILE} requires Python {REQUIRED_PYTHON_VERSION_TEXT}"
+        )
+    observed = {
+        package: importlib.metadata.version(package)
+        for package in SORTFORMER_REQUIRED_PACKAGES
+    }
+    if observed != SORTFORMER_REQUIRED_PACKAGES:
+        raise RuntimeError(f"{SORTFORMER_PROFILE} runtime package identity mismatch")
+
+    distribution = importlib.metadata.distribution("nemo-toolkit")
+    direct_url_text = distribution.read_text("direct_url.json")
+    if direct_url_text is None:
+        raise RuntimeError(f"{SORTFORMER_PROFILE} NeMo direct-url identity is absent")
+    direct_url = json.loads(direct_url_text)
+    vcs_info = direct_url.get("vcs_info")
+    if not isinstance(vcs_info, dict) or any(
+        vcs_info.get(field) != expected
+        for field, expected in (
+            ("commit_id", SORTFORMER_NEMO_SOURCE_REVISION),
+            ("requested_revision", SORTFORMER_NEMO_SOURCE_REVISION),
+            ("vcs", "git"),
+        )
+    ):
+        raise RuntimeError(f"{SORTFORMER_PROFILE} NeMo source revision mismatch")
+
+    import nemo
+
+    nemo_root = Path(nemo.__file__).resolve().parent
+    source_root = nemo_root.parent
+    source_files = []
+    for relative, expected_sha256 in SORTFORMER_SOURCE_FILES:
+        source_path = source_root / relative
+        if not source_path.is_file() or not hmac.compare_digest(
+            _sha256(source_path), expected_sha256
+        ):
+            raise RuntimeError(f"{SORTFORMER_PROFILE} NeMo source identity mismatch")
+        source_files.append({"path": relative, "sha256": expected_sha256})
+    if [entry["path"] for entry in source_files] != sorted(
+        entry["path"] for entry in source_files
+    ):
+        raise RuntimeError(f"{SORTFORMER_PROFILE} source identities are not canonical")
+
+    runtime = {
+        "python": REQUIRED_PYTHON_VERSION_TEXT,
+        "nemo": observed["nemo-toolkit"],
+        "torch": observed["torch"],
+        "torchaudio": observed["torchaudio"],
+        "numpy": observed["numpy"],
+        "safetensors": observed["safetensors"],
+        "librosa": observed["librosa"],
+        "lhotse": observed["lhotse"],
+        "soundfile": observed["soundfile"],
+        "scipy": observed["scipy"],
+        "omegaconf": observed["omegaconf"],
+        "hydra_core": observed["hydra-core"],
+        "lightning": observed["lightning"],
+    }
+    return runtime, source_root
+
+
+def _sortformer_tensor_bytes(
+    tensor: torch_types.Tensor, numpy: Any, torch: Any
+) -> tuple[str, bytes]:
+    if tensor.device.type != "cpu" or not tensor.is_contiguous():
+        raise RuntimeError(
+            f"{SORTFORMER_PROFILE} source tensor is not contiguous CPU storage"
+        )
+    detached = tensor.detach()
+    if detached.dtype == torch.float32:
+        if not torch.isfinite(detached).all().item():
+            raise RuntimeError(f"{SORTFORMER_PROFILE} source tensor is non-finite")
+        array = detached.numpy().astype("<f4", copy=False)
+        return "f32", array.tobytes(order="C")
+    if detached.dtype == torch.int64:
+        array = detached.numpy().astype("<i8", copy=False)
+        return "i64", array.tobytes(order="C")
+    raise RuntimeError(f"{SORTFORMER_PROFILE} source tensor dtype is unsupported")
+
+
+def _sortformer_manifest_record(record: dict[str, Any]) -> dict[str, Any]:
+    disposition = record["disposition"]
+    projected_disposition: dict[str, Any] = {"kind": disposition["kind"]}
+    if disposition["kind"] == "exported":
+        destination = disposition["destination"]
+        projected_disposition["transform"] = disposition["transform"]
+        projected_disposition["destination"] = {
+            "name": destination["name"],
+            "dtype": destination["dtype"],
+            "shape": destination["shape"],
+            "logical_layout": destination["logical_layout"],
+            "elements": destination["elements"],
+            "bytes": destination["bytes"],
+        }
+    return {
+        "source_name": record["source_name"],
+        "source_origin": record["source_origin"],
+        "source_dtype": record["source_dtype"],
+        "source_shape": record["source_shape"],
+        "source_logical_layout": record["source_logical_layout"],
+        "source_elements": record["source_elements"],
+        "source_bytes": record["source_bytes"],
+        "disposition": projected_disposition,
+    }
+
+
+def _sortformer_manifest_sha256(records: list[dict[str, Any]]) -> str:
+    manifest = {
+        "schema_version": SORTFORMER_TENSOR_MANIFEST_SCHEMA,
+        "model_id": SORTFORMER_MODEL_ID,
+        "model_revision": SORTFORMER_MODEL_REVISION,
+        "nemo_sha256": SORTFORMER_NEMO_SHA256,
+        "config_sha256": SORTFORMER_CONFIG_SHA256,
+        "checkpoint_sha256": SORTFORMER_CHECKPOINT_SHA256,
+        "records": [_sortformer_manifest_record(record) for record in records],
+    }
+    return hashlib.sha256(_canonical_json_bytes(manifest)).hexdigest()
+
+
+def _sortformer_record(
+    name: str,
+    origin: str,
+    tensor: torch_types.Tensor,
+    numpy: Any,
+    torch: Any,
+) -> tuple[dict[str, Any], torch_types.Tensor | None]:
+    dtype, raw = _sortformer_tensor_bytes(tensor, numpy, torch)
+    shape = list(tensor.shape)
+    elements = tensor.numel()
+    source_sha256 = hashlib.sha256(raw).hexdigest()
+    record: dict[str, Any] = {
+        "source_name": name,
+        "source_origin": origin,
+        "source_dtype": dtype,
+        "source_shape": shape,
+        "source_logical_layout": SORTFORMER_SOURCE_LAYOUT,
+        "source_value_sha256": source_sha256,
+        "source_elements": elements,
+        "source_bytes": len(raw),
+    }
+    if dtype == "f32" and name != SORTFORMER_DTYPE_SENTINEL:
+        record["disposition"] = {
+            "kind": "exported",
+            "transform": "identity_contiguous_f32",
+            "destination": {
+                "name": name,
+                "dtype": "f32",
+                "shape": shape,
+                "logical_layout": SORTFORMER_SOURCE_LAYOUT,
+                "value_sha256": source_sha256,
+                "elements": elements,
+                "bytes": len(raw),
+            },
+        }
+        return record, tensor
+    if dtype == "i64" and name.endswith(".num_batches_tracked"):
+        if shape or elements != 1 or len(raw) != 8:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} training counter is invalid")
+        record["disposition"] = {"kind": "dropped_train_only"}
+        return record, None
+    if (
+        name == SORTFORMER_DTYPE_SENTINEL
+        and dtype == "f32"
+        and shape == [0]
+        and elements == 0
+        and source_sha256 == SORTFORMER_EMPTY_SHA256
+    ):
+        record["disposition"] = {"kind": "dropped_runtime_sentinel"}
+        return record, None
+    raise RuntimeError(f"{SORTFORMER_PROFILE} tensor disposition is unsupported")
+
+
+def _build_sortformer_state(
+    config_bytes: bytes,
+    checkpoint_bytes: bytes,
+    numpy: Any,
+    torch: Any,
+) -> tuple[dict[str, torch_types.Tensor], list[dict[str, Any]], str]:
+    from nemo.collections.asr.models import SortformerEncLabelModel
+    from omegaconf import OmegaConf
+
+    config = OmegaConf.create(config_bytes.decode("utf-8"))
+    model = SortformerEncLabelModel(cfg=config).float().cpu().eval()
+    checkpoint = torch.load(
+        io.BytesIO(checkpoint_bytes),
+        map_location="cpu",
+        weights_only=True,
+    )
+    checkpoint_bytes = b""
+    if not isinstance(checkpoint, dict) or not isinstance(
+        checkpoint.get("state_dict"), dict
+    ):
+        raise RuntimeError(f"{SORTFORMER_PROFILE} checkpoint state_dict is absent")
+    state_source = checkpoint["state_dict"]
+    model.load_state_dict(state_source, strict=True, assign=True)
+    checkpoint = None
+    state_source = None
+    model.float().cpu().eval()
+
+    parameter_tensors = list(model.parameters())
+    if (
+        len(parameter_tensors) != SORTFORMER_PARAMETER_TENSORS
+        or sum(parameter.numel() for parameter in parameter_tensors)
+        != SORTFORMER_TRAINABLE_PARAMETERS
+    ):
+        raise RuntimeError(f"{SORTFORMER_PROFILE} parameter census changed")
+
+    state = model.state_dict()
+    inventory = [
+        {
+            "name": name,
+            "dtype": str(tensor.dtype).removeprefix("torch."),
+            "shape": list(tensor.shape),
+            "numel": tensor.numel(),
+        }
+        for name, tensor in state.items()
+    ]
+    if not hmac.compare_digest(
+        hashlib.sha256(_canonical_json_bytes(inventory)).hexdigest(),
+        SORTFORMER_STATE_INVENTORY_SHA256,
+    ):
+        raise RuntimeError(f"{SORTFORMER_PROFILE} state inventory changed")
+
+    state_names = set(state)
+    nonpersistent = {
+        name: tensor
+        for name, tensor in model.named_buffers()
+        if name not in state_names
+    }
+    if set(nonpersistent) != {
+        SORTFORMER_POSITION_TENSOR,
+        SORTFORMER_DTYPE_SENTINEL,
+    }:
+        raise RuntimeError(f"{SORTFORMER_PROFILE} non-persistent buffers changed")
+
+    records = []
+    tensors: dict[str, torch_types.Tensor] = {}
+    for name, tensor in state.items():
+        record, exported = _sortformer_record(
+            name, "state_dict", tensor, numpy, torch
+        )
+        records.append(record)
+        if exported is not None:
+            tensors[name] = exported
+    for name, tensor in nonpersistent.items():
+        record, exported = _sortformer_record(
+            name, "nonpersistent_buffer", tensor, numpy, torch
+        )
+        records.append(record)
+        if exported is not None:
+            tensors[name] = exported
+    records.sort(key=lambda record: record["source_name"])
+
+    state_f32 = [tensor for tensor in state.values() if tensor.dtype == torch.float32]
+    state_i64 = [tensor for tensor in state.values() if tensor.dtype == torch.int64]
+    if (
+        len(state) != SORTFORMER_STATE_TENSORS
+        or sum(tensor.numel() for tensor in state.values())
+        != SORTFORMER_STATE_ELEMENTS
+        or len(state_f32) != SORTFORMER_STATE_F32_TENSORS
+        or sum(tensor.numel() for tensor in state_f32)
+        != SORTFORMER_STATE_F32_ELEMENTS
+        or sum(tensor.numel() * 4 for tensor in state_f32)
+        != SORTFORMER_STATE_F32_BYTES
+        or len(state_i64) != SORTFORMER_STATE_I64_TENSORS
+        or sum(tensor.numel() * tensor.element_size() for tensor in state.values())
+        != SORTFORMER_STATE_PAYLOAD_BYTES
+        or len(records) != SORTFORMER_SOURCE_RECORDS
+        or len(tensors) != SORTFORMER_EXPORTED_TENSORS
+        or sum(tensor.numel() for tensor in tensors.values())
+        != SORTFORMER_PACKAGE_F32_ELEMENTS
+    ):
+        raise RuntimeError(f"{SORTFORMER_PROFILE} tensor census changed")
+    dropped = sum(
+        record["disposition"]["kind"] != "exported" for record in records
+    )
+    if dropped != SORTFORMER_DROPPED_TENSORS:
+        raise RuntimeError(f"{SORTFORMER_PROFILE} dropped tensor census changed")
+    return tensors, records, _sortformer_manifest_sha256(records)
+
+
+def _build_sortformer_receipt(
+    records: list[dict[str, Any]],
+    manifest_sha256: str,
+    package_bytes: bytes,
+    runtime: dict[str, str],
+    converter_sha256: str,
+) -> dict[str, Any]:
+    package_sha256 = hashlib.sha256(package_bytes).hexdigest()
+    return {
+        "schema_version": SORTFORMER_RECEIPT_SCHEMA,
+        "model": {
+            "model_id": SORTFORMER_MODEL_ID,
+            "model_revision": SORTFORMER_MODEL_REVISION,
+            "nemo_bytes": SORTFORMER_NEMO_BYTES,
+            "nemo_sha256": SORTFORMER_NEMO_SHA256,
+            "config_sha256": SORTFORMER_CONFIG_SHA256,
+            "checkpoint_bytes": SORTFORMER_CHECKPOINT_BYTES,
+            "checkpoint_sha256": SORTFORMER_CHECKPOINT_SHA256,
+            "state_inventory_sha256": SORTFORMER_STATE_INVENTORY_SHA256,
+            "tensor_manifest_sha256": manifest_sha256,
+            "nemo_source_revision": SORTFORMER_NEMO_SOURCE_REVISION,
+            "external_contract_sha256": SORTFORMER_EXTERNAL_CONTRACT_SHA256,
+            "runtime_fingerprint_sha256": SORTFORMER_RUNTIME_FINGERPRINT_SHA256,
+            "oracle_adapter_sha256": SORTFORMER_ORACLE_ADAPTER_SHA256,
+            "trainable_parameters": SORTFORMER_TRAINABLE_PARAMETERS,
+            "parameter_tensors": SORTFORMER_PARAMETER_TENSORS,
+            "state_tensors": SORTFORMER_STATE_TENSORS,
+            "state_elements": SORTFORMER_STATE_ELEMENTS,
+            "state_f32_tensors": SORTFORMER_STATE_F32_TENSORS,
+            "state_f32_elements": SORTFORMER_STATE_F32_ELEMENTS,
+            "state_f32_bytes": SORTFORMER_STATE_F32_BYTES,
+            "state_i64_tensors": SORTFORMER_STATE_I64_TENSORS,
+            "state_payload_bytes": SORTFORMER_STATE_PAYLOAD_BYTES,
+        },
+        "execution": {
+            "streaming_mode": True,
+            "async_streaming": False,
+            "encoder_attention_context": [-1, -1],
+            "encoder_attention_style": "regular",
+            "transformer_mask_future": False,
+            "transformer_pre_ln": False,
+            "drop_extra_pre_encoded": 0,
+        },
+        "source_files": [
+            {"path": path, "sha256": sha256}
+            for path, sha256 in SORTFORMER_SOURCE_FILES
+        ],
+        "converter": {
+            "converter_id": SORTFORMER_CONVERTER_ID,
+            "converter_version": SORTFORMER_CONVERTER_VERSION,
+            "source_sha256": converter_sha256,
+        },
+        "runtime": runtime,
+        "license": {
+            "model_license_id": "NVIDIA Open Model License",
+            "model_license_url": "https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/",
+            "model_license_snapshot_retrieved_date": "2026-08-06",
+            "model_license_last_modified": "Mon, 03 Aug 2026 17:46:28 GMT",
+            "model_license_etag": "4b001-658281e31650b",
+            "model_license_payload_sha256": "13c9c998e24abd5211cff4b5c912902f566bd710294da98580be7b3376626f04",
+            "model_weight_distribution_policy": "operator_local_no_git_no_release",
+            "nemo_source_license_spdx": "Apache-2.0",
+            "nemo_source_license_sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1",
+            "embedded_notice_source_path": "nemo/collections/asr/parts/preprocessing/features.py",
+            "embedded_notice_source_sha256": "4290ed2d697362a68a6158fb8b7b8d1e2306b223b83172c63fc6b5d31b28ee69",
+            "embedded_notice_license_spdx": "MIT",
+            "embedded_notice_attribution": "Ryan Leary",
+            "embedded_notice_attribution_required": True,
+        },
+        "package": {
+            "format": "safetensors",
+            "sha256": package_sha256,
+            "bytes": len(package_bytes),
+            "payload_bytes": SORTFORMER_PACKAGE_PAYLOAD_BYTES,
+            "f32_elements": SORTFORMER_PACKAGE_F32_ELEMENTS,
+            "tensor_count": SORTFORMER_EXPORTED_TENSORS,
+            "dtype": "f32",
+            "byte_order": "little_endian",
+            "tensor_order": "lexicographic_name_order",
+            "logical_layout": SORTFORMER_SOURCE_LAYOUT,
+            "metadata_policy": "absent",
+        },
+        "records": records,
+    }
 
 
 def _analytic_ecapa_fixture(numpy: object) -> numpy_types.ndarray:
@@ -423,6 +916,64 @@ def _build_ecapa_full_oracle(
     return captured, metadata
 
 
+def _run_sortformer_export(
+    args: argparse.Namespace,
+    numpy: Any,
+    safetensors: Any,
+    torch: Any,
+) -> int:
+    try:
+        runtime, _source_root = _require_sortformer_runtime()
+        config_bytes, checkpoint_bytes = _read_exact_sortformer_archive(args.input)
+        tensors, records, manifest_sha256 = _build_sortformer_state(
+            config_bytes,
+            checkpoint_bytes,
+            numpy,
+            torch,
+        )
+        config_bytes = b""
+        checkpoint_bytes = b""
+        package_bytes = _build_deterministic_safetensors(tensors, None)
+        if len(package_bytes) <= SORTFORMER_PACKAGE_PAYLOAD_BYTES:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} package header is absent")
+        converter_sha256 = _sha256(Path(__file__).resolve())
+        receipt = _build_sortformer_receipt(
+            records,
+            manifest_sha256,
+            package_bytes,
+            runtime,
+            converter_sha256,
+        )
+        receipt_bytes = _canonical_json_bytes(receipt)
+
+        # All source, runtime, tensor, and complete byte-stream checks finish
+        # before either exclusive-create final path is opened.
+        _publish_new_file(args.output, package_bytes)
+        _publish_new_file(args.receipt_output, receipt_bytes)
+    except (
+        ImportError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        tarfile.TarError,
+        safetensors.SafetensorError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"wrote {len(tensors)} tensors -> {args.output}")
+    print(f"input  sha256: {SORTFORMER_NEMO_SHA256}")
+    print(f"output bytes: {len(package_bytes)}")
+    print(f"output sha256: {receipt['package']['sha256']}")
+    print(f"manifest sha256: {manifest_sha256}")
+    print(f"converter sha256: {converter_sha256}")
+    print(f"receipt bytes: {len(receipt_bytes)}")
+    print(f"receipt sha256: {hashlib.sha256(receipt_bytes).hexdigest()}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Convert a PyTorch .ckpt/.pt state dict to f32 safetensors.",
@@ -438,7 +989,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--profile",
-        choices=("generic", ECAPA_PROFILE),
+        choices=("generic", ECAPA_PROFILE, SORTFORMER_PROFILE),
         default="generic",
         help="model-specific validation/export profile (default: generic)",
     )
@@ -448,10 +999,16 @@ def main() -> int:
         default=None,
         help="also write the frozen public ECAPA full-stage oracle safetensors",
     )
+    parser.add_argument(
+        "--receipt-output",
+        type=Path,
+        default=None,
+        help="write the canonical frozen Sortformer conversion receipt",
+    )
     args = parser.parse_args()
 
     if (
-        args.profile == ECAPA_PROFILE
+        args.profile in (ECAPA_PROFILE, SORTFORMER_PROFILE)
         and sys.version_info[:3] != REQUIRED_PYTHON_VERSION
     ):
         print(
@@ -479,6 +1036,37 @@ def main() -> int:
     if args.output.exists():
         print(f"error: refusing to overwrite existing output: {args.output}", file=sys.stderr)
         return 2
+    if args.profile == SORTFORMER_PROFILE:
+        if args.key is not None:
+            print(f"error: {SORTFORMER_PROFILE} does not accept --key", file=sys.stderr)
+            return 2
+        if args.full_oracle_output is not None:
+            print(
+                f"error: {SORTFORMER_PROFILE} does not accept --full-oracle-output",
+                file=sys.stderr,
+            )
+            return 2
+        if args.receipt_output is None:
+            print(
+                f"error: {SORTFORMER_PROFILE} requires --receipt-output",
+                file=sys.stderr,
+            )
+            return 2
+        if args.receipt_output.exists():
+            print(
+                f"error: refusing to overwrite existing receipt: {args.receipt_output}",
+                file=sys.stderr,
+            )
+            return 2
+        if args.output.resolve() == args.receipt_output.resolve():
+            print("error: package and receipt output paths must differ", file=sys.stderr)
+            return 2
+    elif args.receipt_output is not None:
+        print(
+            f"error: --receipt-output requires the frozen {SORTFORMER_PROFILE} profile",
+            file=sys.stderr,
+        )
+        return 2
     if args.full_oracle_output is not None:
         if args.profile != ECAPA_PROFILE:
             print("error: --full-oracle-output requires the frozen ECAPA profile", file=sys.stderr)
@@ -501,6 +1089,9 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+
+    if args.profile == SORTFORMER_PROFILE:
+        return _run_sortformer_export(args, numpy, safetensors, torch)
 
     ecapa_source_bytes = None
     if args.profile == ECAPA_PROFILE:
