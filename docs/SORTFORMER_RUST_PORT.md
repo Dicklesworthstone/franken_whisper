@@ -1,8 +1,8 @@
 # Native Streaming Sortformer Rust Port Contract
 
-Status: Phase -1 fit screen and converted-weight artifact admission complete;
-external-oracle provenance plus L1-L8 parity evidence remain open under
-`bd-y4ip.10`
+Status: Phase -1 fit screen, converted-weight artifact admission, and a partial
+synthetic L1 valid-log-mel parity checkpoint are complete; licensed public L1,
+native intermediate frontend seams, and L2-L8 remain open under `bd-y4ip.10`
 Fit verdict: **CONDITIONAL GO**
 Promotion authority: none; this document does not enable a runtime route
 
@@ -285,15 +285,16 @@ outside Git.
 - 128 log-mel features, frame splicing 1, no feature normalization;
 - the exact stored Slaney mel buffer with shape `[1, 128, 257]`;
 - natural logarithm after adding `2^-24`;
-- archive dither value `1e-5`, but diarization evaluation sets dither to zero
-  and `pad_to` to zero; and
+- archive dither value `1e-5`, but evaluation mode disables dither; `pad_to`
+  remains 16, masks frames beyond the declared valid length to zero, and the
+  canonical L1 comparison crops back to valid frames; and
 - batch size one, CPU float32, no autocast, no quantization.
 
 The converted package must retain `preprocessor.featurizer.window` with shape
 `[400]` and raw little-endian f32 SHA-256
-`c427e2029118cf789649e5a4d439b6115d0dd0cbf95dcd22f65e3c848add8c5b`, plus
+`7d6b2ab4944b0b65650e1bba1132821fd1d2ed000df84dbd893316788d0ef062`, plus
 `preprocessor.featurizer.fb` with shape `[1, 128, 257]` and SHA-256
-`bce5ec5f194a5913f6508cee5a85512e7bad2352db8fc28f5c6ff75af8b09137`.
+`82663f1145f6965d8b27a85f32a44fa4f3bffef9bd0d6c2d1902b334a012367b`.
 Rust loads and verifies these stored buffers rather than regenerating them.
 
 The first oracle seam is the exact framed log-mel tensor and its valid length.
@@ -547,7 +548,7 @@ mask contract is proven at a seam.
 | Softmax and masks | FrankenTorch only after mask equivalence | fully masked, tail, and long-context cases |
 | Top-k, stable sort, gather, optional permutation | safe Rust model logic | tie, placeholder, disabled, and eval-absence fixtures |
 | Cache/FIFO mutation | safe Rust bounded state machine | empty, first-full, steady, tail, and cancellation fixtures |
-| Log-mel frontend | pinned-buffer, source-derived candidate | frame count plus per-stage tensor parity required at L1 |
+| Log-mel frontend | pinned-buffer Rust implementation | authenticated synthetic source-stage pack plus compiled valid-log-mel parity; native intermediate-stage and public real-voice evidence remain required |
 
 No new tensor runtime is justified. No model-specific fused kernel is justified
 before the f32 whole-forward gate passes and profiling identifies a measured
@@ -556,22 +557,56 @@ implementation.
 
 ## 7. Oracle floor pilot
 
-The current external adapter emits only the final discrete stage document. It
-does not expose probabilities or intermediate activations and is therefore not
-an L1-L6 parity oracle. `bd-y4ip.10` needs a separate identity-bound activation
-exporter whose tensor names, shapes, dtypes, and byte hashes are included in the
-evidence contract. Exact activation bytes derived from real human speech stay
-external and ephemeral; Git retains only identities and aggregate drift. Exact
-committed seam values are limited to deterministic synthetic non-human inputs.
+The final-output external adapter still does not authorize intermediate
+activations. A separate frozen exporter now provides the first synthetic-only
+L1 frontend truth pack. Its source SHA-256 is
+`a5e4a8a29e1ce8e4227ff8973a6279fe5aa560a57e5f06947be2a14cf68adf33`;
+the canonical receipt SHA-256 is
+`058ecfebe91cea90dd669c28ee3e8976ef3ea3e3494f9dc0c5b93f0a26fa17f2`;
+and the 282,716-byte safetensors package SHA-256 is
+`294edcc0a9d80fa9470c2cd45f2c1556a47a56b7c98ba444984f764a1f398a8b`.
+The package and receipt stay operator-local. Git contains only the exporter,
+compiled trust roots, verifier, aggregate metrics, and documentation.
 
-The immediate next gate is L1, not a whole-graph comparison. First freeze the
-separate activation-exporter source and executable digests. Then capture exact
-decoded PCM and valid lengths plus pre-emphasis, STFT, power, mel, and log-mel
-tensors for deterministic synthetic silence, impulse, tone, and partial-tail
-fixtures. After those exact synthetic seams agree, repeat each declared public
-real-voice input five times at one thread and five times at eight threads. Keep
-real-voice values outside Git and retain only identities, shapes, hashes, and
-aggregate drift used to set the predeclared source-variability floor.
+The truth pack covers deterministic non-human silence, impulse, exact integer
+tone-cycle, and partial-tail fixtures. Each captures decoded PCM, input and
+valid lengths, pre-emphasis, windowed frames, complex STFT, power, mel energy,
+unmasked physical log-mel, valid log-mel, and the padded/masked frontend output,
+plus the exact Hann and mel buffers. The exporter requested five runs in each
+configured one-thread and eight-thread regime, producing 44 fixture-stage
+observations and 45 all-pairs comparisons per observation. Every captured
+source replay is byte-exact, so the measured synthetic source floor and its
+tolerance are both zero. The receipt binds the requested regimes; it does not
+claim direct observation of operating-system worker utilization.
+
+That zero source floor is not silently reused as a cross-implementation Rust
+tolerance. The independent radix-2 Rust FFT has a different valid floating-
+point operation order from PyTorch. The diagnostic comparator therefore keeps
+the source floor separate and predeclares binary cross-kernel ceilings of
+`2^-12` maximum absolute drift, `2^-17` mean absolute drift, and `2^-19`
+relative L2 drift; synthetic silence must remain byte-exact. Exceeding any
+ceiling is a test loss, not a reason to regenerate goldens or loosen the gate.
+
+The compiled Rust operator test passed on 2026-08-06 (`1 passed; 0 failed`) and
+reported these valid-log-mel comparisons:
+
+| Fixture | Values | Bit-different | Max absolute | Mean absolute | Relative L2 |
+|---|---:|---:|---:|---:|---:|
+| `silence_320` | 256 | 0 | `0` | `0` | `0` |
+| `impulse_480` | 384 | 59 | `2.765655518e-5` | `2.073744933e-7` | `2.232957057e-7` |
+| `tone_640` | 512 | 323 | `1.392364502e-4` | `2.987362677e-6` | `8.583203051e-7` |
+| `partial_tail_321` | 256 | 150 | `1.716613770e-5` | `6.364425644e-7` | `4.189396136e-7` |
+
+The comparator independently loads the Rust Hann/mel buffers from the admitted
+L0 model package and the expected values from the activation pack. It currently
+reconstructs and compares only `log_mel_f32`; the other captured frontend stages
+are authenticated source-replay evidence, not yet native Rust stage parity.
+
+This establishes only a partial synthetic L1 frontend pilot. Full L1 still
+requires the declared licensed public real-voice runs at one and eight threads,
+with real-voice activation values external and ephemeral. L2-L8, cache
+transitions, complete f32 forward parity, accuracy, resource, and routing gates
+remain open.
 
 An exploratory, separately run probe reported two f32 CPU runs with one PyTorch
 intra-op thread and two with eight intra-op threads on one public
@@ -630,7 +665,7 @@ insufficient.
 | ID | Question | State | Gate |
 |---|---|---|---|
 | OQ-01 | Does evaluation inject configured dither? | Resolved: no | L1 |
-| OQ-02 | Exact STFT padding, mel floor, and length rounding | Source-resolved; numeric fixture pending | L1 |
+| OQ-02 | Exact STFT padding, mel floor, and length rounding | Resolved for the synthetic pack and native valid-log-mel comparator; public real-voice extension open | L1 |
 | OQ-03 | Depthwise subsampling padding and layout at tails | Source-resolved; numeric tail fixture pending | L2 |
 | OQ-04 | Exact relative-position attention equations, masks, and scaling | Source-resolved; numeric fixture pending | L3 |
 | OQ-05 | Exact inference head branch | Resolved from pinned source; numeric fixture required | L5 |
@@ -638,7 +673,7 @@ insufficient.
 | OQ-07 | First, steady, and partial-tail cache mutation | Partially source-resolved; fixtures required | L6 |
 | OQ-08 | Speaker permutation during accepted inference | Resolved: disabled and absent in eval | L6 |
 | OQ-09 | Converted package tensor map and transforms | Resolved: exact 992-record manifest, receipt, and 974-tensor package admitted | L0 |
-| OQ-10 | Cross-input and cross-thread oracle variability | Pilot only | L1-L8 |
+| OQ-10 | Cross-input and cross-thread oracle variability | Synthetic frontend zero-floor complete; licensed public L1-L8 floor open | L1-L8 |
 | OQ-11 | Model bytes in repository or releases | Resolved: forbidden for initial route | L0 |
 | OQ-12 | Known requirement above four speakers | Model ineligibility resolved; product fallback pending `bd-y4ip.14` | L8-L10 |
 | OQ-13 | Known timestamp intervals during parity | Resolved: post-forward mapping only | L9 |
@@ -648,11 +683,11 @@ insufficient.
 | OQ-17 | Activity still open at the final 10 ms sample versus strict 80 ms output validation | Open: tail fixtures and one canonical rule | L7-L8 |
 
 The fit screen has no remaining upstream semantic question that invalidates its
-conditional-GO result. The numeric/tie fixtures in OQ-02 through OQ-07 and the
-remaining oracle work in OQ-10 and OQ-15 are owned by `bd-y4ip.10` and block
-`bd-y4ip.11` parity completion. OQ-09 is resolved. OQ-17 blocks final discrete
-parity. OQ-14 does not block same-host parity but blocks a broad cross-platform
-support claim.
+conditional-GO result. The public-real-voice extension of OQ-02, the numeric/tie
+fixtures in OQ-03 through OQ-07, and the remaining oracle work in OQ-10 and
+OQ-15 are owned by `bd-y4ip.10` and block `bd-y4ip.11` parity completion. OQ-09
+is resolved. OQ-17 blocks final discrete parity. OQ-14 does not block same-host
+parity but blocks a broad cross-platform support claim.
 
 ## 10. Implementation slices
 
@@ -667,9 +702,12 @@ support claim.
    records, 974 exports, and 18 typed drops.**
 5. Capture all L1-L8 real-voice oracle activations outside Git and retain only
    their identities and aggregate drift; commit exact activation values only
-   for deterministic synthetic non-human fixtures. **Open.**
-6. Add tamper and identity-drift tests. **L0 artifact tests complete; L1-L8
-   seam/exporter tests remain open.**
+   for deterministic synthetic non-human fixtures. **Partial: the synthetic
+   frontend pack and native valid-log-mel comparator are complete; licensed
+   public L1 and every L2-L8 seam remain open.**
+6. Add tamper and identity-drift tests. **L0 artifact tests and the synthetic
+   L1 receipt/domain/I64/cancellation slice are complete; the full L1-L8
+   package and seam failure matrix remains open.**
 
 ### Slice B: safe f32 engine (`bd-y4ip.11`)
 
@@ -768,15 +806,20 @@ Completed here:
   topology recomputation, strict safetensors parsing, fallible allocation,
   regular-file and path-swap defenses, synthetic tamper tests, and
   operator-local real-package admission proof; and
-- a pinned-buffer, source-derived bounded whole-file Rust log-mel frontend
-  candidate with fallible allocation and synthetic mathematical/unit tests.
+- a separate synthetic activation receipt/package verifier with compiled trust
+  roots, a ten-run zero source floor over four non-human fixtures, and an exact
+  operator-local activation admission proof; and
+- a pinned-buffer, source-derived bounded whole-file Rust log-mel frontend with
+  fallible allocation, mathematical/unit tests, and compiled valid-log-mel
+  parity inside the frozen synthetic cross-kernel envelope.
 
 Not completed here:
 
 - complete multi-input oracle floor;
-- L1-L8 seam fixtures;
+- licensed public-real-voice L1 plus all L2-L8 seam fixtures;
+- native intermediate frontend-stage parity before `log_mel_f32`;
 - any Rust neural model forward pass beyond the log-mel frontend;
-- f32, quantized, or fused parity;
+- f32 neural, quantized, or fused parity;
 - authoritative peak RSS, RTF, or cancellation evidence;
 - frozen public multi-record accuracy certification; or
 - production routing.

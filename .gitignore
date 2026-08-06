@@ -112,6 +112,10 @@ storage.sqlite3-shm
 *.[gG][gG][mM][lL]
 [gG][gG][mM][lL]-*.[bB][iI][nN]
 [pP][yY][tT][oO][rR][cC][hH]_[mM][oO][dD][eE][lL]*.[bB][iI][nN]
+*[aA][cC][tT][iI][vV][aA][tT][iI][oO][nN]-[rR][eE][cC][eE][iI][pP][tT]*.[jJ][sS][oO][nN]
+*[aA][cC][tT][iI][vV][aA][tT][iI][oO][nN]_[rR][eE][cC][eE][iI][pP][tT]*.[jJ][sS][oO][nN]
+*[cC][oO][nN][vV][eE][rR][sS][iI][oO][nN]-[rR][eE][cC][eE][iI][pP][tT]*.[jJ][sS][oO][nN]
+*[cC][oO][nN][vV][eE][rR][sS][iI][oO][nN]_[rR][eE][cC][eE][iI][pP][tT]*.[jJ][sS][oO][nN]
 
 # Confidential transcript sidecars must remain outside the repository
 *transcript*.md

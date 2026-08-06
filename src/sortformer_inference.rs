@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{FwError, FwResult};
 use crate::native_engine::mel::{REAL_FFT_512_BINS, REAL_FFT_512_LEN, real_fft_512};
 use crate::native_engine::weights::SafetensorsFile;
-use crate::sortformer_conformance::VerifiedSortformerPackage;
+use crate::sortformer_conformance::{VerifiedSortformerActivationPack, VerifiedSortformerPackage};
 
 pub const SORTFORMER_SAMPLE_RATE_HZ: usize = 16_000;
 pub const SORTFORMER_CHANNELS: usize = 1;
@@ -30,10 +30,10 @@ pub const SORTFORMER_MEL_BINS: usize = 128;
 
 pub const SORTFORMER_WINDOW_TENSOR_NAME: &str = "preprocessor.featurizer.window";
 pub const SORTFORMER_WINDOW_TENSOR_SHA256: &str =
-    "c427e2029118cf789649e5a4d439b6115d0dd0cbf95dcd22f65e3c848add8c5b";
+    "7d6b2ab4944b0b65650e1bba1132821fd1d2ed000df84dbd893316788d0ef062";
 pub const SORTFORMER_MEL_TENSOR_NAME: &str = "preprocessor.featurizer.fb";
 pub const SORTFORMER_MEL_TENSOR_SHA256: &str =
-    "bce5ec5f194a5913f6508cee5a85512e7bad2352db8fc28f5c6ff75af8b09137";
+    "82663f1145f6965d8b27a85f32a44fa4f3bffef9bd0d6c2d1902b334a012367b";
 
 const PREEMPHASIS: f32 = 0.97;
 const LOG_GUARD: f32 = f32::from_bits(0x3380_0000); // exactly 2^-24
@@ -42,6 +42,13 @@ const WINDOW_CENTER: usize = SORTFORMER_WINDOW_SAMPLES / 2;
 const ZERO_FILL_CHUNK_VALUES: usize = 1024 * 1024;
 const WINDOW_SHAPE: &[usize] = &[SORTFORMER_WINDOW_SAMPLES];
 const MEL_SHAPE: &[usize] = &[1, SORTFORMER_MEL_BINS, REAL_FFT_512_BINS];
+
+/// Predeclared implementation envelope for the diagnostic synthetic L1 probe.
+/// These are cross-kernel budgets, not the reference oracle's measured floor;
+/// the latter is independently required to remain byte-exact at zero.
+pub const SORTFORMER_FRONTEND_MAX_ABS_DIFF: f64 = 0.000_244_140_625; // 2^-12
+pub const SORTFORMER_FRONTEND_MAX_MEAN_ABS_DIFF: f64 = 0.000_007_629_394_531_25; // 2^-17
+pub const SORTFORMER_FRONTEND_MAX_RELATIVE_L2: f64 = 0.000_001_907_348_632_812_5; // 2^-19
 
 #[derive(Clone, Copy)]
 struct TensorContract<'a> {
@@ -92,6 +99,26 @@ pub struct SortformerFrontendOutput {
     pub mel_bins: usize,
     pub valid_frames: usize,
     pub data: Vec<f32>,
+}
+
+/// Numeric result for one authenticated non-human fixture.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortformerFrontendParityMetrics {
+    pub fixture: String,
+    pub compared_values: usize,
+    pub mismatch_count: usize,
+    pub byte_exact: bool,
+    pub max_abs_diff: f64,
+    pub mean_abs_diff: f64,
+    pub relative_l2: f64,
+}
+
+/// Diagnostic partial-L1 result. This report is not routing or promotion
+/// authority and contains only aggregate drift over frozen synthetic inputs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortformerFrontendParityReport {
+    pub oracle_floor_byte_exact: bool,
+    pub fixtures: Vec<SortformerFrontendParityMetrics>,
 }
 
 /// Audio boundary for the evaluation frontend.
@@ -299,6 +326,202 @@ impl SortformerFrontend {
             data,
         })
     }
+}
+
+/// Run the native frontend against the independently authenticated synthetic
+/// oracle pack and enforce the predeclared cross-kernel envelope.
+///
+/// The frontend buffers come from `model_package`; the expected activations
+/// come from `activation_pack`. Keeping those trust chains separate prevents a
+/// tautological replay of the oracle's own analysis buffers.
+pub fn verify_sortformer_frontend_synthetic_parity(
+    model_package: &VerifiedSortformerPackage,
+    activation_pack: &VerifiedSortformerActivationPack,
+) -> FwResult<SortformerFrontendParityReport> {
+    verify_sortformer_frontend_synthetic_parity_with_checkpoint(
+        model_package,
+        activation_pack,
+        &|| Ok(()),
+    )
+}
+
+/// Cancellation-aware form of [`verify_sortformer_frontend_synthetic_parity`].
+pub fn verify_sortformer_frontend_synthetic_parity_with_checkpoint(
+    model_package: &VerifiedSortformerPackage,
+    activation_pack: &VerifiedSortformerActivationPack,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<SortformerFrontendParityReport> {
+    let frontend =
+        SortformerFrontend::from_verified_package_with_checkpoint(model_package, checkpoint)?;
+    let oracle_floor_byte_exact = activation_pack.receipt().oracle_floor.all_byte_exact;
+    if !oracle_floor_byte_exact {
+        return Err(frontend_error(
+            "parity_oracle_floor",
+            "authenticated activation pack does not carry a byte-exact source floor",
+        ));
+    }
+
+    let mut fixtures = Vec::new();
+    fixtures
+        .try_reserve_exact(activation_pack.receipt().fixtures.len())
+        .map_err(|_| {
+            frontend_error(
+                "parity_allocation",
+                "synthetic parity report could not be allocated",
+            )
+        })?;
+    for fixture in &activation_pack.receipt().fixtures {
+        frontend_checkpoint(checkpoint)?;
+        let decoded_name = format!("fixture.{}.decoded_pcm_f32", fixture.name);
+        let decoded_shape = [
+            1,
+            usize::try_from(fixture.sample_count).map_err(|_| {
+                frontend_error(
+                    "parity_shape",
+                    "synthetic fixture sample count does not fit this platform",
+                )
+            })?,
+        ];
+        let decoded = load_activation_f32(activation_pack, &decoded_name, &decoded_shape)?;
+        let observed =
+            frontend.compute_with_checkpoint(SortformerPcm::mono_16khz(&decoded), checkpoint)?;
+
+        let valid_frames = usize::try_from(fixture.valid_frames).map_err(|_| {
+            frontend_error(
+                "parity_shape",
+                "synthetic fixture frame count does not fit this platform",
+            )
+        })?;
+        if observed.mel_bins != SORTFORMER_MEL_BINS || observed.valid_frames != valid_frames {
+            return Err(frontend_error(
+                "parity_shape",
+                "native frontend output geometry changed from the authenticated fixture",
+            ));
+        }
+        let expected_name = format!("fixture.{}.log_mel_f32", fixture.name);
+        let expected = load_activation_f32(
+            activation_pack,
+            &expected_name,
+            &[1, SORTFORMER_MEL_BINS, valid_frames],
+        )?;
+        let metrics = frontend_parity_metrics(&fixture.name, &observed.data, &expected)?;
+        let silence_requires_exact = fixture.generator == "all_zero_i16_v1";
+        if (silence_requires_exact && !metrics.byte_exact)
+            || metrics.max_abs_diff > SORTFORMER_FRONTEND_MAX_ABS_DIFF
+            || metrics.mean_abs_diff > SORTFORMER_FRONTEND_MAX_MEAN_ABS_DIFF
+            || metrics.relative_l2 > SORTFORMER_FRONTEND_MAX_RELATIVE_L2
+        {
+            return Err(frontend_error(
+                "parity_budget",
+                &format!(
+                    "synthetic fixture {} exceeds the frozen frontend envelope: \
+                     mismatches={}, max_abs={:.9e}, mean_abs={:.9e}, relative_l2={:.9e}",
+                    metrics.fixture,
+                    metrics.mismatch_count,
+                    metrics.max_abs_diff,
+                    metrics.mean_abs_diff,
+                    metrics.relative_l2,
+                ),
+            ));
+        }
+        fixtures.push(metrics);
+    }
+    frontend_checkpoint(checkpoint)?;
+    Ok(SortformerFrontendParityReport {
+        oracle_floor_byte_exact,
+        fixtures,
+    })
+}
+
+fn load_activation_f32(
+    pack: &VerifiedSortformerActivationPack,
+    name: &str,
+    expected_shape: &[usize],
+) -> FwResult<Vec<f32>> {
+    if pack
+        .safetensors()
+        .dtype_name(name)
+        .map_err(|_| frontend_error("parity_tensor", "authenticated activation tensor is absent"))?
+        != "F32"
+    {
+        return Err(frontend_error(
+            "parity_tensor",
+            "authenticated activation tensor is not exact F32",
+        ));
+    }
+    let (shape, values) = pack.safetensors().tensor_f32(name).map_err(|_| {
+        frontend_error(
+            "parity_tensor",
+            "authenticated activation tensor could not be materialized",
+        )
+    })?;
+    if shape != expected_shape {
+        return Err(frontend_error(
+            "parity_shape",
+            "authenticated activation tensor shape changed",
+        ));
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(frontend_error(
+            "parity_nonfinite",
+            "authenticated activation tensor contains a non-finite value",
+        ));
+    }
+    Ok(values)
+}
+
+fn frontend_parity_metrics(
+    fixture: &str,
+    observed: &[f32],
+    expected: &[f32],
+) -> FwResult<SortformerFrontendParityMetrics> {
+    if observed.len() != expected.len() {
+        return Err(frontend_error(
+            "parity_shape",
+            "native and oracle frontend tensors have different value counts",
+        ));
+    }
+    let mut mismatch_count = 0usize;
+    let mut max_abs_diff = 0.0_f64;
+    let mut absolute_sum = 0.0_f64;
+    let mut squared_difference_sum = 0.0_f64;
+    let mut squared_scale_sum = 0.0_f64;
+    for (&left, &right) in observed.iter().zip(expected) {
+        if !left.is_finite() || !right.is_finite() {
+            return Err(frontend_error(
+                "parity_nonfinite",
+                "native or oracle frontend comparison value is non-finite",
+            ));
+        }
+        if left.to_bits() != right.to_bits() {
+            mismatch_count = mismatch_count.saturating_add(1);
+        }
+        let difference = (f64::from(left) - f64::from(right)).abs();
+        max_abs_diff = max_abs_diff.max(difference);
+        absolute_sum += difference;
+        squared_difference_sum += difference * difference;
+        let scale = f64::from(left).abs().max(f64::from(right).abs());
+        squared_scale_sum += scale * scale;
+    }
+    let mean_abs_diff = if observed.is_empty() {
+        0.0
+    } else {
+        absolute_sum / observed.len() as f64
+    };
+    let relative_l2 = if squared_scale_sum == 0.0 {
+        0.0
+    } else {
+        (squared_difference_sum / squared_scale_sum).sqrt()
+    };
+    Ok(SortformerFrontendParityMetrics {
+        fixture: fixture.to_owned(),
+        compared_values: observed.len(),
+        mismatch_count,
+        byte_exact: mismatch_count == 0,
+        max_abs_diff,
+        mean_abs_diff,
+        relative_l2,
+    })
 }
 
 fn mel_nonzero_ranges(filterbank: &[f32]) -> FwResult<[(usize, usize); SORTFORMER_MEL_BINS]> {
@@ -979,5 +1202,68 @@ mod tests {
         )
         .expect_err("non-finite window");
         assert!(error.to_string().contains("tensor_nonfinite"));
+    }
+
+    #[test]
+    fn parity_metrics_use_f64_aggregates_and_bit_mismatches() {
+        let metrics = frontend_parity_metrics("synthetic", &[1.0, 2.0], &[1.0, 1.0])
+            .expect("finite equal-shape metrics");
+        assert_eq!(metrics.compared_values, 2);
+        assert_eq!(metrics.mismatch_count, 1);
+        assert!(!metrics.byte_exact);
+        assert_eq!(metrics.max_abs_diff, 1.0);
+        assert_eq!(metrics.mean_abs_diff, 0.5);
+        assert_eq!(metrics.relative_l2, (1.0_f64 / 5.0).sqrt());
+
+        let error = frontend_parity_metrics("nonfinite", &[f32::NAN], &[0.0])
+            .expect_err("non-finite comparison must fail closed");
+        assert!(error.to_string().contains("parity_nonfinite"));
+    }
+
+    #[test]
+    fn synthetic_frontend_envelope_is_frozen_to_binary_powers() {
+        assert_eq!(SORTFORMER_FRONTEND_MAX_ABS_DIFF, 2.0_f64.powi(-12));
+        assert_eq!(SORTFORMER_FRONTEND_MAX_MEAN_ABS_DIFF, 2.0_f64.powi(-17));
+        assert_eq!(SORTFORMER_FRONTEND_MAX_RELATIVE_L2, 2.0_f64.powi(-19));
+    }
+
+    #[test]
+    #[ignore = "requires operator-local converted weights and synthetic activation truth pack"]
+    fn operator_local_synthetic_frontend_parity_is_within_frozen_envelope() {
+        let model_receipt = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_RECEIPT")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_RECEIPT");
+        let model_package = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PACKAGE")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_PACKAGE");
+        let activation_receipt = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_ACTIVATION_RECEIPT")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_ACTIVATION_RECEIPT");
+        let activation_package = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_ACTIVATION_PACKAGE")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_ACTIVATION_PACKAGE");
+        let model = crate::sortformer_conformance::load_verified_sortformer_package(
+            std::path::Path::new(&model_receipt),
+            std::path::Path::new(&model_package),
+        )
+        .expect("operator-local converted model admission");
+        let activations = crate::sortformer_conformance::load_verified_sortformer_activation_pack(
+            std::path::Path::new(&activation_receipt),
+            std::path::Path::new(&activation_package),
+        )
+        .expect("operator-local activation admission");
+        let report = verify_sortformer_frontend_synthetic_parity(&model, &activations)
+            .expect("native frontend must stay within the predeclared synthetic envelope");
+        assert!(report.oracle_floor_byte_exact);
+        assert_eq!(report.fixtures.len(), 4);
+        for metrics in report.fixtures {
+            eprintln!(
+                "fixture={} compared={} mismatches={} byte_exact={} max_abs={:.9e} \
+                 mean_abs={:.9e} relative_l2={:.9e}",
+                metrics.fixture,
+                metrics.compared_values,
+                metrics.mismatch_count,
+                metrics.byte_exact,
+                metrics.max_abs_diff,
+                metrics.mean_abs_diff,
+                metrics.relative_l2,
+            );
+        }
     }
 }

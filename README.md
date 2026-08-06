@@ -527,7 +527,17 @@ drift, but a swap-and-restore inside the remaining hash-to-exec window is still
 an open oracle-authority gate. Activation-seam capture therefore uses a
 separately reviewed exporter and digest; the final-output adapter pin does not
 authorize intermediate values.
-Its version probe must bind the frozen contract hash, independently verify that
+The first admitted activation pack is synthetic-only: four deterministic
+non-human frontend fixtures, 46 F32/I64 tensors, and 44 stage-level replay
+observations that are byte-exact across five runs requested in each configured
+one-thread and eight-thread regime.
+Rust authenticates the separate receipt/package roots and compares the native
+valid log-mel output against a frozen cross-kernel envelope while requiring
+silence to remain byte-exact. This is partial-L1 diagnostic evidence, not a
+complete Sortformer forward pass, production route, or real-call accuracy
+claim; licensed public real-voice seams and every downstream layer remain open.
+The external Sortformer adapter's version probe must bind the frozen contract
+hash, independently verify that
 the 471,367,680-byte local artifact hashes to the pinned Hugging Face LFS
 SHA-256, and retain a path-free runtime fingerprint. The frozen evaluation row
 is CPU-only float32 with autocast and quantization disabled, deterministic
