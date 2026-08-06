@@ -1,6 +1,6 @@
 # Native Streaming Sortformer Rust Port Contract
 
-Status: Phase -1 fit screen complete; L0/L1 foundation in progress under `bd-y4ip.10`
+Status: Phase -1 fit screen and L0 artifact admission complete; L1-L8 oracle work in progress under `bd-y4ip.10`
 Fit verdict: **CONDITIONAL GO**
 Promotion authority: none; this document does not enable a runtime route
 
@@ -49,6 +49,11 @@ current production behavior unchanged.
 | `model_weights.ckpt` bytes | `471352898` |
 | `model_weights.ckpt` SHA-256 | `eca9773c2dab91dd41fbaa4473cebb9d00811d67788ce2de609dadc6e499cdf4` |
 | Pinned externally-derived 990-entry state inventory SHA-256 | `f4f219cf4ac6f755247b56d19e425db3d6a7c23c4509176549b363b63abdf532` |
+| Canonical 992-record topology-manifest SHA-256 | `2c32b0b9e48bb296e66615b038827d0fdde4b4fda2ce044a6c30cd317456c8d7` |
+| Reviewed converter source SHA-256 | `c954480a39a9daa0e161be3bd7cbd42f29cf4a44edee82dde674b0afb46c1bc4` |
+| Canonical conversion receipt SHA-256 | `167ffd94b455b9c0737e0b21ada56af9a4fbbfbd9d3d4c0d8bc9721e698b9a97` |
+| Converted package bytes | `491570584` |
+| Converted package SHA-256 | `487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a` |
 | NeMo source revision | `40ace43c7cf151af78dc22027c02feeca7e06b6a` |
 | Python | `3.12.12` |
 | NeMo package | `3.1.0+40ace43c7c` |
@@ -223,12 +228,24 @@ training-only i64 counters and the empty runtime dtype sentinel are the only
 legal drops. Transpose, reshape, split, concatenate, cast, quantization, and
 prepacking require a new receipt schema and new parity evidence.
 
-The trust chain is deliberately one-way: an independently reviewed expected
-receipt SHA-256 authenticates the exact canonical receipt bytes; the receipt
-authenticates the whole safetensors byte length and SHA-256; and the loader then
-checks the exact name, shape, dtype, raw payload hash, finite values, and census
-of every destination tensor. Hashing an untrusted receipt and passing that
-digest back to the loader is not authenticity.
+The trust chain is deliberately one-way. The Rust binary compiles the reviewed
+converter-source, canonical topology-manifest, receipt, package-length, and
+package SHA-256 roots. Its public loader accepts only receipt and package paths;
+there is no caller-supplied digest parameter. The topology digest is recomputed
+from all structural receipt fields, so a renamed or reshaped f32 tensor cannot
+hide behind matching aggregate counts. The receipt then authenticates every
+source/destination value hash, while the loader independently checks the exact
+name, shape, dtype, raw payload, finite values, compact lexicographic layout,
+metadata absence, and complete census of every destination tensor.
+
+The frozen offline profile in `scripts/convert_to_safetensors.py` produced this
+package from one owned, hash-verified copy of the exact `.nemo` byte stream. It
+verified both archive members, the installed NeMo Git provenance and 17 source
+files, the complete runtime-version tuple, the original insertion-order state
+inventory, every tensor's contiguous CPU representation, and all aggregate
+censuses before opening exclusive-create output paths. It instantiated the
+pinned graph without `restore_from` temporary extraction. The licensed model,
+converted package, and receipt remain operator-local and outside Git.
 
 ## 5. Frozen forward graph
 
@@ -587,7 +604,7 @@ insufficient.
 | OQ-06 | Top-k tie behavior and chronological reordering | Lane grouping/order source-resolved; exact tie mapping pending | L6 |
 | OQ-07 | First, steady, and partial-tail cache mutation | Partially source-resolved; fixtures required | L6 |
 | OQ-08 | Speaker permutation during accepted inference | Resolved: disabled and absent in eval | L6 |
-| OQ-09 | Converted package tensor map and transforms | Open until conversion receipt | L0 |
+| OQ-09 | Converted package tensor map and transforms | Resolved: exact 992-record manifest, receipt, and 974-tensor package admitted | L0 |
 | OQ-10 | Cross-input and cross-thread oracle variability | Pilot only | L1-L8 |
 | OQ-11 | Model bytes in repository or releases | Resolved: forbidden for initial route | L0 |
 | OQ-12 | Known requirement above four speakers | Model ineligibility resolved; product fallback pending `bd-y4ip.14` | L8-L10 |
@@ -607,14 +624,17 @@ does not block same-host parity but blocks a broad cross-platform support claim.
 
 ### Slice A: truth and conversion (`bd-y4ip.10`)
 
-1. Extend the public-input oracle floor.
-2. Define the canonical conversion-receipt schema.
-3. Convert the pinned checkpoint outside Git into safetensors.
-4. Audit the exact tensor census and hashes.
+1. Extend the public-input oracle floor. **Open.**
+2. Define the canonical conversion-receipt schema. **Complete for L0 v1.**
+3. Convert the pinned checkpoint outside Git into safetensors. **Complete for
+   the operator-local reviewed package; no weights entered Git.**
+4. Audit the exact tensor census and hashes. **Complete for all 992 source
+   records, 974 exports, and 18 typed drops.**
 5. Capture all L1-L8 real-voice oracle activations outside Git and retain only
    their identities and aggregate drift; commit exact activation values only
-   for deterministic synthetic non-human fixtures.
-6. Add tamper and identity-drift tests.
+   for deterministic synthetic non-human fixtures. **Open.**
+6. Add tamper and identity-drift tests. **L0 artifact tests complete; L1-L8
+   seam/exporter tests remain open.**
 
 ### Slice B: safe f32 engine (`bd-y4ip.11`)
 
@@ -700,19 +720,21 @@ Completed here:
   transitive-closure gap explicitly open;
 - license and model-byte distribution policy;
 - aggregate parameter/export/drop/operator/state census plus the pinned
-  externally-derived inventory digest; the exact per-tensor map and canonical
-  reproduction recipe remain a conversion gate;
+  externally-derived insertion-order inventory digest;
+- a reviewed frozen offline converter, canonical 992-record topology manifest,
+  653,202-byte receipt, and 491,570,584-byte metadata-free package, all with
+  compiled digests while licensed bytes remain operator-local;
 - explicit streaming and capacity contract;
 - one-host exploratory nondeterminism probe, explicitly non-authoritative;
 - a cycle-free, dependency-wired implementation and proof ladder;
-- a safe conversion-receipt/package verifier with strict safetensors parsing,
-  fallible allocation, and synthetic tamper tests; and
+- a safe conversion-receipt/package verifier with compiled trust roots, exact
+  topology recomputation, strict safetensors parsing, fallible allocation,
+  synthetic tamper tests, and operator-local real-package admission proof; and
 - a pinned-buffer, source-derived bounded whole-file Rust log-mel frontend
   candidate with fallible allocation and synthetic mathematical/unit tests.
 
 Not completed here:
 
-- conversion receipt or converted safetensors package;
 - complete multi-input oracle floor;
 - L1-L8 seam fixtures;
 - any Rust neural model forward pass beyond the log-mel frontend;

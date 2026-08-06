@@ -519,12 +519,12 @@ Python/PyTorch/torchaudio/NumPy versions. It derives BLAS and CPU-feature facts
 from the installed runtimes and asserts the raw streaming profile plus the
 derived FIFO-pop schedule after NeMo validates it; those facts may not be
 supplied by literals alone.
-The operator-installed adapter remains an explicit trust boundary: the host
-validates its schema and self-consistent attestations and records the exact
-executable SHA-256, but it does not maintain an executable-digest allowlist.
-Consequently, a report from an unreviewed replacement that merely claims the v2
-adapter version is not certification that the runtime checks were implemented;
-qualified benchmark evidence must also name the reviewed executable digest.
+The operator-installed adapter remains an explicit trust boundary. The host
+hashes it before execution and rejects any executable other than the exact
+compiled SHA-256 pin, then validates its schema and attestations. A replacement
+that merely claims the v2 adapter version therefore cannot enter a Sortformer
+comparison. Activation-seam capture uses a separately reviewed exporter and
+digest; the final-output adapter pin does not authorize intermediate values.
 Its version probe must bind the frozen contract hash, independently verify that
 the 471,367,680-byte local artifact hashes to the pinned Hugging Face LFS
 SHA-256, and retain a path-free runtime fingerprint. The frozen evaluation row
