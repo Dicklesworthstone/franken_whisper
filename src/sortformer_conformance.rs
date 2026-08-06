@@ -3,7 +3,7 @@
 //! This module does not run the model and does not admit a production route.
 //! It authenticates an operator-local, non-executable safetensors conversion
 //! against an independently reviewed canonical receipt. Production admission
-//! uses compiled converter, topology-manifest, receipt, and package trust
+//! uses compiled converter, topology-projection, receipt, and package trust
 //! roots; arbitrary caller-supplied digests are not an admissible authority.
 
 #![forbid(unsafe_code)]

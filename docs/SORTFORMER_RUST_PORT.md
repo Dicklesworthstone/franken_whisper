@@ -1,6 +1,8 @@
 # Native Streaming Sortformer Rust Port Contract
 
-Status: Phase -1 fit screen and L0 artifact admission complete; L1-L8 oracle work in progress under `bd-y4ip.10`
+Status: Phase -1 fit screen and converted-weight artifact admission complete;
+external-oracle provenance plus L1-L8 parity evidence remain open under
+`bd-y4ip.10`
 Fit verdict: **CONDITIONAL GO**
 Promotion authority: none; this document does not enable a runtime route
 
@@ -14,10 +16,10 @@ not replace those stages and remains a compact hybrid or low-resource ablation.
 
 The existing native acoustic diarizer remains available as a deterministic
 native-acoustic comparator, low-memory fallback candidate, and regression
-control; it is not the learned-model graph oracle. The pinned NeMo graph plus a future
-source/runtime/adapter-bound activation exporter will become the L1-L6 external
-graph oracle under `bd-y4ip.10`; the current adapter is only an identity-checked
-discrete-output diagnostic oracle. No native Sortformer route,
+control; it is not the learned-model graph oracle. The pinned NeMo graph plus a
+future source/runtime/exporter-bound activation adapter will become the L1-L6
+external graph oracle under `bd-y4ip.10`; the current final-output adapter is
+only an identity-checked discrete-output diagnostic oracle. No native Sortformer route,
 automatic routing change, accuracy claim, or speed claim is authorized until
 the ordered parity and public evaluation gates below pass. The currently
 resolved production behavior remains unchanged.
@@ -49,9 +51,9 @@ current production behavior unchanged.
 | `model_weights.ckpt` bytes | `471352898` |
 | `model_weights.ckpt` SHA-256 | `eca9773c2dab91dd41fbaa4473cebb9d00811d67788ce2de609dadc6e499cdf4` |
 | Pinned externally-derived 990-entry state inventory SHA-256 | `f4f219cf4ac6f755247b56d19e425db3d6a7c23c4509176549b363b63abdf532` |
-| Canonical 992-record topology-manifest SHA-256 | `2c32b0b9e48bb296e66615b038827d0fdde4b4fda2ce044a6c30cd317456c8d7` |
-| Reviewed converter source SHA-256 | `c954480a39a9daa0e161be3bd7cbd42f29cf4a44edee82dde674b0afb46c1bc4` |
-| Canonical conversion receipt SHA-256 | `167ffd94b455b9c0737e0b21ada56af9a4fbbfbd9d3d4c0d8bc9721e698b9a97` |
+| Canonical 992-record topology-projection SHA-256 | `2c32b0b9e48bb296e66615b038827d0fdde4b4fda2ce044a6c30cd317456c8d7` |
+| Reviewed converter source SHA-256 | `6a946cc6647bf52244d0eaad89db834bdc52cc61fd08d9563632dd1f9d239c1e` |
+| Canonical conversion receipt SHA-256 | `a1c6dce95ef4fd715965951bdaaa136e55e2219f93cf78122f8b462fbd07cbbe` |
 | Converted package bytes | `491570584` |
 | Converted package SHA-256 | `487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a` |
 | NeMo source revision | `40ace43c7cf151af78dc22027c02feeca7e06b6a` |
@@ -63,6 +65,18 @@ current production behavior unchanged.
 | Sortformer oracle adapter SHA-256 | `8f376c979b7eaca41dc0a438d9aaa41c1c723052b97c45eb2acc59b6d6f00bde` |
 | External model-contract SHA-256 | `7ac048e3372fe4c622840beddfbeef42944d961408360324cb7276a69c8542c5` |
 | Qualified runtime-fingerprint SHA-256 | `3713fd3f024c1cef7d860706baf0dbaaf18058c03c26331da6254687693d564c` |
+
+### 2.1 Converted-weight admission evidence
+
+On 2026-08-05, the frozen converter completed both an initial publication and
+an exact-artifact retry on Darwin 25.2.0 arm64. Each exited zero with 974
+tensors and the converter, topology-projection, receipt, and package identities
+listed above; the resulting directory was mode `0700` and both files were mode
+`0600`. The focused Rust verifier run passed 27 tests with only the deliberately
+operator-local test ignored. That exact ignored test was then run locally
+against the admitted receipt/package pair and passed 1/1. This proves L0
+converted-weight admission only; it is not a model-forward or diarization
+accuracy result.
 
 The archive configuration says `nemo_version: 2.6.0rc0`; that string is not
 the executable reference. The intended oracle behavior is the pinned NeMo
@@ -106,9 +120,11 @@ exporting the exact decoded PCM plus exact intermediate tensors. A repeated
 version document alone does not close that gap. Every accepted future oracle
 row must also authenticate the adapter executable against the pinned digest
 above before its self-reported identity is trusted, authenticate the installed
-NeMo source bytes rather than only package metadata, and remove or contain the
-current hash-then-open executable/audio/model TOCTOU windows. Those are
-`bd-y4ip.10`/`bd-y4ip.7` gates, not evidence supplied by this document.
+NeMo source bytes rather than only package metadata, and remove or contain its
+executable/audio/model hash-then-open windows. The converter's model input is
+now one owned verified byte stream, but the external final-output adapter has a
+separate lifecycle. Those are `bd-y4ip.10`/`bd-y4ip.7` gates, not evidence
+supplied by this document.
 
 ## 3. License and artifact-distribution boundary
 
@@ -229,23 +245,28 @@ legal drops. Transpose, reshape, split, concatenate, cast, quantization, and
 prepacking require a new receipt schema and new parity evidence.
 
 The trust chain is deliberately one-way. The Rust binary compiles the reviewed
-converter-source, canonical topology-manifest, receipt, package-length, and
+converter-source, canonical topology-projection, receipt, package-length, and
 package SHA-256 roots. Its public loader accepts only receipt and package paths;
 there is no caller-supplied digest parameter. The topology digest is recomputed
 from all structural receipt fields, so a renamed or reshaped f32 tensor cannot
-hide behind matching aggregate counts. The receipt then authenticates every
-source/destination value hash, while the loader independently checks the exact
-name, shape, dtype, raw payload, finite values, compact lexicographic layout,
-metadata absence, and complete census of every destination tensor.
+hide behind matching aggregate counts. The authenticated receipt binds every
+source and destination value hash. The loader independently proves each
+exported destination's exact name, shape, dtype, raw payload, finite values,
+compact lexicographic layout, metadata absence, and complete census; it does
+not re-derive dropped source hashes from the executable checkpoint.
 
 The frozen offline profile in `scripts/convert_to_safetensors.py` produced this
 package from one owned, hash-verified copy of the exact `.nemo` byte stream. It
-verified both archive members, the installed NeMo Git provenance and 17 source
-files, the complete runtime-version tuple, the original insertion-order state
-inventory, every tensor's contiguous CPU representation, and all aggregate
-censuses before opening exclusive-create output paths. It instantiated the
-pinned graph without `restore_from` temporary extraction. The licensed model,
-converted package, and receipt remain operator-local and outside Git.
+verified both archive members, installed `direct_url.json` revision metadata,
+17 selected source files before and after export, the listed package-version
+tuple, the original insertion-order state inventory, every tensor's contiguous
+CPU representation, the frozen topology-projection and package identities, and
+all aggregate censuses.
+It also binds and rechecks its own source inode and digest, instantiates the
+pinned graph without `restore_from` temporary extraction, publishes owner-only
+mode-0600 outputs, and permits retries only by reusing exact artifacts. The
+licensed model, converted package, and receipt remain operator-local and
+outside Git.
 
 ## 5. Frozen forward graph
 
@@ -540,6 +561,15 @@ evidence contract. Exact activation bytes derived from real human speech stay
 external and ephemeral; Git retains only identities and aggregate drift. Exact
 committed seam values are limited to deterministic synthetic non-human inputs.
 
+The immediate next gate is L1, not a whole-graph comparison. First freeze the
+separate activation-exporter source and executable digests. Then capture exact
+decoded PCM and valid lengths plus pre-emphasis, STFT, power, mel, and log-mel
+tensors for deterministic synthetic silence, impulse, tone, and partial-tail
+fixtures. After those exact synthetic seams agree, repeat each declared public
+real-voice input five times at one thread and five times at eight threads. Keep
+real-voice values outside Git and retain only identities, shapes, hashes, and
+aggregate drift used to set the predeclared source-variability floor.
+
 An exploratory, separately run probe reported two f32 CPU runs with one PyTorch
 intra-op thread and two with eight intra-op threads on one public
 53.603313-second input whose PCM-file SHA-256 is
@@ -616,9 +646,10 @@ insufficient.
 
 The fit screen has no remaining upstream semantic question that invalidates its
 conditional-GO result. The numeric/tie fixtures in OQ-02 through OQ-07 and the
-artifact/oracle work in OQ-09, OQ-10, and OQ-15 are owned by `bd-y4ip.10` and
-block `bd-y4ip.11` parity completion. OQ-17 blocks final discrete parity. OQ-14
-does not block same-host parity but blocks a broad cross-platform support claim.
+remaining oracle work in OQ-10 and OQ-15 are owned by `bd-y4ip.10` and block
+`bd-y4ip.11` parity completion. OQ-09 is resolved. OQ-17 blocks final discrete
+parity. OQ-14 does not block same-host parity but blocks a broad cross-platform
+support claim.
 
 ## 10. Implementation slices
 
@@ -627,7 +658,8 @@ does not block same-host parity but blocks a broad cross-platform support claim.
 1. Extend the public-input oracle floor. **Open.**
 2. Define the canonical conversion-receipt schema. **Complete for L0 v1.**
 3. Convert the pinned checkpoint outside Git into safetensors. **Complete for
-   the operator-local reviewed package; no weights entered Git.**
+   the operator-local identity-bound, verifier-admitted package; no weights
+   entered Git.**
 4. Audit the exact tensor census and hashes. **Complete for all 992 source
    records, 974 exports, and 18 typed drops.**
 5. Capture all L1-L8 real-voice oracle activations outside Git and retain only
@@ -693,8 +725,10 @@ unchanged until that work passes its own frozen gate.
   real-voice activation or embedding values are ephemeral; Git may retain their
   hashes and aggregate drift only. Exact committed values use synthetic
   non-human inputs.
-- Errors and evidence retain hashes and typed failure codes, not local paths,
-  audio samples, transcripts, speaker names, or embeddings.
+- Retained Git, robot, and oracle evidence uses hashes and typed failure codes,
+  not local paths, audio samples, transcripts, speaker names, or embeddings.
+  Operator-local conversion commands and terminal diagnostics may contain local
+  model/output paths and must not be copied into committed evidence.
 - The Rust loader is safe code and rejects executable checkpoint formats.
 - Every future model allocation must derive from checked tensor dimensions and
   declared bounds.
@@ -721,7 +755,7 @@ Completed here:
 - license and model-byte distribution policy;
 - aggregate parameter/export/drop/operator/state census plus the pinned
   externally-derived insertion-order inventory digest;
-- a reviewed frozen offline converter, canonical 992-record topology manifest,
+- a reviewed frozen offline converter, canonical 992-record topology projection,
   653,202-byte receipt, and 491,570,584-byte metadata-free package, all with
   compiled digests while licensed bytes remain operator-local;
 - explicit streaming and capacity contract;
