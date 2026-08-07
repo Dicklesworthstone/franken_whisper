@@ -136,6 +136,28 @@ pub fn normalize_to_wav(input: &Path, work_dir: &Path) -> FwResult<PathBuf> {
     normalize_to_wav_with_timeout(input, work_dir, ffmpeg_timeout(), None)
 }
 
+/// Decode an already-normalized 16 kHz mono PCM WAV for an in-process model.
+pub fn read_normalized_wav_16k_mono(path: &Path) -> FwResult<Vec<f32>> {
+    const MAX_WAV_CONTAINER_OVERHEAD_BYTES: u64 = 1024 * 1024;
+    let maximum_bytes = u64::try_from(
+        crate::sortformer_inference::SORTFORMER_MAX_AUDIO_SAMPLES
+            .checked_mul(std::mem::size_of::<i16>())
+            .ok_or_else(|| {
+                FwError::InvalidRequest("normalized WAV byte ceiling overflows".to_owned())
+            })?,
+    )
+    .map_err(|_| FwError::InvalidRequest("normalized WAV byte ceiling exceeds u64".to_owned()))?
+    .checked_add(MAX_WAV_CONTAINER_OVERHEAD_BYTES)
+    .ok_or_else(|| FwError::InvalidRequest("normalized WAV byte ceiling overflows".to_owned()))?;
+    if std::fs::metadata(path)?.len() > maximum_bytes {
+        return Err(FwError::InvalidRequest(
+            "normalized WAV exceeds the native Sortformer two-hour byte ceiling".to_owned(),
+        ));
+    }
+    let bytes = std::fs::read(path)?;
+    crate::native_engine::decode::read_wav_16k_mono(&bytes)
+}
+
 pub(crate) fn normalize_to_wav_with_timeout(
     input: &Path,
     work_dir: &Path,
@@ -3181,5 +3203,21 @@ mod tests {
         assert!(!DEFAULT_STATE_DIR.is_empty());
         assert!(!FFMPEG_TOOLS_DIR.is_empty());
         assert!(DOWNLOAD_TIMEOUT.as_secs() > 0);
+    }
+
+    #[test]
+    fn sortformer_normalized_wav_rejects_oversized_container_before_reading() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("oversized.wav");
+        let file = std::fs::File::create(&path).expect("sparse WAV placeholder");
+        let pcm_bytes = u64::try_from(
+            crate::sortformer_inference::SORTFORMER_MAX_AUDIO_SAMPLES * std::mem::size_of::<i16>(),
+        )
+        .expect("two-hour PCM payload fits u64");
+        file.set_len(pcm_bytes + 1024 * 1024 + 1)
+            .expect("extend sparse WAV placeholder");
+        let error = super::read_normalized_wav_16k_mono(&path)
+            .expect_err("oversized normalized WAV must fail before payload read");
+        assert!(error.to_string().contains("two-hour byte ceiling"));
     }
 }

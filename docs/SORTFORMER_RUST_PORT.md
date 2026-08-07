@@ -1,10 +1,12 @@
 # Native Streaming Sortformer Rust Port Contract
 
-Status: Phase -1 fit screen, converted-weight artifact admission, and a partial
-synthetic L1 valid-log-mel parity checkpoint are complete; licensed public L1,
-native intermediate frontend seams, and L2-L8 remain open under `bd-y4ip.10`
+Status: authenticated native L1-L5 parity, exact-score L6 equation parity,
+byte-exact L7-L8 postprocessing, a production-shaped library session, and an
+explicit evaluation-only CLI are complete; chained L6 hard-top-k identity and
+broad accuracy/resource certification remain open under `bd-y4ip.11`
 Fit verdict: **CONDITIONAL GO**
-Promotion authority: none; this document does not enable a runtime route
+Promotion authority: explicit evaluation only; `Auto` and the transcribe
+diarization resolver remain unchanged
 
 ## 1. Decision and no-claim boundary
 
@@ -17,12 +19,13 @@ not replace those stages and remains a compact hybrid or low-resource ablation.
 The existing native acoustic diarizer remains available as a deterministic
 native-acoustic comparator, low-memory fallback candidate, and regression
 control; it is not the learned-model graph oracle. The pinned NeMo graph plus a
-future source/runtime/exporter-bound activation adapter will become the L1-L6
-external graph oracle under `bd-y4ip.10`; the current final-output adapter is
-only an identity-checked discrete-output diagnostic oracle. No native Sortformer route,
-automatic routing change, accuracy claim, or speed claim is authorized until
-the ordered parity and public evaluation gates below pass. The currently
-resolved production behavior remains unchanged.
+source/runtime/exporter-bound public activation pack is now the L1-L8 external
+graph oracle; the older final-output adapter remains only an identity-checked
+discrete-output diagnostic oracle. No automatic routing change, broad accuracy
+claim, or speed claim is authorized until the ordered parity and public
+evaluation gates below pass. The explicit `sortformer-diarize` command reports
+`evaluation_only`, requires an authenticated operator-local receipt and
+package, and does not affect the currently resolved transcribe behavior.
 
 The port is a conditional fit rather than an unconditional fit because:
 
@@ -163,7 +166,58 @@ The initial Rust route therefore uses this conservative policy:
 This is a repository policy, not legal advice and not a claim that every future
 form of redistribution is permitted.
 
-### 3.1 Initial hardware and memory tier
+### 3.1 Native proof snapshot (2026-08-07)
+
+The safe Rust f32 graph now loads the authenticated 491,570,584-byte package,
+runs the frozen streaming schedule through all 17 FastConformer and 18
+Transformer blocks, updates the speaker cache/FIFO state, and emits L7 activity
+and L8 anonymous speaker turns. `SortformerSession` checkpoints cancellation at
+chunk and neural-block boundaries, uses checked bounded allocations, and clamps
+user-visible tail turns to the physical recording duration. The standalone
+`sortformer-diarize` command exercises that same library path after the existing
+audio normalizer; it does not participate in `DiarizationEngine::Auto`.
+
+The current local Apple M4 Pro evidence snapshot is:
+
+| Evidence | Result |
+|---|---:|
+| Public fixture | VoxConverse `mevkw`, samples 0..400000, 25.0 s, overlap, two reference speakers |
+| L5 production probability drift | max abs `6.854534149e-7`; relative L2 `9.072629352e-8` |
+| L7/L8 comparison | byte-exact against authenticated public outputs before physical-duration clamping |
+| Authoritative transcript-free DER / JER | `0.058904110` / `0.065850064` |
+| DER components | miss `0.92 s`; false alarm `0.80 s`; confusion `0.00 s` |
+| Native inference / audio / RTF | `31.749242 s` / `25.0 s` / `1.269970` |
+| Session materialization after package admission | `3.001861 s` |
+| Pre-optimization real CLI public input | VoxConverse `syiwe`, `69.146125 s`, three inferred active lanes |
+| Pre-optimization CLI inference / RTF | `108.945964 s` / `1.575590` |
+| Pre-optimization CLI session materialization after package admission | `3.112265 s` |
+| Optimized release CLI inference / RTF | `2.960639 s` / `0.0428171` |
+| Release package admission / session materialization / combined model load | `1.904567 s` / `0.428503 s` / `2.333070 s` |
+| Release end-to-end wall time | `6.13 s` |
+| Release peak RSS | `1,368,850,432` bytes |
+
+These are real local runtime and accuracy observations. The optimized release
+row is about 23.4 times faster than real time on this one Apple M4 Pro input;
+it is not broad accuracy certification or a same-invocation speedup claim over
+an incumbent. Peak RSS remains about 1.27 GiB. The production forward no longer
+retains parity-only subsampler/block traces or computes FastConformer Q/K/V twice, but
+the before/after timings above were separate invocations and therefore are not
+a ledger-qualified optimization win. A frozen multi-record public evaluation,
+same-invocation baseline comparison, 90-minute resource row, and further
+profile-guided optimization remain required.
+
+The exact-score L6 compression test passes inside the frozen numeric envelope.
+The full chained run nevertheless diverges at `iqtde` step 002 because the
+NeMo weak-cache K=66 cutoff has one slot among three bit-equal frames; its
+libc++ `nth_element` selects frame 27 while the deterministic Rust full-sort
+policy selects a different tied identity. The preceding chained L5 maximum
+drift (`2.098083496e-5`) exceeds the oracle cutoff margin
+(`1.4305114746e-5`). A scalar L5 candidate and several tie policies were tested
+and rejected when unchanged gates failed elsewhere. No acceptance tolerance,
+fixture, or gate was changed. Until this identity is resolved or formally
+bounded by the named cross-platform probe, promotion remains forbidden.
+
+### 3.2 Initial hardware and memory tier
 
 The f32 reference target is the current 64-bit little-endian
 `aarch64-apple-darwin` development host: Apple M4 Pro, 64 GiB physical memory,
@@ -174,11 +228,12 @@ other ARM, operating-system, or lower-memory support claim.
 This is a desktop/server memory-tier port, not an embedded or low-memory route.
 The immutable f32 tensor payload is about 468.7 MiB after adding the positional
 buffer; the safetensors container, decoded tensors, activations, streaming
-state, and allocator overhead make that number an invalid RSS estimate. Until
-L10 measures child-only peak RSS, evaluation requires at least 4 GiB of
-available memory and treats that floor as provisional rather than certified.
-Product routing and any low-memory fallback choice remain owned by the later
-integration gate.
+state, and allocator overhead make that number an invalid RSS estimate. The
+first child-only debug CLI measurement reached 1,378,844,672 bytes on a 69.15 s
+public recording. That single row does not certify a 90-minute ceiling, so
+evaluation continues to require at least 4 GiB of available memory and treats
+that floor as provisional. Product routing and any low-memory fallback choice
+remain owned by the later integration gate.
 
 ## 4. Model and state census
 
@@ -388,42 +443,44 @@ crops features to the processed signal length. It is not evidence of a true
 incremental-waveform frontend; live audio continuity requires separate frontend
 and state seams.
 
-The accepted high-latency profile is the canonical contract already frozen in
+The native package and activation truth pack use the archive's own synchronous
+streaming profile. This is intentionally distinct from the separately
+qualified high-latency external-adapter override in
 `src/differential_oracle.rs`:
 
 | Quantity | Output-frame count |
 |---|---:|
-| Chunk | 340 |
+| Chunk | 188 |
 | Left context | 1 |
-| Right context | 40 |
-| FIFO capacity | 40 |
-| Configured cache update | 300 |
+| Right context | 1 |
+| FIFO capacity | 0 |
+| Configured cache update | 188 |
 | Speaker cache | 188 |
 | Silence cache frames per speaker | 3 |
 
 For a chunk beginning at feature index `start`, the feature loader uses
-`left = min(8, start)`, `end = min(start + 340*8, feature_length)`, and
-`right = min(40*8, feature_length - end)`, then transposes and pre-encodes.
+`left = min(8, start)`, `end = min(start + 188*8, feature_length)`, and
+`right = min(8, feature_length - end)`, then transposes and pre-encodes.
 After factor-8 subsampling it uses `round(left/8)` left frames and
 `ceil(right/8)` right frames. `drop_extra_pre_encoded` is zero.
 
-The nominal input-buffer latency is 30.4 seconds and the output stride is 80
-ms. The pinned validator warns about the configured 300-frame update being
-shorter than the chunk but does not rewrite it. FIFO movement is:
+The nominal first input buffer is 12.08 seconds (188 central frames plus one
+right-context frame at the 80 ms output stride), and the output stride is 80
+ms. The archive's configured update equals its chunk length. FIFO movement is:
 
 ```text
 min(max(configured_update, chunk_len - fifo_capacity + current_fifo),
     current_fifo + chunk_len)
 ```
 
-This moves 300 frames for the first full chunk with an empty FIFO, leaves 40
-queued, immediately compresses the 300-frame cache to 188, and moves 340 frames
-in steady state. Rust must evaluate the partial-tail subtraction with checked
-signed arithmetic rather than permitting an unsigned underflow. An interior
-chunk includes 381 pre-encoding frames; with a
-full cache and FIFO, the recurrent encoder sequence can reach
-`188 + 40 + 381 = 609` frames. Tail behavior is a required seam, not an
-extrapolation.
+With a zero-capacity FIFO this moves all 188 central frames on a full chunk.
+The first update fills the cache exactly; later full chunks cross capacity and
+trigger compression back to 188. Rust must evaluate the partial-tail
+subtraction with checked signed arithmetic rather than permitting an unsigned
+underflow. An interior feature chunk contains 1,520 pre-encoding frames and
+subsamples to 190 encoder frames (one left-context, 188 central, one
+right-context); with a full cache the recurrent encoder sequence can reach 378
+frames. Tail behavior is a required seam, not an extrapolation.
 
 Initial speaker-cache and FIFO embeddings have shape `[batch, 0, 512]`.
 `spkcache_preds` and `fifo_preds` are initially `None`, as are
@@ -548,7 +605,7 @@ mask contract is proven at a seam.
 | Softmax and masks | FrankenTorch only after mask equivalence | fully masked, tail, and long-context cases |
 | Top-k, stable sort, gather, optional permutation | safe Rust model logic | tie, placeholder, disabled, and eval-absence fixtures |
 | Cache/FIFO mutation | safe Rust bounded state machine | empty, first-full, steady, tail, and cancellation fixtures |
-| Log-mel frontend | pinned-buffer Rust implementation | authenticated synthetic source-stage pack plus compiled valid-log-mel parity; native intermediate-stage and public real-voice evidence remain required |
+| Log-mel frontend | pinned-buffer Rust implementation | authenticated synthetic parity plus public source seams; native public-stage parity remains required |
 
 No new tensor runtime is justified. No model-specific fused kernel is justified
 before the f32 whole-forward gate passes and profiling identifies a measured
@@ -558,11 +615,11 @@ implementation.
 ## 7. Oracle floor pilot
 
 The final-output external adapter still does not authorize intermediate
-activations. A separate frozen exporter now provides the first synthetic-only
-L1 frontend truth pack. Its source SHA-256 is
-`a5e4a8a29e1ce8e4227ff8973a6279fe5aa560a57e5f06947be2a14cf68adf33`;
+activations. A separate frozen exporter provides both the synthetic L1 pack
+and the licensed-public L1-L8 source pack. Its source SHA-256 is
+`bb15a4b9bfbaab59c5ddeb76801acf584b717c1cee0b420d416348bccf17f0b8`;
 the canonical receipt SHA-256 is
-`058ecfebe91cea90dd669c28ee3e8976ef3ea3e3494f9dc0c5b93f0a26fa17f2`;
+`cfea19c99f3894927941d7290c05eacc33a403ff70d7cf84f3d1c4859d6e5efd`;
 and the 282,716-byte safetensors package SHA-256 is
 `294edcc0a9d80fa9470c2cd45f2c1556a47a56b7c98ba444984f764a1f398a8b`.
 The package and receipt stay operator-local. Git contains only the exporter,
@@ -602,11 +659,218 @@ L0 model package and the expected values from the activation pack. It currently
 reconstructs and compares only `log_mel_f32`; the other captured frontend stages
 are authenticated source-replay evidence, not yet native Rust stage parity.
 
-This establishes only a partial synthetic L1 frontend pilot. Full L1 still
-requires the declared licensed public real-voice runs at one and eight threads,
-with real-voice activation values external and ephemeral. L2-L8, cache
-transitions, complete f32 forward parity, accuracy, resource, and routing gates
-remain open.
+The public pack uses four frozen VoxConverse development fixtures: an exact
+two-chunk case, an overlap-heavy two-speaker case, a complete three-speaker
+recording, and a complete four-speaker recording. The descriptor, source
+version, license acknowledgement, recording/annotation hashes, clip PCM hashes,
+and exact sample intervals are bound in the receipt. No transcript is used.
+
+Five runs at one PyTorch intra-op thread and five runs at eight threads captured
+5,492 named L1-L8 seams. To avoid a 3.99 GB replay artifact, every full tensor
+retains its shape, element/byte count, and baseline SHA-256 while tensors larger
+than 4,096 values store a deterministic endpoint-inclusive stratified probe.
+Small and discrete tensors remain complete. The resulting metadata-free package
+is 87,386,140 bytes with SHA-256
+`bf131cb9a88f1295d35e7eba750b653189b808fbf50113399a650a34e48d21d7`;
+the 6,145,112-byte canonical receipt SHA-256 is
+`9cec843ffb91e0b602598fb3b34c183603f6f7bd678cea7fa0139b8746a5db34`.
+Both stay operator-local.
+
+All discrete probes and cache/FIFO Option transitions were byte-exact. Numeric
+thread-regime drift appeared in 873 probes; each accepted source tolerance is
+zero when exact and otherwise the smallest power of two at least twice the
+measured baseline-to-replay floor. The rule was frozen before Rust neural
+results existed. That pack completed source truth rather than native parity;
+the subsequent native results are recorded below. Chained L6 identity, broad
+accuracy/resources, and automatic routing remain open.
+
+The independent Rust/PyTorch L2 comparison does not misuse a zero source floor
+as a cross-kernel equality requirement. Before running the native L2 path, it
+freezes per-seam ceilings of `2^-10` maximum absolute drift and `2^-16`
+relative L2 drift. The effective limit is the maximum of that predeclared
+cross-kernel ceiling and the independently authenticated source-replay floor.
+These constants are compiled into `src/sortformer_inference.rs`; a native loss
+must be fixed or reported and must not be followed by loosening the ceiling.
+The immediately following FastConformer block-input seam multiplies L2 by
+`f32(sqrt(512))`; before that comparison its absolute ceiling is therefore
+frozen separately at `2^-5`, while its scale-aware relative-L2 ceiling remains
+`2^-16`.
+
+The local Apple Silicon public operator run on 2026-08-06 passed in 132.05
+seconds (`1 passed; 0 failed`). It compared all six L2 seams for all 17
+streaming transitions (102 seam probes) and the first two reconstructable L3
+block-00 input seams for each of the four fixtures (8 seam probes). The worst
+L2 result remained `3.232955933e-4` maximum absolute drift and
+`1.559432089e-6` relative L2. The worst L3 handoff result was
+`7.324218750e-3` maximum absolute drift and `1.467437671e-6` relative L2,
+below the frozen `2^-5` and `2^-16` limits respectively. The L3 harness
+prepends exact prior pre-encode embeddings while that state is independently
+reconstructable. It deliberately stops after the first cache-compression
+transition because subsequent speaker-cache selection depends on L5
+probabilities; claiming those later L3 inputs before implementing L3-L6 would
+be circular. Thus this is complete L2 evidence and bounded L2-to-L3 handoff
+evidence, not FastConformer or whole-model parity.
+
+Before executing the first native FastConformer operator comparison, the
+block-00 `feed_forward1` seam freezes cross-kernel ceilings of `2^-8` maximum
+absolute drift and `2^-14` relative L2 drift. This seam includes the preceding
+LayerNorm, both affine projections, and Swish, but excludes the subsequent
+half-step residual. As with every earlier gate, a loss cannot be followed by a
+tolerance increase.
+
+The resulting local Apple Silicon run passed all eight reconstructable
+block-00 `feed_forward1` probes in 133.66 seconds (`1 passed; 0 failed`). The
+worst observed maximum absolute drift was `1.434326172e-3`; the worst observed
+relative L2 was `1.249860390e-6`. Both remain below the predeclared limits.
+This proves the first LayerNorm and FFN operator seam only; it does not yet
+prove the half-step residual, attention, convolution, second FFN, or block
+output.
+
+Before executing the next native comparison, the block-00 raw Q/K/V affine
+seams freeze cross-kernel ceilings of `2^-7` maximum absolute drift and
+`2^-13` relative L2 drift. These seams include FFN1's half-step residual and
+the self-attention LayerNorm. They stop before head reshaping, relative
+position scoring, softmax, or the attention output projection.
+
+The local Apple Silicon Q/K/V run passed all 24 probes in 185.35 seconds
+(`1 passed; 0 failed`). The worst maximum absolute drift was
+`6.843358278e-5`, and the worst relative L2 was `9.905910225e-7`, both well
+inside the frozen limits.
+
+Before executing the complete block-00 attention comparison, its output seam
+freezes cross-kernel ceilings of `2^-6` maximum absolute drift and `2^-11`
+relative L2 drift. This adds sinusoidal relative positions, the biasless
+position projection, Transformer-XL relative shift, score scaling, stable
+softmax, value reduction, and the output affine. The accepted public path has
+no padding or finite-context mask at these exact-length synchronous seams.
+
+The first cache-free complete attention probe passed locally on Apple Silicon
+(`1 passed; 0 failed`, test runtime 192.52 seconds) with
+`1.907348633e-4` maximum absolute drift and `9.384883845e-7` relative L2.
+This validates the relative-attention equations and indexing at one public
+block-00 seam. The remaining seven reconstructable attention seams and later
+blocks remain open until the reference contractions are moved off the slow
+scalar path.
+
+Before running the remainder of block 00, the captured raw depthwise-
+convolution seam freezes `2^-5` maximum absolute and `2^-12` relative-L2
+ceilings. The captured FFN2 and final block-output seams freeze `2^-4`
+maximum absolute and `2^-10` relative-L2 ceilings to account for cumulative
+upstream drift. These gates are fixed before observing native results.
+
+The first complete block-00 tail probe then passed locally on Apple Silicon
+(`1 passed; 0 failed`, test runtime 155.49 seconds). Against the authenticated
+public activations, the raw depthwise-convolution seam had
+`3.004074097e-5` maximum absolute drift and `9.965494622e-7` relative L2;
+FFN2 had `6.637573242e-4` and `1.041926232e-6`; and the final normalized block
+output had `4.339218140e-5` and `9.981426293e-7`. The attention output in the
+same invocation reproduced the prior result (`1.907348633e-4` and
+`9.384883845e-7`). All four probes were inside their predeclared gates. This is
+one cache-free public seam, not yet all eight reconstructable seams or all 17
+FastConformer blocks; those remain explicit promotion blockers.
+
+A subsequent same-process, same-input A/B retained the scalar attention as the
+incumbent and compared the FrankenTorch matrix-kernel candidate on the exact
+189-frame public tensor. The scalar call took 3.309788 seconds and the candidate
+took 1.514581 seconds, a 2.18x attention-only speedup. Candidate-versus-incumbent
+drift was `1.106262207e-4` maximum absolute and `3.386240615e-7` relative L2;
+the candidate independently passed the authenticated NVIDIA output seam with
+`1.869201660e-4` and `9.443736629e-7`. The surrounding full-test wall time was
+not accepted as a speed result because unrelated host contention varied sharply.
+
+The complete block was then checked at all eight independently reconstructable
+public seams (the first two transitions of each fixture): 32 attention,
+depthwise-convolution, FFN2, and final-output comparisons all passed. Worst
+maximum absolute drift was `2.536773682e-4` for attention,
+`3.600120544e-5` for depthwise convolution, `1.037597656e-3` for FFN2, and
+`4.458427429e-5` for the final output. The worst relative L2 among these probes
+was `1.330486704e-6`. In this more favorable same-process timing sample the
+scalar and matrix-kernel attention calls took 0.762980 and 0.174491 seconds,
+respectively. Therefore the observed exact-input speedup range is 2.18x to
+4.37x; host contention prevents a stronger throughput claim. Block 00 is now
+public-seam complete for all independently reconstructable states. Layers 01-16
+and the later compressed-cache transitions remain open.
+
+Before executing the chained 17-layer comparison, layers 01-16 freeze the
+existing cumulative block ceilings of `2^-4` maximum absolute and `2^-10`
+relative-L2 drift for block input, FFN1, Q/K/V, attention, FFN2, and normalized
+output. The raw depthwise-convolution seam retains its tighter `2^-5` and
+`2^-12` ceilings. Block 00 retains the already-proven specialized gates above.
+These thresholds are fixed before observing any native later-layer result.
+
+The generalized safe-Rust implementation then passed the complete L3 public
+gate locally on Apple Silicon: all 1,224 comparisons (`17 layers * 9 seams * 8
+independently reconstructable states`) passed in a 261.52-second test run. The
+largest absolute drift anywhere was the already-recorded block-00 input handoff,
+`7.324218750e-3`. The worst relative L2 in the chained encoder was
+`4.926325194e-6` at fixture `syiwe_complete_three_speakers`, step 000,
+block-16 FFN2. All eight block-16 outputs passed; their largest maximum absolute
+drift was `3.659725189e-5`, and their largest relative L2 was
+`3.840209473e-6`. This closes the independently reconstructable L3 seam gate.
+It does not claim later compressed-cache states or any L4-L8 result.
+
+Before the first native L4 comparison, the encoder projection and every
+captured seam in the 18 post-LayerNorm Transformer blocks freeze ceilings of
+`2^-4` maximum absolute and `2^-10` relative-L2 drift. The exact source graph
+uses projection `512 -> 192`, eight 24-wide attention heads, separate
+query/key division by `sqrt(sqrt(24))`, no future mask at these all-valid
+synchronous states, post-attention residual then LayerNorm, ReLU FFN
+`192 -> 768 -> 192`, a second residual, and a second LayerNorm. Evaluation
+dropout is inactive. These gates and equations are fixed before native results.
+
+The first native L4 run failed closed at the block-00 stage named
+`attention_output` (`2.177211221` maximum absolute drift and
+`0.9889359979` relative L2); neither gate was changed. Direct reconstruction
+inside the pinned PyTorch oracle exposed an important capture detail: the CPU
+forward hook stores a detached but non-cloned alias of `out_projection`.
+NeMo immediately executes `self_attn_output += encoder_query`, so the frozen
+stage actually contains the post-residual, pre-LayerNorm state. The analogous
+`dense_out` hook is likewise mutated by its following residual addition. The
+native comparator must therefore compare those two frozen stage names against
+the post-residual states while the model computation itself remains the exact
+source equation. Raw Q/K/V and final block outputs are unaffected. This is a
+truth-pack seam-semantics correction, not permission to relax a numeric gate;
+complete L4 parity remains unclaimed until a repaired run passes.
+
+After that interpretation repair, the same local Apple Silicon gate first
+passed one complete streaming state through the projection and all 18 chained
+Transformer blocks: 145 authenticated comparisons, with no tolerance change.
+The expanded run then passed all eight independently reconstructable public
+states: 1,160 authenticated L4 comparisons in a 399.92-second invocation. The
+worst maximum absolute drift was `4.321336746e-5` at fixture
+`hiyis_exact_two_chunks`, step 001, block-00 feed-forward output. The worst
+relative L2 was `4.516767665e-6` at the same fixture and step's block-00
+attention value. All eight block-17 outputs passed; their maximum absolute
+drift ranged from `2.190470695e-6` to `6.370246410e-6`. This closes L4 for the
+eight states that do not depend on native cache compression. Later states
+remain dependent on L6 chaining.
+
+Before any native L5 result, the speaker-head seams (`hidden`, `logits`,
+`probabilities`, and the context-trimmed `stream_output`) freeze the same cumulative ceilings of `2^-4` maximum
+absolute and `2^-10` relative-L2 drift. The exact evaluation graph is ReLU on
+the block-17 output, identity dropout, affine `192 -> 192`, ReLU, identity
+dropout, affine `192 -> 4`, and elementwise sigmoid. The raw hidden affine
+output is captured before its following ReLU. These are four model capacity
+lanes, not evidence that every input contains four active speakers.
+
+The same 399.92-second local invocation also executed all four L5 seams for all
+eight independently reconstructable states and passed. Because that command's
+evidence filter retained the L4 aggregate and terminal test result rather than
+an L5 aggregate, this establishes gate success but does not yet provide a
+publishable L5 worst-drift row. The full chained L1-L6 run must retain an L5
+aggregate before L5 is treated as fully documented.
+
+Before the first native L6 comparison, every floating cache/FIFO/state boundary
+freezes ceilings of `2^-4` maximum absolute and `2^-10` relative-L2 drift;
+integer silence counts and Option presence are exact. The pinned synchronous
+state has a 188-frame speaker cache, zero-frame FIFO capacity, 188-frame update
+period, four speaker lanes, and three silence sentinels per lane. The native
+implementation preserves the initially absent cache/FIFO prediction Options,
+updates the cumulative silence profile at probability-sum `< 0.2`, synthesizes
+the first prior-cache predictions from the current full model output, and uses
+the exact source score/disable/strong-boost/weak-boost/latest-boost/global-top-k
+compression order. Speaker permutation and random score noise remain absent in
+evaluation. These gates and equations are fixed before any native L6 result.
 
 An exploratory, separately run probe reported two f32 CPU runs with one PyTorch
 intra-op thread and two with eight intra-op threads on one public
@@ -623,17 +887,8 @@ The probability tensor shape was `[1, 670, 4]`.
 - all four derived segment outputs had SHA-256
   `17bd517a696ff2301713b47fcacceb49a653f4dca3885ea4f63eeaeaa45ad5a2`.
 
-The probe executable and dataset record identity were not bound to the current
-adapter contract, and that adapter cannot emit probabilities. These figures are
-therefore exploratory and non-authoritative, not an oracle floor or accepted
-evidence row. `bd-y4ip.10` must bind the exact probe/exporter digest plus public
-corpus name, version, record identifier, license, and retrieval identity, then
-repeat the measurement over predeclared inputs that cover silence, short tails,
-exact chunks, multiple chunks, overlap, two through four speakers, and cache
-compression. Each tolerance must be the smallest predeclared bound that covers
-the measured source-variability floor plus a stated numerical margin; it may
-never be tighter than the measured variability or selected after seeing Rust
-results.
+Those older figures remain exploratory and non-authoritative; the identity-bound
+four-fixture pack above supersedes them as source-floor evidence.
 
 ## 8. Ordered equivalence ladder
 
@@ -666,34 +921,36 @@ insufficient.
 |---|---|---|---|
 | OQ-01 | Does evaluation inject configured dither? | Resolved: no | L1 |
 | OQ-02 | Exact STFT padding, mel floor, and length rounding | Resolved for the synthetic pack and native valid-log-mel comparator; public real-voice extension open | L1 |
-| OQ-03 | Depthwise subsampling padding and layout at tails | Source-resolved; numeric tail fixture pending | L2 |
-| OQ-04 | Exact relative-position attention equations, masks, and scaling | Source-resolved; numeric fixture pending | L3 |
-| OQ-05 | Exact inference head branch | Resolved from pinned source; numeric fixture required | L5 |
-| OQ-06 | Top-k tie behavior and chronological reordering | Lane grouping/order source-resolved; exact tie mapping pending | L6 |
-| OQ-07 | First, steady, and partial-tail cache mutation | Partially source-resolved; fixtures required | L6 |
+| OQ-03 | Depthwise subsampling padding and layout at tails | Resolved by authenticated public tail parity | L2 |
+| OQ-04 | Exact relative-position attention equations, masks, and scaling | Resolved across all 17 native blocks and public states | L3 |
+| OQ-05 | Exact inference head branch | Resolved across all 18 Transformer blocks and the four-lane head | L5 |
+| OQ-06 | Top-k tie behavior and chronological reordering | Exact libc++ tied-frame identity remains platform-defined; named chained probe open | L6 |
+| OQ-07 | First, steady, and partial-tail cache mutation | Equations and exact-score compression resolved; chained tied-cutoff identity open | L6 |
 | OQ-08 | Speaker permutation during accepted inference | Resolved: disabled and absent in eval | L6 |
 | OQ-09 | Converted package tensor map and transforms | Resolved: exact 992-record manifest, receipt, and 974-tensor package admitted | L0 |
-| OQ-10 | Cross-input and cross-thread oracle variability | Synthetic frontend zero-floor complete; licensed public L1-L8 floor open | L1-L8 |
+| OQ-10 | Cross-input and cross-thread oracle variability | Synthetic and licensed-public source floors complete; native cross-platform tied-top-k row open | L1-L8 |
 | OQ-11 | Model bytes in repository or releases | Resolved: forbidden for initial route | L0 |
 | OQ-12 | Known requirement above four speakers | Model ineligibility resolved; product fallback pending `bd-y4ip.14` | L8-L10 |
 | OQ-13 | Known timestamp intervals during parity | Resolved: post-forward mapping only | L9 |
 | OQ-14 | Other operating systems and CPU feature tiers | Open; require separate runtime rows | L10 |
 | OQ-15 | Frontend/postprocessing transitive runtime identity | Open: pin it or remove it from seam authority | L0-L1 |
 | OQ-16 | Unknown recording actually contains more than four speakers | Open: capacity sentinel or capped status | L9 |
-| OQ-17 | Activity still open at the final 10 ms sample versus strict 80 ms output validation | Open: tail fixtures and one canonical rule | L7-L8 |
+| OQ-17 | Activity still open at the final 10 ms sample versus strict 80 ms output validation | Resolved: raw L8 matches NeMo exactly; production turns clamp to physical duration | L7-L8 |
 
 The fit screen has no remaining upstream semantic question that invalidates its
-conditional-GO result. The public-real-voice extension of OQ-02, the numeric/tie
-fixtures in OQ-03 through OQ-07, and the remaining oracle work in OQ-10 and
-OQ-15 are owned by `bd-y4ip.10` and block `bd-y4ip.11` parity completion. OQ-09
-is resolved. OQ-17 blocks final discrete parity. OQ-14 does not block same-host
-parity but blocks a broad cross-platform support claim.
+conditional-GO result. OQ-03 through OQ-05 and OQ-17 are now resolved by native
+public parity. The platform-defined tied-frame identity in OQ-06/OQ-07, the
+transitive runtime boundary in OQ-15, cross-platform support in OQ-14, and
+capacity/product policy in OQ-12/OQ-16 remain open. OQ-14 does not block this
+same-host evaluation route, but it and the chained L6 probe block a broad
+support or promotion claim.
 
 ## 10. Implementation slices
 
 ### Slice A: truth and conversion (`bd-y4ip.10`)
 
-1. Extend the public-input oracle floor. **Open.**
+1. Extend the public-input oracle floor. **Complete for the frozen four-fixture
+   licensed-public L1-L8 pack.**
 2. Define the canonical conversion-receipt schema. **Complete for L0 v1.**
 3. Convert the pinned checkpoint outside Git into safetensors. **Complete for
    the operator-local identity-bound, verifier-admitted package; no weights
@@ -702,12 +959,12 @@ parity but blocks a broad cross-platform support claim.
    records, 974 exports, and 18 typed drops.**
 5. Capture all L1-L8 real-voice oracle activations outside Git and retain only
    their identities and aggregate drift; commit exact activation values only
-   for deterministic synthetic non-human fixtures. **Partial: the synthetic
-   frontend pack and native valid-log-mel comparator are complete; licensed
-   public L1 and every L2-L8 seam remain open.**
-6. Add tamper and identity-drift tests. **L0 artifact tests and the synthetic
-   L1 receipt/domain/I64/cancellation slice are complete; the full L1-L8
-   package and seam failure matrix remains open.**
+   for deterministic synthetic non-human fixtures. **Complete for the frozen
+   source pack; native parity remains Slice B work.**
+6. Add tamper and identity-drift tests. **Complete for compiled receipt/package
+   roots, strict schemas, stage/full-shape/probe/hash checks, source-floor
+   margins, and cache Option transitions; broader f32 seam mismatch controls
+   remain Slice B work.**
 
 ### Slice B: safe f32 engine (`bd-y4ip.11`)
 
@@ -717,9 +974,11 @@ FrankenTorch facade, checkpoint cancellation between bounded chunks and every
 layer, and initially return `DifferentialStageDocument`. The strict Sortformer
 validator in `src/differential_oracle.rs` is the first output boundary.
 
-This slice must not change `DiarizationEngine`, CLI parsing, automatic routing,
-the production report contract, or comparison protocol v2. It remains
-evaluation-only until f32 parity is complete.
+This slice must not change `DiarizationEngine`, automatic routing, the
+production transcribe report contract, or comparison protocol v2. The explicit
+`sortformer-diarize` command is a path-redacted evaluation surface over the
+same library session; it reports `evaluation_only` and cannot be selected by
+`Auto`.
 
 ### Slice C: evaluation worker (`bd-y4ip.13`)
 
@@ -806,22 +1065,39 @@ Completed here:
   topology recomputation, strict safetensors parsing, fallible allocation,
   regular-file and path-swap defenses, synthetic tamper tests, and
   operator-local real-package admission proof; and
-- a separate synthetic activation receipt/package verifier with compiled trust
-  roots, a ten-run zero source floor over four non-human fixtures, and an exact
-  operator-local activation admission proof; and
+- separate synthetic and licensed-public activation receipt/package verifiers
+  with compiled trust roots, ten-run source floors, all 5,492 L1-L8 public seam
+  contracts, and exact operator-local activation admission boundaries; and
 - a pinned-buffer, source-derived bounded whole-file Rust log-mel frontend with
   fallible allocation, mathematical/unit tests, and compiled valid-log-mel
-  parity inside the frozen synthetic cross-kernel envelope.
+  parity inside the frozen synthetic cross-kernel envelope;
+- authenticated native L2 depthwise subsampling across the admitted public
+  states;
+- all 17 native FastConformer blocks across eight independently reconstructable
+  public states, including exact prior-cache handoff and 1,224 L3 comparisons;
+- the encoder projection and all 18 native Transformer blocks across those same
+  states, with 1,160 L4 comparisons; and
+- the complete four-lane sigmoid speaker head across those same eight states;
+- exact-score L6 cache compression inside the frozen gate, plus an explicit
+  unchanged-gate failure row for the platform-defined chained top-k tie;
+- byte-exact L7 activity/speech/overlap/change and L8 anonymous-turn parity on
+  every reconstructable full public tensor;
+- an authenticated `SortformerSession` with checked whole-recording streaming,
+  neural-block cancellation checkpoints, bounded resource validation, and
+  physical-duration tail clamping;
+- a path-redacted `sortformer-diarize` evaluation-only CLI whose real public
+  three-speaker run inferred three active lanes; and
+- one overlap-heavy two-speaker public DER/JER row plus local debug RTF,
+  model-load, and child-only peak-RSS observations recorded above.
 
 Not completed here:
 
-- complete multi-input oracle floor;
-- licensed public-real-voice L1 plus all L2-L8 seam fixtures;
 - native intermediate frontend-stage parity before `log_mel_f32`;
-- any Rust neural model forward pass beyond the log-mel frontend;
-- f32 neural, quantized, or fused parity;
-- authoritative peak RSS, RTF, or cancellation evidence;
+- exact identity parity for every chained L6 transition at numerically tied
+  top-k cutoffs;
+- quantized whole-model parity or additional profile-justified fused kernels;
+- release-build and 90-minute resource certification;
 - frozen public multi-record accuracy certification; or
-- production routing.
+- transcribe/robot report integration or automatic production routing.
 
 Those omissions are downstream gates, not evidence that they passed.
