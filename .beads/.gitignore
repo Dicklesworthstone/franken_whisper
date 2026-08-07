@@ -12,3 +12,6 @@ last-touched
 *.tmp
 beads.base.jsonl
 beads.db-fsqlite-ns-*
+
+# History snapshots — local only; never commit
+.br_history/

@@ -286,3 +286,6 @@ __pycache__/
 # br recovery intermediate / failed rebuild artifacts
 .beads/.br_recovery/
 *.rebuild-failed
+
+# Beads history snapshots — local rotation only; never commit
+.beads/.br_history/
