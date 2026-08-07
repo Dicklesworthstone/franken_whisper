@@ -1,5 +1,9 @@
 # Regression alerts
 
+> Historical pass-1 watch list. Sortformer distribution is now an explicit,
+> hash-pinned release-cache workflow; evaluation-only and Auto-certification
+> requirements remain current until the separate public gate passes.
+
 No scored surface regressed below its pre-pass score.
 
 Watch items that remain outside this pass:

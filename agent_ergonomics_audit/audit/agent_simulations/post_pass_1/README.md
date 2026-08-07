@@ -1,5 +1,10 @@
 # Post-pass agent simulations
 
+> Historical pass-1 evidence. Later owner-authorized work supersedes the
+> operator-local Sortformer boundary with an explicit hash-pinned model release
+> and `fw pull sortformer`; the accuracy and Auto-routing boundary remains in
+> force until its separate public certification gate passes.
+
 All probes used synthetic placeholders or discovery-only commands. No private audio or transcript was opened.
 
 ## Binary orientation

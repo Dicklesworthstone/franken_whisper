@@ -1,5 +1,9 @@
 # Pass 1 playbook
 
+> Historical playbook. Current model diagnostics remain local and path-free,
+> while `fw pull sortformer` is the one explicit network-enabled provisioning
+> command for the hash-pinned native Sortformer release package.
+
 1. Make the binary self-describing: `fw --version`, `fw capabilities --json`, and `fw robot-docs guide` must work without a repository checkout.
 2. Give agents one live entry point: `fw robot triage` returns readiness and the next exact command.
 3. Keep model diagnostics local and path-free: `fw models --json` performs no network access and preserves Sortformer's operator-local boundary.

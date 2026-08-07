@@ -1,5 +1,10 @@
 # Phase 0 scope decision
 
+> Historical scope boundary for pass 1. The repository owner later explicitly
+> authorized model release distribution, superseding only the operator-local
+> packaging guardrail below. Privacy, accuracy-certification, and Auto-routing
+> gates remain binding.
+
 - Target: `/Users/jemanuel/projects/franken_whisper`
 - Reference implementation: `/Users/jemanuel/projects/franken_ocr`
 - Mode: `full`

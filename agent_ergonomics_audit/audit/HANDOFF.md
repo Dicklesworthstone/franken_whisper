@@ -1,5 +1,10 @@
 # Pass 1 handoff
 
+> Historical handoff. The later Sortformer distribution tranche supersedes the
+> operator-local packaging constraint below with a licensed, hash-pinned model
+> release and explicit native pull command. It does not retroactively change
+> the evidence observed during this pass or certify diarization accuracy.
+
 Pass 1 implemented the agent-first command surface, deterministic local model
 discovery, fail-closed dual-binary installer, and DSR-first release staging.
 Two fresh-eyes reviews corrected robot help handling, zero-duration metrics,
