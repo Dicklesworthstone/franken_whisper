@@ -142,8 +142,12 @@ supplied by this document.
 
 The model is under the custom
 [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/),
-not the repository's Rust source license. The model card and license must be
-reviewed again before distributing any derived weights.
+not the repository's Rust source license. The model card and license were
+reviewed for the dedicated converted-weight release. Each distributed package
+is accompanied by an unmodified snapshot of the NVIDIA Open Model License, the
+required NVIDIA notice, and the identity-bound conversion receipt. A different
+upstream revision or conversion recipe requires a new review and release
+identity.
 
 The reference snapshot retrieved on 2026-08-06 had raw-payload SHA-256
 `13c9c998e24abd5211cff4b5c912902f566bd710294da98580be7b3376626f04`,
@@ -156,18 +160,22 @@ notice, which must be preserved in any distribution that carries derived
 source. These identities establish an auditable review input, not legal
 approval.
 
-The initial Rust route therefore uses this conservative policy:
+The distribution policy is therefore:
 
 - no original or converted weights are committed to Git, embedded in the
-  binary, attached to a release, or copied into test fixtures;
-- the operator obtains the model under the upstream license and performs a
-  local, identity-bound conversion;
-- the converter emits a non-executable safetensors package plus a canonical
-  conversion receipt outside the repository;
+  binary, or copied into test fixtures;
+- the exact converted safetensors package is distributed only by the dedicated
+  `sortformer-v2.1-f32-v1` GitHub model release, never by a source or binary
+  archive;
+- that release contains exactly the weights, the canonical conversion receipt,
+  the NVIDIA Open Model License snapshot, and the required notice;
+- `fw pull sortformer` downloads only those compiled manifest URLs, verifies
+  every size and SHA-256, and admits the four files together into an
+  identity-versioned per-user cache;
+- explicit caller-supplied receipt/package paths remain an offline evaluation
+  route, but do not inherit release-transport provenance; and
 - runtime loading never deserializes the pickle-based `.ckpt` from the `.nemo`
-  archive; and
-- any future downloader or redistributor requires an explicit license and
-  Notice review as its own gate.
+  archive.
 
 This is a repository policy, not legal advice and not a claim that every future
 form of redistribution is permitted.

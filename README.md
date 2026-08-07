@@ -55,6 +55,9 @@ admits it only after all four embedded size/SHA-256 trust roots pass. A doctor
 491,570,584-byte weights are never stored in Git; they are distributed as the
 `sortformer-v2.1-f32-v1` GitHub release artifact beside the NVIDIA Open Model
 License, required notice, and deterministic conversion receipt.
+Release archives also carry [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md),
+which records the licensed libc++ selection logic translated into safe Rust for
+the pinned PyTorch CPU top-k parity contract.
 
 > **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels, `#![forbid(unsafe_code)]` in-crate) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md).
 >

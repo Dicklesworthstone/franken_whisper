@@ -129,9 +129,10 @@ jobs:
           mkdir -p dist
           VERSION_NO_V="${RELEASE_VERSION#v}"
           ARCHIVE="franken_whisper-${VERSION_NO_V}-${{ matrix.os_arch }}.${{ matrix.archive_ext }}"
-          cd target/${{ matrix.target }}/release
-          tar -czf "../../../dist/$ARCHIVE" franken_whisper fw
-          cd ../../../dist
+          tar -czf "dist/$ARCHIVE" \
+            -C "target/${{ matrix.target }}/release" franken_whisper fw \
+            -C "$GITHUB_WORKSPACE" README.md LICENSE THIRD_PARTY_NOTICES.md AGENTS.md
+          cd dist
           shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
 
       - name: Package archive (Windows)
@@ -143,7 +144,11 @@ jobs:
           $archive = "franken_whisper-${versionNoV}-${{ matrix.os_arch }}.${{ matrix.archive_ext }}"
           $binaries = @(
             "target/${{ matrix.target }}/release/franken_whisper.exe",
-            "target/${{ matrix.target }}/release/fw.exe"
+            "target/${{ matrix.target }}/release/fw.exe",
+            "README.md",
+            "LICENSE",
+            "THIRD_PARTY_NOTICES.md",
+            "AGENTS.md"
           )
           Compress-Archive -Path $binaries -DestinationPath "dist/$archive"
           Push-Location dist
