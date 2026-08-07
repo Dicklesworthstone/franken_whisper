@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "model_id": "nvidia/diar_streaming_sortformer_4spk-v2.1",
+  "model_revision": "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d",
+  "artifact_version": "sortformer-v2.1-f32-v1",
+  "conversion_recipe": "franken-whisper-native-sortformer-converter-v1-f32",
+  "distribution_policy": "github_release_with_license_and_notice",
+  "license_id": "NVIDIA Open Model License",
+  "license_url": "https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/",
+  "required_notice": "Licensed by NVIDIA Corporation under the NVIDIA Open Model License",
+  "speaker_lane_capacity": 4,
+  "files": [
+    {
+      "role": "license",
+      "filename": "NVIDIA-OPEN-MODEL-LICENSE.html",
+      "size": 307201,
+      "sha256": "ed91059bb4088adf04719686957b3e37cb372beead1cdbb115a930b17b85593c",
+      "url": "https://github.com/Dicklesworthstone/franken_whisper/releases/download/sortformer-v2.1-f32-v1/NVIDIA-OPEN-MODEL-LICENSE.html"
+    },
+    {
+      "role": "notice",
+      "filename": "NOTICE.sortformer.txt",
+      "size": 1729,
+      "sha256": "2efddd2d681136ddede12497e67caf4cf2444f15de824ee671ebbc93fe276d13",
+      "url": "https://github.com/Dicklesworthstone/franken_whisper/releases/download/sortformer-v2.1-f32-v1/NOTICE.sortformer.txt"
+    },
+    {
+      "role": "conversion_receipt",
+      "filename": "conversion-receipt.json",
+      "size": 653202,
+      "sha256": "a1c6dce95ef4fd715965951bdaaa136e55e2219f93cf78122f8b462fbd07cbbe",
+      "url": "https://github.com/Dicklesworthstone/franken_whisper/releases/download/sortformer-v2.1-f32-v1/conversion-receipt.json"
+    },
+    {
+      "role": "weights",
+      "filename": "weights.safetensors",
+      "size": 491570584,
+      "sha256": "487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a",
+      "url": "https://github.com/Dicklesworthstone/franken_whisper/releases/download/sortformer-v2.1-f32-v1/weights.safetensors"
+    }
+  ]
+}

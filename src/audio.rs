@@ -136,8 +136,27 @@ pub fn normalize_to_wav(input: &Path, work_dir: &Path) -> FwResult<PathBuf> {
     normalize_to_wav_with_timeout(input, work_dir, ffmpeg_timeout(), None)
 }
 
+/// Normalize audio while honoring a caller-owned cancellation token during
+/// native decoding and ffmpeg fallback supervision.
+pub fn normalize_to_wav_with_cancel(
+    input: &Path,
+    work_dir: &Path,
+    token: &crate::orchestrator::CancellationToken,
+) -> FwResult<PathBuf> {
+    normalize_to_wav_with_timeout(input, work_dir, ffmpeg_timeout(), Some(token))
+}
+
 /// Decode an already-normalized 16 kHz mono PCM WAV for an in-process model.
 pub fn read_normalized_wav_16k_mono(path: &Path) -> FwResult<Vec<f32>> {
+    read_normalized_wav_16k_mono_with_checkpoint(path, &|| Ok(()))
+}
+
+/// Read a normalized WAV with cancellation checkpoints between bounded I/O
+/// chunks and around the decoder boundary.
+pub fn read_normalized_wav_16k_mono_with_checkpoint(
+    path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<Vec<f32>> {
     const MAX_WAV_CONTAINER_OVERHEAD_BYTES: u64 = 1024 * 1024;
     let maximum_bytes = u64::try_from(
         crate::sortformer_inference::SORTFORMER_MAX_AUDIO_SAMPLES
@@ -149,13 +168,48 @@ pub fn read_normalized_wav_16k_mono(path: &Path) -> FwResult<Vec<f32>> {
     .map_err(|_| FwError::InvalidRequest("normalized WAV byte ceiling exceeds u64".to_owned()))?
     .checked_add(MAX_WAV_CONTAINER_OVERHEAD_BYTES)
     .ok_or_else(|| FwError::InvalidRequest("normalized WAV byte ceiling overflows".to_owned()))?;
-    if std::fs::metadata(path)?.len() > maximum_bytes {
+    let mut file = std::fs::File::open(path)?;
+    let file_bytes = file.metadata()?.len();
+    if file_bytes > maximum_bytes {
         return Err(FwError::InvalidRequest(
             "normalized WAV exceeds the native Sortformer two-hour byte ceiling".to_owned(),
         ));
     }
-    let bytes = std::fs::read(path)?;
-    crate::native_engine::decode::read_wav_16k_mono(&bytes)
+    checkpoint()?;
+    let capacity = usize::try_from(file_bytes).map_err(|_| {
+        FwError::InvalidRequest("normalized WAV byte length exceeds usize".to_owned())
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
+        FwError::InvalidRequest("normalized WAV buffer allocation failed".to_owned())
+    })?;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        checkpoint()?;
+        let read = std::io::Read::read(&mut file, &mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        let next_length = bytes.len().checked_add(read).ok_or_else(|| {
+            FwError::InvalidRequest("normalized WAV byte length overflows usize".to_owned())
+        })?;
+        let next_length_u64 = u64::try_from(next_length).map_err(|_| {
+            FwError::InvalidRequest("normalized WAV byte length exceeds u64".to_owned())
+        })?;
+        if next_length_u64 > maximum_bytes {
+            return Err(FwError::InvalidRequest(
+                "normalized WAV grew beyond the native Sortformer two-hour byte ceiling".to_owned(),
+            ));
+        }
+        bytes.try_reserve(read).map_err(|_| {
+            FwError::InvalidRequest("normalized WAV buffer growth was refused".to_owned())
+        })?;
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    checkpoint()?;
+    let samples = crate::native_engine::decode::read_wav_16k_mono(&bytes)?;
+    checkpoint()?;
+    Ok(samples)
 }
 
 pub(crate) fn normalize_to_wav_with_timeout(
@@ -174,7 +228,6 @@ pub(crate) fn normalize_to_wav_with_timeout(
     if prefer_wav_passthrough() && !force_ffmpeg_normalizer() && is_already_normalized_wav(input) {
         tracing::info!(
             stage = "normalize",
-            input = %input.display(),
             "input already 16 kHz mono 16-bit PCM WAV; passing through (FRANKEN_WHISPER_WAV_PASSTHROUGH)"
         );
         if let Some(tok) = token {
@@ -187,7 +240,6 @@ pub(crate) fn normalize_to_wav_with_timeout(
     if force_ffmpeg_normalizer() {
         tracing::info!(
             stage = "normalize",
-            input = %input.display(),
             "ffmpeg normalizer forced via env; skipping built-in path"
         );
         return normalize_via_ffmpeg(input, &output, work_dir, timeout, token);
@@ -203,7 +255,6 @@ pub(crate) fn normalize_to_wav_with_timeout(
         Ok(()) => {
             tracing::debug!(
                 stage = "normalize",
-                input = %input.display(),
                 "normalized with built-in Rust decoder (no external dependencies)"
             );
             if let Some(tok) = token {
@@ -217,8 +268,7 @@ pub(crate) fn normalize_to_wav_with_timeout(
         Err(builtin_error) => {
             tracing::info!(
                 stage = "normalize",
-                input = %input.display(),
-                reason = %builtin_error,
+                reason_code = builtin_error.error_code(),
                 "built-in decoder cannot handle this format; falling back to ffmpeg"
             );
         }

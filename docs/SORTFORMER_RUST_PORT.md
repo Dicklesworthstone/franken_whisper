@@ -24,8 +24,14 @@ graph oracle; the older final-output adapter remains only an identity-checked
 discrete-output diagnostic oracle. No automatic routing change, broad accuracy
 claim, or speed claim is authorized until the ordered parity and public
 evaluation gates below pass. The explicit `sortformer-diarize` command reports
-`evaluation_only`, requires an authenticated operator-local receipt and
-package, and does not affect the currently resolved transcribe behavior.
+`evaluation_only`, defaults to a fully hash-verified release cache populated by
+explicit `fw pull sortformer`, and does not affect the currently resolved
+transcribe behavior. Explicit receipt/package paths remain available for
+offline evaluation, but report no release-transport policy because hash
+authentication alone cannot establish how caller-selected files arrived.
+Unknown recordings report
+`four_lane_capped_output_true_speaker_count_unknown`; the active lane count is
+not treated as a certified true-speaker count.
 
 The port is a conditional fit rather than an unconditional fit because:
 
@@ -323,8 +329,11 @@ all aggregate censuses.
 It also binds and rechecks its own source inode and digest, instantiates the
 pinned graph without `restore_from` temporary extraction, publishes owner-only
 mode-0600 outputs, and permits retries only by reusing exact artifacts. The
-licensed model, converted package, and receipt remain operator-local and
-outside Git.
+licensed model bytes and receipt remain outside Git. The exact converted
+package and canonical receipt are now redistributed in the dedicated,
+hash-pinned `sortformer-v2.1-f32-v1` GitHub release beside the NVIDIA Open
+Model License agreement and required notice; `fw pull sortformer` verifies the
+separate distribution manifest before cache publication.
 
 ## 5. Frozen forward graph
 
@@ -953,8 +962,8 @@ support or promotion claim.
    licensed-public L1-L8 pack.**
 2. Define the canonical conversion-receipt schema. **Complete for L0 v1.**
 3. Convert the pinned checkpoint outside Git into safetensors. **Complete for
-   the operator-local identity-bound, verifier-admitted package; no weights
-   entered Git.**
+   the identity-bound, verifier-admitted package now distributed through the
+   dedicated model release; no weights entered Git.**
 4. Audit the exact tensor census and hashes. **Complete for all 992 source
    records, 974 exports, and 18 typed drops.**
 5. Capture all L1-L8 real-voice oracle activations outside Git and retain only
@@ -1021,7 +1030,10 @@ unchanged until that work passes its own frozen gate.
 
 - No confidential audio or transcript is part of conversion, parity, or
   committed test evidence.
-- Model packages remain operator-local and outside the repository. All
+- Model packages remain outside the repository. The native f32 weights are
+  distributed only as a dedicated GitHub release asset beside the NVIDIA
+  license, required notice, and conversion receipt; `fw pull sortformer`
+  verifies every embedded size and SHA-256 before cache admission. All
   real-voice activation or embedding values are ephemeral; Git may retain their
   hashes and aggregate drift only. Exact committed values use synthetic
   non-human inputs.
@@ -1057,7 +1069,8 @@ Completed here:
   externally-derived insertion-order inventory digest;
 - a reviewed frozen offline converter, canonical 992-record topology projection,
   653,202-byte receipt, and 491,570,584-byte metadata-free package, all with
-  compiled digests while licensed bytes remain operator-local;
+  compiled digests while licensed bytes remain outside Git and independently
+  release-distributed with legal sidecars;
 - explicit streaming and capacity contract;
 - one-host exploratory nondeterminism probe, explicitly non-authoritative;
 - a cycle-free, dependency-wired implementation and proof ladder;
@@ -1085,8 +1098,9 @@ Completed here:
 - an authenticated `SortformerSession` with checked whole-recording streaming,
   neural-block cancellation checkpoints, bounded resource validation, and
   physical-duration tail clamping;
-- a path-redacted `sortformer-diarize` evaluation-only CLI whose real public
-  three-speaker run inferred three active lanes; and
+- an explicit, cancellation-aware `fw pull sortformer` path plus a
+  path-redacted cached `sortformer-diarize` evaluation-only CLI whose real
+  public three-speaker run inferred three active lanes; and
 - one overlap-heavy two-speaker public DER/JER row plus local debug RTF,
   model-load, and child-only peak-RSS observations recorded above.
 

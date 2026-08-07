@@ -1,14 +1,13 @@
-//! Evaluation-only native inference building blocks for the pinned four-speaker
-//! Streaming Sortformer.
+//! Native inference for the pinned four-lane Streaming Sortformer.
 //!
-//! This module is intentionally not a diarization route. It begins the f32
-//! equivalence ladder with the exact stored frontend buffers and preprocessing
-//! graph. Promotion, automatic routing, streaming state, and speaker decisions
-//! remain separate gates.
+//! The complete f32 graph and bounded streaming state execute in-process. The
+//! explicit CLI route remains evaluation-only until the frozen public
+//! comparison gate is satisfied; this module alone does not authorize Auto
+//! routing or a broad accuracy claim.
 //!
-//! The initial frontend emulates offline whole-file evaluation and materializes
-//! the complete `[128, T]` result. Incremental preemphasis/STFT continuity is a
-//! separate seam; live streaming is not certified by this module.
+//! Audio ingestion is currently whole-file and the frontend materializes the
+//! complete `[128, T]` feature matrix. Online microphone streaming and its
+//! incremental preemphasis/STFT continuity remain separate, uncertified seams.
 
 use std::fmt;
 
@@ -3723,26 +3722,292 @@ fn update_silence_profile(
     Ok(())
 }
 
+type RankedFrame = (f32, usize);
+
+fn torch_score_precedes(left: &RankedFrame, right: &RankedFrame) -> bool {
+    (left.0.is_nan() && !right.0.is_nan()) || left.0 > right.0
+}
+
+fn libcxx_sort3(values: &mut [RankedFrame], x: usize, y: usize, z: usize) -> bool {
+    if !torch_score_precedes(&values[y], &values[x]) {
+        if !torch_score_precedes(&values[z], &values[y]) {
+            return false;
+        }
+        values.swap(y, z);
+        if torch_score_precedes(&values[y], &values[x]) {
+            values.swap(x, y);
+        }
+        return true;
+    }
+    if torch_score_precedes(&values[z], &values[y]) {
+        values.swap(x, z);
+        return true;
+    }
+    values.swap(x, y);
+    if torch_score_precedes(&values[z], &values[y]) {
+        values.swap(y, z);
+    }
+    true
+}
+
+fn libcxx_selection_sort(values: &mut [RankedFrame], first: usize, last: usize) {
+    for destination in first..last.saturating_sub(1) {
+        let mut best = destination;
+        for candidate in destination + 1..last {
+            if torch_score_precedes(&values[candidate], &values[best]) {
+                best = candidate;
+            }
+        }
+        if best != destination {
+            values.swap(destination, best);
+        }
+    }
+}
+
+/// Reproduce the score-only `std::nth_element` selection used by the pinned
+/// PyTorch 2.7.1 CPU `topk(sorted=false)` kernel. The upstream comparator does
+/// not break equal scores by index, so a full Rust sort is not equivalent: a
+/// boundary tie can select a different cache frame and cascade into later
+/// streaming state.
+///
+/// This safe index-based translation is pinned to LLVM libc++ 15.0.7
+/// `include/__algorithm/nth_element.h`, licensed Apache-2.0 WITH
+/// LLVM-exception. Keeping the source revision and license here is part of the
+/// parity contract: a standard-library algorithm change must not silently
+/// alter authenticated cache-frame selection.
+fn libcxx_nth_element(
+    values: &mut [RankedFrame],
+    mut first: usize,
+    nth: usize,
+    mut last: usize,
+) -> FwResult<()> {
+    const SELECTION_SORT_LIMIT: usize = 7;
+    if nth > last || last > values.len() {
+        return Err(reference_error(
+            "l6_compression",
+            "L6 top-k selection bounds are invalid",
+        ));
+    }
+    loop {
+        if nth == last {
+            return Ok(());
+        }
+        let len = last.checked_sub(first).ok_or_else(|| {
+            reference_error("l6_compression", "L6 top-k selection range inverted")
+        })?;
+        match len {
+            0 | 1 => return Ok(()),
+            2 => {
+                let right = last - 1;
+                if torch_score_precedes(&values[right], &values[first]) {
+                    values.swap(first, right);
+                }
+                return Ok(());
+            }
+            3 => {
+                libcxx_sort3(values, first, first + 1, last - 1);
+                return Ok(());
+            }
+            _ => {}
+        }
+        if len <= SELECTION_SORT_LIMIT {
+            libcxx_selection_sort(values, first, last);
+            return Ok(());
+        }
+
+        let mut middle = first + len / 2;
+        let last_minus_one = last - 1;
+        let mut swaps = usize::from(libcxx_sort3(
+            values,
+            first,
+            middle,
+            last_minus_one,
+        ));
+        let mut left = first;
+        let mut right = last_minus_one;
+
+        if !torch_score_precedes(&values[left], &values[middle]) {
+            let guard_found = loop {
+                right = right.checked_sub(1).ok_or_else(|| {
+                    reference_error("l6_compression", "L6 top-k guard underflowed")
+                })?;
+                if left == right {
+                    break false;
+                }
+                if torch_score_precedes(&values[right], &values[middle]) {
+                    break true;
+                }
+            };
+            if guard_found {
+                values.swap(left, right);
+                swaps += 1;
+            } else {
+                left += 1;
+                right = last - 1;
+                if !torch_score_precedes(&values[first], &values[right]) {
+                    loop {
+                        if left == right {
+                            return Ok(());
+                        }
+                        if torch_score_precedes(&values[first], &values[left]) {
+                            values.swap(left, right);
+                            swaps += 1;
+                            left += 1;
+                            break;
+                        }
+                        left += 1;
+                    }
+                }
+                if left == right {
+                    return Ok(());
+                }
+                loop {
+                    while !torch_score_precedes(&values[first], &values[left]) {
+                        left += 1;
+                        if left == last {
+                            return Err(reference_error(
+                                "l6_compression",
+                                "L6 top-k upward partition lost its guard",
+                            ));
+                        }
+                    }
+                    loop {
+                        right = right.checked_sub(1).ok_or_else(|| {
+                            reference_error(
+                                "l6_compression",
+                                "L6 top-k downward partition underflowed",
+                            )
+                        })?;
+                        if !torch_score_precedes(&values[first], &values[right]) {
+                            break;
+                        }
+                    }
+                    if left >= right {
+                        break;
+                    }
+                    values.swap(left, right);
+                    swaps += 1;
+                    left += 1;
+                }
+                if nth < left {
+                    return Ok(());
+                }
+                first = left;
+                continue;
+            }
+        }
+
+        left += 1;
+        if left < right {
+            loop {
+                while torch_score_precedes(&values[left], &values[middle]) {
+                    left += 1;
+                    if left == last {
+                        return Err(reference_error(
+                            "l6_compression",
+                            "L6 top-k upward scan lost its median guard",
+                        ));
+                    }
+                }
+                loop {
+                    right = right.checked_sub(1).ok_or_else(|| {
+                        reference_error("l6_compression", "L6 top-k scan underflowed")
+                    })?;
+                    if torch_score_precedes(&values[right], &values[middle]) {
+                        break;
+                    }
+                }
+                if left >= right {
+                    break;
+                }
+                values.swap(left, right);
+                swaps += 1;
+                if middle == left {
+                    middle = right;
+                }
+                left += 1;
+            }
+        }
+        if left != middle && torch_score_precedes(&values[middle], &values[left]) {
+            values.swap(left, middle);
+            swaps += 1;
+        }
+        if nth == left {
+            return Ok(());
+        }
+        if swaps == 0 {
+            if nth < left {
+                let mut previous = first;
+                let mut cursor = first;
+                loop {
+                    cursor += 1;
+                    if cursor == left {
+                        return Ok(());
+                    }
+                    if torch_score_precedes(&values[cursor], &values[previous]) {
+                        break;
+                    }
+                    previous = cursor;
+                }
+            } else {
+                let mut previous = left;
+                let mut cursor = left;
+                loop {
+                    cursor += 1;
+                    if cursor == last {
+                        return Ok(());
+                    }
+                    if torch_score_precedes(&values[cursor], &values[previous]) {
+                        break;
+                    }
+                    previous = cursor;
+                }
+            }
+        }
+        if nth < left {
+            last = left;
+        } else {
+            first = left + 1;
+        }
+    }
+}
+
+fn pytorch_cpu_topk_unsorted(
+    mut values: Vec<RankedFrame>,
+    count: usize,
+) -> FwResult<Vec<RankedFrame>> {
+    let keep = count.min(values.len());
+    if keep == 0 {
+        return Ok(Vec::new());
+    }
+    if keep.saturating_mul(64) <= values.len() {
+        return Err(reference_error(
+            "l6_compression",
+            "L6 top-k unexpectedly entered PyTorch's partial-sort geometry",
+        ));
+    }
+    let value_count = values.len();
+    libcxx_nth_element(&mut values, 0, keep - 1, value_count)?;
+    values.truncate(keep);
+    Ok(values)
+}
+
 fn ranked_speaker_indices(
     scores: &[f32],
     frames: usize,
     speaker: usize,
     count: usize,
 ) -> FwResult<Vec<usize>> {
-    let mut indices = (0..frames).collect::<Vec<_>>();
-    indices.sort_unstable_by(|left, right| {
-        let left_score = scores[left * SORTFORMER_SPEAKER_LANES + speaker];
-        let right_score = scores[right * SORTFORMER_SPEAKER_LANES + speaker];
-        right_score
-            .total_cmp(&left_score)
-            .then_with(|| left.cmp(right))
-    });
-    if indices.len() != frames {
-        return Err(reference_error("l6_compression", "L6 ranking lost a frame"));
-    }
-    let keep = count.min(frames);
-    indices.truncate(keep);
-    Ok(indices)
+    let values = (0..frames)
+        .map(|frame| {
+            (
+                scores[frame * SORTFORMER_SPEAKER_LANES + speaker],
+                frame,
+            )
+        })
+        .collect();
+    pytorch_cpu_topk_unsorted(values, count)
+        .map(|ranked| ranked.into_iter().map(|(_, index)| index).collect())
 }
 
 fn boost_top_scores(scores: &mut [f32], frames: usize, count: usize, scale: f32) -> FwResult<()> {
@@ -3840,13 +4105,7 @@ fn compress_speaker_cache(state: &mut SortformerStreamingState) -> FwResult<()> 
             flattened.push((score, speaker * score_frames + frame));
         }
     }
-    flattened.sort_unstable_by(|(left_score, left_index), (right_score, right_index)| {
-        right_score
-            .total_cmp(left_score)
-            .then_with(|| left_index.cmp(right_index))
-    });
-    flattened.truncate(SORTFORMER_SPEAKER_CACHE_FRAMES);
-    let mut selected = flattened
+    let mut selected = pytorch_cpu_topk_unsorted(flattened, SORTFORMER_SPEAKER_CACHE_FRAMES)?
         .into_iter()
         .map(|(score, index)| {
             if score == f32::NEG_INFINITY {
@@ -5581,6 +5840,47 @@ mod tests {
                 .all(|&value| value == 0.0)
         );
         validate_streaming_state(&state).expect("compressed state remains valid");
+    }
+
+    #[test]
+    fn l6_topk_matches_pinned_pytorch_2_7_1_cpu_tie_selection() {
+        let issue_fixture = [1.0_f32, 2.0, 5.0, 4.0, 5.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, score)| (score, index))
+            .collect();
+        let one = pytorch_cpu_topk_unsorted(issue_fixture, 1).expect("top one");
+        assert_eq!(one, vec![(5.0, 2)]);
+
+        let repeated = (0..20).map(|index| (0.0, index)).collect();
+        let repeated = pytorch_cpu_topk_unsorted(repeated, 7).expect("repeated top seven");
+        assert_eq!(
+            repeated
+                .into_iter()
+                .map(|(_, index)| index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5, 6]
+        );
+
+        let patterned = (0..24)
+            .map(|index| ((index % 3) as f32, index))
+            .collect();
+        let patterned = pytorch_cpu_topk_unsorted(patterned, 10).expect("patterned top ten");
+        assert_eq!(
+            patterned
+                .into_iter()
+                .map(|(_, index)| index)
+                .collect::<Vec<_>>(),
+            vec![23, 14, 2, 17, 11, 5, 20, 8, 7, 19]
+        );
+    }
+
+    #[test]
+    fn l6_topk_fails_closed_outside_the_pinned_nth_element_geometry() {
+        let values = (0..65).map(|index| (index as f32, index)).collect();
+        let error = pytorch_cpu_topk_unsorted(values, 1)
+            .expect_err("partial-sort geometry is outside the native cache contract");
+        assert!(error.to_string().contains("partial-sort geometry"));
     }
 
     #[test]

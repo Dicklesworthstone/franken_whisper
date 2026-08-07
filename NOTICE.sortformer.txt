@@ -1,0 +1,35 @@
+Streaming Sortformer model notice
+=================================
+
+Model: nvidia/diar_streaming_sortformer_4spk-v2.1
+Pinned model revision: fafaab5faa1617a0ca52d38dd3dc4bd636800d3d
+
+Licensed by NVIDIA Corporation under the NVIDIA Open Model License
+
+The complete NVIDIA Open Model License agreement is distributed beside the
+model artifact as NVIDIA-OPEN-MODEL-LICENSE.html and is available from:
+https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/
+
+The converted artifact includes behavior adapted from NVIDIA NeMo source code,
+licensed under Apache-2.0, including a preprocessing implementation carrying
+the following embedded notice:
+
+Copyright (c) 2018 Ryan Leary
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

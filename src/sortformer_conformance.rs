@@ -1,10 +1,11 @@
 //! Fail-closed L0 artifact verifier for the native Streaming Sortformer port.
 //!
-//! This module does not run the model and does not admit a production route.
-//! It authenticates an operator-local, non-executable safetensors conversion
-//! against an independently reviewed canonical receipt. Production admission
+//! This module does not run the model and does not by itself admit an automatic
+//! production route. It authenticates the non-executable safetensors conversion
+//! against an independently reviewed canonical receipt. The package may arrive
+//! through the hash-pinned release cache or explicit offline paths; admission
 //! uses compiled converter, topology-projection, receipt, and package trust
-//! roots; arbitrary caller-supplied digests are not an admissible authority.
+//! roots, never arbitrary caller-supplied digests.
 
 #![forbid(unsafe_code)]
 
@@ -125,7 +126,11 @@ const PACKAGE_BYTE_ORDER: &str = "little_endian";
 const PACKAGE_TENSOR_ORDER: &str = "lexicographic_name_order";
 const PACKAGE_METADATA_POLICY: &str = "absent";
 const LICENSE_ID: &str = "NVIDIA Open Model License";
-const LICENSE_POLICY: &str = "operator_local_no_git_no_release";
+// Historical conversion-time policy embedded in the immutable v1 receipt. The
+// separately versioned distribution manifest supersedes this transport policy
+// after distribution-license review without rewriting or weakening the
+// conversion trust root.
+const CONVERSION_RECEIPT_LICENSE_POLICY: &str = "operator_local_no_git_no_release";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// Complete canonical conversion receipt. The receipt intentionally contains
@@ -1017,7 +1022,7 @@ fn frozen_license_identity() -> SortformerLicenseIdentity {
         model_license_last_modified: "Mon, 03 Aug 2026 17:46:28 GMT".to_owned(),
         model_license_etag: "4b001-658281e31650b".to_owned(),
         model_license_payload_sha256: SORTFORMER_MODEL_LICENSE_SNAPSHOT_SHA256.to_owned(),
-        model_weight_distribution_policy: LICENSE_POLICY.to_owned(),
+        model_weight_distribution_policy: CONVERSION_RECEIPT_LICENSE_POLICY.to_owned(),
         nemo_source_license_spdx: "Apache-2.0".to_owned(),
         nemo_source_license_sha256: SORTFORMER_NEMO_LICENSE_SHA256.to_owned(),
         embedded_notice_source_path: "nemo/collections/asr/parts/preprocessing/features.py"
@@ -3352,7 +3357,7 @@ fn open_regular_artifact(
             &format!("{kind} artifact could not be opened"),
         )
     })?;
-    if !before.file_type().is_file() {
+    if metadata_is_indirection(&before) || !before.file_type().is_file() {
         return Err(domain.error(
             &format!("{kind}_type"),
             &format!("{kind} artifact must be a regular file"),
@@ -3384,7 +3389,28 @@ fn open_prechecked_regular_artifact(
         })?;
         File::from(descriptor)
     };
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| {
+                domain.error(
+                    &format!("{kind}_open"),
+                    &format!("{kind} artifact could not be opened"),
+                )
+            })?
+    };
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )))]
     let file = File::open(path).map_err(|_| {
         domain.error(
             &format!("{kind}_open"),
@@ -3398,7 +3424,7 @@ fn open_prechecked_regular_artifact(
             &format!("{kind} artifact metadata is unavailable"),
         )
     })?;
-    if !after.file_type().is_file() {
+    if !after.file_type().is_file() || metadata_is_indirection(&after) {
         return Err(domain.error(
             &format!("{kind}_type"),
             &format!("{kind} artifact must be a regular file"),
@@ -3416,6 +3442,21 @@ fn open_prechecked_regular_artifact(
         }
     }
     Ok((file, after.len()))
+}
+
+fn metadata_is_indirection(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn read_bounded_file(

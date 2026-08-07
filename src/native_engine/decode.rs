@@ -3800,11 +3800,18 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
     let mut sample_rate = 0u32;
     let mut bits = 0u16;
     let mut data: Option<&[u8]> = None;
-    while pos + 8 <= bytes.len() {
+    while bytes.len().saturating_sub(pos) >= 8 {
         let id = &bytes[pos..pos + 4];
         let size = rd_u32(bytes, pos + 4).ok_or_else(|| bad("truncated chunk header"))? as usize;
-        let body_start = pos + 8;
-        let body_end = body_start.saturating_add(size).min(bytes.len());
+        let body_start = pos
+            .checked_add(8)
+            .ok_or_else(|| bad("chunk header offset overflow"))?;
+        let body_end = body_start
+            .checked_add(size)
+            .ok_or_else(|| bad("chunk size overflow"))?;
+        if body_end > bytes.len() {
+            return Err(bad("truncated chunk body"));
+        }
         match id {
             b"fmt " => {
                 let body = &bytes[body_start..body_end];
@@ -3822,7 +3829,12 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
             _ => {}
         }
         // Chunks are word-aligned (pad byte if odd size).
-        pos = body_end + (size & 1);
+        pos = body_end
+            .checked_add(size & 1)
+            .ok_or_else(|| bad("chunk padding offset overflow"))?;
+        if pos > bytes.len() {
+            return Err(bad("truncated chunk padding"));
+        }
     }
     if bits != 16 {
         return Err(bad("only 16-bit PCM supported"));
@@ -3830,9 +3842,18 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
     if sample_rate != SAMPLE_RATE as u32 {
         return Err(bad("expected 16 kHz audio"));
     }
-    let channels = usize::from(channels.max(1));
+    if channels == 0 {
+        return Err(bad("channel count must be nonzero"));
+    }
+    let channels = usize::from(channels);
     let data = data.ok_or_else(|| bad("no data chunk"))?;
-    let n_frames = data.len() / (2 * channels);
+    let frame_bytes = 2_usize
+        .checked_mul(channels)
+        .ok_or_else(|| bad("PCM frame size overflow"))?;
+    if !data.len().is_multiple_of(frame_bytes) {
+        return Err(bad("data chunk ends inside a PCM frame"));
+    }
+    let n_frames = data.len() / frame_bytes;
     let mut out = Vec::with_capacity(n_frames);
     if channels == 1 {
         // Mono fast path (the whisper input format, so the common case): a plain
@@ -4977,31 +4998,67 @@ mod tests {
     // WAV reader.
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn wav_reader_round_trips_a_synthetic_clip() {
-        // Build a 16kHz mono 16-bit WAV with a tiny ramp and read it back.
-        let samples_i16: Vec<i16> = (0..8).map(|i| (i * 1000) as i16).collect();
-        let data_bytes: Vec<u8> = samples_i16.iter().flat_map(|s| s.to_le_bytes()).collect();
+    fn synthetic_pcm_wav(channels: u16, data_bytes: &[u8]) -> Vec<u8> {
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
         wav.extend_from_slice(&(36 + data_bytes.len() as u32).to_le_bytes());
         wav.extend_from_slice(b"WAVE");
         wav.extend_from_slice(b"fmt ");
         wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
         wav.extend_from_slice(&16000u32.to_le_bytes());
-        wav.extend_from_slice(&32000u32.to_le_bytes()); // byte rate
-        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
-        wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+        wav.extend_from_slice(&(32_000_u32 * u32::from(channels)).to_le_bytes());
+        wav.extend_from_slice(&(2_u16 * channels).to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&(data_bytes.len() as u32).to_le_bytes());
-        wav.extend_from_slice(&data_bytes);
+        wav.extend_from_slice(data_bytes);
+        wav
+    }
+
+    #[test]
+    fn wav_reader_round_trips_a_synthetic_clip() {
+        // Build a 16kHz mono 16-bit WAV with a tiny ramp and read it back.
+        let samples_i16: Vec<i16> = (0..8).map(|i| (i * 1000) as i16).collect();
+        let data_bytes: Vec<u8> = samples_i16.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let wav = synthetic_pcm_wav(1, &data_bytes);
 
         let out = read_wav_16k_mono(&wav).unwrap();
         assert_eq!(out.len(), 8);
         assert!((out[0] - 0.0).abs() < 1e-9);
         assert!((out[1] - 1000.0 / 32768.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wav_reader_rejects_truncated_declared_data_and_partial_frames() {
+        let mut truncated = synthetic_pcm_wav(1, &0_i16.to_le_bytes());
+        truncated.pop();
+        assert!(
+            read_wav_16k_mono(&truncated)
+                .expect_err("declared data must be complete")
+                .to_string()
+                .contains("truncated chunk body")
+        );
+
+        let partial_stereo = synthetic_pcm_wav(2, &0_i16.to_le_bytes());
+        assert!(
+            read_wav_16k_mono(&partial_stereo)
+                .expect_err("stereo data must contain complete frames")
+                .to_string()
+                .contains("inside a PCM frame")
+        );
+    }
+
+    #[test]
+    fn wav_reader_rejects_zero_channels() {
+        let wav = synthetic_pcm_wav(0, &[]);
+        assert!(
+            read_wav_16k_mono(&wav)
+                .expect_err("zero-channel PCM is invalid")
+                .to_string()
+                .contains("channel count must be nonzero")
+        );
     }
 
     /// The `channels == 1` fast path in `read_wav_16k_mono` (`87556b4`) must be
@@ -6207,13 +6264,23 @@ mod tests {
         // denormal tails (softmax underflow) — the exact transient shape this
         // flake shows. Snapshot every pool worker's MXCSR around each run; a
         // non-0x1f80 value (FTZ = 0x8000, DAZ = 0x40) is the smoking gun.
-        // Read-only register read, x86-gated — no memory access.
+        // Read-only register snapshot, x86-gated. `stmxcsr` writes exactly four
+        // bytes to the initialized stack slot supplied below.
         #[cfg(target_arch = "x86_64")]
         #[allow(unsafe_code)]
         fn mxcsr_now() -> u32 {
-            // SAFETY: `_mm_getcsr` reads the thread's MXCSR register; it
-            // touches no memory and has no side effects.
-            unsafe { core::arch::x86_64::_mm_getcsr() }
+            let mut value = 0_u32;
+            // SAFETY: `value` is a live, aligned, writable four-byte stack slot;
+            // `stmxcsr` stores only the MXCSR register into that slot and does
+            // not modify flags or the stack pointer.
+            unsafe {
+                core::arch::asm!(
+                    "stmxcsr [{destination}]",
+                    destination = in(reg) &mut value,
+                    options(nostack, preserves_flags),
+                );
+            }
+            value
         }
         #[cfg(not(target_arch = "x86_64"))]
         fn mxcsr_now() -> u32 {
