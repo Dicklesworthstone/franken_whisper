@@ -11,7 +11,7 @@
 //!
 //! Run: cargo +nightly run --release --example ln_membound_probe
 #![feature(portable_simd)]
-use std::simd::{Simd, StdFloat, num::SimdFloat};
+use std::simd::{Simd, StdFloat};
 
 const ROWS: usize = 1500;
 const COLS: usize = 1280;

@@ -20,14 +20,19 @@
 //!
 //! Run at RAYON_NUM_THREADS matching decode (probe uses whatever rayon picks; the
 //! logits GEMV parallelizes). Usage: `hugepage_gemv_probe [iters]` (default 60).
+#[cfg(target_os = "linux")]
 use franken_whisper::native_engine::nn;
+#[cfg(target_os = "linux")]
 use franken_whisper::native_engine::nn::I8Mat;
+#[cfg(target_os = "linux")]
 use std::hint::black_box;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 /// Allocate a 2 MB-aligned, MADV_HUGEPAGE-advised copy of `src` as a `Vec<i8>`.
 /// SAFETY: the returned Vec is backed by `mmap`, NOT the global allocator — it must
 /// be `mem::forget`-leaked, never dropped/freed. This is a probe; leaking is fine.
+#[cfg(target_os = "linux")]
 fn hugepage_copy_i8(src: &[i8]) -> Vec<i8> {
     let len = src.len();
     const ALIGN: usize = 2 * 1024 * 1024;
@@ -51,6 +56,7 @@ fn hugepage_copy_i8(src: &[i8]) -> Vec<i8> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn make_i8(out: usize, inp: usize, seed: u64) -> (Vec<i8>, Vec<f32>) {
     let mut s = seed | 1;
     let mut nb = || {
@@ -66,6 +72,7 @@ fn make_i8(out: usize, inp: usize, seed: u64) -> (Vec<i8>, Vec<f32>) {
     (data, scales)
 }
 
+#[cfg(target_os = "linux")]
 fn bench(label: &str, out: usize, inp: usize, iters: usize) {
     let (data, scales) = make_i8(out, inp, 0xA11CE ^ out as u64);
     // Activation x[inp] (reused; small, cache-resident — isolates the weight stream).
@@ -129,20 +136,28 @@ fn bench(label: &str, out: usize, inp: usize, iters: usize) {
 }
 
 fn main() {
-    let iters: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
-    println!(
-        "=== huge-page (2 MB THP) vs normal (4 KB) weight-stream A/B, real turbo decode GEMV shapes @ {}t ===",
-        rayon::current_num_threads()
-    );
-    println!(
-        "THP=madvise, AnonHugePages baseline 0 → normal Vec gets NO huge pages; huge = mmap+MADV_HUGEPAGE. byte-exact (identical weights)."
-    );
-    // Real turbo decode per-token streaming set (n_state=1280, mlp_hidden=5120, vocab=51865):
-    bench("mlp_fc/fc1", 5120, 1280, iters);
-    bench("mlp_proj/fc2", 1280, 5120, iters);
-    bench("logits", 51865, 1280, iters);
-    bench("qkv(fused)", 3840, 1280, iters);
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("hugepage_gemv_probe requires Linux MADV_HUGEPAGE support");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let iters: usize = std::env::args()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        println!(
+            "=== huge-page (2 MB THP) vs normal (4 KB) weight-stream A/B, real turbo decode GEMV shapes @ {}t ===",
+            rayon::current_num_threads()
+        );
+        println!(
+            "THP=madvise, AnonHugePages baseline 0 → normal Vec gets NO huge pages; huge = mmap+MADV_HUGEPAGE. byte-exact (identical weights)."
+        );
+        // Real turbo decode per-token streaming set (n_state=1280, mlp_hidden=5120, vocab=51865):
+        bench("mlp_fc/fc1", 5120, 1280, iters);
+        bench("mlp_proj/fc2", 1280, 5120, iters);
+        bench("logits", 51865, 1280, iters);
+        bench("qkv(fused)", 3840, 1280, iters);
+    }
 }

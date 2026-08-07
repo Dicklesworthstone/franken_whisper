@@ -1245,6 +1245,18 @@ fn runtime_isa() -> Vec<&'static str> {
             features.push("aes");
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            features.push("neon");
+        }
+        if std::arch::is_aarch64_feature_detected!("fp16") {
+            features.push("fp16");
+        }
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            features.push("dotprod");
+        }
+    }
     features
 }
 

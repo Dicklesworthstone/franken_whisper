@@ -9,15 +9,19 @@
 //! order-independent; -inf < any finite). This A/Bs the two, asserting bit-equality.
 //! Usage: `maxreduce_probe [iters]` (default 2000).
 #![allow(unsafe_code)]
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
 /// Exact replica of the sampler's scalar max-reduce.
+#[cfg(target_arch = "x86_64")]
 fn max_scalar(x: &[f32]) -> f32 {
     x.iter().copied().fold(f32::NEG_INFINITY, f32::max)
 }
 
 /// AVX2 vmaxps tree-reduction. Byte-identical to the scalar fold for NaN-free input.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 unsafe fn max_avx2(x: &[f32]) -> f32 {
@@ -61,6 +65,7 @@ unsafe fn max_avx2(x: &[f32]) -> f32 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn bench(name: &str, n: usize, iters: usize) {
     let mut s = 0x9E37_79B9_7F4A_7C15u64;
     let mut nf = || {
@@ -113,11 +118,21 @@ fn bench(name: &str, n: usize, iters: usize) {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
+    if !std::is_x86_feature_detected!("avx2") {
+        eprintln!("maxreduce_probe requires AVX2 support");
+        return;
+    }
     let iters: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(2000);
     println!("=== sampler max-reduce: scalar fold(f32::max) vs AVX2 vmaxps (1 thread) ===");
     bench("vocab logits [51866]", 51866, iters);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("maxreduce_probe requires an x86_64 processor");
 }

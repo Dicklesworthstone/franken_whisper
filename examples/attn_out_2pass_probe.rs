@@ -14,11 +14,15 @@
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use core::arch::x86_64::*;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 const M: usize = 1500; // frames
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 const K: usize = 1280; // n_state (contraction)
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 const N: usize = 1280; // n_state (output)
 
 /// Scalar reference i32 dot of one output (o) for one activation row (r): Σ a[r,k]·w[o,k].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn ref_dot(a: &[i8], w: &[i8], r: usize, o: usize) -> i32 {
     let ar = &a[r * K..r * K + K];
     let wr = &w[o * K..o * K + K];

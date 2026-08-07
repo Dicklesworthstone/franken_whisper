@@ -24,14 +24,20 @@
 //! Usage: `self_attn_score_dot_probe [iters]`  (turbo shapes: n_head=20, d_head=64).
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
+#[cfg(target_arch = "x86_64")]
 const N_STATE: usize = 1280;
+#[cfg(target_arch = "x86_64")]
 const N_HEAD: usize = 20;
+#[cfg(target_arch = "x86_64")]
 const D_HEAD: usize = N_STATE / N_HEAD; // 64
 
 /// Current engine code: scalar sequential dot (byte-exact reference).
+#[cfg(target_arch = "x86_64")]
 fn scalar_scores(qh: &[f32], k: &[f32], scale: f32, base: usize, tk: usize, out: &mut [f32]) {
     debug_assert_eq!(qh.len(), D_HEAD);
     debug_assert!(k.len() >= tk * N_STATE);
@@ -133,6 +139,7 @@ impl Avx2Fma {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)

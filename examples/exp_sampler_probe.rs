@@ -15,10 +15,13 @@
 //! logits (all ≤ 0, most very negative), ~10% masked to -inf (exp→0), like the
 //! real sampler after masking. Usage: `exp_sampler_probe [iters]` (default 200).
 #![allow(unsafe_code)]
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
 /// Scalar libm logsumexp — the CURRENT franken path (`compute_logprobs`).
+#[cfg(target_arch = "x86_64")]
 fn logsumexp_scalar(x: &[f32], max: f32) -> f32 {
     let mut s = 0.0f32;
     for &l in x {
@@ -33,6 +36,7 @@ fn logsumexp_scalar(x: &[f32], max: f32) -> f32 {
 /// float-bit construction). ~1e-6 rel error — a fair stand-in for a wired SIMD exp.
 /// -inf lanes (x-max = -inf) underflow to 0 via the x<=-87 clamp, matching the
 /// scalar `l > -inf` guard's contribution of 0.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_code)]
 unsafe fn logsumexp_avx2(x: &[f32], max: f32) -> f32 {
@@ -90,7 +94,12 @@ unsafe fn logsumexp_avx2(x: &[f32], max: f32) -> f32 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
+    if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+        eprintln!("exp_sampler_probe requires AVX2 and FMA support");
+        return;
+    }
     let iters: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -147,4 +156,9 @@ fn main() {
     println!("  AVX2 poly   : {:>8.3} µs  {:.2}x", ta * 1e6, ts / ta);
     println!("  numerical delta: sum rel-err {rel:.2e}  |  logprob (ln-sum) delta {ln_delta:.2e}");
     println!("  scalar sum={ref_s:.6}  avx sum={avx_s:.6}");
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("exp_sampler_probe requires an x86_64 processor");
 }

@@ -90,7 +90,7 @@ fn main() {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5)
+        (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
     };
     let cross_k: Vec<Vec<f32>> = (0..n_layer)
         .map(|_| (0..enc_frames * n_state).map(|_| nf()).collect())

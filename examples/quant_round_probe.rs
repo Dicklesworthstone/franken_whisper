@@ -15,6 +15,7 @@
 use core::arch::x86_64::*;
 
 /// Exact replica of `nn::quantize_act_i7`'s inner (scalar `.round()`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn quant_scalar(x: &[f32], rows: usize, cols: usize, out: &mut [u8], scales: &mut [f32]) {
     for r in 0..rows {
         let xr = &x[r * cols..(r + 1) * cols];
@@ -94,10 +95,12 @@ fn quant_avx2(x: &[f32], rows: usize, cols: usize, out: &mut [u8], scales: &mut 
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn now() -> std::time::Instant {
     std::time::Instant::now()
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn main() {
     let shapes = [
         (1500usize, 1280usize, "fc1/qkv [1500,1280]"),
@@ -215,4 +218,9 @@ fn main() {
             );
         }
     }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn main() {
+    eprintln!("quant_round_probe requires an x86_64 processor with AVX2 support");
 }

@@ -9,13 +9,18 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
+#[cfg(target_arch = "x86_64")]
 use rayon::prelude::*;
 
+#[cfg(target_arch = "x86_64")]
 use franken_whisper::native_engine::nn::{self, I8Mat};
 
+#[cfg(target_arch = "x86_64")]
 fn fill_i8(n: usize, seed: u64) -> Vec<i8> {
     let mut s = seed;
     (0..n)
@@ -136,6 +141,7 @@ unsafe fn dot_i8_2row(w0: &[i8], w1: &[i8], x: &[i8]) -> (i32, i32) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn gemv_pf(w: &I8Mat, xi8: &[i8], xs: f32, out_slice: &mut [f32], ahead: usize) {
     let (out, inp) = (w.out, w.inp);
     let workers = rayon::current_num_threads().max(1);
@@ -157,6 +163,7 @@ fn gemv_pf(w: &I8Mat, xi8: &[i8], xs: f32, out_slice: &mut [f32], ahead: usize) 
         });
 }
 
+#[cfg(target_arch = "x86_64")]
 fn gemv_2row(w: &I8Mat, xi8: &[i8], xs: f32, out_slice: &mut [f32]) {
     let (out, inp) = (w.out, w.inp);
     let workers = rayon::current_num_threads().max(1);
@@ -191,6 +198,7 @@ fn gemv_2row(w: &I8Mat, xi8: &[i8], xs: f32, out_slice: &mut [f32]) {
         });
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
     let iters: usize = std::env::args()
         .nth(1)
@@ -290,4 +298,9 @@ fn main() {
     );
 
     black_box((o_ref, o_pf, o_2r));
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("logits_gemv_bw_probe requires an x86_64 processor with AVX2 support");
 }

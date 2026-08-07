@@ -19,12 +19,42 @@
 //! should be the default; if it wins big, the non-exactness is an owner speed call.
 //!
 //! Run: cargo run --release --example f16batch_m2col_probe
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 use half::f16;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 use half::slice::HalfFloatSliceExt;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 use rayon::prelude::*;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 const OUT: usize = 1280;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 const INP: usize = 1280;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 const TQ: usize = 1500;
 
 /// EXACT replica of nn::dot_f16c: 4 f32 accumulators over f16 weight × f32 act,
@@ -230,6 +260,11 @@ fn dot_f16c_3col(w: &[f16], x0: &[f32], x1: &[f32], x2: &[f32]) -> (f32, f32, f3
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 fn gemv_m3col(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize) {
     let row_band = TQ.div_ceil(workers).max(1);
     out_slice
@@ -325,6 +360,11 @@ fn dot_f16corder_f32(w: &[f32], x: &[f32]) -> f32 {
 /// L1 scratch, then do B byte-exact f32 dots against it. Cuts BOTH cvtph and weight
 /// L3 re-reads by B× vs the M1 token-outer path (vs M2col's 2×). Weight-stationary
 /// within the block (strided output writes); byte-identical (scratch = lossless f16→f32).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 fn gemv_mblock(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize, b: usize) {
     let row_band = TQ.div_ceil(workers).max(1);
     out_slice
@@ -350,6 +390,11 @@ fn gemv_mblock(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize, b: u
 }
 
 /// M1 kernel: exact replica of gemv_f16_batch_rows (row-morsel, tq-band direct-write).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 fn gemv_m1(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize) {
     let row_band = TQ.div_ceil(workers).max(1);
     out_slice
@@ -369,6 +414,11 @@ fn gemv_m1(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize) {
 }
 
 /// M2col kernel: pairs of activation rows share each weight-row conversion.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 fn gemv_m2col(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize) {
     let row_band = TQ.div_ceil(workers).max(1);
     out_slice
@@ -401,6 +451,11 @@ fn gemv_m2col(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize) {
 }
 
 /// Tiled dequant f16→f32 (BlackThrush's exact TILE_O/TILE_I blocking) into [inp,out].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 fn dequant_tiled(w: &[f16]) -> Vec<f32> {
     const TILE_O: usize = 32;
     const TILE_I: usize = 64;
@@ -424,6 +479,11 @@ fn dequant_tiled(w: &[f16]) -> Vec<f32> {
 }
 
 /// ft sgemm on a pre-transposed f32 weight [inp,out]: `[tq,inp] @ [inp,out]`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 fn sgemm_f32(x: &[f32], w_t: &[f32], out_slice: &mut [f32]) -> bool {
     let lhs =
         ft_core::TensorMeta::from_shape(vec![TQ, INP], ft_core::DType::F32, ft_core::Device::Cpu);
@@ -439,25 +499,31 @@ fn sgemm_f32(x: &[f32], w_t: &[f32], out_slice: &mut [f32]) -> bool {
 }
 
 /// BlackThrush's full route: PER-CALL tiled dequant + ft sgemm. NON-byte-exact.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 fn gemv_tiled_f32(w: &[f16], x: &[f32], out_slice: &mut [f32]) -> bool {
     let w_t = dequant_tiled(w);
     sgemm_f32(x, &w_t, out_slice)
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 fn ms(t: std::time::Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 fn main() {
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "f16c",
-        target_feature = "fma"
-    )))]
-    {
-        eprintln!("needs f16c+fma (build with RUSTFLAGS=-Ctarget-cpu=native)");
-        return;
-    }
     let mut s = 0x2545F4914F6CDD1Du64;
     let mut nf = || {
         s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -606,4 +672,13 @@ fn main() {
         bm1 / bs,
         bm2 / bs
     );
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+)))]
+fn main() {
+    eprintln!("f16batch_m2col_probe needs f16c+fma (build with RUSTFLAGS=-Ctarget-cpu=native)");
 }

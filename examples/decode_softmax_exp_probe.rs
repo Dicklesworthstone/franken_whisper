@@ -180,7 +180,11 @@ fn main() {
     ] {
         let base: Vec<f32> = (0..rows * cols).map(|_| nf()).collect();
         // byte-exactness delta on this shape
-        let (mut a, mut b) = (base.clone(), base.clone());
+        let mut a = base.clone();
+        #[cfg(target_arch = "x86_64")]
+        let mut b = base.clone();
+        #[cfg(not(target_arch = "x86_64"))]
+        let b = base.clone();
         for r in a.chunks_mut(cols) {
             softmax_row_scalar(r);
         }

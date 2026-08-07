@@ -10,7 +10,7 @@
 //! speedup + max|Δ| vs the scalar row (the poly's approximation error).
 //! Usage: `softmax_probe [iters]` (default 30).
 use std::hint::black_box;
-use std::simd::{Simd, StdFloat, cmp::SimdPartialOrd, num::SimdFloat, num::SimdInt};
+use std::simd::{Simd, StdFloat, num::SimdFloat, num::SimdInt};
 use std::time::Instant;
 
 /// franken's current softmax row: scalar max / libm exp (+finite guard) / normalize.

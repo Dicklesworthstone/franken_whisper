@@ -15,8 +15,10 @@
 //! scheduling levers — see bd-transcript-gate-unrunnable-xu9g).
 //!
 //! Run: cargo run --release --example i8batch_4col_probe
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use rayon::prelude::*;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 const INP: usize = 1280;
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -250,6 +252,7 @@ fn dot_i8_4col(w: &[i8], xa: &[i8], xb: &[i8], xc: &[i8], xd: &[i8]) -> (i32, i3
 }
 
 /// 2col caller: weight-outer band, 2 tokens/step, 1col tail.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn gemv_m2(w: &[i8], xi8: &[i8], out: usize, tq: usize, dst: &mut [f32], workers: usize) {
     let band = out.div_ceil(workers).max(1);
     let bands: Vec<(usize, usize)> = (0..out)
@@ -290,6 +293,7 @@ fn gemv_m2(w: &[i8], xi8: &[i8], out: usize, tq: usize, dst: &mut [f32], workers
 }
 
 /// 4col caller: 4 tokens/step, then 2col, then 1col tail. Identical output to gemv_m2.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn gemv_m4(w: &[i8], xi8: &[i8], out: usize, tq: usize, dst: &mut [f32], workers: usize) {
     let band = out.div_ceil(workers).max(1);
     let bands: Vec<(usize, usize)> = (0..out)
@@ -344,6 +348,7 @@ fn gemv_m4(w: &[i8], xi8: &[i8], out: usize, tq: usize, dst: &mut [f32], workers
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn ms(t: std::time::Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }

@@ -13,15 +13,19 @@
 #![allow(unsafe_code)]
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
 /// franken's exact scalar max fold (decode.rs:507).
+#[cfg(target_arch = "x86_64")]
 fn max_scalar(l: &[f32]) -> f32 {
     l.iter().copied().fold(f32::NEG_INFINITY, f32::max)
 }
 
 /// franken's exact scalar argmax: first index with strict `>` (decode.rs:538-546).
+#[cfg(target_arch = "x86_64")]
 fn argmax_scalar(l: &[f32]) -> usize {
     let mut best_i = 0usize;
     let mut best = f32::NEG_INFINITY;
@@ -106,6 +110,7 @@ fn argmax_simd(l: &[f32]) -> usize {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn timeit<T>(f: impl Fn(&[f32]) -> T, l: &[f32], iters: usize) -> f64 {
     for _ in 0..5 {
         black_box(f(l));
@@ -119,7 +124,12 @@ fn timeit<T>(f: impl Fn(&[f32]) -> T, l: &[f32], iters: usize) -> f64 {
     best
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
+    if !std::is_x86_feature_detected!("avx2") {
+        eprintln!("sampler_maxargmax_probe requires AVX2 support");
+        return;
+    }
     let iters: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -178,4 +188,9 @@ fn main() {
             "  (per-token, SERIAL sampler critical path — full wall-clock weight, not parallelized.)"
         );
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("sampler_maxargmax_probe requires an x86_64 processor");
 }
