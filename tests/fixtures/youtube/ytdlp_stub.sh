@@ -16,7 +16,7 @@
 #                                        repo jfk.wav) to <dest_dir>/<id>.wav and
 #                                        prints that path on its own stdout line
 #
-# Error injection via STUB_FAIL_MODE:
+# Error injection via STUB_FAIL_MODE or an `fw_stub_fail=<mode>` URL query:
 #   private -> stderr "ERROR: Private video. Sign in if you've been granted..." exit 1
 #   geo     -> stderr "ERROR: ... This video is not available in your country." exit 1
 #   429     -> stderr "ERROR: HTTP Error 429: Too Many Requests"                exit 1
@@ -37,7 +37,23 @@ if [ -n "${STUB_CALL_LOG:-}" ]; then
 fi
 
 # ---- error injection ------------------------------------------------------
-case "${STUB_FAIL_MODE:-}" in
+# The URL-query form keeps parallel Rust tests hermetic without creating and
+# immediately executing temporary wrapper scripts. Some Linux/network-backed
+# filesystems can reject that pattern transiently with ETXTBSY even after the
+# writer has closed the file.
+FAIL_MODE="${STUB_FAIL_MODE:-}"
+if [ -z "$FAIL_MODE" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      *fw_stub_fail=private*) FAIL_MODE="private" ;;
+      *fw_stub_fail=geo*)     FAIL_MODE="geo" ;;
+      *fw_stub_fail=429*)     FAIL_MODE="429" ;;
+      *fw_stub_fail=exit1*)   FAIL_MODE="exit1" ;;
+    esac
+  done
+fi
+
+case "$FAIL_MODE" in
   private)
     echo "ERROR: [youtube] PRIVATE_ID: Private video. Sign in if you've been granted access to this video" >&2
     exit 1

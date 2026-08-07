@@ -1047,9 +1047,11 @@ pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
             return Ok(p);
         }
         if let Some(p) = discover_any_model(&dirs) {
-            tracing::info!(
-                model = %p.display(),
-                "no model specified and no ggml-default.bin found; auto-selected an available ggml model"
+            // Discovery is used by machine-oriented status commands as well as
+            // execution. Never emit the operator-local path; even verbose
+            // diagnostics must preserve the path-free discovery contract.
+            tracing::debug!(
+                "no model specified and no ggml-default.bin found; auto-selected an available local ggml model"
             );
             return Ok(p.canonicalize()?);
         }
@@ -1159,19 +1161,42 @@ fn model_resolution_error(spec: &str, file_name: &str, dirs: &[PathBuf]) -> Stri
     msg
 }
 
-/// The default native model spec, or `None` when the operator has not chosen
-/// one.
+/// The explicitly configured default native model spec, or `None` when the
+/// operator has not chosen one.
 ///
 /// Reads `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` if set and non-empty. When
-/// unset this returns `None`; the *fallback policy* (whether to refuse, probe a
-/// well-known name, etc.) is owned by the rollout machinery in bead bd-jryr,
-/// not here.
+/// unset this returns `None`. Call [`configured_or_discovered_model_spec`] when
+/// execution should also honor the resolver's deterministic local-only model
+/// discovery policy.
 #[must_use]
 pub fn default_model_spec() -> Option<String> {
     match std::env::var("FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL") {
         Ok(s) if !s.is_empty() => Some(s),
         _ => None,
     }
+}
+
+/// Select the native Whisper model used when a request did not provide one.
+///
+/// An explicit `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` wins. Otherwise this
+/// delegates to [`resolve_model`] with its `default` sentinel, which first
+/// checks `ggml-default.bin` and then deterministically discovers an existing
+/// local `ggml-*.bin`. The returned discovered path is canonical, no network
+/// access is performed, and a non-UTF-8 path fails with an actionable error
+/// because downstream request model specifications are UTF-8 strings.
+pub fn configured_or_discovered_model_spec() -> FwResult<String> {
+    if let Some(spec) = default_model_spec() {
+        return Ok(spec);
+    }
+
+    let path = resolve_model("default")?;
+    path.into_os_string().into_string().map_err(|_| {
+        FwError::InvalidRequest(
+            "the auto-discovered Whisper model path is not valid UTF-8; pass an explicit \
+             UTF-8 --model path"
+                .to_owned(),
+        )
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────

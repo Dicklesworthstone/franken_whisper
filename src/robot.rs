@@ -861,6 +861,272 @@ pub fn health_report_value(report: &HealthReport) -> serde_json::Value {
     })
 }
 
+/// Describe the running binary's stable agent-facing command and error
+/// contract. This is intentionally generated in-process so packaged binaries
+/// remain self-describing even when README files are unavailable.
+#[must_use]
+pub fn capabilities_value() -> serde_json::Value {
+    let process_exit_codes: Vec<Value> = crate::error::PROCESS_EXIT_CODES
+        .iter()
+        .map(|(code, name, meaning)| json!({"code": code, "name": name, "meaning": meaning}))
+        .collect();
+    let error_codes: Vec<Value> = crate::error::ERROR_CODE_CATALOG
+        .iter()
+        .map(|(code, recovery)| json!({"code": code, "recovery": recovery}))
+        .collect();
+
+    json!({
+        "schema_version": "franken-whisper-capabilities-v1",
+        "tool": "franken_whisper",
+        "version": env!("CARGO_PKG_VERSION"),
+        "preferred_agent_binary": "fw",
+        "aliases": ["fw", "franken_whisper"],
+        "target": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        },
+        "compiled_features": {
+            "tui": cfg!(feature = "tui"),
+            "gpu_frankentorch": cfg!(feature = "gpu-frankentorch"),
+            "gpu_frankenjax": cfg!(feature = "gpu-frankenjax"),
+        },
+        "agent_orientation": {
+            "command": "fw robot triage",
+            "model_status": "fw models --json",
+            "event_schema": "fw robot schema",
+            "guide": "fw robot-docs guide",
+        },
+        "structured_commands": [
+            {"command": "fw capabilities --json", "output": "json"},
+            {"command": "fw models --json", "output": "json"},
+            {"command": "fw doctor --json", "output": "json"},
+            {"command": "fw robot triage", "output": "json"},
+            {"command": "fw robot schema", "output": "json"},
+            {"command": "fw robot backends", "output": "json"},
+            {"command": "fw robot run --input AUDIO", "output": "ndjson"},
+        ],
+        "privacy": {
+            "agent_discovery_network_access": false,
+            "model_downloads_automatic": false,
+            "agent_discovery_emits_audio_or_transcript_paths": false,
+            "agent_discovery_emits_operator_local_model_paths": false,
+            "sortformer_distribution": "operator_local_no_git_no_release",
+        },
+        "process_exit_codes": process_exit_codes,
+        "error_codes": error_codes,
+        "robot_schema_version": ROBOT_SCHEMA_VERSION,
+    })
+}
+
+/// Report model/package readiness without returning operator-local paths or
+/// downloading anything. Presence checks are deliberately separated from
+/// cryptographic authentication, which remains fail-closed at model load.
+#[must_use]
+pub fn models_report_value() -> serde_json::Value {
+    let configured_whisper = crate::native_engine::default_model_spec();
+    let whisper_available = configured_whisper.as_deref().map_or_else(
+        || crate::native_engine::resolve_model("default").is_ok(),
+        |spec| crate::native_engine::resolve_model(spec).is_ok(),
+    );
+    let whisper_selection = if configured_whisper.is_some() {
+        "configured"
+    } else if whisper_available {
+        "auto_discovered"
+    } else {
+        "missing"
+    };
+
+    let ecapa_available = crate::native_engine::weights::resolve_aux_model(
+        crate::ecapa_conformance::ECAPA_PACKAGE_FILENAME,
+    )
+    .is_ok();
+
+    json!({
+        "schema_version": "franken-whisper-model-registry-v1",
+        "network_access_performed": false,
+        "local_paths_emitted": false,
+        "models": [
+            {
+                "id": "native-acoustic-diarization",
+                "kind": "built_in_signal_processing",
+                "tasks": ["speaker_change_detection", "speaker_clustering", "overlap_evidence"],
+                "runtime_status": "available_uncertified_heuristic",
+                "installed": true,
+                "artifact_required": false,
+                "authority": "explicit_builtin_baseline_not_accuracy_certification",
+            },
+            {
+                "id": "native-whisper-ggml",
+                "kind": "whisper_asr",
+                "tasks": ["transcription", "word_timestamps"],
+                "runtime_status": if whisper_available { "ready" } else { "missing_artifact" },
+                "installed": whisper_available,
+                "selection": whisper_selection,
+                "artifact": {
+                    "format": "ggml",
+                    "validation": "header_and_tensor_contract_at_load",
+                    "redistribution": "not_bundled_use_upstream_whisper_cpp_model",
+                },
+                "next_command": if whisper_available {
+                    "fw robot run --input AUDIO --backend whisper-cpp"
+                } else {
+                    "fw transcribe --input AUDIO --model /absolute/path/to/ggml-model.bin --json"
+                },
+            },
+            {
+                "id": crate::ecapa_conformance::ECAPA_MODEL_ID,
+                "kind": "speaker_embedding",
+                "tasks": ["speaker_embedding", "speaker_clustering"],
+                "runtime_status": if ecapa_available { "present_authentication_deferred" } else { "missing_artifact" },
+                "installed": ecapa_available,
+                "artifact": {
+                    "filename": crate::ecapa_conformance::ECAPA_PACKAGE_FILENAME,
+                    "bytes": crate::ecapa_conformance::ECAPA_PACKAGE_BYTES,
+                    "sha256": crate::ecapa_conformance::ECAPA_PACKAGE_SHA256,
+                    "validation": "sha256_and_tensor_contract_before_inference",
+                    "redistribution": "operator_local_not_published",
+                    "license": "Apache-2.0 source model",
+                },
+                "next_command": "fw robot-docs guide",
+            },
+            {
+                "id": crate::sortformer_conformance::SORTFORMER_MODEL_ID,
+                "revision": crate::sortformer_conformance::SORTFORMER_MODEL_REVISION,
+                "kind": "streaming_speaker_diarization",
+                "tasks": ["speaker_activity", "overlap", "speaker_turns"],
+                "runtime_status": "evaluation_only_explicit_invocation",
+                "installed": null,
+                "speaker_lane_capacity": 4,
+                "artifact": {
+                    "format": "safetensors_f32",
+                    "bytes": crate::sortformer_conformance::SORTFORMER_PACKAGE_BYTES,
+                    "sha256": crate::sortformer_conformance::SORTFORMER_PACKAGE_SHA256,
+                    "receipt_schema": crate::sortformer_conformance::SORTFORMER_RECEIPT_SCHEMA,
+                    "receipt_sha256": crate::sortformer_conformance::SORTFORMER_CONVERSION_RECEIPT_SHA256,
+                    "validation": "compiled_receipt_and_package_trust_roots_before_inference",
+                    "redistribution": "operator_local_no_git_no_release",
+                    "license": "NVIDIA Open Model License",
+                    "license_url": crate::sortformer_conformance::SORTFORMER_LICENSE_URL,
+                },
+                "next_command": "fw sortformer-diarize --input AUDIO --receipt RECEIPT --package PACKAGE",
+            }
+        ],
+    })
+}
+
+/// Produce detect-only installation diagnostics and exact next commands.
+#[must_use]
+pub fn doctor_report_value(db_path: &Path) -> serde_json::Value {
+    let health = build_health_report(db_path);
+    let health_value = health_report_value(&health);
+    let models = models_report_value();
+    let whisper_ready = models["models"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["id"] == "native-whisper-ggml")
+        })
+        .and_then(|entry| entry["installed"].as_bool())
+        .unwrap_or(false);
+    let bridge_ready = health.backends.iter().any(|backend| backend.available);
+    let transcription_ready = whisper_ready || bridge_ready;
+
+    let mut recommendations = Vec::new();
+    if transcription_ready {
+        recommendations.push(json!({
+            "reason": "static preflight found at least one transcription candidate; execution remains the runtime proof",
+            "command": "fw robot run --input AUDIO --backend auto",
+        }));
+    } else {
+        recommendations.push(json!({
+            "reason": "no transcription backend or native Whisper model is ready",
+            "command": "fw models --json",
+        }));
+        recommendations.push(json!({
+            "reason": "an explicit local ggml path bypasses model search ambiguity",
+            "command": "fw transcribe --input AUDIO --model /absolute/path/to/ggml-model.bin --json",
+        }));
+    }
+    if !health.database.available {
+        recommendations.push(json!({
+            "reason": "the configured persistence path is not ready",
+            "command": "fw transcribe --input AUDIO --no-persist --json",
+        }));
+    }
+    if !health.ffmpeg.available {
+        recommendations.push(json!({
+            "reason": "ffmpeg is optional for common audio but required for video and exotic codecs",
+            "command": "fw capabilities --json",
+        }));
+    }
+
+    json!({
+        "schema_version": "franken-whisper-doctor-v1",
+        "mode": "detect_only",
+        "mutations_performed": false,
+        "runtime_probe_performed": false,
+        "operationally_verified": false,
+        "readiness_authority": "static_preflight_not_transcription_proof",
+        "ready": transcription_ready,
+        "status": if transcription_ready { "preflight_ready_unverified" } else { "action_required" },
+        "checks": {
+            "transcription": if transcription_ready { "ready" } else { "unavailable" },
+            "persistence": if health.database.available { "ready" } else { "optional_unavailable" },
+            "ffmpeg_fallback": if health.ffmpeg.available { "ready" } else { "optional_unavailable" },
+            "sortformer": "evaluation_only_requires_explicit_operator_local_artifacts",
+        },
+        "health": health_value,
+        "model_registry": models,
+        "recommendations": recommendations,
+    })
+}
+
+/// Single-round-trip orientation payload for software agents.
+#[must_use]
+pub fn triage_report_value(db_path: &Path) -> serde_json::Value {
+    let doctor = doctor_report_value(db_path);
+    let ready = doctor["ready"].as_bool().unwrap_or(false);
+    let model_entries = doctor["model_registry"]["models"]
+        .as_array()
+        .map_or(0, Vec::len);
+    json!({
+        "schema_version": "franken-whisper-triage-v1",
+        "quick_ref": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "ready": ready,
+            "status": doctor["status"],
+            "model_entries": model_entries,
+            "next_command": doctor["recommendations"][0]["command"],
+        },
+        "doctor": doctor,
+        "commands": {
+            "capabilities": "fw capabilities --json",
+            "models": "fw models --json",
+            "schema": "fw robot schema",
+            "backends": "fw robot backends",
+            "guide": "fw robot-docs guide",
+        },
+        "process_exit_codes": crate::error::PROCESS_EXIT_CODES
+            .iter()
+            .map(|(code, name, meaning)| json!({"code": code, "name": name, "meaning": meaning}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Compact built-in handbook that remains available in binary-only installs.
+#[must_use]
+pub const fn robot_docs_guide() -> &'static str {
+    "# FrankenWhisper agent guide\n\n\
+1. Run `fw robot triage` for live readiness and the next exact command.\n\
+2. Run `fw models --json` before selecting native Whisper, ECAPA, or Sortformer.\n\
+3. Use `fw robot run --input AUDIO --backend auto` for NDJSON transcription.\n\
+4. Parse stdout only as JSON/NDJSON; diagnostics and tracing belong on stderr.\n\
+5. On failure, branch on the stable `FW-*` code from `fw capabilities --json`.\n\
+6. Sortformer remains evaluation-only and requires explicit operator-local receipt/package paths.\n\
+7. No command in this guide downloads model weights automatically.\n"
+}
+
 /// Emit a single `health.report` NDJSON line to stdout.
 pub fn emit_health_report(report: &HealthReport) -> FwResult<()> {
     emit_line(&health_report_value(report))
@@ -901,6 +1167,17 @@ pub fn robot_schema_value() -> serde_json::Value {
         "version": ROBOT_SCHEMA_VERSION,
         "schema_version": ROBOT_SCHEMA_VERSION,
         "line_oriented": "ndjson",
+        "agent_discovery": {
+            "triage": "fw robot triage",
+            "capabilities": "fw capabilities --json",
+            "models": "fw models --json",
+            "doctor": "fw doctor --json",
+            "guide": "fw robot-docs guide",
+        },
+        "error_codes": crate::error::ERROR_CODE_CATALOG
+            .iter()
+            .map(|(code, recovery)| json!({"code": code, "recovery": recovery}))
+            .collect::<Vec<_>>(),
         "events": {
             "run_start": {
                 "required": RUN_START_REQUIRED_FIELDS,
@@ -962,7 +1239,7 @@ pub fn robot_schema_value() -> serde_json::Value {
             },
             "run_error": {
                 "required": RUN_ERROR_REQUIRED_FIELDS,
-                "example": run_error_value("backend failed", "FW-ROBOT-EXEC"),
+                "example": run_error_value("backend failed", "FW-BACKEND-UNAVAILABLE"),
             },
             "backends.discovery": {
                 "required": BACKENDS_DISCOVERY_REQUIRED_FIELDS,
@@ -5715,5 +5992,80 @@ mod tests {
         let copied2 = status;
         assert_eq!(copied, copied2);
         assert_eq!(status, super::CheckStatus::Degraded);
+    }
+
+    #[test]
+    fn capabilities_catalog_is_self_describing_and_complete() {
+        let value = super::capabilities_value();
+        assert_eq!(value["schema_version"], "franken-whisper-capabilities-v1");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["preferred_agent_binary"], "fw");
+        assert_eq!(value["privacy"]["model_downloads_automatic"], false);
+        assert_eq!(
+            value["error_codes"].as_array().map(Vec::len),
+            Some(crate::error::ERROR_CODE_CATALOG.len())
+        );
+        assert!(
+            value["structured_commands"]
+                .as_array()
+                .is_some_and(|commands| commands.iter().any(|entry| {
+                    entry["command"] == "fw robot run --input AUDIO" && entry["output"] == "ndjson"
+                }))
+        );
+    }
+
+    #[test]
+    fn model_registry_keeps_sortformer_operator_local_and_exact() {
+        let value = super::models_report_value();
+        assert_eq!(value["schema_version"], "franken-whisper-model-registry-v1");
+        assert_eq!(value["network_access_performed"], false);
+        assert_eq!(value["local_paths_emitted"], false);
+        let entries = value["models"].as_array().expect("model entries");
+        let sortformer = entries
+            .iter()
+            .find(|entry| entry["id"] == crate::sortformer_conformance::SORTFORMER_MODEL_ID)
+            .expect("Sortformer registry entry");
+        assert_eq!(sortformer["artifact"]["bytes"], 491_570_584_u64);
+        assert_eq!(
+            sortformer["artifact"]["redistribution"],
+            "operator_local_no_git_no_release"
+        );
+        assert_eq!(
+            sortformer["runtime_status"],
+            "evaluation_only_explicit_invocation"
+        );
+        let serialized = serde_json::to_string(&value).expect("model registry JSON");
+        assert!(!serialized.contains("/Users/"));
+        assert!(!serialized.contains("/home/"));
+    }
+
+    #[test]
+    fn doctor_and_triage_expose_stable_readiness_contracts() {
+        let db = std::path::Path::new("nonexistent-parent/doctor.sqlite3");
+        let doctor = super::doctor_report_value(db);
+        assert_eq!(doctor["schema_version"], "franken-whisper-doctor-v1");
+        assert_eq!(doctor["mode"], "detect_only");
+        assert_eq!(doctor["mutations_performed"], false);
+        assert!(doctor["ready"].is_boolean());
+        assert!(
+            doctor["recommendations"]
+                .as_array()
+                .is_some_and(|recommendations| !recommendations.is_empty())
+        );
+
+        let triage = super::triage_report_value(db);
+        assert_eq!(triage["schema_version"], "franken-whisper-triage-v1");
+        assert_eq!(triage["quick_ref"]["ready"], doctor["ready"]);
+        assert!(triage["quick_ref"]["next_command"].is_string());
+        assert_eq!(triage["commands"]["schema"], "fw robot schema");
+    }
+
+    #[test]
+    fn built_in_agent_guide_names_orientation_and_privacy_boundaries() {
+        let guide = super::robot_docs_guide();
+        assert!(guide.contains("fw robot triage"));
+        assert!(guide.contains("fw models --json"));
+        assert!(guide.contains("operator-local"));
+        assert!(guide.contains("downloads model weights automatically"));
     }
 }

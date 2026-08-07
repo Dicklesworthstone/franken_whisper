@@ -111,6 +111,7 @@ pub enum DiarizationEngine {
     Ecapa,
     /// In-process ECAPA identity with separately bounded acoustic channel
     /// evidence when a compatible channel-valid pair can actually be scored.
+    #[value(alias = "ecapa_fused")]
     EcapaFused,
 }
 
@@ -1950,7 +1951,7 @@ fn canonical_speaker_count_candidate_upper_bound(
         },
         SpeakerCountCalibrationStatus::FixedSafeUncalibrated
         | SpeakerCountCalibrationStatus::Unavailable => {
-            let available_candidates = prototype_count.max(1).min(MAX_SPEAKER_COUNT);
+            let available_candidates = prototype_count.clamp(1, MAX_SPEAKER_COUNT);
             match request {
                 SpeakerCountRequest::Infer => available_candidates,
                 SpeakerCountRequest::Prior { bins } => bins
@@ -3852,8 +3853,11 @@ pub struct BackendsReport {
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Auto,
+    #[value(alias = "whisper_cpp")]
     WhisperCpp,
+    #[value(alias = "insanely_fast")]
     InsanelyFast,
+    #[value(alias = "whisper_diarization")]
     WhisperDiarization,
 }
 

@@ -592,6 +592,7 @@ pub(crate) fn is_stdout_capture_limit_error(error: &FwError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Duration;
 
     use crate::orchestrator::CancellationToken;
@@ -600,6 +601,17 @@ mod tests {
         cancellable_poll_delay, render_command_for_log, run_command_cancellable,
         run_command_cancellable_with_probe,
     };
+
+    fn assert_reported_cwd(stdout: &[u8], expected: &Path) {
+        let reported_text = String::from_utf8_lossy(stdout);
+        let reported = Path::new(reported_text.trim())
+            .canonicalize()
+            .expect("reported cwd should resolve");
+        let expected = expected
+            .canonicalize()
+            .expect("expected cwd should resolve");
+        assert_eq!(reported, expected, "reported cwd: {reported_text}");
+    }
 
     #[test]
     fn cancellable_poll_schedule_rejoins_fixed_cadence() {
@@ -809,11 +821,7 @@ mod tests {
     fn run_command_with_cwd() {
         let dir = tempfile::tempdir().expect("tempdir");
         let output = run_command("pwd", &[], Some(dir.path())).expect("pwd should succeed");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains(dir.path().to_str().unwrap()),
-            "expected cwd in stdout, got: {stdout}"
-        );
+        assert_reported_cwd(&output.stdout, dir.path());
     }
 
     #[test]
@@ -1017,11 +1025,7 @@ mod tests {
         let cancel = CancellationToken::no_deadline();
         let output = run_command_cancellable("pwd", &[], Some(dir.path()), &cancel, None)
             .expect("pwd should succeed");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains(dir.path().to_str().unwrap()),
-            "expected cwd in stdout, got: {stdout}"
-        );
+        assert_reported_cwd(&output.stdout, dir.path());
     }
 
     #[test]

@@ -27,7 +27,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "fw"
-path = "src/main.rs"
+path = "src/bin/fw.rs"
 
 [dependencies]
 ctrlc = "3.4"

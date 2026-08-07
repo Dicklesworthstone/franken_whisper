@@ -552,29 +552,20 @@ pub(crate) fn capability_probe() -> NativeProbe {
 /// Resolve the effective model spec for a request, or a [`FwError`] explaining
 /// how to provision one.
 ///
-/// Precedence: `request.model` (when set) then
-/// `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`. With neither set, returns
-/// [`FwError::BackendUnavailable`] whose message names the env var and reuses
-/// [`native_engine::resolve_model`]'s search-dir listing so the fix is obvious.
+/// Precedence: `request.model` (when set), then
+/// `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then deterministic discovery of an
+/// existing local `ggml-*.bin`. If none resolves, returns an actionable
+/// [`FwError::BackendUnavailable`].
 fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
         return Ok(model);
     }
-    if let Some(spec) = native_engine::default_model_spec() {
-        return Ok(spec);
-    }
-    // No request model and no default: produce an actionable message that
-    // reuses the resolver's search-dir listing (by attempting a resolution of a
-    // placeholder, whose error text enumerates the searched directories).
-    let dirs_hint = native_engine::resolve_model("default")
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-    Err(FwError::BackendUnavailable(format!(
-        "native whisper.cpp engine has no model: pass --model, or set \
-         $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. \
-         {dirs_hint}"
-    )))
+    native_engine::configured_or_discovered_model_spec().map_err(|error| {
+        FwError::BackendUnavailable(format!(
+            "native whisper.cpp engine has no usable local model: pass --model, or set \
+             $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
+        ))
+    })
 }
 
 /// Build the [`decode::DecodeParams`] for a request.
@@ -1705,12 +1696,12 @@ mod tests {
     // ── Model resolution / availability ───────────────────────────────────
 
     #[test]
-    fn run_without_model_or_default_is_backend_unavailable() {
+    fn run_without_any_configured_or_discovered_model_is_backend_unavailable() {
         let mut req = native_request();
         req.model = None;
-        // If the operator has a default model configured in this environment we
-        // cannot assert the unavailable path; only assert when truly unset.
-        if native_engine::default_model_spec().is_some() {
+        // This failure path exists only when neither an explicit default nor a
+        // deterministically discoverable local model is present.
+        if native_engine::configured_or_discovered_model_spec().is_ok() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");

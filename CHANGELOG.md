@@ -69,6 +69,21 @@ Everything in v0.2.1 (native-default engine, NaN-hardening, the aarch64 `target-
 
 Compare: [`v0.1.0...main`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.1.0...main)
 
+### Agent-first packaging and local release automation (post-2026-08-07)
+
+- Added the compact `fw` binary alias and machine-readable `capabilities`,
+  `models`, `doctor`, `robot triage`, and `robot-docs guide` entry points. Robot
+  argument failures now remain single-line JSON without echoing private paths.
+- Made native Whisper model discovery and execution share one deterministic
+  resolver, while reporting acoustic diarization and Sortformer certification
+  boundaries explicitly instead of treating file presence as runtime proof.
+- Hardened `install.sh` around exact versions, SHA-256 verification, strict
+  archive allowlisting, paired `franken_whisper`/`fw` replacement, live-lock
+  ownership, and pinned source builds.
+- Added five-target DSR staging with exact sibling revisions. GitHub workflows
+  remain manually dispatched fallbacks; operator-local Sortformer weights are
+  excluded from Git and release assets.
+
 ### Native decode-quality surface — whisper.cpp-faithful fallback + beam (post-2026-07-11)
 
 The native engine's greedy/temperature-0 decoder gains whisper.cpp's full decode-quality toolset, **all gated and default-off** (the greedy path stays byte-identical; opt-in is an explicit quality-over-speed/reproducibility choice). Each knob is a faithful port of the corresponding whisper.cpp mechanism, unit-tested against its reference math, and measured against a `whisper-cli` beam=5 oracle.

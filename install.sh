@@ -34,7 +34,7 @@
 #   FW_INSTALL_DIR             Override default install directory
 #   VERSION                    Override version to install
 #
-# Platforms (prebuilt binaries — 5 targets as of v0.2.0):
+# Platforms (prebuilt binaries — 5 release targets):
 #   Linux x86_64          franken_whisper-X.Y.Z-linux_amd64.tar.gz
 #   Linux aarch64         franken_whisper-X.Y.Z-linux_arm64.tar.gz
 #   macOS x86_64 (Intel)  franken_whisper-X.Y.Z-darwin_amd64.tar.gz
@@ -56,8 +56,10 @@ VERSION="${VERSION:-}"
 OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-franken_whisper}"
 BINARY_NAME="franken_whisper"
+ALIAS_NAME="fw"
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
+DEST_EXPLICIT=0
 EASY=0
 QUIET=0
 VERIFY=0
@@ -69,6 +71,15 @@ CHECKSUM="${CHECKSUM:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 OFFLINE_TARBALL=""
 LOCK_FILE="/tmp/franken-whisper-install.lock"
+INSTALLER_TEMP_ROOT="${TMPDIR:-/tmp}"
+while [ "$INSTALLER_TEMP_ROOT" != "/" ] && [[ "$INSTALLER_TEMP_ROOT" == */ ]]; do
+    INSTALLER_TEMP_ROOT="${INSTALLER_TEMP_ROOT%/}"
+done
+if [ "$INSTALLER_TEMP_ROOT" = "/" ]; then
+    INSTALLER_TEMP_TEMPLATE="/franken-whisper-install.XXXXXX"
+else
+    INSTALLER_TEMP_TEMPLATE="$INSTALLER_TEMP_ROOT/franken-whisper-install.XXXXXX"
+fi
 SYSTEM=0
 NO_GUM=0
 MAX_RETRIES=3
@@ -76,11 +87,8 @@ DOWNLOAD_TIMEOUT=120
 # shellcheck disable=SC2034  # informational metadata, not read by the script
 INSTALLER_VERSION="2.0.0"
 
-# Where we record the installed version. The v0.2.0 binary has NO --version
-# flag (running `franken_whisper --version` ERRORS), so we cannot ask the
-# binary what version it is. Instead we write a marker file on every install
-# and read it back for the already-installed short-circuit. Falls back to
-# "unknown" for binaries placed by something other than this installer.
+# The running binary is authoritative for its version. The marker remains a
+# fallback for older/manual installations that cannot self-report.
 VERSION_MARKER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/franken_whisper"
 VERSION_MARKER="$VERSION_MARKER_DIR/.installed-version"
 
@@ -310,13 +318,25 @@ EOF
 # ============================================================================
 # Argument Parsing
 # ============================================================================
+require_option_value() {
+    local option="$1"
+    if [ "$#" -lt 2 ] || [ -z "${2:-}" ] || [[ "${2:-}" == --* ]]; then
+        die "$option requires a non-empty value"
+    fi
+}
+
+require_assignment_value() {
+    local option="$1" value="$2"
+    [ -n "$value" ] || die "$option requires a non-empty value"
+}
+
 # shellcheck disable=SC2034  # SYSTEM records --system intent for clarity; DEST is what's actually used
 while [ $# -gt 0 ]; do
     case "$1" in
-        --version) VERSION="$2"; shift 2;;
-        --version=*) VERSION="${1#*=}"; shift;;
-        --dest) DEST="$2"; shift 2;;
-        --dest=*) DEST="${1#*=}"; shift;;
+        --version) require_option_value "$1" "${2:-}"; VERSION="$2"; shift 2;;
+        --version=*) VERSION="${1#*=}"; require_assignment_value "--version" "$VERSION"; shift;;
+        --dest) require_option_value "$1" "${2:-}"; DEST="$2"; DEST_EXPLICIT=1; shift 2;;
+        --dest=*) DEST="${1#*=}"; require_assignment_value "--dest" "$DEST"; DEST_EXPLICIT=1; shift;;
         --system)
             SYSTEM=1; DEST="/usr/local/bin"
             # Keep the version marker beside the system binary (not under the
@@ -328,24 +348,53 @@ while [ $# -gt 0 ]; do
         --easy-mode) EASY=1; shift;;
         --verify) VERIFY=1; shift;;
         --force) FORCE_INSTALL=1; shift;;
-        --artifact-url) ARTIFACT_URL="$2"; shift 2;;
-        --artifact-url=*) ARTIFACT_URL="${1#*=}"; shift;;
-        --checksum) CHECKSUM="$2"; shift 2;;
-        --checksum=*) CHECKSUM="${1#*=}"; shift;;
-        --offline) OFFLINE_TARBALL="$2"; shift 2;;
-        --offline=*) OFFLINE_TARBALL="${1#*=}"; shift;;
+        --artifact-url) require_option_value "$1" "${2:-}"; ARTIFACT_URL="$2"; shift 2;;
+        --artifact-url=*) ARTIFACT_URL="${1#*=}"; require_assignment_value "--artifact-url" "$ARTIFACT_URL"; shift;;
+        --checksum) require_option_value "$1" "${2:-}"; CHECKSUM="$2"; shift 2;;
+        --checksum=*) CHECKSUM="${1#*=}"; require_assignment_value "--checksum" "$CHECKSUM"; shift;;
+        --offline) require_option_value "$1" "${2:-}"; OFFLINE_TARBALL="$2"; shift 2;;
+        --offline=*) OFFLINE_TARBALL="${1#*=}"; require_assignment_value "--offline" "$OFFLINE_TARBALL"; shift;;
         --from-source) FROM_SOURCE=1; shift;;
         --no-verify) NO_CHECKSUM=1; shift;;
         --quiet|-q) QUIET=1; shift;;
         --no-gum) NO_GUM=1; shift;;
         --uninstall) UNINSTALL=1; shift;;
         -h|--help) usage;;
-        *) shift;;
+        --*) die "Unknown option: $1 (run with --help for supported options)";;
+        *) die "Unexpected positional argument: $1 (run with --help for usage)";;
     esac
 done
 
 # Environment variable overrides
-[ -n "${FW_INSTALL_DIR:-}" ] && DEST="$FW_INSTALL_DIR"
+if [ -n "${FW_INSTALL_DIR:-}" ]; then
+    [ "$SYSTEM" -eq 0 ] || die "FW_INSTALL_DIR cannot be combined with --system"
+    DEST="$FW_INSTALL_DIR"
+    DEST_EXPLICIT=1
+fi
+
+[ "$SYSTEM" -eq 0 ] || [ "$DEST_EXPLICIT" -eq 0 ] || die "--system cannot be combined with --dest"
+[ -z "$OFFLINE_TARBALL" ] || [ "$FROM_SOURCE" -eq 0 ] || die "--offline cannot be combined with --from-source"
+[ -z "$OFFLINE_TARBALL" ] || [ -z "$ARTIFACT_URL" ] || die "--offline cannot be combined with --artifact-url"
+[ "$FROM_SOURCE" -eq 0 ] || [ -z "$ARTIFACT_URL" ] || die "--from-source cannot be combined with --artifact-url"
+if [ -n "$VERSION" ] && [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+    die "Invalid --version '$VERSION' (expected vX.Y.Z or X.Y.Z)"
+fi
+if [ -n "$VERSION" ] && [[ "$VERSION" != v* ]]; then
+    VERSION="v$VERSION"
+fi
+if [ -n "$CHECKSUM" ] && [[ ! "${CHECKSUM%% *}" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    die "Invalid --checksum (expected exactly 64 hexadecimal characters)"
+fi
+if [ -n "$ARTIFACT_URL" ] && [[ ! "$ARTIFACT_URL" =~ ^https:// ]]; then
+    die "--artifact-url must use HTTPS; use --offline for local archives"
+fi
+[ -z "$ARTIFACT_URL" ] || [ -n "$VERSION" ] || die "--artifact-url requires --version so the staged binary can be authenticated"
+if [ -n "$ARTIFACT_URL" ] && [ -z "$CHECKSUM" ] && [ "$NO_CHECKSUM" -eq 0 ]; then
+    die "--artifact-url requires --checksum (or explicit testing-only --no-verify)"
+fi
+if [ "$UNINSTALL" -eq 1 ] && { [ -n "$VERSION" ] || [ -n "$OFFLINE_TARBALL" ] || [ "$FROM_SOURCE" -eq 1 ] || [ -n "$ARTIFACT_URL" ] || [ -n "$CHECKSUM" ] || [ "$VERIFY" -eq 1 ]; }; then
+    die "--uninstall cannot be combined with install-source, version, checksum, or verification options"
+fi
 
 check_gum || true
 setup_proxy
@@ -362,6 +411,11 @@ do_uninstall() {
         log_success "Removed $DEST/$BINARY_NAME"
     else
         log_warn "Binary not found at $DEST/$BINARY_NAME"
+    fi
+
+    if [ -f "$DEST/$ALIAS_NAME" ]; then
+        rm -f "$DEST/$ALIAS_NAME"
+        log_success "Removed $DEST/$ALIAS_NAME"
     fi
 
     if [ -f "$VERSION_MARKER" ]; then
@@ -390,8 +444,8 @@ do_uninstall() {
 # ============================================================================
 # Platform Detection
 # ============================================================================
-# Sets PLATFORM (release asset suffix) and IS_WSL. Falls back to source build
-# if no prebuilt artifact maps to this OS/arch.
+# Sets PLATFORM (release asset suffix) and IS_WSL. Unsupported targets fail
+# with an explicit message; source builds require an explicit --from-source.
 PLATFORM=""
 IS_WSL=0
 detect_platform() {
@@ -406,12 +460,7 @@ detect_platform() {
     case "$(uname -m)" in
         x86_64|amd64) arch="amd64" ;;
         aarch64|arm64) arch="arm64" ;;
-        *)
-            log_warn "Unsupported architecture $(uname -m); falling back to source build"
-            FROM_SOURCE=1
-            PLATFORM="${os}_unknown"
-            return 0
-            ;;
+        *) die "Unsupported architecture: $(uname -m). Use --from-source only after confirming sibling-crate support." ;;
     esac
 
     # WSL: behaves like linux for our purposes, but warn the user.
@@ -421,7 +470,7 @@ detect_platform() {
         log_warn "WSL detected — installing the linux_${arch} binary (some audio/tty features may need extra setup)"
     fi
 
-    # All four POSIX targets ship a prebuilt binary as of v0.2.0:
+    # All four POSIX targets ship a prebuilt binary:
     #   linux_amd64, linux_arm64, darwin_amd64, darwin_arm64
     # (windows_amd64 ships a .zip but native Windows isn't covered by this
     # bash installer — see the --help Windows note.)
@@ -473,8 +522,7 @@ resolve_version() {
         return 0
     fi
 
-    log_warn "Could not resolve latest version; will try building from source"
-    VERSION=""
+    die "Could not resolve the latest release. Retry with --version vX.Y.Z, --offline ARCHIVE, or explicitly choose --from-source."
 }
 
 # ============================================================================
@@ -493,23 +541,17 @@ acquire_lock() {
     if [ -f "$LOCK_DIR/pid" ]; then
         local old_pid
         old_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
-        if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
-            log_warn "Removing stale lock (PID $old_pid not running)"
-            rm -rf "$LOCK_DIR"
+        if [[ ! "$old_pid" =~ ^[0-9]+$ ]]; then
+            log_warn "Removing invalid installer lock metadata"
+            rm -f "$LOCK_DIR/pid"
+            rmdir "$LOCK_DIR" 2>/dev/null || true
             if mkdir "$LOCK_DIR" 2>/dev/null; then
                 LOCKED=1; echo $$ > "$LOCK_DIR/pid"; return 0
             fi
-        fi
-
-        local lock_age=0
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR/pid" 2>/dev/null || echo 0) ))
-        else
-            lock_age=$(( $(date +%s) - $(stat -c %Y "$LOCK_DIR/pid" 2>/dev/null || echo 0) ))
-        fi
-        if [ "$lock_age" -gt 300 ]; then
-            log_warn "Removing stale lock (age: ${lock_age}s)"
-            rm -rf "$LOCK_DIR"
+        elif ! kill -0 "$old_pid" 2>/dev/null; then
+            log_warn "Removing stale lock metadata (PID $old_pid not running)"
+            rm -f "$LOCK_DIR/pid"
+            rmdir "$LOCK_DIR" 2>/dev/null || true
             if mkdir "$LOCK_DIR" 2>/dev/null; then
                 LOCKED=1; echo $$ > "$LOCK_DIR/pid"; return 0
             fi
@@ -517,7 +559,7 @@ acquire_lock() {
     fi
 
     if [ "$LOCKED" -eq 0 ]; then
-        die "Another installation is running. If incorrect, run: rm -rf $LOCK_DIR"
+        die "Another installation is running. Inspect PID metadata at $LOCK_DIR/pid before retrying."
     fi
 }
 
@@ -526,8 +568,26 @@ acquire_lock() {
 # ============================================================================
 TMP=""
 cleanup() {
-    [ -n "$TMP" ] && rm -rf "$TMP"
-    [ "$LOCKED" -eq 1 ] && rm -rf "$LOCK_DIR"
+    if [ -n "$TMP" ]; then
+        local temp_parent temp_name
+        temp_parent=$(dirname "$TMP")
+        temp_name=$(basename "$TMP")
+        if [ "$temp_parent" = "$INSTALLER_TEMP_ROOT" ] && [[ "$temp_name" == franken-whisper-install.* ]]; then
+            # `TMP` is a freshly-created installer-owned directory. Delete its
+            # children bottom-up, then remove the now-empty root. Never apply a
+            # recursive removal command to an unvalidated path.
+            find "$TMP" -depth -mindepth 1 -delete 2>/dev/null || \
+                log_warn "Temporary installer files remain at $TMP"
+            rmdir "$TMP" 2>/dev/null || true
+        else
+            log_warn "Refusing to clean unexpected temporary path: $TMP"
+        fi
+    fi
+    if [ "$LOCKED" -eq 1 ]; then
+        rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+        rmdir "$LOCK_DIR" 2>/dev/null || \
+            log_warn "Installer lock directory was not empty and was retained: $LOCK_DIR"
+    fi
 }
 trap cleanup EXIT
 
@@ -536,7 +596,7 @@ trap cleanup EXIT
 # ============================================================================
 check_disk_space() {
     # ~50MB headroom for the archive + extracted binary. Source builds need
-    # far more (3 repo clones + crate cache + release target: several GB) —
+    # far more (5 repo clones + crate cache + release target: several GB) —
     # build_from_source emits its own explicit disk warning before cloning.
     local min_kb=51200
     # Walk up to the nearest existing ancestor so df has a real path to stat.
@@ -596,9 +656,25 @@ preflight_checks() {
 }
 
 # ============================================================================
-# Installed-version marker (binary has no --version flag)
+# Installed-version detection
 # ============================================================================
+binary_reported_version() {
+    local binary="$1" reported
+    [ -x "$binary" ] || return 1
+    reported=$("$binary" --version 2>/dev/null | head -1 || true)
+    if [[ "$reported" =~ ([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?) ]]; then
+        printf 'v%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
 read_installed_version() {
+    local reported
+    if reported=$(binary_reported_version "$DEST/$BINARY_NAME"); then
+        printf '%s\n' "$reported"
+        return 0
+    fi
     if [ -f "$VERSION_MARKER" ]; then
         cat "$VERSION_MARKER" 2>/dev/null || echo "unknown"
     else
@@ -611,14 +687,14 @@ write_installed_version() {
     printf '%s\n' "${1:-unknown}" > "$VERSION_MARKER" 2>/dev/null || true
 }
 
-# Already-installed short-circuit. The binary cannot self-report its version,
-# so we compare the requested VERSION against the marker file we wrote on a
-# prior install. Honors --force.
+# Already-installed short-circuit. The binary self-report wins, with the marker
+# retained only for legacy/manual installations. Honors --force.
 already_installed() {
     [ "$FORCE_INSTALL" -eq 1 ] && return 1
     [ -n "$OFFLINE_TARBALL" ] && return 1   # offline: caller knows what they want
     [ -z "$VERSION" ] && return 1
     [ -x "$DEST/$BINARY_NAME" ] || return 1
+    [ -x "$DEST/$ALIAS_NAME" ] || return 1
     local installed
     installed=$(read_installed_version)
     [ "$installed" = "$VERSION" ]
@@ -696,8 +772,25 @@ sha256_of() {
 }
 
 # ============================================================================
-# Atomic binary install
+# Validated binary-pair install
 # ============================================================================
+validate_binary_for_install() {
+    local src="$1" label="$2"
+    local reported expected
+    if ! reported=$(binary_reported_version "$src"); then
+        log_error "$label failed --version validation"
+        return 1
+    fi
+    if [ -n "$VERSION" ]; then
+        expected="$VERSION"
+        [[ "$expected" == v* ]] || expected="v$expected"
+        if [ "$reported" != "$expected" ]; then
+            log_error "$label reports $reported but the requested release is $expected"
+            return 1
+        fi
+    fi
+}
+
 install_binary_atomic() {
     local src="$1" dest="$2"
     local tmp_dest="${dest}.tmp.$$"
@@ -708,34 +801,94 @@ install_binary_atomic() {
     fi
 }
 
-# Extract an archive into TMP and install the franken_whisper binary it
-# contains. The release tarballs hold a single bare `franken_whisper` binary.
+# Validate both command names before replacing either one. Install the alias
+# first and the authoritative long name last, so an unlikely second rename
+# failure never makes the primary command advertise an unvalidated release.
+install_binary_pair() {
+    local long_src="$1" alias_src="$2"
+    local long_report alias_report
+    validate_binary_for_install "$long_src" "$BINARY_NAME binary" || \
+        die "Release archive failed binary validation; existing installation was not replaced"
+    validate_binary_for_install "$alias_src" "$ALIAS_NAME binary" || \
+        die "Release archive failed alias validation; existing installation was not replaced"
+    long_report=$(binary_reported_version "$long_src")
+    alias_report=$(binary_reported_version "$alias_src")
+    [ "$long_report" = "$alias_report" ] || \
+        die "Release archive contains mismatched binary versions; existing installation was not replaced"
+    install_binary_atomic "$alias_src" "$DEST/$ALIAS_NAME"
+    install_binary_atomic "$long_src" "$DEST/$BINARY_NAME"
+}
+
+# Admit only flat, regular-file release archives. This rejects absolute paths,
+# traversal, nested files, and symlink/hardlink entries before extraction.
+validate_archive_members() {
+    local archive="$1" archive_ext="$2" members member normalized
+    local binary_count=0 alias_count=0 readme_count=0 license_count=0 agents_count=0
+    if [ "$archive_ext" = "zip" ]; then
+        members=$(unzip -Z1 "$archive") || return 1
+    else
+        members=$(tar -tzf "$archive") || return 1
+        if tar -tvzf "$archive" | awk '{print substr($1, 1, 1)}' | grep -qv '^-'; then
+            log_error "Archive contains a non-regular entry"
+            return 1
+        fi
+    fi
+    while IFS= read -r member; do
+        normalized="${member#./}"
+        case "$normalized" in
+            "$BINARY_NAME") binary_count=$((binary_count + 1)) ;;
+            "$ALIAS_NAME") alias_count=$((alias_count + 1)) ;;
+            "README.md") readme_count=$((readme_count + 1)) ;;
+            "LICENSE") license_count=$((license_count + 1)) ;;
+            "AGENTS.md") agents_count=$((agents_count + 1)) ;;
+            *)
+                log_error "Archive contains an unexpected member"
+                return 1
+                ;;
+        esac
+    done <<< "$members"
+    [ "$binary_count" -eq 1 ] && [ "$alias_count" -le 1 ] && \
+        [ "$readme_count" -le 1 ] && [ "$license_count" -le 1 ] && \
+        [ "$agents_count" -le 1 ] || {
+        log_error "Archive must contain one $BINARY_NAME and no duplicate allowlisted members"
+        return 1
+    }
+}
+
+# Extract an archive into TMP and install both supported binary names. New
+# release archives contain both; an older/custom archive containing only the
+# long name can still produce the byte-identical short alias.
 extract_and_install() {
     local archive="$1" archive_ext="$2"
 
     log_step "Extracting..."
     if [[ "$archive_ext" == "zip" ]]; then
         command -v unzip &>/dev/null || die "unzip required for .zip archives"
+    else
+        command -v tar &>/dev/null || die "tar required for .tar.gz archives"
+    fi
+    validate_archive_members "$archive" "$archive_ext" || return 1
+    if [[ "$archive_ext" == "zip" ]]; then
         unzip -o "$archive" -d "$TMP/extract" >/dev/null 2>&1 || return 1
     else
         mkdir -p "$TMP/extract"
         tar -xzf "$archive" -C "$TMP/extract" 2>/dev/null || return 1
     fi
 
-    local bin=""
-    if [ -f "$TMP/extract/$BINARY_NAME" ]; then
-        bin="$TMP/extract/$BINARY_NAME"
-    else
-        bin=$(find "$TMP/extract" -name "${BINARY_NAME}*" -type f \
-            ! -name "*.txt" ! -name "*.md" ! -name "*.tar.*" ! -name "*.zip" ! -name "*.part" 2>/dev/null | head -1)
-    fi
-    if [ -z "$bin" ] || [ ! -f "$bin" ]; then
+    local bin="$TMP/extract/$BINARY_NAME"
+    if [ ! -f "$bin" ] || [ -L "$bin" ]; then
         log_error "Binary not found after extraction"
         return 1
     fi
 
-    chmod +x "$bin"
-    install_binary_atomic "$bin" "$DEST/$BINARY_NAME"
+    local alias_bin="$TMP/extract/$ALIAS_NAME"
+    if [ -e "$alias_bin" ] && { [ ! -f "$alias_bin" ] || [ -L "$alias_bin" ]; }; then
+        log_error "Short alias is not a regular file"
+        return 1
+    fi
+    [ -f "$alias_bin" ] || alias_bin="$bin"
+    chmod +x "$bin" "$alias_bin"
+    install_binary_pair "$bin" "$alias_bin"
     return 0
 }
 
@@ -760,15 +913,17 @@ install_offline() {
         if [ -n "$expected" ]; then
             log_step "Verifying checksum..."
             local actual; actual=$(sha256_of "$OFFLINE_TARBALL")
+            expected=$(printf '%s' "$expected" | tr 'A-F' 'a-f')
+            actual=$(printf '%s' "$actual" | tr 'A-F' 'a-f')
             if [ -z "$actual" ]; then
-                log_warn "No SHA256 tool found; skipping verification"
+                die "No SHA256 tool found; use --no-verify only in a controlled test environment"
             elif [ "$expected" != "$actual" ]; then
                 die "Checksum mismatch! expected=$expected got=$actual"
             else
                 log_success "Checksum verified"
             fi
         else
-            log_warn "No checksum available for offline archive; skipping verification"
+            die "No checksum available for offline archive; provide --checksum, a sibling .sha256, or explicit testing-only --no-verify"
         fi
     else
         log_warn "Checksum verification disabled (--no-verify)"
@@ -776,7 +931,7 @@ install_offline() {
 
     extract_and_install "$OFFLINE_TARBALL" "$archive_ext" || die "Failed to install from offline archive"
     write_installed_version "${VERSION:-offline}"
-    log_success "Installed to $DEST/$BINARY_NAME (offline)"
+    log_success "Installed to $DEST/$BINARY_NAME and $DEST/$ALIAS_NAME (offline)"
 }
 
 # ============================================================================
@@ -786,17 +941,14 @@ install_offline() {
 #   franken_whisper depends on SIBLING path crates that live OUTSIDE its repo:
 #     - ../frankensqlite/crates/{fsqlite,fsqlite-types}   (required)
 #     - ../frankentorch/crates/{ft-kernel-cpu,ft-core}    (required)
-#     - ../frankentui/crates/ftui                         (only for --features tui)
-#   These are `path = "..."` dependencies, so Cargo.lock records NO version or
-#   commit for them — there is no pinned sibling revision to check out. That
-#   means a source build necessarily tracks the siblings' default branch
-#   (main) and CAN FAIL if their APIs have drifted past the franken_whisper
-#   tag you asked for. (asupersync / franken-kernel / franken-evidence /
-#   franken-decision are real crates.io deps and resolve normally — we do NOT
-#   clone them.)
-#   We clone the siblings honestly and attempt the build with default
-#   (no-tui) features. If it fails, we surface the real cargo error and exit
-#   non-zero rather than pretending it worked.
+#     - ../frankenjax/crates/{fj-api,fj-core}             (optional feature,
+#                                                           manifest required)
+#     - ../frankentui/crates/ftui                         (optional feature,
+#                                                           manifest required)
+#   Cargo.lock does not record commits for path dependencies. Release source
+#   builds therefore use scripts/prepare_release_siblings.sh from the selected
+#   franken_whisper revision to provision exact clean sibling commits. Existing
+#   mismatched sibling directories fail closed and are never reset or cleaned.
 ensure_rust() {
     command -v cargo >/dev/null 2>&1 && return 0
     log_step "Installing Rust via rustup..."
@@ -814,7 +966,7 @@ ensure_rust() {
 
 build_from_source() {
     log_step "Building from source..."
-    log_warn "Source builds clone three repositories and compile a release"
+    log_warn "Source builds clone five repositories and compile a release"
     log_warn "binary: expect several GB of disk use (crate cache + target dir)"
     log_warn "and multiple minutes of compile time."
     ensure_rust || die "Rust (cargo) is required for source builds and could not be installed"
@@ -826,29 +978,25 @@ build_from_source() {
     log_step "Cloning franken_whisper..."
     git clone --quiet "https://github.com/${OWNER}/${REPO}.git" "$fw_dir" || die "Failed to clone franken_whisper"
 
-    # Check out the requested tag (default branch if none / resolution failed).
+    # Check out the requested tag (default branch only for an explicit
+    # unversioned --from-source request).
     if [ -n "$VERSION" ]; then
         if ! (cd "$fw_dir" && git checkout --quiet "$VERSION" 2>/dev/null); then
-            log_warn "Could not check out tag $VERSION; building default branch"
+            die "Could not check out requested source tag $VERSION"
         fi
     fi
 
-    # Clone REQUIRED sibling path-dependency repos next to franken_whisper.
-    # No pin is available (path deps) — we track each sibling's main branch.
-    log_step "Cloning sibling path dependencies (frankensqlite, frankentorch)..."
-    log_warn "Source builds track sibling main branches (no commit pin in Cargo.lock); this may fail if APIs have drifted"
-    for dep in frankensqlite frankentorch; do
-        if ! git clone --quiet --depth 1 "https://github.com/${OWNER}/${dep}.git" "$build_root/$dep"; then
-            die "Failed to clone required sibling dependency: $dep"
-        fi
-    done
+    local sibling_preparer="$fw_dir/scripts/prepare_release_siblings.sh"
+    [ -f "$sibling_preparer" ] || die "Selected source revision lacks a pinned sibling preparation contract"
+    log_step "Provisioning exact sibling path-dependency revisions..."
+    bash "$sibling_preparer" "$build_root" || die "Failed to provision pinned sibling dependencies"
 
     log_step "Building with cargo (default features; this may take several minutes)..."
     local target_dir="$TMP/target"
-    if ! (cd "$fw_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --release -p franken_whisper); then
+    if ! (cd "$fw_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --bins); then
         log_error "Source build failed."
-        log_error "This is most likely sibling API drift (frankensqlite/frankentorch main moved past this tag)."
-        log_error "Prefer a prebuilt release binary, or build manually with matching sibling checkouts:"
+        log_error "The pinned sibling contract was satisfied, but Cargo still failed."
+        log_error "Prefer a prebuilt release binary, or reproduce with the same pinned sibling checkouts:"
         log_error "  git clone https://github.com/${OWNER}/${REPO}.git && cd ${REPO} && git checkout ${VERSION:-main}"
         log_error "  (clone frankensqlite + frankentorch as siblings, then: cargo build --release)"
         die "Build from source failed"
@@ -860,9 +1008,12 @@ build_from_source() {
     fi
     [ -x "$bin" ] || die "Binary not found after build"
 
-    install_binary_atomic "$bin" "$DEST/$BINARY_NAME"
+    local alias_bin="$target_dir/release/$ALIAS_NAME"
+    [ -x "$alias_bin" ] || die "Short alias binary not found after build"
+
+    install_binary_pair "$bin" "$alias_bin"
     write_installed_version "${VERSION:-source}"
-    log_success "Installed to $DEST/$BINARY_NAME (source build)"
+    log_success "Installed to $DEST/$BINARY_NAME and $DEST/$ALIAS_NAME (source build)"
 }
 
 # ============================================================================
@@ -876,12 +1027,14 @@ download_release() {
     local archive_name url
     if [ -n "$ARTIFACT_URL" ]; then
         url="$ARTIFACT_URL"
-        archive_name="$(basename "$ARTIFACT_URL")"
+        printf -v archive_name '%s' "${ARTIFACT_URL##*/}"
         [[ "$archive_name" == *.zip ]] && archive_ext="zip"
     else
         # Assets use the version WITHOUT the leading 'v' (e.g. 0.2.0).
         local ver_no_v="${VERSION#v}"
-        archive_name="${BINARY_NAME}-${ver_no_v}-${platform}.${archive_ext}"
+        local name="$BINARY_NAME" version="$ver_no_v"
+        local os="${platform%_*}" arch="${platform#*_}" ext="$archive_ext"
+        archive_name="${name}-${version}-${os}_${arch}.${ext}"
         url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}"
     fi
 
@@ -915,8 +1068,11 @@ download_release() {
         if [ -n "$expected" ]; then
             log_step "Verifying checksum..."
             local actual; actual=$(sha256_of "$TMP/$archive_name")
+            expected=$(printf '%s' "$expected" | tr 'A-F' 'a-f')
+            actual=$(printf '%s' "$actual" | tr 'A-F' 'a-f')
             if [ -z "$actual" ]; then
-                log_warn "No SHA256 tool found (sha256sum/shasum); skipping verification"
+                log_error "No SHA256 tool found (sha256sum/shasum)"
+                return 1
             elif [ "$expected" != "$actual" ]; then
                 log_error "Checksum mismatch!"
                 log_error "  Expected: $expected"
@@ -927,28 +1083,36 @@ download_release() {
                 log_success "Checksum verified: ${actual:0:16}..."
             fi
         else
-            log_warn "Checksum not available; skipping verification"
+            log_error "Checksum not available for $archive_name"
+            return 1
         fi
     fi
 
     extract_and_install "$TMP/$archive_name" "$archive_ext" || return 1
     write_installed_version "$VERSION"
-    log_success "Installed to $DEST/$BINARY_NAME"
+    log_success "Installed to $DEST/$BINARY_NAME and $DEST/$ALIAS_NAME"
     return 0
 }
 
 # ============================================================================
 # Self-test
 # ============================================================================
-# NOTE: the binary has NO --version flag. We exercise `robot health`, which is
-# a fast, side-effect-free JSON probe that proves the binary actually runs.
+# Validate the installed binary and its stable agent-discovery surfaces. Model
+# readiness is reported by doctor but is not required: model weights are
+# intentionally operator-provisioned and not bundled by this installer.
 run_self_test() {
-    log_step "Running self-test (robot health)..."
-    if "$DEST/$BINARY_NAME" robot health >/dev/null 2>&1; then
-        log_success "Self-test passed"
-    else
-        log_warn "Binary installed but 'robot health' returned non-zero (backends may be missing)"
-    fi
+    log_step "Verifying installed agent contracts..."
+    local long_version alias_version capabilities schema doctor
+    long_version=$(binary_reported_version "$DEST/$BINARY_NAME") || die "Installed franken_whisper cannot report its version"
+    alias_version=$(binary_reported_version "$DEST/$ALIAS_NAME") || die "Installed fw alias cannot report its version"
+    [ "$long_version" = "$alias_version" ] || die "Installed binary names report different versions"
+    capabilities=$("$DEST/$ALIAS_NAME" capabilities --json) || die "Installed fw capabilities probe failed"
+    schema=$("$DEST/$ALIAS_NAME" robot schema) || die "Installed fw robot schema probe failed"
+    doctor=$("$DEST/$ALIAS_NAME" doctor --json) || die "Installed fw doctor probe failed"
+    [[ "$capabilities" == *'"schema_version":"franken-whisper-capabilities-v1"'* ]] || die "Capabilities probe returned an unexpected schema"
+    [[ "$schema" == *'"schema_version"'* ]] || die "Robot schema probe returned an unexpected payload"
+    [[ "$doctor" == *'"schema_version":"franken-whisper-doctor-v1"'* ]] || die "Doctor probe returned an unexpected schema"
+    log_success "Installation contracts verified (model readiness remains operator-configured)"
 }
 
 # ============================================================================
@@ -981,7 +1145,6 @@ print_summary() {
     fi
 
     echo ""
-    local model_hint="scripts/fetch_test_models.sh (in the repo)"
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         gum style \
             --border rounded --border-foreground 82 --padding "1 2" --margin "1 0" \
@@ -1006,18 +1169,17 @@ print_summary() {
     fi
 
     echo "  Quick start:"
-    echo "    franken_whisper transcribe --input audio.mp3 --json"
-    echo "    franken_whisper robot health"
-    echo "    franken_whisper robot backends"
-    echo "    franken_whisper robot run --input audio.mp3 --backend auto"
-    echo "    franken_whisper --help"
+    echo "    fw robot triage"
+    echo "    fw models --json"
+    echo "    fw doctor --json"
+    echo "    fw robot run --input audio.mp3 --backend auto"
+    echo "    fw --help"
     echo ""
-    echo "  Fetch test models:"
-    echo "    $model_hint"
+    echo "  Model policy:"
+    echo "    Weights are not bundled or downloaded automatically; run 'fw models --json'."
     echo ""
     echo "  Uninstall:"
     echo "    curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/main/install.sh | bash -s -- --uninstall"
-    echo "    (or: rm -f $DEST/$BINARY_NAME)"
     echo ""
 }
 
@@ -1028,7 +1190,7 @@ main() {
     acquire_lock
     print_banner
 
-    TMP=$(mktemp -d)
+    TMP=$(mktemp -d "$INSTALLER_TEMP_TEMPLATE")
 
     # Offline / airgap path: no platform/version resolution needed.
     if [ -n "$OFFLINE_TARBALL" ]; then
@@ -1051,7 +1213,7 @@ main() {
 
     preflight_checks
 
-    # Already-installed short-circuit (marker-file based; binary has no --version).
+    # Already-installed short-circuit (binary self-report, marker fallback).
     if already_installed; then
         log_success "franken_whisper $VERSION is already installed at $DEST/$BINARY_NAME"
         log_info "Use --force to reinstall"
@@ -1064,12 +1226,8 @@ main() {
         if download_release "$PLATFORM"; then
             :
         else
-            log_warn "Binary download failed; falling back to build-from-source"
-            build_from_source
+            die "Binary download or verification failed. Retry, use --offline ARCHIVE, or explicitly choose --from-source."
         fi
-    elif [ "$FROM_SOURCE" -eq 0 ]; then
-        log_warn "No release version found; building from source"
-        build_from_source
     else
         build_from_source
     fi

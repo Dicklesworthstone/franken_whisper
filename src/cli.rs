@@ -17,6 +17,16 @@ use crate::sync::ConflictPolicy;
 
 const MAX_SPEAKER_HINTS_BYTES: u64 = 1024 * 1024;
 
+/// Extended version report used by `--version`. Model weights are deliberately
+/// called out because they are not bundled with the project binary and may be
+/// governed by licenses other than the project license.
+pub const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nproject license: MIT with OpenAI/Anthropic rider\n",
+    "model weights: not bundled; third-party model terms apply\n",
+    "Sortformer distribution: operator_local_no_git_no_release"
+);
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum SpeakerHintsFile {
@@ -223,6 +233,10 @@ impl ShutdownController {
 #[derive(Debug, Parser)]
 #[command(name = "franken_whisper")]
 #[command(about = "Agent-first Rust ASR orchestrator with ffmpeg normalization")]
+#[command(version, long_version = LONG_VERSION)]
+#[command(
+    after_help = "Agent orientation: `fw robot triage`\nMachine contract: `fw capabilities --json`\nModel readiness: `fw models --json`"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -230,16 +244,23 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Transcribe one local audio/video source, optionally with diarization.
     Transcribe(Box<TranscribeArgs>),
+    /// Emit stable JSON/NDJSON surfaces intended for software agents.
+    #[command(visible_alias = "agent")]
     Robot {
         #[command(subcommand)]
         command: RobotCommand,
     },
+    /// Query persisted transcription runs.
     Runs(RunsArgs),
+    /// Export or import the SQLite state as an auditable JSONL snapshot.
     Sync {
         #[command(subcommand)]
         command: SyncCommand,
     },
+    /// Encode, decode, and control low-bandwidth TTY audio streams.
+    #[command(visible_alias = "tty")]
     TtyAudio {
         #[command(subcommand)]
         command: TtyAudioCommand,
@@ -259,10 +280,93 @@ pub enum Command {
         #[command(subcommand)]
         command: DifferentialOracleCommand,
     },
+    /// Run the explicitly selected, evaluation-only native Streaming Sortformer.
+    #[command(name = "sortformer-diarize", visible_alias = "sortformer")]
+    SortformerDiarize(SortformerDiarizeArgs),
+    /// Launch the optional human-oriented terminal interface.
     Tui,
     /// Download YouTube audio (videos / playlists / a URL file) and
     /// transcribe each into a markdown + JSON pair.
     Youtube(Box<YoutubeArgs>),
+    /// Describe stable commands, schemas, features, and error recovery as JSON.
+    Capabilities(CapabilitiesArgs),
+    /// Report built-in and operator-local model readiness without downloading.
+    Models(ModelsArgs),
+    /// Diagnose whether this installation can perform useful work.
+    Doctor(DoctorArgs),
+    /// Print compact agent integration documentation from the running binary.
+    #[command(name = "robot-docs")]
+    RobotDocs {
+        #[command(subcommand)]
+        command: RobotDocsCommand,
+    },
+}
+
+/// Output controls for the machine-discoverable capability catalog.
+#[derive(Debug, Args)]
+pub struct CapabilitiesArgs {
+    /// Emit the complete stable JSON contract instead of a compact summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Output controls for the model and package registry.
+#[derive(Debug, Args)]
+pub struct ModelsArgs {
+    /// Emit the complete stable JSON registry instead of a compact summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Detect-only installation diagnostics. This command never downloads, moves,
+/// converts, or modifies model artifacts.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Path to the frankensqlite database file to inspect.
+    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    pub db: PathBuf,
+
+    /// Emit one JSON object with no terminal decoration.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Exit non-zero unless at least one transcription path is ready.
+    #[arg(long)]
+    pub strict: bool,
+}
+
+/// Built-in documentation topics for software agents.
+#[derive(Debug, Subcommand)]
+pub enum RobotDocsCommand {
+    /// Print the canonical orientation and recovery guide.
+    Guide,
+}
+
+/// Explicit native Streaming Sortformer invocation.
+#[derive(Args)]
+pub struct SortformerDiarizeArgs {
+    /// Audio input in any format accepted by the native normalizer or ffmpeg fallback.
+    #[arg(long)]
+    pub input: PathBuf,
+
+    /// Authenticated operator-local conversion receipt.
+    #[arg(long)]
+    pub receipt: PathBuf,
+
+    /// Authenticated operator-local safetensors package.
+    #[arg(long)]
+    pub package: PathBuf,
+}
+
+impl fmt::Debug for SortformerDiarizeArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SortformerDiarizeArgs")
+            .field("input", &"<redacted>")
+            .field("receipt", &"<redacted>")
+            .field("package", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Public-corpus registry, preparation, and aggregate evaluation commands.
@@ -673,10 +777,17 @@ impl YoutubeArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum RobotCommand {
+    /// Run a transcription pipeline and stream NDJSON events.
     Run(Box<TranscribeArgs>),
+    /// Emit the stable robot event schema as one JSON line.
     Schema,
+    /// Discover backend capabilities and live availability.
     Backends,
+    /// Probe dependencies and runtime resources.
     Health(HealthArgs),
+    /// Orient an agent in one round trip with state-aware next commands.
+    Triage(HealthArgs),
+    /// Query persisted adaptive-routing decisions as NDJSON.
     RoutingHistory(RoutingHistoryArgs),
 }
 
@@ -685,6 +796,10 @@ pub struct HealthArgs {
     /// Path to frankensqlite database file.
     #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
     pub db: PathBuf,
+
+    /// Exit non-zero when the report is not fully healthy.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Args)]
@@ -3647,5 +3762,107 @@ mod tests {
         assert!(!debug.contains("PRIVATE"));
         assert!(!debug.contains("call.m4a"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn sortformer_diarize_cli_is_explicit_and_redacts_every_path() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "sortformer-diarize",
+            "--input",
+            "/PRIVATE/call.m4a",
+            "--receipt",
+            "/PRIVATE/conversion-receipt.json",
+            "--package",
+            "/PRIVATE/weights.safetensors",
+        ])
+        .expect("explicit native Sortformer command");
+        let Command::SortformerDiarize(args) = cli.command else {
+            panic!("expected native Sortformer command");
+        };
+        let debug = format!("{args:?}");
+        assert_eq!(debug.matches("<redacted>").count(), 3);
+        assert!(!debug.contains("PRIVATE"));
+        assert!(!debug.contains("call.m4a"));
+        assert!(!debug.contains("weights.safetensors"));
+    }
+
+    #[test]
+    fn agent_discovery_commands_parse_with_stable_shapes() {
+        let capabilities =
+            Cli::try_parse_from(["fw", "capabilities", "--json"]).expect("capabilities command");
+        assert!(matches!(
+            capabilities.command,
+            Command::Capabilities(CapabilitiesArgs { json: true })
+        ));
+
+        let models = Cli::try_parse_from(["fw", "models", "--json"]).expect("models command");
+        assert!(matches!(
+            models.command,
+            Command::Models(ModelsArgs { json: true })
+        ));
+
+        let doctor =
+            Cli::try_parse_from(["fw", "doctor", "--json", "--strict"]).expect("doctor command");
+        assert!(matches!(
+            doctor.command,
+            Command::Doctor(DoctorArgs {
+                json: true,
+                strict: true,
+                ..
+            })
+        ));
+
+        let triage = Cli::try_parse_from(["fw", "agent", "triage", "--strict"])
+            .expect("robot alias triage command");
+        assert!(matches!(
+            triage.command,
+            Command::Robot {
+                command: RobotCommand::Triage(HealthArgs { strict: true, .. })
+            }
+        ));
+
+        let guide = Cli::try_parse_from(["fw", "robot-docs", "guide"]).expect("robot docs guide");
+        assert!(matches!(
+            guide.command,
+            Command::RobotDocs {
+                command: RobotDocsCommand::Guide
+            }
+        ));
+    }
+
+    #[test]
+    fn underscore_value_aliases_remain_agent_friendly() {
+        let mut args = minimal_args();
+        args.backend = BackendKind::WhisperCpp;
+        assert_eq!(args.backend, BackendKind::WhisperCpp);
+
+        let parsed = Cli::try_parse_from([
+            "fw",
+            "transcribe",
+            "--input",
+            "test.wav",
+            "--backend",
+            "whisper_cpp",
+            "--diarization-engine",
+            "ecapa_fused",
+        ])
+        .expect("underscore aliases");
+        let Command::Transcribe(parsed) = parsed.command else {
+            panic!("expected transcribe command");
+        };
+        assert_eq!(parsed.backend, BackendKind::WhisperCpp);
+        assert_eq!(parsed.diarization_engine, DiarizationEngine::EcapaFused);
+    }
+
+    #[test]
+    fn version_report_discloses_model_distribution_boundary() {
+        let error = Cli::try_parse_from(["fw", "--version"])
+            .expect_err("version is represented as a clap display result");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        let rendered = error.to_string();
+        assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
+        assert!(rendered.contains("model weights: not bundled"));
+        assert!(rendered.contains("operator_local_no_git_no_release"));
     }
 }

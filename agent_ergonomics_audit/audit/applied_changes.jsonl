@@ -1,0 +1,16 @@
+{"id":"R01","status":"implemented","files":["src/native_engine/mod.rs","src/backend/whisper_cpp_native.rs","src/backend/insanely_fast_native.rs","src/backend/whisper_diarization_native.rs"],"evidence":"execution now consumes the same deterministic local model resolver used by readiness"}
+{"id":"R02","status":"implemented","files":["src/cli.rs","src/main.rs","src/robot.rs","src/error.rs"],"evidence":"version, capabilities, models, doctor, and robot-docs are first-class commands"}
+{"id":"R03","status":"implemented","files":["src/main.rs","tests/cli_integration.rs"],"evidence":"robot and agent syntax failures use one path-safe JSON line and process exit 2"}
+{"id":"R04","status":"implemented","files":["src/error.rs","src/main.rs","src/robot.rs"],"evidence":"the public discovery catalog and terminal events share the exact 13-code FwError vocabulary"}
+{"id":"R05","status":"implemented","files":["src/cli.rs","src/main.rs","src/robot.rs"],"evidence":"robot triage returns health, quick reference, recommendations, and copy-ready commands"}
+{"id":"R06","status":"implemented","files":["install.sh"],"evidence":"argument values, unknown flags, positional tokens, conflicts, URL scheme, version, and checksum syntax fail before preflight"}
+{"id":"R07","status":"implemented","files":["install.sh","Cargo.toml","src/bin/fw.rs"],"evidence":"both executable names are built and packaged; both are version-validated before the primary command is replaced"}
+{"id":"R08","status":"implemented","files":["install.sh"],"evidence":"offline and downloaded archives require a hash and admit only flat regular binaries plus the exact DSR documentation allowlist"}
+{"id":"R09","status":"implemented","files":["install.sh"],"evidence":"release download failure is terminal; source compilation is explicit only"}
+{"id":"R10","status":"implemented","files":["scripts/prepare_release_siblings.sh",".github/workflows/dist.yml","install.sh"],"evidence":"source and release builds verify exact frankensqlite and frankentorch revisions without resetting existing worktrees"}
+{"id":"R11","status":"implemented","files":["~/.config/dsr/repos.d/franken_whisper.yaml","README.md"],"evidence":"DSR resolves five targets, both binaries, pinned siblings, blocking gates, and versioned archive names"}
+{"id":"R12","status":"implemented","files":[".github/workflows/dist.yml",".github/workflows/release-automation.yml"],"evidence":"Actions are manual fallback/readiness definitions and cannot auto-publish from a tag push"}
+{"id":"R13","status":"implemented","files":["src/main.rs","tests/cli_integration.rs"],"evidence":"routing history always terminates with an explicit result count, including zero"}
+{"id":"R14","status":"implemented","files":["src/model.rs","src/cli.rs"],"evidence":"agent-common underscore spellings map to canonical backend and diarization values"}
+{"id":"R15","status":"implemented","files":["README.md"],"evidence":"top-level agent quickstart separates binary install, capability discovery, model readiness, schema, and canonical release authority"}
+{"id":"R16","status":"implemented","files":["Cargo.toml","src/bin/fw.rs","tests/cli_integration.rs"],"evidence":"a thin alias entrypoint eliminates Cargo duplicate-target warnings while retaining equivalent command contracts"}

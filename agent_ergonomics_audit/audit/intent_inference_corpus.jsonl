@@ -1,0 +1,12 @@
+{"intent":"learn the installed tool version and model distribution boundary","attempt":"fw --version","pre_outcome":"usage error","desired":"version plus bundled/unbundled model policy"}
+{"intent":"orient an unfamiliar agent in one round trip","attempt":"fw robot triage","pre_outcome":"unrecognized subcommand","desired":"single JSON readiness payload with exact next command"}
+{"intent":"discover stable machine contracts","attempt":"fw capabilities --json","pre_outcome":"unrecognized subcommand","desired":"versioned JSON command, feature, exit, privacy, and error catalog"}
+{"intent":"learn which local models can run without exposing paths","attempt":"fw models --json","pre_outcome":"unrecognized subcommand","desired":"path-free, network-free registry with status and policy"}
+{"intent":"diagnose an installation without changing it","attempt":"fw doctor --json","pre_outcome":"unrecognized subcommand","desired":"detect-only checks and copy-ready recovery"}
+{"intent":"recover from a mistyped robot flag programmatically","attempt":"fw robot run --inpt call.m4a","pre_outcome":"human Clap stderr","desired":"one path-safe FW-INVALID-REQUEST JSON line and exit 2"}
+{"intent":"run native Whisper with an already discoverable local model","attempt":"fw transcribe --input sample.wav","pre_outcome":"availability succeeded but execution reported no model","desired":"execution uses the same deterministic discovery result"}
+{"intent":"query an empty routing history","attempt":"fw robot routing-history --db empty.sqlite3","pre_outcome":"no stdout","desired":"terminal count event with records=0"}
+{"intent":"correct an installer typo before mutation","attempt":"bash install.sh --ofline package.tar.gz","pre_outcome":"unknown flag ignored and a real install attempt began","desired":"immediate unknown-option failure"}
+{"intent":"install an offline archive without a value","attempt":"bash install.sh --offline","pre_outcome":"raw unbound-variable shell failure","desired":"immediate option-requires-value error"}
+{"intent":"use the short installed name shown in agent docs","attempt":"fw robot schema","pre_outcome":"Cargo alias existed but release installer did not install it","desired":"both names packaged, installed, and contract-equivalent"}
+{"intent":"build a release from a clean checkout","attempt":"dsr build franken_whisper","pre_outcome":"active DSR registration missing and sibling path dependencies unresolved","desired":"five targets, both binaries, exact sibling revisions, blocking gates"}

@@ -27,6 +27,30 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/
 
 </div>
 
+## Agent quickstart
+
+The release installs two equivalent binary names: `fw` is the concise
+agent-facing name, and `franken_whisper` remains the descriptive name. Start
+with the live triage payload instead of scraping help text:
+
+```bash
+fw --version
+fw robot triage
+fw capabilities --json
+fw models --json
+fw doctor --json
+fw robot schema
+```
+
+`fw robot run --input AUDIO --backend auto` streams NDJSON. Robot syntax
+errors are also emitted as one path-safe JSON object on stdout with exit code
+2; runtime failures use one of the 13 exact `FW-*` codes published by
+`fw capabilities --json`. Discovery and doctor commands do not download
+models. A doctor `ready` result is static preflight evidence only; the payload
+sets `operationally_verified: false` until an actual transcription succeeds.
+The 491,570,584-byte native Sortformer package is evaluation-only and must
+remain operator-local: it is never stored in Git or attached to a release.
+
 > **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels, `#![forbid(unsafe_code)]` in-crate) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md).
 >
 > | Model / workload | Mode | Matched-greedy result |
@@ -48,7 +72,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 `franken_whisper` is a single Rust binary that wraps every major Whisper backend behind a unified, agent-first interface — and ships its own engine:
 
 - **A real in-process Whisper engine, in pure Rust.** ggml model parsing, log-mel frontend, encoder/decoder transformer inference on FrankenTorch CPU kernels, greedy decoding with whisper.cpp's full timestamp-rule suite, and cross-attention DTW word timestamps. No FFI, no Python, no subprocess — drop a ggml model file in place and transcribe.
-- **Rust-native acoustic and ECAPA speaker diarization.** The bounded-memory acoustic path separates voice from channel evidence, while the two explicit ECAPA modes add a pinned in-process speaker representation either alone or authorized to use bounded channel evidence when a selected consensus merge joins a compatible channel-valid pair. Every native mode accepts hard or soft known-speaker intervals, projects an independent turn timeline onto DTW word boundaries, and makes no gender or person-identity claims.
+- **Rust-native acoustic and ECAPA speaker diarization.** The bounded-memory acoustic path separates voice from channel evidence, while the two explicit ECAPA modes add a pinned in-process speaker representation either alone or authorized to use bounded channel evidence when a selected consensus merge joins a compatible channel-valid pair. Every native mode accepts hard or soft known-speaker intervals, projects an independent turn timeline onto DTW word boundaries, and makes no gender or person-identity claims. The built-in acoustic route is an available but uncertified heuristic baseline—not evidence of reliable multi-speaker accuracy; the native Sortformer route is separately labeled evaluation-only.
 - **Adaptive Bayesian backend routing.** Each `auto` request runs a formal decision contract with an explicit loss matrix, per-backend Beta posteriors, Brier-scored calibration, and deterministic fallback when the model is mis-calibrated.
 - **Real-time NDJSON streaming.** Every pipeline stage emits sequenced, timestamped events on stable schema `v1.0.0`. No fragile regex; agents parse JSON.
 - **Durable run history.** Every transcription persists to SQLite with full event logs, replay envelopes, and JSONL export/import, even when the process crashes mid-run.
@@ -63,7 +87,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 | Feature | whisper.cpp | insanely-fast-whisper | whisper-diarization | **franken_whisper** |
 |---------|:-----------:|:---------------------:|:-------------------:|:-------------------:|
 | Streaming output | partial | — | — | **sequenced NDJSON stage events** |
-| Machine-readable errors | exit code only | exceptions | exceptions | **12 structured `FW-*` error codes** |
+| Machine-readable errors | exit code only | exceptions | exceptions | **13 exact `FW-*` error codes** |
 | Adaptive backend selection | — | — | — | **Bayesian decision contract** |
 | Run persistence | — | — | — | **SQLite + JSONL replay packs** |
 | Diarization | TinyDiarize hints | yes (HF token) | yes | **Rust acoustic + explicit ECAPA + normalized external evidence** |
@@ -212,7 +236,7 @@ Most tools occupy one level. `franken_whisper` is the orchestration layer: it wr
 | Decision audit trail | — | — | — | — | **200-entry evidence ledger** |
 | Replay envelopes | — | — | — | — | **SHA-256 content + output hashes** |
 | Replay packs | — | — | — | — | **4-artifact deterministic reproducibility bundle** |
-| Structured errors | exit code | exceptions | exceptions | — | **12 `FW-*` codes / 6 `FW-ROBOT-*` codes** |
+| Structured errors | exit code | exceptions | exceptions | — | **13 exact terminal `FW-*` codes** |
 | NDJSON streaming | partial | — | — | WebSocket | **sequenced stage events** |
 | Cancellation | `SIGKILL` | `KeyboardInterrupt` | — | — | **cooperative `CancellationToken`** |
 | Resource cleanup | none guaranteed | GC | GC | GC | **RAII + bounded LIFO finalizers** |
@@ -235,7 +259,7 @@ Most tools occupy one level. `franken_whisper` is the orchestration layer: it wr
 |------------|:----------------:|:---------------:|:----------:|:-------------------:|
 | Runs locally | no | no | no | **yes** |
 | Open source | no | no | no | **yes (MIT + rider)** |
-| Data leaves machine | yes | yes | yes | **never (except optional HF model download)** |
+| Data leaves machine | yes | yes | yes | **never by core; external tools are explicit and operator-controlled** |
 | Cost per hour of audio | ~$0.04 | ~$0.75 | ~$0.65 | **$0 (your hardware)** |
 | Inference speed | very fast | fast | moderate | **depends on selected backend** |
 | Multi-model routing | — | — | — | **Bayesian adaptive** |
@@ -252,7 +276,7 @@ Most tools occupy one level. `franken_whisper` is the orchestration layer: it wr
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/main/install.sh?$(date +%s)" | bash
 ```
 
-The installer downloads the appropriate release asset for your platform, verifies its SHA-256 checksum against `checksums-sha256.txt`, and installs to `~/.local/bin`.
+The installer downloads the appropriate release asset for your platform, verifies its SHA-256 checksum against `checksums-sha256.txt`, validates the staged binary's self-reported version before replacement, and installs both `fw` and `franken_whisper` to `~/.local/bin`. Unknown options, missing values, and conflicting source/offline modes fail before any download. A release download failure never silently falls back to a source build; use `--from-source` explicitly.
 
 Options:
 
@@ -260,14 +284,14 @@ Options:
 |------|---------|
 | `--system` | Install to `/usr/local/bin` instead of `~/.local/bin` |
 | `--easy-mode` | Auto-update shell `PATH` and rc files |
-| `--verify` | Run a post-install self-test (`robot health`) |
+| `--verify` | Verify both binary names plus capabilities, schema, and detect-only doctor contracts |
 | `--version vX.Y.Z` | Pin to a specific release |
 | `--force` | Reinstall even if the same version is present |
 | `--offline TARBALL` | Airgap install from a local archive (verifies sibling `.sha256`) |
 | `--from-source` | Build from a source clone (clones sibling FrankenSuite deps) |
 | `--quiet` / `--no-gum` | Script-friendly / plain-ANSI output |
 | `--no-verify` | Skip checksum verification (testing only) |
-| `--uninstall` | Remove the binary and `PATH` modifications |
+| `--uninstall` | Remove both binary names and installer-added `PATH` lines |
 
 `HTTP_PROXY`/`HTTPS_PROXY` are honored on every download. Prebuilt targets: `linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64`, `windows_amd64` (zip; manual install on native Windows — the bash installer covers Linux, macOS, and WSL).
 
@@ -277,8 +301,12 @@ Options:
 git clone https://github.com/Dicklesworthstone/franken_whisper.git
 cd franken_whisper
 
+# Provision the exact clean sibling commits used by release builds.
+# Existing mismatched sibling directories are never modified.
+scripts/prepare_release_siblings.sh
+
 # minimal build
-cargo build --release
+cargo build --locked --release --bins
 
 # with TUI support
 cargo build --release --features tui
@@ -290,7 +318,7 @@ cargo build --release --features gpu-frankentorch
 cargo build --release --features gpu-frankenjax
 ```
 
-The release profile is aggressively optimized for distribution: `opt-level = "z"`, full LTO, single codegen unit, `panic = "abort"`, stripped symbols.
+The release profile uses `opt-level = 3`, full LTO, one codegen unit, `panic = "abort"`, and stripped symbols.
 
 ### Prerequisites
 
@@ -306,18 +334,19 @@ The release profile is aggressively optimized for distribution: `opt-level = "z"
 
 ### Sibling Crate Dependencies
 
-`franken_whisper` integrates several crates from the FrankenSuite ecosystem. The core infrastructure crates are published on **crates.io** and resolve automatically; only the SQLite stack and the optional features use local path dependencies.
+`franken_whisper` integrates several crates from the FrankenSuite ecosystem. The orchestration contracts resolve from **crates.io**. The pure-Rust SQLite stack and FrankenTorch CPU kernels are required sibling path dependencies. Cargo also resolves the local FrankenJAX and FrankenTUI manifests even when their optional features are disabled, so clean release builds stage and pin all four sibling repositories with `scripts/prepare_release_siblings.sh` and DSR.
 
 | Crate | Source | Purpose |
 |-------|--------|---------|
-| `asupersync` | crates.io `0.3.1` | Cancel-correct orchestration primitives |
-| `franken-kernel` | crates.io `0.3.1` | Budget, TraceId, time utilities |
-| `franken-evidence` | crates.io `0.3.1` | Evidence ledger primitives |
-| `franken-decision` | crates.io `0.3.1` | Decision contract framework |
+| `asupersync` | crates.io `0.3.4` | Cancel-correct orchestration primitives |
+| `franken-kernel` | crates.io `0.3.4` | Budget, TraceId, time utilities |
+| `franken-evidence` | crates.io `0.3.4` | Evidence ledger primitives |
+| `franken-decision` | crates.io `0.3.4` | Decision contract framework |
 | `fsqlite` | path: `../frankensqlite` | Pure-Rust SQLite implementation |
 | `fsqlite-types` | path: `../frankensqlite` | Core SQLite value types |
 | `ftui` *(feature: `tui`)* | path: `../frankentui` | Terminal UI framework |
-| `ft-api` / `ft-core` *(feature: `gpu-frankentorch`)* | path: `../frankentorch` | GPU tensor operations |
+| `ft-kernel-cpu` / `ft-core` | path: `../frankentorch` | Required native Whisper CPU kernels and tensor types |
+| `ft-api` *(feature: `gpu-frankentorch`)* | path: `../frankentorch` | Optional GPU tensor operations |
 | `fj-api` / `fj-core` *(feature: `gpu-frankenjax`)* | path: `../frankenjax` | JAX-based GPU compute |
 
 ---
@@ -531,11 +560,31 @@ The first admitted activation pack is synthetic-only: four deterministic
 non-human frontend fixtures, 46 F32/I64 tensors, and 44 stage-level replay
 observations that are byte-exact across five runs requested in each configured
 one-thread and eight-thread regime.
-Rust authenticates the separate receipt/package roots and compares the native
-valid log-mel output against a frozen cross-kernel envelope while requiring
-silence to remain byte-exact. This is partial-L1 diagnostic evidence, not a
-complete Sortformer forward pass, production route, or real-call accuracy
-claim; licensed public real-voice seams and every downstream layer remain open.
+Rust authenticates the separate receipt/package roots and now runs the complete
+f32 graph in process through L8 anonymous speaker turns. The explicit
+evaluation-only command accepts every audio format supported by the normalizer:
+
+```bash
+franken_whisper sortformer-diarize \
+  --input call.m4a \
+  --receipt /operator/local/conversion-receipt.json \
+  --package /operator/local/weights.safetensors
+```
+
+It emits one path-free `sortformer-diarization-v1` JSON object with anonymous
+speaker lanes, turns, inferred active-lane count, and timing. It cannot be
+selected by `--diarization-engine auto`. On the frozen 25-second overlap-heavy
+two-speaker public clip, the native output scored DER `0.058904110` and JER
+`0.065850064`; that is one evidence row, not broad accuracy certification.
+Raw L7/L8 matches the authenticated public truth, while production turns clamp
+to the physical audio duration. One chained L6 hard-top-k tie remains
+platform-defined, so the command reports `evaluation_only` and automatic
+promotion remains forbidden. The converted f32 package is 491,570,584 bytes
+(SHA-256 `487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a`).
+Its authenticated policy is `operator_local_no_git_no_release`: neither the
+original nor converted model is stored in Git or attached to GitHub releases.
+Full proof details and current performance/resource rows are in
+[`SORTFORMER_RUST_PORT.md`](docs/SORTFORMER_RUST_PORT.md).
 The external Sortformer adapter's version probe must bind the frozen contract
 hash, independently verify that
 the 471,367,680-byte local artifact hashes to the pinned Hugging Face LFS
@@ -1814,24 +1863,19 @@ The cancellation token is threaded through every pipeline stage, including the i
 | `FW-CMD-TIMEOUT` | Backend subprocess exceeded timeout |
 | `FW-BACKEND-UNAVAILABLE` | No suitable backend found for the request |
 | `FW-INVALID-REQUEST` | Malformed or contradictory request parameters |
+| `FW-CONTRACT-VIOLATION` | An in-process producer violated a runtime contract |
 | `FW-STORAGE` | SQLite persistence error |
 | `FW-UNSUPPORTED` | Requested feature not available |
 | `FW-MISSING-ARTIFACT` | Expected output file not produced by backend |
 | `FW-CANCELLED` | Operation cancelled via token or Ctrl+C |
 | `FW-STAGE-TIMEOUT` | Pipeline stage exceeded its budget |
 
-**Robot Error Code Mapping.** In robot mode the 12 internal variants collapse into 6 robot-specific codes for simpler agent handling:
-
-| Robot Code | Internal Variants | When |
-|------------|-------------------|------|
-| `FW-ROBOT-TIMEOUT` | `CommandTimedOut`, `StageTimeout` | Any timeout during pipeline execution |
-| `FW-ROBOT-BACKEND` | `BackendUnavailable` | No suitable backend found |
-| `FW-ROBOT-REQUEST` | `InvalidRequest` | Malformed CLI arguments |
-| `FW-ROBOT-STORAGE` | `Storage` | SQLite persistence failure |
-| `FW-ROBOT-CANCELLED` | `Cancelled` | Ctrl+C or deadline cancellation |
-| `FW-ROBOT-EXEC` | All others (`Io`, `Json`, `CommandMissing`, `CommandFailed`, `Unsupported`, `MissingArtifact`) | General execution failure |
-
-Even argument-parsing failures (e.g. mutually-exclusive input modes) produce a structured `run_error` envelope on stdout in robot mode. There is no path where the robot interface degrades to human-readable stderr.
+**Robot Error Contract.** Public robot `run_error` envelopes expose the same
+13 variant-specific codes as `FwError::error_code()`; agents do not need to
+reverse-map a coarse error family. Even Clap-level syntax failures produce one
+path-safe `FW-INVALID-REQUEST` JSON object on stdout and exit with usage code
+2. Semantically invalid requests emit `run_start` followed by the exact
+terminal error. There is no robot path that degrades to human-readable stderr.
 
 ### Engine Trait & Backend Capabilities
 
@@ -2721,14 +2765,14 @@ The release profile is aggressively optimized for deployment:
 
 ```toml
 [profile.release]
-opt-level = "z"        # Optimize for binary size (smaller than "s")
+opt-level = 3          # Optimize runtime performance
 lto = true             # Full link-time optimization across all crates
 codegen-units = 1      # Single codegen unit for maximum optimization opportunity
 panic = "abort"        # Abort on panic (no unwinding overhead, smaller binary)
 strip = true           # Strip debug symbols from final binary
 ```
 
-This produces the smallest possible binary while retaining full optimization. The tradeoff is slower compilation (`codegen-units = 1` + LTO) and no panic unwinding (acceptable for a CLI tool where panics are fatal regardless). On a typical Linux x86_64 build, the stripped release binary is significantly smaller than a default release build.
+This prioritizes runtime performance while retaining a stripped distribution binary. The tradeoff is slower compilation (`codegen-units = 1` + LTO) and no panic unwinding (acceptable for a CLI tool where panics are fatal regardless).
 
 ### Glossary
 
@@ -3058,7 +3102,7 @@ The benchmark regression policy is documented in [`docs/benchmark_regression_pol
 
 ### Binary Size
 
-With the aggressive release profile (`opt-level = "z"`, LTO, stripped):
+With the release profile (`opt-level = 3`, full LTO, stripped):
 
 | Build | Approximate Size |
 |-------|------------------|
@@ -3081,11 +3125,11 @@ With the aggressive release profile (`opt-level = "z"`, LTO, stripped):
 | Integration test files (`tests/*.rs`) | 26 |
 | Benchmark suites | 5 (Criterion) |
 | Public modules | 18 |
-| Error variants | 12 (each with structured code) |
+| Error variants | 13 (each with a unique structured code) |
 | Backend engines | 3 bridge adapters + 3 paired native pilots under rollout governance |
 | Pipeline stages | 10 (composable, independently budgeted) |
 | Stage budget knobs | 12 (10 stages + probe + cleanup) |
-| CLI subcommands | 10 (`transcribe`, `robot`, `runs`, `sync`, `tty-audio`, `diarization-eval`, `diarization-corpus`, `diarization-oracle`, `tui`, `youtube`) |
+| CLI subcommands | 15 (including `capabilities`, `models`, `doctor`, `robot-docs`, and explicit `sortformer-diarize`) |
 | CLI flags (`transcribe`) | 70+ (inference, VAD, diarization, speculative, audio windowing, word timestamps) |
 | Robot event types | 12 (run lifecycle, stage, speculation, health, routing, transcript) |
 | TTY control frame types | 10 (`Handshake`, `HandshakeAck`, `Ack`, `RetransmitRequest`, `RetransmitResponse`, `Backpressure`, `TranscriptPartial`, `TranscriptRetract`, `TranscriptCorrect`, `SessionClose`) |
@@ -3098,7 +3142,7 @@ With the aggressive release profile (`opt-level = "z"`, LTO, stripped):
 | Router history window | 50 outcome records per backend |
 | Clippy enforcement | `#![forbid(unsafe_code)]` + `-D warnings` on all targets |
 | Cargo features | 3 (`tui`, `gpu-frankentorch`, `gpu-frankenjax`) |
-| Release optimizations | `opt-level = "z"`, LTO, single codegen unit, `panic = "abort"`, stripped |
+| Release optimizations | `opt-level = 3`, full LTO, single codegen unit, `panic = "abort"`, stripped |
 
 ---
 
@@ -3160,12 +3204,24 @@ A clause-to-test traceability table lives in [`tests/COVERAGE.md`](tests/COVERAG
 
 ## CI / CD Release Pipeline
 
-Two GitHub Actions workflows drive distribution:
+[Doodlestein Self Releaser (DSR)](https://github.com/Dicklesworthstone/doodlestein_self_releaser)
+is the canonical release authority. Its local registration builds Linux x86_64
+and ARM64, macOS Intel and Apple Silicon, and Windows x86_64 on native/SSH
+hosts; packages both `franken_whisper` and `fw`; and syncs the exact pinned
+`frankensqlite`, `frankentorch`, `frankenjax`, and `frankentui` commits adjacent
+to the source tree. The last two are optional feature crates at runtime, but
+Cargo still resolves their path manifests during a clean release build.
 
-- **[`dist.yml`](.github/workflows/dist.yml)**: multi-platform binary builds (Linux x86_64 / ARM64, macOS Intel / ARM64, Windows x86_64), triggered on push to `v*` tags or manual `workflow_dispatch`. The `test` job runs `cargo fmt --check` (advisory), `cargo clippy --all-targets -- -D warnings`, and `cargo test --lib`. The `build` job produces `franken_whisper-{VERSION}-{OS}_{ARCH}` archives (`.tar.gz` on Unix, `.zip` on Windows) with stripped binaries and SHA-256 checksums published as `checksums-sha256.txt`.
-- **[`release-automation.yml`](.github/workflows/release-automation.yml)** watches `main` for changes to `Cargo.toml`. When the package version changes, it creates a matching `v{VERSION}` git tag, which in turn fires `dist.yml`. End-to-end: edit `Cargo.toml`, commit, push, and a complete multi-platform release lands minutes later.
+```bash
+dsr build franken_whisper --version 0.5.0 --dry-run
+dsr build franken_whisper --version 0.5.0
+```
 
-The Rust toolchain channel used in CI is kept in sync with `rust-toolchain.toml` so local builds and CI builds resolve to the same nightly.
+[`dist.yml`](.github/workflows/dist.yml) is a manually dispatched,
+fail-closed fallback only. It never runs automatically on tag pushes, and its
+format, check, clippy, full-test, privacy, and sibling-pin gates all block
+packaging. [`release-automation.yml`](.github/workflows/release-automation.yml)
+is read-only: it reports the DSR command and never creates or pushes tags.
 
 ---
 
@@ -3573,7 +3629,7 @@ The built-in Rust decoder handles MP3, AAC, FLAC, WAV, OGG, Vorbis, and ALAC nat
 
 ### Agent consumption is the primary interface
 
-The `robot` subcommand is the *primary* interface: sequenced NDJSON events with stable schema versioning (v1.0.0), 12 structured error codes (6 robot-facing), health diagnostics, routing history, speculation events, and structured error envelopes even for argument-parsing failures.
+The `robot` subcommand is the *primary* interface: sequenced NDJSON events with stable schema versioning (v1.0.0), 13 exact terminal error codes, health diagnostics, routing history, speculation events, and structured error envelopes even for argument-parsing failures.
 
 ### Safe-Rust ASR orchestration
 
@@ -3998,7 +4054,7 @@ The state directory respects `XDG_STATE_HOME`: when set, `tools/` is rooted at `
 | 2 | Argument parse failure | `clap`'s default exit code on invalid command-line syntax (occurs before the binary's own error handling runs) |
 | 130 | Cancelled | Ctrl+C (POSIX convention: 128 + SIGINT=2) |
 
-`FW-*` errors all exit with code 1; the structured machine-readable distinction lives in the error code itself, not the exit code. In robot mode, agents should inspect the final NDJSON event (`run_complete` vs. `run_error`) to determine success rather than relying on exit codes; the process exit code is reserved for catastrophic failures that prevented the robot stream from completing at all.
+Process exits are deliberately coarse and published by `fw capabilities --json`: 0 for success, 1 for a parsed request that failed at runtime, 2 for invalid command syntax or values, and 130 for interruption. In robot mode, agents should inspect the final JSON/NDJSON event and its exact `FW-*` code; the process status classifies lifecycle, not root cause.
 
 ### Logging
 
@@ -4207,7 +4263,7 @@ cross build --release --target aarch64-unknown-linux-gnu
 
 ### Build Reproducibility
 
-The release profile (`opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`) plus a pinned nightly toolchain (`rust-toolchain.toml`) makes binaries close to byte-reproducible. Two builds of the same commit on the same host typically differ only in embedded timestamps and the build-id section. For truly reproducible builds, additionally set `SOURCE_DATE_EPOCH` and use `cargo build --frozen` against a checked-in `Cargo.lock`.
+The release profile (`opt-level = 3`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`) plus a pinned nightly toolchain (`rust-toolchain.toml`) makes binaries close to byte-reproducible. Two builds of the same commit on the same host typically differ only in embedded timestamps and the build-id section. For truly reproducible builds, additionally set `SOURCE_DATE_EPOCH` and use `cargo build --frozen` against a checked-in `Cargo.lock`.
 
 ### Why Rust 2024 / Why Nightly
 

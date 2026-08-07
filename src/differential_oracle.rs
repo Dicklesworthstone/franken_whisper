@@ -1603,6 +1603,14 @@ enum ExternalRunError {
     Skipped(ExternalSkip),
 }
 
+// The full Rust test suite runs thousands of tests concurrently. Each external
+// oracle invocation owns a child process and two pipe-reader threads, so letting
+// all oracle fixtures run at once can exhaust the worker's process/thread quota
+// before a fixture reaches the protocol condition it is meant to assert. Keep
+// this serialization test-only; production calls retain their normal concurrency.
+#[cfg(test)]
+static EXTERNAL_ORACLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Clone, Copy)]
 struct ExternalRunLimits<'a> {
     hard_timeout: Duration,
@@ -1647,6 +1655,11 @@ fn execute_external(
     recording_key: &str,
     limits: ExternalRunLimits<'_>,
 ) -> Result<ExternalSuccess, ExternalRunError> {
+    #[cfg(test)]
+    let _external_oracle_test_guard = EXTERNAL_ORACLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let ExternalRunLimits {
         hard_timeout,
         token,

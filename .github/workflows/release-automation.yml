@@ -1,21 +1,17 @@
 name: release-automation
 
-# Watches the main branch for a Cargo.toml version bump and auto-creates a
-# matching `vX.Y.Z` tag. The tag then triggers dist.yml. Modeled on the
-# destructive_command_guard release-automation pattern.
+# DSR is the release authority. This manual, read-only fallback validates the
+# privacy gate and reports the exact DSR command; it never creates or pushes a
+# tag and therefore cannot queue a nonfunctional Actions release.
 
 on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  tag-release:
+  release-readiness:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -32,7 +28,6 @@ jobs:
           "$guard_bin" --tracked
 
       - name: Read version from Cargo.toml
-        if: github.event_name != 'pull_request'
         id: version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -42,24 +37,7 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Read latest tag
-        if: github.event_name != 'pull_request'
-        id: latest
+      - name: Report canonical release command
         run: |
-          latest=$(git tag --list 'v*' --sort=-v:refname | head -1)
-          echo "latest=$latest" >> "$GITHUB_OUTPUT"
-
-      - name: Create tag
-        if: github.event_name != 'pull_request' && steps.latest.outputs.latest != format('v{0}', steps.version.outputs.version)
-        run: |
-          tag="v${{ steps.version.outputs.version }}"
-          echo "Creating release tag $tag"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$tag" -m "Release $tag"
-          git push origin "$tag"
-
-      - name: Skip (already tagged)
-        if: github.event_name != 'pull_request' && steps.latest.outputs.latest == format('v{0}', steps.version.outputs.version)
-        run: |
-          echo "Latest tag matches Cargo.toml version; nothing to do."
+          echo "Canonical release path:"
+          echo "  dsr release franken_whisper v${{ steps.version.outputs.version }}"

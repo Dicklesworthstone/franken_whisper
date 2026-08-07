@@ -2295,32 +2295,22 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn write_atomic_failure_preserves_same_path_original() {
-        // Stronger atomicity check: an existing file at the exact target path
-        // must survive a failed write to that same path. Force failure by
-        // removing write permission on the directory after creating the
-        // original, so temp-file creation fails.
-        use std::os::unix::fs::PermissionsExt;
+        // Stronger atomicity check: an existing object at the exact target
+        // path must survive a failed persist. A non-empty directory cannot be
+        // replaced by a regular file, even when the test runs as root.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("locked.md");
-        std::fs::write(&target, "ORIGINAL").unwrap();
-
-        // Read+execute only: temp file creation will fail.
-        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
-        perms.set_mode(0o500);
-        std::fs::set_permissions(dir.path(), perms).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let original = target.join("original.txt");
+        std::fs::write(&original, "ORIGINAL").unwrap();
 
         let res = write_atomic(&target, "REPLACEMENT");
 
-        // Restore perms so tempdir cleanup works regardless of outcome.
-        let mut restore = std::fs::metadata(dir.path()).unwrap().permissions();
-        restore.set_mode(0o700);
-        std::fs::set_permissions(dir.path(), restore).unwrap();
-
-        assert!(res.is_err(), "write into read-only dir must fail");
+        assert!(res.is_err(), "replacing a non-empty directory must fail");
         assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
+            std::fs::read_to_string(&original).unwrap(),
             "ORIGINAL",
-            "original must be intact after failed write"
+            "original target contents must survive a failed persist"
         );
     }
 }

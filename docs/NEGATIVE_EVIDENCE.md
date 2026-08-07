@@ -26621,7 +26621,7 @@ never as verdict gates. Until that predicate holds, **do not ship and do not
 record this as a rejection**; the measured hotspot remains open.
 
 ---
-## 2026-07-28 - MistyDog: **NO-SHIP CERTIFICATION / NO-DATA — Rust acoustic diarization has focused synthetic proof, but no admissible public-corpus DER/JER or calibration artifact.**
+## 2026-07-28 - MistyDog: **NO-PROMOTION CERTIFICATION / NO-DATA — Rust acoustic diarization has focused synthetic proof, but no admissible public-corpus DER/JER or calibration artifact.**
 
 `bd-odj7` now has a typed waveform implementation, permutation-invariant
 scorers, deterministic replay checks, bounded-memory tests, hard/soft enrollment

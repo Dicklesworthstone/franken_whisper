@@ -1,0 +1,20 @@
+{
+  "checked_at": "2026-08-07T12:22:33Z",
+  "jsm_present": true,
+  "skills": {
+    "operationalizing-expertise": {"present": true},
+    "codebase-archaeology": {"present": true},
+    "codebase-report": {"present": true},
+    "multi-pass-bug-hunting": {"present": true},
+    "multi-model-triangulation": {"present": true},
+    "ubs": {"present": true},
+    "dcg": {"present": true},
+    "agent-mail": {"present": true},
+    "beads-br": {"present": true},
+    "beads-bv": {"present": true},
+    "cass": {"present": true},
+    "idea-wizard": {"present": true},
+    "gh-cli": {"present": true},
+    "cc-hooks": {"present": true}
+  }
+}

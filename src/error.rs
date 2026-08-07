@@ -4,6 +4,69 @@ use thiserror::Error;
 
 pub type FwResult<T> = Result<T, FwError>;
 
+/// Stable process exit-code contract exposed by `capabilities --json`.
+pub const PROCESS_EXIT_CODES: &[(i32, &str, &str)] = &[
+    (0, "success", "requested operation completed"),
+    (1, "runtime_error", "request parsed but execution failed"),
+    (2, "usage_error", "command-line syntax or value was invalid"),
+    (130, "interrupted", "operation was cancelled by SIGINT"),
+];
+
+/// Stable, variant-specific error catalog. `FwError::error_code()` is the
+/// executable mapping; this catalog gives agents recovery semantics without
+/// making them scrape prose from README files.
+pub const ERROR_CODE_CATALOG: &[(&str, &str)] = &[
+    ("FW-IO", "inspect filesystem permissions and retry"),
+    (
+        "FW-JSON",
+        "validate the referenced JSON document against the declared schema",
+    ),
+    (
+        "FW-CMD-MISSING",
+        "install the named optional command or select a native backend",
+    ),
+    (
+        "FW-CMD-FAILED",
+        "inspect the sanitized subprocess failure and backend configuration",
+    ),
+    (
+        "FW-CMD-TIMEOUT",
+        "increase the command budget or choose a faster backend",
+    ),
+    (
+        "FW-BACKEND-UNAVAILABLE",
+        "run `fw robot triage` and follow its recommended command",
+    ),
+    (
+        "FW-INVALID-REQUEST",
+        "correct the request; use the command-specific `--help`",
+    ),
+    (
+        "FW-CONTRACT-VIOLATION",
+        "do not retry blindly; preserve evidence and report the producer bug",
+    ),
+    (
+        "FW-STORAGE",
+        "inspect the state path and run `fw doctor --json`",
+    ),
+    (
+        "FW-UNSUPPORTED",
+        "select a supported platform, backend, or output mode",
+    ),
+    (
+        "FW-MISSING-ARTIFACT",
+        "provision the exact named artifact and verify its digest",
+    ),
+    (
+        "FW-CANCELLED",
+        "retry only if cancellation was not intentional",
+    ),
+    (
+        "FW-STAGE-TIMEOUT",
+        "increase the stage budget or reduce the workload",
+    ),
+];
+
 #[derive(Debug, Error)]
 pub enum FwError {
     #[error("i/o failure: {0}")]

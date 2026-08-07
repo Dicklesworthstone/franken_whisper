@@ -2,9 +2,16 @@ name: dist
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
+    inputs:
+      version:
+        description: 'Release tag (vX.Y.Z). DSR is the canonical release path.'
+        required: true
+        type: string
+
+# DSR is the canonical build/release authority. This workflow is a manually
+# dispatched, fail-closed fallback and never auto-runs on tag pushes.
+env:
+  RELEASE_VERSION: ${{ inputs.version }}
 
 permissions:
   contents: write
@@ -32,31 +39,35 @@ jobs:
       # franken_whisper pins to nightly via rust-toolchain.toml; install
       # the nightly channel up front so cargo doesn't have to fetch it on
       # demand (and so we get rustfmt + clippy on the same channel).
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
         with:
+          toolchain: nightly-2026-07-20
           components: rustfmt, clippy
 
-      # fmt + clippy are reported as advisory because the codebase isn't
-      # cleanly fmt'd or clippy-clean yet; the gate that actually blocks
-      # release on this job is `cargo test --lib`. The downstream `build`
-      # job uses `if: always() && !cancelled()` so binaries still ship even
-      # if these checks fail, but a green test_job is the canonical signal.
+      - name: Validate requested release version
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "v$cargo_version" = "$RELEASE_VERSION"
+
+      - name: Prepare exact sibling path dependencies
+        run: scripts/prepare_release_siblings.sh
+
       - name: Check formatting
-        run: cargo fmt -- --check
-        continue-on-error: true
+        run: cargo fmt --check
+
+      - name: Check all targets
+        run: cargo check --all-targets
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
-        continue-on-error: true
 
       - name: Run tests
-        run: cargo test --lib
+        run: cargo test
 
   build:
     needs: [privacy, test]
-    # Tests are advisory, never block the binary release.
-    # Privacy is not advisory: no binary may ship from a prohibited source tree.
-    if: always() && !cancelled() && needs.privacy.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -65,27 +76,22 @@ jobs:
             target: x86_64-unknown-linux-gnu
             os_arch: linux_amd64
             archive_ext: tar.gz
-            binary: franken_whisper
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             os_arch: linux_arm64
             archive_ext: tar.gz
-            binary: franken_whisper
           - os: macos-15-intel
             target: x86_64-apple-darwin
             os_arch: darwin_amd64
             archive_ext: tar.gz
-            binary: franken_whisper
           - os: macos-14
             target: aarch64-apple-darwin
             os_arch: darwin_arm64
             archive_ext: tar.gz
-            binary: franken_whisper
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             os_arch: windows_amd64
             archive_ext: zip
-            binary: franken_whisper.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -95,33 +101,36 @@ jobs:
       # franken_whisper pins nightly via rust-toolchain.toml; matching that
       # here lets the cross-compile target install live on the same channel
       # cargo will actually use for the build.
-      - name: Install Rust nightly with target
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned Rust nightly with target
+        uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
         with:
+          toolchain: nightly-2026-07-20
           targets: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Prepare exact sibling path dependencies
+        shell: bash
+        run: scripts/prepare_release_siblings.sh
 
-      - name: Strip binary (Unix)
+      - name: Build release binaries
+        run: cargo build --locked --release --bins --target ${{ matrix.target }}
+
+      - name: Strip binaries (Unix)
         if: runner.os != 'Windows'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.binary }} || true
+        run: strip target/${{ matrix.target }}/release/franken_whisper target/${{ matrix.target }}/release/fw
 
       - name: Package archive (Unix)
         if: runner.os != 'Windows'
         # install.sh strips the leading "v" before constructing the asset
         # name (`franken_whisper-${VERSION#v}-${os}_${arch}.tar.gz`), so we
-        # must do the same here. Tag push -> v1.2.3 -> 1.2.3 in the name.
-        # Workflow_dispatch from a non-tag context ($GITHUB_REF_NAME = branch)
-        # produces something like `franken_whisper-main-...`; that's only
-        # downloadable via direct URL, never via install.sh.
+        # must do the same here. The required dispatch input is validated by
+        # the blocking test job before any build runs.
         run: |
           set -euo pipefail
           mkdir -p dist
-          VERSION_NO_V="${GITHUB_REF_NAME#v}"
+          VERSION_NO_V="${RELEASE_VERSION#v}"
           ARCHIVE="franken_whisper-${VERSION_NO_V}-${{ matrix.os_arch }}.${{ matrix.archive_ext }}"
           cd target/${{ matrix.target }}/release
-          tar -czf "../../../dist/$ARCHIVE" "${{ matrix.binary }}"
+          tar -czf "../../../dist/$ARCHIVE" franken_whisper fw
           cd ../../../dist
           shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
 
@@ -130,9 +139,13 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $versionNoV = "${env:GITHUB_REF_NAME}" -replace '^v',''
+          $versionNoV = "${env:RELEASE_VERSION}" -replace '^v',''
           $archive = "franken_whisper-${versionNoV}-${{ matrix.os_arch }}.${{ matrix.archive_ext }}"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" -DestinationPath "dist/$archive"
+          $binaries = @(
+            "target/${{ matrix.target }}/release/franken_whisper.exe",
+            "target/${{ matrix.target }}/release/fw.exe"
+          )
+          Compress-Archive -Path $binaries -DestinationPath "dist/$archive"
           Push-Location dist
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
           "$hash  $archive" | Out-File -Encoding ASCII "$archive.sha256"
@@ -169,7 +182,9 @@ jobs:
           shopt -s nullglob
           cd dist
           rm -f checksums-sha256.txt
-          for f in franken_whisper-*.tar.gz franken_whisper-*.zip; do
+          archives=(franken_whisper-*.tar.gz franken_whisper-*.zip)
+          test "${#archives[@]}" -eq 5
+          for f in "${archives[@]}"; do
             shasum -a 256 "$f" >> checksums-sha256.txt
           done
           cat checksums-sha256.txt
@@ -187,14 +202,13 @@ jobs:
           done
 
       - name: Copy install scripts to dist
-        run: |
-          cp install.sh dist/ 2>/dev/null || echo "No install.sh found"
-          cp install.ps1 dist/ 2>/dev/null || echo "No install.ps1 found"
+        run: cp install.sh dist/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          name: ${{ github.ref_name }}
+          name: ${{ env.RELEASE_VERSION }}
+          tag_name: ${{ env.RELEASE_VERSION }}
           draft: false
           prerelease: false
           generate_release_notes: true
@@ -223,7 +237,7 @@ jobs:
       - name: Extract version from tag
         if: steps.check.outputs.skip != 'true'
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: echo "version=${RELEASE_VERSION#v}" >> $GITHUB_OUTPUT
 
       - name: Trigger formula update
         if: steps.check.outputs.skip != 'true'

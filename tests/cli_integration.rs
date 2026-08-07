@@ -72,6 +72,138 @@ fn private_external_temp_root(prefix: &str) -> tempfile::TempDir {
     private_tempdir_in(project_parent, prefix)
 }
 
+fn run_agent_command(binary: &str, args: &[&str]) -> std::process::Output {
+    ProcessCommand::new(binary)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("agent command {args:?} failed to execute: {error}"))
+}
+
+#[test]
+fn packaged_binary_names_share_version_help_and_schema_contracts() {
+    let long = env!("CARGO_BIN_EXE_franken_whisper");
+    let short = env!("CARGO_BIN_EXE_fw");
+
+    for args in [
+        &["--version"][..],
+        &["--help"][..],
+        &["robot", "schema"][..],
+    ] {
+        let long_output = run_agent_command(long, args);
+        let short_output = run_agent_command(short, args);
+        assert!(
+            long_output.status.success(),
+            "long binary failed for {args:?}"
+        );
+        assert!(
+            short_output.status.success(),
+            "short binary failed for {args:?}"
+        );
+        if args == ["--help"] {
+            let long_help = std::str::from_utf8(&long_output.stdout)
+                .expect("long-form help must be valid UTF-8");
+            let short_help = std::str::from_utf8(&short_output.stdout)
+                .expect("short-form help must be valid UTF-8");
+            assert!(long_help.contains("Usage: franken_whisper <COMMAND>"));
+            assert!(short_help.contains("Usage: fw <COMMAND>"));
+            assert_eq!(
+                long_help.replace(
+                    "Usage: franken_whisper <COMMAND>",
+                    "Usage: <BINARY> <COMMAND>"
+                ),
+                short_help.replace("Usage: fw <COMMAND>", "Usage: <BINARY> <COMMAND>"),
+                "help contract drift beyond the intentionally invoked binary name"
+            );
+        } else {
+            assert_eq!(
+                long_output.stdout, short_output.stdout,
+                "stdout drift for {args:?}"
+            );
+        }
+        assert_eq!(
+            long_output.stderr, short_output.stderr,
+            "stderr drift for {args:?}"
+        );
+        if args == ["--version"] {
+            let version =
+                String::from_utf8(long_output.stdout).expect("version report must be valid UTF-8");
+            assert_eq!(
+                version.lines().next(),
+                Some(concat!("franken_whisper ", env!("CARGO_PKG_VERSION"))),
+                "Clap must add the command name exactly once"
+            );
+        }
+    }
+}
+
+#[test]
+fn robot_help_remains_human_help_for_both_binary_names() {
+    for binary in [
+        env!("CARGO_BIN_EXE_franken_whisper"),
+        env!("CARGO_BIN_EXE_fw"),
+    ] {
+        let output = run_agent_command(binary, &["robot", "--help"]);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8(output.stdout).expect("help must be UTF-8");
+        assert!(stdout.contains("Usage:"));
+        assert!(stdout.contains("triage"));
+        assert!(!stdout.contains("\"event\":\"run_error\""));
+    }
+}
+
+#[test]
+fn agent_discovery_json_commands_are_single_line_and_path_safe() {
+    let binary = env!("CARGO_BIN_EXE_fw");
+    for args in [
+        &["capabilities", "--json"][..],
+        &["models", "--json"][..],
+        &["doctor", "--json"][..],
+        &["robot", "triage"][..],
+        &["robot", "schema"][..],
+    ] {
+        let output = run_agent_command(binary, args);
+        assert!(
+            output.status.success(),
+            "agent discovery command {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty(), "stderr pollution for {args:?}");
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 agent JSON");
+        assert_eq!(
+            stdout.lines().count(),
+            1,
+            "expected one JSON line for {args:?}"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("valid agent discovery JSON");
+        assert!(value.is_object(), "object response for {args:?}");
+        if args == ["models", "--json"] {
+            assert_eq!(value["local_paths_emitted"], false);
+            let encoded = serde_json::to_string(&value).expect("re-encode model registry");
+            assert!(!encoded.contains("/Users/"));
+            assert!(!encoded.contains("/home/"));
+            assert!(encoded.contains("operator_local_no_git_no_release"));
+        }
+    }
+}
+
+#[test]
+fn robot_syntax_errors_are_one_json_line_with_usage_exit_code() {
+    let output = run_agent_command(
+        env!("CARGO_BIN_EXE_fw"),
+        &["robot", "run", "--inpt", "private-call.m4a"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 robot syntax error");
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON syntax error");
+    assert_eq!(value["event"], "run_error");
+    assert_eq!(value["code"], "FW-INVALID-REQUEST");
+    assert!(!stdout.contains("private-call.m4a"));
+}
+
 // ---------------------------------------------------------------------------
 // Storage: runs get --id
 // ---------------------------------------------------------------------------
@@ -591,6 +723,14 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
         .prefix("fw-confidential-output-")
         .tempdir_in(external_temp_root)
         .expect("external output");
+    let runtime_project =
+        private_tempdir_in(external_temp_root, "fw-confidential-evaluation-project-");
+    std::fs::create_dir(runtime_project.path().join(".git")).expect("project marker");
+    std::fs::write(
+        runtime_project.path().join("Cargo.toml"),
+        "[package]\nname = \"confidential-evaluation-e2e-root\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("project manifest");
     let audio_path = input.path().join("PRIVATE_AUDIO_CLI_SENTINEL.m4a");
     let reference_path = input.path().join("PRIVATE_REFERENCE_CLI_SENTINEL.json");
     let hypothesis_path = input.path().join("PRIVATE_HYPOTHESIS_CLI_SENTINEL.json");
@@ -644,15 +784,8 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
     )
     .expect("manifest");
 
-    let runtime_directory = std::env::current_dir().expect("test runtime directory");
-    let test_executable = std::env::current_exe().expect("test executable");
-    let runtime_project_root = runtime_directory
-        .ancestors()
-        .chain(test_executable.ancestors())
-        .find(|ancestor| ancestor.join(".git").exists() && ancestor.join("Cargo.toml").is_file())
-        .expect("runtime project checkout");
     let result = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
-        .current_dir(runtime_project_root)
+        .current_dir(runtime_project.path())
         .args([
             "diarization-eval",
             "--input-root",
@@ -994,7 +1127,7 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
     );
     assert_eq!(
         evidence.schema_version,
-        "public-diarization-acoustic-sidecar-study-v3"
+        "public-diarization-acoustic-sidecar-study-v6"
     );
     assert_eq!(
         evidence.runner_version,
@@ -1002,7 +1135,7 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
     );
     assert_eq!(
         evidence.runner_version,
-        "public-diarization-acoustic-sidecar-study-runner-v3"
+        "public-diarization-acoustic-sidecar-study-runner-v8"
     );
     assert_eq!(
         evidence.protocol.pair_calibration_fit_id,
@@ -1619,7 +1752,7 @@ fn robot_run_invalid_request_emits_run_error() {
         .find(|line| line["event"] == "run_error")
         .expect("run_error envelope should be emitted");
 
-    assert_eq!(run_error["code"], "FW-ROBOT-REQUEST");
+    assert_eq!(run_error["code"], "FW-INVALID-REQUEST");
     let message = run_error["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("--input") && message.contains("--stdin") && message.contains("--mic"),
@@ -1700,7 +1833,7 @@ fn robot_run_emits_cancelled_stage_before_terminal_run_error() {
 
     assert!(budgets_idx < cancelled_idx);
     assert!(cancelled_idx < error_idx);
-    assert_eq!(parsed[error_idx]["code"], "FW-ROBOT-CANCELLED");
+    assert_eq!(parsed[error_idx]["code"], "FW-CANCELLED");
     assert_eq!(
         parsed[cancelled_idx]["payload"]["cancellation_evidence"]["reason"],
         "checkpoint deadline exceeded"
@@ -1776,7 +1909,7 @@ fn robot_run_normalize_stage_timeout_maps_to_timeout_error_code() {
         .iter()
         .find(|line| line["event"] == "run_error")
         .expect("run_error envelope should be emitted");
-    assert_eq!(run_error["code"], "FW-ROBOT-TIMEOUT");
+    assert_eq!(run_error["code"], "FW-STAGE-TIMEOUT");
 }
 
 #[test]
@@ -3399,8 +3532,8 @@ fn transcribe_file_input_uses_state_dir_provisioned_ffmpeg_when_path_is_missing(
         "state-dir provisioned ffmpeg should be invoked when PATH ffmpeg is unavailable"
     );
     assert!(
-        ffprobe_marker.is_file(),
-        "state-dir provisioned ffprobe should be invoked when PATH ffprobe is unavailable"
+        !ffprobe_marker.exists(),
+        "normalized PCM WAV duration should use the exact header probe without spawning ffprobe"
     );
 }
 
@@ -3617,7 +3750,7 @@ fn transcribe_backend_stage_payload_exposes_execution_metadata() {
     let input_wav = dir.path().join("backend_meta.wav");
     generate_voiced_wav(&input_wav);
 
-    let report = run_transcribe_json_with_stub(
+    let report = run_transcribe_json_with_stub_env(
         &[
             "--input",
             input_wav.to_str().expect("utf8"),
@@ -3629,6 +3762,7 @@ fn transcribe_backend_stage_payload_exposes_execution_metadata() {
         None,
         &stub_bin,
         &state_root,
+        &[("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")],
     );
 
     let events = report["events"].as_array().expect("events should be array");
@@ -4695,7 +4829,7 @@ fn robot_schema_event_entries_have_required_and_example() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn robot_routing_history_empty_db_returns_no_events() {
+fn robot_routing_history_empty_db_emits_terminal_count() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("empty_routing.sqlite3");
     let store = RunStore::open(&db_path).expect("store open");
@@ -4703,6 +4837,23 @@ fn robot_routing_history_empty_db_returns_no_events() {
     // Query with no runs — should return empty.
     let runs = store.list_recent_runs(10).expect("list runs");
     assert!(runs.is_empty(), "fresh DB should have no runs");
+
+    let output = run_agent_command(
+        env!("CARGO_BIN_EXE_fw"),
+        &[
+            "robot",
+            "routing-history",
+            "--db",
+            db_path.to_str().expect("UTF-8 database path"),
+        ],
+    );
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 routing history");
+    assert_eq!(stdout.lines().count(), 1);
+    let terminal: serde_json::Value = serde_json::from_str(stdout.trim()).expect("terminal JSON");
+    assert_eq!(terminal["event"], "routing_history.complete");
+    assert_eq!(terminal["records"], 0);
 }
 
 #[test]

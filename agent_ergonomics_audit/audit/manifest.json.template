@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.1.0",
+  "tool_name": "<REPLACE>",
+  "tool_repo": "<absolute path to target>",
+  "audit_workspace": "<absolute path to <target>/agent_ergonomics_audit/ — IN-TREE, NOT a sibling>",
+  "rubric_version": "<git SHA of references/rubric/SCORING-RUBRIC.md when scoring ran>",
+  "passes": [],
+  "current_pass": 1,
+  "pass_N+1_ready": false,
+  "next_pass_focus": null,
+  "_schema_doc": {
+    "passes_entry": {
+      "pass": "<int, 1-indexed>",
+      "started_at": "<ISO8601>",
+      "completed_at": "<ISO8601 or null while in-progress>",
+      "mode": "audit-only|full|re-score-only|simulate-only|single-surface-rescore",
+      "target_sha": "<git SHA of target at start of pass>",
+      "target_branch": "<branch name of target at start of pass — informational; this skill does not switch branches and never creates a new one. Typically 'main'.>",
+      "feature_branch": "DEPRECATED — kept for back-compat with old manifests. Always null in new passes. The skill no longer creates feature branches.",
+      "summary": {
+        "surfaces_inventoried": 0,
+        "surfaces_scored": 0,
+        "recommendations_total": 0,
+        "recommendations_applied": 0,
+        "substantive_commits": 0,
+        "dimensions_touched": 0,
+        "ambition_bar_met": false,
+        "ambition_bar_self_prompt_run": false,
+        "median_uplift_pts": 0,
+        "regressions_count": 0,
+        "fresh_eyes_rounds": 0
+      },
+      "artifacts": {
+        "surface_inventory": "audit/surface_inventory.jsonl",
+        "agent_surfaces": "audit/agent_surfaces.jsonl",
+        "intent_corpus": "audit/intent_inference_corpus.jsonl",
+        "recommendations": "audit/recommendations.jsonl",
+        "playbook": "audit/playbook.md",
+        "applied_changes": "audit/applied_changes.jsonl",
+        "ambition_bar_check": "audit/ambition_bar_check.md",
+        "scorecard": "audit/scorecard_pass_N.md",
+        "heatmap": "audit/heatmap.svg",
+        "uplift_diff": "audit/uplift_diff.md",
+        "regression_alerts": "audit/regression_alerts.md",
+        "handoff": "audit/HANDOFF.md",
+        "simulations_pre": "audit/agent_simulations/pre_pass_N/",
+        "simulations_post": "audit/agent_simulations/post_pass_N/"
+      }
+    }
+  }
+}
