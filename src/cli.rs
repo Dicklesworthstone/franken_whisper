@@ -24,17 +24,21 @@ pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\nproject license: MIT with OpenAI/Anthropic rider\n",
     "model weights: not bundled; third-party model terms apply\n",
-    "Sortformer distribution: operator_local_no_git_no_release"
+    "Sortformer distribution: hash-pinned GitHub release artifact with license and notice"
 );
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum SpeakerHintsFile {
     Intervals(Vec<KnownSpeakerInterval>),
-    Document {
-        schema_version: String,
-        known_intervals: Vec<KnownSpeakerInterval>,
-    },
+    Document(SpeakerHintsDocument),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpeakerHintsDocument {
+    schema_version: String,
+    known_intervals: Vec<KnownSpeakerInterval>,
 }
 
 fn parse_speaker_hints(bytes: &[u8]) -> FwResult<Vec<KnownSpeakerInterval>> {
@@ -45,28 +49,83 @@ fn parse_speaker_hints(bytes: &[u8]) -> FwResult<Vec<KnownSpeakerInterval>> {
     })?;
     match parsed {
         SpeakerHintsFile::Intervals(intervals) => Ok(intervals),
-        SpeakerHintsFile::Document {
+        SpeakerHintsFile::Document(SpeakerHintsDocument {
             schema_version,
             known_intervals,
-        } if schema_version == "speaker-hints-v1" => Ok(known_intervals),
-        SpeakerHintsFile::Document { .. } => Err(FwError::InvalidRequest(
+        }) if schema_version == "speaker-hints-v1" => Ok(known_intervals),
+        SpeakerHintsFile::Document(_) => Err(FwError::InvalidRequest(
             "speaker hints document must use schema_version speaker-hints-v1".to_owned(),
         )),
     }
 }
 
 fn read_speaker_hints(path: &Path) -> FwResult<Vec<KnownSpeakerInterval>> {
+    let path_metadata = std::fs::symlink_metadata(path).map_err(|_| {
+        FwError::InvalidRequest("speaker hints file could not be inspected".to_owned())
+    })?;
+    if metadata_is_indirection(&path_metadata) || !path_metadata.is_file() {
+        return Err(FwError::InvalidRequest(
+            "speaker hints must be a regular non-symlink file".to_owned(),
+        ));
+    }
+    #[cfg(target_family = "unix")]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+
+        let descriptor = open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| {
+            FwError::InvalidRequest("speaker hints file could not be opened".to_owned())
+        })?;
+        std::fs::File::from(descriptor)
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| {
+                FwError::InvalidRequest("speaker hints file could not be opened".to_owned())
+            })?
+    };
+    #[cfg(not(any(target_family = "unix", windows)))]
     let file = std::fs::File::open(path).map_err(|_| {
         FwError::InvalidRequest("speaker hints file could not be opened".to_owned())
     })?;
-    if file
-        .metadata()
-        .map_err(|_| {
-            FwError::InvalidRequest("speaker hints file metadata could not be read".to_owned())
-        })?
-        .len()
-        > MAX_SPEAKER_HINTS_BYTES
+    let descriptor_metadata = file.metadata().map_err(|_| {
+        FwError::InvalidRequest("speaker hints file metadata could not be read".to_owned())
+    })?;
+    if !descriptor_metadata.is_file() {
+        return Err(FwError::InvalidRequest(
+            "speaker hints must be a regular file".to_owned(),
+        ));
+    }
+    #[cfg(target_family = "unix")]
     {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if path_metadata.dev() != descriptor_metadata.dev()
+            || path_metadata.ino() != descriptor_metadata.ino()
+        {
+            return Err(FwError::InvalidRequest(
+                "speaker hints file changed while being opened".to_owned(),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    if metadata_is_indirection(&descriptor_metadata) {
+        return Err(FwError::InvalidRequest(
+            "speaker hints must be a regular non-symlink file".to_owned(),
+        ));
+    }
+    if descriptor_metadata.len() > MAX_SPEAKER_HINTS_BYTES {
         return Err(FwError::InvalidRequest(
             "speaker hints file exceeds the 1 MiB safety limit".to_owned(),
         ));
@@ -82,6 +141,21 @@ fn read_speaker_hints(path: &Path) -> FwResult<Vec<KnownSpeakerInterval>> {
         ));
     }
     parse_speaker_hints(&bytes)
+}
+
+fn metadata_is_indirection(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn parse_speaker_count_range(value: &str) -> FwResult<(u32, u32)> {
@@ -235,7 +309,7 @@ impl ShutdownController {
 #[command(about = "Agent-first Rust ASR orchestrator with ffmpeg normalization")]
 #[command(version, long_version = LONG_VERSION)]
 #[command(
-    after_help = "Agent orientation: `fw robot triage`\nMachine contract: `fw capabilities --json`\nModel readiness: `fw models --json`"
+    after_help = "Agent orientation: `fw robot triage`\nMachine contract: `fw capabilities --json`\nModel readiness: `fw models --json`\nExplicit Sortformer install: `fw pull sortformer --json`"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -290,8 +364,10 @@ pub enum Command {
     Youtube(Box<YoutubeArgs>),
     /// Describe stable commands, schemas, features, and error recovery as JSON.
     Capabilities(CapabilitiesArgs),
-    /// Report built-in and operator-local model readiness without downloading.
+    /// Report built-in and cached model readiness without downloading.
     Models(ModelsArgs),
+    /// Explicitly download and verify a release-bound model package.
+    Pull(PullArgs),
     /// Diagnose whether this installation can perform useful work.
     Doctor(DoctorArgs),
     /// Print compact agent integration documentation from the running binary.
@@ -314,6 +390,24 @@ pub struct CapabilitiesArgs {
 #[derive(Debug, Args)]
 pub struct ModelsArgs {
     /// Emit the complete stable JSON registry instead of a compact summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Model family accepted by the explicit downloader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PullModelArg {
+    Sortformer,
+}
+
+/// Explicit model-download controls. No other command performs network access.
+#[derive(Debug, Args)]
+pub struct PullArgs {
+    /// Model package to fetch into the per-user verified cache.
+    #[arg(value_enum, default_value_t = PullModelArg::Sortformer)]
+    pub model: PullModelArg,
+
+    /// Emit one stable JSON object and suppress human progress output.
     #[arg(long)]
     pub json: bool,
 }
@@ -349,13 +443,27 @@ pub struct SortformerDiarizeArgs {
     #[arg(long)]
     pub input: PathBuf,
 
-    /// Authenticated operator-local conversion receipt.
-    #[arg(long)]
-    pub receipt: PathBuf,
+    /// Explicit conversion receipt; omit with --package to use the verified cache.
+    #[arg(long, requires = "package")]
+    pub receipt: Option<PathBuf>,
 
-    /// Authenticated operator-local safetensors package.
+    /// Explicit safetensors package; omit with --receipt to use the verified cache.
+    #[arg(long, requires = "receipt")]
+    pub package: Option<PathBuf>,
+
+    /// Optional speaker-hints-v1 JSON used for lane-to-reference mapping.
     #[arg(long)]
-    pub package: PathBuf,
+    pub speaker_hints: Option<PathBuf>,
+}
+
+impl SortformerDiarizeArgs {
+    pub fn load_speaker_hints(&self) -> FwResult<Vec<KnownSpeakerInterval>> {
+        self.speaker_hints
+            .as_deref()
+            .map(read_speaker_hints)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
 }
 
 impl fmt::Debug for SortformerDiarizeArgs {
@@ -365,6 +473,7 @@ impl fmt::Debug for SortformerDiarizeArgs {
             .field("input", &"<redacted>")
             .field("receipt", &"<redacted>")
             .field("package", &"<redacted>")
+            .field("speaker_hints", &"<redacted>")
             .finish()
     }
 }
@@ -2045,6 +2154,26 @@ mod tests {
                 .contains("speaker-hints-v1")
         );
         assert!(parse_speaker_hints(b"not json").is_err());
+        assert!(
+            parse_speaker_hints(
+                br#"{"schema_version":"speaker-hints-v1","known_intervals":[],"extra":true}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn speaker_hints_reader_rejects_symlinks_before_parsing() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary speaker-hints directory");
+        let target = directory.path().join("target.json");
+        let link = directory.path().join("link.json");
+        std::fs::write(&target, b"[]").expect("write speaker-hints target");
+        symlink(&target, &link).expect("create speaker-hints symlink");
+        let error = read_speaker_hints(&link).expect_err("symlink must fail closed");
+        assert!(error.to_string().contains("regular non-symlink"));
     }
 
     #[test]
@@ -3781,10 +3910,24 @@ mod tests {
             panic!("expected native Sortformer command");
         };
         let debug = format!("{args:?}");
-        assert_eq!(debug.matches("<redacted>").count(), 3);
+        assert_eq!(debug.matches("<redacted>").count(), 4);
         assert!(!debug.contains("PRIVATE"));
         assert!(!debug.contains("call.m4a"));
         assert!(!debug.contains("weights.safetensors"));
+
+        let cached = Cli::try_parse_from([
+            "franken_whisper",
+            "sortformer-diarize",
+            "--input",
+            "/PRIVATE/call.m4a",
+        ])
+        .expect("cached native Sortformer command");
+        let Command::SortformerDiarize(cached) = cached.command else {
+            panic!("expected cached native Sortformer command");
+        };
+        assert!(cached.receipt.is_none());
+        assert!(cached.package.is_none());
+        assert!(cached.speaker_hints.is_none());
     }
 
     #[test]
@@ -3800,6 +3943,16 @@ mod tests {
         assert!(matches!(
             models.command,
             Command::Models(ModelsArgs { json: true })
+        ));
+
+        let pull =
+            Cli::try_parse_from(["fw", "pull", "sortformer", "--json"]).expect("pull command");
+        assert!(matches!(
+            pull.command,
+            Command::Pull(PullArgs {
+                model: PullModelArg::Sortformer,
+                json: true,
+            })
         ));
 
         let doctor =
@@ -3863,6 +4016,6 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
         assert!(rendered.contains("model weights: not bundled"));
-        assert!(rendered.contains("operator_local_no_git_no_release"));
+        assert!(rendered.contains("hash-pinned GitHub release artifact"));
     }
 }

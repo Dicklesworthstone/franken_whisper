@@ -183,7 +183,7 @@ fn agent_discovery_json_commands_are_single_line_and_path_safe() {
             let encoded = serde_json::to_string(&value).expect("re-encode model registry");
             assert!(!encoded.contains("/Users/"));
             assert!(!encoded.contains("/home/"));
-            assert!(encoded.contains("operator_local_no_git_no_release"));
+            assert!(encoded.contains("github_release_with_license_and_notice"));
         }
     }
 }
@@ -202,6 +202,82 @@ fn robot_syntax_errors_are_one_json_line_with_usage_exit_code() {
     assert_eq!(value["event"], "run_error");
     assert_eq!(value["code"], "FW-INVALID-REQUEST");
     assert!(!stdout.contains("private-call.m4a"));
+}
+
+#[test]
+fn sortformer_runtime_errors_are_one_path_safe_json_line() {
+    let cache = tempfile::tempdir().expect("isolated model cache");
+    let private_input = "/private/confidential/customer-call.m4a";
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args(["sortformer-diarize", "--input", private_input])
+        .env("FRANKEN_WHISPER_MODEL_DIR", cache.path())
+        .output()
+        .expect("run Sortformer command");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 Sortformer error");
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON runtime error");
+    assert_eq!(value["schema_version"], "sortformer-diarization-v1");
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["local_paths_emitted"], false);
+    assert!(!stdout.contains(private_input));
+    assert!(!stdout.contains(cache.path().to_string_lossy().as_ref()));
+}
+
+#[test]
+fn sortformer_syntax_errors_are_one_path_safe_json_line() {
+    let private_input = "/private/confidential/customer-call.m4a";
+    let output = run_agent_command(
+        env!("CARGO_BIN_EXE_fw"),
+        &["sortformer-diarize", "--inpt", private_input],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 Sortformer syntax error");
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON syntax error");
+    assert_eq!(value["schema_version"], "sortformer-diarization-v1");
+    assert_eq!(value["code"], "FW-INVALID-REQUEST");
+    assert_eq!(value["local_paths_emitted"], false);
+    assert!(!stdout.contains(private_input));
+}
+
+#[test]
+fn json_model_pull_syntax_errors_are_one_path_safe_json_line() {
+    let output = run_agent_command(
+        env!("CARGO_BIN_EXE_fw"),
+        &["pull", "sortformer", "--json", "--unknown-private-flag"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 pull syntax error");
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON syntax error");
+    assert_eq!(value["schema_version"], "franken-whisper-model-pull-v1");
+    assert!(value["model"].is_null());
+    assert_eq!(value["code"], "FW-INVALID-REQUEST");
+    assert_eq!(value["local_paths_emitted"], false);
+    assert!(!stdout.contains("unknown-private-flag"));
+}
+
+#[test]
+fn json_model_pull_runtime_errors_are_one_path_safe_json_line() {
+    let private_relative_cache = "private/customer/cache";
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args(["pull", "sortformer", "--json"])
+        .env("FRANKEN_WHISPER_MODEL_DIR", private_relative_cache)
+        .output()
+        .expect("run model-pull command");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 pull runtime error");
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON runtime error");
+    assert_eq!(value["schema_version"], "franken-whisper-model-pull-v1");
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["local_paths_emitted"], false);
+    assert!(!stdout.contains(private_relative_cache));
 }
 
 // ---------------------------------------------------------------------------

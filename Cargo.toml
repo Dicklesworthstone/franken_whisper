@@ -1,6 +1,6 @@
 [package]
 name = "franken_whisper"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 license-file = "LICENSE"
 description = "Agent-first Rust ASR orchestration stack with ffmpeg normalization and frankensqlite-backed persistence"
@@ -16,7 +16,7 @@ gpu-frankenjax = ["dep:fj-api", "dep:fj-core"]
 # implicit package-named bin, so both are declared here.
 #
 # NOTE: cargo emits `warning: src/main.rs found to be present in multiple build
-# targets` — this is EXPECTED and INTENTIONAL (one 518-line entry point, two
+# targets` — this is EXPECTED and INTENTIONAL (one shared entry point, two
 # installable names). Do NOT "fix" it by dropping a bin (breaks the `fw`/
 # `franken_whisper` dual name that installers + docs rely on) or by refactoring
 # main into the lib behind thin per-bin wrappers (a large, CLI-risky change for a
@@ -53,7 +53,7 @@ symphonia = { version = "0.5.5", features = ["mp3", "aac", "isomp4", "ogg", "fla
 # ft-kernel-cpu; pinned to the same minor.
 rayon = "1.10"
 
-asupersync = { version = "0.3.4", default-features = false }
+asupersync = { version = "0.3.4", default-features = false, features = ["tls-webpki-roots"] }
 franken-kernel = "0.3.4"
 franken-evidence = "0.3.4"
 franken-decision = "0.3.4"

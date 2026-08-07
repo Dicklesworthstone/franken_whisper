@@ -560,11 +560,11 @@ impl CancellationToken {
     /// Create a token with no deadline (never cancels on its own; still honors
     /// the global Ctrl+C shutdown).
     ///
-    /// `pub(crate)` so native backends can synthesize a token when a caller did
-    /// not supply one (e.g. the diarization stage inside
-    /// `whisper_diarization_native::run`).
+    /// This remains cancellation-aware because it always honors the process
+    /// Ctrl+C shutdown flag; "unbounded" means only that no time deadline is
+    /// added.
     #[must_use]
-    pub(crate) fn unbounded() -> Self {
+    pub fn unbounded() -> Self {
         Self { deadline: None }
     }
 

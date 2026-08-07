@@ -63,14 +63,24 @@ Compare: [`v0.4.0...v0.5.0`](https://github.com/Dicklesworthstone/franken_whispe
 
 Everything in v0.2.1 (native-default engine, NaN-hardening, the aarch64 `target-cpu` codegen fix, the routing fallback fix, and the CPU int8/GELU perf work) is included.
 
-## [Unreleased] (since v0.1.0)
+## [0.6.0] - 2026-08-07
 
-152 commits since v0.1.0
+Native learned-diarization evaluation, explicit model distribution, and the
+agent-first packaging tranche.
 
-Compare: [`v0.1.0...main`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.1.0...main)
+Compare: [`v0.5.0...v0.6.0`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.5.0...v0.6.0)
 
 ### Agent-first packaging and local release automation (post-2026-08-07)
 
+- Added explicit `fw pull sortformer` distribution backed by a compiled,
+  hash-pinned GitHub model-release manifest. The native Rust downloader streams
+  into an isolated per-user cache, verifies the weights, conversion receipt,
+  NVIDIA license, and required notice, and emits path-free JSON. Transcription
+  remains offline; model bytes remain outside Git.
+- Added cached `sortformer-diarize` operation plus typed hard/soft known-interval
+  lane mapping. Hard caller assertions fail closed on ambiguity or
+  contradiction; soft references remain suggestions and never make an
+  anonymous lane authoritative. Four-lane capacity is reported explicitly.
 - Added the compact `fw` binary alias and machine-readable `capabilities`,
   `models`, `doctor`, `robot triage`, and `robot-docs guide` entry points. Robot
   argument failures now remain single-line JSON without echoing private paths.
@@ -81,8 +91,9 @@ Compare: [`v0.1.0...main`](https://github.com/Dicklesworthstone/franken_whisper/
   archive allowlisting, paired `franken_whisper`/`fw` replacement, live-lock
   ownership, and pinned source builds.
 - Added five-target DSR staging with exact sibling revisions. GitHub workflows
-  remain manually dispatched fallbacks; operator-local Sortformer weights are
-  excluded from Git and release assets.
+  remain manually dispatched fallbacks; Sortformer weights are excluded from
+  Git and distributed only through the dedicated model release with their
+  license and notice sidecars.
 
 ### Native decode-quality surface — whisper.cpp-faithful fallback + beam (post-2026-07-11)
 

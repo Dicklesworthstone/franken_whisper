@@ -893,12 +893,14 @@ pub fn capabilities_value() -> serde_json::Value {
         "agent_orientation": {
             "command": "fw robot triage",
             "model_status": "fw models --json",
+            "sortformer_install": "fw pull sortformer --json",
             "event_schema": "fw robot schema",
             "guide": "fw robot-docs guide",
         },
         "structured_commands": [
             {"command": "fw capabilities --json", "output": "json"},
             {"command": "fw models --json", "output": "json"},
+            {"command": "fw pull sortformer --json", "output": "json"},
             {"command": "fw doctor --json", "output": "json"},
             {"command": "fw robot triage", "output": "json"},
             {"command": "fw robot schema", "output": "json"},
@@ -910,7 +912,7 @@ pub fn capabilities_value() -> serde_json::Value {
             "model_downloads_automatic": false,
             "agent_discovery_emits_audio_or_transcript_paths": false,
             "agent_discovery_emits_operator_local_model_paths": false,
-            "sortformer_distribution": "operator_local_no_git_no_release",
+            "sortformer_distribution": crate::model_distribution::SORTFORMER_DISTRIBUTION_POLICY,
         },
         "process_exit_codes": process_exit_codes,
         "error_codes": error_codes,
@@ -918,11 +920,25 @@ pub fn capabilities_value() -> serde_json::Value {
     })
 }
 
-/// Report model/package readiness without returning operator-local paths or
-/// downloading anything. Presence checks are deliberately separated from
-/// cryptographic authentication, which remains fail-closed at model load.
+/// Report model/package readiness without returning local paths or downloading
+/// anything. Sortformer cache readiness includes all four compiled hash roots;
+/// other model families retain their documented admission behavior.
 #[must_use]
 pub fn models_report_value() -> serde_json::Value {
+    models_report_value_with_cancel(|| false)
+        .expect("an uncancelled model readiness report must not be interrupted")
+}
+
+/// Cancellation-correct form of [`models_report_value`].
+///
+/// Verifying the cached Sortformer artifact hashes roughly 492 MB. Interactive
+/// and robot command callers use this form so an interrupt is reported as
+/// cancellation rather than incorrectly presenting an installed model as
+/// missing.
+pub fn models_report_value_with_cancel<F>(is_cancelled: F) -> FwResult<serde_json::Value>
+where
+    F: Fn() -> bool + Sync,
+{
     let configured_whisper = crate::native_engine::default_model_spec();
     let whisper_available = configured_whisper.as_deref().map_or_else(
         || crate::native_engine::resolve_model("default").is_ok(),
@@ -940,9 +956,11 @@ pub fn models_report_value() -> serde_json::Value {
         crate::ecapa_conformance::ECAPA_PACKAGE_FILENAME,
     )
     .is_ok();
+    let sortformer_available =
+        crate::model_distribution::cached_sortformer_readiness_with_cancel(is_cancelled)?;
 
-    json!({
-        "schema_version": "franken-whisper-model-registry-v1",
+    Ok(json!({
+        "schema_version": "franken-whisper-model-registry-v2",
         "network_access_performed": false,
         "local_paths_emitted": false,
         "models": [
@@ -994,9 +1012,12 @@ pub fn models_report_value() -> serde_json::Value {
                 "revision": crate::sortformer_conformance::SORTFORMER_MODEL_REVISION,
                 "kind": "streaming_speaker_diarization",
                 "tasks": ["speaker_activity", "overlap", "speaker_turns"],
-                "runtime_status": "evaluation_only_explicit_invocation",
-                "installed": null,
+                "runtime_status": if sortformer_available { "evaluation_only_explicit_ready" } else { "missing_release_artifact" },
+                "installed": sortformer_available,
+                "certification": "evaluation_only",
                 "speaker_lane_capacity": 4,
+                "capacity_semantics": "four_lane_capped_output_true_speaker_count_unknown",
+                "auto_routing_status": "certification_receipt_required",
                 "artifact": {
                     "format": "safetensors_f32",
                     "bytes": crate::sortformer_conformance::SORTFORMER_PACKAGE_BYTES,
@@ -1004,28 +1025,55 @@ pub fn models_report_value() -> serde_json::Value {
                     "receipt_schema": crate::sortformer_conformance::SORTFORMER_RECEIPT_SCHEMA,
                     "receipt_sha256": crate::sortformer_conformance::SORTFORMER_CONVERSION_RECEIPT_SHA256,
                     "validation": "compiled_receipt_and_package_trust_roots_before_inference",
-                    "redistribution": "operator_local_no_git_no_release",
+                    "artifact_version": crate::model_distribution::SORTFORMER_ARTIFACT_VERSION,
+                    "redistribution": crate::model_distribution::SORTFORMER_DISTRIBUTION_POLICY,
                     "license": "NVIDIA Open Model License",
                     "license_url": crate::sortformer_conformance::SORTFORMER_LICENSE_URL,
+                    "required_notice": crate::model_distribution::SORTFORMER_REQUIRED_NOTICE,
                 },
-                "next_command": "fw sortformer-diarize --input AUDIO --receipt RECEIPT --package PACKAGE",
+                "next_command": if sortformer_available {
+                    "fw sortformer-diarize --input AUDIO"
+                } else {
+                    "fw pull sortformer --json"
+                },
             }
         ],
-    })
+    }))
 }
 
 /// Produce detect-only installation diagnostics and exact next commands.
 #[must_use]
 pub fn doctor_report_value(db_path: &Path) -> serde_json::Value {
+    doctor_report_value_with_cancel(db_path, || false)
+        .expect("an uncancelled doctor report must not be interrupted")
+}
+
+/// Cancellation-correct form of [`doctor_report_value`].
+pub fn doctor_report_value_with_cancel<F>(
+    db_path: &Path,
+    is_cancelled: F,
+) -> FwResult<serde_json::Value>
+where
+    F: Fn() -> bool + Sync,
+{
     let health = build_health_report(db_path);
     let health_value = health_report_value(&health);
-    let models = models_report_value();
+    let models = models_report_value_with_cancel(is_cancelled)?;
     let whisper_ready = models["models"]
         .as_array()
         .and_then(|entries| {
             entries
                 .iter()
                 .find(|entry| entry["id"] == "native-whisper-ggml")
+        })
+        .and_then(|entry| entry["installed"].as_bool())
+        .unwrap_or(false);
+    let sortformer_ready = models["models"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["id"] == crate::sortformer_conformance::SORTFORMER_MODEL_ID)
         })
         .and_then(|entry| entry["installed"].as_bool())
         .unwrap_or(false);
@@ -1060,8 +1108,14 @@ pub fn doctor_report_value(db_path: &Path) -> serde_json::Value {
             "command": "fw capabilities --json",
         }));
     }
+    if !sortformer_ready {
+        recommendations.push(json!({
+            "reason": "the optional native Sortformer diarization package is not cached",
+            "command": "fw pull sortformer --json",
+        }));
+    }
 
-    json!({
+    Ok(json!({
         "schema_version": "franken-whisper-doctor-v1",
         "mode": "detect_only",
         "mutations_performed": false,
@@ -1074,23 +1128,39 @@ pub fn doctor_report_value(db_path: &Path) -> serde_json::Value {
             "transcription": if transcription_ready { "ready" } else { "unavailable" },
             "persistence": if health.database.available { "ready" } else { "optional_unavailable" },
             "ffmpeg_fallback": if health.ffmpeg.available { "ready" } else { "optional_unavailable" },
-            "sortformer": "evaluation_only_requires_explicit_operator_local_artifacts",
+            "sortformer": if sortformer_ready {
+                "native_explicit_ready_auto_certification_pending"
+            } else {
+                "missing_release_artifact_run_fw_pull_sortformer"
+            },
         },
         "health": health_value,
         "model_registry": models,
         "recommendations": recommendations,
-    })
+    }))
 }
 
 /// Single-round-trip orientation payload for software agents.
 #[must_use]
 pub fn triage_report_value(db_path: &Path) -> serde_json::Value {
-    let doctor = doctor_report_value(db_path);
+    triage_report_value_with_cancel(db_path, || false)
+        .expect("an uncancelled triage report must not be interrupted")
+}
+
+/// Cancellation-correct form of [`triage_report_value`].
+pub fn triage_report_value_with_cancel<F>(
+    db_path: &Path,
+    is_cancelled: F,
+) -> FwResult<serde_json::Value>
+where
+    F: Fn() -> bool + Sync,
+{
+    let doctor = doctor_report_value_with_cancel(db_path, is_cancelled)?;
     let ready = doctor["ready"].as_bool().unwrap_or(false);
     let model_entries = doctor["model_registry"]["models"]
         .as_array()
         .map_or(0, Vec::len);
-    json!({
+    Ok(json!({
         "schema_version": "franken-whisper-triage-v1",
         "quick_ref": {
             "version": env!("CARGO_PKG_VERSION"),
@@ -1111,7 +1181,7 @@ pub fn triage_report_value(db_path: &Path) -> serde_json::Value {
             .iter()
             .map(|(code, name, meaning)| json!({"code": code, "name": name, "meaning": meaning}))
             .collect::<Vec<_>>(),
-    })
+    }))
 }
 
 /// Compact built-in handbook that remains available in binary-only installs.
@@ -1123,8 +1193,8 @@ pub const fn robot_docs_guide() -> &'static str {
 3. Use `fw robot run --input AUDIO --backend auto` for NDJSON transcription.\n\
 4. Parse stdout only as JSON/NDJSON; diagnostics and tracing belong on stderr.\n\
 5. On failure, branch on the stable `FW-*` code from `fw capabilities --json`.\n\
-6. Sortformer remains evaluation-only and requires explicit operator-local receipt/package paths.\n\
-7. No command in this guide downloads model weights automatically.\n"
+6. Run `fw pull sortformer --json` once to install the hash-pinned model, license, notice, and receipt.\n\
+7. Downloads are explicit; transcription and diarization never access the network.\n"
 }
 
 /// Emit a single `health.report` NDJSON line to stdout.
@@ -6015,9 +6085,9 @@ mod tests {
     }
 
     #[test]
-    fn model_registry_keeps_sortformer_operator_local_and_exact() {
+    fn model_registry_keeps_sortformer_release_bound_and_exact() {
         let value = super::models_report_value();
-        assert_eq!(value["schema_version"], "franken-whisper-model-registry-v1");
+        assert_eq!(value["schema_version"], "franken-whisper-model-registry-v2");
         assert_eq!(value["network_access_performed"], false);
         assert_eq!(value["local_paths_emitted"], false);
         let entries = value["models"].as_array().expect("model entries");
@@ -6028,15 +6098,23 @@ mod tests {
         assert_eq!(sortformer["artifact"]["bytes"], 491_570_584_u64);
         assert_eq!(
             sortformer["artifact"]["redistribution"],
-            "operator_local_no_git_no_release"
+            crate::model_distribution::SORTFORMER_DISTRIBUTION_POLICY
         );
+        assert!(sortformer["installed"].is_boolean());
         assert_eq!(
-            sortformer["runtime_status"],
-            "evaluation_only_explicit_invocation"
+            sortformer["auto_routing_status"],
+            "certification_receipt_required"
         );
         let serialized = serde_json::to_string(&value).expect("model registry JSON");
         assert!(!serialized.contains("/Users/"));
         assert!(!serialized.contains("/home/"));
+    }
+
+    #[test]
+    fn model_registry_preserves_cache_hash_cancellation() {
+        let error = super::models_report_value_with_cancel(|| true)
+            .expect_err("cancelled readiness must not be reported as missing");
+        assert!(matches!(error, crate::error::FwError::Cancelled(_)));
     }
 
     #[test]
@@ -6065,7 +6143,7 @@ mod tests {
         let guide = super::robot_docs_guide();
         assert!(guide.contains("fw robot triage"));
         assert!(guide.contains("fw models --json"));
-        assert!(guide.contains("operator-local"));
-        assert!(guide.contains("downloads model weights automatically"));
+        assert!(guide.contains("fw pull sortformer --json"));
+        assert!(guide.contains("Downloads are explicit"));
     }
 }

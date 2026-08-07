@@ -119,6 +119,13 @@ storage.sqlite3-shm
 
 # Confidential transcript sidecars must remain outside the repository
 *transcript*.md
+
+# Downloaded Sortformer release assets belong in the per-user model cache,
+# never in the source checkout. The small hash-pinned manifest and notice are
+# the only model-distribution artifacts intentionally tracked here.
+weights.safetensors
+conversion-receipt.json
+NVIDIA-OPEN-MODEL-LICENSE.html
 *[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[mM][dD]
 *[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[tT][xX][tT]
 *[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[jJ][sS][oO][nN]
@@ -223,6 +230,7 @@ storage.sqlite3-wal.corrupt-*
 *.log
 nohup.out
 /*.txt
+!/NOTICE.sortformer.txt
 /*.py
 /*.sh
 /*.json

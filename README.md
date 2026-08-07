@@ -38,6 +38,7 @@ fw --version
 fw robot triage
 fw capabilities --json
 fw models --json
+fw pull sortformer --json
 fw doctor --json
 fw robot schema
 ```
@@ -46,10 +47,14 @@ fw robot schema
 errors are also emitted as one path-safe JSON object on stdout with exit code
 2; runtime failures use one of the 13 exact `FW-*` codes published by
 `fw capabilities --json`. Discovery and doctor commands do not download
-models. A doctor `ready` result is static preflight evidence only; the payload
-sets `operationally_verified: false` until an actual transcription succeeds.
-The 491,570,584-byte native Sortformer package is evaluation-only and must
-remain operator-local: it is never stored in Git or attached to a release.
+models. `fw pull sortformer` is the only built-in Sortformer network path: it
+streams the separately licensed release package into the per-user cache and
+admits it only after all four embedded size/SHA-256 trust roots pass. A doctor
+`ready` result is static preflight evidence only; the payload sets
+`operationally_verified: false` until an actual transcription succeeds. The
+491,570,584-byte weights are never stored in Git; they are distributed as the
+`sortformer-v2.1-f32-v1` GitHub release artifact beside the NVIDIA Open Model
+License, required notice, and deterministic conversion receipt.
 
 > **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels, `#![forbid(unsafe_code)]` in-crate) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md).
 >
@@ -565,14 +570,43 @@ f32 graph in process through L8 anonymous speaker turns. The explicit
 evaluation-only command accepts every audio format supported by the normalizer:
 
 ```bash
-franken_whisper sortformer-diarize \
-  --input call.m4a \
-  --receipt /operator/local/conversion-receipt.json \
-  --package /operator/local/weights.safetensors
+fw pull sortformer --json
+fw sortformer-diarize --input call.m4a
+
+# Optional caller assertions/suggestions for anonymous-lane mapping:
+fw sortformer-diarize --input call.m4a --speaker-hints /private/hints.json
 ```
 
-It emits one path-free `sortformer-diarization-v1` JSON object with anonymous
-speaker lanes, turns, inferred active-lane count, and timing. It cannot be
+The bounded hint file can be a bare interval array or this versioned form:
+
+```json
+{
+  "schema_version": "speaker-hints-v1",
+  "known_intervals": [
+    {
+      "speaker_ref": "speaker-a",
+      "start_ms": 1200,
+      "end_ms": 4800,
+      "confidence": 1.0,
+      "policy": "hard_must_link",
+      "provenance": "caller-context"
+    }
+  ]
+}
+```
+
+`fw pull` is explicit, restartable across verified per-file cache hits, cooperative
+under Ctrl+C, and never emits cache paths in JSON mode. The diarization command
+rehashes the cached package and conversion receipt, runs completely offline,
+and emits one path-free `sortformer-diarization-v1` object with turns, inferred
+active-lane count, timing, and the candid capacity status
+`four_lane_capped_output_true_speaker_count_unknown`; an inferred lane count is
+never presented as proof that the recording contains no additional speakers.
+Hard known intervals may bind a
+unique anonymous lane to a caller-provided opaque reference; contradictory or
+ambiguous hard evidence fails closed. Soft intervals remain non-authoritative
+suggestions, every non-hard-bound lane remains anonymous, and inference never
+mutates model weights. It cannot yet be
 selected by `--diarization-engine auto`. On the frozen 25-second overlap-heavy
 two-speaker public clip, the native output scored DER `0.058904110` and JER
 `0.065850064`; that is one evidence row, not broad accuracy certification.
@@ -581,8 +615,13 @@ to the physical audio duration. One chained L6 hard-top-k tie remains
 platform-defined, so the command reports `evaluation_only` and automatic
 promotion remains forbidden. The converted f32 package is 491,570,584 bytes
 (SHA-256 `487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a`).
-Its authenticated policy is `operator_local_no_git_no_release`: neither the
-original nor converted model is stored in Git or attached to GitHub releases.
+Its distribution policy is `github_release_with_license_and_notice`: weights
+remain outside Git and are attached to the dedicated model release with the
+license, notice, and authenticated conversion receipt.
+The default cache is `~/.cache/franken_whisper/models`; an override through
+`FRANKEN_WHISPER_MODEL_DIR` must be absolute. Partially downloaded files retain
+hidden staging names for diagnosis and are never admitted as model artifacts.
+Speaker-hints JSON must be a bounded regular non-symlink file.
 Full proof details and current performance/resource rows are in
 [`SORTFORMER_RUST_PORT.md`](docs/SORTFORMER_RUST_PORT.md).
 The external Sortformer adapter's version probe must bind the frozen contract
@@ -594,8 +633,8 @@ algorithms enabled, zero data-loader workers, eight PyTorch intra-op threads,
 and one inter-op thread. Output labels are arrival-ordered `speaker_0` through
 `speaker_3`; a reference containing five or more speakers is retained as an
 explicit model-capacity skip rather than being dropped or forced into four
-labels. The model and NeMo runtime remain operator-installed and no weights are
-downloaded by `franken_whisper`.
+labels. The external Python/NeMo oracle remains operator-installed. This is
+separate from the native Rust runtime's explicit `fw pull sortformer` cache.
 The full adapter protocol, environment overrides, privacy rules, and authority
 boundary are in the
 [`acoustic diarization contract`](docs/acoustic_diarization_contract.md#114-stage-aware-external-differential-oracles).
@@ -1246,6 +1285,7 @@ Built on the [FrankenTUI](https://github.com/Dicklesworthstone/frankentui) frame
 | `FRANKEN_WHISPER_NATIVE_EXECUTION` | `0` | Enable in-process native engine dispatch |
 | `FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY` | `1` | In bridge-only mode, allow recoverable bridge failures to fall back to native engines |
 | `FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE` | `primary` | Native engine rollout stage (see below) |
+| `FRANKEN_WHISPER_MODEL_DIR` | `~/.cache/franken_whisper/models` | Model root used by native Whisper/auxiliary discovery and `fw pull sortformer`; the pull path requires an absolute override |
 | `XDG_STATE_HOME` | `$HOME/.local/state` | Base for auto-provisioned ffmpeg + per-user tool state |
 | `RUST_LOG` | — | tracing filter (e.g. `franken_whisper=debug`) |
 
@@ -3129,7 +3169,7 @@ With the release profile (`opt-level = 3`, full LTO, stripped):
 | Backend engines | 3 bridge adapters + 3 paired native pilots under rollout governance |
 | Pipeline stages | 10 (composable, independently budgeted) |
 | Stage budget knobs | 12 (10 stages + probe + cleanup) |
-| CLI subcommands | 15 (including `capabilities`, `models`, `doctor`, `robot-docs`, and explicit `sortformer-diarize`) |
+| CLI subcommands | 16 (including `capabilities`, `models`, `pull`, `doctor`, `robot-docs`, and explicit `sortformer-diarize`) |
 | CLI flags (`transcribe`) | 70+ (inference, VAD, diarization, speculative, audio windowing, word timestamps) |
 | Robot event types | 12 (run lifecycle, stage, speculation, health, routing, transcript) |
 | TTY control frame types | 10 (`Handshake`, `HandshakeAck`, `Ack`, `RetransmitRequest`, `RetransmitResponse`, `Backpressure`, `TranscriptPartial`, `TranscriptRetract`, `TranscriptCorrect`, `SessionClose`) |
@@ -3213,8 +3253,8 @@ to the source tree. The last two are optional feature crates at runtime, but
 Cargo still resolves their path manifests during a clean release build.
 
 ```bash
-dsr build franken_whisper --version 0.5.0 --dry-run
-dsr build franken_whisper --version 0.5.0
+dsr build franken_whisper --version 0.6.0 --dry-run
+dsr build franken_whisper --version 0.6.0
 ```
 
 [`dist.yml`](.github/workflows/dist.yml) is a manually dispatched,
@@ -4293,7 +4333,7 @@ The release profile (`opt-level = 3`, `lto = true`, `codegen-units = 1`, `panic 
 - **A hostile audio file** (e.g., crafted to exploit a decoder vulnerability). `symphonia` is a pure-Rust decoder with strong safety guarantees; the ffmpeg fallback path is constrained by `-vn -ar 16000 -ac 1 -c:a pcm_s16le` so options injection is hard, but a zero-day in the decoder itself is out of scope.
 - **A hostile model file.** Whisper models are downloaded by the backend, not by `franken_whisper`. Pin model checksums in your deployment if this matters.
 - **Side-channel leaks from inference timing.** Latency profiling produces visible timing data; an attacker who can observe `orchestration.latency_profile` events could in theory infer audio properties. In the intended single-user threat model this is not a concern.
-- **Network adversaries.** `franken_whisper` does no network I/O during transcription. The only network-adjacent code is the optional ffmpeg auto-provisioner (Linux x86_64, HTTPS download from `johnvansickle.com`) and HuggingFace model fetching by the diarization backend. Both can be disabled.
+- **Network adversaries.** `franken_whisper` does no network I/O during transcription. Network access is confined to explicit provisioning paths: `fw pull sortformer`, the optional ffmpeg auto-provisioner (Linux x86_64), and model fetching by an external diarization backend. Deploy the verified cache and disable provisioning for air-gapped use.
 
 ### Trust boundaries
 
