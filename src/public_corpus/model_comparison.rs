@@ -53,7 +53,7 @@ pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION: &str =
 pub const PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION: &str =
     "public-diarization-model-comparison-outcomes-v3";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256: &str =
-    "ae676adfdda66897e5bd56d8acef4f720bb294c5a99cb37ac3d040018459fc20";
+    "af046e2f7060590d6d94421f404040a75a006ddcaaef37e79bf92e888a1cd04b";
 pub const PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION: &str = "five-lane-balanced-williams-v1";
 pub const PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS: u64 = 1_800;
 const MODEL_COMPARISON_WORKER_SCHEMA_VERSION: &str = "public-model-comparison-worker-v1";
@@ -1598,7 +1598,7 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         sortformer_output_frame_ms: SORTFORMER_ORACLE_OUTPUT_FRAME_MS,
         attempt_hard_timeout_seconds: PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS,
         worker_schema_version: MODEL_COMPARISON_WORKER_SCHEMA_VERSION.to_owned(),
-        worker_process_policy: "one_fresh_process_per_lane_observation+attempt_deadline_covers_parent_request_worker_and_post_identity+cancellation_timeout_and_output_limits_checked_before_observation+bounded_observer_probe+checked_outer_process_group_descendant_termination+unix_group_absence_confirmation+initial_group_signal_error_is_success_only_after_certified_group_absence+unforgeable_inherited_parent_liveness_pipe_bound_to_direct_parent+abrupt_parent_death_self_terminates_complete_worker_group+nested_adapter_group_inheritance+live_size_bounded_nonblocking_pipe_capture_on_linux_android_apple+live_size_bounded_anonymous_file_capture_on_other_supported_platforms+fail_closed_without_recursive_termination_or_parent_liveness_authority+executable_audio_normalized_pcm_reference_protocol_scorer_identity_binding"
+        worker_process_policy: "one_fresh_process_per_lane_observation+attempt_deadline_covers_parent_request_worker_and_post_identity+cancellation_timeout_and_output_limits_checked_before_observation+bounded_observer_probe+resource_probe_checks_attempt_deadline_during_platform_scan+matched_live_group_members_require_complete_rss_field+zero_only_complete_sample_is_missing_not_measured+checked_outer_process_group_descendant_termination+unix_group_absence_confirmation+initial_group_signal_error_is_success_only_after_certified_group_absence+unforgeable_inherited_parent_liveness_pipe_bound_to_direct_parent+abrupt_parent_death_self_terminates_complete_worker_group+nested_adapter_group_inheritance+live_size_bounded_nonblocking_pipe_capture_on_linux_android_apple+live_size_bounded_anonymous_file_capture_on_other_supported_platforms+fail_closed_without_recursive_termination_or_parent_liveness_authority+executable_audio_normalized_pcm_reference_protocol_scorer_identity_binding"
             .to_owned(),
         worker_stdout_limit_bytes: crate::process::MAX_CAPTURED_OUTPUT_BYTES as u64,
         cancellation_probe_delay_ms: MODEL_COMPARISON_CANCEL_PROBE_DELAY_MS,
@@ -1964,7 +1964,25 @@ where
     let cancellation = CancellationToken::unbounded();
     let mut rss_sampler = ProcessTreeRssSampler::new();
     let command_result = {
-        let mut observer = |root_pid| rss_sampler.observe(root_pid, is_cancelled);
+        let attempt_stopped = || {
+            is_cancelled()
+                || remaining_attempt_budget(hard_timeout, attempt_started.elapsed()).is_none()
+        };
+        let mut observer = |root_pid| {
+            let result = rss_sampler.observe(root_pid, &attempt_stopped);
+            if is_cancelled() {
+                return Err(FwError::Cancelled(
+                    "public model comparison cancelled".to_owned(),
+                ));
+            }
+            if remaining_attempt_budget(hard_timeout, attempt_started.elapsed()).is_none() {
+                return Err(model_comparison_error(
+                    "worker_timeout",
+                    "the comparison attempt deadline expired during resource observation",
+                ));
+            }
+            result
+        };
         crate::process::run_command_cancellable_with_input_probe_and_observer(
             &program,
             &args,
@@ -2283,7 +2301,7 @@ fn sample_process_group_rss_bytes(
 ) -> FwResult<Option<u64>> {
     let started = Instant::now();
     let mut total_kib = 0u64;
-    let mut matched = false;
+    let mut matched_member = false;
     let entries = std::fs::read_dir("/proc").map_err(|_| {
         model_comparison_error(
             "worker_resource",
@@ -2314,31 +2332,66 @@ fn sample_process_group_rss_bytes(
             continue;
         };
         let process_root = entry.path();
-        let Ok(stat) = std::fs::read_to_string(process_root.join("stat")) else {
-            continue;
+        let stat = match std::fs::read_to_string(process_root.join("stat")) {
+            Ok(stat) => stat,
+            Err(_) if matches!(process_root.try_exists(), Ok(false)) => continue,
+            Err(_) => {
+                return Err(model_comparison_error(
+                    "worker_resource",
+                    "a live procfs process could not provide group identity",
+                ));
+            }
         };
         if linux_stat_process_group(&stat) != Some(root_pid) {
             continue;
         }
-        let status = std::fs::read_to_string(process_root.join("status")).map_err(|_| {
-            model_comparison_error(
+        let terminal_process =
+            linux_stat_process_state(&stat).is_some_and(|state| matches!(state, 'X' | 'x' | 'Z'));
+        let status = match std::fs::read_to_string(process_root.join("status")) {
+            Ok(status) => status,
+            Err(_) if matches!(process_root.try_exists(), Ok(false)) => continue,
+            Err(_) => {
+                return Err(model_comparison_error(
+                    "worker_resource",
+                    "a matched live procfs process could not provide status",
+                ));
+            }
+        };
+        let Some(rss_kib) = linux_status_rss_kib(&status) else {
+            if terminal_process {
+                matched_member = true;
+                continue;
+            }
+            return Err(model_comparison_error(
                 "worker_resource",
-                "a matched procfs process could not provide status",
-            )
-        })?;
-        let rss_kib = linux_status_rss_kib(&status).ok_or_else(|| {
-            model_comparison_error(
-                "worker_resource",
-                "a matched procfs process did not provide positive VmRSS",
-            )
-        })?;
+                "a matched live procfs process did not provide a valid VmRSS field",
+            ));
+        };
+        matched_member = true;
         total_kib = total_kib.checked_add(rss_kib).ok_or_else(|| {
             model_comparison_error("worker_resource", "the procfs RSS sum overflowed")
         })?;
-        matched = true;
     }
-    if !matched || total_kib == 0 {
+    if matched_member && total_kib == 0 {
         return Ok(None);
+    }
+    if !matched_member {
+        return match i32::try_from(root_pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            Some(process_group) => match rustix::process::test_kill_process_group(process_group) {
+                Err(error) if error == rustix::io::Errno::SRCH => Ok(None),
+                _ => Err(model_comparison_error(
+                    "worker_resource",
+                    "the live procfs worker group produced no complete RSS sample",
+                )),
+            },
+            None => Err(model_comparison_error(
+                "worker_resource",
+                "the procfs worker group identity was invalid",
+            )),
+        };
     }
     total_kib.checked_mul(1_024).map(Some).ok_or_else(|| {
         model_comparison_error("worker_resource", "the procfs RSS sample overflowed bytes")
@@ -2382,6 +2435,15 @@ fn linux_stat_process_group(stat: &str) -> Option<u32> {
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn linux_stat_process_state(stat: &str) -> Option<char> {
+    let after_command = stat.get(stat.rfind(") ")? + 2..)?;
+    let state = after_command.split_whitespace().next()?;
+    let mut chars = state.chars();
+    let value = chars.next()?;
+    chars.next().is_none().then_some(value)
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
 fn linux_status_rss_kib(status: &str) -> Option<u64> {
     let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
     let mut fields = line.split_whitespace();
@@ -2389,7 +2451,7 @@ fn linux_status_rss_kib(status: &str) -> Option<u64> {
         return None;
     }
     let value = fields.next()?.parse::<u64>().ok()?;
-    (fields.next()? == "kB" && fields.next().is_none() && value > 0).then_some(value)
+    (fields.next()? == "kB" && fields.next().is_none()).then_some(value)
 }
 
 fn verify_parent_worker_inputs<F>(
@@ -4930,12 +4992,23 @@ mod tests {
             linux_stat_process_group("123 (worker with spaces) S 7 123 123 0"),
             Some(123)
         );
+        assert_eq!(
+            linux_stat_process_state("123 (worker with spaces) S 7 123 123 0"),
+            Some('S')
+        );
+        assert_eq!(
+            linux_stat_process_state("123 (finished worker) Z 7 123 123 0"),
+            Some('Z')
+        );
         assert_eq!(linux_stat_process_group("malformed"), None);
+        assert_eq!(linux_stat_process_state("malformed"), None);
         assert_eq!(
             linux_status_rss_kib("Name:\tx\nVmRSS:\t4096 kB\n"),
             Some(4_096)
         );
-        assert_eq!(linux_status_rss_kib("VmRSS:\t0 kB\n"), None);
+        assert_eq!(linux_status_rss_kib("VmRSS:\t0 kB\n"), Some(0));
+        assert_eq!(linux_status_rss_kib("VmRSS:\t0 bytes\n"), None);
+        assert_eq!(linux_status_rss_kib("Name:\tx\n"), None);
     }
 
     #[test]
@@ -4955,6 +5028,20 @@ mod tests {
             .expect("one terminal race is allowed");
         assert!(sampler.retain_observation(Ok(None)).is_err());
         assert!(sampler.finish().is_err());
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn process_tree_rss_sampler_propagates_cancellation_before_observation() {
+        let mut sampler = ProcessTreeRssSampler::new();
+        let error = sampler
+            .observe(std::process::id(), &|| true)
+            .expect_err("a stopped attempt must not start or retain an RSS sample");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert_eq!(
+            sampler.finish().expect("cancellation is not probe failure"),
+            None
+        );
     }
 
     #[cfg(target_vendor = "apple")]

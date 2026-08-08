@@ -232,23 +232,35 @@ NeMo lane identities matched, but boundaries differed at native/reference
 The first chained cache-state or threshold divergence must be localized before
 the f32 route can pass its complete L7/L8 gate.
 
-The current resource row was reproduced by protocol v5 in five fresh workers,
+The current resource row was reproduced by protocol v6 in five fresh workers,
 and all five lanes completed, so its common-complete intersection contains one
 recording. The comparison executable SHA-256 is
-`879a81289995e7d13381f27423756caa34bdbdb24f50f34a2f455918d92d0ab1`,
+`2816def9153aeed644b86aa8c480a046a8b18a4a3414fe4bc73926988142ee0d`,
 the protocol SHA-256 is
-`54a4f4681e5a3c0297d00c876ce701cdae9a933b9fc7c6027fa33c0de062467c`,
+`af046e2f7060590d6d94421f404040a75a006ddcaaef37e79bf92e888a1cd04b`,
 the aggregate result SHA-256 is
-`9bd245a74dbcc762df0555b57fdc57762e32f8fd9e046fe288eaf0cd484258b7`,
+`418a5a6337851ae6ff6cffd2f485a71d04be40faebc2862ca7f19fcf8e07452b`,
+the bundle-file SHA-256 is
+`0860d2b5112b6c01813a6b7ecaec84a73e3e4ca26317cd27a7bd4798bcf05bf9`,
 and the evidence-file SHA-256 is
-`ebd85336e165e65f716d29c15420ff78280881a48943700ead15eff3f07be68b`.
-The 39 ms cancellation probe used the same bounded observer path as real
-lanes, and successful cleanup verified disappearance of the owned Unix process
-group. RSS is an approximate sampled process-group sum whose sample starts are
-at least 50 ms apart, not an exact high-water mark. This v5 row supersedes the
-v4 resource/cancellation evidence. It is still only one development
-observation, not a complete ten-row Williams schedule, a multi-condition
-accuracy gate, or production-route authorization.
+`655953efe564a9ae5697e8017876c961e96c5b1f8deb1b0aaad5f131aca409ac`.
+The real artifact pair validated and the retained tamper regression rejected a
+self-consistently rehashed bundle-identity substitution. Every lane retained a
+37 ms cancellation probe through the same bounded observer path used by real
+attempts. Native acoustic, ECAPA, fused ECAPA, native Sortformer, and external
+Sortformer respectively recorded RTF `0.009794`, `0.023725`, `0.023804`,
+`0.080059`, and `0.125304`, with sampled whole-process-tree RSS of 22,544,384,
+249,888,768, 251,822,080, 1,359,282,176, and 2,213,494,784 bytes. The external
+lane honestly failed the frozen 2 GiB cap; the native lane passed it. Native and
+external Sortformer DER were `0.021214713430` and `0.019846022241` on this row.
+RSS remains an approximate sampled process-group sum whose sample starts are at
+least 50 ms apart, not an exact high-water mark. Protocol v6 additionally checks
+cancellation and the attempt deadline inside platform scans, rejects silent
+omission of matched live Linux group members, and treats a complete zero-only
+scan as missing rather than measured zero. This v6 row supersedes the v5
+resource/cancellation evidence. It is still only one development observation,
+not a complete ten-row Williams schedule, a multi-condition accuracy gate, or
+production-route authorization.
 
 The exact-score L6 compression test passes inside the frozen numeric envelope.
 The full chained run nevertheless diverges at `iqtde` step 002 because the

@@ -1130,11 +1130,16 @@ including nested subprocess adapters. Sample starts are no closer than 50 ms,
 and each platform probe has its own fixed bound; this is not an exact process
 high-water mark or a promise of exactly 50 ms between samples. A worker that
 exits before any sample is explicitly unavailable, while repeated disappearance
-of a still-live group fails the resource probe. Wall time, RTF, sampled
-whole-tree RSS, and cancellation latency carry explicit scope, authority, and
-cap dispositions rather than zero or shared-process estimates. The companion path-free public bundle is record-level scorer
-input and therefore retains opaque public recording/speaker IDs and reference
-timestamps, but no source path, filename, audio, or transcript.
+of a still-live group fails the resource probe. The platform scan checks both
+cancellation and the enclosing attempt deadline. A matched live Linux group
+member cannot be silently omitted: every such member must expose a valid RSS
+field. A complete zero-only scan is treated as a missing sample, never as a
+measured zero, and repeated zero-only observations fail closed. Wall time, RTF,
+sampled whole-tree RSS, and cancellation latency carry explicit scope,
+authority, and cap dispositions rather than zero or shared-process estimates.
+The companion path-free public bundle is record-level scorer input and therefore
+retains opaque public recording/speaker IDs and reference timestamps, but no
+source path, filename, audio, or transcript.
 
 `verify_public_model_comparison_bundle_identity_pair` validates both retained
 artifacts and proves that their corpus, source, descriptor, bundle, split, and

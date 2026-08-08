@@ -1461,7 +1461,11 @@ checks precede observation. The retained cancellation probe exercises this same
 observer path. On Unix, cleanup reaps the root and confirms that the owned
 process group disappeared; cleanup failure overrides the nominal lane result.
 A fast exit without a sample is explicitly unavailable, while repeated loss of
-a still-live group fails the resource probe. Recursive-process cancellation
+a still-live group fails the resource probe. Platform scans check cancellation
+and the enclosing attempt deadline. A matched live Linux group member cannot be
+silently omitted: it must expose a valid RSS field. A complete zero-only scan is
+missing rather than a measured zero, and repeated zero-only scans fail closed.
+Recursive-process cancellation
 latency is retained separately; unavailable platform probes remain explicitly
 unavailable rather than becoming zero. The comparison command downloads no
 model. `native_sortformer` uses only the release-bound cache installed by the
