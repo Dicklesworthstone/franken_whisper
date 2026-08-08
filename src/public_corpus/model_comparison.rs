@@ -53,7 +53,7 @@ pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION: &str =
 pub const PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION: &str =
     "public-diarization-model-comparison-outcomes-v3";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+    "54a4f4681e5a3c0297d00c876ce701cdae9a933b9fc7c6027fa33c0de062467c";
 pub const PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION: &str = "five-lane-balanced-williams-v1";
 pub const PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS: u64 = 1_800;
 const MODEL_COMPARISON_WORKER_SCHEMA_VERSION: &str = "public-model-comparison-worker-v1";
@@ -1598,7 +1598,7 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         sortformer_output_frame_ms: SORTFORMER_ORACLE_OUTPUT_FRAME_MS,
         attempt_hard_timeout_seconds: PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS,
         worker_schema_version: MODEL_COMPARISON_WORKER_SCHEMA_VERSION.to_owned(),
-        worker_process_policy: "one_fresh_process_per_lane_observation+attempt_deadline_covers_parent_request_worker_and_post_identity+outer_process_group_descendant_termination+nested_adapter_group_inheritance+live_size_bounded_nonblocking_pipe_capture_on_linux_android_apple+live_size_bounded_anonymous_file_capture_on_other_supported_platforms+fail_closed_without_recursive_termination+executable_audio_normalized_pcm_reference_protocol_scorer_identity_binding"
+        worker_process_policy: "one_fresh_process_per_lane_observation+attempt_deadline_covers_parent_request_worker_and_post_identity+cancellation_timeout_and_output_limits_checked_before_observation+bounded_observer_probe+checked_outer_process_group_descendant_termination+unix_group_absence_confirmation+nested_adapter_group_inheritance+live_size_bounded_nonblocking_pipe_capture_on_linux_android_apple+live_size_bounded_anonymous_file_capture_on_other_supported_platforms+fail_closed_without_recursive_termination+executable_audio_normalized_pcm_reference_protocol_scorer_identity_binding"
             .to_owned(),
         worker_stdout_limit_bytes: crate::process::MAX_CAPTURED_OUTPUT_BYTES as u64,
         cancellation_probe_delay_ms: MODEL_COMPARISON_CANCEL_PROBE_DELAY_MS,
@@ -1623,7 +1623,7 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
             "fixed_safe_v1_change+probabilistic_v1_clustering+unknown_fallback".to_owned(),
         sortformer_postprocessing: "native_l8_and_pinned_external_sortformer_oracle_contract_v2"
             .to_owned(),
-        wall_time_policy: "fresh_process_per_lane_and_observation;process_launch+bounded_ipc+identity_validation+audio_decode+model_load+inference+output_validation+scorer+parent_post_identity+resource_probe;matched_timeout_and_thread_policy;cross_lane_comparable;peak_rss_is_maximum_concurrently_sampled_sum_across_worker_process_group_including_descendant_adapters".to_owned(),
+        wall_time_policy: "fresh_process_per_lane_and_observation;process_launch+bounded_ipc+identity_validation+audio_decode+model_load+inference+output_validation+scorer+parent_post_identity+resource_probe;matched_timeout_and_thread_policy;cross_lane_comparable;sampled_peak_rss_is_maximum_observed_approximate_process_group_sum_including_descendant_adapters;sample_starts_are_no_closer_than_the_minimum_interval;unsupported_or_fast_exit_without_sample_is_explicitly_unavailable".to_owned(),
         aggregate_only: true,
         production_route_changed: false,
     })
@@ -1683,7 +1683,7 @@ where
             "the fresh-process cancellation probe did not terminate by cancellation",
         ));
     }
-    if rss_sampler.finish()?.is_none() {
+    if rss_sampler.supported() && rss_sampler.finish()?.is_none() {
         return Err(model_comparison_error(
             "worker_cancellation_probe",
             "the live cancellation path did not retain a whole-process-tree RSS sample",
@@ -2100,6 +2100,10 @@ impl ProcessTreeRssSampler {
         self.failed
     }
 
+    const fn supported(&self) -> bool {
+        self.supported
+    }
+
     fn finish(&self) -> FwResult<Option<u64>> {
         if self.failed {
             return Err(model_comparison_error(
@@ -2117,7 +2121,7 @@ fn sample_process_group_rss_bytes(
     is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> FwResult<Option<u64>> {
     let cancellation = CancellationToken::unbounded();
-    let output = crate::process::run_command_cancellable_with_probe(
+    let output = match crate::process::run_command_cancellable_with_probe(
         "/bin/ps",
         &[
             "-o".to_owned(),
@@ -2131,14 +2135,21 @@ fn sample_process_group_rss_bytes(
             MODEL_COMPARISON_PROCESS_TREE_RSS_PROBE_TIMEOUT_MS,
         )),
         Some(is_cancelled),
-    )
-    .map_err(|error| match error {
-        error @ FwError::Cancelled(_) => error,
-        _ => model_comparison_error(
-            "worker_resource",
-            "the bounded macOS RSS probe could not complete",
-        ),
-    })?;
+    ) {
+        Ok(output) => output,
+        Err(error @ FwError::Cancelled(_)) => return Err(error),
+        Err(FwError::CommandFailed {
+            status: 1,
+            stderr_suffix,
+            ..
+        }) if stderr_suffix.is_empty() => return Ok(None),
+        Err(_) => {
+            return Err(model_comparison_error(
+                "worker_resource",
+                "the bounded macOS RSS probe could not complete",
+            ));
+        }
+    };
     parse_process_group_rss_kib(&output.stdout)?.map_or(Ok(None), |kib| {
         kib.checked_mul(1_024).map(Some).ok_or_else(|| {
             model_comparison_error("worker_resource", "the macOS RSS sample overflowed bytes")
@@ -4829,6 +4840,29 @@ mod tests {
             .expect("one terminal race is allowed");
         assert!(sampler.retain_observation(Ok(None)).is_err());
         assert!(sampler.finish().is_err());
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn mac_process_tree_rss_sampler_recognizes_a_disappeared_group() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().expect("spawn isolated process group");
+        let root_pid = child.id();
+        assert!(child.wait().expect("reap isolated process group").success());
+
+        assert_eq!(
+            sample_process_group_rss_bytes(root_pid, &|| false)
+                .expect("a disappeared process group is a terminal race, not a probe failure"),
+            None
+        );
     }
 
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
