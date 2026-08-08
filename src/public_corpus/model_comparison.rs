@@ -2050,11 +2050,7 @@ impl ProcessTreeRssSampler {
         }
     }
 
-    fn observe(
-        &mut self,
-        root_pid: u32,
-        is_cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> FwResult<()> {
+    fn observe(&mut self, root_pid: u32, is_cancelled: &(dyn Fn() -> bool + Sync)) -> FwResult<()> {
         if !self.supported
             || self.last_sample.is_some_and(|sampled_at| {
                 sampled_at.elapsed()
@@ -2123,7 +2119,12 @@ fn sample_process_group_rss_bytes(
     let cancellation = CancellationToken::unbounded();
     let output = crate::process::run_command_cancellable_with_probe(
         "/bin/ps",
-        &["-o".to_owned(), "rss=".to_owned(), "-g".to_owned(), root_pid.to_string()],
+        &[
+            "-o".to_owned(),
+            "rss=".to_owned(),
+            "-g".to_owned(),
+            root_pid.to_string(),
+        ],
         None,
         &cancellation,
         Some(Duration::from_millis(
@@ -2134,9 +2135,9 @@ fn sample_process_group_rss_bytes(
     .map_err(|error| match error {
         error @ FwError::Cancelled(_) => error,
         _ => model_comparison_error(
-                "worker_resource",
-                "the bounded macOS RSS probe could not complete",
-            ),
+            "worker_resource",
+            "the bounded macOS RSS probe could not complete",
+        ),
     })?;
     parse_process_group_rss_kib(&output.stdout)?.map_or(Ok(None), |kib| {
         kib.checked_mul(1_024).map(Some).ok_or_else(|| {
@@ -3837,36 +3838,71 @@ pub fn verify_public_model_comparison_bundle_identity_pair(
 ) -> FwResult<()> {
     super::verify_public_corpus_bundle(bundle)?;
     verify_public_model_comparison_evidence(evidence)?;
-    let recording_count = u64::try_from(bundle.references.len()).map_err(|_| {
+    let bundle_identity = model_comparison_bundle_identity(bundle).ok_or_else(|| {
         model_comparison_error(
             "bundle_pair",
-            "the public bundle recording count exceeds the comparison schema",
+            "the public bundle cannot produce one uniform comparison identity",
         )
     })?;
-    let split_matches = bundle
-        .recordings
-        .iter()
-        .all(|recording| recording.split == evidence.evaluation_split)
-        && bundle
-            .manifest
-            .recordings
-            .iter()
-            .all(|recording| recording.split == evidence.evaluation_split);
-    if bundle.corpus_key != evidence.corpus_key
-        || bundle.source_version != evidence.source_version
-        || bundle.descriptor_sha256 != evidence.descriptor_sha256
-        || bundle.bundle_sha256 != evidence.bundle_sha256
-        || bundle.references.len() != bundle.recordings.len()
-        || bundle.references.len() != bundle.manifest.recordings.len()
-        || recording_count != evidence.observation_count
-        || !split_matches
-    {
+    if bundle_identity != model_comparison_evidence_identity(evidence) {
         return Err(model_comparison_error(
             "bundle_pair",
             "the public bundle and model-comparison evidence identities do not match",
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ModelComparisonArtifactIdentity<'a> {
+    corpus_key: &'a str,
+    source_version: &'a str,
+    descriptor_sha256: &'a str,
+    bundle_sha256: &'a str,
+    evaluation_split: EvaluationSplit,
+    observation_count: u64,
+}
+
+fn model_comparison_bundle_identity(
+    bundle: &super::PublicCorpusBundle,
+) -> Option<ModelComparisonArtifactIdentity<'_>> {
+    let observation_count = u64::try_from(bundle.references.len()).ok()?;
+    let evaluation_split = bundle.recordings.first()?.split;
+    if bundle.references.len() != bundle.recordings.len()
+        || bundle.references.len() != bundle.manifest.recordings.len()
+        || !bundle
+            .recordings
+            .iter()
+            .all(|recording| recording.split == evaluation_split)
+        || !bundle
+            .manifest
+            .recordings
+            .iter()
+            .all(|recording| recording.split == evaluation_split)
+    {
+        return None;
+    }
+    Some(ModelComparisonArtifactIdentity {
+        corpus_key: &bundle.corpus_key,
+        source_version: &bundle.source_version,
+        descriptor_sha256: &bundle.descriptor_sha256,
+        bundle_sha256: &bundle.bundle_sha256,
+        evaluation_split,
+        observation_count,
+    })
+}
+
+fn model_comparison_evidence_identity(
+    evidence: &PublicModelComparisonEvidence,
+) -> ModelComparisonArtifactIdentity<'_> {
+    ModelComparisonArtifactIdentity {
+        corpus_key: &evidence.corpus_key,
+        source_version: &evidence.source_version,
+        descriptor_sha256: &evidence.descriptor_sha256,
+        bundle_sha256: &evidence.bundle_sha256,
+        evaluation_split: evidence.evaluation_split,
+        observation_count: evidence.observation_count,
+    }
 }
 
 fn sortformer_runtime_identity_required(outcomes: &ModelComparisonOutcomeCounts) -> bool {
