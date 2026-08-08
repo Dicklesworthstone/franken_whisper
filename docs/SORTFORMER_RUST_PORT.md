@@ -180,7 +180,7 @@ The distribution policy is therefore:
 This is a repository policy, not legal advice and not a claim that every future
 form of redistribution is permitted.
 
-### 3.1 Native proof snapshot (2026-08-07)
+### 3.1 Native proof snapshot (2026-08-08)
 
 The safe Rust f32 graph now loads the authenticated 491,570,584-byte package,
 runs the frozen streaming schedule through all 17 FastConformer and 18
@@ -197,7 +197,7 @@ The current local Apple M4 Pro evidence snapshot is:
 |---|---:|
 | Public fixture | VoxConverse `mevkw`, samples 0..400000, 25.0 s, overlap, two reference speakers |
 | L5 production probability drift | max abs `6.854534149e-7`; relative L2 `9.072629352e-8` |
-| L7/L8 comparison | byte-exact against authenticated public outputs before physical-duration clamping |
+| Reconstructable-prefix L7/L8 comparison | byte-exact against authenticated public outputs before physical-duration clamping |
 | Authoritative transcript-free DER / JER | `0.058904110` / `0.065850064` |
 | DER components | miss `0.92 s`; false alarm `0.80 s`; confusion `0.00 s` |
 | Native inference / audio / RTF | `31.749242 s` / `25.0 s` / `1.269970` |
@@ -209,6 +209,10 @@ The current local Apple M4 Pro evidence snapshot is:
 | Release package admission / session materialization / combined model load | `1.904567 s` / `0.428503 s` / `2.333070 s` |
 | Release end-to-end wall time | `6.13 s` |
 | Release peak RSS | `1,368,850,432` bytes |
+| Whole-recording same-invocation comparison | VoxConverse `mevkw`, 102.0 s: native DER/JER `0.021214713430` / `0.029991623791`; NeMo DER/JER `0.019846022241` / `0.029477961362` |
+| Whole-recording native resource row | wall `9.251 s`; RTF `0.090696078431`; 50 ms whole-tree RSS `1,360,838,656` bytes |
+| Whole-recording NeMo resource row | wall `12.957 s`; RTF `0.127029411765`; 50 ms whole-tree RSS `2,213,019,648` bytes; frozen 2 GiB cap failed |
+| Whole-recording L8 discrepancy | Four one-frame (80 ms) boundary differences among 16 anonymous turns; broad byte-exact L7/L8 parity remains open |
 
 These are real local runtime and accuracy observations. The optimized release
 row is about 23.4 times faster than real time on this one Apple M4 Pro input;
@@ -219,6 +223,21 @@ the before/after timings above were separate invocations and therefore are not
 a ledger-qualified optimization win. A frozen multi-record public evaluation,
 same-invocation baseline comparison, 90-minute resource row, and further
 profile-guided optimization remain required.
+
+The 102-second row is a loss report, not a tolerance change. The native and
+NeMo lane identities matched, but boundaries differed at native/reference
+`13840/13760` ms (start), `64800/64880` ms (end), `74480/74400` ms (end), and
+`101840/101760` ms (end). This supersedes any interpretation that the exact
+25-second reconstructable-prefix result proves whole-recording discrete parity.
+The first chained cache-state or threshold divergence must be localized before
+the f32 route can pass its complete L7/L8 gate.
+
+That row was produced by protocol v4 in five fresh workers and all five lanes
+completed, so its common-complete intersection contains one recording. The
+aggregate evidence result SHA-256 is
+`53a256178b380113d6ccc8f1848749150988a3dcd188e122cf90f06bde0dcc6a`.
+It is still only one development observation, not a complete ten-row Williams
+schedule, a multi-condition accuracy gate, or production-route authorization.
 
 The exact-score L6 compression test passes inside the frozen numeric envelope.
 The full chained run nevertheless diverges at `iqtde` step 002 because the
@@ -992,7 +1011,7 @@ layer, and initially return `DifferentialStageDocument`. The strict Sortformer
 validator in `src/differential_oracle.rs` is the first output boundary.
 
 This slice must not change `DiarizationEngine`, automatic routing, or the
-production transcribe report contract. Comparison protocol v3 adds the native
+production transcribe report contract. Comparison protocol v4 adds the native
 Sortformer lane without changing product routing. The explicit
 `sortformer-diarize` command is a path-redacted evaluation surface over the
 same library session; it reports `evaluation_only` and cannot be selected by
@@ -1103,7 +1122,8 @@ Completed here:
 - exact-score L6 cache compression inside the frozen gate, plus an explicit
   unchanged-gate failure row for the platform-defined chained top-k tie;
 - byte-exact L7 activity/speech/overlap/change and L8 anonymous-turn parity on
-  every reconstructable full public tensor;
+  every reconstructable public truth-pack tensor, with the separately recorded
+  102-second whole-recording loss still open;
 - an authenticated `SortformerSession` with checked whole-recording streaming,
   neural-block cancellation checkpoints, bounded resource validation, and
   physical-duration tail clamping;

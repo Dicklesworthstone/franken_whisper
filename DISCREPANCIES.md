@@ -73,3 +73,24 @@
   hard/soft hint, clustering, projection, persistence, and rollout resolver
   tests.
 - **Review date:** 2026-07-28
+
+## DISC-007: Native Sortformer whole-recording boundaries are not yet byte-exact
+
+- **Reference:** The pinned NeMo Streaming Sortformer v2.1 adapter emits the
+  authenticated anonymous speaker turns for the same normalized public WAV.
+- **Our impl:** The safe Rust f32 route is byte-exact at L7/L8 on the frozen
+  25-second reconstructable `mevkw` truth-pack prefix, but the complete
+  102-second streaming execution differs from NeMo at four 80 ms boundaries
+  among 16 turns: native/reference `13840/13760` ms (start), `64800/64880` ms
+  (end), `74480/74400` ms (end), and `101840/101760` ms (end).
+- **Impact:** On this one public development row, native DER/JER is
+  `0.021214713430` / `0.029991623791` versus NeMo
+  `0.019846022241` / `0.029477961362`. Speaker-lane identities and the other
+  turn boundaries match, but broad whole-recording L7/L8 parity is disproven.
+- **Resolution:** **INVESTIGATING; not accepted.** Localize the first chained
+  cache-state, logit, or threshold divergence without widening the frozen
+  numeric gates. Keep Sortformer evaluation-only and outside automatic routing.
+- **Tests affected:** The existing reconstructable public activation pack still
+  passes; a complete chained whole-recording discrete-parity regression is
+  required under `bd-y4ip.11`.
+- **Review date:** 2026-08-08

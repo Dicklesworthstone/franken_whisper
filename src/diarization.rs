@@ -16976,18 +16976,43 @@ fn canonicalize_zero_duration_projection_segments(
 }
 
 fn validate_diarization_turns(turns: &[DiarizationTurn]) -> FwResult<()> {
-    let mut previous_end = 0u64;
+    let mut previous_key = None;
+    let mut maximum_end = 0u64;
+    let mut maximum_unmarked_end = 0u64;
+    let mut maximum_unlabeled_end = 0u64;
+    let mut speaker_end = BTreeMap::<Option<&str>, u64>::new();
     for turn in turns {
         let valid_confidence = |value: Option<f64>| {
             value.is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
         };
+        let speaker = turn.speaker_ref.as_deref();
+        let turn_key = (turn.start_ms, turn.end_ms, speaker);
+        let overlaps_any_turn = turn.start_ms < maximum_end;
+        let overlaps_unmarked_turn = turn.start_ms < maximum_unmarked_end;
+        let overlaps_unlabeled_turn = turn.start_ms < maximum_unlabeled_end;
+        let overlaps_same_speaker = speaker_end
+            .get(&speaker)
+            .is_some_and(|end_ms| turn.start_ms < *end_ms);
         if turn.end_ms <= turn.start_ms
-            || turn.start_ms < previous_end
+            || previous_key.is_some_and(|key| key > turn_key)
+            || overlaps_same_speaker
+            || (overlaps_any_turn
+                && (!turn.overlap_suspected
+                    || overlaps_unmarked_turn
+                    || speaker.is_none()
+                    || overlaps_unlabeled_turn))
             || turn
                 .speaker_ref
                 .as_ref()
-                .is_some_and(|speaker| speaker.trim().is_empty())
+                .is_some_and(|speaker| {
+                    speaker.trim().is_empty()
+                        || speaker.len() > crate::model::MAX_SPEAKER_REF_BYTES
+                })
             || (turn.speaker_ref.is_none() && turn.speaker_confidence.is_some())
+            || (turn.hard_hint_attributed
+                && (turn.speaker_ref.is_none()
+                    || turn.speaker_confidence.map(f64::to_bits)
+                        != Some(1.0_f64.to_bits())))
             || !valid_confidence(turn.speaker_confidence)
             || !valid_confidence(turn.change_confidence)
         {
@@ -16995,7 +17020,18 @@ fn validate_diarization_turns(turns: &[DiarizationTurn]) -> FwResult<()> {
                 "diarization turns must be finite, labeled consistently, and monotonic".to_owned(),
             ));
         }
-        previous_end = turn.end_ms;
+        previous_key = Some(turn_key);
+        maximum_end = maximum_end.max(turn.end_ms);
+        if !turn.overlap_suspected {
+            maximum_unmarked_end = maximum_unmarked_end.max(turn.end_ms);
+        }
+        if speaker.is_none() {
+            maximum_unlabeled_end = maximum_unlabeled_end.max(turn.end_ms);
+        }
+        speaker_end
+            .entry(speaker)
+            .and_modify(|end_ms| *end_ms = (*end_ms).max(turn.end_ms))
+            .or_insert(turn.end_ms);
     }
     Ok(())
 }
@@ -38859,6 +38895,16 @@ mod tests {
                 .iter()
                 .all(|turn| turn.start_ms == 0 && turn.end_ms == 500 && turn.overlap_suspected)
         );
+
+        let segments = vec![transcript_segment(
+            Some(0.0),
+            Some(0.5),
+            "simultaneous speech",
+            Some(0.9),
+        )];
+        let projection = project_diarization_onto_segments(&segments, &turns, true)
+            .expect("an explicitly marked cross-speaker overlap is a valid turn timeline");
+        assert_eq!(projection.overlap_suspected_segment_indices, vec![0]);
     }
 
     #[test]
@@ -39271,6 +39317,132 @@ mod tests {
                 .to_string()
                 .contains("projection segments")
         );
+    }
+
+    #[test]
+    fn malformed_turn_overlap_provenance_fails_closed() {
+        let segments = vec![transcript_segment(Some(0.0), Some(1.0), "word", None)];
+
+        let unmarked_cross_speaker = vec![
+            turn(0, 1_000, Some("alice"), Some(0.9)),
+            turn(500, 1_500, Some("bob"), Some(0.9)),
+        ];
+        assert!(
+            project_diarization_onto_segments(&segments, &unmarked_cross_speaker, true)
+                .expect_err("unmarked cross-speaker overlap")
+                .to_string()
+                .contains("diarization turns")
+        );
+
+        let mut marked_second = turn(500, 1_500, Some("bob"), Some(0.9));
+        marked_second.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(
+                &segments,
+                &[turn(0, 1_000, Some("alice"), Some(0.9)), marked_second],
+                true,
+            )
+            .expect_err("both cross-speaker turns must carry overlap provenance")
+            .to_string()
+            .contains("diarization turns")
+        );
+
+        let mut marked_first = turn(0, 1_000, Some("alice"), Some(0.9));
+        marked_first.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(
+                &segments,
+                &[marked_first, turn(500, 1_500, Some("bob"), Some(0.9))],
+                true,
+            )
+            .expect_err("overlap provenance must be symmetric")
+            .to_string()
+            .contains("diarization turns")
+        );
+
+        let mut alice_first = turn(0, 1_000, Some("alice"), Some(0.9));
+        alice_first.overlap_suspected = true;
+        let mut alice_second = turn(500, 1_500, Some("alice"), Some(0.8));
+        alice_second.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(&segments, &[alice_first, alice_second], true,)
+                .expect_err("same-speaker overlap must be canonicalized before projection")
+                .to_string()
+                .contains("diarization turns")
+        );
+
+        let mut later = turn(500, 1_500, Some("alice"), Some(0.9));
+        later.overlap_suspected = true;
+        let mut earlier = turn(0, 1_000, Some("bob"), Some(0.9));
+        earlier.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(&segments, &[later, earlier], true)
+                .expect_err("turn starts must be nondecreasing")
+                .to_string()
+                .contains("diarization turns")
+        );
+
+        let mut labeled_first = turn(0, 1_000, Some("alice"), Some(0.9));
+        labeled_first.overlap_suspected = true;
+        let mut unlabeled_second = turn(500, 1_500, None, None);
+        unlabeled_second.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(
+                &segments,
+                &[labeled_first, unlabeled_second],
+                true,
+            )
+            .expect_err("overlap requires two labeled speakers")
+            .to_string()
+            .contains("diarization turns")
+        );
+
+        let mut unlabeled_first = turn(0, 1_000, None, None);
+        unlabeled_first.overlap_suspected = true;
+        let mut labeled_second = turn(500, 1_500, Some("alice"), Some(0.9));
+        labeled_second.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(
+                &segments,
+                &[unlabeled_first, labeled_second],
+                true,
+            )
+            .expect_err("a labeled speaker cannot overlap an anonymous turn")
+            .to_string()
+            .contains("diarization turns")
+        );
+
+        let mut bob = turn(0, 1_000, Some("bob"), Some(0.9));
+        bob.overlap_suspected = true;
+        let mut alice = turn(0, 1_000, Some("alice"), Some(0.9));
+        alice.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(&segments, &[bob, alice], true)
+                .expect_err("equal-time turns must use deterministic speaker ordering")
+                .to_string()
+                .contains("diarization turns")
+        );
+
+        let mut anonymous_hard = turn(0, 1_000, None, None);
+        anonymous_hard.hard_hint_attributed = true;
+        let mut uncertain_hard = turn(0, 1_000, Some("alice"), Some(0.9));
+        uncertain_hard.hard_hint_attributed = true;
+        let overlong = "s".repeat(crate::model::MAX_SPEAKER_REF_BYTES + 1);
+        for (invalid, reason) in [
+            (anonymous_hard, "anonymous hard hint"),
+            (uncertain_hard, "non-authoritative hard-hint confidence"),
+            (
+                turn(0, 1_000, Some(&overlong), Some(0.9)),
+                "overlong speaker reference",
+            ),
+        ] {
+            assert!(
+                project_diarization_onto_segments(&segments, &[invalid], true)
+                    .expect_err(reason)
+                    .to_string()
+                    .contains("diarization turns")
+            );
+        }
     }
 
     #[test]
@@ -40707,7 +40879,9 @@ mod tests {
         let audio_bytes = std::fs::read(audio_path).expect("read public WAV");
         let mut samples = crate::native_engine::decode::read_wav_16k_mono(&audio_bytes)
             .expect("decode 16 kHz mono WAV");
-        samples.truncate(samples.len().min(16_000 * 10));
+        if std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_FULL_AUDIO").is_none() {
+            samples.truncate(samples.len().min(16_000 * 10));
+        }
         let duration_ms = u64::try_from(samples.len()).expect("sample count fits") / 16;
         let boundary_hints = super::AcousticBoundaryHints {
             speech_regions_ms: vec![(0, duration_ms)],

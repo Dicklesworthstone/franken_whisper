@@ -15,12 +15,21 @@ static PROCESS_TREE_EXTERNALLY_OWNED: std::sync::atomic::AtomicBool =
 /// escaping into a new one; their direct child is still reaped locally, while
 /// the outer owner remains authoritative for recursive termination.
 #[cfg(unix)]
-pub(crate) fn mark_process_tree_externally_owned() {
+pub(crate) fn mark_process_tree_externally_owned() -> FwResult<()> {
+    if rustix::process::getpgrp() != rustix::process::getpid() {
+        return Err(FwError::ContractViolation(
+            "an externally owned subprocess tree must enter through a fresh process-group root"
+                .to_owned(),
+        ));
+    }
     PROCESS_TREE_EXTERNALLY_OWNED.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
 }
 
 #[cfg(not(unix))]
-pub(crate) fn mark_process_tree_externally_owned() {}
+pub(crate) fn mark_process_tree_externally_owned() -> FwResult<()> {
+    Ok(())
+}
 
 #[must_use]
 pub fn command_exists(program: &str) -> bool {
@@ -261,6 +270,7 @@ pub(crate) fn run_command_cancellable_with_probe(
         hard_timeout,
         additional_cancel,
         None,
+        None,
     )
 }
 
@@ -268,6 +278,7 @@ pub(crate) fn run_command_cancellable_with_probe(
 /// is staged in an anonymous temporary file before launch, so a child that
 /// stops reading cannot leave a blocked writer thread behind after timeout or
 /// cancellation.
+#[cfg(test)]
 pub(crate) fn run_command_cancellable_with_input_and_probe(
     program: &str,
     args: &[String],
@@ -285,6 +296,35 @@ pub(crate) fn run_command_cancellable_with_input_and_probe(
         hard_timeout,
         additional_cancel,
         Some(stdin_payload),
+        None,
+    )
+}
+
+/// Run a cancellable subprocess with bounded stdin while observing the complete
+/// child process group at the normal polling cadence.
+///
+/// The observer receives the root child PID. On Unix this API fails closed if
+/// the caller is already inside an externally owned process group; otherwise
+/// the child PID is also the fresh process-group identifier created with
+/// `process_group(0)`. Returning an error terminates and reaps the entire tree.
+pub(crate) fn run_command_cancellable_with_input_probe_and_observer(
+    program: &str,
+    args: &[String],
+    token: &crate::orchestrator::CancellationToken,
+    hard_timeout: Option<Duration>,
+    additional_cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stdin_payload: &[u8],
+    observer: &mut dyn FnMut(u32) -> FwResult<()>,
+) -> FwResult<Output> {
+    run_command_cancellable_with_optional_input(
+        program,
+        args,
+        None,
+        token,
+        hard_timeout,
+        additional_cancel,
+        Some(stdin_payload),
+        Some(observer),
     )
 }
 
@@ -297,6 +337,7 @@ fn run_command_cancellable_with_optional_input(
     hard_timeout: Option<Duration>,
     additional_cancel: Option<&(dyn Fn() -> bool + Sync)>,
     stdin_payload: Option<&[u8]>,
+    mut observer: Option<&mut dyn FnMut(u32) -> FwResult<()>>,
 ) -> FwResult<Output> {
     token.checkpoint()?;
     if additional_cancel.is_some_and(|probe| probe()) {
@@ -333,6 +374,12 @@ fn run_command_cancellable_with_optional_input(
     }
 
     let owns_process_group = configure_descendant_process_tree(&mut command);
+    #[cfg(unix)]
+    if observer.is_some() && !owns_process_group {
+        return Err(FwError::Unsupported(
+            "process-tree observation requires a fresh caller-owned process group".to_owned(),
+        ));
+    }
     let mut child = command.spawn()?;
     let started_at = Instant::now();
     let mut poll_iteration = 0usize;
@@ -346,6 +393,15 @@ fn run_command_cancellable_with_optional_input(
             }
         };
     loop {
+        if let Some(observer) = observer.as_deref_mut()
+            && let Err(error) = observer(child.id())
+        {
+            terminate_descendant_process_tree(&mut child, owns_process_group);
+            let _ = child.wait();
+            let _ = stdout_reader.finish();
+            let _ = stderr_reader.finish();
+            return Err(error);
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 // Close inherited stdin/stdout/stderr in any descendants before
@@ -881,7 +937,8 @@ mod tests {
 
     use super::{
         cancellable_poll_delay, render_command_for_log, run_command_cancellable,
-        run_command_cancellable_with_input_and_probe, run_command_cancellable_with_probe,
+        run_command_cancellable_with_input_and_probe,
+        run_command_cancellable_with_input_probe_and_observer, run_command_cancellable_with_probe,
     };
 
     fn assert_reported_cwd(stdout: &[u8], expected: &Path) {
@@ -928,6 +985,85 @@ mod tests {
         )
         .expect("cat must receive the bounded stdin payload");
         assert_eq!(output.stdout, payload);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_process_observer_receives_the_stable_group_root() {
+        let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
+        let mut observed = Vec::new();
+        let mut observer = |root_pid| {
+            observed.push(root_pid);
+            Ok(())
+        };
+        let output = run_command_cancellable_with_input_probe_and_observer(
+            "sh",
+            &["-c".to_owned(), "sleep 0.15".to_owned()],
+            &cancel,
+            Some(Duration::from_secs(10)),
+            None,
+            &[],
+            &mut observer,
+        )
+        .expect("observed command must complete");
+        assert!(output.status.success());
+        assert!(!observed.is_empty());
+        assert!(observed[0] > 0);
+        assert!(observed.iter().all(|pid| *pid == observed[0]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_observer_failure_terminates_the_complete_group() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("observer-descendant.pid");
+        let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
+        let mut polls = 0usize;
+        let mut observer = |_root_pid| {
+            polls = polls.saturating_add(1);
+            if polls >= 7 {
+                Err(crate::error::FwError::ContractViolation(
+                    "observer fixture failure".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        let result = run_command_cancellable_with_input_probe_and_observer(
+            "sh",
+            &[
+                "-c".to_owned(),
+                "sleep 60 & child=$!; printf '%s' \"$child\" > \"$1\"; wait".to_owned(),
+                "fw-process-observer-test".to_owned(),
+                pid_path.to_string_lossy().into_owned(),
+            ],
+            &cancel,
+            Some(Duration::from_secs(10)),
+            None,
+            &[],
+            &mut observer,
+        );
+        assert!(
+            matches!(result, Err(crate::error::FwError::ContractViolation(_))),
+            "observer failure must escape after reaping the process tree: {result:?}"
+        );
+
+        let descendant_pid: i32 = std::fs::read_to_string(&pid_path)
+            .expect("descendant pid fixture")
+            .parse()
+            .expect("numeric descendant pid");
+        let descendant_pid =
+            rustix::process::Pid::from_raw(descendant_pid).expect("positive descendant process id");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(descendant_pid).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(descendant_pid).is_err(),
+            "observer failure left a descendant process alive"
+        );
     }
 
     #[test]

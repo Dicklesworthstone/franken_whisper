@@ -761,7 +761,11 @@ value. These limits are validated before the hard-hint overlap check.
 
 ## 6. Output and confidence
 
-The diarized-turn timeline is the acoustic source of truth. Each turn contains:
+The diarized-turn timeline is the acoustic source of truth. Turns use
+deterministic `(start_ms, end_ms, speaker_ref)` order, each individual speaker's
+turns do not overlap, and simultaneous turns for distinct speakers are legal
+only when every participating turn is labeled and carries explicit overlap
+evidence. Each turn contains:
 
 - finite monotonic start and end;
 - optional speaker ID, where absence means unknown;
@@ -1420,7 +1424,7 @@ declared capacity-ineligible and is never passed to either Sortformer lane.
 Consecutive sorted observations follow a ten-row balanced Williams schedule,
 and `order_balance_complete` is true only after a complete schedule. Every
 declared lane is retained as completed, skipped, or failed with a stable
-reason. Protocol v3 binds each complete effective native request, the ordered
+reason. Protocol v4 binds each complete effective native request, the ordered
 payload-free outcome taxonomy, and the protocol body to a pinned canonical
 SHA-256 identity; changing any of them requires a new version-and-digest pair.
 The command requires eight native Rayon workers to match the pinned Sortformer
@@ -1440,16 +1444,64 @@ an explicit scorer-equivalence probe. Timing is retained for deployment
 observation only. Parent-observed time for every lane includes process launch,
 bounded IPC, identity validation, audio decode, model load, inference, output
 validation, scoring, post-run identity validation, and resource-probe parsing.
-Those fresh-process scopes are cross-lane comparable. The artifact reports
-direct-worker-only peak RSS from the native platform probe (explicitly excluding
-subprocess-adapter memory from whole-tree claims) and measured recursive-
-process cancellation latency; unavailable platform probes remain explicitly
-unavailable rather than becoming zero. The comparison command downloads no
+Those fresh-process scopes are cross-lane comparable. The artifact reports the
+maximum 50 ms-sampled concurrent RSS sum across the complete worker process
+group, including nested subprocess adapters, plus measured recursive-process
+cancellation latency; unavailable platform probes remain explicitly unavailable
+rather than becoming zero. The comparison command downloads no
 model. `native_sortformer` uses only the release-bound cache installed by the
 explicit `fw pull sortformer` command; unavailable ECAPA, native Sortformer,
 or external-adapter components produce typed skips.
 The command does not alter transcription routing or the default-off acoustic
 sidecar.
+
+ReDimNet2-B2 is a compact evaluation-only representation provider, not a
+segmentation, overlap, speaker-count, or clustering authority. Its pinned
+upstream identity is PalabraAI/redimnet2 v1.0.0 at peeled revision
+`5294667e806ac3b0f27abc301a114ef132b64b42`, with checkpoint size 15,897,450
+bytes and SHA-256
+`0545a29679a87fe1c662d2bbd05e3b3fe0d1b392832729abaa135e4079a2f77a`.
+The checkpoint configuration, not paper prose, is authoritative: 72 mel bands,
+six reshape stages, a 1,440-channel weighted 1D path, attentive-statistics
+pooling, and a raw 192-dimensional embedding that is not L2-normalized. The
+model contains 3,677,760 parameters: 3,676,320 trainable plus the frozen
+1,440-element first-stage weighting tensor.
+
+`scripts/export_redimnet2.py` is the only accepted raw-checkpoint boundary. It
+requires the exact Python/package tuple and 14-file source manifest, loads the
+checkpoint with `weights_only=True` from an already hash-verified owned byte
+buffer, strictly loads the upstream graph, drops exactly 68 scalar int64 batch
+counters, and retains 661 finite contiguous f32 tensors containing 3,918,794
+elements. It verifies source-module provenance and source/exporter stability
+before publication. It creates a new external mode-0700 directory and three
+mode-0600 files with exclusive creation; repository-contained input or output
+paths fail closed. Neither the Rust runtime nor this exporter downloads a
+model.
+
+The canonical converted package is 15,745,544 bytes with SHA-256
+`d41a729f5ef008d70c6d6bf4ab7ca27e299a478ff665665a4e31afff7f46ddeb`.
+The synthetic oracle package is 8,828,392 bytes with SHA-256
+`21042537873c3dacafafd134d7c9e296318458f55f1a429c00bc9542f95f3238`.
+It binds waveform, frontend, stem, stage 0, stage 3, final weighted 1D,
+backbone 2D, attentive pooling, pooled batch normalization, raw embedding, and
+consumer-normalized embedding seams. Five source replays at each of one and
+eight PyTorch threads were deterministic within a thread count. The cross-
+thread source floor peaked at max-absolute `3.147125244140625e-4` in the
+frontend and relative-L2 `1.4254854456195043e-5` in the final weighted path;
+the receipt retains every seam floor and the pre-native tolerance matrix. The
+initial frontend ceiling of `2e-5`/`2e-6` was rejected before native work and
+is preserved in the receipt rather than erased. Two independent final exports
+were byte-identical.
+
+The v1.0.0 tag contains no top-level repository license file even though a
+later main revision has an MIT file and individual pinned sources carry MIT or
+Apache notices. Model-weight redistribution scope is therefore unresolved.
+The receipt fixes distribution status to `operator_local_no_release`; no
+converted package, checkpoint, truth tensors, feature values, local paths,
+audio, transcripts, or biometric vectors may enter Git, a public release, or
+runtime evidence. This licensing boundary does not prevent local parity and
+comparison work, but it does prevent artifact publication or a distributable
+product claim.
 
 The AMI adapter enforces the corpus site's scenario-only training,
 development, and unseen-test meeting-family split. Other corpora use an
