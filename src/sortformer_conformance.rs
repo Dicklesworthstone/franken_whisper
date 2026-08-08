@@ -21,8 +21,6 @@ use sha2::{Digest, Sha256};
 use crate::error::{FwError, FwResult};
 use crate::native_engine::weights::SafetensorsFile;
 
-pub use crate::differential_oracle::SORTFORMER_ORACLE_ADAPTER_SHA256;
-
 pub const SORTFORMER_RECEIPT_SCHEMA: &str = "franken-whisper-sortformer-conversion-receipt-v1";
 pub const SORTFORMER_TENSOR_MANIFEST_SCHEMA: &str = "franken-whisper-sortformer-tensor-manifest-v1";
 /// Receipt schema label only. The compiled converter-source and canonical
@@ -33,6 +31,12 @@ pub const SORTFORMER_CONVERTER_SOURCE_SHA256: &str =
     "3ce885d1dcb0aeeebf2bb73c165f501a1d240e01ad70354c65cf43d8a3c6d8ce";
 pub const SORTFORMER_CONVERSION_RECEIPT_SHA256: &str =
     "407c642f3d51b399514f6a35227b1c80886387472a44fb78f01b824d26318fb0";
+/// Historical external adapter identity used when the immutable converted
+/// package and receipt were produced. Runtime comparison adapters are
+/// independently versioned and bound by the comparison protocol; changing
+/// their post-processing must not invalidate this conversion provenance.
+pub const SORTFORMER_CONVERSION_ORACLE_ADAPTER_SHA256: &str =
+    "8f376c979b7eaca41dc0a438d9aaa41c1c723052b97c45eb2acc59b6d6f00bde";
 pub const SORTFORMER_MODEL_ID: &str = "nvidia/diar_streaming_sortformer_4spk-v2.1";
 pub const SORTFORMER_MODEL_REVISION: &str = "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d";
 pub const SORTFORMER_NEMO_BYTES: u64 = 471_367_680;
@@ -983,7 +987,7 @@ fn frozen_model_identity() -> SortformerModelIdentity {
         nemo_source_revision: SORTFORMER_NEMO_SOURCE_REVISION.to_owned(),
         external_contract_sha256: SORTFORMER_EXTERNAL_CONTRACT_SHA256.to_owned(),
         runtime_fingerprint_sha256: SORTFORMER_RUNTIME_FINGERPRINT_SHA256.to_owned(),
-        oracle_adapter_sha256: SORTFORMER_ORACLE_ADAPTER_SHA256.to_owned(),
+        oracle_adapter_sha256: SORTFORMER_CONVERSION_ORACLE_ADAPTER_SHA256.to_owned(),
         trainable_parameters: SORTFORMER_TRAINABLE_PARAMETERS,
         parameter_tensors: SORTFORMER_PARAMETER_TENSORS,
         state_tensors: SORTFORMER_STATE_TENSORS,
@@ -4349,6 +4353,19 @@ mod tests {
             load_verified_sortformer_public_activation_pack;
         let _: PublicActivationCheckpointLoader =
             load_verified_sortformer_public_activation_pack_with_checkpoint;
+    }
+
+    #[test]
+    fn conversion_receipt_keeps_historical_adapter_provenance() {
+        assert_ne!(
+            SORTFORMER_CONVERSION_ORACLE_ADAPTER_SHA256,
+            crate::differential_oracle::SORTFORMER_ORACLE_ADAPTER_SHA256,
+            "a runtime adapter revision must not rewrite immutable conversion provenance"
+        );
+        assert_eq!(
+            frozen_model_identity().oracle_adapter_sha256,
+            SORTFORMER_CONVERSION_ORACLE_ADAPTER_SHA256
+        );
     }
 
     #[test]

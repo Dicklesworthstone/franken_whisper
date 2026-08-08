@@ -16589,6 +16589,7 @@ pub fn diarization_turns_from_assignments(
 ) -> FwResult<Vec<DiarizationTurn>> {
     let mut turns = Vec::<DiarizationTurn>::with_capacity(assignments.len());
     let mut secondary_turns = Vec::<DiarizationTurn>::new();
+    let mut previous_secondary_turn_index: Option<usize> = None;
     let mut previous_start = 0u64;
     for (index, assignment) in assignments.iter().enumerate() {
         let secondary_is_valid = match (
@@ -16650,6 +16651,16 @@ pub fn diarization_turns_from_assignments(
                     ));
                 }
                 previous.end_ms = boundary;
+                if let Some(secondary_index) = previous_secondary_turn_index {
+                    let secondary = &mut secondary_turns[secondary_index];
+                    if boundary <= secondary.start_ms {
+                        return Err(FwError::InvalidRequest(
+                            "acoustic assignment overlap leaves no positive secondary turn duration"
+                                .to_owned(),
+                        ));
+                    }
+                    secondary.end_ms = secondary.end_ms.min(boundary);
+                }
                 turn.start_ms = boundary;
             }
             if previous.speaker_ref == turn.speaker_ref
@@ -16673,6 +16684,7 @@ pub fn diarization_turns_from_assignments(
             turns.push(turn);
         }
 
+        let mut current_secondary_turn_index = None;
         if let (Some(speaker_ref), Some(confidence)) = (
             assignment.secondary_speaker_ref.as_ref(),
             assignment.secondary_speaker_confidence,
@@ -16688,7 +16700,7 @@ pub fn diarization_turns_from_assignments(
             };
             if let Some(previous) = secondary_turns.last_mut()
                 && previous.speaker_ref == secondary.speaker_ref
-                && secondary.start_ms <= previous.end_ms.saturating_add(25)
+                && secondary.start_ms <= previous.end_ms
             {
                 previous.end_ms = previous.end_ms.max(secondary.end_ms);
                 previous.speaker_confidence = minimum_optional_confidence(
@@ -16699,10 +16711,13 @@ pub fn diarization_turns_from_assignments(
                     previous.change_confidence,
                     secondary.change_confidence,
                 );
-                continue;
+                current_secondary_turn_index = secondary_turns.len().checked_sub(1);
+            } else {
+                secondary_turns.push(secondary);
+                current_secondary_turn_index = secondary_turns.len().checked_sub(1);
             }
-            secondary_turns.push(secondary);
         }
+        previous_secondary_turn_index = current_secondary_turn_index;
     }
     turns.extend(secondary_turns);
     turns = canonicalize_same_speaker_turn_overlaps(turns);
@@ -16976,12 +16991,37 @@ fn canonicalize_zero_duration_projection_segments(
 }
 
 fn validate_diarization_turns(turns: &[DiarizationTurn]) -> FwResult<()> {
+    let invalid = |code: &str| {
+        FwError::InvalidRequest(format!(
+            "diarization.turns.{code}: diarization turns must be finite, labeled consistently, and monotonic"
+        ))
+    };
+    let invalid_pair = |code: &str,
+                        current_index: usize,
+                        current: &DiarizationTurn,
+                        prior_index: usize,
+                        prior: &DiarizationTurn| {
+        FwError::InvalidRequest(format!(
+            "diarization.turns.{code}[current={current_index}:{}-{}:labeled={}:overlap={},prior={prior_index}:{}-{}:labeled={}:overlap={}]: diarization turns must be finite, labeled consistently, and monotonic",
+            current.start_ms,
+            current.end_ms,
+            current.speaker_ref.is_some(),
+            current.overlap_suspected,
+            prior.start_ms,
+            prior.end_ms,
+            prior.speaker_ref.is_some(),
+            prior.overlap_suspected,
+        ))
+    };
     let mut previous_key = None;
     let mut maximum_end = 0u64;
+    let mut maximum_end_index = 0usize;
     let mut maximum_unmarked_end = 0u64;
+    let mut maximum_unmarked_end_index = 0usize;
     let mut maximum_unlabeled_end = 0u64;
+    let mut maximum_unlabeled_end_index = 0usize;
     let mut speaker_end = BTreeMap::<Option<&str>, u64>::new();
-    for turn in turns {
+    for (index, turn) in turns.iter().enumerate() {
         let valid_confidence = |value: Option<f64>| {
             value.is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
         };
@@ -16993,35 +17033,65 @@ fn validate_diarization_turns(turns: &[DiarizationTurn]) -> FwResult<()> {
         let overlaps_same_speaker = speaker_end
             .get(&speaker)
             .is_some_and(|end_ms| turn.start_ms < *end_ms);
-        if turn.end_ms <= turn.start_ms
-            || previous_key.is_some_and(|key| key > turn_key)
-            || overlaps_same_speaker
-            || (overlaps_any_turn
-                && (!turn.overlap_suspected
-                    || overlaps_unmarked_turn
-                    || speaker.is_none()
-                    || overlaps_unlabeled_turn))
-            || turn.speaker_ref.as_ref().is_some_and(|speaker| {
-                speaker.trim().is_empty() || speaker.len() > crate::model::MAX_SPEAKER_REF_BYTES
-            })
-            || (turn.speaker_ref.is_none() && turn.speaker_confidence.is_some())
-            || (turn.hard_hint_attributed
-                && (turn.speaker_ref.is_none()
-                    || turn.speaker_confidence.map(f64::to_bits) != Some(1.0_f64.to_bits())))
-            || !valid_confidence(turn.speaker_confidence)
-            || !valid_confidence(turn.change_confidence)
+        if turn.end_ms <= turn.start_ms {
+            return Err(invalid("geometry"));
+        }
+        if previous_key.is_some_and(|key| key > turn_key) {
+            return Err(invalid("ordering"));
+        }
+        if overlaps_same_speaker {
+            return Err(invalid("same_speaker_overlap"));
+        }
+        if overlaps_any_turn
+            && (!turn.overlap_suspected
+                || overlaps_unmarked_turn
+                || speaker.is_none()
+                || overlaps_unlabeled_turn)
         {
-            return Err(FwError::InvalidRequest(
-                "diarization turns must be finite, labeled consistently, and monotonic".to_owned(),
+            let prior_index = if overlaps_unmarked_turn {
+                maximum_unmarked_end_index
+            } else if overlaps_unlabeled_turn {
+                maximum_unlabeled_end_index
+            } else {
+                maximum_end_index
+            };
+            return Err(invalid_pair(
+                "overlap_provenance",
+                index,
+                turn,
+                prior_index,
+                &turns[prior_index],
             ));
         }
-        previous_key = Some(turn_key);
-        maximum_end = maximum_end.max(turn.end_ms);
-        if !turn.overlap_suspected {
-            maximum_unmarked_end = maximum_unmarked_end.max(turn.end_ms);
+        if turn.speaker_ref.as_ref().is_some_and(|speaker| {
+            speaker.trim().is_empty() || speaker.len() > crate::model::MAX_SPEAKER_REF_BYTES
+        }) {
+            return Err(invalid("speaker_ref"));
         }
-        if speaker.is_none() {
-            maximum_unlabeled_end = maximum_unlabeled_end.max(turn.end_ms);
+        if turn.speaker_ref.is_none() && turn.speaker_confidence.is_some() {
+            return Err(invalid("anonymous_confidence"));
+        }
+        if turn.hard_hint_attributed
+            && (turn.speaker_ref.is_none()
+                || turn.speaker_confidence.map(f64::to_bits) != Some(1.0_f64.to_bits()))
+        {
+            return Err(invalid("hard_hint"));
+        }
+        if !valid_confidence(turn.speaker_confidence) || !valid_confidence(turn.change_confidence) {
+            return Err(invalid("confidence"));
+        }
+        previous_key = Some(turn_key);
+        if turn.end_ms > maximum_end {
+            maximum_end = turn.end_ms;
+            maximum_end_index = index;
+        }
+        if !turn.overlap_suspected && turn.end_ms > maximum_unmarked_end {
+            maximum_unmarked_end = turn.end_ms;
+            maximum_unmarked_end_index = index;
+        }
+        if speaker.is_none() && turn.end_ms > maximum_unlabeled_end {
+            maximum_unlabeled_end = turn.end_ms;
+            maximum_unlabeled_end_index = index;
         }
         speaker_end
             .entry(speaker)
@@ -38992,6 +39062,55 @@ mod tests {
     }
 
     #[test]
+    fn separated_secondary_overlap_does_not_bridge_unmarked_speech() {
+        let mut first = assignment(0, 0, 500, Some("alice"), 0.8);
+        first.overlap_suspected = true;
+        first.secondary_speaker_ref = Some("bob".to_owned());
+        first.secondary_speaker_confidence = Some(0.65);
+        let middle = assignment(1, 500, 525, Some("carol"), 0.9);
+        let mut last = assignment(2, 525, 1_025, Some("alice"), 0.8);
+        last.overlap_suspected = true;
+        last.secondary_speaker_ref = Some("bob".to_owned());
+        last.secondary_speaker_confidence = Some(0.65);
+
+        let turns = diarization_turns_from_assignments(&[first, middle, last], 1_025)
+            .expect("separated overlap timeline");
+        let bob = turns
+            .iter()
+            .filter(|turn| turn.speaker_ref.as_deref() == Some("bob"))
+            .collect::<Vec<_>>();
+        assert_eq!(bob.len(), 2, "{turns:#?}");
+        assert_eq!((bob[0].start_ms, bob[0].end_ms), (0, 500));
+        assert_eq!((bob[1].start_ms, bob[1].end_ms), (525, 1_025));
+        project_diarization_onto_segments(&[], &turns, true)
+            .expect("the unmarked middle turn must not be covered by synthetic overlap");
+    }
+
+    #[test]
+    fn clipped_primary_boundary_also_clips_its_secondary_overlap() {
+        let mut overlapped = assignment(0, 0, 525, Some("alice"), 0.8);
+        overlapped.overlap_suspected = true;
+        overlapped.secondary_speaker_ref = Some("bob".to_owned());
+        overlapped.secondary_speaker_confidence = Some(0.65);
+        let following = assignment(1, 500, 1_025, Some("carol"), 0.9);
+
+        let turns = diarization_turns_from_assignments(&[overlapped, following], 1_025)
+            .expect("analysis-frame overlap must have one shared clipped boundary");
+        let bob = turns
+            .iter()
+            .find(|turn| turn.speaker_ref.as_deref() == Some("bob"))
+            .expect("secondary overlap turn");
+        let carol = turns
+            .iter()
+            .find(|turn| turn.speaker_ref.as_deref() == Some("carol"))
+            .expect("following primary turn");
+        assert_eq!(bob.end_ms, carol.start_ms, "{turns:#?}");
+        assert_eq!(bob.end_ms, 512);
+        project_diarization_onto_segments(&[], &turns, true)
+            .expect("the clipped secondary must not overlap the unmarked next turn");
+    }
+
+    #[test]
     fn secondary_assignment_without_overlap_evidence_fails_closed() {
         let mut invalid = assignment(0, 0, 500, Some("alice"), 0.8);
         invalid.secondary_speaker_ref = Some("bob".to_owned());
@@ -40870,10 +40989,15 @@ mod tests {
             samples.truncate(samples.len().min(16_000 * 10));
         }
         let duration_ms = u64::try_from(samples.len()).expect("sample count fits") / 16;
-        let boundary_hints = super::AcousticBoundaryHints {
-            speech_regions_ms: vec![(0, duration_ms)],
-            ..super::AcousticBoundaryHints::default()
-        };
+        let boundary_hints =
+            if std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_DEFAULT_BOUNDARIES").is_some() {
+                super::AcousticBoundaryHints::default()
+            } else {
+                super::AcousticBoundaryHints {
+                    speech_regions_ms: vec![(0, duration_ms)],
+                    ..super::AcousticBoundaryHints::default()
+                }
+            };
         for (engine, expected_implementation, expected_evidence_mode) in [
             (
                 crate::model::DiarizationEngine::Ecapa,

@@ -45,15 +45,15 @@ use crate::sortformer_inference::{
     SortformerSpeakerTurn,
 };
 
-pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v6";
+pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v7";
 pub const PUBLIC_MODEL_COMPARISON_RUNNER_VERSION: &str =
-    "public-diarization-model-comparison-runner-v6";
+    "public-diarization-model-comparison-runner-v7";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION: &str =
-    "public-diarization-model-comparison-protocol-v6";
+    "public-diarization-model-comparison-protocol-v7";
 pub const PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION: &str =
     "public-diarization-model-comparison-outcomes-v3";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256: &str =
-    "af046e2f7060590d6d94421f404040a75a006ddcaaef37e79bf92e888a1cd04b";
+    "f6d62452f4291c453f861a5613f33bd2e935945825a7fd4f4e559f47048874d8";
 pub const PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION: &str = "five-lane-balanced-williams-v1";
 pub const PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS: u64 = 1_800;
 const MODEL_COMPARISON_WORKER_SCHEMA_VERSION: &str = "public-model-comparison-worker-v1";
@@ -595,6 +595,8 @@ pub struct PublicModelComparisonProtocol {
     pub ecapa_contract_sha256: String,
     pub ecapa_package_sha256: String,
     pub sortformer_contract_sha256: String,
+    pub external_sortformer_adapter_version: String,
+    pub external_sortformer_adapter_sha256: String,
     pub native_acoustic_postprocessing: String,
     pub native_ecapa_postprocessing: String,
     pub native_ecapa_fused_postprocessing: String,
@@ -1616,13 +1618,15 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         ecapa_contract_sha256: ECAPA_CONTRACT_SHA256.to_owned(),
         ecapa_package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
         sortformer_contract_sha256: SORTFORMER_ORACLE_CONTRACT_SHA256.to_owned(),
+        external_sortformer_adapter_version: SORTFORMER_ORACLE_ADAPTER_VERSION.to_owned(),
+        external_sortformer_adapter_sha256: SORTFORMER_ORACLE_ADAPTER_SHA256.to_owned(),
         native_acoustic_postprocessing:
             "fixed_safe_v1_change+fixed_safe_v1_clustering+unknown_fallback".to_owned(),
         native_ecapa_postprocessing:
             "fixed_safe_v1_change+probabilistic_v1_clustering+unknown_fallback".to_owned(),
         native_ecapa_fused_postprocessing:
             "fixed_safe_v1_change+probabilistic_v1_clustering+unknown_fallback".to_owned(),
-        sortformer_postprocessing: "native_l8_and_pinned_external_sortformer_oracle_contract_v2"
+        sortformer_postprocessing: "native_l8_and_pinned_external_sortformer_oracle_contract_v3"
             .to_owned(),
         wall_time_policy: "fresh_process_per_lane_and_observation;process_launch+bounded_ipc+identity_validation+audio_decode+model_load+inference+output_validation+scorer+parent_post_identity+resource_probe;matched_timeout_and_thread_policy;cross_lane_comparable;sampled_peak_rss_is_maximum_observed_approximate_process_group_sum_including_descendant_adapters;sample_starts_are_no_closer_than_the_minimum_interval;unsupported_or_fast_exit_without_sample_is_explicitly_unavailable".to_owned(),
         aggregate_only: true,
@@ -5104,6 +5108,14 @@ mod tests {
             PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION
         );
         assert_eq!(protocol.outcome_codes, ModelComparisonOutcomeCode::ALL);
+        assert_eq!(
+            protocol.external_sortformer_adapter_version,
+            SORTFORMER_ORACLE_ADAPTER_VERSION
+        );
+        assert_eq!(
+            protocol.external_sortformer_adapter_sha256,
+            SORTFORMER_ORACLE_ADAPTER_SHA256
+        );
         assert_eq!(
             super::super::canonical_sha256(&protocol).expect("canonical protocol digest"),
             PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256

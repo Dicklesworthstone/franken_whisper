@@ -1424,9 +1424,10 @@ declared capacity-ineligible and is never passed to either Sortformer lane.
 Consecutive sorted observations follow a ten-row balanced Williams schedule,
 and `order_balance_complete` is true only after a complete schedule. Every
 declared lane is retained as completed, skipped, or failed with a stable
-reason. Protocol v6 binds each complete effective native request, the ordered
-payload-free outcome taxonomy, and the protocol body to a pinned canonical
-SHA-256 identity; changing any of them requires a new version-and-digest pair.
+reason. Protocol v7 binds each complete effective native request, the ordered
+payload-free outcome taxonomy, the external Sortformer adapter version and
+executable SHA-256, and the protocol body to a pinned canonical SHA-256
+identity; changing any of them requires a new version-and-digest pair.
 The command requires eight native Rayon workers to match the pinned Sortformer
 intra-op thread count and applies the same frozen 1800-second whole-attempt
 limit to every lane. Each lane/observation runs in a fresh bounded worker
@@ -1664,12 +1665,17 @@ size one, inferred count up to four, and untuned onset/offset 0.5 with zero padd
 and minimum-duration filtering. The canonical adapter labels are
 `speaker_0` through `speaker_3`; arrival order is determined by each label's
 minimum onset and tied first onsets are allowed. Turns start and end on 80 ms
-frames, except that an end may equal the document duration. Sortformer overlap
-is represented only by concurrent labeled turns, never by
+frames, except that an end may equal the document duration. NeMo expands each
+80 ms prediction into eight 10 ms VAD frames; if activity remains live at EOF,
+its binarizer reports the final repeated subframe and therefore an end with a
+70 ms residue. The adapter may canonicalize only that residue to the physical
+document duration, and only when the gap is at most 79 ms. All starts and every
+other non-document end remain strict 80 ms grid points. Sortformer overlap is
+represented only by concurrent labeled turns, never by
 `overlap_suspected`. Speech activity, overlap, and speaker-change boundaries
 must exactly equal the O(n log n) event-sweep derivation from the final turns.
 
-The accepted `franken-whisper-sortformer-oracle-v2` adapter must verify the
+The accepted `franken-whisper-sortformer-oracle-v3` adapter must verify the
 installed `nemo-toolkit` distribution's `direct_url.json` commit and requested
 revision rather than repeating the expected tool revision as an unchecked
 constant. It also fails closed on drift from the qualified Python 3.12.12,
@@ -1680,11 +1686,20 @@ profile plus the derived first/steady FIFO-pop schedule after NeMo's parameter
 validator runs. The host binds the
 resulting version document and exact adapter executable hash into evidence.
 This operator override is a declared trust boundary, not remote attestation.
-The host validates the version schema and internal hashes, but it does not
-allowlist executable digests or prove that an arbitrary replacement really ran
-the stated checks. A qualified row must therefore cite the reviewed adapter
-digest, and acceptance of a self-consistent v2 version document alone must not
-be inflated into certification of its implementation.
+The host validates the version schema and internal hashes and allowlists the
+reviewed executable digest, but it cannot remotely attest that the external
+runtime honored its source-level checks. The same-invocation comparison
+protocol separately binds the exact adapter version and executable digest, so
+changing operator code cannot silently reuse an older protocol identity.
+Acceptance of a self-consistent version document alone must not be inflated
+into certification of its implementation.
+
+The immutable native conversion receipt records the v2 adapter digest that was
+used when that package was produced. That historical conversion provenance is
+deliberately distinct from the current v3 runtime comparison adapter identity:
+revising output canonicalization must not rewrite or invalidate an already
+published conversion receipt, while protocol v7 still prevents a runtime
+adapter revision from silently reusing prior comparison evidence.
 
 The frozen execution profile is CPU-only float32, with autocast disabled,
 quantization disabled, deterministic algorithms enabled, batch size one, zero

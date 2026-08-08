@@ -71,11 +71,19 @@ current production behavior unchanged.
 | PyTorch / torchaudio | `2.7.1` / `2.7.1` |
 | NumPy | `2.4.6` |
 | safetensors | `0.8.0` |
-| Sortformer oracle adapter SHA-256 | `8f376c979b7eaca41dc0a438d9aaa41c1c723052b97c45eb2acc59b6d6f00bde` |
+| Historical conversion-oracle adapter SHA-256 | `8f376c979b7eaca41dc0a438d9aaa41c1c723052b97c45eb2acc59b6d6f00bde` |
+| Current runtime-comparison adapter | `franken-whisper-sortformer-oracle-v3` |
+| Current runtime-comparison adapter SHA-256 | `d8ced65ea4fa48e7f238005bf81659f57b9b575ddf6e04a75a835313ac0bf4eb` |
 | External model-contract SHA-256 | `7ac048e3372fe4c622840beddfbeef42944d961408360324cb7276a69c8542c5` |
 | Qualified runtime-fingerprint SHA-256 | `3713fd3f024c1cef7d860706baf0dbaaf18058c03c26331da6254687693d564c` |
 
 ### 2.1 Converted-weight admission evidence
+
+The conversion receipt permanently binds the historical conversion-oracle
+adapter digest above. Runtime comparison adapters are independently versioned
+and hash-bound by the public comparison protocol. This separation keeps
+immutable package provenance stable while making any runtime adapter change
+produce a new comparison protocol identity.
 
 On 2026-08-05, the frozen converter completed both an initial publication and
 an exact-artifact retry on Darwin 25.2.0 arm64. Each exited zero with 974
@@ -232,7 +240,51 @@ NeMo lane identities matched, but boundaries differed at native/reference
 The first chained cache-state or threshold divergence must be localized before
 the f32 route can pass its complete L7/L8 gate.
 
-The current resource row was reproduced by protocol v6 in five fresh workers,
+The balanced ten-record development comparison was reproduced by protocol v7
+on 2026-08-08 with the exact release executable
+`e7f3991525ca5b9aa4b8535a4ebf4d2ec92b5fa618f6af362480d132c2d43f4c`.
+The protocol SHA-256 is
+`f6d62452f4291c453f861a5613f33bd2e935945825a7fd4f4e559f47048874d8`,
+the result SHA-256 is
+`e4fc7ca6b461cc0e0648631822b58e0246d2319f749cf8f7d5936a3a159758b5`,
+and the deterministic-accuracy SHA-256 is
+`84ff4a04394537595d6f2038a6e5a70c6b2afe90fe710c75bbb26b870997884b`.
+The path-free bundle and evidence file SHA-256 values are respectively
+`ebef44364e844f9eb3432758793814f8eda22185fa503050879390fa8cbbdc13`
+and `59d94e06df362a4bea7049ee4780638db637a0c00210519469420a992b81bcb6`.
+The exact adapter was `franken-whisper-sortformer-oracle-v3` with executable
+SHA-256
+`d8ced65ea4fa48e7f238005bf81659f57b9b575ddf6e04a75a835313ac0bf4eb`.
+The ten Williams rows completed in balanced order. Native acoustic, ECAPA, and
+fused ECAPA completed 10/10 attempts; native and external Sortformer each
+completed every one of the eight four-speaker-capacity-eligible attempts and
+retained two typed capacity skips, with zero failed attempts in every lane.
+The common-complete intersection therefore contains eight recordings.
+
+On those eight available Sortformer recordings, native and external
+Sortformer respectively recorded micro DER `0.014704749721` and
+`0.014435836015`, macro JER `0.015993908493` and `0.015972975758`, overlap F1
+`0.859849181534` and `0.861681374826`, and full-timeline exact speaker-count
+rate `1.0` for both. Native reported an exact inferred count on 8/8; the
+external diagnostic does not expose an independently resolved count estimate.
+Their aggregate RTF values were `0.058895178751` and `0.056356249758`.
+Approximate sampled whole-process-tree peak RSS was 1,427,947,520 bytes for
+native and 2,422,849,536 bytes for external NeMo: native passed the frozen
+2 GiB cap and external NeMo honestly failed it. Every lane passed the 500 ms
+cancellation cap with a 27 ms retained maximum. ECAPA-only and fused ECAPA
+also completed 10/10 after the turn builder stopped extending a secondary
+overlap across unmarked speech and coupled its end to an adjacent primary's
+analysis-frame midpoint clipping.
+
+The artifact pair passed independent structural and bundle-identity
+verification, including rejection of a self-consistently rehashed bundle
+substitution. It is mode-0600, aggregate-only, path-free, diagnostic-only,
+development-uncertified evidence with `production_route_changed=false` and no
+superiority permission. It does not certify deployment accuracy, solve the
+greater-than-four-speaker capacity boundary, excuse the external RSS loss, or
+authorize `Auto` routing.
+
+The historical one-record resource row was reproduced by protocol v6 in five fresh workers,
 and all five lanes completed, so its common-complete intersection contains one
 recording. The comparison executable SHA-256 is
 `2816def9153aeed644b86aa8c480a046a8b18a4a3414fe4bc73926988142ee0d`,
