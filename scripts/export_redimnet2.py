@@ -15,9 +15,12 @@ biometric sample. Receipts contain hashes and tensor shapes, never local paths.
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
 import contextlib
 import hashlib
 import hmac
+import importlib
 import importlib.metadata
 import io
 import json
@@ -25,14 +28,15 @@ import os
 import stat
 import struct
 import sys
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch as torch_types
 
-EXPORTER_SCHEMA = "franken-whisper-redimnet2-export-v1"
-RECEIPT_SCHEMA = "franken-whisper-redimnet2-conversion-receipt-v1"
+EXPORTER_SCHEMA = "franken-whisper-redimnet2-export-v2"
+RECEIPT_SCHEMA = "franken-whisper-redimnet2-conversion-receipt-v2"
 TRUTH_SCHEMA = "franken-whisper-redimnet2-synthetic-truth-v1"
 MODEL_ID = "PalabraAI/redimnet2:b2-vox2-lm"
 MODEL_RELEASE = "v1.0.0"
@@ -53,6 +57,14 @@ SYNTHETIC_SAMPLES = 48_000
 SYNTHETIC_FIXTURE_ID = "modular-noise-triangle-impulse-v1"
 THREAD_COUNTS = (1, 8)
 REPETITIONS_PER_THREAD_COUNT = 5
+MAX_RUNTIME_EXECUTABLE_BYTES = 128 * 1024 * 1024
+KNOWN_UPSTREAM_WARNING = (
+    "FutureWarning",
+    "`torch.cuda.amp.autocast(args...)` is deprecated. Please use "
+    "`torch.amp.autocast('cuda', args...)` instead.",
+    "torch_cuda_amp_autocast_deprecated",
+)
+KNOWN_UPSTREAM_STDOUT = ("out_channels : None\n", "redimnet2_out_channels_none")
 
 REQUIRED_PYTHON = (3, 12, 12)
 REQUIRED_PACKAGES = {
@@ -110,7 +122,7 @@ PARITY_TOLERANCES = {
     "l2_embedding": {"max_abs": 5.0e-5, "relative_l2": 5.0e-5},
 }
 
-TOLERANCE_CALIBRATION = {
+REJECTED_TOLERANCE_CALIBRATION = {
     "frontend": {
         "initial_rejected_ceiling": {"max_abs": 2.0e-5, "relative_l2": 2.0e-6},
         "measured_source_floor": {
@@ -174,6 +186,28 @@ def _verify_source_tree(source_root: Path) -> list[dict[str, Any]]:
     canonical_root = source_root.resolve(strict=True)
     if canonical_root != source_root.absolute():
         raise RuntimeError("source root must not contain indirect path components")
+    expected_package_files = {
+        relative for relative in SOURCE_FILES if relative.startswith("redimnet2/")
+    }
+    observed_package_files = set()
+    pending = [canonical_root / "redimnet2"]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                relative = Path(entry.path).relative_to(canonical_root).as_posix()
+                if entry.is_symlink():
+                    raise RuntimeError("pinned source package contains an indirect entry")
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    observed_package_files.add(relative)
+                else:
+                    raise RuntimeError("pinned source package contains a special entry")
+    if observed_package_files != expected_package_files:
+        raise RuntimeError(
+            "pinned source package executable census differs from the manifest"
+        )
     manifest = []
     for relative, expected_sha256 in sorted(SOURCE_FILES.items()):
         source = canonical_root / relative
@@ -187,7 +221,7 @@ def _verify_source_tree(source_root: Path) -> list[dict[str, Any]]:
     return manifest
 
 
-def _require_runtime() -> dict[str, str]:
+def _require_runtime() -> dict[str, Any]:
     if sys.version_info[:3] != REQUIRED_PYTHON:
         raise RuntimeError("pinned ReDimNet2 export requires Python 3.12.12")
     observed = {
@@ -195,7 +229,243 @@ def _require_runtime() -> dict[str, str]:
     }
     if observed != REQUIRED_PACKAGES:
         raise RuntimeError("pinned ReDimNet2 runtime package identity changed")
-    return observed
+    distributions = {}
+    for package in sorted(REQUIRED_PACKAGES):
+        distribution = importlib.metadata.distribution(package)
+        record = distribution.read_text("RECORD")
+        metadata = distribution.read_text("METADATA")
+        if record is None or metadata is None:
+            raise RuntimeError("pinned runtime distribution identity is incomplete")
+        verified_files, verified_bytes, file_set_sha256 = _verify_distribution_record(
+            distribution, record
+        )
+        distributions[package] = {
+            "file_set_sha256": file_set_sha256,
+            "metadata_sha256": _sha256_bytes(metadata.encode("utf-8")),
+            "record_sha256": _sha256_bytes(record.encode("utf-8")),
+            "version": observed[package],
+            "verified_bytes": verified_bytes,
+            "verified_files": verified_files,
+        }
+    return {
+        "distributions": distributions,
+        "interpreter": {
+            "byteorder": sys.byteorder,
+            "cache_tag": sys.implementation.cache_tag,
+            "implementation": sys.implementation.name,
+            "pointer_bits": struct.calcsize("P") * 8,
+            "platform": sys.platform,
+            "version": ".".join(str(value) for value in REQUIRED_PYTHON),
+        },
+        "packages": observed,
+    }
+
+
+def _verify_distribution_record(
+    distribution: importlib.metadata.Distribution, record: str
+) -> tuple[int, int, str]:
+    rows = list(csv.reader(io.StringIO(record)))
+    observed_paths = set()
+    commitments = []
+    verified_bytes = 0
+    for row in rows:
+        if len(row) != 3 or not row[0] or row[0] in observed_paths:
+            raise RuntimeError("pinned runtime RECORD contains an invalid entry")
+        observed_paths.add(row[0])
+        if not row[1] and not row[2]:
+            continue
+        if not row[1].startswith("sha256=") or not row[2].isdigit():
+            raise RuntimeError("pinned runtime RECORD uses an unsupported identity")
+        expected_bytes = int(row[2])
+        encoded_digest = row[1].removeprefix("sha256=")
+        try:
+            expected_digest = base64.urlsafe_b64decode(
+                encoded_digest + "=" * (-len(encoded_digest) % 4)
+            ).hex()
+        except ValueError as error:
+            raise RuntimeError("pinned runtime RECORD contains an invalid digest") from error
+        if len(expected_digest) != 64:
+            raise RuntimeError("pinned runtime RECORD digest length changed")
+        candidate = Path(distribution.locate_file(row[0]))
+        if candidate.is_symlink():
+            raise RuntimeError("pinned runtime RECORD resolves through a file symlink")
+        candidate = candidate.resolve(strict=True)
+        before = candidate.stat(follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != expected_bytes:
+            raise RuntimeError("pinned runtime RECORD file identity changed")
+        digest = hashlib.sha256()
+        with candidate.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        after = candidate.stat(follow_symlinks=False)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+            before.st_mode,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+            after.st_mode,
+        ) or not hmac.compare_digest(digest.hexdigest(), expected_digest):
+            raise RuntimeError("pinned runtime RECORD file changed or failed its digest")
+        commitments.append(
+            _canonical_json_bytes(
+                {
+                    "bytes": expected_bytes,
+                    "relative_path": row[0],
+                    "sha256": expected_digest,
+                }
+            )
+        )
+        verified_bytes += expected_bytes
+    if not commitments:
+        raise RuntimeError("pinned runtime RECORD verified no files")
+    file_set = hashlib.sha256()
+    for commitment in sorted(commitments):
+        file_set.update(struct.pack("<Q", len(commitment)))
+        file_set.update(commitment)
+    return len(commitments), verified_bytes, file_set.hexdigest()
+
+
+def _runtime_executable_identity() -> dict[str, Any]:
+    executable = Path(sys.executable).resolve(strict=True)
+    if executable.is_symlink():
+        raise RuntimeError("runtime executable resolution remained indirect")
+    before = executable.stat(follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_RUNTIME_EXECUTABLE_BYTES:
+        raise RuntimeError("runtime executable identity is outside its fixed bound")
+    value = executable.read_bytes()
+    after = executable.stat(follow_symlinks=False)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_mode,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        after.st_mode,
+    ):
+        raise RuntimeError("runtime executable changed while it was hashed")
+    return {"bytes": len(value), "sha256": _sha256_bytes(value)}
+
+
+def _complete_runtime_identity(runtime: dict[str, Any], torch: Any) -> dict[str, Any]:
+    config = torch.__config__.show()
+    if not isinstance(config, str):
+        raise RuntimeError("torch build configuration is unavailable")
+    completed = dict(runtime)
+    completed["interpreter"] = dict(runtime["interpreter"])
+    completed["interpreter"]["executable"] = _runtime_executable_identity()
+    completed["torch_build"] = {
+        "config_sha256": _sha256_bytes(config.encode("utf-8")),
+        "cuda_version": torch.version.cuda,
+        "debug": bool(torch.version.debug),
+        "git_version": torch.version.git_version,
+        "version": torch.__version__,
+    }
+    return completed
+
+
+def _install_offline_audit_hook() -> None:
+    denied_events = {
+        "os.exec",
+        "os.fork",
+        "os.forkpty",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "os.system",
+        "subprocess.Popen",
+    }
+
+    def reject_external_activity(event: str, _arguments: tuple[Any, ...]) -> None:
+        if event.startswith("socket.") or event in denied_events:
+            raise RuntimeError(
+                "offline export policy blocked network or child-process activity"
+            )
+
+    sys.addaudithook(reject_external_activity)
+
+
+def _validated_warning_receipt(observed: list[warnings.WarningMessage]) -> list[dict[str, Any]]:
+    expected_category, expected_message, warning_code = KNOWN_UPSTREAM_WARNING
+    count = 0
+    for warning in observed:
+        category = warning.category.__name__
+        message = str(warning.message)
+        if category != expected_category or message != expected_message:
+            raise RuntimeError("upstream execution emitted an unrecognized warning")
+        count += 1
+    if count == 0:
+        return []
+    return [
+        {
+            "category": expected_category,
+            "code": warning_code,
+            "count": count,
+            "message_sha256": _sha256_bytes(expected_message.encode("utf-8")),
+        }
+    ]
+
+
+def _validated_console_receipt(stdout: str, stderr: str) -> list[dict[str, Any]]:
+    expected_stdout, output_code = KNOWN_UPSTREAM_STDOUT
+    if stderr or stdout != expected_stdout:
+        raise RuntimeError("upstream execution emitted unrecognized console output")
+    return [
+        {
+            "bytes": len(expected_stdout.encode("utf-8")),
+            "code": output_code,
+            "sha256": _sha256_bytes(expected_stdout.encode("utf-8")),
+            "stream": "stdout",
+        }
+    ]
+
+
+def _tolerance_calibration(
+    floor_maxima: dict[str, dict[str, float]],
+) -> dict[str, dict[str, Any]]:
+    calibration = {}
+    for seam in sorted(PARITY_TOLERANCES):
+        floor = floor_maxima[seam]
+        ceiling = PARITY_TOLERANCES[seam]
+        headroom = {}
+        for metric in sorted(ceiling):
+            floor_value = floor[metric]
+            ceiling_value = ceiling[metric]
+            headroom[metric] = {
+                "absolute_allowance": ceiling_value - floor_value,
+                "ceiling_to_floor_multiplier": (
+                    ceiling_value / floor_value if floor_value > 0.0 else None
+                ),
+            }
+        calibration[seam] = {
+            "frozen_ceiling": ceiling,
+            "headroom": headroom,
+            "measured_source_floor": floor,
+            "rounding_rationale": (
+                "pre_native_decimal_engineering_ceiling_compared_directly_as_f64;"
+                "no_rust_observation_influenced_the_ceiling"
+            ),
+        }
+    calibration["frontend"]["initial_rejected_ceiling"] = (
+        REJECTED_TOLERANCE_CALIBRATION["frontend"]["initial_rejected_ceiling"]
+    )
+    calibration["frontend"]["rejection_reason"] = REJECTED_TOLERANCE_CALIBRATION[
+        "frontend"
+    ]["reason"]
+    return calibration
 
 
 def _verify_imported_source(source_root: Path) -> None:
@@ -319,6 +589,16 @@ def _capture_truth(
         attentive_pool = model.pool(pool_input)
         pooled_bn = model.bn(attentive_pool)
         raw_embedding = model.linear(pooled_bn)
+        authoritative_raw_embedding = model(waveform)
+        authoritative_raw_embedding = _validated_f32_tensor(
+            "authoritative_raw_embedding", authoritative_raw_embedding
+        )
+        if tuple(authoritative_raw_embedding.shape) != tuple(raw_embedding.shape) or not torch.equal(
+            authoritative_raw_embedding, raw_embedding
+        ):
+            raise RuntimeError(
+                "manual seam expansion disagrees with the authoritative model forward"
+            )
         norm = torch.linalg.vector_norm(raw_embedding, ord=2, dim=1, keepdim=True)
         if not torch.isfinite(norm).all().item() or torch.any(norm <= 0).item():
             raise RuntimeError("raw embedding has no finite positive L2 norm")
@@ -420,28 +700,45 @@ def _tensor_manifest(tensors: dict[str, torch_types.Tensor]) -> list[dict[str, A
     ]
 
 
-def _publish_exclusive(path: Path, value: bytes) -> None:
+def _publish_exclusive(directory_descriptor: int, name: str, value: bytes) -> None:
     descriptor = os.open(
-        path,
-        os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0),
+        name,
+        os.O_CREAT
+        | os.O_EXCL
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
         0o600,
+        dir_fd=directory_descriptor,
     )
-    with os.fdopen(descriptor, "wb") as output:
+    with os.fdopen(descriptor, "w+b") as output:
         os.fchmod(output.fileno(), 0o600)
+        created = os.fstat(output.fileno())
+        if not stat.S_ISREG(created.st_mode):
+            raise RuntimeError("published output is not a regular file")
         output.write(value)
         output.flush()
         os.fsync(output.fileno())
-    if path.is_symlink():
-        raise RuntimeError("published output unexpectedly became a symlink")
-    observed = path.read_bytes()
-    mode = path.stat(follow_symlinks=False).st_mode
-    if stat.S_IMODE(mode) != 0o600 or not hmac.compare_digest(
-        _sha256_bytes(observed), _sha256_bytes(value)
+        output.seek(0)
+        observed = output.read()
+        after = os.fstat(output.fileno())
+    published = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    created_identity = (created.st_dev, created.st_ino)
+    if (
+        (after.st_dev, after.st_ino) != created_identity
+        or (published.st_dev, published.st_ino) != created_identity
+        or not stat.S_ISREG(after.st_mode)
+        or not stat.S_ISREG(published.st_mode)
+        or stat.S_IMODE(after.st_mode) != 0o600
+        or stat.S_IMODE(published.st_mode) != 0o600
+        or not hmac.compare_digest(
+            _sha256_bytes(observed), _sha256_bytes(value)
+        )
     ):
         raise RuntimeError("published output identity changed")
 
 
-def _prepare_output_directory(output_dir: Path) -> Path:
+def _prepare_output_directory(output_dir: Path) -> tuple[Path, int, tuple[int, int]]:
     repo_root = Path(__file__).resolve(strict=True).parent.parent
     if output_dir.exists() or output_dir.is_symlink():
         raise RuntimeError("output directory must not already exist")
@@ -450,15 +747,27 @@ def _prepare_output_directory(output_dir: Path) -> Path:
     if destination == repo_root or repo_root in destination.parents:
         raise RuntimeError("ReDimNet2 artifacts must stay outside the repository")
     os.mkdir(destination, mode=0o700)
-    os.chmod(destination, 0o700)
-    return destination
+    descriptor = os.open(
+        destination,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    os.fchmod(descriptor, 0o700)
+    observed = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode) or stat.S_IMODE(observed.st_mode) != 0o700:
+        os.close(descriptor)
+        raise RuntimeError("output directory identity or mode changed")
+    return destination, descriptor, (observed.st_dev, observed.st_ino)
 
 
-def _require_external_input(path: Path, label: str) -> None:
+def _require_external_input(path: Path, label: str) -> Path:
     repo_root = Path(__file__).resolve(strict=True).parent.parent
     canonical = path.resolve(strict=True)
     if canonical == repo_root or repo_root in canonical.parents:
         raise RuntimeError(f"{label} must stay outside the repository")
+    return canonical
 
 
 def _parse_args() -> argparse.Namespace:
@@ -471,18 +780,20 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    _install_offline_audit_hook()
     exporter_path = Path(__file__).resolve(strict=True)
     exporter_bytes = exporter_path.read_bytes()
-    _require_external_input(args.checkpoint, "checkpoint")
-    _require_external_input(args.source_root, "source root")
-    source_manifest = _verify_source_tree(args.source_root)
+    checkpoint_path = _require_external_input(args.checkpoint, "checkpoint")
+    source_root = _require_external_input(args.source_root, "source root")
+    source_manifest = _verify_source_tree(source_root)
     runtime = _require_runtime()
     checkpoint_bytes = _stable_file_bytes(
-        args.checkpoint, CHECKPOINT_BYTES, CHECKPOINT_SHA256
+        checkpoint_path, CHECKPOINT_BYTES, CHECKPOINT_SHA256
     )
 
     import torch
 
+    runtime = _complete_runtime_identity(runtime, torch)
     torch.use_deterministic_algorithms(True)
     torch.set_grad_enabled(False)
     checkpoint = torch.load(
@@ -516,38 +827,55 @@ def main() -> int:
     ):
         raise RuntimeError("exported tensor census changed")
 
-    canonical_source_root = args.source_root.resolve(strict=True)
-    sys.path.insert(0, str(canonical_source_root))
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            from redimnet2.redimnet2 import ReDimNet2Wrap
+    if any(name == "redimnet2" or name.startswith("redimnet2.") for name in sys.modules):
+        raise RuntimeError("pinned source package was imported before source verification")
+    sys.dont_write_bytecode = True
+    importlib.invalidate_caches()
+    upstream_stdout = io.StringIO()
+    upstream_stderr = io.StringIO()
+    with warnings.catch_warnings(record=True) as observed_warnings:
+        warnings.simplefilter("always")
+        sys.path.insert(0, str(source_root))
+        try:
+            with contextlib.redirect_stdout(upstream_stdout), contextlib.redirect_stderr(
+                upstream_stderr
+            ):
+                from redimnet2.redimnet2 import ReDimNet2Wrap
 
-            model = ReDimNet2Wrap(**config)
-    finally:
-        sys.path.pop(0)
-    _verify_imported_source(canonical_source_root)
-    load_result = model.load_state_dict(state, strict=True)
-    if load_result.missing_keys or load_result.unexpected_keys:
-        raise RuntimeError("checkpoint no longer loads strictly")
-    total_parameters = sum(parameter.numel() for parameter in model.parameters())
-    trainable_parameters = sum(
-        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+                model = ReDimNet2Wrap(**config)
+                _verify_imported_source(source_root)
+                load_result = model.load_state_dict(state, strict=True)
+                if load_result.missing_keys or load_result.unexpected_keys:
+                    raise RuntimeError("checkpoint no longer loads strictly")
+                total_parameters = sum(
+                    parameter.numel() for parameter in model.parameters()
+                )
+                trainable_parameters = sum(
+                    parameter.numel()
+                    for parameter in model.parameters()
+                    if parameter.requires_grad
+                )
+                frozen_parameters = total_parameters - trainable_parameters
+                if (
+                    total_parameters != TOTAL_PARAMETERS
+                    or trainable_parameters != TRAINABLE_PARAMETERS
+                    or frozen_parameters != FROZEN_PARAMETERS
+                ):
+                    raise RuntimeError("model parameter census changed")
+
+                waveform = _synthetic_waveform()
+                truth, floor_runs, floor_maxima = _measure_source_floor(model, waveform)
+        finally:
+            sys.path.pop(0)
+    warning_receipt = _validated_warning_receipt(observed_warnings)
+    console_receipt = _validated_console_receipt(
+        upstream_stdout.getvalue(), upstream_stderr.getvalue()
     )
-    frozen_parameters = total_parameters - trainable_parameters
-    if (
-        total_parameters != TOTAL_PARAMETERS
-        or trainable_parameters != TRAINABLE_PARAMETERS
-        or frozen_parameters != FROZEN_PARAMETERS
-    ):
-        raise RuntimeError("model parameter census changed")
-
-    waveform = _synthetic_waveform()
-    truth, floor_runs, floor_maxima = _measure_source_floor(model, waveform)
     package_bytes = _build_deterministic_safetensors(exported)
     truth_bytes = _build_deterministic_safetensors(truth)
     if exporter_path.read_bytes() != exporter_bytes:
         raise RuntimeError("exporter changed while conversion was running")
-    if _verify_source_tree(args.source_root) != source_manifest:
+    if _verify_source_tree(source_root) != source_manifest:
         raise RuntimeError("source tree changed while conversion was running")
 
     receipt = {
@@ -581,7 +909,11 @@ def main() -> int:
             "release": MODEL_RELEASE,
             "source_revision": MODEL_SOURCE_REVISION,
         },
-        "network_access": False,
+        "offline_execution_policy": {
+            "child_process_events_denied": True,
+            "python_audit_hook_enforced": True,
+            "socket_events_denied": True,
+        },
         "package": {
             "bytes": len(package_bytes),
             "format": "safetensors-f32-metadata-free",
@@ -595,7 +927,7 @@ def main() -> int:
             "speaker_identities": False,
             "transcripts": False,
         },
-        "runtime": {"packages": runtime, "python": "3.12.12"},
+        "runtime": runtime,
         "schema": RECEIPT_SCHEMA,
         "source_files": source_manifest,
         "truth": {
@@ -610,19 +942,32 @@ def main() -> int:
             "source_floor_maxima": floor_maxima,
             "source_floor_runs": floor_runs,
             "thread_counts": list(THREAD_COUNTS),
-            "tolerance_calibration": TOLERANCE_CALIBRATION,
+            "tolerance_calibration": _tolerance_calibration(floor_maxima),
+            "upstream_console": console_receipt,
+            "upstream_warnings": warning_receipt,
         },
     }
     receipt_bytes = _canonical_json_bytes(receipt) + b"\n"
-    destination = _prepare_output_directory(args.output_dir)
-    _publish_exclusive(destination / "redimnet2_b2_vox2_lm_f32.safetensors", package_bytes)
-    _publish_exclusive(
-        destination / "redimnet2_b2_vox2_lm_synthetic_truth.safetensors", truth_bytes
+    destination, directory_descriptor, directory_identity = _prepare_output_directory(
+        args.output_dir
     )
-    _publish_exclusive(destination / "conversion_receipt.json", receipt_bytes)
-    directory_descriptor = os.open(destination, os.O_RDONLY)
     try:
+        _publish_exclusive(
+            directory_descriptor, "redimnet2_b2_vox2_lm_f32.safetensors", package_bytes
+        )
+        _publish_exclusive(
+            directory_descriptor,
+            "redimnet2_b2_vox2_lm_synthetic_truth.safetensors",
+            truth_bytes,
+        )
+        _publish_exclusive(directory_descriptor, "conversion_receipt.json", receipt_bytes)
         os.fsync(directory_descriptor)
+        destination_status = destination.stat(follow_symlinks=False)
+        if destination.is_symlink() or (
+            destination_status.st_dev,
+            destination_status.st_ino,
+        ) != directory_identity:
+            raise RuntimeError("output directory changed during publication")
     finally:
         os.close(directory_descriptor)
 
@@ -644,6 +989,9 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        raise SystemExit(1) from error
+    except Exception:
+        print(
+            "error: ReDimNet2 export failed; no receipt was published",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
