@@ -14,9 +14,8 @@
 //! Usage: `logit_max_reduce_probe [iters]`.
 #![allow(unsafe_code)]
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-#[cfg(target_arch = "x86_64")]
 mod x86_probe {
+    use std::arch::x86_64::*;
     use std::hint::black_box;
     use std::time::Instant;
 

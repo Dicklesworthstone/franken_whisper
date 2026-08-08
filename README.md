@@ -613,10 +613,13 @@ mutates model weights. It cannot yet be
 selected by `--diarization-engine auto`. On the frozen 25-second overlap-heavy
 two-speaker public clip, the native output scored DER `0.058904110` and JER
 `0.065850064`; that is one evidence row, not broad accuracy certification.
-Raw L7/L8 matches the authenticated public truth, while production turns clamp
-to the physical audio duration. One chained L6 hard-top-k tie remains
-platform-defined, so the command reports `evaluation_only` and automatic
-promotion remains forbidden. The converted f32 package is 491,570,584 bytes
+Raw L7/L8 is byte-exact on that frozen 25-second reconstructable truth-pack
+prefix, while production turns clamp to the physical audio duration. A later
+whole-recording run on the same 102-second public recording found four one-frame
+(80 ms) native-versus-NeMo boundary differences among 16 anonymous turns, so
+broad whole-recording L7/L8 parity is not established. One chained L6 hard-top-k
+tie remains platform-defined; the command therefore reports `evaluation_only`
+and automatic promotion remains forbidden. The converted f32 package is 491,570,584 bytes
 (SHA-256 `487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a`).
 Its distribution policy is `github_release_with_license_and_notice`: weights
 remain outside Git and are attached to the dedicated model release with the
@@ -641,6 +644,33 @@ separate from the native Rust runtime's explicit `fw pull sortformer` cache.
 The full adapter protocol, environment overrides, privacy rules, and authority
 boundary are in the
 [`acoustic diarization contract`](docs/acoustic_diarization_contract.md#114-stage-aware-external-differential-oracles).
+
+ReDimNet2-B2 is a separate compact speaker-embedding experiment, not an
+end-to-end diarizer and not an `auto` route. The offline
+`scripts/export_redimnet2.py` command accepts the pinned upstream checkpoint,
+the exact v1.0.0 source tree, and a new output directory:
+
+```bash
+python3 scripts/export_redimnet2.py INPUT.pt SOURCE_ROOT OUTPUT_DIR
+```
+
+All three arguments must resolve outside this checkout, `OUTPUT_DIR` must not
+exist, and the command performs no download. It requires Python 3.12.12 with
+torch/torchaudio 2.7.1, NumPy 2.2.6, SciPy 1.15.3, and safetensors 0.5.3. It
+hash-binds the 15,897,450-byte upstream checkpoint and 14 imported/source files,
+drops only 68 scalar batch counters, and writes a metadata-free 15,745,544-byte
+f32 package (SHA-256
+`d41a729f5ef008d70c6d6bf4ab7ca27e299a478ff665665a4e31afff7f46ddeb`),
+an 8,828,392-byte non-human synthetic seam pack (SHA-256
+`21042537873c3dacafafd134d7c9e296318458f55f1a429c00bc9542f95f3238`),
+and a canonical path-free receipt. Two fresh exports were byte-identical. The
+model has 3,677,760 total parameters, of which 3,676,320 are trainable and 1,440
+are frozen; its raw 192-vector is retained separately from consumer-side L2
+normalization. The v1.0.0 tag predates the repository's current MIT file, so the
+receipt deliberately marks this package `operator_local_no_release` until the
+model-weight license scope is explicitly established. No ReDimNet weights,
+truth tensors, feature values, local paths, audio, transcripts, or biometric
+vectors belong in Git or public runtime reports.
 
 The two explicit Rust-native ECAPA modes run the pinned ECAPA-TDNN speaker
 representation in process through the common segmentation, known-speaker
@@ -1055,7 +1085,7 @@ worker counts at eight, and applies the same frozen 1800-second attempt timeout
 to every lane. The application downloads neither the ECAPA
 package nor the external Sortformer adapter/model; the native Sortformer lane
 uses the release-bound cache installed only by `fw pull sortformer`. Absent
-components become typed lane skips. Protocol v3 pins the complete effective native request
+components become typed lane skips. Protocol v4 pins the complete effective native request
 for each lane, its ordered payload-free outcome taxonomy, and its own canonical
 digest. Any change to those bindings requires a new version-and-digest pair.
 
@@ -1068,11 +1098,11 @@ worker identity validation, audio decode, model load, inference, output
 validation, scoring, parent-side post-run identity validation, and the native
 platform resource probe. The parent kills the complete descendant process
 group on cancellation or timeout, records a live recursive-descendant
-cancellation probe, and retains direct-worker peak RSS from that resource probe.
-That peak-RSS value does not aggregate a subprocess adapter's memory, so it
-cannot by itself pass a whole-process-tree memory gate. Wall time, RTF, peak RSS,
-and cancellation latency carry explicit scope, authority, and cap dispositions
-rather than zero or shared-process estimates. The companion path-free public bundle is record-level scorer
+cancellation probe, and samples the concurrent RSS sum of the complete worker
+process group every 50 ms. That whole-tree scope includes nested subprocess
+adapters instead of silently reporting only the Rust worker. Wall time, RTF,
+whole-tree RSS, and cancellation latency carry explicit scope, authority, and
+cap dispositions rather than zero or shared-process estimates. The companion path-free public bundle is record-level scorer
 input and therefore retains opaque public recording/speaker IDs and reference
 timestamps, but no source path, filename, audio, or transcript.
 

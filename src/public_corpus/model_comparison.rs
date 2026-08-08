@@ -45,15 +45,15 @@ use crate::sortformer_inference::{
     SortformerSpeakerTurn,
 };
 
-pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v3";
+pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v4";
 pub const PUBLIC_MODEL_COMPARISON_RUNNER_VERSION: &str =
-    "public-diarization-model-comparison-runner-v3";
+    "public-diarization-model-comparison-runner-v4";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION: &str =
-    "public-diarization-model-comparison-protocol-v3";
+    "public-diarization-model-comparison-protocol-v4";
 pub const PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION: &str =
     "public-diarization-model-comparison-outcomes-v3";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256: &str =
-    "2356b06726b93d465178a4ab25fc9d5daa92fddcd4ce9382909e83159304bec4";
+    "f387fd87682064c4e2ecb95c8a207024a43b798620b2564144c7b82353d2cef8";
 pub const PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION: &str = "five-lane-balanced-williams-v1";
 pub const PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS: u64 = 1_800;
 const MODEL_COMPARISON_WORKER_SCHEMA_VERSION: &str = "public-model-comparison-worker-v1";
@@ -66,6 +66,7 @@ const MODEL_COMPARISON_NATIVE_RTF_CAP_MILLIONTHS: u64 = 500_000;
 const MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS: u64 = 10_000_000;
 const MODEL_COMPARISON_PEAK_RSS_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS: u64 = 500;
+const MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS: u64 = 50;
 
 /// Canonical comparison lanes. The order is part of the retained contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -321,10 +322,9 @@ pub enum ModelComparisonWallTimeScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelComparisonPeakRssScope {
-    /// Peak RSS of the direct comparison worker. A subprocess adapter's RSS is
-    /// not aggregated into this value and therefore cannot pass a whole-tree
-    /// memory gate.
-    DirectWorkerProcess,
+    /// Maximum concurrently observed RSS sum across the fresh worker process
+    /// group, including every inherited subprocess adapter.
+    WholeProcessTree,
 }
 
 /// Counts for every declared outcome, including stable reasons.
@@ -499,6 +499,7 @@ pub struct ModelComparisonResourceEvidence {
     pub completed_wall_time_ms: u64,
     pub peak_rss_authority: ModelComparisonResourceAuthority,
     pub peak_rss_scope: ModelComparisonPeakRssScope,
+    pub peak_rss_sampling_interval_ms: Option<u64>,
     pub authoritative_peak_rss_bytes: Option<u64>,
     pub cancellation_latency_authority: ModelComparisonResourceAuthority,
     pub maximum_cancellation_latency_ms: Option<u64>,
@@ -587,6 +588,7 @@ pub struct PublicModelComparisonProtocol {
     pub native_real_time_factor_cap_millionths: u64,
     pub external_real_time_factor_cap_millionths: u64,
     pub peak_rss_cap_bytes: u64,
+    pub process_tree_rss_sample_interval_ms: u64,
     pub cancellation_latency_cap_ms: u64,
     pub ecapa_contract_sha256: String,
     pub ecapa_package_sha256: String,
@@ -1055,7 +1057,7 @@ where
     if evaluation_split != EvaluationSplit::Development {
         return Err(model_comparison_error(
             "split",
-            "the uncertified v3 comparison is restricted to the development split",
+            "the uncertified v4 comparison is restricted to the development split",
         ));
     }
     if attempt_hard_timeout != Duration::from_secs(PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS)
@@ -1484,7 +1486,7 @@ where
     };
     evidence.deterministic_accuracy_sha256 = deterministic_accuracy_sha256(&evidence)?;
     evidence.result_sha256 = super::canonical_sha256(&evidence)?;
-    verify_public_model_comparison_evidence(&evidence)?;
+    verify_public_model_comparison_bundle_pair(&bundle, &evidence)?;
 
     let mut cancellation_adapter = || is_cancelled();
     let staged_bundle = super::stage_new_json(
@@ -1606,6 +1608,8 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         external_real_time_factor_cap_millionths:
             MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS,
         peak_rss_cap_bytes: MODEL_COMPARISON_PEAK_RSS_CAP_BYTES,
+        process_tree_rss_sample_interval_ms:
+            MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS,
         cancellation_latency_cap_ms: MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS,
         ecapa_contract_sha256: ECAPA_CONTRACT_SHA256.to_owned(),
         ecapa_package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
@@ -1618,7 +1622,7 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
             "fixed_safe_v1_change+probabilistic_v1_clustering+unknown_fallback".to_owned(),
         sortformer_postprocessing: "native_l8_and_pinned_external_sortformer_oracle_contract_v2"
             .to_owned(),
-        wall_time_policy: "fresh_process_per_lane_and_observation;process_launch+bounded_ipc+identity_validation+audio_decode+model_load+inference+output_validation+scorer+parent_post_identity+resource_probe;matched_timeout_and_thread_policy;cross_lane_comparable;peak_rss_from_direct_worker_process_only_not_descendant_adapters".to_owned(),
+        wall_time_policy: "fresh_process_per_lane_and_observation;process_launch+bounded_ipc+identity_validation+audio_decode+model_load+inference+output_validation+scorer+parent_post_identity+resource_probe;matched_timeout_and_thread_policy;cross_lane_comparable;peak_rss_is_maximum_concurrently_sampled_sum_across_worker_process_group_including_descendant_adapters".to_owned(),
         aggregate_only: true,
         production_route_changed: false,
     })
@@ -1824,17 +1828,23 @@ where
             "the current executable path is not valid UTF-8",
         )
     })?;
-    let (program, args, rss_probe) = comparison_worker_command(executable_text);
+    let program = executable_text.to_owned();
+    let args = vec!["__comparison-worker".to_owned()];
     let cancellation = CancellationToken::unbounded();
-    let output = match crate::process::run_command_cancellable_with_input_and_probe(
-        &program,
-        &args,
-        None,
-        &cancellation,
-        Some(worker_timeout),
-        Some(is_cancelled),
-        &payload,
-    ) {
+    let mut rss_sampler = ProcessTreeRssSampler::new();
+    let command_result = {
+        let mut observer = |root_pid| rss_sampler.observe(root_pid);
+        crate::process::run_command_cancellable_with_input_probe_and_observer(
+            &program,
+            &args,
+            &cancellation,
+            Some(worker_timeout),
+            Some(is_cancelled),
+            &payload,
+            &mut observer,
+        )
+    };
+    let output = match command_result {
         Ok(output) => output,
         Err(error @ FwError::Cancelled(_)) => return Err(error),
         Err(FwError::CommandTimedOut { .. }) => {
@@ -1861,6 +1871,14 @@ where
             )?;
             if timed_out {
                 return Ok(worker_timeout_outcome(lane, attempt_started));
+            }
+            if rss_sampler.failed() {
+                let mut outcome = InternalLaneOutcome::failed(
+                    lane,
+                    ModelComparisonOutcomeCode::WorkerResourceProbeFailed,
+                );
+                outcome.attempt_wall_time_ms = elapsed_millis(attempt_started);
+                return Ok(outcome);
             }
             let mut outcome = InternalLaneOutcome::failed(
                 lane,
@@ -1954,14 +1972,7 @@ where
             "a fresh-process comparison worker contradicted its bound identities",
         ));
     }
-    let peak_rss_bytes = match rss_probe {
-        #[cfg(target_vendor = "apple")]
-        WorkerRssProbe::MacOsTime => parse_macos_peak_rss(&output.stderr).map(Some),
-        #[cfg(target_os = "linux")]
-        WorkerRssProbe::GnuTime => parse_gnu_peak_rss(&output.stderr).map(Some),
-        WorkerRssProbe::Unavailable => Ok(None),
-    };
-    let peak_rss_bytes = match peak_rss_bytes {
+    let peak_rss_bytes = match rss_sampler.finish() {
         Ok(value) => value,
         Err(_) => {
             if remaining_attempt_budget(hard_timeout, attempt_started.elapsed()).is_none() {
@@ -2002,46 +2013,182 @@ fn worker_timeout_outcome(
     outcome
 }
 
-#[derive(Clone, Copy)]
-enum WorkerRssProbe {
-    #[cfg(target_vendor = "apple")]
-    MacOsTime,
-    #[cfg(target_os = "linux")]
-    GnuTime,
-    Unavailable,
+struct ProcessTreeRssSampler {
+    supported: bool,
+    failed: bool,
+    last_sample: Option<Instant>,
+    maximum_bytes: Option<u64>,
 }
 
-fn comparison_worker_command(executable: &str) -> (String, Vec<String>, WorkerRssProbe) {
-    #[cfg(target_vendor = "apple")]
-    if Path::new("/usr/bin/time").is_file() {
-        return (
-            "/usr/bin/time".to_owned(),
-            vec![
-                "-l".to_owned(),
-                executable.to_owned(),
-                "__comparison-worker".to_owned(),
-            ],
-            WorkerRssProbe::MacOsTime,
-        );
+impl ProcessTreeRssSampler {
+    fn new() -> Self {
+        #[cfg(target_vendor = "apple")]
+        let supported = Path::new("/bin/ps").is_file();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let supported = Path::new("/proc").is_dir();
+        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        let supported = false;
+        Self {
+            supported,
+            failed: false,
+            last_sample: None,
+            maximum_bytes: None,
+        }
     }
-    #[cfg(target_os = "linux")]
-    if Path::new("/usr/bin/time").is_file() {
-        return (
-            "/usr/bin/time".to_owned(),
-            vec![
-                "-f".to_owned(),
-                "fw_peak_rss_kib=%M".to_owned(),
-                executable.to_owned(),
-                "__comparison-worker".to_owned(),
-            ],
-            WorkerRssProbe::GnuTime,
-        );
+
+    fn observe(&mut self, root_pid: u32) -> FwResult<()> {
+        if !self.supported
+            || self.last_sample.is_some_and(|sampled_at| {
+                sampled_at.elapsed()
+                    < Duration::from_millis(MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS)
+            })
+        {
+            return Ok(());
+        }
+        self.last_sample = Some(Instant::now());
+        match sample_process_group_rss_bytes(root_pid) {
+            Ok(Some(bytes)) if bytes > 0 => {
+                self.maximum_bytes = Some(self.maximum_bytes.unwrap_or(0).max(bytes));
+                Ok(())
+            }
+            Ok(None) if self.maximum_bytes.is_some() => Ok(()),
+            Ok(None) | Ok(Some(_)) | Err(_) => {
+                self.failed = true;
+                Err(model_comparison_error(
+                    "worker_resource",
+                    "the whole-process-tree RSS probe could not produce a positive sample",
+                ))
+            }
+        }
     }
-    (
-        executable.to_owned(),
-        vec!["__comparison-worker".to_owned()],
-        WorkerRssProbe::Unavailable,
-    )
+
+    const fn failed(&self) -> bool {
+        self.failed
+    }
+
+    fn finish(&self) -> FwResult<Option<u64>> {
+        if self.failed || (self.supported && self.maximum_bytes.is_none()) {
+            return Err(model_comparison_error(
+                "worker_resource",
+                "the whole-process-tree RSS probe did not retain a positive sample",
+            ));
+        }
+        Ok(self.maximum_bytes)
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn sample_process_group_rss_bytes(root_pid: u32) -> FwResult<Option<u64>> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "rss=", "-g", &root_pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|_| {
+            model_comparison_error("worker_resource", "the macOS RSS probe could not run")
+        })?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    parse_process_group_rss_kib(&output.stdout)?.map_or(Ok(None), |kib| {
+        kib.checked_mul(1_024).map(Some).ok_or_else(|| {
+            model_comparison_error("worker_resource", "the macOS RSS sample overflowed bytes")
+        })
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sample_process_group_rss_bytes(root_pid: u32) -> FwResult<Option<u64>> {
+    let mut total_kib = 0u64;
+    let mut matched = false;
+    let entries = std::fs::read_dir("/proc").map_err(|_| {
+        model_comparison_error(
+            "worker_resource",
+            "the procfs RSS probe could not enumerate",
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            model_comparison_error(
+                "worker_resource",
+                "the procfs RSS probe encountered an unreadable directory entry",
+            )
+        })?;
+        let Some(_pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let process_root = entry.path();
+        let Ok(stat) = std::fs::read_to_string(process_root.join("stat")) else {
+            continue;
+        };
+        if linux_stat_process_group(&stat) != Some(root_pid) {
+            continue;
+        }
+        let Ok(status) = std::fs::read_to_string(process_root.join("status")) else {
+            continue;
+        };
+        let Some(rss_kib) = linux_status_rss_kib(&status) else {
+            continue;
+        };
+        total_kib = total_kib.checked_add(rss_kib).ok_or_else(|| {
+            model_comparison_error("worker_resource", "the procfs RSS sum overflowed")
+        })?;
+        matched = true;
+    }
+    if !matched || total_kib == 0 {
+        return Ok(None);
+    }
+    total_kib.checked_mul(1_024).map(Some).ok_or_else(|| {
+        model_comparison_error("worker_resource", "the procfs RSS sample overflowed bytes")
+    })
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn sample_process_group_rss_bytes(_root_pid: u32) -> FwResult<Option<u64>> {
+    Ok(None)
+}
+
+#[cfg(any(test, target_vendor = "apple"))]
+fn parse_process_group_rss_kib(stdout: &[u8]) -> FwResult<Option<u64>> {
+    let text = std::str::from_utf8(stdout).map_err(|_| {
+        model_comparison_error("worker_resource", "the RSS probe emitted non-UTF-8 output")
+    })?;
+    let mut total = 0u64;
+    let mut observed = false;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let value = line.parse::<u64>().map_err(|_| {
+            model_comparison_error(
+                "worker_resource",
+                "the RSS probe emitted a non-integer process sample",
+            )
+        })?;
+        total = total.checked_add(value).ok_or_else(|| {
+            model_comparison_error("worker_resource", "the RSS probe sum overflowed")
+        })?;
+        observed = true;
+    }
+    Ok((observed && total > 0).then_some(total))
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn linux_stat_process_group(stat: &str) -> Option<u32> {
+    let after_command = stat.get(stat.rfind(") ")? + 2..)?;
+    after_command.split_whitespace().nth(2)?.parse().ok()
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn linux_status_rss_kib(status: &str) -> Option<u64> {
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "VmRSS:" {
+        return None;
+    }
+    let value = fields.next()?.parse::<u64>().ok()?;
+    (fields.next()? == "kB" && fields.next().is_none() && value > 0).then_some(value)
 }
 
 fn verify_parent_worker_inputs<F>(
@@ -2108,66 +2255,6 @@ where
             Ok(true)
         }
         Err(error) => Err(error),
-    }
-}
-
-#[cfg(any(test, target_vendor = "apple"))]
-fn parse_macos_peak_rss(stderr: &[u8]) -> FwResult<u64> {
-    let text = std::str::from_utf8(stderr).map_err(|_| {
-        model_comparison_error(
-            "worker_resource",
-            "the macOS resource probe emitted non-UTF-8 output",
-        )
-    })?;
-    let values = text
-        .lines()
-        .filter(|line| line.trim_end().ends_with("maximum resident set size"))
-        .filter_map(|line| line.split_whitespace().next())
-        .map(str::parse::<u64>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| {
-            model_comparison_error(
-                "worker_resource",
-                "the macOS peak-RSS value was not an unsigned integer",
-            )
-        })?;
-    match values.as_slice() {
-        [value] if *value > 0 => Ok(*value),
-        _ => Err(model_comparison_error(
-            "worker_resource",
-            "the macOS resource probe did not emit exactly one positive peak-RSS value",
-        )),
-    }
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn parse_gnu_peak_rss(stderr: &[u8]) -> FwResult<u64> {
-    let text = std::str::from_utf8(stderr).map_err(|_| {
-        model_comparison_error(
-            "worker_resource",
-            "the GNU resource probe emitted non-UTF-8 output",
-        )
-    })?;
-    let values = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("fw_peak_rss_kib="))
-        .map(str::trim)
-        .map(str::parse::<u64>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| {
-            model_comparison_error(
-                "worker_resource",
-                "the GNU peak-RSS value was not an unsigned integer",
-            )
-        })?;
-    match values.as_slice() {
-        [value] if *value > 0 => value.checked_mul(1_024).ok_or_else(|| {
-            model_comparison_error("worker_resource", "the GNU peak-RSS value overflowed bytes")
-        }),
-        _ => Err(model_comparison_error(
-            "worker_resource",
-            "the GNU resource probe did not emit exactly one positive peak-RSS value",
-        )),
     }
 }
 
@@ -2295,7 +2382,7 @@ pub fn run_model_comparison_worker_from_stdio() -> FwResult<String> {
     // The comparison parent launched this authenticated worker inside one
     // dedicated process group. Nested external adapters must inherit that
     // group so an outer timeout or cancellation cannot orphan them.
-    crate::process::mark_process_tree_externally_owned();
+    crate::process::mark_process_tree_externally_owned()?;
 
     let ecapa = if matches!(
         request.lane,
@@ -3174,7 +3261,9 @@ fn lane_resource_evidence(
         } else {
             ModelComparisonResourceAuthority::UnavailableNoProbe
         },
-        peak_rss_scope: ModelComparisonPeakRssScope::DirectWorkerProcess,
+        peak_rss_scope: ModelComparisonPeakRssScope::WholeProcessTree,
+        peak_rss_sampling_interval_ms: peak_rss_complete
+            .then_some(MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS),
         authoritative_peak_rss_bytes: peak_rss_complete
             .then_some(maximum_peak_rss_bytes)
             .flatten(),
@@ -3658,6 +3747,51 @@ pub fn verify_public_model_comparison_evidence(
         return Err(model_comparison_error(
             "result_hash",
             "model-comparison result digest does not match",
+        ));
+    }
+    Ok(())
+}
+
+/// Fully validate a model-comparison evidence file together with the exact
+/// path-free public bundle that supplied its scorer observations.
+///
+/// Aggregate-only comparison evidence cannot reconstruct per-recording
+/// observations by itself. This paired verifier closes that boundary by
+/// validating both artifacts and requiring their corpus, source, descriptor,
+/// bundle, split, and recording-count identities to agree.
+pub fn verify_public_model_comparison_bundle_pair(
+    bundle: &super::PublicCorpusBundle,
+    evidence: &PublicModelComparisonEvidence,
+) -> FwResult<()> {
+    super::verify_public_corpus_bundle(bundle)?;
+    verify_public_model_comparison_evidence(evidence)?;
+    let recording_count = u64::try_from(bundle.references.len()).map_err(|_| {
+        model_comparison_error(
+            "bundle_pair",
+            "the public bundle recording count exceeds the comparison schema",
+        )
+    })?;
+    let split_matches = bundle
+        .recordings
+        .iter()
+        .all(|recording| recording.split == evidence.evaluation_split)
+        && bundle
+            .manifest
+            .recordings
+            .iter()
+            .all(|recording| recording.split == evidence.evaluation_split);
+    if bundle.corpus_key != evidence.corpus_key
+        || bundle.source_version != evidence.source_version
+        || bundle.descriptor_sha256 != evidence.descriptor_sha256
+        || bundle.bundle_sha256 != evidence.bundle_sha256
+        || bundle.references.len() != bundle.recordings.len()
+        || bundle.references.len() != bundle.manifest.recordings.len()
+        || recording_count != evidence.observation_count
+        || !split_matches
+    {
+        return Err(model_comparison_error(
+            "bundle_pair",
+            "the public bundle and model-comparison evidence identities do not match",
         ));
     }
     Ok(())
@@ -4272,7 +4406,10 @@ fn validate_resource_evidence(
         || resources.completed_wall_time_ms < outcomes.completed
         || canonical(resources.completed_wall_time_ms as f64 / 1_000.0) != available.wall_time_sec
         || !peak_rss_valid
-        || resources.peak_rss_scope != ModelComparisonPeakRssScope::DirectWorkerProcess
+        || resources.peak_rss_scope != ModelComparisonPeakRssScope::WholeProcessTree
+        || resources.peak_rss_sampling_interval_ms
+            != (resources.peak_rss_authority == ModelComparisonResourceAuthority::Measured)
+                .then_some(MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS)
         || resources.cancellation_latency_authority != ModelComparisonResourceAuthority::Measured
         || !resources
             .maximum_cancellation_latency_ms
@@ -4426,6 +4563,35 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "set FRANKEN_WHISPER_MODEL_COMPARISON_TEST_BUNDLE and _EVIDENCE to public artifacts"]
+    fn external_public_model_comparison_pair_rejects_self_consistent_identity_tampering() {
+        let bundle_path = std::env::var_os("FRANKEN_WHISPER_MODEL_COMPARISON_TEST_BUNDLE")
+            .map(PathBuf::from)
+            .expect("set FRANKEN_WHISPER_MODEL_COMPARISON_TEST_BUNDLE");
+        let evidence_path = std::env::var_os("FRANKEN_WHISPER_MODEL_COMPARISON_TEST_EVIDENCE")
+            .map(PathBuf::from)
+            .expect("set FRANKEN_WHISPER_MODEL_COMPARISON_TEST_EVIDENCE");
+        let bundle_bytes = std::fs::read(bundle_path).expect("read public bundle");
+        let evidence_bytes = std::fs::read(evidence_path).expect("read public evidence");
+        let bundle = super::super::parse_public_corpus_bundle(&bundle_bytes)
+            .expect("independently valid public bundle");
+        let mut evidence: PublicModelComparisonEvidence =
+            serde_json::from_slice(&evidence_bytes).expect("parse public comparison evidence");
+        verify_public_model_comparison_bundle_pair(&bundle, &evidence)
+            .expect("matching public artifact pair");
+
+        evidence.bundle_sha256 = "00".repeat(32);
+        evidence.deterministic_accuracy_sha256 =
+            deterministic_accuracy_sha256(&evidence).expect("rehash tampered accuracy evidence");
+        evidence.result_sha256.clear();
+        evidence.result_sha256 =
+            super::super::canonical_sha256(&evidence).expect("rehash tampered evidence");
+        let error = verify_public_model_comparison_bundle_pair(&bundle, &evidence)
+            .expect_err("a self-consistent evidence document cannot switch bundle identity");
+        assert!(error.to_string().contains("bundle_pair"));
+    }
+
+    #[test]
     fn williams_schedule_balances_every_lane_and_position() {
         for lane in ModelComparisonLane::ALL {
             let mut positions = [0u32; 5];
@@ -4517,21 +4683,43 @@ mod tests {
     }
 
     #[test]
-    fn platform_peak_rss_parsers_require_one_positive_authoritative_value() {
+    fn process_tree_rss_parsers_require_positive_bounded_values() {
         assert_eq!(
-            parse_macos_peak_rss(b"  123456  maximum resident set size\n").unwrap(),
-            123_456
+            parse_process_group_rss_kib(b"1024\n2048\n").unwrap(),
+            Some(3_072)
         );
-        assert!(parse_macos_peak_rss(b"0  maximum resident set size\n").is_err());
-        assert!(
-            parse_macos_peak_rss(b"1  maximum resident set size\n2  maximum resident set size\n")
-                .is_err()
-        );
+        assert_eq!(parse_process_group_rss_kib(b"\n0\n").unwrap(), None);
+        assert!(parse_process_group_rss_kib(b"not-a-number\n").is_err());
         assert_eq!(
-            parse_gnu_peak_rss(b"fw_peak_rss_kib=1024\n").unwrap(),
-            1_048_576
+            linux_stat_process_group("123 (worker with spaces) S 7 123 123 0"),
+            Some(123)
         );
-        assert!(parse_gnu_peak_rss(b"Maximum resident set size: absent\n").is_err());
+        assert_eq!(linux_stat_process_group("malformed"), None);
+        assert_eq!(
+            linux_status_rss_kib("Name:\tx\nVmRSS:\t4096 kB\n"),
+            Some(4_096)
+        );
+        assert_eq!(linux_status_rss_kib("VmRSS:\t0 kB\n"), None);
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn process_tree_rss_sampler_observes_a_live_bounded_group() {
+        let cancellation = CancellationToken::no_deadline();
+        let mut sampler = ProcessTreeRssSampler::new();
+        let mut observer = |root_pid| sampler.observe(root_pid);
+        let output = crate::process::run_command_cancellable_with_input_probe_and_observer(
+            "sh",
+            &["-c".to_owned(), "sleep 0.15".to_owned()],
+            &cancellation,
+            Some(Duration::from_secs(5)),
+            None,
+            &[],
+            &mut observer,
+        )
+        .expect("bounded process group must be observable");
+        assert!(output.status.success());
+        assert!(sampler.finish().unwrap().is_some_and(|bytes| bytes > 0));
     }
 
     #[test]
@@ -5241,7 +5429,10 @@ mod tests {
             attempted_wall_time_ms: 250,
             completed_wall_time_ms: 250,
             peak_rss_authority: ModelComparisonResourceAuthority::Measured,
-            peak_rss_scope: ModelComparisonPeakRssScope::DirectWorkerProcess,
+            peak_rss_scope: ModelComparisonPeakRssScope::WholeProcessTree,
+            peak_rss_sampling_interval_ms: Some(
+                MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS,
+            ),
             authoritative_peak_rss_bytes: Some(1024),
             cancellation_latency_authority: ModelComparisonResourceAuthority::Measured,
             maximum_cancellation_latency_ms: Some(50),
