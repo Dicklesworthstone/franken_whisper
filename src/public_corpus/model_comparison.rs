@@ -4861,6 +4861,182 @@ mod tests {
         validate_metric_numbers(metrics).expect("fixture aggregate must be internally valid");
     }
 
+    fn failed_fixture_resource_evidence(
+        lane: ModelComparisonLane,
+    ) -> ModelComparisonResourceEvidence {
+        ModelComparisonResourceEvidence {
+            wall_time_authority: ModelComparisonResourceAuthority::Measured,
+            wall_time_scope:
+                ModelComparisonWallTimeScope::FreshProcessIdentityValidationModelLoadInferenceAndScorer,
+            wall_time_cross_lane_comparable: true,
+            timed_attempt_count: 1,
+            attempted_wall_time_ms: 1,
+            completed_wall_time_ms: 0,
+            peak_rss_authority: ModelComparisonResourceAuthority::UnavailableNoProbe,
+            peak_rss_scope: ModelComparisonPeakRssScope::WholeProcessTree,
+            peak_rss_minimum_sampling_interval_ms: None,
+            sampled_peak_rss_bytes: None,
+            cancellation_latency_authority: ModelComparisonResourceAuthority::Measured,
+            maximum_cancellation_latency_ms: Some(1),
+            hard_timeout_seconds: Some(PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS),
+            maximum_completed_real_time_factor_millionths: None,
+            real_time_factor_cap_millionths: if lane == ModelComparisonLane::ExternalSortformer {
+                MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS
+            } else {
+                MODEL_COMPARISON_NATIVE_RTF_CAP_MILLIONTHS
+            },
+            real_time_factor_within_cap: None,
+            peak_rss_cap_bytes: MODEL_COMPARISON_PEAK_RSS_CAP_BYTES,
+            peak_rss_within_cap: None,
+            cancellation_latency_cap_ms: MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS,
+            cancellation_latency_within_cap: Some(true),
+        }
+    }
+
+    fn synthetic_public_model_comparison_identity_pair() -> (
+        super::super::PublicCorpusBundle,
+        PublicModelComparisonEvidence,
+    ) {
+        let reference = DiarizationReferenceDocument {
+            schema_version: DIARIZATION_REFERENCE_SCHEMA_VERSION.to_owned(),
+            recording_id: "public-model-comparison-pair-fixture".to_owned(),
+            duration_ms: 1_000,
+            turns: vec![EvaluationTurn::labeled(0, 1_000, "speaker-a")],
+            ignored_regions: Vec::new(),
+            speaker_hints: Vec::new(),
+            words: Vec::new(),
+        };
+        let manifest = crate::diarization::DiarizationCorpusManifest {
+            schema_version: crate::diarization::DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION
+                .to_owned(),
+            corpus_id: "voxconverse-v1".to_owned(),
+            license_id: "CC-BY-4.0-ORIGINAL-COPYRIGHT".to_owned(),
+            recordings: vec![crate::diarization::CorpusRecordingManifest {
+                recording_id: reference.recording_id.clone(),
+                split: EvaluationSplit::Development,
+                origin_recording_id: "public-model-comparison-pair-origin".to_owned(),
+                speaker_refs: vec!["speaker-a".to_owned()],
+                derived_from_recording_ids: Vec::new(),
+                augmentation_group_id: None,
+                enrollment_recording_ids: Vec::new(),
+            }],
+        };
+        let leakage_audit = crate::diarization::audit_diarization_manifest(&manifest)
+            .expect("fixture leakage audit");
+        let reference_sha256 =
+            super::super::canonical_sha256(&reference).expect("fixture reference hash");
+        let descriptor_sha256 = "1".repeat(64);
+        let mut bundle = super::super::PublicCorpusBundle {
+            schema_version: super::super::PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION.to_owned(),
+            adapter_version: super::super::PUBLIC_CORPUS_ADAPTER_VERSION.to_owned(),
+            corpus_key: manifest.corpus_id.clone(),
+            source_version: "synthetic-public-pair-v1".to_owned(),
+            license_id: manifest.license_id.clone(),
+            license_acknowledgement_id: "accept-voxconverse-cc-by-4.0-and-original-copyright"
+                .to_owned(),
+            descriptor_sha256: descriptor_sha256.clone(),
+            manifest,
+            leakage_audit,
+            references: vec![reference.clone()],
+            recordings: vec![super::super::PublicCorpusRecordingEvidence {
+                recording_id: reference.recording_id,
+                split: EvaluationSplit::Development,
+                audio_sha256: "2".repeat(64),
+                annotation_sha256: "3".repeat(64),
+                word_annotation_sha256: None,
+                reference_sha256,
+                sample_rate_hz: 16_000,
+                channel_count: 1,
+                selected_channel: 1,
+                turn_count: reference.turns.len(),
+                word_count: 0,
+                overlap_turn_count: 0,
+                ignored_region_count: 0,
+                annotation_tail_clipped_turn_count: 0,
+                annotation_tail_clipped_duration_ms: 0,
+                annotation_maximum_tail_overrun_ms: 0,
+            }],
+            bundle_sha256: String::new(),
+        };
+        bundle.bundle_sha256 =
+            super::super::canonical_sha256(&bundle).expect("fixture bundle hash");
+
+        let lanes = ModelComparisonLane::ALL
+            .into_iter()
+            .map(|lane| ModelComparisonLaneAggregate {
+                lane,
+                outcomes: ModelComparisonOutcomeCounts {
+                    declared: 1,
+                    failed: 1,
+                    failed_by_code: BTreeMap::from([(
+                        ModelComparisonOutcomeCode::WorkerExecutionFailed,
+                        1,
+                    )]),
+                    ..ModelComparisonOutcomeCounts::default()
+                },
+                available_case: ModelComparisonAggregateMetrics::default(),
+                common_complete_case: ModelComparisonAggregateMetrics::default(),
+                resources: failed_fixture_resource_evidence(lane),
+            })
+            .collect();
+        let protocol = frozen_model_comparison_protocol().expect("fixture protocol");
+        let mut evidence = PublicModelComparisonEvidence {
+            schema_version: PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION.to_owned(),
+            runner_version: PUBLIC_MODEL_COMPARISON_RUNNER_VERSION.to_owned(),
+            scorer_version: DIARIZATION_SCORER_VERSION.to_owned(),
+            corpus_key: bundle.corpus_key.clone(),
+            source_version: bundle.source_version.clone(),
+            evaluation_split: EvaluationSplit::Development,
+            descriptor_sha256,
+            bundle_sha256: bundle.bundle_sha256.clone(),
+            comparison_executable_sha256: "4".repeat(64),
+            observation_count: 1,
+            observation_set_sha256: "5".repeat(64),
+            execution_order_sha256: expected_execution_order_sha256(1)
+                .expect("fixture execution order"),
+            outcome_sequence_sha256: "6".repeat(64),
+            external_runtime_observation_set_sha256: "7".repeat(64),
+            sortformer_runtime_identity: None,
+            common_complete_recording_count: 0,
+            common_complete_observation_set_sha256: empty_common_complete_sha256(),
+            order_balance_complete: false,
+            protocol,
+            protocol_sha256: PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256.to_owned(),
+            lanes,
+            development_uncertified: true,
+            comparison_authority: "diagnostic_only".to_owned(),
+            superiority_claim_permitted: false,
+            production_route_changed: false,
+            deterministic_accuracy_sha256: String::new(),
+            result_sha256: String::new(),
+        };
+        evidence.deterministic_accuracy_sha256 =
+            deterministic_accuracy_sha256(&evidence).expect("fixture accuracy hash");
+        evidence.result_sha256 =
+            super::super::canonical_sha256(&evidence).expect("fixture evidence hash");
+        (bundle, evidence)
+    }
+
+    #[test]
+    fn public_model_comparison_identity_pair_accepts_valid_and_rejects_substitution() {
+        let (bundle, evidence) = synthetic_public_model_comparison_identity_pair();
+        verify_public_model_comparison_bundle_identity_pair(&bundle, &evidence)
+            .expect("valid synthetic identity pair");
+
+        let mut substituted = evidence;
+        substituted.bundle_sha256 = "8".repeat(64);
+        substituted.deterministic_accuracy_sha256 =
+            deterministic_accuracy_sha256(&substituted).expect("substituted accuracy hash");
+        substituted.result_sha256.clear();
+        substituted.result_sha256 =
+            super::super::canonical_sha256(&substituted).expect("substituted evidence hash");
+        verify_public_model_comparison_evidence(&substituted)
+            .expect("substituted evidence remains structurally self-consistent");
+        let error = verify_public_model_comparison_bundle_identity_pair(&bundle, &substituted)
+            .expect_err("bundle identity substitution must be rejected");
+        assert!(error.to_string().contains("model_comparison.bundle_pair"));
+    }
+
     #[test]
     #[ignore = "set FRANKEN_WHISPER_MODEL_COMPARISON_TEST_BUNDLE and _EVIDENCE to public artifacts"]
     fn external_public_model_comparison_pair_rejects_self_consistent_identity_tampering() {
