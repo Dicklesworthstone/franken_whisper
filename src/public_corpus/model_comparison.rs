@@ -45,15 +45,15 @@ use crate::sortformer_inference::{
     SortformerSpeakerTurn,
 };
 
-pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v4";
+pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v5";
 pub const PUBLIC_MODEL_COMPARISON_RUNNER_VERSION: &str =
-    "public-diarization-model-comparison-runner-v4";
+    "public-diarization-model-comparison-runner-v5";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION: &str =
-    "public-diarization-model-comparison-protocol-v4";
+    "public-diarization-model-comparison-protocol-v5";
 pub const PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION: &str =
     "public-diarization-model-comparison-outcomes-v3";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256: &str =
-    "f387fd87682064c4e2ecb95c8a207024a43b798620b2564144c7b82353d2cef8";
+    "0000000000000000000000000000000000000000000000000000000000000000";
 pub const PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION: &str = "five-lane-balanced-williams-v1";
 pub const PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS: u64 = 1_800;
 const MODEL_COMPARISON_WORKER_SCHEMA_VERSION: &str = "public-model-comparison-worker-v1";
@@ -66,7 +66,8 @@ const MODEL_COMPARISON_NATIVE_RTF_CAP_MILLIONTHS: u64 = 500_000;
 const MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS: u64 = 10_000_000;
 const MODEL_COMPARISON_PEAK_RSS_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS: u64 = 500;
-const MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS: u64 = 50;
+const MODEL_COMPARISON_PROCESS_TREE_RSS_MINIMUM_SAMPLE_INTERVAL_MS: u64 = 50;
+const MODEL_COMPARISON_PROCESS_TREE_RSS_PROBE_TIMEOUT_MS: u64 = 250;
 
 /// Canonical comparison lanes. The order is part of the retained contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -499,8 +500,8 @@ pub struct ModelComparisonResourceEvidence {
     pub completed_wall_time_ms: u64,
     pub peak_rss_authority: ModelComparisonResourceAuthority,
     pub peak_rss_scope: ModelComparisonPeakRssScope,
-    pub peak_rss_sampling_interval_ms: Option<u64>,
-    pub authoritative_peak_rss_bytes: Option<u64>,
+    pub peak_rss_minimum_sampling_interval_ms: Option<u64>,
+    pub sampled_peak_rss_bytes: Option<u64>,
     pub cancellation_latency_authority: ModelComparisonResourceAuthority,
     pub maximum_cancellation_latency_ms: Option<u64>,
     pub hard_timeout_seconds: Option<u64>,
@@ -588,7 +589,7 @@ pub struct PublicModelComparisonProtocol {
     pub native_real_time_factor_cap_millionths: u64,
     pub external_real_time_factor_cap_millionths: u64,
     pub peak_rss_cap_bytes: u64,
-    pub process_tree_rss_sample_interval_ms: u64,
+    pub process_tree_rss_minimum_sample_interval_ms: u64,
     pub cancellation_latency_cap_ms: u64,
     pub ecapa_contract_sha256: String,
     pub ecapa_package_sha256: String,
@@ -1486,7 +1487,7 @@ where
     };
     evidence.deterministic_accuracy_sha256 = deterministic_accuracy_sha256(&evidence)?;
     evidence.result_sha256 = super::canonical_sha256(&evidence)?;
-    verify_public_model_comparison_bundle_pair(&bundle, &evidence)?;
+    verify_public_model_comparison_bundle_identity_pair(&bundle, &evidence)?;
 
     let mut cancellation_adapter = || is_cancelled();
     let staged_bundle = super::stage_new_json(
@@ -1608,8 +1609,8 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         external_real_time_factor_cap_millionths:
             MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS,
         peak_rss_cap_bytes: MODEL_COMPARISON_PEAK_RSS_CAP_BYTES,
-        process_tree_rss_sample_interval_ms:
-            MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS,
+        process_tree_rss_minimum_sample_interval_ms:
+            MODEL_COMPARISON_PROCESS_TREE_RSS_MINIMUM_SAMPLE_INTERVAL_MS,
         cancellation_latency_cap_ms: MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS,
         ecapa_contract_sha256: ECAPA_CONTRACT_SHA256.to_owned(),
         ecapa_package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
@@ -1656,16 +1657,21 @@ where
         post_spawn_started.get_or_init(Instant::now).elapsed() >= cancel_after
     };
     let cancellation = CancellationToken::unbounded();
-    let result = crate::process::run_command_cancellable_with_probe(
-        executable_text,
-        &["__comparison-cancel-probe".to_owned()],
-        None,
-        &cancellation,
-        Some(Duration::from_secs(
-            MODEL_COMPARISON_CANCEL_PROBE_TIMEOUT_SECONDS,
-        )),
-        Some(&cancel_probe),
-    );
+    let mut rss_sampler = ProcessTreeRssSampler::new();
+    let result = {
+        let mut observer = |root_pid| rss_sampler.observe(root_pid, &cancel_probe);
+        crate::process::run_command_cancellable_with_input_probe_and_observer(
+            executable_text,
+            &["__comparison-cancel-probe".to_owned()],
+            &cancellation,
+            Some(Duration::from_secs(
+                MODEL_COMPARISON_CANCEL_PROBE_TIMEOUT_SECONDS,
+            )),
+            Some(&cancel_probe),
+            &[],
+            &mut observer,
+        )
+    };
     if is_cancelled() {
         return Err(FwError::Cancelled(
             "public model comparison cancelled".to_owned(),
@@ -1675,6 +1681,12 @@ where
         return Err(model_comparison_error(
             "worker_cancellation_probe",
             "the fresh-process cancellation probe did not terminate by cancellation",
+        ));
+    }
+    if rss_sampler.finish()?.is_none() {
+        return Err(model_comparison_error(
+            "worker_cancellation_probe",
+            "the live cancellation path did not retain a whole-process-tree RSS sample",
         ));
     }
     let total_ms = u64::try_from(
@@ -1833,7 +1845,7 @@ where
     let cancellation = CancellationToken::unbounded();
     let mut rss_sampler = ProcessTreeRssSampler::new();
     let command_result = {
-        let mut observer = |root_pid| rss_sampler.observe(root_pid);
+        let mut observer = |root_pid| rss_sampler.observe(root_pid, is_cancelled);
         crate::process::run_command_cancellable_with_input_probe_and_observer(
             &program,
             &args,
@@ -2017,6 +2029,7 @@ struct ProcessTreeRssSampler {
     supported: bool,
     failed: bool,
     last_sample: Option<Instant>,
+    consecutive_missing_samples: u8,
     maximum_bytes: Option<u64>,
 }
 
@@ -2032,31 +2045,56 @@ impl ProcessTreeRssSampler {
             supported,
             failed: false,
             last_sample: None,
+            consecutive_missing_samples: 0,
             maximum_bytes: None,
         }
     }
 
-    fn observe(&mut self, root_pid: u32) -> FwResult<()> {
+    fn observe(
+        &mut self,
+        root_pid: u32,
+        is_cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> FwResult<()> {
         if !self.supported
             || self.last_sample.is_some_and(|sampled_at| {
                 sampled_at.elapsed()
-                    < Duration::from_millis(MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS)
+                    < Duration::from_millis(
+                        MODEL_COMPARISON_PROCESS_TREE_RSS_MINIMUM_SAMPLE_INTERVAL_MS,
+                    )
             })
         {
             return Ok(());
         }
         self.last_sample = Some(Instant::now());
-        match sample_process_group_rss_bytes(root_pid) {
+        let sample = sample_process_group_rss_bytes(root_pid, is_cancelled);
+        self.retain_observation(sample)
+    }
+
+    fn retain_observation(&mut self, sample: FwResult<Option<u64>>) -> FwResult<()> {
+        match sample {
             Ok(Some(bytes)) if bytes > 0 => {
+                self.consecutive_missing_samples = 0;
                 self.maximum_bytes = Some(self.maximum_bytes.unwrap_or(0).max(bytes));
                 Ok(())
             }
-            Ok(None) if self.maximum_bytes.is_some() => Ok(()),
-            Ok(None) | Ok(Some(_)) | Err(_) => {
+            Ok(None) => {
+                self.consecutive_missing_samples =
+                    self.consecutive_missing_samples.saturating_add(1);
+                if self.consecutive_missing_samples < 2 {
+                    return Ok(());
+                }
                 self.failed = true;
                 Err(model_comparison_error(
                     "worker_resource",
-                    "the whole-process-tree RSS probe could not produce a positive sample",
+                    "the whole-process-tree RSS probe repeatedly lost the live worker group",
+                ))
+            }
+            Err(error @ FwError::Cancelled(_)) => Err(error),
+            Ok(Some(_)) | Err(_) => {
+                self.failed = true;
+                Err(model_comparison_error(
+                    "worker_resource",
+                    "the whole-process-tree RSS probe could not produce a complete positive sample",
                 ))
             }
         }
@@ -2067,10 +2105,10 @@ impl ProcessTreeRssSampler {
     }
 
     fn finish(&self) -> FwResult<Option<u64>> {
-        if self.failed || (self.supported && self.maximum_bytes.is_none()) {
+        if self.failed {
             return Err(model_comparison_error(
                 "worker_resource",
-                "the whole-process-tree RSS probe did not retain a positive sample",
+                "the whole-process-tree RSS probe did not retain a complete sample",
             ));
         }
         Ok(self.maximum_bytes)
@@ -2078,18 +2116,28 @@ impl ProcessTreeRssSampler {
 }
 
 #[cfg(target_vendor = "apple")]
-fn sample_process_group_rss_bytes(root_pid: u32) -> FwResult<Option<u64>> {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-o", "rss=", "-g", &root_pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map_err(|_| {
-            model_comparison_error("worker_resource", "the macOS RSS probe could not run")
-        })?;
-    if !output.status.success() {
-        return Ok(None);
-    }
+fn sample_process_group_rss_bytes(
+    root_pid: u32,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> FwResult<Option<u64>> {
+    let cancellation = CancellationToken::unbounded();
+    let output = crate::process::run_command_cancellable_with_probe(
+        "/bin/ps",
+        &["-o".to_owned(), "rss=".to_owned(), "-g".to_owned(), root_pid.to_string()],
+        None,
+        &cancellation,
+        Some(Duration::from_millis(
+            MODEL_COMPARISON_PROCESS_TREE_RSS_PROBE_TIMEOUT_MS,
+        )),
+        Some(is_cancelled),
+    )
+    .map_err(|error| match error {
+        error @ FwError::Cancelled(_) => error,
+        _ => model_comparison_error(
+                "worker_resource",
+                "the bounded macOS RSS probe could not complete",
+            ),
+    })?;
     parse_process_group_rss_kib(&output.stdout)?.map_or(Ok(None), |kib| {
         kib.checked_mul(1_024).map(Some).ok_or_else(|| {
             model_comparison_error("worker_resource", "the macOS RSS sample overflowed bytes")
@@ -2098,7 +2146,11 @@ fn sample_process_group_rss_bytes(root_pid: u32) -> FwResult<Option<u64>> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn sample_process_group_rss_bytes(root_pid: u32) -> FwResult<Option<u64>> {
+fn sample_process_group_rss_bytes(
+    root_pid: u32,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> FwResult<Option<u64>> {
+    let started = Instant::now();
     let mut total_kib = 0u64;
     let mut matched = false;
     let entries = std::fs::read_dir("/proc").map_err(|_| {
@@ -2108,6 +2160,15 @@ fn sample_process_group_rss_bytes(root_pid: u32) -> FwResult<Option<u64>> {
         )
     })?;
     for entry in entries {
+        cancellation_checkpoint(is_cancelled)?;
+        if started.elapsed()
+            >= Duration::from_millis(MODEL_COMPARISON_PROCESS_TREE_RSS_PROBE_TIMEOUT_MS)
+        {
+            return Err(model_comparison_error(
+                "worker_resource",
+                "the procfs RSS probe exceeded its fixed observation budget",
+            ));
+        }
         let entry = entry.map_err(|_| {
             model_comparison_error(
                 "worker_resource",
@@ -2128,12 +2189,18 @@ fn sample_process_group_rss_bytes(root_pid: u32) -> FwResult<Option<u64>> {
         if linux_stat_process_group(&stat) != Some(root_pid) {
             continue;
         }
-        let Ok(status) = std::fs::read_to_string(process_root.join("status")) else {
-            continue;
-        };
-        let Some(rss_kib) = linux_status_rss_kib(&status) else {
-            continue;
-        };
+        let status = std::fs::read_to_string(process_root.join("status")).map_err(|_| {
+            model_comparison_error(
+                "worker_resource",
+                "a matched procfs process could not provide status",
+            )
+        })?;
+        let rss_kib = linux_status_rss_kib(&status).ok_or_else(|| {
+            model_comparison_error(
+                "worker_resource",
+                "a matched procfs process did not provide positive VmRSS",
+            )
+        })?;
         total_kib = total_kib.checked_add(rss_kib).ok_or_else(|| {
             model_comparison_error("worker_resource", "the procfs RSS sum overflowed")
         })?;
@@ -2148,7 +2215,10 @@ fn sample_process_group_rss_bytes(root_pid: u32) -> FwResult<Option<u64>> {
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-fn sample_process_group_rss_bytes(_root_pid: u32) -> FwResult<Option<u64>> {
+fn sample_process_group_rss_bytes(
+    _root_pid: u32,
+    _is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> FwResult<Option<u64>> {
     Ok(None)
 }
 
@@ -3262,9 +3332,9 @@ fn lane_resource_evidence(
             ModelComparisonResourceAuthority::UnavailableNoProbe
         },
         peak_rss_scope: ModelComparisonPeakRssScope::WholeProcessTree,
-        peak_rss_sampling_interval_ms: peak_rss_complete
-            .then_some(MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS),
-        authoritative_peak_rss_bytes: peak_rss_complete
+        peak_rss_minimum_sampling_interval_ms: peak_rss_complete
+            .then_some(MODEL_COMPARISON_PROCESS_TREE_RSS_MINIMUM_SAMPLE_INTERVAL_MS),
+        sampled_peak_rss_bytes: peak_rss_complete
             .then_some(maximum_peak_rss_bytes)
             .flatten(),
         cancellation_latency_authority: ModelComparisonResourceAuthority::Measured,
@@ -3348,7 +3418,7 @@ where
 
 fn cancellation_checkpoint<F>(is_cancelled: &F) -> FwResult<()>
 where
-    F: Fn() -> bool + Sync,
+    F: Fn() -> bool + Sync + ?Sized,
 {
     if is_cancelled() {
         Err(FwError::Cancelled(
@@ -3752,14 +3822,16 @@ pub fn verify_public_model_comparison_evidence(
     Ok(())
 }
 
-/// Fully validate a model-comparison evidence file together with the exact
-/// path-free public bundle that supplied its scorer observations.
+/// Structurally validate a model-comparison evidence file and pair it with one
+/// exact path-free public-bundle identity.
 ///
 /// Aggregate-only comparison evidence cannot reconstruct per-recording
-/// observations by itself. This paired verifier closes that boundary by
-/// validating both artifacts and requiring their corpus, source, descriptor,
-/// bundle, split, and recording-count identities to agree.
-pub fn verify_public_model_comparison_bundle_pair(
+/// observations, the observation-set commitment, or aggregate metrics. This
+/// identity verifier therefore establishes only that both self-validating
+/// artifacts assert the same corpus, source, descriptor, bundle, split, and
+/// recording count. Derivation proof still requires source reconstruction and
+/// a fresh comparison run.
+pub fn verify_public_model_comparison_bundle_identity_pair(
     bundle: &super::PublicCorpusBundle,
     evidence: &PublicModelComparisonEvidence,
 ) -> FwResult<()> {
@@ -4055,7 +4127,9 @@ pub(crate) fn deterministic_accuracy_sha256(
         lane.available_case.real_time_factor = None;
         lane.common_complete_case.wall_time_sec = 0.0;
         lane.common_complete_case.real_time_factor = None;
-        lane.resources.authoritative_peak_rss_bytes = None;
+        lane.resources.peak_rss_authority = ModelComparisonResourceAuthority::UnavailableNoProbe;
+        lane.resources.peak_rss_minimum_sampling_interval_ms = None;
+        lane.resources.sampled_peak_rss_bytes = None;
         lane.resources.maximum_cancellation_latency_ms = None;
         lane.resources.attempted_wall_time_ms = 0;
         lane.resources.completed_wall_time_ms = 0;
@@ -4368,10 +4442,10 @@ fn validate_resource_evidence(
 ) -> FwResult<()> {
     let peak_rss_valid = match resources.peak_rss_authority {
         ModelComparisonResourceAuthority::Measured => resources
-            .authoritative_peak_rss_bytes
+            .sampled_peak_rss_bytes
             .is_some_and(|value| value > 0),
         ModelComparisonResourceAuthority::UnavailableNoProbe => {
-            resources.authoritative_peak_rss_bytes.is_none()
+            resources.sampled_peak_rss_bytes.is_none()
         }
     };
     let expected_rtf_cap = if lane == ModelComparisonLane::ExternalSortformer {
@@ -4389,7 +4463,7 @@ fn validate_resource_evidence(
     };
     let peak_cap_valid = resources.peak_rss_within_cap
         == resources
-            .authoritative_peak_rss_bytes
+            .sampled_peak_rss_bytes
             .map(|value| value <= resources.peak_rss_cap_bytes);
     let cancellation_cap_valid = resources.cancellation_latency_within_cap
         == resources
@@ -4407,9 +4481,9 @@ fn validate_resource_evidence(
         || canonical(resources.completed_wall_time_ms as f64 / 1_000.0) != available.wall_time_sec
         || !peak_rss_valid
         || resources.peak_rss_scope != ModelComparisonPeakRssScope::WholeProcessTree
-        || resources.peak_rss_sampling_interval_ms
+        || resources.peak_rss_minimum_sampling_interval_ms
             != (resources.peak_rss_authority == ModelComparisonResourceAuthority::Measured)
-                .then_some(MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS)
+                .then_some(MODEL_COMPARISON_PROCESS_TREE_RSS_MINIMUM_SAMPLE_INTERVAL_MS)
         || resources.cancellation_latency_authority != ModelComparisonResourceAuthority::Measured
         || !resources
             .maximum_cancellation_latency_ms
@@ -4577,7 +4651,7 @@ mod tests {
             .expect("independently valid public bundle");
         let mut evidence: PublicModelComparisonEvidence =
             serde_json::from_slice(&evidence_bytes).expect("parse public comparison evidence");
-        verify_public_model_comparison_bundle_pair(&bundle, &evidence)
+        verify_public_model_comparison_bundle_identity_pair(&bundle, &evidence)
             .expect("matching public artifact pair");
 
         evidence.bundle_sha256 = "00".repeat(32);
@@ -4586,7 +4660,7 @@ mod tests {
         evidence.result_sha256.clear();
         evidence.result_sha256 =
             super::super::canonical_sha256(&evidence).expect("rehash tampered evidence");
-        let error = verify_public_model_comparison_bundle_pair(&bundle, &evidence)
+        let error = verify_public_model_comparison_bundle_identity_pair(&bundle, &evidence)
             .expect_err("a self-consistent evidence document cannot switch bundle identity");
         assert!(error.to_string().contains("bundle_pair"));
     }
@@ -4702,12 +4776,32 @@ mod tests {
         assert_eq!(linux_status_rss_kib("VmRSS:\t0 kB\n"), None);
     }
 
+    #[test]
+    fn process_tree_rss_sampler_allows_fast_exit_without_counterfeit_measurement() {
+        let sampler = ProcessTreeRssSampler::new();
+        assert_eq!(sampler.finish().unwrap(), None);
+    }
+
+    #[test]
+    fn process_tree_rss_sampler_fails_after_a_live_group_repeatedly_disappears() {
+        let mut sampler = ProcessTreeRssSampler::new();
+        sampler
+            .retain_observation(Ok(Some(4_096)))
+            .expect("positive sample");
+        sampler
+            .retain_observation(Ok(None))
+            .expect("one terminal race is allowed");
+        assert!(sampler.retain_observation(Ok(None)).is_err());
+        assert!(sampler.finish().is_err());
+    }
+
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     #[test]
     fn process_tree_rss_sampler_observes_a_live_bounded_group() {
         let cancellation = CancellationToken::no_deadline();
         let mut sampler = ProcessTreeRssSampler::new();
-        let mut observer = |root_pid| sampler.observe(root_pid);
+        let never_cancel = || false;
+        let mut observer = |root_pid| sampler.observe(root_pid, &never_cancel);
         let output = crate::process::run_command_cancellable_with_input_probe_and_observer(
             "sh",
             &["-c".to_owned(), "sleep 0.15".to_owned()],
@@ -5430,10 +5524,10 @@ mod tests {
             completed_wall_time_ms: 250,
             peak_rss_authority: ModelComparisonResourceAuthority::Measured,
             peak_rss_scope: ModelComparisonPeakRssScope::WholeProcessTree,
-            peak_rss_sampling_interval_ms: Some(
-                MODEL_COMPARISON_PROCESS_TREE_RSS_SAMPLE_INTERVAL_MS,
+            peak_rss_minimum_sampling_interval_ms: Some(
+                MODEL_COMPARISON_PROCESS_TREE_RSS_MINIMUM_SAMPLE_INTERVAL_MS,
             ),
-            authoritative_peak_rss_bytes: Some(1024),
+            sampled_peak_rss_bytes: Some(1024),
             cancellation_latency_authority: ModelComparisonResourceAuthority::Measured,
             maximum_cancellation_latency_ms: Some(50),
             hard_timeout_seconds: Some(PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS),
@@ -5465,7 +5559,7 @@ mod tests {
             )
             .is_ok()
         );
-        resources.authoritative_peak_rss_bytes = Some(0);
+        resources.sampled_peak_rss_bytes = Some(0);
         assert!(
             validate_resource_evidence(
                 ModelComparisonLane::NativeAcoustic,

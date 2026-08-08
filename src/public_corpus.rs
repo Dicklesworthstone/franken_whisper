@@ -69,7 +69,7 @@ pub use model_comparison::{
     PublicModelComparisonEvidence, PublicModelComparisonProtocol, PublicModelComparisonRequest,
     model_comparison_schedule_row, run_model_comparison_cancel_probe,
     run_model_comparison_worker_from_stdio, run_public_model_comparison_with_cancel,
-    verify_public_model_comparison_bundle_pair, verify_public_model_comparison_evidence,
+    verify_public_model_comparison_bundle_identity_pair, verify_public_model_comparison_evidence,
 };
 
 /// Schema identity for the path-bearing, external-only adapter input.
