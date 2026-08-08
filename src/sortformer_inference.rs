@@ -773,16 +773,23 @@ impl SortformerF32Facade {
         checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
     ) -> FwResult<Vec<f32>> {
         frontend_checkpoint(checkpoint)?;
-        validate_sortformer_feature_chunk_geometry(
-            feature_frames,
-            left_feature_frames,
-            right_feature_frames,
-        )?;
+        let (left_embedding_frames, right_embedding_frames, expected_embedding_frames) =
+            validate_sortformer_feature_chunk_geometry(
+                feature_frames,
+                left_feature_frames,
+                right_feature_frames,
+            )?;
         let chunk_embeddings = self.subsample_feature_chunk_with_checkpoint(
             time_major_features,
             feature_frames,
             checkpoint,
         )?;
+        if chunk_embeddings.frames != expected_embedding_frames {
+            return Err(reference_error(
+                "stream_shape",
+                "Sortformer subsampler output differs from the validated stream geometry",
+            ));
+        }
         let prefix_frames = state
             .speaker_cache
             .rows
@@ -822,8 +829,6 @@ impl SortformerF32Facade {
         for value in &mut probabilities.data {
             *value = sigmoid_f32(*value)?;
         }
-        let left_embedding_frames = left_feature_frames / SORTFORMER_SUBSAMPLING_FACTOR;
-        let right_embedding_frames = right_feature_frames.div_ceil(SORTFORMER_SUBSAMPLING_FACTOR);
         let chunk_predictions = Self::update_streaming_state_transactionally(
             state,
             &chunk_embeddings,
@@ -3701,7 +3706,7 @@ fn validate_sortformer_feature_chunk_geometry(
     feature_frames: usize,
     left_feature_frames: usize,
     right_feature_frames: usize,
-) -> FwResult<()> {
+) -> FwResult<(usize, usize, usize)> {
     let context_feature_frames = left_feature_frames
         .checked_add(right_feature_frames)
         .ok_or_else(|| reference_error("stream_context", "stream context length overflows"))?;
@@ -3718,7 +3723,33 @@ fn validate_sortformer_feature_chunk_geometry(
             "Sortformer stream context is outside the frozen recommended profile",
         ));
     }
-    Ok(())
+    // Three stride-two, pad-one convolutions emit ceil(feature_frames / 8)
+    // rows. The pinned stream contract trims an exact left row and rounds the
+    // right feature context up, so validate the post-subsampling geometry here
+    // before the expensive encoder/Transformer path begins.
+    let output_embedding_frames = feature_frames.div_ceil(SORTFORMER_SUBSAMPLING_FACTOR);
+    let left_embedding_frames = left_feature_frames / SORTFORMER_SUBSAMPLING_FACTOR;
+    let right_embedding_frames = right_feature_frames.div_ceil(SORTFORMER_SUBSAMPLING_FACTOR);
+    let central_embedding_frames = output_embedding_frames
+        .checked_sub(left_embedding_frames)
+        .and_then(|frames| frames.checked_sub(right_embedding_frames))
+        .ok_or_else(|| {
+            reference_error(
+                "stream_context",
+                "Sortformer stream context removes the complete subsampled chunk",
+            )
+        })?;
+    if central_embedding_frames == 0 || central_embedding_frames > SORTFORMER_CHUNK_FRAMES {
+        return Err(reference_error(
+            "stream_context",
+            "Sortformer stream context leaves no bounded central embedding chunk",
+        ));
+    }
+    Ok((
+        left_embedding_frames,
+        right_embedding_frames,
+        output_embedding_frames,
+    ))
 }
 
 fn slice_rows(values: &[f32], width: usize, start: usize, end: usize) -> FwResult<&[f32]> {
@@ -5990,14 +6021,43 @@ mod tests {
     fn recommended_feature_chunk_geometry_is_bounded_before_subsampling() {
         let central = SORTFORMER_CHUNK_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR;
         let right = SORTFORMER_RIGHT_CONTEXT_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR;
-        assert!(validate_sortformer_feature_chunk_geometry(central, 0, 0).is_ok());
-        assert!(
+        assert_eq!(
+            validate_sortformer_feature_chunk_geometry(central, 0, 0)
+                .expect("one full central chunk"),
+            (0, 0, SORTFORMER_CHUNK_FRAMES)
+        );
+        assert_eq!(
+            validate_sortformer_feature_chunk_geometry(1, 0, 0).expect("one-frame final tail"),
+            (0, 0, 1)
+        );
+        assert_eq!(
             validate_sortformer_feature_chunk_geometry(
                 central + SORTFORMER_SUBSAMPLING_FACTOR + right,
                 SORTFORMER_SUBSAMPLING_FACTOR,
                 right,
             )
-            .is_ok()
+            .expect("full chunk with recommended context"),
+            (
+                SORTFORMER_LEFT_CONTEXT_FRAMES,
+                SORTFORMER_RIGHT_CONTEXT_FRAMES,
+                SORTFORMER_LEFT_CONTEXT_FRAMES
+                    + SORTFORMER_CHUNK_FRAMES
+                    + SORTFORMER_RIGHT_CONTEXT_FRAMES,
+            )
+        );
+        assert_eq!(
+            validate_sortformer_feature_chunk_geometry(central + 1, 0, 1)
+                .expect("full central chunk with a partial right context"),
+            (0, 1, SORTFORMER_CHUNK_FRAMES + 1)
+        );
+        assert!(validate_sortformer_feature_chunk_geometry(2, 0, 1).is_err());
+        assert!(
+            validate_sortformer_feature_chunk_geometry(
+                SORTFORMER_SUBSAMPLING_FACTOR + 2,
+                SORTFORMER_SUBSAMPLING_FACTOR,
+                1,
+            )
+            .is_err()
         );
         assert!(validate_sortformer_feature_chunk_geometry(central + 1, 0, 0).is_err());
         assert!(
