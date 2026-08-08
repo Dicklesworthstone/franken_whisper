@@ -17,6 +17,7 @@
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run self-test after install
+#   --no-pull          Suppress the post-install Sortformer model prompt
 #   --force            Reinstall even if the same version is already present
 #   --artifact-url URL Use a custom release artifact URL
 #   --checksum SHA     Provide expected SHA256 checksum
@@ -32,6 +33,8 @@
 # Environment:
 #   HTTP_PROXY / HTTPS_PROXY   Honored on every download
 #   FW_INSTALL_DIR             Override default install directory
+#   FW_INSTALL_PROMPT_TIMEOUT  Model prompt timeout in seconds (default: 120)
+#   FRANKEN_WHISPER_MODEL_DIR  Override the model cache root
 #   VERSION                    Override version to install
 #
 # Platforms (prebuilt binaries — 5 release targets):
@@ -63,6 +66,7 @@ DEST_EXPLICIT=0
 EASY=0
 QUIET=0
 VERIFY=0
+NO_PULL=0
 FROM_SOURCE=0
 UNINSTALL=0
 FORCE_INSTALL=0
@@ -267,6 +271,7 @@ Options:
   --system           Install to /usr/local/bin (requires sudo)
   --easy-mode        Auto-update PATH in shell rc files
   --verify           Run self-test after install
+  --no-pull          Suppress the post-install Sortformer model prompt/guidance
   --force            Reinstall even if the same version is already present
   --artifact-url URL Use a custom release artifact URL
   --checksum SHA     Provide expected SHA256 checksum
@@ -282,6 +287,8 @@ Options:
 Environment Variables:
   HTTP_PROXY / HTTPS_PROXY   Honored on every download
   FW_INSTALL_DIR             Override default install directory
+  FW_INSTALL_PROMPT_TIMEOUT  Model prompt timeout in seconds (default: 120)
+  FRANKEN_WHISPER_MODEL_DIR  Override the model cache root
   VERSION                    Override version to install
 
 Platforms (prebuilt binaries):
@@ -347,6 +354,7 @@ while [ $# -gt 0 ]; do
             shift;;
         --easy-mode) EASY=1; shift;;
         --verify) VERIFY=1; shift;;
+        --no-pull) NO_PULL=1; shift;;
         --force) FORCE_INSTALL=1; shift;;
         --artifact-url) require_option_value "$1" "${2:-}"; ARTIFACT_URL="$2"; shift 2;;
         --artifact-url=*) ARTIFACT_URL="${1#*=}"; require_assignment_value "--artifact-url" "$ARTIFACT_URL"; shift;;
@@ -1099,8 +1107,8 @@ download_release() {
 # Self-test
 # ============================================================================
 # Validate the installed binary and its stable agent-discovery surfaces. Model
-# readiness is reported by doctor but is not required: model weights are
-# intentionally operator-provisioned and not bundled by this installer.
+# readiness is reported by doctor but is not required: model weights are not
+# bundled, and the installer offers an explicit post-install pull instead.
 run_self_test() {
     log_step "Verifying installed agent contracts..."
     local long_version alias_version capabilities schema doctor
@@ -1114,6 +1122,67 @@ run_self_test() {
     [[ "$schema" == *'"schema_version"'* ]] || die "Robot schema probe returned an unexpected payload"
     [[ "$doctor" == *'"schema_version":"franken-whisper-doctor-v1"'* ]] || die "Doctor probe returned an unexpected schema"
     log_success "Installation contracts verified (model readiness remains operator-configured)"
+}
+
+# Return success only when a human operator can answer a prompt. `/dev/tty`
+# keeps the prompt usable under `curl ... | bash`, where stdin carries the
+# installer source rather than terminal input.
+interactive_tty() {
+    [ -t 0 ] && return 0
+    ( : </dev/tty >/dev/tty ) 2>/dev/null && return 0
+    return 1
+}
+
+maybe_offer_sortformer_pull() {
+    [ "$NO_PULL" -eq 1 ] && return 0
+
+    local bin="$DEST/$ALIAS_NAME"
+    local cache_root="${FRANKEN_WHISPER_MODEL_DIR:-$HOME/.cache/franken_whisper/models}"
+
+    # Airgapped, quiet, and headless installs never start a surprise network
+    # transfer. They retain one explicit command for later provisioning.
+    if [ -n "$OFFLINE_TARBALL" ]; then
+        log_info "Sortformer weights are not bundled. When online, download them with: fw pull sortformer"
+        return 0
+    fi
+    if [ "$QUIET" -eq 1 ] || ! interactive_tty; then
+        log_info "Sortformer weights are not bundled. Download them later with: fw pull sortformer"
+        return 0
+    fi
+
+    echo ""
+    log_info "Native speaker diarization needs the pinned Sortformer model."
+    log_info "The verified download is about 492 MB into $cache_root."
+    local answer=""
+    local read_status=0
+    local prompt_timeout="${FW_INSTALL_PROMPT_TIMEOUT:-120}"
+    if [[ ! "$prompt_timeout" =~ ^[0-9]+$ ]] || [ "$prompt_timeout" -eq 0 ]; then
+        prompt_timeout=120
+    fi
+    printf 'Download the diarization model now with fw pull sortformer? (y/N): '
+    if ( : </dev/tty ) 2>/dev/null; then
+        IFS= read -r -t "$prompt_timeout" answer </dev/tty || read_status=$?
+    else
+        IFS= read -r -t "$prompt_timeout" answer || read_status=$?
+    fi
+    if [ "$read_status" -ne 0 ]; then
+        answer=""
+        echo ""
+        log_warn "No reply within ${prompt_timeout}s; taking the default (No)."
+    fi
+    case "$answer" in
+        y|Y|yes|Yes|YES)
+            log_step "Running: fw pull sortformer"
+            if "$bin" pull sortformer; then
+                log_success "Verified Sortformer model installed under $cache_root"
+            else
+                log_warn "Model provisioning did not finish. Retry later with: fw pull sortformer"
+            fi
+            ;;
+        *)
+            log_info "Skipped. Download the diarization model later with: fw pull sortformer"
+            ;;
+    esac
 }
 
 # ============================================================================
@@ -1177,7 +1246,8 @@ print_summary() {
     echo "    fw --help"
     echo ""
     echo "  Model policy:"
-    echo "    Weights are not bundled or downloaded automatically; run 'fw models --json'."
+    echo "    Weights are not bundled. This installer offers 'fw pull sortformer';"
+    echo "    inspect readiness at any time with 'fw models --json'."
     echo ""
     echo "  Uninstall:"
     echo "    curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/main/install.sh | bash -s -- --uninstall"
@@ -1200,6 +1270,7 @@ main() {
         install_offline
         maybe_add_path
         [ "$VERIFY" -eq 1 ] && run_self_test
+        maybe_offer_sortformer_pull
         print_summary
         return 0
     fi
@@ -1235,6 +1306,7 @@ main() {
 
     maybe_add_path
     [ "$VERIFY" -eq 1 ] && run_self_test
+    maybe_offer_sortformer_pull
     print_summary
 }
 

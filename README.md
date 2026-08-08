@@ -284,7 +284,7 @@ Most tools occupy one level. `franken_whisper` is the orchestration layer: it wr
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/main/install.sh?$(date +%s)" | bash
 ```
 
-The installer downloads the appropriate release asset for your platform, verifies its SHA-256 checksum against `checksums-sha256.txt`, validates the staged binary's self-reported version before replacement, and installs both `fw` and `franken_whisper` to `~/.local/bin`. Unknown options, missing values, and conflicting source/offline modes fail before any download. A release download failure never silently falls back to a source build; use `--from-source` explicitly.
+The installer downloads the appropriate release asset for your platform, verifies its SHA-256 checksum against `checksums-sha256.txt`, validates the staged binary's self-reported version before replacement, and installs both `fw` and `franken_whisper` to `~/.local/bin`. After an interactive online install, it explains the approximately 492 MB Sortformer download and asks whether to run the installed `fw pull sortformer`; the safe default is **No**. Quiet, headless, and air-gapped installs never start that model download. Unknown options, missing values, and conflicting source/offline modes fail before any download. A release download failure never silently falls back to a source build; use `--from-source` explicitly.
 
 Options:
 
@@ -293,6 +293,7 @@ Options:
 | `--system` | Install to `/usr/local/bin` instead of `~/.local/bin` |
 | `--easy-mode` | Auto-update shell `PATH` and rc files |
 | `--verify` | Verify both binary names plus capabilities, schema, and detect-only doctor contracts |
+| `--no-pull` | Suppress the post-install Sortformer download prompt and guidance |
 | `--version vX.Y.Z` | Pin to a specific release |
 | `--force` | Reinstall even if the same version is present |
 | `--offline TARBALL` | Airgap install from a local archive (verifies sibling `.sha256`) |
@@ -301,7 +302,7 @@ Options:
 | `--no-verify` | Skip checksum verification (testing only) |
 | `--uninstall` | Remove both binary names and installer-added `PATH` lines |
 
-`HTTP_PROXY`/`HTTPS_PROXY` are honored on every download. Prebuilt targets: `linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64`, `windows_amd64` (zip; manual install on native Windows — the bash installer covers Linux, macOS, and WSL).
+`HTTP_PROXY`/`HTTPS_PROXY` are honored on every download. `FW_INSTALL_PROMPT_TIMEOUT` changes the interactive prompt timeout from its 120-second default, and `FRANKEN_WHISPER_MODEL_DIR` selects an absolute model-cache root for both the prompt and `fw pull sortformer`. Prebuilt targets: `linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64`, `windows_amd64` (zip; manual install on native Windows — the bash installer covers Linux, macOS, and WSL).
 
 ### From Source
 
