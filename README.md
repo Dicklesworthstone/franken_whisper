@@ -655,18 +655,35 @@ python3 scripts/export_redimnet2.py INPUT.pt SOURCE_ROOT OUTPUT_DIR
 ```
 
 All three arguments must resolve outside this checkout, `OUTPUT_DIR` must not
-exist, and the command performs no download. It requires Python 3.12.12 with
+exist, and the command performs no download. The exporter installs a Python
+audit hook that denies socket and child-process events for the full conversion.
+Its exporter and conversion-receipt schemas are v2; the synthetic truth tensor
+contract remains v1. It requires Python 3.12.12 with
 torch/torchaudio 2.7.1, NumPy 2.2.6, SciPy 1.15.3, and safetensors 0.5.3. It
-hash-binds the 15,897,450-byte upstream checkpoint and 14 imported/source files,
+hash-binds the 15,897,450-byte upstream checkpoint and 14 source files, rejects
+every unmanifested regular file, symlink, bytecode file, or native extension in
+the executable `redimnet2` package tree, disables bytecode writes, and refuses
+preloaded ReDimNet modules. The receipt binds the interpreter binary, Python
+implementation/cache tag, distribution RECORD/METADATA digests, and a
+path-free commitment after verifying every hashed RECORD entry's bytes. It also
+binds the Torch Git/build identity and build-configuration digest. It
 drops only 68 scalar batch counters, and writes a metadata-free 15,745,544-byte
 f32 package (SHA-256
 `d41a729f5ef008d70c6d6bf4ab7ca27e299a478ff665665a4e31afff7f46ddeb`),
 an 8,828,392-byte non-human synthetic seam pack (SHA-256
 `21042537873c3dacafafd134d7c9e296318458f55f1a429c00bc9542f95f3238`),
-and a canonical path-free receipt. Two fresh exports were byte-identical. The
+and a canonical path-free receipt. Two final hardened fresh exports were
+byte-identical; their receipt SHA-256 is
+`e4e5aab1838dd386895425acc11e3405191e30ce2111c313c2734bfc2bccd77e`. The
 model has 3,677,760 total parameters, of which 3,676,320 are trainable and 1,440
 are frozen; its raw 192-vector is retained separately from consumer-side L2
-normalization. The v1.0.0 tag predates the repository's current MIT file, so the
+normalization. Every manually captured terminal embedding must equal the real
+upstream `forward` output bit-for-bit. Known upstream warnings and the one
+pinned initialization message are captured and retained only as path-free
+code/count/byte/digest records; any unknown warning or console output fails.
+Publication uses a stable destination directory handle with no-follow,
+create-exclusive files, inode checks, and
+fsync. The v1.0.0 tag predates the repository's current MIT file, so the
 receipt deliberately marks this package `operator_local_no_release` until the
 model-weight license scope is explicitly established. No ReDimNet weights,
 truth tensors, feature values, local paths, audio, transcripts, or biometric
@@ -1085,7 +1102,7 @@ worker counts at eight, and applies the same frozen 1800-second attempt timeout
 to every lane. The application downloads neither the ECAPA
 package nor the external Sortformer adapter/model; the native Sortformer lane
 uses the release-bound cache installed only by `fw pull sortformer`. Absent
-components become typed lane skips. Protocol v4 pins the complete effective native request
+components become typed lane skips. Protocol v5 pins the complete effective native request
 for each lane, its ordered payload-free outcome taxonomy, and its own canonical
 digest. Any change to those bindings requires a new version-and-digest pair.
 
@@ -1098,13 +1115,26 @@ worker identity validation, audio decode, model load, inference, output
 validation, scoring, parent-side post-run identity validation, and the native
 platform resource probe. The parent kills the complete descendant process
 group on cancellation or timeout, records a live recursive-descendant
-cancellation probe, and samples the concurrent RSS sum of the complete worker
-process group every 50 ms. That whole-tree scope includes nested subprocess
-adapters instead of silently reporting only the Rust worker. Wall time, RTF,
+cancellation probe through the same bounded observer path used by real lanes.
+Cancellation, timeout, and output-limit checks run before observation. On Unix,
+cleanup reaps the root and verifies that the owned process group is absent;
+cleanup failure overrides a nominal success, cancellation, or timeout. The RSS
+field is an approximate sampled maximum of the concurrent process-group sum,
+including nested subprocess adapters. Sample starts are no closer than 50 ms,
+and each platform probe has its own fixed bound; this is not an exact process
+high-water mark or a promise of exactly 50 ms between samples. A worker that
+exits before any sample is explicitly unavailable, while repeated disappearance
+of a still-live group fails the resource probe. Wall time, RTF, sampled
 whole-tree RSS, and cancellation latency carry explicit scope, authority, and
 cap dispositions rather than zero or shared-process estimates. The companion path-free public bundle is record-level scorer
 input and therefore retains opaque public recording/speaker IDs and reference
 timestamps, but no source path, filename, audio, or transcript.
+
+`verify_public_model_comparison_bundle_identity_pair` validates both retained
+artifacts and proves that their corpus, source, descriptor, bundle, split, and
+recording-count identities agree. Because the evidence is aggregate-only, this
+API does not derive its observation-set commitment or metrics from the bundle;
+that stronger proof still requires source reconstruction and a fresh run.
 
 All path arguments must be absolute. Entire output file names must use lowercase
 ASCII letters, digits, period, underscore, and hyphen and end in the exact

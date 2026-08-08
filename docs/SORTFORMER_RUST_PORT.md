@@ -210,8 +210,8 @@ The current local Apple M4 Pro evidence snapshot is:
 | Release end-to-end wall time | `6.13 s` |
 | Release peak RSS | `1,368,850,432` bytes |
 | Whole-recording same-invocation comparison | VoxConverse `mevkw`, 102.0 s: native DER/JER `0.021214713430` / `0.029991623791`; NeMo DER/JER `0.019846022241` / `0.029477961362` |
-| Whole-recording native resource row | wall `9.251 s`; RTF `0.090696078431`; 50 ms whole-tree RSS `1,360,838,656` bytes |
-| Whole-recording NeMo resource row | wall `12.957 s`; RTF `0.127029411765`; 50 ms whole-tree RSS `2,213,019,648` bytes; frozen 2 GiB cap failed |
+| Whole-recording native resource row | wall `14.940 s`; RTF `0.146470588235`; approximate whole-tree sampled RSS `1,363,558,400` bytes |
+| Whole-recording NeMo resource row | wall `18.482 s`; RTF `0.181196078431`; approximate whole-tree sampled RSS `2,209,021,952` bytes; frozen 2 GiB cap failed |
 | Whole-recording L8 discrepancy | Four one-frame (80 ms) boundary differences among 16 anonymous turns; broad byte-exact L7/L8 parity remains open |
 
 These are real local runtime and accuracy observations. The optimized release
@@ -232,12 +232,23 @@ NeMo lane identities matched, but boundaries differed at native/reference
 The first chained cache-state or threshold divergence must be localized before
 the f32 route can pass its complete L7/L8 gate.
 
-That row was produced by protocol v4 in five fresh workers and all five lanes
-completed, so its common-complete intersection contains one recording. The
-aggregate evidence result SHA-256 is
-`53a256178b380113d6ccc8f1848749150988a3dcd188e122cf90f06bde0dcc6a`.
-It is still only one development observation, not a complete ten-row Williams
-schedule, a multi-condition accuracy gate, or production-route authorization.
+The current resource row was reproduced by protocol v5 in five fresh workers,
+and all five lanes completed, so its common-complete intersection contains one
+recording. The comparison executable SHA-256 is
+`879a81289995e7d13381f27423756caa34bdbdb24f50f34a2f455918d92d0ab1`,
+the protocol SHA-256 is
+`54a4f4681e5a3c0297d00c876ce701cdae9a933b9fc7c6027fa33c0de062467c`,
+the aggregate result SHA-256 is
+`9bd245a74dbcc762df0555b57fdc57762e32f8fd9e046fe288eaf0cd484258b7`,
+and the evidence-file SHA-256 is
+`ebd85336e165e65f716d29c15420ff78280881a48943700ead15eff3f07be68b`.
+The 39 ms cancellation probe used the same bounded observer path as real
+lanes, and successful cleanup verified disappearance of the owned Unix process
+group. RSS is an approximate sampled process-group sum whose sample starts are
+at least 50 ms apart, not an exact high-water mark. This v5 row supersedes the
+v4 resource/cancellation evidence. It is still only one development
+observation, not a complete ten-row Williams schedule, a multi-condition
+accuracy gate, or production-route authorization.
 
 The exact-score L6 compression test passes inside the frozen numeric envelope.
 The full chained run nevertheless diverges at `iqtde` step 002 because the
@@ -1011,7 +1022,7 @@ layer, and initially return `DifferentialStageDocument`. The strict Sortformer
 validator in `src/differential_oracle.rs` is the first output boundary.
 
 This slice must not change `DiarizationEngine`, automatic routing, or the
-production transcribe report contract. Comparison protocol v4 adds the native
+production transcribe report contract. Comparison protocol v5 adds the native
 Sortformer lane without changing product routing. The explicit
 `sortformer-diarize` command is a path-redacted evaluation surface over the
 same library session; it reports `evaluation_only` and cannot be selected by

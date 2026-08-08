@@ -1424,7 +1424,7 @@ declared capacity-ineligible and is never passed to either Sortformer lane.
 Consecutive sorted observations follow a ten-row balanced Williams schedule,
 and `order_balance_complete` is true only after a complete schedule. Every
 declared lane is retained as completed, skipped, or failed with a stable
-reason. Protocol v4 binds each complete effective native request, the ordered
+reason. Protocol v5 binds each complete effective native request, the ordered
 payload-free outcome taxonomy, and the protocol body to a pinned canonical
 SHA-256 identity; changing any of them requires a new version-and-digest pair.
 The command requires eight native Rayon workers to match the pinned Sortformer
@@ -1444,16 +1444,32 @@ an explicit scorer-equivalence probe. Timing is retained for deployment
 observation only. Parent-observed time for every lane includes process launch,
 bounded IPC, identity validation, audio decode, model load, inference, output
 validation, scoring, post-run identity validation, and resource-probe parsing.
-Those fresh-process scopes are cross-lane comparable. The artifact reports the
-maximum 50 ms-sampled concurrent RSS sum across the complete worker process
-group, including nested subprocess adapters, plus measured recursive-process
-cancellation latency; unavailable platform probes remain explicitly unavailable
-rather than becoming zero. The comparison command downloads no
+Those fresh-process scopes are cross-lane comparable. The artifact reports an
+approximate sampled maximum of the concurrent RSS sum across the complete
+worker process group, including nested subprocess adapters. Sample starts are
+separated by at least 50 ms and each probe is bounded; probe work makes the
+actual start-to-start cadence longer, so this is neither an exact high-water
+mark nor an exactly-50-ms sampler. Cancellation, timeout, and output-limit
+checks precede observation. The retained cancellation probe exercises this same
+observer path. On Unix, cleanup reaps the root and confirms that the owned
+process group disappeared; cleanup failure overrides the nominal lane result.
+A fast exit without a sample is explicitly unavailable, while repeated loss of
+a still-live group fails the resource probe. Recursive-process cancellation
+latency is retained separately; unavailable platform probes remain explicitly
+unavailable rather than becoming zero. The comparison command downloads no
 model. `native_sortformer` uses only the release-bound cache installed by the
 explicit `fw pull sortformer` command; unavailable ECAPA, native Sortformer,
 or external-adapter components produce typed skips.
 The command does not alter transcription routing or the default-off acoustic
 sidecar.
+
+`verify_public_model_comparison_bundle_identity_pair` is deliberately an
+artifact-identity verifier. It validates each artifact structurally and checks
+the shared corpus, source, descriptor, bundle, split, and recording-count tuple.
+Aggregate-only evidence omits the per-record normalized-input and outcome rows,
+so this verifier cannot recompute the observation-set commitment or aggregate
+metrics. Derivation proof requires source reconstruction and a fresh comparison
+run.
 
 ReDimNet2-B2 is a compact evaluation-only representation provider, not a
 segmentation, overlap, speaker-count, or clustering authority. Its pinned
@@ -1467,16 +1483,28 @@ pooling, and a raw 192-dimensional embedding that is not L2-normalized. The
 model contains 3,677,760 parameters: 3,676,320 trainable plus the frozen
 1,440-element first-stage weighting tensor.
 
-`scripts/export_redimnet2.py` is the only accepted raw-checkpoint boundary. It
-requires the exact Python/package tuple and 14-file source manifest, loads the
+`scripts/export_redimnet2.py` is the only accepted raw-checkpoint boundary. Its
+current exporter and conversion-receipt schemas are v2; the synthetic truth
+tensor contract remains v1. It requires the exact Python/package tuple and
+14-file source manifest. Before
+import, it requires the executable `redimnet2` package-file census to equal the
+manifest exactly, rejecting unmanifested bytecode, native extensions, regular
+files, special entries, and symlinks; it disables bytecode writes, invalidates
+import caches, and rejects preloaded ReDimNet modules. It loads the
 checkpoint with `weights_only=True` from an already hash-verified owned byte
 buffer, strictly loads the upstream graph, drops exactly 68 scalar int64 batch
 counters, and retains 661 finite contiguous f32 tensors containing 3,918,794
-elements. It verifies source-module provenance and source/exporter stability
-before publication. It creates a new external mode-0700 directory and three
-mode-0600 files with exclusive creation; repository-contained input or output
-paths fail closed. Neither the Rust runtime nor this exporter downloads a
-model.
+elements. The receipt binds the interpreter binary, Python implementation and
+cache tag, package RECORD/METADATA digests, and a path-free file-set commitment
+after verifying every hashed RECORD entry. It also binds Torch
+Git/build/configuration identity. A Python audit hook denies socket and
+child-process events; the exporter verifies source-module provenance and
+source/exporter stability before
+publication. It creates a new external mode-0700 directory and three mode-0600
+files through a stable directory handle using no-follow and exclusive creation,
+then verifies inode identity and fsyncs the directory; repository-contained
+input or output paths fail closed. Neither the Rust runtime nor this exporter
+downloads a model.
 
 The canonical converted package is 15,745,544 bytes with SHA-256
 `d41a729f5ef008d70c6d6bf4ab7ca27e299a478ff665665a4e31afff7f46ddeb`.
@@ -1488,10 +1516,16 @@ consumer-normalized embedding seams. Five source replays at each of one and
 eight PyTorch threads were deterministic within a thread count. The cross-
 thread source floor peaked at max-absolute `3.147125244140625e-4` in the
 frontend and relative-L2 `1.4254854456195043e-5` in the final weighted path;
-the receipt retains every seam floor and the pre-native tolerance matrix. The
+the receipt retains every seam floor, ceiling, absolute headroom, floor
+multiplier, and pre-native rounding rationale. The manual terminal seam is
+accepted only when it is bit-exact to the authoritative upstream `forward`.
+Known upstream deprecation warnings and the one pinned initialization message
+are captured and retained only as path-free code, count, byte, and message
+digests; unknown warnings or console output fail. The
 initial frontend ceiling of `2e-5`/`2e-6` was rejected before native work and
-is preserved in the receipt rather than erased. Two independent final exports
-were byte-identical.
+is preserved in the receipt rather than erased. Two independent final hardened
+exports were byte-identical, including the path-free receipt at SHA-256
+`e4e5aab1838dd386895425acc11e3405191e30ce2111c313c2734bfc2bccd77e`.
 
 The v1.0.0 tag contains no top-level repository license file even though a
 later main revision has an MIT file and individual pinned sources carry MIT or
