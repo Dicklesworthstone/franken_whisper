@@ -1,9 +1,9 @@
 # Native Streaming Sortformer Rust Port Contract
 
-Status: authenticated native L1-L5 parity, exact-score L6 equation parity,
-byte-exact L7-L8 postprocessing, a production-shaped library session, and an
-explicit evaluation-only CLI are complete; chained L6 hard-top-k identity and
-broad accuracy/resource certification remain open under `bd-y4ip.11`
+Status: authenticated native L1-L8 parity is complete for the pinned NVIDIA
+recommended streaming profile, together with a production-shaped library
+session and explicit evaluation-only CLI; broader L9 accuracy, L10 resource,
+greater-than-four-speaker, and product-routing certification remain open
 Fit verdict: **CONDITIONAL GO**
 Promotion authority: explicit evaluation only; `Auto` and the transcribe
 diarization resolver remain unchanged
@@ -33,16 +33,16 @@ Unknown recordings report
 `four_lane_capped_output_true_speaker_count_unknown`; the active lane count is
 not treated as a certified true-speaker count.
 
-The port is a conditional fit rather than an unconditional fit because:
+The port remains a conditional fit rather than an unconditional fit because:
 
 - the 117.7-million-parameter graph is a tier-2 port with a substantial
   FastConformer front end and stateful streaming overlay;
-- the custom speaker-cache compression, top-k selection, and FIFO update
-  semantics still require seam fixtures before implementation;
+- the upstream model has a fixed four-speaker output capacity and cannot by
+  itself establish that an unconstrained recording contains more speakers;
 - the custom NVIDIA Open Model License requires an explicit distribution
   policy; and
-- the current one-record exploratory nondeterminism probe is not an accepted
-  oracle floor.
+- the accepted four-fixture parity pack and ten-row development diagnostic are
+  not a sealed-corpus product decision gate.
 
 No existing native diarization code should be deleted to make room for this
 route. A failed parity, resource, capacity, or public-accuracy gate leaves the
@@ -217,10 +217,16 @@ The current local Apple M4 Pro evidence snapshot is:
 | Release package admission / session materialization / combined model load | `1.904567 s` / `0.428503 s` / `2.333070 s` |
 | Release end-to-end wall time | `6.13 s` |
 | Release peak RSS | `1,368,850,432` bytes |
-| Whole-recording same-invocation comparison | VoxConverse `mevkw`, 102.0 s: native DER/JER `0.021214713430` / `0.029991623791`; NeMo DER/JER `0.019846022241` / `0.029477961362` |
+| Recommended-profile public parity pack | Four complete/declared public fixtures, including 102-second `mevkw` and one four-speaker row; 4,540 authenticated L1-L8 tensors |
+| Recommended-profile whole-recording L5 drift | `mevkw`, 102.0 s: max abs `1.072883606e-6`; relative L2 `8.214150678e-8` |
+| Recommended-profile whole-recording L7/L8 | Native activity and all 16 anonymous turns byte-exact against the authenticated NeMo source output |
+| Strict default-score DER / JER | `0.029816514` / `0.038068192` with zero boundary collar and overlap included |
+| Strict default-score components | miss `2.32 s`; false alarm `1.28 s`; confusion `0.04 s` |
+| Contended local release parity runtime | inference `16.401269 s` / audio `102.0 s` / RTF `0.160797`; retained only as parity-run timing, not the throughput baseline |
+| Historical archive-profile comparison | VoxConverse `mevkw`, 102.0 s: native DER/JER `0.021214713430` / `0.029991623791`; recommended-profile NeMo DER/JER `0.019846022241` / `0.029477961362` under the protocol scorer |
 | Whole-recording native resource row | wall `14.940 s`; RTF `0.146470588235`; approximate whole-tree sampled RSS `1,363,558,400` bytes |
 | Whole-recording NeMo resource row | wall `18.482 s`; RTF `0.181196078431`; approximate whole-tree sampled RSS `2,209,021,952` bytes; frozen 2 GiB cap failed |
-| Whole-recording L8 discrepancy | Four one-frame (80 ms) boundary differences among 16 anonymous turns; broad byte-exact L7/L8 parity remains open |
+| Historical archive-profile L8 discrepancy | Four one-frame (80 ms) boundary differences among 16 anonymous turns; resolved as a streaming-profile mismatch, not a Rust/source parity loss |
 
 These are real local runtime and accuracy observations. The optimized release
 row is about 23.4 times faster than real time on this one Apple M4 Pro input;
@@ -232,13 +238,18 @@ a ledger-qualified optimization win. A frozen multi-record public evaluation,
 same-invocation baseline comparison, 90-minute resource row, and further
 profile-guided optimization remain required.
 
-The 102-second row is a loss report, not a tolerance change. The native and
-NeMo lane identities matched, but boundaries differed at native/reference
+The historical 102-second archive-profile row remains a valid loss report, not
+a tolerance change. That invocation compared the converted archive defaults
+(`188/1/1/0/188/188`) against NVIDIA's recommended runtime profile
+(`340/1/40/40/300/188`). The lane identities matched, but boundaries differed
+at native/reference
 `13840/13760` ms (start), `64800/64880` ms (end), `74480/74400` ms (end), and
-`101840/101760` ms (end). This supersedes any interpretation that the exact
-25-second reconstructable-prefix result proves whole-recording discrete parity.
-The first chained cache-state or threshold divergence must be localized before
-the f32 route can pass its complete L7/L8 gate.
+`101840/101760` ms (end). The accepted native profile now matches the published
+recommended geometry, and the complete recommended-profile source pack proves
+all 16 turns byte-exact without changing a numeric or discrete gate. The strict
+default-score row above and the protocol rows below intentionally use different
+scorer policies: the former has zero collar and includes overlap; protocol v7
+uses a 250 ms reference-boundary collar and excludes overlap.
 
 The balanced ten-record development comparison was reproduced by protocol v7
 on 2026-08-08 with the exact release executable
@@ -314,16 +325,15 @@ resource/cancellation evidence. It is still only one development observation,
 not a complete ten-row Williams schedule, a multi-condition accuracy gate, or
 production-route authorization.
 
-The exact-score L6 compression test passes inside the frozen numeric envelope.
-The full chained run nevertheless diverges at `iqtde` step 002 because the
-NeMo weak-cache K=66 cutoff has one slot among three bit-equal frames; its
-libc++ `nth_element` selects frame 27 while the deterministic Rust full-sort
-policy selects a different tied identity. The preceding chained L5 maximum
-drift (`2.098083496e-5`) exceeds the oracle cutoff margin
-(`1.4305114746e-5`). A scalar L5 candidate and several tie policies were tested
-and rejected when unchanged gates failed elsewhere. No acceptance tolerance,
-fixture, or gate was changed. Until this identity is resolved or formally
-bounded by the named cross-platform probe, promotion remains forbidden.
+The exact-score L6 compression test and complete recommended-profile chained
+run pass inside the frozen numeric and discrete envelopes. The earlier `iqtde`
+archive-profile investigation correctly exposed a weak-cache K=66 cutoff tie:
+libc++ `nth_element` selected frame 27 where a deterministic full sort selected
+a different bit-equal identity. The accepted Rust path now uses a safe,
+index-based translation of the pinned LLVM libc++ 15.0.7 `nth_element`
+algorithm and retains a fail-closed geometry test. No tolerance, fixture, or
+gate was changed. This closes same-host L6 identity for the accepted profile;
+other standard-library/runtime/CPU tiers still require their own evidence.
 
 ### 3.2 Initial hardware and memory tier
 
@@ -985,15 +995,15 @@ aggregate before L5 is treated as fully documented.
 
 Before the first native L6 comparison, every floating cache/FIFO/state boundary
 freezes ceilings of `2^-4` maximum absolute and `2^-10` relative-L2 drift;
-integer silence counts and Option presence are exact. The pinned synchronous
-state has a 188-frame speaker cache, zero-frame FIFO capacity, 188-frame update
-period, four speaker lanes, and three silence sentinels per lane. The native
-implementation preserves the initially absent cache/FIFO prediction Options,
-updates the cumulative silence profile at probability-sum `< 0.2`, synthesizes
-the first prior-cache predictions from the current full model output, and uses
-the exact source score/disable/strong-boost/weak-boost/latest-boost/global-top-k
-compression order. Speaker permutation and random score noise remain absent in
-evaluation. These gates and equations are fixed before any native L6 result.
+integer silence counts and Option presence are exact. The accepted recommended
+state has a 188-frame speaker cache, 40-frame FIFO, 300-frame update period,
+340-frame chunk, four speaker lanes, and three silence sentinels per lane. The
+native implementation preserves initially absent cache/FIFO prediction
+Options, populates both after the first transition, updates the cumulative
+silence profile at probability-sum `< 0.2`, and uses the exact source
+score/disable/strong-boost/weak-boost/latest-boost/global-top-k compression
+order. Speaker permutation and random score noise remain absent in evaluation.
+These gates and equations were fixed before the accepted native L6 result.
 
 An exploratory, separately run probe reported two f32 CPU runs with one PyTorch
 intra-op thread and two with eight intra-op threads on one public
@@ -1047,11 +1057,11 @@ insufficient.
 | OQ-03 | Depthwise subsampling padding and layout at tails | Resolved by authenticated public tail parity | L2 |
 | OQ-04 | Exact relative-position attention equations, masks, and scaling | Resolved across all 17 native blocks and public states | L3 |
 | OQ-05 | Exact inference head branch | Resolved across all 18 Transformer blocks and the four-lane head | L5 |
-| OQ-06 | Top-k tie behavior and chronological reordering | Exact libc++ tied-frame identity remains platform-defined; named chained probe open | L6 |
-| OQ-07 | First, steady, and partial-tail cache mutation | Equations and exact-score compression resolved; chained tied-cutoff identity open | L6 |
+| OQ-06 | Top-k tie behavior and chronological reordering | Resolved for the accepted host/profile by the pinned safe libc++ 15.0.7 `nth_element` translation and exact chained probe | L6 |
+| OQ-07 | First, steady, and partial-tail cache mutation | Resolved for the recommended 188-cache/40-FIFO/300-update profile, including short final chunks | L6 |
 | OQ-08 | Speaker permutation during accepted inference | Resolved: disabled and absent in eval | L6 |
 | OQ-09 | Converted package tensor map and transforms | Resolved: exact 992-record manifest, receipt, and 974-tensor package admitted | L0 |
-| OQ-10 | Cross-input and cross-thread oracle variability | Synthetic and licensed-public source floors complete; native cross-platform tied-top-k row open | L1-L8 |
+| OQ-10 | Cross-input and cross-thread oracle variability | Synthetic and licensed-public source floors complete; other native platform/runtime tiers remain open | L1-L8 |
 | OQ-11 | Model bytes in repository or releases | Resolved: forbidden for initial route | L0 |
 | OQ-12 | Known requirement above four speakers | Model ineligibility resolved; product fallback pending `bd-y4ip.14` | L8-L10 |
 | OQ-13 | Known timestamp intervals during parity | Resolved: post-forward mapping only | L9 |
@@ -1061,12 +1071,11 @@ insufficient.
 | OQ-17 | Activity still open at the final 10 ms sample versus strict 80 ms output validation | Resolved: raw L8 matches NeMo exactly; production turns clamp to physical duration | L7-L8 |
 
 The fit screen has no remaining upstream semantic question that invalidates its
-conditional-GO result. OQ-03 through OQ-05 and OQ-17 are now resolved by native
-public parity. The platform-defined tied-frame identity in OQ-06/OQ-07, the
-transitive runtime boundary in OQ-15, cross-platform support in OQ-14, and
-capacity/product policy in OQ-12/OQ-16 remain open. OQ-14 does not block this
-same-host evaluation route, but it and the chained L6 probe block a broad
-support or promotion claim.
+conditional-GO result. OQ-03 through OQ-08 and OQ-17 are resolved for the
+accepted same-host recommended-profile route. The transitive runtime boundary
+in OQ-15, cross-platform support in OQ-14, and capacity/product policy in
+OQ-12/OQ-16 remain open. OQ-14 does not block this same-host evaluation route,
+but it still blocks a broad platform-support claim.
 
 ## 10. Implementation slices
 
@@ -1194,7 +1203,7 @@ Completed here:
   regular-file and path-swap defenses, synthetic tamper tests, and
   operator-local real-package admission proof; and
 - separate synthetic and licensed-public activation receipt/package verifiers
-  with compiled trust roots, ten-run source floors, all 5,492 L1-L8 public seam
+  with compiled trust roots, ten-run source floors, all 4,540 L1-L8 public seam
   contracts, and exact operator-local activation admission boundaries; and
 - a pinned-buffer, source-derived bounded whole-file Rust log-mel frontend with
   fallible allocation, mathematical/unit tests, and compiled valid-log-mel
@@ -1206,11 +1215,11 @@ Completed here:
 - the encoder projection and all 18 native Transformer blocks across those same
   states, with 1,160 L4 comparisons; and
 - the complete four-lane sigmoid speaker head across those same eight states;
-- exact-score L6 cache compression inside the frozen gate, plus an explicit
-  unchanged-gate failure row for the platform-defined chained top-k tie;
+- exact-score and complete chained L6 cache/FIFO compression inside the frozen
+  gates, including the pinned safe libc++ tie behavior and short final chunks;
 - byte-exact L7 activity/speech/overlap/change and L8 anonymous-turn parity on
-  every reconstructable public truth-pack tensor, with the separately recorded
-  102-second whole-recording loss still open;
+  every complete discrete public truth-pack tensor, including the full
+  102-second three-speaker recording and complete four-speaker fixture;
 - an authenticated `SortformerSession` with checked whole-recording streaming,
   neural-block cancellation checkpoints, bounded resource validation, and
   physical-duration tail clamping;
@@ -1223,8 +1232,6 @@ Completed here:
 Not completed here:
 
 - native intermediate frontend-stage parity before `log_mel_f32`;
-- exact identity parity for every chained L6 transition at numerically tied
-  top-k cutoffs;
 - quantized whole-model parity or additional profile-justified fused kernels;
 - release-build and 90-minute resource certification;
 - frozen public multi-record accuracy certification; or

@@ -74,23 +74,30 @@
   tests.
 - **Review date:** 2026-07-28
 
-## DISC-007: Native Sortformer whole-recording boundaries are not yet byte-exact
+## DISC-007: Native Sortformer archive-profile comparison used mismatched streaming geometry
 
 - **Reference:** The pinned NeMo Streaming Sortformer v2.1 adapter emits the
   authenticated anonymous speaker turns for the same normalized public WAV.
-- **Our impl:** The safe Rust f32 route is byte-exact at L7/L8 on the frozen
-  25-second reconstructable `mevkw` truth-pack prefix, but the complete
-  102-second streaming execution differs from NeMo at four 80 ms boundaries
-  among 16 turns: native/reference `13840/13760` ms (start), `64800/64880` ms
-  (end), `74480/74400` ms (end), and `101840/101760` ms (end).
-- **Impact:** On this one public development row, native DER/JER is
+- **Our impl:** The original safe Rust invocation used the archive-default
+  `188/1/1/0/188/188` chunk/context/FIFO/update/cache geometry while the NeMo
+  comparison lane used NVIDIA's recommended `340/1/40/40/300/188` profile.
+  That mismatched comparison differed at four 80 ms boundaries among 16 turns:
+  native/reference `13840/13760` ms (start), `64800/64880` ms (end),
+  `74480/74400` ms (end), and `101840/101760` ms (end).
+- **Historical impact:** On this one public development row, archive-profile
+  native DER/JER was
   `0.021214713430` / `0.029991623791` versus NeMo
   `0.019846022241` / `0.029477961362`. Speaker-lane identities and the other
-  turn boundaries match, but broad whole-recording L7/L8 parity is disproven.
-- **Resolution:** **INVESTIGATING; not accepted.** Localize the first chained
-  cache-state, logit, or threshold divergence without widening the frozen
-  numeric gates. Keep Sortformer evaluation-only and outside automatic routing.
-- **Tests affected:** The existing reconstructable public activation pack still
-  passes; a complete chained whole-recording discrete-parity regression is
-  required under `bd-y4ip.11`.
+  turn boundaries matched. It was a valid configuration-comparison loss, not a
+  valid same-profile implementation-parity row.
+- **Resolution:** **RESOLVED for the accepted recommended profile.** Native now
+  uses the published recommended geometry. A regenerated identity-bound public
+  pack covers four complete/declared fixtures and 4,540 L1-L8 tensors. On the
+  full 102-second row, native L5 drift is inside the unchanged frozen envelope
+  and native L7 activity plus all 16 L8 turns are byte-exact against source.
+  Sortformer remains evaluation-only because corpus accuracy, fixed-four-lane
+  capacity, resource tiers, and product routing are separate gates.
+- **Tests affected:** Complete recommended-profile L1-L8 public parity,
+  short-final-chunk FIFO regression, pinned libc++ top-k tie regression, and
+  full-recording session parity.
 - **Review date:** 2026-08-08

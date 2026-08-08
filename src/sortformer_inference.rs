@@ -1184,11 +1184,15 @@ impl SortformerF32Facade {
 
     /// Verify the exact evaluation speaker head: ReLU, 192-to-192 affine,
     /// ReLU, 192-to-4 affine, then elementwise sigmoid. Dropout is identity.
+    /// The source `stream_output` excludes prior cache and FIFO rows plus the
+    /// current chunk's left context, so the caller supplies the pre-step FIFO
+    /// length explicitly instead of treating a non-empty FIFO as new audio.
     pub fn verify_public_l5_speaker_head(
         &self,
         activation_pack: &VerifiedSortformerPublicActivationPack,
         fixture: &str,
         step: usize,
+        before_fifo_frames: usize,
         l4_output: &Mat,
     ) -> FwResult<(Vec<SortformerSeamParityMetrics>, Mat)> {
         if l4_output.rows == 0 || l4_output.cols != SORTFORMER_TRANSFORMER_WIDTH {
@@ -1240,16 +1244,19 @@ impl SortformerF32Facade {
             / SORTFORMER_SUBSAMPLING_FACTOR;
         let output_frames = usize::try_from(transition.output_frames)
             .map_err(|_| reference_error("l5_stream", "output frame count exceeds usize"))?;
-        let stream_start = cache_frames
-            .checked_add(left_frames)
-            .ok_or_else(|| reference_error("l5_stream", "stream output offset overflows"))?;
-        let stream_end = stream_start
-            .checked_add(output_frames)
-            .ok_or_else(|| reference_error("l5_stream", "stream output extent overflows"))?;
-        let start_value = stream_start
+        let stream_rows = sortformer_stream_output_rows(
+            cache_frames,
+            before_fifo_frames,
+            left_frames,
+            output_frames,
+            probabilities.rows,
+        )?;
+        let start_value = stream_rows
+            .start
             .checked_mul(SORTFORMER_SPEAKER_LANES)
             .ok_or_else(|| reference_error("l5_stream", "stream value offset overflows"))?;
-        let end_value = stream_end
+        let end_value = stream_rows
+            .end
             .checked_mul(SORTFORMER_SPEAKER_LANES)
             .ok_or_else(|| reference_error("l5_stream", "stream value extent overflows"))?;
         let stream_values = probabilities
@@ -3625,6 +3632,29 @@ fn slice_rows(values: &[f32], width: usize, start: usize, end: usize) -> FwResul
         .ok_or_else(|| reference_error("l6_shape", "L6 row slice exceeds its tensor"))
 }
 
+fn sortformer_stream_output_rows(
+    cache_frames: usize,
+    fifo_frames: usize,
+    left_context_frames: usize,
+    output_frames: usize,
+    probability_rows: usize,
+) -> FwResult<std::ops::Range<usize>> {
+    let start = cache_frames
+        .checked_add(fifo_frames)
+        .and_then(|frames| frames.checked_add(left_context_frames))
+        .ok_or_else(|| reference_error("l5_stream", "stream output offset overflows"))?;
+    let end = start
+        .checked_add(output_frames)
+        .ok_or_else(|| reference_error("l5_stream", "stream output extent overflows"))?;
+    if end > probability_rows {
+        return Err(reference_error(
+            "l5_stream",
+            "stream output interval exceeds speaker probabilities",
+        ));
+    }
+    Ok(start..end)
+}
+
 fn slice_mat_rows(input: &Mat, start: usize, end: usize) -> FwResult<Mat> {
     Ok(Mat::from_vec(
         end.checked_sub(start)
@@ -5810,6 +5840,24 @@ mod tests {
     }
 
     #[test]
+    fn stream_output_skips_cache_fifo_and_left_context() {
+        assert_eq!(
+            sortformer_stream_output_rows(0, 0, 0, 340, 380).expect("first recommended chunk"),
+            0..340
+        );
+        assert_eq!(
+            sortformer_stream_output_rows(188, 40, 1, 340, 609).expect("steady recommended chunk"),
+            229..569
+        );
+        assert_eq!(
+            sortformer_stream_output_rows(188, 40, 1, 255, 484).expect("partial recommended tail"),
+            229..484
+        );
+        assert!(sortformer_stream_output_rows(188, 40, 1, 256, 484).is_err());
+        assert!(sortformer_stream_output_rows(usize::MAX, 1, 0, 1, usize::MAX).is_err());
+    }
+
+    #[test]
     fn recommended_fifo_pop_handles_short_final_chunks_without_underflow() {
         assert_eq!(
             sortformer_fifo_pop_frames(0, 40).expect("at capacity"),
@@ -6257,7 +6305,7 @@ mod tests {
                 .contains("private cancellation detail")
         );
         eprintln!(
-            "sortformer_session_e2e load_seconds={load_seconds:.6} inference_seconds={inference_seconds:.6} audio_seconds={audio_seconds:.6} rtf={:.6} probability_max_abs={:.9e} probability_relative_l2={:.9e} der={:.9} jer={:.9} miss_seconds={:.6} false_alarm_seconds={:.6} confusion_seconds={:.6}",
+            "sortformer_session_e2e load_seconds={load_seconds:.6} inference_seconds={inference_seconds:.6} audio_seconds={audio_seconds:.6} rtf={:.6} probability_max_abs={:.9e} probability_relative_l2={:.9e} strict_default_zero_collar_include_der={:.9} strict_default_zero_collar_include_jer={:.9} miss_seconds={:.6} false_alarm_seconds={:.6} confusion_seconds={:.6}",
             inference_seconds / audio_seconds,
             probability_metrics.max_abs_diff,
             probability_metrics.relative_l2,
@@ -6781,6 +6829,7 @@ mod tests {
                                 &activations,
                                 &fixture.name,
                                 usize::try_from(transition.step).expect("step fits usize"),
+                                streaming_state.fifo.rows,
                                 &l4_output,
                             )
                             .expect("all L5 speaker-head seams stay within frozen envelopes");
