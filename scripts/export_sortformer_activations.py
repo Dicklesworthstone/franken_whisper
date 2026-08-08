@@ -33,8 +33,9 @@ FLOOR_SCHEMA = "franken-whisper-sortformer-oracle-floor-v1"
 EXPORTER_ID = "franken-whisper-sortformer-activation-exporter"
 EXPORTER_VERSION = "2"
 FIXTURE_SET = "sortformer-synthetic-frontend-v1"
-PUBLIC_FIXTURE_SET = "sortformer-voxconverse-seams-v1"
-PUBLIC_SCHEMA = "franken-whisper-sortformer-public-activation-receipt-v1"
+PUBLIC_EXPORTER_VERSION = "3"
+PUBLIC_FIXTURE_SET = "sortformer-voxconverse-recommended-streaming-seams-v2"
+PUBLIC_SCHEMA = "franken-whisper-sortformer-public-activation-receipt-v2"
 PUBLIC_FLOOR_SCHEMA = "franken-whisper-sortformer-public-oracle-floor-v1"
 PUBLIC_DESCRIPTOR_SCHEMA = "public-diarization-corpus-input-v2"
 PUBLIC_DESCRIPTOR_SHA256 = (
@@ -1335,7 +1336,7 @@ def _build_public_receipt(
         },
         "exporter": {
             "exporter_id": EXPORTER_ID,
-            "exporter_version": EXPORTER_VERSION,
+            "exporter_version": PUBLIC_EXPORTER_VERSION,
             "source_sha256": exporter_sha256,
             "conversion_helper_sha256": HELPER_SOURCE_SHA256,
         },

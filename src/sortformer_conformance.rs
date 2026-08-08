@@ -84,7 +84,7 @@ pub const SORTFORMER_ACTIVATION_PACKAGE_SHA256: &str =
 pub const SORTFORMER_ACTIVATION_EXPORTER_SHA256: &str =
     "b3020f1e6c136343adecabc3209f3b1ef70f40a7e36d2b2ed9b25fbbd439b6dd";
 pub const SORTFORMER_PUBLIC_ACTIVATION_EXPORTER_SHA256: &str =
-    "4dcb5383d9e457088575f550d979ea8b7e03f4f65871bdf246956e4756ba2f94";
+    "af752ee007d46eb010d69109cc8c6f4f753f0304d30add401e114066a4a2f877";
 pub const SORTFORMER_ACTIVATION_PACKAGE_BYTES: u64 = 282_716;
 pub const SORTFORMER_ACTIVATION_PAYLOAD_BYTES: u64 = 278_076;
 pub const SORTFORMER_ACTIVATION_F32_ELEMENTS: u64 = 69_503;
@@ -92,11 +92,11 @@ pub const SORTFORMER_ACTIVATION_I64_ELEMENTS: u64 = 8;
 pub const SORTFORMER_ACTIVATION_TENSORS: u64 = 46;
 
 pub const SORTFORMER_PUBLIC_ACTIVATION_RECEIPT_SCHEMA: &str =
-    "franken-whisper-sortformer-public-activation-receipt-v1";
+    "franken-whisper-sortformer-public-activation-receipt-v2";
 pub const SORTFORMER_PUBLIC_ACTIVATION_FLOOR_SCHEMA: &str =
     "franken-whisper-sortformer-public-oracle-floor-v1";
 pub const SORTFORMER_PUBLIC_ACTIVATION_RECEIPT_SHA256: &str =
-    "ae9c9fa4f467f630a7b45af55f9e67d2f087d39fa0c6201f775a6e3a111a8d73";
+    "8dd949aeccc0754338c3c777e8ef596f043387a2a38543f0a91353d06f70234f";
 pub const SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_SHA256: &str =
     "4ec66cf29e4286fed21fdf3d9c170293aafb26ba9783b9e0eea4d245b4630a6d";
 pub const SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_BYTES: u64 = 72_590_196;
@@ -2003,7 +2003,7 @@ fn verify_public_activation_receipt(
     }
     if receipt.authority != "diagnostic_only"
         || receipt.equivalence_level != "l1_through_l8_public_source_truth_pack"
-        || receipt.fixture_set != "sortformer-voxconverse-seams-v1"
+        || receipt.fixture_set != "sortformer-voxconverse-recommended-streaming-seams-v2"
     {
         return Err(sortformer_activation_error(
             "public_authority",
@@ -2025,7 +2025,7 @@ fn verify_public_activation_receipt(
     if receipt.exporter
         != (SortformerActivationExporterIdentity {
             exporter_id: "franken-whisper-sortformer-activation-exporter".to_owned(),
-            exporter_version: "2".to_owned(),
+            exporter_version: "3".to_owned(),
             source_sha256: SORTFORMER_PUBLIC_ACTIVATION_EXPORTER_SHA256.to_owned(),
             conversion_helper_sha256: SORTFORMER_CONVERTER_SOURCE_SHA256.to_owned(),
         })
@@ -2126,8 +2126,8 @@ fn verify_public_streaming_transitions(
                 .keys()
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            let expected_preds_before = step >= 2;
-            let expected_preds_after = step >= 1;
+            let expected_preds_before = step >= 1;
+            let expected_preds_after = true;
             let before_option = |name| transition.before_options.get(name).copied();
             let after_option = |name| transition.after_options.get(name).copied();
             if transition.step != step
@@ -2138,8 +2138,8 @@ fn verify_public_streaming_transitions(
                 || transition.output_frames == 0
                 || transition.before_cache_frames != if step == 0 { 0 } else { 188 }
                 || transition.after_cache_frames != 188
-                || transition.compression_transition != (step == 1)
-                || transition.cache_compression != (step >= 1)
+                || transition.compression_transition != (step == 0)
+                || !transition.cache_compression
                 || !transition.speaker_permutation_absent
                 || before_option("spk_perm") != Some(false)
                 || after_option("spk_perm") != Some(false)

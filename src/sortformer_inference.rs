@@ -1369,19 +1369,10 @@ impl SortformerF32Facade {
             &chunk_predictions,
         )?;
 
-        if fifo_frames
-            .checked_add(chunk_frames)
-            .ok_or_else(|| reference_error("l6_shape", "L6 FIFO length overflows"))?
-            > SORTFORMER_FIFO_FRAMES
-        {
-            let total_fifo_frames = fifo_frames + chunk_frames;
-            let required_pop = chunk_frames
-                .checked_sub(SORTFORMER_FIFO_FRAMES)
-                .and_then(|frames| frames.checked_add(fifo_frames))
-                .ok_or_else(|| reference_error("l6_shape", "L6 pop length underflows"))?;
-            let pop_frames = SORTFORMER_CACHE_UPDATE_FRAMES
-                .max(required_pop)
-                .min(total_fifo_frames);
+        if let Some(pop_frames) = sortformer_fifo_pop_frames(fifo_frames, chunk_frames)? {
+            let total_fifo_frames = fifo_frames
+                .checked_add(chunk_frames)
+                .ok_or_else(|| reference_error("l6_shape", "L6 FIFO length overflows"))?;
             let pop_embeddings = slice_mat_rows(&state.fifo, 0, pop_frames)?;
             let pop_predictions = slice_mat_rows(
                 state
@@ -3602,6 +3593,23 @@ fn validate_streaming_state(state: &SortformerStreamingState) -> FwResult<()> {
     Ok(())
 }
 
+fn sortformer_fifo_pop_frames(fifo_frames: usize, chunk_frames: usize) -> FwResult<Option<usize>> {
+    let total_fifo_frames = fifo_frames
+        .checked_add(chunk_frames)
+        .ok_or_else(|| reference_error("l6_shape", "L6 FIFO length overflows"))?;
+    if total_fifo_frames <= SORTFORMER_FIFO_FRAMES {
+        return Ok(None);
+    }
+    let required_pop = total_fifo_frames
+        .checked_sub(SORTFORMER_FIFO_FRAMES)
+        .ok_or_else(|| reference_error("l6_shape", "L6 pop length underflows"))?;
+    Ok(Some(
+        SORTFORMER_CACHE_UPDATE_FRAMES
+            .max(required_pop)
+            .min(total_fifo_frames),
+    ))
+}
+
 fn slice_rows(values: &[f32], width: usize, start: usize, end: usize) -> FwResult<&[f32]> {
     if width == 0 || start > end {
         return Err(reference_error("l6_shape", "L6 row slice is invalid"));
@@ -5799,6 +5807,30 @@ mod tests {
         assert_eq!(SORTFORMER_L5_MAX_RELATIVE_L2, 2.0_f64.powi(-10));
         assert_eq!(SORTFORMER_L6_MAX_ABS_DIFF, 2.0_f64.powi(-4));
         assert_eq!(SORTFORMER_L6_MAX_RELATIVE_L2, 2.0_f64.powi(-10));
+    }
+
+    #[test]
+    fn recommended_fifo_pop_handles_short_final_chunks_without_underflow() {
+        assert_eq!(
+            sortformer_fifo_pop_frames(0, 40).expect("at capacity"),
+            None
+        );
+        assert_eq!(
+            sortformer_fifo_pop_frames(0, 340).expect("first full chunk"),
+            Some(300)
+        );
+        assert_eq!(
+            sortformer_fifo_pop_frames(40, 340).expect("steady full chunk"),
+            Some(340)
+        );
+        assert_eq!(
+            sortformer_fifo_pop_frames(40, 255).expect("large final tail"),
+            Some(295)
+        );
+        assert_eq!(
+            sortformer_fifo_pop_frames(40, 20).expect("short final tail"),
+            Some(60)
+        );
     }
 
     #[test]
