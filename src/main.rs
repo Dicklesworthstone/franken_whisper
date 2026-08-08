@@ -157,6 +157,8 @@ fn command_uses_machine_output(command: &Command) -> bool {
         Command::Models(args) => args.json,
         Command::Pull(args) => args.json,
         Command::SortformerDiarize(_) => true,
+        Command::ComparisonWorker => true,
+        Command::ComparisonCancelProbe(_) => true,
         Command::Doctor(args) => args.json,
         _ => false,
     }
@@ -514,6 +516,32 @@ fn run(cli: Cli) -> FwResult<()> {
                 );
                 Ok(())
             }
+            PublicCorpusCommand::PrepareVoxconverse(args) => {
+                let current_dir = std::env::current_dir().map_err(|_| {
+                    FwError::InvalidRequest(
+                        "public_corpus.project_root: current directory could not be resolved"
+                            .to_owned(),
+                    )
+                })?;
+                let project_root =
+                    franken_whisper::confidential_evaluation::discover_project_root(&current_dir)?;
+                let summary =
+                    franken_whisper::public_corpus::prepare_voxconverse_descriptor_with_cancel(
+                        franken_whisper::public_corpus::VoxconverseDescriptorPreparationRequest {
+                            project_root: &project_root,
+                            input_root: &args.input_root,
+                            development_audio_root: &args.development_audio_root,
+                            test_audio_root: &args.test_audio_root,
+                            annotation_root: &args.annotation_root,
+                            output_path: &args.output,
+                            source_version: &args.source_version,
+                            license_acknowledgement_id: &args.license_ack,
+                        },
+                        ShutdownController::is_shutting_down,
+                    )?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+                Ok(())
+            }
             PublicCorpusCommand::Build(args) => {
                 let current_dir = std::env::current_dir().map_err(|_| {
                     FwError::InvalidRequest(
@@ -613,8 +641,8 @@ fn run(cli: Cli) -> FwResult<()> {
                             license_acknowledgement_id: &args.license_ack,
                             evaluation_split:
                                 franken_whisper::diarization::EvaluationSplit::Development,
-                            sortformer_hard_timeout: Duration::from_secs(
-                                franken_whisper::public_corpus::PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS,
+                            attempt_hard_timeout: Duration::from_secs(
+                                franken_whisper::public_corpus::PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS,
                             ),
                         },
                         ShutdownController::is_shutting_down,
@@ -814,6 +842,15 @@ fn run(cli: Cli) -> FwResult<()> {
                 }))?
             );
             Ok(())
+        }
+        Command::ComparisonWorker => {
+            let response =
+                franken_whisper::public_corpus::run_model_comparison_worker_from_stdio()?;
+            println!("{response}");
+            Ok(())
+        }
+        Command::ComparisonCancelProbe(args) => {
+            franken_whisper::public_corpus::run_model_comparison_cancel_probe(args.descendant)
         }
         Command::Sync { command } => match command {
             SyncCommand::Export(args) => {

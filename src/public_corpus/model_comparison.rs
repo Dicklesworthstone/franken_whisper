@@ -6,7 +6,8 @@
 //! update these aggregate sufficient statistics and ordered digests.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -36,19 +37,35 @@ use crate::model::{
     DiarizationEngine, DiarizationFallbackPolicy, DiarizationRequest, SpeakerCountEstimate,
     SpeakerCountRequest,
 };
+use crate::model_distribution::resolve_cached_sortformer_with_cancel;
 use crate::orchestrator::CancellationToken;
+use crate::sortformer_conformance::load_verified_sortformer_package_with_checkpoint;
+use crate::sortformer_inference::{
+    SORTFORMER_SAMPLE_RATE_HZ, SORTFORMER_SPEAKER_LANES, SortformerPcm, SortformerSession,
+    SortformerSpeakerTurn,
+};
 
-pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v2";
+pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v3";
 pub const PUBLIC_MODEL_COMPARISON_RUNNER_VERSION: &str =
-    "public-diarization-model-comparison-runner-v2";
+    "public-diarization-model-comparison-runner-v3";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION: &str =
-    "public-diarization-model-comparison-protocol-v2";
+    "public-diarization-model-comparison-protocol-v3";
 pub const PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION: &str =
-    "public-diarization-model-comparison-outcomes-v2";
+    "public-diarization-model-comparison-outcomes-v3";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256: &str =
-    "8fc9679ea061cec04bc62533a70ddbaacaafb2e41501c6e2a06e6d13b11140b7";
-pub const PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION: &str = "four-lane-balanced-williams-v1";
-pub const PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS: u64 = 1_800;
+    "2356b06726b93d465178a4ab25fc9d5daa92fddcd4ce9382909e83159304bec4";
+pub const PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION: &str = "five-lane-balanced-williams-v1";
+pub const PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS: u64 = 1_800;
+const MODEL_COMPARISON_WORKER_SCHEMA_VERSION: &str = "public-model-comparison-worker-v1";
+const MAX_MODEL_COMPARISON_WORKER_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_MODEL_COMPARISON_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
+const MODEL_COMPARISON_CANCEL_PROBE_DELAY_MS: u64 = 150;
+const MODEL_COMPARISON_CANCEL_PROBE_TIMEOUT_SECONDS: u64 = 5;
+const MODEL_COMPARISON_CANCEL_PROBE_SELF_LIMIT_SECONDS: u64 = 10;
+const MODEL_COMPARISON_NATIVE_RTF_CAP_MILLIONTHS: u64 = 500_000;
+const MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS: u64 = 10_000_000;
+const MODEL_COMPARISON_PEAK_RSS_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS: u64 = 500;
 
 /// Canonical comparison lanes. The order is part of the retained contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -57,14 +74,16 @@ pub enum ModelComparisonLane {
     NativeAcoustic,
     NativeEcapa,
     NativeEcapaFused,
+    NativeSortformer,
     ExternalSortformer,
 }
 
 impl ModelComparisonLane {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::NativeAcoustic,
         Self::NativeEcapa,
         Self::NativeEcapaFused,
+        Self::NativeSortformer,
         Self::ExternalSortformer,
     ];
 
@@ -74,26 +93,51 @@ impl ModelComparisonLane {
             Self::NativeAcoustic => "native_acoustic",
             Self::NativeEcapa => "native_ecapa",
             Self::NativeEcapaFused => "native_ecapa_fused",
+            Self::NativeSortformer => "native_sortformer",
             Self::ExternalSortformer => "external_sortformer",
         }
     }
 }
 
 /// Frozen balanced order used across consecutive sorted observations.
-pub const MODEL_COMPARISON_WILLIAMS_SCHEDULE: [[ModelComparisonLane; 4]; 4] = [
+pub const MODEL_COMPARISON_WILLIAMS_SCHEDULE: [[ModelComparisonLane; 5]; 10] = [
     [
         ModelComparisonLane::NativeAcoustic,
         ModelComparisonLane::NativeEcapa,
         ModelComparisonLane::ExternalSortformer,
         ModelComparisonLane::NativeEcapaFused,
+        ModelComparisonLane::NativeSortformer,
     ],
     [
         ModelComparisonLane::NativeEcapa,
         ModelComparisonLane::NativeEcapaFused,
         ModelComparisonLane::NativeAcoustic,
+        ModelComparisonLane::NativeSortformer,
         ModelComparisonLane::ExternalSortformer,
     ],
     [
+        ModelComparisonLane::NativeEcapaFused,
+        ModelComparisonLane::NativeSortformer,
+        ModelComparisonLane::NativeEcapa,
+        ModelComparisonLane::ExternalSortformer,
+        ModelComparisonLane::NativeAcoustic,
+    ],
+    [
+        ModelComparisonLane::NativeSortformer,
+        ModelComparisonLane::ExternalSortformer,
+        ModelComparisonLane::NativeEcapaFused,
+        ModelComparisonLane::NativeAcoustic,
+        ModelComparisonLane::NativeEcapa,
+    ],
+    [
+        ModelComparisonLane::ExternalSortformer,
+        ModelComparisonLane::NativeAcoustic,
+        ModelComparisonLane::NativeSortformer,
+        ModelComparisonLane::NativeEcapa,
+        ModelComparisonLane::NativeEcapaFused,
+    ],
+    [
+        ModelComparisonLane::NativeSortformer,
         ModelComparisonLane::NativeEcapaFused,
         ModelComparisonLane::ExternalSortformer,
         ModelComparisonLane::NativeEcapa,
@@ -101,14 +145,36 @@ pub const MODEL_COMPARISON_WILLIAMS_SCHEDULE: [[ModelComparisonLane; 4]; 4] = [
     ],
     [
         ModelComparisonLane::ExternalSortformer,
+        ModelComparisonLane::NativeSortformer,
         ModelComparisonLane::NativeAcoustic,
         ModelComparisonLane::NativeEcapaFused,
         ModelComparisonLane::NativeEcapa,
+    ],
+    [
+        ModelComparisonLane::NativeAcoustic,
+        ModelComparisonLane::ExternalSortformer,
+        ModelComparisonLane::NativeEcapa,
+        ModelComparisonLane::NativeSortformer,
+        ModelComparisonLane::NativeEcapaFused,
+    ],
+    [
+        ModelComparisonLane::NativeEcapa,
+        ModelComparisonLane::NativeAcoustic,
+        ModelComparisonLane::NativeEcapaFused,
+        ModelComparisonLane::ExternalSortformer,
+        ModelComparisonLane::NativeSortformer,
+    ],
+    [
+        ModelComparisonLane::NativeEcapaFused,
+        ModelComparisonLane::NativeEcapa,
+        ModelComparisonLane::NativeSortformer,
+        ModelComparisonLane::NativeAcoustic,
+        ModelComparisonLane::ExternalSortformer,
     ],
 ];
 
 #[must_use]
-pub const fn model_comparison_schedule_row(observation_index: usize) -> [ModelComparisonLane; 4] {
+pub const fn model_comparison_schedule_row(observation_index: usize) -> [ModelComparisonLane; 5] {
     MODEL_COMPARISON_WILLIAMS_SCHEDULE[observation_index % MODEL_COMPARISON_WILLIAMS_SCHEDULE.len()]
 }
 
@@ -138,6 +204,8 @@ impl ModelComparisonOutcomeStatus {
 pub enum ModelComparisonOutcomeCode {
     EcapaModelUnavailable,
     EcapaModelInvalid,
+    NativeSortformerModelUnavailable,
+    NativeSortformerModelInvalid,
     SortformerModelCapacityExceeded,
     SortformerAdapterUnavailable,
     SortformerRuntimeIneligible,
@@ -151,14 +219,21 @@ pub enum ModelComparisonOutcomeCode {
     EcapaContractViolation,
     EcapaStageTimedOut,
     EcapaExecutionFailed,
+    NativeSortformerExecutionFailed,
     SortformerExecutionFailed,
     ScoringFailed,
+    WorkerTimedOut,
+    WorkerExecutionFailed,
+    WorkerMalformedOutput,
+    WorkerResourceProbeFailed,
 }
 
 impl ModelComparisonOutcomeCode {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 24] = [
         Self::EcapaModelUnavailable,
         Self::EcapaModelInvalid,
+        Self::NativeSortformerModelUnavailable,
+        Self::NativeSortformerModelInvalid,
         Self::SortformerModelCapacityExceeded,
         Self::SortformerAdapterUnavailable,
         Self::SortformerRuntimeIneligible,
@@ -172,8 +247,13 @@ impl ModelComparisonOutcomeCode {
         Self::EcapaContractViolation,
         Self::EcapaStageTimedOut,
         Self::EcapaExecutionFailed,
+        Self::NativeSortformerExecutionFailed,
         Self::SortformerExecutionFailed,
         Self::ScoringFailed,
+        Self::WorkerTimedOut,
+        Self::WorkerExecutionFailed,
+        Self::WorkerMalformedOutput,
+        Self::WorkerResourceProbeFailed,
     ];
 
     #[must_use]
@@ -181,6 +261,7 @@ impl ModelComparisonOutcomeCode {
         matches!(
             self,
             Self::EcapaModelUnavailable
+                | Self::NativeSortformerModelUnavailable
                 | Self::SortformerModelCapacityExceeded
                 | Self::SortformerAdapterUnavailable
                 | Self::SortformerRuntimeIneligible
@@ -192,6 +273,8 @@ impl ModelComparisonOutcomeCode {
         match self {
             Self::EcapaModelUnavailable => "ecapa_model_unavailable",
             Self::EcapaModelInvalid => "ecapa_model_invalid",
+            Self::NativeSortformerModelUnavailable => "native_sortformer_model_unavailable",
+            Self::NativeSortformerModelInvalid => "native_sortformer_model_invalid",
             Self::SortformerModelCapacityExceeded => "sortformer_model_capacity_exceeded",
             Self::SortformerAdapterUnavailable => "sortformer_adapter_unavailable",
             Self::SortformerRuntimeIneligible => "sortformer_runtime_ineligible",
@@ -205,8 +288,13 @@ impl ModelComparisonOutcomeCode {
             Self::EcapaContractViolation => "ecapa_contract_violation",
             Self::EcapaStageTimedOut => "ecapa_stage_timed_out",
             Self::EcapaExecutionFailed => "ecapa_execution_failed",
+            Self::NativeSortformerExecutionFailed => "native_sortformer_execution_failed",
             Self::SortformerExecutionFailed => "sortformer_execution_failed",
             Self::ScoringFailed => "scoring_failed",
+            Self::WorkerTimedOut => "worker_timed_out",
+            Self::WorkerExecutionFailed => "worker_execution_failed",
+            Self::WorkerMalformedOutput => "worker_malformed_output",
+            Self::WorkerResourceProbeFailed => "worker_resource_probe_failed",
         }
     }
 }
@@ -216,21 +304,27 @@ impl ModelComparisonOutcomeCode {
 #[serde(rename_all = "snake_case")]
 pub enum ModelComparisonResourceAuthority {
     Measured,
-    NotComparableSharedProcess,
-    UnavailableChildProcess,
     UnavailableNoProbe,
 }
 
 /// What work is included in each lane's measured elapsed time.
 ///
-/// These scopes are intentionally different, so retained wall times are useful
-/// deployment observations but are not an inference-throughput leaderboard.
+/// Every lane uses this same scope so retained wall times are cross-lane
+/// comparable without relying on shared parent-process setup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelComparisonWallTimeScope {
-    NativeAcousticPipelineAndScorer,
-    NativeEcapaPipelineAndScorerSharedModelLoadExcluded,
-    ExternalSortformerAttestationValidationColdOracleAndScorerPerObservation,
+    FreshProcessIdentityValidationModelLoadInferenceAndScorer,
+}
+
+/// Process scope covered by the native platform peak-RSS probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelComparisonPeakRssScope {
+    /// Peak RSS of the direct comparison worker. A subprocess adapter's RSS is
+    /// not aggregated into this value and therefore cannot pass a whole-tree
+    /// memory gate.
+    DirectWorkerProcess,
 }
 
 /// Counts for every declared outcome, including stable reasons.
@@ -403,12 +497,19 @@ pub struct ModelComparisonResourceEvidence {
     pub timed_attempt_count: u64,
     pub attempted_wall_time_ms: u64,
     pub completed_wall_time_ms: u64,
-    pub shared_setup_wall_time_ms: Option<u64>,
     pub peak_rss_authority: ModelComparisonResourceAuthority,
+    pub peak_rss_scope: ModelComparisonPeakRssScope,
     pub authoritative_peak_rss_bytes: Option<u64>,
     pub cancellation_latency_authority: ModelComparisonResourceAuthority,
     pub maximum_cancellation_latency_ms: Option<u64>,
     pub hard_timeout_seconds: Option<u64>,
+    pub maximum_completed_real_time_factor_millionths: Option<u64>,
+    pub real_time_factor_cap_millionths: u64,
+    pub real_time_factor_within_cap: Option<bool>,
+    pub peak_rss_cap_bytes: u64,
+    pub peak_rss_within_cap: Option<bool>,
+    pub cancellation_latency_cap_ms: u64,
+    pub cancellation_latency_within_cap: Option<bool>,
 }
 
 /// One path-free external runtime identity shared by every Sortformer row.
@@ -430,7 +531,7 @@ pub struct ModelComparisonExternalRuntimeIdentity {
     pub version_stdout_sha256: String,
 }
 
-/// One lane's available-case and all-four-common-case reductions.
+/// One lane's available-case and all-five-common-case reductions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelComparisonLaneAggregate {
@@ -449,7 +550,7 @@ pub struct PublicModelComparisonProtocol {
     pub runner_version: String,
     pub schedule_version: String,
     pub lanes: Vec<ModelComparisonLane>,
-    pub schedule: Vec<[ModelComparisonLane; 4]>,
+    pub schedule: Vec<[ModelComparisonLane; 5]>,
     pub full_recordings_only: bool,
     pub input_sample_rate_hz: u32,
     pub input_channels: u16,
@@ -469,12 +570,24 @@ pub struct PublicModelComparisonProtocol {
     pub native_acoustic_request_sha256: String,
     pub native_ecapa_request_sha256: String,
     pub native_ecapa_fused_request_sha256: String,
+    pub native_sortformer_package_sha256: String,
+    pub native_sortformer_receipt_sha256: String,
     pub native_rayon_threads: u16,
     pub sortformer_intraop_threads: u16,
     pub sortformer_interop_threads: u16,
     pub sortformer_max_speakers: u16,
     pub sortformer_output_frame_ms: u32,
-    pub sortformer_hard_timeout_seconds: u64,
+    pub attempt_hard_timeout_seconds: u64,
+    pub worker_schema_version: String,
+    pub worker_process_policy: String,
+    pub worker_stdout_limit_bytes: u64,
+    pub cancellation_probe_delay_ms: u64,
+    pub cancellation_probe_timeout_seconds: u64,
+    pub cancellation_probe_self_limit_seconds: u64,
+    pub native_real_time_factor_cap_millionths: u64,
+    pub external_real_time_factor_cap_millionths: u64,
+    pub peak_rss_cap_bytes: u64,
+    pub cancellation_latency_cap_ms: u64,
     pub ecapa_contract_sha256: String,
     pub ecapa_package_sha256: String,
     pub sortformer_contract_sha256: String,
@@ -499,6 +612,7 @@ pub struct PublicModelComparisonEvidence {
     pub evaluation_split: EvaluationSplit,
     pub descriptor_sha256: String,
     pub bundle_sha256: String,
+    pub comparison_executable_sha256: String,
     pub observation_count: u64,
     pub observation_set_sha256: String,
     pub execution_order_sha256: String,
@@ -533,15 +647,30 @@ pub struct PublicModelComparisonRequest<'a> {
     pub evidence_output_path: &'a Path,
     pub license_acknowledgement_id: &'a str,
     pub evaluation_split: EvaluationSplit,
-    pub sortformer_hard_timeout: Duration,
+    pub attempt_hard_timeout: Duration,
 }
 
 enum EcapaAvailability {
-    Ready(Box<EcapaModel>),
+    Ready {
+        model: Box<EcapaModel>,
+        package_path: PathBuf,
+    },
     Unavailable,
     Invalid,
 }
 
+enum NativeSortformerAvailability {
+    Ready {
+        session: Box<SortformerSession>,
+        package_path: PathBuf,
+        receipt_path: PathBuf,
+    },
+    Unavailable,
+    Invalid,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InternalLaneOutcome {
     lane: ModelComparisonLane,
     status: ModelComparisonOutcomeStatus,
@@ -551,9 +680,11 @@ struct InternalLaneOutcome {
     external_runtime_identity: Option<ModelComparisonExternalRuntimeIdentity>,
     attempt_wall_time_ms: u64,
     count: Option<ModelComparisonCountObservation>,
+    worker_peak_rss_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ModelComparisonCountObservation {
     reference_full_timeline: u64,
     hypothesis_full_timeline: u64,
@@ -576,6 +707,7 @@ impl InternalLaneOutcome {
             external_runtime_identity: None,
             attempt_wall_time_ms: 0,
             count: Some(count),
+            worker_peak_rss_bytes: None,
         }
     }
 
@@ -590,6 +722,7 @@ impl InternalLaneOutcome {
             external_runtime_identity: None,
             attempt_wall_time_ms: 0,
             count: None,
+            worker_peak_rss_bytes: None,
         }
     }
 
@@ -614,6 +747,7 @@ impl InternalLaneOutcome {
             external_runtime_identity: None,
             attempt_wall_time_ms: 0,
             count: None,
+            worker_peak_rss_bytes: None,
         }
     }
 
@@ -636,6 +770,43 @@ impl InternalLaneOutcome {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelComparisonWorkerRequest {
+    schema_version: String,
+    lane: ModelComparisonLane,
+    audio_path: PathBuf,
+    expected_audio_sha256: String,
+    expected_normalized_input_sha256: String,
+    reference: crate::diarization::DiarizationReferenceDocument,
+    expected_reference_sha256: String,
+    reference_speaker_count: u64,
+    protocol_sha256: String,
+    scorer_config_sha256: String,
+    executable_sha256: String,
+    hard_timeout_seconds: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelComparisonWorkerResponse {
+    schema_version: String,
+    lane: ModelComparisonLane,
+    executable_sha256_before: String,
+    executable_sha256_after: String,
+    audio_sha256_before: String,
+    audio_sha256_after: String,
+    normalized_input_sha256: String,
+    reference_sha256: String,
+    protocol_sha256: String,
+    scorer_config_sha256: String,
+    ecapa_package_sha256_after: Option<String>,
+    native_sortformer_package_sha256_after: Option<String>,
+    native_sortformer_receipt_sha256_after: Option<String>,
+    worker_wall_time_ms: u64,
+    outcome: InternalLaneOutcome,
+}
+
 #[derive(Default)]
 struct LaneReduction {
     outcomes: ModelComparisonOutcomeCounts,
@@ -644,6 +815,9 @@ struct LaneReduction {
     timed_attempt_count: u64,
     attempted_wall_time_ms: u64,
     completed_wall_time_ms: u64,
+    maximum_peak_rss_bytes: Option<u64>,
+    peak_rss_measured_attempt_count: u64,
+    maximum_completed_real_time_factor_millionths: Option<u64>,
 }
 
 #[derive(Default)]
@@ -858,7 +1032,7 @@ impl ModelComparisonAccumulator {
     }
 }
 
-/// Execute the frozen four-lane comparison and publish a validated public
+/// Execute the frozen five-lane comparison and publish a validated public
 /// bundle plus aggregate comparison evidence, each with an atomic no-clobber
 /// commit. The two independent files are not a transactional pair.
 pub fn run_public_model_comparison_with_cancel<F>(
@@ -876,20 +1050,19 @@ where
         evidence_output_path,
         license_acknowledgement_id,
         evaluation_split,
-        sortformer_hard_timeout,
+        attempt_hard_timeout,
     } = request;
     if evaluation_split != EvaluationSplit::Development {
         return Err(model_comparison_error(
             "split",
-            "the uncertified v2 comparison is restricted to the development split",
+            "the uncertified v3 comparison is restricted to the development split",
         ));
     }
-    if sortformer_hard_timeout
-        != Duration::from_secs(PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS)
+    if attempt_hard_timeout != Duration::from_secs(PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS)
     {
         return Err(model_comparison_error(
-            "sortformer_timeout",
-            "Sortformer timeout must equal the frozen 1800-second comparison timeout",
+            "attempt_timeout",
+            "attempt timeout must equal the frozen 1800-second comparison timeout",
         ));
     }
     cancellation_checkpoint(&is_cancelled)?;
@@ -942,7 +1115,6 @@ where
     super::validate_public_id(&descriptor.corpus_key, "corpus_key")?;
     super::validate_public_id(&descriptor.source_version, "source_version")?;
 
-    let scorer_config = comparison_scorer_config();
     let sortformer_contract = sortformer_oracle_contract();
     let native_rayon_threads = u16::try_from(rayon::current_num_threads()).map_err(|_| {
         model_comparison_error(
@@ -970,6 +1142,25 @@ where
             "model-comparison protocol changed without a versioned digest update",
         ));
     }
+    let worker_executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| {
+            model_comparison_error(
+                "worker_executable",
+                "the current comparison executable could not be resolved",
+            )
+        })?;
+    let worker_executable_sha256 = hash_bounded_file_with_cancel(
+        &worker_executable,
+        MAX_MODEL_COMPARISON_EXECUTABLE_BYTES,
+        &is_cancelled,
+        "worker_executable",
+    )?;
+    let cancellation_latency_ms = measure_worker_cancellation_latency(
+        &worker_executable,
+        &worker_executable_sha256,
+        &is_cancelled,
+    )?;
     cancellation_checkpoint(&is_cancelled)?;
 
     let mut cancellation_adapter = || is_cancelled();
@@ -1004,9 +1195,6 @@ where
         ));
     }
 
-    let ecapa_setup_started = Instant::now();
-    let ecapa = load_ecapa_availability(&is_cancelled)?;
-    let ecapa_shared_setup_wall_time_ms = elapsed_millis(ecapa_setup_started);
     let mut reductions = ModelComparisonLane::ALL
         .into_iter()
         .map(|lane| (lane, LaneReduction::default()))
@@ -1082,6 +1270,7 @@ where
             ));
         }
         let clipped_reference = super::clipped_reference(reference, Some(duration_ms))?;
+        let clipped_reference_sha256 = super::canonical_sha256(&clipped_reference)?;
         let normalized_input_sha256 = super::hash_pcm_prefix(&samples);
         observation_hasher.update((observation_index as u64).to_le_bytes());
         hash_token(
@@ -1104,21 +1293,21 @@ where
         let mut row = Vec::with_capacity(ModelComparisonLane::ALL.len());
         for lane in schedule {
             cancellation_checkpoint(&is_cancelled)?;
-            let attempt_started = Instant::now();
-            let mut outcome = execute_lane(
+            let outcome = execute_lane_worker(
                 lane,
+                &worker_executable,
+                &worker_executable_sha256,
                 &audio_path,
                 &recording_evidence.audio_sha256,
-                &samples,
                 &normalized_input_sha256,
                 &clipped_reference,
+                &clipped_reference_sha256,
                 reference_speaker_count,
-                &scorer_config,
-                &ecapa,
-                sortformer_hard_timeout,
+                &protocol_sha256,
+                &protocol.scorer_config_sha256,
+                attempt_hard_timeout,
                 &is_cancelled,
             )?;
-            outcome.attempt_wall_time_ms = elapsed_millis(attempt_started);
             row.push(outcome);
         }
         let common_complete = row
@@ -1146,10 +1335,28 @@ where
             reduction.attempted_wall_time_ms = reduction
                 .attempted_wall_time_ms
                 .saturating_add(outcome.attempt_wall_time_ms);
+            if let Some(peak_rss_bytes) = outcome.worker_peak_rss_bytes {
+                reduction.peak_rss_measured_attempt_count =
+                    reduction.peak_rss_measured_attempt_count.saturating_add(1);
+                reduction.maximum_peak_rss_bytes = Some(
+                    reduction
+                        .maximum_peak_rss_bytes
+                        .unwrap_or(0)
+                        .max(peak_rss_bytes),
+                );
+            }
             if outcome.status == ModelComparisonOutcomeStatus::Completed {
                 reduction.completed_wall_time_ms = reduction
                     .completed_wall_time_ms
                     .saturating_add(outcome.attempt_wall_time_ms);
+                let rtf_millionths =
+                    ratio_millionths_ceil(outcome.attempt_wall_time_ms, duration_ms, "worker_rtf")?;
+                reduction.maximum_completed_real_time_factor_millionths = Some(
+                    reduction
+                        .maximum_completed_real_time_factor_millionths
+                        .unwrap_or(0)
+                        .max(rtf_millionths),
+                );
             }
             outcome_hasher.update((observation_index as u64).to_le_bytes());
             hash_token(&mut outcome_hasher, outcome.lane.as_str().as_bytes());
@@ -1203,8 +1410,20 @@ where
         }
     }
     cancellation_checkpoint(&is_cancelled)?;
+    let final_worker_executable_sha256 = hash_bounded_file_with_cancel(
+        &worker_executable,
+        MAX_MODEL_COMPARISON_EXECUTABLE_BYTES,
+        &is_cancelled,
+        "worker_executable",
+    )?;
+    if final_worker_executable_sha256 != worker_executable_sha256 {
+        return Err(model_comparison_error(
+            "worker_executable_changed",
+            "the comparison executable changed during the invocation",
+        ));
+    }
 
-    let timeout_seconds = sortformer_hard_timeout.as_secs();
+    let timeout_seconds = attempt_hard_timeout.as_secs();
     let lanes = ModelComparisonLane::ALL
         .into_iter()
         .map(|lane| {
@@ -1219,10 +1438,13 @@ where
                 resources: lane_resource_evidence(
                     lane,
                     timeout_seconds,
-                    ecapa_shared_setup_wall_time_ms,
                     reduction.timed_attempt_count,
                     reduction.attempted_wall_time_ms,
                     reduction.completed_wall_time_ms,
+                    reduction.peak_rss_measured_attempt_count,
+                    reduction.maximum_peak_rss_bytes,
+                    cancellation_latency_ms,
+                    reduction.maximum_completed_real_time_factor_millionths,
                 ),
             })
         })
@@ -1236,6 +1458,7 @@ where
         evaluation_split,
         descriptor_sha256,
         bundle_sha256: bundle.bundle_sha256.clone(),
+        comparison_executable_sha256: worker_executable_sha256,
         observation_count: u64::try_from(bundle.references.len()).unwrap_or(u64::MAX),
         observation_set_sha256: format!("{:x}", observation_hasher.finalize()),
         execution_order_sha256: format!("{:x}", order_hasher.finalize()),
@@ -1344,7 +1567,7 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         input_bits_per_sample: 16,
         input_sample_format: "signed_integer_pcm_little_endian".to_owned(),
         normalized_observation_binding:
-            "same_validated_wav_bytes+native_single_decode_f32+full_duration_floor_ms".to_owned(),
+            "same_validated_wav_bytes+fresh_worker_decode_f32+audio_and_executable_hash_before_and_after+full_duration_floor_ms".to_owned(),
         speaker_count_policy: "infer_without_oracle_count_input".to_owned(),
         oracle_count_diagnostic_present: false,
         sortformer_capacity_eligibility:
@@ -1361,12 +1584,29 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         native_ecapa_fused_request_sha256: super::canonical_sha256(
             &native_ecapa_fused_request,
         )?,
+        native_sortformer_package_sha256:
+            crate::sortformer_conformance::SORTFORMER_PACKAGE_SHA256.to_owned(),
+        native_sortformer_receipt_sha256:
+            crate::sortformer_conformance::SORTFORMER_CONVERSION_RECEIPT_SHA256.to_owned(),
         native_rayon_threads: sortformer_contract.torch_intraop_threads,
         sortformer_intraop_threads: sortformer_contract.torch_intraop_threads,
         sortformer_interop_threads: sortformer_contract.torch_interop_threads,
         sortformer_max_speakers,
         sortformer_output_frame_ms: SORTFORMER_ORACLE_OUTPUT_FRAME_MS,
-        sortformer_hard_timeout_seconds: PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS,
+        attempt_hard_timeout_seconds: PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS,
+        worker_schema_version: MODEL_COMPARISON_WORKER_SCHEMA_VERSION.to_owned(),
+        worker_process_policy: "one_fresh_process_per_lane_observation+attempt_deadline_covers_parent_request_worker_and_post_identity+outer_process_group_descendant_termination+nested_adapter_group_inheritance+live_size_bounded_nonblocking_pipe_capture_on_linux_android_apple+live_size_bounded_anonymous_file_capture_on_other_supported_platforms+fail_closed_without_recursive_termination+executable_audio_normalized_pcm_reference_protocol_scorer_identity_binding"
+            .to_owned(),
+        worker_stdout_limit_bytes: crate::process::MAX_CAPTURED_OUTPUT_BYTES as u64,
+        cancellation_probe_delay_ms: MODEL_COMPARISON_CANCEL_PROBE_DELAY_MS,
+        cancellation_probe_timeout_seconds: MODEL_COMPARISON_CANCEL_PROBE_TIMEOUT_SECONDS,
+        cancellation_probe_self_limit_seconds: MODEL_COMPARISON_CANCEL_PROBE_SELF_LIMIT_SECONDS,
+        native_real_time_factor_cap_millionths:
+            MODEL_COMPARISON_NATIVE_RTF_CAP_MILLIONTHS,
+        external_real_time_factor_cap_millionths:
+            MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS,
+        peak_rss_cap_bytes: MODEL_COMPARISON_PEAK_RSS_CAP_BYTES,
+        cancellation_latency_cap_ms: MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS,
         ecapa_contract_sha256: ECAPA_CONTRACT_SHA256.to_owned(),
         ecapa_package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
         sortformer_contract_sha256: SORTFORMER_ORACLE_CONTRACT_SHA256.to_owned(),
@@ -1376,11 +1616,938 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
             "fixed_safe_v1_change+probabilistic_v1_clustering+unknown_fallback".to_owned(),
         native_ecapa_fused_postprocessing:
             "fixed_safe_v1_change+probabilistic_v1_clustering+unknown_fallback".to_owned(),
-        sortformer_postprocessing: "pinned_sortformer_oracle_contract_v2".to_owned(),
-        wall_time_policy: "measured_per_observation;native_ecapa_shared_model_load_separate;sortformer_executable_and_input_attestation+version_probe+cold_oracle_run+output_validation+scorer_per_observation;not_cross_lane_comparable".to_owned(),
+        sortformer_postprocessing: "native_l8_and_pinned_external_sortformer_oracle_contract_v2"
+            .to_owned(),
+        wall_time_policy: "fresh_process_per_lane_and_observation;process_launch+bounded_ipc+identity_validation+audio_decode+model_load+inference+output_validation+scorer+parent_post_identity+resource_probe;matched_timeout_and_thread_policy;cross_lane_comparable;peak_rss_from_direct_worker_process_only_not_descendant_adapters".to_owned(),
         aggregate_only: true,
         production_route_changed: false,
     })
+}
+
+fn measure_worker_cancellation_latency<F>(
+    executable: &Path,
+    expected_executable_sha256: &str,
+    is_cancelled: &F,
+) -> FwResult<u64>
+where
+    F: Fn() -> bool + Sync,
+{
+    cancellation_checkpoint(is_cancelled)?;
+    let executable_text = executable.to_str().ok_or_else(|| {
+        model_comparison_error(
+            "worker_executable",
+            "the current executable path is not valid UTF-8",
+        )
+    })?;
+    let cancel_after = Duration::from_millis(MODEL_COMPARISON_CANCEL_PROBE_DELAY_MS);
+    let pre_spawn_probe_seen = std::sync::atomic::AtomicBool::new(false);
+    let post_spawn_started = std::sync::OnceLock::new();
+    let cancel_probe = || {
+        if !pre_spawn_probe_seen.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return is_cancelled();
+        }
+        if is_cancelled() {
+            return true;
+        }
+        post_spawn_started.get_or_init(Instant::now).elapsed() >= cancel_after
+    };
+    let cancellation = CancellationToken::unbounded();
+    let result = crate::process::run_command_cancellable_with_probe(
+        executable_text,
+        &["__comparison-cancel-probe".to_owned()],
+        None,
+        &cancellation,
+        Some(Duration::from_secs(
+            MODEL_COMPARISON_CANCEL_PROBE_TIMEOUT_SECONDS,
+        )),
+        Some(&cancel_probe),
+    );
+    if is_cancelled() {
+        return Err(FwError::Cancelled(
+            "public model comparison cancelled".to_owned(),
+        ));
+    }
+    if !matches!(result, Err(FwError::Cancelled(_))) {
+        return Err(model_comparison_error(
+            "worker_cancellation_probe",
+            "the fresh-process cancellation probe did not terminate by cancellation",
+        ));
+    }
+    let total_ms = u64::try_from(
+        post_spawn_started
+            .get()
+            .ok_or_else(|| {
+                model_comparison_error(
+                    "worker_cancellation_probe",
+                    "the cancellation timer did not start after the probe process launched",
+                )
+            })?
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let executable_sha256_after = hash_bounded_file_with_cancel(
+        executable,
+        MAX_MODEL_COMPARISON_EXECUTABLE_BYTES,
+        is_cancelled,
+        "worker_executable",
+    )?;
+    if executable_sha256_after != expected_executable_sha256 {
+        return Err(model_comparison_error(
+            "worker_executable_changed",
+            "the comparison executable changed during the cancellation probe",
+        ));
+    }
+    Ok(total_ms
+        .saturating_sub(MODEL_COMPARISON_CANCEL_PROBE_DELAY_MS)
+        .max(1))
+}
+
+/// Run a process-tree probe until the comparison parent kills the worker group.
+/// The root probe launches one copy of itself so the measured path proves that
+/// inherited descendants do not keep pipes or work alive after cancellation.
+pub fn run_model_comparison_cancel_probe(descendant_mode: bool) -> FwResult<()> {
+    let started = Instant::now();
+    let self_limit = Duration::from_secs(MODEL_COMPARISON_CANCEL_PROBE_SELF_LIMIT_SECONDS);
+    if descendant_mode {
+        while started.elapsed() < self_limit {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        return Err(model_comparison_error(
+            "worker_cancellation_probe",
+            "the cancellation-probe descendant reached its standalone safety limit",
+        ));
+    }
+    let executable = std::env::current_exe().map_err(|_| {
+        model_comparison_error(
+            "worker_cancellation_probe",
+            "the cancellation-probe executable could not be resolved",
+        )
+    })?;
+    let mut descendant = std::process::Command::new(executable)
+        .arg("__comparison-cancel-probe")
+        .arg("--descendant")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| {
+            model_comparison_error(
+                "worker_cancellation_probe",
+                "the cancellation-probe descendant could not be launched",
+            )
+        })?;
+    loop {
+        if started.elapsed() >= self_limit {
+            let _ = descendant.kill();
+            let _ = descendant.wait();
+            return Err(model_comparison_error(
+                "worker_cancellation_probe",
+                "the cancellation-probe root reached its standalone safety limit",
+            ));
+        }
+        match descendant.try_wait() {
+            Ok(Some(_)) => {
+                return Err(model_comparison_error(
+                    "worker_cancellation_probe",
+                    "the cancellation-probe descendant exited before cancellation",
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = descendant.kill();
+                let _ = descendant.wait();
+                return Err(model_comparison_error(
+                    "worker_cancellation_probe",
+                    "the cancellation-probe descendant could not be monitored",
+                ));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_lane_worker<F>(
+    lane: ModelComparisonLane,
+    executable: &Path,
+    executable_sha256: &str,
+    audio_path: &Path,
+    audio_sha256: &str,
+    normalized_input_sha256: &str,
+    reference: &crate::diarization::DiarizationReferenceDocument,
+    reference_sha256: &str,
+    reference_speaker_count: u64,
+    protocol_sha256: &str,
+    scorer_config_sha256: &str,
+    hard_timeout: Duration,
+    is_cancelled: &F,
+) -> FwResult<InternalLaneOutcome>
+where
+    F: Fn() -> bool + Sync,
+{
+    let attempt_started = Instant::now();
+    let request = ModelComparisonWorkerRequest {
+        schema_version: MODEL_COMPARISON_WORKER_SCHEMA_VERSION.to_owned(),
+        lane,
+        audio_path: audio_path.to_path_buf(),
+        expected_audio_sha256: audio_sha256.to_owned(),
+        expected_normalized_input_sha256: normalized_input_sha256.to_owned(),
+        reference: reference.clone(),
+        expected_reference_sha256: reference_sha256.to_owned(),
+        reference_speaker_count,
+        protocol_sha256: protocol_sha256.to_owned(),
+        scorer_config_sha256: scorer_config_sha256.to_owned(),
+        executable_sha256: executable_sha256.to_owned(),
+        hard_timeout_seconds: hard_timeout.as_secs(),
+    };
+    let payload = serde_json::to_vec(&request).map_err(|_| {
+        model_comparison_error(
+            "worker_request",
+            "the fresh-process worker request could not be serialized",
+        )
+    })?;
+    if payload.len() as u64 > MAX_MODEL_COMPARISON_WORKER_REQUEST_BYTES {
+        return Err(model_comparison_error(
+            "worker_request",
+            "the fresh-process worker request exceeds its fixed byte bound",
+        ));
+    }
+    cancellation_checkpoint(is_cancelled)?;
+    let Some(worker_timeout) = remaining_attempt_budget(hard_timeout, attempt_started.elapsed())
+    else {
+        return Ok(worker_timeout_outcome(lane, attempt_started));
+    };
+
+    let executable_text = executable.to_str().ok_or_else(|| {
+        model_comparison_error(
+            "worker_executable",
+            "the current executable path is not valid UTF-8",
+        )
+    })?;
+    let (program, args, rss_probe) = comparison_worker_command(executable_text);
+    let cancellation = CancellationToken::unbounded();
+    let output = match crate::process::run_command_cancellable_with_input_and_probe(
+        &program,
+        &args,
+        None,
+        &cancellation,
+        Some(worker_timeout),
+        Some(is_cancelled),
+        &payload,
+    ) {
+        Ok(output) => output,
+        Err(error @ FwError::Cancelled(_)) => return Err(error),
+        Err(FwError::CommandTimedOut { .. }) => {
+            let _timed_out = verify_parent_worker_inputs_for_attempt(
+                executable,
+                executable_sha256,
+                audio_path,
+                audio_sha256,
+                attempt_started,
+                hard_timeout,
+                is_cancelled,
+            )?;
+            return Ok(worker_timeout_outcome(lane, attempt_started));
+        }
+        Err(_) => {
+            let timed_out = verify_parent_worker_inputs_for_attempt(
+                executable,
+                executable_sha256,
+                audio_path,
+                audio_sha256,
+                attempt_started,
+                hard_timeout,
+                is_cancelled,
+            )?;
+            if timed_out {
+                return Ok(worker_timeout_outcome(lane, attempt_started));
+            }
+            let mut outcome = InternalLaneOutcome::failed(
+                lane,
+                ModelComparisonOutcomeCode::WorkerExecutionFailed,
+            );
+            outcome.attempt_wall_time_ms = elapsed_millis(attempt_started);
+            return Ok(outcome);
+        }
+    };
+    let response: ModelComparisonWorkerResponse = match serde_json::from_slice(&output.stdout) {
+        Ok(response) => response,
+        Err(_) => {
+            let timed_out = verify_parent_worker_inputs_for_attempt(
+                executable,
+                executable_sha256,
+                audio_path,
+                audio_sha256,
+                attempt_started,
+                hard_timeout,
+                is_cancelled,
+            )?;
+            if timed_out {
+                return Ok(worker_timeout_outcome(lane, attempt_started));
+            }
+            let mut outcome = InternalLaneOutcome::failed(
+                lane,
+                ModelComparisonOutcomeCode::WorkerMalformedOutput,
+            );
+            outcome.attempt_wall_time_ms = elapsed_millis(attempt_started);
+            return Ok(outcome);
+        }
+    };
+    let timed_out = verify_parent_worker_inputs_for_attempt(
+        executable,
+        executable_sha256,
+        audio_path,
+        audio_sha256,
+        attempt_started,
+        hard_timeout,
+        is_cancelled,
+    )?;
+    if timed_out {
+        return Ok(worker_timeout_outcome(lane, attempt_started));
+    }
+    let parent_elapsed_after_identity_ms = elapsed_millis(attempt_started);
+    let ecapa_identity_expected = matches!(
+        lane,
+        ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused
+    ) && !matches!(
+        response.outcome.code,
+        Some(
+            ModelComparisonOutcomeCode::EcapaModelUnavailable
+                | ModelComparisonOutcomeCode::EcapaModelInvalid
+        )
+    );
+    let native_sortformer_identity_expected = lane == ModelComparisonLane::NativeSortformer
+        && !matches!(
+            response.outcome.code,
+            Some(
+                ModelComparisonOutcomeCode::NativeSortformerModelUnavailable
+                    | ModelComparisonOutcomeCode::NativeSortformerModelInvalid
+                    | ModelComparisonOutcomeCode::SortformerModelCapacityExceeded
+            )
+        );
+    if response.schema_version != MODEL_COMPARISON_WORKER_SCHEMA_VERSION
+        || response.lane != lane
+        || response.outcome.lane != lane
+        || response.executable_sha256_before != executable_sha256
+        || response.executable_sha256_after != executable_sha256
+        || response.audio_sha256_before != audio_sha256
+        || response.audio_sha256_after != audio_sha256
+        || response.normalized_input_sha256 != normalized_input_sha256
+        || response.reference_sha256 != reference_sha256
+        || response.protocol_sha256 != protocol_sha256
+        || response.scorer_config_sha256 != scorer_config_sha256
+        || response.worker_wall_time_ms == 0
+        || response.worker_wall_time_ms > parent_elapsed_after_identity_ms
+        || response.outcome.attempt_wall_time_ms != 0
+        || response.outcome.worker_peak_rss_bytes.is_some()
+        || response.ecapa_package_sha256_after.as_deref()
+            != ecapa_identity_expected.then_some(ECAPA_PACKAGE_SHA256)
+        || response.native_sortformer_package_sha256_after.as_deref()
+            != native_sortformer_identity_expected
+                .then_some(crate::sortformer_conformance::SORTFORMER_PACKAGE_SHA256)
+        || response.native_sortformer_receipt_sha256_after.as_deref()
+            != native_sortformer_identity_expected
+                .then_some(crate::sortformer_conformance::SORTFORMER_CONVERSION_RECEIPT_SHA256)
+    {
+        return Err(model_comparison_error(
+            "worker_identity",
+            "a fresh-process comparison worker contradicted its bound identities",
+        ));
+    }
+    let peak_rss_bytes = match rss_probe {
+        #[cfg(target_vendor = "apple")]
+        WorkerRssProbe::MacOsTime => parse_macos_peak_rss(&output.stderr).map(Some),
+        #[cfg(target_os = "linux")]
+        WorkerRssProbe::GnuTime => parse_gnu_peak_rss(&output.stderr).map(Some),
+        WorkerRssProbe::Unavailable => Ok(None),
+    };
+    let peak_rss_bytes = match peak_rss_bytes {
+        Ok(value) => value,
+        Err(_) => {
+            if remaining_attempt_budget(hard_timeout, attempt_started.elapsed()).is_none() {
+                return Ok(worker_timeout_outcome(lane, attempt_started));
+            }
+            let mut outcome = InternalLaneOutcome::failed(
+                lane,
+                ModelComparisonOutcomeCode::WorkerResourceProbeFailed,
+            );
+            outcome.attempt_wall_time_ms = elapsed_millis(attempt_started);
+            return Ok(outcome);
+        }
+    };
+    if remaining_attempt_budget(hard_timeout, attempt_started.elapsed()).is_none() {
+        return Ok(worker_timeout_outcome(lane, attempt_started));
+    }
+    let mut outcome = response.outcome;
+    // The authoritative lane time is measured by the parent and therefore
+    // includes process launch, bounded IPC, the complete worker, response
+    // validation, post-run identity hashing, and the resource probe.
+    outcome.attempt_wall_time_ms = elapsed_millis(attempt_started);
+    outcome.worker_peak_rss_bytes = peak_rss_bytes;
+    Ok(outcome)
+}
+
+fn remaining_attempt_budget(limit: Duration, elapsed: Duration) -> Option<Duration> {
+    limit
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn worker_timeout_outcome(
+    lane: ModelComparisonLane,
+    attempt_started: Instant,
+) -> InternalLaneOutcome {
+    let mut outcome = InternalLaneOutcome::failed(lane, ModelComparisonOutcomeCode::WorkerTimedOut);
+    outcome.attempt_wall_time_ms = elapsed_millis(attempt_started);
+    outcome
+}
+
+#[derive(Clone, Copy)]
+enum WorkerRssProbe {
+    #[cfg(target_vendor = "apple")]
+    MacOsTime,
+    #[cfg(target_os = "linux")]
+    GnuTime,
+    Unavailable,
+}
+
+fn comparison_worker_command(executable: &str) -> (String, Vec<String>, WorkerRssProbe) {
+    #[cfg(target_vendor = "apple")]
+    if Path::new("/usr/bin/time").is_file() {
+        return (
+            "/usr/bin/time".to_owned(),
+            vec![
+                "-l".to_owned(),
+                executable.to_owned(),
+                "__comparison-worker".to_owned(),
+            ],
+            WorkerRssProbe::MacOsTime,
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if Path::new("/usr/bin/time").is_file() {
+        return (
+            "/usr/bin/time".to_owned(),
+            vec![
+                "-f".to_owned(),
+                "fw_peak_rss_kib=%M".to_owned(),
+                executable.to_owned(),
+                "__comparison-worker".to_owned(),
+            ],
+            WorkerRssProbe::GnuTime,
+        );
+    }
+    (
+        executable.to_owned(),
+        vec!["__comparison-worker".to_owned()],
+        WorkerRssProbe::Unavailable,
+    )
+}
+
+fn verify_parent_worker_inputs<F>(
+    executable: &Path,
+    expected_executable_sha256: &str,
+    audio_path: &Path,
+    expected_audio_sha256: &str,
+    is_cancelled: &F,
+) -> FwResult<()>
+where
+    F: Fn() -> bool + Sync,
+{
+    let executable_sha256 = hash_bounded_file_with_cancel(
+        executable,
+        MAX_MODEL_COMPARISON_EXECUTABLE_BYTES,
+        is_cancelled,
+        "worker_executable",
+    )?;
+    let audio_sha256 = hash_bounded_file_with_cancel(
+        audio_path,
+        super::MAX_EVALUATION_AUDIO_BYTES,
+        is_cancelled,
+        "worker_audio",
+    )?;
+    if executable_sha256 != expected_executable_sha256 || audio_sha256 != expected_audio_sha256 {
+        return Err(model_comparison_error(
+            "worker_identity_changed",
+            "a bound worker input changed during an attempt",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_parent_worker_inputs_for_attempt<F>(
+    executable: &Path,
+    expected_executable_sha256: &str,
+    audio_path: &Path,
+    expected_audio_sha256: &str,
+    attempt_started: Instant,
+    hard_timeout: Duration,
+    is_cancelled: &F,
+) -> FwResult<bool>
+where
+    F: Fn() -> bool + Sync,
+{
+    let stop = || {
+        is_cancelled()
+            || remaining_attempt_budget(hard_timeout, attempt_started.elapsed()).is_none()
+    };
+    match verify_parent_worker_inputs(
+        executable,
+        expected_executable_sha256,
+        audio_path,
+        expected_audio_sha256,
+        &stop,
+    ) {
+        Ok(()) => Ok(remaining_attempt_budget(hard_timeout, attempt_started.elapsed()).is_none()),
+        Err(FwError::Cancelled(_)) if is_cancelled() => Err(FwError::Cancelled(
+            "public model comparison cancelled".to_owned(),
+        )),
+        Err(FwError::Cancelled(_))
+            if remaining_attempt_budget(hard_timeout, attempt_started.elapsed()).is_none() =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(test, target_vendor = "apple"))]
+fn parse_macos_peak_rss(stderr: &[u8]) -> FwResult<u64> {
+    let text = std::str::from_utf8(stderr).map_err(|_| {
+        model_comparison_error(
+            "worker_resource",
+            "the macOS resource probe emitted non-UTF-8 output",
+        )
+    })?;
+    let values = text
+        .lines()
+        .filter(|line| line.trim_end().ends_with("maximum resident set size"))
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            model_comparison_error(
+                "worker_resource",
+                "the macOS peak-RSS value was not an unsigned integer",
+            )
+        })?;
+    match values.as_slice() {
+        [value] if *value > 0 => Ok(*value),
+        _ => Err(model_comparison_error(
+            "worker_resource",
+            "the macOS resource probe did not emit exactly one positive peak-RSS value",
+        )),
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_gnu_peak_rss(stderr: &[u8]) -> FwResult<u64> {
+    let text = std::str::from_utf8(stderr).map_err(|_| {
+        model_comparison_error(
+            "worker_resource",
+            "the GNU resource probe emitted non-UTF-8 output",
+        )
+    })?;
+    let values = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("fw_peak_rss_kib="))
+        .map(str::trim)
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            model_comparison_error(
+                "worker_resource",
+                "the GNU peak-RSS value was not an unsigned integer",
+            )
+        })?;
+    match values.as_slice() {
+        [value] if *value > 0 => value.checked_mul(1_024).ok_or_else(|| {
+            model_comparison_error("worker_resource", "the GNU peak-RSS value overflowed bytes")
+        }),
+        _ => Err(model_comparison_error(
+            "worker_resource",
+            "the GNU resource probe did not emit exactly one positive peak-RSS value",
+        )),
+    }
+}
+
+/// Execute exactly one hidden comparison lane from a bounded stdin request.
+/// The response contains no filesystem paths, recording identifier, turns, or
+/// speaker labels and is intended only for the parent comparison invocation.
+pub fn run_model_comparison_worker_from_stdio() -> FwResult<String> {
+    let mut request_bytes = Vec::new();
+    std::io::stdin()
+        .take(MAX_MODEL_COMPARISON_WORKER_REQUEST_BYTES.saturating_add(1))
+        .read_to_end(&mut request_bytes)
+        .map_err(|_| {
+            model_comparison_error(
+                "worker_request",
+                "the fresh-process worker could not read its request",
+            )
+        })?;
+    if request_bytes.len() as u64 > MAX_MODEL_COMPARISON_WORKER_REQUEST_BYTES {
+        return Err(model_comparison_error(
+            "worker_request",
+            "the fresh-process worker request exceeds its fixed byte bound",
+        ));
+    }
+    let request: ModelComparisonWorkerRequest =
+        serde_json::from_slice(&request_bytes).map_err(|_| {
+            model_comparison_error(
+                "worker_request",
+                "the fresh-process worker request is malformed",
+            )
+        })?;
+    if request.schema_version != MODEL_COMPARISON_WORKER_SCHEMA_VERSION
+        || !super::is_sha256_hex(&request.expected_audio_sha256)
+        || !super::is_sha256_hex(&request.expected_normalized_input_sha256)
+        || !super::is_sha256_hex(&request.expected_reference_sha256)
+        || !super::is_sha256_hex(&request.protocol_sha256)
+        || !super::is_sha256_hex(&request.scorer_config_sha256)
+        || !super::is_sha256_hex(&request.executable_sha256)
+        || request.hard_timeout_seconds != PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS
+        || !request.audio_path.is_absolute()
+    {
+        return Err(model_comparison_error(
+            "worker_request",
+            "the fresh-process worker request violates its frozen contract",
+        ));
+    }
+
+    let started = Instant::now();
+    let is_cancelled = crate::cli::ShutdownController::is_shutting_down;
+    let executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| {
+            model_comparison_error(
+                "worker_executable",
+                "the fresh-process worker executable could not be resolved",
+            )
+        })?;
+    let executable_sha256_before = hash_bounded_file_with_cancel(
+        &executable,
+        MAX_MODEL_COMPARISON_EXECUTABLE_BYTES,
+        &is_cancelled,
+        "worker_executable",
+    )?;
+    if executable_sha256_before != request.executable_sha256 {
+        return Err(model_comparison_error(
+            "worker_executable_changed",
+            "the fresh-process worker executable identity changed before execution",
+        ));
+    }
+    let canonical_audio = std::fs::canonicalize(&request.audio_path).map_err(|_| {
+        model_comparison_error(
+            "worker_audio",
+            "the fresh-process worker audio input could not be resolved",
+        )
+    })?;
+    if canonical_audio != request.audio_path {
+        return Err(model_comparison_error(
+            "worker_audio",
+            "the fresh-process worker audio input was not canonical",
+        ));
+    }
+    let audio_bytes = super::read_bounded(
+        &canonical_audio,
+        super::MAX_EVALUATION_AUDIO_BYTES,
+        "model_comparison_worker_audio",
+    )?;
+    let audio_sha256_before = format!("{:x}", Sha256::digest(&audio_bytes));
+    if audio_sha256_before != request.expected_audio_sha256 {
+        return Err(model_comparison_error(
+            "worker_audio_changed",
+            "the fresh-process worker audio identity changed before execution",
+        ));
+    }
+    let samples = decode_pcm16_wave(&audio_bytes, &is_cancelled)?;
+    drop(audio_bytes);
+    let normalized_input_sha256 = super::hash_pcm_prefix(&samples);
+    if normalized_input_sha256 != request.expected_normalized_input_sha256 {
+        return Err(model_comparison_error(
+            "worker_audio_changed",
+            "the fresh-process worker normalized audio identity disagrees",
+        ));
+    }
+    let reference_sha256 = super::canonical_sha256(&request.reference)?;
+    let reference_speaker_count = count_labeled_speakers(&request.reference.turns)?;
+    if reference_sha256 != request.expected_reference_sha256
+        || reference_speaker_count != request.reference_speaker_count
+    {
+        return Err(model_comparison_error(
+            "worker_reference",
+            "the fresh-process worker reference identity disagrees",
+        ));
+    }
+    let protocol = frozen_model_comparison_protocol()?;
+    let protocol_sha256 = super::canonical_sha256(&protocol)?;
+    let scorer_config = comparison_scorer_config();
+    let scorer_config_sha256 = super::canonical_sha256(&scorer_config)?;
+    if protocol_sha256 != request.protocol_sha256
+        || scorer_config_sha256 != request.scorer_config_sha256
+        || u16::try_from(rayon::current_num_threads()).ok() != Some(protocol.native_rayon_threads)
+    {
+        return Err(model_comparison_error(
+            "worker_protocol",
+            "the fresh-process worker runtime disagrees with the frozen protocol",
+        ));
+    }
+    // The comparison parent launched this authenticated worker inside one
+    // dedicated process group. Nested external adapters must inherit that
+    // group so an outer timeout or cancellation cannot orphan them.
+    crate::process::mark_process_tree_externally_owned();
+
+    let ecapa = if matches!(
+        request.lane,
+        ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused
+    ) {
+        load_ecapa_availability(&is_cancelled)?
+    } else {
+        EcapaAvailability::Unavailable
+    };
+    let native_sortformer_capacity = u64::try_from(SORTFORMER_SPEAKER_LANES).map_err(|_| {
+        model_comparison_error(
+            "worker_protocol",
+            "native Sortformer capacity exceeds the retained range",
+        )
+    })?;
+    let native_sortformer = if request.lane == ModelComparisonLane::NativeSortformer
+        && reference_speaker_count <= native_sortformer_capacity
+    {
+        load_native_sortformer_availability(&is_cancelled)?
+    } else {
+        NativeSortformerAvailability::Unavailable
+    };
+    let mut outcome = execute_lane(
+        request.lane,
+        &canonical_audio,
+        &request.expected_audio_sha256,
+        &samples,
+        &normalized_input_sha256,
+        &request.reference,
+        reference_speaker_count,
+        &scorer_config,
+        &ecapa,
+        &native_sortformer,
+        Duration::from_secs(request.hard_timeout_seconds),
+        &is_cancelled,
+    )?;
+    sanitize_worker_outcome(&mut outcome);
+
+    let ecapa_package_sha256_after = match &ecapa {
+        EcapaAvailability::Ready { package_path, .. } => Some(hash_bounded_file_with_cancel(
+            package_path,
+            super::MAX_EVALUATION_AUDIO_BYTES,
+            &is_cancelled,
+            "worker_ecapa_package",
+        )?),
+        EcapaAvailability::Unavailable | EcapaAvailability::Invalid => None,
+    };
+    let (native_sortformer_package_sha256_after, native_sortformer_receipt_sha256_after) =
+        match &native_sortformer {
+            NativeSortformerAvailability::Ready {
+                package_path,
+                receipt_path,
+                ..
+            } => (
+                Some(hash_bounded_file_with_cancel(
+                    package_path,
+                    crate::sortformer_conformance::SORTFORMER_PACKAGE_BYTES,
+                    &is_cancelled,
+                    "worker_native_sortformer_package",
+                )?),
+                Some(hash_bounded_file_with_cancel(
+                    receipt_path,
+                    MAX_MODEL_COMPARISON_WORKER_REQUEST_BYTES,
+                    &is_cancelled,
+                    "worker_native_sortformer_receipt",
+                )?),
+            ),
+            NativeSortformerAvailability::Unavailable | NativeSortformerAvailability::Invalid => {
+                (None, None)
+            }
+        };
+    if ecapa_package_sha256_after
+        .as_deref()
+        .is_some_and(|value| value != ECAPA_PACKAGE_SHA256)
+        || native_sortformer_package_sha256_after
+            .as_deref()
+            .is_some_and(|value| value != crate::sortformer_conformance::SORTFORMER_PACKAGE_SHA256)
+        || native_sortformer_receipt_sha256_after
+            .as_deref()
+            .is_some_and(|value| {
+                value != crate::sortformer_conformance::SORTFORMER_CONVERSION_RECEIPT_SHA256
+            })
+    {
+        return Err(model_comparison_error(
+            "worker_model_identity_changed",
+            "a fresh-process worker model artifact changed during execution",
+        ));
+    }
+
+    let audio_sha256_after = hash_bounded_file_with_cancel(
+        &canonical_audio,
+        super::MAX_EVALUATION_AUDIO_BYTES,
+        &is_cancelled,
+        "worker_audio",
+    )?;
+    let executable_sha256_after = hash_bounded_file_with_cancel(
+        &executable,
+        MAX_MODEL_COMPARISON_EXECUTABLE_BYTES,
+        &is_cancelled,
+        "worker_executable",
+    )?;
+    if audio_sha256_after != request.expected_audio_sha256
+        || executable_sha256_after != request.executable_sha256
+    {
+        return Err(model_comparison_error(
+            "worker_identity_changed",
+            "a fresh-process worker input identity changed during execution",
+        ));
+    }
+    let response = ModelComparisonWorkerResponse {
+        schema_version: MODEL_COMPARISON_WORKER_SCHEMA_VERSION.to_owned(),
+        lane: request.lane,
+        executable_sha256_before,
+        executable_sha256_after,
+        audio_sha256_before,
+        audio_sha256_after,
+        normalized_input_sha256,
+        reference_sha256,
+        protocol_sha256,
+        scorer_config_sha256,
+        ecapa_package_sha256_after,
+        native_sortformer_package_sha256_after,
+        native_sortformer_receipt_sha256_after,
+        worker_wall_time_ms: elapsed_millis(started),
+        outcome,
+    };
+    serde_json::to_string(&response).map_err(|_| {
+        model_comparison_error(
+            "worker_output",
+            "the fresh-process worker response could not be serialized",
+        )
+    })
+}
+
+fn sanitize_worker_outcome(outcome: &mut InternalLaneOutcome) {
+    let Some(score) = outcome.score.as_mut() else {
+        return;
+    };
+    score.recording_id.clear();
+    score.reference_sha256.clear();
+    score.hypothesis_sha256.clear();
+    score.result_sha256.clear();
+    score.performance = None;
+    score.diarization.speaker_mapping.clear();
+    score.speaker_occupancy.speakers.clear();
+}
+
+fn hash_bounded_file_with_cancel<F>(
+    path: &Path,
+    maximum_bytes: u64,
+    is_cancelled: &F,
+    field: &str,
+) -> FwResult<String>
+where
+    F: Fn() -> bool + Sync,
+{
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| model_comparison_error(field, "a bound file could not be inspected"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > maximum_bytes {
+        return Err(model_comparison_error(
+            field,
+            "a bound file is not a regular non-symlink file within its byte limit",
+        ));
+    }
+    #[cfg(target_family = "unix")]
+    let mut file = {
+        use rustix::fs::{Mode, OFlags, open};
+
+        let descriptor = open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| model_comparison_error(field, "a bound file could not be opened"))?;
+        std::fs::File::from(descriptor)
+    };
+    #[cfg(windows)]
+    let mut file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| model_comparison_error(field, "a bound file could not be opened"))?
+    };
+    #[cfg(not(any(target_family = "unix", windows)))]
+    let mut file = std::fs::File::open(path)
+        .map_err(|_| model_comparison_error(field, "a bound file could not be opened"))?;
+    let opened_metadata = file.metadata().map_err(|_| {
+        model_comparison_error(field, "a bound file descriptor could not be inspected")
+    })?;
+    if !opened_metadata.is_file() || opened_metadata.len() != metadata.len() {
+        return Err(model_comparison_error(
+            field,
+            "a bound file identity changed while opening",
+        ));
+    }
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if opened_metadata.dev() != metadata.dev() || opened_metadata.ino() != metadata.ino() {
+            return Err(model_comparison_error(
+                field,
+                "a bound file identity changed while opening",
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(model_comparison_error(
+                field,
+                "a bound file descriptor resolves through a reparse point",
+            ));
+        }
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut observed = 0u64;
+    loop {
+        cancellation_checkpoint(is_cancelled)?;
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| model_comparison_error(field, "a bound file could not be read"))?;
+        if count == 0 {
+            break;
+        }
+        observed = observed.saturating_add(count as u64);
+        if observed > maximum_bytes {
+            return Err(model_comparison_error(
+                field,
+                "a bound file grew beyond its byte limit while hashing",
+            ));
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let final_metadata = file.metadata().map_err(|_| {
+        model_comparison_error(field, "a bound file descriptor could not be re-inspected")
+    })?;
+    if observed != metadata.len() || final_metadata.len() != metadata.len() {
+        return Err(model_comparison_error(
+            field,
+            "a bound file changed length while hashing",
+        ));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn load_ecapa_availability<F>(is_cancelled: &F) -> FwResult<EcapaAvailability>
@@ -1395,9 +2562,46 @@ where
     };
     let checkpoint = || cancellation_checkpoint(is_cancelled);
     match EcapaModel::load_with_checkpoint(&model_path, &checkpoint) {
-        Ok(model) => Ok(EcapaAvailability::Ready(Box::new(model))),
+        Ok(model) => Ok(EcapaAvailability::Ready {
+            model: Box::new(model),
+            package_path: model_path,
+        }),
         Err(error @ FwError::Cancelled(_)) => Err(error),
         Err(_) => Ok(EcapaAvailability::Invalid),
+    }
+}
+
+fn load_native_sortformer_availability<F>(
+    is_cancelled: &F,
+) -> FwResult<NativeSortformerAvailability>
+where
+    F: Fn() -> bool + Sync,
+{
+    cancellation_checkpoint(is_cancelled)?;
+    let cached = match resolve_cached_sortformer_with_cancel(|| is_cancelled()) {
+        Ok(cached) => cached,
+        Err(error @ FwError::Cancelled(_)) => return Err(error),
+        Err(FwError::MissingArtifact(_)) => return Ok(NativeSortformerAvailability::Unavailable),
+        Err(_) => return Ok(NativeSortformerAvailability::Invalid),
+    };
+    let checkpoint = || cancellation_checkpoint(is_cancelled);
+    let package = match load_verified_sortformer_package_with_checkpoint(
+        &cached.receipt_path,
+        &cached.package_path,
+        &checkpoint,
+    ) {
+        Ok(package) => package,
+        Err(error @ FwError::Cancelled(_)) => return Err(error),
+        Err(_) => return Ok(NativeSortformerAvailability::Invalid),
+    };
+    match SortformerSession::from_verified_package_with_checkpoint(&package, &checkpoint) {
+        Ok(session) => Ok(NativeSortformerAvailability::Ready {
+            session: Box::new(session),
+            package_path: cached.package_path,
+            receipt_path: cached.receipt_path,
+        }),
+        Err(error @ FwError::Cancelled(_)) => Err(error),
+        Err(_) => Ok(NativeSortformerAvailability::Invalid),
     }
 }
 
@@ -1412,7 +2616,8 @@ fn execute_lane<F>(
     reference_speaker_count: u64,
     scorer_config: &DiarizationScorerConfig,
     ecapa: &EcapaAvailability,
-    sortformer_hard_timeout: Duration,
+    native_sortformer: &NativeSortformerAvailability,
+    attempt_hard_timeout: Duration,
     is_cancelled: &F,
 ) -> FwResult<InternalLaneOutcome>
 where
@@ -1447,7 +2652,7 @@ where
         }
         ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused => {
             let model = match ecapa {
-                EcapaAvailability::Ready(model) => model,
+                EcapaAvailability::Ready { model, .. } => model,
                 EcapaAvailability::Unavailable => {
                     return Ok(InternalLaneOutcome::skipped(
                         lane,
@@ -1492,6 +2697,64 @@ where
             };
             score_native_report(lane, report, reference, scorer_config)
         }
+        ModelComparisonLane::NativeSortformer => {
+            let capacity = u64::try_from(SORTFORMER_SPEAKER_LANES).map_err(|_| {
+                model_comparison_error(
+                    "native_sortformer_contract",
+                    "native Sortformer speaker capacity exceeds the retained count range",
+                )
+            })?;
+            if reference_speaker_count > capacity {
+                return Ok(InternalLaneOutcome::skipped(
+                    lane,
+                    ModelComparisonOutcomeCode::SortformerModelCapacityExceeded,
+                ));
+            }
+            let session = match native_sortformer {
+                NativeSortformerAvailability::Ready { session, .. } => session,
+                NativeSortformerAvailability::Unavailable => {
+                    return Ok(InternalLaneOutcome::skipped(
+                        lane,
+                        ModelComparisonOutcomeCode::NativeSortformerModelUnavailable,
+                    ));
+                }
+                NativeSortformerAvailability::Invalid => {
+                    return Ok(InternalLaneOutcome::failed(
+                        lane,
+                        ModelComparisonOutcomeCode::NativeSortformerModelInvalid,
+                    ));
+                }
+            };
+            if SORTFORMER_SAMPLE_RATE_HZ != 16_000 {
+                return Err(model_comparison_error(
+                    "native_sortformer_contract",
+                    "native Sortformer sample rate disagrees with the comparison protocol",
+                ));
+            }
+            let checkpoint = || cancellation_checkpoint(is_cancelled);
+            let output = match session
+                .diarize_with_checkpoint(SortformerPcm::mono_16khz(samples), &checkpoint)
+            {
+                Ok(output) => output,
+                Err(error @ FwError::Cancelled(_)) => return Err(error),
+                Err(_) => {
+                    return Ok(InternalLaneOutcome::failed(
+                        lane,
+                        ModelComparisonOutcomeCode::NativeSortformerExecutionFailed,
+                    ));
+                }
+            };
+            let (turns, selected_count) =
+                sortformer_evaluation_turns(output.turns, reference.duration_ms)?;
+            let count = count_observation(reference, &turns, Some(selected_count))?;
+            match score_hypothesis(reference, turns, None, scorer_config) {
+                Ok(score) => Ok(InternalLaneOutcome::completed(lane, score, None, count)),
+                Err(_) => Ok(InternalLaneOutcome::failed(
+                    lane,
+                    ModelComparisonOutcomeCode::ScoringFailed,
+                )),
+            }
+        }
         ModelComparisonLane::ExternalSortformer => {
             let sortformer_capacity =
                 u64::try_from(SORTFORMER_ORACLE_MAX_SPEAKERS).map_err(|_| {
@@ -1514,7 +2777,7 @@ where
                     expected_audio_sha256: audio_sha256,
                     expected_duration_ms: reference.duration_ms,
                     recording_key: audio_sha256,
-                    hard_timeout: sortformer_hard_timeout,
+                    hard_timeout: attempt_hard_timeout,
                 },
                 &cancellation,
                 is_cancelled,
@@ -1602,6 +2865,53 @@ where
             }
         }
     }
+}
+
+fn checked_sortformer_timestamp_ms(seconds: f32, duration_ms: u64) -> FwResult<u64> {
+    let milliseconds = f64::from(seconds) * 1_000.0;
+    if !milliseconds.is_finite() || milliseconds < 0.0 || milliseconds > u64::MAX as f64 {
+        return Err(model_comparison_error(
+            "native_sortformer_timestamp",
+            "native Sortformer emitted an invalid timestamp",
+        ));
+    }
+    Ok((milliseconds.round() as u64).min(duration_ms))
+}
+
+fn sortformer_evaluation_turns(
+    source: Vec<SortformerSpeakerTurn>,
+    duration_ms: u64,
+) -> FwResult<(Vec<EvaluationTurn>, u64)> {
+    let mut active_lanes = BTreeSet::new();
+    let mut turns = Vec::with_capacity(source.len());
+    for turn in source {
+        if turn.speaker >= SORTFORMER_SPEAKER_LANES {
+            return Err(model_comparison_error(
+                "native_sortformer_speaker_lane",
+                "native Sortformer emitted an out-of-range speaker lane",
+            ));
+        }
+        let start_ms = checked_sortformer_timestamp_ms(turn.start_seconds, duration_ms)?;
+        let end_ms = checked_sortformer_timestamp_ms(turn.end_seconds, duration_ms)?;
+        if end_ms <= start_ms {
+            continue;
+        }
+        active_lanes.insert(turn.speaker);
+        turns.push(EvaluationTurn {
+            start_ms,
+            end_ms,
+            speaker: Some(format!("speaker_{:02}", turn.speaker)),
+            speaker_confidence: None,
+            overlap_suspected: false,
+        });
+    }
+    let selected_count = u64::try_from(active_lanes.len()).map_err(|_| {
+        model_comparison_error(
+            "native_sortformer_count",
+            "native Sortformer active lane count exceeds the retained range",
+        )
+    })?;
+    Ok((turns, selected_count))
 }
 
 fn comparison_diarization_request(engine: DiarizationEngine) -> DiarizationRequest {
@@ -1835,43 +3145,54 @@ fn classify_ecapa_failure(error: &FwError) -> Option<ModelComparisonOutcomeCode>
 fn lane_resource_evidence(
     lane: ModelComparisonLane,
     sortformer_timeout_seconds: u64,
-    ecapa_shared_setup_wall_time_ms: u64,
     timed_attempt_count: u64,
     attempted_wall_time_ms: u64,
     completed_wall_time_ms: u64,
+    peak_rss_measured_attempt_count: u64,
+    maximum_peak_rss_bytes: Option<u64>,
+    maximum_cancellation_latency_ms: u64,
+    maximum_completed_real_time_factor_millionths: Option<u64>,
 ) -> ModelComparisonResourceEvidence {
+    let peak_rss_complete = timed_attempt_count > 0
+        && peak_rss_measured_attempt_count == timed_attempt_count
+        && maximum_peak_rss_bytes.is_some();
+    let rtf_cap_millionths = if lane == ModelComparisonLane::ExternalSortformer {
+        MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS
+    } else {
+        MODEL_COMPARISON_NATIVE_RTF_CAP_MILLIONTHS
+    };
     ModelComparisonResourceEvidence {
         wall_time_authority: ModelComparisonResourceAuthority::Measured,
-        wall_time_scope: match lane {
-            ModelComparisonLane::NativeAcoustic => {
-                ModelComparisonWallTimeScope::NativeAcousticPipelineAndScorer
-            }
-            ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused => {
-                ModelComparisonWallTimeScope::NativeEcapaPipelineAndScorerSharedModelLoadExcluded
-            }
-            ModelComparisonLane::ExternalSortformer => {
-                ModelComparisonWallTimeScope::ExternalSortformerAttestationValidationColdOracleAndScorerPerObservation
-            }
-        },
-        wall_time_cross_lane_comparable: false,
+        wall_time_scope:
+            ModelComparisonWallTimeScope::FreshProcessIdentityValidationModelLoadInferenceAndScorer,
+        wall_time_cross_lane_comparable: true,
         timed_attempt_count,
         attempted_wall_time_ms,
         completed_wall_time_ms,
-        shared_setup_wall_time_ms: matches!(
-            lane,
-            ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused
-        )
-        .then_some(ecapa_shared_setup_wall_time_ms),
-        peak_rss_authority: if lane == ModelComparisonLane::ExternalSortformer {
-            ModelComparisonResourceAuthority::UnavailableChildProcess
+        peak_rss_authority: if peak_rss_complete {
+            ModelComparisonResourceAuthority::Measured
         } else {
-            ModelComparisonResourceAuthority::NotComparableSharedProcess
+            ModelComparisonResourceAuthority::UnavailableNoProbe
         },
-        authoritative_peak_rss_bytes: None,
-        cancellation_latency_authority: ModelComparisonResourceAuthority::UnavailableNoProbe,
-        maximum_cancellation_latency_ms: None,
-        hard_timeout_seconds: (lane == ModelComparisonLane::ExternalSortformer)
-            .then_some(sortformer_timeout_seconds),
+        peak_rss_scope: ModelComparisonPeakRssScope::DirectWorkerProcess,
+        authoritative_peak_rss_bytes: peak_rss_complete
+            .then_some(maximum_peak_rss_bytes)
+            .flatten(),
+        cancellation_latency_authority: ModelComparisonResourceAuthority::Measured,
+        maximum_cancellation_latency_ms: Some(maximum_cancellation_latency_ms),
+        hard_timeout_seconds: Some(sortformer_timeout_seconds),
+        maximum_completed_real_time_factor_millionths,
+        real_time_factor_cap_millionths: rtf_cap_millionths,
+        real_time_factor_within_cap: maximum_completed_real_time_factor_millionths
+            .map(|value| value <= rtf_cap_millionths),
+        peak_rss_cap_bytes: MODEL_COMPARISON_PEAK_RSS_CAP_BYTES,
+        peak_rss_within_cap: maximum_peak_rss_bytes
+            .filter(|_| peak_rss_complete)
+            .map(|value| value <= MODEL_COMPARISON_PEAK_RSS_CAP_BYTES),
+        cancellation_latency_cap_ms: MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS,
+        cancellation_latency_within_cap: Some(
+            maximum_cancellation_latency_ms <= MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS,
+        ),
     }
 }
 
@@ -1953,6 +3274,24 @@ fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis())
         .unwrap_or(u64::MAX)
         .max(1)
+}
+
+fn ratio_millionths_ceil(numerator: u64, denominator: u64, field: &str) -> FwResult<u64> {
+    if denominator == 0 {
+        return Err(model_comparison_error(
+            field,
+            "a resource ratio denominator was zero",
+        ));
+    }
+    let scaled = u128::from(numerator)
+        .checked_mul(1_000_000)
+        .ok_or_else(|| model_comparison_error(field, "a resource ratio overflowed"))?;
+    let rounded = scaled
+        .checked_add(u128::from(denominator) - 1)
+        .ok_or_else(|| model_comparison_error(field, "a resource ratio overflowed"))?
+        / u128::from(denominator);
+    u64::try_from(rounded)
+        .map_err(|_| model_comparison_error(field, "a resource ratio exceeds u64"))
 }
 
 fn deterministic_score_sha256(score: &AuthoritativeDiarizationScore) -> FwResult<String> {
@@ -2045,6 +3384,11 @@ fn lane_outcome_codes_valid(
         ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused => {
             *code == ModelComparisonOutcomeCode::EcapaModelUnavailable
         }
+        ModelComparisonLane::NativeSortformer => matches!(
+            code,
+            ModelComparisonOutcomeCode::NativeSortformerModelUnavailable
+                | ModelComparisonOutcomeCode::SortformerModelCapacityExceeded
+        ),
         ModelComparisonLane::ExternalSortformer => matches!(
             code,
             ModelComparisonOutcomeCode::SortformerModelCapacityExceeded
@@ -2052,36 +3396,53 @@ fn lane_outcome_codes_valid(
                 | ModelComparisonOutcomeCode::SortformerRuntimeIneligible
         ),
     });
-    let failures_valid = outcomes.failed_by_code.keys().all(|code| match lane {
-        ModelComparisonLane::NativeAcoustic => matches!(
+    let failures_valid = outcomes.failed_by_code.keys().all(|code| {
+        if matches!(
             code,
-            ModelComparisonOutcomeCode::NativeExecutionFailed
-                | ModelComparisonOutcomeCode::ScoringFailed
-        ),
-        ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused => matches!(
-            code,
-            ModelComparisonOutcomeCode::EcapaModelInvalid
-                | ModelComparisonOutcomeCode::EcapaInvalidInput
-                | ModelComparisonOutcomeCode::EcapaResourceLimit
-                | ModelComparisonOutcomeCode::EcapaCheckpointFailure
-                | ModelComparisonOutcomeCode::EcapaInternalContractFailure
-                | ModelComparisonOutcomeCode::EcapaNumericalFailure
-                | ModelComparisonOutcomeCode::EcapaPipelineRejected
-                | ModelComparisonOutcomeCode::EcapaContractViolation
-                | ModelComparisonOutcomeCode::EcapaStageTimedOut
-                | ModelComparisonOutcomeCode::EcapaExecutionFailed
-                | ModelComparisonOutcomeCode::ScoringFailed
-        ),
-        ModelComparisonLane::ExternalSortformer => matches!(
-            code,
-            ModelComparisonOutcomeCode::SortformerExecutionFailed
-                | ModelComparisonOutcomeCode::ScoringFailed
-        ),
+            ModelComparisonOutcomeCode::WorkerTimedOut
+                | ModelComparisonOutcomeCode::WorkerExecutionFailed
+                | ModelComparisonOutcomeCode::WorkerMalformedOutput
+                | ModelComparisonOutcomeCode::WorkerResourceProbeFailed
+        ) {
+            return true;
+        }
+        match lane {
+            ModelComparisonLane::NativeAcoustic => matches!(
+                code,
+                ModelComparisonOutcomeCode::NativeExecutionFailed
+                    | ModelComparisonOutcomeCode::ScoringFailed
+            ),
+            ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused => matches!(
+                code,
+                ModelComparisonOutcomeCode::EcapaModelInvalid
+                    | ModelComparisonOutcomeCode::EcapaInvalidInput
+                    | ModelComparisonOutcomeCode::EcapaResourceLimit
+                    | ModelComparisonOutcomeCode::EcapaCheckpointFailure
+                    | ModelComparisonOutcomeCode::EcapaInternalContractFailure
+                    | ModelComparisonOutcomeCode::EcapaNumericalFailure
+                    | ModelComparisonOutcomeCode::EcapaPipelineRejected
+                    | ModelComparisonOutcomeCode::EcapaContractViolation
+                    | ModelComparisonOutcomeCode::EcapaStageTimedOut
+                    | ModelComparisonOutcomeCode::EcapaExecutionFailed
+                    | ModelComparisonOutcomeCode::ScoringFailed
+            ),
+            ModelComparisonLane::NativeSortformer => matches!(
+                code,
+                ModelComparisonOutcomeCode::NativeSortformerModelInvalid
+                    | ModelComparisonOutcomeCode::NativeSortformerExecutionFailed
+                    | ModelComparisonOutcomeCode::ScoringFailed
+            ),
+            ModelComparisonLane::ExternalSortformer => matches!(
+                code,
+                ModelComparisonOutcomeCode::SortformerExecutionFailed
+                    | ModelComparisonOutcomeCode::ScoringFailed
+            ),
+        }
     });
     skips_valid && failures_valid
 }
 
-fn validate_shared_ecapa_outcomes(
+fn validate_matched_ecapa_model_availability(
     ecapa: &ModelComparisonOutcomeCounts,
     ecapa_fused: &ModelComparisonOutcomeCounts,
     observation_count: u64,
@@ -2112,7 +3473,7 @@ fn validate_shared_ecapa_outcomes(
     if !state_valid {
         return Err(model_comparison_error(
             "ecapa_shared_state",
-            "ECAPA and fused ECAPA lanes disagree with the one shared model-load state",
+            "fresh-process ECAPA and fused ECAPA lanes disagree about bound model availability",
         ));
     }
     Ok(())
@@ -2164,6 +3525,7 @@ pub fn verify_public_model_comparison_evidence(
     for value in [
         &evidence.descriptor_sha256,
         &evidence.bundle_sha256,
+        &evidence.comparison_executable_sha256,
         &evidence.observation_set_sha256,
         &evidence.execution_order_sha256,
         &evidence.outcome_sequence_sha256,
@@ -2235,7 +3597,7 @@ pub fn verify_public_model_comparison_evidence(
             })?;
     }
     let minimum_intersection = completed_sum.saturating_sub(
-        evidence.observation_count.checked_mul(3).ok_or_else(|| {
+        evidence.observation_count.checked_mul(4).ok_or_else(|| {
             model_comparison_error(
                 "aggregate_overflow",
                 "observation intersection bound overflows the retained range",
@@ -2245,7 +3607,7 @@ pub fn verify_public_model_comparison_evidence(
     if evidence.common_complete_recording_count < minimum_intersection {
         return Err(model_comparison_error(
             "common_complete",
-            "common-complete count violates the four-set intersection lower bound",
+            "common-complete count violates the five-set intersection lower bound",
         ));
     }
     let common_reference = &evidence.lanes[0].common_complete_case;
@@ -2260,21 +3622,23 @@ pub fn verify_public_model_comparison_evidence(
             "common-complete lanes disagree on reference-side sufficient statistics",
         ));
     }
-    let ecapa_setup = evidence.lanes[1].resources.shared_setup_wall_time_ms;
-    if ecapa_setup.is_none() || ecapa_setup != evidence.lanes[2].resources.shared_setup_wall_time_ms
+    if evidence
+        .lanes
+        .iter()
+        .any(|lane| !lane.resources.wall_time_cross_lane_comparable)
     {
         return Err(model_comparison_error(
             "resource_setup",
-            "ECAPA lanes must share one retained model-load observation",
+            "every lane must retain the frozen fresh-process cross-lane-comparable scope",
         ));
     }
-    validate_shared_ecapa_outcomes(
+    validate_matched_ecapa_model_availability(
         &evidence.lanes[1].outcomes,
         &evidence.lanes[2].outcomes,
         evidence.observation_count,
     )?;
-    let sortformer = &evidence.lanes[3];
-    if sortformer_runtime_identity_required(&sortformer.outcomes)
+    let external_sortformer = &evidence.lanes[4];
+    if sortformer_runtime_identity_required(&external_sortformer.outcomes)
         && evidence.sortformer_runtime_identity.is_none()
     {
         return Err(model_comparison_error(
@@ -2561,8 +3925,11 @@ pub(crate) fn deterministic_accuracy_sha256(
         lane.resources.maximum_cancellation_latency_ms = None;
         lane.resources.attempted_wall_time_ms = 0;
         lane.resources.completed_wall_time_ms = 0;
-        lane.resources.shared_setup_wall_time_ms = None;
         lane.resources.hard_timeout_seconds = None;
+        lane.resources.maximum_completed_real_time_factor_millionths = None;
+        lane.resources.real_time_factor_within_cap = None;
+        lane.resources.peak_rss_within_cap = None;
+        lane.resources.cancellation_latency_within_cap = None;
     }
     super::canonical_sha256(&deterministic)
 }
@@ -2865,50 +4232,60 @@ fn validate_resource_evidence(
     outcomes: &ModelComparisonOutcomeCounts,
     available: &ModelComparisonAggregateMetrics,
 ) -> FwResult<()> {
-    let expected_scope = match lane {
-        ModelComparisonLane::NativeAcoustic => {
-            ModelComparisonWallTimeScope::NativeAcousticPipelineAndScorer
-        }
-        ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused => {
-            ModelComparisonWallTimeScope::NativeEcapaPipelineAndScorerSharedModelLoadExcluded
-        }
-        ModelComparisonLane::ExternalSortformer => {
-            ModelComparisonWallTimeScope::ExternalSortformerAttestationValidationColdOracleAndScorerPerObservation
+    let peak_rss_valid = match resources.peak_rss_authority {
+        ModelComparisonResourceAuthority::Measured => resources
+            .authoritative_peak_rss_bytes
+            .is_some_and(|value| value > 0),
+        ModelComparisonResourceAuthority::UnavailableNoProbe => {
+            resources.authoritative_peak_rss_bytes.is_none()
         }
     };
-    let expected_peak_authority = if lane == ModelComparisonLane::ExternalSortformer {
-        ModelComparisonResourceAuthority::UnavailableChildProcess
+    let expected_rtf_cap = if lane == ModelComparisonLane::ExternalSortformer {
+        MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS
     } else {
-        ModelComparisonResourceAuthority::NotComparableSharedProcess
+        MODEL_COMPARISON_NATIVE_RTF_CAP_MILLIONTHS
     };
-    let setup_valid = if matches!(
-        lane,
-        ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused
-    ) {
-        resources
-            .shared_setup_wall_time_ms
-            .is_some_and(|value| value > 0)
-    } else {
-        resources.shared_setup_wall_time_ms.is_none()
+    let completed_rtf_valid = match resources.maximum_completed_real_time_factor_millionths {
+        Some(value) => {
+            outcomes.completed > 0
+                && resources.real_time_factor_within_cap
+                    == Some(value <= resources.real_time_factor_cap_millionths)
+        }
+        None => outcomes.completed == 0 && resources.real_time_factor_within_cap.is_none(),
     };
+    let peak_cap_valid = resources.peak_rss_within_cap
+        == resources
+            .authoritative_peak_rss_bytes
+            .map(|value| value <= resources.peak_rss_cap_bytes);
+    let cancellation_cap_valid = resources.cancellation_latency_within_cap
+        == resources
+            .maximum_cancellation_latency_ms
+            .map(|value| value <= resources.cancellation_latency_cap_ms);
     if resources.wall_time_authority != ModelComparisonResourceAuthority::Measured
-        || resources.wall_time_scope != expected_scope
-        || resources.wall_time_cross_lane_comparable
+        || resources.wall_time_scope
+            != ModelComparisonWallTimeScope::FreshProcessIdentityValidationModelLoadInferenceAndScorer
+        || !resources.wall_time_cross_lane_comparable
         || resources.timed_attempt_count != outcomes.declared
         || resources.attempted_wall_time_ms < resources.completed_wall_time_ms
         || resources.attempted_wall_time_ms < outcomes.declared
         || (outcomes.completed == 0 && resources.completed_wall_time_ms != 0)
         || resources.completed_wall_time_ms < outcomes.completed
         || canonical(resources.completed_wall_time_ms as f64 / 1_000.0) != available.wall_time_sec
-        || !setup_valid
-        || resources.peak_rss_authority != expected_peak_authority
-        || resources.authoritative_peak_rss_bytes.is_some()
-        || resources.cancellation_latency_authority
-            != ModelComparisonResourceAuthority::UnavailableNoProbe
-        || resources.maximum_cancellation_latency_ms.is_some()
+        || !peak_rss_valid
+        || resources.peak_rss_scope != ModelComparisonPeakRssScope::DirectWorkerProcess
+        || resources.cancellation_latency_authority != ModelComparisonResourceAuthority::Measured
+        || !resources
+            .maximum_cancellation_latency_ms
+            .is_some_and(|value| value > 0)
         || resources.hard_timeout_seconds
-            != (lane == ModelComparisonLane::ExternalSortformer)
-                .then_some(PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS)
+            != Some(PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS)
+        || resources.real_time_factor_cap_millionths != expected_rtf_cap
+        || !completed_rtf_valid
+        || resources.peak_rss_cap_bytes != MODEL_COMPARISON_PEAK_RSS_CAP_BYTES
+        || !peak_cap_valid
+        || resources.cancellation_latency_cap_ms
+            != MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS
+        || !cancellation_cap_valid
     {
         return Err(model_comparison_error(
             "resource_authority",
@@ -3051,17 +4428,17 @@ mod tests {
     #[test]
     fn williams_schedule_balances_every_lane_and_position() {
         for lane in ModelComparisonLane::ALL {
-            let mut positions = [0u32; 4];
+            let mut positions = [0u32; 5];
             for row in MODEL_COMPARISON_WILLIAMS_SCHEDULE {
                 positions[row
                     .iter()
                     .position(|candidate| *candidate == lane)
                     .expect("lane")] += 1;
             }
-            assert_eq!(positions, [1, 1, 1, 1]);
+            assert_eq!(positions, [2, 2, 2, 2, 2]);
         }
         assert_eq!(
-            model_comparison_schedule_row(4),
+            model_comparison_schedule_row(10),
             MODEL_COMPARISON_WILLIAMS_SCHEDULE[0]
         );
         let mut directed_adjacencies = BTreeMap::new();
@@ -3070,8 +4447,8 @@ mod tests {
                 *directed_adjacencies.entry((pair[0], pair[1])).or_insert(0) += 1;
             }
         }
-        assert_eq!(directed_adjacencies.len(), 12);
-        assert!(directed_adjacencies.values().all(|count| *count == 1));
+        assert_eq!(directed_adjacencies.len(), 20);
+        assert!(directed_adjacencies.values().all(|count| *count == 2));
     }
 
     #[test]
@@ -3090,6 +4467,122 @@ mod tests {
             super::super::canonical_sha256(&protocol).expect("canonical protocol digest"),
             PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256
         );
+    }
+
+    #[test]
+    fn native_sortformer_timestamps_fail_closed_before_clamping() {
+        assert_eq!(checked_sortformer_timestamp_ms(0.000_5, 10).unwrap(), 1);
+        assert_eq!(checked_sortformer_timestamp_ms(2.0, 10).unwrap(), 10);
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.001] {
+            let error = checked_sortformer_timestamp_ms(invalid, 10)
+                .expect_err("invalid model timestamps must fail closed");
+            assert!(error.to_string().contains("native_sortformer_timestamp"));
+        }
+    }
+
+    #[test]
+    fn native_sortformer_count_excludes_turns_removed_by_duration_clamping() {
+        let source = vec![
+            SortformerSpeakerTurn {
+                start_seconds: 0.001,
+                end_seconds: 0.001,
+                speaker: 0,
+            },
+            SortformerSpeakerTurn {
+                start_seconds: 0.002,
+                end_seconds: 0.008,
+                speaker: 1,
+            },
+            SortformerSpeakerTurn {
+                start_seconds: 0.020,
+                end_seconds: 0.030,
+                speaker: 2,
+            },
+        ];
+        let (turns, selected_count) =
+            sortformer_evaluation_turns(source, 10).expect("valid Sortformer turns");
+        assert_eq!(selected_count, 1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].speaker.as_deref(), Some("speaker_01"));
+        let error = sortformer_evaluation_turns(
+            vec![SortformerSpeakerTurn {
+                start_seconds: 0.0,
+                end_seconds: 0.005,
+                speaker: SORTFORMER_SPEAKER_LANES,
+            }],
+            10,
+        )
+        .expect_err("out-of-range speaker lanes must fail closed");
+        assert!(error.to_string().contains("native_sortformer_speaker_lane"));
+    }
+
+    #[test]
+    fn platform_peak_rss_parsers_require_one_positive_authoritative_value() {
+        assert_eq!(
+            parse_macos_peak_rss(b"  123456  maximum resident set size\n").unwrap(),
+            123_456
+        );
+        assert!(parse_macos_peak_rss(b"0  maximum resident set size\n").is_err());
+        assert!(
+            parse_macos_peak_rss(b"1  maximum resident set size\n2  maximum resident set size\n")
+                .is_err()
+        );
+        assert_eq!(
+            parse_gnu_peak_rss(b"fw_peak_rss_kib=1024\n").unwrap(),
+            1_048_576
+        );
+        assert!(parse_gnu_peak_rss(b"Maximum resident set size: absent\n").is_err());
+    }
+
+    #[test]
+    fn attempt_budget_covers_parent_work_before_and_after_the_worker() {
+        assert_eq!(
+            remaining_attempt_budget(Duration::from_secs(10), Duration::from_secs(3)),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            remaining_attempt_budget(Duration::from_secs(10), Duration::from_secs(10)),
+            None
+        );
+        assert_eq!(
+            remaining_attempt_budget(Duration::from_secs(10), Duration::from_secs(11)),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_identity_hash_rejects_a_symlink_even_when_bytes_match() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary identity directory");
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        std::fs::write(&target, b"identity-bound bytes").expect("identity target");
+        symlink(&target, &link).expect("identity symlink");
+        let error = hash_bounded_file_with_cancel(&link, 1024, &|| false, "fixture")
+            .expect_err("worker identity hashes must not follow symlinks");
+        assert!(error.to_string().contains("non-symlink"));
+    }
+
+    #[test]
+    fn worker_outcome_serialization_removes_recording_and_speaker_identifiers() {
+        let count = ModelComparisonCountObservation {
+            reference_full_timeline: 1,
+            hypothesis_full_timeline: 1,
+            selected_count: Some(1),
+        };
+        let mut outcome = InternalLaneOutcome::completed(
+            ModelComparisonLane::NativeAcoustic,
+            score("reference-private-label", "hypothesis-private-label"),
+            None,
+            count,
+        );
+        sanitize_worker_outcome(&mut outcome);
+        let json = serde_json::to_string(&outcome).expect("sanitized worker outcome");
+        assert!(!json.contains("public-model-comparison-fixture"));
+        assert!(!json.contains("reference-private-label"));
+        assert!(!json.contains("hypothesis-private-label"));
     }
 
     #[test]
@@ -3741,17 +5234,25 @@ mod tests {
     fn resource_authority_never_uses_zero_as_unavailable() {
         let mut resources = ModelComparisonResourceEvidence {
             wall_time_authority: ModelComparisonResourceAuthority::Measured,
-            wall_time_scope: ModelComparisonWallTimeScope::NativeAcousticPipelineAndScorer,
-            wall_time_cross_lane_comparable: false,
+            wall_time_scope:
+                ModelComparisonWallTimeScope::FreshProcessIdentityValidationModelLoadInferenceAndScorer,
+            wall_time_cross_lane_comparable: true,
             timed_attempt_count: 1,
             attempted_wall_time_ms: 250,
             completed_wall_time_ms: 250,
-            shared_setup_wall_time_ms: None,
-            peak_rss_authority: ModelComparisonResourceAuthority::NotComparableSharedProcess,
-            authoritative_peak_rss_bytes: None,
-            cancellation_latency_authority: ModelComparisonResourceAuthority::UnavailableNoProbe,
-            maximum_cancellation_latency_ms: None,
-            hard_timeout_seconds: None,
+            peak_rss_authority: ModelComparisonResourceAuthority::Measured,
+            peak_rss_scope: ModelComparisonPeakRssScope::DirectWorkerProcess,
+            authoritative_peak_rss_bytes: Some(1024),
+            cancellation_latency_authority: ModelComparisonResourceAuthority::Measured,
+            maximum_cancellation_latency_ms: Some(50),
+            hard_timeout_seconds: Some(PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS),
+            maximum_completed_real_time_factor_millionths: Some(250_000),
+            real_time_factor_cap_millionths: MODEL_COMPARISON_NATIVE_RTF_CAP_MILLIONTHS,
+            real_time_factor_within_cap: Some(true),
+            peak_rss_cap_bytes: MODEL_COMPARISON_PEAK_RSS_CAP_BYTES,
+            peak_rss_within_cap: Some(true),
+            cancellation_latency_cap_ms: MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS,
+            cancellation_latency_within_cap: Some(true),
         };
         let outcomes = ModelComparisonOutcomeCounts {
             declared: 1,
@@ -3807,7 +5308,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_ecapa_load_state_must_cover_both_lanes() {
+    fn matched_ecapa_availability_must_cover_both_fresh_process_lanes() {
         let unavailable = ModelComparisonOutcomeCounts {
             declared: 2,
             skipped: 2,
@@ -3817,13 +5318,13 @@ mod tests {
             )]),
             ..ModelComparisonOutcomeCounts::default()
         };
-        assert!(validate_shared_ecapa_outcomes(&unavailable, &unavailable, 2).is_ok());
+        assert!(validate_matched_ecapa_model_availability(&unavailable, &unavailable, 2).is_ok());
         let ready = ModelComparisonOutcomeCounts {
             declared: 2,
             completed: 2,
             ..ModelComparisonOutcomeCounts::default()
         };
-        assert!(validate_shared_ecapa_outcomes(&unavailable, &ready, 2).is_err());
+        assert!(validate_matched_ecapa_model_availability(&unavailable, &ready, 2).is_err());
     }
 
     fn pcm16_wave_bytes(sample_count: usize) -> Vec<u8> {

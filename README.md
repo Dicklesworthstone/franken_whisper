@@ -989,13 +989,24 @@ operator-licensed diarization corpora. The registry does not download data or
 accept a license on the operator's behalf.
 
 `registry` is available on every supported CLI target. The artifact-writing
-`build`, `ablate`, `sidecar-study`, and `compare-models` commands require Linux,
-Android, or an Apple platform; Windows and other targets return
+`prepare-voxconverse`, `build`, `ablate`, `sidecar-study`, and `compare-models`
+commands require Linux, Android, or an Apple platform; Windows and other targets return
 `public_corpus.output_platform` before reading corpus media or annotations.
 
 ```bash
 # inspect frozen source, license, conversion, and acknowledgement contracts
 franken_whisper diarization-corpus registry
+
+# hash the official extracted VoxConverse WAV/RTTM files in place and write a
+# deterministic descriptor beneath the external input root; no media is copied
+franken_whisper diarization-corpus prepare-voxconverse \
+  --input-root /absolute/external/voxconverse \
+  --development-audio-root /absolute/external/voxconverse/dev-wav/audio \
+  --test-audio-root /absolute/external/voxconverse/test-wav/voxconverse_test_wav \
+  --annotation-root /absolute/external/voxconverse/labels \
+  --output /absolute/external/voxconverse/descriptor.json \
+  --source-version <IMMUTABLE_UPSTREAM_ARCHIVE_AND_LABEL_ID> \
+  --license-ack accept-voxconverse-cc-by-4.0-and-original-copyright
 
 # validate external WAV/RTTM inputs and create one path-free bundle
 franken_whisper diarization-corpus build \
@@ -1031,24 +1042,37 @@ RAYON_NUM_THREADS=8 franken_whisper diarization-corpus compare-models \
   --license-ack <REGISTRY_ACKNOWLEDGEMENT_ID>
 ```
 
+The VoxConverse adapter preserves original file hashes and applies one narrow,
+evidenced geometry normalization in memory: an official turn that starts before
+WAV EOF may be clipped when it overruns EOF by at most 100 ms. The preparation
+receipt and bundle retain clipped-turn and clipped-millisecond counts; larger
+overruns and turns beginning at EOF fail closed.
+
 `compare-models` is a development-only, diagnostic comparison of
-`native_acoustic`, `native_ecapa`, `native_ecapa_fused`, and
-`external_sortformer`. It infers speaker count, fixes native and Sortformer CPU
-worker counts at eight, and applies a frozen 1800-second timeout to each
-Sortformer oracle-run subprocess. The application downloads neither the ECAPA
-package nor the Sortformer adapter/model; absent operator-installed components
-become typed lane skips. Protocol v2 pins the complete effective native request
+`native_acoustic`, `native_ecapa`, `native_ecapa_fused`, `native_sortformer`,
+and `external_sortformer`. It infers speaker count, fixes native and Sortformer CPU
+worker counts at eight, and applies the same frozen 1800-second attempt timeout
+to every lane. The application downloads neither the ECAPA
+package nor the external Sortformer adapter/model; the native Sortformer lane
+uses the release-bound cache installed only by `fw pull sortformer`. Absent
+components become typed lane skips. Protocol v3 pins the complete effective native request
 for each lane, its ordered payload-free outcome taxonomy, and its own canonical
 digest. Any change to those bindings requires a new version-and-digest pair.
 
 The comparison evidence is aggregate-only and cannot authorize a superiority
-or production-routing claim. Its wall-time scopes are intentionally unlike and
-not cross-lane comparable: ECAPA model loading is shared and reported
-separately, while each Sortformer observation includes executable and input
-attestation, a version-probe subprocess, a cold oracle subprocess, output
-validation, and scoring.
-Authoritative isolated peak RSS and cancellation-latency measurements are not
-yet available. The companion path-free public bundle is record-level scorer
+or production-routing claim. Every lane/observation runs in a fresh process
+under the balanced Williams order. The worker rechecks the executable, audio,
+normalized PCM, reference, scorer, protocol, and applicable model artifact
+identities. Parent-observed wall time includes process launch, bounded IPC,
+worker identity validation, audio decode, model load, inference, output
+validation, scoring, parent-side post-run identity validation, and the native
+platform resource probe. The parent kills the complete descendant process
+group on cancellation or timeout, records a live recursive-descendant
+cancellation probe, and retains direct-worker peak RSS from that resource probe.
+That peak-RSS value does not aggregate a subprocess adapter's memory, so it
+cannot by itself pass a whole-process-tree memory gate. Wall time, RTF, peak RSS,
+and cancellation latency carry explicit scope, authority, and cap dispositions
+rather than zero or shared-process estimates. The companion path-free public bundle is record-level scorer
 input and therefore retains opaque public recording/speaker IDs and reference
 timestamps, but no source path, filename, audio, or transcript.
 

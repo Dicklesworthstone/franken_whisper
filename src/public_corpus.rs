@@ -61,22 +61,26 @@ pub use model_comparison::{
     MODEL_COMPARISON_WILLIAMS_SCHEDULE, ModelComparisonAggregateMetrics,
     ModelComparisonExternalRuntimeIdentity, ModelComparisonLane, ModelComparisonLaneAggregate,
     ModelComparisonOutcomeCode, ModelComparisonOutcomeCounts, ModelComparisonOutcomeStatus,
-    ModelComparisonResourceAuthority, ModelComparisonResourceEvidence,
-    ModelComparisonWallTimeScope, PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION,
-    PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256, PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION,
-    PUBLIC_MODEL_COMPARISON_RUNNER_VERSION, PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION,
-    PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION, PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS,
+    ModelComparisonPeakRssScope, ModelComparisonResourceAuthority, ModelComparisonResourceEvidence,
+    ModelComparisonWallTimeScope, PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS,
+    PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION, PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256,
+    PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION, PUBLIC_MODEL_COMPARISON_RUNNER_VERSION,
+    PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION, PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION,
     PublicModelComparisonEvidence, PublicModelComparisonProtocol, PublicModelComparisonRequest,
-    model_comparison_schedule_row, run_public_model_comparison_with_cancel,
+    model_comparison_schedule_row, run_model_comparison_cancel_probe,
+    run_model_comparison_worker_from_stdio, run_public_model_comparison_with_cancel,
     verify_public_model_comparison_evidence,
 };
 
 /// Schema identity for the path-bearing, external-only adapter input.
 pub const PUBLIC_CORPUS_INPUT_SCHEMA_VERSION: &str = "public-diarization-corpus-input-v2";
+/// Schema identity for a path-free native descriptor-preparation receipt.
+pub const VOXCONVERSE_DESCRIPTOR_PREPARATION_SCHEMA_VERSION: &str =
+    "voxconverse-descriptor-preparation-v2";
 /// Schema identity for the path-free generated bundle.
-pub const PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION: &str = "public-diarization-corpus-bundle-v2";
+pub const PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION: &str = "public-diarization-corpus-bundle-v3";
 /// Frozen implementation identity for this adapter.
-pub const PUBLIC_CORPUS_ADAPTER_VERSION: &str = "public-diarization-corpus-adapter-v2";
+pub const PUBLIC_CORPUS_ADAPTER_VERSION: &str = "public-diarization-corpus-adapter-v3";
 /// Schema identity for the built-in public-corpus registry.
 pub const PUBLIC_CORPUS_REGISTRY_SCHEMA_VERSION: &str = "public-diarization-corpus-registry-v1";
 /// Schema for optional transcript-free aligned-word annotation documents.
@@ -226,6 +230,10 @@ const HASH_HEX_LEN: usize = 64;
 // Keep the fail-closed cap well below multi-gigabyte allocations; longer
 // corpora must be partitioned into independently checksummed recordings.
 const MAX_EVALUATION_AUDIO_BYTES: u64 = 256 * 1024 * 1024;
+/// Frozen VoxConverse-only allowance for official RTTM turns that end a few
+/// frames beyond a truncated clip. Larger overruns and turns beginning at or
+/// after EOF remain invalid.
+const VOXCONVERSE_MAX_RTTM_TAIL_OVERRUN_MS: u64 = 100;
 
 /// How a registry entry freezes its train/development/test assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +290,38 @@ pub struct PublicCorpusRegistry {
     pub entries: Vec<PublicCorpusRegistryEntry>,
 }
 
+/// Inputs for deterministic native preparation of the official VoxConverse descriptor.
+///
+/// This request deliberately has no `Debug` or serialization implementation:
+/// local paths cannot enter diagnostics or retained evidence.
+pub struct VoxconverseDescriptorPreparationRequest<'a> {
+    pub project_root: &'a Path,
+    pub input_root: &'a Path,
+    pub development_audio_root: &'a Path,
+    pub test_audio_root: &'a Path,
+    pub annotation_root: &'a Path,
+    pub output_path: &'a Path,
+    pub source_version: &'a str,
+    pub license_acknowledgement_id: &'a str,
+}
+
+/// Path-free receipt emitted after a VoxConverse descriptor is durably published.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoxconverseDescriptorPreparationSummary {
+    pub schema_version: String,
+    pub corpus_key: String,
+    pub source_version: String,
+    pub development_recording_count: usize,
+    pub test_recording_count: usize,
+    pub total_recording_count: usize,
+    pub tail_clipped_turn_count: usize,
+    pub tail_clipped_duration_ms: u64,
+    pub maximum_tail_overrun_ms: u64,
+    /// SHA-256 of the exact pretty-printed descriptor bytes, including its final newline.
+    pub descriptor_file_sha256: String,
+}
+
 /// Path-free integrity and media-layout evidence for one recording.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,6 +339,9 @@ pub struct PublicCorpusRecordingEvidence {
     pub word_count: usize,
     pub overlap_turn_count: usize,
     pub ignored_region_count: usize,
+    pub annotation_tail_clipped_turn_count: usize,
+    pub annotation_tail_clipped_duration_ms: u64,
+    pub annotation_maximum_tail_overrun_ms: u64,
 }
 
 /// Generated public-corpus evidence. This contains no paths, URIs, or text.
@@ -1557,9 +1600,9 @@ struct PublicChangeSelectionPolicyFingerprint {
     fail_closed_default: AcousticChangeDetectorMode,
 }
 
-/// External-only local descriptor. It intentionally has neither `Debug` nor
-/// `Serialize`, preventing accidental logging or retention of source paths.
-#[derive(Deserialize)]
+/// External-only local descriptor. It intentionally has no `Debug`; the sole
+/// serialization path is the explicit external descriptor-preparation command.
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublicCorpusInput {
     schema_version: String,
@@ -1569,7 +1612,7 @@ struct PublicCorpusInput {
 }
 
 /// One path-bearing external source row.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublicCorpusInputRecording {
     recording_id: String,
@@ -1712,7 +1755,7 @@ pub fn public_corpus_registry() -> PublicCorpusRegistry {
                 "<external-root>/audio/{dev,test}/*.wav and <external-root>/annotations/{dev,test}/*.rttm"
                     .to_owned(),
             conversion_contract:
-                "Use the upstream WAV and RTTM pairing without transcript material; keep development and test identities disjoint and freeze every selected file by SHA-256"
+                "Use the upstream WAV and RTTM pairing without transcript material; keep development and test identities disjoint; freeze every selected file by SHA-256; clip only an official RTTM tail that starts before WAV EOF and overruns it by at most 100 ms, retaining clipped-turn and clipped-duration evidence"
                     .to_owned(),
             upstream_integrity_note:
                 "The corpus page publishes archive MD5 values; this adapter additionally requires SHA-256 for every selected extracted WAV and RTTM"
@@ -1735,6 +1778,389 @@ pub fn public_corpus_registry() -> PublicCorpusRegistry {
         adapter_version: PUBLIC_CORPUS_ADAPTER_VERSION.to_owned(),
         entries,
     }
+}
+
+/// Prepare a complete path-bearing VoxConverse descriptor beneath an external
+/// input root. The command hashes source files in place and never copies audio,
+/// annotations, or transcript material.
+pub fn prepare_voxconverse_descriptor_with_cancel(
+    request: VoxconverseDescriptorPreparationRequest<'_>,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> FwResult<VoxconverseDescriptorPreparationSummary> {
+    checkpoint_cancelled(&mut is_cancelled)?;
+    let canonical_project = canonical_directory(request.project_root, "project_root")?;
+    let canonical_input = canonical_directory(request.input_root, "input_root")?;
+    if paths_overlap(&canonical_project, &canonical_input) {
+        return Err(public_corpus_error(
+            "input_root_overlap",
+            "input root must be disjoint from the project checkout",
+        ));
+    }
+    validate_public_id(request.source_version, "source_version")?;
+    let registry = public_corpus_registry();
+    let registry_entry = registry
+        .entries
+        .iter()
+        .find(|entry| entry.corpus_key == "voxconverse-v1")
+        .ok_or_else(|| public_corpus_error("registry", "VoxConverse registry entry is absent"))?;
+    if request.license_acknowledgement_id != registry_entry.license_acknowledgement_id {
+        return Err(public_corpus_error(
+            "license_acknowledgement",
+            "license acknowledgement does not match the VoxConverse registry contract",
+        ));
+    }
+
+    let output_parent = validate_new_output_with_policy(
+        &canonical_project,
+        &canonical_input,
+        request.output_path,
+        OutputLocationPolicy::BeneathInput,
+    )?;
+    let development_audio_root = canonical_subdirectory(
+        &canonical_input,
+        request.development_audio_root,
+        "development_audio_root",
+    )?;
+    let test_audio_root =
+        canonical_subdirectory(&canonical_input, request.test_audio_root, "test_audio_root")?;
+    let annotation_root =
+        canonical_subdirectory(&canonical_input, request.annotation_root, "annotation_root")?;
+    let development_annotation_root = canonical_subdirectory(
+        &canonical_input,
+        &annotation_root.join("dev"),
+        "development_annotation_root",
+    )?;
+    let test_annotation_root = canonical_subdirectory(
+        &canonical_input,
+        &annotation_root.join("test"),
+        "test_annotation_root",
+    )?;
+
+    let (
+        mut recordings,
+        development_clipped_turns,
+        development_clipped_ms,
+        development_max_overrun,
+    ) = prepare_voxconverse_split(
+        &canonical_input,
+        &development_audio_root,
+        &development_annotation_root,
+        EvaluationSplit::Development,
+        &mut is_cancelled,
+    )?;
+    let development_recording_count = recordings.len();
+    let (mut test_recordings, test_clipped_turns, test_clipped_ms, test_max_overrun) =
+        prepare_voxconverse_split(
+            &canonical_input,
+            &test_audio_root,
+            &test_annotation_root,
+            EvaluationSplit::Test,
+            &mut is_cancelled,
+        )?;
+    let test_recording_count = test_recordings.len();
+    recordings.append(&mut test_recordings);
+    if recordings.is_empty() || recordings.len() > MAX_RECORDINGS {
+        return Err(public_corpus_error(
+            "recording_count",
+            "prepared recording count is outside the supported range",
+        ));
+    }
+    // The scorer manifest contract is globally ordered by recording identity,
+    // with the split used only as a deterministic tie-breaker.  Sorting by
+    // split first happens to work for small fixtures whose development IDs
+    // precede their test IDs, but fails on the real VoxConverse corpus where
+    // the two upstream ID sets interleave.
+    recordings.sort_by(|left, right| {
+        (left.recording_id.as_str(), left.split).cmp(&(right.recording_id.as_str(), right.split))
+    });
+    let descriptor = PublicCorpusInput {
+        schema_version: PUBLIC_CORPUS_INPUT_SCHEMA_VERSION.to_owned(),
+        corpus_key: "voxconverse-v1".to_owned(),
+        source_version: request.source_version.to_owned(),
+        recordings,
+    };
+    validate_public_corpus_descriptor_metadata(&descriptor, registry_entry)?;
+
+    let mut descriptor_bytes = serde_json::to_vec_pretty(&descriptor).map_err(|_| {
+        public_corpus_error(
+            "descriptor_serialize",
+            "prepared descriptor could not be serialized",
+        )
+    })?;
+    descriptor_bytes.push(b'\n');
+    if descriptor_bytes.len() as u64 > MAX_DESCRIPTOR_BYTES {
+        return Err(public_corpus_error(
+            "descriptor_size",
+            "prepared descriptor exceeds the supported size limit",
+        ));
+    }
+    let descriptor_file_sha256 = format!("{:x}", Sha256::digest(&descriptor_bytes));
+    write_new_json(
+        request.output_path,
+        &output_parent,
+        &descriptor,
+        "VoxConverse descriptor",
+        &mut is_cancelled,
+    )?;
+
+    Ok(VoxconverseDescriptorPreparationSummary {
+        schema_version: VOXCONVERSE_DESCRIPTOR_PREPARATION_SCHEMA_VERSION.to_owned(),
+        corpus_key: "voxconverse-v1".to_owned(),
+        source_version: request.source_version.to_owned(),
+        development_recording_count,
+        test_recording_count,
+        total_recording_count: development_recording_count + test_recording_count,
+        tail_clipped_turn_count: development_clipped_turns.saturating_add(test_clipped_turns),
+        tail_clipped_duration_ms: development_clipped_ms.saturating_add(test_clipped_ms),
+        maximum_tail_overrun_ms: development_max_overrun.max(test_max_overrun),
+        descriptor_file_sha256,
+    })
+}
+
+fn canonical_subdirectory(root: &Path, path: &Path, field: &str) -> FwResult<PathBuf> {
+    let canonical = canonical_directory(path, field)?;
+    if !canonical.starts_with(root) {
+        return Err(public_corpus_error(
+            "input_escape",
+            &format!("{field} must resolve beneath input_root"),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn prepare_voxconverse_split(
+    input_root: &Path,
+    audio_root: &Path,
+    annotation_root: &Path,
+    split: EvaluationSplit,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> FwResult<(Vec<PublicCorpusInputRecording>, usize, u64, u64)> {
+    let audio_files = collect_voxconverse_files(input_root, audio_root, "wav", "audio")?;
+    let annotation_files =
+        collect_voxconverse_files(input_root, annotation_root, "rttm", "annotation")?;
+    if audio_files.is_empty() {
+        return Err(public_corpus_error(
+            "voxconverse_empty_split",
+            "VoxConverse split contains no WAV files",
+        ));
+    }
+    if audio_files.keys().ne(annotation_files.keys()) {
+        return Err(public_corpus_error(
+            "voxconverse_pairing",
+            "VoxConverse WAV and RTTM basenames must match exactly within each split",
+        ));
+    }
+
+    let mut recordings = Vec::with_capacity(audio_files.len());
+    let mut tail_clipped_turn_count = 0usize;
+    let mut tail_clipped_duration_ms = 0u64;
+    let mut maximum_tail_overrun_ms = 0u64;
+    for (recording_id, audio_path) in audio_files {
+        checkpoint_cancelled(is_cancelled)?;
+        let annotation_path = annotation_files.get(&recording_id).ok_or_else(|| {
+            public_corpus_error(
+                "voxconverse_pairing",
+                "VoxConverse WAV has no matching RTTM annotation",
+            )
+        })?;
+        let (audio_sha256, wave) =
+            hash_and_inspect_wave(&audio_path, is_cancelled).map_err(|error| {
+                public_corpus_error(
+                    "voxconverse_audio",
+                    &format!("recording {recording_id} failed WAV validation: {error}"),
+                )
+            })?;
+        let annotation_bytes = read_bounded(annotation_path, MAX_ANNOTATION_BYTES, "annotation")?;
+        let annotation_sha256 = format!("{:x}", Sha256::digest(&annotation_bytes));
+        let (annotation_channel, speaker_map, tail_clipped_turns, tail_clipped_ms, max_overrun_ms) =
+            inspect_voxconverse_rttm(&annotation_bytes, &recording_id, wave.duration_ms).map_err(
+                |error| {
+                    public_corpus_error(
+                        "voxconverse_annotation",
+                        &format!("recording {recording_id} failed RTTM validation: {error}"),
+                    )
+                },
+            )?;
+        tail_clipped_turn_count = tail_clipped_turn_count.saturating_add(tail_clipped_turns);
+        tail_clipped_duration_ms = tail_clipped_duration_ms.saturating_add(tail_clipped_ms);
+        maximum_tail_overrun_ms = maximum_tail_overrun_ms.max(max_overrun_ms);
+        let audio_path = audio_path
+            .strip_prefix(input_root)
+            .map_err(|_| public_corpus_error("input_escape", "audio escaped input_root"))?
+            .to_owned();
+        let annotation_path = annotation_path
+            .strip_prefix(input_root)
+            .map_err(|_| public_corpus_error("input_escape", "annotation escaped input_root"))?
+            .to_owned();
+        recordings.push(PublicCorpusInputRecording {
+            recording_id: recording_id.clone(),
+            split,
+            origin_recording_id: recording_id.clone(),
+            audio_path,
+            audio_sha256,
+            expected_sample_rate_hz: wave.sample_rate_hz,
+            expected_channel_count: wave.channel_count,
+            selected_channel: 1,
+            annotation_path,
+            annotation_sha256,
+            annotation_recording_id: recording_id,
+            annotation_channel,
+            speaker_map,
+            word_annotation_path: None,
+            word_annotation_sha256: None,
+            ignored_regions: Vec::new(),
+            derived_from_recording_ids: Vec::new(),
+            augmentation_group_id: None,
+            enrollment_recording_ids: Vec::new(),
+        });
+    }
+    Ok((
+        recordings,
+        tail_clipped_turn_count,
+        tail_clipped_duration_ms,
+        maximum_tail_overrun_ms,
+    ))
+}
+
+fn collect_voxconverse_files(
+    input_root: &Path,
+    directory: &Path,
+    extension: &str,
+    field: &str,
+) -> FwResult<BTreeMap<String, PathBuf>> {
+    let mut files = BTreeMap::new();
+    let entries = std::fs::read_dir(directory).map_err(|_| {
+        public_corpus_error(
+            "directory_read",
+            &format!("{field} directory could not be enumerated"),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            public_corpus_error(
+                "directory_read",
+                &format!("{field} directory entry could not be read"),
+            )
+        })?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            return Err(public_corpus_error(
+                "voxconverse_filename",
+                "VoxConverse file names must be UTF-8",
+            ));
+        };
+        if file_name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some(extension) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+            public_corpus_error(
+                "input_file",
+                &format!("{field} input metadata could not be read"),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(public_corpus_error(
+                "input_file",
+                &format!("{field} input must be a regular file, not an indirection"),
+            ));
+        }
+        let recording_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "voxconverse_filename",
+                    "VoxConverse file stem must be UTF-8",
+                )
+            })?;
+        if recording_id.len() != 5 || !recording_id.bytes().all(|byte| byte.is_ascii_lowercase()) {
+            return Err(public_corpus_error(
+                "voxconverse_recording_id",
+                "VoxConverse recording IDs must contain exactly five lowercase ASCII letters",
+            ));
+        }
+        let canonical = canonical_input_file(input_root, &path, field)?;
+        if files.insert(recording_id.to_owned(), canonical).is_some() {
+            return Err(public_corpus_error(
+                "duplicate_recording",
+                "VoxConverse split contains a duplicate recording ID",
+            ));
+        }
+    }
+    Ok(files)
+}
+
+fn inspect_voxconverse_rttm(
+    bytes: &[u8],
+    recording_id: &str,
+    duration_ms: u64,
+) -> FwResult<(String, BTreeMap<String, String>, usize, u64, u64)> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| public_corpus_error("rttm_utf8", "RTTM annotation must be valid UTF-8"))?;
+    let mut channels = BTreeSet::new();
+    let mut speakers = BTreeSet::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let fields = trimmed.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 10 || fields[0] != "SPEAKER" {
+            return Err(public_corpus_error(
+                "rttm_shape",
+                &format!(
+                    "RTTM line {} must contain exactly ten SPEAKER fields",
+                    line_index + 1
+                ),
+            ));
+        }
+        if fields[1] != recording_id {
+            return Err(public_corpus_error(
+                "voxconverse_annotation_id",
+                "RTTM recording identity must match its file name",
+            ));
+        }
+        channels.insert(fields[2].to_owned());
+        speakers.insert(fields[7].to_owned());
+    }
+    if channels.len() != 1 || speakers.is_empty() {
+        return Err(public_corpus_error(
+            "voxconverse_annotation_shape",
+            "each VoxConverse RTTM must contain one channel and at least one speaker",
+        ));
+    }
+    let annotation_channel = channels.into_iter().next().ok_or_else(|| {
+        public_corpus_error(
+            "voxconverse_annotation_shape",
+            "VoxConverse RTTM channel is absent",
+        )
+    })?;
+    validate_rttm_channel(&annotation_channel)?;
+    let speaker_map = speakers
+        .into_iter()
+        .enumerate()
+        .map(|(index, speaker)| (speaker, format!("{recording_id}-speaker-{index:03}")))
+        .collect::<BTreeMap<_, _>>();
+    validate_speaker_map(&speaker_map)?;
+    let parsed = parse_rttm(
+        bytes,
+        recording_id,
+        &annotation_channel,
+        &speaker_map,
+        duration_ms,
+        VOXCONVERSE_MAX_RTTM_TAIL_OVERRUN_MS,
+    )?;
+    Ok((
+        annotation_channel,
+        speaker_map,
+        parsed.tail_clipped_turn_count,
+        parsed.tail_clipped_duration_ms,
+        parsed.maximum_tail_overrun_ms,
+    ))
 }
 
 /// Parse and fully validate one generated bundle.
@@ -1923,6 +2349,33 @@ pub fn verify_public_corpus_bundle(bundle: &PublicCorpusBundle) -> FwResult<()> 
             return Err(public_corpus_error(
                 "recording_audio_contract",
                 "recording evidence has invalid sample-rate or channel geometry",
+            ));
+        }
+        let clipped_turn_count =
+            u64::try_from(evidence.annotation_tail_clipped_turn_count).unwrap_or(u64::MAX);
+        let tail_clip_evidence_valid = if bundle.corpus_key == "voxconverse-v1" {
+            evidence.annotation_tail_clipped_turn_count <= evidence.turn_count
+                && (evidence.annotation_tail_clipped_turn_count == 0)
+                    == (evidence.annotation_tail_clipped_duration_ms == 0)
+                && (evidence.annotation_tail_clipped_turn_count == 0)
+                    == (evidence.annotation_maximum_tail_overrun_ms == 0)
+                && evidence.annotation_tail_clipped_duration_ms >= clipped_turn_count
+                && evidence.annotation_tail_clipped_duration_ms
+                    >= evidence.annotation_maximum_tail_overrun_ms
+                && evidence.annotation_maximum_tail_overrun_ms
+                    <= VOXCONVERSE_MAX_RTTM_TAIL_OVERRUN_MS
+                && evidence.annotation_tail_clipped_duration_ms
+                    <= clipped_turn_count
+                        .saturating_mul(evidence.annotation_maximum_tail_overrun_ms)
+        } else {
+            evidence.annotation_tail_clipped_turn_count == 0
+                && evidence.annotation_tail_clipped_duration_ms == 0
+                && evidence.annotation_maximum_tail_overrun_ms == 0
+        };
+        if !tail_clip_evidence_valid {
+            return Err(public_corpus_error(
+                "annotation_tail_clip_evidence",
+                "annotation tail-clip evidence violates the frozen corpus conversion policy",
             ));
         }
     }
@@ -2286,13 +2739,20 @@ fn materialize_public_corpus_bundle_for_split_with_cancel(
                 "annotation SHA-256 does not match the descriptor",
             ));
         }
-        let turns = parse_rttm(
+        let maximum_tail_overrun_ms = if descriptor.corpus_key == "voxconverse-v1" {
+            VOXCONVERSE_MAX_RTTM_TAIL_OVERRUN_MS
+        } else {
+            0
+        };
+        let parsed_rttm = parse_rttm(
             &annotation_bytes,
             &recording.annotation_recording_id,
             &recording.annotation_channel,
             &recording.speaker_map,
             wave.duration_ms,
+            maximum_tail_overrun_ms,
         )?;
+        let turns = parsed_rttm.turns;
         let (mut words, actual_word_annotation_sha256) =
             if let (Some(relative_path), Some(expected_sha256)) = (
                 recording.word_annotation_path.as_ref(),
@@ -2423,6 +2883,9 @@ fn materialize_public_corpus_bundle_for_split_with_cancel(
                 .filter(|turn| turn.overlap_suspected)
                 .count(),
             ignored_region_count: reference.ignored_regions.len(),
+            annotation_tail_clipped_turn_count: parsed_rttm.tail_clipped_turn_count,
+            annotation_tail_clipped_duration_ms: parsed_rttm.tail_clipped_duration_ms,
+            annotation_maximum_tail_overrun_ms: parsed_rttm.maximum_tail_overrun_ms,
         });
         references.push(reference);
     }
@@ -12662,16 +13125,27 @@ fn canonical_evidence_number(value: f64) -> f64 {
     if rounded == 0.0 { 0.0 } else { rounded }
 }
 
+struct ParsedRttm {
+    turns: Vec<EvaluationTurn>,
+    tail_clipped_turn_count: usize,
+    tail_clipped_duration_ms: u64,
+    maximum_tail_overrun_ms: u64,
+}
+
 fn parse_rttm(
     bytes: &[u8],
     recording_id: &str,
     channel: &str,
     speaker_map: &BTreeMap<String, String>,
     duration_ms: u64,
-) -> FwResult<Vec<EvaluationTurn>> {
+    maximum_tail_overrun_ms: u64,
+) -> FwResult<ParsedRttm> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| public_corpus_error("rttm_utf8", "RTTM annotation must be valid UTF-8"))?;
     let mut turns = Vec::new();
+    let mut tail_clipped_turn_count = 0usize;
+    let mut tail_clipped_duration_ms = 0u64;
+    let mut observed_maximum_tail_overrun_ms = 0u64;
     for (line_index, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -12698,17 +13172,27 @@ fn parse_rttm(
                 &format!("RTTM line {} has zero duration", line_index + 1),
             ));
         }
-        let end_ms = start_ms.checked_add(duration).ok_or_else(|| {
+        let mut end_ms = start_ms.checked_add(duration).ok_or_else(|| {
             public_corpus_error(
                 "rttm_time_overflow",
                 &format!("RTTM line {} exceeds supported time range", line_index + 1),
             )
         })?;
         if end_ms > duration_ms {
-            return Err(public_corpus_error(
-                "rttm_bounds",
-                &format!("RTTM line {} exceeds WAV duration", line_index + 1),
-            ));
+            let overrun_ms = end_ms - duration_ms;
+            if maximum_tail_overrun_ms == 0
+                || start_ms >= duration_ms
+                || overrun_ms > maximum_tail_overrun_ms
+            {
+                return Err(public_corpus_error(
+                    "rttm_bounds",
+                    &format!("RTTM line {} exceeds WAV duration", line_index + 1),
+                ));
+            }
+            end_ms = duration_ms;
+            tail_clipped_turn_count = tail_clipped_turn_count.saturating_add(1);
+            tail_clipped_duration_ms = tail_clipped_duration_ms.saturating_add(overrun_ms);
+            observed_maximum_tail_overrun_ms = observed_maximum_tail_overrun_ms.max(overrun_ms);
         }
         let speaker = speaker_map.get(fields[7]).ok_or_else(|| {
             public_corpus_error(
@@ -12752,7 +13236,12 @@ fn parse_rttm(
             ))
     });
     mark_overlapping_turns(&mut turns);
-    Ok(turns)
+    Ok(ParsedRttm {
+        turns,
+        tail_clipped_turn_count,
+        tail_clipped_duration_ms,
+        maximum_tail_overrun_ms: observed_maximum_tail_overrun_ms,
+    })
 }
 
 fn parse_rttm_milliseconds(value: &str, line_index: usize) -> FwResult<u64> {
@@ -13254,6 +13743,21 @@ fn validate_new_output(
     input: &Path,
     output: &Path,
 ) -> FwResult<ValidatedOutputParent> {
+    validate_new_output_with_policy(project, input, output, OutputLocationPolicy::External)
+}
+
+#[derive(Clone, Copy)]
+enum OutputLocationPolicy {
+    External,
+    BeneathInput,
+}
+
+fn validate_new_output_with_policy(
+    project: &Path,
+    input: &Path,
+    output: &Path,
+    location_policy: OutputLocationPolicy,
+) -> FwResult<ValidatedOutputParent> {
     if !output.is_absolute() || output.extension().and_then(|value| value.to_str()) != Some("json")
     {
         return Err(public_corpus_error(
@@ -13365,19 +13869,33 @@ fn validate_new_output(
                 ));
             }
         }
-        if paths_overlap(project, &validated.canonical_path)
-            || paths_overlap(input, &validated.canonical_path)
-        {
-            return Err(public_corpus_error(
-                "output_overlap",
-                "output parent must be disjoint from the project and input roots",
-            ));
+        match location_policy {
+            OutputLocationPolicy::External => {
+                if paths_overlap(project, &validated.canonical_path)
+                    || paths_overlap(input, &validated.canonical_path)
+                {
+                    return Err(public_corpus_error(
+                        "output_overlap",
+                        "output parent must be disjoint from the project and input roots",
+                    ));
+                }
+            }
+            OutputLocationPolicy::BeneathInput => {
+                if paths_overlap(project, &validated.canonical_path)
+                    || !validated.canonical_path.starts_with(input)
+                {
+                    return Err(public_corpus_error(
+                        "descriptor_output_location",
+                        "descriptor output parent must be beneath input_root and outside the project checkout",
+                    ));
+                }
+            }
         }
         Ok(validated)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
-        let _ = (project, input, parent);
+        let _ = (project, input, parent, location_policy);
         Err(FwError::Unsupported(
             "public_corpus.output_platform: race-safe public artifact publication requires Linux, Android, or an Apple platform"
                 .to_owned(),
@@ -14012,9 +14530,10 @@ mod tests {
     use super::write_new_json;
     use super::{
         PUBLIC_CORPUS_INPUT_SCHEMA_VERSION, PublicAblationAccumulator, PublicCorpusAblationSplit,
-        PublicCorpusAblationVariant, build_public_corpus_bundle,
-        build_public_corpus_bundle_with_cancel, clipped_reference, development_improvement_gate,
-        held_out_non_regression_gate, merged_scored_speech_regions, parse_public_corpus_bundle,
+        PublicCorpusAblationVariant, VoxconverseDescriptorPreparationRequest,
+        build_public_corpus_bundle, build_public_corpus_bundle_with_cancel, clipped_reference,
+        development_improvement_gate, held_out_non_regression_gate, merged_scored_speech_regions,
+        parse_public_corpus_bundle, prepare_voxconverse_descriptor_with_cancel,
         public_corpus_registry, validate_new_output, validate_split,
     };
     use crate::FwResult;
@@ -25888,6 +26407,146 @@ mod tests {
         ignore = "public artifact publication is unsupported on this platform"
     )]
     #[test]
+    fn native_voxconverse_preparation_pairs_hashes_and_publishes_without_copying_media() {
+        let project = private_tempdir("project");
+        let input = private_tempdir("input");
+        let development_audio = input.path().join("development-audio");
+        let test_audio = input.path().join("test-audio");
+        let annotations = input.path().join("annotations");
+        create_private_directory(&development_audio);
+        create_private_directory(&test_audio);
+        create_private_directory(&annotations);
+        create_private_directory(&annotations.join("dev"));
+        create_private_directory(&annotations.join("test"));
+        // Deliberately make the test ID sort before the development ID. This
+        // guards the scorer's global recording-ID order across interleaved
+        // corpus splits instead of only exercising split-contiguous fixtures.
+        write_wave(&development_audio.join("zzzzz.wav"), 16_000, 1, 16_000);
+        write_wave(&test_audio.join("aaaaa.wav"), 16_000, 1, 16_000);
+        std::fs::write(
+            annotations.join("dev/zzzzz.rttm"),
+            "SPEAKER zzzzz 1 0.000 0.500 <NA> <NA> spk01 <NA> <NA>\nSPEAKER zzzzz 1 0.500 0.500 <NA> <NA> spk00 <NA> <NA>\n",
+        )
+        .expect("development RTTM");
+        std::fs::write(
+            annotations.join("test/aaaaa.rttm"),
+            "SPEAKER aaaaa 1 0.000 1.000 <NA> <NA> spk00 <NA> <NA>\n",
+        )
+        .expect("test RTTM");
+        let output = input.path().join("voxconverse-descriptor.json");
+
+        let summary = prepare_voxconverse_descriptor_with_cancel(
+            VoxconverseDescriptorPreparationRequest {
+                project_root: project.path(),
+                input_root: input.path(),
+                development_audio_root: &development_audio,
+                test_audio_root: &test_audio,
+                annotation_root: &annotations,
+                output_path: &output,
+                source_version: "voxconverse-fixture-v1",
+                license_acknowledgement_id: "accept-voxconverse-cc-by-4.0-and-original-copyright",
+            },
+            || false,
+        )
+        .expect("prepare descriptor");
+
+        assert_eq!(summary.development_recording_count, 1);
+        assert_eq!(summary.test_recording_count, 1);
+        assert_eq!(summary.total_recording_count, 2);
+        assert_eq!(summary.tail_clipped_turn_count, 0);
+        assert_eq!(summary.tail_clipped_duration_ms, 0);
+        assert_eq!(summary.maximum_tail_overrun_ms, 0);
+        assert_eq!(summary.descriptor_file_sha256, sha256(&output));
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).expect("descriptor bytes"))
+                .expect("descriptor JSON");
+        assert_eq!(value["recordings"][0]["recording_id"], "aaaaa");
+        assert_eq!(value["recordings"][0]["split"], "test");
+        assert_eq!(value["recordings"][1]["recording_id"], "zzzzz");
+        assert_eq!(value["recordings"][1]["split"], "development");
+        assert_eq!(
+            value["recordings"][1]["speaker_map"]["spk00"],
+            "zzzzz-speaker-000"
+        );
+        assert_eq!(
+            value["recordings"][1]["speaker_map"]["spk01"],
+            "zzzzz-speaker-001"
+        );
+        assert!(development_audio.join("zzzzz.wav").exists());
+        assert!(test_audio.join("aaaaa.wav").exists());
+    }
+
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
+    #[test]
+    fn native_voxconverse_preparation_rejects_an_unpaired_split_before_publication() {
+        let project = private_tempdir("project");
+        let input = private_tempdir("input");
+        let development_audio = input.path().join("development-audio");
+        let test_audio = input.path().join("test-audio");
+        let annotations = input.path().join("annotations");
+        create_private_directory(&development_audio);
+        create_private_directory(&test_audio);
+        create_private_directory(&annotations);
+        create_private_directory(&annotations.join("dev"));
+        create_private_directory(&annotations.join("test"));
+        write_wave(&development_audio.join("abcde.wav"), 16_000, 1, 16_000);
+        let output = input.path().join("voxconverse-descriptor.json");
+
+        let error = prepare_voxconverse_descriptor_with_cancel(
+            VoxconverseDescriptorPreparationRequest {
+                project_root: project.path(),
+                input_root: input.path(),
+                development_audio_root: &development_audio,
+                test_audio_root: &test_audio,
+                annotation_root: &annotations,
+                output_path: &output,
+                source_version: "voxconverse-fixture-v1",
+                license_acknowledgement_id: "accept-voxconverse-cc-by-4.0-and-original-copyright",
+            },
+            || false,
+        )
+        .expect_err("unpaired split must fail");
+        assert!(error.to_string().contains("voxconverse_pairing"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn voxconverse_tail_policy_clips_only_a_bounded_turn_that_starts_before_eof() {
+        let accepted = super::inspect_voxconverse_rttm(
+            b"SPEAKER abcde 1 0.900 0.150 <NA> <NA> spk00 <NA> <NA>\n",
+            "abcde",
+            1_000,
+        )
+        .expect("50 ms official tail overrun");
+        assert_eq!(accepted.2, 1);
+        assert_eq!(accepted.3, 50);
+        assert_eq!(accepted.4, 50);
+
+        let too_large = super::inspect_voxconverse_rttm(
+            b"SPEAKER abcde 1 0.900 0.201 <NA> <NA> spk00 <NA> <NA>\n",
+            "abcde",
+            1_000,
+        )
+        .expect_err("101 ms overrun must fail");
+        assert!(too_large.to_string().contains("rttm_bounds"));
+
+        let begins_at_eof = super::inspect_voxconverse_rttm(
+            b"SPEAKER abcde 1 1.000 0.050 <NA> <NA> spk00 <NA> <NA>\n",
+            "abcde",
+            1_000,
+        )
+        .expect_err("turn beginning at EOF must fail");
+        assert!(begins_at_eof.to_string().contains("rttm_bounds"));
+    }
+
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
+    #[test]
     fn selected_split_materialization_never_opens_held_out_media() {
         let project = private_tempdir("project");
         let input = private_tempdir("input");
@@ -28379,11 +29038,23 @@ mod tests {
                 .all(|turn| turn.overlap_suspected)
         );
         assert_eq!(bundle.references[0].ignored_regions.len(), 1);
+        assert_eq!(bundle.recordings[0].annotation_tail_clipped_turn_count, 0);
+        assert_eq!(bundle.recordings[0].annotation_tail_clipped_duration_ms, 0);
+        assert_eq!(bundle.recordings[0].annotation_maximum_tail_overrun_ms, 0);
         let retained = std::fs::read(&fixture.output_path).expect("retained bundle");
         assert_eq!(
             parse_public_corpus_bundle(&retained).expect("parse bundle"),
             bundle
         );
+        let mut impossible_tail_clip = bundle.clone();
+        impossible_tail_clip.recordings[0].annotation_tail_clipped_turn_count = 1;
+        impossible_tail_clip.recordings[0].annotation_tail_clipped_duration_ms = 1;
+        impossible_tail_clip.recordings[0].annotation_maximum_tail_overrun_ms = 1;
+        let error = parse_public_corpus_bundle(
+            &serde_json::to_vec(&impossible_tail_clip).expect("tampered bundle JSON"),
+        )
+        .expect_err("non-VoxConverse tail clipping must fail");
+        assert!(error.to_string().contains("annotation_tail_clip_evidence"));
         let hypothesis = crate::diarization::DiarizationHypothesisDocument {
             schema_version: crate::diarization::DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
             recording_id: bundle.references[0].recording_id.clone(),

@@ -1012,7 +1012,7 @@ where
                 "revision": crate::sortformer_conformance::SORTFORMER_MODEL_REVISION,
                 "kind": "streaming_speaker_diarization",
                 "tasks": ["speaker_activity", "overlap", "speaker_turns"],
-                "runtime_status": if sortformer_available { "evaluation_only_explicit_ready" } else { "missing_release_artifact" },
+                "runtime_status": if sortformer_available { "evaluation_only_explicit_ready" } else { "not_cached_explicit_pull_required" },
                 "installed": sortformer_available,
                 "certification": "evaluation_only",
                 "speaker_lane_capacity": 4,
@@ -1131,7 +1131,7 @@ where
             "sortformer": if sortformer_ready {
                 "native_explicit_ready_auto_certification_pending"
             } else {
-                "missing_release_artifact_run_fw_pull_sortformer"
+                "not_cached_run_fw_pull_sortformer"
             },
         },
         "health": health_value,

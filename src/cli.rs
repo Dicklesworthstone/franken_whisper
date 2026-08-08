@@ -357,6 +357,12 @@ pub enum Command {
     /// Run the explicitly selected, evaluation-only native Streaming Sortformer.
     #[command(name = "sortformer-diarize", visible_alias = "sortformer")]
     SortformerDiarize(SortformerDiarizeArgs),
+    /// Internal fresh-process lane worker. This is intentionally absent from help.
+    #[command(name = "__comparison-worker", hide = true)]
+    ComparisonWorker,
+    /// Internal process-tree cancellation probe. This is intentionally absent from help.
+    #[command(name = "__comparison-cancel-probe", hide = true)]
+    ComparisonCancelProbe(ComparisonCancelProbeArgs),
     /// Launch the optional human-oriented terminal interface.
     Tui,
     /// Download YouTube audio (videos / playlists / a URL file) and
@@ -376,6 +382,12 @@ pub enum Command {
         #[command(subcommand)]
         command: RobotDocsCommand,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct ComparisonCancelProbeArgs {
+    #[arg(long, hide = true)]
+    pub descendant: bool,
 }
 
 /// Output controls for the machine-discoverable capability catalog.
@@ -483,6 +495,8 @@ impl fmt::Debug for SortformerDiarizeArgs {
 pub enum PublicCorpusCommand {
     /// Emit the built-in corpus/license/conversion registry as JSON.
     Registry,
+    /// Prepare a deterministic external VoxConverse descriptor without copying media.
+    PrepareVoxconverse(PublicCorpusVoxconversePrepareArgs),
     /// Build a path-free bundle (artifact writing requires Linux/Android/Apple).
     Build(PublicCorpusBuildArgs),
     /// Run frozen ablations (artifact writing requires Linux/Android/Apple).
@@ -491,6 +505,53 @@ pub enum PublicCorpusCommand {
     SidecarStudy(PublicCorpusSidecarStudyArgs),
     /// Compare diarizers (artifact writing requires Linux/Android/Apple).
     CompareModels(PublicCorpusModelComparisonArgs),
+}
+
+/// Arguments for native VoxConverse descriptor preparation.
+#[derive(Args)]
+pub struct PublicCorpusVoxconversePrepareArgs {
+    /// Absolute external root containing all selected inputs and the new descriptor.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute directory containing the official development WAV files.
+    #[arg(long)]
+    pub development_audio_root: PathBuf,
+
+    /// Absolute directory containing the official test WAV files.
+    #[arg(long)]
+    pub test_audio_root: PathBuf,
+
+    /// Absolute root containing the official `dev/` and `test/` RTTM directories.
+    #[arg(long)]
+    pub annotation_root: PathBuf,
+
+    /// New absolute descriptor path beneath `--input-root`.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Immutable, path-free upstream version identity recorded in the descriptor.
+    #[arg(long)]
+    pub source_version: String,
+
+    /// Exact acknowledgement ID emitted by `diarization-corpus registry`.
+    #[arg(long)]
+    pub license_ack: String,
+}
+
+impl fmt::Debug for PublicCorpusVoxconversePrepareArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicCorpusVoxconversePrepareArgs")
+            .field("input_root", &"<redacted>")
+            .field("development_audio_root", &"<redacted>")
+            .field("test_audio_root", &"<redacted>")
+            .field("annotation_root", &"<redacted>")
+            .field("output", &"<redacted>")
+            .field("source_version", &"<redacted>")
+            .field("license_ack", &self.license_ack)
+            .finish()
+    }
 }
 
 /// Developer-only external differential-diagnostic commands.
@@ -3737,6 +3798,44 @@ mod tests {
                 command: PublicCorpusCommand::Registry
             }
         ));
+    }
+
+    #[test]
+    fn public_corpus_cli_parses_voxconverse_preparation_and_redacts_paths() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-corpus",
+            "prepare-voxconverse",
+            "--input-root",
+            "/PRIVATE/VOX",
+            "--development-audio-root",
+            "/PRIVATE/VOX/dev-audio",
+            "--test-audio-root",
+            "/PRIVATE/VOX/test-audio",
+            "--annotation-root",
+            "/PRIVATE/VOX/labels",
+            "--output",
+            "/PRIVATE/VOX/descriptor.json",
+            "--source-version",
+            "voxconverse-fixture-v1",
+            "--license-ack",
+            "accept-voxconverse-cc-by-4.0-and-original-copyright",
+        ])
+        .expect("VoxConverse preparation command");
+        let debug = format!("{cli:?}");
+        assert!(!debug.contains("PRIVATE"));
+        assert!(debug.contains("<redacted>"));
+        let Command::DiarizationCorpus {
+            command: PublicCorpusCommand::PrepareVoxconverse(args),
+        } = cli.command
+        else {
+            panic!("expected VoxConverse preparation command");
+        };
+        assert_eq!(args.source_version, "voxconverse-fixture-v1");
+        assert_eq!(
+            args.license_ack,
+            "accept-voxconverse-cc-by-4.0-and-original-copyright"
+        );
     }
 
     #[test]
