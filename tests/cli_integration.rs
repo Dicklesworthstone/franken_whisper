@@ -79,6 +79,105 @@ fn run_agent_command(binary: &str, args: &[&str]) -> std::process::Output {
         .unwrap_or_else(|error| panic!("agent command {args:?} failed to execute: {error}"))
 }
 
+#[cfg(unix)]
+fn wait_for_pid_witness(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> rustix::process::Pid {
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(raw) = text.parse::<i32>()
+            && let Some(pid) = rustix::process::Pid::from_raw(raw)
+        {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PID witness was not published before the deadline: {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn comparison_cancel_probe_rejects_an_unleased_process_group_root() {
+    use std::os::unix::process::CommandExt as _;
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .arg("__comparison-cancel-probe")
+        .process_group(0)
+        .env_remove("FRANKEN_WHISPER_PARENT_LIVENESS_FD")
+        .env_remove("FRANKEN_WHISPER_PARENT_LIVENESS_PID")
+        .output()
+        .expect("run unleased cancellation-probe root");
+    assert!(
+        !output.status.success(),
+        "a fresh process-group root must not authenticate without the inherited liveness lease"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn abrupt_comparison_parent_death_terminates_the_complete_worker_group() {
+    let directory = private_external_temp_root("fw-abrupt-parent-");
+    let root_pid_path = directory.path().join("root.pid");
+    let descendant_pid_path = directory.path().join("descendant.pid");
+    let mut parent = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args([
+            "__comparison-cancel-probe",
+            "--lease-parent",
+            "--root-pid-file",
+            root_pid_path.to_str().expect("UTF-8 root PID path"),
+            "--descendant-pid-file",
+            descendant_pid_path
+                .to_str()
+                .expect("UTF-8 descendant PID path"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn abrupt-parent fixture");
+
+    // Debug builds on macOS may spend several seconds initializing each of the
+    // three nested CLI processes before the PID witnesses are committed.
+    let witness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let root_pid = wait_for_pid_witness(&root_pid_path, witness_deadline);
+    let descendant_pid = wait_for_pid_witness(&descendant_pid_path, witness_deadline);
+    assert_eq!(
+        rustix::process::getpgid(Some(root_pid)).expect("worker process group"),
+        root_pid
+    );
+    assert_eq!(
+        rustix::process::getpgid(Some(descendant_pid)).expect("descendant process group"),
+        root_pid
+    );
+    assert!(
+        parent.try_wait().expect("inspect fixture parent").is_none(),
+        "fixture parent exited before abrupt termination"
+    );
+
+    parent.kill().expect("abruptly terminate fixture parent");
+    parent.wait().expect("reap fixture parent");
+
+    let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match rustix::process::test_kill_process_group(root_pid) {
+            Err(error) if error == rustix::io::Errno::SRCH => break,
+            _ if std::time::Instant::now() < cleanup_deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => {
+                let _ =
+                    rustix::process::kill_process_group(root_pid, rustix::process::Signal::KILL);
+                panic!("worker group survived abrupt parent death: {result:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn packaged_binary_names_share_version_help_and_schema_contracts() {
     let long = env!("CARGO_BIN_EXE_franken_whisper");

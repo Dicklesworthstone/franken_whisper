@@ -10,10 +10,143 @@ use crate::error::{FwError, FwResult};
 static PROCESS_TREE_EXTERNALLY_OWNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Declare that this process already belongs to a bounded parent-owned Unix
-/// process group. Nested subprocesses then inherit that group instead of
-/// escaping into a new one; their direct child is still reaped locally, while
-/// the outer owner remains authoritative for recursive termination.
+#[cfg(unix)]
+const PARENT_LIVENESS_FD_ENV: &str = "FRANKEN_WHISPER_PARENT_LIVENESS_FD";
+#[cfg(unix)]
+const PARENT_LIVENESS_PID_ENV: &str = "FRANKEN_WHISPER_PARENT_LIVENESS_PID";
+
+#[cfg(unix)]
+struct PreparedParentLivenessLease {
+    reader: std::os::fd::OwnedFd,
+    writer: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl PreparedParentLivenessLease {
+    fn activate(self) -> std::os::fd::OwnedFd {
+        let Self { reader, writer } = self;
+        drop(reader);
+        writer
+    }
+}
+
+#[cfg(unix)]
+fn prepare_parent_liveness_lease(command: &mut Command) -> FwResult<PreparedParentLivenessLease> {
+    use std::os::fd::AsRawFd as _;
+
+    let (reader, writer) = rustix::pipe::pipe().map_err(std::io::Error::from)?;
+    if reader.as_raw_fd() <= 2 {
+        return Err(FwError::Unsupported(
+            "parent-liveness authority requires an inherited descriptor above standard I/O"
+                .to_owned(),
+        ));
+    }
+    rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::empty()).map_err(std::io::Error::from)?;
+    rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC).map_err(std::io::Error::from)?;
+    command.env(PARENT_LIVENESS_FD_ENV, reader.as_raw_fd().to_string());
+    command.env(PARENT_LIVENESS_PID_ENV, std::process::id().to_string());
+    Ok(PreparedParentLivenessLease { reader, writer })
+}
+
+#[cfg(not(unix))]
+fn prepare_parent_liveness_lease(_command: &mut Command) -> FwResult<()> {
+    Err(FwError::Unsupported(
+        "parent-liveness authority is unsupported on this platform".to_owned(),
+    ))
+}
+
+#[cfg(unix)]
+fn inherited_parent_liveness_reader() -> FwResult<std::fs::File> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let fd_text = std::env::var(PARENT_LIVENESS_FD_ENV).map_err(|_| {
+        FwError::ContractViolation(
+            "an externally owned subprocess tree requires an inherited parent-liveness descriptor"
+                .to_owned(),
+        )
+    })?;
+    let fd = fd_text
+        .parse::<i32>()
+        .ok()
+        .filter(|fd| *fd > 2)
+        .ok_or_else(|| {
+            FwError::ContractViolation(
+                "the inherited parent-liveness descriptor is outside the accepted range".to_owned(),
+            )
+        })?;
+    let expected_parent = std::env::var(PARENT_LIVENESS_PID_ENV)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| {
+            FwError::ContractViolation(
+                "the inherited parent-liveness authority has an invalid parent identity".to_owned(),
+            )
+        })?;
+    if rustix::process::getppid() != Some(expected_parent) {
+        return Err(FwError::ContractViolation(
+            "the inherited parent-liveness authority does not belong to the direct parent"
+                .to_owned(),
+        ));
+    }
+
+    let mut last_error = None;
+    for root in ["/dev/fd", "/proc/self/fd"] {
+        match std::fs::File::open(Path::new(root).join(fd.to_string())) {
+            Ok(file) => {
+                let metadata = file.metadata().map_err(FwError::Io)?;
+                if !metadata.file_type().is_fifo() {
+                    return Err(FwError::ContractViolation(
+                        "the inherited parent-liveness descriptor is not a kernel pipe".to_owned(),
+                    ));
+                }
+                return Ok(file);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(FwError::ContractViolation(format!(
+        "the inherited parent-liveness descriptor could not be opened: {}",
+        last_error
+            .map(|error| error.kind().to_string())
+            .unwrap_or_else(|| "unavailable".to_owned())
+    )))
+}
+
+#[cfg(unix)]
+fn start_parent_liveness_watcher(mut reader: std::fs::File) -> FwResult<()> {
+    thread::Builder::new()
+        .name("fw-parent-liveness".to_owned())
+        .spawn(move || {
+            let mut byte = [0u8; 1];
+            loop {
+                match reader.read(&mut byte) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Ok(0) | Ok(_) | Err(_) => {
+                        let process_group = rustix::process::getpgrp();
+                        let _ = rustix::process::kill_process_group(
+                            process_group,
+                            rustix::process::Signal::KILL,
+                        );
+                        std::process::exit(125);
+                    }
+                }
+            }
+        })
+        .map(drop)
+        .map_err(|_| {
+            FwError::ContractViolation(
+                "the parent-liveness watcher could not be started".to_owned(),
+            )
+        })
+}
+
+/// Authenticate that this process belongs to a bounded parent-owned Unix
+/// process group and start the inherited parent-liveness watcher. Nested
+/// subprocesses then inherit that group instead of escaping into a new one;
+/// their direct child is still reaped locally, while the outer owner remains
+/// authoritative for recursive termination. Parent death closes the sole
+/// lease writer and makes the group root terminate the complete group.
 #[cfg(unix)]
 pub(crate) fn mark_process_tree_externally_owned() -> FwResult<()> {
     if rustix::process::getpgrp() != rustix::process::getpid() {
@@ -22,13 +155,24 @@ pub(crate) fn mark_process_tree_externally_owned() -> FwResult<()> {
                 .to_owned(),
         ));
     }
-    PROCESS_TREE_EXTERNALLY_OWNED.store(true, std::sync::atomic::Ordering::Release);
+    let reader = inherited_parent_liveness_reader()?;
+    if PROCESS_TREE_EXTERNALLY_OWNED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return Err(FwError::ContractViolation(
+            "the externally owned subprocess tree was already initialized".to_owned(),
+        ));
+    }
+    if let Err(error) = start_parent_liveness_watcher(reader) {
+        PROCESS_TREE_EXTERNALLY_OWNED.store(false, std::sync::atomic::Ordering::Release);
+        return Err(error);
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
 pub(crate) fn mark_process_tree_externally_owned() -> FwResult<()> {
-    Ok(())
+    Err(FwError::Unsupported(
+        "parent-liveness authority is unsupported on this platform".to_owned(),
+    ))
 }
 
 #[must_use]
@@ -310,7 +454,9 @@ pub(crate) fn run_command_cancellable_with_input_and_probe(
 /// The observer receives the root child PID. On Unix this API fails closed if
 /// the caller is already inside an externally owned process group; otherwise
 /// the child PID is also the fresh process-group identifier created with
-/// `process_group(0)`. Returning an error terminates and reaps the entire tree.
+/// `process_group(0)`. The child also inherits the read end of a liveness pipe
+/// whose sole writer remains in this direct parent. Returning an error
+/// terminates and reaps the entire tree.
 pub(crate) fn run_command_cancellable_with_input_probe_and_observer(
     program: &str,
     args: &[String],
@@ -377,6 +523,16 @@ fn run_command_cancellable_with_optional_input(
         command.current_dir(dir);
     }
 
+    #[cfg(unix)]
+    let prepared_parent_liveness_lease = observer
+        .is_some()
+        .then(|| prepare_parent_liveness_lease(&mut command))
+        .transpose()?;
+    #[cfg(not(unix))]
+    if observer.is_some() {
+        prepare_parent_liveness_lease(&mut command)?;
+    }
+
     let owns_process_group = configure_descendant_process_tree(&mut command);
     #[cfg(unix)]
     if observer.is_some() && !owns_process_group {
@@ -385,6 +541,9 @@ fn run_command_cancellable_with_optional_input(
         ));
     }
     let mut child = command.spawn()?;
+    #[cfg(unix)]
+    let _parent_liveness_lease =
+        prepared_parent_liveness_lease.map(PreparedParentLivenessLease::activate);
     let started_at = Instant::now();
     let mut poll_iteration = 0usize;
     let (stdout_reader, stderr_reader) =
@@ -586,11 +745,6 @@ fn terminate_descendant_process_tree(child: &mut Child, owns_process_group: bool
     }
     wait_for_child_reap(child, deadline)?;
 
-    if group_signal_error.is_some() {
-        return Err(process_tree_cleanup_error(
-            "the owned Unix process group rejected termination",
-        ));
-    }
     if let Some(process_group) = process_group {
         loop {
             match rustix::process::test_kill_process_group(process_group) {
@@ -604,6 +758,11 @@ fn terminate_descendant_process_tree(child: &mut Child, owns_process_group: bool
                     thread::sleep(Duration::from_millis(5));
                 }
                 Ok(()) => {
+                    if let Some(error) = group_signal_error {
+                        return Err(process_tree_cleanup_error(&format!(
+                            "the owned Unix process group rejected termination ({error}) and remained alive"
+                        )));
+                    }
                     return Err(process_tree_cleanup_error(
                         "the owned Unix process group remained alive after termination",
                     ));

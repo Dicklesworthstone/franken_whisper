@@ -1424,7 +1424,7 @@ declared capacity-ineligible and is never passed to either Sortformer lane.
 Consecutive sorted observations follow a ten-row balanced Williams schedule,
 and `order_balance_complete` is true only after a complete schedule. Every
 declared lane is retained as completed, skipped, or failed with a stable
-reason. Protocol v5 binds each complete effective native request, the ordered
+reason. Protocol v6 binds each complete effective native request, the ordered
 payload-free outcome taxonomy, and the protocol body to a pinned canonical
 SHA-256 identity; changing any of them requires a new version-and-digest pair.
 The command requires eight native Rayon workers to match the pinned Sortformer
@@ -1434,7 +1434,14 @@ process. Its request binds the executable, source WAV, normalized PCM,
 reference, scorer, protocol, and applicable model artifacts. Cancellation and
 timeout terminate the worker's complete process group, including a nested
 external adapter, and a live recursive-descendant probe measures the process-
-tree cancellation path.
+tree cancellation path. A group-signal error is not itself success: it is
+accepted only if direct-root reap and the subsequent absence probe certify that
+the complete group is gone.
+Before reading that request, the process-group root authenticates an inherited
+kernel-pipe capability against its direct parent and starts a liveness watcher.
+The parent retains the only write end. If the parent crashes or is killed, EOF
+makes the worker kill its complete group, including nested adapters; platforms
+without this capability fail before an observed worker is launched.
 
 The aggregate comparison evidence is `diagnostic_only`,
 `development_uncertified`, forbids a superiority claim, and records

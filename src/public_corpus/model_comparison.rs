@@ -6,7 +6,7 @@
 //! update these aggregate sufficient statistics and ordered digests.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -45,15 +45,15 @@ use crate::sortformer_inference::{
     SortformerSpeakerTurn,
 };
 
-pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v5";
+pub const PUBLIC_MODEL_COMPARISON_SCHEMA_VERSION: &str = "public-diarization-model-comparison-v6";
 pub const PUBLIC_MODEL_COMPARISON_RUNNER_VERSION: &str =
-    "public-diarization-model-comparison-runner-v5";
+    "public-diarization-model-comparison-runner-v6";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_VERSION: &str =
-    "public-diarization-model-comparison-protocol-v5";
+    "public-diarization-model-comparison-protocol-v6";
 pub const PUBLIC_MODEL_COMPARISON_OUTCOME_TAXONOMY_VERSION: &str =
     "public-diarization-model-comparison-outcomes-v3";
 pub const PUBLIC_MODEL_COMPARISON_PROTOCOL_SHA256: &str =
-    "54a4f4681e5a3c0297d00c876ce701cdae9a933b9fc7c6027fa33c0de062467c";
+    "ae676adfdda66897e5bd56d8acef4f720bb294c5a99cb37ac3d040018459fc20";
 pub const PUBLIC_MODEL_COMPARISON_SCHEDULE_VERSION: &str = "five-lane-balanced-williams-v1";
 pub const PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS: u64 = 1_800;
 const MODEL_COMPARISON_WORKER_SCHEMA_VERSION: &str = "public-model-comparison-worker-v1";
@@ -1598,7 +1598,7 @@ fn frozen_model_comparison_protocol() -> FwResult<PublicModelComparisonProtocol>
         sortformer_output_frame_ms: SORTFORMER_ORACLE_OUTPUT_FRAME_MS,
         attempt_hard_timeout_seconds: PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS,
         worker_schema_version: MODEL_COMPARISON_WORKER_SCHEMA_VERSION.to_owned(),
-        worker_process_policy: "one_fresh_process_per_lane_observation+attempt_deadline_covers_parent_request_worker_and_post_identity+cancellation_timeout_and_output_limits_checked_before_observation+bounded_observer_probe+checked_outer_process_group_descendant_termination+unix_group_absence_confirmation+nested_adapter_group_inheritance+live_size_bounded_nonblocking_pipe_capture_on_linux_android_apple+live_size_bounded_anonymous_file_capture_on_other_supported_platforms+fail_closed_without_recursive_termination+executable_audio_normalized_pcm_reference_protocol_scorer_identity_binding"
+        worker_process_policy: "one_fresh_process_per_lane_observation+attempt_deadline_covers_parent_request_worker_and_post_identity+cancellation_timeout_and_output_limits_checked_before_observation+bounded_observer_probe+checked_outer_process_group_descendant_termination+unix_group_absence_confirmation+initial_group_signal_error_is_success_only_after_certified_group_absence+unforgeable_inherited_parent_liveness_pipe_bound_to_direct_parent+abrupt_parent_death_self_terminates_complete_worker_group+nested_adapter_group_inheritance+live_size_bounded_nonblocking_pipe_capture_on_linux_android_apple+live_size_bounded_anonymous_file_capture_on_other_supported_platforms+fail_closed_without_recursive_termination_or_parent_liveness_authority+executable_audio_normalized_pcm_reference_protocol_scorer_identity_binding"
             .to_owned(),
         worker_stdout_limit_bytes: crate::process::MAX_CAPTURED_OUTPUT_BYTES as u64,
         cancellation_probe_delay_ms: MODEL_COMPARISON_CANCEL_PROBE_DELAY_MS,
@@ -1722,10 +1722,63 @@ where
 /// Run a process-tree probe until the comparison parent kills the worker group.
 /// The root probe launches one copy of itself so the measured path proves that
 /// inherited descendants do not keep pipes or work alive after cancellation.
-pub fn run_model_comparison_cancel_probe(descendant_mode: bool) -> FwResult<()> {
+pub fn run_model_comparison_cancel_probe(
+    descendant_mode: bool,
+    lease_parent_mode: bool,
+    root_pid_file: Option<&Path>,
+    descendant_pid_file: Option<&Path>,
+) -> FwResult<()> {
     let started = Instant::now();
     let self_limit = Duration::from_secs(MODEL_COMPARISON_CANCEL_PROBE_SELF_LIMIT_SECONDS);
+    if descendant_mode && lease_parent_mode {
+        return Err(model_comparison_error(
+            "worker_cancellation_probe",
+            "the cancellation probe selected contradictory hidden modes",
+        ));
+    }
+    if lease_parent_mode {
+        if root_pid_file.is_none() || descendant_pid_file.is_none() {
+            return Err(model_comparison_error(
+                "worker_cancellation_probe",
+                "the abrupt-parent probe requires both PID witness paths",
+            ));
+        }
+        let executable = std::env::current_exe().map_err(|_| {
+            model_comparison_error(
+                "worker_cancellation_probe",
+                "the abrupt-parent probe executable could not be resolved",
+            )
+        })?;
+        let executable = executable.to_str().ok_or_else(|| {
+            model_comparison_error(
+                "worker_cancellation_probe",
+                "the abrupt-parent probe executable path is not valid UTF-8",
+            )
+        })?;
+        let mut args = vec!["__comparison-cancel-probe".to_owned()];
+        append_cancel_probe_pid_path(&mut args, "--root-pid-file", root_pid_file)?;
+        append_cancel_probe_pid_path(&mut args, "--descendant-pid-file", descendant_pid_file)?;
+        let cancellation = CancellationToken::unbounded();
+        let mut observer = |_root_pid| Ok(());
+        let result = crate::process::run_command_cancellable_with_input_probe_and_observer(
+            executable,
+            &args,
+            &cancellation,
+            Some(self_limit),
+            None,
+            &[],
+            &mut observer,
+        );
+        return Err(match result {
+            Ok(_) => model_comparison_error(
+                "worker_cancellation_probe",
+                "the abrupt-parent probe worker exited unexpectedly",
+            ),
+            Err(error) => error,
+        });
+    }
     if descendant_mode {
+        write_cancel_probe_pid(descendant_pid_file)?;
         while started.elapsed() < self_limit {
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -1734,16 +1787,29 @@ pub fn run_model_comparison_cancel_probe(descendant_mode: bool) -> FwResult<()> 
             "the cancellation-probe descendant reached its standalone safety limit",
         ));
     }
+    crate::process::mark_process_tree_externally_owned()?;
+    write_cancel_probe_pid(root_pid_file)?;
     let executable = std::env::current_exe().map_err(|_| {
         model_comparison_error(
             "worker_cancellation_probe",
             "the cancellation-probe executable could not be resolved",
         )
     })?;
-    let mut descendant = std::process::Command::new(executable)
+    let mut descendant_command = std::process::Command::new(executable);
+    descendant_command
         .arg("__comparison-cancel-probe")
         .arg("--descendant")
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    if let Some(path) = descendant_pid_file {
+        let path = path.to_str().ok_or_else(|| {
+            model_comparison_error(
+                "worker_cancellation_probe",
+                "the descendant PID witness path is not valid UTF-8",
+            )
+        })?;
+        descendant_command.arg("--descendant-pid-file").arg(path);
+    }
+    let mut descendant = descendant_command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -1780,6 +1846,59 @@ pub fn run_model_comparison_cancel_probe(descendant_mode: bool) -> FwResult<()> 
             }
         }
     }
+}
+
+fn append_cancel_probe_pid_path(
+    args: &mut Vec<String>,
+    flag: &str,
+    path: Option<&Path>,
+) -> FwResult<()> {
+    let path = path
+        .and_then(Path::to_str)
+        .filter(|path| Path::new(path).is_absolute())
+        .ok_or_else(|| {
+            model_comparison_error(
+                "worker_cancellation_probe",
+                "the abrupt-parent PID witness path must be absolute UTF-8",
+            )
+        })?;
+    args.push(flag.to_owned());
+    args.push(path.to_owned());
+    Ok(())
+}
+
+fn write_cancel_probe_pid(path: Option<&Path>) -> FwResult<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if !path.is_absolute() {
+        return Err(model_comparison_error(
+            "worker_cancellation_probe",
+            "the PID witness path must be absolute",
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|_| {
+        model_comparison_error(
+            "worker_cancellation_probe",
+            "the PID witness could not be created exclusively",
+        )
+    })?;
+    file.write_all(std::process::id().to_string().as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|_| {
+            model_comparison_error(
+                "worker_cancellation_probe",
+                "the PID witness could not be committed",
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2344,6 +2463,7 @@ where
 /// The response contains no filesystem paths, recording identifier, turns, or
 /// speaker labels and is intended only for the parent comparison invocation.
 pub fn run_model_comparison_worker_from_stdio() -> FwResult<String> {
+    crate::process::mark_process_tree_externally_owned()?;
     let mut request_bytes = Vec::new();
     std::io::stdin()
         .take(MAX_MODEL_COMPARISON_WORKER_REQUEST_BYTES.saturating_add(1))
@@ -2461,11 +2581,6 @@ pub fn run_model_comparison_worker_from_stdio() -> FwResult<String> {
             "the fresh-process worker runtime disagrees with the frozen protocol",
         ));
     }
-    // The comparison parent launched this authenticated worker inside one
-    // dedicated process group. Nested external adapters must inherit that
-    // group so an outer timeout or cancellation cannot orphan them.
-    crate::process::mark_process_tree_externally_owned()?;
-
     let ecapa = if matches!(
         request.lane,
         ModelComparisonLane::NativeEcapa | ModelComparisonLane::NativeEcapaFused

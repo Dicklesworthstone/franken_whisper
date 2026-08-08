@@ -850,7 +850,12 @@ fn run(cli: Cli) -> FwResult<()> {
             Ok(())
         }
         Command::ComparisonCancelProbe(args) => {
-            franken_whisper::public_corpus::run_model_comparison_cancel_probe(args.descendant)
+            franken_whisper::public_corpus::run_model_comparison_cancel_probe(
+                args.descendant,
+                args.lease_parent,
+                args.root_pid_file.as_deref(),
+                args.descendant_pid_file.as_deref(),
+            )
         }
         Command::Sync { command } => match command {
             SyncCommand::Export(args) => {

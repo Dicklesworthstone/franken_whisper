@@ -388,6 +388,12 @@ pub enum Command {
 pub struct ComparisonCancelProbeArgs {
     #[arg(long, hide = true)]
     pub descendant: bool,
+    #[arg(long, hide = true)]
+    pub lease_parent: bool,
+    #[arg(long, hide = true)]
+    pub root_pid_file: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    pub descendant_pid_file: Option<PathBuf>,
 }
 
 /// Output controls for the machine-discoverable capability catalog.

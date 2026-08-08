@@ -1102,7 +1102,7 @@ worker counts at eight, and applies the same frozen 1800-second attempt timeout
 to every lane. The application downloads neither the ECAPA
 package nor the external Sortformer adapter/model; the native Sortformer lane
 uses the release-bound cache installed only by `fw pull sortformer`. Absent
-components become typed lane skips. Protocol v5 pins the complete effective native request
+components become typed lane skips. Protocol v6 pins the complete effective native request
 for each lane, its ordered payload-free outcome taxonomy, and its own canonical
 digest. Any change to those bindings requires a new version-and-digest pair.
 
@@ -1118,7 +1118,13 @@ group on cancellation or timeout, records a live recursive-descendant
 cancellation probe through the same bounded observer path used by real lanes.
 Cancellation, timeout, and output-limit checks run before observation. On Unix,
 cleanup reaps the root and verifies that the owned process group is absent;
-cleanup failure overrides a nominal success, cancellation, or timeout. The RSS
+cleanup failure overrides a nominal success, cancellation, or timeout. An
+initial group-signal error is accepted only when the subsequent absence probe
+still certifies that the complete group is gone. Before
+reading its request, the worker opens an inherited kernel-pipe capability bound
+to its direct parent and starts a liveness watcher. Abrupt parent death closes
+the sole write end, causing the worker to terminate its complete process group;
+unsupported platforms fail before launching an observed worker. The RSS
 field is an approximate sampled maximum of the concurrent process-group sum,
 including nested subprocess adapters. Sample starts are no closer than 50 ms,
 and each platform probe has its own fixed bound; this is not an exact process
