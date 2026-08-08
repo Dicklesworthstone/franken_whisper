@@ -2747,7 +2747,7 @@ where
     F: Fn() -> bool + Sync,
 {
     cancellation_checkpoint(is_cancelled)?;
-    let cached = match resolve_cached_sortformer_with_cancel(|| is_cancelled()) {
+    let cached = match resolve_cached_sortformer_with_cancel(is_cancelled) {
         Ok(cached) => cached,
         Err(error @ FwError::Cancelled(_)) => return Err(error),
         Err(FwError::MissingArtifact(_)) => return Ok(NativeSortformerAvailability::Unavailable),

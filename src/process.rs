@@ -501,7 +501,7 @@ fn configure_descendant_process_tree(command: &mut Command) -> bool {
         if !externally_owned {
             command.process_group(0);
         }
-        return !externally_owned;
+        !externally_owned
     }
     #[cfg(not(unix))]
     {
