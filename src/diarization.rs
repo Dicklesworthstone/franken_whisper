@@ -17001,18 +17001,13 @@ fn validate_diarization_turns(turns: &[DiarizationTurn]) -> FwResult<()> {
                     || overlaps_unmarked_turn
                     || speaker.is_none()
                     || overlaps_unlabeled_turn))
-            || turn
-                .speaker_ref
-                .as_ref()
-                .is_some_and(|speaker| {
-                    speaker.trim().is_empty()
-                        || speaker.len() > crate::model::MAX_SPEAKER_REF_BYTES
-                })
+            || turn.speaker_ref.as_ref().is_some_and(|speaker| {
+                speaker.trim().is_empty() || speaker.len() > crate::model::MAX_SPEAKER_REF_BYTES
+            })
             || (turn.speaker_ref.is_none() && turn.speaker_confidence.is_some())
             || (turn.hard_hint_attributed
                 && (turn.speaker_ref.is_none()
-                    || turn.speaker_confidence.map(f64::to_bits)
-                        != Some(1.0_f64.to_bits())))
+                    || turn.speaker_confidence.map(f64::to_bits) != Some(1.0_f64.to_bits())))
             || !valid_confidence(turn.speaker_confidence)
             || !valid_confidence(turn.change_confidence)
         {
@@ -39387,14 +39382,10 @@ mod tests {
         let mut unlabeled_second = turn(500, 1_500, None, None);
         unlabeled_second.overlap_suspected = true;
         assert!(
-            project_diarization_onto_segments(
-                &segments,
-                &[labeled_first, unlabeled_second],
-                true,
-            )
-            .expect_err("overlap requires two labeled speakers")
-            .to_string()
-            .contains("diarization turns")
+            project_diarization_onto_segments(&segments, &[labeled_first, unlabeled_second], true,)
+                .expect_err("overlap requires two labeled speakers")
+                .to_string()
+                .contains("diarization turns")
         );
 
         let mut unlabeled_first = turn(0, 1_000, None, None);
@@ -39402,14 +39393,10 @@ mod tests {
         let mut labeled_second = turn(500, 1_500, Some("alice"), Some(0.9));
         labeled_second.overlap_suspected = true;
         assert!(
-            project_diarization_onto_segments(
-                &segments,
-                &[unlabeled_first, labeled_second],
-                true,
-            )
-            .expect_err("a labeled speaker cannot overlap an anonymous turn")
-            .to_string()
-            .contains("diarization turns")
+            project_diarization_onto_segments(&segments, &[unlabeled_first, labeled_second], true,)
+                .expect_err("a labeled speaker cannot overlap an anonymous turn")
+                .to_string()
+                .contains("diarization turns")
         );
 
         let mut bob = turn(0, 1_000, Some("bob"), Some(0.9));
