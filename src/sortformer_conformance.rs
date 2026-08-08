@@ -83,6 +83,8 @@ pub const SORTFORMER_ACTIVATION_PACKAGE_SHA256: &str =
     "294edcc0a9d80fa9470c2cd45f2c1556a47a56b7c98ba444984f764a1f398a8b";
 pub const SORTFORMER_ACTIVATION_EXPORTER_SHA256: &str =
     "b3020f1e6c136343adecabc3209f3b1ef70f40a7e36d2b2ed9b25fbbd439b6dd";
+pub const SORTFORMER_PUBLIC_ACTIVATION_EXPORTER_SHA256: &str =
+    "4dcb5383d9e457088575f550d979ea8b7e03f4f65871bdf246956e4756ba2f94";
 pub const SORTFORMER_ACTIVATION_PACKAGE_BYTES: u64 = 282_716;
 pub const SORTFORMER_ACTIVATION_PAYLOAD_BYTES: u64 = 278_076;
 pub const SORTFORMER_ACTIVATION_F32_ELEMENTS: u64 = 69_503;
@@ -94,14 +96,14 @@ pub const SORTFORMER_PUBLIC_ACTIVATION_RECEIPT_SCHEMA: &str =
 pub const SORTFORMER_PUBLIC_ACTIVATION_FLOOR_SCHEMA: &str =
     "franken-whisper-sortformer-public-oracle-floor-v1";
 pub const SORTFORMER_PUBLIC_ACTIVATION_RECEIPT_SHA256: &str =
-    "842b448d19c196d6d812132a4ae3a799c594c592a99b2ac7648db683bae76190";
+    "ae9c9fa4f467f630a7b45af55f9e67d2f087d39fa0c6201f775a6e3a111a8d73";
 pub const SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_SHA256: &str =
-    "bf131cb9a88f1295d35e7eba750b653189b808fbf50113399a650a34e48d21d7";
-pub const SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_BYTES: u64 = 87_386_140;
-pub const SORTFORMER_PUBLIC_ACTIVATION_PAYLOAD_BYTES: u64 = 86_559_260;
-pub const SORTFORMER_PUBLIC_ACTIVATION_F32_ELEMENTS: u64 = 21_607_295;
-pub const SORTFORMER_PUBLIC_ACTIVATION_I64_ELEMENTS: u64 = 16_260;
-pub const SORTFORMER_PUBLIC_ACTIVATION_TENSORS: u64 = 5_492;
+    "4ec66cf29e4286fed21fdf3d9c170293aafb26ba9783b9e0eea4d245b4630a6d";
+pub const SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_BYTES: u64 = 72_590_196;
+pub const SORTFORMER_PUBLIC_ACTIVATION_PAYLOAD_BYTES: u64 = 71_906_004;
+pub const SORTFORMER_PUBLIC_ACTIVATION_F32_ELEMENTS: u64 = 17_934_361;
+pub const SORTFORMER_PUBLIC_ACTIVATION_I64_ELEMENTS: u64 = 21_070;
+pub const SORTFORMER_PUBLIC_ACTIVATION_TENSORS: u64 = 4_540;
 
 pub const SORTFORMER_POSITION_TENSOR: &str = "encoder.pos_enc.pe";
 pub const SORTFORMER_DTYPE_SENTINEL: &str = "preprocessor.dtype_sentinel_tensor";
@@ -508,7 +510,19 @@ pub struct SortformerPublicActivationExecutionIdentity {
     pub effective_frontend_pad_to: u64,
     pub inference_mode: String,
     pub activity_threshold_f32_bits: String,
+    pub streaming_profile: SortformerPublicStreamingProfile,
     pub postprocessing: SortformerPublicPostprocessing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicStreamingProfile {
+    pub spkcache_len: u64,
+    pub fifo_len: u64,
+    pub chunk_len: u64,
+    pub spkcache_update_period: u64,
+    pub chunk_left_context: u64,
+    pub chunk_right_context: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1850,16 +1864,17 @@ fn frozen_public_activation_fixtures() -> Vec<SortformerPublicActivationFixture>
             diarization_chunks: 2,
         },
         SortformerPublicActivationFixture {
-            name: "mevkw_overlap_two_speakers".to_owned(),
+            name: "mevkw_complete_three_speakers".to_owned(),
             recording_id: "mevkw".to_owned(),
             start_sample: 0,
-            sample_count: 400_000,
-            expected_speaker_count: 2,
+            sample_count: 1_632_000,
+            expected_speaker_count: 3,
             contains_overlap: true,
             coverage: vec![
+                "complete_recording".to_owned(),
                 "overlap".to_owned(),
-                "two_speakers".to_owned(),
-                "partial_tail".to_owned(),
+                "three_speakers".to_owned(),
+                "multiple_cache_compressions".to_owned(),
             ],
             sample_rate_hz: 16_000,
             channels: 1,
@@ -1868,13 +1883,13 @@ fn frozen_public_activation_fixtures() -> Vec<SortformerPublicActivationFixture>
             annotation_sha256: "d875474325126b6d573577c79a60a3f9f1019f16a04d46b0b85b34185f98fc91"
                 .to_owned(),
             full_recording_sample_count: 1_632_000,
-            clip_pcm16_sha256: "3b37452661042ac368e90bdaebc2300a43beb30e58fdbb15e5080fbd26979da6"
+            clip_pcm16_sha256: "5c091538e34a8cbf2b5e9b226cba6f3fcbdd87b9f3480c316e54d43ab1867f59"
                 .to_owned(),
             clip_decoded_f32_sha256:
-                "a943a837c1d977c625299ee9340a99e3c1889eb5ad90e2944d239c23b8404a20".to_owned(),
-            valid_frames: 2_500,
-            physical_frames: 2_501,
-            diarization_chunks: 2,
+                "742bb2084c28f526ab30874d6748a802c21e9a6865a3d8040376c164ee739a52".to_owned(),
+            valid_frames: 10_200,
+            physical_frames: 10_201,
+            diarization_chunks: 4,
         },
         SortformerPublicActivationFixture {
             name: "syiwe_complete_three_speakers".to_owned(),
@@ -1901,7 +1916,7 @@ fn frozen_public_activation_fixtures() -> Vec<SortformerPublicActivationFixture>
                 "828c6fc75d173c20ce8bb357a225e471edfb71ed5814cd04237a7d56478fba22".to_owned(),
             valid_frames: 6_914,
             physical_frames: 6_915,
-            diarization_chunks: 5,
+            diarization_chunks: 3,
         },
         SortformerPublicActivationFixture {
             name: "iqtde_complete_four_speakers".to_owned(),
@@ -1928,7 +1943,7 @@ fn frozen_public_activation_fixtures() -> Vec<SortformerPublicActivationFixture>
                 "04c6eed039c7774fe16ebd264e6961e683dc84b942577f56357efe10b5038851".to_owned(),
             valid_frames: 10_977,
             physical_frames: 10_978,
-            diarization_chunks: 8,
+            diarization_chunks: 5,
         },
     ]
 }
@@ -1954,6 +1969,14 @@ fn frozen_public_activation_execution() -> SortformerPublicActivationExecutionId
         effective_frontend_pad_to: 0,
         inference_mode: "eval_no_grad_synchronous_streaming".to_owned(),
         activity_threshold_f32_bits: "0x3f000000".to_owned(),
+        streaming_profile: SortformerPublicStreamingProfile {
+            spkcache_len: 188,
+            fifo_len: 40,
+            chunk_len: 340,
+            spkcache_update_period: 300,
+            chunk_left_context: 1,
+            chunk_right_context: 40,
+        },
         postprocessing: SortformerPublicPostprocessing {
             onset: 0.5,
             offset: 0.5,
@@ -2003,7 +2026,7 @@ fn verify_public_activation_receipt(
         != (SortformerActivationExporterIdentity {
             exporter_id: "franken-whisper-sortformer-activation-exporter".to_owned(),
             exporter_version: "2".to_owned(),
-            source_sha256: SORTFORMER_ACTIVATION_EXPORTER_SHA256.to_owned(),
+            source_sha256: SORTFORMER_PUBLIC_ACTIVATION_EXPORTER_SHA256.to_owned(),
             conversion_helper_sha256: SORTFORMER_CONVERTER_SOURCE_SHA256.to_owned(),
         })
     {
@@ -4749,12 +4772,12 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_activation_exporter_matches_the_compiled_trust_root() {
+    fn checked_in_activation_exporter_matches_the_public_compiled_trust_root() {
         assert_eq!(
             sha256_bytes(include_bytes!(
                 "../scripts/export_sortformer_activations.py"
             )),
-            SORTFORMER_ACTIVATION_EXPORTER_SHA256
+            SORTFORMER_PUBLIC_ACTIVATION_EXPORTER_SHA256
         );
     }
 

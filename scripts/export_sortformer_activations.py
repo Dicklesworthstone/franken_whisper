@@ -61,13 +61,18 @@ PUBLIC_FIXTURES = (
         "coverage": ["exact_two_chunks", "cache_fill", "cache_compression"],
     },
     {
-        "name": "mevkw_overlap_two_speakers",
+        "name": "mevkw_complete_three_speakers",
         "recording_id": "mevkw",
         "start_sample": 0,
-        "sample_count": 400_000,
-        "expected_speaker_count": 2,
+        "sample_count": 1_632_000,
+        "expected_speaker_count": 3,
         "contains_overlap": True,
-        "coverage": ["overlap", "two_speakers", "partial_tail"],
+        "coverage": [
+            "complete_recording",
+            "overlap",
+            "three_speakers",
+            "multiple_cache_compressions",
+        ],
     },
     {
         "name": "syiwe_complete_three_speakers",
@@ -89,6 +94,14 @@ PUBLIC_FIXTURES = (
     },
 )
 PUBLIC_PROBE_ELEMENTS = 4_096
+PUBLIC_STREAMING_PROFILE = {
+    "spkcache_len": 188,
+    "fifo_len": 40,
+    "chunk_len": 340,
+    "spkcache_update_period": 300,
+    "chunk_left_context": 1,
+    "chunk_right_context": 40,
+}
 HELPER_SOURCE_SHA256 = (
     "3ce885d1dcb0aeeebf2bb73c165f501a1d240e01ad70354c65cf43d8a3c6d8ce"
 )
@@ -1290,6 +1303,7 @@ def _build_public_receipt(
         "effective_frontend_pad_to": 0,
         "inference_mode": "eval_no_grad_synchronous_streaming",
         "activity_threshold_f32_bits": _f32_bits(0.5),
+        "streaming_profile": PUBLIC_STREAMING_PROFILE,
         "postprocessing": {
             "onset": 0.5,
             "offset": 0.5,
@@ -1400,6 +1414,8 @@ def run(arguments: argparse.Namespace) -> int:
     else:
         model.preprocessor.featurizer.dither = 0.0
         model.preprocessor.featurizer.pad_to = 0
+        for name, value in PUBLIC_STREAMING_PROFILE.items():
+            setattr(model.sortformer_modules, name, value)
         tensors, fixtures, corpus, transitions, seam_contracts, floor = (
             _capture_public_floor(model, arguments.public_root, torch)
         )

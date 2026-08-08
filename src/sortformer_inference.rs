@@ -91,8 +91,11 @@ pub const SORTFORMER_L6_MAX_ABS_DIFF: f64 = 0.062_5; // 2^-4
 pub const SORTFORMER_L6_MAX_RELATIVE_L2: f64 = 0.000_976_562_5; // 2^-10
 
 const SORTFORMER_SPEAKER_CACHE_FRAMES: usize = 188;
-const SORTFORMER_FIFO_FRAMES: usize = 0;
-const SORTFORMER_CACHE_UPDATE_FRAMES: usize = 188;
+const SORTFORMER_FIFO_FRAMES: usize = 40;
+const SORTFORMER_CHUNK_FRAMES: usize = 340;
+const SORTFORMER_CACHE_UPDATE_FRAMES: usize = 300;
+const SORTFORMER_LEFT_CONTEXT_FRAMES: usize = 1;
+const SORTFORMER_RIGHT_CONTEXT_FRAMES: usize = 40;
 const SORTFORMER_SILENCE_FRAMES_PER_SPEAKER: usize = 3;
 const SORTFORMER_SILENCE_THRESHOLD: f32 = 0.2;
 const SORTFORMER_PREDICTION_SCORE_THRESHOLD: f32 = 0.25;
@@ -771,14 +774,15 @@ impl SortformerF32Facade {
     ) -> FwResult<Vec<f32>> {
         frontend_checkpoint(checkpoint)?;
         if !matches!(left_feature_frames, 0 | SORTFORMER_SUBSAMPLING_FACTOR)
-            || !matches!(right_feature_frames, 0 | SORTFORMER_SUBSAMPLING_FACTOR)
+            || right_feature_frames
+                > SORTFORMER_RIGHT_CONTEXT_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR
             || left_feature_frames
                 .checked_add(right_feature_frames)
                 .is_none_or(|context| context >= feature_frames)
         {
             return Err(reference_error(
                 "stream_context",
-                "Sortformer stream context is outside the fixed one-frame profile",
+                "Sortformer stream context is outside the frozen recommended profile",
             ));
         }
         let chunk_embeddings = self.subsample_feature_chunk_with_checkpoint(
@@ -1821,7 +1825,7 @@ impl SortformerSession {
         let duration_seconds = (pcm.samples.len() as f64 / pcm.sample_rate_hz as f64) as f32;
         let features = self.frontend.compute_with_checkpoint(pcm, checkpoint)?;
         const CENTRAL_FEATURE_FRAMES: usize =
-            SORTFORMER_CACHE_UPDATE_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR;
+            SORTFORMER_CHUNK_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR;
         let expected_output_frames = features
             .valid_frames
             .div_ceil(SORTFORMER_SUBSAMPLING_FACTOR);
@@ -1839,12 +1843,13 @@ impl SortformerSession {
             let left = if central_start == 0 {
                 0
             } else {
-                SORTFORMER_SUBSAMPLING_FACTOR
+                SORTFORMER_LEFT_CONTEXT_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR
             };
             let central_end = central_start
                 .checked_add(CENTRAL_FEATURE_FRAMES)
                 .map_or(features.valid_frames, |end| end.min(features.valid_frames));
-            let right = (features.valid_frames - central_end).min(SORTFORMER_SUBSAMPLING_FACTOR);
+            let right = (features.valid_frames - central_end)
+                .min(SORTFORMER_RIGHT_CONTEXT_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR);
             let chunk_start = central_start - left;
             let chunk_end = central_end + right;
             let feature_frames = chunk_end - chunk_start;
@@ -5979,7 +5984,7 @@ mod tests {
             .expect("operator-local public activation admission");
         for fixture in [
             "hiyis_exact_two_chunks",
-            "mevkw_overlap_two_speakers",
+            "mevkw_complete_three_speakers",
             "syiwe_complete_three_speakers",
         ] {
             let probabilities = complete_public_mat(
@@ -6074,7 +6079,7 @@ mod tests {
             .receipt()
             .fixtures
             .iter()
-            .find(|fixture| fixture.name == "mevkw_overlap_two_speakers")
+            .find(|fixture| fixture.name == "mevkw_complete_three_speakers")
             .expect("mevkw fixture");
         let wav_path = std::path::Path::new(&public_root)
             .join("audio")
@@ -6104,7 +6109,7 @@ mod tests {
         let audio_seconds = pcm.len() as f64 / SORTFORMER_SAMPLE_RATE_HZ as f64;
         let probability_metrics = compare_public_f32_probe(
             &activations,
-            "fixture.mevkw_overlap_two_speakers.l5.final_probabilities_f32",
+            "fixture.mevkw_complete_three_speakers.l5.final_probabilities_f32",
             &[1, output.frames, SORTFORMER_SPEAKER_LANES],
             &output.probabilities,
             SORTFORMER_L5_MAX_ABS_DIFF,
@@ -6114,7 +6119,7 @@ mod tests {
         assert!(
             compare_public_i64_probe(
                 &activations,
-                "fixture.mevkw_overlap_two_speakers.l7.activity_i64",
+                "fixture.mevkw_complete_three_speakers.l7.activity_i64",
                 &[1, output.frames, SORTFORMER_SPEAKER_LANES],
                 &output.activity.activity,
             )
@@ -6130,7 +6135,7 @@ mod tests {
         assert!(
             compare_public_f32_probe(
                 &activations,
-                "fixture.mevkw_overlap_two_speakers.l8.turns_f32",
+                "fixture.mevkw_complete_three_speakers.l8.turns_f32",
                 &[raw_turns.len(), 3],
                 &turns,
                 0.0,
