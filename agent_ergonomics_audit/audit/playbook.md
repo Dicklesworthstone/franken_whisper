@@ -6,7 +6,7 @@
 
 1. Make the binary self-describing: `fw --version`, `fw capabilities --json`, and `fw robot-docs guide` must work without a repository checkout.
 2. Give agents one live entry point: `fw robot triage` returns readiness and the next exact command.
-3. Keep model diagnostics local and path-free: `fw models --json` performs no network access and preserves Sortformer's operator-local boundary.
+3. Keep model diagnostics local and path-free: `fw models --json` performs no network access; only the explicit `fw pull sortformer` provisioning command may fetch the hash-pinned release package.
 4. Make robot output machine-pure from argument parsing through terminal execution errors.
 5. Publish one exact code per error variant plus the four process-exit classes.
 6. Use one deterministic local model-selection policy for both availability and execution.

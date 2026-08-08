@@ -24,7 +24,10 @@
 ## Guardrails
 
 - Preserve confidential-audio and transcript boundaries. No private media, transcript text, private paths, embeddings, or derived content may enter this repository or its audit artifacts.
-- Preserve the authenticated Sortformer policy `operator_local_no_git_no_release`; this pass may improve guidance and diagnostics but may not publish or silently download restricted model artifacts.
+- Preserve the authenticated Sortformer model/package identity. Distribution is
+  explicit-only through `fw pull sortformer`, with the separately licensed
+  weights, conversion receipt, NVIDIA license, and required notice carried by a
+  dedicated model release; discovery and inference must never download silently.
 - Preserve evaluation-only and rollout/certification boundaries. Packaging must not imply production accuracy or auto-route uncertified diarization engines.
 - Do not weaken correctness, conformance, performance, privacy, or evidence gates.
 - Do not delete files, use destructive Git operations, rewrite unrelated concurrent work, or create compatibility shims.

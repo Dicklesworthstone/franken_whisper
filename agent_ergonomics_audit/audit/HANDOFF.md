@@ -47,8 +47,10 @@ Evidence boundaries and next work:
   dirty-tree manifest records the current HEAD rather than a digest of edits;
 - build all five configured DSR targets from a clean landed commit before
   claiming cross-platform release readiness;
-- Sortformer remains evaluation-only, operator-local, and excluded from Git and
-  release assets;
+- at the time of this historical pass, Sortformer was evaluation-only,
+  operator-local, and excluded from release assets; later work preserves the
+  evaluation-only accuracy boundary while distributing the licensed,
+  hash-pinned package through an explicit model release outside Git;
 - the acoustic diarizer remains an uncertified heuristic baseline;
 - run a held-out, speaker-balanced corpus benchmark before making any
   diarization quality or promotion claim.

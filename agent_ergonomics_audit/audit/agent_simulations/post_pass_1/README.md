@@ -13,7 +13,11 @@ All probes used synthetic placeholders or discovery-only commands. No private au
 - `fw robot --help` returned ordinary human help on stdout, exit 0, with `triage` visible.
 - `fw capabilities --json`, `fw models --json`, `fw doctor --json`, `fw robot triage`, and `fw robot schema` each returned exactly one JSON line.
 - Captured stderr for `models`, `doctor`, and `triage` was exactly zero bytes after removing model-path logging.
-- Discovery reported four model entries without local paths or network access. The acoustic baseline was labeled `available_uncertified_heuristic`; Sortformer was labeled evaluation-only and operator-local.
+- During this historical pass, discovery reported four model entries without
+  local paths or network access. The acoustic baseline was labeled
+  `available_uncertified_heuristic`; Sortformer was labeled evaluation-only and
+  operator-local. Later explicit-pull release packaging supersedes only the
+  operator-local distribution fact, not the accuracy/Auto boundary.
 - Doctor reported `runtime_probe_performed: false`, `operationally_verified: false`, and static-preflight authority even when it found a local execution candidate.
 
 ## Error and empty-result behavior
