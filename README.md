@@ -284,7 +284,7 @@ Most tools occupy one level. `franken_whisper` is the orchestration layer: it wr
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/main/install.sh?$(date +%s)" | bash
 ```
 
-The installer downloads the appropriate release asset for your platform, verifies its SHA-256 checksum against `checksums-sha256.txt`, validates the staged binary's self-reported version before replacement, and installs both `fw` and `franken_whisper` to `~/.local/bin`. After an interactive online install, it explains the approximately 492 MB Sortformer download and asks whether to run the installed `fw pull sortformer`; the safe default is **No**. Quiet, headless, and air-gapped installs never start that model download. Unknown options, missing values, and conflicting source/offline modes fail before any download. A release download failure never silently falls back to a source build; use `--from-source` explicitly.
+The installer downloads the appropriate release asset for your platform, verifies its SHA-256 checksum against `checksums-sha256.txt`, validates the staged binary's self-reported version before replacement, and installs both `fw` and `franken_whisper` to `~/.local/bin`. After an interactive online install, it explains the approximately 492 MB Sortformer download and asks whether to run the installed `fw pull sortformer`; the safe default is **No**. Quiet, headless, and air-gapped installs never start that model download. For `sudo ... --system`, the optional pull drops back to the validated invoking user so the model does not land in root's private cache. Unknown options, missing values, and conflicting source/offline modes fail before any download. A release download failure never silently falls back to a source build; use `--from-source` explicitly.
 
 Options:
 
@@ -610,17 +610,19 @@ Hard known intervals may bind a
 unique anonymous lane to a caller-provided opaque reference; contradictory or
 ambiguous hard evidence fails closed. Soft intervals remain non-authoritative
 suggestions, every non-hard-bound lane remains anonymous, and inference never
-mutates model weights. It cannot yet be
-selected by `--diarization-engine auto`. On the frozen 25-second overlap-heavy
-two-speaker public clip, the native output scored DER `0.058904110` and JER
-`0.065850064`; that is one evidence row, not broad accuracy certification.
-Raw L7/L8 is byte-exact on that frozen 25-second reconstructable truth-pack
-prefix, while production turns clamp to the physical audio duration. A later
-whole-recording run on the same 102-second public recording found four one-frame
-(80 ms) native-versus-NeMo boundary differences among 16 anonymous turns, so
-broad whole-recording L7/L8 parity is not established. One chained L6 hard-top-k
-tie remains platform-defined; the command therefore reports `evaluation_only`
-and automatic promotion remains forbidden. The converted f32 package is 491,570,584 bytes
+mutates model weights. It cannot yet be selected by
+`--diarization-engine auto`. The authenticated NVIDIA-recommended streaming
+truth pack covers four public fixtures and 4,540 L1-L8 tensors. On its complete
+102-second three-speaker row, native L5 probabilities stayed within the frozen
+envelope (maximum absolute difference `1.072883606e-6`, relative L2
+`8.214150678e-8`), and L7 activity plus all 16 L8 turns were byte-exact. The
+historical four one-frame boundary differences came from comparing the old
+archive-default streaming geometry with the recommended profile, not from a
+same-profile Rust/source loss. Same-host L6 tied-selection parity is resolved
+by the pinned safe libc++ `nth_element` translation. This is parity evidence,
+not broad corpus accuracy, greater-than-four-speaker capacity, cross-platform,
+or Auto-promotion evidence; the command therefore still reports
+`evaluation_only`. The converted f32 package is 491,570,584 bytes
 (SHA-256 `487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a`).
 Its distribution policy is `github_release_with_license_and_notice`: weights
 remain outside Git and are attached to the dedicated model release with the

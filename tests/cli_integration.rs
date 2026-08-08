@@ -584,27 +584,6 @@ printf '%s\n' '{"text":"stub transcript","language":"en","segments":[{"start":0.
 }
 
 #[cfg(unix)]
-fn generate_silent_wav(path: &std::path::Path) {
-    let status = ProcessCommand::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=r=16000:cl=mono",
-            "-t",
-            "0.3",
-        ])
-        .arg(path)
-        .status()
-        .expect("spawn ffmpeg");
-    assert!(status.success(), "ffmpeg should synthesize silent wav");
-}
-
-#[cfg(unix)]
 fn generate_voiced_wav(path: &std::path::Path) {
     let status = ProcessCommand::new("ffmpeg")
         .args([
@@ -674,6 +653,9 @@ fi
 if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_MARKER:-}" ]]; then
   printf '%s\n' "$input -> $output" >> "${FRANKEN_WHISPER_TEST_FFMPEG_MARKER}"
 fi
+if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS:-}" ]]; then
+  /bin/sleep "${FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS}"
+fi
 if [[ -n "$input" && -f "$input" ]]; then
   /bin/cp "$input" "$output"
 else
@@ -742,6 +724,10 @@ fn run_transcribe_json_with_stub_env(
     cmd.arg("transcribe");
     cmd.args(args);
     cmd.env("FRANKEN_WHISPER_WHISPER_CPP_BIN", stub_bin);
+    // These tests assert the external stub's exact transcript and bridge
+    // metadata. A locally cached native model must not silently bypass the
+    // fixture and make the result depend on developer-machine state.
+    cmd.env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0");
     cmd.env("FRANKEN_WHISPER_STATE_DIR", state_root);
     for (key, value) in extra_env {
         cmd.env(key, value);
@@ -2018,16 +2004,13 @@ fn robot_run_emits_cancelled_stage_before_terminal_run_error() {
 #[cfg(unix)]
 #[test]
 fn robot_run_normalize_stage_timeout_maps_to_timeout_error_code() {
-    if !ffmpeg_available() {
-        return;
-    }
-
     let dir = tempdir().expect("tempdir");
     let state_root = dir.path().join("state");
     let db_path = dir.path().join("storage.sqlite3");
     let stub_bin = write_whisper_cpp_stub_binary(dir.path());
+    let ffmpeg_stub = write_provisioned_ffmpeg_stub(dir.path());
     let input_wav = dir.path().join("timeout-input.wav");
-    generate_silent_wav(&input_wav);
+    generate_voiced_wav_without_ffmpeg(&input_wav, 300);
 
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
         .args([
@@ -2043,7 +2026,10 @@ fn robot_run_normalize_stage_timeout_maps_to_timeout_error_code() {
         ])
         .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
         .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
-        .env("FRANKEN_WHISPER_STAGE_BUDGET_NORMALIZE_MS", "1")
+        .env("FRANKEN_WHISPER_FFMPEG_BIN", &ffmpeg_stub)
+        .env("FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE", "1")
+        .env("FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS", "0.2")
+        .env("FRANKEN_WHISPER_STAGE_BUDGET_NORMALIZE_MS", "10")
         .output()
         .expect("robot command should execute");
 
@@ -3392,6 +3378,10 @@ fn robot_tiny_diarize_emits_redacted_hint_evidence_and_native_acoustic_report() 
         ])
         .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
         .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        // This fixture proves propagation of whisper.cpp's TinyDiarize turn
+        // markers into the acoustic report. A cached native Whisper model must
+        // not bypass the purpose-built bridge response on developer machines.
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
         .output()
         .expect("robot TinyDiarize acoustic run must execute");
 

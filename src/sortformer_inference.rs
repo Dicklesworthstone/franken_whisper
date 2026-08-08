@@ -773,18 +773,11 @@ impl SortformerF32Facade {
         checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
     ) -> FwResult<Vec<f32>> {
         frontend_checkpoint(checkpoint)?;
-        if !matches!(left_feature_frames, 0 | SORTFORMER_SUBSAMPLING_FACTOR)
-            || right_feature_frames
-                > SORTFORMER_RIGHT_CONTEXT_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR
-            || left_feature_frames
-                .checked_add(right_feature_frames)
-                .is_none_or(|context| context >= feature_frames)
-        {
-            return Err(reference_error(
-                "stream_context",
-                "Sortformer stream context is outside the frozen recommended profile",
-            ));
-        }
+        validate_sortformer_feature_chunk_geometry(
+            feature_frames,
+            left_feature_frames,
+            right_feature_frames,
+        )?;
         let chunk_embeddings = self.subsample_feature_chunk_with_checkpoint(
             time_major_features,
             feature_frames,
@@ -831,14 +824,14 @@ impl SortformerF32Facade {
         }
         let left_embedding_frames = left_feature_frames / SORTFORMER_SUBSAMPLING_FACTOR;
         let right_embedding_frames = right_feature_frames.div_ceil(SORTFORMER_SUBSAMPLING_FACTOR);
-        let chunk_predictions = self.update_streaming_state(
+        let chunk_predictions = Self::update_streaming_state_transactionally(
             state,
             &chunk_embeddings,
             &probabilities,
             left_embedding_frames,
             right_embedding_frames,
+            checkpoint,
         )?;
-        frontend_checkpoint(checkpoint)?;
         Ok(chunk_predictions.data)
     }
 
@@ -1281,6 +1274,8 @@ impl SortformerF32Facade {
 
     /// Apply the pinned synchronous L6 cache/FIFO update for one native
     /// speaker-head invocation and return its context-trimmed stream output.
+    /// Every fallible update is transactional: an error leaves `state`
+    /// byte-identical to its admitted pre-step value.
     ///
     /// `chunk_embeddings` are the L2 pre-encode embeddings including left and
     /// right context. `probabilities` cover the concatenated prior cache, FIFO,
@@ -1293,7 +1288,53 @@ impl SortformerF32Facade {
         left_context_frames: usize,
         right_context_frames: usize,
     ) -> FwResult<Mat> {
+        Self::update_streaming_state_transactionally(
+            state,
+            chunk_embeddings,
+            probabilities,
+            left_context_frames,
+            right_context_frames,
+            &|| Ok(()),
+        )
+    }
+
+    fn update_streaming_state_transactionally(
+        state: &mut SortformerStreamingState,
+        chunk_embeddings: &SortformerSubsamplingOutput,
+        probabilities: &Mat,
+        left_context_frames: usize,
+        right_context_frames: usize,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Mat> {
+        let mut candidate = try_clone_streaming_state(state)?;
+        let chunk_predictions = Self::update_streaming_state_in_place(
+            &mut candidate,
+            chunk_embeddings,
+            probabilities,
+            left_context_frames,
+            right_context_frames,
+        )?;
+        frontend_checkpoint(checkpoint)?;
+        *state = candidate;
+        Ok(chunk_predictions)
+    }
+
+    fn update_streaming_state_in_place(
+        state: &mut SortformerStreamingState,
+        chunk_embeddings: &SortformerSubsamplingOutput,
+        probabilities: &Mat,
+        left_context_frames: usize,
+        right_context_frames: usize,
+    ) -> FwResult<Mat> {
         validate_streaming_state(state)?;
+        if !matches!(left_context_frames, 0 | SORTFORMER_LEFT_CONTEXT_FRAMES)
+            || right_context_frames > SORTFORMER_RIGHT_CONTEXT_FRAMES
+        {
+            return Err(reference_error(
+                "l6_chunk",
+                "L6 embedding context is outside the frozen recommended profile",
+            ));
+        }
         if chunk_embeddings.width != SORTFORMER_ENCODER_WIDTH
             || chunk_embeddings.frames.checked_mul(chunk_embeddings.width)
                 != Some(chunk_embeddings.data.len())
@@ -1309,10 +1350,12 @@ impl SortformerF32Facade {
             .checked_sub(left_context_frames)
             .and_then(|frames| frames.checked_sub(right_context_frames))
             .ok_or_else(|| reference_error("l6_chunk", "L6 context exceeds chunk frames"))?;
-        if chunk_frames == 0 {
+        if chunk_frames == 0 || chunk_frames > SORTFORMER_CHUNK_FRAMES {
             return Err(reference_error(
                 "l6_chunk",
-                "L6 requires at least one non-context chunk frame",
+                &format!(
+                    "L6 central chunk must contain between 1 and {SORTFORMER_CHUNK_FRAMES} frames"
+                ),
             ));
         }
         let expected_probability_rows = state
@@ -3542,6 +3585,7 @@ fn validate_streaming_state(state: &SortformerStreamingState) -> FwResult<()> {
     let fifo_values = state.fifo.rows.checked_mul(SORTFORMER_ENCODER_WIDTH);
     if state.speaker_cache.cols != SORTFORMER_ENCODER_WIDTH
         || cache_values != Some(state.speaker_cache.data.len())
+        || state.speaker_cache.rows > SORTFORMER_SPEAKER_CACHE_FRAMES
         || state.fifo.cols != SORTFORMER_ENCODER_WIDTH
         || fifo_values != Some(state.fifo.data.len())
         || state.fifo.rows > SORTFORMER_FIFO_FRAMES
@@ -3600,6 +3644,42 @@ fn validate_streaming_state(state: &SortformerStreamingState) -> FwResult<()> {
     Ok(())
 }
 
+fn try_clone_mat(input: &Mat) -> FwResult<Mat> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(input.data.len())
+        .map_err(|_| reference_error("allocation", "L6 state clone allocation failed"))?;
+    data.extend_from_slice(&input.data);
+    Ok(Mat::from_vec(input.rows, input.cols, data))
+}
+
+fn try_clone_streaming_state(
+    state: &SortformerStreamingState,
+) -> FwResult<SortformerStreamingState> {
+    validate_streaming_state(state)?;
+    let mut mean_silence_embedding = Vec::new();
+    mean_silence_embedding
+        .try_reserve_exact(state.mean_silence_embedding.len())
+        .map_err(|_| reference_error("allocation", "L6 state clone allocation failed"))?;
+    mean_silence_embedding.extend_from_slice(&state.mean_silence_embedding);
+    Ok(SortformerStreamingState {
+        speaker_cache: try_clone_mat(&state.speaker_cache)?,
+        speaker_cache_predictions: state
+            .speaker_cache_predictions
+            .as_ref()
+            .map(try_clone_mat)
+            .transpose()?,
+        fifo: try_clone_mat(&state.fifo)?,
+        fifo_predictions: state
+            .fifo_predictions
+            .as_ref()
+            .map(try_clone_mat)
+            .transpose()?,
+        speaker_permutation: state.speaker_permutation,
+        mean_silence_embedding,
+        silence_frames: state.silence_frames,
+    })
+}
+
 fn sortformer_fifo_pop_frames(fifo_frames: usize, chunk_frames: usize) -> FwResult<Option<usize>> {
     let total_fifo_frames = fifo_frames
         .checked_add(chunk_frames)
@@ -3615,6 +3695,30 @@ fn sortformer_fifo_pop_frames(fifo_frames: usize, chunk_frames: usize) -> FwResu
             .max(required_pop)
             .min(total_fifo_frames),
     ))
+}
+
+fn validate_sortformer_feature_chunk_geometry(
+    feature_frames: usize,
+    left_feature_frames: usize,
+    right_feature_frames: usize,
+) -> FwResult<()> {
+    let context_feature_frames = left_feature_frames
+        .checked_add(right_feature_frames)
+        .ok_or_else(|| reference_error("stream_context", "stream context length overflows"))?;
+    let central_feature_frames = feature_frames
+        .checked_sub(context_feature_frames)
+        .ok_or_else(|| reference_error("stream_context", "stream context exceeds the chunk"))?;
+    if !matches!(left_feature_frames, 0 | SORTFORMER_SUBSAMPLING_FACTOR)
+        || right_feature_frames > SORTFORMER_RIGHT_CONTEXT_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR
+        || central_feature_frames == 0
+        || central_feature_frames > SORTFORMER_CHUNK_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR
+    {
+        return Err(reference_error(
+            "stream_context",
+            "Sortformer stream context is outside the frozen recommended profile",
+        ));
+    }
+    Ok(())
 }
 
 fn slice_rows(values: &[f32], width: usize, start: usize, end: usize) -> FwResult<&[f32]> {
@@ -5855,6 +5959,7 @@ mod tests {
         );
         assert!(sortformer_stream_output_rows(188, 40, 1, 256, 484).is_err());
         assert!(sortformer_stream_output_rows(usize::MAX, 1, 0, 1, usize::MAX).is_err());
+        assert!(sortformer_stream_output_rows(0, 0, 1, usize::MAX, usize::MAX).is_err());
     }
 
     #[test]
@@ -5878,6 +5983,159 @@ mod tests {
         assert_eq!(
             sortformer_fifo_pop_frames(40, 20).expect("short final tail"),
             Some(60)
+        );
+    }
+
+    #[test]
+    fn recommended_feature_chunk_geometry_is_bounded_before_subsampling() {
+        let central = SORTFORMER_CHUNK_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR;
+        let right = SORTFORMER_RIGHT_CONTEXT_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR;
+        assert!(validate_sortformer_feature_chunk_geometry(central, 0, 0).is_ok());
+        assert!(
+            validate_sortformer_feature_chunk_geometry(
+                central + SORTFORMER_SUBSAMPLING_FACTOR + right,
+                SORTFORMER_SUBSAMPLING_FACTOR,
+                right,
+            )
+            .is_ok()
+        );
+        assert!(validate_sortformer_feature_chunk_geometry(central + 1, 0, 0).is_err());
+        assert!(
+            validate_sortformer_feature_chunk_geometry(
+                central + SORTFORMER_SUBSAMPLING_FACTOR + right + 1,
+                SORTFORMER_SUBSAMPLING_FACTOR,
+                right + 1,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_sortformer_feature_chunk_geometry(usize::MAX, usize::MAX, usize::MAX,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn streaming_state_error_rolls_back_fifo_and_silence_mutations() {
+        let mut state = SortformerStreamingState::new();
+        state.fifo = Mat::from_vec(
+            SORTFORMER_FIFO_FRAMES,
+            SORTFORMER_ENCODER_WIDTH,
+            vec![f32::MAX; SORTFORMER_FIFO_FRAMES * SORTFORMER_ENCODER_WIDTH],
+        );
+        state.fifo_predictions = Some(Mat::from_vec(
+            SORTFORMER_FIFO_FRAMES,
+            SORTFORMER_SPEAKER_LANES,
+            vec![0.0; SORTFORMER_FIFO_FRAMES * SORTFORMER_SPEAKER_LANES],
+        ));
+        let original = state.clone();
+        let chunk = SortformerSubsamplingOutput {
+            frames: 1,
+            width: SORTFORMER_ENCODER_WIDTH,
+            data: vec![f32::MAX; SORTFORMER_ENCODER_WIDTH],
+        };
+        let probabilities = Mat::from_vec(
+            SORTFORMER_FIFO_FRAMES + 1,
+            SORTFORMER_SPEAKER_LANES,
+            vec![0.0; (SORTFORMER_FIFO_FRAMES + 1) * SORTFORMER_SPEAKER_LANES],
+        );
+
+        let error = SortformerF32Facade::update_streaming_state_transactionally(
+            &mut state,
+            &chunk,
+            &probabilities,
+            0,
+            0,
+            &|| Ok(()),
+        )
+        .expect_err("non-finite silence mean must reject the candidate update");
+        assert!(error.to_string().contains("silence mean became non-finite"));
+        assert_eq!(state, original, "failed update must not mutate live state");
+
+        let mut state = SortformerStreamingState::new();
+        let original = state.clone();
+        let chunk = SortformerSubsamplingOutput {
+            frames: 1,
+            width: SORTFORMER_ENCODER_WIDTH,
+            data: vec![0.0; SORTFORMER_ENCODER_WIDTH],
+        };
+        let probabilities = Mat::from_vec(
+            1,
+            SORTFORMER_SPEAKER_LANES,
+            vec![0.0; SORTFORMER_SPEAKER_LANES],
+        );
+        let error = SortformerF32Facade::update_streaming_state_transactionally(
+            &mut state,
+            &chunk,
+            &probabilities,
+            0,
+            0,
+            &|| Err(FwError::Cancelled("private cancellation detail".to_owned())),
+        )
+        .expect_err("cancellation before commit must reject the candidate update");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert!(!error.to_string().contains("private cancellation detail"));
+        assert_eq!(
+            state, original,
+            "cancelled update must not mutate live state"
+        );
+    }
+
+    #[test]
+    fn streaming_state_rejects_an_oversized_central_chunk_without_mutation() {
+        let mut state = SortformerStreamingState::new();
+        let original = state.clone();
+        let frames = SORTFORMER_CHUNK_FRAMES + 1;
+        let chunk = SortformerSubsamplingOutput {
+            frames,
+            width: SORTFORMER_ENCODER_WIDTH,
+            data: vec![0.0; frames * SORTFORMER_ENCODER_WIDTH],
+        };
+        let probabilities = Mat::from_vec(
+            frames,
+            SORTFORMER_SPEAKER_LANES,
+            vec![0.0; frames * SORTFORMER_SPEAKER_LANES],
+        );
+
+        let error = SortformerF32Facade::update_streaming_state_transactionally(
+            &mut state,
+            &chunk,
+            &probabilities,
+            0,
+            0,
+            &|| Ok(()),
+        )
+        .expect_err("the frozen profile must reject an oversized central chunk");
+        assert!(error.to_string().contains("between 1 and 340 frames"));
+        assert_eq!(state, original, "rejected chunk must not mutate live state");
+
+        let context_frames = SORTFORMER_RIGHT_CONTEXT_FRAMES + 2;
+        let chunk = SortformerSubsamplingOutput {
+            frames: context_frames,
+            width: SORTFORMER_ENCODER_WIDTH,
+            data: vec![0.0; context_frames * SORTFORMER_ENCODER_WIDTH],
+        };
+        let probabilities = Mat::from_vec(
+            context_frames,
+            SORTFORMER_SPEAKER_LANES,
+            vec![0.0; context_frames * SORTFORMER_SPEAKER_LANES],
+        );
+        let error = SortformerF32Facade::update_streaming_state_transactionally(
+            &mut state,
+            &chunk,
+            &probabilities,
+            0,
+            SORTFORMER_RIGHT_CONTEXT_FRAMES + 1,
+            &|| Ok(()),
+        )
+        .expect_err("the frozen profile must reject oversized right context");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the frozen recommended profile")
+        );
+        assert_eq!(
+            state, original,
+            "rejected context must not mutate live state"
         );
     }
 

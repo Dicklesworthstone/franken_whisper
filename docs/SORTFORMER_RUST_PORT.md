@@ -194,8 +194,9 @@ The safe Rust f32 graph now loads the authenticated 491,570,584-byte package,
 runs the frozen streaming schedule through all 17 FastConformer and 18
 Transformer blocks, updates the speaker cache/FIFO state, and emits L7 activity
 and L8 anonymous speaker turns. `SortformerSession` checkpoints cancellation at
-chunk and neural-block boundaries, uses checked bounded allocations, and clamps
-user-visible tail turns to the physical recording duration. The standalone
+chunk and neural-block boundaries, commits each bounded cache/FIFO transition
+transactionally only after its final checkpoint, and clamps user-visible tail
+turns to the physical recording duration. The standalone
 `sortformer-diarize` command exercises that same library path after the existing
 audio normalizer; it does not participate in `DiarizationEngine::Auto`.
 
@@ -733,7 +734,7 @@ mask contract is proven at a seam.
 | ReLU / Swish / sigmoid | safe reference, then general kernel | special values and full-tensor drift |
 | Softmax and masks | FrankenTorch only after mask equivalence | fully masked, tail, and long-context cases |
 | Top-k, stable sort, gather, optional permutation | safe Rust model logic | tie, placeholder, disabled, and eval-absence fixtures |
-| Cache/FIFO mutation | safe Rust bounded state machine | empty, first-full, steady, tail, and cancellation fixtures |
+| Cache/FIFO mutation | safe Rust bounded transactional state machine | empty, first-full, steady, tail, rejected-input, rollback, and cancellation fixtures |
 | Log-mel frontend | pinned-buffer Rust implementation | authenticated synthetic parity plus public source seams; native public-stage parity remains required |
 
 No new tensor runtime is justified. No model-specific fused kernel is justified
@@ -1221,8 +1222,8 @@ Completed here:
   every complete discrete public truth-pack tensor, including the full
   102-second three-speaker recording and complete four-speaker fixture;
 - an authenticated `SortformerSession` with checked whole-recording streaming,
-  neural-block cancellation checkpoints, bounded resource validation, and
-  physical-duration tail clamping;
+  neural-block cancellation checkpoints, bounded resource validation,
+  transactional cache/FIFO rollback, and physical-duration tail clamping;
 - an explicit, cancellation-aware `fw pull sortformer` path plus a
   path-redacted cached `sortformer-diarize` evaluation-only CLI whose real
   public three-speaker run inferred three active lanes; and

@@ -17,7 +17,7 @@
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run self-test after install
-#   --no-pull          Suppress the post-install Sortformer model prompt
+#   --no-pull          Suppress the post-install Sortformer model prompt/guidance
 #   --force            Reinstall even if the same version is already present
 #   --artifact-url URL Use a custom release artifact URL
 #   --checksum SHA     Provide expected SHA256 checksum
@@ -1137,7 +1137,9 @@ maybe_offer_sortformer_pull() {
     [ "$NO_PULL" -eq 1 ] && return 0
 
     local bin="$DEST/$ALIAS_NAME"
-    local cache_root="${FRANKEN_WHISPER_MODEL_DIR:-$HOME/.cache/franken_whisper/models}"
+    local cache_home="$HOME"
+    local pull_user=""
+    local -a pull_command=("$bin" pull sortformer)
 
     # Airgapped, quiet, and headless installs never start a surprise network
     # transfer. They retain one explicit command for later provisioning.
@@ -1150,9 +1152,59 @@ maybe_offer_sortformer_pull() {
         return 0
     fi
 
+    # A system install commonly runs under sudo. Pulling as root would populate
+    # root's private cache, leaving the invoking user unable to use the model.
+    # Drop only the optional model pull back to that validated user, retain a
+    # target-user HOME, and forward only the model/proxy variables the pull
+    # contract documents.
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        if ! command -v sudo >/dev/null 2>&1 || ! id -u "$SUDO_USER" >/dev/null 2>&1; then
+            log_warn "Cannot safely identify the invoking sudo user; skipping the model pull prompt."
+            log_info "Run this later as the intended model owner: fw pull sortformer"
+            return 0
+        fi
+        cache_home=$(sudo -H -u "$SUDO_USER" sh -c 'printf "%s" "$HOME"') || {
+            log_warn "Cannot resolve the invoking sudo user's home; skipping the model pull prompt."
+            log_info "Run this later as the intended model owner: fw pull sortformer"
+            return 0
+        }
+        if [ -z "$cache_home" ] || [[ "$cache_home" != /* ]]; then
+            log_warn "The invoking sudo user's home is not an absolute path; skipping the model pull prompt."
+            log_info "Run this later as the intended model owner: fw pull sortformer"
+            return 0
+        fi
+        pull_user="$SUDO_USER"
+        local -a forwarded_env=()
+        local env_name
+        for env_name in \
+            FRANKEN_WHISPER_MODEL_DIR \
+            HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
+            http_proxy https_proxy all_proxy no_proxy
+        do
+            if [ "${!env_name+x}" = "x" ]; then
+                forwarded_env+=("$env_name=${!env_name}")
+            fi
+        done
+        pull_command=(sudo -H -u "$pull_user")
+        if [ "${#forwarded_env[@]}" -gt 0 ]; then
+            pull_command+=(env "${forwarded_env[@]}")
+        fi
+        pull_command+=("$bin" pull sortformer)
+    fi
+
+    local cache_root="${FRANKEN_WHISPER_MODEL_DIR:-$cache_home/.cache/franken_whisper/models}"
+    if [[ "$cache_root" != /* ]]; then
+        log_warn "FRANKEN_WHISPER_MODEL_DIR must be absolute; skipping the model pull prompt."
+        log_info "Set an absolute model root, then run: fw pull sortformer"
+        return 0
+    fi
+
     echo ""
     log_info "Native speaker diarization needs the pinned Sortformer model."
     log_info "The verified download is about 492 MB into $cache_root."
+    if [ -n "$pull_user" ]; then
+        log_info "The model pull will run as the invoking user: $pull_user"
+    fi
     local answer=""
     local read_status=0
     local prompt_timeout="${FW_INSTALL_PROMPT_TIMEOUT:-120}"
@@ -1173,9 +1225,15 @@ maybe_offer_sortformer_pull() {
     case "$answer" in
         y|Y|yes|Yes|YES)
             log_step "Running: fw pull sortformer"
-            if "$bin" pull sortformer; then
+            local pull_status=0
+            if "${pull_command[@]}"; then
                 log_success "Verified Sortformer model installed under $cache_root"
             else
+                pull_status=$?
+                if [ "$pull_status" -gt 128 ]; then
+                    log_warn "Model provisioning was interrupted."
+                    return "$pull_status"
+                fi
                 log_warn "Model provisioning did not finish. Retry later with: fw pull sortformer"
             fi
             ;;
@@ -1244,11 +1302,13 @@ print_summary() {
     echo "    fw doctor --json"
     echo "    fw robot run --input audio.mp3 --backend auto"
     echo "    fw --help"
-    echo ""
-    echo "  Model policy:"
-    echo "    Weights are not bundled. This installer offers 'fw pull sortformer';"
-    echo "    inspect readiness at any time with 'fw models --json'."
-    echo ""
+    if [ "$NO_PULL" -eq 0 ]; then
+        echo ""
+        echo "  Model policy:"
+        echo "    Weights are not bundled. This installer offers 'fw pull sortformer';"
+        echo "    inspect readiness at any time with 'fw models --json'."
+        echo ""
+    fi
     echo "  Uninstall:"
     echo "    curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/main/install.sh | bash -s -- --uninstall"
     echo ""
