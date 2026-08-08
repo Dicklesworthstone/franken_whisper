@@ -837,7 +837,7 @@ def _build_sortformer_receipt(
             "model_license_last_modified": "Mon, 03 Aug 2026 17:46:28 GMT",
             "model_license_etag": "4b001-658281e31650b",
             "model_license_payload_sha256": "13c9c998e24abd5211cff4b5c912902f566bd710294da98580be7b3376626f04",
-            "model_weight_distribution_policy": "operator_local_no_git_no_release",
+            "model_weight_distribution_policy": "github_release_with_license_and_notice",
             "nemo_source_license_spdx": "Apache-2.0",
             "nemo_source_license_sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1",
             "embedded_notice_source_path": "nemo/collections/asr/parts/preprocessing/features.py",

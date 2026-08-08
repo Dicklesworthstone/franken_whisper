@@ -440,9 +440,8 @@ fn lane_support(
         let start_ms = f64::from(turn.start_seconds) * 1_000.0;
         let end_ms = f64::from(turn.end_seconds) * 1_000.0;
         for &(hint_start_ms, hint_end_ms, confidence) in &envelope {
-            let overlap = (end_ms.min(hint_end_ms as f64)
-                - start_ms.max(hint_start_ms as f64))
-            .max(0.0);
+            let overlap =
+                (end_ms.min(hint_end_ms as f64) - start_ms.max(hint_start_ms as f64)).max(0.0);
             if let Some(lane_support) = support.get_mut(turn.speaker) {
                 *lane_support += overlap * confidence;
             }

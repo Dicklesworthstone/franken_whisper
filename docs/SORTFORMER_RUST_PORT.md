@@ -61,8 +61,8 @@ current production behavior unchanged.
 | `model_weights.ckpt` SHA-256 | `eca9773c2dab91dd41fbaa4473cebb9d00811d67788ce2de609dadc6e499cdf4` |
 | Pinned externally-derived 990-entry state inventory SHA-256 | `f4f219cf4ac6f755247b56d19e425db3d6a7c23c4509176549b363b63abdf532` |
 | Canonical 992-record topology-projection SHA-256 | `2c32b0b9e48bb296e66615b038827d0fdde4b4fda2ce044a6c30cd317456c8d7` |
-| Reviewed converter source SHA-256 | `6a946cc6647bf52244d0eaad89db834bdc52cc61fd08d9563632dd1f9d239c1e` |
-| Canonical conversion receipt SHA-256 | `a1c6dce95ef4fd715965951bdaaa136e55e2219f93cf78122f8b462fbd07cbbe` |
+| Reviewed converter source SHA-256 | `3ce885d1dcb0aeeebf2bb73c165f501a1d240e01ad70354c65cf43d8a3c6d8ce` |
+| Canonical conversion receipt SHA-256 | `407c642f3d51b399514f6a35227b1c80886387472a44fb78f01b824d26318fb0` |
 | Converted package bytes | `491570584` |
 | Converted package SHA-256 | `487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a` |
 | NeMo source revision | `40ace43c7cf151af78dc22027c02feeca7e06b6a` |
@@ -634,9 +634,9 @@ implementation.
 The final-output external adapter still does not authorize intermediate
 activations. A separate frozen exporter provides both the synthetic L1 pack
 and the licensed-public L1-L8 source pack. Its source SHA-256 is
-`bb15a4b9bfbaab59c5ddeb76801acf584b717c1cee0b420d416348bccf17f0b8`;
+`b3020f1e6c136343adecabc3209f3b1ef70f40a7e36d2b2ed9b25fbbd439b6dd`;
 the canonical receipt SHA-256 is
-`cfea19c99f3894927941d7290c05eacc33a403ff70d7cf84f3d1c4859d6e5efd`;
+`ac3dab6f7ad48ccaeeee0ba8e1f4932b5377736e28fa471fa7d43020922df2a9`;
 and the 282,716-byte safetensors package SHA-256 is
 `294edcc0a9d80fa9470c2cd45f2c1556a47a56b7c98ba444984f764a1f398a8b`.
 The package and receipt stay operator-local. Git contains only the exporter,
@@ -690,7 +690,7 @@ Small and discrete tensors remain complete. The resulting metadata-free package
 is 87,386,140 bytes with SHA-256
 `bf131cb9a88f1295d35e7eba750b653189b808fbf50113399a650a34e48d21d7`;
 the 6,145,112-byte canonical receipt SHA-256 is
-`9cec843ffb91e0b602598fb3b34c183603f6f7bd678cea7fa0139b8746a5db34`.
+`842b448d19c196d6d812132a4ae3a799c594c592a99b2ac7648db683bae76190`.
 Both stay operator-local.
 
 All discrete probes and cache/FIFO Option transitions were byte-exact. Numeric
@@ -991,8 +991,9 @@ FrankenTorch facade, checkpoint cancellation between bounded chunks and every
 layer, and initially return `DifferentialStageDocument`. The strict Sortformer
 validator in `src/differential_oracle.rs` is the first output boundary.
 
-This slice must not change `DiarizationEngine`, automatic routing, the
-production transcribe report contract, or comparison protocol v2. The explicit
+This slice must not change `DiarizationEngine`, automatic routing, or the
+production transcribe report contract. Comparison protocol v3 adds the native
+Sortformer lane without changing product routing. The explicit
 `sortformer-diarize` command is a path-redacted evaluation surface over the
 same library session; it reports `evaluation_only` and cannot be selected by
 `Auto`.
@@ -1076,7 +1077,7 @@ Completed here:
 - aggregate parameter/export/drop/operator/state census plus the pinned
   externally-derived insertion-order inventory digest;
 - a reviewed frozen offline converter, canonical 992-record topology projection,
-  653,202-byte receipt, and 491,570,584-byte metadata-free package, all with
+  653,208-byte receipt, and 491,570,584-byte metadata-free package, all with
   compiled digests while licensed bytes remain outside Git and independently
   release-distributed with legal sidecars;
 - explicit streaming and capacity contract;

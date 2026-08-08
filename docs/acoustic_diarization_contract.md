@@ -1297,12 +1297,19 @@ access.
 `public-diarization-corpus-input-v2` from an absolute root outside the checkout.
 Every selected input is a relative path under that canonical root. Symlink
 escapes, traversal, absolute descriptor paths, wrong SHA-256 values, unexpected
-WAV sample rate/channel count, invalid selected channels, malformed RTTM,
-unmapped speakers, and out-of-bounds turns fail closed. RTTM is the deliberately
-small interchange surface: exactly ten `SPEAKER` fields, plain decimal seconds,
-one selected recording/channel, and an explicit source-label to path-free
-speaker-ID map. Concurrent different-speaker turns are preserved and marked as
-overlap. Ignored regions remain explicit scorer inputs.
+WAV sample rate/channel count, invalid selected channels, malformed RTTM, and
+unmapped speakers fail closed. Out-of-bounds turns also fail closed except for
+one corpus-specific conversion rule: an official VoxConverse turn that begins
+before WAV EOF and ends no more than 100 ms after EOF is clipped to EOF, with
+the clipped-turn count and clipped milliseconds retained in path-free evidence.
+The pinned archive audit admitted 61 test turns (zero development turns), with
+a maximum 92 ms overrun; counterexamples at 101 ms or beginning at EOF remain
+rejected. This is a frozen source-normalization rule, not a scorer-tolerance
+change. RTTM is the deliberately small interchange surface: exactly ten
+`SPEAKER` fields, plain decimal seconds, one selected recording/channel, and an
+explicit source-label to path-free speaker-ID map. Concurrent different-speaker
+turns are preserved and marked as overlap. Ignored regions remain explicit
+scorer inputs.
 
 Each recording may bind an optional external
 `public-diarization-word-annotation-v1` document by relative path and exact
@@ -1311,10 +1318,11 @@ opaque word IDs, integer-millisecond intervals, and reference speaker IDs.
 The adapter validates every word against active reference speech, caps
 per-recording and corpus totals, and never imports lexical text.
 
-The generated `public-diarization-corpus-bundle-v2` contains the path-free
+The generated `public-diarization-corpus-bundle-v3` contains the path-free
 manifest, canonical reference documents, media/annotation/reference SHA-256
 values, optional word-annotation SHA-256 values and counts, checked WAV
-geometry, and a passing self-hashed leakage audit. It never contains local
+geometry, annotation-tail normalization counts, and a passing self-hashed
+leakage audit. It never contains local
 paths, URIs, transcripts, or media bytes. The output is created once in a
 directory outside both the checkout and input root; source media is never
 copied. Entire output file names use lowercase ASCII letters, digits, period,
@@ -1405,38 +1413,41 @@ change the default-off acoustic-v2 path.
 `diarization-corpus compare-models` is a separate development-only diagnostic.
 One invocation runs the same validated mono signed-PCM 16 kHz WAV bytes and the
 same frozen scorer over `native_acoustic`, `native_ecapa`,
-`native_ecapa_fused`, and the pinned operator-installed `external_sortformer`
-oracle. The headline uses inferred speaker count; a reference count above the
-Sortformer four-speaker contract is declared capacity-ineligible and is never
-passed to the model. Consecutive sorted observations follow a four-row Williams
-schedule, and `order_balance_complete` is true only after a complete schedule.
-Every declared lane is retained as completed, skipped, or failed with a stable
-reason. Protocol v2 binds each complete effective native request, the ordered
+`native_ecapa_fused`, the release-bound `native_sortformer`, and the pinned
+operator-installed `external_sortformer` oracle. The headline uses inferred
+speaker count; a reference count above the Sortformer four-speaker contract is
+declared capacity-ineligible and is never passed to either Sortformer lane.
+Consecutive sorted observations follow a ten-row balanced Williams schedule,
+and `order_balance_complete` is true only after a complete schedule. Every
+declared lane is retained as completed, skipped, or failed with a stable
+reason. Protocol v3 binds each complete effective native request, the ordered
 payload-free outcome taxonomy, and the protocol body to a pinned canonical
 SHA-256 identity; changing any of them requires a new version-and-digest pair.
-The command requires eight native
-Rayon workers to match the pinned Sortformer intra-op thread count and applies
-a frozen 1800-second limit to each Sortformer `OracleRun` subprocess. That
-value is not a whole-observation cap:
-the version probe has a separate 15-second limit. Top-level and per-row
-checkpoints, WAV decoding, native acoustic and ECAPA execution, and Sortformer
-subprocess polling observe caller cancellation. Hashing plus portions of input
-and output validation and scoring have no declared whole-attempt deadline, so
-whole-attempt cancellation latency remains unavailable rather than certified.
+The command requires eight native Rayon workers to match the pinned Sortformer
+intra-op thread count and applies the same frozen 1800-second whole-attempt
+limit to every lane. Each lane/observation runs in a fresh bounded worker
+process. Its request binds the executable, source WAV, normalized PCM,
+reference, scorer, protocol, and applicable model artifacts. Cancellation and
+timeout terminate the worker's complete process group, including a nested
+external adapter, and a live recursive-descendant probe measures the process-
+tree cancellation path.
 
 The aggregate comparison evidence is `diagnostic_only`,
 `development_uncertified`, forbids a superiority claim, and records
 `production_route_changed=false`. Absolute DER/JER values use the project
 scorer and must not be compared directly with published md-eval numbers without
 an explicit scorer-equivalence probe. Timing is retained for deployment
-observation only: native acoustic includes pipeline plus scorer; ECAPA lanes
-exclude one shared model load; Sortformer includes executable and input
-attestation, a version-probe subprocess, a cold oracle subprocess, output
-validation, and scoring per recording. Those scopes are not cross-lane
-comparable, and the current artifact intentionally reports isolated peak RSS
-and cancellation latency as unavailable. Neither ECAPA nor Sortformer weights
-are downloaded or vendored by this command; unavailable operator components
-produce typed skips.
+observation only. Parent-observed time for every lane includes process launch,
+bounded IPC, identity validation, audio decode, model load, inference, output
+validation, scoring, post-run identity validation, and resource-probe parsing.
+Those fresh-process scopes are cross-lane comparable. The artifact reports
+direct-worker-only peak RSS from the native platform probe (explicitly excluding
+subprocess-adapter memory from whole-tree claims) and measured recursive-
+process cancellation latency; unavailable platform probes remain explicitly
+unavailable rather than becoming zero. The comparison command downloads no
+model. `native_sortformer` uses only the release-bound cache installed by the
+explicit `fw pull sortformer` command; unavailable ECAPA, native Sortformer,
+or external-adapter components produce typed skips.
 The command does not alter transcription routing or the default-off acoustic
 sidecar.
 

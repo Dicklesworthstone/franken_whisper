@@ -30,9 +30,9 @@ pub const SORTFORMER_TENSOR_MANIFEST_SCHEMA: &str = "franken-whisper-sortformer-
 pub const SORTFORMER_CONVERTER_ID: &str = "franken-whisper-native-sortformer-converter";
 pub const SORTFORMER_CONVERTER_VERSION: &str = "1";
 pub const SORTFORMER_CONVERTER_SOURCE_SHA256: &str =
-    "6a946cc6647bf52244d0eaad89db834bdc52cc61fd08d9563632dd1f9d239c1e";
+    "3ce885d1dcb0aeeebf2bb73c165f501a1d240e01ad70354c65cf43d8a3c6d8ce";
 pub const SORTFORMER_CONVERSION_RECEIPT_SHA256: &str =
-    "a1c6dce95ef4fd715965951bdaaa136e55e2219f93cf78122f8b462fbd07cbbe";
+    "407c642f3d51b399514f6a35227b1c80886387472a44fb78f01b824d26318fb0";
 pub const SORTFORMER_MODEL_ID: &str = "nvidia/diar_streaming_sortformer_4spk-v2.1";
 pub const SORTFORMER_MODEL_REVISION: &str = "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d";
 pub const SORTFORMER_NEMO_BYTES: u64 = 471_367_680;
@@ -74,11 +74,11 @@ pub const SORTFORMER_ACTIVATION_RECEIPT_SCHEMA: &str =
     "franken-whisper-sortformer-activation-receipt-v1";
 pub const SORTFORMER_ACTIVATION_FLOOR_SCHEMA: &str = "franken-whisper-sortformer-oracle-floor-v1";
 pub const SORTFORMER_ACTIVATION_RECEIPT_SHA256: &str =
-    "cfea19c99f3894927941d7290c05eacc33a403ff70d7cf84f3d1c4859d6e5efd";
+    "ac3dab6f7ad48ccaeeee0ba8e1f4932b5377736e28fa471fa7d43020922df2a9";
 pub const SORTFORMER_ACTIVATION_PACKAGE_SHA256: &str =
     "294edcc0a9d80fa9470c2cd45f2c1556a47a56b7c98ba444984f764a1f398a8b";
 pub const SORTFORMER_ACTIVATION_EXPORTER_SHA256: &str =
-    "bb15a4b9bfbaab59c5ddeb76801acf584b717c1cee0b420d416348bccf17f0b8";
+    "b3020f1e6c136343adecabc3209f3b1ef70f40a7e36d2b2ed9b25fbbd439b6dd";
 pub const SORTFORMER_ACTIVATION_PACKAGE_BYTES: u64 = 282_716;
 pub const SORTFORMER_ACTIVATION_PAYLOAD_BYTES: u64 = 278_076;
 pub const SORTFORMER_ACTIVATION_F32_ELEMENTS: u64 = 69_503;
@@ -90,7 +90,7 @@ pub const SORTFORMER_PUBLIC_ACTIVATION_RECEIPT_SCHEMA: &str =
 pub const SORTFORMER_PUBLIC_ACTIVATION_FLOOR_SCHEMA: &str =
     "franken-whisper-sortformer-public-oracle-floor-v1";
 pub const SORTFORMER_PUBLIC_ACTIVATION_RECEIPT_SHA256: &str =
-    "9cec843ffb91e0b602598fb3b34c183603f6f7bd678cea7fa0139b8746a5db34";
+    "842b448d19c196d6d812132a4ae3a799c594c592a99b2ac7648db683bae76190";
 pub const SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_SHA256: &str =
     "bf131cb9a88f1295d35e7eba750b653189b808fbf50113399a650a34e48d21d7";
 pub const SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_BYTES: u64 = 87_386_140;
@@ -130,7 +130,7 @@ const LICENSE_ID: &str = "NVIDIA Open Model License";
 // separately versioned distribution manifest supersedes this transport policy
 // after distribution-license review without rewriting or weakening the
 // conversion trust root.
-const CONVERSION_RECEIPT_LICENSE_POLICY: &str = "operator_local_no_git_no_release";
+const CONVERSION_RECEIPT_LICENSE_POLICY: &str = "github_release_with_license_and_notice";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// Complete canonical conversion receipt. The receipt intentionally contains

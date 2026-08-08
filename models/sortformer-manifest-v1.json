@@ -27,8 +27,8 @@
     {
       "role": "conversion_receipt",
       "filename": "conversion-receipt.json",
-      "size": 653202,
-      "sha256": "a1c6dce95ef4fd715965951bdaaa136e55e2219f93cf78122f8b462fbd07cbbe",
+      "size": 653208,
+      "sha256": "407c642f3d51b399514f6a35227b1c80886387472a44fb78f01b824d26318fb0",
       "url": "https://github.com/Dicklesworthstone/franken_whisper/releases/download/sortformer-v2.1-f32-v1/conversion-receipt.json"
     },
     {

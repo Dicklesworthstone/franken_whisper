@@ -141,7 +141,7 @@ fn validate_manifest(manifest: &SortformerManifest) -> FwResult<()> {
         (
             "conversion_receipt",
             SORTFORMER_RECEIPT_FILENAME,
-            653_202,
+            653_208,
             crate::sortformer_conformance::SORTFORMER_CONVERSION_RECEIPT_SHA256,
         ),
         (
@@ -1011,12 +1011,42 @@ fn validate_install_target(path: &Path) -> FwResult<()> {
 }
 
 fn ensure_real_directory(path: &Path) -> FwResult<()> {
-    std::fs::create_dir_all(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata_is_indirection(&metadata) || !metadata.is_dir() {
-        return Err(manifest_error(
-            "model cache directory must be a real directory, not a symlink",
-        ));
+    if !path.is_absolute() {
+        return Err(manifest_error("model cache directory must be absolute"));
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                current.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(manifest_error(
+                    "model cache directory must not contain parent traversal",
+                ));
+            }
+            Component::Normal(name) => {
+                current.push(name);
+                let metadata = match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match std::fs::create_dir(&current) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        std::fs::symlink_metadata(&current)?
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if metadata_is_indirection(&metadata) || !metadata.is_dir() {
+                    return Err(manifest_error(
+                        "every model cache path component must be a real directory",
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1202,5 +1232,28 @@ mod tests {
         .expect_err("hash cancellation");
         assert!(matches!(error, FwError::Cancelled(_)));
         assert!(polls.load(Ordering::Relaxed) >= 3);
+    }
+
+    #[test]
+    fn cache_directory_creation_rejects_relative_and_parent_traversal() {
+        assert!(ensure_real_directory(Path::new("relative/cache")).is_err());
+        assert!(ensure_real_directory(Path::new("/tmp/../cache")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_directory_creation_rejects_an_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary cache root");
+        let real = root.path().join("real");
+        let link = root.path().join("link");
+        std::fs::create_dir(&real).expect("real directory");
+        symlink(&real, &link).expect("intermediate symlink");
+
+        let error = ensure_real_directory(&link.join("artifact"))
+            .expect_err("an intermediate symlink must fail closed");
+        assert!(error.to_string().contains("real directory"));
+        assert!(!real.join("artifact").exists());
     }
 }

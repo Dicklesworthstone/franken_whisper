@@ -3817,12 +3817,7 @@ fn libcxx_nth_element(
 
         let mut middle = first + len / 2;
         let last_minus_one = last - 1;
-        let mut swaps = usize::from(libcxx_sort3(
-            values,
-            first,
-            middle,
-            last_minus_one,
-        ));
+        let mut swaps = usize::from(libcxx_sort3(values, first, middle, last_minus_one));
         let mut left = first;
         let mut right = last_minus_one;
 
@@ -3999,12 +3994,7 @@ fn ranked_speaker_indices(
     count: usize,
 ) -> FwResult<Vec<usize>> {
     let values = (0..frames)
-        .map(|frame| {
-            (
-                scores[frame * SORTFORMER_SPEAKER_LANES + speaker],
-                frame,
-            )
-        })
+        .map(|frame| (scores[frame * SORTFORMER_SPEAKER_LANES + speaker], frame))
         .collect();
     pytorch_cpu_topk_unsorted(values, count)
         .map(|ranked| ranked.into_iter().map(|(_, index)| index).collect())
@@ -5862,9 +5852,7 @@ mod tests {
             vec![0, 1, 2, 3, 4, 5, 6]
         );
 
-        let patterned = (0..24)
-            .map(|index| ((index % 3) as f32, index))
-            .collect();
+        let patterned = (0..24).map(|index| ((index % 3) as f32, index)).collect();
         let patterned = pytorch_cpu_topk_unsorted(patterned, 10).expect("patterned top ten");
         assert_eq!(
             patterned
@@ -5976,7 +5964,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires operator-local public truth pack"]
-    fn operator_local_public_l7_l8_exact_postprocessing_parity() {
+    fn verified_public_l7_l8_exact_postprocessing_parity() {
         let activation_receipt =
             std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PUBLIC_ACTIVATION_RECEIPT")
                 .expect("set FRANKEN_WHISPER_SORTFORMER_PUBLIC_ACTIVATION_RECEIPT");
@@ -6057,8 +6045,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires operator-local weights, public truth pack, and external VoxConverse root"]
-    fn operator_local_public_session_mevkw_end_to_end() {
+    #[ignore = "requires verified cached weights, public truth pack, and external VoxConverse root"]
+    fn verified_public_session_mevkw_end_to_end() {
         let model_receipt = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_RECEIPT")
             .expect("set FRANKEN_WHISPER_SORTFORMER_RECEIPT");
         let model_package = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PACKAGE")
@@ -6075,7 +6063,7 @@ mod tests {
             std::path::Path::new(&model_receipt),
             std::path::Path::new(&model_package),
         )
-        .expect("operator-local converted model admission");
+        .expect("verified converted model admission");
         let activations =
             crate::sortformer_conformance::load_verified_sortformer_public_activation_pack(
                 std::path::Path::new(&activation_receipt),
@@ -6258,8 +6246,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires operator-local converted weights and synthetic activation truth pack"]
-    fn operator_local_synthetic_frontend_parity_is_within_frozen_envelope() {
+    #[ignore = "requires verified cached weights and synthetic activation truth pack"]
+    fn verified_synthetic_frontend_parity_is_within_frozen_envelope() {
         let model_receipt = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_RECEIPT")
             .expect("set FRANKEN_WHISPER_SORTFORMER_RECEIPT");
         let model_package = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PACKAGE")
@@ -6272,7 +6260,7 @@ mod tests {
             std::path::Path::new(&model_receipt),
             std::path::Path::new(&model_package),
         )
-        .expect("operator-local converted model admission");
+        .expect("verified converted model admission");
         let activations = crate::sortformer_conformance::load_verified_sortformer_activation_pack(
             std::path::Path::new(&activation_receipt),
             std::path::Path::new(&activation_package),
@@ -6298,8 +6286,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires operator-local weights and public activation truth pack"]
-    fn operator_local_l6_exact_score_compression_matches_public_oracle() {
+    #[ignore = "requires verified cached weights and public activation truth pack"]
+    fn verified_l6_exact_score_compression_matches_public_oracle() {
         let model_receipt = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_RECEIPT")
             .expect("set FRANKEN_WHISPER_SORTFORMER_RECEIPT");
         let model_package = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PACKAGE")
@@ -6314,7 +6302,7 @@ mod tests {
             std::path::Path::new(&model_receipt),
             std::path::Path::new(&model_package),
         )
-        .expect("operator-local converted model admission");
+        .expect("verified converted model admission");
         let activations =
             crate::sortformer_conformance::load_verified_sortformer_public_activation_pack(
                 std::path::Path::new(&activation_receipt),
@@ -6393,8 +6381,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires operator-local weights, public truth pack, and external VoxConverse root"]
-    fn operator_local_public_l1_l6_parity_is_within_frozen_envelopes() {
+    #[ignore = "requires verified cached weights, public truth pack, and external VoxConverse root"]
+    fn verified_public_l1_l6_parity_is_within_frozen_envelopes() {
         let model_receipt = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_RECEIPT")
             .expect("set FRANKEN_WHISPER_SORTFORMER_RECEIPT");
         let model_package = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PACKAGE")
@@ -6411,7 +6399,7 @@ mod tests {
             std::path::Path::new(&model_receipt),
             std::path::Path::new(&model_package),
         )
-        .expect("operator-local converted model admission");
+        .expect("verified converted model admission");
         let activations =
             crate::sortformer_conformance::load_verified_sortformer_public_activation_pack(
                 std::path::Path::new(&activation_receipt),
