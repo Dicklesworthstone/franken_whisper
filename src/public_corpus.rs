@@ -181,6 +181,7 @@ const PUBLIC_SIDECAR_MAX_RETAINED_SIGNALS: u64 = 401;
 const PUBLIC_SIDECAR_MAX_RETAINED_SIGNAL_CAPACITY: u64 = 1_024;
 const PUBLIC_SIDECAR_MAX_REPORTED_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const PUBLIC_SIDECAR_MINIMUM_PAIRED_RECORDINGS: u64 = 5;
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 const PUBLIC_OUTPUT_CANCELLATION_GRANULARITY_BYTES: usize = 64 * 1024;
 /// Predeclared minimum relative micro-DER reduction required on development.
 pub const PUBLIC_CORPUS_MIN_DEVELOPMENT_DER_IMPROVEMENT: f64 = 0.05;
@@ -14527,6 +14528,8 @@ mod tests {
     use serde::ser::SerializeStruct as _;
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    use super::validate_new_output;
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     use super::write_new_json;
     use super::{
         PUBLIC_CORPUS_INPUT_SCHEMA_VERSION, PublicAblationAccumulator, PublicCorpusAblationSplit,
@@ -14534,7 +14537,7 @@ mod tests {
         build_public_corpus_bundle, build_public_corpus_bundle_with_cancel, clipped_reference,
         development_improvement_gate, held_out_non_regression_gate, merged_scored_speech_regions,
         parse_public_corpus_bundle, prepare_voxconverse_descriptor_with_cancel,
-        public_corpus_registry, validate_new_output, validate_split,
+        public_corpus_registry, validate_split,
     };
     use crate::FwResult;
     use crate::diarization::{

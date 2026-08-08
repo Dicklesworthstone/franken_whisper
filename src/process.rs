@@ -1210,10 +1210,11 @@ mod tests {
 
     use crate::orchestrator::CancellationToken;
 
+    #[cfg(unix)]
+    use super::run_command_cancellable_with_input_probe_and_observer;
     use super::{
         cancellable_poll_delay, render_command_for_log, run_command_cancellable,
-        run_command_cancellable_with_input_and_probe,
-        run_command_cancellable_with_input_probe_and_observer, run_command_cancellable_with_probe,
+        run_command_cancellable_with_input_and_probe, run_command_cancellable_with_probe,
     };
 
     fn assert_reported_cwd(stdout: &[u8], expected: &Path) {
@@ -1613,6 +1614,67 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_terminates_the_complete_windows_descendant_process_tree() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("windows-descendant.pid");
+        let escaped_pid_path = pid_path.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$child = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60') -PassThru; Set-Content -LiteralPath '{escaped_pid_path}' -NoNewline -Value $child.Id; Wait-Process -Id $child.Id"
+        );
+        let args = vec![
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            script,
+        ];
+        let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(30));
+        let descendant_started = || pid_path.is_file();
+        let result = run_command_cancellable_with_probe(
+            "powershell.exe",
+            &args,
+            None,
+            &cancel,
+            Some(Duration::from_secs(20)),
+            Some(&descendant_started),
+        );
+        assert!(
+            matches!(result, Err(crate::error::FwError::Cancelled(_))),
+            "fixture cancellation must escape after reaping the process tree: {result:?}"
+        );
+
+        let descendant_pid: u32 = std::fs::read_to_string(&pid_path)
+            .expect("descendant pid fixture")
+            .parse()
+            .expect("numeric descendant pid");
+        let probe_script = format!(
+            "if (Get-Process -Id {descendant_pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+        );
+        let descendant_is_alive = || {
+            std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    probe_script.as_str(),
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while descendant_is_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !descendant_is_alive(),
+            "Windows taskkill /T left a descendant process alive"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn successful_root_cannot_leave_a_descendant_process_alive() {
@@ -1731,12 +1793,25 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use super::validate_command_output;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
+
+    #[cfg(unix)]
+    fn fake_exit_status(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn fake_exit_status(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code as u32)
+    }
 
     fn fake_output(code: i32, stderr: &str) -> std::process::Output {
         std::process::Output {
-            status: ExitStatus::from_raw(code << 8), // raw wait status: exit code in upper byte
+            status: fake_exit_status(code),
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
         }
@@ -1920,6 +1995,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn validate_command_output_signal_terminated_uses_negative_one() {
         // When a process is killed by a signal, exit code may not be available.

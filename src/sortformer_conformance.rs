@@ -3372,6 +3372,8 @@ fn open_prechecked_regular_artifact(
     before: &std::fs::Metadata,
     domain: SortformerArtifactDomain,
 ) -> FwResult<(File, u64)> {
+    #[cfg(not(target_family = "unix"))]
+    let _ = before;
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     let file = {
         use rustix::fs::{Mode, OFlags, open};

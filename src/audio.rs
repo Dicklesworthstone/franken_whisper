@@ -2207,6 +2207,7 @@ mod tests {
         assert_eq!(result, file_path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn materialize_file_symlink_follows_link() {
         use super::materialize_input;

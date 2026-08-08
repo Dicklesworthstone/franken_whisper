@@ -628,6 +628,7 @@ pub(crate) struct FinalizerRegistry {
     entries: Vec<(String, Finalizer)>,
 }
 
+#[cfg(any(unix, test))]
 fn sanitize_process_pid(pid: u32) -> Option<u32> {
     if pid == 0 || pid > i32::MAX as u32 {
         None

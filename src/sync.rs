@@ -2492,6 +2492,8 @@ fn replace_file_atomically(from: &Path, to: &Path) -> FwResult<()> {
 }
 
 fn sync_parent_dir(path: &Path) -> FwResult<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         if let Some(parent) = path.parent() {

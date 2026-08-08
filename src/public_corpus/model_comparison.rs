@@ -67,6 +67,7 @@ const MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS: u64 = 10_000_000;
 const MODEL_COMPARISON_PEAK_RSS_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS: u64 = 500;
 const MODEL_COMPARISON_PROCESS_TREE_RSS_MINIMUM_SAMPLE_INTERVAL_MS: u64 = 50;
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 const MODEL_COMPARISON_PROCESS_TREE_RSS_PROBE_TIMEOUT_MS: u64 = 250;
 
 /// Canonical comparison lanes. The order is part of the retained contract.
