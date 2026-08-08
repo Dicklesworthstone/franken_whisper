@@ -1,10 +1,83 @@
 use std::io::{Read, Seek, Write};
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{FwError, FwResult};
+
+#[cfg(not(windows))]
+type ManagedChild = std::process::Child;
+#[cfg(windows)]
+type ManagedChild = Box<dyn process_wrap::std::ChildWrapper>;
+
+#[cfg(not(windows))]
+fn spawn_managed_child(mut command: Command) -> std::io::Result<ManagedChild> {
+    command.spawn()
+}
+
+#[cfg(windows)]
+fn spawn_managed_child(command: Command) -> std::io::Result<ManagedChild> {
+    use process_wrap::std::{CommandWrap, JobObject};
+
+    let mut command = CommandWrap::from(command);
+    command.wrap(JobObject);
+    let mut spawned_pid = None;
+    let spawn = command.spawn_with(|command| {
+        let child = command.spawn()?;
+        spawned_pid = Some(child.id());
+        Ok(child)
+    });
+    match spawn {
+        Ok(child) => Ok(child),
+        Err(error) => {
+            if let Some(pid) = spawned_pid {
+                terminate_failed_windows_job_assignment(pid).map_err(|cleanup| {
+                    std::io::Error::other(format!(
+                        "Windows Job Object setup failed ({error}); suspended-root cleanup also failed ({cleanup})"
+                    ))
+                })?;
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminate_failed_windows_job_assignment(pid: u32) -> std::io::Result<()> {
+    const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let pid = pid.to_string();
+    let mut cleanup = Command::new("taskkill")
+        .args(["/PID", pid.as_str(), "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let started_at = Instant::now();
+    let status = loop {
+        match cleanup.try_wait()? {
+            Some(status) => break status,
+            None if started_at.elapsed() < CLEANUP_TIMEOUT => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            None => {
+                let _ = cleanup.kill();
+                let _ = cleanup.wait();
+                return Err(std::io::Error::other(
+                    "taskkill exceeded the suspended-root cleanup deadline",
+                ));
+            }
+        }
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "taskkill rejected suspended-root cleanup",
+        ))
+    }
+}
 
 #[cfg(unix)]
 static PROCESS_TREE_EXTERNALLY_OWNED: std::sync::atomic::AtomicBool =
@@ -285,7 +358,7 @@ pub fn run_command_with_timeout(
         }
         let prepared_capture = prepare_bounded_output_capture(&mut command)?;
         let owns_process_group = configure_descendant_process_tree(&mut command);
-        let mut child = command.spawn()?;
+        let mut child = spawn_managed_child(command)?;
         let started_at = Instant::now();
         let (stdout_reader, stderr_reader) =
             match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
@@ -540,7 +613,7 @@ fn run_command_cancellable_with_optional_input(
             "process-tree observation requires a fresh caller-owned process group".to_owned(),
         ));
     }
-    let mut child = command.spawn()?;
+    let mut child = spawn_managed_child(command)?;
     #[cfg(unix)]
     let _parent_liveness_lease =
         prepared_parent_liveness_lease.map(PreparedParentLivenessLease::activate);
@@ -648,8 +721,9 @@ fn run_command_cancellable_with_optional_input(
 
 /// Put each bounded child at the root of a process tree that cancellation can
 /// terminate as one unit. On Unix, `process_group(0)` creates a group whose id
-/// is the child pid. Windows `taskkill /T` discovers descendants from the root
-/// pid and does not require a console process group.
+/// is the child pid. Windows tree ownership is established later by
+/// `spawn_managed_child`, which assigns the suspended root to a Job Object
+/// before allowing it to run.
 fn configure_descendant_process_tree(command: &mut Command) -> bool {
     #[cfg(unix)]
     {
@@ -673,6 +747,7 @@ const fn bounded_process_tree_unsupported() -> bool {
     !cfg!(any(unix, windows))
 }
 
+#[cfg(not(windows))]
 const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn process_tree_cleanup_error(detail: &str) -> FwError {
@@ -694,7 +769,8 @@ fn merge_process_tree_cleanup_result(primary: FwError, cleanup: FwResult<()>) ->
     }
 }
 
-fn wait_for_child_reap(child: &mut Child, deadline: Instant) -> FwResult<()> {
+#[cfg(not(windows))]
+fn wait_for_child_reap(child: &mut ManagedChild, deadline: Instant) -> FwResult<()> {
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return Ok(()),
@@ -714,7 +790,10 @@ fn wait_for_child_reap(child: &mut Child, deadline: Instant) -> FwResult<()> {
 }
 
 #[cfg(unix)]
-fn terminate_descendant_process_tree(child: &mut Child, owns_process_group: bool) -> FwResult<()> {
+fn terminate_descendant_process_tree(
+    child: &mut ManagedChild,
+    owns_process_group: bool,
+) -> FwResult<()> {
     let deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
     let process_group = owns_process_group.then(|| rustix::process::Pid::from_child(child));
     let mut group_signal_error = None;
@@ -774,59 +853,20 @@ fn terminate_descendant_process_tree(child: &mut Child, owns_process_group: bool
 }
 
 #[cfg(windows)]
-fn terminate_descendant_process_tree(child: &mut Child, _owns_process_group: bool) -> FwResult<()> {
-    const TASKKILL_TIMEOUT: Duration = Duration::from_secs(2);
-
-    let child_id = child.id().to_string();
-    let mut helper = Command::new("taskkill");
-    helper
-        .args(["/PID", child_id.as_str(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut taskkill = helper
-        .spawn()
-        .map_err(|_| process_tree_cleanup_error("Windows taskkill /T could not be launched"))?;
-    let started = Instant::now();
-    let taskkill_status = loop {
-        match taskkill.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < TASKKILL_TIMEOUT => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                let _ = taskkill.kill();
-                let _ = taskkill.wait();
-                return Err(process_tree_cleanup_error(
-                    "Windows taskkill /T exceeded its cleanup deadline",
-                ));
-            }
-            Err(_) => {
-                let _ = taskkill.kill();
-                let _ = taskkill.wait();
-                return Err(process_tree_cleanup_error(
-                    "Windows taskkill /T could not be monitored",
-                ));
-            }
-        }
-    };
-    if !taskkill_status.success() {
-        return Err(process_tree_cleanup_error(
-            "Windows taskkill /T did not report success",
-        ));
-    }
-    if let Err(error) = child.kill()
-        && error.kind() != std::io::ErrorKind::InvalidInput
-    {
-        return Err(process_tree_cleanup_error(
-            "the Windows root child rejected direct termination",
-        ));
-    }
-    wait_for_child_reap(child, Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT)
+fn terminate_descendant_process_tree(
+    child: &mut ManagedChild,
+    _owns_process_group: bool,
+) -> FwResult<()> {
+    child.kill().map_err(|_| {
+        process_tree_cleanup_error("the owned Windows Job Object rejected termination")
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn terminate_descendant_process_tree(child: &mut Child, _owns_process_group: bool) -> FwResult<()> {
+fn terminate_descendant_process_tree(
+    child: &mut ManagedChild,
+    _owns_process_group: bool,
+) -> FwResult<()> {
     child
         .kill()
         .map_err(|_| process_tree_cleanup_error("the root child rejected direct termination"))?;
@@ -979,7 +1019,7 @@ fn prepare_bounded_output_capture(command: &mut Command) -> FwResult<PreparedBou
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn start_bounded_output_capture(
-    child: &mut Child,
+    child: &mut ManagedChild,
     _prepared: PreparedBoundedOutputCapture,
     rendered: &str,
 ) -> FwResult<(BoundedOutputReader, BoundedOutputReader)> {
@@ -1001,7 +1041,7 @@ fn start_bounded_output_capture(
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn start_bounded_output_capture(
-    _child: &mut Child,
+    _child: &mut ManagedChild,
     prepared: PreparedBoundedOutputCapture,
     _rendered: &str,
 ) -> FwResult<(BoundedOutputReader, BoundedOutputReader)> {
@@ -1615,20 +1655,144 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn cancellation_terminates_the_complete_windows_descendant_process_tree() {
-        let directory = tempfile::tempdir().expect("temporary pid directory");
-        let pid_path = directory.path().join("windows-descendant.pid");
+    fn windows_descendant_fixture(pid_path: &std::path::Path, root_tail: &str) -> Vec<String> {
         let escaped_pid_path = pid_path.to_string_lossy().replace('\'', "''");
         let script = format!(
-            "$child = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60') -PassThru; Set-Content -LiteralPath '{escaped_pid_path}' -NoNewline -Value $child.Id; Wait-Process -Id $child.Id"
+            "$child = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60') -PassThru; $identity = '{{0}},{{1}}' -f $child.Id,$child.StartTime.ToFileTimeUtc(); Set-Content -LiteralPath '{escaped_pid_path}' -NoNewline -Value $identity; {root_tail}"
         );
-        let args = vec![
+        vec![
             "-NoProfile".to_owned(),
             "-NonInteractive".to_owned(),
             "-Command".to_owned(),
             script,
-        ];
+        ]
+    }
+
+    #[cfg(windows)]
+    fn windows_descendant_identity(pid_path: &std::path::Path) -> (u32, i64) {
+        let identity = std::fs::read_to_string(pid_path).expect("descendant identity fixture");
+        let (pid, start_time) = identity
+            .split_once(',')
+            .expect("pid and start-time identity");
+        (
+            pid.parse().expect("numeric descendant pid"),
+            start_time.parse().expect("numeric descendant start time"),
+        )
+    }
+
+    #[cfg(windows)]
+    fn windows_process_identity_is_alive(pid: u32, start_time: i64) -> bool {
+        let script = format!(
+            "$process = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($process -and $process.StartTime.ToFileTimeUtc() -eq {start_time}) {{ exit 0 }} else {{ exit 1 }}"
+        );
+        std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_descendant_reaped(pid_path: &std::path::Path) {
+        let (pid, start_time) = windows_descendant_identity(pid_path);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while windows_process_identity_is_alive(pid, start_time)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !windows_process_identity_is_alive(pid, start_time),
+            "Windows Job Object left the exact descendant process alive"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_identity_probe_rejects_a_reused_pid() {
+        let pid = std::process::id();
+        let query =
+            format!("[Console]::Out.Write((Get-Process -Id {pid}).StartTime.ToFileTimeUtc())");
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", query.as_str()])
+            .output()
+            .expect("query current Windows process identity");
+        assert!(output.status.success());
+        let start_time: i64 = String::from_utf8(output.stdout)
+            .expect("PowerShell identity is UTF-8")
+            .parse()
+            .expect("PowerShell identity is a FileTime integer");
+        assert!(
+            windows_process_identity_is_alive(pid, start_time),
+            "the exact live process identity must match"
+        );
+        assert!(
+            !windows_process_identity_is_alive(pid, start_time.saturating_sub(1)),
+            "an existing PID with a different creation time must not match"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn successful_windows_root_cannot_leave_a_descendant_process_alive() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("windows-success-descendant.pid");
+        let args = windows_descendant_fixture(&pid_path, "exit 0");
+        let output =
+            run_command_with_timeout("powershell.exe", &args, None, Some(Duration::from_secs(20)))
+                .expect("successful root must retain Job Object cleanup authority");
+        assert!(output.status.success());
+        assert_windows_descendant_reaped(&pid_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_windows_job_assignment_cleanup_fails_closed() {
+        let error = super::terminate_failed_windows_job_assignment(u32::MAX)
+            .expect_err("an impossible process id must not receive cleanup authority");
+        assert!(
+            error.to_string().contains("taskkill"),
+            "cleanup failure must remain explicit: {error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_timeout_terminates_the_complete_descendant_process_tree() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("windows-timeout-descendant.pid");
+        let args = windows_descendant_fixture(&pid_path, "Wait-Process -Id $child.Id");
+        let error =
+            run_command_with_timeout("powershell.exe", &args, None, Some(Duration::from_secs(5)))
+                .expect_err("long-running Windows fixture must time out");
+        assert!(error.to_string().contains("timed out"));
+        assert_windows_descendant_reaped(&pid_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_output_cap_terminates_the_complete_descendant_process_tree() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("windows-output-cap-descendant.pid");
+        let args = windows_descendant_fixture(
+            &pid_path,
+            "$chunk = 'x' * 65536; while ($true) { [Console]::Out.Write($chunk) }",
+        );
+        let error =
+            run_command_with_timeout("powershell.exe", &args, None, Some(Duration::from_secs(20)))
+                .expect_err("unbounded Windows stdout must trip the capture cap");
+        assert!(super::is_stdout_capture_limit_error(&error));
+        assert_windows_descendant_reaped(&pid_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_terminates_the_complete_windows_descendant_process_tree() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("windows-descendant.pid");
+        let args = windows_descendant_fixture(&pid_path, "Wait-Process -Id $child.Id");
         let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(30));
         let descendant_started = || pid_path.is_file();
         let result = run_command_cancellable_with_probe(
@@ -1643,36 +1807,7 @@ mod tests {
             matches!(result, Err(crate::error::FwError::Cancelled(_))),
             "fixture cancellation must escape after reaping the process tree: {result:?}"
         );
-
-        let descendant_pid: u32 = std::fs::read_to_string(&pid_path)
-            .expect("descendant pid fixture")
-            .parse()
-            .expect("numeric descendant pid");
-        let probe_script = format!(
-            "if (Get-Process -Id {descendant_pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
-        );
-        let descendant_is_alive = || {
-            std::process::Command::new("powershell.exe")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    probe_script.as_str(),
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        };
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while descendant_is_alive() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            !descendant_is_alive(),
-            "Windows taskkill /T left a descendant process alive"
-        );
+        assert_windows_descendant_reaped(&pid_path);
     }
 
     #[cfg(unix)]

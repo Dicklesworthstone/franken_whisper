@@ -2979,6 +2979,7 @@ mod tests {
 
     // ── ffmpeg provisioning unit tests ──────────────────────────────────
 
+    #[cfg(not(windows))]
     #[test]
     fn platform_tool_name_returns_bare_name_on_non_windows() {
         use super::platform_tool_name;
@@ -2986,6 +2987,16 @@ mod tests {
         assert_eq!(name, "ffmpeg");
         let name2 = platform_tool_name("ffprobe");
         assert_eq!(name2, "ffprobe");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn platform_tool_name_appends_executable_suffix_on_windows() {
+        use super::platform_tool_name;
+        let name = platform_tool_name("ffmpeg");
+        assert_eq!(name, "ffmpeg.exe");
+        let name2 = platform_tool_name("ffprobe");
+        assert_eq!(name2, "ffprobe.exe");
     }
 
     #[test]

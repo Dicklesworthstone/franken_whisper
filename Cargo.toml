@@ -82,6 +82,12 @@ fj-core = { path = "../frankenjax/crates/fj-core", optional = true }
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 
+# std does not expose race-free Windows Job Object assignment. This narrowly
+# featured safe wrapper spawns suspended, assigns the child before it can create
+# descendants, and retains the job handle after the root exits.
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "9.1.0", default-features = false, features = ["std", "job-object"] }
+
 [lints.rust]
 unsafe_code = "deny"
 
