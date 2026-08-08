@@ -4439,9 +4439,9 @@ mod tests {
             Path::new(&package),
         )
         .expect("operator-local public L1-L8 activation pack must pass exact admission");
-        assert_eq!(verified.receipt().records.len(), 5_492);
-        assert_eq!(verified.receipt().seam_contracts.len(), 5_492);
-        assert_eq!(verified.safetensors().len(), 5_492);
+        assert_eq!(verified.receipt().records.len(), 4_540);
+        assert_eq!(verified.receipt().seam_contracts.len(), 4_540);
+        assert_eq!(verified.safetensors().len(), 4_540);
         assert_eq!(verified.receipt().fixtures.len(), 4);
         assert!(verified.receipt().oracle_floor.all_discrete_byte_exact);
         let rendered = format!("{verified:?}");

@@ -6001,7 +6001,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires operator-local public truth pack"]
-    fn verified_public_l7_l8_exact_postprocessing_parity() {
+    fn verified_public_complete_probability_l7_l8_exact_postprocessing_parity() {
         let activation_receipt =
             std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PUBLIC_ACTIVATION_RECEIPT")
                 .expect("set FRANKEN_WHISPER_SORTFORMER_PUBLIC_ACTIVATION_RECEIPT");
@@ -6014,11 +6014,7 @@ mod tests {
                 std::path::Path::new(&activation_package),
             )
             .expect("operator-local public activation admission");
-        for fixture in [
-            "hiyis_exact_two_chunks",
-            "mevkw_complete_three_speakers",
-            "syiwe_complete_three_speakers",
-        ] {
+        for fixture in ["hiyis_exact_two_chunks", "syiwe_complete_three_speakers"] {
             let probabilities = complete_public_mat(
                 &activations,
                 &format!("fixture.{fixture}.l5.final_probabilities_f32"),
@@ -6355,6 +6351,11 @@ mod tests {
             &format!("fixture.{fixture}.step.{step:03}.l6.before.spkcache_preds"),
             SORTFORMER_SPEAKER_LANES,
         );
+        let exact_fifo_predictions = complete_public_mat(
+            &activations,
+            &format!("fixture.{fixture}.step.{step:03}.l6.before.fifo_preds"),
+            SORTFORMER_SPEAKER_LANES,
+        );
         let exact_probabilities = complete_public_mat(
             &activations,
             &format!("fixture.{fixture}.step.{step:03}.l5.probabilities"),
@@ -6369,6 +6370,7 @@ mod tests {
         let chunk_frames = exact_probabilities
             .rows
             .checked_sub(SORTFORMER_SPEAKER_CACHE_FRAMES)
+            .and_then(|frames| frames.checked_sub(SORTFORMER_FIFO_FRAMES))
             .expect("exact probabilities include the cache prefix");
         let mut state = SortformerStreamingState::new();
         let mut cache_embeddings =
@@ -6382,11 +6384,21 @@ mod tests {
             cache_embeddings,
         );
         state.speaker_cache_predictions = Some(exact_cache_predictions);
-        state.fifo_predictions = Some(Mat::from_vec(0, SORTFORMER_SPEAKER_LANES, Vec::new()));
+        let mut fifo_embeddings = vec![0.0; SORTFORMER_FIFO_FRAMES * SORTFORMER_ENCODER_WIDTH];
+        for frame in 0..SORTFORMER_FIFO_FRAMES {
+            fifo_embeddings[frame * SORTFORMER_ENCODER_WIDTH] =
+                (SORTFORMER_SPEAKER_CACHE_FRAMES + frame) as f32;
+        }
+        state.fifo = Mat::from_vec(
+            SORTFORMER_FIFO_FRAMES,
+            SORTFORMER_ENCODER_WIDTH,
+            fifo_embeddings,
+        );
+        state.fifo_predictions = Some(exact_fifo_predictions);
         let mut chunk_embeddings = vec![0.0; chunk_frames * SORTFORMER_ENCODER_WIDTH];
         for frame in 0..chunk_frames {
             chunk_embeddings[frame * SORTFORMER_ENCODER_WIDTH] =
-                (SORTFORMER_SPEAKER_CACHE_FRAMES - left + frame) as f32;
+                (SORTFORMER_SPEAKER_CACHE_FRAMES + SORTFORMER_FIFO_FRAMES - left + frame) as f32;
         }
         let chunk = SortformerSubsamplingOutput {
             frames: chunk_frames,
@@ -6489,6 +6501,7 @@ mod tests {
             let mut central_start = 0usize;
             let mut streaming_state = SortformerStreamingState::new();
             let mut compared_neural_steps = 0usize;
+            let mut final_probabilities = Vec::new();
             for transition in transitions {
                 let step = usize::try_from(transition.step).expect("step fits usize");
                 let before_state = reference
@@ -6811,6 +6824,7 @@ mod tests {
                         chunk_predictions.rows,
                         usize::try_from(transition.output_frames).expect("output frames fit usize")
                     );
+                    final_probabilities.extend_from_slice(&chunk_predictions.data);
                     if fixture.name == "iqtde_complete_four_speakers" && step == 2 {
                         let mut exact_score_state = diagnostic_state_before;
                         exact_score_state.speaker_cache_predictions = Some(complete_public_mat(
@@ -6890,12 +6904,76 @@ mod tests {
             }
             assert_eq!(central_start, features.valid_frames);
             assert_eq!(compared_neural_steps, transitions.len());
+            let final_frames = final_probabilities.len() / SORTFORMER_SPEAKER_LANES;
+            assert_eq!(
+                final_frames * SORTFORMER_SPEAKER_LANES,
+                final_probabilities.len()
+            );
+            let activity = sortformer_activity_output(&final_probabilities, final_frames)
+                .expect("chained public L7 post-processing");
+            for (suffix, shape, values) in [
+                (
+                    "activity_i64",
+                    vec![1, activity.frames, SORTFORMER_SPEAKER_LANES],
+                    activity.activity.as_slice(),
+                ),
+                (
+                    "speech_i64",
+                    vec![1, activity.frames],
+                    activity.speech.as_slice(),
+                ),
+                (
+                    "overlap_i64",
+                    vec![1, activity.frames],
+                    activity.overlap.as_slice(),
+                ),
+            ] {
+                assert!(
+                    compare_public_i64_probe(
+                        &activations,
+                        &format!("fixture.{}.l7.{suffix}", fixture.name),
+                        &shape,
+                        values,
+                    )
+                    .expect("chained public L7 seam is exact")
+                    .byte_exact
+                );
+            }
+            let changes = activity.change_indices.concat();
+            assert!(
+                compare_public_i64_probe(
+                    &activations,
+                    &format!("fixture.{}.l7.change_indices_i64", fixture.name),
+                    &[activity.change_indices.len(), 2],
+                    &changes,
+                )
+                .expect("chained public L7 changes are exact")
+                .byte_exact
+            );
+            let turns = sortformer_speaker_turns(&final_probabilities, final_frames)
+                .expect("chained public L8 post-processing");
+            let flattened_turns = turns
+                .iter()
+                .flat_map(|turn| [turn.start_seconds, turn.end_seconds, turn.speaker as f32])
+                .collect::<Vec<_>>();
+            assert!(
+                compare_public_f32_probe(
+                    &activations,
+                    &format!("fixture.{}.l8.turns_f32", fixture.name),
+                    &[turns.len(), 3],
+                    &flattened_turns,
+                    0.0,
+                    0.0,
+                )
+                .expect("chained public L8 turns are exact")
+                .byte_exact
+            );
         }
     }
 
     #[test]
-    fn transformer_score_kernel_matches_scalar_at_streaming_geometry() {
-        let frames = 189_usize;
+    fn transformer_score_kernel_matches_scalar_at_recommended_steady_geometry() {
+        let frames = 609_usize;
         let width = SORTFORMER_TRANSFORMER_HEAD_WIDTH;
         let lhs: Vec<f32> = (0..frames * width)
             .map(|index| ((index % 31) as f32 - 15.0) * 0.031_25)

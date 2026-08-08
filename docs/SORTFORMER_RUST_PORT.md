@@ -554,51 +554,59 @@ crops features to the processed signal length. It is not evidence of a true
 incremental-waveform frontend; live audio continuity requires separate frontend
 and state seams.
 
-The native package and activation truth pack use the archive's own synchronous
-streaming profile. This is intentionally distinct from the separately
-qualified high-latency external-adapter override in
-`src/differential_oracle.rs`:
+The accepted native path and activation truth pack use NVIDIA's published
+recommended synchronous-streaming profile, which is also the profile pinned by
+the external comparison adapter. The raw `.nemo` archive carries lower-context
+construction defaults (`188/1/1/0/188`); those defaults are not the documented
+deployment profile and are no longer treated as the runtime oracle. Keeping the
+two configurations separate is essential: an earlier native run used the
+archive defaults while the external adapter used the recommended profile and
+therefore produced four apparent 80 ms boundary differences that were not a
+numeric or top-k parity failure.
 
 | Quantity | Output-frame count |
 |---|---:|
-| Chunk | 188 |
+| Chunk | 340 |
 | Left context | 1 |
-| Right context | 1 |
-| FIFO capacity | 0 |
-| Configured cache update | 188 |
+| Right context | 40 |
+| FIFO capacity | 40 |
+| Configured cache update | 300 |
 | Speaker cache | 188 |
 | Silence cache frames per speaker | 3 |
 
 For a chunk beginning at feature index `start`, the feature loader uses
-`left = min(8, start)`, `end = min(start + 188*8, feature_length)`, and
-`right = min(8, feature_length - end)`, then transposes and pre-encodes.
+`left = min(8, start)`, `end = min(start + 340*8, feature_length)`, and
+`right = min(320, feature_length - end)`, then transposes and pre-encodes.
 After factor-8 subsampling it uses `round(left/8)` left frames and
 `ceil(right/8)` right frames. `drop_extra_pre_encoded` is zero.
 
-The nominal first input buffer is 12.08 seconds (188 central frames plus one
-right-context frame at the 80 ms output stride), and the output stride is 80
-ms. The archive's configured update equals its chunk length. FIFO movement is:
+The nominal first input buffer is 30.40 seconds (340 central frames plus 40
+right-context frames at the 80 ms output stride), and the output stride is 80
+ms. FIFO movement is:
 
 ```text
 min(max(configured_update, chunk_len - fifo_capacity + current_fifo),
     current_fifo + chunk_len)
 ```
 
-With a zero-capacity FIFO this moves all 188 central frames on a full chunk.
-The first update fills the cache exactly; later full chunks cross capacity and
-trigger compression back to 188. Rust must evaluate the partial-tail
-subtraction with checked signed arithmetic rather than permitting an unsigned
-underflow. An interior feature chunk contains 1,520 pre-encoding frames and
-subsamples to 190 encoder frames (one left-context, 188 central, one
-right-context); with a full cache the recurrent encoder sequence can reach 378
-frames. Tail behavior is a required seam, not an extrapolation.
+The first full chunk moves 300 frames into cache construction and retains 40 in
+FIFO. A steady full chunk combines 40 FIFO frames with 340 current frames,
+moves 340, and again retains 40. A short final chunk may move fewer than the
+configured 300 frames because the pop is capped by the physically available
+FIFO-plus-chunk total; Rust performs the capacity subtraction with checked
+arithmetic so a tail shorter than 40 frames cannot underflow. An interior
+feature chunk contains 3,048 pre-encoding frames and subsamples to 381 encoder
+frames (one left-context, 340 central, 40 right-context); with a full cache the
+recurrent encoder sequence can reach 569 frames. First-full, steady, large-tail,
+and sub-40-frame-tail behavior are explicit regressions rather than
+extrapolations.
 
 Initial speaker-cache and FIFO embeddings have shape `[batch, 0, 512]`.
 `spkcache_preds` and `fifo_preds` are initially `None`, as are
 `spkcache_lengths`, `fifo_lengths`, and `spk_perm`; these Options must not be
 substituted with empty tensors without a seam proving equivalence. `fifo_preds`
-becomes a tensor at the first update, while `spkcache_preds` is synthesized only
-at the first over-capacity cache compression. Mean silence is a zero
+and `spkcache_preds` both become tensors at the first update because the
+300-frame first pop already exceeds the 188-frame speaker cache. Mean silence is a zero
 `[batch, 512]` tensor and the silence count is zero-valued i64 `[batch]`.
 Lengths otherwise derive from physical shapes. Rust may own checked scalar
 lengths as an implementation invariant, but parity must not invent oracle
@@ -770,30 +778,34 @@ L0 model package and the expected values from the activation pack. It currently
 reconstructs and compares only `log_mel_f32`; the other captured frontend stages
 are authenticated source-replay evidence, not yet native Rust stage parity.
 
-The public pack uses four frozen VoxConverse development fixtures: an exact
-two-chunk case, an overlap-heavy two-speaker case, a complete three-speaker
-recording, and a complete four-speaker recording. The descriptor, source
-version, license acknowledgement, recording/annotation hashes, clip PCM hashes,
-and exact sample intervals are bound in the receipt. No transcript is used.
+The version-2 public pack uses four frozen VoxConverse development fixtures: an
+exact two-chunk one-speaker case, the complete 102-second overlap-bearing
+three-speaker `mevkw` recording, a second complete three-speaker recording, and
+a complete four-speaker recording. The descriptor, source version, license
+acknowledgement, recording/annotation hashes, clip PCM hashes, exact sample
+intervals, and NVIDIA recommended `340/1/40/40/300/188` streaming profile are
+bound in the receipt. No transcript is used.
 
 Five runs at one PyTorch intra-op thread and five runs at eight threads captured
-5,492 named L1-L8 seams. To avoid a 3.99 GB replay artifact, every full tensor
+4,540 named L1-L8 seams. To avoid a multi-gigabyte replay artifact, every full tensor
 retains its shape, element/byte count, and baseline SHA-256 while tensors larger
 than 4,096 values store a deterministic endpoint-inclusive stratified probe.
 Small and discrete tensors remain complete. The resulting metadata-free package
-is 87,386,140 bytes with SHA-256
-`bf131cb9a88f1295d35e7eba750b653189b808fbf50113399a650a34e48d21d7`;
-the 6,145,112-byte canonical receipt SHA-256 is
-`842b448d19c196d6d812132a4ae3a799c594c592a99b2ac7648db683bae76190`.
+is 72,590,196 bytes with SHA-256
+`4ec66cf29e4286fed21fdf3d9c170293aafb26ba9783b9e0eea4d245b4630a6d`;
+the 5,092,023-byte canonical receipt SHA-256 is
+`8dd949aeccc0754338c3c777e8ef596f043387a2a38543f0a91353d06f70234f`.
+The reviewed exporter source SHA-256 is
+`af752ee007d46eb010d69109cc8c6f4f753f0304d30add401e114066a4a2f877`.
 Both stay operator-local.
 
 All discrete probes and cache/FIFO Option transitions were byte-exact. Numeric
 thread-regime drift appeared in 873 probes; each accepted source tolerance is
 zero when exact and otherwise the smallest power of two at least twice the
 measured baseline-to-replay floor. The rule was frozen before Rust neural
-results existed. That pack completed source truth rather than native parity;
-the subsequent native results are recorded below. Chained L6 identity, broad
-accuracy/resources, and automatic routing remain open.
+results existed. That pack completes source truth rather than substituting for
+native parity; the subsequent native results are recorded below. Broad
+accuracy/resources and automatic routing remain separate gates.
 
 The independent Rust/PyTorch L2 comparison does not misuse a zero source floor
 as a cross-kernel equality requirement. Before running the native L2 path, it
