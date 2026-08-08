@@ -147,9 +147,8 @@ pub fn run_command_with_timeout(
             match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
                 Ok(readers) => readers,
                 Err(error) => {
-                    terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = child.wait();
-                    return Err(error);
+                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                    return Err(merge_process_tree_cleanup_result(error, cleanup));
                 }
             };
 
@@ -159,55 +158,60 @@ pub fn run_command_with_timeout(
                     // A bounded command owns its complete process tree. Even
                     // after the root exits successfully, descendants must not
                     // retain inherited pipes or continue operator-local work.
-                    terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = child.wait();
+                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
                     let stdout_result = stdout_reader.finish();
                     let stderr_result = stderr_reader.finish();
+                    cleanup?;
                     let stdout = stdout_result?;
                     let stderr = stderr_result?;
                     return validate_captured_command_output(&rendered, status, stdout, stderr);
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = child.wait();
+                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
                     let _ = stdout_reader.finish();
                     let _ = stderr_reader.finish();
-                    return Err(FwError::Io(error));
+                    return Err(merge_process_tree_cleanup_result(
+                        FwError::Io(error),
+                        cleanup,
+                    ));
                 }
             }
 
             match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
                 Ok(Some(stream)) => {
-                    terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = child.wait();
+                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
                     let _ = stdout_reader.finish();
                     let _ = stderr_reader.finish();
-                    return Err(capture_limit_error(stream));
+                    return Err(merge_process_tree_cleanup_result(
+                        capture_limit_error(stream),
+                        cleanup,
+                    ));
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = child.wait();
+                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
                     let _ = stdout_reader.finish();
                     let _ = stderr_reader.finish();
-                    return Err(error);
+                    return Err(merge_process_tree_cleanup_result(error, cleanup));
                 }
             }
 
             if started_at.elapsed() >= limit {
-                terminate_descendant_process_tree(&mut child, owns_process_group);
-                let _ = child.wait();
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
                 let _ = stdout_reader.finish();
                 let stderr = stderr_reader
                     .finish()
                     .map(|capture| capture.bytes)
                     .unwrap_or_default();
                 let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
-                return Err(FwError::from_command_timeout(
-                    rendered,
-                    saturating_duration_ms(limit),
-                    stderr_str,
+                return Err(merge_process_tree_cleanup_result(
+                    FwError::from_command_timeout(
+                        rendered,
+                        saturating_duration_ms(limit),
+                        stderr_str,
+                    ),
+                    cleanup,
                 ));
             }
 
@@ -387,77 +391,24 @@ fn run_command_cancellable_with_optional_input(
         match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
             Ok(readers) => readers,
             Err(error) => {
-                terminate_descendant_process_tree(&mut child, owns_process_group);
-                let _ = child.wait();
-                return Err(error);
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                return Err(merge_process_tree_cleanup_result(error, cleanup));
             }
         };
     loop {
-        if let Some(observer) = observer.as_deref_mut()
-            && let Err(error) = observer(child.id())
-        {
-            terminate_descendant_process_tree(&mut child, owns_process_group);
-            let _ = child.wait();
-            let _ = stdout_reader.finish();
-            let _ = stderr_reader.finish();
-            return Err(error);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Close inherited stdin/stdout/stderr in any descendants before
-                // joining I/O helpers; otherwise a successful root could leave
-                // the bounded caller blocked forever.
-                terminate_descendant_process_tree(&mut child, owns_process_group);
-                let _ = child.wait();
-                let stdout_result = stdout_reader.finish();
-                let stderr_result = stderr_reader.finish();
-                let stdout = stdout_result?;
-                let stderr = stderr_result?;
-                return validate_captured_command_output(&rendered, status, stdout, stderr);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                terminate_descendant_process_tree(&mut child, owns_process_group);
-                let _ = child.wait();
-                let _ = stdout_reader.finish();
-                let _ = stderr_reader.finish();
-                return Err(FwError::Io(error));
-            }
-        }
-
-        match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
-            Ok(Some(stream)) => {
-                terminate_descendant_process_tree(&mut child, owns_process_group);
-                let _ = child.wait();
-                let _ = stdout_reader.finish();
-                let _ = stderr_reader.finish();
-                return Err(capture_limit_error(stream));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                terminate_descendant_process_tree(&mut child, owns_process_group);
-                let _ = child.wait();
-                let _ = stdout_reader.finish();
-                let _ = stderr_reader.finish();
-                return Err(error);
-            }
-        }
-
-        // Check pipeline deadline via cancellation token.
         if let Err(err) = token.checkpoint() {
-            terminate_descendant_process_tree(&mut child, owns_process_group);
-            let _ = child.wait();
+            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
             let _ = stdout_reader.finish();
             let _ = stderr_reader.finish();
-            return Err(err);
+            return Err(merge_process_tree_cleanup_result(err, cleanup));
         }
         if additional_cancel.is_some_and(|probe| probe()) {
-            terminate_descendant_process_tree(&mut child, owns_process_group);
-            let _ = child.wait();
+            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
             let _ = stdout_reader.finish();
             let _ = stderr_reader.finish();
-            return Err(FwError::Cancelled(
-                "subprocess cancelled by caller predicate".to_owned(),
+            return Err(merge_process_tree_cleanup_result(
+                FwError::Cancelled("subprocess cancelled by caller predicate".to_owned()),
+                cleanup,
             ));
         }
 
@@ -465,19 +416,70 @@ fn run_command_cancellable_with_optional_input(
         if let Some(limit) = hard_timeout
             && started_at.elapsed() >= limit
         {
-            terminate_descendant_process_tree(&mut child, owns_process_group);
-            let _ = child.wait();
+            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
             let _ = stdout_reader.finish();
             let stderr = stderr_reader
                 .finish()
                 .map(|capture| capture.bytes)
                 .unwrap_or_default();
             let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
-            return Err(FwError::from_command_timeout(
-                rendered,
-                saturating_duration_ms(limit),
-                stderr_str,
+            return Err(merge_process_tree_cleanup_result(
+                FwError::from_command_timeout(rendered, saturating_duration_ms(limit), stderr_str),
+                cleanup,
             ));
+        }
+
+        match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
+            Ok(Some(stream)) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let _ = stdout_reader.finish();
+                let _ = stderr_reader.finish();
+                return Err(merge_process_tree_cleanup_result(
+                    capture_limit_error(stream),
+                    cleanup,
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let _ = stdout_reader.finish();
+                let _ = stderr_reader.finish();
+                return Err(merge_process_tree_cleanup_result(error, cleanup));
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Close inherited stdin/stdout/stderr in any descendants before
+                // joining I/O helpers; otherwise a successful root could leave
+                // the bounded caller blocked forever.
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let stdout_result = stdout_reader.finish();
+                let stderr_result = stderr_reader.finish();
+                cleanup?;
+                let stdout = stdout_result?;
+                let stderr = stderr_result?;
+                return validate_captured_command_output(&rendered, status, stdout, stderr);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let _ = stdout_reader.finish();
+                let _ = stderr_reader.finish();
+                return Err(merge_process_tree_cleanup_result(
+                    FwError::Io(error),
+                    cleanup,
+                ));
+            }
+        }
+
+        if let Some(observer) = observer.as_deref_mut()
+            && let Err(error) = observer(child.id())
+        {
+            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let _ = stdout_reader.finish();
+            let _ = stderr_reader.finish();
+            return Err(merge_process_tree_cleanup_result(error, cleanup));
         }
 
         thread::sleep(cancellable_poll_delay(poll_iteration));
@@ -512,19 +514,108 @@ const fn bounded_process_tree_unsupported() -> bool {
     !cfg!(any(unix, windows))
 }
 
-#[cfg(unix)]
-fn terminate_descendant_process_tree(child: &mut Child, owns_process_group: bool) {
-    if owns_process_group {
-        let process_group = rustix::process::Pid::from_child(child);
-        let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn process_tree_cleanup_error(detail: &str) -> FwError {
+    FwError::ContractViolation(format!(
+        "bounded subprocess cleanup could not certify the complete process tree: {detail}"
+    ))
+}
+
+fn combine_process_tree_cleanup_error(primary: FwError, cleanup: FwError) -> FwError {
+    FwError::ContractViolation(format!(
+        "{cleanup}; the original subprocess outcome was: {primary}"
+    ))
+}
+
+fn merge_process_tree_cleanup_result(primary: FwError, cleanup: FwResult<()>) -> FwError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => combine_process_tree_cleanup_error(primary, cleanup),
     }
-    // Preserve direct-child termination if the child exited between the group
-    // signal and this fallback, or if the group signal was denied.
-    let _ = child.kill();
+}
+
+fn wait_for_child_reap(child: &mut Child, deadline: Instant) -> FwResult<()> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                return Err(process_tree_cleanup_error(
+                    "the root child did not terminate before the cleanup deadline",
+                ));
+            }
+            Err(_) => {
+                return Err(process_tree_cleanup_error(
+                    "the root child could not be monitored while being reaped",
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminate_descendant_process_tree(child: &mut Child, owns_process_group: bool) -> FwResult<()> {
+    let deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
+    let process_group = owns_process_group.then(|| rustix::process::Pid::from_child(child));
+    let mut group_signal_error = None;
+    if let Some(process_group) = process_group
+        && let Err(error) =
+            rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL)
+        && error != rustix::io::Errno::SRCH
+    {
+        group_signal_error = Some(error);
+    }
+
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if let Err(error) = child.kill()
+                && error.kind() != std::io::ErrorKind::InvalidInput
+            {
+                return Err(process_tree_cleanup_error(
+                    "the root child rejected direct termination",
+                ));
+            }
+        }
+        Err(_) => {
+            return Err(process_tree_cleanup_error(
+                "the root child could not be inspected before termination",
+            ));
+        }
+    }
+    wait_for_child_reap(child, deadline)?;
+
+    if group_signal_error.is_some() {
+        return Err(process_tree_cleanup_error(
+            "the owned Unix process group rejected termination",
+        ));
+    }
+    if let Some(process_group) = process_group {
+        loop {
+            match rustix::process::test_kill_process_group(process_group) {
+                Err(error) if error == rustix::io::Errno::SRCH => break,
+                Err(_) => {
+                    return Err(process_tree_cleanup_error(
+                        "the owned Unix process group could not be inspected after termination",
+                    ));
+                }
+                Ok(()) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(()) => {
+                    return Err(process_tree_cleanup_error(
+                        "the owned Unix process group remained alive after termination",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
-fn terminate_descendant_process_tree(child: &mut Child, _owns_process_group: bool) {
+fn terminate_descendant_process_tree(child: &mut Child, _owns_process_group: bool) -> FwResult<()> {
     const TASKKILL_TIMEOUT: Duration = Duration::from_secs(2);
 
     let child_id = child.id().to_string();
@@ -534,28 +625,53 @@ fn terminate_descendant_process_tree(child: &mut Child, _owns_process_group: boo
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Ok(mut taskkill) = helper.spawn() {
-        let started = Instant::now();
-        loop {
-            match taskkill.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if started.elapsed() < TASKKILL_TIMEOUT => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Ok(None) | Err(_) => {
-                    let _ = taskkill.kill();
-                    let _ = taskkill.wait();
-                    break;
-                }
+    let mut taskkill = helper
+        .spawn()
+        .map_err(|_| process_tree_cleanup_error("Windows taskkill /T could not be launched"))?;
+    let started = Instant::now();
+    let taskkill_status = loop {
+        match taskkill.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < TASKKILL_TIMEOUT => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = taskkill.kill();
+                let _ = taskkill.wait();
+                return Err(process_tree_cleanup_error(
+                    "Windows taskkill /T exceeded its cleanup deadline",
+                ));
+            }
+            Err(_) => {
+                let _ = taskkill.kill();
+                let _ = taskkill.wait();
+                return Err(process_tree_cleanup_error(
+                    "Windows taskkill /T could not be monitored",
+                ));
             }
         }
+    };
+    if !taskkill_status.success() {
+        return Err(process_tree_cleanup_error(
+            "Windows taskkill /T did not report success",
+        ));
     }
-    let _ = child.kill();
+    if let Err(error) = child.kill()
+        && error.kind() != std::io::ErrorKind::InvalidInput
+    {
+        return Err(process_tree_cleanup_error(
+            "the Windows root child rejected direct termination",
+        ));
+    }
+    wait_for_child_reap(child, Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn terminate_descendant_process_tree(child: &mut Child, _owns_process_group: bool) {
-    let _ = child.kill();
+fn terminate_descendant_process_tree(child: &mut Child, _owns_process_group: bool) -> FwResult<()> {
+    child
+        .kill()
+        .map_err(|_| process_tree_cleanup_error("the root child rejected direct termination"))?;
+    wait_for_child_reap(child, Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT)
 }
 
 fn validate_command_output(rendered: &str, output: Output) -> FwResult<Output> {
@@ -1021,7 +1137,7 @@ mod tests {
         let mut polls = 0usize;
         let mut observer = |_root_pid| {
             polls = polls.saturating_add(1);
-            if polls >= 7 {
+            if polls >= 2 && pid_path.is_file() {
                 Err(crate::error::FwError::ContractViolation(
                     "observer fixture failure".to_owned(),
                 ))
