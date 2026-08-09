@@ -1638,8 +1638,9 @@ fn dot_i8_enc(w: &[i8], x: &[i8]) -> i32 {
 }
 
 /// M4×N2 register-blocked i8×i8 → i32: 4 activation rows × 2 weight rows = 8 dots,
-/// each 16-i8 chunk sign-extended ONCE and reused across all 8 dots (8 accumulators
-/// + 4 act + 2 weight = 14 ymm, fits Zen3's 16). This amortizes the vpmovsxbw
+/// each 16-i8 chunk sign-extended ONCE and reused across all 8 dots (8 accumulators,
+/// 4 activation registers, and 2 weight registers = 14 ymm, fitting Zen3's 16).
+/// This amortizes the vpmovsxbw
 /// sign-extend + the loads that make the per-call [`dot_i8_enc`] effectively M1
 /// (it re-loads+re-extends the weight row for every activation row). Mirrors the
 /// maddubs `dot_maddubs_i7_m4n2`; integer-EXACT (associative i32 add ⇒ bit-identical

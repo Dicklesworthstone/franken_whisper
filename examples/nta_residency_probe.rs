@@ -45,7 +45,7 @@ fn sum_nta(buf: &[i8]) -> i64 {
         let mut i = 0;
         while i + 32 <= n {
             if i + 512 < n {
-                _mm_prefetch::<_MM_HINT_NTA>(p.add(i + 512) as *const i8);
+                _mm_prefetch::<_MM_HINT_NTA>(p.add(i + 512));
             }
             let v = _mm256_loadu_si256(p.add(i) as *const __m256i);
             let lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v));
