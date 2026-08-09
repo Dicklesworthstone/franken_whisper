@@ -723,11 +723,17 @@ fn run_transcribe_json_with_stub_env(
     let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
     cmd.arg("transcribe");
     cmd.args(args);
+    // This helper owns the external bridge fixture contract. Keep the
+    // independent default Sortformer stage out of these focused ingest,
+    // normalization, backend, and persistence tests; the actual all-native
+    // default is covered by native_engine_e2e.
+    cmd.arg("--no-diarize");
     cmd.env("FRANKEN_WHISPER_WHISPER_CPP_BIN", stub_bin);
     // These tests assert the external stub's exact transcript and bridge
     // metadata. A locally cached native model must not silently bypass the
     // fixture and make the result depend on developer-machine state.
     cmd.env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0");
+    cmd.env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0");
     cmd.env("FRANKEN_WHISPER_STATE_DIR", state_root);
     for (key, value) in extra_env {
         cmd.env(key, value);
@@ -3517,7 +3523,7 @@ fn robot_tiny_diarize_emits_redacted_hint_evidence_and_native_acoustic_report() 
 
 #[cfg(unix)]
 #[test]
-fn transcribe_without_optional_flags_emits_skip_events_and_preserves_backend_segments() {
+fn transcribe_bridge_fixture_with_no_diarize_emits_skip_events_and_preserves_segments() {
     if !ffmpeg_available() {
         return;
     }
@@ -3547,7 +3553,7 @@ fn transcribe_without_optional_flags_emits_skip_events_and_preserves_backend_seg
     assert_eq!(report["result"]["segments"][0]["text"], "stub transcript");
     assert!(
         report["result"]["segments"][0]["speaker"].is_null(),
-        "speaker should remain null when --diarize was not requested"
+        "speaker should remain null when the fixture helper disables pipeline diarization"
     );
 
     let events = report["events"].as_array().expect("events");
@@ -3931,7 +3937,7 @@ fn transcribe_backend_stage_payload_exposes_execution_metadata() {
     assert_eq!(backend_payload["resolved_backend"], "whisper_cpp");
     assert_eq!(backend_payload["implementation"], "bridge");
     assert_eq!(backend_payload["execution_mode"], "bridge_only");
-    assert_eq!(backend_payload["native_rollout_stage"], "primary");
+    assert_eq!(backend_payload["native_rollout_stage"], "sole");
     assert!(backend_payload["engine_identity"].is_string());
     assert!(
         backend_payload["engine_version"].is_string()
@@ -4000,6 +4006,7 @@ fn transcribe_bridge_only_mode_recovers_with_native_when_bridge_binary_missing()
                 missing_bridge_bin.to_str().expect("utf8"),
             ),
             ("FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL", "tiny.en"),
+            ("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "1"),
         ],
     );
 
@@ -4016,7 +4023,7 @@ fn transcribe_bridge_only_mode_recovers_with_native_when_bridge_binary_missing()
         backend_payload["execution_mode"],
         "bridge_only_native_recovery"
     );
-    assert_eq!(backend_payload["native_rollout_stage"], "primary");
+    assert_eq!(backend_payload["native_rollout_stage"], "sole");
     assert!(backend_payload["native_fallback_error"].is_string());
 
     let replay_event = events
@@ -5080,6 +5087,7 @@ fn speculative_cli_dispatch_emits_partial_confirm_and_stats_events() {
             input_wav.to_str().expect("utf-8 path"),
             "--backend",
             "whisper-cpp",
+            "--no-diarize",
             "--no-persist",
             // Single window so the stub only fires twice (fast + quality).
             "--speculative",
@@ -5094,6 +5102,8 @@ fn speculative_cli_dispatch_emits_partial_confirm_and_stats_events() {
         ])
         .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
         .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
+        .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0")
         .output()
         .expect("robot transcribe should execute");
 
