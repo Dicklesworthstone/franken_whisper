@@ -11,23 +11,20 @@ readme = "README.md"
 keywords = ["whisper", "speech-to-text", "diarization", "asr", "audio"]
 categories = ["command-line-utilities", "multimedia::audio"]
 include = [
-    "Cargo.toml",
-    "Cargo.lock",
-    "rust-toolchain.toml",
-    "README.md",
-    "CHANGELOG.md",
-    "LICENSE",
-    "NOTICE.sortformer.txt",
-    "THIRD_PARTY_NOTICES.md",
-    "src/**",
-    "models/**",
-    "scripts/**",
-    "docs/**",
-    "tests/**/*.rs",
-    "tests/fixtures/**",
-    "tests/mocks/**",
-    "examples/**",
-    "benches/**/*.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/rust-toolchain.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/NOTICE.sortformer.txt",
+    "/THIRD_PARTY_NOTICES.md",
+    "/src/**",
+    "/models/**",
+    "/scripts/convert_to_safetensors.py",
+    "/scripts/export_sortformer_activations.py",
+    "/docs/native_engine_contract.md",
+    "/docs/NEGATIVE_EVIDENCE.md",
 ]
 
 [features]
