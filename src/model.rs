@@ -3125,10 +3125,9 @@ fn validate_speaker_count_outcome(
                 | DiarizationReportKind::NativeSortformer
                 | DiarizationReportKind::NativeEcapaOnly
                 | DiarizationReportKind::NativeEcapaFused
-        ) {
-            if kind != DiarizationReportKind::NativeSortformer {
-                validate_native_speaker_evidence(evidence, kind)?;
-            }
+        ) && kind != DiarizationReportKind::NativeSortformer
+        {
+            validate_native_speaker_evidence(evidence, kind)?;
         }
         if evidence.supported {
             supported_evidence_refs.insert(evidence.speaker_ref.as_str());

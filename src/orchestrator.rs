@@ -5516,7 +5516,9 @@ fn run_native_sortformer_diarization(
         let voiced_frame_count = output
             .activity
             .activity
-            .chunks_exact(LANES)
+            .as_chunks::<LANES>()
+            .0
+            .iter()
             .filter(|frame| frame.get(lane).is_some_and(|value| *value != 0))
             .count() as u64;
         let mean_assignment_confidence = lane_turns
