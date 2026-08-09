@@ -180,6 +180,115 @@ fn sortformer_audio_duration_ms(sample_count: usize) -> FwResult<u64> {
         .map(|milliseconds| milliseconds.div_ceil(sample_rate))
 }
 
+fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
+    let pull_whisper = matches!(model, PullModelArg::All | PullModelArg::Whisper);
+    let pull_sortformer = matches!(model, PullModelArg::All | PullModelArg::Sortformer);
+    let requested_model = match model {
+        PullModelArg::All => "all",
+        PullModelArg::Whisper => "whisper",
+        PullModelArg::Sortformer => "sortformer",
+    };
+    let result = (|| {
+        let mut pulled = Vec::new();
+        if pull_whisper {
+            let outcome = franken_whisper::model_distribution::pull_whisper(
+                ShutdownController::is_shutting_down,
+                |line| {
+                    if !json_output {
+                        eprintln!("fw pull whisper: {line}");
+                    }
+                },
+            )?;
+            if !json_output {
+                eprintln!(
+                    "fw pull whisper: ready ({})",
+                    if outcome.from_cache {
+                        "already cached"
+                    } else {
+                        "downloaded and verified"
+                    }
+                );
+            }
+            pulled.push(serde_json::json!({
+                "model": "whisper",
+                "status": "ready",
+                "from_cache": outcome.from_cache,
+                "artifact_version": outcome.package.artifact_version,
+                "package_sha256": outcome.package.weights_sha256,
+                "distribution_policy": franken_whisper::model_distribution::WHISPER_DISTRIBUTION_POLICY,
+                "license": "MIT",
+                "weight_bytes_identity_preserved": true,
+                "preparation_recipe": franken_whisper::model_distribution::WHISPER_PREPARATION_RECIPE,
+            }));
+        }
+        if pull_sortformer {
+            let outcome = franken_whisper::model_distribution::pull_sortformer(
+                ShutdownController::is_shutting_down,
+                |line| {
+                    if !json_output {
+                        eprintln!("fw pull sortformer: {line}");
+                    }
+                },
+            )?;
+            if !json_output {
+                eprintln!(
+                    "fw pull sortformer: ready ({})",
+                    if outcome.from_cache {
+                        "already cached"
+                    } else {
+                        "downloaded and verified"
+                    }
+                );
+            }
+            pulled.push(serde_json::json!({
+                "model": "sortformer",
+                "status": "ready",
+                "from_cache": outcome.from_cache,
+                "artifact_version": outcome.package.artifact_version,
+                "package_sha256": outcome.package.package_sha256,
+                "distribution_policy": franken_whisper::model_distribution::SORTFORMER_DISTRIBUTION_POLICY,
+                "model_license_notice": franken_whisper::model_distribution::SORTFORMER_REQUIRED_NOTICE,
+            }));
+        }
+        Ok::<_, FwError>(pulled)
+    })();
+
+    match result {
+        Ok(pulled) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "schema_version": "franken-whisper-model-pull-v2",
+                        "command": "pull",
+                        "model": requested_model,
+                        "status": "ready",
+                        "models": pulled,
+                        "local_paths_emitted": false,
+                    }))?
+                );
+            }
+            Ok(())
+        }
+        Err(error) if json_output => {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": "franken-whisper-model-pull-v2",
+                    "command": "pull",
+                    "model": requested_model,
+                    "status": "error",
+                    "code": error.error_code(),
+                    "message": "model provisioning failed",
+                    "local_paths_emitted": false,
+                }))?
+            );
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn run(cli: Cli) -> FwResult<()> {
     match cli.command {
         Command::Transcribe(args) => {
@@ -345,63 +454,7 @@ fn run(cli: Cli) -> FwResult<()> {
             }
             Ok(())
         }
-        Command::Pull(args) => match args.model {
-            PullModelArg::Sortformer => {
-                let outcome = match franken_whisper::model_distribution::pull_sortformer(
-                    ShutdownController::is_shutting_down,
-                    |line| {
-                        if !args.json {
-                            eprintln!("fw pull sortformer: {line}");
-                        }
-                    },
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(error) if args.json => {
-                        println!(
-                            "{}",
-                            serde_json::to_string(&serde_json::json!({
-                                "schema_version": "franken-whisper-model-pull-v1",
-                                "command": "pull",
-                                "model": "sortformer",
-                                "status": "error",
-                                "code": error.error_code(),
-                                "message": "Sortformer model pull failed",
-                                "local_paths_emitted": false,
-                            }))?
-                        );
-                        return Err(error);
-                    }
-                    Err(error) => return Err(error),
-                };
-                if args.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&serde_json::json!({
-                            "schema_version": "franken-whisper-model-pull-v1",
-                            "command": "pull",
-                            "model": "sortformer",
-                            "status": "ready",
-                            "from_cache": outcome.from_cache,
-                            "artifact_version": outcome.package.artifact_version,
-                            "package_sha256": outcome.package.package_sha256,
-                            "distribution_policy": franken_whisper::model_distribution::SORTFORMER_DISTRIBUTION_POLICY,
-                            "model_license_notice": franken_whisper::model_distribution::SORTFORMER_REQUIRED_NOTICE,
-                            "local_paths_emitted": false,
-                        }))?
-                    );
-                } else {
-                    eprintln!(
-                        "fw pull sortformer: ready ({})",
-                        if outcome.from_cache {
-                            "already cached"
-                        } else {
-                            "downloaded and verified"
-                        }
-                    );
-                }
-                Ok(())
-            }
-        },
+        Command::Pull(args) => pull_models(args.model, args.json),
         Command::Doctor(args) => {
             let value = franken_whisper::robot::doctor_report_value_with_cancel(
                 &args.db,

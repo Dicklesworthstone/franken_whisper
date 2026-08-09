@@ -415,6 +415,8 @@ pub struct ModelsArgs {
 /// Model family accepted by the explicit downloader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PullModelArg {
+    All,
+    Whisper,
     Sortformer,
 }
 
@@ -422,7 +424,7 @@ pub enum PullModelArg {
 #[derive(Debug, Args)]
 pub struct PullArgs {
     /// Model package to fetch into the per-user verified cache.
-    #[arg(value_enum, default_value_t = PullModelArg::Sortformer)]
+    #[arg(value_enum, default_value_t = PullModelArg::All)]
     pub model: PullModelArg,
 
     /// Emit one stable JSON object and suppress human progress output.
@@ -4057,6 +4059,15 @@ mod tests {
             Command::Pull(PullArgs {
                 model: PullModelArg::Sortformer,
                 json: true,
+            })
+        ));
+
+        let pull_default = Cli::try_parse_from(["fw", "pull"]).expect("default pull command");
+        assert!(matches!(
+            pull_default.command,
+            Command::Pull(PullArgs {
+                model: PullModelArg::All,
+                json: false,
             })
         ));
 

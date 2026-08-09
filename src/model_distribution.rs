@@ -1,9 +1,9 @@
-//! Explicit, hash-pinned distribution for the native Streaming Sortformer model.
+//! Explicit, hash-pinned distribution for native model packages.
 //!
-//! The binary contains only a small immutable manifest. `fw pull sortformer`
-//! streams the separately licensed model and every required legal/provenance
-//! sidecar into a per-user cache. Inference is offline and admits the cache only
-//! when all four files match the embedded sizes and SHA-256 digests.
+//! The binary contains only small immutable manifests. `fw pull whisper` and
+//! `fw pull sortformer` stream release artifacts into a per-user cache.
+//! Inference is offline and admits a cache entry only after its compiled size
+//! and SHA-256 trust roots match.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +28,8 @@ use crate::error::{FwError, FwResult};
 
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const BUILTIN_MANIFEST_JSON: &str = include_str!("../models/sortformer-manifest-v1.json");
+pub const BUILTIN_WHISPER_MANIFEST_JSON: &str =
+    include_str!("../models/whisper-manifest-v1.json");
 pub const SORTFORMER_ARTIFACT_VERSION: &str = "sortformer-v2.1-f32-v1";
 pub const SORTFORMER_DISTRIBUTION_POLICY: &str = "github_release_with_license_and_notice";
 pub const SORTFORMER_MODEL_DIR_ENV: &str = "FRANKEN_WHISPER_MODEL_DIR";
@@ -37,6 +39,18 @@ pub const SORTFORMER_LICENSE_FILENAME: &str = "NVIDIA-OPEN-MODEL-LICENSE.html";
 pub const SORTFORMER_NOTICE_FILENAME: &str = "NOTICE.sortformer.txt";
 pub const SORTFORMER_REQUIRED_NOTICE: &str =
     "Licensed by NVIDIA Corporation under the NVIDIA Open Model License";
+pub const WHISPER_ARTIFACT_VERSION: &str = "whisper-large-v3-turbo-f16-v1";
+pub const WHISPER_MODEL_ID: &str = "openai/whisper-large-v3-turbo";
+pub const WHISPER_UPSTREAM_REPOSITORY: &str = "ggerganov/whisper.cpp";
+pub const WHISPER_UPSTREAM_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+pub const WHISPER_WEIGHTS_FILENAME: &str = "ggml-large-v3-turbo.bin";
+pub const WHISPER_WEIGHTS_BYTES: u64 = 1_624_555_275;
+pub const WHISPER_WEIGHTS_SHA256: &str =
+    "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69";
+pub const WHISPER_DISTRIBUTION_POLICY: &str = "github_release_with_compiled_sha256";
+pub const WHISPER_PREPARATION_RECIPE: &str =
+    "franken-whisper-native-ggml-selection-v1-identity";
+pub const WHISPER_LICENSE_URL: &str = "https://github.com/openai/whisper/blob/main/LICENSE";
 
 const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024;
@@ -48,6 +62,7 @@ const INSTALL_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const INSTALL_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const EXPECTED_RELEASE_PREFIX: &str = "https://github.com/Dicklesworthstone/franken_whisper/releases/download/sortformer-v2.1-f32-v1/";
+const EXPECTED_WHISPER_RELEASE_PREFIX: &str = "https://github.com/Dicklesworthstone/franken_whisper/releases/download/whisper-large-v3-turbo-f16-v1/";
 static STAGING_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +78,22 @@ pub struct SortformerManifest {
     pub license_url: String,
     pub required_notice: String,
     pub speaker_lane_capacity: u16,
+    pub files: Vec<RemoteFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WhisperManifest {
+    pub schema_version: u32,
+    pub model_id: String,
+    pub upstream_repository: String,
+    pub upstream_revision: String,
+    pub artifact_version: String,
+    pub preparation_recipe: String,
+    pub distribution_policy: String,
+    pub license_id: String,
+    pub license_url: String,
+    pub weight_precision: String,
     pub files: Vec<RemoteFile>,
 }
 
@@ -87,13 +118,68 @@ pub struct CachedSortformerPackage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedWhisperPackage {
+    pub weights_path: PathBuf,
+    pub artifact_version: String,
+    pub weights_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullOutcome {
     pub package: CachedSortformerPackage,
     pub from_cache: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhisperPullOutcome {
+    pub package: CachedWhisperPackage,
+    pub from_cache: bool,
+}
+
 pub fn builtin_manifest() -> FwResult<SortformerManifest> {
     parse_manifest(BUILTIN_MANIFEST_JSON.as_bytes())
+}
+
+pub fn builtin_whisper_manifest() -> FwResult<WhisperManifest> {
+    let manifest: WhisperManifest = serde_json::from_slice(BUILTIN_WHISPER_MANIFEST_JSON.as_bytes())?;
+    validate_whisper_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_whisper_manifest(manifest: &WhisperManifest) -> FwResult<()> {
+    if manifest.schema_version != MANIFEST_SCHEMA_VERSION
+        || manifest.model_id != WHISPER_MODEL_ID
+        || manifest.upstream_repository != WHISPER_UPSTREAM_REPOSITORY
+        || manifest.upstream_revision != WHISPER_UPSTREAM_REVISION
+        || manifest.artifact_version != WHISPER_ARTIFACT_VERSION
+        || manifest.preparation_recipe != WHISPER_PREPARATION_RECIPE
+        || manifest.distribution_policy != WHISPER_DISTRIBUTION_POLICY
+        || manifest.license_id != "MIT"
+        || manifest.license_url != WHISPER_LICENSE_URL
+        || manifest.weight_precision != "f16"
+        || manifest.files.len() != 1
+    {
+        return Err(whisper_manifest_error(
+            "embedded Whisper manifest disagrees with the compiled runtime contract",
+        ));
+    }
+    let file = &manifest.files[0];
+    validate_filename(&file.filename)?;
+    validate_hash(&file.sha256)?;
+    validate_https_url(&file.url)?;
+    if file.role != "weights"
+        || file.filename != WHISPER_WEIGHTS_FILENAME
+        || file.size != WHISPER_WEIGHTS_BYTES
+        || file.sha256 != WHISPER_WEIGHTS_SHA256
+        || file.url != format!("{EXPECTED_WHISPER_RELEASE_PREFIX}{WHISPER_WEIGHTS_FILENAME}")
+        || file.size == 0
+        || file.size > MAX_ARTIFACT_BYTES
+    {
+        return Err(whisper_manifest_error(
+            "Whisper manifest file entry disagrees with its compiled trust root",
+        ));
+    }
+    Ok(())
 }
 
 pub fn parse_manifest(bytes: &[u8]) -> FwResult<SortformerManifest> {
@@ -172,6 +258,10 @@ fn validate_manifest(manifest: &SortformerManifest) -> FwResult<()> {
 
 fn manifest_error(message: impl Into<String>) -> FwError {
     FwError::ContractViolation(format!("sortformer.model_manifest: {}", message.into()))
+}
+
+fn whisper_manifest_error(message: impl Into<String>) -> FwError {
+    FwError::ContractViolation(format!("whisper.model_manifest: {}", message.into()))
 }
 
 fn validate_filename(filename: &str) -> FwResult<()> {
@@ -271,6 +361,63 @@ pub fn sortformer_cache_dir() -> FwResult<PathBuf> {
         )));
     }
     Ok(root.join("sortformer").join(SORTFORMER_ARTIFACT_VERSION))
+}
+
+pub fn whisper_cache_dir() -> FwResult<PathBuf> {
+    let root = cache_root().ok_or_else(|| {
+        FwError::InvalidRequest(format!(
+            "cannot resolve model cache; set {SORTFORMER_MODEL_DIR_ENV}"
+        ))
+    })?;
+    if !root.is_absolute() {
+        return Err(FwError::InvalidRequest(format!(
+            "{SORTFORMER_MODEL_DIR_ENV} must be an absolute path"
+        )));
+    }
+    Ok(root.join("whisper").join(WHISPER_ARTIFACT_VERSION))
+}
+
+pub fn resolve_cached_whisper() -> FwResult<CachedWhisperPackage> {
+    resolve_cached_whisper_with_cancel(|| false)
+}
+
+pub fn resolve_cached_whisper_with_cancel<F>(
+    is_cancelled: F,
+) -> FwResult<CachedWhisperPackage>
+where
+    F: Fn() -> bool + Sync,
+{
+    let manifest = builtin_whisper_manifest()?;
+    let directory = whisper_cache_dir()?;
+    let remote = manifest
+        .files
+        .first()
+        .ok_or_else(|| whisper_manifest_error("weights role is missing"))?;
+    let weights_path = directory.join(&remote.filename);
+    if !file_matches_with_cancel(&weights_path, remote, &is_cancelled)? {
+        return Err(FwError::MissingArtifact(weights_path));
+    }
+    Ok(CachedWhisperPackage {
+        weights_path,
+        artifact_version: manifest.artifact_version,
+        weights_sha256: WHISPER_WEIGHTS_SHA256.to_owned(),
+    })
+}
+
+pub fn cached_whisper_readiness_with_cancel<F>(is_cancelled: F) -> FwResult<bool>
+where
+    F: Fn() -> bool + Sync,
+{
+    match resolve_cached_whisper_with_cancel(is_cancelled) {
+        Ok(_) => Ok(true),
+        Err(FwError::Cancelled(message)) => Err(FwError::Cancelled(message)),
+        Err(_) => Ok(false),
+    }
+}
+
+#[must_use]
+pub fn cached_whisper_is_ready() -> bool {
+    cached_whisper_readiness_with_cancel(|| false).unwrap_or(false)
 }
 
 pub fn resolve_cached_sortformer() -> FwResult<CachedSortformerPackage> {
@@ -398,6 +545,49 @@ where
     cancellation_checkpoint(&is_cancelled)?;
     let package = resolve_cached_in_with_cancel(&manifest, &directory, &is_cancelled)?;
     Ok(PullOutcome {
+        package,
+        from_cache: false,
+    })
+}
+
+pub fn pull_whisper<F, P>(is_cancelled: F, mut progress: P) -> FwResult<WhisperPullOutcome>
+where
+    F: Fn() -> bool + Sync,
+    P: FnMut(&str),
+{
+    cancellation_checkpoint(&is_cancelled)?;
+    let manifest = builtin_whisper_manifest()?;
+    let directory = whisper_cache_dir()?;
+    ensure_real_directory(&directory)?;
+    match resolve_cached_whisper_with_cancel(&is_cancelled) {
+        Ok(package) => {
+            progress("native Whisper weights are already cached and verified");
+            return Ok(WhisperPullOutcome {
+                package,
+                from_cache: true,
+            });
+        }
+        Err(FwError::Cancelled(message)) => return Err(FwError::Cancelled(message)),
+        Err(_) => {}
+    }
+
+    let runtime = RuntimeBuilder::new().build().map_err(|error| {
+        FwError::BackendUnavailable(format!("cannot build model-download runtime: {error}"))
+    })?;
+    let remote = manifest
+        .files
+        .first()
+        .ok_or_else(|| whisper_manifest_error("weights role is missing"))?;
+    install_file(
+        &runtime,
+        remote,
+        &directory.join(&remote.filename),
+        &is_cancelled,
+        &mut progress,
+    )?;
+    cancellation_checkpoint(&is_cancelled)?;
+    let package = resolve_cached_whisper_with_cancel(&is_cancelled)?;
+    Ok(WhisperPullOutcome {
         package,
         from_cache: false,
     })

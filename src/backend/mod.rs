@@ -1955,14 +1955,14 @@ fn readiness_for(kind: BackendKind, request: &TranscribeRequest) -> BackendReadi
 }
 
 fn native_rollout_stage() -> NativeEngineRolloutStage {
-    let default = NativeEngineRolloutStage::Primary;
+    let default = NativeEngineRolloutStage::Sole;
     match std::env::var(NativeEngineRolloutStage::ENV_VAR) {
         Ok(raw) => NativeEngineRolloutStage::parse(&raw).unwrap_or_else(|| {
             tracing::warn!(
                 env_var = NativeEngineRolloutStage::ENV_VAR,
                 value = %raw,
                 fallback = default.as_str(),
-                "invalid native rollout stage value; defaulting to primary"
+                "invalid native rollout stage value; defaulting to sole"
             );
             default
         }),

@@ -191,8 +191,9 @@ impl Mat {
 /// 1. `$FRANKEN_WHISPER_MODEL_DIR` — operator-chosen production model dir.
 /// 2. `$FRANKEN_WHISPER_TEST_MODEL_DIR` — CI / dev fixtures.
 /// 3. `~/.cache/franken_whisper/models` — default production cache.
-/// 4. `~/.cache/franken_whisper/test-models` — default test cache.
-/// 5. `~/models/whisper` — the conventional whisper.cpp download location.
+/// 4. The verified FrankenWhisper release-package directory beneath that cache.
+/// 5. `~/.cache/franken_whisper/test-models` — default test cache.
+/// 6. `~/models/whisper` — the conventional whisper.cpp download location.
 ///
 /// Empty env vars are skipped. The home-relative entries are omitted entirely
 /// when `$HOME` is unset (rather than rooting at the filesystem root). This is
@@ -202,19 +203,30 @@ impl Mat {
 #[must_use]
 fn model_search_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for var in [
-        "FRANKEN_WHISPER_MODEL_DIR",
-        "FRANKEN_WHISPER_TEST_MODEL_DIR",
-    ] {
-        if let Ok(dir) = std::env::var(var)
-            && !dir.is_empty()
-        {
-            dirs.push(PathBuf::from(dir));
-        }
+    if let Ok(dir) = std::env::var("FRANKEN_WHISPER_MODEL_DIR")
+        && !dir.is_empty()
+    {
+        let root = PathBuf::from(dir);
+        dirs.push(root.clone());
+        dirs.push(
+            root.join("whisper")
+                .join(crate::model_distribution::WHISPER_ARTIFACT_VERSION),
+        );
+    }
+    if let Ok(dir) = std::env::var("FRANKEN_WHISPER_TEST_MODEL_DIR")
+        && !dir.is_empty()
+    {
+        dirs.push(PathBuf::from(dir));
     }
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
-        dirs.push(home.join(".cache").join("franken_whisper").join("models"));
+        let cache_root = home.join(".cache").join("franken_whisper").join("models");
+        dirs.push(cache_root.clone());
+        dirs.push(
+            cache_root
+                .join("whisper")
+                .join(crate::model_distribution::WHISPER_ARTIFACT_VERSION),
+        );
         dirs.push(
             home.join(".cache")
                 .join("franken_whisper")
@@ -1007,12 +1019,12 @@ pub fn find_model_file(short_name: &str) -> Option<PathBuf> {
 ///    `"large-v3-turbo"` — searched as `ggml-{name}.bin` across
 ///    [`model_search_dirs`] in precedence order.
 ///
-/// # No network access
+/// # No network access during inference
 ///
-/// This function (and the whole engine) **never** downloads anything. Per the
-/// project's privacy stance ("data never leaves machine"), model provisioning
-/// is an explicit, separate, user-invoked step; a missing model is a hard,
-/// actionable error here rather than a silent fetch.
+/// This resolver never downloads anything. Model provisioning is performed by
+/// the separate, explicit `fw pull` command (normally invoked by the installer),
+/// so transcription remains offline and a missing model is a hard, actionable
+/// error rather than a silent network operation.
 ///
 /// # Errors
 ///
@@ -1155,8 +1167,8 @@ fn model_resolution_error(spec: &str, file_name: &str, dirs: &[PathBuf]) -> Stri
     }
     msg.push_str(
         "\nFix: place the model file in one of the above directories, set \
-         $FRANKEN_WHISPER_MODEL_DIR to its directory, or pass an explicit path. \
-         FrankenWhisper never downloads models (data never leaves the machine).",
+         $FRANKEN_WHISPER_MODEL_DIR to its directory, pass an explicit path, or run \
+         `fw pull whisper`. Transcription itself never accesses the network.",
     );
     msg
 }
