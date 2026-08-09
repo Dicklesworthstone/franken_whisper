@@ -387,26 +387,26 @@ fn main() {
                     for r in 0..reps {
                         // alternate arm order per rep to cancel order bias
                         if r % 2 == 0 {
-                            for e in evict.iter_mut() {
+                            for e in &mut evict {
                                 *e *= 1.0000001;
                             }
                             let t = std::time::Instant::now();
                             gemv_m2(&w, &xi8, out, tq, &mut a, workers);
                             b2 = b2.min(ms(t));
-                            for e in evict.iter_mut() {
+                            for e in &mut evict {
                                 *e *= 1.0000001;
                             }
                             let t = std::time::Instant::now();
                             gemv_m4(&w, &xi8, out, tq, &mut b, workers);
                             b4 = b4.min(ms(t));
                         } else {
-                            for e in evict.iter_mut() {
+                            for e in &mut evict {
                                 *e *= 1.0000001;
                             }
                             let t = std::time::Instant::now();
                             gemv_m4(&w, &xi8, out, tq, &mut b, workers);
                             b4 = b4.min(ms(t));
-                            for e in evict.iter_mut() {
+                            for e in &mut evict {
                                 *e *= 1.0000001;
                             }
                             let t = std::time::Instant::now();

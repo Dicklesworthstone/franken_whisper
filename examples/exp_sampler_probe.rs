@@ -45,8 +45,8 @@ unsafe fn logsumexp_avx2(x: &[f32], max: f32) -> f32 {
         let n = x.len();
         let xp = x.as_ptr();
         let vmax = _mm256_set1_ps(max);
-        let log2e = _mm256_set1_ps(1.442_695_f32);
-        let ln2 = _mm256_set1_ps(0.693_147_2_f32);
+        let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
+        let ln2 = _mm256_set1_ps(std::f32::consts::LN_2);
         let lo = _mm256_set1_ps(-87.3365_f32); // exp underflows to 0 below this
         // degree-5 exp(r) minimax on r∈[-ln2/2, ln2/2]
         let c0 = _mm256_set1_ps(1.0);

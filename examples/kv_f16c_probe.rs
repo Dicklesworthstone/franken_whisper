@@ -75,7 +75,7 @@ mod x86_probe {
     unsafe fn scores_f32_avx2(q: &[f32], k: &[f32], tk: usize, d: usize) -> Vec<f32> {
         unsafe {
             let mut s = vec![0.0f32; tk];
-            for j in 0..tk {
+            for (j, score) in s.iter_mut().enumerate().take(tk) {
                 let krow = k.as_ptr().add(j * d);
                 let mut acc = _mm256_setzero_ps();
                 let mut dd = 0;
@@ -85,7 +85,7 @@ mod x86_probe {
                     acc = _mm256_fmadd_ps(qv, kv, acc);
                     dd += 8;
                 }
-                s[j] = hsum256(acc);
+                *score = hsum256(acc);
             }
             s
         }
@@ -115,7 +115,7 @@ mod x86_probe {
     unsafe fn scores_f16_f16c(q: &[f32], k: &[u16], tk: usize, d: usize) -> Vec<f32> {
         unsafe {
             let mut s = vec![0.0f32; tk];
-            for j in 0..tk {
+            for (j, score) in s.iter_mut().enumerate().take(tk) {
                 let krow = k.as_ptr().add(j * d);
                 let mut acc = _mm256_setzero_ps();
                 let mut dd = 0;
@@ -126,7 +126,7 @@ mod x86_probe {
                     acc = _mm256_fmadd_ps(qv, kv, acc);
                     dd += 8;
                 }
-                s[j] = hsum256(acc);
+                *score = hsum256(acc);
             }
             s
         }

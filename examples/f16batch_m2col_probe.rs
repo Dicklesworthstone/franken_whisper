@@ -581,49 +581,49 @@ fn main() {
     let (mut bm1, mut bm2, mut bt, mut bs) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
     let (mut bb4, mut bb8, mut bb16, mut bb3) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
     for _ in 0..reps {
-        for e in evict.iter_mut() {
+        for e in &mut evict {
             *e *= 1.0000001;
         }
         let t = std::time::Instant::now();
         gemv_m1(&w, &x, &mut a, workers);
         bm1 = bm1.min(ms(t));
-        for e in evict.iter_mut() {
+        for e in &mut evict {
             *e *= 1.0000001;
         }
         let t = std::time::Instant::now();
         gemv_m2col(&w, &x, &mut b, workers);
         bm2 = bm2.min(ms(t));
-        for e in evict.iter_mut() {
+        for e in &mut evict {
             *e *= 1.0000001;
         }
         let t = std::time::Instant::now();
         gemv_mblock(&w, &x, &mut e, workers, 4);
         bb4 = bb4.min(ms(t));
-        for ev in evict.iter_mut() {
+        for ev in &mut evict {
             *ev *= 1.0000001;
         }
         let t = std::time::Instant::now();
         gemv_mblock(&w, &x, &mut e, workers, 8);
         bb8 = bb8.min(ms(t));
-        for ev in evict.iter_mut() {
+        for ev in &mut evict {
             *ev *= 1.0000001;
         }
         let t = std::time::Instant::now();
         gemv_mblock(&w, &x, &mut e, workers, 16);
         bb16 = bb16.min(ms(t));
-        for ev in evict.iter_mut() {
+        for ev in &mut evict {
             *ev *= 1.0000001;
         }
         let t = std::time::Instant::now();
         gemv_m3col(&w, &x, &mut f, workers);
         bb3 = bb3.min(ms(t));
-        for ev in evict.iter_mut() {
+        for ev in &mut evict {
             *ev *= 1.0000001;
         }
         let t = std::time::Instant::now();
         gemv_tiled_f32(&w, &x, &mut c);
         bt = bt.min(ms(t));
-        for ev in evict.iter_mut() {
+        for ev in &mut evict {
             *ev *= 1.0000001;
         }
         let t = std::time::Instant::now();

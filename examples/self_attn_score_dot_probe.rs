@@ -77,7 +77,7 @@ unsafe fn avx2_scores_4acc(
     unsafe {
         let vscale = _mm256_set1_ps(scale);
         let qp = qh.as_ptr();
-        for j in 0..tk {
+        for (j, sj) in out.iter_mut().take(tk).enumerate() {
             let kp = k.as_ptr().add(j * N_STATE + base);
             let mut a0 = _mm256_setzero_ps();
             let mut a1 = _mm256_setzero_ps();
@@ -107,7 +107,7 @@ unsafe fn avx2_scores_4acc(
             let mut sum128 = _mm_add_ps(hi, lo);
             sum128 = _mm_hadd_ps(sum128, sum128);
             sum128 = _mm_hadd_ps(sum128, sum128);
-            out[j] = _mm_cvtss_f32(sum128);
+            *sj = _mm_cvtss_f32(sum128);
         }
     }
 }
@@ -126,6 +126,7 @@ impl Avx2Fma {
     #[inline]
     #[allow(unsafe_code)]
     fn scores(self, qh: &[f32], k: &[f32], scale: f32, base: usize, tk: usize, out: &mut [f32]) {
+        debug_assert_eq!(std::mem::size_of_val(&self), 0);
         let required_k = tk
             .checked_mul(N_STATE)
             .expect("self-attention key-cache length overflow");
