@@ -1,12 +1,14 @@
 # Native Streaming Sortformer Rust Port Contract
 
-Status: authenticated native L1-L8 parity is complete for the pinned NVIDIA
-recommended streaming profile, together with a production-shaped library
-session and explicit evaluation-only CLI; broader L9 accuracy, L10 resource,
-greater-than-four-speaker, and product-routing certification remain open
+Status: authenticated native L1-L8 parity and product-path integration are
+complete for the pinned NVIDIA recommended streaming profile; broader L9
+accuracy, L10 resource, greater-than-four-speaker capacity, and routing
+certification remain open
 Fit verdict: **CONDITIONAL GO**
-Promotion authority: explicit evaluation only; `Auto` and the transcribe
-diarization resolver remain unchanged
+Product authority: the owner directed `Auto` to use native Sortformer with a
+native acoustic fallback. The model registry and focused diagnostic command
+remain `evaluation_only`; this routing choice is not evidence that the open
+certification gates passed.
 
 ## 1. Decision and no-claim boundary
 
@@ -21,12 +23,14 @@ native-acoustic comparator, low-memory fallback candidate, and regression
 control; it is not the learned-model graph oracle. The pinned NeMo graph plus a
 source/runtime/exporter-bound public activation pack is now the L1-L8 external
 graph oracle; the older final-output adapter remains only an identity-checked
-discrete-output diagnostic oracle. No automatic routing change, broad accuracy
-claim, or speed claim is authorized until the ordered parity and public
-evaluation gates below pass. The explicit `sortformer-diarize` command reports
-`evaluation_only`, defaults to a fully hash-verified release cache populated by
-explicit `fw pull sortformer`, and does not affect the currently resolved
-transcribe behavior. Explicit receipt/package paths remain available for
+discrete-output diagnostic oracle. The original evidence plan did not authorize
+automatic routing before the ordered parity and public-evaluation gates passed.
+The product owner later directed `Auto` to use this route without relabeling the
+decision as certification. The default pipeline and focused
+`sortformer-diarize` command use the same fully hash-verified cache populated by
+the installer or `fw pull sortformer`; the registry and focused command retain
+the explicit `evaluation_only` label.
+Explicit receipt/package paths remain available for
 offline evaluation, but report no release-transport policy because hash
 authentication alone cannot establish how caller-selected files arrived.
 Unknown recordings report
@@ -44,9 +48,9 @@ The port remains a conditional fit rather than an unconditional fit because:
 - the accepted four-fixture parity pack and ten-row development diagnostic are
   not a sealed-corpus product decision gate.
 
-No existing native diarization code should be deleted to make room for this
-route. A failed parity, resource, capacity, or public-accuracy gate leaves the
-current production behavior unchanged.
+No existing native diarization code is deleted for this route. Missing-model,
+known-identity, and capacity-ineligible requests can use the explicit native
+acoustic fallback; internal contract failures and cancellation remain errors.
 
 ## 2. Primary upstream and runtime pins
 
@@ -196,9 +200,9 @@ Transformer blocks, updates the speaker cache/FIFO state, and emits L7 activity
 and L8 anonymous speaker turns. `SortformerSession` checkpoints cancellation at
 chunk and neural-block boundaries, commits each bounded cache/FIFO transition
 transactionally only after its final checkpoint, and clamps user-visible tail
-turns to the physical recording duration. The standalone
-`sortformer-diarize` command exercises that same library path after the existing
-audio normalizer; it does not participate in `DiarizationEngine::Auto`.
+turns to the physical recording duration. The focused `sortformer-diarize`
+command and `DiarizationEngine::Auto` exercise that same authenticated library
+path after normalization.
 
 The current local Apple M4 Pro evidence snapshot is:
 
@@ -218,6 +222,10 @@ The current local Apple M4 Pro evidence snapshot is:
 | Release package admission / session materialization / combined model load | `1.904567 s` / `0.428503 s` / `2.333070 s` |
 | Release end-to-end wall time | `6.13 s` |
 | Release peak RSS | `1,368,850,432` bytes |
+| Matched 10-minute local throughput probe | public JFK fixture repeated to exactly `600.0 s`; input SHA-256 `2b16e12cf5deb1386617ea6a5590ab48417549af71e4f84892fe3faf4323407f` |
+| Native Whisper large-v3-turbo probe | `89.88 s` whole job / `86.551 s` backend; whole-job RTF `0.1498` |
+| Native Sortformer matched probe | `35.86 s` whole command / `3.463590 s` model load / `29.905288 s` inference / inference RTF `0.0498421` |
+| One-hour estimate from the matched probe | Whisper about `9.0 min`; Sortformer about `3.1 min` with one model load (`3.6 min` if all fixed cost is conservatively scaled); diarization about one-third to two-fifths of transcription wall time |
 | Recommended-profile public parity pack | Four complete/declared public fixtures, including 102-second `mevkw` and one four-speaker row; 4,540 authenticated L1-L8 tensors |
 | Recommended-profile whole-recording L5 drift | `mevkw`, 102.0 s: max abs `1.072883606e-6`; relative L2 `8.214150678e-8` |
 | Recommended-profile whole-recording L7/L8 | Native activity and all 16 anonymous turns byte-exact against the authenticated NeMo source output |
@@ -238,6 +246,18 @@ the before/after timings above were separate invocations and therefore are not
 a ledger-qualified optimization win. A frozen multi-record public evaluation,
 same-invocation baseline comparison, 90-minute resource row, and further
 profile-guided optimization remain required.
+
+The matched ten-minute throughput probe was run on the same Apple M4 Pro under
+macOS 26.2 with release binaries SHA-256
+`080cdb58838b984aeca5b3c3a6d2e5f162601c1d770123451513b3b7ac77cf99`
+(`franken_whisper`) and
+`3965a6ab14fc69c5d22be3f77d9d777a29d46908b22b7a0e5d3b9bcac4c6823e`
+(`fw`). Every bridge executable was pointed at a nonexistent path. The Whisper
+arm used the default release package with `--no-diarize --no-persist`; the
+Sortformer arm used the focused command and the same 600-second WAV. Repeating
+one public utterance makes this a throughput probe, not a natural-call latency
+distribution or accuracy result. The hour values are explicit extrapolations,
+not measured one-hour runs.
 
 The historical 102-second archive-profile row remains a valid loss report, not
 a tolerance change. That invocation compared the converted archive defaults
@@ -293,8 +313,9 @@ verification, including rejection of a self-consistently rehashed bundle
 substitution. It is mode-0600, aggregate-only, path-free, diagnostic-only,
 development-uncertified evidence with `production_route_changed=false` and no
 superiority permission. It does not certify deployment accuracy, solve the
-greater-than-four-speaker capacity boundary, excuse the external RSS loss, or
-authorize `Auto` routing.
+greater-than-four-speaker capacity boundary, or excuse the external RSS loss.
+The later owner-directed `Auto` decision is product authority, not a conclusion
+from this evidence artifact.
 
 The historical one-record resource row was reproduced by protocol v6 in five fresh workers,
 and all five lanes completed, so its common-complete intersection contains one
@@ -351,8 +372,8 @@ state, and allocator overhead make that number an invalid RSS estimate. The
 first child-only debug CLI measurement reached 1,378,844,672 bytes on a 69.15 s
 public recording. That single row does not certify a 90-minute ceiling, so
 evaluation continues to require at least 4 GiB of available memory and treats
-that floor as provisional. Product routing and any low-memory fallback choice
-remain owned by the later integration gate.
+that floor as provisional. The default route is therefore a desktop-class
+choice with the lower-memory acoustic fallback available explicitly.
 
 ## 4. Model and state census
 
@@ -1107,20 +1128,22 @@ FrankenTorch facade, checkpoint cancellation between bounded chunks and every
 layer, and initially return `DifferentialStageDocument`. The strict Sortformer
 validator in `src/differential_oracle.rs` is the first output boundary.
 
-This slice must not change `DiarizationEngine`, automatic routing, or the
-production transcribe report contract. Comparison protocol v5 adds the native
-Sortformer lane without changing product routing. The explicit
-`sortformer-diarize` command is a path-redacted evaluation surface over the
-same library session; it reports `evaluation_only` and cannot be selected by
-`Auto`.
+At Slice B, `DiarizationEngine`, automatic routing, and the production
+transcribe report contract remained unchanged. Comparison protocol v5 added
+the native Sortformer lane without changing product routing. The explicit
+`sortformer-diarize` command remains a path-redacted `evaluation_only` surface
+over the same library session; the later owner-directed Slice E integration
+made that native engine selectable by `Auto` without promoting its
+certification state.
 
 ### Slice C: evaluation worker (`bd-y4ip.13`)
 
-After whole-forward f32 parity, wire a native Sortformer worker only into the
-existing evaluation/comparison lane. It must emit typed provenance and
-capacity status and must not alter resolver defaults, production routing, or
-the comparison protocol's authority. Public accuracy and resource rows remain
-required before product integration.
+After whole-forward f32 parity, Slice C wired a native Sortformer worker only
+into the existing evaluation/comparison lane. It emitted typed provenance and
+capacity status without altering resolver defaults, production routing, or the
+comparison protocol's authority. The later owner-directed Slice E integration
+changed product routing; the public accuracy and resource rows remain required
+for certification.
 
 ### Slice D: optimization (`bd-y4ip.12`)
 
@@ -1139,17 +1162,15 @@ oracle timing row is not a native performance win.
 
 ### Slice E: product integration (`bd-y4ip.14`)
 
-After accuracy and resource certification, add a model-neutral native report
-kind, typed Sortformer provenance, resolver/cache behavior, count and capacity
-semantics, waveform preservation, CLI and robot parsing, persistence, and a
-versioned comparison protocol, including an explicit capacity sentinel or a
-candid four-lane-capped status. This slice also owns typed hard/soft known-
-interval mapping, contradiction tests, immutable per-call weights, and explicit
-anonymous-versus-identified output semantics. Identified output and any `Auto`
-promotion require a mapping-specific frozen gate with predeclared public and
-adversarial inputs, mapping accuracy, calibration, coverage, and false-
-identification evidence; failure preserves anonymous output. `Auto` remains
-unchanged until that work passes its own frozen gate.
+The model-neutral report kind, resolver/cache behavior, capacity status,
+waveform preservation, CLI/robot parsing, and persistence integration now
+exist. The owner-directed `Auto` route uses anonymous output and remains
+uncertified; it does not claim that the originally required accuracy and
+resource certification occurred. Known intervals take the acoustic
+hint-preserving fallback instead of manufacturing a Sortformer identity map.
+A future identified-output promotion still requires the mapping-specific frozen
+gate with predeclared public/adversarial inputs, calibration, coverage, and
+false-identification evidence.
 
 ## 11. Privacy, safety, and failure behavior
 
@@ -1171,16 +1192,15 @@ unchanged until that work passes its own frozen gate.
   declared bounds.
 - The completed loader/frontend uses fallible bounded allocation and checks
   cancellation before and after large reservations, during bounded hashing and
-  loading, during chunked zero-fill, and throughout frontend work. The future
-  engine must also check every layer, every chunk, cache mutation,
-  post-processing, and validation.
+  loading, during chunked zero-fill, throughout frontend work, at neural-block
+  and streaming-chunk boundaries, around cache mutation, and during
+  post-processing and validation.
 - Timeout or cancellation must not leave an inference worker mutating shared
   state after the caller returns.
-- Unsupported capacity, missing model, identity drift, malformed output, or a
-  resource breach must produce a typed skip; a fallback may be invoked only
-  after `bd-y4ip.14` separately certifies its applicable capacity, accuracy,
-  privacy, and resource envelope. Neither path may silently degrade into a
-  success row.
+- Unsupported capacity, missing model, or known-identity requests may invoke
+  the explicit acoustic fallback. Identity drift, malformed output, internal
+  contract violations, cancellation, and resource failures remain errors and
+  cannot be relabeled as successful fallback.
 
 ## 12. Current proof state
 
@@ -1226,7 +1246,9 @@ Completed here:
   transactional cache/FIFO rollback, and physical-duration tail clamping;
 - an explicit, cancellation-aware `fw pull sortformer` path plus a
   path-redacted cached `sortformer-diarize` evaluation-only CLI whose real
-  public three-speaker run inferred three active lanes; and
+  public three-speaker run inferred three active lanes;
+- owner-directed transcribe/robot integration with anonymous four-lane capacity
+  status and a fail-closed acoustic fallback boundary; and
 - one overlap-heavy two-speaker public DER/JER row plus local debug RTF,
   model-load, and child-only peak-RSS observations recorded above.
 
@@ -1236,6 +1258,6 @@ Not completed here:
 - quantized whole-model parity or additional profile-justified fused kernels;
 - release-build and 90-minute resource certification;
 - frozen public multi-record accuracy certification; or
-- transcribe/robot report integration or automatic production routing.
+- evidence-based production-routing certification.
 
 Those omissions are downstream gates, not evidence that they passed.

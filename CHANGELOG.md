@@ -23,11 +23,12 @@ was never tagged or released; its work is included here.
   regime-change features, ECAPA speaker representations, overlap-aware turn
   projection, inferred speaker-count evidence, and typed hard/soft known-speaker
   intervals.
-- Added the explicit four-lane Streaming Sortformer evaluation command and a
-  memory-safe Rust inference implementation for the pinned NVIDIA model.
-  Sortformer remains outside automatic routing until its public-corpus
-  promotion gate is satisfied.
-- Added `fw pull sortformer`, `fw models --json`, `fw doctor --json`,
+- Added a memory-safe Rust Streaming Sortformer implementation for the pinned
+  NVIDIA model, including overlapping four-lane activity, anonymous turns,
+  segment projection, a focused diagnostic command, and an explicit
+  development-uncertified certification state.
+- Added `fw pull all`, `fw pull whisper`, `fw pull sortformer`,
+  `fw models --json`, `fw doctor --json`,
   `fw capabilities --json`, `fw robot triage`, and `fw robot-docs guide` for
   agent-controlled discovery, provisioning, and diagnostics.
 - Added the `fw` binary alias alongside `franken_whisper` and path-safe robot
@@ -37,6 +38,17 @@ was never tagged or released; its work is included here.
 
 ### Changed
 
+- Native Rust execution is now the default (`sole` rollout) for every backend
+  family. Bridge subprocesses require an explicit compatibility configuration;
+  native failures do not silently cross that boundary.
+- Speaker diarization is enabled by default and `auto` selects native
+  Sortformer. `--no-diarize` provides transcript-only operation. Missing,
+  known-identity, and capacity-ineligible Sortformer requests use the explicit
+  native acoustic fallback policy. Sortformer remains capped at four anonymous
+  lanes and development-uncertified despite being the product default.
+- The default Whisper resolver requires the hash-pinned release package rather
+  than substituting an unrelated discovered model. Explicit operator model
+  paths remain supported as a separate trust boundary.
 - Packages now declare registry versions for FrankenSQLite and FrankenTorch so
   the crates.io artifact resolves without adjacent source checkouts. The source
   tree retains versioned paths for exact sibling development builds.
@@ -48,9 +60,10 @@ was never tagged or released; its work is included here.
   even though it never compiled or accelerated a graph.
 - The installer now validates both binary names before replacing either,
   performs each replacement with an atomic rename, verifies checksums and
-  self-reported versions, and offers the approximately 492 MB Sortformer
-  download only to an interactive operator. Quiet, headless, and offline
-  installs never start that transfer.
+  self-reported versions, and provisions both pinned native model packages
+  (about 2.12 GB combined). Interactive installs default the visible prompt to
+  Yes; quiet/headless installs provision automatically; `--no-pull` opts out.
+  Offline installs accept only a preseeded verified cache or explicit opt-out.
 - Beam-search conformance now preserves the byte-exact greedy oracle while
   requiring beam output to have zero WER and one of two reviewed punctuation
   forms. It no longer asserts the false premise that beam must equal greedy.
@@ -62,6 +75,12 @@ was never tagged or released; its work is included here.
 - Aligned public diarization projection validation with persisted report
   invariants for overlap labels, hard-hint authority, confidence, ordering, and
   bounded speaker references.
+- Raised the bounded default diarization-stage budget from 30 seconds to 15
+  minutes so long-form native Sortformer jobs are not cancelled by a legacy
+  short-stage default; the environment override remains available.
+- Unified model admission and execution resolution so corrupt higher-priority
+  GGML candidates cannot shadow a valid lower-priority model, and kept model
+  pull syntax/runtime errors on the same v2 robot schema.
 - Corrected the confidence-normalization stage to report its authoritative CPU
   implementation as `acceleration.ok` instead of a spurious GPU-fallback
   warning.
@@ -77,6 +96,11 @@ was never tagged or released; its work is included here.
 - The 491,570,584-byte Sortformer package remains a separately licensed,
   SHA-256-pinned GitHub Release artifact and is never bundled in the crate,
   binary archive, Homebrew formula, or Git repository.
+- The 1,624,555,275-byte Whisper large-v3-turbo GGML f16 package is distributed
+  as the `whisper-large-v3-turbo-f16-v1` GitHub Release artifact. Its bytes are
+  identity-preserved from the pinned upstream revision, compiled-hash verified,
+  and selected for the native Rust loader and FrankenTorch kernels; it is not
+  stored in Git or bundled in binary archives.
 
 Compare: [`v0.5.0...v0.7.0`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.5.0...v0.7.0)
 

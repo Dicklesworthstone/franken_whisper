@@ -97,7 +97,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
   Vorbis, and ALAC decode in-process via `symphonia`. `ffmpeg` is a fallback
   for video and exotic codecs, and is auto-provisioned on Linux x86_64 if
   missing.
-- **Native engine rollout governance.** In-process Rust replacements for the bridge adapters ship behind a 5-stage rollout (Shadow → Validated → Fallback → Primary → Sole) with conformance gating at every promotion.
+- **Native engine rollout governance.** In-process Rust replacements follow a 5-stage rollout (Shadow → Validated → Fallback → Primary → Sole). The shipped default is `Sole`, so bridges run only after an explicit operator opt-out or rollout override.
 - **TTY audio transport.** Compressed audio (mu-law + zlib + base64) over PTY links with handshake, integrity hashes, deterministic retransmission, and an adaptive bitrate controller. Transcript-streaming control frames (protocol v2) carry speculation events end-to-end over the same link.
 - **Word-level timestamps.** First-class support via `whisper.cpp`'s word-timestamp pipeline, with the cancellation token threaded into the inner extraction loop.
 
@@ -648,8 +648,9 @@ unique anonymous lane to a caller-provided opaque reference; contradictory or
 ambiguous hard evidence fails closed. Soft intervals remain non-authoritative
 suggestions, every non-hard-bound lane remains anonymous, and inference never
 mutates model weights. `--diarization-engine auto` now selects this native
-runtime under the owner-directed default, while reports retain the
-`evaluation_only` certification label. The authenticated NVIDIA-recommended streaming
+runtime under the owner-directed default. The model registry and focused
+diagnostic command retain the `evaluation_only` certification label. The
+authenticated NVIDIA-recommended streaming
 truth pack covers four public fixtures and 4,540 L1-L8 tensors. On its complete
 102-second three-speaker row, native L5 probabilities stayed within the frozen
 envelope (maximum absolute difference `1.072883606e-6`, relative L2
@@ -659,8 +660,9 @@ archive-default streaming geometry with the recommended profile, not from a
 same-profile Rust/source loss. Same-host L6 tied-selection parity is resolved
 by the pinned safe libc++ `nth_element` translation. This is parity evidence,
 not broad corpus accuracy, greater-than-four-speaker capacity, cross-platform,
-or broad accuracy certification evidence; the runtime therefore still reports
-`evaluation_only`. The converted f32 package is 491,570,584 bytes
+or broad accuracy certification evidence; the registry and focused diagnostic
+command therefore still report `evaluation_only`. The converted f32 package is
+491,570,584 bytes
 (SHA-256 `487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a`).
 Its distribution policy is `github_release_with_license_and_notice`: weights
 remain outside Git and are attached to the dedicated model release with the
@@ -928,7 +930,9 @@ franken_whisper deliberately downloads with the forgiving `bestaudio/best` forma
 
 ### `transcribe`
 
-Core transcription command. Runs the full pipeline: ingest, normalize, optional VAD / source separation, backend execution, optional acceleration, optional alignment / punctuation / diarization, and persistence.
+Core transcription command. Runs ingest, normalization, native Whisper,
+native speaker diarization, optional alignment/punctuation stages, and
+persistence. Use `--no-diarize` for transcript-only work.
 
 ```bash
 franken_whisper transcribe [OPTIONS]
@@ -950,7 +954,8 @@ franken_whisper transcribe [OPTIONS]
 | `--model <MODEL>` | backend-specific | Model name or path forwarded to backend |
 | `--language <LANG>` | auto-detect | Language hint (ISO 639-1) |
 | `--translate` | `false` | Translate to English |
-| `--diarize` | `false` | Enable the typed speaker-diarization stage |
+| `--diarize` | `true` | Explicitly retain the default typed speaker-diarization stage |
+| `--no-diarize` | `false` | Disable the speaker-diarization stage |
 
 **Output:**
 
@@ -1037,8 +1042,8 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--diarization-engine <ENGINE>` | `auto` | `auto`, `acoustic`, `external`, `ecapa`, or `ecapa-fused`; both ECAPA modes require the pinned converted package and remain outside automatic routing |
-| `--diarization-fallback <POLICY>` | `unknown` | `unknown`, `acoustic`, `external`, or `error`; ECAPA fallback behavior depends on whether inference ran but evidence was insufficient, or the model was unavailable |
+| `--diarization-engine <ENGINE>` | `auto` | `auto` selects native Sortformer; alternatives are `sortformer`, `acoustic`, `external`, `ecapa`, and `ecapa-fused` |
+| `--diarization-fallback <POLICY>` | `acoustic` | `unknown`, `acoustic`, `external`, or `error`; the default handles missing/capacity-ineligible Sortformer evidence in Rust |
 | `--speaker-hints <PATH>` | — | Read a `speaker-hints-v1` document in place; the path is not retained, but parsed fields persist with the run unless `--no-persist` is used |
 | `--enrollment-edge-guard-ms <N>` | `100` | Remove boundary-adjacent audio before enrolling a known interval |
 | `--diarization-max-prototypes <N>` | `512` | Bounded global native-diarization prototype cap (`1..=512`) |
@@ -1145,7 +1150,7 @@ and `external_sortformer`. It infers speaker count, fixes native and Sortformer 
 worker counts at eight, and applies the same frozen 1800-second attempt timeout
 to every lane. The application downloads neither the ECAPA
 package nor the external Sortformer adapter/model; the native Sortformer lane
-uses the release-bound cache installed only by `fw pull sortformer`. Absent
+uses the release-bound cache installed by the installer or `fw pull sortformer`. Absent
 components become typed lane skips. Protocol v6 pins the complete effective native request
 for each lane, its ordered payload-free outcome taxonomy, and its own canonical
 digest. Any change to those bindings requires a new version-and-digest pair.
@@ -1417,17 +1422,18 @@ Built on the [FrankenTUI](https://github.com/Dicklesworthstone/frankentui) frame
 | `FRANKEN_WHISPER_HF_TOKEN` | — | HuggingFace token (preferred over `HF_TOKEN`) |
 | `HF_TOKEN` | — | HuggingFace token (fallback) |
 | `FRANKEN_WHISPER_DIARIZATION_DEVICE` | — | GPU device for the diarization backend |
-| `FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT` | `shadow` | `auto` admission stage: `shadow`, `validated`, `fallback`, `primary`, or `sole`; invalid values fail closed to `shadow` |
+| `FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT` | `shadow` | Legacy acoustic-only admission control; `auto` now selects native Sortformer and uses acoustic through the explicit fallback policy |
 | `FRANKEN_WHISPER_STATE_DIR` | `.franken_whisper` | State directory root |
 | `FRANKEN_WHISPER_DB` | `.franken_whisper/storage.sqlite3` | SQLite database path |
 | `FRANKEN_WHISPER_FFMPEG_BIN` | auto | Explicit ffmpeg binary path |
 | `FRANKEN_WHISPER_FFPROBE_BIN` | auto | Explicit ffprobe binary path |
 | `FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG` | `1` | Auto-provision local ffmpeg/ffprobe when missing (`0`/`false` disables) |
 | `FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE` | `0` | Force normalization through ffmpeg even when the built-in decoder can handle it |
-| `FRANKEN_WHISPER_NATIVE_EXECUTION` | `0` | Enable in-process native engine dispatch |
+| `FRANKEN_WHISPER_NATIVE_EXECUTION` | `1` | In-process native dispatch; set `0` only to request legacy bridge execution |
 | `FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY` | `1` | In bridge-only mode, allow recoverable bridge failures to fall back to native engines |
-| `FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE` | `primary` | Native engine rollout stage (see below) |
-| `FRANKEN_WHISPER_MODEL_DIR` | `~/.cache/franken_whisper/models` | Model root used by native Whisper/auxiliary discovery and `fw pull sortformer`; the pull path requires an absolute override |
+| `FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE` | `sole` | Native engine rollout stage (see below) |
+| `FRANKEN_WHISPER_MODEL_DIR` | `~/.cache/franken_whisper/models` | Shared root for native Whisper, Sortformer, auxiliary discovery, and `fw pull all`; overrides must be absolute |
+| `FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS` | `900000` | Bounded native diarization budget (15 minutes); raise for multi-hour recordings on slower hosts |
 | `XDG_STATE_HOME` | `$HOME/.local/state` | Base for auto-provisioned ffmpeg + per-user tool state |
 | `RUST_LOG` | — | tracing filter (e.g. `franken_whisper=debug`) |
 
@@ -1447,7 +1453,9 @@ features.
 
 ### Backend Routing
 
-The `auto` backend uses adaptive Bayesian routing:
+The `auto` backend retains its adaptive Bayesian family decision contract, but
+the default `sole` rollout executes the selected family through its native Rust
+implementation. Bridge commands are opt-in compatibility paths.
 
 **Non-diarization priority (deterministic fallback):** `whisper_cpp` → `insanely_fast` → `whisper_diarization`
 **Diarization priority (deterministic fallback):** `insanely_fast` → `whisper_diarization` → `whisper_cpp`
@@ -1463,18 +1471,17 @@ Native Rust engine replacements follow a 5-stage rollout under conformance gatin
 | `shadow` | Deterministic bridge execution only; native conformance validated out-of-band |
 | `validated` | Deterministic bridge execution only with stricter conformance gating |
 | `fallback` | Deterministic bridge execution only; fallback policy and evidence paths hardened |
-| `primary` | Native preferred with deterministic bridge fallback (requires `FRANKEN_WHISPER_NATIVE_EXECUTION=1`) |
-| `sole` | Native only (requires `FRANKEN_WHISPER_NATIVE_EXECUTION=1`) |
+| `primary` | Native preferred with deterministic bridge fallback |
+| `sole` | Native only (**default**) |
 
 The execution-path metadata on every `backend.ok` event and replay envelope records the active stage so post-hoc analysis can correlate output drift with rollout transitions.
 
-Acoustic diarization has an independent, default-off `auto` rollout controlled
-by `FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT`. `shadow` and `validated`
-leave acoustic output unexposed; `fallback` admits it only when verified
-external labels are absent; `primary` prefers it; `sole` admits only it.
-Explicit `--diarization-engine acoustic` bypasses this `auto` gate. Every run
-emits `diarize.rollout` with the requested and resolved engine, stage, config
-validity, and external-evidence presence.
+`auto` diarization resolves to the native Sortformer engine. If the verified
+package is unavailable, known-speaker intervals require identity mapping, or a
+count request exceeds four lanes, the default `acoustic` policy runs the
+bounded Rust acoustic engine. Explicit engine selection remains available.
+Every run emits `diarize.rollout` with the requested and resolved engine,
+configuration validity, and fallback evidence.
 
 ---
 
@@ -1655,7 +1662,7 @@ Every completed run produces a `ReplayEnvelope` containing SHA-256 hashes:
 | backend_identity:    "whisper-cli-v1.7.2"       |
 | backend_version:     "1.7.2"                    |
 | output_payload_hash: SHA-256(raw backend JSON)  |
-| native_rollout_stage: "primary" | …             |
+| native_rollout_stage: "sole"    | …             |
 +-------------------------------------------------+
 ```
 
@@ -1873,7 +1880,9 @@ Shadow → Validated → Fallback → Primary → Sole
 - `FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE`: which stage the deployment is at
 - `FRANKEN_WHISPER_NATIVE_EXECUTION`: whether native dispatch is enabled at runtime (`0`/`1`)
 
-Both must agree for native engines to actually execute. Setting `NATIVE_EXECUTION=1` with stage `shadow` has no effect; the stage gate prevents native execution regardless of the runtime flag.
+Both default to native-only execution (`1` and `sole`). Setting the execution
+flag to `0` requests bridge-only compatibility behavior; selecting an earlier
+rollout stage also changes the bridge/native policy explicitly.
 
 **Execution Path Metadata.** Every `backend.ok` event and replay envelope includes explicit execution-path metadata: `implementation` (bridge / native), `execution_mode`, `native_rollout_stage`, and `native_fallback_error` (populated when native fails and bridge recovers). The contract is documented in [`docs/native_engine_contract.md`](docs/native_engine_contract.md).
 
@@ -2568,7 +2577,7 @@ The token's `checkpoint()` method checks two conditions: (1) has Ctrl+C been pre
 | Condition | Skipped Stages |
 |-----------|----------------|
 | Input is already 16 kHz mono WAV | Normalize (passthrough) |
-| No `--diarize` flag | Diarize |
+| `--no-diarize` flag | Diarize |
 | No `--vad` flag | VAD |
 | Accelerate excluded through `PipelineBuilder` | Confidence normalization |
 | `--no-persist` flag | Persist |
@@ -3452,8 +3461,8 @@ franken_whisper transcribe --input exotic_file.opus --json
 Check the rollout stage:
 
 ```bash
-echo "$FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE"   # primary / sole means native is active
-echo "$FRANKEN_WHISPER_NATIVE_EXECUTION"        # must be 1 for native to actually run
+echo "${FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE:-sole}"
+echo "${FRANKEN_WHISPER_NATIVE_EXECUTION:-1}"
 ```
 
 Roll back to `fallback` while the conformance harness investigates:
@@ -3474,10 +3483,10 @@ rm .franken_whisper/locks/sync.lock
 
 ## Limitations
 
-- **A backend binary or a model file required.** Transcription needs either a bridge binary (`whisper-cli`, `insanely-fast-whisper`, or `whisper-diarization`) or a ggml model file for the in-process native engine (which then needs no external binaries at all). With neither present, runs fail with `FW-BACKEND-UNAVAILABLE`.
+- **Both default model packages are required for the default pipeline.** The installer provisions them, or run `fw pull all`. `--no-diarize` removes the Sortformer requirement for a transcript-only request. Explicit bridge modes remain available when their external tools are installed.
 - **ffmpeg only needed for video / exotic formats / mic.** The built-in Rust decoder handles common audio formats natively. ffmpeg is used as an automatic fallback for video files and exotic codecs. Microphone capture always depends on ffmpeg.
 - **Source checkouts need pinned siblings.** The Git checkout intentionally uses versioned path dependencies for FrankenSQLite, FrankenTorch, and optional FrankenTUI development. Run `scripts/prepare_release_siblings.sh` before a source build. The crates.io package resolves the same version requirements from the registry and does not require sibling checkouts.
-- **Native engines remain rollout-governed.** Explicit native execution uses in-process Rust. Automatic replacement of usable bridge adapters remains controlled by `FRANKEN_WHISPER_NATIVE_EXECUTION` and the configured rollout stage.
+- **Native execution is the default, not a certification claim.** The `sole` stage prevents silent bridge fallback. Sortformer remains development-uncertified and capped at four anonymous lanes despite being the product default.
 - **One-way sync.** JSONL export / import is one-way. There is no bidirectional merge beyond the explicit `--conflict-policy` flag.
 - **Single-machine.** Designed for single-machine use with local SQLite. No distributed or multi-node support.
 - **ffmpeg auto-provisioning is Linux x86_64 only.** On other platforms (`macOS`, Windows, Linux ARM) you must install ffmpeg manually for the formats `symphonia` cannot decode and for microphone capture.
@@ -3487,11 +3496,10 @@ rm .franken_whisper/locks/sync.lock
 ## FAQ
 
 **Q: Do I need all three backends installed?**
-No. `franken_whisper` works with any single backend—or with no bridge backend
-at all: place a ggml model in `$FRANKEN_WHISPER_MODEL_DIR` (or
-`~/.cache/franken_whisper/models`) and the in-process native engine can
-transcribe it. The `auto` router uses the available choices. You can also force
-a specific backend with `--backend whisper_cpp`.
+No. The default install needs no bridge backend: it provisions the native
+Whisper and Sortformer packages and runs both stages in process. External tools
+are explicit compatibility/evaluation choices. `fw pull all` repairs or
+provisions the native cache if it is missing.
 
 **Q: What audio formats are supported?**
 Common audio formats (MP3, AAC, FLAC, WAV, OGG, Vorbis, ALAC) are decoded
@@ -3565,10 +3573,10 @@ Step by step, when you run `franken_whisper transcribe --input meeting.mp3 --jso
 3. PIPELINE COMPOSITION
    PipelineBuilder evaluates request flags:
    - No --vad flag           -> skip VAD stage
-   - No --diarize flag       -> skip Diarize stage
+   - No --diarize flag       -> include native Sortformer diarization (default)
    - Accelerate excluded     -> skip confidence normalization
    - --no-persist NOT set    -> include Persist stage (default)
-   Pipeline: [Ingest, Normalize, Backend, Persist]
+   Pipeline: [Ingest, Normalize, Backend, Diarize, Persist]
 
 4. TRACE ID GENERATION
    TraceId::from_parts(1710000000000, random_u64) -> "1710000000000-a1b2c3d4e5f6"
@@ -3599,20 +3607,26 @@ Step by step, when you run `franken_whisper transcribe --input meeting.mp3 --jso
      - Calibration check: Brier=0.12, score=0.8 -> adaptive mode (no fallback)
      - Record predicted_probability into the calibration sliding window
    emit: stage { code: "backend.start", payload: { backend: "whisper_cpp" } }
-   Spawn: whisper-cli -m large-v3 -f normalized_16k_mono.wav --output-json
-   Wait for subprocess (check cancellation token periodically)
-   Parse JSON output -> TranscriptionResult { transcript, segments, language }
+   Resolve and verify the pinned GGML model package
+   Run the Rust-native Whisper frontend, encoder, decoder, and DTW alignment
+   Assemble TranscriptionResult { transcript, segments, language }
    emit: stage { code: "backend.ok",
                  payload: { segments: 42, language: "en",
-                            implementation: "bridge",
-                            native_rollout_stage: "primary" } }
+                            implementation: "native",
+                            native_rollout_stage: "sole" } }
 
 8. CONFIDENCE NORMALIZATION (inline, no separate stage)
    Replace missing confidences with ln(1 + char_count) + 1.0
    Divide each positive finite value by their total mass
    Record pre_mass=34.2, post_mass=1.0 in AccelerationReport
 
-9. PERSIST STAGE (budget: 20s)
+9. DIARIZE STAGE (budget: 900s)
+   Verify and load the pinned native Sortformer package
+   Infer anonymous activity lanes and overlap, then project turns onto segments
+   If the package or request is capacity-ineligible, use the explicit acoustic fallback
+   emit: stage { code: "diarize.ok", payload: { resolved_engine: "sortformer" } }
+
+10. PERSIST STAGE (budget: 20s)
    emit: stage { code: "persist.start" }
    SAVEPOINT sp_persist_1
      INSERT INTO runs (run_id, started_at, ...)
@@ -3622,25 +3636,25 @@ Step by step, when you run `franken_whisper transcribe --input meeting.mp3 --jso
    RELEASE SAVEPOINT sp_persist_1
    emit: stage { code: "persist.ok" }
 
-10. LATENCY PROFILING
+11. LATENCY PROFILING
     emit: stage { code: "orchestration.latency_profile" }
     Per-stage utilization: normalize=0.14% (decrease_budget_candidate),
                            backend=2.3% (decrease_budget_candidate),
                            persist=0.5% (decrease_budget_candidate)
 
-11. REPLAY ENVELOPE
+12. REPLAY ENVELOPE
     Compute SHA-256(normalized_16k_mono.wav) -> input_content_hash
-    Record backend_identity: "whisper-cli", backend_version: "1.7.2"
+    Record backend_identity: "whisper.cpp-native", backend version and package identity
     Compute SHA-256(raw_backend_json) -> output_payload_hash
-    Record native_rollout_stage: "primary"
+    Record native_rollout_stage: "sole"
 
-12. CALIBRATION UPDATE
+13. CALIBRATION UPDATE
     Record actual_outcome = 1.0 (success) against the predicted_probability from step 7
 
-13. REPORT ASSEMBLY
+14. REPORT ASSEMBLY
     RunReport { run_id, trace_id, request, result, events, evidence, replay, warnings }
 
-14. OUTPUT
+15. OUTPUT
     Serialize RunReport as JSON -> stdout
     Exit code 0
 ```
@@ -3839,7 +3853,7 @@ These examples walk through the actual math and bit-level operations of the most
 
 ### Worked Example: A Single Bayesian Routing Decision
 
-Suppose a user runs `franken_whisper transcribe --input meeting.mp3 --backend auto` on a 6-minute audio file with no `--diarize` flag. The user's PATH has `whisper-cli` and `insanely-fast-whisper` installed but no `python3` for `whisper-diarization`. The Brier score from recent runs is 0.18 and the calibration sliding window holds 32 observations.
+Suppose a user runs `franken_whisper transcribe --input meeting.mp3 --backend auto --no-diarize` on a 6-minute audio file. The user's PATH has `whisper-cli` and `insanely-fast-whisper` installed but no `python3` for `whisper-diarization`. The Brier score from recent runs is 0.18 and the calibration sliding window holds 32 observations.
 
 **Step 1. Detect availability.** The router probes via `which`:
 
@@ -4479,9 +4493,9 @@ hosts.
 
 - **A hostile backend binary.** If `whisper-cli` or `insanely-fast-whisper` is itself malicious, `franken_whisper` cannot detect that. Use distribution-trusted binaries.
 - **A hostile audio file** (e.g., crafted to exploit a decoder vulnerability). `symphonia` is a pure-Rust decoder with strong safety guarantees; the ffmpeg fallback path is constrained by `-vn -ar 16000 -ac 1 -c:a pcm_s16le` so options injection is hard, but a zero-day in the decoder itself is out of scope.
-- **A hostile model file.** Whisper models are downloaded by the backend, not by `franken_whisper`. Pin model checksums in your deployment if this matters.
+- **An explicitly configured hostile model file.** Installer-provisioned Whisper and Sortformer packages are checked against compiled size/SHA-256 roots. An operator can still override the Whisper model with an arbitrary compatible local path; that override crosses a separate trust boundary.
 - **Side-channel leaks from inference timing.** Latency profiling produces visible timing data; an attacker who can observe `orchestration.latency_profile` events could in theory infer audio properties. In the intended single-user threat model this is not a concern.
-- **Network adversaries.** `franken_whisper` does no network I/O during transcription. Network access is confined to explicit provisioning paths: `fw pull sortformer`, the optional ffmpeg auto-provisioner (Linux x86_64), and model fetching by an external diarization backend. Deploy the verified cache and disable provisioning for air-gapped use.
+- **Network adversaries.** `franken_whisper` does no network I/O during transcription. Network access is confined to provisioning paths: installer-invoked or explicit `fw pull all`, the optional ffmpeg auto-provisioner (Linux x86_64), and model fetching by an explicit external diarization backend. Preseed the verified cache and use `--no-pull` for air-gapped installation.
 
 ### Trust boundaries
 
@@ -4514,7 +4528,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 
 | Use case | Configuration sketch |
 |----------|----------------------|
-| **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --diarize --diarization-engine acoustic --json` (automatic count inference; optional soft `--speaker-count-range 2..8`) |
+| **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --json` (native Whisper plus native Sortformer by default; explicit count hints remain optional) |
 | **Podcast batch processing** | `for f in podcasts/*.mp3; do franken_whisper transcribe --input "$f" --backend whisper_cpp --model large-v3 --json; done` |
 | **Live transcription dashboard** | `robot run --mic --mic-seconds 300 --speculative --fast-model tiny.en --quality-model large-v3` piped to a Server-Sent Events translator |
 | **Voicemail archival** | `transcribe --stdin --backend auto --json` invoked from a mail-handler hook |
@@ -4525,7 +4539,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 | **Forensic transcription with audit trail** | `--json --output-srt --output-vtt` plus a snapshot of the replay pack for chain-of-custody |
 | **Karaoke / lyrics alignment** | `transcribe --input song.mp3 --output-lrc --json` then post-process with the word-level timestamps via library API |
 | **Real-time accessibility captioning** | `robot run --mic --speculative` with `transcript.partial` driving a low-latency UI and `transcript.confirm` / `transcript.correct` updating the canonical text |
-| **Air-gapped sensitive recordings** | Disable auto-provisioning, deploy the Whisper model manually, use `--diarization-engine acoustic` when speaker turns are needed, and add `--no-persist` if local transcript storage is forbidden |
+| **Air-gapped sensitive recordings** | Preseed and verify both release packages, install with `--offline`, and add `--no-persist` if local transcript storage is forbidden |
 
 The common theme: `franken_whisper` is the same binary in every use case. The configuration changes; the integration story (NDJSON events, structured errors, deterministic replay) does not.
 
@@ -5044,15 +5058,15 @@ The Source Separate stage has its own budget (`FRANKEN_WHISPER_STAGE_BUDGET_SEPA
 
 Before deploying `franken_whisper` to a production workflow, walk through:
 
-- [ ] **Backend(s) installed.** `franken_whisper robot health` returns `overall_status=ok`. At least one backend's `available=true`.
+- [ ] **Native packages installed.** `fw doctor --json` returns `ready=true`, proving both compiled model trust roots pass.
 - [ ] **HuggingFace token configured** (only if using the external pyannote diarization backend). Set via `FRANKEN_WHISPER_HF_TOKEN`. Verify redaction works by triggering an external diarization run with `RUST_LOG=debug` and confirming the token does not appear in logs.
 - [ ] **Pinned ECAPA package installed** (only if using `ecapa` or `ecapa-fused`). Verify the filename, auxiliary-model directory, and SHA-256 from Prerequisites; no HF token is needed.
 - [ ] **ffmpeg accessible** (if you'll transcribe video or use mic capture). Either system-installed, manually placed, or auto-provisioned. Verify with `franken_whisper robot health` → `ffmpeg.available=true`.
 - [ ] **State directory writable.** `FRANKEN_WHISPER_STATE_DIR` (or default `.franken_whisper/`) is on a partition with enough free space for your expected DB growth.
-- [ ] **Stage budgets sized.** If you'll transcribe audio longer than 15 minutes, raise `FRANKEN_WHISPER_STAGE_BUDGET_BACKEND_MS`. If you'll diarize multi-hour content, raise `DIARIZE_MS`.
+- [ ] **Stage budgets sized.** If you'll transcribe audio longer than 15 minutes, raise `FRANKEN_WHISPER_STAGE_BUDGET_BACKEND_MS`. If you'll diarize multi-hour content, raise `FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS`.
 - [ ] **Backup strategy.** Schedule periodic `sync export-jsonl` + off-host copy. Test the restore path at least once.
 - [ ] **Concurrent agent expectations documented.** If multiple processes will write to the same DB, all must use `RunStore::begin_concurrent_session()` (or accept SQLITE_BUSY retries on conflict).
-- [ ] **Native rollout stage chosen.** Default `primary` is fine for most deployments. Set `shadow` or `validated` if you want bridge-only behavior with native conformance running silently.
+- [ ] **Native rollout stage chosen.** Default `sole` is the all-native product path. Set another stage only when you deliberately want bridge compatibility behavior.
 - [ ] **Error handling integrated.** Your downstream consumer differentiates `run_complete` from `run_error` events in robot mode, and handles each `FW-ROBOT-*` code appropriately.
 - [ ] **Disk monitoring in place.** Alert on `disk_free_bytes / disk_total_bytes < 0.10` and on `wal_checkpoint.log_frames` climbing across consecutive `robot health` probes.
 
@@ -5155,7 +5169,7 @@ franken_whisper transcribe --input fixtures/canary.wav --backend whisper_cpp --j
 ```bash
 cat > /etc/franken_whisper.env <<EOF
 FRANKEN_WHISPER_STAGE_BUDGET_BACKEND_MS=1800000
-FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS=120000
+FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS=1800000
 FRANKEN_WHISPER_STAGE_BUDGET_NORMALIZE_MS=300000
 EOF
 env $(cat /etc/franken_whisper.env | xargs) franken_whisper transcribe --input long.mp3 --json
