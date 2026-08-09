@@ -338,6 +338,18 @@ by `fw pull all`, model discovery, and the installer. Prebuilt targets are
 `linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64`, and
 `windows_amd64` (zip; manual install on native Windows).
 
+### Homebrew
+
+```bash
+brew install dicklesworthstone/tap/franken-whisper
+fw pull all
+```
+
+Homebrew installs both binary names but does not bundle model weights. The
+second command downloads the same SHA-256-pinned native Whisper and Sortformer
+packages used by the installer. Model inference remains offline after that
+one-time provisioning step.
+
 ### From Source
 
 ```bash
