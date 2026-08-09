@@ -1305,7 +1305,7 @@ print_summary() {
     if [ "$NO_PULL" -eq 0 ]; then
         echo ""
         echo "  Model policy:"
-        echo "    The installer downloaded and verified the native Whisper and"
+        echo "    The installer provisioned or verified the native Whisper and"
         echo "    Sortformer packages. Inspect readiness with 'fw models --json'."
         echo ""
     fi

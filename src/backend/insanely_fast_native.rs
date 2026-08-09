@@ -1003,7 +1003,7 @@ mod tests {
     fn run_without_any_configured_or_release_model_is_backend_unavailable() {
         let mut req = request();
         req.model = None;
-        if native_engine::configured_or_release_model_spec().is_ok() {
+        if native_engine::configured_or_release_model_available() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");

@@ -11422,6 +11422,7 @@ mod tests {
     fn neural_unknown_fallback_preserves_only_hard_hint_attribution() {
         let request = DiarizationRequest {
             engine: DiarizationEngine::EcapaFused,
+            fallback: DiarizationFallbackPolicy::Unknown,
             known_intervals: vec![
                 KnownSpeakerInterval {
                     speaker_ref: "alice".to_owned(),

@@ -77,9 +77,8 @@ const DIARIZER_NOTE: &str = "legacy text/temporal heuristic without waveform spe
 /// [`whisper_cpp_native::is_available`](super::whisper_cpp_native::is_available):
 /// this engine runs the **same** [`crate::native_engine`] over the **same** ggml
 /// model files, so the two must agree on availability. Reports `true` only when a
-/// usable model header exists (the configured default resolves, or any
-/// `ggml-*.bin` with a valid header sits in a search dir). Never panics or
-/// performs network access.
+/// usable model header exists for the configured override or the pinned
+/// release-package path. Never panics or performs network access.
 #[must_use]
 pub fn is_available() -> bool {
     super::whisper_cpp_native::is_available()
@@ -584,7 +583,7 @@ mod tests {
     fn run_without_any_configured_or_release_model_is_backend_unavailable() {
         let mut req = request();
         req.model = None;
-        if native_engine::configured_or_release_model_spec().is_ok() {
+        if native_engine::configured_or_release_model_available() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");

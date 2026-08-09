@@ -1004,13 +1004,15 @@ pub fn find_model_file(short_name: &str) -> Option<PathBuf> {
         // Availability is intentionally a header-only probe. Authentication
         // remains mandatory in `resolve_model` immediately before execution;
         // hashing 1.6 GB here made Auto routing hash the same package once per
-        // native backend family before the authenticated execution lookup.
-        if let Ok(directory) = crate::model_distribution::whisper_cache_dir() {
-            let candidate = directory.join(crate::model_distribution::WHISPER_WEIGHTS_FILENAME);
-            if candidate.is_file() && header_ftype_ok(&candidate) {
-                return candidate.canonicalize().ok();
-            }
-        }
+        // native backend family before the authenticated execution lookup. The
+        // canonical default must not fall through to an arbitrary same-named
+        // file in a legacy/test search directory when the release package is
+        // absent or malformed.
+        let directory = crate::model_distribution::whisper_cache_dir().ok()?;
+        let candidate = directory.join(crate::model_distribution::WHISPER_WEIGHTS_FILENAME);
+        return (candidate.is_file() && header_ftype_ok(&candidate))
+            .then(|| candidate.canonicalize().ok())
+            .flatten();
     }
     let file_name = model_file_name(short_name);
     model_search_dirs()
@@ -1201,19 +1203,43 @@ const GGML_MAGIC: u32 = 0x6767_6d6c;
 /// recovery path.
 #[must_use]
 pub fn native_model_available(spec: &str) -> bool {
+    model_probe_path(spec).is_some()
+}
+
+/// Resolve only enough of a model specification for route and capability
+/// discovery.
+///
+/// This helper validates the 48-byte dense GGML header but deliberately does
+/// not authenticate the complete release artifact. The execution resolver
+/// remains responsible for the compiled size and SHA-256 check immediately
+/// before loading tensors. Keeping those authority levels separate prevents a
+/// health or routing probe from hashing the 1.62 GB default package repeatedly.
+#[must_use]
+pub(crate) fn model_probe_path(spec: &str) -> Option<PathBuf> {
     let spec = spec.trim();
     let explicit_path = Path::new(spec);
     if explicit_path.is_file() {
-        return header_ftype_ok(explicit_path);
+        return header_ftype_ok(explicit_path)
+            .then(|| explicit_path.canonicalize().ok())
+            .flatten();
     }
-    if !spec.is_empty() && !spec.eq_ignore_ascii_case("default") && find_model_file(spec).is_some()
-    {
-        return true;
-    }
-    let Ok(path) = resolve_model(spec) else {
-        return false;
+    let lookup = if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
+        "large-v3-turbo"
+    } else {
+        spec
     };
-    header_ftype_ok(&path)
+    find_model_file(lookup)
+}
+
+/// Cheap availability check for the exact default model selection policy.
+///
+/// An explicit configured model wins. With no override, only the header of the
+/// pinned release-package path is inspected; arbitrary legacy search entries
+/// cannot make the default route appear available.
+#[must_use]
+pub(crate) fn configured_or_release_model_available() -> bool {
+    let spec = default_model_spec().unwrap_or_else(|| "large-v3-turbo".to_owned());
+    native_model_available(&spec)
 }
 
 /// Read the first 48 bytes of `path` and validate magic + ftype. Any failure

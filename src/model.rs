@@ -7091,12 +7091,9 @@ mod tests {
         let mut forged_fallback_code = typed_diarization_report_fixture();
         forged_fallback_code.diagnostics =
             vec![DIARIZATION_DIAGNOSTIC_NATIVE_ACOUSTIC_FALLBACK.to_owned()];
-        assert!(
-            forged_fallback_code
-                .validate()
-                .expect_err("an acoustic-fallback code requires neural attempt provenance")
-                .contains("not canonical for the report implementation")
-        );
+        forged_fallback_code
+            .validate()
+            .expect("structural validation cannot infer the requested execution path");
 
         let mut ecapa_only = typed_diarization_report_fixture();
         ecapa_only.implementation = "native-ecapa-only-v1".to_owned();
@@ -7912,7 +7909,7 @@ mod tests {
             forged_direct_acoustic
                 .validate_against_request(&direct_acoustic_request, None)
                 .expect_err("direct acoustic execution cannot claim a neural fallback")
-                .contains("not canonical for the report implementation")
+                .contains("authorized execution path")
         );
 
         let mut forged_acoustic_fallback = acoustic_fallback.clone();

@@ -340,10 +340,7 @@ pub(crate) fn reset_availability_cache() {
 /// The uncached availability probe. Performs the actual directory scan and
 /// header sniffing; see [`is_available`] for the memoizing wrapper.
 fn is_available_uncached() -> bool {
-    if let Some(spec) = native_engine::default_model_spec() {
-        return native_engine::native_model_available(&spec);
-    }
-    native_engine::configured_or_release_model_spec().is_ok()
+    native_engine::configured_or_release_model_available()
 }
 
 /// Number of leading bytes covering the ggml magic plus the eleven `i32`
@@ -431,18 +428,18 @@ impl NativeProbe {
 
 /// Probe what the native engine can actually do (see [`NativeProbe`]).
 ///
-/// Resolves the same model [`run`] would: `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`
-/// first, otherwise the authenticated default release package—mirroring
-/// [`is_available`]'s policy so capabilities never contradict availability.
+/// Selects the same model specification [`run`] would:
+/// `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` first, otherwise the default release
+/// package. Discovery validates only the bounded header; execution separately
+/// authenticates the complete release artifact before loading tensors.
 pub(crate) fn capability_probe() -> NativeProbe {
     let gpu = native_engine::encoder::gpu_encoder_available();
 
-    // Use the exact resolver execution uses, including the fail-closed explicit
-    // default and the pinned-package-first unset default.
-    let Ok(spec) = native_engine::configured_or_release_model_spec() else {
-        return NativeProbe::without_model(gpu);
-    };
-    let path = native_engine::resolve_model(&spec).ok();
+    // Mirror execution selection while retaining discovery's header-only
+    // authority. Full release-package authentication remains mandatory in
+    // `effective_model_spec` immediately before tensors are loaded.
+    let spec = native_engine::default_model_spec().unwrap_or_else(|| "large-v3-turbo".to_owned());
+    let path = native_engine::model_probe_path(&spec);
 
     let Some(path) = path else {
         return NativeProbe::without_model(gpu);
@@ -1615,7 +1612,7 @@ mod tests {
         req.model = None;
         // This failure path exists only when neither an explicit default nor a
         // deterministically discoverable local model is present.
-        if native_engine::configured_or_release_model_spec().is_ok() {
+        if native_engine::configured_or_release_model_available() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");

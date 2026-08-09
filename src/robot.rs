@@ -896,7 +896,7 @@ pub fn capabilities_value() -> serde_json::Value {
         "agent_orientation": {
             "command": "fw robot triage",
             "model_status": "fw models --json",
-            "sortformer_install": "fw pull sortformer --json",
+            "default_models_install": "fw pull all --json",
             "event_schema": "fw robot schema",
             "guide": "fw robot-docs guide",
         },
@@ -6092,6 +6092,15 @@ mod tests {
         assert_eq!(value["schema_version"], "franken-whisper-capabilities-v1");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["preferred_agent_binary"], "fw");
+        assert_eq!(
+            value["agent_orientation"]["default_models_install"],
+            "fw pull all --json"
+        );
+        assert!(
+            value["agent_orientation"]
+                .get("sortformer_install")
+                .is_none()
+        );
         assert_eq!(value["native_compute"]["cpu_backend"], "frankentorch");
         assert_eq!(
             value["native_compute"]["metal_target_compiled"],
@@ -6099,7 +6108,14 @@ mod tests {
         );
         assert!(value["compiled_features"].get("gpu_frankentorch").is_none());
         assert!(value["compiled_features"].get("gpu_frankenjax").is_none());
-        assert_eq!(value["privacy"]["model_downloads_automatic"], false);
+        assert_eq!(
+            value["privacy"]["inference_model_downloads_automatic"],
+            false
+        );
+        assert_eq!(
+            value["privacy"]["installer_provisions_default_models"],
+            true
+        );
         assert_eq!(
             value["error_codes"].as_array().map(Vec::len),
             Some(crate::error::ERROR_CODE_CATALOG.len())
@@ -6132,7 +6148,7 @@ mod tests {
         assert!(sortformer["installed"].is_boolean());
         assert_eq!(
             sortformer["auto_routing_status"],
-            "certification_receipt_required"
+            "owner_directed_native_default_accuracy_certification_pending"
         );
         let serialized = serde_json::to_string(&value).expect("model registry JSON");
         assert!(!serialized.contains("/Users/"));
@@ -6172,7 +6188,8 @@ mod tests {
         let guide = super::robot_docs_guide();
         assert!(guide.contains("fw robot triage"));
         assert!(guide.contains("fw models --json"));
-        assert!(guide.contains("fw pull sortformer --json"));
-        assert!(guide.contains("Downloads are explicit"));
+        assert!(guide.contains("fw pull all --json"));
+        assert!(guide.contains("installer does this automatically"));
+        assert!(guide.contains("inference itself never accesses the network"));
     }
 }
