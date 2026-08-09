@@ -131,6 +131,9 @@ pub struct EncoderWeights {
     n_head: usize,
     /// Maximum audio context (`hparams.n_audio_ctx`, e.g. 1500).
     n_ctx: usize,
+    /// Model-specific admission decision for FrankenTorch's non-byte-exact
+    /// polynomial SDPA softmax.
+    sdpa_poly_exp: bool,
     /// `conv1` weight PRE-TRANSPOSED to `[n_mels*K, n_state]` (the `[Cin*K, Cout]` layout
     /// `nn::conv1d_wt` / `matmul_bias` consume) + bias `[n_state]`. Transposed once at load
     /// so the per-window encode never re-transposes it.
@@ -146,6 +149,53 @@ pub struct EncoderWeights {
     /// Final `ln_post` scale/shift, length `n_state`.
     ln_post_w: Vec<f32>,
     ln_post_b: Vec<f32>,
+}
+
+/// Read guard that pins FrankenTorch's process-global SDPA policy for one CPU
+/// encoder forward.
+struct SdpaPolyExpPolicyGuard {
+    _guard: std::sync::RwLockReadGuard<'static, ()>,
+}
+
+struct SdpaPolyExpPolicyState {
+    gate: std::sync::RwLock<()>,
+    current: std::sync::atomic::AtomicBool,
+}
+
+fn sdpa_poly_exp_policy_state() -> &'static SdpaPolyExpPolicyState {
+    static STATE: std::sync::OnceLock<SdpaPolyExpPolicyState> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| SdpaPolyExpPolicyState {
+        gate: std::sync::RwLock::new(()),
+        current: std::sync::atomic::AtomicBool::new(ft_kernel_cpu::sdpa_poly_exp()),
+    })
+}
+
+fn enter_sdpa_poly_exp_policy(want: bool) -> SdpaPolyExpPolicyGuard {
+    use std::sync::atomic::Ordering;
+
+    let state = sdpa_poly_exp_policy_state();
+    loop {
+        let read = state
+            .gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.current.load(Ordering::Acquire) == want {
+            return SdpaPolyExpPolicyGuard { _guard: read };
+        }
+        drop(read);
+
+        let write = state
+            .gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.current.load(Ordering::Acquire) != want {
+            ft_kernel_cpu::set_sdpa_poly_exp(want);
+            state.current.store(want, Ordering::Release);
+        }
+        drop(write);
+        // Re-acquire a read guard. If an opposing waiter won the interval after
+        // the write guard was released, the loop observes it and retries.
+    }
 }
 
 /// Decoder-owned cross-attention K/V cache (see module docs).
@@ -672,10 +722,10 @@ impl EncoderWeights {
         // grew into, are gone. Fusing lets FW_ENC_FREE_F32 free each f32 while only
         // ~one linear per worker is transient, dropping PEAK below the f32 floor.)
 
-        // bd-bcm7: enable ft_kernel_cpu's poly softmax for large-v3-turbo (proven WER-neutral:
-        // byte-identical transcript, WER Δ 0.000, 1.0722× e2e). tiny.en stays off (uncertified).
-        // Kill-switch FW_SDPA_POLY_EXP=0; operator force FT_SDPA_POLY_EXP=1.
-        super::configure_sdpa_poly_exp(&model.hparams);
+        // bd-bcm7: large-v3-turbo admits the polynomial SDPA softmax (proven
+        // WER-neutral); tiny.en does not. Retain this on the model rather than
+        // mutating FrankenTorch's process-global switch during model loading.
+        let sdpa_poly_exp = super::sdpa_poly_exp_for(&model.hparams);
 
         // FEASIBILITY HARNESS (off by default): `FW_ENC_WEIGHT_ROUNDTRIP=row|<N>` replaces
         // every f32 GEMM weight with its i7 quantize→dequantize roundtrip, so the EXISTING
@@ -704,6 +754,7 @@ impl EncoderWeights {
             n_state,
             n_head,
             n_ctx,
+            sdpa_poly_exp,
             conv1_wt,
             conv1_b,
             conv2_wt,
@@ -1127,6 +1178,11 @@ fn forward_time_major(
     // per layer instead of per-op CPU<->GPU ping-pong); every other case uses the
     // CPU blocks. `FRANKEN_WHISPER_GPU=0` forces the CPU path.
     if !gpu_encode_stack(&mut x, w) {
+        // FrankenTorch currently exposes the polynomial-softmax choice as a
+        // process-global switch. Hold a shared guard for this model's complete
+        // CPU encoder forward so same-policy encoders can run concurrently but
+        // an opposing model cannot flip the switch between transformer layers.
+        let _sdpa_policy = enter_sdpa_poly_exp_policy(w.sdpa_poly_exp);
         // Optional depth truncation (`FW_ENCODER_LAYERS=N`): run only the first N
         // of the model's encoder transformer blocks. NON-byte-exact (fewer
         // refinements → different encoder output) — a VIABILITY PROBE for encoder
@@ -2151,6 +2207,7 @@ mod tests {
             n_state,
             n_head,
             n_ctx: pe_ctx,
+            sdpa_poly_exp: false,
             conv1_wt: rng.mat(n_mels * CONV_K, n_state, s),
             conv1_b: rng.vec(n_state, s),
             conv2_wt: rng.mat(n_state * CONV_K, n_state, s),

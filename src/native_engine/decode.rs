@@ -5375,10 +5375,9 @@ mod tests {
     #[test]
     fn gated_max_context_zero_disables_prompt_carry() {
         // max_context=0 (whisper --max-context 0) disables carried previous-context
-        // — the per-request equivalent of FW_NO_CONTEXT. On tiled/looping audio the
-        // default carried prompt triggers the bd-r0qd early-EOT drop; max_context=0
-        // avoids it, so it recovers >= the default's content. (See
-        // project_final_window_early_eot_bug.)
+        // — the per-request equivalent of FW_NO_CONTEXT. The default tiny.en
+        // segment-timestamp policy also suppresses cross-window carry, so both
+        // paths must decode the same tiled content exactly once.
         let (Some(model), Some(jfk)) = (load_tiny_en(), load_jfk_samples()) else {
             eprintln!("SKIP gated_max_context_zero: tiny.en model or jfk.wav missing");
             return;
@@ -5387,6 +5386,13 @@ mod tests {
         let mut tiled = jfk.clone();
         tiled.extend_from_slice(&jfk);
         tiled.extend_from_slice(&jfk);
+        let joined = |o: &DecodeOutput| -> String {
+            o.segments
+                .iter()
+                .map(|segment| segment.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let count_country = |o: &DecodeOutput| -> usize {
             o.segments
                 .iter()
@@ -5399,17 +5405,21 @@ mod tests {
         let nocarry_out = transcribe_samples(&model, &tiled, &p, &noop).unwrap();
         let (d, n) = (count_country(&default_out), count_country(&nocarry_out));
         eprintln!("tiled-jfk 'country' count: default={d} max_context=0={n}");
-        // max_context=0 disables prompt carry, so the looping tiles decode fully
-        // (jfk×3 = 6 'country' when fully transcribed). This holds regardless of
-        // the default path: the FW_RETRY_FAILED_WINDOW retry is now default-ON, so
-        // the default ALSO recovers the tail — max_context=0 stays >= it.
-        assert!(
-            n >= 6,
-            "max_context=0 should fully transcribe the tiled content, got {n}"
+        // jfk contains "country" twice, so an exact three-tile decode contains
+        // six occurrences. A lower count is content loss; a higher count is a
+        // duplicated window-boundary decode. Pin both paths exactly rather than
+        // treating duplicated content as a stronger transcription.
+        assert_eq!(
+            d,
+            6,
+            "default path must decode each tile exactly once: {}",
+            joined(&default_out)
         );
-        assert!(
-            n >= d,
-            "max_context=0 must not lose content vs the default path, got {n} vs {d}"
+        assert_eq!(
+            n,
+            6,
+            "max_context=0 must decode each tile exactly once: {}",
+            joined(&nocarry_out)
         );
     }
 
@@ -6111,11 +6121,26 @@ mod tests {
             return;
         };
         let params = e2e_params();
-        let a = transcribe_samples(&model, &samples, &params, &noop).expect("run a");
-        let b = transcribe_samples(&model, &samples, &params, &noop).expect("run b");
-        let ja: String = a.segments.iter().map(|s| s.text.clone()).collect();
-        let jb: String = b.segments.iter().map(|s| s.text.clone()).collect();
-        assert_eq!(ja, jb, "greedy temp-0 must be deterministic across runs");
+        // Exercise two physical decodes. Calling `transcribe_samples` twice on
+        // one model would make the second result an exact-cache hit and prove
+        // only that the cache can clone its first answer.
+        let a = transcribe_samples_uncached(&model, &samples, &params, &noop).expect("run a");
+        let b = transcribe_samples_uncached(&model, &samples, &params, &noop).expect("run b");
+        assert_eq!(a.segments.len(), b.segments.len(), "segment count");
+        for (index, (left, right)) in a.segments.iter().zip(&b.segments).enumerate() {
+            assert_eq!(left.start_sec, right.start_sec, "segment {index} start");
+            assert_eq!(left.end_sec, right.end_sec, "segment {index} end");
+            assert_eq!(left.text, right.text, "segment {index} text");
+            assert_eq!(left.speaker, right.speaker, "segment {index} speaker");
+            assert_eq!(
+                left.confidence, right.confidence,
+                "segment {index} confidence"
+            );
+        }
+        assert_eq!(a.language, b.language, "detected language");
+        assert_eq!(a.windows, b.windows, "window statistics");
+        assert_eq!(a.work, b.work, "decode work counters");
+        assert_eq!(a.word_timings, b.word_timings, "word timings");
     }
 
     #[test]

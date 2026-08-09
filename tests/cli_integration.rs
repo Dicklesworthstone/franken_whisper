@@ -83,6 +83,7 @@ fn run_agent_command(binary: &str, args: &[&str]) -> std::process::Output {
 fn wait_for_pid_witness(
     path: &std::path::Path,
     deadline: std::time::Instant,
+    parent: &mut std::process::Child,
 ) -> rustix::process::Pid {
     loop {
         if let Ok(text) = std::fs::read_to_string(path)
@@ -91,11 +92,29 @@ fn wait_for_pid_witness(
         {
             return pid;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "PID witness was not published before the deadline: {}",
-            path.display()
-        );
+        match parent.try_wait() {
+            Ok(Some(status)) => panic!(
+                "PID-witness fixture exited before publishing {}: {status}",
+                path.display()
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = parent.kill();
+                let _ = parent.wait();
+                panic!(
+                    "could not inspect PID-witness fixture while waiting for {}: {error}",
+                    path.display()
+                );
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = parent.kill();
+            let _ = parent.wait();
+            panic!(
+                "PID witness was not published before the deadline: {}",
+                path.display()
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
@@ -142,10 +161,14 @@ fn abrupt_comparison_parent_death_terminates_the_complete_worker_group() {
         .expect("spawn abrupt-parent fixture");
 
     // Debug builds on macOS may spend several seconds initializing each of the
-    // three nested CLI processes before the PID witnesses are committed.
-    let witness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let root_pid = wait_for_pid_witness(&root_pid_path, witness_deadline);
-    let descendant_pid = wait_for_pid_witness(&descendant_pid_path, witness_deadline);
+    // three nested CLI processes. The complete integration suite also launches
+    // many agent-discovery subprocesses concurrently, so setup gets a generous
+    // scheduling window; the post-kill cleanup contract remains two seconds.
+    let root_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let root_pid = wait_for_pid_witness(&root_pid_path, root_deadline, &mut parent);
+    let descendant_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let descendant_pid =
+        wait_for_pid_witness(&descendant_pid_path, descendant_deadline, &mut parent);
     assert_eq!(
         rustix::process::getpgid(Some(root_pid)).expect("worker process group"),
         root_pid

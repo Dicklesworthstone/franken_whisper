@@ -633,21 +633,21 @@ fn calibrated_encoder_int8_model(hparams: &WhisperHParams) -> bool {
     tiny_en || is_large_v3_turbo(hparams)
 }
 
-/// Enable `ft_kernel_cpu`'s 8-lane poly softmax in `sdpa_forward_f32` for the models where it
-/// is proven WER-neutral, at model load.
+/// Decide whether `ft_kernel_cpu`'s 8-lane poly softmax is admitted for a model.
 ///
 /// **`large-v3-turbo` only.** Evidence (bd-bcm7, `docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`):
 /// transcript **byte-identical** on jfk ×1/×3/×8, WER vs whisper.cpp **Δ 0.000**, e2e **1.0722×**
 /// (cv 0.8%, 5/5 paired). `tiny.en` is **uncertified** (regressed on track01) and stays OFF.
-/// Set explicitly per load so a turbo→tiny.en sequence in one process does not leak the ON state.
+/// The decision is stored on the loaded encoder and applied for the complete CPU
+/// encoder forward. It must not be installed here as process-global state: two
+/// different models can load or run concurrently in one embedding process.
 ///
 /// Controls: `FW_SDPA_POLY_EXP=0` kills it even on turbo; `FT_SDPA_POLY_EXP=1` forces it on for any
 /// model (operator override, e.g. for a certified fine-tune).
-pub(crate) fn configure_sdpa_poly_exp(hparams: &WhisperHParams) {
+pub(crate) fn sdpa_poly_exp_for(hparams: &WhisperHParams) -> bool {
     let killed = std::env::var("FW_SDPA_POLY_EXP").as_deref() == Ok("0");
     let forced = std::env::var("FT_SDPA_POLY_EXP").as_deref() == Ok("1");
-    let want = forced || (is_large_v3_turbo(hparams) && !killed);
-    ft_kernel_cpu::set_sdpa_poly_exp(want);
+    forced || (is_large_v3_turbo(hparams) && !killed)
 }
 
 #[must_use]
@@ -1772,8 +1772,8 @@ mod tests {
 
     #[test]
     fn is_large_v3_turbo_discriminates_models_for_poly_exp() {
-        // bd-bcm7: poly softmax is enabled at load for turbo only. Verify the discriminator
-        // that gates it: turbo -> true, tiny.en -> false (uncertified), unknown -> false.
+        // bd-bcm7: poly softmax is admitted for turbo only. Verify the model
+        // discriminator: turbo -> true, tiny.en -> false (uncertified), unknown -> false.
         let turbo = WhisperHParams {
             n_vocab: 51_866,
             n_audio_ctx: 1_500,
