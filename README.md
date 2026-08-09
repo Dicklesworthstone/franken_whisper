@@ -432,19 +432,20 @@ Output (one JSON object per line, schema `1.0.0`):
 ### 3. Speaker Diarization
 
 ```bash
-franken_whisper transcribe \
-  --input meeting.mp3 \
-  --diarize \
-  --diarization-engine acoustic \
-  --json
+franken_whisper transcribe --input meeting.mp3 --json
 ```
 
-Omitting all count options is the primary native path and means automatic
-inference intent. The report always contains a versioned
-`speaker_count.estimate` object. The retained fixed-safe assignment default
-reports explicit uncalibrated/unresolved mass; the development probabilistic
-candidate adds bounded count bins and may select a count only after its
-evidence and occupancy gates pass. A soft preference can be added with
+The default path runs the native four-lane Sortformer package and returns
+anonymous `SPEAKER_NN` turns. It is fast, in-process, and development-
+uncertified: a lane count is not a calibrated estimate of the true number of
+speakers, and recordings with more than four speakers exceed the model's
+capacity. Use `--no-diarize` for transcription only. Requests with known
+intervals or count constraints beyond the four-lane boundary fall back to the
+native acoustic engine under the default `acoustic` fallback policy.
+
+Omitting all count options means inference intent. Acoustic and ECAPA reports
+contain a versioned `speaker_count.estimate` object and retain explicit
+uncalibrated/unresolved mass. A soft preference can be added with
 `--speaker-count-range 2..5` or
 `--speaker-count-prior 2=0.25,3=0.75`. Use
 `--speaker-count-hard 3` only when the caller intentionally wants a hard search
@@ -604,9 +605,9 @@ The first admitted activation pack is synthetic-only: four deterministic
 non-human frontend fixtures, 46 F32/I64 tensors, and 44 stage-level replay
 observations that are byte-exact across five runs requested in each configured
 one-thread and eight-thread regime.
-Rust authenticates the separate receipt/package roots and now runs the complete
-f32 graph in process through L8 anonymous speaker turns. The explicit
-evaluation-only command accepts every audio format supported by the normalizer:
+Rust authenticates the separate receipt/package roots and runs the complete f32
+graph in process through L8 anonymous speaker turns. The same engine powers the
+default pipeline and remains available through a focused diagnostic command:
 
 ```bash
 fw pull sortformer --json
@@ -634,8 +635,9 @@ The bounded hint file can be a bare interval array or this versioned form:
 }
 ```
 
-`fw pull` is explicit, restartable across verified per-file cache hits, cooperative
-under Ctrl+C, and never emits cache paths in JSON mode. The diarization command
+`fw pull` is restartable across verified per-file cache hits, cooperative under
+Ctrl+C, and never emits cache paths in JSON mode. The installer invokes
+`fw pull all` by default; inference stays offline. The focused diarization command
 rehashes the cached package and conversion receipt, runs completely offline,
 and emits one path-free `sortformer-diarization-v1` object with turns, inferred
 active-lane count, timing, and the candid capacity status
@@ -645,8 +647,9 @@ Hard known intervals may bind a
 unique anonymous lane to a caller-provided opaque reference; contradictory or
 ambiguous hard evidence fails closed. Soft intervals remain non-authoritative
 suggestions, every non-hard-bound lane remains anonymous, and inference never
-mutates model weights. It cannot yet be selected by
-`--diarization-engine auto`. The authenticated NVIDIA-recommended streaming
+mutates model weights. `--diarization-engine auto` now selects this native
+runtime under the owner-directed default, while reports retain the
+`evaluation_only` certification label. The authenticated NVIDIA-recommended streaming
 truth pack covers four public fixtures and 4,540 L1-L8 tensors. On its complete
 102-second three-speaker row, native L5 probabilities stayed within the frozen
 envelope (maximum absolute difference `1.072883606e-6`, relative L2
@@ -656,7 +659,7 @@ archive-default streaming geometry with the recommended profile, not from a
 same-profile Rust/source loss. Same-host L6 tied-selection parity is resolved
 by the pinned safe libc++ `nth_element` translation. This is parity evidence,
 not broad corpus accuracy, greater-than-four-speaker capacity, cross-platform,
-or Auto-promotion evidence; the command therefore still reports
+or broad accuracy certification evidence; the runtime therefore still reports
 `evaluation_only`. The converted f32 package is 491,570,584 bytes
 (SHA-256 `487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a`).
 Its distribution policy is `github_release_with_license_and_notice`: weights
@@ -836,7 +839,7 @@ youtube_transcripts/
 └── .fw_youtube_manifest.json
 ```
 
-The **markdown** leads with the title, a metadata line, a source link, and an honesty note, then paragraphs grouped on natural pauses (and speaker changes when `--diarize` is set), each prefixed with a `youtu.be` deep-link that jumps to that moment in the video:
+The **markdown** leads with the title, a metadata line, a source link, and an honesty note, then paragraphs grouped on natural pauses and detected speaker changes. Each paragraph starts with a `youtu.be` deep-link to that moment. Pass `--no-diarize` to omit the speaker stage.
 
 ```markdown
 # Me at the zoo
@@ -882,7 +885,8 @@ The **JSON** sidecar carries the structured form — `video` metadata, `run` met
 | `--model <M>` | backend-specific | Model name or path forwarded to the engine |
 | `--language <L>` | auto-detect | Language hint (ISO 639-1) |
 | `--backend <B>` | `auto` | `auto`, `whisper-cpp`, `insanely-fast`, `whisper-diarization` |
-| `--diarize` | `false` | Speaker diarization (generated `SPEAKER_NN` labels plus supplied opaque references; uncertain speech stays unlabeled) |
+| `--diarize` | `true` | Explicitly retain the default speaker diarization stage |
+| `--no-diarize` | `false` | Disable native speaker diarization |
 | `--concurrency <N>` | `3` | Maximum concurrent downloads |
 | `--no-keep-audio` | `false` | Delete each audio file after its transcript is written |
 | `--no-retry` | `false` | Do not retry videos previously marked failed in the manifest |
