@@ -37,7 +37,7 @@ fn main() {
 
     // Weights [inp,out] row-major as data[i*out+o] (matches Mat layout), gaussian.
     let mut w = vec![0.0f32; inp * out];
-    for v in w.iter_mut() {
+    for v in &mut w {
         *v = rng.gauss(0.06);
     } // typical linear weight magnitude
     // occasional outlier weights (real weights have heavy tails)
@@ -69,7 +69,7 @@ fn main() {
 
     // Activations [m,inp], gaussian-ish (encoder hidden states after LN/gelu).
     let mut x = vec![0.0f32; m * inp];
-    for v in x.iter_mut() {
+    for v in &mut x {
         *v = rng.gauss(1.0);
     }
     // per-row u8 quant: scale=amax/127, round, clamp; store i8v (a_int).

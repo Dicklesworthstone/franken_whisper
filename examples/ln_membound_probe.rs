@@ -169,19 +169,19 @@ fn main() {
     let (mut b_soa, mut b_tr, mut b_mc) = (f64::MAX, f64::MAX, f64::MAX);
     let mut dst = vec![0.0f32; ROWS * COLS];
     for _ in 0..reps {
-        for e in evict.iter_mut() {
+        for e in &mut evict {
             *e *= 1.0000001;
         }
         let t = std::time::Instant::now();
         ln_soa(&src, &mut dst, &w, &b, eps);
         b_soa = b_soa.min(ms(t));
-        for e in evict.iter_mut() {
+        for e in &mut evict {
             *e *= 1.0000001;
         }
         let t = std::time::Instant::now();
         ln_soa_transposed(&src, &mut dst, &w, &b, eps);
         b_tr = b_tr.min(ms(t));
-        for e in evict.iter_mut() {
+        for e in &mut evict {
             *e *= 1.0000001;
         }
         let t = std::time::Instant::now();

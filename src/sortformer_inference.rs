@@ -985,6 +985,10 @@ impl SortformerF32Facade {
     /// Verify the exact scaled input boundary of FastConformer block zero.
     /// This is the first L3 seam and intentionally stops before any block
     /// operator so a later block failure cannot obscure L2-to-L3 handoff.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the public parity seam exposes each recurrent tensor geometry explicitly"
+    )]
     pub fn verify_public_l3_encoder_input(
         &self,
         activation_pack: &VerifiedSortformerPublicActivationPack,
@@ -2159,7 +2163,7 @@ impl BatchNorm1d {
             ));
         }
         for row in input.data.chunks_mut(self.width) {
-            for channel in 0..self.width {
+            for (channel, value) in row.iter_mut().enumerate() {
                 let variance = self.running_var[channel];
                 if variance < 0.0 {
                     return Err(reference_error(
@@ -2167,11 +2171,10 @@ impl BatchNorm1d {
                         "BatchNorm running variance is negative",
                     ));
                 }
-                row[channel] = (row[channel] - self.running_mean[channel])
-                    / (variance + Self::EPSILON).sqrt()
+                *value = (*value - self.running_mean[channel]) / (variance + Self::EPSILON).sqrt()
                     * self.scale[channel]
                     + self.bias[channel];
-                if !row[channel].is_finite() {
+                if !value.is_finite() {
                     return Err(reference_error(
                         "batch_norm_output",
                         "BatchNorm produced a non-finite value",
@@ -3276,7 +3279,7 @@ impl Conv2d {
     }
 
     fn new(shape: [usize; 4], groups: usize, weight: Vec<f32>, bias: Vec<f32>) -> FwResult<Self> {
-        if groups == 0 || shape.contains(&0) || shape[0] % groups != 0 {
+        if groups == 0 || shape.contains(&0) || !shape[0].is_multiple_of(groups) {
             return Err(reference_error(
                 "conv_contract",
                 "invalid Conv2d group geometry",
@@ -4637,10 +4640,10 @@ fn compare_public_i64_probe(
     expected
         .try_reserve_exact(raw.len() / std::mem::size_of::<i64>())
         .map_err(|_| reference_error("allocation", "integer probe allocation failed"))?;
-    for bytes in raw.chunks_exact(std::mem::size_of::<i64>()) {
-        expected.push(i64::from_le_bytes(bytes.try_into().map_err(|_| {
-            reference_error("parity_tensor", "integer probe chunk has invalid width")
-        })?));
+    let (chunks, remainder) = raw.as_chunks::<8>();
+    debug_assert!(remainder.is_empty());
+    for &bytes in chunks {
+        expected.push(i64::from_le_bytes(bytes));
     }
     let mut observed_probe = Vec::new();
     observed_probe

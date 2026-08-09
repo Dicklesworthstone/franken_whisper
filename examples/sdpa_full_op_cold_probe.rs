@@ -72,6 +72,10 @@ fn scatter(
         });
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the probe exposes every SDPA buffer and geometry operand independently"
+)]
 fn full_op(
     q: &[f32],
     k: &[f32],

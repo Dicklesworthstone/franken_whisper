@@ -1495,7 +1495,7 @@ mod tests {
             let mut writer = hound::WavWriter::create(path, spec).expect("create reference WAV");
             for &sample in samples {
                 let sanitized = if sample.is_finite() { sample } else { 0.0 };
-                let quantized = (sanitized.max(-1.0).min(1.0) * f32::from(i16::MAX)).round() as i16;
+                let quantized = (sanitized.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
                 writer
                     .write_sample(quantized)
                     .expect("write reference sample");

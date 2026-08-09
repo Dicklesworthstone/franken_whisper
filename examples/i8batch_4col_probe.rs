@@ -357,7 +357,6 @@ fn main() {
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     {
         eprintln!("needs avx2");
-        return;
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {

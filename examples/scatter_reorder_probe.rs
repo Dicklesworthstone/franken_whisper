@@ -18,7 +18,7 @@ const NS: usize = HH * DH; // 1280
 
 /// Exact replica of nn::sdpa_scatter_interleaved (position-major, i outer / h inner).
 fn scatter_pos_major(out: &mut [f32], o: &[f32], chunks: usize) {
-    let n = if chunks == 0 { T } else { chunks.min(T).max(1) };
+    let n = if chunks == 0 { T } else { chunks.clamp(1, T) };
     let rows_per = T.div_ceil(n).max(1);
     out.par_chunks_mut(rows_per * NS)
         .enumerate()
@@ -38,7 +38,7 @@ fn scatter_pos_major(out: &mut [f32], o: &[f32], chunks: usize) {
 /// i INNER within each band ⇒ contiguous read of `o` per head, strided write into the
 /// (L2-resident) output band. Byte-identical.
 fn scatter_head_major(out: &mut [f32], o: &[f32], chunks: usize) {
-    let n = if chunks == 0 { T } else { chunks.min(T).max(1) };
+    let n = if chunks == 0 { T } else { chunks.clamp(1, T) };
     let rows_per = T.div_ceil(n).max(1);
     out.par_chunks_mut(rows_per * NS)
         .enumerate()
@@ -82,13 +82,13 @@ fn main() {
     for ch in [16usize, 0] {
         let (mut bp, mut bh) = (f64::MAX, f64::MAX);
         for _ in 0..reps {
-            for e in evict.iter_mut() {
+            for e in &mut evict {
                 *e *= 1.0000001;
             }
             let t = std::time::Instant::now();
             scatter_pos_major(&mut a, &o, ch);
             bp = bp.min(ms(t));
-            for e in evict.iter_mut() {
+            for e in &mut evict {
                 *e *= 1.0000001;
             }
             let t = std::time::Instant::now();

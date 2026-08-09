@@ -14,10 +14,12 @@
 //! logits weight (16.6 MB/CCD across 4×32 MB L3) is only partially cached — so a warm loop times
 //! the small ops at L3 bandwidth and logits nearer DRAM, INFLATING the logits fraction. This is
 //! exactly the "bench weight-streaming kernels COLD not warm-loop" lesson in
-//! project_draft_decoding_amortization. So this probe measures BOTH endpoints:
-//!   - WARM: same matrix reused (all-L3 where it fits) — the earlier, mixed-regime number.
-//!   - COLD: each timed call reads a FRESH matrix from a rotating pool sized > L3 (128 MiB),
-//!           so every op is DRAM-bandwidth-bound → the time ratio ≈ the byte ratio.
+//! `project_draft_decoding_amortization`. So this probe measures both endpoints:
+//!
+//! - **Warm:** the same matrix is reused, giving the earlier mixed-regime number.
+//! - **Cold:** each timed call reads a fresh matrix from a rotating pool larger than L3
+//!   (128 MiB), making every operation DRAM-bandwidth-bound so time tracks bytes.
+//!
 //! Real per-token decode is between the two (per-CCD working set 39 MB slightly exceeds the
 //! 32 MB CCD L3, so the oversized logits weight leans COLD). Report both; the honest per-token
 //! fraction is the COLD one.

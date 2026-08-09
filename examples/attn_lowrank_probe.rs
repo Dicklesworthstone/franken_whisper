@@ -122,7 +122,7 @@ fn captured(m: &[f32], n: usize, r: usize) -> f64 {
         let nn_ = nrm(&v);
         if nn_ > 1e-5 {
             let inv = (1.0 / nn_) as f32;
-            for vi in v.iter_mut() {
+            for vi in &mut v {
                 *vi *= inv;
             }
             qc.push(v);
@@ -194,9 +194,9 @@ fn main() {
     layer_norm(&mut hn, n_ctx, n_state, &ln_w, &ln_b);
     let hn = Mat::from_vec(n_ctx, n_state, hn);
     let mut q = nn::matmul(&hn, &wq).unwrap();
-    for r in 0..n_ctx {
-        for k in 0..n_state {
-            q.data[r * n_state + k] += bq[k];
+    for row in q.data.chunks_mut(n_state) {
+        for (value, &bias) in row.iter_mut().zip(&bq) {
+            *value += bias;
         }
     }
     let kk = nn::matmul(&hn, &wk).unwrap();
@@ -212,10 +212,10 @@ fn main() {
             let qi = &q.data[i * n_state + base..i * n_state + base + d_head];
             let row = &mut scores[i * real..(i + 1) * real];
             let mut mx = f32::NEG_INFINITY;
-            for j in 0..real {
+            for (j, value) in row.iter_mut().enumerate() {
                 let kj = &kk.data[j * n_state + base..j * n_state + base + d_head];
                 let s: f32 = qi.iter().zip(kj).map(|(&a, &b)| a * b).sum::<f32>() * scale;
-                row[j] = s;
+                *value = s;
                 if s > mx {
                     mx = s;
                 }

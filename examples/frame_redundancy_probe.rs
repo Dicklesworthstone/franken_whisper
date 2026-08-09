@@ -1,19 +1,23 @@
 //! Encoder frame-redundancy probe — the LAST unmeasured encoder redundancy axis
 //! (land-or-dig, 2026-07-05).
 //!
-//! This session mapped encoder redundancy on two axes and found NONE:
-//!   - DEPTH: layer-pruning is fatal at even 4/32 (project_encoder_flop_reduction_mapped).
-//!   - SPECTRAL: weights are near-full-rank (low-rank dig, e2ee176).
+//! This session mapped encoder redundancy on two axes and found none:
+//!
+//! - **Depth:** layer-pruning is fatal at even 4/32 (`project_encoder_flop_reduction_mapped`).
+//! - **Spectral:** weights are near-full-rank (low-rank dig, `e2ee176`).
+//!
 //! The THIRD axis — SEQUENCE redundancy (are the 1500 encoder frames mutually
 //! redundant, i.e. mergeable?) — is the precondition for ToMe / token-merging, the
 //! biggest owner-gated encoder lever left, and has only ever been "reasoned a poor
 //! bet", never MEASURED. This probe measures it directly on REAL audio:
-//!   (a) adjacent-frame cosine similarity distribution cos(f[i], f[i+1]) — high ⇒
-//!       neighbours mergeable (ToMe's exact signal),
-//!   (b) effective rank of the [n_frames, n_state] hidden state via randomized range
-//!       finding — how many dims the frames actually span (≪ n_frames ⇒ redundant),
-//!   (c) a ToMe proxy: average each adjacent pair (2× merge) and report the
-//!       reconstruction relerr — the error a 2× sequence reduction would inject.
+//!
+//! 1. Adjacent-frame cosine-similarity distribution `cos(f[i], f[i+1])`; high values
+//!    indicate neighbours that ToMe could merge.
+//! 2. Effective rank of the `[n_frames, n_state]` hidden state via randomized range
+//!    finding; a rank much smaller than `n_frames` indicates redundancy.
+//! 3. A ToMe proxy that averages each adjacent pair and reports the reconstruction
+//!    relative error injected by a twofold sequence reduction.
+//!
 //! Measured over the REAL-speech frames only (padding is trivially redundant and is
 //! already handled by tail-truncation). Sample depth via `FW_ENCODER_LAYERS=N`.
 //!
@@ -103,7 +107,7 @@ fn captured_energy(m: &Mat, rows: usize, r: usize) -> f64 {
         let nm = norm(&v);
         if nm > 1e-5 {
             let inv = (1.0 / nm) as f32;
-            for vi in v.iter_mut() {
+            for vi in &mut v {
                 *vi *= inv;
             }
             qcols.push(v);

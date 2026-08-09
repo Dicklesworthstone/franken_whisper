@@ -4304,8 +4304,7 @@ fn silhouette_score(
     // double-scan below-superseded form. ~2.9x faster (see benches/silhouette_perf).
     let mut cluster_sum = vec![0.0_f64; n * num_clusters];
     let mut cluster_count = vec![0u64; n * num_clusters];
-    for i in 0..n {
-        let ci = assignments[i];
+    for (i, &ci) in assignments.iter().enumerate() {
         for j in (i + 1)..n {
             let d = embeddings[i].euclidean_distance(&embeddings[j]);
             let cj = assignments[j];
@@ -4317,8 +4316,7 @@ fn silhouette_score(
     }
 
     let mut sum = 0.0_f64;
-    for i in 0..n {
-        let ci = assignments[i];
+    for (i, &ci) in assignments.iter().enumerate() {
         let base = i * num_clusters;
 
         // a(i): mean distance to other points in same cluster.
@@ -5671,7 +5669,7 @@ fn unavailable_neural_representation_summary(
     };
     summary
         .validate()
-        .map_err(|error| FwError::ContractViolation(error.to_owned()))?;
+        .map_err(|error| FwError::ContractViolation(error.clone()))?;
     Ok(summary)
 }
 
@@ -12895,7 +12893,7 @@ mod tests {
         let sample_rate = sample_rate as usize;
         (0..sample_rate * seconds)
             .map(|index| {
-                if (index / (sample_rate / 2)) % 4 == 0 {
+                if (index / (sample_rate / 2)).is_multiple_of(4) {
                     0
                 } else {
                     let phase = index as f64 * 330.0 * std::f64::consts::TAU / sample_rate as f64;

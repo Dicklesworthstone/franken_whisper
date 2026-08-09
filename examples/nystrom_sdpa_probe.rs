@@ -169,8 +169,8 @@ fn pinv(a: &[f32], m: usize) -> Vec<f32> {
         let az = mm(a, &z, m, m, m); // A Z
         // 2I - AZ
         let mut t = az;
-        for i in 0..m * m {
-            t[i] = -t[i];
+        for value in &mut t {
+            *value = -*value;
         }
         for i in 0..m {
             t[i * m + i] += 2.0;
@@ -235,16 +235,16 @@ fn main() {
         layer_norm(&mut hn, n_ctx, n_state, &ln_w, &ln_b);
         let hn = Mat::from_vec(n_ctx, n_state, hn);
         let mut q = nn::matmul(&hn, &wq).unwrap();
-        for r in 0..n_ctx {
-            for k in 0..n_state {
-                q.data[r * n_state + k] += bq[k];
+        for row in q.data.chunks_mut(n_state) {
+            for (value, &bias) in row.iter_mut().zip(&bq) {
+                *value += bias;
             }
         }
         let kk = nn::matmul(&hn, &wk).unwrap();
         let mut vv = nn::matmul(&hn, &wv).unwrap();
-        for r in 0..n_ctx {
-            for k in 0..n_state {
-                vv.data[r * n_state + k] += bv[k];
+        for row in vv.data.chunks_mut(n_state) {
+            for (value, &bias) in row.iter_mut().zip(&bv) {
+                *value += bias;
             }
         }
 

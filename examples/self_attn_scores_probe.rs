@@ -54,8 +54,10 @@ fn scores_swap(k: &[f32], qh_all: &[f32], scale: f32, tk: usize, out: &mut [f32]
     }
 }
 
+type ScoreKernel = dyn Fn(&[f32], &[f32], f32, usize, &mut [f32]);
+
 fn run(
-    f: &dyn Fn(&[f32], &[f32], f32, usize, &mut [f32]),
+    f: &ScoreKernel,
     k: &[f32],
     qh: &[f32],
     scale: f32,

@@ -4,7 +4,7 @@
 //! to f16 indices, then **`_mm256_i32gather_ps`** from a 1<<16 f32 table, then the
 //! `x<=-10 -> 0`, `x>=10 -> x` clamp blends. The existing code chose the gather
 //! after comparing it to the FULL-SCALAR fallback (per-element `Float16::from_f32`
-//! + table load) and won 1.38x. But it NEVER compared the gather to keeping the
+//! followed by a table load) and won 1.38x. But it NEVER compared the gather to keeping the
 //! fast 8-wide `vcvtps2ph` and replacing ONLY the gather with 8 explicit scalar
 //! table-loads.
 //!

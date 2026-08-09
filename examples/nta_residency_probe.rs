@@ -5,8 +5,9 @@
 //! the next token re-reads decoder weights from DRAM. IF the logits stream could
 //! bypass/limit L3 pollution, the decoder weights would stay resident.
 //!
-//! This tests whether Zen3 can do that: allocate R (resident, < CCD L3) + S (stream,
-//! > L3), and measure R's read bandwidth after normal and PREFETCHNTA-hinted S loads.
+//! This tests whether Zen3 can do that: allocate R (resident, smaller than CCD L3) plus
+//! S (streaming, larger than L3), and measure R's read bandwidth after normal and
+//! PREFETCHNTA-hinted S loads.
 //! MOVNTDQA is excluded because the hint is ignored on WB memory and its aligned-load
 //! precondition is not guaranteed by `Vec<i8>`. If PREFETCHNTA keeps R L3-warm (R BW
 //! stays high) the lever is alive; otherwise it is dead. Single-thread, one CCD's L3.

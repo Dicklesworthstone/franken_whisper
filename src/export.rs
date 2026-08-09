@@ -281,7 +281,7 @@ mod tests {
             59.999,
             3599.999,
             3661.123,
-            86_399.9995,
+            86_399.999_5,
         ] {
             assert_eq!(
                 format_timestamp_vtt(sec).to_string(),

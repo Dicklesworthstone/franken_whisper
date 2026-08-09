@@ -41,8 +41,8 @@ type V = Simd<f32, L>;
 /// x = n·ln2 + r, exp(r) via a degree-6 poly, scale by 2^n via exponent bits.
 #[inline]
 fn exp8(x: V) -> V {
-    let ln2 = V::splat(0.693_147_18);
-    let inv_ln2 = V::splat(1.442_695_04);
+    let ln2 = V::splat(std::f32::consts::LN_2);
+    let inv_ln2 = V::splat(std::f32::consts::LOG2_E);
     // clamp to avoid overflow in 2^n
     let hi = V::splat(88.0);
     let lo = V::splat(-88.0);
@@ -53,7 +53,7 @@ fn exp8(x: V) -> V {
     let mut p = V::splat(1.986_5e-4);
     p = p * r + V::splat(1.398_2e-3);
     p = p * r + V::splat(8.333_45e-3);
-    p = p * r + V::splat(4.166_580e-2);
+    p = p * r + V::splat(4.166_58e-2);
     p = p * r + V::splat(1.666_666_6e-1);
     p = p * r + V::splat(5.0e-1);
     p = p * r + V::splat(1.0);
@@ -121,7 +121,7 @@ fn main() {
     let (rows, cols) = (1500usize, 1500usize); // one encoder self-attn head's scores.
     let base: Vec<f32> = (0..rows * cols)
         .map(|i| {
-            let t = (i as f32 * 0.6180339887) % 1.0;
+            let t = (i as f32 * 0.618_034) % 1.0;
             (t - 0.5) * 8.0
         })
         .collect();

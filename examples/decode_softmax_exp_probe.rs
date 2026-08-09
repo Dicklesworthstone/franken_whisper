@@ -4,9 +4,11 @@
 //! `project_sampler_exp_measured` sized ONLY the sampler's vocab-wide exp (51866/token)
 //! and concluded "pipelining-hidden ⇒ ~0 e2e". But per token the decoder also runs
 //! `nn::softmax_rows` (scalar libm `.exp()`) for:
-//!   - CROSS-attn: 4 layers × 20 heads × 1500 enc frames = 120000 exp/token  (decoder.rs:1281/1312)
-//!   - SELF-attn : 4 layers × 20 heads × seq_len (grows; ~avg 128)           (attention_decode_step)
-//!   - sampler   : 51866 exp/token                                           (compute_logprobs)
+//!
+//! - Cross-attention: 4 layers × 20 heads × 1500 encoder frames = 120000 exponentials/token.
+//! - Self-attention: 4 layers × 20 heads × a growing sequence, averaging about 128.
+//! - Sampling: 51866 exponentials/token.
+//!
 //! Cross-attn alone is ~2.3× the sampler. This probe times franken's exact scalar
 //! `softmax_rows` vs an AVX2 poly-exp softmax on the REAL per-token decode shapes, to size
 //! the true owner-gated SIMD-exp headroom — and confirms it's exposed in TIMESTAMP mode

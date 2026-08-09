@@ -2095,11 +2095,13 @@ fn collect_voxconverse_files(
     Ok(files)
 }
 
+type VoxconverseRttmInspection = (String, BTreeMap<String, String>, usize, u64, u64);
+
 fn inspect_voxconverse_rttm(
     bytes: &[u8],
     recording_id: &str,
     duration_ms: u64,
-) -> FwResult<(String, BTreeMap<String, String>, usize, u64, u64)> {
+) -> FwResult<VoxconverseRttmInspection> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| public_corpus_error("rttm_utf8", "RTTM annotation must be valid UTF-8"))?;
     let mut channels = BTreeSet::new();
@@ -3197,35 +3199,19 @@ pub fn run_public_corpus_ablation_with_cancel(
     for clustering_mode in AcousticClusteringMode::ALL {
         let detector_mode = PUBLIC_CLUSTERING_DIAGNOSTIC_DETECTOR_MODE;
         let feature_ablation = PUBLIC_CLUSTERING_DIAGNOSTIC_FEATURE_ABLATION;
-        let splits = if clustering_mode == AcousticClusteringMode::FixedSafeV1 {
-            evaluate_public_variant(
-                &bundle,
-                &input_recordings,
-                &canonical_input,
-                maximum_recording_duration_ms,
-                &diarization_request,
-                &scorer_config,
-                feature_ablation,
-                detector_mode,
-                clustering_mode,
-                Some(evaluation_stage.selected_split()),
-                &mut is_cancelled,
-            )?
-        } else {
-            evaluate_public_variant(
-                &bundle,
-                &input_recordings,
-                &canonical_input,
-                maximum_recording_duration_ms,
-                &diarization_request,
-                &scorer_config,
-                feature_ablation,
-                detector_mode,
-                clustering_mode,
-                Some(evaluation_stage.selected_split()),
-                &mut is_cancelled,
-            )?
-        };
+        let splits = evaluate_public_variant(
+            &bundle,
+            &input_recordings,
+            &canonical_input,
+            maximum_recording_duration_ms,
+            &diarization_request,
+            &scorer_config,
+            feature_ablation,
+            detector_mode,
+            clustering_mode,
+            Some(evaluation_stage.selected_split()),
+            &mut is_cancelled,
+        )?;
         let feature_schema_sha256 =
             acoustic_feature_schema_sha256(feature_ablation.schema_version());
         let configuration_sha256 = canonical_sha256(&PublicClusteringConfigurationFingerprint {
@@ -8584,6 +8570,10 @@ struct PublicAblationAccumulator {
 }
 
 impl PublicAblationAccumulator {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the accumulator ingests independent scorer and calibration evidence streams"
+    )]
     fn push(
         &mut self,
         score: &crate::diarization::AuthoritativeDiarizationScore,
@@ -9989,13 +9979,13 @@ fn change_candidate_development_gate(
         candidate
             .change_f1
             .zip(baseline.change_f1)
-            .and_then(|(candidate, baseline)| {
+            .map(|(candidate, baseline)| {
                 if baseline > 0.0 {
-                    Some(canonical_evidence_number((candidate - baseline) / baseline))
+                    canonical_evidence_number((candidate - baseline) / baseline)
                 } else if candidate > 0.0 {
-                    Some(1.0)
+                    1.0
                 } else {
-                    Some(0.0)
+                    0.0
                 }
             });
     let mean_absolute_timing_error_delta_sec = candidate
@@ -15231,6 +15221,10 @@ mod tests {
         undefined_metric_behavior: String,
     }
 
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "these assertions freeze cross-module resource ceilings as a release contract"
+    )]
     fn assert_supported_profile_redecode_core_within_frozen_gate() {
         let usize_within =
             |value: usize, maximum: u64| u64::try_from(value).is_ok_and(|value| value <= maximum);
@@ -17167,6 +17161,10 @@ mod tests {
         super::canonical_sha256(&unhashed).expect("hash complete supported-profile gate row")
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test constructor records each independent evidence-binding predicate"
+    )]
     fn public_supported_profile_redecode_pair_comparison(
         baseline: &PublicSupportedProfileRedecodeArmRow,
         candidate: &PublicSupportedProfileRedecodeArmRow,
@@ -18502,6 +18500,10 @@ mod tests {
                 })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the paired test row keeps fixture, authority, and three executions explicit"
+    )]
     fn public_ecapa_change_pair_row(
         fixture: &FrozenEcapaDev8,
         recording: &LoadedFrozenEcapaRecording<'_>,
@@ -18533,9 +18535,11 @@ mod tests {
             &candidate_grid,
             &candidate_replay_grid,
         );
-        let common_calibration_grid_ms = calibration_grid_matches
-            .then(|| baseline_grid.keys().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let common_calibration_grid_ms = if calibration_grid_matches {
+            baseline_grid.keys().copied().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let reference_changes = crate::diarization::speaker_change_points_ms(
             &recording.reference.turns,
             recording.reference.duration_ms,
@@ -18609,8 +18613,8 @@ mod tests {
             public_ecapa_change_collapse_non_regression(&candidate.arm, &baseline.arm);
         let clustering_fallback_non_regression = candidate.arm.clustering_fallback_reason.is_none()
             || baseline.arm.clustering_fallback_reason.is_some();
-        let single_speaker_control_passed =
-            (baseline.arm.accuracy.reference_speakers == 1).then(|| {
+        let single_speaker_control_passed = (baseline.arm.accuracy.reference_speakers == 1)
+            .then_some({
                 baseline.arm.accuracy.hypothesis_speakers == 1
                     && candidate.arm.accuracy.hypothesis_speakers == 1
                     && candidate.arm.accuracy.absolute_speaker_count_error == 0
@@ -19278,7 +19282,7 @@ mod tests {
                 row.candidate.clustering_fallback_reason.is_none()
                     || row.baseline.clustering_fallback_reason.is_some();
             let single_speaker_control_passed = (row.baseline.accuracy.reference_speakers == 1)
-                .then(|| {
+                .then_some({
                     row.baseline.accuracy.hypothesis_speakers == 1
                         && row.candidate.accuracy.hypothesis_speakers == 1
                         && row.candidate.accuracy.absolute_speaker_count_error == 0
@@ -19340,10 +19344,10 @@ mod tests {
             {
                 failures.insert(PublicEcapaChangeGateFailure::ClusteringFallbackRegression);
             }
-            if let Some(passed) = single_speaker_control_passed {
-                if !passed {
-                    failures.insert(PublicEcapaChangeGateFailure::SingleSpeakerControlFailure);
-                }
+            if let Some(passed) = single_speaker_control_passed
+                && !passed
+            {
+                failures.insert(PublicEcapaChangeGateFailure::SingleSpeakerControlFailure);
             }
             for arm in [&row.baseline, &row.candidate] {
                 if arm.tracklet_count > policy.maximum_tracklet_count
@@ -19705,6 +19709,10 @@ mod tests {
             .map(|(candidate, baseline)| super::canonical_evidence_number(candidate - baseline))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test constructor records each independent replay and binding predicate"
+    )]
     fn public_ecapa_pair_comparison(
         baseline: &PublicEcapaResidualBirthArmRow,
         candidate: &PublicEcapaResidualBirthArmRow,

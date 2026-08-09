@@ -68,7 +68,7 @@ fn main() {
     for _c in 0..ncol {
         // weight column: gaussian + occasional sparse outlier (real transformer weights)
         let mut col = vec![0.0f32; inp];
-        for v in col.iter_mut() {
+        for v in &mut col {
             *v = rng.gauss(0.06);
         }
         let oi = (rng.u32() as usize) % inp;
@@ -80,7 +80,7 @@ fn main() {
             // activation row (post-LN encoder hidden): zero-mean-ish gaussian
             // u8-quantized (symmetric amax/127) EXACTLY as matmul_bias_i7 does
             let mut a = vec![0.0f32; inp];
-            for v in a.iter_mut() {
+            for v in &mut a {
                 *v = rng.gauss(1.0);
             }
             let aamax = a.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);

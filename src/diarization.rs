@@ -9208,7 +9208,11 @@ fn apply_acoustic_normalization_transform(
     }
 
     let mut voice_scale_squared = [0.0_f32; VOICE_VECTOR_DIMENSIONS];
-    for dimension in 0..schema.voice_dimensions {
+    for (dimension, scale_squared_slot) in voice_scale_squared
+        .iter_mut()
+        .enumerate()
+        .take(schema.voice_dimensions)
+    {
         if !transform.voice_valid[dimension] {
             continue;
         }
@@ -9226,10 +9230,14 @@ fn apply_acoustic_normalization_transform(
                 "active acoustic voice normalization dimension {dimension} has an invalid center or scale"
             )));
         }
-        voice_scale_squared[dimension] = scale_squared;
+        *scale_squared_slot = scale_squared;
     }
     let mut channel_scale_squared = [0.0_f32; CHANNEL_VECTOR_DIMENSIONS];
-    for dimension in 0..schema.channel_dimensions {
+    for (dimension, scale_squared_slot) in channel_scale_squared
+        .iter_mut()
+        .enumerate()
+        .take(schema.channel_dimensions)
+    {
         if !transform.channel_valid[dimension] {
             continue;
         }
@@ -9247,16 +9255,19 @@ fn apply_acoustic_normalization_transform(
                 "active acoustic channel normalization dimension {dimension} has an invalid center or scale"
             )));
         }
-        channel_scale_squared[dimension] = scale_squared;
+        *scale_squared_slot = scale_squared;
     }
 
-    for dimension in 0..schema.voice_dimensions {
+    for (dimension, &scale_squared) in voice_scale_squared
+        .iter()
+        .enumerate()
+        .take(schema.voice_dimensions)
+    {
         if !transform.voice_valid[dimension] {
             continue;
         }
         let center = transform.voice_centers[dimension];
         let scale = transform.voice_scales[dimension];
-        let scale_squared = voice_scale_squared[dimension];
         for (tracklet_index, tracklet) in tracklets
             .iter()
             .enumerate()
@@ -9279,13 +9290,16 @@ fn apply_acoustic_normalization_transform(
             }
         }
     }
-    for dimension in 0..schema.channel_dimensions {
+    for (dimension, &scale_squared) in channel_scale_squared
+        .iter()
+        .enumerate()
+        .take(schema.channel_dimensions)
+    {
         if !transform.channel_valid[dimension] {
             continue;
         }
         let center = transform.channel_centers[dimension];
         let scale = transform.channel_scales[dimension];
-        let scale_squared = channel_scale_squared[dimension];
         for (tracklet_index, tracklet) in tracklets
             .iter()
             .enumerate()
@@ -9309,7 +9323,11 @@ fn apply_acoustic_normalization_transform(
         }
     }
 
-    for dimension in 0..schema.voice_dimensions {
+    for (dimension, &scale_squared) in voice_scale_squared
+        .iter()
+        .enumerate()
+        .take(schema.voice_dimensions)
+    {
         if !transform.voice_valid[dimension] {
             continue;
         }
@@ -9320,10 +9338,14 @@ fn apply_acoustic_normalization_transform(
             .filter(|tracklet| tracklet.voice_valid[dimension])
         {
             tracklet.voice_mean[dimension] = (tracklet.voice_mean[dimension] - center) / scale;
-            tracklet.voice_variance[dimension] /= voice_scale_squared[dimension];
+            tracklet.voice_variance[dimension] /= scale_squared;
         }
     }
-    for dimension in 0..schema.channel_dimensions {
+    for (dimension, &scale_squared) in channel_scale_squared
+        .iter()
+        .enumerate()
+        .take(schema.channel_dimensions)
+    {
         if !transform.channel_valid[dimension] {
             continue;
         }
@@ -9334,7 +9356,7 @@ fn apply_acoustic_normalization_transform(
             .filter(|tracklet| tracklet.channel_valid)
         {
             tracklet.channel_mean[dimension] = (tracklet.channel_mean[dimension] - center) / scale;
-            tracklet.channel_variance[dimension] /= channel_scale_squared[dimension];
+            tracklet.channel_variance[dimension] /= scale_squared;
         }
     }
     Ok(())
@@ -13860,18 +13882,20 @@ fn supported_profile_redecode_profile_topology_sha256(
         .map(|partition| partition.method)
     {
         Some(DiarizationOperationalPartitionMethod::FixedSafeAgglomerative) => {
-            hasher.update(b"fixed_safe_agglomerative")
+            hasher.update(b"fixed_safe_agglomerative");
         }
         Some(DiarizationOperationalPartitionMethod::ProbabilisticConsensus) => {
-            hasher.update(b"probabilistic_consensus")
+            hasher.update(b"probabilistic_consensus");
         }
         Some(DiarizationOperationalPartitionMethod::EcapaSpherical) => {
-            hasher.update(b"ecapa_spherical")
+            hasher.update(b"ecapa_spherical");
         }
         Some(DiarizationOperationalPartitionMethod::EcapaFusedConsensus) => {
-            hasher.update(b"ecapa_fused_consensus")
+            hasher.update(b"ecapa_fused_consensus");
         }
-        None => hasher.update(b"none"),
+        None => {
+            hasher.update(b"none");
+        }
     }
     hasher.update([0]);
     hasher.update((clustering.profiles.len() as u64).to_le_bytes());
@@ -14861,7 +14885,7 @@ fn apply_ecapa_speaker_representations(
     };
     summary
         .validate()
-        .map_err(|error| FwError::ContractViolation(error.to_owned()))?;
+        .map_err(|error| FwError::ContractViolation(error.clone()))?;
     Ok((summary, embeddings))
 }
 
@@ -15057,6 +15081,10 @@ where
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the evaluation harness passes independent algorithm ablation levers"
+)]
 fn diarize_acoustic_pcm_with_detector_evidence_internal<C>(
     input: AcousticDiarizationInput<'_>,
     feature_ablation: AcousticFeatureAblation,
@@ -15895,6 +15923,10 @@ where
     .0)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the clustering evaluation lane keeps independent evidence levers explicit"
+)]
 fn cluster_acoustic_tracklets_with_mode_internal<C>(
     tracklets: &[AcousticTracklet],
     enrollment: &SpeakerEnrollment,
@@ -15924,6 +15956,10 @@ where
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the clustering evaluation lane keeps independent evidence levers explicit"
+)]
 fn cluster_acoustic_tracklets_with_budgeted_enrollment<C>(
     tracklets: &[AcousticTracklet],
     enrollment: &mut SpeakerEnrollment,
@@ -15956,6 +15992,10 @@ where
     Ok((clustering, count_merge_steps))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the residual-birth experiment keeps every authority and ablation input explicit"
+)]
 fn cluster_acoustic_tracklets_with_budgeted_enrollment_and_residual_birth<C>(
     tracklets: &[AcousticTracklet],
     enrollment: &mut SpeakerEnrollment,
@@ -16010,7 +16050,7 @@ fn cluster_acoustic_tracklets_with_evaluation_levers<C>(
     profile_redecode_mode: SupportedProfileRedecodeMode,
     common_observation_sha256: &str,
     profile_redecode: &mut SupportedProfileRedecodeEvaluationEvidence,
-    #[cfg(test)] mut incumbent_capture: Option<&mut Option<SupportedProfileRedecodeIncumbent>>,
+    #[cfg(test)] incumbent_capture: Option<&mut Option<SupportedProfileRedecodeIncumbent>>,
     #[cfg(not(test))] _incumbent_capture: Option<&mut ()>,
     mut is_cancelled: C,
 ) -> FwResult<(
@@ -16449,7 +16489,7 @@ where
     )?;
     retain_supported_assignments(&speaker_evidence, &mut assignments);
     #[cfg(test)]
-    if let Some(capture) = incumbent_capture.as_deref_mut() {
+    if let Some(capture) = incumbent_capture {
         *capture = Some(SupportedProfileRedecodeIncumbent {
             clusters: clusters.clone(),
             labels: labels.clone(),
@@ -17817,7 +17857,7 @@ where
     {
         let position = visited;
         visited = visited.saturating_add(1);
-        if position % ACOUSTIC_CANCELLATION_INTERVAL_FRAMES == 0 && is_cancelled() {
+        if position.is_multiple_of(ACOUSTIC_CANCELLATION_INTERVAL_FRAMES) && is_cancelled() {
             return Err(FwError::Cancelled(format!(
                 "acoustic clustering cancelled at tracklet {position}"
             )));
@@ -17847,7 +17887,7 @@ where
     {
         let position = visited;
         visited = visited.saturating_add(1);
-        if position % ACOUSTIC_CANCELLATION_INTERVAL_FRAMES == 0 && is_cancelled() {
+        if position.is_multiple_of(ACOUSTIC_CANCELLATION_INTERVAL_FRAMES) && is_cancelled() {
             return Err(FwError::Cancelled(format!(
                 "acoustic clustering cancelled at tracklet {position}"
             )));
@@ -18925,6 +18965,10 @@ struct ProbabilisticLaneResult {
     merge_replay: Vec<(usize, usize)>,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "both internal outcomes are consumed immediately; boxing would add hot-path allocation"
+)]
 enum ProbabilisticAgglomeration {
     Selected {
         clusters: Vec<AcousticCluster>,
@@ -18961,10 +19005,14 @@ fn operational_partition_summary(
     };
     summary
         .validate()
-        .map_err(|error| FwError::ContractViolation(error.to_owned()))?;
+        .map_err(|error| FwError::ContractViolation(error.clone()))?;
     Ok(summary)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "probabilistic clustering keeps policy, calibration, and evidence inputs explicit"
+)]
 fn probabilistic_agglomerate_clusters<C>(
     initial: &[AcousticCluster],
     cannot_links: &BTreeSet<(String, String)>,
@@ -20596,6 +20644,10 @@ where
     Ok(Ok(output))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the evaluation-only residual-birth lane keeps all budget and authority inputs explicit"
+)]
 fn apply_ecapa_residual_birth<C>(
     incumbent: &[AcousticCluster],
     tracklets: &[AcousticTracklet],
@@ -20708,12 +20760,14 @@ where
     }
 }
 
+type NeuralSphericalPartition = (usize, f32, Vec<AcousticCluster>, Vec<ClusterMergeTrace>);
+
 fn infer_neural_spherical_partition<C>(
     initial: &[AcousticCluster],
     policy: SpeakerCountPolicy,
     neural_embeddings: &EcapaTrackletEmbeddings,
     is_cancelled: &mut C,
-) -> FwResult<Option<(usize, f32, Vec<AcousticCluster>, Vec<ClusterMergeTrace>)>>
+) -> FwResult<Option<NeuralSphericalPartition>>
 where
     C: FnMut() -> bool,
 {
@@ -20953,11 +21007,8 @@ where
             }
         }
         if !run_valid
-            || assignments
-                .iter()
-                .any(|assignment| *assignment == usize::MAX)
-            || (0..selected_count)
-                .any(|center| !assignments.iter().any(|assignment| *assignment == center))
+            || assignments.contains(&usize::MAX)
+            || (0..selected_count).any(|center| !assignments.contains(&center))
         {
             continue;
         }
@@ -21329,6 +21380,10 @@ fn soft_count_prior_mix(
     ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "speaker-count fusion combines independent calibrated evidence authorities"
+)]
 fn fused_speaker_count_estimate(
     lanes: &[ProbabilisticLaneResult],
     spectral: Option<&SparseEigengapProposal>,
@@ -22120,9 +22175,9 @@ fn dense_normalized_affinity_matrix(graph: &SparseSpeakerAffinityGraph) -> FwRes
             matrix[row][column] = weight / denominator;
         }
     }
-    for row in 0..node_count {
-        for column in row + 1..node_count {
-            if (matrix[row][column] - matrix[column][row]).abs() > f64::EPSILON {
+    for (row, values) in matrix.iter().enumerate() {
+        for (column, &value) in values.iter().enumerate().skip(row + 1) {
+            if (value - matrix[column][row]).abs() > f64::EPSILON {
                 return Err(FwError::InvalidRequest(
                     "speaker-count dense affinity is not symmetric".to_owned(),
                 ));
@@ -23142,13 +23197,15 @@ where
     Ok(())
 }
 
+type CoassociationConsensus = (Vec<AcousticCluster>, Vec<ClusterMergeTrace>, bool);
+
 fn coassociation_consensus_clusters<C>(
     initial: &[AcousticCluster],
     cannot_links: &BTreeSet<(String, String)>,
     lanes: &[ProbabilisticLaneResult],
     selected_count: usize,
     is_cancelled: &mut C,
-) -> FwResult<Option<(Vec<AcousticCluster>, Vec<ClusterMergeTrace>, bool)>>
+) -> FwResult<Option<CoassociationConsensus>>
 where
     C: FnMut() -> bool,
 {
@@ -24662,15 +24719,13 @@ where
             .ok_or(SupportedProfileRedecodeFallbackReason::InvalidInput)?;
         if let Some(representation) =
             neural_embeddings.and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
-        {
-            if representation
+            && (representation
                 .assignment_embedding()
                 .iter()
                 .any(|coordinate| !coordinate.is_finite())
-                || !representation.assignment_weight().is_finite()
-            {
-                return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
-            }
+                || !representation.assignment_weight().is_finite())
+        {
+            return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
         }
         if cluster.neural_voice.as_ref().is_some_and(|centroid| {
             centroid.iter().any(|coordinate| !coordinate.is_finite())
@@ -25292,7 +25347,7 @@ where
             || supported_profile_redecode_assignment_state(
                 assignment,
                 labels,
-                &supported_cluster_indices,
+                supported_cluster_indices,
             )
             .is_none()
             || enrollment
@@ -25352,7 +25407,7 @@ where
     let first_incumbent_state = supported_profile_redecode_assignment_state(
         &assignments[0],
         labels,
-        &supported_cluster_indices,
+        supported_cluster_indices,
     )
     .unwrap_or(state_count);
     let first_forced = (assignments[0].hard_attribution || assignments[0].overlap_suspected)
@@ -25361,7 +25416,7 @@ where
         &tracklets[0],
         clusters,
         labels,
-        &supported_cluster_indices,
+        supported_cluster_indices,
         enrollment,
         neural_embeddings,
         first_forced,
@@ -25388,13 +25443,13 @@ where
         let incumbent_previous_state = supported_profile_redecode_assignment_state(
             &assignments[time - 1],
             labels,
-            &supported_cluster_indices,
+            supported_cluster_indices,
         )
         .unwrap_or(state_count);
         let incumbent_state = supported_profile_redecode_assignment_state(
             &assignments[time],
             labels,
-            &supported_cluster_indices,
+            supported_cluster_indices,
         )
         .unwrap_or(state_count);
         let forced = (assignments[time].hard_attribution || assignments[time].overlap_suspected)
@@ -25403,7 +25458,7 @@ where
             &tracklets[time],
             clusters,
             labels,
-            &supported_cluster_indices,
+            supported_cluster_indices,
             enrollment,
             neural_embeddings,
             forced,
@@ -25581,7 +25636,7 @@ where
         let incumbent_state = supported_profile_redecode_assignment_state(
             incumbent,
             labels,
-            &supported_cluster_indices,
+            supported_cluster_indices,
         )
         .unwrap_or(state_count);
         if (incumbent.hard_attribution || incumbent.overlap_suspected) && state != incumbent_state {
@@ -25669,9 +25724,8 @@ where
             );
         }
     }
-    let changed_label_byte_cap = changed_assignment_count
-        .checked_mul(crate::model::MAX_SPEAKER_REF_BYTES as u64)
-        .unwrap_or(u64::MAX);
+    let changed_label_byte_cap =
+        changed_assignment_count.saturating_mul(crate::model::MAX_SPEAKER_REF_BYTES as u64);
     if persistent_output_label_bytes > changed_label_byte_cap
         || persistent_output_label_bytes
             > SUPPORTED_PROFILE_REDECODE_MAX_PERSISTENT_OUTPUT_LABEL_BYTES
@@ -25683,7 +25737,7 @@ where
     }
     let structural_output_sha256 = supported_profile_redecode_structural_sha256(
         common_observation_sha256,
-        &supported_cluster_indices,
+        supported_cluster_indices,
         tracklets,
         &candidate_states,
     );
@@ -33223,9 +33277,7 @@ mod tests {
 
     fn residual_birth_basis(slot: usize) -> super::EcapaSpeakerEmbedding {
         let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
-        for dimension in slot * 4..slot * 4 + 4 {
-            embedding[dimension] = 0.5;
-        }
+        embedding[slot * 4..slot * 4 + 4].fill(0.5);
         embedding
     }
 
@@ -39699,11 +39751,11 @@ mod tests {
         embedding[3] = 1.0;
         let valid = ecapa_representation(embedding, None, 50.0, 0.0);
 
-        let mut zero_norm = valid.clone();
+        let mut zero_norm = valid;
         zero_norm.discovery.fill(0.0);
-        let mut non_finite = valid.clone();
+        let mut non_finite = valid;
         non_finite.discovery[7] = f32::NAN;
-        let mut non_finite_weight = valid.clone();
+        let mut non_finite_weight = valid;
         non_finite_weight.discovery_weight = f32::INFINITY;
         let invalid_validation_weight = ecapa_representation(embedding, Some(embedding), 50.0, 0.0);
         let invalid_absent_validation_weight = ecapa_representation(embedding, None, 50.0, 1.0);

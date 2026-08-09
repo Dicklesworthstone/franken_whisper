@@ -1,10 +1,15 @@
 //! maddubs 7-bit-weight int8 encoder GEMM: MEASURE the ledger's extrapolated ~1.6x (BlackThrush, 2026-07-04).
 //!
-//! Context: the int8 encoder GEMM is the #1 owner-gated lever (encoder = ~87% e2e,
-//! compute-bound f32 sgemm). Two prior facts in docs/NEGATIVE_EVIDENCE.md:
-//!   - the WIDENING inner op (vpmovsxbw+vpmaddwd, int32-safe) tiled GEMM = 0.89x f32 (a LOSS);
-//!   - VPMADDUBSW (maddubs) is ~1.79x the widening op on raw throughput, BUT it SATURATES its
-//!     int16 intermediate for full-range int8xint8 (retraction 4cfcd56) -> unusable at 8-bit.
+//! Context: the int8 encoder GEMM is the primary owner-gated lever (encoder is about
+//! 87% of end-to-end time and uses compute-bound f32 SGEMM). Two prior facts are in
+//! `docs/NEGATIVE_EVIDENCE.md`:
+//!
+//! - The widening inner operation (`vpmovsxbw+vpmaddwd`, int32-safe) tiled GEMM is
+//!   0.89x f32, a loss.
+//! - VPMADDUBSW (`maddubs`) is about 1.79x the widening operation on raw throughput,
+//!   but saturates its int16 intermediate for full-range int8-by-int8 operands
+//!   (retraction `4cfcd56`), making it unusable at 8 bits.
+//!
 //! The retraction noted maddubs is "only usable with <=7-bit weights" but DISMISSED that by
 //! reasoning ("not worth it, accuracy"), never MEASURING its tiled-GEMM speed. The ledger's
 //! "actionable ~1.6x f32" is an EXTRAPOLATION (0.70 efficiency x 2.28x compute). This probe

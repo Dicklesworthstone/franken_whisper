@@ -92,7 +92,6 @@ pub struct PullOutcome {
     pub from_cache: bool,
 }
 
-#[must_use]
 pub fn builtin_manifest() -> FwResult<SortformerManifest> {
     parse_manifest(BUILTIN_MANIFEST_JSON.as_bytes())
 }
@@ -580,9 +579,7 @@ where
         staging_file,
         is_cancelled,
     ));
-    if let Err(error) = download {
-        return Err(error);
-    }
+    download?;
     cancellation_checkpoint(is_cancelled)?;
     quarantine_invalid_existing(final_path)?;
     publish_staging_noreplace(&staging_path, final_path)?;

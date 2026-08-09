@@ -3862,9 +3862,12 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
         // BYTE-IDENTICAL to that loop with `channels == 1`: `acc == i32(s)`, and both
         // `i32(s) as f32` and `i16 s as f32` give the exact integer (i16 ⊂ f32
         // mantissa), while `/1.0` is the identity and `/32768.0` (÷2¹⁵) is exact.
+        let (samples, remainder) = data.as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
         out.extend(
-            data.chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
+            samples
+                .iter()
+                .map(|&sample| i16::from_le_bytes(sample) as f32 / 32768.0),
         );
     } else {
         for f in 0..n_frames {
@@ -4137,7 +4140,7 @@ mod tests {
         }
         // All-masked (-inf, max=-inf) → sum exactly 0 (mask zeroes the NaN lanes).
         assert_eq!(
-            logsumexp_sum_simd(&vec![f32::NEG_INFINITY; 32], f32::NEG_INFINITY),
+            logsumexp_sum_simd(&[f32::NEG_INFINITY; 32], f32::NEG_INFINITY),
             0.0
         );
     }
@@ -4185,7 +4188,7 @@ mod tests {
         assert_eq!(argmax_idx(&with_nan), scalar(&with_nan)); // first 3.0 at index 2
         // Empty and all-masked → 0 (matches scalar initial best_i).
         assert_eq!(argmax_idx(&[]), 0);
-        assert_eq!(argmax_idx(&vec![f32::NEG_INFINITY; 20]), 0);
+        assert_eq!(argmax_idx(&[f32::NEG_INFINITY; 20]), 0);
     }
 
     #[test]
@@ -4281,8 +4284,10 @@ mod tests {
         // clamp. (The OnceLock env reader is unset in a clean test process.)
         if std::env::var_os("FW_BEAM_SIZE").is_none() {
             assert_eq!(resolve_beam_size(&DecodeParams::default()), 1);
-            let mut p = DecodeParams::default();
-            p.beam_size = Some(5);
+            let mut p = DecodeParams {
+                beam_size: Some(5),
+                ..DecodeParams::default()
+            };
             assert_eq!(
                 resolve_beam_size(&p),
                 5,
@@ -4300,7 +4305,7 @@ mod tests {
         // Faithful to whisper.cpp 6597-6617: Shannon entropy (nats) over the
         // token-id counts of the LAST 32 entries only.
         // Uniformly repeated tail → 0.0 (degenerate loop, the entropy_thold case).
-        assert_eq!(token_tail_entropy(&vec![7i32; 40]), 0.0);
+        assert_eq!(token_tail_entropy(&[7i32; 40]), 0.0);
         // 32 distinct ids → ln 32 (maximum for the window).
         let distinct: Vec<i32> = (0..32).collect();
         assert!((token_tail_entropy(&distinct) - 32f64.ln()).abs() < 1e-12);
@@ -4318,7 +4323,7 @@ mod tests {
         assert!((token_tail_entropy(&mixed) - expect).abs() < 1e-12);
         // Threshold calibration sanity (wc defaults): a fully repetitive tail is
         // far below 2.4; a fully diverse tail is above it.
-        assert!(token_tail_entropy(&vec![7i32; 33]) < ENTROPY_THRESHOLD);
+        assert!(token_tail_entropy(&[7i32; 33]) < ENTROPY_THRESHOLD);
         assert!(token_tail_entropy(&distinct) > ENTROPY_THRESHOLD);
         // Empty input is defined (0.0), matching "no evidence of a loop".
         assert_eq!(token_tail_entropy(&[]), 0.0);
@@ -5072,15 +5077,19 @@ mod tests {
         use std::time::Instant;
         let n = 4_000_000usize; // ~4.2 min of 16 kHz audio; cycles the full i16 range 61×.
         let mut data = vec![0u8; n * 2];
-        for (i, chunk) in data.chunks_exact_mut(2).enumerate() {
+        let (samples, remainder) = data.as_chunks_mut::<2>();
+        debug_assert!(remainder.is_empty());
+        for (i, chunk) in samples.iter_mut().enumerate() {
             // Deterministic fill covering the full i16 range (incl. ±edge values).
             chunk.copy_from_slice(&(i as i16).to_le_bytes());
         }
         // NEW: the mono fast path (what `read_wav_16k_mono` uses at channels == 1).
         let t = Instant::now();
-        let fast: Vec<f32> = data
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        let (samples, remainder) = data.as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
+        let fast: Vec<f32> = samples
+            .iter()
+            .map(|&sample| i16::from_le_bytes(sample) as f32 / 32768.0)
             .collect();
         let t_fast = t.elapsed();
         // OLD: the general per-channel accumulation loop with channels == 1.
@@ -5438,13 +5447,15 @@ mod tests {
     }
 
     #[test]
-    fn gated_beam_size_field_matches_greedy_on_jfk() {
+    fn gated_beam_size_field_preserves_jfk_words() {
         // Beam search via the DecodeParams.beam_size FIELD (whisper --beam-size).
-        // On jfk (clear, unambiguous speech) beam=5 selects the same hypothesis as
-        // greedy, so the transcript is byte-identical — this exercises the
-        // field → beam decode wiring end to end AND pins the "beam is a superset of
-        // greedy" invariant. First e2e coverage of beam search. FW_BEAM_SIZE is
-        // unset under `cargo test`, so the field is the source of truth.
+        // Beam search is not required to select greedy's byte-identical token
+        // sequence: on the aarch64 native kernels the equally correct beam-5
+        // hypothesis inserts one comma after "so". The old "beam is a superset,
+        // therefore its winner equals greedy" premise was false. Keep this gate
+        // strict in both dimensions: zero word error against the oracle, and an
+        // exact allowlist containing only the two observed punctuation variants.
+        // FW_BEAM_SIZE is unset under `cargo test`, so the field is authoritative.
         let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
             eprintln!("SKIP gated_beam_size_field: tiny.en model or jfk.wav missing");
             return;
@@ -5462,12 +5473,21 @@ mod tests {
         let beam = join(&transcribe_samples(&model, &samples, &p, &noop).unwrap());
         eprintln!("greedy: {greedy}\nbeam5:  {beam}");
         assert_eq!(
-            beam, greedy,
-            "beam=5 must match greedy on jfk (byte-identical superset)"
+            greedy, JFK_REFERENCE,
+            "greedy temp-0 transcript must retain its byte-exact oracle"
         );
+        assert_eq!(
+            crate::conformance::word_error_rate(JFK_REFERENCE, &beam).wer,
+            0.0,
+            "beam=5 must preserve every oracle word"
+        );
+        const BEAM_PUNCTUATION_VARIANTS: [&str; 2] = [
+            JFK_REFERENCE,
+            "And so, my fellow Americans ask not what your country can do for you ask what you can do for your country.",
+        ];
         assert!(
-            greedy.to_lowercase().contains("country"),
-            "baseline should transcribe jfk"
+            BEAM_PUNCTUATION_VARIANTS.contains(&beam.as_str()),
+            "beam=5 produced an unreviewed punctuation variant: {beam}"
         );
     }
 

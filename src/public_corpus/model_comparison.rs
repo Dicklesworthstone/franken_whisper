@@ -3493,6 +3493,10 @@ fn classify_ecapa_failure(error: &FwError) -> Option<ModelComparisonOutcomeCode>
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the signed resource evidence records each measured bound independently"
+)]
 fn lane_resource_evidence(
     lane: ModelComparisonLane,
     sortformer_timeout_seconds: u64,

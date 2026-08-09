@@ -75,7 +75,7 @@ fn gather_v2(dst: &mut [f32], src: &[f32]) {
 // V0-mt: bands over the flat [hh*t] output rows (== current par_chunks_mut).
 fn gather_v0_mt(dst: &mut [f32], src: &[f32], nt: usize) {
     let total = HH * T;
-    let per = (total + nt - 1) / nt;
+    let per = total.div_ceil(nt);
     thread::scope(|s| {
         for (c, blk) in dst.chunks_mut(per * D).enumerate() {
             let row0 = c * per;
@@ -98,7 +98,7 @@ fn gather_v0_mt(dst: &mut [f32], src: &[f32], nt: usize) {
 // we can't take a simple contiguous dst chunk; use raw pointer with disjoint i.
 #[allow(unsafe_code)]
 fn gather_v1_mt(dst: &mut [f32], src: &[f32], nt: usize) {
-    let per = (T + nt - 1) / nt;
+    let per = T.div_ceil(nt);
     let dst_ptr = dst.as_mut_ptr() as usize;
     thread::scope(|s| {
         for c in 0..nt {
@@ -142,9 +142,7 @@ fn bench<F: FnMut(&mut [f32], &[f32])>(
     assert_eq!(&dst[..], truth, "{name} not byte-identical!");
     let mut best = f64::MAX;
     for _ in 0..reps {
-        for v in dst.iter_mut() {
-            *v = 0.0;
-        }
+        dst.fill(0.0);
         let t = Instant::now();
         f(&mut dst, src);
         let e = t.elapsed().as_secs_f64() * 1e3;

@@ -89,7 +89,7 @@ fn main() {
             let nn_ = nrm(&v);
             if nn_ > 1e-6 {
                 let inv = (1.0 / nn_) as f32;
-                for vi in v.iter_mut() {
+                for vi in &mut v {
                     *vi *= inv;
                 }
                 q.push(v);
@@ -100,9 +100,9 @@ fn main() {
         for qc in &q {
             // Gq = G·qc  [ns]
             let mut gq = vec![0.0f32; ns];
-            for i in 0..ns {
+            for (i, value) in gq.iter_mut().enumerate() {
                 let grow = &g.data[i * ns..(i + 1) * ns];
-                gq[i] = grow.iter().zip(qc).map(|(&a, &b)| a * b).sum();
+                *value = grow.iter().zip(qc).map(|(&a, &b)| a * b).sum();
             }
             cap += dot(qc, &gq);
         }

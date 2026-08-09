@@ -4,11 +4,13 @@
 //! at-peak FMA). Memory flags "int8×int8 GEMM" as the owner-gated encoder unlock,
 //! but that assumes a naive int8 GEMM would even be FASTER than the blocked f32
 //! one — never measured at the encoder shape (tq=1500). This settles the SPEED
-//! question (transcript question is separate + owner-gated) by racing, at the
+//! question (transcript question is separate and owner-gated) by racing at the
 //! real encoder projection shapes:
-//!   - f32:  `nn::matmul` (matrixmultiply, BLOCKED)      [current encoder path]
-//!   - int8: `gemv_i8_batch` (naive row×row int8 dot)    [tq=1500 = encoder GEMM]
-//!   - f16:  `gemv_f16_batch` (naive row×row f16 dot)     [reference]
+//!
+//! - f32: `nn::matmul` (matrixmultiply, blocked), the current encoder path.
+//! - int8: `gemv_i8_batch` (naive row-by-row int8 dot), with `tq=1500`.
+//! - f16: `gemv_f16_batch` (naive row-by-row f16 dot), the reference.
+//!
 //! If naive int8 already beats blocked f32, the encoder int8 lever is worth the
 //! transcript work; if it loses (naive has no cache-blocking, cf. cross_kv where
 //! blocked-f32 beat naive-f16 2.25×), a blocked int8 microkernel is required

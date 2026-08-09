@@ -16,6 +16,10 @@ use std::time::Instant;
 /// Build the conv im2col [t_out, cin*k] over `chunks` balanced output-row bands
 /// (chunks==0 ⇒ per worker_count()-style band; here we test explicit counts).
 /// Mirrors nn::conv1d_wt's fill_row exactly (stride/pad handling).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the probe exposes each convolution geometry operand independently"
+)]
 fn im2col(
     x: &[f32],
     t_in: usize,

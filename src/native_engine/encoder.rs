@@ -1294,37 +1294,41 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
             Ok(g) => g,
             Err(_) => return false,
         };
-        if !guard.contains_key(&key) {
-            let refs: Vec<ft_kernel_metal::fused::LayerWeightsRef> = w
-                .layers
-                .iter()
-                .map(|l| ft_kernel_metal::fused::LayerWeightsRef {
-                    ln1_g: &l.attn_ln_w,
-                    ln1_b: &l.attn_ln_b,
-                    wq: &l.attn_q_w.data,
-                    bq: &l.attn_q_b,
-                    wk: &l.attn_k_w.data,
-                    wv: &l.attn_v_w.data,
-                    bv: &l.attn_v_b,
-                    wo: &l.attn_out_w.data,
-                    bo: &l.attn_out_b,
-                    ln2_g: &l.mlp_ln_w,
-                    ln2_b: &l.mlp_ln_b,
-                    w1: &l.mlp_fc_w.data,
-                    b1: &l.mlp_fc_b,
-                    w2: &l.mlp_proj_w.data,
-                    b2: &l.mlp_proj_b,
-                })
-                .collect();
-            match ft_kernel_metal::fused::EncoderGpu::new(w.n_state, w.n_head, w.n_state * 4, &refs)
-            {
-                Ok(enc) => {
-                    guard.insert(key, Arc::new(enc));
+        match guard.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let refs: Vec<ft_kernel_metal::fused::LayerWeightsRef> = w
+                    .layers
+                    .iter()
+                    .map(|l| ft_kernel_metal::fused::LayerWeightsRef {
+                        ln1_g: &l.attn_ln_w,
+                        ln1_b: &l.attn_ln_b,
+                        wq: &l.attn_q_w.data,
+                        bq: &l.attn_q_b,
+                        wk: &l.attn_k_w.data,
+                        wv: &l.attn_v_w.data,
+                        bv: &l.attn_v_b,
+                        wo: &l.attn_out_w.data,
+                        bo: &l.attn_out_b,
+                        ln2_g: &l.mlp_ln_w,
+                        ln2_b: &l.mlp_ln_b,
+                        w1: &l.mlp_fc_w.data,
+                        b1: &l.mlp_fc_b,
+                        w2: &l.mlp_proj_w.data,
+                        b2: &l.mlp_proj_b,
+                    })
+                    .collect();
+                match ft_kernel_metal::fused::EncoderGpu::new(
+                    w.n_state,
+                    w.n_head,
+                    w.n_state * 4,
+                    &refs,
+                ) {
+                    Ok(enc) => Arc::clone(entry.insert(Arc::new(enc))),
+                    Err(_) => return false,
                 }
-                Err(_) => return false,
             }
         }
-        Arc::clone(guard.get(&key).expect("just inserted"))
     };
 
     match enc.forward(&x.data, x.rows) {
@@ -2398,7 +2402,9 @@ mod tests {
         for &(out, inp) in &[(40usize, 24usize), (17, 31), (64, 16), (1, 8), (8, 1)] {
             // Synthetic ggml [out, inp] f16 raw bytes (finite, varied).
             let mut raw = vec![0u8; out * inp * 2];
-            for b2 in raw.chunks_exact_mut(2) {
+            let (f16_values, remainder) = raw.as_chunks_mut::<2>();
+            debug_assert!(remainder.is_empty());
+            for b2 in f16_values {
                 let v = rng.next_f32() * 4.0;
                 b2.copy_from_slice(&Float16::from_f32(v).to_bits().to_le_bytes());
             }
