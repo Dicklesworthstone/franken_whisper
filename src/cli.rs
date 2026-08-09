@@ -896,9 +896,13 @@ pub struct YoutubeArgs {
     #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
     pub backend: BackendKind,
 
-    /// Enable speaker diarization.
+    /// Explicitly enable speaker diarization (already enabled by default).
     #[arg(long)]
     pub diarize: bool,
+
+    /// Disable the default native speaker diarization stage.
+    #[arg(long, conflicts_with = "diarize")]
+    pub no_diarize: bool,
 
     /// Maximum concurrent downloads.
     #[arg(long, default_value_t = 3)]
@@ -944,7 +948,7 @@ impl YoutubeArgs {
             model: self.model.clone(),
             language: self.language.clone(),
             backend: self.backend,
-            diarize: self.diarize,
+            diarize: self.diarize || !self.no_diarize,
             concurrency: self.concurrency,
             keep_audio: !self.no_keep_audio,
             retry_failed: !self.no_retry,
@@ -1083,16 +1087,20 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub translate: bool,
 
-    /// Request speaker diarization.
+    /// Explicitly request speaker diarization (already enabled by default).
     #[arg(long)]
     pub diarize: bool,
+
+    /// Disable the default native speaker diarization stage.
+    #[arg(long, conflicts_with = "diarize")]
+    pub no_diarize: bool,
 
     /// Speaker diarization implementation.
     #[arg(long, value_enum, default_value_t = DiarizationEngine::Auto)]
     pub diarization_engine: DiarizationEngine,
 
     /// Conservative action when the requested diarizer lacks evidence.
-    #[arg(long, value_enum, default_value_t = DiarizationFallbackPolicy::Unknown)]
+    #[arg(long, value_enum, default_value_t = DiarizationFallbackPolicy::Acoustic)]
     pub diarization_fallback: DiarizationFallbackPolicy,
 
     /// Speaker-hints-v1 JSON; its source path is not retained.
@@ -1758,7 +1766,7 @@ impl TranscribeArgs {
             model: self.model.take(),
             language: self.language.take(),
             translate: self.translate,
-            diarize: self.diarize,
+            diarize: self.diarize || !self.no_diarize,
             persist: !self.no_persist,
             db_path: std::mem::take(&mut self.db),
             timeout_ms: self.timeout.map(|secs| secs.saturating_mul(1000)),

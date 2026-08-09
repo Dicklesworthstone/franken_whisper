@@ -100,9 +100,11 @@ pub struct DiarizationConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum DiarizationEngine {
-    /// Select the best admitted implementation, preferring the native acoustic
-    /// engine when its input and evidence requirements are satisfied.
+    /// Select the built-in native learned diarizer, with a native acoustic
+    /// fallback when its verified package is unavailable or ineligible.
     Auto,
+    /// Rust-native Streaming Sortformer speaker activity and turn inference.
+    Sortformer,
     /// Rust-native, waveform-only acoustic diarization.
     Acoustic,
     /// User-installed subprocess backend.
@@ -217,7 +219,7 @@ impl Default for DiarizationRequest {
     fn default() -> Self {
         Self {
             engine: DiarizationEngine::Auto,
-            fallback: DiarizationFallbackPolicy::Unknown,
+            fallback: DiarizationFallbackPolicy::Acoustic,
             speaker_count: SpeakerCountRequest::Infer,
             known_intervals: Vec::new(),
             enrollment_edge_guard_ms: 100,
