@@ -5259,10 +5259,13 @@ fn speculative_cli_without_flag_uses_single_backend_dispatch() {
             input_wav.to_str().expect("utf-8"),
             "--backend",
             "whisper-cpp",
+            "--no-diarize",
             "--no-persist",
         ])
         .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
         .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
+        .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0")
         .output()
         .expect("robot transcribe should execute");
 
