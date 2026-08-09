@@ -1625,6 +1625,16 @@ fn native_available(kind: BackendKind) -> bool {
     }
 }
 
+fn native_available_for_request(kind: BackendKind, request: &TranscribeRequest) -> bool {
+    if kind == BackendKind::Auto {
+        return false;
+    }
+    if let Some(spec) = request.model.as_deref().filter(|spec| !spec.is_empty()) {
+        return native_engine::native_model_available(spec);
+    }
+    native_available(kind)
+}
+
 fn available_for_mode(kind: BackendKind, mode: NativeExecutionMode) -> bool {
     match mode {
         NativeExecutionMode::BridgeOnly => {
@@ -1632,6 +1642,21 @@ fn available_for_mode(kind: BackendKind, mode: NativeExecutionMode) -> bool {
         }
         NativeExecutionMode::NativePreferred => native_available(kind) || bridge_available(kind),
         NativeExecutionMode::NativeOnly => native_available(kind),
+    }
+}
+
+fn available_for_request(
+    kind: BackendKind,
+    mode: NativeExecutionMode,
+    request: &TranscribeRequest,
+) -> bool {
+    let native = native_available_for_request(kind, request);
+    match mode {
+        NativeExecutionMode::BridgeOnly => {
+            bridge_available(kind) || (bridge_native_recovery_enabled() && native)
+        }
+        NativeExecutionMode::NativePreferred => native || bridge_available(kind),
+        NativeExecutionMode::NativeOnly => native,
     }
 }
 
@@ -1690,7 +1715,7 @@ fn run_backend(
     let execution_mode = native_execution_mode(rollout_stage);
     let bridge_native_recovery = bridge_native_recovery_enabled();
     let bridge_is_available = bridge_available(kind);
-    let native_is_available = native_available(kind);
+    let native_is_available = native_available_for_request(kind, request);
 
     match kind {
         BackendKind::Auto => Err(FwError::InvalidRequest(
@@ -1917,7 +1942,7 @@ struct BackendReadiness {
 
 fn readiness_for(kind: BackendKind, request: &TranscribeRequest) -> BackendReadiness {
     let mode = native_execution_mode(native_rollout_stage());
-    if !available_for_mode(kind, mode) {
+    if !available_for_request(kind, mode, request) {
         return BackendReadiness {
             available: false,
             reason: Some(match mode {

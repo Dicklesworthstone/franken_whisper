@@ -270,14 +270,11 @@ pub(crate) fn word_timestamp_mode(params: Option<&WordTimestampParams>) -> WordT
 /// Availability is probed **without a request context** (the router calls this
 /// before dispatch), so the policy is:
 ///
-/// 1. If `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` is set and its model header
-///    validates, report `true`.
-/// 2. Otherwise, report `true` iff **any** `ggml-*.bin` with a valid header
-///    exists in the model search dirs — a cheap directory scan. This keeps a
-///    request that names an explicit model (with no default configured) from
-///    being refused at the dispatch gate while still being honest: with zero
-///    usable model files on disk, the engine reports itself unavailable and the
-///    router stays bridge-only.
+/// 1. If `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` is set, report the validity of
+///    that exact operator choice. An invalid explicit default never falls
+///    through to a different model.
+/// 2. Otherwise, use the native engine's canonical resolver, which prefers the
+///    hash-pinned release package and then considers valid local GGML files.
 ///
 /// Never panics or performs any network access (header-only sniffing).
 ///
@@ -343,12 +340,10 @@ pub(crate) fn reset_availability_cache() {
 /// The uncached availability probe. Performs the actual directory scan and
 /// header sniffing; see [`is_available`] for the memoizing wrapper.
 fn is_available_uncached() -> bool {
-    if let Some(spec) = native_engine::default_model_spec()
-        && native_engine::native_model_available(&spec)
-    {
-        return true;
+    if let Some(spec) = native_engine::default_model_spec() {
+        return native_engine::native_model_available(&spec);
     }
-    any_model_in_search_dirs()
+    native_engine::configured_or_discovered_model_spec().is_ok()
 }
 
 /// Number of leading bytes covering the ggml magic plus the eleven `i32`
@@ -358,81 +353,6 @@ const HEADER_SNIFF_LEN: usize = 48;
 
 /// ggml file magic (`"ggml"` as a little-endian `u32`).
 const GGML_MAGIC: u32 = 0x6767_6d6c;
-
-/// The directories scanned for `ggml-*.bin` model files, mirroring
-/// [`crate::native_engine`]'s precedence so availability never disagrees with
-/// resolution.
-///
-/// 1. `$FRANKEN_WHISPER_MODEL_DIR`
-/// 2. `$FRANKEN_WHISPER_TEST_MODEL_DIR`
-/// 3. `~/.cache/franken_whisper/models`
-/// 4. `~/.cache/franken_whisper/test-models`
-/// 5. `~/models/whisper`
-fn model_search_dirs() -> Vec<std::path::PathBuf> {
-    use std::path::PathBuf;
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for var in [
-        "FRANKEN_WHISPER_MODEL_DIR",
-        "FRANKEN_WHISPER_TEST_MODEL_DIR",
-    ] {
-        if let Ok(dir) = std::env::var(var)
-            && !dir.is_empty()
-        {
-            dirs.push(PathBuf::from(dir));
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        dirs.push(home.join(".cache").join("franken_whisper").join("models"));
-        dirs.push(
-            home.join(".cache")
-                .join("franken_whisper")
-                .join("test-models"),
-        );
-        dirs.push(home.join("models").join("whisper"));
-    }
-    dirs
-}
-
-/// Honestly report whether **any** `ggml-*.bin` with a valid header exists in a
-/// search dir. A cheap directory scan (header-only sniff per candidate, no
-/// network, never panics). Used by [`is_available`] when no default model is
-/// configured so a request that names an explicit model is not refused at the
-/// dispatch gate — while still keeping availability honest (zero usable model
-/// files => `false`).
-fn any_model_in_search_dirs() -> bool {
-    first_model_in_search_dirs().is_some()
-}
-
-/// The first `ggml-*.bin` with a valid header found by scanning the search dirs
-/// in [`model_search_dirs`] precedence order. Directory iteration order within a
-/// single dir is filesystem-defined, so this is only a "some usable model
-/// exists, here is one of them" answer — exactly what the availability probe and
-/// the capability probe need when no default model is configured.
-fn first_model_in_search_dirs() -> Option<std::path::PathBuf> {
-    for dir in model_search_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_ggml = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("ggml-") && n.ends_with(".bin"));
-            if is_ggml && header_ftype_ok(&path) {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
-/// Read the first 48 bytes of `path` and validate the ggml magic + a supported
-/// dense `ftype` (`0` = f32, `1` = f16). Any failure yields `false`.
-fn header_ftype_ok(path: &Path) -> bool {
-    header_hparams(path).is_some()
-}
 
 /// Sniff `path`'s 48-byte ggml header into [`WhisperHParams`], or `None` when the
 /// file is unreadable, too short, carries the wrong magic, or declares an
@@ -517,14 +437,12 @@ impl NativeProbe {
 pub(crate) fn capability_probe() -> NativeProbe {
     let gpu = native_engine::encoder::gpu_encoder_available();
 
-    // The spec doubles as the alignment-head preset hint (e.g. "large-v3-turbo"),
-    // exactly as `decode_params` passes it to the engine.
-    let spec = native_engine::default_model_spec();
-    let path = match spec.as_deref() {
-        Some(spec) => native_engine::resolve_model(spec).ok(),
-        None => None,
-    }
-    .or_else(first_model_in_search_dirs);
+    // Use the exact resolver execution uses, including the fail-closed explicit
+    // default and the pinned-package-first unset default.
+    let Ok(spec) = native_engine::configured_or_discovered_model_spec() else {
+        return NativeProbe::without_model(gpu);
+    };
+    let path = native_engine::resolve_model(&spec).ok();
 
     let Some(path) = path else {
         return NativeProbe::without_model(gpu);
@@ -536,11 +454,7 @@ pub(crate) fn capability_probe() -> NativeProbe {
     // Fall back to the file stem as the preset hint when no spec was configured;
     // `alignment_heads` normalizes it and drops back to the openai "top half of
     // layers" rule for anything it does not recognize.
-    let hint = spec.or_else(|| {
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.trim_start_matches("ggml-").to_owned())
-    });
+    let hint = Some(spec);
 
     NativeProbe {
         multilingual: hparams.is_multilingual(),

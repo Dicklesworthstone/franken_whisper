@@ -257,7 +257,7 @@ fn validate_manifest(manifest: &SortformerManifest) -> FwResult<()> {
 }
 
 fn manifest_error(message: impl Into<String>) -> FwError {
-    FwError::ContractViolation(format!("sortformer.model_manifest: {}", message.into()))
+    FwError::ContractViolation(format!("model.artifact_contract: {}", message.into()))
 }
 
 fn whisper_manifest_error(message: impl Into<String>) -> FwError {
@@ -598,9 +598,7 @@ where
     F: Fn() -> bool + Sync,
 {
     if is_cancelled() {
-        Err(FwError::Cancelled(
-            "Sortformer model download interrupted".to_owned(),
-        ))
+        Err(FwError::Cancelled("model download interrupted".to_owned()))
     } else {
         Ok(())
     }
@@ -819,9 +817,7 @@ where
     .await;
     match result {
         Err(DownloadError::Cancelled) => {
-            return Err(FwError::Cancelled(
-                "Sortformer model download interrupted".to_owned(),
-            ));
+            return Err(FwError::Cancelled("model download interrupted".to_owned()));
         }
         Err(error) => {
             return Err(FwError::BackendUnavailable(format!(
@@ -1056,7 +1052,7 @@ impl InstallLock {
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     return Err(FwError::StageTimeout {
-                        stage: "sortformer_model_pull_lock".to_owned(),
+                        stage: "model_pull_lock".to_owned(),
                         budget_ms: INSTALL_LOCK_TIMEOUT.as_millis() as u64,
                     });
                 }

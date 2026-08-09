@@ -188,12 +188,15 @@ impl Mat {
 /// name, derived from the current process environment.
 ///
 /// Precedence (highest first):
-/// 1. `$FRANKEN_WHISPER_MODEL_DIR` — operator-chosen production model dir.
-/// 2. `$FRANKEN_WHISPER_TEST_MODEL_DIR` — CI / dev fixtures.
-/// 3. `~/.cache/franken_whisper/models` — default production cache.
-/// 4. The verified FrankenWhisper release-package directory beneath that cache.
-/// 5. `~/.cache/franken_whisper/test-models` — default test cache.
-/// 6. `~/models/whisper` — the conventional whisper.cpp download location.
+/// 1. The FrankenWhisper release-package directory beneath
+///    `$FRANKEN_WHISPER_MODEL_DIR`, when configured.
+/// 2. `$FRANKEN_WHISPER_MODEL_DIR` — operator-chosen production model dir.
+/// 3. `$FRANKEN_WHISPER_TEST_MODEL_DIR` — CI / dev fixtures.
+/// 4. The verified FrankenWhisper release-package directory beneath the default
+///    production cache.
+/// 5. `~/.cache/franken_whisper/models` — default production cache.
+/// 6. `~/.cache/franken_whisper/test-models` — default test cache.
+/// 7. `~/models/whisper` — the conventional whisper.cpp download location.
 ///
 /// Empty env vars are skipped. The home-relative entries are omitted entirely
 /// when `$HOME` is unset (rather than rooting at the filesystem root). This is
@@ -207,11 +210,11 @@ fn model_search_dirs() -> Vec<PathBuf> {
         && !dir.is_empty()
     {
         let root = PathBuf::from(dir);
-        dirs.push(root.clone());
         dirs.push(
             root.join("whisper")
                 .join(crate::model_distribution::WHISPER_ARTIFACT_VERSION),
         );
+        dirs.push(root);
     }
     if let Ok(dir) = std::env::var("FRANKEN_WHISPER_TEST_MODEL_DIR")
         && !dir.is_empty()
@@ -221,12 +224,12 @@ fn model_search_dirs() -> Vec<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         let cache_root = home.join(".cache").join("franken_whisper").join("models");
-        dirs.push(cache_root.clone());
         dirs.push(
             cache_root
                 .join("whisper")
                 .join(crate::model_distribution::WHISPER_ARTIFACT_VERSION),
         );
+        dirs.push(cache_root);
         dirs.push(
             home.join(".cache")
                 .join("franken_whisper")
@@ -1055,8 +1058,15 @@ pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
     // missing default. An *explicit* short-name that is missing still errors
     // below — silently substituting a different model would betray the request.
     if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
+        // The installer provisions this immutable, hash-pinned release package.
+        // Prefer it over arbitrary model-shaped files in the general cache.
+        if let Ok(package) = crate::model_distribution::resolve_cached_whisper() {
+            return package.weights_path.canonicalize().map_err(Into::into);
+        }
         if let Ok(p) = resolve_model_in_dirs("default", &dirs) {
-            return Ok(p);
+            if header_ftype_ok(&p) {
+                return Ok(p);
+            }
         }
         if let Some(p) = discover_any_model(&dirs) {
             // Discovery is used by machine-oriented status commands as well as
@@ -1115,7 +1125,7 @@ fn discover_any_model(dirs: &[PathBuf]) -> Option<PathBuf> {
                 continue;
             };
             let path = entry.path();
-            if !path.is_file() {
+            if !path.is_file() || !header_ftype_ok(&path) {
                 continue;
             }
             let rank = PREF.iter().position(|q| *q == short).unwrap_or(PREF.len());
@@ -2147,15 +2157,29 @@ mod tests {
     fn discover_any_model_keeps_directory_precedence_and_quality_rank() {
         let high = TempDir::new("discover_hi");
         let low = TempDir::new("discover_lo");
-        let expected = write_file(high.path(), "ggml-base.bin", b"base");
-        let _custom = write_file(high.path(), "ggml-custom.bin", b"custom");
+        let mut valid = Vec::new();
+        push_valid_header(&mut valid, 1);
+        let expected = write_file(high.path(), "ggml-base.bin", &valid);
+        let _custom = write_file(high.path(), "ggml-custom.bin", &valid);
         let _distractor = write_file(high.path(), "README.md", b"not a model");
         std::fs::create_dir(high.path().join("ggml-large-v3-turbo.bin"))
             .expect("create model-shaped directory");
-        let _lower_priority_dir = write_file(low.path(), "ggml-large-v3-turbo.bin", b"turbo");
+        let _lower_priority_dir =
+            write_file(low.path(), "ggml-large-v3-turbo.bin", &valid);
 
         let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
         assert_eq!(discover_any_model(&dirs), Some(expected));
+    }
+
+    #[test]
+    fn discover_any_model_skips_corrupt_higher_ranked_candidates() {
+        let dir = TempDir::new("discover_corrupt");
+        let _corrupt = write_file(dir.path(), "ggml-large-v3-turbo.bin", b"not ggml");
+        let mut valid = Vec::new();
+        push_valid_header(&mut valid, 1);
+        let expected = write_file(dir.path(), "ggml-base.bin", &valid);
+
+        assert_eq!(discover_any_model(&[dir.path().to_path_buf()]), Some(expected));
     }
 
     #[test]
