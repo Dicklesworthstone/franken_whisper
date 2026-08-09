@@ -353,7 +353,7 @@ fn json_model_pull_syntax_errors_are_one_path_safe_json_line() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 pull syntax error");
     assert_eq!(stdout.lines().count(), 1);
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON syntax error");
-    assert_eq!(value["schema_version"], "franken-whisper-model-pull-v1");
+    assert_eq!(value["schema_version"], "franken-whisper-model-pull-v2");
     assert!(value["model"].is_null());
     assert_eq!(value["code"], "FW-INVALID-REQUEST");
     assert_eq!(value["local_paths_emitted"], false);
@@ -373,7 +373,7 @@ fn json_model_pull_runtime_errors_are_one_path_safe_json_line() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 pull runtime error");
     assert_eq!(stdout.lines().count(), 1);
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON runtime error");
-    assert_eq!(value["schema_version"], "franken-whisper-model-pull-v1");
+    assert_eq!(value["schema_version"], "franken-whisper-model-pull-v2");
     assert_eq!(value["status"], "error");
     assert_eq!(value["local_paths_emitted"], false);
     assert!(!stdout.contains(private_relative_cache));

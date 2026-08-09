@@ -131,24 +131,25 @@ pub enum DiarizationSpeakerEvidenceMode {
     None,
 }
 
-/// Evidence-gated rollout stage for `auto` acoustic diarization.
+/// Legacy rollout stage for acoustic-only `auto` diarization.
 ///
-/// Explicit `DiarizationEngine::Acoustic` requests are not changed by this
-/// stage; the gate controls only whether `auto` may select the acoustic engine.
+/// `DiarizationEngine::Auto` now selects native Sortformer and reaches the
+/// acoustic implementation only through its explicit fallback policy. The
+/// values remain part of the public request/report contract and still govern
+/// whether a legacy `Auto` request may consume external speaker labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AcousticDiarizationRolloutStage {
-    /// Acoustic output is not user-visible and cannot satisfy an `auto`
-    /// request. Focused development evidence may still be collected directly.
+    /// Legacy acoustic output was not user-visible through `auto`.
     #[default]
     Shadow,
-    /// The implementation contract is validated, but `auto` remains off.
+    /// Legacy acoustic implementation contract was validated, but remained off.
     Validated,
-    /// `auto` uses verified external output when present, then acoustic.
+    /// Legacy `auto` used verified external output when present, then acoustic.
     Fallback,
-    /// `auto` prefers acoustic even when external output is present.
+    /// Legacy `auto` preferred acoustic even when external output was present.
     Primary,
-    /// `auto` admits only acoustic; external output is not selected.
+    /// Legacy `auto` admitted only acoustic; external output was not selected.
     Sole,
 }
 
@@ -1761,8 +1762,10 @@ fn validate_report_request_kind_binding(
             }
         },
         DiarizationReportKind::NativeSortformer => {
-            if !matches!(request.engine, DiarizationEngine::Auto | DiarizationEngine::Sortformer)
-                || report.neural_representation.is_some()
+            if !matches!(
+                request.engine,
+                DiarizationEngine::Auto | DiarizationEngine::Sortformer
+            ) || report.neural_representation.is_some()
             {
                 return Err(
                     "native Sortformer implementation is incompatible with the requested engine"
@@ -1801,7 +1804,7 @@ fn validate_report_request_kind_binding(
         DiarizationReportKind::External => {
             validate_external_request_semantics(request)?;
             match request.engine {
-                DiarizationEngine::Auto | DiarizationEngine::External => {
+                DiarizationEngine::External => {
                     if report.neural_representation.is_some() {
                         return Err(
                             "direct external report claims an unrequested neural attempt"
@@ -1838,10 +1841,8 @@ fn validate_report_request_kind_binding(
         }
         DiarizationReportKind::FallbackUnknown => {
             validate_external_request_semantics(request)?;
-            if !matches!(
-                request.engine,
-                DiarizationEngine::Auto | DiarizationEngine::External
-            ) || request.fallback != DiarizationFallbackPolicy::Unknown
+            if request.engine != DiarizationEngine::External
+                || request.fallback != DiarizationFallbackPolicy::Unknown
             {
                 return Err(
                     "unknown fallback implementation is incompatible with the requested engine and fallback"
@@ -2188,9 +2189,7 @@ fn validate_report_kind_invariants(
         }
         DiarizationReportKind::NativeSortformer
         | DiarizationReportKind::NativeEcapaOnly
-        | DiarizationReportKind::NativeEcapaFused => {
-            report.diagnostics.is_empty()
-        }
+        | DiarizationReportKind::NativeEcapaFused => report.diagnostics.is_empty(),
         DiarizationReportKind::NativeEcapaUnavailable => diagnostic_codes_equal(
             &report.diagnostics,
             &[DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE],
@@ -2247,7 +2246,8 @@ fn validate_report_kind_invariants(
             | DiarizationReportKind::NativeEcapaOnly
             | DiarizationReportKind::NativeEcapaFused
     );
-    let native_success = traditional_native_success || kind == DiarizationReportKind::NativeSortformer;
+    let native_success =
+        traditional_native_success || kind == DiarizationReportKind::NativeSortformer;
     if traditional_native_success && report.speaker_count.estimate.is_none() {
         return Err("native diarization reports require a speaker-count estimate".to_owned());
     }
@@ -2374,12 +2374,17 @@ fn validate_report_kind_invariants(
                         .to_owned(),
                 );
             }
-            if report.speaker_count.speaker_evidence.iter().any(|evidence| {
-                evidence.hard_anchored
-                    || !evidence.supported
-                    || evidence.reasons
-                        != vec![SpeakerEvidenceReason::SupportedByLearnedModelActivity]
-            }) {
+            if report
+                .speaker_count
+                .speaker_evidence
+                .iter()
+                .any(|evidence| {
+                    evidence.hard_anchored
+                        || !evidence.supported
+                        || evidence.reasons
+                            != vec![SpeakerEvidenceReason::SupportedByLearnedModelActivity]
+                })
+            {
                 return Err(
                     "native Sortformer speaker evidence is not canonical learned-model activity"
                         .to_owned(),
@@ -7984,6 +7989,31 @@ mod tests {
         unknown
             .validate_against_request(&unknown_request, None)
             .expect("external unavailability may conservatively emit unknown");
+
+        let auto_external_request = DiarizationRequest {
+            engine: DiarizationEngine::Auto,
+            fallback: DiarizationFallbackPolicy::External,
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
+            ..DiarizationRequest::default()
+        };
+        assert!(
+            external
+                .validate_against_request(&auto_external_request, None)
+                .expect_err("native Auto routing cannot claim direct external output")
+                .contains("incompatible with the requested engine")
+        );
+
+        let auto_unknown_request = DiarizationRequest {
+            engine: DiarizationEngine::Auto,
+            fallback: DiarizationFallbackPolicy::Unknown,
+            ..DiarizationRequest::default()
+        };
+        assert!(
+            unknown
+                .validate_against_request(&auto_unknown_request, None)
+                .expect_err("native Auto routing cannot claim legacy external unknown output")
+                .contains("incompatible with the requested engine")
+        );
 
         let mut forged_unknown_occupancy = unknown;
         forged_unknown_occupancy.speaker_count.unknown_voiced_share = 0.0;

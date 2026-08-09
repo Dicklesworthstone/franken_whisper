@@ -87,14 +87,14 @@ pub fn is_available() -> bool {
 
 /// Resolve the effective model spec for a request, or a [`FwError`] explaining
 /// how to provision one. Identical precedence to the whisper.cpp native engine:
-/// `request.model`, then `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then
-/// deterministic discovery of an existing local `ggml-*.bin`, else an
-/// actionable [`FwError::BackendUnavailable`].
+/// `request.model`, then `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then the
+/// authenticated default release package, else an actionable
+/// [`FwError::BackendUnavailable`].
 fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
         return Ok(model);
     }
-    native_engine::configured_or_discovered_model_spec().map_err(|error| {
+    native_engine::configured_or_release_model_spec().map_err(|error| {
         FwError::BackendUnavailable(format!(
             "native whisper-diarization engine has no usable local model: pass --model, or set \
              $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
@@ -581,10 +581,10 @@ mod tests {
     // ── Model resolution / availability ───────────────────────────────────
 
     #[test]
-    fn run_without_any_configured_or_discovered_model_is_backend_unavailable() {
+    fn run_without_any_configured_or_release_model_is_backend_unavailable() {
         let mut req = request();
         req.model = None;
-        if native_engine::configured_or_discovered_model_spec().is_ok() {
+        if native_engine::configured_or_release_model_spec().is_ok() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");

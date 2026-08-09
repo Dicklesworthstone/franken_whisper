@@ -15,6 +15,8 @@
 //! insanely-fast / diarization bridge binaries) at `/nonexistent`. In a `sole`
 //! or `primary` rollout stage with `FRANKEN_WHISPER_NATIVE_EXECUTION=1`, a
 //! transcript can therefore only come from the in-process native engine.
+//! A separate unset-environment case proves the shipped defaults select native
+//! ASR and native Sortformer diarization without either rollout override.
 //!
 //! Every scenario is **gated**: when the real `tiny.en` ggml model is not
 //! resolvable (`find_model_file("tiny.en") == None`), it prints a `SKIP` line
@@ -172,6 +174,10 @@ fn run_transcribe(args: &[&str], extra_env: &[(&str, &str)], state_root: &Path) 
         "FW_ENC_INT8_ATTN_IN",
         "FW_ENC_INT8_FC1",
         "FW_ENC_WEIGHT_ROUNDTRIP",
+        "FRANKEN_WHISPER_NATIVE_EXECUTION",
+        "FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE",
+        "FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY",
+        "FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS",
         "FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT",
         "FW_ACOUSTIC_DIARIZATION_ROLLOUT",
     ] {
@@ -203,6 +209,10 @@ fn run_robot(args: &[&str], extra_env: &[(&str, &str)], state_root: &Path) -> Cl
         "FW_ENC_INT8_ATTN_IN",
         "FW_ENC_INT8_FC1",
         "FW_ENC_WEIGHT_ROUNDTRIP",
+        "FRANKEN_WHISPER_NATIVE_EXECUTION",
+        "FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE",
+        "FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY",
+        "FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS",
     ] {
         cmd.env_remove(key);
     }
@@ -366,6 +376,7 @@ fn gated_sole_stage_native_is_only_path() {
             "whisper-cpp",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -403,6 +414,53 @@ fn gated_sole_stage_native_is_only_path() {
     assert_eq!(
         report["result"]["raw_output"]["implementation"],
         "real-inference"
+    );
+}
+
+#[test]
+fn gated_unset_environment_defaults_to_native_asr_and_sortformer() {
+    if !tiny_en_available() || !franken_whisper::model_distribution::cached_sortformer_is_ready() {
+        eprintln!(
+            "SKIP gated_unset_environment_defaults_to_native_asr_and_sortformer: native model package missing"
+        );
+        return;
+    }
+    let state = tempfile::tempdir().expect("tempdir");
+    let wav = jfk_wav();
+    let env = bridge_bins_missing();
+
+    let run = run_transcribe(
+        &[
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--model",
+            "tiny.en",
+            "--no-persist",
+            "--json",
+        ],
+        &env,
+        state.path(),
+    );
+
+    assert!(
+        run.status.success(),
+        "unset-env default-native run failed\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    let report = run.report();
+    assert_transcript_matches_reference(&report);
+    let payload = backend_ok_payload(&report);
+    assert_eq!(payload["implementation"], "native");
+    assert_eq!(payload["execution_mode"], "native_only");
+    assert_eq!(payload["native_rollout_stage"], "sole");
+    assert_eq!(
+        report["result"]["diarization"]["implementation"],
+        "native-sortformer-v1"
+    );
+    assert_eq!(
+        report["result"]["diarization"]["speaker_evidence_mode"],
+        "sortformer_activity"
     );
 }
 
@@ -655,6 +713,7 @@ fn gated_quality_safe_encoder_int8_jfk_reference_wer_gate() {
             "whisper-cpp",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -713,6 +772,7 @@ fn gated_default_encoder_int8_policy_jfk_reference_wer_gate() {
             "whisper-cpp",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -770,6 +830,7 @@ fn gated_default_encoder_int8_large_v3_turbo_jfk_adversarial_probe() {
             "whisper-cpp",
             "--model",
             "large-v3-turbo",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -826,6 +887,7 @@ fn gated_primary_stage_prefers_native() {
             "whisper-cpp",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -877,6 +939,7 @@ fn bridge_only_missing_bridge_errors_honestly() {
             wav.to_str().expect("utf8"),
             "--backend",
             "whisper-cpp",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -928,6 +991,7 @@ fn gated_insanely_fast_native_through_dispatch() {
             "insanely-fast",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -978,6 +1042,7 @@ fn gated_diarization_native_through_dispatch() {
             "whisper-diarization",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -1053,6 +1118,8 @@ fn gated_diarize_flag_with_legacy_backend_runs_acoustic_diarization() {
             "--backend",
             "whisper-diarization",
             "--diarize",
+            "--diarization-engine",
+            "acoustic",
             "--model",
             "tiny.en",
             "--no-persist",

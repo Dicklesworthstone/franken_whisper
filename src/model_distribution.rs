@@ -28,8 +28,7 @@ use crate::error::{FwError, FwResult};
 
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const BUILTIN_MANIFEST_JSON: &str = include_str!("../models/sortformer-manifest-v1.json");
-pub const BUILTIN_WHISPER_MANIFEST_JSON: &str =
-    include_str!("../models/whisper-manifest-v1.json");
+pub const BUILTIN_WHISPER_MANIFEST_JSON: &str = include_str!("../models/whisper-manifest-v1.json");
 pub const SORTFORMER_ARTIFACT_VERSION: &str = "sortformer-v2.1-f32-v1";
 pub const SORTFORMER_DISTRIBUTION_POLICY: &str = "github_release_with_license_and_notice";
 pub const SORTFORMER_MODEL_DIR_ENV: &str = "FRANKEN_WHISPER_MODEL_DIR";
@@ -48,8 +47,7 @@ pub const WHISPER_WEIGHTS_BYTES: u64 = 1_624_555_275;
 pub const WHISPER_WEIGHTS_SHA256: &str =
     "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69";
 pub const WHISPER_DISTRIBUTION_POLICY: &str = "github_release_with_compiled_sha256";
-pub const WHISPER_PREPARATION_RECIPE: &str =
-    "franken-whisper-native-ggml-selection-v1-identity";
+pub const WHISPER_PREPARATION_RECIPE: &str = "franken-whisper-native-ggml-selection-v1-identity";
 pub const WHISPER_LICENSE_URL: &str = "https://github.com/openai/whisper/blob/main/LICENSE";
 
 const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -141,7 +139,8 @@ pub fn builtin_manifest() -> FwResult<SortformerManifest> {
 }
 
 pub fn builtin_whisper_manifest() -> FwResult<WhisperManifest> {
-    let manifest: WhisperManifest = serde_json::from_slice(BUILTIN_WHISPER_MANIFEST_JSON.as_bytes())?;
+    let manifest: WhisperManifest =
+        serde_json::from_slice(BUILTIN_WHISPER_MANIFEST_JSON.as_bytes())?;
     validate_whisper_manifest(&manifest)?;
     Ok(manifest)
 }
@@ -381,9 +380,7 @@ pub fn resolve_cached_whisper() -> FwResult<CachedWhisperPackage> {
     resolve_cached_whisper_with_cancel(|| false)
 }
 
-pub fn resolve_cached_whisper_with_cancel<F>(
-    is_cancelled: F,
-) -> FwResult<CachedWhisperPackage>
+pub fn resolve_cached_whisper_with_cancel<F>(is_cancelled: F) -> FwResult<CachedWhisperPackage>
 where
     F: Fn() -> bool + Sync,
 {

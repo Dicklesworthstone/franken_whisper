@@ -2211,13 +2211,23 @@ mod tests {
     fn native_diarization_is_enabled_by_default_and_can_be_disabled() {
         let default_request = minimal_args().to_request().expect("default request");
         assert!(default_request.diarize);
-        assert!(default_request.backend_params.acoustic_diarization.is_some());
+        assert!(
+            default_request
+                .backend_params
+                .acoustic_diarization
+                .is_some()
+        );
 
         let mut disabled = minimal_args();
         disabled.no_diarize = true;
         let disabled_request = disabled.to_request().expect("disabled request");
         assert!(!disabled_request.diarize);
-        assert!(disabled_request.backend_params.acoustic_diarization.is_none());
+        assert!(
+            disabled_request
+                .backend_params
+                .acoustic_diarization
+                .is_none()
+        );
     }
 
     #[test]

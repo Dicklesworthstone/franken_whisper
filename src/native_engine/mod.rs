@@ -1000,11 +1000,23 @@ pub(crate) fn perf_span(span: &str, ms: f64, extra: &str) {
 /// the exact search-dir list used by [`resolve_model`].
 #[must_use]
 pub fn find_model_file(short_name: &str) -> Option<PathBuf> {
+    if short_name.eq_ignore_ascii_case("large-v3-turbo") {
+        // Availability is intentionally a header-only probe. Authentication
+        // remains mandatory in `resolve_model` immediately before execution;
+        // hashing 1.6 GB here made Auto routing hash the same package once per
+        // native backend family before the authenticated execution lookup.
+        if let Ok(directory) = crate::model_distribution::whisper_cache_dir() {
+            let candidate = directory.join(crate::model_distribution::WHISPER_WEIGHTS_FILENAME);
+            if candidate.is_file() && header_ftype_ok(&candidate) {
+                return candidate.canonicalize().ok();
+            }
+        }
+    }
     let file_name = model_file_name(short_name);
     model_search_dirs()
         .into_iter()
         .map(|dir| dir.join(&file_name))
-        .find(|p| p.is_file())
+        .find(|path| path.is_file() && header_ftype_ok(path))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1018,9 +1030,10 @@ pub fn find_model_file(short_name: &str) -> Option<PathBuf> {
 /// 1. **A filesystem path** (absolute or relative) that already exists — it is
 ///    canonicalized and returned verbatim. This lets callers point at any
 ///    `.bin` anywhere on disk.
-/// 2. **A short model name** such as `"tiny.en"`, `"base"`, or
-///    `"large-v3-turbo"` — searched as `ggml-{name}.bin` across
-///    [`model_search_dirs`] in precedence order.
+/// 2. **A short model name** such as `"tiny.en"` or `"base"` — searched as
+///    `ggml-{name}.bin` across [`model_search_dirs`] in precedence order. The
+///    canonical `"large-v3-turbo"` name and an unspecified/default request are
+///    reserved for the authenticated release package installed by `fw pull`.
 ///
 /// # No network access during inference
 ///
@@ -1046,98 +1059,35 @@ pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
     if !spec.is_empty() {
         let as_path = Path::new(spec);
         if as_path.is_file() {
-            return Ok(as_path.canonicalize()?);
+            if header_ftype_ok(as_path) {
+                return Ok(as_path.canonicalize()?);
+            }
+            return Err(FwError::InvalidRequest(format!(
+                "Whisper model `{spec}` does not have a supported dense ggml f16/f32 header"
+            )));
         }
+    }
+
+    // This canonical name is the release trust boundary, not an alias for an
+    // arbitrary same-named file in a legacy search directory. Operators can
+    // still request another compatible model by passing its explicit path.
+    if spec.eq_ignore_ascii_case("large-v3-turbo") {
+        let package = crate::model_distribution::resolve_cached_whisper()?;
+        return package.weights_path.canonicalize().map_err(Into::into);
     }
 
     let dirs = model_search_dirs();
 
-    // "Unspecified" (blank, or the `default` sentinel): try the conventional
-    // `ggml-default.bin`, then fall back to auto-discovering ANY ggml model
-    // already on disk so the tool just works instead of hard-failing on a
-    // missing default. An *explicit* short-name that is missing still errors
-    // below — silently substituting a different model would betray the request.
+    // The shipped default is the hash-pinned release package. Never substitute
+    // an arbitrary discovered model when that package is missing or corrupt;
+    // doing so would make the default depend on unrelated files on the host.
     if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
-        // The installer provisions this immutable, hash-pinned release package.
-        // Prefer it over arbitrary model-shaped files in the general cache.
-        if let Ok(package) = crate::model_distribution::resolve_cached_whisper() {
-            return package.weights_path.canonicalize().map_err(Into::into);
-        }
-        if let Ok(p) = resolve_model_in_dirs("default", &dirs) {
-            if header_ftype_ok(&p) {
-                return Ok(p);
-            }
-        }
-        if let Some(p) = discover_any_model(&dirs) {
-            // Discovery is used by machine-oriented status commands as well as
-            // execution. Never emit the operator-local path; even verbose
-            // diagnostics must preserve the path-free discovery contract.
-            tracing::debug!(
-                "no model specified and no ggml-default.bin found; auto-selected an available local ggml model"
-            );
-            return Ok(p.canonicalize()?);
-        }
-        // Nothing on disk at all: return the conventional, actionable error.
-        return resolve_model_in_dirs("default", &dirs);
+        let package = crate::model_distribution::resolve_cached_whisper()?;
+        return package.weights_path.canonicalize().map_err(Into::into);
     }
 
     // Form 2: explicit short-name lookup across the shared search dirs.
     resolve_model_in_dirs(spec, &dirs)
-}
-
-/// Auto-discover any usable `ggml-*.bin` model already on disk. Used **only**
-/// when the caller specified no model (blank / `default`) and no
-/// `ggml-default.bin` exists, so a machine that has *a* model transcribes
-/// instead of erroring. Scans [`model_search_dirs`] in precedence order and,
-/// within the first dir that holds any models, picks deterministically by a
-/// quality preference (best first) so the choice is stable across runs. Never
-/// downloads — it only ever selects a file the operator already placed (the
-/// "data never leaves the machine" stance is preserved).
-fn discover_any_model(dirs: &[PathBuf]) -> Option<PathBuf> {
-    // Best-first preference; unknown names sort last but stay eligible, so an
-    // operator's custom `ggml-<x>.bin` is still used when it is all that exists.
-    const PREF: &[&str] = &[
-        "large-v3-turbo",
-        "large-v3",
-        "large-v2",
-        "large",
-        "medium.en",
-        "medium",
-        "small.en",
-        "small",
-        "base.en",
-        "base",
-        "tiny.en",
-        "tiny",
-    ];
-    for dir in dirs {
-        let Ok(read_dir) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        let mut found: Vec<(usize, String, PathBuf)> = Vec::new();
-        for entry in read_dir.flatten() {
-            let file_name = entry.file_name();
-            let Some(short) = file_name
-                .to_str()
-                .and_then(|n| n.strip_prefix("ggml-"))
-                .and_then(|n| n.strip_suffix(".bin"))
-            else {
-                continue;
-            };
-            let path = entry.path();
-            if !path.is_file() || !header_ftype_ok(&path) {
-                continue;
-            }
-            let rank = PREF.iter().position(|q| *q == short).unwrap_or(PREF.len());
-            found.push((rank, short.to_string(), path));
-        }
-        if !found.is_empty() {
-            // Rank first, then name, for a stable tie-break within a rank.
-            found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            return Some(found.into_iter().next().expect("non-empty").2);
-        }
-    }
-    None
 }
 
 /// Resolve a short-name `spec` against an explicit, ordered list of search
@@ -1148,7 +1098,7 @@ fn resolve_model_in_dirs(spec: &str, dirs: &[PathBuf]) -> FwResult<PathBuf> {
     let file_name = model_file_name(spec);
     for dir in dirs {
         let candidate = dir.join(&file_name);
-        if candidate.is_file() {
+        if candidate.is_file() && header_ftype_ok(&candidate) {
             return Ok(candidate.canonicalize()?);
         }
     }
@@ -1187,9 +1137,8 @@ fn model_resolution_error(spec: &str, file_name: &str, dirs: &[PathBuf]) -> Stri
 /// operator has not chosen one.
 ///
 /// Reads `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` if set and non-empty. When
-/// unset this returns `None`. Call [`configured_or_discovered_model_spec`] when
-/// execution should also honor the resolver's deterministic local-only model
-/// discovery policy.
+/// unset this returns `None`. Call [`configured_or_release_model_spec`] when
+/// execution should select the authenticated release package by default.
 #[must_use]
 pub fn default_model_spec() -> Option<String> {
     match std::env::var("FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL") {
@@ -1201,12 +1150,12 @@ pub fn default_model_spec() -> Option<String> {
 /// Select the native Whisper model used when a request did not provide one.
 ///
 /// An explicit `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` wins. Otherwise this
-/// delegates to [`resolve_model`] with its `default` sentinel, which first
-/// checks `ggml-default.bin` and then deterministically discovers an existing
-/// local `ggml-*.bin`. The returned discovered path is canonical, no network
-/// access is performed, and a non-UTF-8 path fails with an actionable error
-/// because downstream request model specifications are UTF-8 strings.
-pub fn configured_or_discovered_model_spec() -> FwResult<String> {
+/// delegates to [`resolve_model`] with its `default` sentinel, which requires
+/// the compiled-size/SHA-256 release package. The returned path is canonical,
+/// no network access is performed, and a non-UTF-8 path fails with an
+/// actionable error because downstream request model specifications are UTF-8
+/// strings.
+pub fn configured_or_release_model_spec() -> FwResult<String> {
     if let Some(spec) = default_model_spec() {
         return Ok(spec);
     }
@@ -1214,7 +1163,7 @@ pub fn configured_or_discovered_model_spec() -> FwResult<String> {
     let path = resolve_model("default")?;
     path.into_os_string().into_string().map_err(|_| {
         FwError::InvalidRequest(
-            "the auto-discovered Whisper model path is not valid UTF-8; pass an explicit \
+            "the release Whisper model path is not valid UTF-8; pass an explicit \
              UTF-8 --model path"
                 .to_owned(),
         )
@@ -1237,11 +1186,13 @@ const GGML_MAGIC: u32 = 0x6767_6d6c;
 /// Honestly report whether a native model is usable for `spec` **without
 /// loading any tensors**.
 ///
-/// This resolves the spec (no network) and then reads only the first
-/// [`HEADER_SNIFF_LEN`] bytes of the file, checking that the magic is correct
-/// and that `hparams.ftype` is a supported dense type (`0` = f32 or `1` = f16;
-/// quantized models are rejected, matching the parser). It returns `false` —
-/// never panics or errors — for any miss, I/O failure, or unsupported header.
+/// This locates the explicit path or short-name candidate (no network) and
+/// reads only the first [`HEADER_SNIFF_LEN`] bytes, checking the magic and that
+/// `hparams.ftype` is a supported dense type (`0` = f32 or `1` = f16;
+/// quantized models are rejected, matching the parser). The execution resolver
+/// separately authenticates the pinned release package before loading it. This
+/// function returns `false`—never panics or errors—for a miss, I/O failure, or
+/// unsupported header.
 ///
 /// This is the function the backend rollout machinery (bead bd-jryr) calls to
 /// replace the previously dishonest `always true` availability constant: with
@@ -1250,6 +1201,15 @@ const GGML_MAGIC: u32 = 0x6767_6d6c;
 /// recovery path.
 #[must_use]
 pub fn native_model_available(spec: &str) -> bool {
+    let spec = spec.trim();
+    let explicit_path = Path::new(spec);
+    if explicit_path.is_file() {
+        return header_ftype_ok(explicit_path);
+    }
+    if !spec.is_empty() && !spec.eq_ignore_ascii_case("default") && find_model_file(spec).is_some()
+    {
+        return true;
+    }
     let Ok(path) = resolve_model(spec) else {
         return false;
     };
@@ -2118,7 +2078,9 @@ mod tests {
     #[test]
     fn resolve_model_existing_path_is_canonicalized() {
         let dir = TempDir::new("path");
-        let path = write_file(dir.path(), "ggml-tiny.en.bin", b"anything");
+        let mut valid = Vec::new();
+        push_valid_header(&mut valid, 1);
+        let path = write_file(dir.path(), "ggml-tiny.en.bin", &valid);
         // Pass a relative-ish/non-canonical spec via the absolute path; result
         // must be the canonical form of the same file.
         let resolved = resolve_model(path.to_str().expect("utf8")).expect("resolve");
@@ -2129,9 +2091,11 @@ mod tests {
     fn resolve_in_dirs_precedence_first_match_wins() {
         let high = TempDir::new("hi");
         let low = TempDir::new("lo");
+        let mut valid = Vec::new();
+        push_valid_header(&mut valid, 1);
         // Same short name present in both dirs; the first dir must win.
-        let hi_path = write_file(high.path(), "ggml-base.bin", b"high");
-        let _lo_path = write_file(low.path(), "ggml-base.bin", b"low");
+        let hi_path = write_file(high.path(), "ggml-base.bin", &valid);
+        let _lo_path = write_file(low.path(), "ggml-base.bin", &valid);
 
         let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
         let resolved = resolve_model_in_dirs("base", &dirs).expect("resolve");
@@ -2147,39 +2111,34 @@ mod tests {
     fn resolve_in_dirs_falls_through_to_later_dir() {
         let empty = TempDir::new("empty");
         let real = TempDir::new("real");
-        let path = write_file(real.path(), "ggml-small.bin", b"x");
+        let mut valid = Vec::new();
+        push_valid_header(&mut valid, 1);
+        let path = write_file(real.path(), "ggml-small.bin", &valid);
         let dirs = vec![empty.path().to_path_buf(), real.path().to_path_buf()];
         let resolved = resolve_model_in_dirs("small", &dirs).expect("resolve");
         assert_eq!(resolved, path.canonicalize().expect("canon"));
     }
 
     #[test]
-    fn discover_any_model_keeps_directory_precedence_and_quality_rank() {
-        let high = TempDir::new("discover_hi");
-        let low = TempDir::new("discover_lo");
+    fn resolve_in_dirs_skips_corrupt_higher_precedence_candidate() {
+        let corrupt = TempDir::new("corrupt");
+        let valid_dir = TempDir::new("valid");
+        write_file(corrupt.path(), "ggml-small.bin", b"not a ggml model");
         let mut valid = Vec::new();
         push_valid_header(&mut valid, 1);
-        let expected = write_file(high.path(), "ggml-base.bin", &valid);
-        let _custom = write_file(high.path(), "ggml-custom.bin", &valid);
-        let _distractor = write_file(high.path(), "README.md", b"not a model");
-        std::fs::create_dir(high.path().join("ggml-large-v3-turbo.bin"))
-            .expect("create model-shaped directory");
-        let _lower_priority_dir =
-            write_file(low.path(), "ggml-large-v3-turbo.bin", &valid);
+        let expected = write_file(valid_dir.path(), "ggml-small.bin", &valid);
 
-        let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
-        assert_eq!(discover_any_model(&dirs), Some(expected));
+        let dirs = vec![corrupt.path().to_path_buf(), valid_dir.path().to_path_buf()];
+        let resolved = resolve_model_in_dirs("small", &dirs).expect("resolve valid fallback");
+        assert_eq!(resolved, expected.canonicalize().expect("canon"));
     }
 
     #[test]
-    fn discover_any_model_skips_corrupt_higher_ranked_candidates() {
-        let dir = TempDir::new("discover_corrupt");
-        let _corrupt = write_file(dir.path(), "ggml-large-v3-turbo.bin", b"not ggml");
-        let mut valid = Vec::new();
-        push_valid_header(&mut valid, 1);
-        let expected = write_file(dir.path(), "ggml-base.bin", &valid);
-
-        assert_eq!(discover_any_model(&[dir.path().to_path_buf()]), Some(expected));
+    fn resolve_model_rejects_explicit_corrupt_file() {
+        let dir = TempDir::new("explicit_corrupt");
+        let path = write_file(dir.path(), "ggml-tiny.en.bin", b"not a ggml model");
+        let error = resolve_model(path.to_str().expect("utf8")).expect_err("reject corrupt model");
+        assert!(matches!(error, FwError::InvalidRequest(_)));
     }
 
     #[test]

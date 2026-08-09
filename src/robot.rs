@@ -949,10 +949,16 @@ where
     let configured_whisper = crate::native_engine::default_model_spec();
     let whisper_package_available =
         crate::model_distribution::cached_whisper_readiness_with_cancel(&is_cancelled)?;
-    let whisper_available = configured_whisper.as_deref().map_or_else(
-        || crate::native_engine::resolve_model("default").is_ok(),
-        |spec| crate::native_engine::resolve_model(spec).is_ok(),
-    );
+    let whisper_available = if let Some(spec) = configured_whisper.as_deref() {
+        crate::native_engine::resolve_model(spec).is_ok()
+    } else if whisper_package_available {
+        // The release-package readiness check immediately above already
+        // hashed all 1.6 GB and validated the compiled trust root. Avoid a
+        // redundant second hash through `resolve_model("default")`.
+        true
+    } else {
+        crate::native_engine::resolve_model("default").is_ok()
+    };
     let whisper_selection = if configured_whisper.is_some() {
         "configured"
     } else if whisper_package_available {

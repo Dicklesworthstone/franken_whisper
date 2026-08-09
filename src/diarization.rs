@@ -17992,9 +17992,7 @@ fn compare_cluster_identity(left: &AcousticCluster, right: &AcousticCluster) -> 
         }
         DiarizationSpeakerEvidenceMode::SortformerActivity
         | DiarizationSpeakerEvidenceMode::External
-        | DiarizationSpeakerEvidenceMode::None => {
-            std::cmp::Ordering::Equal
-        }
+        | DiarizationSpeakerEvidenceMode::None => std::cmp::Ordering::Equal,
     }
 }
 

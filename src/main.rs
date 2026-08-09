@@ -133,7 +133,7 @@ fn parse_cli() -> Cli {
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
-                    "schema_version": "franken-whisper-model-pull-v1",
+                    "schema_version": "franken-whisper-model-pull-v2",
                     "command": "pull",
                     "model": null,
                     "status": "error",

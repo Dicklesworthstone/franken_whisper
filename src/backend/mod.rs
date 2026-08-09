@@ -26,6 +26,7 @@ use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, EngineCapabilities, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
 };
+use crate::native_engine;
 use crate::orchestrator::CancellationToken;
 use crate::process::run_command_with_timeout;
 
@@ -1554,11 +1555,10 @@ fn native_runtime_metadata(kind: BackendKind) -> BackendRuntimeMetadata {
 }
 
 fn native_execution_enabled() -> bool {
-    // The pure-Rust native engine is the DEFAULT execution path — it is the whole point of
-    // franken_whisper, and after the NaN-hardening it produces correct, deep-linked
-    // timestamps with zero panics. Combined with the `Primary` rollout stage this yields
-    // `NativePreferred` (native first, external bridge only as a fallback). Opt OUT with
-    // `FRANKEN_WHISPER_NATIVE_EXECUTION=0` (or `false`/`no`/`off`) to force the bridges.
+    // The pure-Rust native engine is the default execution path. Combined with
+    // the default `Sole` rollout stage, no bridge can run unless the operator
+    // explicitly opts out with `FRANKEN_WHISPER_NATIVE_EXECUTION=0` or selects
+    // another rollout stage.
     match std::env::var(NATIVE_EXECUTION_ENV_VAR).ok() {
         Some(value) => {
             let normalized = value.trim().to_ascii_lowercase();
@@ -1663,10 +1663,10 @@ fn available_for_request(
 /// Whether an InsanelyFast diarization request in `mode` will be served by the
 /// external **bridge** (`insanely-fast-whisper`, which runs pyannote via
 /// HuggingFace) rather than the **native** path. The native engine transcribes and
-/// leaves speaker labelling to the orchestrator's local heuristic `Diarize` stage,
-/// which never contacts HuggingFace — so the HF-token requirement is real only when
-/// the bridge is what actually runs. `NativePreferred` uses the bridge only when the
-/// native engine is unavailable; `NativeOnly` never touches the bridge.
+/// leaves speaker labelling to the orchestrator's native diarization stage,
+/// which never contacts HuggingFace. The HF-token requirement is therefore
+/// real only when the bridge actually runs. `NativePreferred` uses the bridge
+/// only when the native engine is unavailable; `NativeOnly` never touches it.
 fn insanely_fast_bridge_diarizes(mode: NativeExecutionMode) -> bool {
     match mode {
         NativeExecutionMode::BridgeOnly => true,
@@ -5757,9 +5757,9 @@ mod tests {
             fast["hf_token_env_overrides"].is_array(),
             "hf_token_env_overrides should be array"
         );
-        // bd-0522: this is now DYNAMIC — true only when the insanely-fast BRIDGE will run
-        // the diarization. The native path uses the orchestrator's local heuristic and needs
-        // no token. Assert the descriptor reflects that honest condition, not a stale `true`.
+        // bd-0522: this is dynamic — true only when the insanely-fast bridge
+        // will run diarization. The native path uses the orchestrator's Rust
+        // diarizer and needs no token.
         let mode = super::native_execution_mode(super::native_rollout_stage());
         assert_eq!(
             fast["requires_hf_token_for_diarization"].as_bool(),

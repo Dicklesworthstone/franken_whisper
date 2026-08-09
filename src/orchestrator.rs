@@ -836,7 +836,11 @@ impl StageBudgetPolicy {
             acceleration_ms: budget_from_source(&mut source, STAGE_BUDGET_ACCELERATION_ENV, 20_000),
             align_ms: budget_from_source(&mut source, STAGE_BUDGET_ALIGN_ENV, 30_000),
             punctuate_ms: budget_from_source(&mut source, STAGE_BUDGET_PUNCTUATE_ENV, 10_000),
-            diarize_ms: budget_from_source(&mut source, STAGE_BUDGET_DIARIZE_ENV, 30_000),
+            // Native Sortformer runs at a small fraction of real time on the
+            // reference desktop, but an hour-long recording still needs
+            // minutes rather than seconds. Keep the stage bounded while
+            // allowing normal long-form jobs to finish by default.
+            diarize_ms: budget_from_source(&mut source, STAGE_BUDGET_DIARIZE_ENV, 900_000),
             persist_ms: budget_from_source(&mut source, STAGE_BUDGET_PERSIST_ENV, 20_000),
             cleanup_budget_ms: budget_from_source(&mut source, STAGE_BUDGET_CLEANUP_ENV, 5_000),
         }
@@ -4660,8 +4664,7 @@ async fn execute_diarize(
                     let sortformer_attempt = if acoustic_request.known_intervals.is_empty()
                         && sortformer_count_request_is_capacity_eligible(
                             &acoustic_request.speaker_count,
-                        )
-                    {
+                        ) {
                         run_native_sortformer_diarization(
                             &samples,
                             &normalized_input_sha256,
@@ -4678,7 +4681,10 @@ async fn execute_diarize(
                     };
                     let (diarization_report, projection) = match sortformer_attempt {
                         Ok(output) => output,
-                        Err(_) if fallback_policy == DiarizationFallbackPolicy::Acoustic => {
+                        Err(error)
+                            if fallback_policy == DiarizationFallbackPolicy::Acoustic
+                                && sortformer_acoustic_fallback_eligible(&error) =>
+                        {
                             run_native_acoustic_fallback(
                                 diarization::AcousticDiarizationInput {
                                     samples: &samples,
@@ -4695,14 +4701,13 @@ async fn execute_diarize(
                         Err(error) => return Err(error),
                     };
                     let notes = diarization_report.diagnostics.clone();
-                    let speakers_detected = usize::try_from(
-                        diarization_report.speaker_count.supported_speaker_count,
-                    )
-                    .map_err(|_| {
-                        FwError::InvalidRequest(
-                            "diarization speaker count does not fit this platform".to_owned(),
-                        )
-                    })?;
+                    let speakers_detected =
+                        usize::try_from(diarization_report.speaker_count.supported_speaker_count)
+                            .map_err(|_| {
+                            FwError::InvalidRequest(
+                                "diarization speaker count does not fit this platform".to_owned(),
+                            )
+                        })?;
                     apply_native_diarization_projection(
                         &mut result,
                         projection,
@@ -5368,10 +5373,18 @@ fn sortformer_count_request_is_capacity_eligible(request: &SpeakerCountRequest) 
         SpeakerCountRequest::Infer => true,
         SpeakerCountRequest::HardConstraint { count } => *count <= 4,
         SpeakerCountRequest::Range { minimum, .. } => *minimum <= 4,
-        SpeakerCountRequest::Prior { bins } => bins
-            .iter()
-            .any(|bin| bin.count <= 4 && bin.probability > 0.0),
+        // Sortformer does not fuse the caller's probability mass into its
+        // activity head. Preserve that request semantic through the acoustic
+        // path instead of returning an unrelated capped lane count.
+        SpeakerCountRequest::Prior { .. } => false,
     }
+}
+
+fn sortformer_acoustic_fallback_eligible(error: &FwError) -> bool {
+    matches!(
+        error,
+        FwError::MissingArtifact(_) | FwError::BackendUnavailable(_) | FwError::InvalidRequest(_)
+    )
 }
 
 fn run_native_sortformer_diarization(
@@ -5389,19 +5402,18 @@ fn run_native_sortformer_diarization(
                 .to_owned(),
         ));
     }
-    let cached = crate::model_distribution::resolve_cached_sortformer_with_cancel(|| {
-        checkpoint().is_err()
-    })?;
+    let cached =
+        crate::model_distribution::resolve_cached_sortformer_with_cancel(|| checkpoint().is_err())?;
     checkpoint()?;
     let package = crate::sortformer_conformance::load_verified_sortformer_package_with_checkpoint(
         &cached.receipt_path,
         &cached.package_path,
         checkpoint,
     )?;
-    let session = crate::sortformer_inference::SortformerSession::from_verified_package_with_checkpoint(
-        &package,
-        checkpoint,
-    )?;
+    let session =
+        crate::sortformer_inference::SortformerSession::from_verified_package_with_checkpoint(
+            &package, checkpoint,
+        )?;
     let output = session.diarize_with_checkpoint(
         crate::sortformer_inference::SortformerPcm::mono_16khz(samples),
         checkpoint,
@@ -5484,23 +5496,23 @@ fn run_native_sortformer_diarization(
 
     let mut speaker_evidence = Vec::with_capacity(active_lanes.len());
     let mut profiles = Vec::with_capacity(active_lanes.len());
-    let mut total_active_duration_ms = 0_u64;
-    let mut dominant_duration_ms = 0_u64;
     for lane in active_lanes {
         checkpoint()?;
-        let speaker_ref = labels
-            .get(&lane)
-            .cloned()
-            .ok_or_else(|| FwError::ContractViolation("active Sortformer lane lacks a label".to_owned()))?;
+        let speaker_ref = labels.get(&lane).cloned().ok_or_else(|| {
+            FwError::ContractViolation("active Sortformer lane lacks a label".to_owned())
+        })?;
         let lane_turns = turns
             .iter()
             .filter(|turn| turn.speaker_ref.as_ref() == Some(&speaker_ref))
             .collect::<Vec<_>>();
-        let voiced_duration_ms = lane_turns.iter().try_fold(0_u64, |total, turn| {
-            total.checked_add(turn.end_ms - turn.start_ms)
-        }).ok_or_else(|| FwError::ContractViolation("Sortformer lane duration overflowed".to_owned()))?;
-        total_active_duration_ms = total_active_duration_ms.saturating_add(voiced_duration_ms);
-        dominant_duration_ms = dominant_duration_ms.max(voiced_duration_ms);
+        let voiced_duration_ms = lane_turns
+            .iter()
+            .try_fold(0_u64, |total, turn| {
+                total.checked_add(turn.end_ms - turn.start_ms)
+            })
+            .ok_or_else(|| {
+                FwError::ContractViolation("Sortformer lane duration overflowed".to_owned())
+            })?;
         let voiced_frame_count = output
             .activity
             .activity
@@ -5550,15 +5562,11 @@ fn run_native_sortformer_diarization(
         FwError::ContractViolation("Sortformer active lane count exceeds u32".to_owned())
     })?;
     let (status, status_reason, fallback_status) = match &request.speaker_count {
-        SpeakerCountRequest::HardConstraint { count }
-            if *count == supported_speaker_count =>
-        {
-            (
-                SpeakerCountOutcomeStatus::Satisfied,
-                SpeakerCountOutcomeReason::RequestedCountMatched,
-                DiarizationFallbackStatus::NotNeeded,
-            )
-        }
+        SpeakerCountRequest::HardConstraint { count } if *count == supported_speaker_count => (
+            SpeakerCountOutcomeStatus::Satisfied,
+            SpeakerCountOutcomeReason::RequestedCountMatched,
+            DiarizationFallbackStatus::NotNeeded,
+        ),
         SpeakerCountRequest::HardConstraint { .. } => (
             SpeakerCountOutcomeStatus::Unsatisfied,
             SpeakerCountOutcomeReason::RequestedCountMismatch,
@@ -5580,11 +5588,21 @@ fn run_native_sortformer_diarization(
             DiarizationFallbackStatus::SpeakerCountUnresolved,
         ),
     };
-    let dominant_speaker_share = if total_active_duration_ms == 0 {
-        0.0
-    } else {
-        dominant_duration_ms as f64 / total_active_duration_ms as f64
-    };
+    let timed_speech_ms = interval_union_duration_ms(
+        segments
+            .iter()
+            .filter_map(|segment| {
+                segment
+                    .start_sec
+                    .zip(segment.end_sec)
+                    .and_then(|(start_sec, end_sec)| {
+                        finite_seconds_interval_to_ms(start_sec, end_sec)
+                    })
+            })
+            .collect(),
+    )?;
+    let (dominant_speaker_share, unknown_voiced_share) =
+        sortformer_activity_shares(&turns, timed_speech_ms)?;
     let report = DiarizationReport {
         implementation: "native-sortformer-v1".to_owned(),
         contract_version: "sortformer-diarization-v1".to_owned(),
@@ -5603,7 +5621,7 @@ fn run_native_sortformer_diarization(
             supported_speaker_count,
             active_speaker_refs,
             dominant_speaker_share,
-            unknown_voiced_share: 0.0,
+            unknown_voiced_share,
             reasons: vec![status_reason],
             speaker_evidence,
         },
@@ -5756,6 +5774,53 @@ fn interval_union_duration_ms(mut intervals: Vec<(u64, u64)>) -> FwResult<u64> {
         })?;
     }
     Ok(total)
+}
+
+fn sortformer_activity_shares(
+    turns: &[DiarizationTurn],
+    timed_speech_ms: u64,
+) -> FwResult<(f64, f64)> {
+    let mut speaker_durations = BTreeMap::<&str, u64>::new();
+    for turn in turns {
+        let speaker_ref = turn.speaker_ref.as_deref().ok_or_else(|| {
+            FwError::ContractViolation(
+                "native Sortformer emitted an attributed turn without a speaker label".to_owned(),
+            )
+        })?;
+        let duration = turn.end_ms.checked_sub(turn.start_ms).ok_or_else(|| {
+            FwError::ContractViolation(
+                "native Sortformer emitted a reversed speaker turn".to_owned(),
+            )
+        })?;
+        if duration == 0 {
+            return Err(FwError::ContractViolation(
+                "native Sortformer emitted an empty speaker turn".to_owned(),
+            ));
+        }
+        let total = speaker_durations.entry(speaker_ref).or_default();
+        *total = total.checked_add(duration).ok_or_else(|| {
+            FwError::ContractViolation(
+                "native Sortformer speaker duration exceeds the report schema".to_owned(),
+            )
+        })?;
+    }
+    let attributed_speech_ms = interval_union_duration_ms(
+        turns
+            .iter()
+            .map(|turn| (turn.start_ms, turn.end_ms))
+            .collect(),
+    )?;
+
+    // Per-speaker duration intentionally includes overlap, while attribution
+    // coverage uses the turn union. This keeps overlap from hiding genuinely
+    // uncovered ASR-timed speech or pushing either share above one.
+    let evidence_duration_ms = timed_speech_ms.max(attributed_speech_ms).max(1);
+    let dominant_duration_ms = speaker_durations.values().copied().max().unwrap_or(0);
+    Ok((
+        dominant_duration_ms as f64 / evidence_duration_ms as f64,
+        evidence_duration_ms.saturating_sub(attributed_speech_ms) as f64
+            / evidence_duration_ms as f64,
+    ))
 }
 
 fn transcript_boundaries_ms(segments: &[crate::model::TranscriptionSegment]) -> Vec<u64> {
@@ -6619,9 +6684,10 @@ mod tests {
         recommended_budget, resolved_diarization_engine, resolved_diarization_engine_for_rollout,
         result_has_external_diarization, run_pipeline, run_stage_with_budget, sanitize_process_pid,
         selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_file_with_checkpoint,
-        sha256_json_value, silhouette_score, source_separate, source_separate_with_analysis,
-        split_long_regions, stage_budget_ms, stage_failure_code, stage_failure_message,
-        stage_latency_profile, state_root, tiny_diarize_boundary_hints,
+        sha256_json_value, silhouette_score, sortformer_acoustic_fallback_eligible,
+        sortformer_activity_shares, sortformer_count_request_is_capacity_eligible, source_separate,
+        source_separate_with_analysis, split_long_regions, stage_budget_ms, stage_failure_code,
+        stage_failure_message, stage_latency_profile, state_root, tiny_diarize_boundary_hints,
         tiny_diarize_hint_evidence_payload, transcript_boundaries_ms,
         unknown_neural_diarization_with_hard_hints, vad_energy_detect,
         vad_energy_detect_with_analysis, validate_diarization_execution_request,
@@ -8396,7 +8462,7 @@ mod tests {
         assert_eq!(j["acceleration_ms"], 20_000);
         assert_eq!(j["align_ms"], 30_000);
         assert_eq!(j["punctuate_ms"], 10_000);
-        assert_eq!(j["diarize_ms"], 30_000);
+        assert_eq!(j["diarize_ms"], 900_000);
         assert_eq!(j["persist_ms"], 20_000);
         assert_eq!(j["cleanup_budget_ms"], 5_000);
 
@@ -10648,7 +10714,7 @@ mod tests {
     }
 
     #[test]
-    fn acoustic_rollout_parser_and_auto_resolution_are_fail_closed() {
+    fn acoustic_rollout_parser_and_auto_resolution_select_native_sortformer() {
         assert_eq!(
             parse_acoustic_diarization_rollout(" shadow "),
             Some(AcousticDiarizationRolloutStage::Shadow)
@@ -10711,37 +10777,19 @@ mod tests {
         for stage in [
             AcousticDiarizationRolloutStage::Shadow,
             AcousticDiarizationRolloutStage::Validated,
-        ] {
-            assert_eq!(
-                resolved_diarization_engine_for_rollout(&request, &without_external, stage),
-                DiarizationEngine::External,
-                "{stage:?} must not expose acoustic output through auto"
-            );
-        }
-        assert_eq!(
-            resolved_diarization_engine_for_rollout(
-                &request,
-                &external,
-                AcousticDiarizationRolloutStage::Fallback,
-            ),
-            DiarizationEngine::External
-        );
-        assert_eq!(
-            resolved_diarization_engine_for_rollout(
-                &request,
-                &without_external,
-                AcousticDiarizationRolloutStage::Fallback,
-            ),
-            DiarizationEngine::Acoustic
-        );
-        for stage in [
+            AcousticDiarizationRolloutStage::Fallback,
             AcousticDiarizationRolloutStage::Primary,
             AcousticDiarizationRolloutStage::Sole,
         ] {
             assert_eq!(
+                resolved_diarization_engine_for_rollout(&request, &without_external, stage),
+                DiarizationEngine::Sortformer,
+                "{stage:?} must select the native Sortformer path through auto"
+            );
+            assert_eq!(
                 resolved_diarization_engine_for_rollout(&request, &external, stage),
-                DiarizationEngine::Acoustic,
-                "{stage:?} must select acoustic through auto"
+                DiarizationEngine::Sortformer,
+                "pre-existing external labels must not silently replace the native default"
             );
         }
         assert!(
@@ -10780,6 +10828,115 @@ mod tests {
             ),
             "sole limits auto admission, not an explicit acoustic request's fallback policy"
         );
+    }
+
+    #[test]
+    fn sortformer_fallback_conceals_only_recoverable_admission_failures() {
+        assert!(sortformer_acoustic_fallback_eligible(
+            &FwError::MissingArtifact(PathBuf::from("model.bin"))
+        ));
+        assert!(sortformer_acoustic_fallback_eligible(
+            &FwError::BackendUnavailable("unsupported host".to_owned())
+        ));
+        assert!(sortformer_acoustic_fallback_eligible(
+            &FwError::InvalidRequest("capacity-ineligible request".to_owned())
+        ));
+
+        assert!(!sortformer_acoustic_fallback_eligible(
+            &FwError::ContractViolation("invalid native output".to_owned())
+        ));
+        assert!(!sortformer_acoustic_fallback_eligible(&FwError::Cancelled(
+            "operator requested cancellation".to_owned()
+        )));
+        assert!(!sortformer_acoustic_fallback_eligible(
+            &FwError::StageTimeout {
+                stage: "diarize".to_owned(),
+                budget_ms: 1,
+            }
+        ));
+        assert!(!sortformer_acoustic_fallback_eligible(&FwError::Io(
+            std::io::Error::other("read failed")
+        )));
+    }
+
+    #[test]
+    fn sortformer_capacity_admission_preserves_count_request_semantics() {
+        assert!(sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::Infer
+        ));
+        assert!(sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::HardConstraint { count: 4 }
+        ));
+        assert!(!sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::HardConstraint { count: 5 }
+        ));
+        assert!(sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 8,
+            }
+        ));
+        assert!(!sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::Range {
+                minimum: 5,
+                maximum: 8,
+            }
+        ));
+        assert!(!sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::Prior { bins: Vec::new() }
+        ));
+    }
+
+    #[test]
+    fn sortformer_activity_shares_use_union_for_overlap_coverage() {
+        let turns = vec![
+            DiarizationTurn {
+                start_ms: 0,
+                end_ms: 400,
+                speaker_ref: Some("SPEAKER_00".to_owned()),
+                speaker_confidence: Some(0.9),
+                change_confidence: None,
+                overlap_suspected: true,
+                hard_hint_attributed: false,
+            },
+            DiarizationTurn {
+                start_ms: 0,
+                end_ms: 400,
+                speaker_ref: Some("SPEAKER_01".to_owned()),
+                speaker_confidence: Some(0.8),
+                change_confidence: None,
+                overlap_suspected: true,
+                hard_hint_attributed: false,
+            },
+        ];
+        let (dominant, unknown) = sortformer_activity_shares(&turns, 1_000).unwrap();
+        assert!((dominant - 0.4).abs() < f64::EPSILON);
+        assert!((unknown - 0.6).abs() < f64::EPSILON);
+
+        let (dominant, unknown) = sortformer_activity_shares(&[], 1_000).unwrap();
+        assert_eq!(dominant, 0.0);
+        assert_eq!(unknown, 1.0);
+
+        let mut unlabeled = turns;
+        unlabeled[0].speaker_ref = None;
+        assert!(matches!(
+            sortformer_activity_shares(&unlabeled, 1_000),
+            Err(FwError::ContractViolation(_))
+        ));
+
+        let invalid_interval = vec![DiarizationTurn {
+            start_ms: 500,
+            end_ms: 400,
+            speaker_ref: Some("SPEAKER_00".to_owned()),
+            speaker_confidence: Some(0.9),
+            change_confidence: None,
+            overlap_suspected: false,
+            hard_hint_attributed: false,
+        }];
+        assert!(matches!(
+            sortformer_activity_shares(&invalid_interval, 1_000),
+            Err(FwError::ContractViolation(_))
+        ));
     }
 
     #[test]
@@ -13859,7 +14016,7 @@ mod tests {
     #[test]
     fn stage_budget_ms_returns_diarize_budget() {
         let budgets = StageBudgetPolicy::from_source(|_| None);
-        assert_eq!(stage_budget_ms("diarize", budgets), Some(30_000));
+        assert_eq!(stage_budget_ms("diarize", budgets), Some(900_000));
     }
 
     #[test]

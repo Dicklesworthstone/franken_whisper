@@ -343,7 +343,7 @@ fn is_available_uncached() -> bool {
     if let Some(spec) = native_engine::default_model_spec() {
         return native_engine::native_model_available(&spec);
     }
-    native_engine::configured_or_discovered_model_spec().is_ok()
+    native_engine::configured_or_release_model_spec().is_ok()
 }
 
 /// Number of leading bytes covering the ggml magic plus the eleven `i32`
@@ -432,14 +432,14 @@ impl NativeProbe {
 /// Probe what the native engine can actually do (see [`NativeProbe`]).
 ///
 /// Resolves the same model [`run`] would: `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`
-/// first, else any usable `ggml-*.bin` in a search dir — mirroring
+/// first, otherwise the authenticated default release package—mirroring
 /// [`is_available`]'s policy so capabilities never contradict availability.
 pub(crate) fn capability_probe() -> NativeProbe {
     let gpu = native_engine::encoder::gpu_encoder_available();
 
     // Use the exact resolver execution uses, including the fail-closed explicit
     // default and the pinned-package-first unset default.
-    let Ok(spec) = native_engine::configured_or_discovered_model_spec() else {
+    let Ok(spec) = native_engine::configured_or_release_model_spec() else {
         return NativeProbe::without_model(gpu);
     };
     let path = native_engine::resolve_model(&spec).ok();
@@ -467,14 +467,14 @@ pub(crate) fn capability_probe() -> NativeProbe {
 /// how to provision one.
 ///
 /// Precedence: `request.model` (when set), then
-/// `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then deterministic discovery of an
-/// existing local `ggml-*.bin`. If none resolves, returns an actionable
+/// `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then the authenticated default
+/// release package. If none resolves, returns an actionable
 /// [`FwError::BackendUnavailable`].
 fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
         return Ok(model);
     }
-    native_engine::configured_or_discovered_model_spec().map_err(|error| {
+    native_engine::configured_or_release_model_spec().map_err(|error| {
         FwError::BackendUnavailable(format!(
             "native whisper.cpp engine has no usable local model: pass --model, or set \
              $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
@@ -1610,12 +1610,12 @@ mod tests {
     // ── Model resolution / availability ───────────────────────────────────
 
     #[test]
-    fn run_without_any_configured_or_discovered_model_is_backend_unavailable() {
+    fn run_without_any_configured_or_release_model_is_backend_unavailable() {
         let mut req = native_request();
         req.model = None;
         // This failure path exists only when neither an explicit default nor a
         // deterministically discoverable local model is present.
-        if native_engine::configured_or_discovered_model_spec().is_ok() {
+        if native_engine::configured_or_release_model_spec().is_ok() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
