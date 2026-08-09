@@ -17,7 +17,7 @@
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run self-test after install
-#   --no-pull          Suppress the post-install Sortformer model prompt/guidance
+#   --no-pull          Skip automatic native Whisper + diarization model download
 #   --force            Reinstall even if the same version is already present
 #   --artifact-url URL Use a custom release artifact URL
 #   --checksum SHA     Provide expected SHA256 checksum
@@ -271,7 +271,7 @@ Options:
   --system           Install to /usr/local/bin (requires sudo)
   --easy-mode        Auto-update PATH in shell rc files
   --verify           Run self-test after install
-  --no-pull          Suppress the post-install Sortformer model prompt/guidance
+  --no-pull          Skip automatic native Whisper + diarization model download
   --force            Reinstall even if the same version is already present
   --artifact-url URL Use a custom release artifact URL
   --checksum SHA     Provide expected SHA256 checksum
@@ -1103,9 +1103,8 @@ download_release() {
 # ============================================================================
 # Self-test
 # ============================================================================
-# Validate the installed binary and its stable agent-discovery surfaces. Model
-# readiness is reported by doctor but is not required: model weights are not
-# bundled, and the installer offers an explicit post-install pull instead.
+# Validate the installed binary, stable agent-discovery surfaces, and both
+# hash-pinned model packages required by the default all-native pipeline.
 run_self_test() {
     log_step "Verifying installed agent contracts..."
     local long_version alias_version capabilities schema doctor
@@ -1118,57 +1117,71 @@ run_self_test() {
     [[ "$capabilities" == *'"schema_version":"franken-whisper-capabilities-v1"'* ]] || die "Capabilities probe returned an unexpected schema"
     [[ "$schema" == *'"schema_version"'* ]] || die "Robot schema probe returned an unexpected payload"
     [[ "$doctor" == *'"schema_version":"franken-whisper-doctor-v1"'* ]] || die "Doctor probe returned an unexpected schema"
-    log_success "Installation contracts verified (model readiness remains operator-configured)"
+    [[ "$doctor" == *'"ready":true'* ]] || die "Native default model verification failed; run: fw pull all"
+    log_success "Installation contracts and both native default model packages verified"
 }
 
 # Return success only when a human operator can answer a prompt. `/dev/tty`
-# keeps the prompt usable under `curl ... | bash`, where stdin carries the
-# installer source rather than terminal input.
+# keeps the prompt usable under `curl ... | bash`, where stdin contains the
+# installer rather than terminal input.
 interactive_tty() {
     [ -t 0 ] && return 0
-    ( : </dev/tty >/dev/tty ) 2>/dev/null && return 0
-    return 1
+    ( : </dev/tty >/dev/tty ) 2>/dev/null
 }
 
-maybe_offer_sortformer_pull() {
-    [ "$NO_PULL" -eq 1 ] && return 0
+confirm_default_model_pull() {
+    # Headless and quiet installs take the documented default: provision both
+    # packages. Interactive installs make the 2.12 GB transfer visible while
+    # retaining Yes as the automatic default.
+    if [ "$QUIET" -eq 1 ] || ! interactive_tty; then
+        return 0
+    fi
+
+    local prompt_timeout="${FW_INSTALL_PROMPT_TIMEOUT:-120}"
+    if [[ ! "$prompt_timeout" =~ ^[0-9]+$ ]] || [ "$prompt_timeout" -eq 0 ]; then
+        prompt_timeout=120
+    fi
+    local answer=""
+    local read_status=0
+    printf 'Download and verify the native Whisper + diarization models now (about 2.12 GB)? (Y/n): ' >/dev/tty
+    IFS= read -r -t "$prompt_timeout" answer </dev/tty || read_status=$?
+    if [ "$read_status" -ne 0 ]; then
+        printf '\n' >/dev/tty
+        log_info "No reply within ${prompt_timeout}s; taking the documented default (Yes)."
+        return 0
+    fi
+    case "$answer" in
+        n|N|no|No|NO) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+provision_default_models() {
+    if [ "$NO_PULL" -eq 1 ]; then
+        log_warn "Skipping native default model provisioning (--no-pull)"
+        return 0
+    fi
 
     local bin="$DEST/$ALIAS_NAME"
     local cache_home="$HOME"
     local pull_user=""
-    local -a pull_command=("$bin" pull sortformer)
-
-    # Airgapped, quiet, and headless installs never start a surprise network
-    # transfer. They retain one explicit command for later provisioning.
-    if [ -n "$OFFLINE_TARBALL" ]; then
-        log_info "Sortformer weights are not bundled. When online, download them with: fw pull sortformer"
-        return 0
-    fi
-    if [ "$QUIET" -eq 1 ] || ! interactive_tty; then
-        log_info "Sortformer weights are not bundled. Download them later with: fw pull sortformer"
-        return 0
-    fi
+    local -a pull_command=("$bin" pull all)
+    local -a doctor_command=("$bin" doctor --json)
 
     # A system install commonly runs under sudo. Pulling as root would populate
     # root's private cache, leaving the invoking user unable to use the model.
-    # Drop only the optional model pull back to that validated user, retain a
+    # Drop only model provisioning back to that validated user, retain a
     # target-user HOME, and forward only the model/proxy variables the pull
     # contract documents.
     if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
         if ! command -v sudo >/dev/null 2>&1 || ! id -u "$SUDO_USER" >/dev/null 2>&1; then
-            log_warn "Cannot safely identify the invoking sudo user; skipping the model pull prompt."
-            log_info "Run this later as the intended model owner: fw pull sortformer"
-            return 0
+            die "Cannot safely identify the invoking sudo user for native model provisioning"
         fi
         cache_home=$(sudo -H -u "$SUDO_USER" sh -c 'printf "%s" "$HOME"') || {
-            log_warn "Cannot resolve the invoking sudo user's home; skipping the model pull prompt."
-            log_info "Run this later as the intended model owner: fw pull sortformer"
-            return 0
+            die "Cannot resolve the invoking sudo user's home for native model provisioning"
         }
         if [ -z "$cache_home" ] || [[ "$cache_home" != /* ]]; then
-            log_warn "The invoking sudo user's home is not an absolute path; skipping the model pull prompt."
-            log_info "Run this later as the intended model owner: fw pull sortformer"
-            return 0
+            die "The invoking sudo user's home is not an absolute path"
         fi
         pull_user="$SUDO_USER"
         local -a forwarded_env=()
@@ -1182,63 +1195,52 @@ maybe_offer_sortformer_pull() {
                 forwarded_env+=("$env_name=${!env_name}")
             fi
         done
-        pull_command=(sudo -H -u "$pull_user")
+        local -a user_prefix=(sudo -H -u "$pull_user")
         if [ "${#forwarded_env[@]}" -gt 0 ]; then
-            pull_command+=(env "${forwarded_env[@]}")
+            user_prefix+=(env "${forwarded_env[@]}")
         fi
-        pull_command+=("$bin" pull sortformer)
+        pull_command=("${user_prefix[@]}" "$bin" pull all)
+        doctor_command=("${user_prefix[@]}" "$bin" doctor --json)
     fi
 
     local cache_root="${FRANKEN_WHISPER_MODEL_DIR:-$cache_home/.cache/franken_whisper/models}"
     if [[ "$cache_root" != /* ]]; then
-        log_warn "FRANKEN_WHISPER_MODEL_DIR must be absolute; skipping the model pull prompt."
-        log_info "Set an absolute model root, then run: fw pull sortformer"
+        die "FRANKEN_WHISPER_MODEL_DIR must be absolute"
+    fi
+
+    # An offline archive never authorizes a network operation. Accept an
+    # already-preseeded, verified cache; otherwise require the caller to make
+    # the missing-model choice explicit with --no-pull.
+    if [ -n "$OFFLINE_TARBALL" ]; then
+        local offline_doctor
+        offline_doctor=$("${doctor_command[@]}") || die "Could not inspect the offline model cache"
+        if [[ "$offline_doctor" != *'"ready":true'* ]]; then
+            die "Offline install requires both model packages to be preseeded and verified, or explicit --no-pull"
+        fi
+        log_success "Verified preseeded native model packages under $cache_root"
         return 0
     fi
 
-    echo ""
-    log_info "Sortformer speaker diarization needs the pinned model; acoustic and ECAPA modes do not."
-    log_info "The verified download is about 492 MB into $cache_root."
+    if ! confirm_default_model_pull; then
+        NO_PULL=1
+        log_warn "Skipped native model provisioning at the operator's request"
+        log_info "Provision both default models later with: fw pull all"
+        return 0
+    fi
+
+    log_step "Provisioning native Whisper and Sortformer models (about 2.12 GB)..."
     if [ -n "$pull_user" ]; then
         log_info "The model pull will run as the invoking user: $pull_user"
     fi
-    local answer=""
-    local read_status=0
-    local prompt_timeout="${FW_INSTALL_PROMPT_TIMEOUT:-120}"
-    if [[ ! "$prompt_timeout" =~ ^[0-9]+$ ]] || [ "$prompt_timeout" -eq 0 ]; then
-        prompt_timeout=120
-    fi
-    if ( : </dev/tty ) 2>/dev/null; then
-        printf 'Download the diarization model now with fw pull sortformer? (y/N): ' >/dev/tty
-        IFS= read -r -t "$prompt_timeout" answer </dev/tty || read_status=$?
+    if [ "$QUIET" -eq 1 ]; then
+        "${pull_command[@]}" >/dev/null 2>&1 || die "Native model provisioning failed; retry with: fw pull all"
     else
-        printf 'Download the diarization model now with fw pull sortformer? (y/N): '
-        IFS= read -r -t "$prompt_timeout" answer || read_status=$?
+        "${pull_command[@]}" || die "Native model provisioning failed; retry with: fw pull all"
     fi
-    if [ "$read_status" -ne 0 ]; then
-        answer=""
-        echo ""
-        log_warn "No reply within ${prompt_timeout}s; taking the default (No)."
-    fi
-    case "$answer" in
-        y|Y|yes|Yes|YES)
-            log_step "Running: fw pull sortformer"
-            local pull_status=0
-            if "${pull_command[@]}"; then
-                log_success "Verified Sortformer model installed under $cache_root"
-            else
-                pull_status=$?
-                if [ "$pull_status" -gt 128 ]; then
-                    log_warn "Model provisioning was interrupted."
-                    return "$pull_status"
-                fi
-                log_warn "Model provisioning did not finish. Retry later with: fw pull sortformer"
-            fi
-            ;;
-        *)
-            log_info "Skipped. Download the diarization model later with: fw pull sortformer"
-            ;;
-    esac
+    local doctor
+    doctor=$("${doctor_command[@]}") || die "Native model verification failed after download"
+    [[ "$doctor" == *'"ready":true'* ]] || die "Native model packages did not satisfy the compiled trust roots"
+    log_success "Verified native Whisper and Sortformer models under $cache_root"
 }
 
 # ============================================================================
@@ -1303,8 +1305,8 @@ print_summary() {
     if [ "$NO_PULL" -eq 0 ]; then
         echo ""
         echo "  Model policy:"
-        echo "    Weights are not bundled. This installer offers 'fw pull sortformer';"
-        echo "    inspect readiness at any time with 'fw models --json'."
+        echo "    The installer downloaded and verified the native Whisper and"
+        echo "    Sortformer packages. Inspect readiness with 'fw models --json'."
         echo ""
     fi
     echo "  Uninstall:"
@@ -1327,8 +1329,8 @@ main() {
         check_write_permissions
         install_offline
         maybe_add_path
+        provision_default_models
         [ "$VERIFY" -eq 1 ] && run_self_test
-        maybe_offer_sortformer_pull
         print_summary
         return 0
     fi
@@ -1346,8 +1348,10 @@ main() {
     # Already-installed short-circuit (binary self-report, marker fallback).
     if already_installed; then
         log_success "franken_whisper $VERSION is already installed at $DEST/$BINARY_NAME"
-        log_info "Use --force to reinstall"
+        log_info "Use --force to reinstall the binary"
         maybe_add_path
+        provision_default_models
+        [ "$VERIFY" -eq 1 ] && run_self_test
         print_summary
         return 0
     fi
@@ -1363,8 +1367,8 @@ main() {
     fi
 
     maybe_add_path
+    provision_default_models
     [ "$VERIFY" -eq 1 ] && run_self_test
-    maybe_offer_sortformer_pull
     print_summary
 }
 
