@@ -79,7 +79,7 @@ unsafe fn dot_i8_pf(w: &[i8], x: &[i8], ahead: usize) -> i32 {
         let mut i = 0;
         while i + 32 <= n {
             if i + ahead < n {
-                _mm_prefetch::<_MM_HINT_T0>(wp.add(i + ahead) as *const i8);
+                _mm_prefetch::<_MM_HINT_T0>(wp.add(i + ahead));
             }
             let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
             let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));

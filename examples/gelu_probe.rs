@@ -109,9 +109,9 @@ mod x86_probe {
                 _mm256_storeu_ps(data.as_mut_ptr().add(i), r);
                 i += 8;
             }
-            for k in i..n {
-                let x = data[k];
-                data[k] = if x <= -10.0 {
+            for value in &mut data[i..n] {
+                let x = *value;
+                *value = if x <= -10.0 {
                     0.0
                 } else if x >= 10.0 {
                     x
@@ -147,7 +147,7 @@ mod x86_probe {
         // Realistic post-layernorm activations: roughly unit-scale, spread over [-6,6].
         let base: Vec<f32> = (0..n)
             .map(|i| {
-                let t = (i as f32 * 0.6180339887) % 1.0; // low-discrepancy in [0,1)
+                let t = (i as f32 * 0.618_034) % 1.0; // low-discrepancy in [0,1)
                 (t - 0.5) * 12.0
             })
             .collect();

@@ -5031,19 +5031,21 @@ The router is doing nothing exotic: it blends priors with empirical data via Bet
 
 ## Speaker Diarization Paths
 
-| Aspect | Rust acoustic | Rust ECAPA-only | Rust ECAPA-fused | External | TinyDiarize |
-|--------|---------------|-----------------|-------------------|----------|-------------|
-| Selection | `--diarization-engine acoustic` | `--diarization-engine ecapa` | `--diarization-engine ecapa-fused` (JSON: `ecapa_fused`) | `--diarization-engine external` | `--tiny-diarize` |
-| Speaker identity evidence | Hand-authored waveform voice features | Pinned ECAPA embeddings; no acoustic channel evidence in pair scoring | Pinned ECAPA embeddings plus bounded acoustic channel evidence when a selected consensus merge joins a compatible usable pair; otherwise generic consensus provenance | Backend-defined, normalized only after provenance checks | Decoder turn tokens |
-| Dependencies | Built-in Rust + normalized PCM | Built-in Rust + user-installed, hash-pinned ECAPA safetensors | Same pinned local ECAPA package | Typically Python, model files, and possibly an HF token | whisper-cli |
-| Output | Independent turns plus conservative projection to ASR segments | The common turn/report/projection contract | The common turn/report/projection contract | Timed backend labels normalized to the common report | Inline turn hints |
-| Known intervals | Hard must-link and soft enrollment | Hard must-link and soft enrollment | Hard must-link and soft enrollment | Backend-specific | No |
-| Speaker count | Infer by default; optional soft range/prior or exact search constraint | Same bounded inference and constraint contract | Same bounded inference and constraint contract | Backend-specific | No |
-| Unknown/overlap | Explicit unknown and overlap suspicion | Same common handling | Same common handling | Backend-specific | No calibrated assignment |
-| Accuracy authority | Public-development evidence exists; rollout remains uncertified | `DevelopmentUncertified`; outside `auto` | `DevelopmentUncertified`; outside `auto` | Depends on the installed backend and corpus | No project accuracy certification |
+| Aspect | Native Sortformer | Rust acoustic | Rust ECAPA-only | Rust ECAPA-fused | External | TinyDiarize |
+|--------|-------------------|---------------|-----------------|-------------------|----------|-------------|
+| Selection | `auto` default or `--diarization-engine sortformer` | `--diarization-engine acoustic` | `--diarization-engine ecapa` | `--diarization-engine ecapa-fused` (JSON: `ecapa_fused`) | `--diarization-engine external` | `--tiny-diarize` |
+| Speaker identity evidence | Learned anonymous activity lanes; no biometric identity claim | Hand-authored waveform voice features | Pinned ECAPA embeddings; no acoustic channel evidence in pair scoring | Pinned ECAPA embeddings plus bounded acoustic channel evidence when a selected consensus merge joins a compatible usable pair; otherwise generic consensus provenance | Backend-defined, normalized only after provenance checks | Decoder turn tokens |
+| Dependencies | Built-in Rust + installer-provisioned, SHA-256-pinned Sortformer package | Built-in Rust + normalized PCM | Built-in Rust + user-installed, hash-pinned ECAPA safetensors | Same pinned local ECAPA package | Typically Python, model files, and possibly an HF token | whisper-cli |
+| Output | Independent overlapping turns plus conservative projection to ASR segments | Independent turns plus conservative projection to ASR segments | The common turn/report/projection contract | The common turn/report/projection contract | Timed backend labels normalized to the common report | Inline turn hints |
+| Known intervals | Identity enrollment routes to the acoustic fallback | Hard must-link and soft enrollment | Hard must-link and soft enrollment | Hard must-link and soft enrollment | Backend-specific | No |
+| Speaker count | Inferred active lanes without a required count; hard capacity of four | Infer by default; optional soft range/prior or exact search constraint | Same bounded inference and constraint contract | Same bounded inference and constraint contract | Backend-specific | No |
+| Unknown/overlap | Explicit independent overlap; unmatched evidence remains unknown | Explicit unknown and overlap suspicion | Same common handling | Same common handling | Backend-specific | No calibrated assignment |
+| Accuracy authority | `DevelopmentUncertified`; selected by `auto` as the product default | Public-development evidence exists; rollout remains uncertified | `DevelopmentUncertified`; outside `auto` | `DevelopmentUncertified`; outside `auto` | Depends on the installed backend and corpus | No project accuracy certification |
 
-Use acoustic diarization for dependency-light waveform evidence and auditable
-known intervals. Use explicit `ecapa` when the pinned model is installed and
+Native Sortformer is the default for anonymous calls with no more than four
+active speakers. Use acoustic diarization for dependency-light waveform evidence,
+recordings outside the four-lane capacity, and auditable known intervals. Use
+explicit `ecapa` when the pinned model is installed and
 speaker identity should come only from ECAPA; use `ecapa-fused` when bounded
 channel evidence is also appropriate and may be available. The supported-profile
 redecode experiment additionally requires complete neural tracklet coverage;
