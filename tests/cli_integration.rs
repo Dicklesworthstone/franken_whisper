@@ -3874,23 +3874,11 @@ fn transcribe_happy_path_stage_sequence_contract_is_stable() {
         );
         position.unwrap()
     };
-    let code_index_any = |codes: &[&str]| -> usize {
-        let position = events.iter().position(|event| {
-            let code = event["code"].as_str().unwrap_or_default();
-            codes.contains(&code)
-        });
-        assert!(
-            position.is_some(),
-            "expected any code {codes:?} in {events:?}"
-        );
-        position.unwrap()
-    };
-
     let ingest_start = code_index("ingest.start");
     let normalize_start = code_index("normalize.start");
     let backend_start = code_index("backend.start");
     let acceleration_start = code_index("acceleration.start");
-    let acceleration_terminal = code_index_any(&["acceleration.ok", "acceleration.fallback"]);
+    let acceleration_terminal = code_index("acceleration.ok");
     let persist_start = code_index("persist.start");
     let persist_ok = code_index("persist.ok");
 
@@ -4091,9 +4079,6 @@ fn transcribe_acceleration_context_telemetry_round_trips_in_run_artifacts() {
     assert!(payload["logical_stream_kind"].is_string());
     assert!(payload["acceleration_backend"].is_string());
     assert!(payload["mode"].is_string());
-    assert!(payload["frankentorch_feature"].is_boolean());
-    assert!(payload["frankenjax_feature"].is_boolean());
-
     let fence = &payload["cancellation_fence"];
     assert_eq!(fence["status"], "open");
     assert!(fence["checked_at_rfc3339"].is_string());

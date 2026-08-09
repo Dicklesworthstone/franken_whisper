@@ -69,7 +69,7 @@ pub enum PipelineStage {
     Separate,
     /// Execute the transcription backend (whisper-cpp, insanely-fast-whisper, etc.).
     Backend,
-    /// Run native acceleration pass (GPU confidence normalization).
+    /// Normalize per-segment confidence mass on the CPU.
     Accelerate,
     /// Evidence-gated timestamp alignment: canonical attention-DTW when
     /// available, otherwise an explicitly labeled character-density fallback.
@@ -1246,7 +1246,7 @@ fn acceleration_context_payload(
     cancellation_fence: Value,
 ) -> serde_json::Value {
     let acceleration_mode = if acceleration_backend == "none" {
-        "cpu_fallback"
+        "cpu_normalization"
     } else {
         "accelerated"
     };
@@ -1262,8 +1262,6 @@ fn acceleration_context_payload(
         "logical_stream_owner_id": stream_owner_id,
         "requested_gpu_device": request.backend_params.gpu_device,
         "flash_attention_requested": request.backend_params.flash_attention,
-        "frankentorch_feature": false,
-        "frankenjax_feature": false,
         "cancellation_fence": cancellation_fence,
     })
 }
@@ -2656,10 +2654,9 @@ async fn execute_accelerate(
     log.push(
         "acceleration",
         "acceleration.start",
-        "running native acceleration pass",
+        "running confidence normalization",
         json!({
-            "frankentorch_feature": false,
-            "frankenjax_feature": false,
+            "implementation": "cpu_mass_normalization",
             "segments": result.segments.len(),
             "budget_ms": stage_budgets.acceleration_ms,
         }),
@@ -2670,7 +2667,7 @@ async fn execute_accelerate(
     let (updated_result, acceleration) =
         match run_stage_with_budget("acceleration", acceleration_budget_ms, move || {
             let mut local = result;
-            let acceleration = accelerate::apply_with_token(&mut local, Some(&acceleration_token));
+            let acceleration = accelerate::apply_with_token(&mut local, Some(&acceleration_token))?;
             Ok((local, acceleration))
         }) {
             Ok(output) => output,
@@ -2711,22 +2708,12 @@ async fn execute_accelerate(
         acceleration_context,
     );
 
-    let acceleration_code = if acceleration.backend.as_str() == "none" {
-        tracing::warn!(
-            stage = "acceleration",
-            fallback = "none",
-            "Acceleration fallback: no acceleration backend available"
-        );
-        "acceleration.fallback"
-    } else {
-        tracing::debug!(stage = "acceleration", "Pipeline stage complete");
-        "acceleration.ok"
-    };
+    tracing::debug!(stage = "acceleration", "Pipeline stage complete");
 
     log.push(
         "acceleration",
-        acceleration_code,
-        "acceleration pass finished",
+        "acceleration.ok",
+        "confidence normalization finished",
         json!({
             "backend": acceleration.backend.as_str(),
             "normalized": acceleration.normalized_confidences,
@@ -7858,11 +7845,11 @@ mod tests {
         assert_eq!(accelerated["flash_attention_requested"], true);
         assert_eq!(accelerated["cancellation_fence"], fence);
 
-        let fallback =
+        let cpu =
             acceleration_context_payload(&request, "none", "trace:acceleration:none:cpu", fence);
-        assert_eq!(fallback["mode"], "cpu_fallback");
-        assert_eq!(fallback["logical_stream_kind"], "cpu_lane");
-        assert_eq!(fallback["acceleration_backend"], "none");
+        assert_eq!(cpu["mode"], "cpu_normalization");
+        assert_eq!(cpu["logical_stream_kind"], "cpu_lane");
+        assert_eq!(cpu["acceleration_backend"], "none");
     }
 
     #[test]
@@ -9296,7 +9283,8 @@ mod tests {
 
     #[test]
     fn cx_accelerate_respects_cancellation() {
-        // apply_with_token should return early when given expired token
+        // apply_with_token should return a typed cancellation error when given
+        // an expired token.
         let token = super::CancellationToken::with_deadline_from_now(Duration::from_millis(0)); // ubs:ignore — cancellation token is not a secret
         std::thread::sleep(Duration::from_millis(5));
 
@@ -9317,16 +9305,10 @@ mod tests {
             artifact_paths: vec![],
         };
 
-        let report = crate::accelerate::apply_with_token(&mut result, Some(&token));
-        assert_eq!(
-            report.backend.as_str(),
-            "none",
-            "cancelled acceleration should return None backend"
-        );
-        assert!(
-            report.notes.iter().any(|n| n.contains("cancelled")),
-            "notes should mention cancellation"
-        );
+        let error = crate::accelerate::apply_with_token(&mut result, Some(&token))
+            .expect_err("cancelled acceleration must not return a success report");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert!(result.acceleration.is_none());
     }
 
     #[test]

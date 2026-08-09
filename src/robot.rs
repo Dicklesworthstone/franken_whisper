@@ -887,8 +887,11 @@ pub fn capabilities_value() -> serde_json::Value {
         },
         "compiled_features": {
             "tui": cfg!(feature = "tui"),
-            "gpu_frankentorch": false,
-            "gpu_frankenjax": false,
+        },
+        "native_compute": {
+            "cpu_backend": "frankentorch",
+            "metal_target_compiled": cfg!(target_os = "macos"),
+            "metal_runtime_policy": "automatic_for_eligible_large_operations",
         },
         "agent_orientation": {
             "command": "fw robot triage",
@@ -1300,7 +1303,7 @@ pub fn robot_schema_value() -> serde_json::Value {
                         "logical_stream_owner_id": "trace:acceleration:none:cpu",
                         "logical_stream_kind": "cpu_lane",
                         "acceleration_backend": "none",
-                        "mode": "cpu_fallback",
+                        "mode": "cpu_normalization",
                         "cancellation_fence": {"status": "open"}
                     },
                     "warnings": [],
@@ -3423,7 +3426,7 @@ mod tests {
                     "logical_stream_owner_id": "trace:acceleration:none:cpu",
                     "logical_stream_kind": "cpu_lane",
                     "acceleration_backend": "none",
-                    "mode": "cpu_fallback",
+                    "mode": "cpu_normalization",
                     "cancellation_fence": {"status": "open"},
                 }),
             ],
@@ -6070,6 +6073,13 @@ mod tests {
         assert_eq!(value["schema_version"], "franken-whisper-capabilities-v1");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["preferred_agent_binary"], "fw");
+        assert_eq!(value["native_compute"]["cpu_backend"], "frankentorch");
+        assert_eq!(
+            value["native_compute"]["metal_target_compiled"],
+            cfg!(target_os = "macos")
+        );
+        assert!(value["compiled_features"].get("gpu_frankentorch").is_none());
+        assert!(value["compiled_features"].get("gpu_frankenjax").is_none());
         assert_eq!(value["privacy"]["model_downloads_automatic"], false);
         assert_eq!(
             value["error_codes"].as_array().map(Vec::len),

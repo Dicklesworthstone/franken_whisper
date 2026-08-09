@@ -3,7 +3,7 @@
 //! Deterministic tests validating acceleration telemetry fields for:
 //! - Stream owner identity tracking
 //! - Cancellation fence payload round-trips
-//! - Fallback trigger scenarios (GPU -> CPU fallback)
+//! - Test-local fallback trigger scenarios for future GPU orchestration
 //! - AccelerationContext telemetry field persistence
 //! - Evidence artifact structure validation
 //! - Integration between cancellation tokens and acceleration context
@@ -340,12 +340,11 @@ fn fence_payload_seq_ordering_is_monotonic() {
 }
 
 // ===========================================================================
-// 3. Fallback trigger scenarios (GPU -> CPU fallback)
+// 3. Test-local fallback trigger scenarios for future GPU orchestration
 // ===========================================================================
 
 #[test]
-fn fallback_trigger_gpu_feature_disabled_produces_cpu_backend() {
-    // Without GPU features, acceleration always falls back to CPU (None backend).
+fn production_normalization_uses_cpu_backend_identity() {
     let mut result = make_result(vec![
         make_segment("alpha", Some(0.5)),
         make_segment("beta", Some(0.3)),
@@ -353,18 +352,17 @@ fn fallback_trigger_gpu_feature_disabled_produces_cpu_backend() {
 
     let report = franken_whisper::accelerate::apply(&mut result);
 
-    // In default build (no gpu features), backend should be None.
     assert_eq!(
         report.backend,
         AccelerationBackend::None,
-        "without GPU features, backend should be None"
+        "CPU confidence normalization should not claim a GPU backend"
     );
     assert!(
         report
             .notes
             .iter()
             .any(|n| n.contains("CPU") || n.contains("cpu")),
-        "notes should mention CPU fallback: {:?}",
+        "notes should identify CPU normalization: {:?}",
         report.notes
     );
 }
@@ -458,14 +456,14 @@ fn fallback_context_records_multiple_triggers() {
 }
 
 #[test]
-fn fallback_compute_attention_uses_cpu_without_gpu_feature() {
+fn compute_attention_uses_packaged_cpu_implementation() {
     let query = vec![1.0, 2.0, 3.0, 4.0];
     let key = vec![0.5, 1.5, 2.5, 3.5];
 
     let result = compute_attention(&query, &key, AttentionKind::SelfAttention);
     assert!(
         !result.gpu_accelerated,
-        "without GPU feature, should use CPU"
+        "the packaged helper should use CPU"
     );
     assert_eq!(result.kind, AttentionKind::SelfAttention);
     assert_eq!(result.scores.len(), 4);
@@ -479,7 +477,7 @@ fn fallback_compute_attention_uses_cpu_without_gpu_feature() {
 }
 
 #[test]
-fn fallback_compute_vad_uses_cpu_without_gpu_feature() {
+fn compute_vad_uses_packaged_cpu_implementation() {
     let energy = vec![0.0, 1.0, -1.0, 2.0, -2.0];
     let result = compute_vad_scores(&energy);
     assert!(!result.gpu_accelerated);
@@ -493,7 +491,7 @@ fn fallback_compute_vad_uses_cpu_without_gpu_feature() {
 }
 
 #[test]
-fn fallback_compute_layer_norm_uses_cpu_without_gpu_feature() {
+fn compute_layer_norm_uses_packaged_cpu_implementation() {
     let values = vec![1.0, 2.0, 3.0, 4.0];
     let gamma = vec![1.0; 4];
     let beta = vec![0.0; 4];
@@ -510,7 +508,7 @@ fn fallback_compute_layer_norm_uses_cpu_without_gpu_feature() {
 }
 
 #[test]
-fn fallback_compute_embedding_uses_cpu_without_gpu_feature() {
+fn compute_embedding_uses_packaged_cpu_implementation() {
     let table = vec![
         vec![1.0, 0.0, 0.0],
         vec![0.0, 1.0, 0.0],

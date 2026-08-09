@@ -1,31 +1,20 @@
-use std::collections::HashMap;
-
 use crate::model::{
     AccelerationBackend, AccelerationReport, TranscriptionResult, TranscriptionSegment,
 };
 
 pub fn apply(result: &mut TranscriptionResult) -> AccelerationReport {
-    apply_with_token(result, None)
+    apply_with_token(result, None).unwrap_or_else(|error| {
+        unreachable!("acceleration without a cancellation token cannot fail: {error}")
+    })
 }
 
 #[allow(clippy::vec_init_then_push)]
 pub(crate) fn apply_with_token(
     result: &mut TranscriptionResult,
     token: Option<&crate::orchestrator::CancellationToken>,
-) -> AccelerationReport {
-    if let Some(tok) = token
-        && tok.checkpoint().is_err()
-    {
-        let report = AccelerationReport {
-            backend: AccelerationBackend::None,
-            input_values: 0,
-            normalized_confidences: false,
-            pre_mass: None,
-            post_mass: None,
-            notes: vec!["acceleration cancelled by pipeline checkpoint".to_owned()],
-        };
-        result.acceleration = Some(report.clone());
-        return report;
+) -> crate::error::FwResult<AccelerationReport> {
+    if let Some(tok) = token {
+        tok.checkpoint()?;
     }
     tracing::debug!(stage = "acceleration", "Entering accelerate::apply");
     if result.segments.is_empty() {
@@ -38,7 +27,7 @@ pub(crate) fn apply_with_token(
             notes: vec!["no segments available for acceleration".to_owned()],
         };
         result.acceleration = Some(report.clone());
-        return report;
+        return Ok(report);
     }
 
     let baseline = confidence_vector(&result.segments);
@@ -47,7 +36,10 @@ pub(crate) fn apply_with_token(
     let values = normalize_cpu(&baseline);
     let report = build_report(result, AccelerationBackend::None, values, pre_mass, notes);
     result.acceleration = Some(report.clone());
-    report
+    if let Some(tok) = token {
+        tok.checkpoint()?;
+    }
+    Ok(report)
 }
 
 fn build_report(
@@ -191,22 +183,9 @@ pub(crate) fn attention_scores_cpu(
     }
 }
 
-/// The retired high-level FrankenTorch adapter reports unavailability so the
-/// deterministic CPU implementation remains authoritative.
-pub(crate) fn attention_scores_frankentorch(
-    _query: &[f64],
-    _key: &[f64],
-    _kind: AttentionKind,
-) -> Result<AttentionResult, String> {
-    Err("high-level frankentorch adapter is not packaged".to_owned())
-}
-
-/// Dispatch attention scoring: GPU if available, CPU fallback otherwise.
+/// Compute attention scores on the packaged CPU implementation.
 pub fn compute_attention(query: &[f64], key: &[f64], kind: AttentionKind) -> AttentionResult {
-    match attention_scores_frankentorch(query, key, kind) {
-        Ok(result) => result,
-        Err(_) => attention_scores_cpu(query, key, kind),
-    }
+    attention_scores_cpu(query, key, kind)
 }
 
 // ---------------------------------------------------------------------------
@@ -258,26 +237,13 @@ pub(crate) fn embedding_lookup_cpu(
     }
 }
 
-/// The retired high-level FrankenTorch adapter reports unavailability so the
-/// deterministic CPU implementation remains authoritative.
-pub(crate) fn embedding_lookup_frankentorch(
-    _indices: &[usize],
-    _table: &[Vec<f64>],
-    _kind: EmbeddingKind,
-) -> Result<EmbeddingResult, String> {
-    Err("high-level frankentorch adapter is not packaged".to_owned())
-}
-
-/// Dispatch embedding lookup: GPU if available, CPU fallback otherwise.
+/// Compute an embedding lookup on the packaged CPU implementation.
 pub fn compute_embedding(
     indices: &[usize],
     table: &[Vec<f64>],
     kind: EmbeddingKind,
 ) -> EmbeddingResult {
-    match embedding_lookup_frankentorch(indices, table, kind) {
-        Ok(result) => result,
-        Err(_) => embedding_lookup_cpu(indices, table, kind),
-    }
+    embedding_lookup_cpu(indices, table, kind)
 }
 
 // ---------------------------------------------------------------------------
@@ -328,18 +294,9 @@ pub(crate) fn vad_scores_cpu(energy_values: &[f64]) -> VadResult {
     }
 }
 
-/// The retired high-level FrankenTorch adapter reports unavailability so the
-/// deterministic CPU implementation remains authoritative.
-pub(crate) fn vad_scores_frankentorch(_energy_values: &[f64]) -> Result<VadResult, String> {
-    Err("high-level frankentorch adapter is not packaged".to_owned())
-}
-
-/// Dispatch VAD scoring: GPU if available, CPU fallback otherwise.
+/// Compute VAD scores on the packaged CPU implementation.
 pub fn compute_vad_scores(energy_values: &[f64]) -> VadResult {
-    match vad_scores_frankentorch(energy_values) {
-        Ok(result) => result,
-        Err(_) => vad_scores_cpu(energy_values),
-    }
+    vad_scores_cpu(energy_values)
 }
 
 // ---------------------------------------------------------------------------
@@ -409,318 +366,14 @@ pub(crate) fn layer_norm_cpu(
     }
 }
 
-/// The retired high-level FrankenTorch adapter reports unavailability so the
-/// deterministic CPU implementation remains authoritative.
-pub(crate) fn layer_norm_frankentorch(
-    _values: &[f64],
-    _gamma: &[f64],
-    _beta: &[f64],
-    _epsilon: f64,
-) -> Result<LayerNormResult, String> {
-    Err("high-level frankentorch adapter is not packaged".to_owned())
-}
-
-/// Dispatch layer normalization: GPU if available, CPU fallback otherwise.
+/// Compute layer normalization on the packaged CPU implementation.
 pub fn compute_layer_norm(
     values: &[f64],
     gamma: &[f64],
     beta: &[f64],
     epsilon: f64,
 ) -> LayerNormResult {
-    match layer_norm_frankentorch(values, gamma, beta, epsilon) {
-        Ok(result) => result,
-        Err(_) => layer_norm_cpu(values, gamma, beta, epsilon),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// bd-1r7.2: JIT-compiled inference paths (frankenjax)
-// ---------------------------------------------------------------------------
-
-/// Describes a graph pattern that can be JIT-compiled for inference.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum InferenceGraphPattern {
-    /// Normalize-then-softmax pipeline for confidence scoring.
-    NormalizeSoftmax,
-    /// Linear projection followed by activation (e.g. for feed-forward layers).
-    LinearActivation,
-    /// Full attention pattern: Q*K^T scaling + softmax + V projection.
-    AttentionBlock,
-}
-
-/// A cached compiled kernel for a specific graph pattern.
-#[derive(Debug, Clone)]
-pub struct CompiledKernel {
-    pub pattern: InferenceGraphPattern,
-    pub kernel_id: String,
-}
-
-/// Cache for JIT-compiled kernels. Maps graph patterns to compiled
-/// kernel descriptors so repeated inference calls avoid recompilation.
-#[derive(Debug, Clone)]
-pub struct JitKernelCache {
-    entries: HashMap<InferenceGraphPattern, CompiledKernel>,
-}
-
-impl JitKernelCache {
-    /// Create a new empty kernel cache.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
-    }
-
-    /// Return the number of cached kernels.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Return whether the cache is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Look up a compiled kernel for the given pattern.
-    #[must_use]
-    pub fn get(&self, pattern: &InferenceGraphPattern) -> Option<&CompiledKernel> {
-        self.entries.get(pattern)
-    }
-
-    /// Insert a compiled kernel into the cache.
-    pub fn insert(&mut self, kernel: CompiledKernel) {
-        self.entries.insert(kernel.pattern.clone(), kernel);
-    }
-
-    /// Clear all cached kernels.
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-}
-
-impl Default for JitKernelCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Result of a JIT-compiled inference pass.
-#[derive(Debug, Clone, PartialEq)]
-pub struct JitInferenceResult {
-    pub values: Vec<f64>,
-    pub pattern: InferenceGraphPattern,
-    pub cache_hit: bool,
-    pub gpu_accelerated: bool,
-}
-
-/// CPU fallback for normalize-softmax inference.
-pub(crate) fn jit_normalize_softmax_cpu(values: &[f64]) -> Vec<f64> {
-    let normalized = normalize_cpu(values);
-    softmax_cpu(&normalized)
-}
-
-/// CPU fallback for linear-activation inference.
-/// Applies a simple linear transform (weights * inputs + bias) followed by ReLU.
-pub(crate) fn jit_linear_activation_cpu(inputs: &[f64], weights: &[f64], bias: f64) -> Vec<f64> {
-    inputs
-        .iter()
-        .zip(weights.iter())
-        .map(|(x, w)| {
-            let x_safe = if x.is_finite() { *x } else { 0.0 };
-            let w_safe = if w.is_finite() { *w } else { 0.0 };
-            let linear = x_safe * w_safe + bias;
-            // ReLU activation
-            linear.max(0.0)
-        })
-        .collect()
-}
-
-/// CPU fallback for attention-block inference.
-/// Computes Q*K scaling, softmax, then multiplies by V.
-pub(crate) fn jit_attention_block_cpu(query: &[f64], key: &[f64], value: &[f64]) -> Vec<f64> {
-    if query.is_empty() || key.is_empty() || value.is_empty() {
-        return vec![];
-    }
-
-    let dim = query.len().min(key.len()).min(value.len());
-    let scale = 1.0 / (dim as f64).sqrt();
-
-    let logits: Vec<f64> = query[..dim]
-        .iter()
-        .zip(key[..dim].iter())
-        .map(|(q, k)| {
-            let q_safe = if q.is_finite() { *q } else { 0.0 };
-            let k_safe = if k.is_finite() { *k } else { 0.0 };
-            q_safe * k_safe * scale
-        })
-        .collect();
-
-    let weights = softmax_cpu(&logits);
-
-    // Multiply attention weights by value vector element-wise.
-    weights
-        .iter()
-        .zip(value[..dim].iter())
-        .map(|(w, v)| {
-            let v_safe = if v.is_finite() { *v } else { 0.0 };
-            w * v_safe
-        })
-        .collect()
-}
-
-/// Run deterministic cached inference on the packaged CPU implementation.
-///
-/// For `NormalizeSoftmax`: expects `inputs[0]` = data vector.
-/// For `LinearActivation`: expects `inputs[0]` = data, `inputs[1]` = weights.
-///   The bias is assumed to be 0.0 in the dispatch (caller can offset externally).
-/// For `AttentionBlock`: expects `inputs[0]` = query, `inputs[1]` = key, `inputs[2]` = value.
-pub fn jit_inference(
-    pattern: &InferenceGraphPattern,
-    inputs: &[&[f64]],
-    cache: &mut JitKernelCache,
-) -> JitInferenceResult {
-    let cache_hit = cache.get(pattern).is_some();
-
-    // Ensure the pattern is "compiled" in the cache even for CPU fallback.
-    if !cache_hit {
-        let kernel_id = match pattern {
-            InferenceGraphPattern::NormalizeSoftmax => "cpu_norm_softmax_v1",
-            InferenceGraphPattern::LinearActivation => "cpu_linear_act_v1",
-            InferenceGraphPattern::AttentionBlock => "cpu_attn_block_v1",
-        };
-        cache.insert(CompiledKernel {
-            pattern: pattern.clone(),
-            kernel_id: kernel_id.to_owned(),
-        });
-    }
-
-    let values = match pattern {
-        InferenceGraphPattern::NormalizeSoftmax => {
-            let data = inputs.first().copied().unwrap_or(&[]);
-            jit_normalize_softmax_cpu(data)
-        }
-        InferenceGraphPattern::LinearActivation => {
-            let data = inputs.first().copied().unwrap_or(&[]);
-            let weights = inputs.get(1).copied().unwrap_or(&[]);
-            jit_linear_activation_cpu(data, weights, 0.0)
-        }
-        InferenceGraphPattern::AttentionBlock => {
-            let q = inputs.first().copied().unwrap_or(&[]);
-            let k = inputs.get(1).copied().unwrap_or(&[]);
-            let v = inputs.get(2).copied().unwrap_or(&[]);
-            jit_attention_block_cpu(q, k, v)
-        }
-    };
-
-    // Use cache_hit from *before* we inserted above for the first call.
-    let was_cached = cache.get(pattern).is_some() && cache_hit;
-
-    JitInferenceResult {
-        values,
-        pattern: pattern.clone(),
-        cache_hit: was_cached,
-        gpu_accelerated: false,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// bd-1r7.2: InferenceGraphSpec and JIT compilation/execution helpers
-// ---------------------------------------------------------------------------
-
-/// Describes a computation graph that can be JIT-compiled for inference.
-///
-/// This captures the shape and pattern of the computation so that the JIT
-/// compiler can produce an optimized kernel.
-#[derive(Debug, Clone, PartialEq)]
-pub struct InferenceGraphSpec {
-    /// The computation pattern to compile.
-    pub pattern: InferenceGraphPattern,
-    /// Number of input tensors expected by this graph.
-    pub input_count: usize,
-    /// Dimension of each input tensor (used for shape validation).
-    pub input_dim: usize,
-    /// Optional human-readable label for debugging/logging.
-    pub label: Option<String>,
-}
-
-impl InferenceGraphSpec {
-    /// Create a new graph spec with the given pattern, input count, and dimension.
-    #[must_use]
-    pub fn new(pattern: InferenceGraphPattern, input_count: usize, input_dim: usize) -> Self {
-        Self {
-            pattern,
-            input_count,
-            input_dim,
-            label: None,
-        }
-    }
-
-    /// Attach a human-readable label for debugging.
-    #[must_use]
-    pub fn with_label(mut self, label: impl Into<String>) -> Self {
-        self.label = Some(label.into());
-        self
-    }
-}
-
-/// Compute a deterministic cache key for a compiled graph based on its spec.
-///
-/// The key is a string that uniquely identifies the spec's pattern, input
-/// count, and input dimension so that identical graph shapes share the same
-/// compiled kernel.
-#[must_use]
-pub fn jit_cache_key(spec: &InferenceGraphSpec) -> String {
-    format!(
-        "{:?}:inputs={}:dim={}",
-        spec.pattern, spec.input_count, spec.input_dim
-    )
-}
-
-/// Compile an inference graph from a spec, returning a `CompiledKernel`.
-///
-/// A deterministic CPU kernel descriptor is produced and cached.
-pub fn jit_compile_inference_graph(
-    spec: &InferenceGraphSpec,
-    cache: &mut JitKernelCache,
-) -> Result<CompiledKernel, String> {
-    let key = jit_cache_key(spec);
-
-    if let Some(existing) = cache.get(&spec.pattern) {
-        return Ok(existing.clone());
-    }
-
-    let kernel_id = format!("cpu_jit_{key}");
-    let kernel = CompiledKernel {
-        pattern: spec.pattern.clone(),
-        kernel_id,
-    };
-    cache.insert(kernel.clone());
-    Ok(kernel)
-}
-
-/// Execute a batch of input vectors through a JIT-compiled inference graph.
-///
-/// Each element of `batch` is a set of input slices matching the graph spec.
-/// Returns one `JitInferenceResult` per batch element.
-///
-/// Every batch element uses the same packaged CPU execution contract.
-pub fn jit_execute_batch(
-    spec: &InferenceGraphSpec,
-    batch: &[Vec<Vec<f64>>],
-    cache: &mut JitKernelCache,
-) -> Vec<JitInferenceResult> {
-    // Ensure the graph is compiled (CPU path).
-    let _ = jit_compile_inference_graph(spec, cache);
-
-    batch
-        .iter()
-        .map(|inputs| {
-            let slices: Vec<&[f64]> = inputs.iter().map(Vec::as_slice).collect();
-            jit_inference(&spec.pattern, &slices, cache)
-        })
-        .collect()
+    layer_norm_cpu(values, gamma, beta, epsilon)
 }
 
 // ---------------------------------------------------------------------------
@@ -1552,13 +1205,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_cpu_fallback_notes_contain_cpu_message() {
+    fn apply_notes_identify_cpu_normalization() {
         let mut result = make_result(vec![seg("test", Some(0.5))]);
         let report = apply(&mut result);
-        // Without GPU features, the CPU fallback note should be present
         assert!(
             report.notes.iter().any(|n| n.contains("CPU")),
-            "notes should mention CPU fallback: {:?}",
+            "notes should identify CPU normalization: {:?}",
             report.notes
         );
     }
@@ -1959,8 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_report_notes_contain_cpu_fallback() {
-        // Without GPU feature flags, the report should note CPU fallback usage.
+    fn apply_report_notes_contain_deterministic_cpu_normalization() {
         let mut result = make_result(vec![seg("test segment", Some(0.5))]);
         let report = apply(&mut result);
 
@@ -1970,18 +1621,17 @@ mod tests {
             .any(|note| note.contains("CPU") || note.contains("cpu"));
         assert!(
             has_cpu_note,
-            "notes should mention CPU fallback when no GPU backend is available: {:?}",
+            "notes should identify CPU normalization: {:?}",
             report.notes
         );
 
-        // Check the specific expected note text.
         let has_deterministic_note = report
             .notes
             .iter()
-            .any(|note| note.contains("deterministic CPU normalization fallback"));
+            .any(|note| note.contains("deterministic CPU normalization"));
         assert!(
             has_deterministic_note,
-            "notes should contain 'deterministic CPU normalization fallback': {:?}",
+            "notes should contain 'deterministic CPU normalization': {:?}",
             report.notes
         );
     }
@@ -2168,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_attention_dispatch_uses_cpu_without_features() {
+    fn compute_attention_uses_packaged_cpu_implementation() {
         use super::{AttentionKind, compute_attention};
 
         let result = compute_attention(&[1.0, 2.0], &[2.0, 1.0], AttentionKind::SelfAttention);
@@ -2272,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_embedding_dispatch_uses_cpu_without_features() {
+    fn compute_embedding_uses_packaged_cpu_implementation() {
         use super::{EmbeddingKind, compute_embedding};
 
         let table = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
@@ -2416,7 +2066,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_vad_scores_dispatch_uses_cpu_without_features() {
+    fn compute_vad_scores_uses_packaged_cpu_implementation() {
         use super::compute_vad_scores;
 
         let result = compute_vad_scores(&[0.0, 5.0, -5.0]);
@@ -2545,523 +2195,6 @@ mod tests {
                 "sigmoid should be monotonically increasing: sigmoid({a}) = {}, sigmoid({b}) = {}",
                 sigmoid(a),
                 sigmoid(b)
-            );
-        }
-    }
-
-    // ===================================================================
-    // bd-1r7.2: JIT-compiled inference tests
-    // ===================================================================
-
-    #[test]
-    fn jit_kernel_cache_new_is_empty() {
-        use super::JitKernelCache;
-
-        let cache = JitKernelCache::new();
-        assert!(cache.is_empty());
-        assert_eq!(cache.len(), 0);
-    }
-
-    #[test]
-    fn jit_kernel_cache_default_is_empty() {
-        use super::JitKernelCache;
-
-        let cache = JitKernelCache::default();
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn jit_kernel_cache_insert_and_get() {
-        use super::{CompiledKernel, InferenceGraphPattern, JitKernelCache};
-
-        let mut cache = JitKernelCache::new();
-        assert!(
-            cache
-                .get(&InferenceGraphPattern::NormalizeSoftmax)
-                .is_none()
-        );
-
-        let kernel = CompiledKernel {
-            pattern: InferenceGraphPattern::NormalizeSoftmax,
-            kernel_id: "test_kernel_v1".to_owned(),
-        };
-        cache.insert(kernel);
-
-        assert_eq!(cache.len(), 1);
-        assert!(!cache.is_empty());
-
-        let retrieved = cache.get(&InferenceGraphPattern::NormalizeSoftmax);
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().kernel_id, "test_kernel_v1");
-    }
-
-    #[test]
-    fn jit_kernel_cache_multiple_patterns() {
-        use super::{CompiledKernel, InferenceGraphPattern, JitKernelCache};
-
-        let mut cache = JitKernelCache::new();
-
-        cache.insert(CompiledKernel {
-            pattern: InferenceGraphPattern::NormalizeSoftmax,
-            kernel_id: "ns_v1".to_owned(),
-        });
-        cache.insert(CompiledKernel {
-            pattern: InferenceGraphPattern::LinearActivation,
-            kernel_id: "la_v1".to_owned(),
-        });
-        cache.insert(CompiledKernel {
-            pattern: InferenceGraphPattern::AttentionBlock,
-            kernel_id: "ab_v1".to_owned(),
-        });
-
-        assert_eq!(cache.len(), 3);
-        assert!(
-            cache
-                .get(&InferenceGraphPattern::NormalizeSoftmax)
-                .is_some()
-        );
-        assert!(
-            cache
-                .get(&InferenceGraphPattern::LinearActivation)
-                .is_some()
-        );
-        assert!(cache.get(&InferenceGraphPattern::AttentionBlock).is_some());
-    }
-
-    #[test]
-    fn jit_kernel_cache_overwrite_same_pattern() {
-        use super::{CompiledKernel, InferenceGraphPattern, JitKernelCache};
-
-        let mut cache = JitKernelCache::new();
-
-        cache.insert(CompiledKernel {
-            pattern: InferenceGraphPattern::NormalizeSoftmax,
-            kernel_id: "v1".to_owned(),
-        });
-        cache.insert(CompiledKernel {
-            pattern: InferenceGraphPattern::NormalizeSoftmax,
-            kernel_id: "v2".to_owned(),
-        });
-
-        assert_eq!(cache.len(), 1);
-        assert_eq!(
-            cache
-                .get(&InferenceGraphPattern::NormalizeSoftmax)
-                .unwrap()
-                .kernel_id,
-            "v2"
-        );
-    }
-
-    #[test]
-    fn jit_kernel_cache_clear() {
-        use super::{CompiledKernel, InferenceGraphPattern, JitKernelCache};
-
-        let mut cache = JitKernelCache::new();
-        cache.insert(CompiledKernel {
-            pattern: InferenceGraphPattern::NormalizeSoftmax,
-            kernel_id: "k1".to_owned(),
-        });
-        assert_eq!(cache.len(), 1);
-
-        cache.clear();
-        assert!(cache.is_empty());
-        assert_eq!(cache.len(), 0);
-        assert!(
-            cache
-                .get(&InferenceGraphPattern::NormalizeSoftmax)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn jit_normalize_softmax_cpu_basic() {
-        use super::jit_normalize_softmax_cpu;
-
-        let result = jit_normalize_softmax_cpu(&[1.0, 2.0, 3.0]);
-        assert_eq!(result.len(), 3);
-
-        let sum: f64 = result.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-9,
-            "normalize-then-softmax should sum to 1.0, got {sum}"
-        );
-
-        for v in &result {
-            assert!(v.is_finite() && *v >= 0.0);
-        }
-    }
-
-    #[test]
-    fn jit_normalize_softmax_cpu_empty() {
-        use super::jit_normalize_softmax_cpu;
-
-        let result = jit_normalize_softmax_cpu(&[]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn jit_normalize_softmax_cpu_single() {
-        use super::jit_normalize_softmax_cpu;
-
-        let result = jit_normalize_softmax_cpu(&[5.0]);
-        assert_eq!(result.len(), 1);
-        assert!((result[0] - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn jit_linear_activation_cpu_basic() {
-        use super::jit_linear_activation_cpu;
-
-        let inputs = vec![1.0, -1.0, 2.0];
-        let weights = vec![2.0, 3.0, 0.5];
-        let result = jit_linear_activation_cpu(&inputs, &weights, 0.0);
-
-        assert_eq!(result.len(), 3);
-        // 1.0 * 2.0 + 0.0 = 2.0, relu(2.0) = 2.0
-        assert!((result[0] - 2.0).abs() < 1e-9);
-        // -1.0 * 3.0 + 0.0 = -3.0, relu(-3.0) = 0.0
-        assert!((result[1] - 0.0).abs() < 1e-9);
-        // 2.0 * 0.5 + 0.0 = 1.0, relu(1.0) = 1.0
-        assert!((result[2] - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn jit_linear_activation_cpu_with_bias() {
-        use super::jit_linear_activation_cpu;
-
-        let inputs = vec![1.0, -1.0];
-        let weights = vec![1.0, 1.0];
-        let result = jit_linear_activation_cpu(&inputs, &weights, 0.5);
-
-        // 1.0 * 1.0 + 0.5 = 1.5, relu(1.5) = 1.5
-        assert!((result[0] - 1.5).abs() < 1e-9);
-        // -1.0 * 1.0 + 0.5 = -0.5, relu(-0.5) = 0.0
-        assert!((result[1] - 0.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn jit_linear_activation_cpu_nan_handling() {
-        use super::jit_linear_activation_cpu;
-
-        let result = jit_linear_activation_cpu(&[f64::NAN, 1.0], &[1.0, f64::NAN], 0.0);
-        assert_eq!(result.len(), 2);
-        // NaN * 1.0 → 0.0 * 1.0 = 0.0, relu(0.0) = 0.0
-        assert!((result[0] - 0.0).abs() < 1e-9);
-        // 1.0 * NaN → 1.0 * 0.0 = 0.0, relu(0.0) = 0.0
-        assert!((result[1] - 0.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn jit_linear_activation_cpu_empty() {
-        use super::jit_linear_activation_cpu;
-
-        let result = jit_linear_activation_cpu(&[], &[], 1.0);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn jit_attention_block_cpu_basic() {
-        use super::jit_attention_block_cpu;
-
-        let query = vec![1.0, 0.0, 1.0];
-        let key = vec![1.0, 1.0, 0.0];
-        let value = vec![10.0, 20.0, 30.0];
-        let result = jit_attention_block_cpu(&query, &key, &value);
-
-        assert_eq!(result.len(), 3);
-        // All output values should be finite and non-negative (since weights
-        // from softmax are non-negative and values are positive).
-        for (i, v) in result.iter().enumerate() {
-            assert!(
-                v.is_finite() && *v >= 0.0,
-                "output[{i}] should be finite non-negative, got {v}"
-            );
-        }
-    }
-
-    #[test]
-    fn jit_attention_block_cpu_empty_inputs() {
-        use super::jit_attention_block_cpu;
-
-        assert!(jit_attention_block_cpu(&[], &[1.0], &[1.0]).is_empty());
-        assert!(jit_attention_block_cpu(&[1.0], &[], &[1.0]).is_empty());
-        assert!(jit_attention_block_cpu(&[1.0], &[1.0], &[]).is_empty());
-    }
-
-    #[test]
-    fn jit_attention_block_cpu_nan_handling() {
-        use super::jit_attention_block_cpu;
-
-        let result = jit_attention_block_cpu(&[f64::NAN, 1.0], &[1.0, f64::NAN], &[5.0, 10.0]);
-        assert_eq!(result.len(), 2);
-        for v in &result {
-            assert!(v.is_finite());
-        }
-    }
-
-    #[test]
-    fn jit_inference_normalize_softmax_dispatch() {
-        use super::{InferenceGraphPattern, JitKernelCache, jit_inference};
-
-        let mut cache = JitKernelCache::new();
-        let data = vec![3.0, 1.0, 2.0];
-
-        let result = jit_inference(
-            &InferenceGraphPattern::NormalizeSoftmax,
-            &[data.as_slice()],
-            &mut cache,
-        );
-
-        assert_eq!(result.pattern, InferenceGraphPattern::NormalizeSoftmax);
-        assert!(!result.cache_hit, "first call should be a cache miss");
-        assert_eq!(result.values.len(), 3);
-
-        assert!(!result.gpu_accelerated);
-
-        let sum: f64 = result.values.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-9);
-
-        // Second call should be a cache hit.
-        let result2 = jit_inference(
-            &InferenceGraphPattern::NormalizeSoftmax,
-            &[data.as_slice()],
-            &mut cache,
-        );
-        assert!(result2.cache_hit, "second call should be a cache hit");
-    }
-
-    #[test]
-    fn jit_inference_linear_activation_dispatch() {
-        use super::{InferenceGraphPattern, JitKernelCache, jit_inference};
-
-        let mut cache = JitKernelCache::new();
-        let data = vec![1.0, -1.0, 2.0];
-        let weights = vec![2.0, 3.0, 0.5];
-
-        let result = jit_inference(
-            &InferenceGraphPattern::LinearActivation,
-            &[data.as_slice(), weights.as_slice()],
-            &mut cache,
-        );
-
-        assert_eq!(result.pattern, InferenceGraphPattern::LinearActivation);
-        assert_eq!(result.values.len(), 3);
-
-        // ReLU should zero out negative linear output.
-        assert!(result.values[0] >= 0.0);
-        assert!((result.values[1] - 0.0).abs() < 1e-9);
-        assert!(result.values[2] >= 0.0);
-    }
-
-    #[test]
-    fn jit_inference_attention_block_dispatch() {
-        use super::{InferenceGraphPattern, JitKernelCache, jit_inference};
-
-        let mut cache = JitKernelCache::new();
-        let q = vec![1.0, 0.5];
-        let k = vec![0.5, 1.0];
-        let v = vec![10.0, 20.0];
-
-        let result = jit_inference(
-            &InferenceGraphPattern::AttentionBlock,
-            &[q.as_slice(), k.as_slice(), v.as_slice()],
-            &mut cache,
-        );
-
-        assert_eq!(result.pattern, InferenceGraphPattern::AttentionBlock);
-        assert_eq!(result.values.len(), 2);
-        for val in &result.values {
-            assert!(val.is_finite() && *val >= 0.0);
-        }
-    }
-
-    #[test]
-    fn jit_inference_caching_across_patterns() {
-        use super::{InferenceGraphPattern, JitKernelCache, jit_inference};
-
-        let mut cache = JitKernelCache::new();
-        let data = vec![1.0, 2.0];
-
-        // Call NormalizeSoftmax.
-        let r1 = jit_inference(
-            &InferenceGraphPattern::NormalizeSoftmax,
-            &[data.as_slice()],
-            &mut cache,
-        );
-        assert!(!r1.cache_hit);
-
-        // Call LinearActivation.
-        let r2 = jit_inference(
-            &InferenceGraphPattern::LinearActivation,
-            &[data.as_slice(), data.as_slice()],
-            &mut cache,
-        );
-        assert!(!r2.cache_hit);
-
-        // Call NormalizeSoftmax again — should be cached.
-        let r3 = jit_inference(
-            &InferenceGraphPattern::NormalizeSoftmax,
-            &[data.as_slice()],
-            &mut cache,
-        );
-        assert!(r3.cache_hit);
-
-        assert_eq!(cache.len(), 2);
-    }
-
-    #[test]
-    fn jit_inference_empty_inputs_do_not_panic() {
-        use super::{InferenceGraphPattern, JitKernelCache, jit_inference};
-
-        let mut cache = JitKernelCache::new();
-
-        let r1 = jit_inference(&InferenceGraphPattern::NormalizeSoftmax, &[&[]], &mut cache);
-        assert!(r1.values.is_empty());
-
-        let r2 = jit_inference(
-            &InferenceGraphPattern::LinearActivation,
-            &[&[], &[]],
-            &mut cache,
-        );
-        assert!(r2.values.is_empty());
-
-        let r3 = jit_inference(
-            &InferenceGraphPattern::AttentionBlock,
-            &[&[], &[], &[]],
-            &mut cache,
-        );
-        assert!(r3.values.is_empty());
-    }
-
-    #[test]
-    fn jit_inference_missing_inputs_do_not_panic() {
-        use super::{InferenceGraphPattern, JitKernelCache, jit_inference};
-
-        let mut cache = JitKernelCache::new();
-
-        // No inputs at all for NormalizeSoftmax.
-        let r1 = jit_inference(&InferenceGraphPattern::NormalizeSoftmax, &[], &mut cache);
-        assert!(r1.values.is_empty());
-
-        // No inputs for LinearActivation.
-        let r2 = jit_inference(&InferenceGraphPattern::LinearActivation, &[], &mut cache);
-        assert!(r2.values.is_empty());
-
-        // No inputs for AttentionBlock.
-        let r3 = jit_inference(&InferenceGraphPattern::AttentionBlock, &[], &mut cache);
-        assert!(r3.values.is_empty());
-    }
-
-    #[test]
-    fn inference_graph_pattern_equality() {
-        use super::InferenceGraphPattern;
-
-        assert_eq!(
-            InferenceGraphPattern::NormalizeSoftmax,
-            InferenceGraphPattern::NormalizeSoftmax
-        );
-        assert_ne!(
-            InferenceGraphPattern::NormalizeSoftmax,
-            InferenceGraphPattern::LinearActivation
-        );
-        assert_ne!(
-            InferenceGraphPattern::LinearActivation,
-            InferenceGraphPattern::AttentionBlock
-        );
-    }
-
-    #[test]
-    fn inference_graph_pattern_hash_consistency() {
-        use super::InferenceGraphPattern;
-        use std::collections::HashMap;
-
-        let mut map = HashMap::new();
-        map.insert(InferenceGraphPattern::NormalizeSoftmax, "ns");
-        map.insert(InferenceGraphPattern::LinearActivation, "la");
-        map.insert(InferenceGraphPattern::AttentionBlock, "ab");
-
-        assert_eq!(map.len(), 3);
-        assert_eq!(map[&InferenceGraphPattern::NormalizeSoftmax], "ns");
-        assert_eq!(map[&InferenceGraphPattern::LinearActivation], "la");
-        assert_eq!(map[&InferenceGraphPattern::AttentionBlock], "ab");
-    }
-
-    #[test]
-    fn compiled_kernel_clone() {
-        use super::{CompiledKernel, InferenceGraphPattern};
-
-        let kernel = CompiledKernel {
-            pattern: InferenceGraphPattern::AttentionBlock,
-            kernel_id: "test_kernel".to_owned(),
-        };
-        let cloned = kernel.clone();
-        assert_eq!(cloned.pattern, InferenceGraphPattern::AttentionBlock);
-        assert_eq!(cloned.kernel_id, "test_kernel");
-    }
-
-    #[test]
-    fn jit_inference_result_fields() {
-        use super::{InferenceGraphPattern, JitInferenceResult};
-
-        let result = JitInferenceResult {
-            values: vec![0.5, 0.5],
-            pattern: InferenceGraphPattern::NormalizeSoftmax,
-            cache_hit: false,
-            gpu_accelerated: false,
-        };
-
-        assert_eq!(result.values.len(), 2);
-        assert_eq!(result.pattern, InferenceGraphPattern::NormalizeSoftmax);
-        assert!(!result.cache_hit);
-        assert!(!result.gpu_accelerated);
-    }
-
-    #[test]
-    fn jit_normalize_softmax_cpu_all_equal_produces_uniform() {
-        use super::jit_normalize_softmax_cpu;
-
-        let result = jit_normalize_softmax_cpu(&[5.0, 5.0, 5.0, 5.0]);
-        assert_eq!(result.len(), 4);
-        for v in &result {
-            assert!(
-                (*v - 0.25).abs() < 1e-6,
-                "equal inputs should produce uniform softmax, got {v}"
-            );
-        }
-    }
-
-    #[test]
-    fn jit_linear_activation_cpu_all_relu_zero() {
-        use super::jit_linear_activation_cpu;
-
-        // All negative linear outputs should produce all zeros after ReLU.
-        let result = jit_linear_activation_cpu(&[-1.0, -2.0, -3.0], &[1.0, 1.0, 1.0], 0.0);
-        for v in &result {
-            assert!((*v - 0.0).abs() < 1e-9, "should be 0.0 after ReLU, got {v}");
-        }
-    }
-
-    #[test]
-    fn jit_attention_block_cpu_preserves_value_information() {
-        use super::jit_attention_block_cpu;
-
-        // With uniform attention (identical Q and K), output should
-        // approximate (1/dim * value[i]) for each position, since each
-        // attention weight will be ~1/dim.
-        let dim = 4;
-        let uniform = vec![1.0; dim];
-        let value = vec![4.0, 8.0, 12.0, 16.0];
-        let result = jit_attention_block_cpu(&uniform, &uniform, &value);
-
-        assert_eq!(result.len(), dim);
-        // Each weight should be approximately 1/4 = 0.25.
-        // So output[i] ~ 0.25 * value[i].
-        for (i, r) in result.iter().enumerate() {
-            let expected = 0.25 * value[i];
-            assert!(
-                (*r - expected).abs() < 1e-6,
-                "output[{i}] should be ~{expected}, got {r}"
             );
         }
     }
@@ -3367,22 +2500,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_norm_frankentorch_stub_reports_retired_adapter() {
-        {
-            use super::layer_norm_frankentorch;
-
-            let result = layer_norm_frankentorch(&[1.0, 2.0], &[1.0, 1.0], &[0.0, 0.0], 1e-5);
-            assert!(result.is_err());
-            assert!(
-                result
-                    .unwrap_err()
-                    .contains("high-level frankentorch adapter is not packaged")
-            );
-        }
-    }
-
-    #[test]
-    fn compute_layer_norm_dispatch_uses_cpu_without_features() {
+    fn compute_layer_norm_uses_packaged_cpu_implementation() {
         use super::compute_layer_norm;
 
         let result = compute_layer_norm(&[1.0, 2.0, 3.0], &[1.0; 3], &[0.0; 3], 1e-5);
@@ -3393,348 +2511,6 @@ mod tests {
         for v in &result.normalized {
             assert!(v.is_finite());
         }
-    }
-
-    // ===================================================================
-    // bd-1r7.1: Frankentorch stub tests (feature disabled)
-    // ===================================================================
-
-    #[test]
-    fn attention_scores_frankentorch_stub_reports_retired_adapter() {
-        {
-            use super::{AttentionKind, attention_scores_frankentorch};
-
-            let result =
-                attention_scores_frankentorch(&[1.0], &[1.0], AttentionKind::SelfAttention);
-            assert!(result.is_err());
-        }
-    }
-
-    #[test]
-    fn embedding_lookup_frankentorch_stub_reports_retired_adapter() {
-        {
-            use super::{EmbeddingKind, embedding_lookup_frankentorch};
-
-            let table = vec![vec![1.0]];
-            let result = embedding_lookup_frankentorch(&[0], &table, EmbeddingKind::Token);
-            assert!(result.is_err());
-        }
-    }
-
-    #[test]
-    fn vad_scores_frankentorch_stub_reports_retired_adapter() {
-        {
-            use super::vad_scores_frankentorch;
-
-            let result = vad_scores_frankentorch(&[1.0, 2.0]);
-            assert!(result.is_err());
-        }
-    }
-
-    // ===================================================================
-    // bd-1r7.2: InferenceGraphSpec tests
-    // ===================================================================
-
-    #[test]
-    fn inference_graph_spec_new() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec};
-
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 64);
-        assert_eq!(spec.pattern, InferenceGraphPattern::NormalizeSoftmax);
-        assert_eq!(spec.input_count, 1);
-        assert_eq!(spec.input_dim, 64);
-        assert!(spec.label.is_none());
-    }
-
-    #[test]
-    fn inference_graph_spec_with_label() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec};
-
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::AttentionBlock, 3, 128)
-            .with_label("encoder_layer_0");
-        assert_eq!(spec.label, Some("encoder_layer_0".to_owned()));
-    }
-
-    #[test]
-    fn inference_graph_spec_equality() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec};
-
-        let a = InferenceGraphSpec::new(InferenceGraphPattern::LinearActivation, 2, 32);
-        let b = InferenceGraphSpec::new(InferenceGraphPattern::LinearActivation, 2, 32);
-        assert_eq!(a, b);
-
-        let c = InferenceGraphSpec::new(InferenceGraphPattern::LinearActivation, 2, 64);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn inference_graph_spec_clone() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec};
-
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 16)
-            .with_label("test");
-        let cloned = spec.clone();
-        assert_eq!(spec, cloned);
-    }
-
-    // ===================================================================
-    // bd-1r7.2: jit_cache_key tests
-    // ===================================================================
-
-    #[test]
-    fn jit_cache_key_deterministic() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, jit_cache_key};
-
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 64);
-        let key1 = jit_cache_key(&spec);
-        let key2 = jit_cache_key(&spec);
-        assert_eq!(key1, key2, "cache key should be deterministic");
-    }
-
-    #[test]
-    fn jit_cache_key_different_patterns_produce_different_keys() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, jit_cache_key};
-
-        let spec_a = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 64);
-        let spec_b = InferenceGraphSpec::new(InferenceGraphPattern::LinearActivation, 1, 64);
-        assert_ne!(jit_cache_key(&spec_a), jit_cache_key(&spec_b));
-    }
-
-    #[test]
-    fn jit_cache_key_different_dims_produce_different_keys() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, jit_cache_key};
-
-        let spec_a = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 64);
-        let spec_b = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 128);
-        assert_ne!(jit_cache_key(&spec_a), jit_cache_key(&spec_b));
-    }
-
-    #[test]
-    fn jit_cache_key_different_input_counts_produce_different_keys() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, jit_cache_key};
-
-        let spec_a = InferenceGraphSpec::new(InferenceGraphPattern::AttentionBlock, 3, 64);
-        let spec_b = InferenceGraphSpec::new(InferenceGraphPattern::AttentionBlock, 2, 64);
-        assert_ne!(jit_cache_key(&spec_a), jit_cache_key(&spec_b));
-    }
-
-    #[test]
-    fn jit_cache_key_contains_pattern_info() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, jit_cache_key};
-
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 64);
-        let key = jit_cache_key(&spec);
-        assert!(
-            key.contains("NormalizeSoftmax"),
-            "key should contain pattern name: {key}"
-        );
-        assert!(key.contains("64"), "key should contain dimension: {key}");
-    }
-
-    // ===================================================================
-    // bd-1r7.2: jit_compile_inference_graph tests
-    // ===================================================================
-
-    #[test]
-    fn jit_compile_inference_graph_basic() {
-        use super::{
-            InferenceGraphPattern, InferenceGraphSpec, JitKernelCache, jit_compile_inference_graph,
-        };
-
-        let mut cache = JitKernelCache::new();
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 64);
-
-        let result = jit_compile_inference_graph(&spec, &mut cache);
-        assert!(result.is_ok());
-
-        let kernel = result.unwrap();
-        assert_eq!(kernel.pattern, InferenceGraphPattern::NormalizeSoftmax);
-        assert!(!kernel.kernel_id.is_empty());
-    }
-
-    #[test]
-    fn jit_compile_inference_graph_caches_kernel() {
-        use super::{
-            InferenceGraphPattern, InferenceGraphSpec, JitKernelCache, jit_compile_inference_graph,
-        };
-
-        let mut cache = JitKernelCache::new();
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::LinearActivation, 2, 32);
-
-        let kernel1 = jit_compile_inference_graph(&spec, &mut cache).unwrap();
-        let kernel2 = jit_compile_inference_graph(&spec, &mut cache).unwrap();
-
-        // Second call should return the cached kernel with the same ID.
-        assert_eq!(kernel1.kernel_id, kernel2.kernel_id);
-        assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
-    fn jit_compile_inference_graph_different_patterns() {
-        use super::{
-            InferenceGraphPattern, InferenceGraphSpec, JitKernelCache, jit_compile_inference_graph,
-        };
-
-        let mut cache = JitKernelCache::new();
-
-        let spec_ns = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 64);
-        let spec_la = InferenceGraphSpec::new(InferenceGraphPattern::LinearActivation, 2, 64);
-        let spec_ab = InferenceGraphSpec::new(InferenceGraphPattern::AttentionBlock, 3, 64);
-
-        let k1 = jit_compile_inference_graph(&spec_ns, &mut cache).unwrap();
-        let k2 = jit_compile_inference_graph(&spec_la, &mut cache).unwrap();
-        let k3 = jit_compile_inference_graph(&spec_ab, &mut cache).unwrap();
-
-        assert_eq!(cache.len(), 3);
-        assert_ne!(k1.kernel_id, k2.kernel_id);
-        assert_ne!(k2.kernel_id, k3.kernel_id);
-    }
-
-    // ===================================================================
-    // bd-1r7.2: jit_execute_batch tests
-    // ===================================================================
-
-    #[test]
-    fn jit_execute_batch_normalize_softmax() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, JitKernelCache, jit_execute_batch};
-
-        let mut cache = JitKernelCache::new();
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 3);
-
-        let batch = vec![vec![vec![1.0, 2.0, 3.0]], vec![vec![4.0, 5.0, 6.0]]];
-
-        let results = jit_execute_batch(&spec, &batch, &mut cache);
-        assert_eq!(results.len(), 2);
-
-        for (i, r) in results.iter().enumerate() {
-            assert_eq!(r.pattern, InferenceGraphPattern::NormalizeSoftmax);
-            assert_eq!(r.values.len(), 3);
-            let sum: f64 = r.values.iter().sum();
-            assert!(
-                (sum - 1.0).abs() < 1e-9,
-                "batch[{i}] should sum to 1.0, got {sum}"
-            );
-        }
-    }
-
-    #[test]
-    fn jit_execute_batch_linear_activation() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, JitKernelCache, jit_execute_batch};
-
-        let mut cache = JitKernelCache::new();
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::LinearActivation, 2, 2);
-
-        let batch = vec![
-            vec![vec![1.0, -1.0], vec![2.0, 2.0]],
-            vec![vec![3.0, 0.5], vec![1.0, 1.0]],
-        ];
-
-        let results = jit_execute_batch(&spec, &batch, &mut cache);
-        assert_eq!(results.len(), 2);
-
-        for r in &results {
-            assert_eq!(r.pattern, InferenceGraphPattern::LinearActivation);
-            for v in &r.values {
-                assert!(*v >= 0.0, "ReLU output should be non-negative, got {v}");
-            }
-        }
-    }
-
-    #[test]
-    fn jit_execute_batch_attention_block() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, JitKernelCache, jit_execute_batch};
-
-        let mut cache = JitKernelCache::new();
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::AttentionBlock, 3, 3);
-
-        let batch = vec![vec![
-            vec![1.0, 0.0, 1.0],
-            vec![1.0, 1.0, 0.0],
-            vec![5.0, 10.0, 15.0],
-        ]];
-
-        let results = jit_execute_batch(&spec, &batch, &mut cache);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].pattern, InferenceGraphPattern::AttentionBlock);
-        assert_eq!(results[0].values.len(), 3);
-
-        for v in &results[0].values {
-            assert!(v.is_finite() && *v >= 0.0);
-        }
-    }
-
-    #[test]
-    fn jit_execute_batch_empty_batch() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, JitKernelCache, jit_execute_batch};
-
-        let mut cache = JitKernelCache::new();
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 4);
-
-        let results = jit_execute_batch(&spec, &[], &mut cache);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn jit_execute_batch_populates_cache() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, JitKernelCache, jit_execute_batch};
-
-        let mut cache = JitKernelCache::new();
-        assert!(cache.is_empty());
-
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 2);
-        let batch = vec![vec![vec![1.0, 2.0]]];
-
-        jit_execute_batch(&spec, &batch, &mut cache);
-        assert!(
-            !cache.is_empty(),
-            "cache should be populated after batch execution"
-        );
-    }
-
-    #[test]
-    fn jit_execute_batch_uses_compiled_cache() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, JitKernelCache, jit_execute_batch};
-
-        let mut cache = JitKernelCache::new();
-        let spec = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 3);
-
-        let batch = vec![vec![vec![1.0, 2.0, 3.0]]];
-
-        // jit_execute_batch compiles the graph first, so the internal
-        // jit_inference call already sees the cached kernel.
-        let results1 = jit_execute_batch(&spec, &batch, &mut cache);
-        assert!(
-            results1[0].cache_hit,
-            "batch execution compiles first, so inference sees a cached kernel"
-        );
-
-        // Second call: still a cache hit.
-        let results2 = jit_execute_batch(&spec, &batch, &mut cache);
-        assert!(results2[0].cache_hit);
-
-        // Values should be identical between runs.
-        assert_eq!(results1[0].values, results2[0].values);
-    }
-
-    #[test]
-    fn jit_execute_batch_multiple_patterns_in_sequence() {
-        use super::{InferenceGraphPattern, InferenceGraphSpec, JitKernelCache, jit_execute_batch};
-
-        let mut cache = JitKernelCache::new();
-
-        let spec_ns = InferenceGraphSpec::new(InferenceGraphPattern::NormalizeSoftmax, 1, 2);
-        let spec_la = InferenceGraphSpec::new(InferenceGraphPattern::LinearActivation, 2, 2);
-
-        let batch_ns = vec![vec![vec![1.0, 2.0]]];
-        let batch_la = vec![vec![vec![1.0, 2.0], vec![0.5, 0.5]]];
-
-        let r_ns = jit_execute_batch(&spec_ns, &batch_ns, &mut cache);
-        let r_la = jit_execute_batch(&spec_la, &batch_la, &mut cache);
-
-        assert_eq!(r_ns.len(), 1);
-        assert_eq!(r_la.len(), 1);
-        assert_eq!(r_ns[0].pattern, InferenceGraphPattern::NormalizeSoftmax);
-        assert_eq!(r_la[0].pattern, InferenceGraphPattern::LinearActivation);
     }
 
     // ── bd-1r7.3: benchmark harness tests ──
@@ -4076,43 +2852,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn jit_attention_block_cpu_value_is_shortest() {
-        let q = vec![1.0, 2.0, 3.0, 4.0];
-        let k = vec![0.5, 0.5, 0.5, 0.5];
-        let v = vec![10.0, 20.0]; // shortest
-        let result = super::jit_attention_block_cpu(&q, &k, &v);
-        assert_eq!(result.len(), 2);
-        for val in &result {
-            assert!(val.is_finite() && *val >= 0.0);
-        }
-    }
-
-    #[test]
-    fn jit_cache_key_ignores_label_field() {
-        let spec_no_label =
-            super::InferenceGraphSpec::new(super::InferenceGraphPattern::NormalizeSoftmax, 1, 64);
-        let spec_with_label =
-            super::InferenceGraphSpec::new(super::InferenceGraphPattern::NormalizeSoftmax, 1, 64)
-                .with_label("encoder_attn");
-        let spec_different_label =
-            super::InferenceGraphSpec::new(super::InferenceGraphPattern::NormalizeSoftmax, 1, 64)
-                .with_label("decoder_attn");
-
-        assert_eq!(
-            super::jit_cache_key(&spec_no_label),
-            super::jit_cache_key(&spec_with_label)
-        );
-        assert_eq!(
-            super::jit_cache_key(&spec_with_label),
-            super::jit_cache_key(&spec_different_label)
-        );
-    }
-
     // -- bd-247: accelerate.rs edge-case tests pass 2 --
 
     #[test]
-    fn apply_with_token_cancelled_returns_none_backend() {
+    fn apply_with_token_cancelled_returns_typed_error_without_mutation() {
         use crate::orchestrator::CancellationToken;
         use std::time::Duration;
 
@@ -4134,13 +2877,10 @@ mod tests {
         };
         let token = CancellationToken::with_deadline_from_now(Duration::from_millis(0));
         std::thread::sleep(Duration::from_millis(5));
-        let report = super::apply_with_token(&mut result, Some(&token));
-        assert_eq!(report.backend, AccelerationBackend::None);
-        assert_eq!(report.input_values, 0);
-        assert!(!report.normalized_confidences);
-        assert!(report.notes[0].contains("cancelled"));
-        // Side effect: result.acceleration should be set.
-        assert!(result.acceleration.is_some());
+        let error = super::apply_with_token(&mut result, Some(&token))
+            .expect_err("an expired token must cancel acceleration");
+        assert!(matches!(error, crate::error::FwError::Cancelled(_)));
+        assert!(result.acceleration.is_none());
     }
 
     #[test]
