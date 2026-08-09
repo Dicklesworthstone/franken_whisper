@@ -176,6 +176,7 @@ fn run_transcribe(args: &[&str], extra_env: &[(&str, &str)], state_root: &Path) 
         "FW_ENC_WEIGHT_ROUNDTRIP",
         "FRANKEN_WHISPER_NATIVE_EXECUTION",
         "FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE",
+        "FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL",
         "FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY",
         "FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS",
         "FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT",
@@ -211,6 +212,7 @@ fn run_robot(args: &[&str], extra_env: &[(&str, &str)], state_root: &Path) -> Cl
         "FW_ENC_WEIGHT_ROUNDTRIP",
         "FRANKEN_WHISPER_NATIVE_EXECUTION",
         "FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE",
+        "FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL",
         "FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY",
         "FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS",
     ] {
@@ -419,7 +421,9 @@ fn gated_sole_stage_native_is_only_path() {
 
 #[test]
 fn gated_unset_environment_defaults_to_native_asr_and_sortformer() {
-    if !tiny_en_available() || !franken_whisper::model_distribution::cached_sortformer_is_ready() {
+    if !franken_whisper::model_distribution::cached_whisper_is_ready()
+        || !franken_whisper::model_distribution::cached_sortformer_is_ready()
+    {
         eprintln!(
             "SKIP gated_unset_environment_defaults_to_native_asr_and_sortformer: native model package missing"
         );
@@ -433,8 +437,6 @@ fn gated_unset_environment_defaults_to_native_asr_and_sortformer() {
         &[
             "--input",
             wav.to_str().expect("utf8"),
-            "--model",
-            "tiny.en",
             "--no-persist",
             "--json",
         ],
@@ -449,7 +451,7 @@ fn gated_unset_environment_defaults_to_native_asr_and_sortformer() {
         run.stderr
     );
     let report = run.report();
-    assert_transcript_matches_reference(&report);
+    assert_reference_wer_at_or_below(&report, 0.05, "unset-env packaged Whisper default");
     let payload = backend_ok_payload(&report);
     assert_eq!(payload["implementation"], "native");
     assert_eq!(payload["execution_mode"], "native_only");
