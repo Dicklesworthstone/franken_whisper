@@ -455,6 +455,14 @@ capacity. Use `--no-diarize` for transcription only. Requests with known
 intervals or count constraints beyond the four-lane boundary fall back to the
 native acoustic engine under the default `acoustic` fallback policy.
 
+On this project's Apple M4 Pro development host, a repeated-public-audio
+ten-minute probe took 35.86 seconds end to end for Sortformer (29.91 seconds of
+model inference, inference RTF 0.04984). That scales to about 3.6 minutes of
+diarization per audio hour when one model load is included. The matched native
+Whisper probe took about 9.0 minutes per audio hour, for roughly 12.6 minutes
+combined. This is a throughput orientation row, not a natural-conversation
+accuracy result or a promise for other hardware.
+
 Omitting all count options means inference intent. Acoustic and ECAPA reports
 contain a versioned `speaker_count.estimate` object and retain explicit
 uncalibrated/unresolved mass. A soft preference can be added with
@@ -661,7 +669,7 @@ ambiguous hard evidence fails closed. Soft intervals remain non-authoritative
 suggestions, every non-hard-bound lane remains anonymous, and inference never
 mutates model weights. `--diarization-engine auto` now selects this native
 runtime under the owner-directed default. The model registry and focused
-diagnostic command retain the `evaluation_only` certification label. The
+diagnostic command report `development_uncertified`. The
 authenticated NVIDIA-recommended streaming
 truth pack covers four public fixtures and 4,540 L1-L8 tensors. On its complete
 102-second three-speaker row, native L5 probabilities stayed within the frozen
@@ -673,7 +681,7 @@ same-profile Rust/source loss. Same-host L6 tied-selection parity is resolved
 by the pinned safe libc++ `nth_element` translation. This is parity evidence,
 not broad corpus accuracy, greater-than-four-speaker capacity, cross-platform,
 or broad accuracy certification evidence; the registry and focused diagnostic
-command therefore still report `evaluation_only`. The converted f32 package is
+command therefore report `development_uncertified`. The converted f32 package is
 491,570,584 bytes
 (SHA-256 `487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a`).
 Its distribution policy is `github_release_with_license_and_notice`: weights

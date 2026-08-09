@@ -1041,7 +1041,7 @@ where
                 "tasks": ["speaker_activity", "overlap", "speaker_turns"],
                 "runtime_status": if sortformer_available { "native_default_ready_capped_four_lanes" } else { "native_default_missing_artifact" },
                 "installed": sortformer_available,
-                "certification": "evaluation_only",
+                "certification": crate::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS,
                 "speaker_lane_capacity": 4,
                 "capacity_semantics": "four_lane_capped_output_true_speaker_count_unknown",
                 "auto_routing_status": "owner_directed_native_default_accuracy_certification_pending",
@@ -6146,6 +6146,10 @@ mod tests {
             crate::model_distribution::SORTFORMER_DISTRIBUTION_POLICY
         );
         assert!(sortformer["installed"].is_boolean());
+        assert_eq!(
+            sortformer["certification"],
+            crate::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS
+        );
         assert_eq!(
             sortformer["auto_routing_status"],
             "owner_directed_native_default_accuracy_certification_pending"

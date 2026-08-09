@@ -39,6 +39,7 @@ pub const SORTFORMER_CONVERSION_ORACLE_ADAPTER_SHA256: &str =
     "8f376c979b7eaca41dc0a438d9aaa41c1c723052b97c45eb2acc59b6d6f00bde";
 pub const SORTFORMER_MODEL_ID: &str = "nvidia/diar_streaming_sortformer_4spk-v2.1";
 pub const SORTFORMER_MODEL_REVISION: &str = "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d";
+pub const SORTFORMER_CERTIFICATION_STATUS: &str = "development_uncertified";
 pub const SORTFORMER_NEMO_BYTES: u64 = 471_367_680;
 pub const SORTFORMER_NEMO_SHA256: &str =
     "8abd32832159c6ac1148c926b7276f35ba34582c444e559dce1f1253fea42ef8";

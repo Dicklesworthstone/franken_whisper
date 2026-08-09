@@ -318,6 +318,10 @@ fn sortformer_runtime_errors_are_one_path_safe_json_line() {
     assert_eq!(stdout.lines().count(), 1);
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON runtime error");
     assert_eq!(value["schema_version"], "sortformer-diarization-v1");
+    assert_eq!(
+        value["certification"],
+        franken_whisper::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS
+    );
     assert_eq!(value["status"], "error");
     assert_eq!(value["local_paths_emitted"], false);
     assert!(!stdout.contains(private_input));
@@ -337,6 +341,10 @@ fn sortformer_syntax_errors_are_one_path_safe_json_line() {
     assert_eq!(stdout.lines().count(), 1);
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON syntax error");
     assert_eq!(value["schema_version"], "sortformer-diarization-v1");
+    assert_eq!(
+        value["certification"],
+        franken_whisper::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS
+    );
     assert_eq!(value["code"], "FW-INVALID-REQUEST");
     assert_eq!(value["local_paths_emitted"], false);
     assert!(!stdout.contains(private_input));

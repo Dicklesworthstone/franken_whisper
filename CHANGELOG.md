@@ -84,6 +84,9 @@ was never tagged or released; its work is included here.
 - Corrected the confidence-normalization stage to report its authoritative CPU
   implementation as `acceleration.ok` instead of a spurious GPU-fallback
   warning.
+- Corrected Sortformer registry and focused-command metadata to report
+  `development_uncertified` instead of the contradictory `evaluation_only`
+  label now that the native runtime is the default diarization route.
 - Aligned installer checksum discovery with DSR releases: verified installs
   now prefer the archive-specific `.sha256` sidecar and fall back to the
   exact-name entry in `SHA256SUMS`.

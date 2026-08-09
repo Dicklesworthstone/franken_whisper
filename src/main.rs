@@ -35,7 +35,7 @@ pub(crate) fn main() {
                 "{}",
                 serde_json::to_string(&serde_json::json!({
                     "schema_version": "sortformer-diarization-v1",
-                    "certification": "evaluation_only",
+                    "certification": franken_whisper::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS,
                     "status": "error",
                     "code": error.error_code(),
                     "message": "native Sortformer diarization failed",
@@ -112,7 +112,7 @@ fn parse_cli() -> Cli {
                 "{}",
                 serde_json::to_string(&serde_json::json!({
                     "schema_version": "sortformer-diarization-v1",
-                    "certification": "evaluation_only",
+                    "certification": franken_whisper::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS,
                     "status": "error",
                     "code": "FW-INVALID-REQUEST",
                     "message": "invalid native Sortformer command-line arguments; run `fw sortformer-diarize --help`",
@@ -855,7 +855,7 @@ fn run(cli: Cli) -> FwResult<()> {
                 "{}",
                 serde_json::to_string(&serde_json::json!({
                     "schema_version": "sortformer-diarization-v1",
-                    "certification": "evaluation_only",
+                    "certification": franken_whisper::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS,
                     "status": "ok",
                     "network_access_performed": false,
                     "local_paths_emitted": false,
