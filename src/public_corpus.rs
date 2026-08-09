@@ -9143,6 +9143,7 @@ impl PublicAblationAccumulator {
                         &mut diagnostics.merge_compatible_with_supported_speaker_count
                     }
                     SpeakerEvidenceReason::SupportedByHardHint
+                    | SpeakerEvidenceReason::SupportedByLearnedModelActivity
                     | SpeakerEvidenceReason::SupportedByIndependentRecurrence
                     | SpeakerEvidenceReason::SupportedByRepeatedTracklets
                     | SpeakerEvidenceReason::SupportedByHeldoutObservation
@@ -17755,6 +17756,7 @@ mod tests {
     fn public_ecapa_change_engine_id(engine: crate::model::DiarizationEngine) -> &'static str {
         match engine {
             crate::model::DiarizationEngine::Auto => "auto",
+            crate::model::DiarizationEngine::Sortformer => "sortformer",
             crate::model::DiarizationEngine::Acoustic => "acoustic",
             crate::model::DiarizationEngine::External => "external",
             crate::model::DiarizationEngine::Ecapa => "ecapa",

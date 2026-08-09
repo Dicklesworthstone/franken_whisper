@@ -1905,6 +1905,7 @@ mod tests {
             language: None,
             translate: false,
             diarize: false,
+            no_diarize: false,
             diarization_engine: DiarizationEngine::Auto,
             diarization_fallback: DiarizationFallbackPolicy::Unknown,
             speaker_hints: None,

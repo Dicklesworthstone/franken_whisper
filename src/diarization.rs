@@ -7796,6 +7796,9 @@ pub fn ecapa_speaker_pair_calibration_sha256(
             b"ecapa-with-acoustic-channel".as_slice()
         }
         DiarizationSpeakerEvidenceMode::AcousticV2 => b"acoustic-v2-invalid".as_slice(),
+        DiarizationSpeakerEvidenceMode::SortformerActivity => {
+            b"sortformer-activity-invalid".as_slice()
+        }
         DiarizationSpeakerEvidenceMode::External => b"external-invalid".as_slice(),
         DiarizationSpeakerEvidenceMode::None => b"none-invalid".as_slice(),
     });
@@ -7852,6 +7855,9 @@ pub fn ecapa_speaker_pair_calibration_sha256(
         }
         DiarizationSpeakerEvidenceMode::AcousticV2 => {
             b"robust-separation-acoustic-invalid".as_slice()
+        }
+        DiarizationSpeakerEvidenceMode::SortformerActivity => {
+            b"robust-separation-sortformer-invalid".as_slice()
         }
         DiarizationSpeakerEvidenceMode::External => {
             b"robust-separation-external-invalid".as_slice()
@@ -8106,6 +8112,9 @@ fn speaker_pair_calibration_sha256_for_mode(
 ) -> String {
     match evidence_mode {
         DiarizationSpeakerEvidenceMode::AcousticV2 => acoustic_speaker_pair_calibration_sha256(),
+        DiarizationSpeakerEvidenceMode::SortformerActivity => {
+            acoustic_speaker_pair_calibration_sha256()
+        }
         DiarizationSpeakerEvidenceMode::EcapaOnly
         | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
             ecapa_speaker_pair_calibration_sha256(evidence_mode)
@@ -12921,6 +12930,7 @@ fn ecapa_residual_common_observation_sha256(
     );
     hasher.update([match observation.evidence_mode {
         DiarizationSpeakerEvidenceMode::AcousticV2 => 0,
+        DiarizationSpeakerEvidenceMode::SortformerActivity => 5,
         DiarizationSpeakerEvidenceMode::EcapaOnly => 1,
         DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => 2,
         DiarizationSpeakerEvidenceMode::External => 3,
@@ -12983,6 +12993,7 @@ fn ecapa_residual_common_observation_sha256(
     let request = observation.request;
     hasher.update([match request.engine {
         DiarizationEngine::Auto => 0,
+        DiarizationEngine::Sortformer => 5,
         DiarizationEngine::Acoustic => 1,
         DiarizationEngine::External => 2,
         DiarizationEngine::Ecapa => 3,
@@ -13968,6 +13979,7 @@ fn supported_profile_redecode_frozen_support_summary_sha256(
         for reason in &speaker.reasons {
             hasher.update([match reason {
                 SpeakerEvidenceReason::SupportedByHardHint => 0,
+                SpeakerEvidenceReason::SupportedByLearnedModelActivity => 11,
                 SpeakerEvidenceReason::SupportedByIndependentRecurrence => 1,
                 SpeakerEvidenceReason::SupportedByRepeatedTracklets => 2,
                 SpeakerEvidenceReason::SupportedByHeldoutObservation => 3,
@@ -16087,7 +16099,9 @@ where
         DiarizationSpeakerEvidenceMode::AcousticV2 => neural_embeddings.is_none(),
         DiarizationSpeakerEvidenceMode::EcapaOnly
         | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => neural_embeddings.is_some(),
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => false,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => false,
     };
     if !valid_evidence_context {
         return Err(FwError::InvalidRequest(
@@ -16129,7 +16143,9 @@ where
             neural_embeddings.is_none_or(BTreeMap::is_empty)
                 && enrollment.hard_assignments.is_empty()
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => true,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => true,
     };
     if identity_evidence_unavailable {
         if residual_birth_mode == EcapaResidualBirthMode::DevelopmentCandidateV1
@@ -17691,7 +17707,9 @@ fn apply_global_prototype_budget(
                         .and_then(|profiles| profiles.get(&profile.speaker_ref))?
                         .reliability
                 }
-                DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => {
+                DiarizationSpeakerEvidenceMode::SortformerActivity
+                | DiarizationSpeakerEvidenceMode::External
+                | DiarizationSpeakerEvidenceMode::None => {
                     return None;
                 }
             };
@@ -17972,7 +17990,9 @@ fn compare_cluster_identity(left: &AcousticCluster, right: &AcousticCluster) -> 
         DiarizationSpeakerEvidenceMode::AcousticV2 => {
             compare_float_vectors(&left.voice, &right.voice)
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => {
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => {
             std::cmp::Ordering::Equal
         }
     }
@@ -18023,7 +18043,9 @@ fn prototype_distance(left: &AcousticPrototype, right: &AcousticPrototype) -> f3
                     0.0
                 }
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 10.0,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => 10.0,
     }
 }
 
@@ -18154,7 +18176,9 @@ fn initial_clusters(
             | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => neural_profiles
                 .and_then(|profiles| profiles.get(&speaker_ref))
                 .map(|profile| profile.reliability),
-            DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => None,
+            DiarizationSpeakerEvidenceMode::SortformerActivity
+            | DiarizationSpeakerEvidenceMode::External
+            | DiarizationSpeakerEvidenceMode::None => None,
         } {
             // The anchored cluster already contains the hard-hint observations
             // used to construct this profile. Merging that profile back into
@@ -18205,7 +18229,9 @@ fn cluster_from_prototype(prototype: &AcousticPrototype) -> AcousticCluster {
         DiarizationSpeakerEvidenceMode::AcousticV2 => {
             (prototype.frame_count as f32 / 100.0).min(1.0)
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 0.0,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => 0.0,
     };
     AcousticCluster {
         prototype_members: prototype.members.clone(),
@@ -18407,7 +18433,9 @@ fn cluster_distance(left: &AcousticCluster, right: &AcousticCluster) -> f32 {
                     0.0
                 }
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 10.0,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => 10.0,
     }
 }
 
@@ -18597,7 +18625,9 @@ fn cluster_pair_evidence(
                     left.evidence_mode,
                 )
             }),
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => None,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => None,
     }
 }
 
@@ -23455,7 +23485,9 @@ fn evaluate_cluster_count(
             | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
                 ECAPA_FIXED_SAFE_EFFECTIVE_PARAMETER_COUNT
             }
-            DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 0,
+            DiarizationSpeakerEvidenceMode::SortformerActivity
+            | DiarizationSpeakerEvidenceMode::External
+            | DiarizationSpeakerEvidenceMode::None => 0,
         })
         .sum::<usize>();
     let penalty = 0.035 * voice_parameter_count as f32 * total_weight.ln();
@@ -24043,7 +24075,9 @@ fn tracklet_cluster_distance(
                     0.0
                 }
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 10.0,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => 10.0,
     }
 }
 
@@ -24093,7 +24127,9 @@ fn tracklet_cluster_pair_evidence(
                     cluster.evidence_mode,
                 )
             }),
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => None,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => None,
     }
 }
 
@@ -24504,6 +24540,7 @@ fn clusters_have_robust_different_speaker_evidence(
                     >= MIN_SPEAKER_SEPARATION_LANES
             }
             DiarizationSpeakerEvidenceMode::AcousticV2
+            | DiarizationSpeakerEvidenceMode::SortformerActivity
             | DiarizationSpeakerEvidenceMode::External
             | DiarizationSpeakerEvidenceMode::None => false,
         };
