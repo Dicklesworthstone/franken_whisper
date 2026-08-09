@@ -61,6 +61,86 @@ fn installer_script_is_valid_bash() {
 }
 
 #[test]
+fn release_checksum_resolution_prefers_dsr_sidecar_and_binds_the_archive_name() {
+    let root = tempfile::tempdir().expect("temporary checksum harness");
+    let good_sha = "a".repeat(64);
+    let output = source_and_run(
+        root.path(),
+        &format!(
+            r#"
+TMP="{}"
+VERSION="v0.7.0"
+download_file() {{
+    local url="$1" dest="$2"
+    case "$url" in
+        *.tar.gz.sha256)
+            printf '%s  unrelated.tar.gz\n' "{}" > "$dest"
+            printf '%s  franken_whisper-0.7.0-darwin_arm64.tar.gz\n' "{}" >> "$dest"
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}}
+release_archive_checksum \
+    "https://example.invalid/franken_whisper-0.7.0-darwin_arm64.tar.gz" \
+    "franken_whisper-0.7.0-darwin_arm64.tar.gz"
+"#,
+            root.path().display(),
+            "b".repeat(64),
+            good_sha,
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{good_sha}\n")
+    );
+}
+
+#[test]
+fn release_checksum_resolution_accepts_dsr_combined_manifest_fallback() {
+    let root = tempfile::tempdir().expect("temporary checksum harness");
+    let good_sha = "c".repeat(64);
+    let output = source_and_run(
+        root.path(),
+        &format!(
+            r#"
+TMP="{}"
+VERSION="v0.7.0"
+download_file() {{
+    local url="$1" dest="$2"
+    case "$url" in
+        */SHA256SUMS)
+            printf '%s  franken_whisper-0.7.0-linux_amd64.tar.gz\n' "{}" > "$dest"
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}}
+release_archive_checksum \
+    "https://example.invalid/franken_whisper-0.7.0-linux_amd64.tar.gz" \
+    "franken_whisper-0.7.0-linux_amd64.tar.gz"
+"#,
+            root.path().display(),
+            good_sha,
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{good_sha}\n")
+    );
+}
+
+#[test]
 fn headless_install_provisions_both_models_and_verifies_doctor() {
     let root = tempfile::tempdir().expect("temporary installer harness");
     let bin_dir = write_fake_fw(root.path(), 0, true);

@@ -779,6 +779,41 @@ sha256_of() {
     fi
 }
 
+# Resolve the release archive checksum from the artifacts DSR actually
+# publishes. Prefer the archive-bound sidecar, then the canonical combined
+# SHA256SUMS manifest; retain the older checksums-sha256.txt name only as a
+# final compatibility source for historical releases.
+release_archive_checksum() {
+    local archive_url="$1" archive_name="$2"
+    local release_base="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}"
+    local candidate_url candidate_path expected
+    local -a candidate_urls=(
+        "${archive_url}.sha256"
+        "${release_base}/SHA256SUMS"
+        "${release_base}/checksums-sha256.txt"
+    )
+    local -a candidate_paths=(
+        "$TMP/${archive_name}.sha256"
+        "$TMP/SHA256SUMS"
+        "$TMP/checksums-sha256.txt"
+    )
+    local index
+    for index in "${!candidate_urls[@]}"; do
+        candidate_url="${candidate_urls[$index]}"
+        candidate_path="${candidate_paths[$index]}"
+        if download_file "$candidate_url" "$candidate_path"; then
+            expected=$(awk -v name="$archive_name" \
+                '$2 == name || $2 == "*" name { print $1; exit }' \
+                "$candidate_path" 2>/dev/null || true)
+            if [[ "$expected" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+                printf '%s\n' "$expected"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
 # ============================================================================
 # Validated binary-pair install
 # ============================================================================
@@ -1048,7 +1083,7 @@ download_release() {
     download_file "$url" "$TMP/$archive_name" || return 1
     [ -f "$TMP/$archive_name" ] || return 1
 
-    # Checksum verification against the combined checksums-sha256.txt.
+    # Checksum verification against the DSR per-asset sidecar or SHA256SUMS.
     if [ "$NO_CHECKSUM" -eq 1 ]; then
         log_warn "Checksum verification disabled (--no-verify)"
     else
@@ -1056,19 +1091,7 @@ download_release() {
         if [ -n "$CHECKSUM" ]; then
             expected="${CHECKSUM%% *}"
         else
-            local checksums_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/checksums-sha256.txt"
-            if download_file "$checksums_url" "$TMP/checksums-sha256.txt"; then
-                # Anchor the match to a line ENDING in the exact asset name so a
-                # sidecar entry (e.g. "<asset>.sig") can never shadow the real
-                # checksum, and `|| true` keeps a no-match grep from killing the
-                # script under `set -euo pipefail` (we fall through to the
-                # honest "checksum not available" warning instead). Note:
-                # `awk -v` interprets backslash escapes in the value; our asset
-                # names never contain backslashes, and a hostile name would
-                # merely fail to match -> visible skip-verification warning.
-                expected=$(awk -v name="$archive_name" '$2 == name { print $1; exit }' \
-                    "$TMP/checksums-sha256.txt" 2>/dev/null || true)
-            fi
+            expected=$(release_archive_checksum "$url" "$archive_name" || true)
         fi
 
         if [ -n "$expected" ]; then
