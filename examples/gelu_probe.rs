@@ -68,7 +68,7 @@ mod x86_probe {
 
     fn gelu_table(data: &mut [f32], table: &[f32]) {
         use ft_core::Float16;
-        for v in data.iter_mut() {
+        for v in &mut *data {
             let x = *v;
             *v = if x <= -10.0 {
                 0.0

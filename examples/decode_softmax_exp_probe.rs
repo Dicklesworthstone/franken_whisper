@@ -28,7 +28,7 @@ fn softmax_row_scalar(row: &mut [f32]) {
         return;
     }
     let mut sum = 0.0f32;
-    for v in row.iter_mut() {
+    for v in &mut *row {
         let e = (*v - max).exp();
         let e = if e.is_finite() { e } else { 0.0 };
         *v = e;
@@ -36,7 +36,7 @@ fn softmax_row_scalar(row: &mut [f32]) {
     }
     if sum > 0.0 {
         let inv = 1.0 / sum;
-        for v in row.iter_mut() {
+        for v in &mut *row {
             *v *= inv;
         }
     }
@@ -49,12 +49,12 @@ unsafe fn exp8(x: __m256) -> __m256 {
     let lo = _mm256_set1_ps(-88.0);
     let hi = _mm256_set1_ps(88.0);
     let x = _mm256_max_ps(_mm256_min_ps(x, hi), lo);
-    let log2ef = _mm256_set1_ps(1.442_695_04);
+    let log2ef = _mm256_set1_ps(std::f32::consts::LOG2_E);
     let fx = _mm256_round_ps(
         _mm256_mul_ps(x, log2ef),
         _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
     );
-    let c1 = _mm256_set1_ps(0.693_359_38);
+    let c1 = _mm256_set1_ps(0.693_359_4);
     let c2 = _mm256_set1_ps(-2.121_944_4e-4);
     let mut xr = _mm256_fnmadd_ps(fx, c1, x);
     xr = _mm256_fnmadd_ps(fx, c2, xr);
@@ -63,7 +63,7 @@ unsafe fn exp8(x: __m256) -> __m256 {
     p = _mm256_fmadd_ps(p, xr, _mm256_set1_ps(8.333_452e-3));
     p = _mm256_fmadd_ps(p, xr, _mm256_set1_ps(4.166_579_6e-2));
     p = _mm256_fmadd_ps(p, xr, _mm256_set1_ps(1.666_666_5e-1));
-    p = _mm256_fmadd_ps(p, xr, _mm256_set1_ps(5.000_000_1e-1));
+    p = _mm256_fmadd_ps(p, xr, _mm256_set1_ps(5e-1));
     let xr2 = _mm256_mul_ps(xr, xr);
     p = _mm256_fmadd_ps(p, xr2, _mm256_add_ps(xr, _mm256_set1_ps(1.0)));
     // scale by 2^fx: (int(fx)+127) << 23

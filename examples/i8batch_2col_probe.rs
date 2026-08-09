@@ -187,13 +187,13 @@ mod x86_probe {
                 let reps = 60;
                 let (mut b1, mut b2) = (f64::MAX, f64::MAX);
                 for _ in 0..reps {
-                    for e in evict.iter_mut() {
+                    for e in &mut evict {
                         *e *= 1.0000001;
                     }
                     let t = std::time::Instant::now();
                     gemv_m1(&w, &xi8, out, tq, &mut a, workers);
                     b1 = b1.min(ms(t));
-                    for e in evict.iter_mut() {
+                    for e in &mut evict {
                         *e *= 1.0000001;
                     }
                     let t = std::time::Instant::now();

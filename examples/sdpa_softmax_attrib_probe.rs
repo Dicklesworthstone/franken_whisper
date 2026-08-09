@@ -108,19 +108,19 @@ fn softmax_libm(sc: &mut [f32], br: usize, scale: f32) {
     for r in 0..br {
         let row = &mut sc[r * SEQ..(r + 1) * SEQ];
         let mut m = f32::NEG_INFINITY;
-        for s in row.iter_mut() {
+        for s in &mut *row {
             *s *= scale;
             if *s > m {
                 m = *s;
             }
         }
         let mut sum = 0.0f32;
-        for s in row.iter_mut() {
+        for s in &mut *row {
             let e = (*s - m).exp();
             *s = e;
             sum += e;
         }
-        for s in row.iter_mut() {
+        for s in &mut *row {
             *s /= sum;
         }
     }
@@ -132,19 +132,19 @@ fn softmax_noexp(sc: &mut [f32], br: usize, scale: f32) {
     for r in 0..br {
         let row = &mut sc[r * SEQ..(r + 1) * SEQ];
         let mut m = f32::NEG_INFINITY;
-        for s in row.iter_mut() {
+        for s in &mut *row {
             *s *= scale;
             if *s > m {
                 m = *s;
             }
         }
         let mut sum = 0.0f32;
-        for s in row.iter_mut() {
+        for s in &mut *row {
             let e = *s - m;
             *s = e;
             sum += e;
         }
-        for s in row.iter_mut() {
+        for s in &mut *row {
             *s /= sum;
         }
     }

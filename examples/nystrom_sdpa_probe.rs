@@ -92,12 +92,12 @@ fn softmax_rows(m: &mut [f32], r: usize, c: usize) {
         let row = &mut m[i * c..(i + 1) * c];
         let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut s = 0.0f32;
-        for v in row.iter_mut() {
+        for v in &mut *row {
             *v = (*v - mx).exp();
             s += *v;
         }
         let inv = 1.0 / s;
-        for v in row.iter_mut() {
+        for v in &mut *row {
             *v *= inv;
         }
     }

@@ -498,26 +498,26 @@ mod x86_probe {
                         let (mut b4, mut b6) = (f64::MAX, f64::MAX);
                         for r in 0..reps {
                             if r % 2 == 0 {
-                                for e in evict.iter_mut() {
+                                for e in &mut evict {
                                     *e *= 1.0000001;
                                 }
                                 let t = std::time::Instant::now();
                                 gemv_m4(&w, &xi8, out, tq, &mut a, workers);
                                 b4 = b4.min(ms(t));
-                                for e in evict.iter_mut() {
+                                for e in &mut evict {
                                     *e *= 1.0000001;
                                 }
                                 let t = std::time::Instant::now();
                                 gemv_m6(&w, &xi8, out, tq, &mut b, workers);
                                 b6 = b6.min(ms(t));
                             } else {
-                                for e in evict.iter_mut() {
+                                for e in &mut evict {
                                     *e *= 1.0000001;
                                 }
                                 let t = std::time::Instant::now();
                                 gemv_m6(&w, &xi8, out, tq, &mut b, workers);
                                 b6 = b6.min(ms(t));
-                                for e in evict.iter_mut() {
+                                for e in &mut evict {
                                     *e *= 1.0000001;
                                 }
                                 let t = std::time::Instant::now();

@@ -34,6 +34,13 @@ mod x86_probe {
     use franken_whisper::native_engine::Mat;
     use franken_whisper::native_engine::nn;
 
+    #[derive(Clone, Copy)]
+    struct GemmShape {
+        m: usize,
+        k: usize,
+        n: usize,
+    }
+
     fn fill(n: usize, seed: u64) -> Vec<f32> {
         let mut s = seed;
         (0..n)
@@ -122,7 +129,7 @@ mod x86_probe {
                 if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        quant_row_u8_avx2(row, inv, qr)
+                        quant_row_u8_avx2(row, inv, qr);
                     };
                     #[cfg(not(target_arch = "x86_64"))]
                     for (d, &x) in qr.iter_mut().zip(row) {
@@ -291,10 +298,9 @@ mod x86_probe {
         qw: &[i8],
         sw: &[f32],
         wsum: &[i32],
-        m: usize,
-        k: usize,
-        n: usize,
+        shape: GemmShape,
     ) -> Vec<f32> {
+        let GemmShape { m, k, n } = shape;
         let mut c = vec![0.0f32; m * n];
         c.par_chunks_mut(n).enumerate().for_each(|(i, crow)| {
             let arow = &qa[i * k..(i + 1) * k];
@@ -396,10 +402,9 @@ mod x86_probe {
         qw: &[i8],
         sw: &[f32],
         wsum: &[i32],
-        m: usize,
-        k: usize,
-        n: usize,
+        shape: GemmShape,
     ) -> Vec<f32> {
+        let GemmShape { m, k, n } = shape;
         let mut c = vec![0.0f32; m * n];
         c.par_chunks_mut(n).enumerate().for_each(|(i, crow)| {
             let arow = &qa[i * k..(i + 1) * k];
@@ -504,10 +509,9 @@ mod x86_probe {
         qw: &[i8],
         sw: &[f32],
         wsum: &[i32],
-        m: usize,
-        k: usize,
-        n: usize,
+        shape: GemmShape,
     ) -> Vec<f32> {
+        let GemmShape { m, k, n } = shape;
         let mut c = vec![0.0f32; m * n];
         c.par_chunks_mut(4 * n).enumerate().for_each(|(blk, cblk)| {
             let r0 = blk * 4;
@@ -665,10 +669,9 @@ mod x86_probe {
         qw: &[i8],
         sw: &[f32],
         wsum: &[i32],
-        m: usize,
-        k: usize,
-        n: usize,
+        shape: GemmShape,
     ) -> Vec<f32> {
+        let GemmShape { m, k, n } = shape;
         let mut c = vec![0.0f32; m * n];
         c.par_chunks_mut(8 * n).enumerate().for_each(|(blk, cblk)| {
             let r0 = blk * 8;
@@ -709,10 +712,9 @@ mod x86_probe {
         qw: &[i8],
         sw: &[f32],
         wsum: &[i32],
-        m: usize,
-        k: usize,
-        n: usize,
+        shape: GemmShape,
     ) -> Vec<f32> {
+        let GemmShape { m, k, n } = shape;
         let mut c = vec![0.0f32; m * n];
         c.par_chunks_mut(4 * n).enumerate().for_each(|(blk, cblk)| {
             let r0 = blk * 4;
@@ -781,10 +783,9 @@ mod x86_probe {
         qw: &[i8],
         sw: &[f32],
         wsum: &[i32],
-        m: usize,
-        k: usize,
-        n: usize,
+        shape: GemmShape,
     ) -> Vec<f32> {
+        let GemmShape { m, k, n } = shape;
         let mut c = vec![0.0f32; m * n];
         let pc = ((256 * 1024 / k).max(2)) & !1usize; // even panel width, weight panel ~256KB in L2
         let threads = rayon::current_num_threads().max(1);
@@ -879,6 +880,7 @@ mod x86_probe {
     }
 
     fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
+        let shape = GemmShape { m, k, n };
         let a = fill(m * k, 0x1234);
         let b = fill(k * n, 0x5678); // [k, n] row-major
         let a_mat = Mat::from_vec(m, k, a.clone());
@@ -965,29 +967,29 @@ mod x86_probe {
             sat_diff = sat_diff.max(((got - dot_ref(arow, wrow)) as i64).abs());
         }
 
-        let cmad = gemm_maddubs(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+        let cmad = gemm_maddubs(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape);
         for _ in 0..3 {
-            black_box(gemm_maddubs(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n));
+            black_box(gemm_maddubs(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape));
         }
         let mut best_mad = f64::INFINITY;
         for _ in 0..iters {
             let t0 = Instant::now();
-            let r = gemm_maddubs(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+            let r = gemm_maddubs(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape);
             best_mad = best_mad.min(t0.elapsed().as_secs_f64());
             black_box(r);
         }
 
         // M4-blocked maddubs (weight loaded once per 4 activation rows)
-        let cmad4 = gemm_maddubs_m4(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+        let cmad4 = gemm_maddubs_m4(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape);
         for _ in 0..3 {
             black_box(gemm_maddubs_m4(
-                &qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n,
+                &qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape,
             ));
         }
         let mut best_mad4 = f64::INFINITY;
         for _ in 0..iters {
             let t0 = Instant::now();
-            let r = gemm_maddubs_m4(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+            let r = gemm_maddubs_m4(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape);
             best_mad4 = best_mad4.min(t0.elapsed().as_secs_f64());
             black_box(r);
         }
@@ -998,45 +1000,45 @@ mod x86_probe {
         }
 
         // M8-blocked (weight loaded once per 8 rows)
-        let cmad8 = gemm_maddubs_m8(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+        let cmad8 = gemm_maddubs_m8(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape);
         for _ in 0..3 {
             black_box(gemm_maddubs_m8(
-                &qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n,
+                &qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape,
             ));
         }
         let mut best_mad8 = f64::INFINITY;
         for _ in 0..iters {
             let t0 = Instant::now();
-            let r = gemm_maddubs_m8(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+            let r = gemm_maddubs_m8(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape);
             best_mad8 = best_mad8.min(t0.elapsed().as_secs_f64());
             black_box(r);
         }
 
         // M4xN2 2D tile (activation reused across 2 weight rows)
-        let cmad4n2 = gemm_maddubs_m4n2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+        let cmad4n2 = gemm_maddubs_m4n2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape);
         for _ in 0..3 {
             black_box(gemm_maddubs_m4n2(
-                &qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n,
+                &qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape,
             ));
         }
         let mut best_m4n2 = f64::INFINITY;
         for _ in 0..iters {
             let t0 = Instant::now();
-            let r = gemm_maddubs_m4n2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+            let r = gemm_maddubs_m4n2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape);
             best_m4n2 = best_m4n2.min(t0.elapsed().as_secs_f64());
             black_box(r);
         }
         // L2 weight-panel cache-blocked (on M4xN2 microkernel)
-        let cl2 = gemm_maddubs_l2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+        let cl2 = gemm_maddubs_l2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape);
         for _ in 0..3 {
             black_box(gemm_maddubs_l2(
-                &qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n,
+                &qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape,
             ));
         }
         let mut best_l2 = f64::INFINITY;
         for _ in 0..iters {
             let t0 = Instant::now();
-            let r = gemm_maddubs_l2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+            let r = gemm_maddubs_l2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, shape);
             best_l2 = best_l2.min(t0.elapsed().as_secs_f64());
             black_box(r);
         }
@@ -1054,16 +1056,16 @@ mod x86_probe {
         }
 
         // i5 delayed-widening (5-bit weights; NON-bit-identical to i7 — separate quant level)
-        let ci5 = gemm_maddubs_i5d(&qa_u8, &sa_u8, &qw_i5, &sw_i5, &wsum5, m, k, n);
+        let ci5 = gemm_maddubs_i5d(&qa_u8, &sa_u8, &qw_i5, &sw_i5, &wsum5, shape);
         for _ in 0..3 {
             black_box(gemm_maddubs_i5d(
-                &qa_u8, &sa_u8, &qw_i5, &sw_i5, &wsum5, m, k, n,
+                &qa_u8, &sa_u8, &qw_i5, &sw_i5, &wsum5, shape,
             ));
         }
         let mut best_i5 = f64::INFINITY;
         for _ in 0..iters {
             let t0 = Instant::now();
-            let r = gemm_maddubs_i5d(&qa_u8, &sa_u8, &qw_i5, &sw_i5, &wsum5, m, k, n);
+            let r = gemm_maddubs_i5d(&qa_u8, &sa_u8, &qw_i5, &sw_i5, &wsum5, shape);
             best_i5 = best_i5.min(t0.elapsed().as_secs_f64());
             black_box(r);
         }

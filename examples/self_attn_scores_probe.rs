@@ -43,7 +43,7 @@ fn scores_swap(k: &[f32], qh_all: &[f32], scale: f32, tk: usize, out: &mut [f32]
         let base = h * D_HEAD;
         let qh = &qh_all[base..base + D_HEAD];
         let so = &mut out[h * tk..(h + 1) * tk];
-        for s in so.iter_mut() {
+        for s in &mut *so {
             *s = 0.0;
         }
         for (d, &qd) in qh.iter().enumerate() {

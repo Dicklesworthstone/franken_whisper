@@ -20,7 +20,7 @@ fn softmax_scalar(row: &mut [f32]) {
         return;
     }
     let mut sum = 0.0f32;
-    for v in row.iter_mut() {
+    for v in &mut *row {
         let e = (*v - max).exp();
         let e = if e.is_finite() { e } else { 0.0 };
         *v = e;
@@ -28,7 +28,7 @@ fn softmax_scalar(row: &mut [f32]) {
     }
     if sum > 0.0 {
         let inv = 1.0 / sum;
-        for v in row.iter_mut() {
+        for v in &mut *row {
             *v *= inv;
         }
     }
@@ -91,7 +91,7 @@ fn softmax_simd(row: &mut [f32]) {
     }
     if sum > 0.0 {
         let inv = 1.0 / sum;
-        for v in row.iter_mut() {
+        for v in &mut *row {
             *v *= inv;
         }
     }

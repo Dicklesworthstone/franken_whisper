@@ -221,12 +221,12 @@ fn main() {
                 }
             }
             let mut sum = 0.0f32;
-            for v in row.iter_mut() {
+            for v in &mut *row {
                 *v = (*v - mx).exp();
                 sum += *v;
             }
             let inv = 1.0 / sum;
-            for v in row.iter_mut() {
+            for v in &mut *row {
                 *v *= inv;
             }
         }
