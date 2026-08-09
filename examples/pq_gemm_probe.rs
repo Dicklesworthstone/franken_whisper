@@ -3,11 +3,13 @@
 //! The 4th and final major reduced-cost GEMM class after this session's Strassen
 //! (935a883-pre, O(n²) overhead), CountSketch (935a883, variance+slower), and
 //! low-rank (e2ee176, near-full-rank weights). PQ-GEMM is mechanistically DIFFERENT
-//! from all three: it replaces FMA multiplies with CODEBOOK TABLE LOOKUPS.
-//!   - Split the contraction `in` into n_sub subspaces of width D. Quantize each
-//!     output column's subvector to one of K centroids (codes[out][n_sub], u8).
-//!   - Per activation row x: precompute table[s][c] = dot(x_sub_s, centroid[s][c]).
-//!   - dot(x, W_col) = sum_s table[s][codes[col][s]]  -> n_sub ADDS + LOOKUPS, no mults.
+//! from all three: it replaces FMA multiplies with codebook table lookups.
+//!
+//! - Split the contraction input into `n_sub` subspaces of width D and quantize
+//!   each output column's subvector to one of K centroids.
+//! - For each activation row, precompute `table[s][c] = dot(x_sub_s, centroid[s][c])`.
+//! - Compute each dot product as a sum of `n_sub` table lookups, without multiplies.
+//!
 //! (Jégou PQ / additive-quantization GEMM; the CPU billion-scale-ANN primitive.)
 //!
 //! The whole bet is a SPEED question with a built-in tension: small K (table L1-
@@ -32,6 +34,10 @@ use std::time::Instant;
 /// PQ lookup-sum GEMM: out[m,o] = sum_s table_m[s][codes[o*n_sub+s]].
 /// table precomputed PER ROW: table_m[s][c] = dot(x[m, s*d ..], centroid[s*K*d + c*d ..]).
 /// Parallel over m rows (each row independent). Returns wall time (best-of-iters).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the probe exposes each product-quantization geometry operand independently"
+)]
 fn pq_time(
     x: &[f32],
     m: usize,
@@ -64,13 +70,13 @@ fn pq_time(
                     }
                 }
                 // lookup-sum over outputs
-                for o in 0..out_d {
+                for (o, value) in orow.iter_mut().enumerate().take(out_d) {
                     let cb = o * n_sub;
                     let mut acc = 0.0f32;
                     for s in 0..n_sub {
                         acc += table[s * k + codes[cb + s] as usize];
                     }
-                    orow[o] = acc;
+                    *value = acc;
                 }
             });
         out
