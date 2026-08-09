@@ -4,9 +4,8 @@
 # overwritten: a mismatch fails closed with an actionable error.
 set -euo pipefail
 
-FRANKENSQLITE_REVISION="8f4d1c1517f0e40128745257555d3e1d41a8176c"
-FRANKENTORCH_REVISION="cb86f443d5dad54aec9db00c4149c76afdb61235"
-FRANKENJAX_REVISION="58d2ae579963b2a1d386b6d761d15813b43afc6e"
+FRANKENSQLITE_REVISION="70364dd00fcd99bdeff85d1622875f16d877bfbd"
+FRANKENTORCH_REVISION="9c93f5fe314195a7bab6bf6daf72f199063d39bc"
 FRANKENTUI_REVISION="479436597890a14e82676d0067e3917b2a9de8f5"
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -71,10 +70,6 @@ require_sibling \
     "frankentorch" \
     "https://github.com/Dicklesworthstone/frankentorch.git" \
     "$FRANKENTORCH_REVISION"
-require_sibling \
-    "frankenjax" \
-    "https://github.com/Dicklesworthstone/frankenjax.git" \
-    "$FRANKENJAX_REVISION"
 require_sibling \
     "frankentui" \
     "https://github.com/Dicklesworthstone/frankentui.git" \

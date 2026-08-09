@@ -3,7 +3,7 @@ name = "franken_whisper"
 version = "0.7.0"
 edition = "2024"
 license-file = "LICENSE"
-description = "Agent-first Rust ASR orchestration stack with ffmpeg normalization and frankensqlite-backed persistence"
+description = "Native Rust Whisper ASR and speaker diarization with agent-first NDJSON and durable local workflows"
 repository = "https://github.com/Dicklesworthstone/franken_whisper"
 homepage = "https://github.com/Dicklesworthstone/franken_whisper"
 documentation = "https://docs.rs/franken_whisper"
@@ -20,6 +20,7 @@ include = [
     "/NOTICE.sortformer.txt",
     "/THIRD_PARTY_NOTICES.md",
     "/src/**",
+    "!/src/.DS_Store",
     "/models/**",
     "/scripts/convert_to_safetensors.py",
     "/scripts/export_sortformer_activations.py",

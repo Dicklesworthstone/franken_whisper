@@ -8,6 +8,78 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ---
 
+## [Unreleased]
+
+No unreleased changes yet.
+
+## [0.7.0] - 2026-08-08
+
+This is the first published release after v0.5.0. The planned v0.6.0 snapshot
+was never tagged or released; its work is included here.
+
+### Added
+
+- Added a fully native, bounded-memory speaker-diarization stack with acoustic
+  regime-change features, ECAPA speaker representations, overlap-aware turn
+  projection, inferred speaker-count evidence, and typed hard/soft known-speaker
+  intervals.
+- Added the explicit four-lane Streaming Sortformer evaluation command and a
+  memory-safe Rust inference implementation for the pinned NVIDIA model.
+  Sortformer remains outside automatic routing until its public-corpus
+  promotion gate is satisfied.
+- Added `fw pull sortformer`, `fw models --json`, `fw doctor --json`,
+  `fw capabilities --json`, `fw robot triage`, and `fw robot-docs guide` for
+  agent-controlled discovery, provisioning, and diagnostics.
+- Added the `fw` binary alias alongside `franken_whisper` and path-safe robot
+  error envelopes for invalid arguments and runtime failures.
+- Added public-corpus preparation, model-comparison evidence, replay and
+  conformance tooling without copying source media into the repository.
+
+### Changed
+
+- Packages now declare registry versions for FrankenSQLite and FrankenTorch so
+  the crates.io artifact resolves without adjacent source checkouts. The source
+  tree retains versioned paths for exact sibling development builds.
+- Retired the high-level `gpu-frankentorch` and `gpu-frankenjax` feature
+  adapters. Their registry names resolve to unrelated publishers; native
+  Whisper continues to use the required FrankenTorch CPU kernels and the
+  target-gated Metal kernel on macOS.
+- Removed the unused descriptor-cache API that was labeled as JIT compilation
+  even though it never compiled or accelerated a graph.
+- The installer now validates both binary names before replacing either,
+  performs each replacement with an atomic rename, verifies checksums and
+  self-reported versions, and offers the approximately 492 MB Sortformer
+  download only to an interactive operator. Quiet, headless, and offline
+  installs never start that transfer.
+- Beam-search conformance now preserves the byte-exact greedy oracle while
+  requiring beam output to have zero WER and one of two reviewed punctuation
+  forms. It no longer asserts the false premise that beam must equal greedy.
+- Tightened all-target Clippy hygiene across library, binaries, examples,
+  benches, and tests without changing release gates.
+
+### Fixed
+
+- Aligned public diarization projection validation with persisted report
+  invariants for overlap labels, hard-hint authority, confidence, ordering, and
+  bounded speaker references.
+- Corrected the confidence-normalization stage to report its authoritative CPU
+  implementation as `acceleration.ok` instead of a spurious GPU-fallback
+  warning.
+- Hardened model distribution, archive admission, cancellation, path safety,
+  deterministic evidence commitments, and confidential-evaluation boundaries.
+- Excluded repository metadata, local caches, private media/transcripts, test
+  fixtures, and audit state from the crates.io package.
+
+### Distribution
+
+- DSR is the sole v0.7.0 binary-build authority for Linux x86_64/aarch64,
+  macOS Intel/Apple Silicon, and Windows x86_64. GitHub Actions is not used.
+- The 491,570,584-byte Sortformer package remains a separately licensed,
+  SHA-256-pinned GitHub Release artifact and is never bundled in the crate,
+  binary archive, Homebrew formula, or Git repository.
+
+Compare: [`v0.5.0...v0.7.0`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.5.0...v0.7.0)
+
 ## [0.5.0] - 2026-07-11
 
 ### CPU int8 encoder + SDPA poly-exp — measured, quality-gated maintenance self-speedups on x86-64
@@ -63,12 +135,13 @@ Compare: [`v0.4.0...v0.5.0`](https://github.com/Dicklesworthstone/franken_whispe
 
 Everything in v0.2.1 (native-default engine, NaN-hardening, the aarch64 `target-cpu` codegen fix, the routing fallback fix, and the CPU int8/GELU perf work) is included.
 
-## [0.6.0] - 2026-08-07
+## Planned 0.6.0 development snapshot (never released)
 
 Native learned-diarization evaluation, explicit model distribution, and the
-agent-first packaging tranche.
+agent-first packaging tranche. These changes ship in v0.7.0.
 
-Compare: [`v0.5.0...v0.6.0`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.5.0...v0.6.0)
+There is intentionally no v0.6.0 comparison link because no v0.6.0 tag or
+GitHub Release exists.
 
 ### Agent-first packaging and local release automation (post-2026-08-07)
 
@@ -101,7 +174,7 @@ The native engine's greedy/temperature-0 decoder gains whisper.cpp's full decode
 
 - **Temperature-fallback ladder** (`FW_TEMP_FALLBACK`) — a window that closes no timestamp, averages below `logprob_thold` (−1.0), or loops into a low-entropy repetitive tail (`entropy_thold` 2.4) is re-decoded up the whisper.cpp temperature ladder `[0.2 … 1.0]` with deterministic seeded multinomial sampling (prompt dropped above t=0.5), `greedy.best_of=5` candidates per rung selected by length-normalized sequence score (`FW_TEMP_BEST_OF`). Recovers the long-form content-drop (bd-r0qd): on `example_audio_track_01` (tiny.en, timestamps) it lifts WER **0.528 → 0.192** vs the whisper.cpp oracle, deterministically.
 - **Targeted prompt-reset retry** (`FW_RETRY_FAILED_WINDOW`) — the minimal, deterministic recovery for the carried-prompt × int8 early-EOT drop: retry a failed window once with the prompt cleared, byte-exact on every non-failed window. **The best-measured recovery: WER 0.164** (246/250 words) on the same clip — lower than the full sampling ladder.
-- **Beam search** (`FW_BEAM_SIZE`, default 1 = greedy) — whisper.cpp-style beam over the temperature-0 pass, per-hypothesis KV forking via a proven `DecoderState` clone primitive that shares the window-constant cross-K/V. Verified to converge to `whisper-cli` output on jfk (beam=5 == greedy == whisper.cpp, deterministic), and **measured to reduce WER on hard audio**: on the Steve Jobs iPhone keynote (tiny.en, drop removed via `FW_RETRY_FAILED_WINDOW`) `FW_BEAM_SIZE=5` cuts WER **0.1044 → 0.0984**, crossing below the 0.10 native-rollout gate that greedy fails. The full long-form quality stack is `FW_RETRY_FAILED_WINDOW=1 FW_BEAM_SIZE=5`.
+- **Beam search** (`FW_BEAM_SIZE`, default 1 = greedy) — whisper.cpp-style beam over the temperature-0 pass, per-hypothesis KV forking via a proven `DecoderState` clone primitive that shares the window-constant cross-K/V. On the JFK fixture beam=5 is deterministic and has zero WER, but may choose one reviewed punctuation variant rather than the byte-exact greedy string. On the Steve Jobs iPhone keynote (tiny.en, drop removed via `FW_RETRY_FAILED_WINDOW`) `FW_BEAM_SIZE=5` cuts WER **0.1044 → 0.0984**, crossing below the 0.10 native-rollout gate that greedy fails. The full long-form quality stack is `FW_RETRY_FAILED_WINDOW=1 FW_BEAM_SIZE=5`.
 - **First-class WER in conformance** — `conformance::word_error_rate` (edit-distance, ASR-normalized) now implements the "WER ≤ 0.10" gate the epic is defined against, and the native-vs-bridge comparator's WER metric was corrected from a positional counter (which cascaded a single word deletion to ~1.0) to real edit distance.
 
 Default-on decisions for these knobs are deliberately reserved (they change golden transcripts on repetitive/tiled audio); the measured WER evidence for that call lives in [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
@@ -168,7 +241,7 @@ Default-on decisions for these knobs are deliberately reserved (they change gold
 
 - **README comprehensive rewrite** ([`9ddb9db`](https://github.com/Dicklesworthstone/franken_whisper/commit/9ddb9dbab2528fdd2c2f2b10cc82ff6bd74de6a3)) — full top-to-bottom rewrite (~4,300 lines) reflecting the current architecture and capabilities, with worked examples (Bayesian routing arithmetic, mu-law encoding, Brier-score decomposition), anatomy walkthroughs (routing decision, TTY audio session, conformance check, speculative window), operational topics (state directory layout, CLI exit codes, threat model, performance tuning, disk usage growth, extension guides, debugging recipes), a use-cases gallery, JSON schema reference, and embedding-in-other-languages patterns.
 - **Removed stale "frankensqlite MVCC limitation" Limitations entry** from the README, since the underlying bug has been resolved upstream in the current `/dp/frankensqlite` checkout that the path dependency picks up.
-- **README test count corrected** from the marker-derived 3,860 to the runner-derived 3,668 (3,030 library + 638 integration across 26 integration test files).
+- **README test count methodology corrected** to use the test runner rather than source markers; the README no longer freezes a count that drifts as tests are added.
 
 ### Workspace Hygiene (post-2026-03-21)
 
@@ -430,7 +503,7 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ### Testing
 
-- 2,939 tests passing at release (now ~3,668 unit + integration tests at HEAD; see `[Unreleased] → Documentation Refresh` for the marker-vs-runner count correction)
+- 2,939 tests passed for that historical release.
 - Unit test coverage expanded across orchestrator, error, model, accelerate, robot, and process modules ([`1ed8429`](https://github.com/Dicklesworthstone/franken_whisper/commit/1ed8429b9e751190566b080cc5b294fcfaa29793))
 - Conformance harness with 50ms cross-engine timestamp tolerance and drift detection
 
@@ -447,32 +520,9 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ---
 
-<!-- agent-metadata
-  repo: Dicklesworthstone/franken_whisper
-  generated: 2026-05-18
-  commits_analyzed: 211
-  commits_since_v0.1.0: 152
-  added_since_prior_generation:
-    - speculative_cli_integration (4f54fbd + hardening 2dbab6f)
-    - storage_durability_test_tightening (eede00a; fsqlite MVCC fixed upstream)
-    - readme_rewrite_and_drift_corrections (9ddb9db + README test-count + stale-MVCC-limit removal)
-    - workspace_hygiene (47fe23b clippy + 7855910 Cargo.lock)
-  tags: v0.1.0 (lightweight, on 6a51618)
-  releases: v0.1.0 (GitHub Release, published 2026-03-04)
-  schema_version_at_HEAD: 3
-  workstreams_added_since_2026-03-21:
-    - release_pipeline (dist.yml + release-automation.yml)
-    - crates_io_migration (asupersync/franken-kernel/evidence/decision 0.3.1)
-    - conformance_native_rollout_governance (c72eed3, NativeEngineRolloutStage)
-    - word_level_timestamps + cancellation_threading (f1cbd31)
-    - adaptive_router_calibration (ef80eb8, ed91ddd)
-    - metamorphic_test_suites (audio + speculation + accelerate)
-    - health_probe_diagnostics_hardening
-    - sync_lock_pid_liveness (bd-3jfj/bd-pvol/bd-aijz/bd-7xh8/bd-ht0i/bd-qxf6/bd-uczx)
-    - ffmpeg_bundle_stdin_hardening (bd-wk8p/bd-o8fo/bd-g7b2)
-    - secrets_redaction_in_logs
-    - structured_run_error_for_invalid_robot_requests
--->
-
-[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.1.0...main
+[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.7.0...main
+[0.7.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.0
+[0.5.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.5.0
+[0.4.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.4.0
+[0.3.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.3.0
 [v0.1.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.1.0

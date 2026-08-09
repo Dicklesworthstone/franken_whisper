@@ -311,10 +311,10 @@ Examples:
   curl -fsSL .../install.sh | sudo bash -s -- --system --easy-mode
 
   # Specific version
-  curl -fsSL .../install.sh | bash -s -- --version v0.2.0
+  curl -fsSL .../install.sh | bash -s -- --version v0.7.0
 
   # Airgapped install from a local archive
-  bash install.sh --offline ./franken_whisper-0.2.0-linux_amd64.tar.gz
+  bash install.sh --offline ./franken_whisper-0.7.0-linux_amd64.tar.gz
 
   # Uninstall
   curl -fsSL .../install.sh | bash -s -- --uninstall
@@ -827,8 +827,9 @@ install_binary_pair() {
     install_binary_atomic "$long_src" "$DEST/$BINARY_NAME"
 }
 
-# Admit only flat, regular-file release archives. This rejects absolute paths,
-# traversal, nested files, and symlink/hardlink entries before extraction.
+# Admit only flat release archives with the exact supported member names. Tar
+# entry types are checked before extraction; both formats are checked again for
+# regular, non-symlink binaries before installation.
 validate_archive_members() {
     local archive="$1" archive_ext="$2" members member normalized
     local binary_count=0 alias_count=0 readme_count=0 license_count=0 third_party_count=0 agents_count=0
@@ -856,17 +857,15 @@ validate_archive_members() {
                 ;;
         esac
     done <<< "$members"
-    [ "$binary_count" -eq 1 ] && [ "$alias_count" -le 1 ] && \
+    [ "$binary_count" -eq 1 ] && [ "$alias_count" -eq 1 ] && \
         [ "$readme_count" -le 1 ] && [ "$license_count" -le 1 ] && \
         [ "$third_party_count" -le 1 ] && [ "$agents_count" -le 1 ] || {
-        log_error "Archive must contain one $BINARY_NAME and no duplicate allowlisted members"
+        log_error "Archive must contain exactly one $BINARY_NAME, exactly one $ALIAS_NAME, and no duplicate allowlisted members"
         return 1
     }
 }
 
-# Extract an archive into TMP and install both supported binary names. New
-# release archives contain both; an older/custom archive containing only the
-# long name can still produce the byte-identical short alias.
+# Extract an archive into TMP and install both supported binary names.
 extract_and_install() {
     local archive="$1" archive_ext="$2"
 
@@ -891,11 +890,10 @@ extract_and_install() {
     fi
 
     local alias_bin="$TMP/extract/$ALIAS_NAME"
-    if [ -e "$alias_bin" ] && { [ ! -f "$alias_bin" ] || [ -L "$alias_bin" ]; }; then
-        log_error "Short alias is not a regular file"
+    if [ ! -f "$alias_bin" ] || [ -L "$alias_bin" ]; then
+        log_error "Short alias not found as a regular file after extraction"
         return 1
     fi
-    [ -f "$alias_bin" ] || alias_bin="$bin"
     chmod +x "$bin" "$alias_bin"
     install_binary_pair "$bin" "$alias_bin"
     return 0
@@ -949,9 +947,8 @@ install_offline() {
 # HONESTY NOTE on source builds:
 #   franken_whisper depends on SIBLING path crates that live OUTSIDE its repo:
 #     - ../frankensqlite/crates/{fsqlite,fsqlite-types}   (required)
-#     - ../frankentorch/crates/{ft-kernel-cpu,ft-core}    (required)
-#     - ../frankenjax/crates/{fj-api,fj-core}             (optional feature,
-#                                                           manifest required)
+#     - ../frankentorch/crates/{ft-kernel-cpu,ft-core,
+#                                ft-kernel-metal}          (required/target-gated)
 #     - ../frankentui/crates/ftui                         (optional feature,
 #                                                           manifest required)
 #   Cargo.lock does not record commits for path dependencies. Release source
@@ -975,7 +972,7 @@ ensure_rust() {
 
 build_from_source() {
     log_step "Building from source..."
-    log_warn "Source builds clone five repositories and compile a release"
+    log_warn "Source builds clone four repositories and compile a release"
     log_warn "binary: expect several GB of disk use (crate cache + target dir)"
     log_warn "and multiple minutes of compile time."
     ensure_rust || die "Rust (cargo) is required for source builds and could not be installed"
@@ -1039,7 +1036,7 @@ download_release() {
         printf -v archive_name '%s' "${ARTIFACT_URL##*/}"
         [[ "$archive_name" == *.zip ]] && archive_ext="zip"
     else
-        # Assets use the version WITHOUT the leading 'v' (e.g. 0.2.0).
+        # Assets use the version WITHOUT the leading 'v' (e.g. 0.7.0).
         local ver_no_v="${VERSION#v}"
         local name="$BINARY_NAME" version="$ver_no_v"
         local os="${platform%_*}" arch="${platform#*_}" ext="$archive_ext"
@@ -1200,7 +1197,7 @@ maybe_offer_sortformer_pull() {
     fi
 
     echo ""
-    log_info "Native speaker diarization needs the pinned Sortformer model."
+    log_info "Sortformer speaker diarization needs the pinned model; acoustic and ECAPA modes do not."
     log_info "The verified download is about 492 MB into $cache_root."
     if [ -n "$pull_user" ]; then
         log_info "The model pull will run as the invoking user: $pull_user"
@@ -1211,10 +1208,11 @@ maybe_offer_sortformer_pull() {
     if [[ ! "$prompt_timeout" =~ ^[0-9]+$ ]] || [ "$prompt_timeout" -eq 0 ]; then
         prompt_timeout=120
     fi
-    printf 'Download the diarization model now with fw pull sortformer? (y/N): '
     if ( : </dev/tty ) 2>/dev/null; then
+        printf 'Download the diarization model now with fw pull sortformer? (y/N): ' >/dev/tty
         IFS= read -r -t "$prompt_timeout" answer </dev/tty || read_status=$?
     else
+        printf 'Download the diarization model now with fw pull sortformer? (y/N): '
         IFS= read -r -t "$prompt_timeout" answer || read_status=$?
     fi
     if [ "$read_status" -ne 0 ]; then
@@ -1246,7 +1244,7 @@ maybe_offer_sortformer_pull() {
 # ============================================================================
 # Shell completions
 # ============================================================================
-# NOTE: franken_whisper v0.2.0 has NO `completions` subcommand (verified:
+# NOTE: franken_whisper v0.7.0 has NO `completions` subcommand (verified:
 # `franken_whisper completions` => "unrecognized subcommand"). There is
 # nothing to generate, so completion installation is deliberately skipped.
 

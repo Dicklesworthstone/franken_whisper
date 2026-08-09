@@ -1,15 +1,14 @@
 # franken_whisper
 
 <div align="center">
-  <img src="franken_whisper_illustration.webp" alt="franken_whisper — agent-first Rust ASR orchestration stack">
+  <img src="https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/main/franken_whisper_illustration.webp" alt="franken_whisper — agent-first Rust ASR orchestration stack">
 </div>
 
 <div align="center">
 
 [![License: MIT+Rider](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
-[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
-[![Tests](https://img.shields.io/badge/tests-3%2C100%2B-brightgreen.svg)](#testing)
+[![unsafe audited](https://img.shields.io/badge/unsafe-audited-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 [![Latest Release](https://img.shields.io/github/v/release/Dicklesworthstone/franken_whisper.svg)](https://github.com/Dicklesworthstone/franken_whisper/releases)
 
 </div>
@@ -59,7 +58,7 @@ Release archives also carry [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md),
 which records the licensed libc++ selection logic translated into safe Rust for
 the pinned PyTorch CPU top-k parity contract.
 
-> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels, `#![forbid(unsafe_code)]` in-crate) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md).
+> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md).
 >
 > | Model / workload | Mode | Matched-greedy result |
 > |---|---|---|
@@ -84,8 +83,15 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 - **Adaptive Bayesian backend routing.** Each `auto` request runs a formal decision contract with an explicit loss matrix, per-backend Beta posteriors, Brier-scored calibration, and deterministic fallback when the model is mis-calibrated.
 - **Real-time NDJSON streaming.** Every pipeline stage emits sequenced, timestamped events on stable schema `v1.0.0`. No fragile regex; agents parse JSON.
 - **Durable run history.** Every transcription persists to SQLite with full event logs, replay envelopes, and JSONL export/import, even when the process crashes mid-run.
-- **Cooperative cancellation.** Ctrl+C propagates through the whole pipeline via cancellation tokens. Subprocesses get killed, transactions roll back via savepoints, finalizers run within a bounded budget, exit code 130.
-- **Zero-dependency audio decode.** MP3, AAC, FLAC, WAV, OGG, Vorbis, and ALAC decode natively via `symphonia`. `ffmpeg` is a fallback for video and exotic codecs, and is auto-provisioned on Linux x86_64 if missing.
+- **Cooperative cancellation.** Ctrl+C propagates through the pipeline via
+  cancellation tokens. Owned subprocess trees are terminated and verified,
+  transactions roll back via savepoints, and finalizers run within a bounded
+  budget. Cleanup failures are reported instead of being relabeled as clean
+  cancellation.
+- **No external decoder for common audio.** MP3, AAC, FLAC, WAV, OGG,
+  Vorbis, and ALAC decode in-process via `symphonia`. `ffmpeg` is a fallback
+  for video and exotic codecs, and is auto-provisioned on Linux x86_64 if
+  missing.
 - **Native engine rollout governance.** In-process Rust replacements for the bridge adapters ship behind a 5-stage rollout (Shadow → Validated → Fallback → Primary → Sole) with conformance gating at every promotion.
 - **TTY audio transport.** Compressed audio (mu-law + zlib + base64) over PTY links with handshake, integrity hashes, deterministic retransmission, and an adaptive bitrate controller. Transcript-streaming control frames (protocol v2) carry speculation events end-to-end over the same link.
 - **Word-level timestamps.** First-class support via `whisper.cpp`'s word-timestamp pipeline, with the cancellation token threaded into the inner extraction loop.
@@ -99,11 +105,11 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 | Adaptive backend selection | — | — | — | **Bayesian decision contract** |
 | Run persistence | — | — | — | **SQLite + JSONL replay packs** |
 | Diarization | TinyDiarize hints | yes (HF token) | yes | **Rust acoustic + explicit ECAPA + normalized external evidence** |
-| GPU acceleration | CUDA / Metal | CUDA / MPS | CUDA | **`frankentorch` / `frankenjax`** |
+| Compute acceleration | CUDA / Metal | CUDA / MPS | CUDA | **FrankenTorch CPU kernels + automatic Metal on macOS** |
 | Cancellation | `SIGKILL` | `KeyboardInterrupt` | `SIGKILL` | **cooperative `CancellationToken`** |
 | TTY audio relay | — | — | — | **mulaw + zlib + base64 NDJSON** |
 | Native audio decode | WAV only | needs ffmpeg | needs ffmpeg | **MP3 / AAC / FLAC / WAV / OGG / ALAC** |
-| Memory safety | C++ | Python | Python | **`#![forbid(unsafe_code)]`** |
+| Memory-safety boundary | C++ | Python | Python | **safe Rust with explicitly scoped, audited native kernels** |
 
 ---
 
@@ -166,17 +172,21 @@ Given identical inputs and parameters, `franken_whisper` produces identical outp
 
 ### Fail Loud, Recover Gracefully
 
-Every error has a structured code (`FW-IO`, `FW-CMD-TIMEOUT`, `FW-BACKEND-UNAVAILABLE`, `FW-STAGE-TIMEOUT`, …) and propagates through the NDJSON event stream. Cancellation tokens let in-flight work checkpoint and clean up instead of dying mid-write. In-progress SQLite transactions roll back via savepoints; subprocesses get `SIGKILL`; temp directories are removed by registered finalizers under a bounded budget.
+Every error has a structured code (`FW-IO`, `FW-CMD-TIMEOUT`, `FW-BACKEND-UNAVAILABLE`, `FW-STAGE-TIMEOUT`, …) and propagates through the NDJSON event stream. Cancellation tokens let in-flight work checkpoint and clean up instead of dying mid-write. In-progress SQLite transactions roll back via savepoints; owned subprocess trees are terminated and checked; temporary resources are handled by registered finalizers under a bounded budget.
 
 ### Composition Over Configuration
 
 The pipeline is **composed** dynamically per request. The 10 canonical stages (Ingest, Normalize, VAD, Source Separate, Backend, Accelerate, Align, Punctuate, Diarize, Persist) are skipped when unnecessary, budgeted independently, and profiled automatically. The `PipelineBuilder` validates ordering at build time; runtime never hits "stage X requires stage Y" errors.
 
-### No Unsafe Code
+### Audited Unsafe Boundaries
 
-The entire crate uses `#![forbid(unsafe_code)]`. `forbid` is stricter than `deny`: it cannot be overridden per item. Memory safety is enforced by the compiler, not by code review.
+The crate uses `#![deny(unsafe_code)]`. Native-engine SIMD and
+fully-overwritten-buffer kernels opt in at explicit sites with local safety
+arguments; unannotated unsafe code is rejected. The performance rationale and
+measurements are retained in
+[`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
 
-### Zero External Dependencies for Common Audio
+### No External Decoder for Common Audio
 
 `franken_whisper` decodes MP3, AAC, FLAC, WAV, OGG (Vorbis), and ALAC entirely in-process via `symphonia`; no `ffmpeg`, no Python, no `PATH` lookup. `ffmpeg` is only invoked as a fallback for video files, exotic codecs (AC3, DTS, Opus-in-MKV), and live microphone capture. When `ffmpeg` *is* needed and missing on Linux x86_64, it is downloaded once into the per-user state directory.
 
@@ -192,9 +202,9 @@ Every adaptive controller in the system (the backend router, the speculative win
           +--------------------------------------------------------------+
           |            INFERENCE ENGINES (run the model)                 |
           |                                                              |
-          | whisper.cpp           (C++, CPU/Metal/CUDA, ~47k stars)      |
-          | faster-whisper        (Python/CTranslate2, ~14k stars)       |
-          | OpenAI Whisper        (Python/PyTorch, ~95k stars)           |
+          | whisper.cpp           (C++, CPU/Metal/CUDA)                  |
+          | faster-whisper        (Python/CTranslate2)                   |
+          | OpenAI Whisper        (Python/PyTorch)                       |
           +--------------------------------------------------------------+
                                          |
           +------------------------------v-------------------------------+
@@ -227,14 +237,14 @@ Most tools occupy one level. `franken_whisper` is the orchestration layer: it wr
 | Capability | whisper.cpp | faster-whisper | WhisperX | WhisperLive | WhisperS2T | **franken_whisper** |
 |------------|:-----------:|:--------------:|:--------:|:-----------:|:----------:|:-------------------:|
 | Language | C++ | Python | Python | Python | Python | **Rust** |
-| Multi-backend | — | — | — | 3 | 4 | **3 backends + paired native pilots** |
+| Multi-backend | — | — | — | 3 | 4 | **3 bridge families + native counterparts** |
 | Backend selection | — | — | — | manual | manual | **Bayesian decision contract** |
 | Pipeline stages | monolithic | monolithic | 3 | monolithic | monolithic | **10 composable stages** |
 | Per-stage budgets | — | — | — | — | — | **independent timeouts + auto profiling** |
 | Speculative streaming | — | — | — | single-model | — | **dual-model fast+quality with retraction** |
 | Conformance validation | — | — | — | — | — | **cross-engine, 50 ms tolerance, drift detection** |
 | Native rollout governance | — | — | — | — | — | **5-stage Shadow → Sole with conformance gates** |
-| Memory safety | C++ | Python GC | Python GC | Python GC | Python GC | **`#![forbid(unsafe_code)]`** |
+| Memory-safety boundary | C++ | Python GC | Python GC | Python GC | Python GC | **safe Rust with explicitly scoped, audited native kernels** |
 
 ### Persistence & Observability
 
@@ -268,10 +278,10 @@ Most tools occupy one level. `franken_whisper` is the orchestration layer: it wr
 | Runs locally | no | no | no | **yes** |
 | Open source | no | no | no | **yes (MIT + rider)** |
 | Data leaves machine | yes | yes | yes | **never by core; external tools are explicit and operator-controlled** |
-| Cost per hour of audio | ~$0.04 | ~$0.75 | ~$0.65 | **$0 (your hardware)** |
+| Billing model | usage-priced | usage-priced | usage-priced | **local compute only** |
 | Inference speed | very fast | fast | moderate | **depends on selected backend** |
 | Multi-model routing | — | — | — | **Bayesian adaptive** |
-| Diarization | limited | yes | yes | **yes (any backend)** |
+| Diarization | limited | yes | yes | **native acoustic/ECAPA plus explicit Sortformer evaluation and external routes** |
 | Custom pipeline stages | — | — | — | **10 composable stages** |
 
 ---
@@ -314,20 +324,18 @@ cd franken_whisper
 # Existing mismatched sibling directories are never modified.
 scripts/prepare_release_siblings.sh
 
-# minimal build
+# default CLI and library
 cargo build --locked --release --bins
 
 # with TUI support
 cargo build --release --features tui
-
-# with GPU acceleration via frankentorch
-cargo build --release --features gpu-frankentorch
-
-# with GPU acceleration via frankenjax
-cargo build --release --features gpu-frankenjax
 ```
 
-The release profile uses `opt-level = 3`, full LTO, one codegen unit, `panic = "abort"`, and stripped symbols.
+The native engine always uses FrankenTorch CPU kernels. On macOS, large eligible
+matrix operations automatically use the target-gated Metal kernel when a Metal
+device is available; `FRANKEN_WHISPER_GPU=0` forces CPU execution. The only
+optional Cargo feature is `tui`. The release profile uses `opt-level = 3`, full
+LTO, one codegen unit, `panic = "abort"`, and stripped symbols.
 
 ### Prerequisites
 
@@ -343,7 +351,12 @@ The release profile uses `opt-level = 3`, full LTO, one codegen unit, `panic = "
 
 ### Sibling Crate Dependencies
 
-`franken_whisper` integrates several crates from the FrankenSuite ecosystem. The orchestration contracts resolve from **crates.io**. The pure-Rust SQLite stack and FrankenTorch CPU kernels are required sibling path dependencies. Cargo also resolves the local FrankenJAX and FrankenTUI manifests even when their optional features are disabled, so clean release builds stage and pin all four sibling repositories with `scripts/prepare_release_siblings.sh` and DSR.
+`franken_whisper` integrates several crates from the FrankenSuite ecosystem.
+Published packages resolve them from **crates.io**. A source checkout uses
+versioned path dependencies for the exact local FrankenSQLite, FrankenTorch,
+and optional FrankenTUI sources; `scripts/prepare_release_siblings.sh` stages
+the release-pinned sibling commits without modifying an existing mismatched
+checkout.
 
 | Crate | Source | Purpose |
 |-------|--------|---------|
@@ -351,12 +364,10 @@ The release profile uses `opt-level = 3`, full LTO, one codegen unit, `panic = "
 | `franken-kernel` | crates.io `0.3.4` | Budget, TraceId, time utilities |
 | `franken-evidence` | crates.io `0.3.4` | Evidence ledger primitives |
 | `franken-decision` | crates.io `0.3.4` | Decision contract framework |
-| `fsqlite` | path: `../frankensqlite` | Pure-Rust SQLite implementation |
-| `fsqlite-types` | path: `../frankensqlite` | Core SQLite value types |
-| `ftui` *(feature: `tui`)* | path: `../frankentui` | Terminal UI framework |
-| `ft-kernel-cpu` / `ft-core` | path: `../frankentorch` | Required native Whisper CPU kernels and tensor types |
-| `ft-api` *(feature: `gpu-frankentorch`)* | path: `../frankentorch` | Optional GPU tensor operations |
-| `fj-api` / `fj-core` *(feature: `gpu-frankenjax`)* | path: `../frankenjax` | JAX-based GPU compute |
+| `fsqlite` / `fsqlite-types` | crates.io `0.2.0`; source path `../frankensqlite` | Pure-Rust SQLite persistence and value types |
+| `ft-core` / `ft-kernel-cpu` | crates.io `0.1.0`; source path `../frankentorch` | Required tensor types and native Whisper CPU kernels |
+| `ft-kernel-metal` *(macOS)* | crates.io `0.1.0`; source path `../frankentorch` | Automatic Metal compute for eligible large operations |
+| `ftui` *(feature: `tui`)* | crates.io `0.5.0`; source path `../frankentui` | Optional terminal UI framework |
 
 ---
 
@@ -870,7 +881,9 @@ pip install -U yt-dlp      # cross-platform
 
 Point `franken_whisper` at a specific build with `FRANKEN_WHISPER_YTDLP_BIN=/path/to/yt-dlp` if it is not on `PATH`.
 
-**Keep yt-dlp current.** YouTube changes its site frequently, and `yt-dlp` ships rapid updates to keep pace — so a download that "stops working" is almost always a stale `yt-dlp`, not a franken_whisper bug. franken_whisper warns when the resolved `yt-dlp` build is **more than 90 days old**. The fix is simply:
+**Keep yt-dlp current.** YouTube changes its site frequently, and a stale
+`yt-dlp` is a common cause of download failures. franken_whisper warns when the
+resolved `yt-dlp` build is **more than 90 days old**. Update it with:
 
 ```bash
 yt-dlp -U                       # update to the latest stable
@@ -1399,10 +1412,10 @@ Built on the [FrankenTUI](https://github.com/Dicklesworthstone/frankentui) frame
 | Feature | Description |
 |---------|-------------|
 | `tui` | Enable the interactive TUI via `ftui` |
-| `gpu-frankentorch` | Enable `frankentorch` GPU acceleration |
-| `gpu-frankenjax` | Enable `frankenjax` GPU acceleration |
 
-No features are enabled by default.
+No features are enabled by default. FrankenTorch CPU kernels and the macOS-only
+Metal dependency are target-selected implementation details, not optional
+features.
 
 ### Backend Routing
 
@@ -1455,7 +1468,7 @@ validity, and external-evidence presence.
                   |    3. VAD                          |
                   |    4. Source Separate              |
                   |    5. Backend Execution            |
-                  |    6. Accelerate (GPU softmax)     |
+                  |    6. Confidence normalization    |
                   |    7. Alignment                    |
                   |    8. Punctuation                  |
                   |    9. Diarization                  |
@@ -1463,12 +1476,12 @@ validity, and external-evidence presence.
                   +------------------------------------+
                          |       |       |
     +------------------+  +----------+  +------------------+
-    | Backends         |  | Accel    |  | Storage          |
+    | Backends         |  | Compute  |  | Storage          |
     |                  |  |          |  |                  |
-    | whisper.cpp      |  | frank-   |  | fsqlite (WAL)    |
-    | insanely-fast    |  |  torch   |  |                  |
-    | whisper-diar     |  | frank-   |  | JSONL export     |
-    | + paired native  |  |  jax     |  | replay packs     |
+    | whisper.cpp      |  | Franken- |  | fsqlite (WAL)    |
+    | insanely-fast    |  | Torch    |  |                  |
+    | whisper-diar     |  | CPU /    |  | JSONL export     |
+    | + paired native  |  | Metal    |  | replay packs     |
     +------------------+  +----------+  +------------------+
 
   +------------------+   +------------------+   +------------------+
@@ -1487,7 +1500,7 @@ validity, and external-evidence presence.
 3. **VAD** *(optional)*: Voice Activity Detection skips silence
 4. **Source Separate** *(optional)*: vocal isolation for cleaner transcription
 5. **Backend**: dispatch to the selected engine (adaptive routing or explicit)
-6. **Accelerate** *(optional)*: GPU confidence normalization via `frankentorch` or `frankenjax`
+6. **Accelerate** *(optional)*: bounded, numerically stable confidence normalization
 7. **Alignment** *(optional)*: forced alignment for word-level timestamps
 8. **Punctuation** *(optional)*: punctuation restoration
 9. **Diarization** *(optional)*: speaker identification and labeling
@@ -1584,7 +1597,7 @@ Each stage runs under an independent millisecond budget. Defaults:
 | VAD | 10 s | Lightweight energy detection |
 | Source Separate | 30 s | Demucs-style vocal isolation |
 | Backend | 900 s (15 min) | Full inference (long audio on CPU) |
-| Acceleration | 20 s | GPU confidence normalization |
+| Acceleration | 20 s | CPU confidence mass normalization |
 | Align | 30 s | CTC forced alignment |
 | Punctuate | 10 s | Punctuation model inference |
 | Diarize | 30 s | Speaker clustering |
@@ -1944,7 +1957,8 @@ The retransmit system is designed to be **fully deterministic** for testing and 
 - Strategy escalation follows a fixed chain: `Simple → Redundant → Escalate`.
 - `inject_loss()` resets all prior recovery state, ensuring clean separation between test scenarios.
 
-This determinism enables comprehensive fuzz testing of the retransmit protocol without flaky timing-dependent failures.
+This determinism supports fuzz testing of the retransmit protocol without
+timing-dependent expectations.
 
 ### ffmpeg Auto-Provisioning
 
@@ -2184,7 +2198,7 @@ Quality transitions trigger compression changes on subsequent frames; this gives
 
 These frames carry `TranscriptSegmentCompact` payloads, a wire-efficient representation with single-letter field names (`s` / `e` / `t` / `sp` / `c` for start / end / text / speaker / confidence) to minimize bandwidth.
 
-**Telemetry Counters.** The decode path tracks comprehensive telemetry:
+**Telemetry Counters.** The decode path tracks:
 
 - `frames_decoded`: successfully decoded audio frames
 - `gaps`: sequence number discontinuities (with expected / actual pairs)
@@ -2201,29 +2215,23 @@ The acceleration stage normalizes per-segment confidence scores into a proper pr
 1. Extract confidence values from all segments
 2. Replace missing / invalid values (NaN, infinity, zero, negative) with a text-length-based baseline: `ln(1 + char_count) + 1.0`
 3. Compute pre-mass: `sum(confidences)` before normalization
-4. Apply softmax normalization (GPU path via `frankentorch` / `frankenjax`, or CPU fallback)
+4. Divide each positive finite value by the positive finite mass
 5. Compute post-mass: `sum(normalized)` (should equal 1.0)
 6. Record both masses in `AccelerationReport` for validation
 
-**Numerically Stable Softmax (CPU path):**
+**Mass normalization (CPU path):**
 
 ```
-max_val = max(finite values)               -- prevent overflow
-exps[i] = exp(value[i] - max_val)          -- shift by max
-output[i] = exps[i] / sum(exps)            -- normalize to sum = 1.0
+mass = sum(positive finite values)
+safe[i] = value[i] if value[i] is positive and finite, otherwise 0
+output[i] = safe[i] / mass                 -- normalize to sum = 1.0
 ```
 
 Non-finite values (NaN, infinity) map to 0.0 in the output. If the sum is near zero (all values degenerate), the result falls back to a uniform distribution `1/N`. The `layer_norm_cpu` helper clamps its epsilon floor to a safe minimum to prevent division by zero on pathological inputs.
 
-**Acceleration Paths:**
-
-| Path | Trigger | Method |
-|------|---------|--------|
-| `frankentorch` | `--features gpu-frankentorch` | Tensor softmax via `FrankenTorchSession` |
-| `frankenjax` | `--features gpu-frankenjax` | JAX-based normalization via `fj_api` |
-| CPU fallback | no GPU features | Numerically stable softmax with NaN/inf guards |
-
-The fallback chain is `frankentorch → frankenjax → CPU`.
+This confidence-normalization stage is deliberately CPU-only. Native Whisper
+inference acceleration is separate and uses the required FrankenTorch kernels
+described under Installation.
 
 ### Speculative Streaming Internals
 
@@ -2261,7 +2269,7 @@ The controller adjusts window size based on correction patterns:
 |---------|--------|-----------|
 | High correction rate (> 25%) | Shrink window by `step_ms` | Smaller windows reduce correction latency |
 | Low correction rate (< 6.25%) | Grow window by `step_ms` | Larger windows reduce overhead |
-| Runaway corrections (> 75%) | Force minimum window size | System is clearly struggling |
+| Runaway corrections (> 75%) | Force minimum window size | Bound correction churn |
 | 20 consecutive zero corrections | Shrink (counterintuitive) | May be over-tolerant; tighten to validate |
 | High WER (> 12.5%) | Shrink window | Fast model consistently wrong at this scale |
 
@@ -2392,19 +2400,18 @@ enum Finalizer {
 ```
 franken_whisper
   |
-  +-- asupersync          (crates.io 0.3.1)   Cancel-correct orchestration
-  +-- franken-kernel      (crates.io 0.3.1)   Budget, TraceId, time utilities
-  +-- franken-evidence    (crates.io 0.3.1)   Evidence ledger primitives
-  +-- franken-decision    (crates.io 0.3.1)   Decision contract framework
+  +-- asupersync          (crates.io ^0.3.4)  Cancel-correct orchestration
+  +-- franken-kernel      (crates.io ^0.3.4)  Budget, TraceId, time utilities
+  +-- franken-evidence    (crates.io ^0.3.4)  Evidence ledger primitives
+  +-- franken-decision    (crates.io ^0.3.4)  Decision contract framework
   |
-  +-- fsqlite             (path)              Pure-Rust SQLite implementation
-  +-- fsqlite-types       (path)              Core SQLite value types
+  +-- fsqlite             (crates.io 0.2.0)   Pure-Rust SQLite implementation
+  +-- fsqlite-types       (crates.io 0.2.0)   Core SQLite value types
   |
-  +-- [optional] ftui     (path, feature: tui)              Terminal UI framework
-  +-- [optional] ft-api   (path, feature: gpu-frankentorch) GPU tensor operations
-  +-- [optional] ft-core  (path, feature: gpu-frankentorch)
-  +-- [optional] fj-api   (path, feature: gpu-frankenjax)   JAX-based GPU compute
-  +-- [optional] fj-core  (path, feature: gpu-frankenjax)
+  +-- ft-core             (crates.io 0.1.0)   Tensor types
+  +-- ft-kernel-cpu       (crates.io 0.1.0)   Native Whisper CPU kernels
+  +-- [macOS] ft-kernel-metal (crates.io 0.1.0) Automatic Metal kernels
+  +-- [optional] ftui     (crates.io 0.5.0, feature: tui) Terminal UI
 ```
 
 **Third-party dependencies (non-optional):**
@@ -2430,7 +2437,9 @@ franken_whisper
 
 ### Clippy & Lint Configuration
 
-The codebase enforces strict linting beyond `#![forbid(unsafe_code)]`:
+The codebase enforces strict linting beyond the crate-wide
+`#![deny(unsafe_code)]` policy and its explicitly scoped native-kernel
+exceptions:
 
 ```toml
 [lints.clippy]
@@ -2443,7 +2452,8 @@ semicolon_if_nothing_returned = "warn"  # Consistent semicolons on unit function
 unused_self = "warn"                # Flag methods that don't use self
 ```
 
-`cargo clippy --all-targets -- -D warnings` is run in CI and promotes these warnings to hard errors.
+`cargo clippy --all-targets -- -D warnings` is a release gate and promotes
+these warnings to hard errors.
 
 ### Why These Design Decisions?
 
@@ -2454,10 +2464,19 @@ Multi-armed bandits (UCB, Thompson sampling) optimize for a single reward signal
 Top-level `BEGIN/COMMIT` transactions don't nest in SQLite. If a caller is already inside a transaction (for example, a concurrent session), a nested `BEGIN` either fails or starts an implicit savepoint depending on the driver. Explicit `SAVEPOINT` / `RELEASE` always nest correctly and make the isolation boundaries visible in the code. The naming convention (`sp_persist_N`, `fw_session_name`) provides debuggability when inspecting WAL state.
 
 **Why mu-law over Opus for TTY audio?**
-Opus is a superior audio codec, but adding it would mean either an FFI binding to `libopus` (impossible under `#![forbid(unsafe_code)]`) or a pure-Rust Opus implementation (a large, non-trivial dependency). Mu-law is a 60-year-old telephony standard that *every* ffmpeg build supports out of the box, has a fixed 2:1 compression ratio (16-bit PCM → 8-bit mu-law at 8 kHz), and produces byte streams with substantial statistical redundancy that compresses well with zlib on top. The codec conversion itself is delegated to ffmpeg via `-f mulaw -ar 8000 -ac 1`, so the Rust side stays bit-manipulation-free. The bandwidth overhead vs. Opus is roughly 30% in exchange for zero new build dependencies and an extensible codec-negotiation protocol that can add `opus+b64` later without breaking deployments.
+Opus would require either an FFI binding to `libopus` with a new unsafe boundary
+or a substantial pure-Rust codec dependency. Mu-law is supported by ffmpeg,
+has a fixed 2:1 conversion from 16-bit PCM to 8-bit samples, and leaves
+redundancy that zlib can exploit. The conversion is delegated to ffmpeg via
+`-f mulaw -ar 8000 -ac 1`, avoiding another codec implementation in this
+crate. The extensible negotiation protocol can add `opus+b64` later without
+breaking existing peers.
 
 **Why not whisper-rs (Rust FFI bindings)?**
-`whisper-rs` provides Rust bindings to whisper.cpp via FFI, which is necessarily `unsafe`. `franken_whisper` orchestrates whisper.cpp as an external subprocess instead, preserving memory safety at the cost of subprocess overhead (~50 ms per invocation). The native engine pilots in the rollout are pure-Rust reimplementations that avoid FFI entirely; the 5-stage rollout governance ensures quality parity before they ever replace the bridge adapters.
+`whisper-rs` provides Rust bindings to whisper.cpp via FFI, which is necessarily
+`unsafe`. `franken_whisper` can orchestrate whisper.cpp as an external process,
+while its native engine is a pure-Rust implementation that avoids FFI. The
+5-stage rollout policy keeps bridge replacement subject to conformance evidence.
 
 **Why a 10-stage pipeline instead of a monolithic transcribe function?**
 Stage isolation provides three benefits. First, **independent budgets**: a slow normalize stage cannot eat into the backend's time budget. Second, **observable progress**: agents see exactly which stage is running via NDJSON events. Third, **composability**: the `PipelineBuilder` can skip stages that aren't needed, avoiding unnecessary work. Stage-management overhead is negligible (~1 ms per transition) compared to actual inference time.
@@ -2523,7 +2542,7 @@ The token's `checkpoint()` method checks two conditions: (1) has Ctrl+C been pre
 | Input is already 16 kHz mono WAV | Normalize (passthrough) |
 | No `--diarize` flag | Diarize |
 | No `--vad` flag | VAD |
-| No GPU features compiled | Accelerate (CPU fallback used inline) |
+| Accelerate excluded through `PipelineBuilder` | Confidence normalization |
 | `--no-persist` flag | Persist |
 | Backend doesn't support alignment | Align |
 | `--no-stem` flag set | Source Separate |
@@ -3254,42 +3273,12 @@ With the release profile (`opt-level = 3`, full LTO, stripped):
 
 ---
 
-## Codebase Statistics
-
-| Metric | Value |
-|--------|-------|
-| Total source lines (`src/`) | ~90,000 |
-| Total test lines (`tests/`) | ~17,500 |
-| Library tests | 3,030 |
-| Integration tests | 638 |
-| **Total tests** | **3,668** |
-| Integration test files (`tests/*.rs`) | 26 |
-| Benchmark suites | 5 (Criterion) |
-| Public modules | 18 |
-| Error variants | 13 (each with a unique structured code) |
-| Backend engines | 3 bridge adapters + 3 paired native pilots under rollout governance |
-| Pipeline stages | 10 (composable, independently budgeted) |
-| Stage budget knobs | 12 (10 stages + probe + cleanup) |
-| CLI subcommands | 16 (including `capabilities`, `models`, `pull`, `doctor`, `robot-docs`, and explicit `sortformer-diarize`) |
-| CLI flags (`transcribe`) | 70+ (inference, VAD, diarization, speculative, audio windowing, word timestamps) |
-| Robot event types | 12 (run lifecycle, stage, speculation, health, routing, transcript) |
-| TTY control frame types | 10 (`Handshake`, `HandshakeAck`, `Ack`, `RetransmitRequest`, `RetransmitResponse`, `Backpressure`, `TranscriptPartial`, `TranscriptRetract`, `TranscriptCorrect`, `SessionClose`) |
-| TTY protocol versions | 2 (v1 audio, v2 audio + transcript) |
-| Replay pack artifacts | 4 (`env.json`, `manifest.json`, `repro.lock`, `tolerance_manifest.json`) |
-| Sync conflict policies | 4 (reject, skip, overwrite, overwrite-strict) |
-| Native rollout stages | 5 (shadow, validated, fallback, primary, sole) |
-| Conformance tolerance | 50 ms canonical timestamp tolerance |
-| Evidence ledger capacity | 200 entries (circular buffer) |
-| Router history window | 50 outcome records per backend |
-| Clippy enforcement | `#![forbid(unsafe_code)]` + `-D warnings` on all targets |
-| Cargo features | 3 (`tui`, `gpu-frankentorch`, `gpu-frankenjax`) |
-| Release optimizations | `opt-level = 3`, full LTO, single codegen unit, `panic = "abort"`, stripped |
-
----
-
 ## Testing
 
-Over 100,000 lines of Rust with **3,100+ tests** across unit, integration, conformance, metamorphic, and doc-test suites (the count *dropped* in v0.2.0 — the mock-pilot test suites were deleted along with the pilot mocks they tested; the test-support backend mocks in `tests/mocks/` are unrelated and remain).
+The repository has thousands of unit, integration, conformance, metamorphic,
+and model-gated tests. Release acceptance uses the complete commands below;
+model-gated cases report their external prerequisites instead of fabricating a
+pass.
 
 ```bash
 # run all library tests
@@ -3326,43 +3315,41 @@ cargo clippy --all-targets -- -D warnings
 
 ### Test Categories
 
-| Category | Approx. Count | Description |
-|----------|---------------|-------------|
-| Backend engine tests | 260+ | Engine trait compliance, native pilot validation |
-| Robot contract tests | 150+ | NDJSON schema validation, field presence, panic-safety |
-| TTY audio tests | 350+ | Handshake, integrity, retransmit, telemetry, control frames |
-| Conformance tests | 130+ | Cross-engine tolerance, replay envelope drift, segment invariants, native pilot fixtures |
-| Storage tests | 100+ | SQLite roundtrip, concurrent writes, migration, recovery |
-| Sync tests | 300+ | JSONL export / import, gzip, conflict resolution, lock pid liveness |
-| GPU cancellation tests | 42+ | Stream ownership, fence payloads, fallback |
-| Speculation tests | 200+ | Windowing, adaptive thresholds, correction drift |
-| Metamorphic tests | 90+ | Audio invariants, softmax / layer-norm properties, string-distance laws |
-| CLI integration tests | 80+ | End-to-end command execution with stub backends |
+| Category | Description |
+|----------|-------------|
+| Backend engine | Engine contracts, native execution, and bridge normalization |
+| Robot contract | NDJSON schema, field presence, path safety, and panic handling |
+| TTY audio | Handshake, integrity, retransmit, telemetry, and control frames |
+| Conformance | Cross-engine tolerance, replay drift, segment invariants, and model-gated fixtures |
+| Storage and sync | SQLite round trips, concurrent writes, JSONL recovery, and lock ownership |
+| Cancellation | Process-tree ownership, stage budgets, cleanup, and interruption |
+| Speculation | Windowing, adaptive thresholds, correction drift, and retractions |
+| Metamorphic | Audio, normalization, and string-distance invariants |
+| CLI integration | End-to-end command behavior with controlled backend fixtures |
 
 A clause-to-test traceability table lives in [`tests/COVERAGE.md`](tests/COVERAGE.md).
 
 ---
 
-## CI / CD Release Pipeline
+## Release Engineering
 
 [Doodlestein Self Releaser (DSR)](https://github.com/Dicklesworthstone/doodlestein_self_releaser)
 is the canonical release authority. Its local registration builds Linux x86_64
 and ARM64, macOS Intel and Apple Silicon, and Windows x86_64 on native/SSH
 hosts; packages both `franken_whisper` and `fw`; and syncs the exact pinned
-`frankensqlite`, `frankentorch`, `frankenjax`, and `frankentui` commits adjacent
-to the source tree. The last two are optional feature crates at runtime, but
-Cargo still resolves their path manifests during a clean release build.
+`frankensqlite`, `frankentorch`, and `frankentui` commits adjacent to the source
+tree.
 
 ```bash
-dsr build franken_whisper --version 0.6.0 --dry-run
-dsr build franken_whisper --version 0.6.0
+dsr build franken_whisper --version 0.7.0 --dry-run \
+  --targets darwin/arm64,darwin/amd64,linux/amd64,linux/arm64,windows/amd64
+dsr build franken_whisper --version 0.7.0 \
+  --targets darwin/arm64,darwin/amd64,linux/amd64,linux/arm64,windows/amd64
 ```
 
-[`dist.yml`](.github/workflows/dist.yml) is a manually dispatched,
-fail-closed fallback only. It never runs automatically on tag pushes, and its
-format, check, clippy, full-test, privacy, and sibling-pin gates all block
-packaging. [`release-automation.yml`](.github/workflows/release-automation.yml)
-is read-only: it reports the DSR command and never creates or pushes tags.
+No GitHub Actions workflow participates in the v0.7.0 release. DSR is the build
+and packaging authority; the tag and release assets are verified against its
+local receipts before publication.
 
 ---
 
@@ -3461,8 +3448,8 @@ rm .franken_whisper/locks/sync.lock
 
 - **A backend binary or a model file required.** Transcription needs either a bridge binary (`whisper-cli`, `insanely-fast-whisper`, or `whisper-diarization`) or a ggml model file for the in-process native engine (which then needs no external binaries at all). With neither present, runs fail with `FW-BACKEND-UNAVAILABLE`.
 - **ffmpeg only needed for video / exotic formats / mic.** The built-in Rust decoder handles common audio formats natively. ffmpeg is used as an automatic fallback for video files and exotic codecs. Microphone capture always depends on ffmpeg.
-- **Path-dependent crates.** `fsqlite` / `fsqlite-types` (and the optional `ftui` / `frankentorch` / `frankenjax` crates) are still local path dependencies. `franken_whisper` is therefore not currently published as a standalone crate on crates.io. The core infrastructure crates (`asupersync`, `franken-kernel`, `franken-evidence`, `franken-decision`) are on crates.io.
-- **Native engines under rollout governance.** Native Rust engine implementations are conformance-gated pilots. They execute in-process only when `FRANKEN_WHISPER_NATIVE_EXECUTION=1` and the rollout stage is `primary` or `sole`; otherwise bridge adapters remain active.
+- **Source checkouts need pinned siblings.** The Git checkout intentionally uses versioned path dependencies for FrankenSQLite, FrankenTorch, and optional FrankenTUI development. Run `scripts/prepare_release_siblings.sh` before a source build. The crates.io package resolves the same version requirements from the registry and does not require sibling checkouts.
+- **Native engines remain rollout-governed.** Explicit native execution uses in-process Rust. Automatic replacement of usable bridge adapters remains controlled by `FRANKEN_WHISPER_NATIVE_EXECUTION` and the configured rollout stage.
 - **One-way sync.** JSONL export / import is one-way. There is no bidirectional merge beyond the explicit `--conflict-policy` flag.
 - **Single-machine.** Designed for single-machine use with local SQLite. No distributed or multi-node support.
 - **ffmpeg auto-provisioning is Linux x86_64 only.** On other platforms (`macOS`, Windows, Linux ARM) you must install ffmpeg manually for the formats `symphonia` cannot decode and for microphone capture.
@@ -3472,10 +3459,17 @@ rm .franken_whisper/locks/sync.lock
 ## FAQ
 
 **Q: Do I need all three backends installed?**
-No. `franken_whisper` works with any single backend — and as of v0.2.0, with **no** bridge backend at all: drop a ggml model file in `$FRANKEN_WHISPER_MODEL_DIR` (or `~/.cache/franken_whisper/models`) and the in-process native engine transcribes by itself. The `auto` router will use whatever is available. You can also force a specific backend with `--backend whisper_cpp`.
+No. `franken_whisper` works with any single backend—or with no bridge backend
+at all: place a ggml model in `$FRANKEN_WHISPER_MODEL_DIR` (or
+`~/.cache/franken_whisper/models`) and the in-process native engine can
+transcribe it. The `auto` router uses the available choices. You can also force
+a specific backend with `--backend whisper_cpp`.
 
 **Q: What audio formats are supported?**
-Common audio formats (MP3, AAC, FLAC, WAV, OGG, Vorbis, ALAC) are decoded natively by the built-in Rust decoder with zero external dependencies. Video files and exotic codecs (AC3, DTS, Opus-in-MKV) fall back to ffmpeg automatically.
+Common audio formats (MP3, AAC, FLAC, WAV, OGG, Vorbis, ALAC) are decoded
+in-process by the built-in Rust decoder without an external decoder. Video
+files and exotic codecs (AC3, DTS, Opus-in-MKV) fall back to ffmpeg
+automatically.
 
 **Q: Can I use this as a library?**
 Yes. `franken_whisper` is both a library crate and a binary. The public API exposes all modules: `backend`, `orchestrator`, `robot`, `storage`, `tty_audio`, `conformance`, `speculation`, etc.
@@ -3487,7 +3481,11 @@ Each run produces a `ReplayEnvelope` containing SHA-256 hashes of the input cont
 A four-file deterministic bundle (`env.json`, `manifest.json`, `repro.lock`, `tolerance_manifest.json`) that captures everything needed to reproduce a run on a different machine. Same input → byte-identical pack across runs.
 
 **Q: How does cancellation work?**
-Ctrl+C sets a global shutdown flag. The `CancellationToken` propagates through every pipeline stage, including the inner loops in word-level timestamp extraction. Each stage calls `token.checkpoint()` at safe points, which returns `Err(Cancelled)` if shutdown was requested. No partial writes to SQLite, no orphaned subprocesses.
+Ctrl+C sets a global shutdown flag. The `CancellationToken` propagates through
+pipeline stages, including inner word-timestamp loops. Each stage checks the
+token at bounded work boundaries. SQLite work rolls back and owned subprocess
+cleanup is verified; if cleanup cannot be certified, the command returns an
+error that retains the original cancellation outcome.
 
 **Q: What's the TTY audio module for?**
 It enables audio transport over constrained TTY/PTY links where binary data can't flow directly. Audio is compressed (mu-law + zlib), base64-encoded, and transmitted as NDJSON lines with sequence numbers, CRC32, and SHA-256 integrity hashes. Protocol v2 also carries transcript streaming control frames, so speculative transcription can run end-to-end over the same link.
@@ -3496,7 +3494,11 @@ It enables audio transport over constrained TTY/PTY links where binary data can'
 A priority list always tries backends in the same order. The Bayesian router learns from outcomes: if a backend starts failing, its posterior degrades and traffic shifts to alternatives. When the model is poorly calibrated (Brier > 0.35), it falls back to static priority automatically, but **continues recording calibration observations** so it can resume adaptive routing once the data improves.
 
 **Q: What happens if I Ctrl+C during a long transcription?**
-The shutdown controller propagates cancellation through the pipeline. The active stage finishes its current checkpoint, rolls back uncommitted transactions, kills running subprocesses, runs finalizers within 5 s, and exits with code 130. No data corruption, no orphaned processes.
+The shutdown controller propagates cancellation through the pipeline. The
+active stage reaches a checkpoint, rolls back uncommitted transactions,
+terminates owned subprocess trees, and runs finalizers within the cleanup
+budget. A verified cancellation exits with code 130; cleanup-verification
+failure is surfaced as an error.
 
 **Q: What's speculative streaming?**
 Two models run simultaneously: a fast model produces low-latency partial transcripts while a quality model runs in parallel. When the quality model finishes each window, it either confirms or corrects the fast model's output. Use `--speculative` when you need both low latency and high accuracy.
@@ -3536,7 +3538,7 @@ Step by step, when you run `franken_whisper transcribe --input meeting.mp3 --jso
    PipelineBuilder evaluates request flags:
    - No --vad flag           -> skip VAD stage
    - No --diarize flag       -> skip Diarize stage
-   - No GPU features         -> skip Accelerate stage (CPU fallback inline)
+   - Accelerate excluded     -> skip confidence normalization
    - --no-persist NOT set    -> include Persist stage (default)
    Pipeline: [Ingest, Normalize, Backend, Persist]
 
@@ -3579,7 +3581,7 @@ Step by step, when you run `franken_whisper transcribe --input meeting.mp3 --jso
 
 8. CONFIDENCE NORMALIZATION (inline, no separate stage)
    Replace missing confidences with ln(1 + char_count) + 1.0
-   Apply numerically stable softmax
+   Divide each positive finite value by their total mass
    Record pre_mass=34.2, post_mass=1.0 in AccelerationReport
 
 9. PERSIST STAGE (budget: 20s)
@@ -3764,7 +3766,7 @@ A fast model and a quality model run in parallel on overlapping windows; partial
 
 Every run is persisted to SQLite with the complete request, result, segments, pipeline events, evidence, and replay envelope. Full and incremental JSONL export with SHA-256 checksums and optional gzip compression.
 
-### Audio decoded as a zero-dependency data type
+### Audio decoded without an external process
 
 The built-in Rust decoder handles MP3, AAC, FLAC, WAV, OGG, Vorbis, and ALAC natively. No subprocess, no external binary, no `PATH` dependency. ffmpeg is only the fallback.
 
@@ -3772,9 +3774,13 @@ The built-in Rust decoder handles MP3, AAC, FLAC, WAV, OGG, Vorbis, and ALAC nat
 
 The `robot` subcommand is the *primary* interface: sequenced NDJSON events with stable schema versioning (v1.0.0), 13 exact terminal error codes, health diagnostics, routing history, speculation events, and structured error envelopes even for argument-parsing failures.
 
-### Safe-Rust ASR orchestration
+### Audited Rust safety boundaries
 
-`franken_whisper` enforces `#![forbid(unsafe_code)]`. Note the distinction: `deny` can be overridden per-item, `forbid` cannot. Combined with cooperative cancellation, atomic transactions, bounded finalizers, and RAII cleanup, this gives strong safety guarantees that other wrappers (which all rely on FFI to whisper.cpp or Python interpreters) cannot provide.
+`franken_whisper` denies unsafe code by default. Explicitly annotated
+native-engine kernels use runtime-gated SIMD or fully-overwritten preallocated
+buffers and carry local safety arguments; unannotated unsafe code is rejected.
+Cooperative cancellation, atomic transactions, bounded finalizers, and RAII
+cleanup provide the operational safety boundary around inference.
 
 ---
 
@@ -4348,7 +4354,12 @@ Whisper models require 16 kHz mono audio. `franken_whisper`'s normalization stag
 | Sample rate conversion | linear interpolation | introduces ~−40 dB aliasing above 8 kHz |
 | Bit depth conversion | clamp-and-round 16-bit signed PCM | imperceptible for speech |
 
-The linear resampler is intentional. A higher-quality polyphase resampler would produce slightly cleaner spectra but require an FFT or a large filter bank, neither of which can be implemented in safe Rust without performance regressions. Whisper models tolerate the aliasing well; their training corpus already contains all sorts of resampling artifacts. For pristine archival work where you need every dB of fidelity, pre-resample with `ffmpeg -ar 16000 -ac 1 -filter:a "aresample=resampler=soxr"` and then feed the WAV in via `--input`; the normalize stage will detect it's already 16 kHz mono and become a passthrough.
+The linear resampler is intentional. A higher-quality polyphase resampler
+would add an FFT or filter-bank implementation and more compute to the ingest
+path. Whisper models tolerate this tradeoff for speech. For archival work,
+pre-resample with `ffmpeg -ar 16000 -ac 1 -filter:a
+"aresample=resampler=soxr"` and pass the WAV via `--input`; normalization will
+recognize an existing 16 kHz mono stream.
 
 ### systemd Integration
 
@@ -4387,11 +4398,11 @@ For batch jobs, prefer a `Type=oneshot` unit and a `*.timer` for scheduling. Rob
 
 | Target | Status | Notes |
 |--------|--------|-------|
-| `x86_64-unknown-linux-gnu` | Tier 1 (CI-tested) | Auto-provisioned ffmpeg works |
-| `aarch64-unknown-linux-gnu` | Tier 1 (CI-tested) | Install ffmpeg via package manager |
-| `x86_64-apple-darwin` | Tier 1 (CI-tested) | `brew install ffmpeg` |
-| `aarch64-apple-darwin` | Tier 1 (CI-tested) | `brew install ffmpeg` |
-| `x86_64-pc-windows-msvc` | Tier 1 (CI-built) | Install ffmpeg manually; `dshow` for mic; public-corpus artifact writers fail closed |
+| `x86_64-unknown-linux-gnu` | DSR release target | Auto-provisioned ffmpeg works |
+| `aarch64-unknown-linux-gnu` | DSR release target | Install ffmpeg via package manager |
+| `x86_64-apple-darwin` | DSR release target | `brew install ffmpeg` |
+| `aarch64-apple-darwin` | DSR release target | `brew install ffmpeg` |
+| `x86_64-pc-windows-msvc` | DSR release target | Install ffmpeg manually; `dshow` for mic; public-corpus artifact writers fail closed |
 | `armv7-unknown-linux-musleabihf` | Best-effort | No auto-provisioned ffmpeg; cross-build via `cross` |
 | WebAssembly | Not supported | Symphonia + clap pull in OS APIs |
 
@@ -4404,13 +4415,21 @@ cross build --release --target aarch64-unknown-linux-gnu
 
 ### Build Reproducibility
 
-The release profile (`opt-level = 3`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`) plus a pinned nightly toolchain (`rust-toolchain.toml`) makes binaries close to byte-reproducible. Two builds of the same commit on the same host typically differ only in embedded timestamps and the build-id section. For truly reproducible builds, additionally set `SOURCE_DATE_EPOCH` and use `cargo build --frozen` against a checked-in `Cargo.lock`.
+The release profile fixes optimization, LTO, codegen-unit, panic, and stripping
+settings; `rust-toolchain.toml` pins the compiler and `Cargo.lock` pins resolved
+dependencies. DSR records the source revision and artifact hashes. This is a
+controlled build contract, not a claim of byte-for-byte reproducibility across
+hosts.
 
 ### Why Rust 2024 / Why Nightly
 
-- **Rust 2024 edition** lets the codebase use `let-else`, expanded `impl Trait` positions, RPITIT (return-position `impl Trait` in traits), and `gen` blocks where they make pipeline code clearer. None are accidental complexity; each appears in code that would otherwise be more awkward to read.
-- **Nightly toolchain** is pinned in `rust-toolchain.toml` so local builds match CI. Required for a handful of unstable features that materially improve ergonomics (e.g., features used in the `frankentui`/`frankentorch` integrations). The pin is conservative; the channel is bumped only when CI is green across all platforms.
-- **`#![forbid(unsafe_code)]`** is stronger than `deny`: it cannot be overridden per-item. This is enforced at the crate root, so every dependency is held to the same standard via lint propagation where possible.
+- **Rust 2024 edition** keeps the crate on the current language edition and
+  its updated lifetime, pattern, and unsafe-operation rules.
+- **Nightly toolchain** is pinned in `rust-toolchain.toml` so local and DSR
+  release builds use the same compiler.
+- **`#![deny(unsafe_code)]`** rejects unannotated unsafe code. Explicit
+  native-engine exceptions carry local safety arguments; dependency safety
+  policies remain the responsibility of their respective crates.
 
 ---
 
@@ -4871,7 +4890,10 @@ Every stage in the pipeline interacts with `CancellationToken`. Authors writing 
 5. **Drop checkpoint at stage boundaries**: clear the `stage_start` timer when transitioning so elapsed time from a cancelled stage doesn't leak into the next stage's latency profile.
 6. **Emit `*.cancelled` before returning**: even on cancellation, the NDJSON contract requires a final event for the stage before pipeline termination.
 
-Following these invariants means Ctrl+C always exits cleanly: subprocesses are killed, transactions roll back, temp directories are removed, finalizers run within budget, exit code 130. There is no path where cancellation produces orphaned state.
+Following these invariants gives cooperative cancellation a bounded cleanup
+path: owned subprocesses are terminated, transactions roll back, finalizers run
+within budget, and interruption maps to exit code 130. Cleanup failures remain
+errors rather than being reported as successful cancellation.
 
 ---
 
@@ -5126,7 +5148,9 @@ franken_whisper transcribe --input meeting.mp3 --backend whisper_cpp --no-stem \
 
 ## About Contributions
 
-Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
+Bug reports and proposed fixes are welcome. Pull requests may be used as design
+references, but are not merged directly; changes are independently reviewed and
+reimplemented where appropriate.
 
 ---
 
