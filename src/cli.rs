@@ -309,7 +309,7 @@ impl ShutdownController {
 #[command(about = "Agent-first Rust ASR orchestrator with ffmpeg normalization")]
 #[command(version, long_version = LONG_VERSION)]
 #[command(
-    after_help = "Agent orientation: `fw robot triage`\nMachine contract: `fw capabilities --json`\nModel readiness: `fw models --json`\nExplicit Sortformer install: `fw pull sortformer --json`"
+    after_help = "Agent orientation: `fw robot triage`\nMachine contract: `fw capabilities --json`\nModel readiness: `fw models --json`\nInstall both native models: `fw pull all --json`"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -318,7 +318,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Transcribe one local audio/video source, optionally with diarization.
+    /// Transcribe one local audio/video source with native diarization by default.
     Transcribe(Box<TranscribeArgs>),
     /// Emit stable JSON/NDJSON surfaces intended for software agents.
     #[command(visible_alias = "agent")]
@@ -444,7 +444,7 @@ pub struct DoctorArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Exit non-zero unless at least one transcription path is ready.
+    /// Exit non-zero unless both native default model packages are verified.
     #[arg(long)]
     pub strict: bool,
 }
@@ -1568,6 +1568,7 @@ impl TranscribeArgs {
     /// strings and paths instead of cloning them immediately before the CLI
     /// object is discarded.
     pub fn into_request(mut self) -> FwResult<TranscribeRequest> {
+        let effective_diarize = self.diarize || !self.no_diarize;
         let mut mode_count = 0usize;
         if self.input.is_some() {
             mode_count += 1;
@@ -1589,17 +1590,17 @@ impl TranscribeArgs {
                 "--input, --stdin, and --mic are mutually exclusive".to_owned(),
             ));
         }
-        if !self.diarize
+        if !effective_diarize
             && (self.speaker_hints.is_some()
                 || self.persist_speaker_profiles
                 || self.diarization_engine != DiarizationEngine::Auto
-                || self.diarization_fallback != DiarizationFallbackPolicy::Unknown
+                || self.diarization_fallback != DiarizationFallbackPolicy::Acoustic
                 || self.speaker_count_hard.is_some()
                 || self.speaker_count_range.is_some()
                 || self.speaker_count_prior.is_some())
         {
             return Err(FwError::InvalidRequest(
-                "diarization controls require --diarize".to_owned(),
+                "diarization controls cannot be combined with --no-diarize".to_owned(),
             ));
         }
 
@@ -1703,7 +1704,7 @@ impl TranscribeArgs {
             .map(read_speaker_hints)
             .transpose()?
             .unwrap_or_default();
-        let has_diarization_request = self.diarize
+        let has_diarization_request = effective_diarize
             || !known_intervals.is_empty()
             || speaker_count != SpeakerCountRequest::Infer;
         let acoustic_diarization = has_diarization_request.then_some(DiarizationRequest {
@@ -1766,7 +1767,7 @@ impl TranscribeArgs {
             model: self.model.take(),
             language: self.language.take(),
             translate: self.translate,
-            diarize: self.diarize || !self.no_diarize,
+            diarize: effective_diarize,
             persist: !self.no_persist,
             db_path: std::mem::take(&mut self.db),
             timeout_ms: self.timeout.map(|secs| secs.saturating_mul(1000)),
@@ -1808,7 +1809,7 @@ impl TranscribeArgs {
             "model": self.model,
             "language": self.language,
             "translate": self.translate,
-            "diarize": self.diarize,
+            "diarize": self.diarize || !self.no_diarize,
             "diarization_engine": self.diarization_engine,
             "diarization_fallback": self.diarization_fallback,
             "speaker_count": self.speaker_count_request().ok(),
@@ -1907,7 +1908,7 @@ mod tests {
             diarize: false,
             no_diarize: false,
             diarization_engine: DiarizationEngine::Auto,
-            diarization_fallback: DiarizationFallbackPolicy::Unknown,
+            diarization_fallback: DiarizationFallbackPolicy::Acoustic,
             speaker_hints: None,
             enrollment_edge_guard_ms: 100,
             diarization_max_prototypes: 512,
@@ -2176,31 +2177,47 @@ mod tests {
     }
 
     #[test]
-    fn native_diarization_controls_require_diarize() {
+    fn native_diarization_controls_reject_no_diarize() {
         let mut args = minimal_args();
+        args.no_diarize = true;
         args.diarization_engine = DiarizationEngine::Acoustic;
         let error = args
             .to_request()
-            .expect_err("engine selection without --diarize must fail");
-        assert!(error.to_string().contains("require --diarize"));
+            .expect_err("engine selection with --no-diarize must fail");
+        assert!(error.to_string().contains("--no-diarize"));
 
         let mut args = minimal_args();
+        args.no_diarize = true;
         args.persist_speaker_profiles = true;
         assert!(
             args.to_request()
-                .expect_err("profile persistence without --diarize must fail")
+                .expect_err("profile persistence with --no-diarize must fail")
                 .to_string()
-                .contains("require --diarize")
+                .contains("--no-diarize")
         );
 
         let mut args = minimal_args();
+        args.no_diarize = true;
         args.speaker_count_hard = Some(2);
         assert!(
             args.to_request()
-                .expect_err("speaker-count search without --diarize must fail")
+                .expect_err("speaker-count search with --no-diarize must fail")
                 .to_string()
-                .contains("require --diarize")
+                .contains("--no-diarize")
         );
+    }
+
+    #[test]
+    fn native_diarization_is_enabled_by_default_and_can_be_disabled() {
+        let default_request = minimal_args().to_request().expect("default request");
+        assert!(default_request.diarize);
+        assert!(default_request.backend_params.acoustic_diarization.is_some());
+
+        let mut disabled = minimal_args();
+        disabled.no_diarize = true;
+        let disabled_request = disabled.to_request().expect("disabled request");
+        assert!(!disabled_request.diarize);
+        assert!(disabled_request.backend_params.acoustic_diarization.is_none());
     }
 
     #[test]

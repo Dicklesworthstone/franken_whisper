@@ -903,6 +903,8 @@ pub fn capabilities_value() -> serde_json::Value {
         "structured_commands": [
             {"command": "fw capabilities --json", "output": "json"},
             {"command": "fw models --json", "output": "json"},
+            {"command": "fw pull all --json", "output": "json"},
+            {"command": "fw pull whisper --json", "output": "json"},
             {"command": "fw pull sortformer --json", "output": "json"},
             {"command": "fw doctor --json", "output": "json"},
             {"command": "fw robot triage", "output": "json"},
@@ -912,7 +914,8 @@ pub fn capabilities_value() -> serde_json::Value {
         ],
         "privacy": {
             "agent_discovery_network_access": false,
-            "model_downloads_automatic": false,
+            "inference_model_downloads_automatic": false,
+            "installer_provisions_default_models": true,
             "agent_discovery_emits_audio_or_transcript_paths": false,
             "agent_discovery_emits_operator_local_model_paths": false,
             "sortformer_distribution": crate::model_distribution::SORTFORMER_DISTRIBUTION_POLICY,

@@ -1289,6 +1289,22 @@ mod tests {
     }
 
     #[test]
+    fn embedded_whisper_manifest_is_exact_and_release_bound() {
+        let manifest = builtin_whisper_manifest().expect("embedded Whisper manifest");
+        assert_eq!(manifest.model_id, WHISPER_MODEL_ID);
+        assert_eq!(manifest.upstream_revision, WHISPER_UPSTREAM_REVISION);
+        assert_eq!(manifest.artifact_version, WHISPER_ARTIFACT_VERSION);
+        assert_eq!(manifest.preparation_recipe, WHISPER_PREPARATION_RECIPE);
+        assert_eq!(manifest.files.len(), 1);
+        let weights = &manifest.files[0];
+        assert_eq!(weights.role, "weights");
+        assert_eq!(weights.filename, WHISPER_WEIGHTS_FILENAME);
+        assert_eq!(weights.size, WHISPER_WEIGHTS_BYTES);
+        assert_eq!(weights.sha256, WHISPER_WEIGHTS_SHA256);
+        assert!(weights.url.starts_with(EXPECTED_WHISPER_RELEASE_PREFIX));
+    }
+
+    #[test]
     fn committed_notice_matches_the_manifest() {
         let notice = include_bytes!("../NOTICE.sortformer.txt");
         let digest: [u8; 32] = Sha256::digest(notice).into();
@@ -1400,6 +1416,13 @@ mod tests {
     fn cancellation_is_not_collapsed_into_missing_cache_readiness() {
         let error = cached_sortformer_readiness_with_cancel(|| true)
             .expect_err("cancelled readiness hash must remain cancellation");
+        assert!(matches!(error, FwError::Cancelled(_)));
+    }
+
+    #[test]
+    fn whisper_readiness_preserves_cancellation() {
+        let error = cached_whisper_readiness_with_cancel(|| true)
+            .expect_err("cancelled Whisper hash must remain cancellation");
         assert!(matches!(error, FwError::Cancelled(_)));
     }
 
