@@ -12,7 +12,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 No unreleased changes yet.
 
-## [0.7.0] - 2026-08-08
+## [0.7.0] - 2026-08-09
 
 This is the first published release after v0.5.0. The planned v0.6.0 snapshot
 was never tagged or released; its work is included here.

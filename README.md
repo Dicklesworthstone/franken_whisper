@@ -407,7 +407,7 @@ franken_whisper transcribe --input audio.mp3
 franken_whisper transcribe --input audio.mp3 --json
 
 # explicit backend
-franken_whisper transcribe --input audio.mp3 --backend whisper_cpp --json
+franken_whisper transcribe --input audio.mp3 --backend whisper-cpp --json
 
 # language hint
 franken_whisper transcribe --input audio.mp3 --language ja --json
@@ -2884,7 +2884,7 @@ Metamorphic tests catch entire categories of regressions where the "correct" ans
 
 ```bash
 franken_whisper transcribe --input audio.mp3 \
-  --backend whisper_cpp \
+  --backend whisper-cpp \
   --model tiny.en \
   --no-persist \
   --no-timestamps \
@@ -2897,7 +2897,7 @@ franken_whisper transcribe --input audio.mp3 \
 
 ```bash
 franken_whisper transcribe --input meeting.mp3 \
-  --backend whisper_cpp \
+  --backend whisper-cpp \
   --model large-v3 \
   --diarize \
   --diarization-engine acoustic \
@@ -2953,7 +2953,7 @@ scp /tmp/frames.ndjson gpu-server:/tmp/
 
 # On GPU server (has whisper, fast inference):
 cat /tmp/frames.ndjson | franken_whisper tty-audio decode --output /tmp/audio.wav
-franken_whisper transcribe --input /tmp/audio.wav --backend whisper_cpp --model large-v3 --json
+franken_whisper transcribe --input /tmp/audio.wav --backend whisper-cpp --model large-v3 --json
 ```
 
 ### Release Binary Optimization
@@ -3392,9 +3392,16 @@ local receipts before publication.
 
 ## Troubleshooting
 
-### `FW-CMD-MISSING: whisper-cli not found`
+### `FW-BACKEND-UNAVAILABLE: native Whisper package is missing`
 
-No backend binary is on your `PATH` and no native-engine model file resolved. Either drop a ggml model where the native engine finds it (`$FRANKEN_WHISPER_MODEL_DIR`, `~/.cache/franken_whisper/models`, `~/models/whisper` — `scripts/fetch_test_models.sh` fetches a pinned tiny.en), or install a bridge binary:
+The all-native default requires the compiled-hash-pinned release package. Run
+`fw pull all` to provision both default models, or `fw pull whisper` for a
+transcript-only installation. An operator-supplied GGML model remains available
+as an explicit override through `--model PATH_OR_SHORT_NAME` or
+`FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`; arbitrary files in legacy search
+directories never silently replace the packaged default. To deliberately use
+the compatibility bridge instead, install its binary and opt into a bridge
+rollout:
 
 ```bash
 # whisper.cpp
@@ -3403,6 +3410,8 @@ brew install whisper-cpp                                  # macOS
 
 # or override the binary name
 export FRANKEN_WHISPER_WHISPER_CPP_BIN=/path/to/whisper-cli
+export FRANKEN_WHISPER_NATIVE_EXECUTION=0
+franken_whisper transcribe --input audio.mp3 --backend whisper-cpp --no-diarize
 ```
 
 ### `FW-BACKEND-UNAVAILABLE: external diarization requires HF token`
@@ -4529,7 +4538,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 | Use case | Configuration sketch |
 |----------|----------------------|
 | **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --json` (native Whisper plus native Sortformer by default; explicit count hints remain optional) |
-| **Podcast batch processing** | `for f in podcasts/*.mp3; do franken_whisper transcribe --input "$f" --backend whisper_cpp --model large-v3 --json; done` |
+| **Podcast batch processing** | `for f in podcasts/*.mp3; do franken_whisper transcribe --input "$f" --backend whisper-cpp --model large-v3 --json; done` |
 | **Live transcription dashboard** | `robot run --mic --mic-seconds 300 --speculative --fast-model tiny.en --quality-model large-v3` piped to a Server-Sent Events translator |
 | **Voicemail archival** | `transcribe --stdin --backend auto --json` invoked from a mail-handler hook |
 | **Live event captioning over SSH** | `tty-audio encode --input mic.wav` ➜ SSH ➜ `tty-audio decode --output a.wav && franken_whisper transcribe --input a.wav --json` |
@@ -4802,7 +4811,7 @@ Watch the `orchestration.latency_profile` event. Stages tagged `decrease_budget_
 | Long audio on a slow CPU | raise `BACKEND_MS` to 1800000 (30 min) |
 | Microphone capture of 10+ minutes | raise `INGEST_MS` to 60000 |
 | Cold-start with large models | raise `BACKEND_MS` to absorb model load time |
-| Diarization over multi-hour calls | raise `DIARIZE_MS` to 120000 |
+| Diarization whose processing time may exceed 15 minutes | raise `DIARIZE_MS` to 1800000 (30 min) |
 | Container with strict CPU limits | raise everything except `CLEANUP_MS` 2–3× |
 
 ### 2. Backend selection
@@ -4811,10 +4820,10 @@ Force-pick when you know better than the router:
 
 ```bash
 # Always use whisper.cpp on Apple Silicon (Metal is fast, batching doesn't help)
-franken_whisper transcribe --input a.mp3 --backend whisper_cpp --model large-v3
+franken_whisper transcribe --input a.mp3 --backend whisper-cpp --model large-v3
 
 # Always use insanely-fast-whisper on a CUDA box doing batch jobs
-franken_whisper transcribe --input a.mp3 --backend insanely_fast --batch-size 24 --flash-attention
+franken_whisper transcribe --input a.mp3 --backend insanely-fast --batch-size 24 --flash-attention
 ```
 
 If you want adaptive behavior but want to seed the posteriors, run a small calibration corpus through `--backend auto` once. The router will absorb the empirical success rates into its Beta distributions and route accordingly going forward.
@@ -5063,7 +5072,7 @@ Before deploying `franken_whisper` to a production workflow, walk through:
 - [ ] **Pinned ECAPA package installed** (only if using `ecapa` or `ecapa-fused`). Verify the filename, auxiliary-model directory, and SHA-256 from Prerequisites; no HF token is needed.
 - [ ] **ffmpeg accessible** (if you'll transcribe video or use mic capture). Either system-installed, manually placed, or auto-provisioned. Verify with `franken_whisper robot health` → `ffmpeg.available=true`.
 - [ ] **State directory writable.** `FRANKEN_WHISPER_STATE_DIR` (or default `.franken_whisper/`) is on a partition with enough free space for your expected DB growth.
-- [ ] **Stage budgets sized.** If you'll transcribe audio longer than 15 minutes, raise `FRANKEN_WHISPER_STAGE_BUDGET_BACKEND_MS`. If you'll diarize multi-hour content, raise `FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS`.
+- [ ] **Stage budgets sized.** The limits apply to processing wall time, not audio duration. Raise `FRANKEN_WHISPER_STAGE_BUDGET_BACKEND_MS` or `FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS` only when the target host may need more than the configured stage budget.
 - [ ] **Backup strategy.** Schedule periodic `sync export-jsonl` + off-host copy. Test the restore path at least once.
 - [ ] **Concurrent agent expectations documented.** If multiple processes will write to the same DB, all must use `RunStore::begin_concurrent_session()` (or accept SQLITE_BUSY retries on conflict).
 - [ ] **Native rollout stage chosen.** Default `sole` is the all-native product path. Set another stage only when you deliberately want bridge compatibility behavior.
@@ -5115,7 +5124,7 @@ Idiomatic patterns for common one-off tasks.
 
 ```bash
 for f in videos/*.mp4; do
-  franken_whisper transcribe --input "$f" --backend whisper_cpp --model large-v3 \
+  franken_whisper transcribe --input "$f" --backend whisper-cpp --model large-v3 \
     --output-srt --json > /dev/null
 done
 # Each video gets a sibling .srt file alongside it.
@@ -5158,7 +5167,7 @@ done
 ### Confirm a backend version drift
 
 ```bash
-franken_whisper transcribe --input fixtures/canary.wav --backend whisper_cpp --json \
+franken_whisper transcribe --input fixtures/canary.wav --backend whisper-cpp --json \
   | jq '.replay.backend_version'
 # Compare against the version recorded in your last known-good replay envelope.
 # Any difference is a backend upgrade; trigger conformance re-validation.
@@ -5179,7 +5188,7 @@ env $(cat /etc/franken_whisper.env | xargs) franken_whisper transcribe --input l
 
 ```bash
 # Process A: do the transcription only
-franken_whisper transcribe --input meeting.mp3 --backend whisper_cpp --no-stem \
+franken_whisper transcribe --input meeting.mp3 --backend whisper-cpp --no-stem \
   --db /tmp/runs.sqlite3 --json
 
 # Process B: post-process for speakers in a memory-isolated context
