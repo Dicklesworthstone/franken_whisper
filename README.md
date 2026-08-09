@@ -37,7 +37,7 @@ fw --version
 fw robot triage
 fw capabilities --json
 fw models --json
-fw pull sortformer --json
+fw pull all --json
 fw doctor --json
 fw robot schema
 ```
@@ -45,15 +45,20 @@ fw robot schema
 `fw robot run --input AUDIO --backend auto` streams NDJSON. Robot syntax
 errors are also emitted as one path-safe JSON object on stdout with exit code
 2; runtime failures use one of the 13 exact `FW-*` codes published by
-`fw capabilities --json`. Discovery and doctor commands do not download
-models. `fw pull sortformer` is the only built-in Sortformer network path: it
-streams the separately licensed release package into the per-user cache and
-admits it only after all four embedded size/SHA-256 trust roots pass. A doctor
-`ready` result is static preflight evidence only; the payload sets
+`fw capabilities --json`. Discovery, inference, and doctor commands do not
+download models. `fw pull all` is the explicit in-binary network path for the
+native defaults. It streams the 1,624,555,275-byte Whisper package and the
+separately licensed 491,570,584-byte Sortformer package into the per-user cache,
+then admits each only after its compiled size and SHA-256 trust roots pass. The
+installer runs that command by default. A doctor `ready` result means both
+packages passed static preflight; the payload still sets
 `operationally_verified: false` until an actual transcription succeeds. The
-491,570,584-byte weights are never stored in Git; they are distributed as the
-`sortformer-v2.1-f32-v1` GitHub release artifact beside the NVIDIA Open Model
-License, required notice, and deterministic conversion receipt.
+model weights are never stored in Git. Whisper is distributed as the
+`whisper-large-v3-turbo-f16-v1` release artifact; its GGML f16 bytes are
+identity-preserved from the pinned upstream revision and selected for the native
+Rust loader and optimized FrankenTorch kernels. Sortformer is distributed as
+`sortformer-v2.1-f32-v1` beside the NVIDIA Open Model License, required notice,
+and deterministic conversion receipt.
 Release archives also carry [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md),
 which records the licensed libc++ selection logic translated into safe Rust for
 the pinned PyTorch CPU top-k parity contract.
@@ -79,7 +84,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 `franken_whisper` is a single Rust binary that wraps every major Whisper backend behind a unified, agent-first interface — and ships its own engine:
 
 - **A real in-process Whisper engine, in pure Rust.** ggml model parsing, log-mel frontend, encoder/decoder transformer inference on FrankenTorch CPU kernels, greedy decoding with whisper.cpp's full timestamp-rule suite, and cross-attention DTW word timestamps. No FFI, no Python, no subprocess — drop a ggml model file in place and transcribe.
-- **Rust-native acoustic and ECAPA speaker diarization.** The bounded-memory acoustic path separates voice from channel evidence, while the two explicit ECAPA modes add a pinned in-process speaker representation either alone or authorized to use bounded channel evidence when a selected consensus merge joins a compatible channel-valid pair. Every native mode accepts hard or soft known-speaker intervals, projects an independent turn timeline onto DTW word boundaries, and makes no gender or person-identity claims. The built-in acoustic route is an available but uncertified heuristic baseline—not evidence of reliable multi-speaker accuracy; the native Sortformer route is separately labeled evaluation-only.
+- **Rust-native Sortformer speaker diarization by default.** The in-process fused model emits anonymous activity lanes and overlapping turns for up to four speakers, then projects that independent timeline onto Whisper segments. It remains development-uncertified: four lanes are a hard capacity boundary, not proof that a recording has no additional speakers. Known intervals and requests beyond that capacity use the bounded acoustic path, which is an available but uncertified fallback. Explicit ECAPA modes remain available for experiments with pinned speaker embeddings. None of these modes claims gender or biometric identity.
 - **Adaptive Bayesian backend routing.** Each `auto` request runs a formal decision contract with an explicit loss matrix, per-backend Beta posteriors, Brier-scored calibration, and deterministic fallback when the model is mis-calibrated.
 - **Real-time NDJSON streaming.** Every pipeline stage emits sequenced, timestamped events on stable schema `v1.0.0`. No fragile regex; agents parse JSON.
 - **Durable run history.** Every transcription persists to SQLite with full event logs, replay envelopes, and JSONL export/import, even when the process crashes mid-run.
@@ -104,7 +109,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 | Machine-readable errors | exit code only | exceptions | exceptions | **13 exact `FW-*` error codes** |
 | Adaptive backend selection | — | — | — | **Bayesian decision contract** |
 | Run persistence | — | — | — | **SQLite + JSONL replay packs** |
-| Diarization | TinyDiarize hints | yes (HF token) | yes | **Rust acoustic + explicit ECAPA + normalized external evidence** |
+| Diarization | TinyDiarize hints | yes (HF token) | yes | **native Sortformer default + Rust acoustic fallback + explicit ECAPA** |
 | Compute acceleration | CUDA / Metal | CUDA / MPS | CUDA | **FrankenTorch CPU kernels + automatic Metal on macOS** |
 | Cancellation | `SIGKILL` | `KeyboardInterrupt` | `SIGKILL` | **cooperative `CancellationToken`** |
 | TTY audio relay | — | — | — | **mulaw + zlib + base64 NDJSON** |
@@ -116,8 +121,12 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 ## Quick Example
 
 ```bash
-# Transcribe an audio file. MP3 / FLAC / OGG / AAC decoded natively, no ffmpeg needed.
+# Native Whisper transcription plus native Sortformer diarization is the default.
+# MP3 / FLAC / OGG / AAC are decoded in process; no ffmpeg is needed.
 franken_whisper transcribe --input meeting.mp3 --json
+
+# Skip diarization when only a transcript is needed.
+franken_whisper transcribe --input meeting.mp3 --no-diarize --json
 
 # Transcribe a video file. Audio extracted automatically via ffmpeg fallback.
 franken_whisper transcribe --input presentation.mp4 --json
@@ -129,13 +138,13 @@ franken_whisper robot run --input meeting.mp3 --backend auto
 franken_whisper robot run --input meeting.mp3 --speculative \
   --fast-model tiny.en --quality-model large-v3
 
-# Built-in acoustic speaker diarization (no Python or HF token)
-franken_whisper transcribe --input meeting.mp3 --diarize \
+# Select the built-in acoustic fallback explicitly (no Python or HF token)
+franken_whisper transcribe --input meeting.mp3 \
   --diarization-engine acoustic --json
 
 # Explicit ECAPA identity fused with bounded acoustic channel evidence
 # (requires the pinned local ECAPA package, but no Python or HF token)
-franken_whisper transcribe --input meeting.mp3 --diarize \
+franken_whisper transcribe --input meeting.mp3 \
   --diarization-engine ecapa-fused --json
 
 # TinyDiarize: whisper.cpp's built-in speaker-turn detection (no HF token needed)
@@ -281,7 +290,7 @@ Most tools occupy one level. `franken_whisper` is the orchestration layer: it wr
 | Billing model | usage-priced | usage-priced | usage-priced | **local compute only** |
 | Inference speed | very fast | fast | moderate | **depends on selected backend** |
 | Multi-model routing | — | — | — | **Bayesian adaptive** |
-| Diarization | limited | yes | yes | **native acoustic/ECAPA plus explicit Sortformer evaluation and external routes** |
+| Diarization | limited | yes | yes | **native Sortformer default, acoustic fallback, explicit ECAPA/external routes** |
 | Custom pipeline stages | — | — | — | **10 composable stages** |
 
 ---
@@ -294,7 +303,17 @@ Most tools occupy one level. `franken_whisper` is the orchestration layer: it wr
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/main/install.sh?$(date +%s)" | bash
 ```
 
-The installer downloads the appropriate release asset for your platform, verifies its SHA-256 checksum against `checksums-sha256.txt`, validates the staged binary's self-reported version before replacement, and installs both `fw` and `franken_whisper` to `~/.local/bin`. After an interactive online install, it explains the approximately 492 MB Sortformer download and asks whether to run the installed `fw pull sortformer`; the safe default is **No**. Quiet, headless, and air-gapped installs never start that model download. For `sudo ... --system`, the optional pull drops back to the validated invoking user so the model does not land in root's private cache. Unknown options, missing values, and conflicting source/offline modes fail before any download. A release download failure never silently falls back to a source build; use `--from-source` explicitly.
+The installer downloads the release asset for the detected platform, verifies
+its SHA-256 checksum, validates the staged binary's self-reported version, and
+installs both `fw` and `franken_whisper` to `~/.local/bin`. It then downloads
+and verifies the pinned native Whisper and Sortformer packages (about 2.12 GB
+combined). Interactive installs show a `Y/n` prompt with **Yes** as the default;
+quiet and headless installs provision automatically. `--no-pull` is the explicit
+opt-out. An offline install accepts a preseeded verified cache or requires
+`--no-pull`; it never contacts the network. Under `sudo ... --system`, model
+provisioning drops back to the validated invoking user so the packages do not
+land in root's private cache. A release download failure never silently falls
+back to a source build; use `--from-source` explicitly.
 
 Options:
 
@@ -302,8 +321,8 @@ Options:
 |------|---------|
 | `--system` | Install to `/usr/local/bin` instead of `~/.local/bin` |
 | `--easy-mode` | Auto-update shell `PATH` and rc files |
-| `--verify` | Verify both binary names plus capabilities, schema, and detect-only doctor contracts |
-| `--no-pull` | Suppress the post-install Sortformer download prompt and guidance |
+| `--verify` | Verify both binary names, agent schemas, and both native model packages |
+| `--no-pull` | Skip automatic native Whisper and Sortformer model provisioning |
 | `--version vX.Y.Z` | Pin to a specific release |
 | `--force` | Reinstall even if the same version is present |
 | `--offline TARBALL` | Airgap install from a local archive (verifies sibling `.sha256`) |
@@ -312,7 +331,12 @@ Options:
 | `--no-verify` | Skip checksum verification (testing only) |
 | `--uninstall` | Remove both binary names and installer-added `PATH` lines |
 
-`HTTP_PROXY`/`HTTPS_PROXY` are honored on every download. `FW_INSTALL_PROMPT_TIMEOUT` changes the interactive prompt timeout from its 120-second default, and `FRANKEN_WHISPER_MODEL_DIR` selects an absolute model-cache root for both the prompt and `fw pull sortformer`. Prebuilt targets: `linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64`, `windows_amd64` (zip; manual install on native Windows — the bash installer covers Linux, macOS, and WSL).
+`HTTP_PROXY`/`HTTPS_PROXY` are honored on every download.
+`FW_INSTALL_PROMPT_TIMEOUT` changes the interactive prompt timeout from 120
+seconds, and `FRANKEN_WHISPER_MODEL_DIR` selects an absolute cache root shared
+by `fw pull all`, model discovery, and the installer. Prebuilt targets are
+`linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64`, and
+`windows_amd64` (zip; manual install on native Windows).
 
 ### From Source
 
@@ -341,9 +365,9 @@ LTO, one codegen unit, `panic = "abort"`, and stripped symbols.
 
 - **Rust nightly** (2024 edition; pinned via `rust-toolchain.toml`)
 - **ffmpeg** (optional): only needed for video files, exotic codecs `symphonia` cannot decode, and live microphone capture. On Linux x86_64 it is auto-provisioned on first use unless `FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0`.
-- **A Whisper model file** for the built-in native engine (e.g. `ggml-tiny.en.bin` / `ggml-large-v3-turbo.bin` from [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp)); place it in `$FRANKEN_WHISPER_MODEL_DIR`, `~/.cache/franken_whisper/models`, or `~/models/whisper` — `scripts/fetch_test_models.sh` fetches a pinned `tiny.en`. With a model present, **no external backend binaries are required**: set `FRANKEN_WHISPER_NATIVE_EXECUTION=1` to prefer the native engine; even without that flag, the default-on recovery path runs it automatically whenever no bridge binary is usable.
+- **The two native default model packages.** The installer provisions them, or run `fw pull all`. Native Whisper uses the pinned `whisper-large-v3-turbo-f16-v1` GGML f16 release; native diarization uses the pinned four-lane `sortformer-v2.1-f32-v1` package. Both are hash-checked against compiled trust roots. No external backend binary is required for the default pipeline.
 - **The pinned ECAPA package** (only for `ecapa` or `ecapa-fused`): `ecapa_tdnn_voxceleb.safetensors`, SHA-256 `9276a840c52cdd2e9afb73cd87a38e15749e12bf494d3ca47b5bc162f237cbcc`, under `$FRANKEN_WHISPER_MODEL_DIR/aux/` or `~/.cache/franken_whisper/models/aux/`. The converted artifact is not published, so `scripts/fetch_aux_models.sh` prints the pinned conversion instructions and expected digest instead of downloading it.
-- **Bridge backend binaries** (optional alternates; the Bayesian router arbitrates):
+- **Bridge backend binaries** (optional explicit alternates):
   - `whisper-cli` (from whisper.cpp); override via `FRANKEN_WHISPER_WHISPER_CPP_BIN`
   - `insanely-fast-whisper` (Python entry point); override via `FRANKEN_WHISPER_INSANELY_FAST_BIN`
   - `python3` with `pyannote.audio` installed (only for the optional external diarization backend); override via `FRANKEN_WHISPER_PYTHON_BIN`
