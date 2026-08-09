@@ -15,6 +15,12 @@ use rayon::prelude::*;
 use std::hint::black_box;
 use std::time::Instant;
 
+type CrossHeadBuffers = (Vec<f32>, Vec<Float16>, Vec<f32>, Vec<Float16>);
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the probe exposes each cross-cache geometry and output mode independently"
+)]
 fn build(
     cross_k: &[Vec<f32>],
     cross_v: &[Vec<f32>],
@@ -24,7 +30,7 @@ fn build(
     n_state: usize,
     d_head: usize,
     need_f32: bool,
-) -> Vec<(Vec<f32>, Vec<Float16>, Vec<f32>, Vec<Float16>)> {
+) -> Vec<CrossHeadBuffers> {
     (0..n_layer * n_head)
         .into_par_iter()
         .map(|idx| {

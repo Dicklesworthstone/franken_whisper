@@ -154,7 +154,7 @@ fn bench(name: &str, k: usize, n: usize, seq: usize, ratios: &[f64], davg: &[usi
                 }
                 if d > 1 {
                     let inv = 1.0 / d as f32;
-                    for a in acc.iter_mut() {
+                    for a in &mut acc {
                         *a *= inv;
                     }
                 }
