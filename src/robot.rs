@@ -924,8 +924,9 @@ pub fn capabilities_value() -> serde_json::Value {
 }
 
 /// Report model/package readiness without returning local paths or downloading
-/// anything. Sortformer cache readiness includes all four compiled hash roots;
-/// other model families retain their documented admission behavior.
+/// anything. Release-package readiness includes every compiled size and hash
+/// trust root; operator-configured Whisper files remain visible as a separate
+/// local override state.
 #[must_use]
 pub fn models_report_value() -> serde_json::Value {
     models_report_value_with_cancel(|| false)
@@ -934,8 +935,8 @@ pub fn models_report_value() -> serde_json::Value {
 
 /// Cancellation-correct form of [`models_report_value`].
 ///
-/// Verifying the cached Sortformer artifact hashes roughly 492 MB. Interactive
-/// and robot command callers use this form so an interrupt is reported as
+/// Verifying both default packages hashes roughly 2.1 GB. Interactive and
+/// robot command callers use this form so an interrupt is reported as
 /// cancellation rather than incorrectly presenting an installed model as
 /// missing.
 pub fn models_report_value_with_cancel<F>(is_cancelled: F) -> FwResult<serde_json::Value>
@@ -943,12 +944,16 @@ where
     F: Fn() -> bool + Sync,
 {
     let configured_whisper = crate::native_engine::default_model_spec();
+    let whisper_package_available =
+        crate::model_distribution::cached_whisper_readiness_with_cancel(&is_cancelled)?;
     let whisper_available = configured_whisper.as_deref().map_or_else(
         || crate::native_engine::resolve_model("default").is_ok(),
         |spec| crate::native_engine::resolve_model(spec).is_ok(),
     );
     let whisper_selection = if configured_whisper.is_some() {
         "configured"
+    } else if whisper_package_available {
+        "verified_release_package"
     } else if whisper_available {
         "auto_discovered"
     } else {
@@ -960,7 +965,7 @@ where
     )
     .is_ok();
     let sortformer_available =
-        crate::model_distribution::cached_sortformer_readiness_with_cancel(is_cancelled)?;
+        crate::model_distribution::cached_sortformer_readiness_with_cancel(&is_cancelled)?;
 
     Ok(json!({
         "schema_version": "franken-whisper-model-registry-v2",
@@ -983,15 +988,25 @@ where
                 "runtime_status": if whisper_available { "ready" } else { "missing_artifact" },
                 "installed": whisper_available,
                 "selection": whisper_selection,
+                "default_release_package_installed": whisper_package_available,
                 "artifact": {
                     "format": "ggml",
-                    "validation": "header_and_tensor_contract_at_load",
-                    "redistribution": "not_bundled_use_upstream_whisper_cpp_model",
+                    "filename": crate::model_distribution::WHISPER_WEIGHTS_FILENAME,
+                    "bytes": crate::model_distribution::WHISPER_WEIGHTS_BYTES,
+                    "sha256": crate::model_distribution::WHISPER_WEIGHTS_SHA256,
+                    "artifact_version": crate::model_distribution::WHISPER_ARTIFACT_VERSION,
+                    "precision": "f16",
+                    "preparation_recipe": crate::model_distribution::WHISPER_PREPARATION_RECIPE,
+                    "weight_bytes_identity_preserved": true,
+                    "validation": "compiled_size_and_sha256_then_header_and_tensor_contract_at_load",
+                    "redistribution": crate::model_distribution::WHISPER_DISTRIBUTION_POLICY,
+                    "license": "MIT",
+                    "license_url": crate::model_distribution::WHISPER_LICENSE_URL,
                 },
                 "next_command": if whisper_available {
-                    "fw robot run --input AUDIO --backend whisper-cpp"
+                    "fw robot run --input AUDIO"
                 } else {
-                    "fw transcribe --input AUDIO --model /absolute/path/to/ggml-model.bin --json"
+                    "fw pull whisper --json"
                 },
             },
             {
@@ -1015,12 +1030,12 @@ where
                 "revision": crate::sortformer_conformance::SORTFORMER_MODEL_REVISION,
                 "kind": "streaming_speaker_diarization",
                 "tasks": ["speaker_activity", "overlap", "speaker_turns"],
-                "runtime_status": if sortformer_available { "evaluation_only_explicit_ready" } else { "not_cached_explicit_pull_required" },
+                "runtime_status": if sortformer_available { "native_default_ready_capped_four_lanes" } else { "native_default_missing_artifact" },
                 "installed": sortformer_available,
                 "certification": "evaluation_only",
                 "speaker_lane_capacity": 4,
                 "capacity_semantics": "four_lane_capped_output_true_speaker_count_unknown",
-                "auto_routing_status": "certification_receipt_required",
+                "auto_routing_status": "owner_directed_native_default_accuracy_certification_pending",
                 "artifact": {
                     "format": "safetensors_f32",
                     "bytes": crate::sortformer_conformance::SORTFORMER_PACKAGE_BYTES,
@@ -1035,7 +1050,7 @@ where
                     "required_notice": crate::model_distribution::SORTFORMER_REQUIRED_NOTICE,
                 },
                 "next_command": if sortformer_available {
-                    "fw sortformer-diarize --input AUDIO"
+                    "fw robot run --input AUDIO"
                 } else {
                     "fw pull sortformer --json"
                 },
@@ -1069,7 +1084,7 @@ where
                 .iter()
                 .find(|entry| entry["id"] == "native-whisper-ggml")
         })
-        .and_then(|entry| entry["installed"].as_bool())
+        .and_then(|entry| entry["default_release_package_installed"].as_bool())
         .unwrap_or(false);
     let sortformer_ready = models["models"]
         .as_array()
@@ -1080,23 +1095,18 @@ where
         })
         .and_then(|entry| entry["installed"].as_bool())
         .unwrap_or(false);
-    let bridge_ready = health.backends.iter().any(|backend| backend.available);
-    let transcription_ready = whisper_ready || bridge_ready;
+    let default_pipeline_ready = whisper_ready && sortformer_ready;
 
     let mut recommendations = Vec::new();
-    if transcription_ready {
+    if default_pipeline_ready {
         recommendations.push(json!({
-            "reason": "static preflight found at least one transcription candidate; execution remains the runtime proof",
-            "command": "fw robot run --input AUDIO --backend auto",
+            "reason": "both verified native default model packages are present; execution remains the runtime proof",
+            "command": "fw robot run --input AUDIO",
         }));
     } else {
         recommendations.push(json!({
-            "reason": "no transcription backend or native Whisper model is ready",
-            "command": "fw models --json",
-        }));
-        recommendations.push(json!({
-            "reason": "an explicit local ggml path bypasses model search ambiguity",
-            "command": "fw transcribe --input AUDIO --model /absolute/path/to/ggml-model.bin --json",
+            "reason": "one or both verified native default model packages are missing",
+            "command": "fw pull all --json",
         }));
     }
     if !health.database.available {
@@ -1113,7 +1123,7 @@ where
     }
     if !sortformer_ready {
         recommendations.push(json!({
-            "reason": "the optional native Sortformer diarization package is not cached",
+            "reason": "the native default Sortformer diarization package is not cached",
             "command": "fw pull sortformer --json",
         }));
     }
@@ -1125,14 +1135,14 @@ where
         "runtime_probe_performed": false,
         "operationally_verified": false,
         "readiness_authority": "static_preflight_not_transcription_proof",
-        "ready": transcription_ready,
-        "status": if transcription_ready { "preflight_ready_unverified" } else { "action_required" },
+        "ready": default_pipeline_ready,
+        "status": if default_pipeline_ready { "preflight_ready_unverified" } else { "action_required" },
         "checks": {
-            "transcription": if transcription_ready { "ready" } else { "unavailable" },
+            "native_whisper": if whisper_ready { "ready" } else { "not_cached_run_fw_pull_whisper" },
             "persistence": if health.database.available { "ready" } else { "optional_unavailable" },
             "ffmpeg_fallback": if health.ffmpeg.available { "ready" } else { "optional_unavailable" },
             "sortformer": if sortformer_ready {
-                "native_explicit_ready_auto_certification_pending"
+                "native_default_ready_accuracy_certification_pending"
             } else {
                 "not_cached_run_fw_pull_sortformer"
             },
@@ -1192,12 +1202,12 @@ where
 pub const fn robot_docs_guide() -> &'static str {
     "# FrankenWhisper agent guide\n\n\
 1. Run `fw robot triage` for live readiness and the next exact command.\n\
-2. Run `fw models --json` before selecting native Whisper, ECAPA, or Sortformer.\n\
-3. Use `fw robot run --input AUDIO --backend auto` for NDJSON transcription.\n\
+2. Run `fw models --json` to verify the native Whisper and Sortformer packages.\n\
+3. Use `fw robot run --input AUDIO` for native ASR plus native diarization.\n\
 4. Parse stdout only as JSON/NDJSON; diagnostics and tracing belong on stderr.\n\
 5. On failure, branch on the stable `FW-*` code from `fw capabilities --json`.\n\
-6. Run `fw pull sortformer --json` once to install the hash-pinned model, license, notice, and receipt.\n\
-7. Downloads are explicit; transcription and diarization never access the network.\n"
+6. Run `fw pull all --json` to provision both hash-pinned native default packages.\n\
+7. The installer does this automatically; inference itself never accesses the network.\n"
 }
 
 /// Emit a single `health.report` NDJSON line to stdout.
