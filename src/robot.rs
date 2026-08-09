@@ -887,8 +887,8 @@ pub fn capabilities_value() -> serde_json::Value {
         },
         "compiled_features": {
             "tui": cfg!(feature = "tui"),
-            "gpu_frankentorch": cfg!(feature = "gpu-frankentorch"),
-            "gpu_frankenjax": cfg!(feature = "gpu-frankenjax"),
+            "gpu_frankentorch": false,
+            "gpu_frankenjax": false,
         },
         "agent_orientation": {
             "command": "fw robot triage",

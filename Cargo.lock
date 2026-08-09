@@ -197,7 +197,7 @@ dependencies = [
  "nom",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.18",
+ "thiserror",
  "time",
 ]
 
@@ -269,7 +269,7 @@ dependencies = [
  "subtle",
  "sysinfo",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror",
  "unicode-normalization",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -1023,26 +1023,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "egg"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd40cfd4196d7a8f882ace95d623d4d6734588e502b4e188675a7c2f55eb4fb4"
-dependencies = [
- "env_logger",
- "hashbrown 0.15.5",
- "indexmap",
- "log",
- "num-bigint",
- "num-traits",
- "quanta",
- "rustc-hash",
- "smallvec",
- "symbol_table",
- "symbolic_expressions",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1062,15 +1042,6 @@ name = "env_home"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
-
-[[package]]
-name = "env_logger"
-version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a12e6657c4c97ebab115a42dcee77225f7f482cdd841cf7088c657a42e9e00e7"
-dependencies = [
- "log",
-]
 
 [[package]]
 name = "equivalent"
@@ -1113,124 +1084,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "fj-ad"
-version = "0.1.0"
-dependencies = [
- "fj-core",
- "fj-lax",
- "smallvec",
-]
-
-[[package]]
-name = "fj-api"
-version = "0.1.0"
-dependencies = [
- "fj-ad",
- "fj-core",
- "fj-dispatch",
- "fj-interpreters",
- "fj-trace",
-]
-
-[[package]]
-name = "fj-backend-cpu"
-version = "0.1.0"
-dependencies = [
- "fj-core",
- "fj-interpreters",
- "fj-lax",
- "fj-runtime",
- "rayon",
- "rustc-hash",
-]
-
-[[package]]
-name = "fj-cache"
-version = "0.1.0"
-dependencies = [
- "fj-core",
- "serde",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "fj-core"
-version = "0.1.0"
-dependencies = [
- "half",
- "rustc-hash",
- "serde",
- "smallvec",
-]
-
-[[package]]
-name = "fj-dispatch"
-version = "0.1.0"
-dependencies = [
- "fj-ad",
- "fj-backend-cpu",
- "fj-cache",
- "fj-core",
- "fj-egraph",
- "fj-interpreters",
- "fj-lax",
- "fj-ledger",
- "fj-runtime",
- "fj-trace",
- "rustc-hash",
-]
-
-[[package]]
-name = "fj-egraph"
-version = "0.1.0"
-dependencies = [
- "egg",
- "fj-core",
- "smallvec",
-]
-
-[[package]]
-name = "fj-interpreters"
-version = "0.1.0"
-dependencies = [
- "fj-core",
- "fj-lax",
- "fj-trace",
- "rustc-hash",
-]
-
-[[package]]
-name = "fj-lax"
-version = "0.1.0"
-dependencies = [
- "fj-core",
-]
-
-[[package]]
-name = "fj-ledger"
-version = "0.1.0"
-dependencies = [
- "fj-core",
- "serde",
-]
-
-[[package]]
-name = "fj-runtime"
-version = "0.1.0"
-dependencies = [
- "fj-core",
- "fj-ledger",
-]
-
-[[package]]
-name = "fj-trace"
-version = "0.1.0"
-dependencies = [
- "fj-core",
- "smallvec",
-]
-
-[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1239,12 +1092,6 @@ dependencies = [
  "crc32fast",
  "miniz_oxide",
 ]
-
-[[package]]
-name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "foldhash"
@@ -1311,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "franken_whisper"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -1320,15 +1167,12 @@ dependencies = [
  "crc32fast",
  "criterion",
  "ctrlc",
- "fj-api",
- "fj-core",
  "flate2",
  "franken-decision",
  "franken-evidence",
  "franken-kernel",
  "fsqlite",
  "fsqlite-types",
- "ft-api",
  "ft-core",
  "ft-kernel-cpu",
  "ft-kernel-metal",
@@ -1344,7 +1188,7 @@ dependencies = [
  "sha2 0.10.9",
  "symphonia",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1378,7 +1222,7 @@ dependencies = [
 name = "fsqlite-btree"
 version = "0.2.0"
 dependencies = [
- "foldhash 0.2.0",
+ "foldhash",
  "fsqlite-error",
  "fsqlite-func",
  "fsqlite-pager",
@@ -1396,7 +1240,7 @@ version = "0.2.0"
 dependencies = [
  "asupersync",
  "blake3",
- "foldhash 0.2.0",
+ "foldhash",
  "fsqlite-ast",
  "fsqlite-btree",
  "fsqlite-error",
@@ -1430,7 +1274,7 @@ dependencies = [
 name = "fsqlite-error"
 version = "0.2.0"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror",
 ]
 
 [[package]]
@@ -1515,7 +1359,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror",
  "tracing",
  "xxhash-rust",
 ]
@@ -1540,7 +1384,7 @@ dependencies = [
  "bumpalo",
  "chacha20poly1305",
  "dashmap",
- "foldhash 0.2.0",
+ "foldhash",
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-types",
@@ -1655,44 +1499,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ft-api"
-version = "0.1.0"
-dependencies = [
- "ft-autograd",
- "ft-core",
- "ft-dispatch",
- "ft-kernel-cpu",
- "ft-runtime",
- "libm",
- "rayon",
- "wide",
-]
-
-[[package]]
-name = "ft-autograd"
-version = "0.1.0"
-dependencies = [
- "ft-core",
- "ft-dispatch",
- "ft-kernel-cpu",
- "libm",
- "rayon",
-]
-
-[[package]]
 name = "ft-core"
 version = "0.1.0"
 dependencies = [
  "half",
  "num-complex",
-]
-
-[[package]]
-name = "ft-dispatch"
-version = "0.1.0"
-dependencies = [
- "ft-core",
- "ft-kernel-cpu",
 ]
 
 [[package]]
@@ -1714,13 +1525,6 @@ dependencies = [
  "foreign-types",
  "metal",
  "objc",
-]
-
-[[package]]
-name = "ft-runtime"
-version = "0.1.0"
-dependencies = [
- "ft-core",
 ]
 
 [[package]]
@@ -1983,24 +1787,13 @@ checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.1.5",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
  "serde",
  "serde_core",
 ]
@@ -2715,21 +2508,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quanta"
-version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3ab5a9d756f0d97bdc89019bd2e4ea098cf9cde50ee7564dde6b81ccc8f06c7"
-dependencies = [
- "crossbeam-utils",
- "libc",
- "once_cell",
- "raw-cpuid",
- "wasi",
- "web-sys",
- "winapi",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2804,15 +2582,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32b266a82f4aa99bb5c25e28d11cc44ace63d91adbcbcee4d323e2ae3d49ef37"
 dependencies = [
  "rustversion",
-]
-
-[[package]]
-name = "raw-cpuid"
-version = "11.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
-dependencies = [
- "bitflags 2.13.1",
 ]
 
 [[package]]
@@ -3220,9 +2989,6 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "socket2"
@@ -3261,23 +3027,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "symbol_table"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f19bffd69fb182e684d14e3c71d04c0ef33d1641ac0b9e81c712c734e83703bc"
-dependencies = [
- "crossbeam-utils",
- "foldhash 0.1.5",
- "hashbrown 0.15.5",
-]
-
-[[package]]
-name = "symbolic_expressions"
-version = "5.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c68d531d83ec6c531150584c42a4290911964d5f0d79132b193b67252a23b71"
 
 [[package]]
 name = "symphonia"
@@ -3514,31 +3263,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
 dependencies = [
- "thiserror-impl 2.0.18",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -4175,7 +3904,7 @@ dependencies = [
  "nom",
  "oid-registry",
  "rusticata-macros",
- "thiserror 2.0.18",
+ "thiserror",
  "time",
 ]
 

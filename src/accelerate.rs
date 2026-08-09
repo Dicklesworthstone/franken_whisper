@@ -43,49 +43,7 @@ pub(crate) fn apply_with_token(
 
     let baseline = confidence_vector(&result.segments);
     let pre_mass = Some(baseline.iter().copied().sum::<f64>());
-    let mut notes = Vec::new();
-
-    #[cfg(feature = "gpu-frankentorch")]
-    {
-        match normalize_with_frankentorch(&baseline) {
-            Ok(values) => {
-                let report = build_report(
-                    result,
-                    AccelerationBackend::Frankentorch,
-                    values,
-                    pre_mass,
-                    notes,
-                );
-                result.acceleration = Some(report.clone());
-                return report;
-            }
-            Err(error) => {
-                notes.push(format!("frankentorch unavailable at runtime: {error}"));
-            }
-        }
-    }
-
-    #[cfg(feature = "gpu-frankenjax")]
-    {
-        match normalize_with_frankenjax(&baseline) {
-            Ok(values) => {
-                let report = build_report(
-                    result,
-                    AccelerationBackend::Frankenjax,
-                    values,
-                    pre_mass,
-                    notes,
-                );
-                result.acceleration = Some(report.clone());
-                return report;
-            }
-            Err(error) => {
-                notes.push(format!("frankenjax unavailable at runtime: {error}"));
-            }
-        }
-    }
-
-    notes.push("using deterministic CPU normalization fallback".to_owned());
+    let notes = vec!["using deterministic CPU normalization".to_owned()];
     let values = normalize_cpu(&baseline);
     let report = build_report(result, AccelerationBackend::None, values, pre_mass, notes);
     result.acceleration = Some(report.clone());
@@ -233,61 +191,14 @@ pub(crate) fn attention_scores_cpu(
     }
 }
 
-/// GPU-accelerated attention scores via frankentorch.
-#[cfg(feature = "gpu-frankentorch")]
-pub(crate) fn attention_scores_frankentorch(
-    query: &[f64],
-    key: &[f64],
-    kind: AttentionKind,
-) -> Result<AttentionResult, String> {
-    use ft_api::FrankenTorchSession;
-    use ft_core::ExecutionMode;
-
-    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-    let dim = query.len().min(key.len());
-
-    let q_tensor = session
-        .tensor_variable(query[..dim].to_vec(), vec![dim], false)
-        .map_err(|e| e.to_string())?;
-    let k_tensor = session
-        .tensor_variable(key[..dim].to_vec(), vec![dim], false)
-        .map_err(|e| e.to_string())?;
-
-    let product = session
-        .tensor_mul(q_tensor, k_tensor)
-        .map_err(|e| e.to_string())?;
-
-    let scale = 1.0 / (dim as f64).sqrt();
-    let scale_tensor = session
-        .tensor_variable(vec![scale; dim], vec![dim], false)
-        .map_err(|e| e.to_string())?;
-    let scaled = session
-        .tensor_mul(product, scale_tensor)
-        .map_err(|e| e.to_string())?;
-
-    let softmaxed = session
-        .tensor_softmax(scaled, 0)
-        .map_err(|e| e.to_string())?;
-
-    let scores = session
-        .tensor_values(softmaxed)
-        .map_err(|e| e.to_string())?;
-
-    Ok(AttentionResult {
-        kind,
-        scores,
-        gpu_accelerated: true,
-    })
-}
-
-/// Fallback stub when `gpu-frankentorch` is not enabled.
-#[cfg(not(feature = "gpu-frankentorch"))]
+/// The retired high-level FrankenTorch adapter reports unavailability so the
+/// deterministic CPU implementation remains authoritative.
 pub(crate) fn attention_scores_frankentorch(
     _query: &[f64],
     _key: &[f64],
     _kind: AttentionKind,
 ) -> Result<AttentionResult, String> {
-    Err("gpu-frankentorch feature not enabled".to_owned())
+    Err("high-level frankentorch adapter is not packaged".to_owned())
 }
 
 /// Dispatch attention scoring: GPU if available, CPU fallback otherwise.
@@ -347,54 +258,14 @@ pub(crate) fn embedding_lookup_cpu(
     }
 }
 
-/// GPU-accelerated embedding lookup via frankentorch.
-#[cfg(feature = "gpu-frankentorch")]
-pub(crate) fn embedding_lookup_frankentorch(
-    indices: &[usize],
-    table: &[Vec<f64>],
-    kind: EmbeddingKind,
-) -> Result<EmbeddingResult, String> {
-    use ft_api::FrankenTorchSession;
-    use ft_core::ExecutionMode;
-
-    let embed_dim = table.first().map_or(0, Vec::len);
-    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-
-    // Flatten the embedding table into a single tensor.
-    let flat: Vec<f64> = table.iter().flat_map(|row| row.iter().copied()).collect();
-    let table_tensor = session
-        .tensor_variable(flat, vec![table.len(), embed_dim], false)
-        .map_err(|e| e.to_string())?;
-
-    let index_floats: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
-    let idx_tensor = session
-        .tensor_variable(index_floats, vec![indices.len()], false)
-        .map_err(|e| e.to_string())?;
-
-    let gathered = session
-        .tensor_gather(table_tensor, 0, idx_tensor)
-        .map_err(|e| e.to_string())?;
-
-    let raw = session.tensor_values(gathered).map_err(|e| e.to_string())?;
-
-    // Reshape flat output back into per-token embedding vectors.
-    let embeddings: Vec<Vec<f64>> = raw.chunks(embed_dim).map(|c| c.to_vec()).collect();
-
-    Ok(EmbeddingResult {
-        kind,
-        embeddings,
-        gpu_accelerated: true,
-    })
-}
-
-/// Fallback stub when `gpu-frankentorch` is not enabled.
-#[cfg(not(feature = "gpu-frankentorch"))]
+/// The retired high-level FrankenTorch adapter reports unavailability so the
+/// deterministic CPU implementation remains authoritative.
 pub(crate) fn embedding_lookup_frankentorch(
     _indices: &[usize],
     _table: &[Vec<f64>],
     _kind: EmbeddingKind,
 ) -> Result<EmbeddingResult, String> {
-    Err("gpu-frankentorch feature not enabled".to_owned())
+    Err("high-level frankentorch adapter is not packaged".to_owned())
 }
 
 /// Dispatch embedding lookup: GPU if available, CPU fallback otherwise.
@@ -457,39 +328,10 @@ pub(crate) fn vad_scores_cpu(energy_values: &[f64]) -> VadResult {
     }
 }
 
-/// GPU-accelerated VAD scoring via frankentorch.
-#[cfg(feature = "gpu-frankentorch")]
-pub(crate) fn vad_scores_frankentorch(energy_values: &[f64]) -> Result<VadResult, String> {
-    use ft_api::FrankenTorchSession;
-    use ft_core::ExecutionMode;
-
-    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-    let tensor = session
-        .tensor_variable(energy_values.to_vec(), vec![energy_values.len()], false)
-        .map_err(|e| e.to_string())?;
-    let activated = session.tensor_sigmoid(tensor).map_err(|e| e.to_string())?;
-
-    let frame_scores = session
-        .tensor_values(activated)
-        .map_err(|e| e.to_string())?;
-
-    let activity_ratio = if frame_scores.is_empty() {
-        0.0
-    } else {
-        frame_scores.iter().copied().sum::<f64>() / frame_scores.len() as f64
-    };
-
-    Ok(VadResult {
-        frame_scores,
-        activity_ratio,
-        gpu_accelerated: true,
-    })
-}
-
-/// Fallback stub when `gpu-frankentorch` is not enabled.
-#[cfg(not(feature = "gpu-frankentorch"))]
+/// The retired high-level FrankenTorch adapter reports unavailability so the
+/// deterministic CPU implementation remains authoritative.
 pub(crate) fn vad_scores_frankentorch(_energy_values: &[f64]) -> Result<VadResult, String> {
-    Err("gpu-frankentorch feature not enabled".to_owned())
+    Err("high-level frankentorch adapter is not packaged".to_owned())
 }
 
 /// Dispatch VAD scoring: GPU if available, CPU fallback otherwise.
@@ -567,26 +409,15 @@ pub(crate) fn layer_norm_cpu(
     }
 }
 
-/// GPU-accelerated layer normalization via frankentorch.
-#[cfg(feature = "gpu-frankentorch")]
+/// The retired high-level FrankenTorch adapter reports unavailability so the
+/// deterministic CPU implementation remains authoritative.
 pub(crate) fn layer_norm_frankentorch(
     _values: &[f64],
     _gamma: &[f64],
     _beta: &[f64],
     _epsilon: f64,
 ) -> Result<LayerNormResult, String> {
-    Err("frankentorch layer-norm op unavailable in current ft-api; using CPU fallback".to_owned())
-}
-
-/// Fallback stub when `gpu-frankentorch` is not enabled.
-#[cfg(not(feature = "gpu-frankentorch"))]
-pub(crate) fn layer_norm_frankentorch(
-    _values: &[f64],
-    _gamma: &[f64],
-    _beta: &[f64],
-    _epsilon: f64,
-) -> Result<LayerNormResult, String> {
-    Err("gpu-frankentorch feature not enabled".to_owned())
+    Err("high-level frankentorch adapter is not packaged".to_owned())
 }
 
 /// Dispatch layer normalization: GPU if available, CPU fallback otherwise.
@@ -739,53 +570,7 @@ pub(crate) fn jit_attention_block_cpu(query: &[f64], key: &[f64], value: &[f64])
         .collect()
 }
 
-/// GPU-accelerated JIT inference via frankenjax.
-#[cfg(feature = "gpu-frankenjax")]
-pub(crate) fn jit_inference_frankenjax(
-    pattern: &InferenceGraphPattern,
-    inputs: &[&[f64]],
-    cache: &mut JitKernelCache,
-) -> Result<JitInferenceResult, String> {
-    let cache_hit = cache.get(pattern).is_some();
-
-    if !cache_hit {
-        // Compile and cache the kernel for this pattern.
-        let kernel_id = match pattern {
-            InferenceGraphPattern::NormalizeSoftmax => "jax_norm_softmax_v1",
-            InferenceGraphPattern::LinearActivation => "jax_linear_act_v1",
-            InferenceGraphPattern::AttentionBlock => "jax_attn_block_v1",
-        };
-        cache.insert(CompiledKernel {
-            pattern: pattern.clone(),
-            kernel_id: kernel_id.to_owned(),
-        });
-    }
-
-    match pattern {
-        InferenceGraphPattern::NormalizeSoftmax => {
-            let data = inputs.first().ok_or("missing input for NormalizeSoftmax")?;
-            let normalized = normalize_with_frankenjax(data)?;
-            let values = softmax_cpu(&normalized);
-
-            Ok(JitInferenceResult {
-                values,
-                pattern: pattern.clone(),
-                cache_hit,
-                gpu_accelerated: true,
-            })
-        }
-        InferenceGraphPattern::LinearActivation => Err(
-            "frankenjax ProgramSpec no longer exposes LinearActivation kernel; CPU fallback is used"
-                .to_owned(),
-        ),
-        InferenceGraphPattern::AttentionBlock => Err(
-            "frankenjax ProgramSpec no longer exposes AttentionBlock kernel; CPU fallback is used"
-                .to_owned(),
-        ),
-    }
-}
-
-/// Run JIT-compiled inference: GPU (frankenjax) if available, CPU fallback otherwise.
+/// Run deterministic cached inference on the packaged CPU implementation.
 ///
 /// For `NormalizeSoftmax`: expects `inputs[0]` = data vector.
 /// For `LinearActivation`: expects `inputs[0]` = data, `inputs[1]` = weights.
@@ -796,14 +581,6 @@ pub fn jit_inference(
     inputs: &[&[f64]],
     cache: &mut JitKernelCache,
 ) -> JitInferenceResult {
-    #[cfg(feature = "gpu-frankenjax")]
-    {
-        match jit_inference_frankenjax(pattern, inputs, cache) {
-            Ok(result) => return result,
-            Err(_) => {}
-        }
-    }
-
     let cache_hit = cache.get(pattern).is_some();
 
     // Ensure the pattern is "compiled" in the cache even for CPU fallback.
@@ -903,32 +680,7 @@ pub fn jit_cache_key(spec: &InferenceGraphSpec) -> String {
 
 /// Compile an inference graph from a spec, returning a `CompiledKernel`.
 ///
-/// When the `gpu-frankenjax` feature is enabled this delegates to the JAX
-/// JIT compiler; otherwise a deterministic CPU kernel descriptor is produced.
-#[cfg(feature = "gpu-frankenjax")]
-pub fn jit_compile_inference_graph(
-    spec: &InferenceGraphSpec,
-    cache: &mut JitKernelCache,
-) -> Result<CompiledKernel, String> {
-    let key = jit_cache_key(spec);
-
-    // Return cached kernel if available.
-    if let Some(existing) = cache.get(&spec.pattern) {
-        return Ok(existing.clone());
-    }
-
-    // Compile via frankenjax (simplified: we produce a kernel descriptor).
-    let kernel_id = format!("jax_jit_{key}");
-    let kernel = CompiledKernel {
-        pattern: spec.pattern.clone(),
-        kernel_id,
-    };
-    cache.insert(kernel.clone());
-    Ok(kernel)
-}
-
-/// Fallback stub when `gpu-frankenjax` is not enabled.
-#[cfg(not(feature = "gpu-frankenjax"))]
+/// A deterministic CPU kernel descriptor is produced and cached.
 pub fn jit_compile_inference_graph(
     spec: &InferenceGraphSpec,
     cache: &mut JitKernelCache,
@@ -953,28 +705,7 @@ pub fn jit_compile_inference_graph(
 /// Each element of `batch` is a set of input slices matching the graph spec.
 /// Returns one `JitInferenceResult` per batch element.
 ///
-/// When the `gpu-frankenjax` feature is enabled, this attempts GPU execution
-/// for each batch element before falling back to CPU.
-#[cfg(feature = "gpu-frankenjax")]
-pub fn jit_execute_batch(
-    spec: &InferenceGraphSpec,
-    batch: &[Vec<Vec<f64>>],
-    cache: &mut JitKernelCache,
-) -> Vec<JitInferenceResult> {
-    // Ensure the graph is compiled.
-    let _ = jit_compile_inference_graph(spec, cache);
-
-    batch
-        .iter()
-        .map(|inputs| {
-            let slices: Vec<&[f64]> = inputs.iter().map(Vec::as_slice).collect();
-            jit_inference(&spec.pattern, &slices, cache)
-        })
-        .collect()
-}
-
-/// Fallback stub when `gpu-frankenjax` is not enabled.
-#[cfg(not(feature = "gpu-frankenjax"))]
+/// Every batch element uses the same packaged CPU execution contract.
 pub fn jit_execute_batch(
     spec: &InferenceGraphSpec,
     batch: &[Vec<Vec<f64>>],
@@ -1038,70 +769,6 @@ pub(crate) fn sigmoid(x: f64) -> f64 {
     // Clamp to avoid overflow in exp.
     let clamped = x.clamp(-500.0, 500.0);
     1.0 / (1.0 + (-clamped).exp())
-}
-
-#[cfg(feature = "gpu-frankentorch")]
-fn normalize_with_frankentorch(values: &[f64]) -> Result<Vec<f64>, String> {
-    use ft_api::FrankenTorchSession;
-    use ft_core::ExecutionMode;
-
-    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-    let tensor = session
-        .tensor_variable(values.to_vec(), vec![values.len()], false)
-        .map_err(|error| error.to_string())?;
-    let normalized = session
-        .tensor_softmax(tensor, 0)
-        .map_err(|error| error.to_string())?;
-
-    let out = session
-        .tensor_values(normalized)
-        .map_err(|error| error.to_string())?;
-
-    // GPU softmax can emit NaN/Inf (all-(-inf) inputs, overflow, or a NaN in
-    // values). A non-finite/degenerate result would be stamped onto segment
-    // confidences and panic the downstream clamps, so fall back to the
-    // defensive CPU path when the tensor output is not a usable distribution.
-    if out.iter().all(|v| v.is_finite()) && out.iter().sum::<f64>() > f64::EPSILON {
-        Ok(out)
-    } else {
-        Ok(normalize_cpu(values))
-    }
-}
-
-#[cfg(feature = "gpu-frankenjax")]
-fn normalize_with_frankenjax(values: &[f64]) -> Result<Vec<f64>, String> {
-    use fj_api::jit;
-    use fj_core::{ProgramSpec, Value, build_program};
-
-    let vector = Value::vector_f64(values).map_err(|error| error.to_string())?;
-    let result = jit(build_program(ProgramSpec::ReduceSumVec))
-        .call(vec![vector])
-        .map_err(|error| format!("jit reduce failed: {error}"))?;
-
-    let total = result
-        .first()
-        .and_then(Value::as_f64_scalar)
-        .ok_or_else(|| "reduce output did not contain scalar".to_owned())?;
-
-    // Mirror normalize_cpu's defenses: the raw ReduceSumVec total does no finite
-    // filtering, so a NaN/Inf input (or the denormal 2.225e-308) yields a
-    // non-finite or vanishing total. `total <= f64::EPSILON` is false for NaN,
-    // so guard finiteness explicitly and fall back to a uniform distribution.
-    if !total.is_finite() || total <= f64::EPSILON {
-        return Ok(vec![1.0 / values.len() as f64; values.len()]);
-    }
-
-    Ok(values
-        .iter()
-        .map(|value| {
-            let safe = if value.is_finite() && *value > 0.0 {
-                *value
-            } else {
-                0.0
-            };
-            safe / total
-        })
-        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1462,26 +1129,6 @@ mod tests {
         assert_eq!(report.backend, crate::model::AccelerationBackend::None);
     }
 
-    #[test]
-    fn backend_priority_prefers_frankentorch_then_frankenjax() {
-        let priority: Vec<AccelerationBackend> = vec![
-            #[cfg(feature = "gpu-frankentorch")]
-            AccelerationBackend::Frankentorch,
-            #[cfg(feature = "gpu-frankenjax")]
-            AccelerationBackend::Frankenjax,
-        ];
-
-        if priority.len() == 2 {
-            assert_eq!(
-                priority,
-                vec![
-                    AccelerationBackend::Frankentorch,
-                    AccelerationBackend::Frankenjax
-                ]
-            );
-        }
-    }
-
     // --- Edge-case tests for acceleration hardening ---
 
     fn make_result(segments: Vec<TranscriptionSegment>) -> TranscriptionResult {
@@ -1823,36 +1470,6 @@ mod tests {
             assert!(c.is_finite(), "confidence must be finite, got {c}");
             assert!((0.0..=1.0).contains(&c), "confidence in [0,1], got {c}");
         }
-    }
-
-    #[cfg(feature = "gpu-frankentorch")]
-    #[test]
-    fn normalize_with_frankentorch_non_finite_falls_back_to_finite() {
-        use super::normalize_with_frankentorch;
-        // A NaN-carrying input must never yield a non-finite normalized vector;
-        // the GPU path validates its output and falls back to normalize_cpu.
-        let out = normalize_with_frankentorch(&[f64::NAN, 1.0, 2.0])
-            .expect("normalize_with_frankentorch should not error");
-        assert_eq!(out.len(), 3);
-        assert!(
-            out.iter().all(|v| v.is_finite()),
-            "normalized output must be finite, got {out:?}"
-        );
-    }
-
-    #[cfg(feature = "gpu-frankenjax")]
-    #[test]
-    fn normalize_with_frankenjax_non_finite_stays_finite() {
-        use super::normalize_with_frankenjax;
-        // A NaN in the input makes the raw ReduceSumVec total non-finite; the
-        // finiteness guard degrades to a uniform (finite) distribution.
-        let out = normalize_with_frankenjax(&[f64::NAN, 1.0, 2.0])
-            .expect("normalize_with_frankenjax should not error");
-        assert_eq!(out.len(), 3);
-        assert!(
-            out.iter().all(|v| v.is_finite()),
-            "normalized output must be finite, got {out:?}"
-        );
     }
 
     // --- Direct build_report tests ---
@@ -2556,8 +2173,7 @@ mod tests {
 
         let result = compute_attention(&[1.0, 2.0], &[2.0, 1.0], AttentionKind::SelfAttention);
 
-        // Without gpu-frankentorch feature, this must be CPU.
-        #[cfg(not(feature = "gpu-frankentorch"))]
+        // The packaged high-level acceleration layer is CPU-authoritative.
         assert!(!result.gpu_accelerated);
 
         assert_eq!(result.scores.len(), 2);
@@ -2662,7 +2278,6 @@ mod tests {
         let table = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
         let result = compute_embedding(&[1, 0], &table, EmbeddingKind::Token);
 
-        #[cfg(not(feature = "gpu-frankentorch"))]
         assert!(!result.gpu_accelerated);
 
         assert_eq!(result.embeddings.len(), 2);
@@ -2806,7 +2421,6 @@ mod tests {
 
         let result = compute_vad_scores(&[0.0, 5.0, -5.0]);
 
-        #[cfg(not(feature = "gpu-frankentorch"))]
         assert!(!result.gpu_accelerated);
 
         assert_eq!(result.frame_scores.len(), 3);
@@ -3203,7 +2817,6 @@ mod tests {
         assert!(!result.cache_hit, "first call should be a cache miss");
         assert_eq!(result.values.len(), 3);
 
-        #[cfg(not(feature = "gpu-frankenjax"))]
         assert!(!result.gpu_accelerated);
 
         let sum: f64 = result.values.iter().sum();
@@ -3754,8 +3367,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_norm_frankentorch_stub_returns_error_without_feature() {
-        #[cfg(not(feature = "gpu-frankentorch"))]
+    fn layer_norm_frankentorch_stub_reports_retired_adapter() {
         {
             use super::layer_norm_frankentorch;
 
@@ -3764,7 +3376,7 @@ mod tests {
             assert!(
                 result
                     .unwrap_err()
-                    .contains("gpu-frankentorch feature not enabled")
+                    .contains("high-level frankentorch adapter is not packaged")
             );
         }
     }
@@ -3775,7 +3387,6 @@ mod tests {
 
         let result = compute_layer_norm(&[1.0, 2.0, 3.0], &[1.0; 3], &[0.0; 3], 1e-5);
 
-        #[cfg(not(feature = "gpu-frankentorch"))]
         assert!(!result.gpu_accelerated);
 
         assert_eq!(result.normalized.len(), 3);
@@ -3789,8 +3400,7 @@ mod tests {
     // ===================================================================
 
     #[test]
-    fn attention_scores_frankentorch_stub_returns_error_without_feature() {
-        #[cfg(not(feature = "gpu-frankentorch"))]
+    fn attention_scores_frankentorch_stub_reports_retired_adapter() {
         {
             use super::{AttentionKind, attention_scores_frankentorch};
 
@@ -3801,8 +3411,7 @@ mod tests {
     }
 
     #[test]
-    fn embedding_lookup_frankentorch_stub_returns_error_without_feature() {
-        #[cfg(not(feature = "gpu-frankentorch"))]
+    fn embedding_lookup_frankentorch_stub_reports_retired_adapter() {
         {
             use super::{EmbeddingKind, embedding_lookup_frankentorch};
 
@@ -3813,8 +3422,7 @@ mod tests {
     }
 
     #[test]
-    fn vad_scores_frankentorch_stub_returns_error_without_feature() {
-        #[cfg(not(feature = "gpu-frankentorch"))]
+    fn vad_scores_frankentorch_stub_reports_retired_adapter() {
         {
             use super::vad_scores_frankentorch;
 

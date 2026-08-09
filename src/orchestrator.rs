@@ -1262,8 +1262,8 @@ fn acceleration_context_payload(
         "logical_stream_owner_id": stream_owner_id,
         "requested_gpu_device": request.backend_params.gpu_device,
         "flash_attention_requested": request.backend_params.flash_attention,
-        "frankentorch_feature": cfg!(feature = "gpu-frankentorch"),
-        "frankenjax_feature": cfg!(feature = "gpu-frankenjax"),
+        "frankentorch_feature": false,
+        "frankenjax_feature": false,
         "cancellation_fence": cancellation_fence,
     })
 }
@@ -2658,8 +2658,8 @@ async fn execute_accelerate(
         "acceleration.start",
         "running native acceleration pass",
         json!({
-            "frankentorch_feature": cfg!(feature = "gpu-frankentorch"),
-            "frankenjax_feature": cfg!(feature = "gpu-frankenjax"),
+            "frankentorch_feature": false,
+            "frankenjax_feature": false,
             "segments": result.segments.len(),
             "budget_ms": stage_budgets.acceleration_ms,
         }),
