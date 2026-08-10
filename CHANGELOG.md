@@ -12,10 +12,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 No unreleased changes yet.
 
-## [0.7.0] - 2026-08-09
+## [0.7.1] - 2026-08-09
 
 This is the first published release after v0.5.0. The planned v0.6.0 snapshot
-was never tagged or released; its work is included here.
+was never tagged or released; its work is included here. The v0.7.0 tag was a
+pre-publication candidate and has no GitHub Release or crates.io publication.
 
 ### Added
 
@@ -90,6 +91,9 @@ was never tagged or released; its work is included here.
 - Aligned installer checksum discovery with DSR releases: verified installs
   now prefer the archive-specific `.sha256` sidecar and fall back to the
   exact-name entry in `SHA256SUMS`.
+- Aligned the installer's strict flat-archive allowlist with the DSR package by
+  admitting the required `NOTICE.sortformer.txt` license notice while retaining
+  duplicate, symlink, non-regular-entry, and unknown-member rejection.
 - Hardened model distribution, archive admission, cancellation, path safety,
   deterministic evidence commitments, and confidential-evaluation boundaries.
 - Excluded repository metadata, local caches, private media/transcripts, test
@@ -97,7 +101,7 @@ was never tagged or released; its work is included here.
 
 ### Distribution
 
-- DSR is the sole v0.7.0 binary-build authority for Linux x86_64/aarch64,
+- DSR is the sole v0.7.1 binary-build authority for Linux x86_64/aarch64,
   macOS Intel/Apple Silicon, and Windows x86_64. GitHub Actions is not used.
 - The 491,570,584-byte Sortformer package remains a separately licensed,
   SHA-256-pinned GitHub Release artifact and is never bundled in the crate,
@@ -108,7 +112,7 @@ was never tagged or released; its work is included here.
   and selected for the native Rust loader and FrankenTorch kernels; it is not
   stored in Git or bundled in binary archives.
 
-Compare: [`v0.5.0...v0.7.0`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.5.0...v0.7.0)
+Compare: [`v0.5.0...v0.7.1`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.5.0...v0.7.1)
 
 ## [0.5.0] - 2026-07-11
 
@@ -168,7 +172,7 @@ Everything in v0.2.1 (native-default engine, NaN-hardening, the aarch64 `target-
 ## Planned 0.6.0 development snapshot (never released)
 
 Native learned-diarization evaluation, explicit model distribution, and the
-agent-first packaging tranche. These changes ship in v0.7.0.
+agent-first packaging tranche. These changes ship in v0.7.1.
 
 There is intentionally no v0.6.0 comparison link because no v0.6.0 tag or
 GitHub Release exists.
@@ -550,8 +554,8 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.7.0...main
-[0.7.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.0
+[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.7.1...main
+[0.7.1]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.1
 [0.5.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.3.0

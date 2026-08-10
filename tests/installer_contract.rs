@@ -78,7 +78,7 @@ fn installer_accepts_the_exact_dsr_release_archive_members() {
     }
     let archive = root
         .path()
-        .join("franken_whisper-0.7.0-darwin_arm64.tar.gz");
+        .join("franken_whisper-0.7.1-darwin_arm64.tar.gz");
     let status = Command::new("tar")
         .args(["-czf"])
         .arg(&archive)

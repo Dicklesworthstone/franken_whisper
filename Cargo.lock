@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "franken_whisper"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "asupersync",
  "base64 0.22.1",

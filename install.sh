@@ -311,10 +311,10 @@ Examples:
   curl -fsSL .../install.sh | sudo bash -s -- --system --easy-mode
 
   # Specific version
-  curl -fsSL .../install.sh | bash -s -- --version v0.7.0
+  curl -fsSL .../install.sh | bash -s -- --version v0.7.1
 
   # Airgapped install from a local archive
-  bash install.sh --offline ./franken_whisper-0.7.0-linux_amd64.tar.gz
+  bash install.sh --offline ./franken_whisper-0.7.1-linux_amd64.tar.gz
 
   # Uninstall
   curl -fsSL .../install.sh | bash -s -- --uninstall
@@ -1271,7 +1271,7 @@ provision_default_models() {
 # ============================================================================
 # Shell completions
 # ============================================================================
-# NOTE: franken_whisper v0.7.0 has NO `completions` subcommand (verified:
+# NOTE: franken_whisper v0.7.1 has NO `completions` subcommand (verified:
 # `franken_whisper completions` => "unrecognized subcommand"). There is
 # nothing to generate, so completion installation is deliberately skipped.
 
