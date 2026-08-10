@@ -17501,11 +17501,11 @@ pub fn build_speaker_attributed_segments(
             let turn_start = turn.start_ms as f64 / 1_000.0;
             let turn_end = turn.end_ms as f64 / 1_000.0;
             let overlap = end_sec.min(turn_end) - start_sec.max(turn_start);
-            if overlap > 0.0 {
-                if let Some(confidence) = turn.speaker_confidence {
-                    weighted += overlap * confidence;
-                    duration += overlap;
-                }
+            if overlap > 0.0
+                && let Some(confidence) = turn.speaker_confidence
+            {
+                weighted += overlap * confidence;
+                duration += overlap;
             }
         }
         if duration > 0.0 {
@@ -39660,7 +39660,8 @@ mod tests {
         ];
         let projection =
             project_diarization_onto_segments(&segments, &turns, true).expect("projection");
-        let merged = build_speaker_attributed_segments(&projection.segments, &turns);
+        let merged =
+            crate::diarization::build_speaker_attributed_segments(&projection.segments, &turns);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].speaker.as_deref(), Some("alice"));
         assert_eq!(merged[0].text, "hello there,");
