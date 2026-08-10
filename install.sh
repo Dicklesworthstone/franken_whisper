@@ -902,6 +902,13 @@ validate_archive_members() {
             "NOTICE.sortformer.txt") sortformer_notice_count=$((sortformer_notice_count + 1)) ;;
             "THIRD_PARTY_NOTICES.md") third_party_count=$((third_party_count + 1)) ;;
             "AGENTS.md") agents_count=$((agents_count + 1)) ;;
+            "._$BINARY_NAME"|"._$ALIAS_NAME"|"._README.md"|"._LICENSE"|"._NOTICE.sortformer.txt"|"._THIRD_PARTY_NOTICES.md"|"._AGENTS.md"|".DS_Store")
+                # Harmless macOS packaging byproducts (AppleDouble resource-fork
+                # sidecar files and Finder metadata) that carry no executable
+                # content and are never read by extract_and_install. Ignored so
+                # a release built on macOS without COPYFILE_DISABLE=1 still
+                # installs instead of hard-failing on every affected release.
+                ;;
             *)
                 log_error "Archive contains an unexpected member"
                 return 1
