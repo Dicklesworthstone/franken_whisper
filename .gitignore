@@ -297,3 +297,18 @@ __pycache__/
 
 # Beads history snapshots — local rotation only; never commit
 .beads/.br_history/
+
+# === multi-repo ephemeral patterns 2026-08-10 ===
+# Recoverable Beads write-lock snapshots moved aside when stale
+.beads/.write.lock.stale-*
+# br fsqlite-ns VFS sidecars
+.beads/beads.db-fsqlite-ns-*
+# Eidetic / Wrangler / Claude local runtime
+.ee/
+.wrangler/
+.claude/
+.repo_janitor_workspace/
+.skill-loop-progress.md
+.skill-loop-progress-*.md
+# Local one-off audio probe dumps
+/test.m4a
