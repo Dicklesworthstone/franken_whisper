@@ -778,6 +778,23 @@ ASR segment `confidence` remains ASR confidence. Speaker confidence is a
 separate field. Transcript projection may split only at legal DTW word
 boundaries and cannot invent, drop, duplicate, or reorder text.
 
+**Projection fusion (`projection-fusion-v1`, bd-d4py).** Projection runs in
+two passes. The primary pass keeps the historical conservative gates
+(70% duration dominance for non-word segments, the 0.30 turn-confidence gate
+for words). A second fusion pass then attributes segments the primary pass
+left `null` using the same turn evidence: a segment overlapping any labeled
+turn takes the max-overlap labeled turn, and a timed segment in a turn gap
+takes the nearest labeled turn within 2 s. Word-granularity speaker changes
+that land mid-clause are re-anchored to the nearest sentence-final
+punctuation boundary within ±4 words, using the transcript's own punctuation
+as the boundary oracle (quantized diarizer boundaries — e.g. Sortformer's
+80 ms lanes — otherwise misattribute the first/last word of each turn).
+Fusion rewrites only the projected per-segment speaker labels: turn
+timelines, text bytes, timing, and ASR confidence are untouched, untimed
+segments stay `UNKNOWN`, and the report additionally carries the merged
+`speaker_segments` view (consecutive same-speaker runs with joined text and
+duration-weighted turn confidence).
+
 ### 6.1 Speaker-count and evidence result
 
 `SpeakerCountRequest` has exactly one mode:

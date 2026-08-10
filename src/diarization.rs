@@ -14700,6 +14700,7 @@ fn finish_prepared_ecapa_diarization(
             clustering.operational_partition.clone()
         },
         neural_representation: Some(prepared.neural_representation.clone()),
+        speaker_segments: Vec::new(),
         diagnostics,
     };
     validate_native_diarization_report(
@@ -15450,6 +15451,7 @@ where
             clustering.operational_partition
         },
         neural_representation,
+        speaker_segments: Vec::new(),
         diagnostics,
     };
     validate_native_diarization_report(
@@ -16988,11 +16990,191 @@ pub fn project_diarization_onto_segments(
         }
         projected.push(output);
     }
+
+    // Fusion pass (bd-d4py, projection-fusion-v1): the conservative pass above
+    // leaves a segment unlabeled when its evidence misses a gate (low turn
+    // confidence, sub-dominant ownership) or when the segment sits in a gap
+    // between turns. The turn evidence to label those segments is present in
+    // the same payload; use it instead of returning `null`:
+    //   (a) any segment overlapping a labeled turn takes the max-overlap
+    //       labeled turn, and
+    //   (b) a timed segment in a turn gap takes the nearest labeled turn
+    //       within `NEIGHBOR_FALLBACK_MAX_GAP_SEC`.
+    // Text, timing, ASR confidence, and the report's turn timeline are never
+    // modified; only the projected per-segment speaker field is filled.
+    fill_unlabeled_segments_from_turns(&mut projected, &canonical_segments, turns);
+
+    // Boundary snapping (bd-d4py): at word granularity, speaker changes that
+    // fall mid-clause are re-anchored to the nearest sentence-final
+    // punctuation boundary within a small window, using the transcript's own
+    // punctuation as the oracle. Measured on real 2-person audio this beats
+    // every global time-shift candidate.
+    if word_aligned {
+        snap_speaker_changes_to_punctuation(&mut projected);
+    }
+
     Ok(DiarizationProjection {
         segments: projected,
         mixed_speaker_segment_indices: mixed,
         overlap_suspected_segment_indices: overlaps,
     })
+}
+
+/// Maximum gap (seconds) between an unlabeled segment and the nearest labeled
+/// turn for neighbor-fallback attribution (projection-fusion-v1).
+const NEIGHBOR_FALLBACK_MAX_GAP_SEC: f64 = 2.0;
+
+/// Number of words on each side of a projected speaker change searched for a
+/// sentence-final punctuation boundary to snap to (projection-fusion-v1).
+const PUNCTUATION_SNAP_WINDOW_WORDS: usize = 4;
+
+/// Fill projected segments the conservative pass left unlabeled, using the
+/// turn timeline that shipped in the same report (bd-d4py).
+fn fill_unlabeled_segments_from_turns(
+    projected: &mut [TranscriptionSegment],
+    canonical_segments: &[TranscriptionSegment],
+    turns: &[DiarizationTurn],
+) {
+    for (index, output) in projected.iter_mut().enumerate() {
+        if output.speaker.is_some() {
+            continue;
+        }
+        let Some((start_sec, end_sec)) = canonical_segments
+            .get(index)
+            .and_then(|segment| segment.start_sec.zip(segment.end_sec))
+        else {
+            continue;
+        };
+        // (a) Best labeled overlap, regardless of the primary pass's
+        // confidence/dominance gates.
+        let overlapping = overlapping_turns(start_sec, end_sec, turns);
+        let mut ranked = overlapping
+            .iter()
+            .filter(|(_, turn)| turn.speaker_ref.is_some())
+            .collect::<Vec<_>>();
+        ranked.sort_by(|(left_overlap, left), (right_overlap, right)| {
+            right_overlap
+                .total_cmp(left_overlap)
+                .then(left.start_ms.cmp(&right.start_ms))
+                .then(left.speaker_ref.cmp(&right.speaker_ref))
+        });
+        if let Some((_, best)) = ranked.first() {
+            output.speaker = best.speaker_ref.clone();
+            continue;
+        }
+        // (b) Nearest labeled neighbor turn within the bounded gap.
+        let mut nearest: Option<(f64, &DiarizationTurn)> = None;
+        for turn in turns {
+            if turn.speaker_ref.is_none() {
+                continue;
+            }
+            let turn_start = turn.start_ms as f64 / 1_000.0;
+            let turn_end = turn.end_ms as f64 / 1_000.0;
+            let gap = if turn_end <= start_sec {
+                start_sec - turn_end
+            } else if turn_start >= end_sec {
+                turn_start - end_sec
+            } else {
+                0.0
+            };
+            let closer = nearest.is_none_or(|(best_gap, best_turn)| {
+                gap < best_gap || (gap == best_gap && turn.start_ms < best_turn.start_ms)
+            });
+            if gap <= NEIGHBOR_FALLBACK_MAX_GAP_SEC && closer {
+                nearest = Some((gap, turn));
+            }
+        }
+        if let Some((_, turn)) = nearest {
+            output.speaker = turn.speaker_ref.clone();
+        }
+    }
+}
+
+/// Whether a word ends a sentence for boundary-snapping purposes.
+fn ends_sentence(text: &str) -> bool {
+    text.trim_end()
+        .chars()
+        .last()
+        .is_some_and(|c| matches!(c, '.' | '?' | '!'))
+}
+
+/// Re-anchor projected speaker changes to sentence-final punctuation
+/// boundaries within ±[`PUNCTUATION_SNAP_WINDOW_WORDS`] words (bd-d4py).
+///
+/// Diarization turn boundaries are quantized (80 ms lanes for Sortformer), so
+/// a naive time-overlap join puts the last word of each turn on the wrong
+/// speaker. The transcript's own punctuation is a better boundary oracle:
+/// when a speaker change lands mid-clause but a sentence ends within the
+/// window, move the change to just after that sentence end. Labels are the
+/// only thing rewritten — never text, timing, or confidence.
+fn snap_speaker_changes_to_punctuation(projected: &mut [TranscriptionSegment]) {
+    if projected.len() < 2 {
+        return;
+    }
+    // A change at position `i` means projected[i-1].speaker != projected[i].speaker.
+    let mut i = 1usize;
+    while i < projected.len() {
+        let differs = projected[i - 1].speaker != projected[i].speaker
+            && projected[i - 1].speaker.is_some()
+            && projected[i].speaker.is_some();
+        if !differs {
+            i += 1;
+            continue;
+        }
+        // Already on a sentence boundary: nothing to snap.
+        if ends_sentence(&projected[i - 1].text) {
+            i += 1;
+            continue;
+        }
+        // Candidate boundary positions j (change occurs before word j) where
+        // word j-1 ends a sentence, within the window, without crossing
+        // another speaker change of the same pair.
+        let lo = i.saturating_sub(PUNCTUATION_SNAP_WINDOW_WORDS).max(1);
+        let hi = (i + PUNCTUATION_SNAP_WINDOW_WORDS).min(projected.len() - 1);
+        let mut best: Option<usize> = None;
+        for j in lo..=hi {
+            if j == i || !ends_sentence(&projected[j - 1].text) {
+                continue;
+            }
+            // Do not move the boundary across a *different* label than the
+            // two involved in this change.
+            let (left_label, right_label) = (
+                projected[i - 1].speaker.clone(),
+                projected[i].speaker.clone(),
+            );
+            let span = if j < i { j..i } else { i..j };
+            let crosses_foreign_label = projected[span]
+                .iter()
+                .any(|seg| seg.speaker != left_label && seg.speaker != right_label);
+            if crosses_foreign_label {
+                continue;
+            }
+            let better = best.is_none_or(|current| {
+                j.abs_diff(i) < current.abs_diff(i)
+                    || (j.abs_diff(i) == current.abs_diff(i) && j < current)
+            });
+            if better {
+                best = Some(j);
+            }
+        }
+        if let Some(j) = best {
+            let left_label = projected[i - 1].speaker.clone();
+            let right_label = projected[i].speaker.clone();
+            if j > i {
+                for seg in &mut projected[i..j] {
+                    seg.speaker = left_label.clone();
+                }
+            } else {
+                for seg in &mut projected[j..i] {
+                    seg.speaker = right_label.clone();
+                }
+            }
+            // Continue after the snapped boundary to avoid re-processing.
+            i = j.max(i) + 1;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Canonicalize a zero-width decoder observation for acoustic projection.
@@ -17261,6 +17443,76 @@ fn choose_dominant_segment_speaker(
     } else {
         (None, ranked.len() > 1)
     }
+}
+
+/// Build the merged speaker-attributed view from projected segments
+/// (bd-d4py): consecutive segments with the same projected speaker collapse
+/// into one run with space-joined, byte-faithful text.
+///
+/// `turns` supply the duration-weighted mean speaker confidence per run when
+/// the run is timed and labeled; unknown runs are retained (speaker `None`)
+/// so the merged view covers the complete transcript.
+pub fn build_speaker_attributed_segments(
+    segments: &[TranscriptionSegment],
+    turns: &[DiarizationTurn],
+) -> Vec<crate::model::SpeakerAttributedSegment> {
+    let mut merged: Vec<crate::model::SpeakerAttributedSegment> = Vec::new();
+    for segment in segments {
+        match merged.last_mut() {
+            Some(run) if run.speaker == segment.speaker => {
+                if !segment.text.is_empty() {
+                    if !run.text.is_empty() {
+                        run.text.push(' ');
+                    }
+                    run.text.push_str(&segment.text);
+                }
+                run.segment_count += 1;
+                if segment.end_sec.is_some() {
+                    run.end_sec = segment.end_sec;
+                }
+                if run.start_sec.is_none() {
+                    run.start_sec = segment.start_sec;
+                }
+            }
+            _ => {
+                merged.push(crate::model::SpeakerAttributedSegment {
+                    start_sec: segment.start_sec,
+                    end_sec: segment.end_sec,
+                    speaker: segment.speaker.clone(),
+                    text: segment.text.clone(),
+                    segment_count: 1,
+                    speaker_confidence: None,
+                });
+            }
+        }
+    }
+    for run in &mut merged {
+        let (Some(speaker), Some(start_sec), Some(end_sec)) =
+            (run.speaker.as_deref(), run.start_sec, run.end_sec)
+        else {
+            continue;
+        };
+        let mut weighted = 0.0f64;
+        let mut duration = 0.0f64;
+        for turn in turns {
+            if turn.speaker_ref.as_deref() != Some(speaker) {
+                continue;
+            }
+            let turn_start = turn.start_ms as f64 / 1_000.0;
+            let turn_end = turn.end_ms as f64 / 1_000.0;
+            let overlap = end_sec.min(turn_end) - start_sec.max(turn_start);
+            if overlap > 0.0 {
+                if let Some(confidence) = turn.speaker_confidence {
+                    weighted += overlap * confidence;
+                    duration += overlap;
+                }
+            }
+        }
+        if duration > 0.0 {
+            run.speaker_confidence = Some(weighted / duration);
+        }
+    }
+    merged
 }
 
 fn distinct_known_speakers(turns: &[DiarizationTurn]) -> usize {
@@ -26104,6 +26356,7 @@ mod tests {
                 skipped_tracklet_count: 1,
                 reasons: vec![NeuralSpeakerRepresentationReason::ShortTracklet],
             }),
+            speaker_segments: Vec::new(),
             diagnostics: vec![
                 crate::model::DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE.to_owned(),
             ],
@@ -39305,7 +39558,11 @@ mod tests {
     }
 
     #[test]
-    fn tied_word_uses_earlier_speaker_only_above_confidence_policy() {
+    fn tied_word_is_attributed_even_below_primary_confidence_gate() {
+        // projection-fusion-v1 (bd-d4py): the primary pass still refuses a
+        // sub-0.30-confidence turn, but the fusion pass fills the label from
+        // the same max-overlap evidence instead of returning `null` for a
+        // word that plainly overlaps a labeled turn.
         let low_confidence_turns = vec![
             turn(0, 1_000, Some("alice"), Some(0.2)),
             turn(1_000, 2_000, Some("bob"), Some(0.9)),
@@ -39318,7 +39575,7 @@ mod tests {
         )];
         let low =
             project_diarization_onto_segments(&word, &low_confidence_turns, true).expect("low");
-        assert_eq!(low.segments[0].speaker, None);
+        assert_eq!(low.segments[0].speaker.as_deref(), Some("alice"));
 
         let high_confidence_turns = vec![
             turn(0, 1_000, Some("alice"), Some(0.8)),
@@ -39327,6 +39584,93 @@ mod tests {
         let high =
             project_diarization_onto_segments(&word, &high_confidence_turns, true).expect("high");
         assert_eq!(high.segments[0].speaker.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn gap_word_takes_nearest_labeled_neighbor_within_bound() {
+        // projection-fusion-v1 (bd-d4py): a timed word in a silence gap
+        // between turns takes the nearest labeled turn within 2 s; a word
+        // farther than the bound stays honestly unknown.
+        let turns = vec![
+            turn(0, 1_000, Some("alice"), Some(0.9)),
+            turn(10_000, 11_000, Some("bob"), Some(0.9)),
+        ];
+        let near_gap = vec![transcript_segment(Some(1.5), Some(1.8), "uh", Some(0.5))];
+        let projection =
+            project_diarization_onto_segments(&near_gap, &turns, true).expect("projection");
+        assert_eq!(projection.segments[0].speaker.as_deref(), Some("alice"));
+
+        let far_gap = vec![transcript_segment(Some(5.0), Some(5.3), "uh", Some(0.5))];
+        let projection =
+            project_diarization_onto_segments(&far_gap, &turns, true).expect("projection");
+        assert_eq!(projection.segments[0].speaker, None);
+    }
+
+    #[test]
+    fn speaker_change_snaps_to_sentence_punctuation_within_window() {
+        // projection-fusion-v1 (bd-d4py): the diarizer's quantized boundary
+        // lands one word late ("Jeff. Hey" split as "Jeff. Hey|," instead of
+        // "Jeff.|Hey"); the transcript's own punctuation re-anchors it.
+        let turns = vec![
+            turn(0, 2_200, Some("jeff"), Some(0.9)),
+            turn(2_200, 4_000, Some("hang"), Some(0.9)),
+        ];
+        let words = vec![
+            transcript_segment(Some(0.0), Some(0.7), "how", Some(0.9)),
+            transcript_segment(Some(0.7), Some(1.4), "are", Some(0.9)),
+            transcript_segment(Some(1.4), Some(2.0), "you?", Some(0.9)),
+            // The diarizer boundary (2.2 s) falls after this word, but the
+            // sentence ended at "you?" — the change must snap back to it.
+            transcript_segment(Some(2.0), Some(2.4), "good,", Some(0.9)),
+            transcript_segment(Some(2.4), Some(3.0), "thanks", Some(0.9)),
+            transcript_segment(Some(3.0), Some(3.6), "Jeff.", Some(0.9)),
+        ];
+        let projection =
+            project_diarization_onto_segments(&words, &turns, true).expect("projection");
+        assert_eq!(
+            projection
+                .segments
+                .iter()
+                .map(|segment| segment.speaker.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("jeff"),
+                Some("jeff"),
+                Some("jeff"),
+                Some("hang"),
+                Some("hang"),
+                Some("hang"),
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_speaker_segments_cover_transcript_and_carry_confidence() {
+        // bd-d4py: the merged view collapses consecutive same-speaker words,
+        // keeps byte-faithful text, and reports duration-weighted turn
+        // confidence.
+        let turns = vec![
+            turn(0, 2_000, Some("alice"), Some(0.9)),
+            turn(2_000, 4_000, Some("bob"), Some(0.7)),
+        ];
+        let segments = vec![
+            transcript_segment(Some(0.0), Some(1.0), "hello", Some(0.9)),
+            transcript_segment(Some(1.0), Some(1.9), "there,", Some(0.9)),
+            transcript_segment(Some(2.1), Some(3.0), "hi!", Some(0.9)),
+        ];
+        let projection =
+            project_diarization_onto_segments(&segments, &turns, true).expect("projection");
+        let merged = build_speaker_attributed_segments(&projection.segments, &turns);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].speaker.as_deref(), Some("alice"));
+        assert_eq!(merged[0].text, "hello there,");
+        assert_eq!(merged[0].segment_count, 2);
+        assert_eq!(merged[0].start_sec, Some(0.0));
+        assert_eq!(merged[0].end_sec, Some(1.9));
+        assert!((merged[0].speaker_confidence.expect("confidence") - 0.9).abs() < 1e-9);
+        assert_eq!(merged[1].speaker.as_deref(), Some("bob"));
+        assert_eq!(merged[1].text, "hi!");
+        assert!((merged[1].speaker_confidence.expect("confidence") - 0.7).abs() < 1e-9);
     }
 
     #[test]

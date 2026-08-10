@@ -2926,6 +2926,7 @@ mod tests {
                 authority: SpeakerCountCalibrationStatus::DevelopmentUncertified,
             }),
             neural_representation: None,
+            speaker_segments: Vec::new(),
             diagnostics: Vec::new(),
         });
     }

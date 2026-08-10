@@ -1399,8 +1399,36 @@ pub struct DiarizationReport {
     pub operational_partition: Option<DiarizationOperationalPartitionSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neural_representation: Option<NeuralSpeakerRepresentationSummary>,
+    /// Merged consecutive same-speaker transcript runs (bd-d4py): the
+    /// speaker-attributed view a caller wants, derived from the projected
+    /// segments so no consumer has to rebuild the turn/segment join.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speaker_segments: Vec<SpeakerAttributedSegment>,
     #[serde(default)]
     pub diagnostics: Vec<String>,
+}
+
+/// One merged run of consecutive same-speaker transcript segments (bd-d4py).
+///
+/// Text is the space-joined segment text of the run, unmodified. A `speaker`
+/// of `None` is an honest unknown run (no turn evidence reached it), retained
+/// so the merged view still covers the complete transcript.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeakerAttributedSegment {
+    /// Run start in seconds (first timed segment of the run), if any.
+    pub start_sec: Option<f64>,
+    /// Run end in seconds (last timed segment of the run), if any.
+    pub end_sec: Option<f64>,
+    /// Projected speaker reference, or `None` for an unknown run.
+    pub speaker: Option<String>,
+    /// Space-joined text of the run's segments, byte-faithful.
+    pub text: String,
+    /// Number of transcript segments merged into this run.
+    pub segment_count: usize,
+    /// Duration-weighted mean `speaker_confidence` of this speaker's turns
+    /// overlapping the run, when computable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_confidence: Option<f64>,
 }
 
 impl DiarizationReport {
@@ -6831,6 +6859,7 @@ mod tests {
                 authority: SpeakerCountCalibrationStatus::DevelopmentUncertified,
             }),
             neural_representation: None,
+            speaker_segments: Vec::new(),
             diagnostics: Vec::new(),
         };
         let query_id_sha256 = speaker_attribution_query_sha256(
