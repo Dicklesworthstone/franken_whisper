@@ -1280,6 +1280,12 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub tiny_diarize: bool,
 
+    /// Opt in to rule-based segment-text normalization (sentence-casing and
+    /// terminal periods). Off by default so `segments[].text` stays faithful
+    /// to the decoded transcript.
+    #[arg(long)]
+    pub normalize_segment_text: bool,
+
     /// Time offset in milliseconds to start processing (whisper.cpp).
     #[arg(long)]
     pub offset_ms: Option<u64>,
@@ -1756,7 +1762,14 @@ impl TranscribeArgs {
             word_timestamps: None,
             insanely_fast_tuning: None,
             alignment: None,
-            punctuation: None,
+            punctuation: if self.normalize_segment_text {
+                Some(crate::model::PunctuationConfig {
+                    model: None,
+                    enabled: true,
+                })
+            } else {
+                None
+            },
             source_separation: None,
             speculative,
         };
@@ -1963,6 +1976,7 @@ mod tests {
             no_fallback: false,
             suppress_nst: false,
             tiny_diarize: false,
+            normalize_segment_text: false,
             offset_ms: None,
             duration_ms: None,
             audio_ctx: None,
@@ -2370,6 +2384,29 @@ mod tests {
         let args = minimal_args();
         let request = args.to_request().expect("should succeed");
         assert!(!request.backend_params.tiny_diarize);
+    }
+
+    #[test]
+    fn normalize_segment_text_flag_enables_punctuation_config() {
+        let mut args = minimal_args();
+        args.normalize_segment_text = true;
+        let request = args.to_request().expect("should succeed");
+        let punctuation = request
+            .backend_params
+            .punctuation
+            .expect("opt-in flag populates punctuation config");
+        assert!(punctuation.enabled);
+        assert!(punctuation.model.is_none());
+    }
+
+    #[test]
+    fn segment_text_normalization_defaults_off() {
+        let args = minimal_args();
+        let request = args.to_request().expect("should succeed");
+        assert!(
+            request.backend_params.punctuation.is_none(),
+            "segment text must stay faithful to the decoded transcript by default"
+        );
     }
 
     // --- Speaker count request ---
