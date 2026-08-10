@@ -867,7 +867,7 @@ install_binary_pair() {
 # regular, non-symlink binaries before installation.
 validate_archive_members() {
     local archive="$1" archive_ext="$2" members member normalized
-    local binary_count=0 alias_count=0 readme_count=0 license_count=0 third_party_count=0 agents_count=0
+    local binary_count=0 alias_count=0 readme_count=0 license_count=0 sortformer_notice_count=0 third_party_count=0 agents_count=0
     if [ "$archive_ext" = "zip" ]; then
         members=$(unzip -Z1 "$archive") || return 1
     else
@@ -884,6 +884,7 @@ validate_archive_members() {
             "$ALIAS_NAME") alias_count=$((alias_count + 1)) ;;
             "README.md") readme_count=$((readme_count + 1)) ;;
             "LICENSE") license_count=$((license_count + 1)) ;;
+            "NOTICE.sortformer.txt") sortformer_notice_count=$((sortformer_notice_count + 1)) ;;
             "THIRD_PARTY_NOTICES.md") third_party_count=$((third_party_count + 1)) ;;
             "AGENTS.md") agents_count=$((agents_count + 1)) ;;
             *)
@@ -894,6 +895,7 @@ validate_archive_members() {
     done <<< "$members"
     [ "$binary_count" -eq 1 ] && [ "$alias_count" -eq 1 ] && \
         [ "$readme_count" -le 1 ] && [ "$license_count" -le 1 ] && \
+        [ "$sortformer_notice_count" -le 1 ] && \
         [ "$third_party_count" -le 1 ] && [ "$agents_count" -le 1 ] || {
         log_error "Archive must contain exactly one $BINARY_NAME, exactly one $ALIAS_NAME, and no duplicate allowlisted members"
         return 1

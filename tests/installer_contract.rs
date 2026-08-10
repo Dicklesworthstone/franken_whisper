@@ -61,6 +61,54 @@ fn installer_script_is_valid_bash() {
 }
 
 #[test]
+fn installer_accepts_the_exact_dsr_release_archive_members() {
+    let root = tempfile::tempdir().expect("temporary archive harness");
+    let stage = root.path().join("stage");
+    fs::create_dir(&stage).expect("create archive stage");
+    for member in [
+        "franken_whisper",
+        "fw",
+        "README.md",
+        "LICENSE",
+        "NOTICE.sortformer.txt",
+        "THIRD_PARTY_NOTICES.md",
+        "AGENTS.md",
+    ] {
+        fs::write(stage.join(member), member).expect("write archive member");
+    }
+    let archive = root
+        .path()
+        .join("franken_whisper-0.7.0-darwin_arm64.tar.gz");
+    let status = Command::new("tar")
+        .args(["-czf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(&stage)
+        .args([
+            "franken_whisper",
+            "fw",
+            "README.md",
+            "LICENSE",
+            "NOTICE.sortformer.txt",
+            "THIRD_PARTY_NOTICES.md",
+            "AGENTS.md",
+        ])
+        .status()
+        .expect("create release archive");
+    assert!(status.success());
+
+    let output = source_and_run(
+        root.path(),
+        &format!("validate_archive_members \"{}\" tar.gz", archive.display()),
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn release_checksum_resolution_prefers_dsr_sidecar_and_binds_the_archive_name() {
     let root = tempfile::tempdir().expect("temporary checksum harness");
     let good_sha = "a".repeat(64);
