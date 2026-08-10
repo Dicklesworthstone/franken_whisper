@@ -1442,6 +1442,7 @@ pub fn diagnostics() -> Vec<serde_json::Value> {
                 "--split-on-word",
                 "--vad*",
                 "--best-of/--beam-size/--temperature*",
+                "--offset-ms/--duration-ms",
             ],
         }),
         serde_json::json!({
@@ -1463,6 +1464,7 @@ pub fn diagnostics() -> Vec<serde_json::Value> {
                 "--split-on-word",
                 "--vad*",
                 "--best-of/--beam-size/--temperature*",
+                "--offset-ms/--duration-ms",
             ],
         }),
     ]

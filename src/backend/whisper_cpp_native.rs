@@ -572,13 +572,21 @@ pub fn run(
     // before any expensive work.
     let spec = effective_model_spec(request)?;
 
+    // Requested audio window (bd-vgod): `--offset-ms` / `--duration-ms` slice
+    // the normalized PCM before decode, so wall-clock scales with the slice.
+    let audio_window = requested_audio_window(request);
+
     // Silence pre-gate: the energy analyzer is cheap; loading a (potentially
     // multi-GB) model is not. Pure-silence clips skip the load entirely.
-    let analysis = analyze_wav(normalized_wav, request.backend_params.duration_ms).ok();
-    if let Some(analysis) = analysis.as_ref()
-        && analysis.active_regions.is_empty()
-    {
-        return Ok(silence_result(request, &spec, analysis.duration_ms));
+    // A windowed request skips the whole-file pre-gate: the analyzer scans
+    // the full clip, so its verdict would not describe the requested slice.
+    if audio_window.is_none() {
+        let analysis = analyze_wav(normalized_wav, request.backend_params.duration_ms).ok();
+        if let Some(analysis) = analysis.as_ref()
+            && analysis.active_regions.is_empty()
+        {
+            return Ok(silence_result(request, &spec, analysis.duration_ms));
+        }
     }
 
     if let Some(tok) = token {
@@ -590,8 +598,22 @@ pub fn run(
         .map_err(|e| FwError::BackendUnavailable(e.to_string()))?;
     let model = NativeWhisperModel::load(&model_path)?;
 
-    // Read the normalized WAV to f32 mono samples.
-    let samples = read_normalized_wav(normalized_wav)?;
+    // Read the normalized WAV to f32 mono samples, then apply the requested
+    // window. Timestamps are shifted back into the source timebase after
+    // decode so diarization/VAD/alignment stay consistent with the full clip.
+    let full_samples = read_normalized_wav(normalized_wav)?;
+    let (samples, window_offset_ms) = match audio_window {
+        Some((offset_ms, duration_ms)) => {
+            let (start, end) = window_sample_bounds(full_samples.len(), offset_ms, duration_ms);
+            if start >= end {
+                // Offset at/past EOF: an empty-but-valid result, honestly
+                // tagged, beats a decode error for a region probe.
+                return Ok(silence_result(request, &spec, 0));
+            }
+            (full_samples[start..end].to_vec(), offset_ms)
+        }
+        None => (full_samples, 0),
+    };
 
     if let Some(tok) = token {
         tok.checkpoint()?;
@@ -611,7 +633,14 @@ pub fn run(
 
     let params = decode_params(request, want_dtw, &spec);
     let checkpoint = checkpoint_for(token);
-    let output = model.transcribe(&samples, &params, &checkpoint)?;
+    let mut output = model.transcribe(&samples, &params, &checkpoint)?;
+
+    // Shift every emitted timestamp back into the source-file timebase so a
+    // windowed run stays aligned with diarization, VAD, and alignment stages
+    // that operate on the full normalized clip.
+    if window_offset_ms > 0 {
+        shift_decode_output(&mut output, window_offset_ms as f64 / 1000.0);
+    }
 
     // Prefer real DTW word timings when the engine produced them; otherwise fall
     // back to the linear-interpolation word split (keeping its existing tag).
@@ -647,7 +676,7 @@ pub fn run(
     let version_tag = model.version_tag();
     crate::native_engine::perf_span("version_tag", t_tag.elapsed().as_secs_f64() * 1e3, "");
     crate::native_engine::perf_span("backend_run", t_backend.elapsed().as_secs_f64() * 1e3, "");
-    let raw_output = raw_output_json(
+    let mut raw_output = raw_output_json(
         &spec,
         &model_path,
         version_tag,
@@ -658,6 +687,16 @@ pub fn run(
         false,
         dtw_projection.as_ref(),
     );
+    if let (Value::Object(map), Some((offset_ms, duration_ms))) = (&mut raw_output, audio_window) {
+        map.insert(
+            "audio_window".to_owned(),
+            json!({
+                "offset_ms": offset_ms,
+                "duration_ms": duration_ms,
+                "timebase": "source",
+            }),
+        );
+    }
 
     Ok(TranscriptionResult {
         backend: BackendKind::WhisperCpp,
@@ -1331,6 +1370,63 @@ fn read_normalized_wav(path: &Path) -> FwResult<Vec<f32>> {
     decode::read_wav_16k_mono(&bytes)
 }
 
+/// The requested `--offset-ms` / `--duration-ms` audio window, if any.
+///
+/// Returns `None` when neither flag is set (or both are zero-effect), so the
+/// unwindowed path stays byte-identical to the pre-window behavior.
+fn requested_audio_window(request: &TranscribeRequest) -> Option<(u64, Option<u64>)> {
+    let offset_ms = request.backend_params.offset_ms.unwrap_or(0);
+    let duration_ms = request.backend_params.duration_ms.filter(|d| *d > 0);
+    if offset_ms == 0 && duration_ms.is_none() {
+        None
+    } else {
+        Some((offset_ms, duration_ms))
+    }
+}
+
+/// Convert a ms-domain window into clamped sample bounds over 16 kHz PCM.
+fn window_sample_bounds(len: usize, offset_ms: u64, duration_ms: Option<u64>) -> (usize, usize) {
+    const SAMPLES_PER_MS: u64 = (native_engine::mel::SAMPLE_RATE as u64) / 1000;
+    let start = usize::try_from(offset_ms.saturating_mul(SAMPLES_PER_MS))
+        .unwrap_or(usize::MAX)
+        .min(len);
+    let end = match duration_ms {
+        Some(duration_ms) => usize::try_from(
+            offset_ms
+                .saturating_add(duration_ms)
+                .saturating_mul(SAMPLES_PER_MS),
+        )
+        .unwrap_or(usize::MAX)
+        .min(len),
+        None => len,
+    };
+    (start, end.max(start))
+}
+
+/// Shift every emitted timestamp in a decode output by a uniform offset,
+/// keeping windowed runs in the source-file timebase.
+fn shift_decode_output(output: &mut decode::DecodeOutput, offset_sec: f64) {
+    for segment in &mut output.segments {
+        if let Some(start) = segment.start_sec.as_mut() {
+            *start += offset_sec;
+        }
+        if let Some(end) = segment.end_sec.as_mut() {
+            *end += offset_sec;
+        }
+    }
+    if let Some(word_timings) = output.word_timings.as_mut() {
+        for words in word_timings.iter_mut() {
+            for word in words.iter_mut() {
+                word.start_sec += offset_sec;
+                word.end_sec += offset_sec;
+            }
+        }
+    }
+    for window in &mut output.windows {
+        window.window_offset_sec += offset_sec;
+    }
+}
+
 /// The honest raw-output metadata JSON for a real-inference run.
 #[allow(clippy::too_many_arguments)]
 fn raw_output_json(
@@ -1452,6 +1548,94 @@ mod tests {
             timeout_ms: None,
             backend_params: BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn requested_audio_window_none_without_flags() {
+        let request = native_request();
+        assert!(requested_audio_window(&request).is_none());
+
+        let mut zeroed = native_request();
+        zeroed.backend_params.offset_ms = Some(0);
+        zeroed.backend_params.duration_ms = Some(0);
+        assert!(
+            requested_audio_window(&zeroed).is_none(),
+            "zero-effect flags must keep the unwindowed path byte-identical"
+        );
+    }
+
+    #[test]
+    fn requested_audio_window_captures_offset_and_duration() {
+        let mut request = native_request();
+        request.backend_params.offset_ms = Some(60_000);
+        assert_eq!(requested_audio_window(&request), Some((60_000, None)));
+
+        request.backend_params.duration_ms = Some(20_000);
+        assert_eq!(
+            requested_audio_window(&request),
+            Some((60_000, Some(20_000)))
+        );
+
+        request.backend_params.offset_ms = None;
+        assert_eq!(requested_audio_window(&request), Some((0, Some(20_000))));
+    }
+
+    #[test]
+    fn window_sample_bounds_slices_and_clamps() {
+        // 120 s of 16 kHz audio.
+        let len = 120 * 16_000;
+        assert_eq!(window_sample_bounds(len, 0, Some(20_000)), (0, 320_000));
+        assert_eq!(
+            window_sample_bounds(len, 60_000, None),
+            (960_000, 1_920_000)
+        );
+        assert_eq!(
+            window_sample_bounds(len, 60_000, Some(20_000)),
+            (960_000, 1_280_000)
+        );
+        // Duration past EOF clamps to EOF.
+        assert_eq!(
+            window_sample_bounds(len, 110_000, Some(60_000)),
+            (1_760_000, 1_920_000)
+        );
+        // Offset at/past EOF collapses to an empty slice.
+        let (start, end) = window_sample_bounds(len, 120_000, Some(1_000));
+        assert!(start >= end);
+        let (start, end) = window_sample_bounds(len, u64::MAX, None);
+        assert!(start >= end);
+    }
+
+    #[test]
+    fn shift_decode_output_moves_all_timestamps_uniformly() {
+        let mut output = decode::DecodeOutput {
+            segments: vec![TranscriptionSegment {
+                start_sec: Some(0.5),
+                end_sec: Some(2.0),
+                text: "hello".to_owned(),
+                speaker: None,
+                confidence: Some(0.9),
+            }],
+            language: Some("en".to_owned()),
+            windows: vec![decode::WindowStats {
+                avg_logprob: -0.1,
+                no_speech_prob: 0.01,
+                tokens: 3,
+                window_offset_sec: 0.0,
+            }],
+            work: decode::DecodeWorkStats::default(),
+            word_timings: Some(vec![vec![WordTiming {
+                text: "hello".to_owned(),
+                start_sec: 0.5,
+                end_sec: 2.0,
+            }]]),
+        };
+        shift_decode_output(&mut output, 60.0);
+        assert_eq!(output.segments[0].start_sec, Some(60.5));
+        assert_eq!(output.segments[0].end_sec, Some(62.0));
+        let words = output.word_timings.as_ref().expect("word timings");
+        assert!((words[0][0].start_sec - 60.5).abs() < 1e-9);
+        assert!((words[0][0].end_sec - 62.0).abs() < 1e-9);
+        assert!((output.windows[0].window_offset_sec - 60.0).abs() < 1e-9);
     }
 
     #[test]

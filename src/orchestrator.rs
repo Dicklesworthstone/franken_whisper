@@ -1694,7 +1694,7 @@ fn optional_stage_skip(
                 .punctuation
                 .as_ref()
                 .is_some_and(|config| config.enabled);
-            if !request.diarize && !punctuation_enabled {
+            if !punctuation_enabled {
                 Some((
                     "punctuation_not_requested".to_owned(),
                     stage_skip_payload(
@@ -2321,8 +2321,96 @@ async fn execute_backend(
 
     inter.backend_output_sha256 = backend_output_sha256;
     inter.backend_runtime = Some(backend_runtime);
+    surface_backend_result_diagnostics(pcx, log, request, &execution.result, inter);
     inter.result = Some(execution.result);
     Ok(())
+}
+
+/// Surface machine-readable diagnostics from the backend result into
+/// `RunReport.warnings`, the evidence ledger, and the event stream.
+///
+/// Two classes today:
+///
+/// * **Dropped long-form decode windows (bd-nqzf).** The native engine records
+///   every window it discarded in `raw_output.dropped_windows`; silent content
+///   loss must never stay stderr-only.
+/// * **Ignored audio-window flags (bd-vgod).** `--offset-ms` / `--duration-ms`
+///   are honored only by the whisper.cpp family; any other resolved backend
+///   silently transcribes the full file, which must be loud.
+fn surface_backend_result_diagnostics(
+    pcx: &mut PipelineCx,
+    log: &mut EventLog,
+    request: &TranscribeRequest,
+    result: &crate::model::TranscriptionResult,
+    inter: &mut PipelineIntermediate,
+) {
+    // Dropped long-form windows: warning + evidence + stage event.
+    if let Some(dropped) = result
+        .raw_output
+        .get("dropped_windows")
+        .and_then(Value::as_array)
+        .filter(|windows| !windows.is_empty())
+    {
+        let total_sec: f64 = dropped
+            .iter()
+            .map(|w| {
+                let start = w.get("start_sec").and_then(Value::as_f64).unwrap_or(0.0);
+                let end = w.get("end_sec").and_then(Value::as_f64).unwrap_or(start);
+                (end - start).max(0.0)
+            })
+            .sum();
+        let ranges: Vec<String> = dropped
+            .iter()
+            .map(|w| {
+                format!(
+                    "{:.1}-{:.1}s",
+                    w.get("start_sec").and_then(Value::as_f64).unwrap_or(0.0),
+                    w.get("end_sec").and_then(Value::as_f64).unwrap_or(0.0)
+                )
+            })
+            .collect();
+        inter.warnings.push(format!(
+            "native decode dropped {} window(s) (~{:.0}s of audio) without emitting a transcript: {}; \
+             the audio in these ranges is missing from the transcript \
+             (re-transcribe the ranges individually to recover; FW_TEMP_FALLBACK=1 enables sampling-ladder recovery)",
+            dropped.len(),
+            total_sec,
+            ranges.join(", ")
+        ));
+        pcx.record_evidence_values(&[json!({
+            "kind": "native_decode_dropped_windows",
+            "count": dropped.len(),
+            "total_dropped_sec": total_sec,
+            "windows": dropped,
+        })]);
+        log.push(
+            "backend",
+            "backend.dropped_windows",
+            "native decode dropped long-form windows without transcript output",
+            json!({
+                "count": dropped.len(),
+                "total_dropped_sec": total_sec,
+                "windows": dropped,
+            }),
+        );
+    }
+
+    // Audio-window flags on a backend that does not honor them: loud ignore.
+    let window_requested = request.backend_params.offset_ms.is_some_and(|v| v > 0)
+        || request.backend_params.duration_ms.is_some_and(|v| v > 0);
+    if window_requested && result.backend != BackendKind::WhisperCpp {
+        inter.warnings.push(format!(
+            "--offset-ms/--duration-ms are not supported by backend `{}`; the full input was transcribed",
+            result.backend.as_str()
+        ));
+    }
+    if window_requested && result.backend == BackendKind::WhisperCpp && request.diarize {
+        inter.warnings.push(
+            "audio window applied to transcription only; diarization/VAD still cover the full \
+             normalized clip"
+                .to_owned(),
+        );
+    }
 }
 
 /// Speculative replacement for [`execute_backend`].
@@ -10585,9 +10673,19 @@ mod tests {
 
         let punctuate_skip = optional_stage_skip(PipelineStage::Punctuate, &request);
         assert!(
-            punctuate_skip.is_none(),
-            "diarize=true should enable punctuation stage through the diarization packet"
+            punctuate_skip.is_some(),
+            "diarize=true alone must not rewrite segment text; punctuation is explicit opt-in"
         );
+
+        request.backend_params.punctuation = Some(crate::model::PunctuationConfig {
+            model: None,
+            enabled: true,
+        });
+        assert!(
+            optional_stage_skip(PipelineStage::Punctuate, &request).is_none(),
+            "explicit punctuation opt-in enables the stage"
+        );
+        request.backend_params.punctuation = None;
 
         request.backend_params.acoustic_diarization = Some(DiarizationRequest {
             engine: DiarizationEngine::External,
