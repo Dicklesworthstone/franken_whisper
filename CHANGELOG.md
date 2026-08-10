@@ -12,6 +12,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 No unreleased changes yet.
 
+## [0.7.2] - 2026-08-10
+
+### Fixed
+
+- The installer now checks the model-cache filesystem for at least 2.25 GB of
+  free space before beginning the default 2.12 GB model pull. A complete
+  low-free-space cache is still accepted after both compiled trust roots pass.
+- The auxiliary-model recovery text now says specifically that operator-local
+  auxiliary models are not downloaded automatically, without contradicting the
+  installer's default pinned Whisper and Sortformer provisioning.
+
 ## [0.7.1] - 2026-08-09
 
 This is the first published release after v0.5.0. The planned v0.6.0 snapshot
@@ -554,7 +565,8 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.7.1...main
+[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.7.2...main
+[0.7.2]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.2
 [0.7.1]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.1
 [0.5.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.4.0

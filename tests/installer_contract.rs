@@ -78,7 +78,7 @@ fn installer_accepts_the_exact_dsr_release_archive_members() {
     }
     let archive = root
         .path()
-        .join("franken_whisper-0.7.1-darwin_arm64.tar.gz");
+        .join("franken_whisper-0.7.2-darwin_arm64.tar.gz");
     let status = Command::new("tar")
         .args(["-czf"])
         .arg(&archive)
@@ -259,6 +259,30 @@ fn post_pull_doctor_failure_fails_closed() {
     assert!(stderr.contains("did not satisfy the compiled trust roots"));
     let calls = fs::read_to_string(root.path().join("calls.log")).expect("read call log");
     assert_eq!(calls, "pull all\ndoctor --json\n");
+}
+
+#[test]
+fn insufficient_model_cache_space_fails_before_download() {
+    let root = tempfile::tempdir().expect("temporary installer harness");
+    let bin_dir = write_fake_fw(root.path(), 0, false);
+    let output = source_and_run(
+        root.path(),
+        &format!(
+            r#"
+available_kb_for_path() {{ printf '1\n'; }}
+DEST="{}"
+NO_PULL=0
+QUIET=1
+OFFLINE_TARBALL=""
+provision_default_models
+"#,
+            bin_dir.display(),
+        ),
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Insufficient free space"));
+    let calls = fs::read_to_string(root.path().join("calls.log")).expect("read call log");
+    assert_eq!(calls, "doctor --json\n");
 }
 
 #[test]

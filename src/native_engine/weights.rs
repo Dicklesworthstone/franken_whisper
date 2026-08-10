@@ -902,7 +902,8 @@ fn aux_resolution_error(file_name: &str, dirs: &[PathBuf]) -> String {
         "\nFix: run `scripts/fetch_aux_models.sh` to provision aux models into the \
          `aux/` subdirectory of $FRANKEN_WHISPER_MODEL_DIR, set $FRANKEN_WHISPER_MODEL_DIR \
          to the directory containing the file, or pass an explicit path. FrankenWhisper \
-         never downloads models automatically (data never leaves the machine).",
+         never downloads operator-local auxiliary models automatically (data never leaves \
+         the machine during inference).",
     );
     msg
 }

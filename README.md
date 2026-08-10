@@ -313,7 +313,9 @@ opt-out. An offline install accepts a preseeded verified cache or requires
 `--no-pull`; it never contacts the network. Under `sudo ... --system`, model
 provisioning drops back to the validated invoking user so the packages do not
 land in root's private cache. A release download failure never silently falls
-back to a source build; use `--from-source` explicitly.
+back to a source build; use `--from-source` explicitly. Before a fresh model
+pull, the installer requires at least 2.25 GB free on the cache filesystem; an
+already-complete cache is admitted after both compiled trust roots are verified.
 
 Options:
 
@@ -3398,13 +3400,13 @@ hosts; packages both `franken_whisper` and `fw`; and syncs the exact pinned
 tree.
 
 ```bash
-dsr build franken_whisper --version 0.7.1 --dry-run \
+dsr build franken_whisper --version 0.7.2 --dry-run \
   --targets darwin/arm64,darwin/amd64,linux/amd64,linux/arm64,windows/amd64
-dsr build franken_whisper --version 0.7.1 \
+dsr build franken_whisper --version 0.7.2 \
   --targets darwin/arm64,darwin/amd64,linux/amd64,linux/arm64,windows/amd64
 ```
 
-No GitHub Actions workflow participates in the v0.7.1 release. DSR is the build
+No GitHub Actions workflow participates in the v0.7.2 release. DSR is the build
 and packaging authority; the tag and release assets are verified against its
 local receipts before publication.
 

@@ -88,6 +88,9 @@ SYSTEM=0
 NO_GUM=0
 MAX_RETRIES=3
 DOWNLOAD_TIMEOUT=120
+# The two compiled model packages occupy 2,117,087,997 bytes. Reserve modest
+# filesystem/metadata headroom before beginning a fresh default pull.
+MIN_MODEL_CACHE_KB=2250000
 # shellcheck disable=SC2034  # informational metadata, not read by the script
 INSTALLER_VERSION="2.0.0"
 
@@ -311,10 +314,10 @@ Examples:
   curl -fsSL .../install.sh | sudo bash -s -- --system --easy-mode
 
   # Specific version
-  curl -fsSL .../install.sh | bash -s -- --version v0.7.1
+  curl -fsSL .../install.sh | bash -s -- --version v0.7.2
 
   # Airgapped install from a local archive
-  bash install.sh --offline ./franken_whisper-0.7.1-linux_amd64.tar.gz
+  bash install.sh --offline ./franken_whisper-0.7.2-linux_amd64.tar.gz
 
   # Uninstall
   curl -fsSL .../install.sh | bash -s -- --uninstall
@@ -622,6 +625,18 @@ check_disk_space() {
             die "Insufficient disk space in $path (need at least 50MB)"
         fi
     fi
+}
+
+available_kb_for_path() {
+    local path="$1"
+    while [ -n "$path" ] && [ ! -d "$path" ]; do
+        local parent; parent=$(dirname "$path")
+        [ "$parent" = "$path" ] && break
+        path="$parent"
+    done
+    [ -d "$path" ] || path="/"
+    command -v df >/dev/null 2>&1 || return 1
+    df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}'
 }
 
 check_write_permissions() {
@@ -1253,6 +1268,22 @@ provision_default_models() {
         return 0
     fi
 
+    local available_model_kb=""
+    available_model_kb=$(available_kb_for_path "$cache_root" || true)
+    if [[ "$available_model_kb" =~ ^[0-9]+$ ]] && [ "$available_model_kb" -lt "$MIN_MODEL_CACHE_KB" ]; then
+        # A complete cache needs no additional capacity. Ask the binary to hash
+        # both compiled trust roots before rejecting a low-free-space host.
+        local cached_doctor
+        cached_doctor=$("${doctor_command[@]}") || die "Could not verify the existing native model cache"
+        if [[ "$cached_doctor" == *'"ready":true'* ]]; then
+            log_success "Verified existing native Whisper and Sortformer models under $cache_root"
+            return 0
+        fi
+        die "Insufficient free space for both native model packages under $cache_root (need at least 2.25 GB available)"
+    elif [ -z "$available_model_kb" ]; then
+        log_warn "Could not measure free space for the model cache; the verified pull will fail closed on an I/O error"
+    fi
+
     log_step "Provisioning native Whisper and Sortformer models (about 2.12 GB)..."
     if [ -n "$pull_user" ]; then
         log_info "The model pull will run as the invoking user: $pull_user"
@@ -1271,7 +1302,7 @@ provision_default_models() {
 # ============================================================================
 # Shell completions
 # ============================================================================
-# NOTE: franken_whisper v0.7.1 has NO `completions` subcommand (verified:
+# NOTE: franken_whisper v0.7.2 has NO `completions` subcommand (verified:
 # `franken_whisper completions` => "unrecognized subcommand"). There is
 # nothing to generate, so completion installation is deliberately skipped.
 
