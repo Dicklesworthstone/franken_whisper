@@ -5523,6 +5523,7 @@ fn run_native_sortformer_diarization(
         .map(|lane| (*lane, format!("SPEAKER_{lane:02}")))
         .collect::<BTreeMap<_, _>>();
 
+    let audio_duration_ms = normalized_pcm_duration_ms(samples.len())?;
     let mut turns = Vec::with_capacity(output.turns.len());
     for (index, turn) in output.turns.iter().enumerate() {
         if index.is_multiple_of(1_024) {
@@ -5537,6 +5538,17 @@ fn run_native_sortformer_diarization(
                 "native Sortformer emitted a non-finite or empty speaker turn".to_owned(),
             )
         })?;
+        // `finite_seconds_interval_to_ms` rounds to the nearest millisecond, while
+        // `audio_duration_ms` is floor-truncated from the sample count. When the true
+        // duration's fractional millisecond is >= 0.5 (e.g. 6119.9375ms), the rounded
+        // turn end can land one millisecond past the floored audio duration and trip
+        // the report/request contract check below. Clamp here so no turn can ever
+        // claim to extend past the audio it was measured against.
+        let end_ms = end_ms.min(audio_duration_ms);
+        let start_ms = start_ms.min(end_ms);
+        if start_ms >= end_ms {
+            continue;
+        }
         let start_frame = usize::try_from(start_ms / FRAME_MS).unwrap_or(usize::MAX);
         let end_frame = usize::try_from(end_ms.div_ceil(FRAME_MS)).unwrap_or(usize::MAX);
         let frame_end = end_frame.min(output.frames);
@@ -5726,7 +5738,7 @@ fn run_native_sortformer_diarization(
         diagnostics: Vec::new(),
     };
     report
-        .validate_against_request(request, Some(normalized_pcm_duration_ms(samples.len())?))
+        .validate_against_request(request, Some(audio_duration_ms))
         .map_err(FwError::ContractViolation)?;
     let projection =
         diarization::project_diarization_onto_segments(segments, &report.turns, word_aligned)?;
