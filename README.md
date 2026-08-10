@@ -1021,6 +1021,7 @@ franken_whisper transcribe [OPTIONS]
 | `--no-fallback` | `false` | Disable temperature fallback |
 | `--suppress-nst` | `false` | Suppress non-speech tokens |
 | `--tiny-diarize` | `false` | Enable TinyDiarize (speaker-turn token injection) |
+| `--normalize-segment-text` | `false` | Opt in to rule-based segment-text normalization (sentence-casing + terminal periods); off by default so `segments[].text` stays byte-faithful to the transcript |
 | `--prompt <TEXT>` | — | Initial prompt to guide transcription style |
 | `--carry-initial-prompt` | `false` | Carry prompt across segments |
 
@@ -1028,8 +1029,8 @@ franken_whisper transcribe [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--offset-ms <N>` | 0 | Start transcription at offset (ms) |
-| `--duration-ms <N>` | — | Transcribe only this duration (ms) |
+| `--offset-ms <N>` | 0 | Start transcription at offset (ms); honored by the native engine (PCM sliced before decode) and the whisper.cpp bridge (`-ot`). Emitted timestamps stay in source-file time |
+| `--duration-ms <N>` | — | Transcribe only this duration (ms); wall-clock scales with the slice. Backends that cannot honor the window record it in `warnings` |
 | `--audio-ctx <N>` | — | Audio context size (tokens) |
 | `--word-threshold <F>` | — | Per-word confidence threshold (drop words below) |
 | `--suppress-regex <REGEX>` | — | Suppress tokens matching regex |

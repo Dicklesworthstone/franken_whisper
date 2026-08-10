@@ -417,7 +417,10 @@ never on additive fields.
 | `model_version_tag` | string | `fw-native-v1+sha256:<12 hex>` content hash of the model file (replay identity). |
 | `encoder_int8_policy` | object | The calibrated encoder-quantization decision (see §9.2). |
 | `windows` | array | Per-decode-window stats (see §9.3). |
+| `dropped_windows` | array | Long-form windows discarded with no transcript output (see §9.4, bd-nqzf). Empty on healthy runs. |
+| `decode_work` | object | Recovery counters: `prompt_reset_retries`, `temperature_fallback_retries`. |
 | `word_timestamps` | string | `"dtw"` (real cross-attention DTW alignment, bd-rjsx), `"interpolated"` (segment-proportional), or `"none"`. |
+| `audio_window` | object *(optional)* | Present only on `--offset-ms`/`--duration-ms` runs: `offset_ms`, `duration_ms`, `timebase: "source"` (bd-vgod). Timestamps stay in the source-file timebase. |
 
 ### 9.2 `encoder_int8_policy` object
 
@@ -438,7 +441,24 @@ never on additive fields.
 | `avg_logprob` | number | Mean token log-probability over the result (whisper.cpp quality signal). |
 | `no_speech_prob` | number | No-speech probability from the window's first forward. |
 
-### 9.4 Silence short-circuit
+### 9.4 `dropped_windows[]` element (bd-nqzf)
+
+A long-form decode window that closed no timestamp, was not classified as
+silence, and still advanced a full chunk — i.e. real audio absent from the
+transcript. Each entry is mirrored into `RunReport.warnings`, the evidence
+ledger (`native_decode_dropped_windows`), and a `backend.dropped_windows`
+stage event by the orchestrator.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `start_sec` | number | Window start, source timebase. |
+| `end_sec` | number | Estimated window end (start + chunk, clamped to clip end). |
+| `reason` | string | `"window_closed_no_timestamp"`. |
+| `no_speech_prob` | number | No-speech probability of the discarded window. |
+| `avg_logprob` | number | Mean token log-probability of the discarded window. |
+| `retried` | bool | Whether the default-on prompt-reset retry (`FW_RETRY_FAILED_WINDOW`) already re-attempted the window. |
+
+### 9.5 Silence short-circuit
 
 When the energy pre-gate proves silence, the engine returns **without loading the
 model** (saving a multi-GB load). The `raw_output` then carries the same `engine` /

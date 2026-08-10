@@ -964,6 +964,7 @@ mod tests {
                 tokens: 3,
                 window_offset_sec: offset_sec,
             }],
+            dropped_windows: Vec::new(),
             work: decode::DecodeWorkStats::default(),
             word_timings: None,
         }

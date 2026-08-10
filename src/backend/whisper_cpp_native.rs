@@ -682,6 +682,8 @@ pub fn run(
         version_tag,
         native_engine::encoder_int8_effective_policy_decision(&model.loaded().hparams),
         &output.windows,
+        &output.dropped_windows,
+        &output.work,
         word_mode,
         request.backend_params.split_on_word,
         false,
@@ -1425,6 +1427,10 @@ fn shift_decode_output(output: &mut decode::DecodeOutput, offset_sec: f64) {
     for window in &mut output.windows {
         window.window_offset_sec += offset_sec;
     }
+    for dropped in &mut output.dropped_windows {
+        dropped.start_sec += offset_sec;
+        dropped.end_sec += offset_sec;
+    }
 }
 
 /// The honest raw-output metadata JSON for a real-inference run.
@@ -1435,6 +1441,8 @@ fn raw_output_json(
     version_tag: String,
     encoder_policy: native_engine::EncoderInt8PolicyDecision,
     windows: &[decode::WindowStats],
+    dropped_windows: &[decode::DroppedWindow],
+    decode_work: &decode::DecodeWorkStats,
     word_mode: WordTimestampMode,
     split_on_word: bool,
     silence: bool,
@@ -1459,6 +1467,21 @@ fn raw_output_json(
             })
         })
         .collect();
+    // Additive native-v2 fields (bd-nqzf): every discarded long-form window is
+    // a real content gap and must be machine-addressable, not stderr-only.
+    let dropped_windows_json: Vec<Value> = dropped_windows
+        .iter()
+        .map(|w| {
+            json!({
+                "start_sec": w.start_sec,
+                "end_sec": w.end_sec,
+                "reason": w.reason,
+                "no_speech_prob": w.no_speech_prob,
+                "avg_logprob": w.avg_logprob,
+                "retried": w.retried,
+            })
+        })
+        .collect();
     let mut output = json!({
         "engine": "whisper.cpp-native",
         "schema_version": SCHEMA_VERSION,
@@ -1479,6 +1502,11 @@ fn raw_output_json(
             "quant_rel_rmse_budget": encoder_policy.quant_rel_rmse_budget,
         },
         "windows": windows_json,
+        "dropped_windows": dropped_windows_json,
+        "decode_work": {
+            "prompt_reset_retries": decode_work.prompt_reset_retries,
+            "temperature_fallback_retries": decode_work.temperature_fallback_retries,
+        },
         "word_timestamps": word_timestamps,
     });
     if let (Value::Object(map), Some(report)) = (&mut output, dtw_projection) {
@@ -1622,6 +1650,14 @@ mod tests {
                 tokens: 3,
                 window_offset_sec: 0.0,
             }],
+            dropped_windows: vec![decode::DroppedWindow {
+                start_sec: 30.0,
+                end_sec: 60.0,
+                reason: "window_closed_no_timestamp",
+                no_speech_prob: 1e-9,
+                avg_logprob: -0.1,
+                retried: true,
+            }],
             work: decode::DecodeWorkStats::default(),
             word_timings: Some(vec![vec![WordTiming {
                 text: "hello".to_owned(),
@@ -1636,6 +1672,8 @@ mod tests {
         assert!((words[0][0].start_sec - 60.5).abs() < 1e-9);
         assert!((words[0][0].end_sec - 62.0).abs() < 1e-9);
         assert!((output.windows[0].window_offset_sec - 60.0).abs() < 1e-9);
+        assert!((output.dropped_windows[0].start_sec - 90.0).abs() < 1e-9);
+        assert!((output.dropped_windows[0].end_sec - 120.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2136,6 +2174,8 @@ mod tests {
             "fw-native-v1+sha256:abc".to_owned(),
             f32_encoder_policy_fixture(),
             &[],
+            &[],
+            &decode::DecodeWorkStats::default(),
             WordTimestampMode::Word,
             false,
             false,
@@ -2145,6 +2185,44 @@ mod tests {
         assert_eq!(json["implementation"].as_str(), Some("real-inference"));
         assert_eq!(json["schema_version"].as_str(), Some(SCHEMA_VERSION));
         assert_eq!(json["in_process"].as_bool(), Some(true));
+        assert_eq!(json["dropped_windows"], json!([]));
+        assert_eq!(json["decode_work"]["prompt_reset_retries"], json!(0));
+    }
+
+    #[test]
+    fn raw_output_surfaces_dropped_windows_structurally() {
+        let dropped = vec![decode::DroppedWindow {
+            start_sec: 514.0,
+            end_sec: 544.0,
+            reason: "window_closed_no_timestamp",
+            no_speech_prob: 5.6e-10,
+            avg_logprob: -0.111,
+            retried: true,
+        }];
+        let work = decode::DecodeWorkStats {
+            prompt_reset_retries: 1,
+            ..decode::DecodeWorkStats::default()
+        };
+        let json = raw_output_json(
+            "large-v3-turbo",
+            Path::new("/models/ggml-large-v3-turbo.bin"),
+            "fw-native-v1+sha256:abc".to_owned(),
+            f32_encoder_policy_fixture(),
+            &[],
+            &dropped,
+            &work,
+            WordTimestampMode::None,
+            false,
+            false,
+            None,
+        );
+        let windows = json["dropped_windows"].as_array().expect("array");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0]["start_sec"], json!(514.0));
+        assert_eq!(windows[0]["end_sec"], json!(544.0));
+        assert_eq!(windows[0]["reason"], json!("window_closed_no_timestamp"));
+        assert_eq!(windows[0]["retried"], json!(true));
+        assert_eq!(json["decode_work"]["prompt_reset_retries"], json!(1));
     }
 
     #[test]
@@ -2170,6 +2248,8 @@ mod tests {
             "fw-native-v1+sha256:abc".to_owned(),
             f32_encoder_policy_fixture(),
             &[],
+            &[],
+            &decode::DecodeWorkStats::default(),
             WordTimestampMode::Word,
             false,
             false,

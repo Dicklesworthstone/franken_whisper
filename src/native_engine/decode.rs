@@ -294,6 +294,28 @@ pub struct DecodeWorkStats {
     pub temperature_fallback_retries: usize,
 }
 
+/// A long-form window the decoder discarded without emitting any transcript
+/// (bd-nqzf / bd-r0qd): the window closed no timestamp, was not classified as
+/// silence, and the seek still advanced a full chunk — so the audio in
+/// `[start_sec, end_sec)` is absent from the output with no textual trace.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DroppedWindow {
+    /// Window start in seconds (slice timebase).
+    pub start_sec: f64,
+    /// Estimated window end in seconds (start + chunk, clamped to clip end).
+    pub end_sec: f64,
+    /// Stable machine-readable reason tag.
+    pub reason: &'static str,
+    /// No-speech probability of the discarded window (low = engine believed
+    /// this was speech when it discarded it).
+    pub no_speech_prob: f64,
+    /// Mean token log-probability of the discarded window.
+    pub avg_logprob: f64,
+    /// Whether the prompt-reset retry (`FW_RETRY_FAILED_WINDOW`, default-on)
+    /// already re-attempted this window before the drop was accepted.
+    pub retried: bool,
+}
+
 /// Result of [`transcribe_samples`]: timed segments, detected/used language,
 /// and per-window QC statistics.
 #[derive(Debug, Clone)]
@@ -301,6 +323,9 @@ pub struct DecodeOutput {
     pub segments: Vec<TranscriptionSegment>,
     pub language: Option<String>,
     pub windows: Vec<WindowStats>,
+    /// Long-form windows discarded without any transcript output. Empty on
+    /// healthy runs; every entry is a real content gap the caller must see.
+    pub dropped_windows: Vec<DroppedWindow>,
     /// Aggregate work counters for performance provenance.
     pub work: DecodeWorkStats,
     /// Per-segment word timings, aligned 1:1 with `segments`, populated only
@@ -2327,6 +2352,7 @@ fn decode_independent_no_timestamp_windows(
         segments,
         language: Some(language.to_owned()),
         windows,
+        dropped_windows: Vec::new(),
         work,
         word_timings: None,
     })
@@ -2494,6 +2520,7 @@ fn transcribe_samples_uncached(
 
     let mut segments: Vec<TranscriptionSegment> = Vec::new();
     let mut windows: Vec<WindowStats> = Vec::new();
+    let mut dropped_windows: Vec<DroppedWindow> = Vec::new();
     let mut work = DecodeWorkStats::default();
     // Per-segment DTW word timings, accumulated 1:1 with `segments` when
     // `params.word_timestamps` is set (bd-rjsx).
@@ -3085,20 +3112,34 @@ fn transcribe_samples_uncached(
                 retry_enc_cache = Some((frame_offset, enc));
                 continue; // re-decode this window with no carried prompt (reusing this encode)
             }
+            let was_prompt_reset_retry = force_empty_prompt;
             force_empty_prompt = false;
 
-            // Surface the otherwise-SILENT content drop (bd-r0qd): a non-first window
-            // that closed no timestamp and isn't silence emits nothing yet advances a
-            // full chunk, so ~30 s of speech vanishes with no signal to the caller.
-            // Transcript-unchanged (a log only) ⇒ byte-exact. Points at the recovery flag.
+            // Surface the otherwise-SILENT content drop (bd-r0qd / bd-nqzf): a
+            // non-first window that closed no timestamp and isn't silence emits
+            // nothing yet advances a full chunk, so ~30 s of speech vanishes.
+            // Recorded structurally in `dropped_windows` so it reaches
+            // `RunReport.warnings` / robot output, not only stderr.
+            // Transcript-unchanged ⇒ byte-exact.
             if result_len == 0 && !is_no_speech && seek_cs > 0 {
+                let dropped_end_cs = (seek_cs + CHUNK_CS).min(seek_end_cs);
+                dropped_windows.push(DroppedWindow {
+                    start_sec: seek_cs as f64 / 100.0,
+                    end_sec: dropped_end_cs as f64 / 100.0,
+                    reason: "window_closed_no_timestamp",
+                    no_speech_prob,
+                    avg_logprob,
+                    retried: was_prompt_reset_retry,
+                });
                 tracing::warn!(
                     target: "franken_whisper::native_engine::decode",
                     seek_sec = seek_cs as f64 / 100.0,
                     no_speech_prob,
                     avg_logprob,
+                    prompt_reset_retried = was_prompt_reset_retry,
                     "long-form window closed no timestamp — ~30 s of audio dropped \
-                     (set FW_RETRY_FAILED_WINDOW=1 to attempt prompt-reset recovery; see bd-r0qd)"
+                     (prompt-reset retry is default-on via FW_RETRY_FAILED_WINDOW; \
+                      set FW_TEMP_FALLBACK=1 for sampling-ladder recovery; see bd-r0qd)"
                 );
             }
 
@@ -3241,6 +3282,7 @@ fn transcribe_samples_uncached(
         segments,
         language: used_language,
         windows,
+        dropped_windows,
         work,
         word_timings: if params.word_timestamps {
             Some(word_timings)
@@ -3945,6 +3987,7 @@ mod tests {
             segments: Vec::new(),
             language: Some("en".to_owned()),
             windows: Vec::new(),
+            dropped_windows: Vec::new(),
             work: DecodeWorkStats {
                 encoder_calls: 1,
                 decoder_prefill_calls: 1,

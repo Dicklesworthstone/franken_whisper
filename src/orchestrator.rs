@@ -5447,12 +5447,16 @@ fn validate_diarization_execution_request(
 fn apply_native_diarization_projection(
     result: &mut crate::model::TranscriptionResult,
     projection: diarization::DiarizationProjection,
-    report: DiarizationReport,
+    mut report: DiarizationReport,
 ) {
     // Speaker projection may alter only the legacy per-segment speaker field.
     // The backend's top-level transcript remains byte-authoritative even when
     // its spacing differs from a reconstruction of the segment list.
     result.segments = projection.segments;
+    // First-class merged view (bd-d4py): consumers get the speaker-attributed
+    // transcript directly instead of re-deriving the turn/segment join.
+    report.speaker_segments =
+        diarization::build_speaker_attributed_segments(&result.segments, &report.turns);
     result.diarization = Some(report);
 }
 
@@ -5718,6 +5722,7 @@ fn run_native_sortformer_diarization(
         fallback_status,
         operational_partition: None,
         neural_representation: None,
+        speaker_segments: Vec::new(),
         diagnostics: Vec::new(),
     };
     report
@@ -6202,6 +6207,7 @@ fn unknown_diarization_report(
         },
         operational_partition: None,
         neural_representation: None,
+        speaker_segments: Vec::new(),
         diagnostics: vec![diagnostic_code.to_owned()],
     }
 }
@@ -6647,6 +6653,7 @@ fn external_diarization_report(
         fallback_status: DiarizationFallbackStatus::ExternalBackend,
         operational_partition: None,
         neural_representation,
+        speaker_segments: Vec::new(),
         diagnostics,
     };
     report
@@ -11156,6 +11163,7 @@ mod tests {
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             operational_partition: None,
             neural_representation: None,
+            speaker_segments: Vec::new(),
             diagnostics: Vec::new(),
         }
     }

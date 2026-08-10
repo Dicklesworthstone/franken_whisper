@@ -772,6 +772,7 @@ mod tests {
             segments: vec![seg(0.0, 9.0, "x")],
             language: Some("en".to_owned()),
             windows: vec![],
+            dropped_windows: Vec::new(),
             work: decode::DecodeWorkStats::default(),
             word_timings: None,
         };
@@ -784,6 +785,7 @@ mod tests {
             segments: vec![],
             language: None,
             windows: vec![],
+            dropped_windows: Vec::new(),
             work: decode::DecodeWorkStats::default(),
             word_timings: None,
         };
