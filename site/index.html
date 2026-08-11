@@ -44,6 +44,15 @@
     .tbl td.num{font-family:"JetBrains Mono Variable","JetBrains Mono",monospace;color:#6ee7b7;font-weight:700}
     .stage-pill{border:1px solid rgba(255,255,255,.07);border-radius:.7rem;background:rgba(2,10,6,.6);padding:.7rem .9rem;font-family:"JetBrains Mono Variable","JetBrains Mono",monospace;font-size:.75rem;color:#a7f3d0}
     .stage-pill span{display:block;font-size:.62rem;color:#64748b;font-family:Inter,system-ui,sans-serif;letter-spacing:.02em;margin-top:.25rem}
+    /* Utilities absent from the frozen Tailwind build (checked with grep). */
+    .z-40{z-index:40}
+    .tracking-\[0\.18em\]{letter-spacing:.18em}
+    @media (min-width:768px){
+      .md\:py-24{padding-top:6rem;padding-bottom:6rem}
+      .md\:pt-44{padding-top:11rem}
+      .md\:grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+      .md\:grid-cols-5{grid-template-columns:repeat(5,minmax(0,1fr))}
+    }
     audio{width:100%;filter:invert(.9) hue-rotate(150deg)}
     :focus-visible{outline:2px solid rgba(52,211,153,.6);outline-offset:2px}
     html,body{overflow-x:hidden}
