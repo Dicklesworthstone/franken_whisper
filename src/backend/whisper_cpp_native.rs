@@ -607,8 +607,21 @@ pub fn run(
             let (start, end) = window_sample_bounds(full_samples.len(), offset_ms, duration_ms);
             if start >= end {
                 // Offset at/past EOF: an empty-but-valid result, honestly
-                // tagged, beats a decode error for a region probe.
-                return Ok(silence_result(request, &spec, 0));
+                // tagged with the requested (empty) window, beats a decode
+                // error for a region probe.
+                let mut result = silence_result(request, &spec, 0);
+                if let Value::Object(map) = &mut result.raw_output {
+                    map.insert(
+                        "audio_window".to_owned(),
+                        json!({
+                            "offset_ms": offset_ms,
+                            "duration_ms": duration_ms,
+                            "timebase": "source",
+                            "empty_slice": true,
+                        }),
+                    );
+                }
+                return Ok(result);
             }
             (full_samples[start..end].to_vec(), offset_ms)
         }

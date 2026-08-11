@@ -2462,6 +2462,18 @@ async fn execute_backend_speculative(
         )
     })?;
 
+    // Loud ignore (bd-vgod): the speculative window manager slices audio on
+    // its own schedule and does not honor the audio-window flags.
+    if request.backend_params.offset_ms.is_some_and(|v| v > 0)
+        || request.backend_params.duration_ms.is_some_and(|v| v > 0)
+    {
+        inter.warnings.push(
+            "--offset-ms/--duration-ms are not supported in speculative mode; the full input \
+             was transcribed"
+                .to_owned(),
+        );
+    }
+
     // Resolve the speculative run's backend ONCE so every window invocation
     // talks to the same engine (per design note above). Failures here surface
     // before any backend.start event is emitted so the stream layout matches
