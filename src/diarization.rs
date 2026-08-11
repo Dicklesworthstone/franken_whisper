@@ -17094,11 +17094,15 @@ fn fill_unlabeled_segments_from_turns(
 }
 
 /// Whether a word ends a sentence for boundary-snapping purposes.
+///
+/// Trailing closing quotes/brackets are transparent so `you?"` and `done.)`
+/// still count as sentence-final.
 fn ends_sentence(text: &str) -> bool {
     text.trim_end()
+        .trim_end_matches(['"', '\'', ')', ']', '\u{00BB}', '\u{201D}', '\u{2019}'])
         .chars()
         .last()
-        .is_some_and(|c| matches!(c, '.' | '?' | '!'))
+        .is_some_and(|c| matches!(c, '.' | '?' | '!' | '\u{2026}'))
 }
 
 /// Re-anchor projected speaker changes to sentence-final punctuation
@@ -17130,8 +17134,12 @@ fn snap_speaker_changes_to_punctuation(projected: &mut [TranscriptionSegment]) {
             continue;
         }
         // Candidate boundary positions j (change occurs before word j) where
-        // word j-1 ends a sentence, within the window, without crossing
-        // another speaker change of the same pair.
+        // word j-1 ends a sentence, within the window. Moving the boundary
+        // may only relabel words that currently belong to the run being
+        // shrunk, and the shrunk run must survive past the new boundary —
+        // snapping moves a change, it never erases a (short) turn.
+        let left_label = projected[i - 1].speaker.clone();
+        let right_label = projected[i].speaker.clone();
         let lo = i.saturating_sub(PUNCTUATION_SNAP_WINDOW_WORDS).max(1);
         let hi = (i + PUNCTUATION_SNAP_WINDOW_WORDS).min(projected.len() - 1);
         let mut best: Option<usize> = None;
@@ -17139,17 +17147,18 @@ fn snap_speaker_changes_to_punctuation(projected: &mut [TranscriptionSegment]) {
             if j == i || !ends_sentence(&projected[j - 1].text) {
                 continue;
             }
-            // Do not move the boundary across a *different* label than the
-            // two involved in this change.
-            let (left_label, right_label) = (
-                projected[i - 1].speaker.clone(),
-                projected[i].speaker.clone(),
-            );
-            let span = if j < i { j..i } else { i..j };
-            let crosses_foreign_label = projected[span]
-                .iter()
-                .any(|seg| seg.speaker != left_label && seg.speaker != right_label);
-            if crosses_foreign_label {
+            let movable = if j > i {
+                // Shrink the right run from the left: words i..j must all be
+                // the right label, and the right run must continue at j.
+                projected[i..j].iter().all(|seg| seg.speaker == right_label)
+                    && projected[j].speaker == right_label
+            } else {
+                // Shrink the left run from the right: words j..i must all be
+                // the left label, and the left run must still exist before j.
+                projected[j..i].iter().all(|seg| seg.speaker == left_label)
+                    && projected[j - 1].speaker == left_label
+            };
+            if !movable {
                 continue;
             }
             let better = best.is_none_or(|current| {
@@ -17161,8 +17170,6 @@ fn snap_speaker_changes_to_punctuation(projected: &mut [TranscriptionSegment]) {
             }
         }
         if let Some(j) = best {
-            let left_label = projected[i - 1].speaker.clone();
-            let right_label = projected[i].speaker.clone();
             if j > i {
                 for seg in &mut projected[i..j] {
                     seg.speaker = left_label.clone();
@@ -39644,6 +39651,35 @@ mod tests {
                 Some("hang"),
                 Some("hang"),
             ]
+        );
+    }
+
+    #[test]
+    fn snapping_never_erases_a_short_interjection_turn() {
+        // projection-fusion-v1 (bd-d4py): a one-word interjection ("yeah.")
+        // whose sentence boundary sits just past it must survive snapping —
+        // the boundary may move, the turn may not disappear.
+        let turns = vec![
+            turn(0, 2_000, Some("alice"), Some(0.9)),
+            turn(2_000, 2_400, Some("bob"), Some(0.9)),
+            turn(2_400, 4_000, Some("alice"), Some(0.9)),
+        ];
+        let words = vec![
+            transcript_segment(Some(0.0), Some(0.8), "so", Some(0.9)),
+            transcript_segment(Some(0.8), Some(1.9), "anyway,", Some(0.9)),
+            transcript_segment(Some(2.0), Some(2.35), "yeah.", Some(0.9)),
+            transcript_segment(Some(2.5), Some(3.0), "right", Some(0.9)),
+        ];
+        let projection =
+            project_diarization_onto_segments(&words, &turns, true).expect("projection");
+        assert_eq!(
+            projection
+                .segments
+                .iter()
+                .map(|segment| segment.speaker.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("alice"), Some("alice"), Some("bob"), Some("alice")],
+            "the one-word bob turn must not be swallowed by boundary snapping"
         );
     }
 
