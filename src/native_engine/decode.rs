@@ -3223,6 +3223,10 @@ fn transcribe_samples_uncached(
                 // requested we always push one (possibly empty) word vec per emitted
                 // segment so `word_timings` stays aligned with `segments`.
                 if params.word_timestamps {
+                    // Span coverage for the word-timestamp stage (bd-vsg6): DTW
+                    // was the one production stage with no `perf_span`, so its
+                    // share of wall time was never attributable.
+                    let t_word_ts = std::time::Instant::now();
                     let win_words = if align_heads.is_empty() {
                         vec![Vec::new(); win_segments.len()]
                     } else {
@@ -3239,6 +3243,11 @@ fn transcribe_samples_uncached(
                             checkpoint,
                         )?
                     };
+                    super::perf_span(
+                        "word_ts",
+                        t_word_ts.elapsed().as_secs_f64() * 1e3,
+                        &format!("\"tokens\":{}", result_len),
+                    );
                     word_timings.extend(win_words);
                 }
 
