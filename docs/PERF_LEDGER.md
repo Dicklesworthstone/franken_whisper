@@ -49,6 +49,46 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-08-11 — KEEP (same-binary interleaved) — **NON-CAMPAIGN / MAINTENANCE** — Metal fused-encoder kernel levers: median **1.40×** on `encoder_window`, transcript identical (bd-453z)
+
+**Result class: self-speedup/maintenance** (fw-vs-fw, kill-switch arms in one
+binary; no pinned darwin incumbent contract exists yet, and the host carried
+multi-agent load — decidable competitive rows still require a quiet M-series
+host). Three levers landed in `ft-kernel-metal` (frankentorch
+`3012f79a`/`3e0a830e` + follow-ups):
+
+1. **FlashAttention v2**: float4-vectorized q/K/V, 64-query threadgroups, and
+   block-online softmax (rescale the accumulator once per 4 keys instead of
+   per key — the per-key rescale chain was the ALU stall). Isolated kernel:
+   47.25 → 20.04 ms at turbo shape (seq 1500, 20 heads). Kill switch
+   `FT_METAL_FLASH_V1=1`.
+2. **simdgroup_matrix GEMM with half tiles + f32 accumulators** (the ggml
+   checkpoint stores f16 weights; this is whisper.cpp's Metal precision):
+   64×64×32 tiles, 256 threads/TG. MLP GEMMs 15.75/17.12 → 8.82/9.42 ms
+   (~1.1 → ~2.1 TFLOPS). Kill switch `FT_METAL_SG_GEMM=0`.
+3. **One command buffer for the whole 32-layer stack** (was one commit+wait
+   per layer): intermediates kept alive to `finish`, Metal hazard-tracking
+   orders the 384 encoders.
+
+**e2e proof, same ELF, interleaved arms (new default vs
+`FT_METAL_FLASH_V1=1 FT_METAL_SG_GEMM=0`), jfk.wav turbo, 5 pairs:**
+`encoder_window` new = 2535/2640/2470/2810/2618 ms vs old kernels =
+3577/3689/3486/3590/3652 ms → per-pair ratios 1.41/1.40/1.41/1.28/1.40,
+**median 1.40×**. `encoder_route` = `gpu_fused` asserted on every arm;
+transcript byte-identical to the pure-CPU path (`FRANKEN_WHISPER_GPU=0`) on
+this clip. ft-kernel-metal parity suite (16 tests incl. per-op CPU refs and
+whole-layer 2e-2 check) green; fmt+clippy clean.
+
+**Cumulative platform picture:** first measurement this morning had
+`encoder_window` at 15.4 s (heavily loaded window); today's quietest windows
+now measure 2.47–2.81 s with the new kernels. The honest cross-load claim is
+the interleaved 1.40× kernels row plus the single-buffer restructure; the
+15.4→2.5 s headline mixes load regimes and is NOT a ratio claim. Gap to the
+informal whisper-cli 1.8.6 Metal reference (1.2 s whole job) narrowed from
+~13× to ~2–3× on the encoder. Remaining levers tracked in bd-453z: conv stem
+still CPU, per-op buffer allocation churn, f16 activations end-to-end,
+MPS-class GEMM tiles (~2.1 of ~4–5 achievable TFLOPS), model load (~3 s).
+
 ## 2026-08-11 — **NON-CAMPAIGN / INFORMATIONAL** — first darwin/arm64 stage split; the fused Metal encoder is the platform's dominant gap
 
 **No competitive claim; the host was NOT quiet** (Apple M4 Pro development

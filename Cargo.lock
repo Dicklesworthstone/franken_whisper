@@ -236,9 +236,9 @@ dependencies = [
  "chacha20poly1305",
  "crc32fast",
  "crossbeam-queue",
- "franken-decision",
- "franken-evidence",
- "franken-kernel",
+ "franken-decision 0.3.10",
+ "franken-evidence 0.3.10",
+ "franken-kernel 0.3.10",
  "futures-lite",
  "getrandom 0.4.3",
  "hashbrown 0.17.0",
@@ -277,6 +277,58 @@ dependencies = [
  "webpki-roots",
  "windows-sys 0.61.2",
  "x509-parser",
+ "xattr",
+ "zeroize",
+]
+
+[[package]]
+name = "asupersync"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b5c1591494d83c382a0ac874d35748fcae8d61b572706ac54d52eedb56f5c30"
+dependencies = [
+ "aes-gcm",
+ "base64 0.23.0",
+ "bincode-next",
+ "chacha20poly1305",
+ "crc32fast",
+ "crossbeam-queue",
+ "franken-decision 0.4.3",
+ "franken-evidence 0.4.3",
+ "franken-kernel 0.4.3",
+ "futures-lite",
+ "getrandom 0.4.3",
+ "hashbrown 0.17.0",
+ "hex",
+ "hmac",
+ "js-sys",
+ "libc",
+ "memchr",
+ "nix",
+ "nkeys",
+ "parking_lot",
+ "pin-project",
+ "polling",
+ "prost",
+ "rmp-serde",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.11.0",
+ "signal-hook 0.4.4",
+ "slab",
+ "smallvec",
+ "socket2",
+ "subtle",
+ "sysinfo",
+ "tempfile",
+ "thiserror",
+ "unicode-normalization",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "windows-sys 0.61.2",
  "xattr",
  "zeroize",
 ]
@@ -1132,8 +1184,19 @@ version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69ebbe3cb66f3d9c4f780ff9d7f03d666b770d5cf8c2cbec20d64dd2c4efd394"
 dependencies = [
- "franken-evidence",
- "franken-kernel",
+ "franken-evidence 0.3.10",
+ "franken-kernel 0.3.10",
+ "serde",
+]
+
+[[package]]
+name = "franken-decision"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4821cef9dc50a45fa2b26df2d870d7740cfa3cb9c2cc710c9fb27427b9bd5a36"
+dependencies = [
+ "franken-evidence 0.4.3",
+ "franken-kernel 0.4.3",
  "serde",
 ]
 
@@ -1142,6 +1205,16 @@ name = "franken-evidence"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b88c812fbe5a25cad64e4bbe4bed49e1a5e8951e4c84d7778d7414bb85cdc46"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "franken-evidence"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24b72f93a1034d50cf79842adc07c25f7500f3beb48b916fc53554a36c94ad7a"
 dependencies = [
  "serde",
  "serde_json",
@@ -1157,10 +1230,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "franken-kernel"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2d195e41be1387e7e9eecf85cd04159f9ce627d816ce8775b29a7ee8784ccc5"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "franken_whisper"
 version = "0.8.0"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.10",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -1168,9 +1250,9 @@ dependencies = [
  "criterion",
  "ctrlc",
  "flate2",
- "franken-decision",
- "franken-evidence",
- "franken-kernel",
+ "franken-decision 0.3.10",
+ "franken-evidence 0.3.10",
+ "franken-kernel 0.3.10",
  "fsqlite",
  "fsqlite-types",
  "ft-core",
@@ -1238,7 +1320,7 @@ dependencies = [
 name = "fsqlite-core"
 version = "0.2.1"
 dependencies = [
- "asupersync",
+ "asupersync 0.4.3",
  "blake3",
  "foldhash",
  "fsqlite-ast",
@@ -1344,7 +1426,7 @@ dependencies = [
 name = "fsqlite-mvcc"
 version = "0.2.1"
 dependencies = [
- "asupersync",
+ "asupersync 0.4.3",
  "blake3",
  "crc32c",
  "crossbeam-epoch",
@@ -1379,7 +1461,7 @@ name = "fsqlite-pager"
 version = "0.2.1"
 dependencies = [
  "argon2",
- "asupersync",
+ "asupersync 0.4.3",
  "blake3",
  "bumpalo",
  "chacha20poly1305",
@@ -1429,7 +1511,7 @@ dependencies = [
 name = "fsqlite-types"
 version = "0.2.1"
 dependencies = [
- "asupersync",
+ "asupersync 0.4.3",
  "bitflags 2.13.1",
  "blake3",
  "fsqlite-error",
@@ -1447,7 +1529,7 @@ dependencies = [
 name = "fsqlite-vdbe"
 version = "0.2.1"
 dependencies = [
- "asupersync",
+ "asupersync 0.4.3",
  "crossbeam-deque",
  "fsqlite-ast",
  "fsqlite-btree",
@@ -1469,7 +1551,7 @@ name = "fsqlite-vfs"
 version = "0.2.1"
 dependencies = [
  "advisory-lock",
- "asupersync",
+ "asupersync 0.4.3",
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-types",
@@ -1485,7 +1567,7 @@ dependencies = [
 name = "fsqlite-wal"
 version = "0.2.1"
 dependencies = [
- "asupersync",
+ "asupersync 0.4.3",
  "blake3",
  "crc32c",
  "fsqlite-error",
