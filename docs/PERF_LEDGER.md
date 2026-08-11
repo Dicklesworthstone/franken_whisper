@@ -49,6 +49,44 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-08-11 — **NON-CAMPAIGN / INFORMATIONAL** — first darwin/arm64 stage split; the fused Metal encoder is the platform's dominant gap
+
+**No competitive claim; the host was NOT quiet** (Apple M4 Pro development
+machine carrying a multi-agent build load; absolute numbers are contaminated
+and no A/A packet ran). Recorded because every prior ledger row is x86-64
+evidence and this is the first attribution data for the platform the darwin
+release binaries actually run on.
+
+**Stage split, `large-v3-turbo`, jfk.wav (11 s, one window), in-engine spans:**
+`encoder_window 15413 ms` (default route) / `18863 ms` (`FRANKEN_WHISPER_GPU=0`),
+`model_weights 2954 ms`, `model_parse 836 ms`, `decode_loop 611 ms`,
+`cross_kv 267 ms`, `mel 8 ms`. tiny.en for scale: `encoder_window 650 ms`,
+`decode_loop 272 ms`, `model_weights 262 ms`.
+
+**Route provenance (new, this entry's lever):** `raw_output.encoder_route`
+now records the executed encoder route. It reports **`gpu_fused`** — the
+fused Metal encoder engages and is still ~15.4 s/window; the silent-fallback
+hypothesis is DEAD. The GPU path buys only ~1.2× over pure CPU here.
+
+**Scale reference (informational, unpinned incumbent):** homebrew
+`whisper-cli` 1.8.6 (Metal, `-bs 1 -bo 1`) completed the ENTIRE job on the
+same clip, same model file, same loaded host in **1.20 s total**. Direction
+is unambiguous even under shared load: on Apple Silicon the native turbo
+encoder is roughly an order of magnitude behind whisper.cpp's Metal path,
+while on x86 the same engine is 2.99× AHEAD. The x86 win never transferred.
+
+**What shipped in this pass (both byte-exact, metadata/instrumentation only):**
+`word_ts` perf span around `window_word_timings` (bd-vsg6 — DTW was the one
+production stage with zero span coverage) and `raw_output.encoder_route`
+with decline reasons (`cpu:gpu_encoder_init_failed`, `cpu:gpu_forward_failed`,
+`cpu:model_below_gpu_width_gate`, …).
+
+**Retry predicate / next lever:** optimizing `ft-kernel-metal::fused` (or
+routing the mel→encoder through a better Metal schedule) is the highest-value
+darwin lever by an order of magnitude; tracked as bd-453z. A decidable
+measurement requires a quiet M-series host and a pinned whisper.cpp Metal
+incumbent contract for darwin.
+
 ## 2026-08-01 — **NON-CAMPAIGN / INFORMATIONAL** — exact per-model transcription cache
 
 **No competitive claim.** Each loaded native model now owns a default-on,

@@ -1305,9 +1305,15 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
         std::env::var("FRANKEN_WHISPER_FUSED_ENC").ok().as_deref(),
         Some("0")
     ) {
+        record_encoder_route("cpu:fused_disabled");
         return false;
     }
-    if w.n_state < GPU_ENCODER_MIN_N_STATE || !gpu_encoder_enabled() {
+    if w.n_state < GPU_ENCODER_MIN_N_STATE {
+        record_encoder_route("cpu:model_below_gpu_width_gate");
+        return false;
+    }
+    if !gpu_encoder_enabled() {
+        record_encoder_route("cpu:gpu_unavailable_or_disabled");
         return false;
     }
 
@@ -1348,7 +1354,10 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
     let enc = {
         let mut guard = match cache.lock() {
             Ok(g) => g,
-            Err(_) => return false,
+            Err(_) => {
+                record_encoder_route("cpu:gpu_cache_poisoned");
+                return false;
+            }
         };
         match guard.entry(key) {
             std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
@@ -1381,7 +1390,10 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
                     &refs,
                 ) {
                     Ok(enc) => Arc::clone(entry.insert(Arc::new(enc))),
-                    Err(_) => return false,
+                    Err(_) => {
+                        record_encoder_route("cpu:gpu_encoder_init_failed");
+                        return false;
+                    }
                 }
             }
         }
@@ -1390,15 +1402,43 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
     match enc.forward(&x.data, x.rows) {
         Ok(out) => {
             x.data = out;
+            record_encoder_route("gpu_fused");
             true
         }
-        Err(_) => false,
+        Err(_) => {
+            record_encoder_route("cpu:gpu_forward_failed");
+            false
+        }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn gpu_encode_stack(_x: &mut Mat, _w: &EncoderWeights) -> bool {
+    record_encoder_route("cpu:no_gpu_backend");
     false
+}
+
+/// Last encoder route actually executed, with the decline reason when the GPU
+/// stack was skipped: `"gpu_fused"` or `"cpu:<reason>"`. `"unknown"` before the
+/// first encode. Route introspection exists because every GPU failure path
+/// returns `false` silently — without it, a fused encoder that is built,
+/// dispatchable, and never dispatched is invisible (the silent-fallback trap).
+static ENCODER_ROUTE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("unknown");
+
+fn record_encoder_route(route: &'static str) {
+    if let Ok(mut guard) = ENCODER_ROUTE.lock() {
+        *guard = route;
+    }
+}
+
+/// The last executed encoder route (`"gpu_fused"` / `"cpu:<reason>"` /
+/// `"unknown"`), for raw-output provenance and perf-pass route assertions.
+#[must_use]
+pub fn last_encoder_route() -> &'static str {
+    ENCODER_ROUTE
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or("unknown")
 }
 
 /// Minimum `n_state` (model width) for the GPU encoder: medium/large whisper

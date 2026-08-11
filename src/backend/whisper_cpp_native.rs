@@ -712,6 +712,15 @@ pub fn run(
             }),
         );
     }
+    // Additive native-v2 route provenance: which encoder route actually ran
+    // (gpu_fused vs cpu:<decline reason>). A silent GPU->CPU fallback is
+    // invisible without this.
+    if let Value::Object(map) = &mut raw_output {
+        map.insert(
+            "encoder_route".to_owned(),
+            json!(native_engine::encoder::last_encoder_route()),
+        );
+    }
 
     Ok(TranscriptionResult {
         backend: BackendKind::WhisperCpp,
