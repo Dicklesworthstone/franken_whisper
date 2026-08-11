@@ -784,7 +784,9 @@ two passes. The primary pass keeps the historical conservative gates
 for words). A second fusion pass then attributes segments the primary pass
 left `null` using the same turn evidence: a segment overlapping any labeled
 turn takes the max-overlap labeled turn, and a timed segment in a turn gap
-takes the nearest labeled turn within 2 s. Word-granularity speaker changes
+takes the nearest labeled turn within 2 s (hard-hint turns are never
+extrapolated into gaps: a `hard_must_link` interval asserts identity only for
+its own audio). Word-granularity speaker changes
 that land mid-clause are re-anchored to the nearest sentence-final
 punctuation boundary within ±4 words, using the transcript's own punctuation
 as the boundary oracle (quantized diarizer boundaries — e.g. Sortformer's

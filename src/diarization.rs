@@ -17062,10 +17062,13 @@ fn fill_unlabeled_segments_from_turns(
             output.speaker = best.speaker_ref.clone();
             continue;
         }
-        // (b) Nearest labeled neighbor turn within the bounded gap.
+        // (b) Nearest labeled neighbor turn within the bounded gap. Hard-hint
+        // turns are excluded: a `hard_must_link` interval asserts caller
+        // identity only for its own audio, and extrapolating it into a gap
+        // would invent attribution the caller never made (§6.1).
         let mut nearest: Option<(f64, &DiarizationTurn)> = None;
         for turn in turns {
-            if turn.speaker_ref.is_none() {
+            if turn.speaker_ref.is_none() || turn.hard_hint_attributed {
                 continue;
             }
             let turn_start = turn.start_ms as f64 / 1_000.0;
@@ -39688,7 +39691,10 @@ mod tests {
         )];
         let mixed =
             project_diarization_onto_segments(&segment, &mixed_turns, false).expect("mixed");
-        assert_eq!(mixed.segments[0].speaker, None);
+        // projection-fusion-v1 (bd-d4py): the primary pass still records the
+        // segment as mixed (no 70% dominance), but the fusion pass attributes
+        // the max-overlap labeled turn instead of leaving `null`.
+        assert_eq!(mixed.segments[0].speaker.as_deref(), Some("alice"));
         assert_eq!(mixed.mixed_speaker_segment_indices, vec![0]);
         assert_eq!(mixed.segments[0].confidence, Some(0.83));
 
