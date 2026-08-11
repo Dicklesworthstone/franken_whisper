@@ -31,8 +31,6 @@ include = [
 [features]
 default = []
 tui = ["dep:ftui"]
-gpu-frankentorch = ["dep:ft-api"]
-gpu-frankenjax = ["dep:fj-api", "dep:fj-core"]
 
 # Two binaries from the same entry point: the full name and the short `fw`
 # alias agents and humans actually type. Listing them explicitly disables the
