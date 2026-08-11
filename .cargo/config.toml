@@ -30,7 +30,7 @@
 # A global `[build] rustflags` applied it to every target; scope it so aarch64 uses correct
 # default codegen while x86_64 (linux/windows/intel-mac) keeps the AVX2/FMA win.
 [target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-Z", "threads=4", "-C", "target-cpu=x86-64-v3"]
 
 # Stack size for threads cargo spawns (tests, benches, `cargo run`).
 #
@@ -56,3 +56,7 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 # from a synchronous caller (e.g. if the sync surface is made async end to end).
 [env]
 RUST_MIN_STACK = "67108864"
+
+[build]
+# Parallel rustc front-end (nightly). Added by build-settings sweep.
+rustflags = ["-Z", "threads=4"]
