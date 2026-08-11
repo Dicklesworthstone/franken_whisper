@@ -294,6 +294,28 @@ pub struct DecodeWorkStats {
     pub temperature_fallback_retries: usize,
 }
 
+/// A long-form window the decoder discarded without emitting any transcript
+/// (bd-nqzf / bd-r0qd): the window closed no timestamp, was not classified as
+/// silence, and the seek still advanced a full chunk — so the audio in
+/// `[start_sec, end_sec)` is absent from the output with no textual trace.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DroppedWindow {
+    /// Window start in seconds (slice timebase).
+    pub start_sec: f64,
+    /// Estimated window end in seconds (start + chunk, clamped to clip end).
+    pub end_sec: f64,
+    /// Stable machine-readable reason tag.
+    pub reason: &'static str,
+    /// No-speech probability of the discarded window (low = engine believed
+    /// this was speech when it discarded it).
+    pub no_speech_prob: f64,
+    /// Mean token log-probability of the discarded window.
+    pub avg_logprob: f64,
+    /// Whether the prompt-reset retry (`FW_RETRY_FAILED_WINDOW`, default-on)
+    /// already re-attempted this window before the drop was accepted.
+    pub retried: bool,
+}
+
 /// Result of [`transcribe_samples`]: timed segments, detected/used language,
 /// and per-window QC statistics.
 #[derive(Debug, Clone)]
@@ -301,6 +323,9 @@ pub struct DecodeOutput {
     pub segments: Vec<TranscriptionSegment>,
     pub language: Option<String>,
     pub windows: Vec<WindowStats>,
+    /// Long-form windows discarded without any transcript output. Empty on
+    /// healthy runs; every entry is a real content gap the caller must see.
+    pub dropped_windows: Vec<DroppedWindow>,
     /// Aggregate work counters for performance provenance.
     pub work: DecodeWorkStats,
     /// Per-segment word timings, aligned 1:1 with `segments`, populated only
@@ -2327,6 +2352,7 @@ fn decode_independent_no_timestamp_windows(
         segments,
         language: Some(language.to_owned()),
         windows,
+        dropped_windows: Vec::new(),
         work,
         word_timings: None,
     })
@@ -2494,6 +2520,7 @@ fn transcribe_samples_uncached(
 
     let mut segments: Vec<TranscriptionSegment> = Vec::new();
     let mut windows: Vec<WindowStats> = Vec::new();
+    let mut dropped_windows: Vec<DroppedWindow> = Vec::new();
     let mut work = DecodeWorkStats::default();
     // Per-segment DTW word timings, accumulated 1:1 with `segments` when
     // `params.word_timestamps` is set (bd-rjsx).
@@ -3085,20 +3112,34 @@ fn transcribe_samples_uncached(
                 retry_enc_cache = Some((frame_offset, enc));
                 continue; // re-decode this window with no carried prompt (reusing this encode)
             }
+            let was_prompt_reset_retry = force_empty_prompt;
             force_empty_prompt = false;
 
-            // Surface the otherwise-SILENT content drop (bd-r0qd): a non-first window
-            // that closed no timestamp and isn't silence emits nothing yet advances a
-            // full chunk, so ~30 s of speech vanishes with no signal to the caller.
-            // Transcript-unchanged (a log only) ⇒ byte-exact. Points at the recovery flag.
+            // Surface the otherwise-SILENT content drop (bd-r0qd / bd-nqzf): a
+            // non-first window that closed no timestamp and isn't silence emits
+            // nothing yet advances a full chunk, so ~30 s of speech vanishes.
+            // Recorded structurally in `dropped_windows` so it reaches
+            // `RunReport.warnings` / robot output, not only stderr.
+            // Transcript-unchanged ⇒ byte-exact.
             if result_len == 0 && !is_no_speech && seek_cs > 0 {
+                let dropped_end_cs = (seek_cs + CHUNK_CS).min(seek_end_cs);
+                dropped_windows.push(DroppedWindow {
+                    start_sec: seek_cs as f64 / 100.0,
+                    end_sec: dropped_end_cs as f64 / 100.0,
+                    reason: "window_closed_no_timestamp",
+                    no_speech_prob,
+                    avg_logprob,
+                    retried: was_prompt_reset_retry,
+                });
                 tracing::warn!(
                     target: "franken_whisper::native_engine::decode",
                     seek_sec = seek_cs as f64 / 100.0,
                     no_speech_prob,
                     avg_logprob,
+                    prompt_reset_retried = was_prompt_reset_retry,
                     "long-form window closed no timestamp — ~30 s of audio dropped \
-                     (set FW_RETRY_FAILED_WINDOW=1 to attempt prompt-reset recovery; see bd-r0qd)"
+                     (prompt-reset retry is default-on via FW_RETRY_FAILED_WINDOW; \
+                      set FW_TEMP_FALLBACK=1 for sampling-ladder recovery; see bd-r0qd)"
                 );
             }
 
@@ -3182,6 +3223,10 @@ fn transcribe_samples_uncached(
                 // requested we always push one (possibly empty) word vec per emitted
                 // segment so `word_timings` stays aligned with `segments`.
                 if params.word_timestamps {
+                    // Span coverage for the word-timestamp stage (bd-vsg6): DTW
+                    // was the one production stage with no `perf_span`, so its
+                    // share of wall time was never attributable.
+                    let t_word_ts = std::time::Instant::now();
                     let win_words = if align_heads.is_empty() {
                         vec![Vec::new(); win_segments.len()]
                     } else {
@@ -3198,6 +3243,11 @@ fn transcribe_samples_uncached(
                             checkpoint,
                         )?
                     };
+                    super::perf_span(
+                        "word_ts",
+                        t_word_ts.elapsed().as_secs_f64() * 1e3,
+                        &format!("\"tokens\":{}", result_len),
+                    );
                     word_timings.extend(win_words);
                 }
 
@@ -3241,6 +3291,7 @@ fn transcribe_samples_uncached(
         segments,
         language: used_language,
         windows,
+        dropped_windows,
         work,
         word_timings: if params.word_timestamps {
             Some(word_timings)
@@ -3800,11 +3851,18 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
     let mut sample_rate = 0u32;
     let mut bits = 0u16;
     let mut data: Option<&[u8]> = None;
-    while pos + 8 <= bytes.len() {
+    while bytes.len().saturating_sub(pos) >= 8 {
         let id = &bytes[pos..pos + 4];
         let size = rd_u32(bytes, pos + 4).ok_or_else(|| bad("truncated chunk header"))? as usize;
-        let body_start = pos + 8;
-        let body_end = body_start.saturating_add(size).min(bytes.len());
+        let body_start = pos
+            .checked_add(8)
+            .ok_or_else(|| bad("chunk header offset overflow"))?;
+        let body_end = body_start
+            .checked_add(size)
+            .ok_or_else(|| bad("chunk size overflow"))?;
+        if body_end > bytes.len() {
+            return Err(bad("truncated chunk body"));
+        }
         match id {
             b"fmt " => {
                 let body = &bytes[body_start..body_end];
@@ -3822,7 +3880,12 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
             _ => {}
         }
         // Chunks are word-aligned (pad byte if odd size).
-        pos = body_end + (size & 1);
+        pos = body_end
+            .checked_add(size & 1)
+            .ok_or_else(|| bad("chunk padding offset overflow"))?;
+        if pos > bytes.len() {
+            return Err(bad("truncated chunk padding"));
+        }
     }
     if bits != 16 {
         return Err(bad("only 16-bit PCM supported"));
@@ -3830,9 +3893,18 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
     if sample_rate != SAMPLE_RATE as u32 {
         return Err(bad("expected 16 kHz audio"));
     }
-    let channels = usize::from(channels.max(1));
+    if channels == 0 {
+        return Err(bad("channel count must be nonzero"));
+    }
+    let channels = usize::from(channels);
     let data = data.ok_or_else(|| bad("no data chunk"))?;
-    let n_frames = data.len() / (2 * channels);
+    let frame_bytes = 2_usize
+        .checked_mul(channels)
+        .ok_or_else(|| bad("PCM frame size overflow"))?;
+    if !data.len().is_multiple_of(frame_bytes) {
+        return Err(bad("data chunk ends inside a PCM frame"));
+    }
+    let n_frames = data.len() / frame_bytes;
     let mut out = Vec::with_capacity(n_frames);
     if channels == 1 {
         // Mono fast path (the whisper input format, so the common case): a plain
@@ -3841,9 +3913,12 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
         // BYTE-IDENTICAL to that loop with `channels == 1`: `acc == i32(s)`, and both
         // `i32(s) as f32` and `i16 s as f32` give the exact integer (i16 ⊂ f32
         // mantissa), while `/1.0` is the identity and `/32768.0` (÷2¹⁵) is exact.
+        let (samples, remainder) = data.as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
         out.extend(
-            data.chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
+            samples
+                .iter()
+                .map(|&sample| i16::from_le_bytes(sample) as f32 / 32768.0),
         );
     } else {
         for f in 0..n_frames {
@@ -3921,6 +3996,7 @@ mod tests {
             segments: Vec::new(),
             language: Some("en".to_owned()),
             windows: Vec::new(),
+            dropped_windows: Vec::new(),
             work: DecodeWorkStats {
                 encoder_calls: 1,
                 decoder_prefill_calls: 1,
@@ -4116,7 +4192,7 @@ mod tests {
         }
         // All-masked (-inf, max=-inf) → sum exactly 0 (mask zeroes the NaN lanes).
         assert_eq!(
-            logsumexp_sum_simd(&vec![f32::NEG_INFINITY; 32], f32::NEG_INFINITY),
+            logsumexp_sum_simd(&[f32::NEG_INFINITY; 32], f32::NEG_INFINITY),
             0.0
         );
     }
@@ -4164,7 +4240,7 @@ mod tests {
         assert_eq!(argmax_idx(&with_nan), scalar(&with_nan)); // first 3.0 at index 2
         // Empty and all-masked → 0 (matches scalar initial best_i).
         assert_eq!(argmax_idx(&[]), 0);
-        assert_eq!(argmax_idx(&vec![f32::NEG_INFINITY; 20]), 0);
+        assert_eq!(argmax_idx(&[f32::NEG_INFINITY; 20]), 0);
     }
 
     #[test]
@@ -4260,8 +4336,10 @@ mod tests {
         // clamp. (The OnceLock env reader is unset in a clean test process.)
         if std::env::var_os("FW_BEAM_SIZE").is_none() {
             assert_eq!(resolve_beam_size(&DecodeParams::default()), 1);
-            let mut p = DecodeParams::default();
-            p.beam_size = Some(5);
+            let mut p = DecodeParams {
+                beam_size: Some(5),
+                ..DecodeParams::default()
+            };
             assert_eq!(
                 resolve_beam_size(&p),
                 5,
@@ -4279,7 +4357,7 @@ mod tests {
         // Faithful to whisper.cpp 6597-6617: Shannon entropy (nats) over the
         // token-id counts of the LAST 32 entries only.
         // Uniformly repeated tail → 0.0 (degenerate loop, the entropy_thold case).
-        assert_eq!(token_tail_entropy(&vec![7i32; 40]), 0.0);
+        assert_eq!(token_tail_entropy(&[7i32; 40]), 0.0);
         // 32 distinct ids → ln 32 (maximum for the window).
         let distinct: Vec<i32> = (0..32).collect();
         assert!((token_tail_entropy(&distinct) - 32f64.ln()).abs() < 1e-12);
@@ -4297,7 +4375,7 @@ mod tests {
         assert!((token_tail_entropy(&mixed) - expect).abs() < 1e-12);
         // Threshold calibration sanity (wc defaults): a fully repetitive tail is
         // far below 2.4; a fully diverse tail is above it.
-        assert!(token_tail_entropy(&vec![7i32; 33]) < ENTROPY_THRESHOLD);
+        assert!(token_tail_entropy(&[7i32; 33]) < ENTROPY_THRESHOLD);
         assert!(token_tail_entropy(&distinct) > ENTROPY_THRESHOLD);
         // Empty input is defined (0.0), matching "no evidence of a loop".
         assert_eq!(token_tail_entropy(&[]), 0.0);
@@ -4977,31 +5055,67 @@ mod tests {
     // WAV reader.
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn wav_reader_round_trips_a_synthetic_clip() {
-        // Build a 16kHz mono 16-bit WAV with a tiny ramp and read it back.
-        let samples_i16: Vec<i16> = (0..8).map(|i| (i * 1000) as i16).collect();
-        let data_bytes: Vec<u8> = samples_i16.iter().flat_map(|s| s.to_le_bytes()).collect();
+    fn synthetic_pcm_wav(channels: u16, data_bytes: &[u8]) -> Vec<u8> {
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
         wav.extend_from_slice(&(36 + data_bytes.len() as u32).to_le_bytes());
         wav.extend_from_slice(b"WAVE");
         wav.extend_from_slice(b"fmt ");
         wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
         wav.extend_from_slice(&16000u32.to_le_bytes());
-        wav.extend_from_slice(&32000u32.to_le_bytes()); // byte rate
-        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
-        wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+        wav.extend_from_slice(&(32_000_u32 * u32::from(channels)).to_le_bytes());
+        wav.extend_from_slice(&(2_u16 * channels).to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&(data_bytes.len() as u32).to_le_bytes());
-        wav.extend_from_slice(&data_bytes);
+        wav.extend_from_slice(data_bytes);
+        wav
+    }
+
+    #[test]
+    fn wav_reader_round_trips_a_synthetic_clip() {
+        // Build a 16kHz mono 16-bit WAV with a tiny ramp and read it back.
+        let samples_i16: Vec<i16> = (0..8).map(|i| (i * 1000) as i16).collect();
+        let data_bytes: Vec<u8> = samples_i16.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let wav = synthetic_pcm_wav(1, &data_bytes);
 
         let out = read_wav_16k_mono(&wav).unwrap();
         assert_eq!(out.len(), 8);
         assert!((out[0] - 0.0).abs() < 1e-9);
         assert!((out[1] - 1000.0 / 32768.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wav_reader_rejects_truncated_declared_data_and_partial_frames() {
+        let mut truncated = synthetic_pcm_wav(1, &0_i16.to_le_bytes());
+        truncated.pop();
+        assert!(
+            read_wav_16k_mono(&truncated)
+                .expect_err("declared data must be complete")
+                .to_string()
+                .contains("truncated chunk body")
+        );
+
+        let partial_stereo = synthetic_pcm_wav(2, &0_i16.to_le_bytes());
+        assert!(
+            read_wav_16k_mono(&partial_stereo)
+                .expect_err("stereo data must contain complete frames")
+                .to_string()
+                .contains("inside a PCM frame")
+        );
+    }
+
+    #[test]
+    fn wav_reader_rejects_zero_channels() {
+        let wav = synthetic_pcm_wav(0, &[]);
+        assert!(
+            read_wav_16k_mono(&wav)
+                .expect_err("zero-channel PCM is invalid")
+                .to_string()
+                .contains("channel count must be nonzero")
+        );
     }
 
     /// The `channels == 1` fast path in `read_wav_16k_mono` (`87556b4`) must be
@@ -5015,15 +5129,19 @@ mod tests {
         use std::time::Instant;
         let n = 4_000_000usize; // ~4.2 min of 16 kHz audio; cycles the full i16 range 61×.
         let mut data = vec![0u8; n * 2];
-        for (i, chunk) in data.chunks_exact_mut(2).enumerate() {
+        let (samples, remainder) = data.as_chunks_mut::<2>();
+        debug_assert!(remainder.is_empty());
+        for (i, chunk) in samples.iter_mut().enumerate() {
             // Deterministic fill covering the full i16 range (incl. ±edge values).
             chunk.copy_from_slice(&(i as i16).to_le_bytes());
         }
         // NEW: the mono fast path (what `read_wav_16k_mono` uses at channels == 1).
         let t = Instant::now();
-        let fast: Vec<f32> = data
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        let (samples, remainder) = data.as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
+        let fast: Vec<f32> = samples
+            .iter()
+            .map(|&sample| i16::from_le_bytes(sample) as f32 / 32768.0)
             .collect();
         let t_fast = t.elapsed();
         // OLD: the general per-channel accumulation loop with channels == 1.
@@ -5309,10 +5427,9 @@ mod tests {
     #[test]
     fn gated_max_context_zero_disables_prompt_carry() {
         // max_context=0 (whisper --max-context 0) disables carried previous-context
-        // — the per-request equivalent of FW_NO_CONTEXT. On tiled/looping audio the
-        // default carried prompt triggers the bd-r0qd early-EOT drop; max_context=0
-        // avoids it, so it recovers >= the default's content. (See
-        // project_final_window_early_eot_bug.)
+        // — the per-request equivalent of FW_NO_CONTEXT. The default tiny.en
+        // segment-timestamp policy also suppresses cross-window carry, so both
+        // paths must decode the same tiled content exactly once.
         let (Some(model), Some(jfk)) = (load_tiny_en(), load_jfk_samples()) else {
             eprintln!("SKIP gated_max_context_zero: tiny.en model or jfk.wav missing");
             return;
@@ -5321,6 +5438,13 @@ mod tests {
         let mut tiled = jfk.clone();
         tiled.extend_from_slice(&jfk);
         tiled.extend_from_slice(&jfk);
+        let joined = |o: &DecodeOutput| -> String {
+            o.segments
+                .iter()
+                .map(|segment| segment.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let count_country = |o: &DecodeOutput| -> usize {
             o.segments
                 .iter()
@@ -5333,17 +5457,21 @@ mod tests {
         let nocarry_out = transcribe_samples(&model, &tiled, &p, &noop).unwrap();
         let (d, n) = (count_country(&default_out), count_country(&nocarry_out));
         eprintln!("tiled-jfk 'country' count: default={d} max_context=0={n}");
-        // max_context=0 disables prompt carry, so the looping tiles decode fully
-        // (jfk×3 = 6 'country' when fully transcribed). This holds regardless of
-        // the default path: the FW_RETRY_FAILED_WINDOW retry is now default-ON, so
-        // the default ALSO recovers the tail — max_context=0 stays >= it.
-        assert!(
-            n >= 6,
-            "max_context=0 should fully transcribe the tiled content, got {n}"
+        // jfk contains "country" twice, so an exact three-tile decode contains
+        // six occurrences. A lower count is content loss; a higher count is a
+        // duplicated window-boundary decode. Pin both paths exactly rather than
+        // treating duplicated content as a stronger transcription.
+        assert_eq!(
+            d,
+            6,
+            "default path must decode each tile exactly once: {}",
+            joined(&default_out)
         );
-        assert!(
-            n >= d,
-            "max_context=0 must not lose content vs the default path, got {n} vs {d}"
+        assert_eq!(
+            n,
+            6,
+            "max_context=0 must decode each tile exactly once: {}",
+            joined(&nocarry_out)
         );
     }
 
@@ -5381,13 +5509,15 @@ mod tests {
     }
 
     #[test]
-    fn gated_beam_size_field_matches_greedy_on_jfk() {
+    fn gated_beam_size_field_preserves_jfk_words() {
         // Beam search via the DecodeParams.beam_size FIELD (whisper --beam-size).
-        // On jfk (clear, unambiguous speech) beam=5 selects the same hypothesis as
-        // greedy, so the transcript is byte-identical — this exercises the
-        // field → beam decode wiring end to end AND pins the "beam is a superset of
-        // greedy" invariant. First e2e coverage of beam search. FW_BEAM_SIZE is
-        // unset under `cargo test`, so the field is the source of truth.
+        // Beam search is not required to select greedy's byte-identical token
+        // sequence: on the aarch64 native kernels the equally correct beam-5
+        // hypothesis inserts one comma after "so". The old "beam is a superset,
+        // therefore its winner equals greedy" premise was false. Keep this gate
+        // strict in both dimensions: zero word error against the oracle, and an
+        // exact allowlist containing only the two observed punctuation variants.
+        // FW_BEAM_SIZE is unset under `cargo test`, so the field is authoritative.
         let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
             eprintln!("SKIP gated_beam_size_field: tiny.en model or jfk.wav missing");
             return;
@@ -5405,12 +5535,21 @@ mod tests {
         let beam = join(&transcribe_samples(&model, &samples, &p, &noop).unwrap());
         eprintln!("greedy: {greedy}\nbeam5:  {beam}");
         assert_eq!(
-            beam, greedy,
-            "beam=5 must match greedy on jfk (byte-identical superset)"
+            greedy, JFK_REFERENCE,
+            "greedy temp-0 transcript must retain its byte-exact oracle"
         );
+        assert_eq!(
+            crate::conformance::word_error_rate(JFK_REFERENCE, &beam).wer,
+            0.0,
+            "beam=5 must preserve every oracle word"
+        );
+        const BEAM_PUNCTUATION_VARIANTS: [&str; 2] = [
+            JFK_REFERENCE,
+            "And so, my fellow Americans ask not what your country can do for you ask what you can do for your country.",
+        ];
         assert!(
-            greedy.to_lowercase().contains("country"),
-            "baseline should transcribe jfk"
+            BEAM_PUNCTUATION_VARIANTS.contains(&beam.as_str()),
+            "beam=5 produced an unreviewed punctuation variant: {beam}"
         );
     }
 
@@ -6034,11 +6173,26 @@ mod tests {
             return;
         };
         let params = e2e_params();
-        let a = transcribe_samples(&model, &samples, &params, &noop).expect("run a");
-        let b = transcribe_samples(&model, &samples, &params, &noop).expect("run b");
-        let ja: String = a.segments.iter().map(|s| s.text.clone()).collect();
-        let jb: String = b.segments.iter().map(|s| s.text.clone()).collect();
-        assert_eq!(ja, jb, "greedy temp-0 must be deterministic across runs");
+        // Exercise two physical decodes. Calling `transcribe_samples` twice on
+        // one model would make the second result an exact-cache hit and prove
+        // only that the cache can clone its first answer.
+        let a = transcribe_samples_uncached(&model, &samples, &params, &noop).expect("run a");
+        let b = transcribe_samples_uncached(&model, &samples, &params, &noop).expect("run b");
+        assert_eq!(a.segments.len(), b.segments.len(), "segment count");
+        for (index, (left, right)) in a.segments.iter().zip(&b.segments).enumerate() {
+            assert_eq!(left.start_sec, right.start_sec, "segment {index} start");
+            assert_eq!(left.end_sec, right.end_sec, "segment {index} end");
+            assert_eq!(left.text, right.text, "segment {index} text");
+            assert_eq!(left.speaker, right.speaker, "segment {index} speaker");
+            assert_eq!(
+                left.confidence, right.confidence,
+                "segment {index} confidence"
+            );
+        }
+        assert_eq!(a.language, b.language, "detected language");
+        assert_eq!(a.windows, b.windows, "window statistics");
+        assert_eq!(a.work, b.work, "decode work counters");
+        assert_eq!(a.word_timings, b.word_timings, "word timings");
     }
 
     #[test]
@@ -6207,13 +6361,23 @@ mod tests {
         // denormal tails (softmax underflow) — the exact transient shape this
         // flake shows. Snapshot every pool worker's MXCSR around each run; a
         // non-0x1f80 value (FTZ = 0x8000, DAZ = 0x40) is the smoking gun.
-        // Read-only register read, x86-gated — no memory access.
+        // Read-only register snapshot, x86-gated. `stmxcsr` writes exactly four
+        // bytes to the initialized stack slot supplied below.
         #[cfg(target_arch = "x86_64")]
         #[allow(unsafe_code)]
         fn mxcsr_now() -> u32 {
-            // SAFETY: `_mm_getcsr` reads the thread's MXCSR register; it
-            // touches no memory and has no side effects.
-            unsafe { core::arch::x86_64::_mm_getcsr() }
+            let mut value = 0_u32;
+            // SAFETY: `value` is a live, aligned, writable four-byte stack slot;
+            // `stmxcsr` stores only the MXCSR register into that slot and does
+            // not modify flags or the stack pointer.
+            unsafe {
+                core::arch::asm!(
+                    "stmxcsr [{destination}]",
+                    destination = in(reg) &mut value,
+                    options(nostack, preserves_flags),
+                );
+            }
+            value
         }
         #[cfg(not(target_arch = "x86_64"))]
         fn mxcsr_now() -> u32 {

@@ -15,6 +15,8 @@
 //! insanely-fast / diarization bridge binaries) at `/nonexistent`. In a `sole`
 //! or `primary` rollout stage with `FRANKEN_WHISPER_NATIVE_EXECUTION=1`, a
 //! transcript can therefore only come from the in-process native engine.
+//! A separate unset-environment case proves the shipped defaults select native
+//! ASR and native Sortformer diarization without either rollout override.
 //!
 //! Every scenario is **gated**: when the real `tiny.en` ggml model is not
 //! resolvable (`find_model_file("tiny.en") == None`), it prints a `SKIP` line
@@ -108,6 +110,29 @@ fn large_v3_turbo_available() -> bool {
     franken_whisper::native_engine::find_model_file("large-v3-turbo").is_some()
 }
 
+/// The quality-safe encoder-int8 kernels are currently compiled only for
+/// x86_64 builds with AVX2. Other targets must exercise and report the
+/// conservative f32 fallback rather than claiming that the int8 arm ran.
+fn expected_default_encoder_int8_policy() -> (&'static str, &'static str) {
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
+        ("quality_safe_int8", "calibrated_model_budget_pass")
+    } else {
+        ("f32", "cpu_feature_fallback")
+    }
+}
+
+fn assert_default_encoder_int8_policy(report: &Value, context: &str) {
+    let (expected_action, expected_reason) = expected_default_encoder_int8_policy();
+    assert_eq!(
+        report["result"]["raw_output"]["encoder_int8_policy"]["action"], expected_action,
+        "{context} must report the action supported by this compiled target"
+    );
+    assert_eq!(
+        report["result"]["raw_output"]["encoder_int8_policy"]["reason"], expected_reason,
+        "{context} must report why the compiled target selected that action"
+    );
+}
+
 /// Outcome of a CLI transcribe subprocess: the parsed JSON report plus the raw
 /// streams and exit status (so error-path tests can inspect all three).
 struct CliRun {
@@ -149,6 +174,13 @@ fn run_transcribe(args: &[&str], extra_env: &[(&str, &str)], state_root: &Path) 
         "FW_ENC_INT8_ATTN_IN",
         "FW_ENC_INT8_FC1",
         "FW_ENC_WEIGHT_ROUNDTRIP",
+        "FRANKEN_WHISPER_NATIVE_EXECUTION",
+        "FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE",
+        "FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL",
+        "FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY",
+        "FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS",
+        "FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT",
+        "FW_ACOUSTIC_DIARIZATION_ROLLOUT",
     ] {
         cmd.env_remove(key);
     }
@@ -178,6 +210,11 @@ fn run_robot(args: &[&str], extra_env: &[(&str, &str)], state_root: &Path) -> Cl
         "FW_ENC_INT8_ATTN_IN",
         "FW_ENC_INT8_FC1",
         "FW_ENC_WEIGHT_ROUNDTRIP",
+        "FRANKEN_WHISPER_NATIVE_EXECUTION",
+        "FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE",
+        "FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL",
+        "FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY",
+        "FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS",
     ] {
         cmd.env_remove(key);
     }
@@ -341,6 +378,7 @@ fn gated_sole_stage_native_is_only_path() {
             "whisper-cpp",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -378,6 +416,53 @@ fn gated_sole_stage_native_is_only_path() {
     assert_eq!(
         report["result"]["raw_output"]["implementation"],
         "real-inference"
+    );
+}
+
+#[test]
+fn gated_unset_environment_defaults_to_native_asr_and_sortformer() {
+    if !franken_whisper::model_distribution::cached_whisper_is_ready()
+        || !franken_whisper::model_distribution::cached_sortformer_is_ready()
+    {
+        eprintln!(
+            "SKIP gated_unset_environment_defaults_to_native_asr_and_sortformer: native model package missing"
+        );
+        return;
+    }
+    let state = tempfile::tempdir().expect("tempdir");
+    let wav = jfk_wav();
+    let env = bridge_bins_missing();
+
+    let run = run_transcribe(
+        &[
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--no-persist",
+            "--json",
+        ],
+        &env,
+        state.path(),
+    );
+
+    assert!(
+        run.status.success(),
+        "unset-env default-native run failed\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    let report = run.report();
+    assert_reference_wer_at_or_below(&report, 0.05, "unset-env packaged Whisper default");
+    let payload = backend_ok_payload(&report);
+    assert_eq!(payload["implementation"], "native");
+    assert_eq!(payload["execution_mode"], "native_only");
+    assert_eq!(payload["native_rollout_stage"], "sole");
+    assert_eq!(
+        report["result"]["diarization"]["implementation"],
+        "native-sortformer-v1"
+    );
+    assert_eq!(
+        report["result"]["diarization"]["speaker_evidence_mode"],
+        "sortformer_activity"
     );
 }
 
@@ -630,6 +715,7 @@ fn gated_quality_safe_encoder_int8_jfk_reference_wer_gate() {
             "whisper-cpp",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -688,6 +774,7 @@ fn gated_default_encoder_int8_policy_jfk_reference_wer_gate() {
             "whisper-cpp",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -709,14 +796,7 @@ fn gated_default_encoder_int8_policy_jfk_reference_wer_gate() {
         !produced.to_lowercase().contains("frank at"),
         "default quality-safe int8 must not emit the known all-i7 adversarial phrase: {produced}"
     );
-    assert_eq!(
-        report["result"]["raw_output"]["encoder_int8_policy"]["action"],
-        "quality_safe_int8"
-    );
-    assert_eq!(
-        report["result"]["raw_output"]["encoder_int8_policy"]["reason"],
-        "calibrated_model_budget_pass"
-    );
+    assert_default_encoder_int8_policy(&report, "tiny.en default encoder-int8 policy");
 
     let payload = backend_ok_payload(&report);
     assert_eq!(
@@ -752,6 +832,7 @@ fn gated_default_encoder_int8_large_v3_turbo_jfk_adversarial_probe() {
             "whisper-cpp",
             "--model",
             "large-v3-turbo",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -778,10 +859,7 @@ fn gated_default_encoder_int8_large_v3_turbo_jfk_adversarial_probe() {
         !produced.to_lowercase().contains("frank at"),
         "large-v3-turbo default quality-safe int8 must not emit known all-i7 phrase: {produced}"
     );
-    assert_eq!(
-        report["result"]["raw_output"]["encoder_int8_policy"]["action"],
-        "quality_safe_int8"
-    );
+    assert_default_encoder_int8_policy(&report, "large-v3-turbo default encoder-int8 policy");
 }
 
 // ===========================================================================
@@ -811,6 +889,7 @@ fn gated_primary_stage_prefers_native() {
             "whisper-cpp",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -862,6 +941,7 @@ fn bridge_only_missing_bridge_errors_honestly() {
             wav.to_str().expect("utf8"),
             "--backend",
             "whisper-cpp",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -913,6 +993,7 @@ fn gated_insanely_fast_native_through_dispatch() {
             "insanely-fast",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -963,6 +1044,7 @@ fn gated_diarization_native_through_dispatch() {
             "whisper-diarization",
             "--model",
             "tiny.en",
+            "--no-diarize",
             "--no-persist",
             "--json",
         ],
@@ -1006,18 +1088,18 @@ fn gated_diarization_native_through_dispatch() {
 }
 
 // ===========================================================================
-// (f) double-diarization regression: --backend whisper-diarization --diarize
-//     must NOT diarize twice. The backend owns diarization, so the pipeline
-//     Diarize stage must emit a `diarize.skip` event with the structured
-//     `backend_owns_diarization` reason, while segments still carry the
-//     backend's SPEAKER_ labels.
+// (f) diarization provenance regression: --backend whisper-diarization
+//     currently labels native ASR segments with a legacy text/temporal
+//     heuristic. Those labels are explicitly not acoustic or external speaker
+//     evidence, so --diarize must run the native acoustic stage instead of
+//     allowing the heuristic to short-circuit it.
 // ===========================================================================
 
 #[test]
-fn gated_diarize_flag_with_diarization_backend_skips_pipeline_diarize() {
+fn gated_diarize_flag_with_legacy_backend_runs_acoustic_diarization() {
     if !tiny_en_available() {
         eprintln!(
-            "SKIP gated_diarize_flag_with_diarization_backend_skips_pipeline_diarize: tiny.en model missing"
+            "SKIP gated_diarize_flag_with_legacy_backend_runs_acoustic_diarization: tiny.en model missing"
         );
         return;
     }
@@ -1027,6 +1109,7 @@ fn gated_diarize_flag_with_diarization_backend_skips_pipeline_diarize() {
     let mut env = vec![
         ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
         ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
+        ("FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT", "sole"),
     ];
     env.extend(bridge_bins_missing());
 
@@ -1037,6 +1120,8 @@ fn gated_diarize_flag_with_diarization_backend_skips_pipeline_diarize() {
             "--backend",
             "whisper-diarization",
             "--diarize",
+            "--diarization-engine",
+            "acoustic",
             "--model",
             "tiny.en",
             "--no-persist",
@@ -1055,26 +1140,29 @@ fn gated_diarize_flag_with_diarization_backend_skips_pipeline_diarize() {
     );
     let report = run.report();
 
-    // (b) the events array contains a diarize skip with the backend-owns reason.
+    // (b) The legacy heuristic must not masquerade as external speaker
+    // evidence or suppress the requested waveform-derived acoustic pass.
     let events = report["events"].as_array().expect("report events array");
-    let diarize_skip = events
+    let rollout = events
         .iter()
-        .find(|e| e["code"].as_str() == Some("diarize.skip"))
+        .find(|event| event["code"].as_str() == Some("diarize.rollout"))
         .unwrap_or_else(|| {
             let codes: Vec<&str> = events.iter().filter_map(|e| e["code"].as_str()).collect();
-            panic!("no diarize.skip event; codes seen: {codes:?}");
+            panic!("no diarize.rollout event; codes seen: {codes:?}");
         });
     assert_eq!(
-        diarize_skip["payload"]["reason"], "backend_owns_diarization",
-        "pipeline diarize stage must be skipped because the backend owns diarization"
+        rollout["payload"]["external_speaker_evidence"], false,
+        "legacy text/temporal labels must not satisfy the external-evidence provenance gate"
     );
     assert_eq!(
-        diarize_skip["payload"]["details"]["backend"],
-        "whisper_diarization"
+        rollout["payload"]["resolved_engine"], "acoustic",
+        "the explicit test rollout must select native acoustic diarization after rejecting legacy heuristic evidence"
     );
 
-    // Defensively prove there was no SECOND diarize pass: exactly one
-    // diarize-stage event total, and it is the skip.
+    // The complete stage trace is authoritative: rollout resolution, one
+    // start, the explicit no-hint evidence record, one assembled report, the
+    // acoustic change summary, and one successful completion. A skip or a
+    // second start would fail this exact sequence.
     let diarize_events: Vec<&str> = events
         .iter()
         .filter(|e| e["stage"].as_str() == Some("diarize"))
@@ -1082,20 +1170,48 @@ fn gated_diarize_flag_with_diarization_backend_skips_pipeline_diarize() {
         .collect();
     assert_eq!(
         diarize_events,
-        vec!["diarize.skip"],
-        "the pipeline diarize stage must run exactly once as a skip, never re-diarizing"
+        vec![
+            "diarize.rollout",
+            "diarize.start",
+            "diarize.tiny_diarize_hint_evidence",
+            "diarize.progress",
+            "diarize.change",
+            "diarize.ok"
+        ],
+        "the pipeline must run exactly one authoritative diarization pass before the native acoustic fallback is attached"
     );
 
-    // (c) segments still carry SPEAKER_ labels (from the backend's diarizer).
+    // (c) The attached durable report, not the backend's provisional labels,
+    // records which evidence actually produced the final attribution.
+    assert_eq!(
+        report["result"]["diarization"]["speaker_evidence_mode"],
+        "acoustic_v2"
+    );
+    assert_eq!(
+        report["result"]["raw_output"]["diarizer"], "text-temporal-heuristic",
+        "backend provenance must continue to disclose its provisional heuristic"
+    );
+
+    // This short single-speaker fixture does not contain enough independent
+    // recurrence to support an identity profile. The acoustic engine must
+    // therefore replace the provisional heuristic labels with explicit
+    // unknown attribution instead of preserving counterfeit confidence.
+    assert_eq!(
+        report["result"]["diarization"]["fallback_status"],
+        "speaker_count_unresolved"
+    );
+    assert_eq!(
+        report["result"]["diarization"]["speaker_count"]["unknown_voiced_share"],
+        1.0
+    );
     let segments = report["result"]["segments"]
         .as_array()
         .expect("segments array");
     assert!(!segments.is_empty(), "diarization produced no segments");
     for seg in segments {
-        let speaker = seg["speaker"].as_str().unwrap_or_default();
         assert!(
-            speaker.starts_with("SPEAKER_"),
-            "segment speaker `{speaker}` must be a SPEAKER_NN label from the backend"
+            seg["speaker"].is_null(),
+            "unsupported legacy labels must be removed rather than promoted to acoustic evidence"
         );
     }
 }

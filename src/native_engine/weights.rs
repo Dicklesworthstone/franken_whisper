@@ -7,7 +7,8 @@
 //! so this module provides:
 //!
 //! - [`SafetensorsFile`] — a strict, self-contained safetensors reader that
-//!   loads any `F32` / `F16` / `BF16` tensor and exposes it as `(shape, Vec<f32>)`.
+//!   loads `F32` / `F16` / `BF16` tensors as `(shape, Vec<f32>)` and preserves
+//!   exact `I64` payloads for model-specific conformance checks.
 //! - [`WeightsManifest`] + [`validate`] — an expected-census check so a wrong
 //!   or stale file fails *loud* with a named diff (missing / mis-shaped / extra
 //!   tensors) instead of silently mis-loading.
@@ -59,26 +60,31 @@ const MAX_HEADER_LEN: u64 = 100 * 1024 * 1024;
 /// `convert_to_safetensors.py`).
 const METADATA_KEY: &str = "__metadata__";
 
-/// A safetensors dtype we know how to materialize as `f32`.
+/// A safetensors dtype accepted by the parser.
+///
+/// Floating-point payloads can be materialized as `f32`; I64 payloads remain
+/// exact control data and are available only through the raw-byte seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StDType {
     F32,
     F16,
     Bf16,
+    I64,
 }
 
 impl StDType {
-    /// Parse the dtype string from a header entry. Only the dense float types
-    /// the neural aux models use are supported; integer / bool / f64 dtypes are
-    /// rejected loudly (the consumers want f32 weights).
+    /// Parse the dtype string from a header entry. Dense float weights and
+    /// exact I64 control tensors are supported; bool and wider float types are
+    /// rejected loudly.
     fn parse(s: &str, tensor: &str) -> FwResult<Self> {
         match s {
             "F32" => Ok(Self::F32),
             "F16" => Ok(Self::F16),
             "BF16" => Ok(Self::Bf16),
+            "I64" => Ok(Self::I64),
             other => Err(FwError::InvalidRequest(format!(
                 "safetensors tensor `{tensor}`: unsupported dtype `{other}` \
-                 (only F32, F16, BF16 are supported)"
+                 (only F32, F16, BF16, I64 are supported)"
             ))),
         }
     }
@@ -88,6 +94,7 @@ impl StDType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::Bf16 => 2,
+            Self::I64 => 8,
         }
     }
 
@@ -97,6 +104,7 @@ impl StDType {
             Self::F32 => "F32",
             Self::F16 => "F16",
             Self::Bf16 => "BF16",
+            Self::I64 => "I64",
         }
     }
 }
@@ -401,11 +409,17 @@ impl SafetensorsFile {
     /// # Errors
     ///
     /// [`FwError::InvalidRequest`] if `name` is absent (the message lists a few
-    /// available names), or — defensively — if the recorded byte span no longer
-    /// matches the element count (should be impossible post-[`load`](Self::load),
-    /// but checked rather than panicking on a slice).
+    /// available names), if the tensor is exact I64 control data, or —
+    /// defensively — if the recorded byte span no longer matches the element
+    /// count (should be impossible post-[`load`](Self::load), but checked rather
+    /// than panicking on a slice).
     pub fn tensor_f32(&self, name: &str) -> FwResult<(Vec<usize>, Vec<f32>)> {
         let entry = self.tensor_entry(name)?;
+        if entry.dtype == StDType::I64 {
+            return Err(FwError::InvalidRequest(format!(
+                "safetensors tensor `{name}`: I64 control data cannot be materialized as f32"
+            )));
+        }
 
         let (n_elements, _) = checked_tensor_layout(name, &entry.shape, entry.dtype)?;
         let raw = self.tensor_raw_bytes(name)?;
@@ -428,6 +442,7 @@ impl SafetensorsFile {
                     out.push(BFloat16::from_le_bytes(*chunk).to_f32());
                 }
             }
+            StDType::I64 => unreachable!("I64 tensors are rejected before allocation"),
         }
         debug_assert_eq!(out.len() * width, raw.len());
         Ok((entry.shape.clone(), out))
@@ -887,7 +902,8 @@ fn aux_resolution_error(file_name: &str, dirs: &[PathBuf]) -> String {
         "\nFix: run `scripts/fetch_aux_models.sh` to provision aux models into the \
          `aux/` subdirectory of $FRANKEN_WHISPER_MODEL_DIR, set $FRANKEN_WHISPER_MODEL_DIR \
          to the directory containing the file, or pass an explicit path. FrankenWhisper \
-         never downloads models automatically (data never leaves the machine).",
+         never downloads operator-local auxiliary models automatically (data never leaves \
+         the machine during inference).",
     );
     msg
 }
@@ -1069,6 +1085,33 @@ mod tests {
         assert_eq!(file.dtype_name("b").expect("dtype"), "BF16");
         // No metadata key present.
         assert!(file.metadata().is_none());
+    }
+
+    #[test]
+    fn i64_control_tensor_preserves_exact_payload() {
+        let payload = [320_i64, -7_i64]
+            .into_iter()
+            .flat_map(i64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let tensors = vec![SynTensor {
+            name: "lengths",
+            dtype: "I64",
+            shape: vec![2],
+            payload: payload.clone(),
+        }];
+        let bytes = build_safetensors(&tensors, None);
+        let file = SafetensorsFile::from_bytes(&bytes).expect("load I64");
+
+        assert_eq!(file.dtype_name("lengths").expect("dtype"), "I64");
+        assert_eq!(file.shape("lengths").expect("shape"), &[2]);
+        assert_eq!(
+            file.tensor_raw_bytes("lengths").expect("raw I64 bytes"),
+            payload
+        );
+        let error = file
+            .tensor_f32("lengths")
+            .expect_err("I64 must not silently convert to f32");
+        assert!(error.to_string().contains("cannot be materialized as f32"));
     }
 
     #[test]
@@ -1257,7 +1300,7 @@ mod tests {
     #[test]
     fn unsupported_dtype_errors() {
         let header = serde_json::json!({
-            "t": { "dtype": "I64", "shape": [1], "data_offsets": [0, 8] }
+            "t": { "dtype": "F64", "shape": [1], "data_offsets": [0, 8] }
         });
         let header_json = serde_json::to_vec(&header).expect("ser");
         let mut bytes = Vec::new();
@@ -1267,7 +1310,7 @@ mod tests {
         let err = SafetensorsFile::from_bytes(&bytes).expect_err("bad dtype");
         let msg = err.to_string();
         assert!(msg.contains("unsupported dtype"), "msg: {msg}");
-        assert!(msg.contains("I64"), "names dtype: {msg}");
+        assert!(msg.contains("F64"), "names dtype: {msg}");
     }
 
     #[test]

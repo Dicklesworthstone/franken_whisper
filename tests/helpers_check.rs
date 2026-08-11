@@ -100,6 +100,11 @@ fn helpers_assert_events_ordered_works() {
 #[test]
 fn helpers_mock_backend_env_has_expected_keys() {
     let env = helpers::mock_backend_env();
+    assert_eq!(
+        env.get("FRANKEN_WHISPER_NATIVE_EXECUTION")
+            .map(String::as_str),
+        Some("0")
+    );
     assert!(env.contains_key("FRANKEN_WHISPER_WHISPER_CPP_BIN"));
     assert!(env.contains_key("FRANKEN_WHISPER_INSANELY_FAST_BIN"));
     assert!(env.contains_key("FRANKEN_WHISPER_PYTHON_BIN"));

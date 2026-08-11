@@ -193,28 +193,27 @@ fn bench_sync_import(c: &mut Criterion) {
 fn bench_sync_export_incremental(c: &mut Criterion) {
     let mut group = c.benchmark_group("sync/export_incremental");
 
-    for run_count in [50usize] {
-        let fixture = tempdir().expect("tempdir");
-        let src_db = fixture.path().join(format!("src-{run_count}.sqlite3"));
-        seed_db(&src_db, run_count);
+    let run_count = 50usize;
+    let fixture = tempdir().expect("tempdir");
+    let src_db = fixture.path().join(format!("src-{run_count}.sqlite3"));
+    seed_db(&src_db, run_count);
 
-        group.bench_with_input(BenchmarkId::new("runs", run_count), &run_count, |b, &n| {
-            b.iter_batched(
-                || {
-                    let iter_dir = tempdir().expect("tempdir");
-                    let out_dir = iter_dir.path().join("out");
-                    let state_root = iter_dir.path().join("state");
-                    (iter_dir, out_dir, state_root)
-                },
-                |(_iter_dir, out_dir, state_root)| {
-                    let manifest = sync::export_incremental(&src_db, &out_dir, &state_root)
-                        .expect("incremental export should succeed");
-                    assert_eq!(manifest.row_counts.runs, n as u64);
-                },
-                BatchSize::SmallInput,
-            );
-        });
-    }
+    group.bench_with_input(BenchmarkId::new("runs", run_count), &run_count, |b, &n| {
+        b.iter_batched(
+            || {
+                let iter_dir = tempdir().expect("tempdir");
+                let out_dir = iter_dir.path().join("out");
+                let state_root = iter_dir.path().join("state");
+                (iter_dir, out_dir, state_root)
+            },
+            |(_iter_dir, out_dir, state_root)| {
+                let manifest = sync::export_incremental(&src_db, &out_dir, &state_root)
+                    .expect("incremental export should succeed");
+                assert_eq!(manifest.row_counts.runs, n as u64);
+            },
+            BatchSize::SmallInput,
+        );
+    });
 
     group.finish();
 }

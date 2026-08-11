@@ -32,6 +32,8 @@ mod bench {
     use core::arch::x86_64::*;
     use std::time::Instant;
 
+    type GemvFn = dyn Fn(&[i8], usize, usize, &[i8], &mut [i32]);
+
     /// Single-row reference == the engine's `nn::dot_i8` (2 i32 accumulators).
     #[inline]
     unsafe fn dot1(w: *const i8, x: *const i8, n: usize) -> i32 {
@@ -118,16 +120,16 @@ mod bench {
     blocked!(dot4, 4);
 
     fn gemv1(w: &[i8], out: usize, inp: usize, x: &[i8], o: &mut [i32]) {
-        for r in 0..out {
-            o[r] = unsafe { dot1(w.as_ptr().add(r * inp), x.as_ptr(), inp) };
+        for (r, output) in o.iter_mut().take(out).enumerate() {
+            *output = unsafe { dot1(w.as_ptr().add(r * inp), x.as_ptr(), inp) };
         }
     }
     fn gemv4(w: &[i8], out: usize, inp: usize, x: &[i8], o: &mut [i32]) {
         let mut r = 0usize;
         while r + 4 <= out {
             let mut p = [core::ptr::null::<i8>(); 4];
-            for k in 0..4 {
-                p[k] = unsafe { w.as_ptr().add((r + k) * inp) };
+            for (k, row) in p.iter_mut().enumerate() {
+                *row = unsafe { w.as_ptr().add((r + k) * inp) };
             }
             let mut res = [0i32; 4];
             unsafe { dot4(p, x.as_ptr(), inp, &mut res) };
@@ -183,24 +185,23 @@ mod bench {
                 gemv1(&ws[0], out, inp, &x, &mut o1);
                 gemv4(&ws[0], out, inp, &x, &mut o4);
                 let exact = o1 == o4;
-                let bench =
-                    |f: &dyn Fn(&[i8], usize, usize, &[i8], &mut [i32]), o: &mut [i32]| -> f64 {
-                        for c in 0..copies.min(4) {
-                            f(&ws[c], out, inp, &x, o);
+                let bench = |f: &GemvFn, o: &mut [i32]| -> f64 {
+                    for weights in ws.iter().take(copies.min(4)) {
+                        f(weights, out, inp, &x, o);
+                    }
+                    let mut best = f64::INFINITY;
+                    for _ in 0..10 {
+                        let t = Instant::now();
+                        for weights in &ws {
+                            f(weights, out, inp, &x, o);
                         }
-                        let mut best = f64::INFINITY;
-                        for _ in 0..10 {
-                            let t = Instant::now();
-                            for c in 0..copies {
-                                f(&ws[c], out, inp, &x, o);
-                            }
-                            let us = t.elapsed().as_secs_f64() * 1e6 / copies as f64;
-                            if us < best {
-                                best = us;
-                            }
+                        let us = t.elapsed().as_secs_f64() * 1e6 / copies as f64;
+                        if us < best {
+                            best = us;
                         }
-                        best
-                    };
+                    }
+                    best
+                };
                 let t1 = bench(&gemv1, &mut o1);
                 let t4 = bench(&gemv4, &mut o4);
                 std::hint::black_box(o4.iter().map(|&v| v as i64).sum::<i64>());

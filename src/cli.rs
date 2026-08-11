@@ -17,14 +17,28 @@ use crate::sync::ConflictPolicy;
 
 const MAX_SPEAKER_HINTS_BYTES: u64 = 1024 * 1024;
 
+/// Extended version report used by `--version`. Model weights are deliberately
+/// called out because they are not bundled with the project binary and may be
+/// governed by licenses other than the project license.
+pub const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nproject license: MIT with OpenAI/Anthropic rider\n",
+    "model weights: not bundled; third-party model terms apply\n",
+    "Sortformer distribution: hash-pinned GitHub release artifact with license and notice"
+);
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum SpeakerHintsFile {
     Intervals(Vec<KnownSpeakerInterval>),
-    Document {
-        schema_version: String,
-        known_intervals: Vec<KnownSpeakerInterval>,
-    },
+    Document(SpeakerHintsDocument),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpeakerHintsDocument {
+    schema_version: String,
+    known_intervals: Vec<KnownSpeakerInterval>,
 }
 
 fn parse_speaker_hints(bytes: &[u8]) -> FwResult<Vec<KnownSpeakerInterval>> {
@@ -35,28 +49,83 @@ fn parse_speaker_hints(bytes: &[u8]) -> FwResult<Vec<KnownSpeakerInterval>> {
     })?;
     match parsed {
         SpeakerHintsFile::Intervals(intervals) => Ok(intervals),
-        SpeakerHintsFile::Document {
+        SpeakerHintsFile::Document(SpeakerHintsDocument {
             schema_version,
             known_intervals,
-        } if schema_version == "speaker-hints-v1" => Ok(known_intervals),
-        SpeakerHintsFile::Document { .. } => Err(FwError::InvalidRequest(
+        }) if schema_version == "speaker-hints-v1" => Ok(known_intervals),
+        SpeakerHintsFile::Document(_) => Err(FwError::InvalidRequest(
             "speaker hints document must use schema_version speaker-hints-v1".to_owned(),
         )),
     }
 }
 
 fn read_speaker_hints(path: &Path) -> FwResult<Vec<KnownSpeakerInterval>> {
+    let path_metadata = std::fs::symlink_metadata(path).map_err(|_| {
+        FwError::InvalidRequest("speaker hints file could not be inspected".to_owned())
+    })?;
+    if metadata_is_indirection(&path_metadata) || !path_metadata.is_file() {
+        return Err(FwError::InvalidRequest(
+            "speaker hints must be a regular non-symlink file".to_owned(),
+        ));
+    }
+    #[cfg(target_family = "unix")]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+
+        let descriptor = open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| {
+            FwError::InvalidRequest("speaker hints file could not be opened".to_owned())
+        })?;
+        std::fs::File::from(descriptor)
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| {
+                FwError::InvalidRequest("speaker hints file could not be opened".to_owned())
+            })?
+    };
+    #[cfg(not(any(target_family = "unix", windows)))]
     let file = std::fs::File::open(path).map_err(|_| {
         FwError::InvalidRequest("speaker hints file could not be opened".to_owned())
     })?;
-    if file
-        .metadata()
-        .map_err(|_| {
-            FwError::InvalidRequest("speaker hints file metadata could not be read".to_owned())
-        })?
-        .len()
-        > MAX_SPEAKER_HINTS_BYTES
+    let descriptor_metadata = file.metadata().map_err(|_| {
+        FwError::InvalidRequest("speaker hints file metadata could not be read".to_owned())
+    })?;
+    if !descriptor_metadata.is_file() {
+        return Err(FwError::InvalidRequest(
+            "speaker hints must be a regular file".to_owned(),
+        ));
+    }
+    #[cfg(target_family = "unix")]
     {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if path_metadata.dev() != descriptor_metadata.dev()
+            || path_metadata.ino() != descriptor_metadata.ino()
+        {
+            return Err(FwError::InvalidRequest(
+                "speaker hints file changed while being opened".to_owned(),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    if metadata_is_indirection(&descriptor_metadata) {
+        return Err(FwError::InvalidRequest(
+            "speaker hints must be a regular non-symlink file".to_owned(),
+        ));
+    }
+    if descriptor_metadata.len() > MAX_SPEAKER_HINTS_BYTES {
         return Err(FwError::InvalidRequest(
             "speaker hints file exceeds the 1 MiB safety limit".to_owned(),
         ));
@@ -72,6 +141,21 @@ fn read_speaker_hints(path: &Path) -> FwResult<Vec<KnownSpeakerInterval>> {
         ));
     }
     parse_speaker_hints(&bytes)
+}
+
+fn metadata_is_indirection(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn parse_speaker_count_range(value: &str) -> FwResult<(u32, u32)> {
@@ -223,6 +307,10 @@ impl ShutdownController {
 #[derive(Debug, Parser)]
 #[command(name = "franken_whisper")]
 #[command(about = "Agent-first Rust ASR orchestrator with ffmpeg normalization")]
+#[command(version, long_version = LONG_VERSION)]
+#[command(
+    after_help = "Agent orientation: `fw robot triage`\nMachine contract: `fw capabilities --json`\nModel readiness: `fw models --json`\nInstall both native models: `fw pull all --json`"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -230,16 +318,23 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Transcribe one local audio/video source with native diarization by default.
     Transcribe(Box<TranscribeArgs>),
+    /// Emit stable JSON/NDJSON surfaces intended for software agents.
+    #[command(visible_alias = "agent")]
     Robot {
         #[command(subcommand)]
         command: RobotCommand,
     },
+    /// Query persisted transcription runs.
     Runs(RunsArgs),
+    /// Export or import the SQLite state as an auditable JSONL snapshot.
     Sync {
         #[command(subcommand)]
         command: SyncCommand,
     },
+    /// Encode, decode, and control low-bandwidth TTY audio streams.
+    #[command(visible_alias = "tty")]
     TtyAudio {
         #[command(subcommand)]
         command: TtyAudioCommand,
@@ -259,10 +354,148 @@ pub enum Command {
         #[command(subcommand)]
         command: DifferentialOracleCommand,
     },
+    /// Run the explicitly selected, evaluation-only native Streaming Sortformer.
+    #[command(name = "sortformer-diarize", visible_alias = "sortformer")]
+    SortformerDiarize(SortformerDiarizeArgs),
+    /// Internal fresh-process lane worker. This is intentionally absent from help.
+    #[command(name = "__comparison-worker", hide = true)]
+    ComparisonWorker,
+    /// Internal process-tree cancellation probe. This is intentionally absent from help.
+    #[command(name = "__comparison-cancel-probe", hide = true)]
+    ComparisonCancelProbe(ComparisonCancelProbeArgs),
+    /// Launch the optional human-oriented terminal interface.
     Tui,
     /// Download YouTube audio (videos / playlists / a URL file) and
     /// transcribe each into a markdown + JSON pair.
     Youtube(Box<YoutubeArgs>),
+    /// Describe stable commands, schemas, features, and error recovery as JSON.
+    Capabilities(CapabilitiesArgs),
+    /// Report built-in and cached model readiness without downloading.
+    Models(ModelsArgs),
+    /// Explicitly download and verify a release-bound model package.
+    Pull(PullArgs),
+    /// Diagnose whether this installation can perform useful work.
+    Doctor(DoctorArgs),
+    /// Print compact agent integration documentation from the running binary.
+    #[command(name = "robot-docs")]
+    RobotDocs {
+        #[command(subcommand)]
+        command: RobotDocsCommand,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct ComparisonCancelProbeArgs {
+    #[arg(long, hide = true)]
+    pub descendant: bool,
+    #[arg(long, hide = true)]
+    pub lease_parent: bool,
+    #[arg(long, hide = true)]
+    pub root_pid_file: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    pub descendant_pid_file: Option<PathBuf>,
+}
+
+/// Output controls for the machine-discoverable capability catalog.
+#[derive(Debug, Args)]
+pub struct CapabilitiesArgs {
+    /// Emit the complete stable JSON contract instead of a compact summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Output controls for the model and package registry.
+#[derive(Debug, Args)]
+pub struct ModelsArgs {
+    /// Emit the complete stable JSON registry instead of a compact summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Model family accepted by the explicit downloader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PullModelArg {
+    All,
+    Whisper,
+    Sortformer,
+}
+
+/// Explicit model-download controls. No other command performs network access.
+#[derive(Debug, Args)]
+pub struct PullArgs {
+    /// Model package to fetch into the per-user verified cache.
+    #[arg(value_enum, default_value_t = PullModelArg::All)]
+    pub model: PullModelArg,
+
+    /// Emit one stable JSON object and suppress human progress output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Detect-only installation diagnostics. This command never downloads, moves,
+/// converts, or modifies model artifacts.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Path to the frankensqlite database file to inspect.
+    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    pub db: PathBuf,
+
+    /// Emit one JSON object with no terminal decoration.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Exit non-zero unless both native default model packages are verified.
+    #[arg(long)]
+    pub strict: bool,
+}
+
+/// Built-in documentation topics for software agents.
+#[derive(Debug, Subcommand)]
+pub enum RobotDocsCommand {
+    /// Print the canonical orientation and recovery guide.
+    Guide,
+}
+
+/// Explicit native Streaming Sortformer invocation.
+#[derive(Args)]
+pub struct SortformerDiarizeArgs {
+    /// Audio input in any format accepted by the native normalizer or ffmpeg fallback.
+    #[arg(long)]
+    pub input: PathBuf,
+
+    /// Explicit conversion receipt; omit with --package to use the verified cache.
+    #[arg(long, requires = "package")]
+    pub receipt: Option<PathBuf>,
+
+    /// Explicit safetensors package; omit with --receipt to use the verified cache.
+    #[arg(long, requires = "receipt")]
+    pub package: Option<PathBuf>,
+
+    /// Optional speaker-hints-v1 JSON used for lane-to-reference mapping.
+    #[arg(long)]
+    pub speaker_hints: Option<PathBuf>,
+}
+
+impl SortformerDiarizeArgs {
+    pub fn load_speaker_hints(&self) -> FwResult<Vec<KnownSpeakerInterval>> {
+        self.speaker_hints
+            .as_deref()
+            .map(read_speaker_hints)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+}
+
+impl fmt::Debug for SortformerDiarizeArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SortformerDiarizeArgs")
+            .field("input", &"<redacted>")
+            .field("receipt", &"<redacted>")
+            .field("package", &"<redacted>")
+            .field("speaker_hints", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Public-corpus registry, preparation, and aggregate evaluation commands.
@@ -270,6 +503,8 @@ pub enum Command {
 pub enum PublicCorpusCommand {
     /// Emit the built-in corpus/license/conversion registry as JSON.
     Registry,
+    /// Prepare a deterministic external VoxConverse descriptor without copying media.
+    PrepareVoxconverse(PublicCorpusVoxconversePrepareArgs),
     /// Build a path-free bundle (artifact writing requires Linux/Android/Apple).
     Build(PublicCorpusBuildArgs),
     /// Run frozen ablations (artifact writing requires Linux/Android/Apple).
@@ -278,6 +513,53 @@ pub enum PublicCorpusCommand {
     SidecarStudy(PublicCorpusSidecarStudyArgs),
     /// Compare diarizers (artifact writing requires Linux/Android/Apple).
     CompareModels(PublicCorpusModelComparisonArgs),
+}
+
+/// Arguments for native VoxConverse descriptor preparation.
+#[derive(Args)]
+pub struct PublicCorpusVoxconversePrepareArgs {
+    /// Absolute external root containing all selected inputs and the new descriptor.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute directory containing the official development WAV files.
+    #[arg(long)]
+    pub development_audio_root: PathBuf,
+
+    /// Absolute directory containing the official test WAV files.
+    #[arg(long)]
+    pub test_audio_root: PathBuf,
+
+    /// Absolute root containing the official `dev/` and `test/` RTTM directories.
+    #[arg(long)]
+    pub annotation_root: PathBuf,
+
+    /// New absolute descriptor path beneath `--input-root`.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Immutable, path-free upstream version identity recorded in the descriptor.
+    #[arg(long)]
+    pub source_version: String,
+
+    /// Exact acknowledgement ID emitted by `diarization-corpus registry`.
+    #[arg(long)]
+    pub license_ack: String,
+}
+
+impl fmt::Debug for PublicCorpusVoxconversePrepareArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicCorpusVoxconversePrepareArgs")
+            .field("input_root", &"<redacted>")
+            .field("development_audio_root", &"<redacted>")
+            .field("test_audio_root", &"<redacted>")
+            .field("annotation_root", &"<redacted>")
+            .field("output", &"<redacted>")
+            .field("source_version", &"<redacted>")
+            .field("license_ack", &self.license_ack)
+            .finish()
+    }
 }
 
 /// Developer-only external differential-diagnostic commands.
@@ -614,9 +896,13 @@ pub struct YoutubeArgs {
     #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
     pub backend: BackendKind,
 
-    /// Enable speaker diarization.
+    /// Explicitly enable speaker diarization (already enabled by default).
     #[arg(long)]
     pub diarize: bool,
+
+    /// Disable the default native speaker diarization stage.
+    #[arg(long, conflicts_with = "diarize")]
+    pub no_diarize: bool,
 
     /// Maximum concurrent downloads.
     #[arg(long, default_value_t = 3)]
@@ -662,7 +948,7 @@ impl YoutubeArgs {
             model: self.model.clone(),
             language: self.language.clone(),
             backend: self.backend,
-            diarize: self.diarize,
+            diarize: self.diarize || !self.no_diarize,
             concurrency: self.concurrency,
             keep_audio: !self.no_keep_audio,
             retry_failed: !self.no_retry,
@@ -673,10 +959,17 @@ impl YoutubeArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum RobotCommand {
+    /// Run a transcription pipeline and stream NDJSON events.
     Run(Box<TranscribeArgs>),
+    /// Emit the stable robot event schema as one JSON line.
     Schema,
+    /// Discover backend capabilities and live availability.
     Backends,
+    /// Probe dependencies and runtime resources.
     Health(HealthArgs),
+    /// Orient an agent in one round trip with state-aware next commands.
+    Triage(HealthArgs),
+    /// Query persisted adaptive-routing decisions as NDJSON.
     RoutingHistory(RoutingHistoryArgs),
 }
 
@@ -685,6 +978,10 @@ pub struct HealthArgs {
     /// Path to frankensqlite database file.
     #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
     pub db: PathBuf,
+
+    /// Exit non-zero when the report is not fully healthy.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Args)]
@@ -790,16 +1087,20 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub translate: bool,
 
-    /// Request speaker diarization.
+    /// Explicitly request speaker diarization (already enabled by default).
     #[arg(long)]
     pub diarize: bool,
+
+    /// Disable the default native speaker diarization stage.
+    #[arg(long, conflicts_with = "diarize")]
+    pub no_diarize: bool,
 
     /// Speaker diarization implementation.
     #[arg(long, value_enum, default_value_t = DiarizationEngine::Auto)]
     pub diarization_engine: DiarizationEngine,
 
     /// Conservative action when the requested diarizer lacks evidence.
-    #[arg(long, value_enum, default_value_t = DiarizationFallbackPolicy::Unknown)]
+    #[arg(long, value_enum, default_value_t = DiarizationFallbackPolicy::Acoustic)]
     pub diarization_fallback: DiarizationFallbackPolicy,
 
     /// Speaker-hints-v1 JSON; its source path is not retained.
@@ -978,6 +1279,12 @@ pub struct TranscribeArgs {
     /// Enable TinyDiarize speaker-turn token injection (whisper.cpp).
     #[arg(long)]
     pub tiny_diarize: bool,
+
+    /// Opt in to rule-based segment-text normalization (sentence-casing and
+    /// terminal periods). Off by default so `segments[].text` stays faithful
+    /// to the decoded transcript.
+    #[arg(long)]
+    pub normalize_segment_text: bool,
 
     /// Time offset in milliseconds to start processing (whisper.cpp).
     #[arg(long)]
@@ -1267,6 +1574,7 @@ impl TranscribeArgs {
     /// strings and paths instead of cloning them immediately before the CLI
     /// object is discarded.
     pub fn into_request(mut self) -> FwResult<TranscribeRequest> {
+        let effective_diarize = self.diarize || !self.no_diarize;
         let mut mode_count = 0usize;
         if self.input.is_some() {
             mode_count += 1;
@@ -1288,17 +1596,17 @@ impl TranscribeArgs {
                 "--input, --stdin, and --mic are mutually exclusive".to_owned(),
             ));
         }
-        if !self.diarize
+        if !effective_diarize
             && (self.speaker_hints.is_some()
                 || self.persist_speaker_profiles
                 || self.diarization_engine != DiarizationEngine::Auto
-                || self.diarization_fallback != DiarizationFallbackPolicy::Unknown
+                || self.diarization_fallback != DiarizationFallbackPolicy::Acoustic
                 || self.speaker_count_hard.is_some()
                 || self.speaker_count_range.is_some()
                 || self.speaker_count_prior.is_some())
         {
             return Err(FwError::InvalidRequest(
-                "diarization controls require --diarize".to_owned(),
+                "diarization controls cannot be combined with --no-diarize".to_owned(),
             ));
         }
 
@@ -1402,7 +1710,7 @@ impl TranscribeArgs {
             .map(read_speaker_hints)
             .transpose()?
             .unwrap_or_default();
-        let has_diarization_request = self.diarize
+        let has_diarization_request = effective_diarize
             || !known_intervals.is_empty()
             || speaker_count != SpeakerCountRequest::Infer;
         let acoustic_diarization = has_diarization_request.then_some(DiarizationRequest {
@@ -1454,7 +1762,14 @@ impl TranscribeArgs {
             word_timestamps: None,
             insanely_fast_tuning: None,
             alignment: None,
-            punctuation: None,
+            punctuation: if self.normalize_segment_text {
+                Some(crate::model::PunctuationConfig {
+                    model: None,
+                    enabled: true,
+                })
+            } else {
+                None
+            },
             source_separation: None,
             speculative,
         };
@@ -1465,7 +1780,7 @@ impl TranscribeArgs {
             model: self.model.take(),
             language: self.language.take(),
             translate: self.translate,
-            diarize: self.diarize,
+            diarize: effective_diarize,
             persist: !self.no_persist,
             db_path: std::mem::take(&mut self.db),
             timeout_ms: self.timeout.map(|secs| secs.saturating_mul(1000)),
@@ -1507,7 +1822,7 @@ impl TranscribeArgs {
             "model": self.model,
             "language": self.language,
             "translate": self.translate,
-            "diarize": self.diarize,
+            "diarize": self.diarize || !self.no_diarize,
             "diarization_engine": self.diarization_engine,
             "diarization_fallback": self.diarization_fallback,
             "speaker_count": self.speaker_count_request().ok(),
@@ -1604,8 +1919,9 @@ mod tests {
             language: None,
             translate: false,
             diarize: false,
+            no_diarize: false,
             diarization_engine: DiarizationEngine::Auto,
-            diarization_fallback: DiarizationFallbackPolicy::Unknown,
+            diarization_fallback: DiarizationFallbackPolicy::Acoustic,
             speaker_hints: None,
             enrollment_edge_guard_ms: 100,
             diarization_max_prototypes: 512,
@@ -1660,6 +1976,7 @@ mod tests {
             no_fallback: false,
             suppress_nst: false,
             tiny_diarize: false,
+            normalize_segment_text: false,
             offset_ms: None,
             duration_ms: None,
             audio_ctx: None,
@@ -1874,30 +2191,56 @@ mod tests {
     }
 
     #[test]
-    fn native_diarization_controls_require_diarize() {
+    fn native_diarization_controls_reject_no_diarize() {
         let mut args = minimal_args();
+        args.no_diarize = true;
         args.diarization_engine = DiarizationEngine::Acoustic;
         let error = args
             .to_request()
-            .expect_err("engine selection without --diarize must fail");
-        assert!(error.to_string().contains("require --diarize"));
+            .expect_err("engine selection with --no-diarize must fail");
+        assert!(error.to_string().contains("--no-diarize"));
 
         let mut args = minimal_args();
+        args.no_diarize = true;
         args.persist_speaker_profiles = true;
         assert!(
             args.to_request()
-                .expect_err("profile persistence without --diarize must fail")
+                .expect_err("profile persistence with --no-diarize must fail")
                 .to_string()
-                .contains("require --diarize")
+                .contains("--no-diarize")
         );
 
         let mut args = minimal_args();
+        args.no_diarize = true;
         args.speaker_count_hard = Some(2);
         assert!(
             args.to_request()
-                .expect_err("speaker-count search without --diarize must fail")
+                .expect_err("speaker-count search with --no-diarize must fail")
                 .to_string()
-                .contains("require --diarize")
+                .contains("--no-diarize")
+        );
+    }
+
+    #[test]
+    fn native_diarization_is_enabled_by_default_and_can_be_disabled() {
+        let default_request = minimal_args().to_request().expect("default request");
+        assert!(default_request.diarize);
+        assert!(
+            default_request
+                .backend_params
+                .acoustic_diarization
+                .is_some()
+        );
+
+        let mut disabled = minimal_args();
+        disabled.no_diarize = true;
+        let disabled_request = disabled.to_request().expect("disabled request");
+        assert!(!disabled_request.diarize);
+        assert!(
+            disabled_request
+                .backend_params
+                .acoustic_diarization
+                .is_none()
         );
     }
 
@@ -1930,6 +2273,26 @@ mod tests {
                 .contains("speaker-hints-v1")
         );
         assert!(parse_speaker_hints(b"not json").is_err());
+        assert!(
+            parse_speaker_hints(
+                br#"{"schema_version":"speaker-hints-v1","known_intervals":[],"extra":true}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn speaker_hints_reader_rejects_symlinks_before_parsing() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary speaker-hints directory");
+        let target = directory.path().join("target.json");
+        let link = directory.path().join("link.json");
+        std::fs::write(&target, b"[]").expect("write speaker-hints target");
+        symlink(&target, &link).expect("create speaker-hints symlink");
+        let error = read_speaker_hints(&link).expect_err("symlink must fail closed");
+        assert!(error.to_string().contains("regular non-symlink"));
     }
 
     #[test]
@@ -2021,6 +2384,29 @@ mod tests {
         let args = minimal_args();
         let request = args.to_request().expect("should succeed");
         assert!(!request.backend_params.tiny_diarize);
+    }
+
+    #[test]
+    fn normalize_segment_text_flag_enables_punctuation_config() {
+        let mut args = minimal_args();
+        args.normalize_segment_text = true;
+        let request = args.to_request().expect("should succeed");
+        let punctuation = request
+            .backend_params
+            .punctuation
+            .expect("opt-in flag populates punctuation config");
+        assert!(punctuation.enabled);
+        assert!(punctuation.model.is_none());
+    }
+
+    #[test]
+    fn segment_text_normalization_defaults_off() {
+        let args = minimal_args();
+        let request = args.to_request().expect("should succeed");
+        assert!(
+            request.backend_params.punctuation.is_none(),
+            "segment text must stay faithful to the decoded transcript by default"
+        );
     }
 
     // --- Speaker count request ---
@@ -3496,6 +3882,44 @@ mod tests {
     }
 
     #[test]
+    fn public_corpus_cli_parses_voxconverse_preparation_and_redacts_paths() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-corpus",
+            "prepare-voxconverse",
+            "--input-root",
+            "/PRIVATE/VOX",
+            "--development-audio-root",
+            "/PRIVATE/VOX/dev-audio",
+            "--test-audio-root",
+            "/PRIVATE/VOX/test-audio",
+            "--annotation-root",
+            "/PRIVATE/VOX/labels",
+            "--output",
+            "/PRIVATE/VOX/descriptor.json",
+            "--source-version",
+            "voxconverse-fixture-v1",
+            "--license-ack",
+            "accept-voxconverse-cc-by-4.0-and-original-copyright",
+        ])
+        .expect("VoxConverse preparation command");
+        let debug = format!("{cli:?}");
+        assert!(!debug.contains("PRIVATE"));
+        assert!(debug.contains("<redacted>"));
+        let Command::DiarizationCorpus {
+            command: PublicCorpusCommand::PrepareVoxconverse(args),
+        } = cli.command
+        else {
+            panic!("expected VoxConverse preparation command");
+        };
+        assert_eq!(args.source_version, "voxconverse-fixture-v1");
+        assert_eq!(
+            args.license_ack,
+            "accept-voxconverse-cc-by-4.0-and-original-copyright"
+        );
+    }
+
+    #[test]
     fn public_corpus_cli_parses_ablation_and_redacts_every_path() {
         let cli = Cli::try_parse_from([
             "franken_whisper",
@@ -3647,5 +4071,140 @@ mod tests {
         assert!(!debug.contains("PRIVATE"));
         assert!(!debug.contains("call.m4a"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn sortformer_diarize_cli_is_explicit_and_redacts_every_path() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "sortformer-diarize",
+            "--input",
+            "/PRIVATE/call.m4a",
+            "--receipt",
+            "/PRIVATE/conversion-receipt.json",
+            "--package",
+            "/PRIVATE/weights.safetensors",
+        ])
+        .expect("explicit native Sortformer command");
+        let Command::SortformerDiarize(args) = cli.command else {
+            panic!("expected native Sortformer command");
+        };
+        let debug = format!("{args:?}");
+        assert_eq!(debug.matches("<redacted>").count(), 4);
+        assert!(!debug.contains("PRIVATE"));
+        assert!(!debug.contains("call.m4a"));
+        assert!(!debug.contains("weights.safetensors"));
+
+        let cached = Cli::try_parse_from([
+            "franken_whisper",
+            "sortformer-diarize",
+            "--input",
+            "/PRIVATE/call.m4a",
+        ])
+        .expect("cached native Sortformer command");
+        let Command::SortformerDiarize(cached) = cached.command else {
+            panic!("expected cached native Sortformer command");
+        };
+        assert!(cached.receipt.is_none());
+        assert!(cached.package.is_none());
+        assert!(cached.speaker_hints.is_none());
+    }
+
+    #[test]
+    fn agent_discovery_commands_parse_with_stable_shapes() {
+        let capabilities =
+            Cli::try_parse_from(["fw", "capabilities", "--json"]).expect("capabilities command");
+        assert!(matches!(
+            capabilities.command,
+            Command::Capabilities(CapabilitiesArgs { json: true })
+        ));
+
+        let models = Cli::try_parse_from(["fw", "models", "--json"]).expect("models command");
+        assert!(matches!(
+            models.command,
+            Command::Models(ModelsArgs { json: true })
+        ));
+
+        let pull =
+            Cli::try_parse_from(["fw", "pull", "sortformer", "--json"]).expect("pull command");
+        assert!(matches!(
+            pull.command,
+            Command::Pull(PullArgs {
+                model: PullModelArg::Sortformer,
+                json: true,
+            })
+        ));
+
+        let pull_default = Cli::try_parse_from(["fw", "pull"]).expect("default pull command");
+        assert!(matches!(
+            pull_default.command,
+            Command::Pull(PullArgs {
+                model: PullModelArg::All,
+                json: false,
+            })
+        ));
+
+        let doctor =
+            Cli::try_parse_from(["fw", "doctor", "--json", "--strict"]).expect("doctor command");
+        assert!(matches!(
+            doctor.command,
+            Command::Doctor(DoctorArgs {
+                json: true,
+                strict: true,
+                ..
+            })
+        ));
+
+        let triage = Cli::try_parse_from(["fw", "agent", "triage", "--strict"])
+            .expect("robot alias triage command");
+        assert!(matches!(
+            triage.command,
+            Command::Robot {
+                command: RobotCommand::Triage(HealthArgs { strict: true, .. })
+            }
+        ));
+
+        let guide = Cli::try_parse_from(["fw", "robot-docs", "guide"]).expect("robot docs guide");
+        assert!(matches!(
+            guide.command,
+            Command::RobotDocs {
+                command: RobotDocsCommand::Guide
+            }
+        ));
+    }
+
+    #[test]
+    fn underscore_value_aliases_remain_agent_friendly() {
+        let mut args = minimal_args();
+        args.backend = BackendKind::WhisperCpp;
+        assert_eq!(args.backend, BackendKind::WhisperCpp);
+
+        let parsed = Cli::try_parse_from([
+            "fw",
+            "transcribe",
+            "--input",
+            "test.wav",
+            "--backend",
+            "whisper_cpp",
+            "--diarization-engine",
+            "ecapa_fused",
+        ])
+        .expect("underscore aliases");
+        let Command::Transcribe(parsed) = parsed.command else {
+            panic!("expected transcribe command");
+        };
+        assert_eq!(parsed.backend, BackendKind::WhisperCpp);
+        assert_eq!(parsed.diarization_engine, DiarizationEngine::EcapaFused);
+    }
+
+    #[test]
+    fn version_report_discloses_model_distribution_boundary() {
+        let error = Cli::try_parse_from(["fw", "--version"])
+            .expect_err("version is represented as a clap display result");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        let rendered = error.to_string();
+        assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
+        assert!(rendered.contains("model weights: not bundled"));
+        assert!(rendered.contains("hash-pinned GitHub release artifact"));
     }
 }

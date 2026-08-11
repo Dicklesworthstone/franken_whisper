@@ -1499,6 +1499,10 @@ struct SegmentImportState {
 
 /// The per-line FK check + overwrite/imported idx tracking (runs before the
 /// existing-row lookup in both paths, so batching cannot change it).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "row import bookkeeping keeps conflict authorities explicit and borrowed"
+)]
 fn record_segment_pre(
     connection: &Connection,
     run_id: &str,
@@ -1537,6 +1541,10 @@ fn record_segment_pre(
 /// `None`). **Shared by the per-line and batched paths** ⇒ byte-identical imported
 /// rows. Returns `Some(inserted_cols)` when a row was INSERTed (so the batched
 /// caller can update its seen-map), else `None`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "row application keeps database, policy, and conflict sink explicit"
+)]
 fn apply_segment_row(
     connection: &Connection,
     run_id: &str,
@@ -1843,6 +1851,10 @@ struct EventImportState {
 
 /// The per-line FK check + overwrite/imported seq tracking (mirror of
 /// [`record_segment_pre`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "row import bookkeeping keeps conflict authorities explicit and borrowed"
+)]
 fn record_event_pre(
     connection: &Connection,
     run_id: &str,
@@ -1873,6 +1885,10 @@ fn record_event_pre(
 
 /// Apply one `events` JSONL row against `existing` (mirror of [`apply_segment_row`];
 /// the compare is all-TEXT). Returns `Some(inserted_cols)` when INSERTed, else `None`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "row application keeps database, policy, and conflict sink explicit"
+)]
 fn apply_event_row(
     connection: &Connection,
     run_id: &str,
@@ -2492,6 +2508,8 @@ fn replace_file_atomically(from: &Path, to: &Path) -> FwResult<()> {
 }
 
 fn sync_parent_dir(path: &Path) -> FwResult<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         if let Some(parent) = path.parent() {
@@ -3451,6 +3469,7 @@ mod tests {
                 authority: SpeakerCountCalibrationStatus::DevelopmentUncertified,
             }),
             neural_representation: None,
+            speaker_segments: Vec::new(),
             diagnostics: Vec::new(),
         });
         report.result.raw_output = json!({

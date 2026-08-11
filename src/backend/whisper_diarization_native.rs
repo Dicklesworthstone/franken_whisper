@@ -77,9 +77,8 @@ const DIARIZER_NOTE: &str = "legacy text/temporal heuristic without waveform spe
 /// [`whisper_cpp_native::is_available`](super::whisper_cpp_native::is_available):
 /// this engine runs the **same** [`crate::native_engine`] over the **same** ggml
 /// model files, so the two must agree on availability. Reports `true` only when a
-/// usable model header exists (the configured default resolves, or any
-/// `ggml-*.bin` with a valid header sits in a search dir). Never panics or
-/// performs network access.
+/// usable model header exists for the configured override or the pinned
+/// release-package path. Never panics or performs network access.
 #[must_use]
 pub fn is_available() -> bool {
     super::whisper_cpp_native::is_available()
@@ -87,25 +86,19 @@ pub fn is_available() -> bool {
 
 /// Resolve the effective model spec for a request, or a [`FwError`] explaining
 /// how to provision one. Identical precedence to the whisper.cpp native engine:
-/// `request.model` then `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, else an
-/// actionable [`FwError::BackendUnavailable`] naming the env var and reusing the
-/// resolver's search-dir listing.
+/// `request.model`, then `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then the
+/// authenticated default release package, else an actionable
+/// [`FwError::BackendUnavailable`].
 fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
         return Ok(model);
     }
-    if let Some(spec) = native_engine::default_model_spec() {
-        return Ok(spec);
-    }
-    let dirs_hint = native_engine::resolve_model("default")
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-    Err(FwError::BackendUnavailable(format!(
-        "native whisper-diarization engine has no model: pass --model, or set \
-         $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. \
-         {dirs_hint}"
-    )))
+    native_engine::configured_or_release_model_spec().map_err(|error| {
+        FwError::BackendUnavailable(format!(
+            "native whisper-diarization engine has no usable local model: pass --model, or set \
+             $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
+        ))
+    })
 }
 
 /// Build the [`decode::DecodeParams`] for a request. Diarization keeps the
@@ -587,10 +580,10 @@ mod tests {
     // ── Model resolution / availability ───────────────────────────────────
 
     #[test]
-    fn run_without_model_or_default_is_backend_unavailable() {
+    fn run_without_any_configured_or_release_model_is_backend_unavailable() {
         let mut req = request();
         req.model = None;
-        if native_engine::default_model_spec().is_some() {
+        if native_engine::configured_or_release_model_available() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -779,6 +772,7 @@ mod tests {
             segments: vec![seg(0.0, 9.0, "x")],
             language: Some("en".to_owned()),
             windows: vec![],
+            dropped_windows: Vec::new(),
             work: decode::DecodeWorkStats::default(),
             word_timings: None,
         };
@@ -791,6 +785,7 @@ mod tests {
             segments: vec![],
             language: None,
             windows: vec![],
+            dropped_windows: Vec::new(),
             work: decode::DecodeWorkStats::default(),
             word_timings: None,
         };

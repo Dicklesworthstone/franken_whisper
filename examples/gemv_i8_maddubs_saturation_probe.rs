@@ -12,48 +12,69 @@
 #![allow(unsafe_code)]
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
 
+#[cfg(target_arch = "x86_64")]
 const K: usize = 1280; // decode/encoder inner dim (n_state)
 
 /// Exact Σ w[k]·x[k] via VPMOVSXBW+VPMADDWD (int32 accumulation — the correct path).
+///
+/// # Safety
+///
+/// The caller must ensure AVX2 is available and both slices contain at least
+/// `K` elements.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_widening(w: &[i8], x: &[i8]) -> i32 {
-    let mut acc = _mm256_setzero_si256();
-    let (pw, px) = (w.as_ptr(), x.as_ptr());
-    let mut k = 0;
-    while k + 16 <= K {
-        let vw = _mm256_cvtepi8_epi16(_mm_loadu_si128(pw.add(k).cast()));
-        let vx = _mm256_cvtepi8_epi16(_mm_loadu_si128(px.add(k).cast()));
-        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(vw, vx));
-        k += 16;
+    // SAFETY: the caller contract guarantees AVX2 and K readable elements;
+    // the loop advances in 16-byte chunks and never exceeds K.
+    unsafe {
+        let mut acc = _mm256_setzero_si256();
+        let (pw, px) = (w.as_ptr(), x.as_ptr());
+        let mut k = 0;
+        while k + 16 <= K {
+            let vw = _mm256_cvtepi8_epi16(_mm_loadu_si128(pw.add(k).cast()));
+            let vx = _mm256_cvtepi8_epi16(_mm_loadu_si128(px.add(k).cast()));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(vw, vx));
+            k += 16;
+        }
+        let mut t = [0i32; 8];
+        _mm256_storeu_si256(t.as_mut_ptr().cast(), acc);
+        t.iter().sum()
     }
-    let mut t = [0i32; 8];
-    _mm256_storeu_si256(t.as_mut_ptr().cast(), acc);
-    t.iter().sum()
 }
 
 /// maddubs + sign-offset: Σ(x+128)·w via VPMADDUBSW (int16 intermediate — SATURATES).
+///
+/// # Safety
+///
+/// The caller must ensure AVX2 is available and both slices contain at least
+/// `K` elements.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_maddubs(w: &[i8], xu: &[u8], wsum: i32) -> i32 {
-    let ones = _mm256_set1_epi16(1);
-    let mut acc = _mm256_setzero_si256();
-    let (pw, px) = (w.as_ptr(), xu.as_ptr());
-    let mut k = 0;
-    while k + 32 <= K {
-        let vx = _mm256_loadu_si256(px.add(k).cast());
-        let vw = _mm256_loadu_si256(pw.add(k).cast());
-        let p16 = _mm256_maddubs_epi16(vx, vw); // saturates to int16!
-        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, ones));
-        k += 32;
+    // SAFETY: the caller contract guarantees AVX2 and K readable elements;
+    // the loop advances in 32-byte chunks and never exceeds K.
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = _mm256_setzero_si256();
+        let (pw, px) = (w.as_ptr(), xu.as_ptr());
+        let mut k = 0;
+        while k + 32 <= K {
+            let vx = _mm256_loadu_si256(px.add(k).cast());
+            let vw = _mm256_loadu_si256(pw.add(k).cast());
+            let p16 = _mm256_maddubs_epi16(vx, vw); // saturates to int16!
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, ones));
+            k += 32;
+        }
+        let mut t = [0i32; 8];
+        _mm256_storeu_si256(t.as_mut_ptr().cast(), acc);
+        t.iter().sum::<i32>() - 128 * wsum
     }
-    let mut t = [0i32; 8];
-    _mm256_storeu_si256(t.as_mut_ptr().cast(), acc);
-    t.iter().sum::<i32>() - 128 * wsum
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
     let mut st = 0x243F_6A88_85A3_08D3u64;
     let mut b8 = || {
@@ -67,7 +88,6 @@ fn main() {
     let x: Vec<i8> = (0..K).map(|_| b8()).collect();
     let xu: Vec<u8> = x.iter().map(|&v| (v as i16 + 128) as u8).collect();
 
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         let mut differ = 0usize;
         let mut maxerr = 0i32;
@@ -107,4 +127,9 @@ fn main() {
             "  ⇒ int8 encoder GEMM on AVX2 (no VNNI) is stuck with widening (~1.27× blocked-f32 compute), eaten to 0.89×."
         );
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("gemv_i8_maddubs_saturation_probe needs an x86_64 target with AVX2");
 }

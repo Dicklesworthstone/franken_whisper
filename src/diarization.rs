@@ -7796,6 +7796,9 @@ pub fn ecapa_speaker_pair_calibration_sha256(
             b"ecapa-with-acoustic-channel".as_slice()
         }
         DiarizationSpeakerEvidenceMode::AcousticV2 => b"acoustic-v2-invalid".as_slice(),
+        DiarizationSpeakerEvidenceMode::SortformerActivity => {
+            b"sortformer-activity-invalid".as_slice()
+        }
         DiarizationSpeakerEvidenceMode::External => b"external-invalid".as_slice(),
         DiarizationSpeakerEvidenceMode::None => b"none-invalid".as_slice(),
     });
@@ -7852,6 +7855,9 @@ pub fn ecapa_speaker_pair_calibration_sha256(
         }
         DiarizationSpeakerEvidenceMode::AcousticV2 => {
             b"robust-separation-acoustic-invalid".as_slice()
+        }
+        DiarizationSpeakerEvidenceMode::SortformerActivity => {
+            b"robust-separation-sortformer-invalid".as_slice()
         }
         DiarizationSpeakerEvidenceMode::External => {
             b"robust-separation-external-invalid".as_slice()
@@ -8106,6 +8112,9 @@ fn speaker_pair_calibration_sha256_for_mode(
 ) -> String {
     match evidence_mode {
         DiarizationSpeakerEvidenceMode::AcousticV2 => acoustic_speaker_pair_calibration_sha256(),
+        DiarizationSpeakerEvidenceMode::SortformerActivity => {
+            acoustic_speaker_pair_calibration_sha256()
+        }
         DiarizationSpeakerEvidenceMode::EcapaOnly
         | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
             ecapa_speaker_pair_calibration_sha256(evidence_mode)
@@ -9208,7 +9217,11 @@ fn apply_acoustic_normalization_transform(
     }
 
     let mut voice_scale_squared = [0.0_f32; VOICE_VECTOR_DIMENSIONS];
-    for dimension in 0..schema.voice_dimensions {
+    for (dimension, scale_squared_slot) in voice_scale_squared
+        .iter_mut()
+        .enumerate()
+        .take(schema.voice_dimensions)
+    {
         if !transform.voice_valid[dimension] {
             continue;
         }
@@ -9226,10 +9239,14 @@ fn apply_acoustic_normalization_transform(
                 "active acoustic voice normalization dimension {dimension} has an invalid center or scale"
             )));
         }
-        voice_scale_squared[dimension] = scale_squared;
+        *scale_squared_slot = scale_squared;
     }
     let mut channel_scale_squared = [0.0_f32; CHANNEL_VECTOR_DIMENSIONS];
-    for dimension in 0..schema.channel_dimensions {
+    for (dimension, scale_squared_slot) in channel_scale_squared
+        .iter_mut()
+        .enumerate()
+        .take(schema.channel_dimensions)
+    {
         if !transform.channel_valid[dimension] {
             continue;
         }
@@ -9247,16 +9264,19 @@ fn apply_acoustic_normalization_transform(
                 "active acoustic channel normalization dimension {dimension} has an invalid center or scale"
             )));
         }
-        channel_scale_squared[dimension] = scale_squared;
+        *scale_squared_slot = scale_squared;
     }
 
-    for dimension in 0..schema.voice_dimensions {
+    for (dimension, &scale_squared) in voice_scale_squared
+        .iter()
+        .enumerate()
+        .take(schema.voice_dimensions)
+    {
         if !transform.voice_valid[dimension] {
             continue;
         }
         let center = transform.voice_centers[dimension];
         let scale = transform.voice_scales[dimension];
-        let scale_squared = voice_scale_squared[dimension];
         for (tracklet_index, tracklet) in tracklets
             .iter()
             .enumerate()
@@ -9279,13 +9299,16 @@ fn apply_acoustic_normalization_transform(
             }
         }
     }
-    for dimension in 0..schema.channel_dimensions {
+    for (dimension, &scale_squared) in channel_scale_squared
+        .iter()
+        .enumerate()
+        .take(schema.channel_dimensions)
+    {
         if !transform.channel_valid[dimension] {
             continue;
         }
         let center = transform.channel_centers[dimension];
         let scale = transform.channel_scales[dimension];
-        let scale_squared = channel_scale_squared[dimension];
         for (tracklet_index, tracklet) in tracklets
             .iter()
             .enumerate()
@@ -9309,7 +9332,11 @@ fn apply_acoustic_normalization_transform(
         }
     }
 
-    for dimension in 0..schema.voice_dimensions {
+    for (dimension, &scale_squared) in voice_scale_squared
+        .iter()
+        .enumerate()
+        .take(schema.voice_dimensions)
+    {
         if !transform.voice_valid[dimension] {
             continue;
         }
@@ -9320,10 +9347,14 @@ fn apply_acoustic_normalization_transform(
             .filter(|tracklet| tracklet.voice_valid[dimension])
         {
             tracklet.voice_mean[dimension] = (tracklet.voice_mean[dimension] - center) / scale;
-            tracklet.voice_variance[dimension] /= voice_scale_squared[dimension];
+            tracklet.voice_variance[dimension] /= scale_squared;
         }
     }
-    for dimension in 0..schema.channel_dimensions {
+    for (dimension, &scale_squared) in channel_scale_squared
+        .iter()
+        .enumerate()
+        .take(schema.channel_dimensions)
+    {
         if !transform.channel_valid[dimension] {
             continue;
         }
@@ -9334,7 +9365,7 @@ fn apply_acoustic_normalization_transform(
             .filter(|tracklet| tracklet.channel_valid)
         {
             tracklet.channel_mean[dimension] = (tracklet.channel_mean[dimension] - center) / scale;
-            tracklet.channel_variance[dimension] /= channel_scale_squared[dimension];
+            tracklet.channel_variance[dimension] /= scale_squared;
         }
     }
     Ok(())
@@ -12899,6 +12930,7 @@ fn ecapa_residual_common_observation_sha256(
     );
     hasher.update([match observation.evidence_mode {
         DiarizationSpeakerEvidenceMode::AcousticV2 => 0,
+        DiarizationSpeakerEvidenceMode::SortformerActivity => 5,
         DiarizationSpeakerEvidenceMode::EcapaOnly => 1,
         DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => 2,
         DiarizationSpeakerEvidenceMode::External => 3,
@@ -12961,6 +12993,7 @@ fn ecapa_residual_common_observation_sha256(
     let request = observation.request;
     hasher.update([match request.engine {
         DiarizationEngine::Auto => 0,
+        DiarizationEngine::Sortformer => 5,
         DiarizationEngine::Acoustic => 1,
         DiarizationEngine::External => 2,
         DiarizationEngine::Ecapa => 3,
@@ -13860,18 +13893,20 @@ fn supported_profile_redecode_profile_topology_sha256(
         .map(|partition| partition.method)
     {
         Some(DiarizationOperationalPartitionMethod::FixedSafeAgglomerative) => {
-            hasher.update(b"fixed_safe_agglomerative")
+            hasher.update(b"fixed_safe_agglomerative");
         }
         Some(DiarizationOperationalPartitionMethod::ProbabilisticConsensus) => {
-            hasher.update(b"probabilistic_consensus")
+            hasher.update(b"probabilistic_consensus");
         }
         Some(DiarizationOperationalPartitionMethod::EcapaSpherical) => {
-            hasher.update(b"ecapa_spherical")
+            hasher.update(b"ecapa_spherical");
         }
         Some(DiarizationOperationalPartitionMethod::EcapaFusedConsensus) => {
-            hasher.update(b"ecapa_fused_consensus")
+            hasher.update(b"ecapa_fused_consensus");
         }
-        None => hasher.update(b"none"),
+        None => {
+            hasher.update(b"none");
+        }
     }
     hasher.update([0]);
     hasher.update((clustering.profiles.len() as u64).to_le_bytes());
@@ -13944,6 +13979,7 @@ fn supported_profile_redecode_frozen_support_summary_sha256(
         for reason in &speaker.reasons {
             hasher.update([match reason {
                 SpeakerEvidenceReason::SupportedByHardHint => 0,
+                SpeakerEvidenceReason::SupportedByLearnedModelActivity => 11,
                 SpeakerEvidenceReason::SupportedByIndependentRecurrence => 1,
                 SpeakerEvidenceReason::SupportedByRepeatedTracklets => 2,
                 SpeakerEvidenceReason::SupportedByHeldoutObservation => 3,
@@ -14664,6 +14700,7 @@ fn finish_prepared_ecapa_diarization(
             clustering.operational_partition.clone()
         },
         neural_representation: Some(prepared.neural_representation.clone()),
+        speaker_segments: Vec::new(),
         diagnostics,
     };
     validate_native_diarization_report(
@@ -14861,7 +14898,7 @@ fn apply_ecapa_speaker_representations(
     };
     summary
         .validate()
-        .map_err(|error| FwError::ContractViolation(error.to_owned()))?;
+        .map_err(|error| FwError::ContractViolation(error.clone()))?;
     Ok((summary, embeddings))
 }
 
@@ -15057,6 +15094,10 @@ where
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the evaluation harness passes independent algorithm ablation levers"
+)]
 fn diarize_acoustic_pcm_with_detector_evidence_internal<C>(
     input: AcousticDiarizationInput<'_>,
     feature_ablation: AcousticFeatureAblation,
@@ -15410,6 +15451,7 @@ where
             clustering.operational_partition
         },
         neural_representation,
+        speaker_segments: Vec::new(),
         diagnostics,
     };
     validate_native_diarization_report(
@@ -15895,6 +15937,10 @@ where
     .0)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the clustering evaluation lane keeps independent evidence levers explicit"
+)]
 fn cluster_acoustic_tracklets_with_mode_internal<C>(
     tracklets: &[AcousticTracklet],
     enrollment: &SpeakerEnrollment,
@@ -15924,6 +15970,10 @@ where
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the clustering evaluation lane keeps independent evidence levers explicit"
+)]
 fn cluster_acoustic_tracklets_with_budgeted_enrollment<C>(
     tracklets: &[AcousticTracklet],
     enrollment: &mut SpeakerEnrollment,
@@ -15956,6 +16006,10 @@ where
     Ok((clustering, count_merge_steps))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the residual-birth experiment keeps every authority and ablation input explicit"
+)]
 fn cluster_acoustic_tracklets_with_budgeted_enrollment_and_residual_birth<C>(
     tracklets: &[AcousticTracklet],
     enrollment: &mut SpeakerEnrollment,
@@ -16010,7 +16064,7 @@ fn cluster_acoustic_tracklets_with_evaluation_levers<C>(
     profile_redecode_mode: SupportedProfileRedecodeMode,
     common_observation_sha256: &str,
     profile_redecode: &mut SupportedProfileRedecodeEvaluationEvidence,
-    #[cfg(test)] mut incumbent_capture: Option<&mut Option<SupportedProfileRedecodeIncumbent>>,
+    #[cfg(test)] incumbent_capture: Option<&mut Option<SupportedProfileRedecodeIncumbent>>,
     #[cfg(not(test))] _incumbent_capture: Option<&mut ()>,
     mut is_cancelled: C,
 ) -> FwResult<(
@@ -16047,7 +16101,9 @@ where
         DiarizationSpeakerEvidenceMode::AcousticV2 => neural_embeddings.is_none(),
         DiarizationSpeakerEvidenceMode::EcapaOnly
         | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => neural_embeddings.is_some(),
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => false,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => false,
     };
     if !valid_evidence_context {
         return Err(FwError::InvalidRequest(
@@ -16089,7 +16145,9 @@ where
             neural_embeddings.is_none_or(BTreeMap::is_empty)
                 && enrollment.hard_assignments.is_empty()
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => true,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => true,
     };
     if identity_evidence_unavailable {
         if residual_birth_mode == EcapaResidualBirthMode::DevelopmentCandidateV1
@@ -16449,7 +16507,7 @@ where
     )?;
     retain_supported_assignments(&speaker_evidence, &mut assignments);
     #[cfg(test)]
-    if let Some(capture) = incumbent_capture.as_deref_mut() {
+    if let Some(capture) = incumbent_capture {
         *capture = Some(SupportedProfileRedecodeIncumbent {
             clusters: clusters.clone(),
             labels: labels.clone(),
@@ -16589,6 +16647,7 @@ pub fn diarization_turns_from_assignments(
 ) -> FwResult<Vec<DiarizationTurn>> {
     let mut turns = Vec::<DiarizationTurn>::with_capacity(assignments.len());
     let mut secondary_turns = Vec::<DiarizationTurn>::new();
+    let mut previous_secondary_turn_index: Option<usize> = None;
     let mut previous_start = 0u64;
     for (index, assignment) in assignments.iter().enumerate() {
         let secondary_is_valid = match (
@@ -16650,6 +16709,16 @@ pub fn diarization_turns_from_assignments(
                     ));
                 }
                 previous.end_ms = boundary;
+                if let Some(secondary_index) = previous_secondary_turn_index {
+                    let secondary = &mut secondary_turns[secondary_index];
+                    if boundary <= secondary.start_ms {
+                        return Err(FwError::InvalidRequest(
+                            "acoustic assignment overlap leaves no positive secondary turn duration"
+                                .to_owned(),
+                        ));
+                    }
+                    secondary.end_ms = secondary.end_ms.min(boundary);
+                }
                 turn.start_ms = boundary;
             }
             if previous.speaker_ref == turn.speaker_ref
@@ -16673,6 +16742,7 @@ pub fn diarization_turns_from_assignments(
             turns.push(turn);
         }
 
+        let mut current_secondary_turn_index = None;
         if let (Some(speaker_ref), Some(confidence)) = (
             assignment.secondary_speaker_ref.as_ref(),
             assignment.secondary_speaker_confidence,
@@ -16688,7 +16758,7 @@ pub fn diarization_turns_from_assignments(
             };
             if let Some(previous) = secondary_turns.last_mut()
                 && previous.speaker_ref == secondary.speaker_ref
-                && secondary.start_ms <= previous.end_ms.saturating_add(25)
+                && secondary.start_ms <= previous.end_ms
             {
                 previous.end_ms = previous.end_ms.max(secondary.end_ms);
                 previous.speaker_confidence = minimum_optional_confidence(
@@ -16699,10 +16769,13 @@ pub fn diarization_turns_from_assignments(
                     previous.change_confidence,
                     secondary.change_confidence,
                 );
-                continue;
+                current_secondary_turn_index = secondary_turns.len().checked_sub(1);
+            } else {
+                secondary_turns.push(secondary);
+                current_secondary_turn_index = secondary_turns.len().checked_sub(1);
             }
-            secondary_turns.push(secondary);
         }
+        previous_secondary_turn_index = current_secondary_turn_index;
     }
     turns.extend(secondary_turns);
     turns = canonicalize_same_speaker_turn_overlaps(turns);
@@ -16917,11 +16990,201 @@ pub fn project_diarization_onto_segments(
         }
         projected.push(output);
     }
+
+    // Fusion pass (bd-d4py, projection-fusion-v1): the conservative pass above
+    // leaves a segment unlabeled when its evidence misses a gate (low turn
+    // confidence, sub-dominant ownership) or when the segment sits in a gap
+    // between turns. The turn evidence to label those segments is present in
+    // the same payload; use it instead of returning `null`:
+    //   (a) any segment overlapping a labeled turn takes the max-overlap
+    //       labeled turn, and
+    //   (b) a timed segment in a turn gap takes the nearest labeled turn
+    //       within `NEIGHBOR_FALLBACK_MAX_GAP_SEC`.
+    // Text, timing, ASR confidence, and the report's turn timeline are never
+    // modified; only the projected per-segment speaker field is filled.
+    fill_unlabeled_segments_from_turns(&mut projected, &canonical_segments, turns);
+
+    // Boundary snapping (bd-d4py): at word granularity, speaker changes that
+    // fall mid-clause are re-anchored to the nearest sentence-final
+    // punctuation boundary within a small window, using the transcript's own
+    // punctuation as the oracle. Measured on real 2-person audio this beats
+    // every global time-shift candidate.
+    if word_aligned {
+        snap_speaker_changes_to_punctuation(&mut projected);
+    }
+
     Ok(DiarizationProjection {
         segments: projected,
         mixed_speaker_segment_indices: mixed,
         overlap_suspected_segment_indices: overlaps,
     })
+}
+
+/// Maximum gap (seconds) between an unlabeled segment and the nearest labeled
+/// turn for neighbor-fallback attribution (projection-fusion-v1).
+const NEIGHBOR_FALLBACK_MAX_GAP_SEC: f64 = 2.0;
+
+/// Number of words on each side of a projected speaker change searched for a
+/// sentence-final punctuation boundary to snap to (projection-fusion-v1).
+const PUNCTUATION_SNAP_WINDOW_WORDS: usize = 4;
+
+/// Fill projected segments the conservative pass left unlabeled, using the
+/// turn timeline that shipped in the same report (bd-d4py).
+fn fill_unlabeled_segments_from_turns(
+    projected: &mut [TranscriptionSegment],
+    canonical_segments: &[TranscriptionSegment],
+    turns: &[DiarizationTurn],
+) {
+    for (index, output) in projected.iter_mut().enumerate() {
+        if output.speaker.is_some() {
+            continue;
+        }
+        let Some((start_sec, end_sec)) = canonical_segments
+            .get(index)
+            .and_then(|segment| segment.start_sec.zip(segment.end_sec))
+        else {
+            continue;
+        };
+        // (a) Best labeled overlap, regardless of the primary pass's
+        // confidence/dominance gates.
+        let overlapping = overlapping_turns(start_sec, end_sec, turns);
+        let mut ranked = overlapping
+            .iter()
+            .filter(|(_, turn)| turn.speaker_ref.is_some())
+            .collect::<Vec<_>>();
+        ranked.sort_by(|(left_overlap, left), (right_overlap, right)| {
+            right_overlap
+                .total_cmp(left_overlap)
+                .then(left.start_ms.cmp(&right.start_ms))
+                .then(left.speaker_ref.cmp(&right.speaker_ref))
+        });
+        if let Some((_, best)) = ranked.first() {
+            output.speaker = best.speaker_ref.clone();
+            continue;
+        }
+        // (b) Nearest labeled neighbor turn within the bounded gap. Hard-hint
+        // turns are excluded: a `hard_must_link` interval asserts caller
+        // identity only for its own audio, and extrapolating it into a gap
+        // would invent attribution the caller never made (§6.1).
+        let mut nearest: Option<(f64, &DiarizationTurn)> = None;
+        for turn in turns {
+            if turn.speaker_ref.is_none() || turn.hard_hint_attributed {
+                continue;
+            }
+            let turn_start = turn.start_ms as f64 / 1_000.0;
+            let turn_end = turn.end_ms as f64 / 1_000.0;
+            let gap = if turn_end <= start_sec {
+                start_sec - turn_end
+            } else if turn_start >= end_sec {
+                turn_start - end_sec
+            } else {
+                0.0
+            };
+            let closer = nearest.is_none_or(|(best_gap, best_turn)| {
+                gap < best_gap || (gap == best_gap && turn.start_ms < best_turn.start_ms)
+            });
+            if gap <= NEIGHBOR_FALLBACK_MAX_GAP_SEC && closer {
+                nearest = Some((gap, turn));
+            }
+        }
+        if let Some((_, turn)) = nearest {
+            output.speaker = turn.speaker_ref.clone();
+        }
+    }
+}
+
+/// Whether a word ends a sentence for boundary-snapping purposes.
+///
+/// Trailing closing quotes/brackets are transparent so `you?"` and `done.)`
+/// still count as sentence-final.
+fn ends_sentence(text: &str) -> bool {
+    text.trim_end()
+        .trim_end_matches(['"', '\'', ')', ']', '\u{00BB}', '\u{201D}', '\u{2019}'])
+        .chars()
+        .last()
+        .is_some_and(|c| matches!(c, '.' | '?' | '!' | '\u{2026}'))
+}
+
+/// Re-anchor projected speaker changes to sentence-final punctuation
+/// boundaries within ±[`PUNCTUATION_SNAP_WINDOW_WORDS`] words (bd-d4py).
+///
+/// Diarization turn boundaries are quantized (80 ms lanes for Sortformer), so
+/// a naive time-overlap join puts the last word of each turn on the wrong
+/// speaker. The transcript's own punctuation is a better boundary oracle:
+/// when a speaker change lands mid-clause but a sentence ends within the
+/// window, move the change to just after that sentence end. Labels are the
+/// only thing rewritten — never text, timing, or confidence.
+fn snap_speaker_changes_to_punctuation(projected: &mut [TranscriptionSegment]) {
+    if projected.len() < 2 {
+        return;
+    }
+    // A change at position `i` means projected[i-1].speaker != projected[i].speaker.
+    let mut i = 1usize;
+    while i < projected.len() {
+        let differs = projected[i - 1].speaker != projected[i].speaker
+            && projected[i - 1].speaker.is_some()
+            && projected[i].speaker.is_some();
+        if !differs {
+            i += 1;
+            continue;
+        }
+        // Already on a sentence boundary: nothing to snap.
+        if ends_sentence(&projected[i - 1].text) {
+            i += 1;
+            continue;
+        }
+        // Candidate boundary positions j (change occurs before word j) where
+        // word j-1 ends a sentence, within the window. Moving the boundary
+        // may only relabel words that currently belong to the run being
+        // shrunk, and the shrunk run must survive past the new boundary —
+        // snapping moves a change, it never erases a (short) turn.
+        let left_label = projected[i - 1].speaker.clone();
+        let right_label = projected[i].speaker.clone();
+        let lo = i.saturating_sub(PUNCTUATION_SNAP_WINDOW_WORDS).max(1);
+        let hi = (i + PUNCTUATION_SNAP_WINDOW_WORDS).min(projected.len() - 1);
+        let mut best: Option<usize> = None;
+        for j in lo..=hi {
+            if j == i || !ends_sentence(&projected[j - 1].text) {
+                continue;
+            }
+            let movable = if j > i {
+                // Shrink the right run from the left: words i..j must all be
+                // the right label, and the right run must continue at j.
+                projected[i..j].iter().all(|seg| seg.speaker == right_label)
+                    && projected[j].speaker == right_label
+            } else {
+                // Shrink the left run from the right: words j..i must all be
+                // the left label, and the left run must still exist before j.
+                projected[j..i].iter().all(|seg| seg.speaker == left_label)
+                    && projected[j - 1].speaker == left_label
+            };
+            if !movable {
+                continue;
+            }
+            let better = best.is_none_or(|current| {
+                j.abs_diff(i) < current.abs_diff(i)
+                    || (j.abs_diff(i) == current.abs_diff(i) && j < current)
+            });
+            if better {
+                best = Some(j);
+            }
+        }
+        if let Some(j) = best {
+            if j > i {
+                for seg in &mut projected[i..j] {
+                    seg.speaker = left_label.clone();
+                }
+            } else {
+                for seg in &mut projected[j..i] {
+                    seg.speaker = right_label.clone();
+                }
+            }
+            // Continue after the snapped boundary to avoid re-processing.
+            i = j.max(i) + 1;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Canonicalize a zero-width decoder observation for acoustic projection.
@@ -16976,26 +17239,112 @@ fn canonicalize_zero_duration_projection_segments(
 }
 
 fn validate_diarization_turns(turns: &[DiarizationTurn]) -> FwResult<()> {
-    let mut previous_end = 0u64;
-    for turn in turns {
+    let invalid = |code: &str| {
+        FwError::InvalidRequest(format!(
+            "diarization.turns.{code}: diarization turns must be finite, labeled consistently, and monotonic"
+        ))
+    };
+    let invalid_pair = |code: &str,
+                        current_index: usize,
+                        current: &DiarizationTurn,
+                        prior_index: usize,
+                        prior: &DiarizationTurn| {
+        FwError::InvalidRequest(format!(
+            "diarization.turns.{code}[current={current_index}:{}-{}:labeled={}:overlap={},prior={prior_index}:{}-{}:labeled={}:overlap={}]: diarization turns must be finite, labeled consistently, and monotonic",
+            current.start_ms,
+            current.end_ms,
+            current.speaker_ref.is_some(),
+            current.overlap_suspected,
+            prior.start_ms,
+            prior.end_ms,
+            prior.speaker_ref.is_some(),
+            prior.overlap_suspected,
+        ))
+    };
+    let mut previous_key = None;
+    let mut maximum_end = 0u64;
+    let mut maximum_end_index = 0usize;
+    let mut maximum_unmarked_end = 0u64;
+    let mut maximum_unmarked_end_index = 0usize;
+    let mut maximum_unlabeled_end = 0u64;
+    let mut maximum_unlabeled_end_index = 0usize;
+    let mut speaker_end = BTreeMap::<Option<&str>, u64>::new();
+    for (index, turn) in turns.iter().enumerate() {
         let valid_confidence = |value: Option<f64>| {
             value.is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
         };
-        if turn.end_ms <= turn.start_ms
-            || turn.start_ms < previous_end
-            || turn
-                .speaker_ref
-                .as_ref()
-                .is_some_and(|speaker| speaker.trim().is_empty())
-            || (turn.speaker_ref.is_none() && turn.speaker_confidence.is_some())
-            || !valid_confidence(turn.speaker_confidence)
-            || !valid_confidence(turn.change_confidence)
+        let speaker = turn.speaker_ref.as_deref();
+        let turn_key = (turn.start_ms, turn.end_ms, speaker);
+        let overlaps_any_turn = turn.start_ms < maximum_end;
+        let overlaps_unmarked_turn = turn.start_ms < maximum_unmarked_end;
+        let overlaps_unlabeled_turn = turn.start_ms < maximum_unlabeled_end;
+        let overlaps_same_speaker = speaker_end
+            .get(&speaker)
+            .is_some_and(|end_ms| turn.start_ms < *end_ms);
+        if turn.end_ms <= turn.start_ms {
+            return Err(invalid("geometry"));
+        }
+        if previous_key.is_some_and(|key| key > turn_key) {
+            return Err(invalid("ordering"));
+        }
+        if overlaps_same_speaker {
+            return Err(invalid("same_speaker_overlap"));
+        }
+        if overlaps_any_turn
+            && (!turn.overlap_suspected
+                || overlaps_unmarked_turn
+                || speaker.is_none()
+                || overlaps_unlabeled_turn)
         {
-            return Err(FwError::InvalidRequest(
-                "diarization turns must be finite, labeled consistently, and monotonic".to_owned(),
+            let prior_index = if overlaps_unmarked_turn {
+                maximum_unmarked_end_index
+            } else if overlaps_unlabeled_turn {
+                maximum_unlabeled_end_index
+            } else {
+                maximum_end_index
+            };
+            return Err(invalid_pair(
+                "overlap_provenance",
+                index,
+                turn,
+                prior_index,
+                &turns[prior_index],
             ));
         }
-        previous_end = turn.end_ms;
+        if turn.speaker_ref.as_ref().is_some_and(|speaker| {
+            speaker.trim().is_empty() || speaker.len() > crate::model::MAX_SPEAKER_REF_BYTES
+        }) {
+            return Err(invalid("speaker_ref"));
+        }
+        if turn.speaker_ref.is_none() && turn.speaker_confidence.is_some() {
+            return Err(invalid("anonymous_confidence"));
+        }
+        if turn.hard_hint_attributed
+            && (turn.speaker_ref.is_none()
+                || turn.speaker_confidence.map(f64::to_bits) != Some(1.0_f64.to_bits()))
+        {
+            return Err(invalid("hard_hint"));
+        }
+        if !valid_confidence(turn.speaker_confidence) || !valid_confidence(turn.change_confidence) {
+            return Err(invalid("confidence"));
+        }
+        previous_key = Some(turn_key);
+        if turn.end_ms > maximum_end {
+            maximum_end = turn.end_ms;
+            maximum_end_index = index;
+        }
+        if !turn.overlap_suspected && turn.end_ms > maximum_unmarked_end {
+            maximum_unmarked_end = turn.end_ms;
+            maximum_unmarked_end_index = index;
+        }
+        if speaker.is_none() && turn.end_ms > maximum_unlabeled_end {
+            maximum_unlabeled_end = turn.end_ms;
+            maximum_unlabeled_end_index = index;
+        }
+        speaker_end
+            .entry(speaker)
+            .and_modify(|end_ms| *end_ms = (*end_ms).max(turn.end_ms))
+            .or_insert(turn.end_ms);
     }
     Ok(())
 }
@@ -17104,6 +17453,76 @@ fn choose_dominant_segment_speaker(
     } else {
         (None, ranked.len() > 1)
     }
+}
+
+/// Build the merged speaker-attributed view from projected segments
+/// (bd-d4py): consecutive segments with the same projected speaker collapse
+/// into one run with space-joined, byte-faithful text.
+///
+/// `turns` supply the duration-weighted mean speaker confidence per run when
+/// the run is timed and labeled; unknown runs are retained (speaker `None`)
+/// so the merged view covers the complete transcript.
+pub fn build_speaker_attributed_segments(
+    segments: &[TranscriptionSegment],
+    turns: &[DiarizationTurn],
+) -> Vec<crate::model::SpeakerAttributedSegment> {
+    let mut merged: Vec<crate::model::SpeakerAttributedSegment> = Vec::new();
+    for segment in segments {
+        match merged.last_mut() {
+            Some(run) if run.speaker == segment.speaker => {
+                if !segment.text.is_empty() {
+                    if !run.text.is_empty() {
+                        run.text.push(' ');
+                    }
+                    run.text.push_str(&segment.text);
+                }
+                run.segment_count += 1;
+                if segment.end_sec.is_some() {
+                    run.end_sec = segment.end_sec;
+                }
+                if run.start_sec.is_none() {
+                    run.start_sec = segment.start_sec;
+                }
+            }
+            _ => {
+                merged.push(crate::model::SpeakerAttributedSegment {
+                    start_sec: segment.start_sec,
+                    end_sec: segment.end_sec,
+                    speaker: segment.speaker.clone(),
+                    text: segment.text.clone(),
+                    segment_count: 1,
+                    speaker_confidence: None,
+                });
+            }
+        }
+    }
+    for run in &mut merged {
+        let (Some(speaker), Some(start_sec), Some(end_sec)) =
+            (run.speaker.as_deref(), run.start_sec, run.end_sec)
+        else {
+            continue;
+        };
+        let mut weighted = 0.0f64;
+        let mut duration = 0.0f64;
+        for turn in turns {
+            if turn.speaker_ref.as_deref() != Some(speaker) {
+                continue;
+            }
+            let turn_start = turn.start_ms as f64 / 1_000.0;
+            let turn_end = turn.end_ms as f64 / 1_000.0;
+            let overlap = end_sec.min(turn_end) - start_sec.max(turn_start);
+            if overlap > 0.0
+                && let Some(confidence) = turn.speaker_confidence
+            {
+                weighted += overlap * confidence;
+                duration += overlap;
+            }
+        }
+        if duration > 0.0 {
+            run.speaker_confidence = Some(weighted / duration);
+        }
+    }
+    merged
 }
 
 fn distinct_known_speakers(turns: &[DiarizationTurn]) -> usize {
@@ -17550,7 +17969,9 @@ fn apply_global_prototype_budget(
                         .and_then(|profiles| profiles.get(&profile.speaker_ref))?
                         .reliability
                 }
-                DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => {
+                DiarizationSpeakerEvidenceMode::SortformerActivity
+                | DiarizationSpeakerEvidenceMode::External
+                | DiarizationSpeakerEvidenceMode::None => {
                     return None;
                 }
             };
@@ -17716,7 +18137,7 @@ where
     {
         let position = visited;
         visited = visited.saturating_add(1);
-        if position % ACOUSTIC_CANCELLATION_INTERVAL_FRAMES == 0 && is_cancelled() {
+        if position.is_multiple_of(ACOUSTIC_CANCELLATION_INTERVAL_FRAMES) && is_cancelled() {
             return Err(FwError::Cancelled(format!(
                 "acoustic clustering cancelled at tracklet {position}"
             )));
@@ -17746,7 +18167,7 @@ where
     {
         let position = visited;
         visited = visited.saturating_add(1);
-        if position % ACOUSTIC_CANCELLATION_INTERVAL_FRAMES == 0 && is_cancelled() {
+        if position.is_multiple_of(ACOUSTIC_CANCELLATION_INTERVAL_FRAMES) && is_cancelled() {
             return Err(FwError::Cancelled(format!(
                 "acoustic clustering cancelled at tracklet {position}"
             )));
@@ -17831,9 +18252,9 @@ fn compare_cluster_identity(left: &AcousticCluster, right: &AcousticCluster) -> 
         DiarizationSpeakerEvidenceMode::AcousticV2 => {
             compare_float_vectors(&left.voice, &right.voice)
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => {
-            std::cmp::Ordering::Equal
-        }
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => std::cmp::Ordering::Equal,
     }
 }
 
@@ -17882,7 +18303,9 @@ fn prototype_distance(left: &AcousticPrototype, right: &AcousticPrototype) -> f3
                     0.0
                 }
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 10.0,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => 10.0,
     }
 }
 
@@ -18013,7 +18436,9 @@ fn initial_clusters(
             | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => neural_profiles
                 .and_then(|profiles| profiles.get(&speaker_ref))
                 .map(|profile| profile.reliability),
-            DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => None,
+            DiarizationSpeakerEvidenceMode::SortformerActivity
+            | DiarizationSpeakerEvidenceMode::External
+            | DiarizationSpeakerEvidenceMode::None => None,
         } {
             // The anchored cluster already contains the hard-hint observations
             // used to construct this profile. Merging that profile back into
@@ -18064,7 +18489,9 @@ fn cluster_from_prototype(prototype: &AcousticPrototype) -> AcousticCluster {
         DiarizationSpeakerEvidenceMode::AcousticV2 => {
             (prototype.frame_count as f32 / 100.0).min(1.0)
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 0.0,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => 0.0,
     };
     AcousticCluster {
         prototype_members: prototype.members.clone(),
@@ -18266,7 +18693,9 @@ fn cluster_distance(left: &AcousticCluster, right: &AcousticCluster) -> f32 {
                     0.0
                 }
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 10.0,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => 10.0,
     }
 }
 
@@ -18456,7 +18885,9 @@ fn cluster_pair_evidence(
                     left.evidence_mode,
                 )
             }),
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => None,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => None,
     }
 }
 
@@ -18824,6 +19255,10 @@ struct ProbabilisticLaneResult {
     merge_replay: Vec<(usize, usize)>,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "both internal outcomes are consumed immediately; boxing would add hot-path allocation"
+)]
 enum ProbabilisticAgglomeration {
     Selected {
         clusters: Vec<AcousticCluster>,
@@ -18860,10 +19295,14 @@ fn operational_partition_summary(
     };
     summary
         .validate()
-        .map_err(|error| FwError::ContractViolation(error.to_owned()))?;
+        .map_err(|error| FwError::ContractViolation(error.clone()))?;
     Ok(summary)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "probabilistic clustering keeps policy, calibration, and evidence inputs explicit"
+)]
 fn probabilistic_agglomerate_clusters<C>(
     initial: &[AcousticCluster],
     cannot_links: &BTreeSet<(String, String)>,
@@ -20495,6 +20934,10 @@ where
     Ok(Ok(output))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the evaluation-only residual-birth lane keeps all budget and authority inputs explicit"
+)]
 fn apply_ecapa_residual_birth<C>(
     incumbent: &[AcousticCluster],
     tracklets: &[AcousticTracklet],
@@ -20607,12 +21050,14 @@ where
     }
 }
 
+type NeuralSphericalPartition = (usize, f32, Vec<AcousticCluster>, Vec<ClusterMergeTrace>);
+
 fn infer_neural_spherical_partition<C>(
     initial: &[AcousticCluster],
     policy: SpeakerCountPolicy,
     neural_embeddings: &EcapaTrackletEmbeddings,
     is_cancelled: &mut C,
-) -> FwResult<Option<(usize, f32, Vec<AcousticCluster>, Vec<ClusterMergeTrace>)>>
+) -> FwResult<Option<NeuralSphericalPartition>>
 where
     C: FnMut() -> bool,
 {
@@ -20852,11 +21297,8 @@ where
             }
         }
         if !run_valid
-            || assignments
-                .iter()
-                .any(|assignment| *assignment == usize::MAX)
-            || (0..selected_count)
-                .any(|center| !assignments.iter().any(|assignment| *assignment == center))
+            || assignments.contains(&usize::MAX)
+            || (0..selected_count).any(|center| !assignments.contains(&center))
         {
             continue;
         }
@@ -21228,6 +21670,10 @@ fn soft_count_prior_mix(
     ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "speaker-count fusion combines independent calibrated evidence authorities"
+)]
 fn fused_speaker_count_estimate(
     lanes: &[ProbabilisticLaneResult],
     spectral: Option<&SparseEigengapProposal>,
@@ -22019,9 +22465,9 @@ fn dense_normalized_affinity_matrix(graph: &SparseSpeakerAffinityGraph) -> FwRes
             matrix[row][column] = weight / denominator;
         }
     }
-    for row in 0..node_count {
-        for column in row + 1..node_count {
-            if (matrix[row][column] - matrix[column][row]).abs() > f64::EPSILON {
+    for (row, values) in matrix.iter().enumerate() {
+        for (column, &value) in values.iter().enumerate().skip(row + 1) {
+            if (value - matrix[column][row]).abs() > f64::EPSILON {
                 return Err(FwError::InvalidRequest(
                     "speaker-count dense affinity is not symmetric".to_owned(),
                 ));
@@ -23041,13 +23487,15 @@ where
     Ok(())
 }
 
+type CoassociationConsensus = (Vec<AcousticCluster>, Vec<ClusterMergeTrace>, bool);
+
 fn coassociation_consensus_clusters<C>(
     initial: &[AcousticCluster],
     cannot_links: &BTreeSet<(String, String)>,
     lanes: &[ProbabilisticLaneResult],
     selected_count: usize,
     is_cancelled: &mut C,
-) -> FwResult<Option<(Vec<AcousticCluster>, Vec<ClusterMergeTrace>, bool)>>
+) -> FwResult<Option<CoassociationConsensus>>
 where
     C: FnMut() -> bool,
 {
@@ -23297,7 +23745,9 @@ fn evaluate_cluster_count(
             | DiarizationSpeakerEvidenceMode::EcapaWithAcousticChannel => {
                 ECAPA_FIXED_SAFE_EFFECTIVE_PARAMETER_COUNT
             }
-            DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 0,
+            DiarizationSpeakerEvidenceMode::SortformerActivity
+            | DiarizationSpeakerEvidenceMode::External
+            | DiarizationSpeakerEvidenceMode::None => 0,
         })
         .sum::<usize>();
     let penalty = 0.035 * voice_parameter_count as f32 * total_weight.ln();
@@ -23885,7 +24335,9 @@ fn tracklet_cluster_distance(
                     0.0
                 }
         }
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => 10.0,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => 10.0,
     }
 }
 
@@ -23935,7 +24387,9 @@ fn tracklet_cluster_pair_evidence(
                     cluster.evidence_mode,
                 )
             }),
-        DiarizationSpeakerEvidenceMode::External | DiarizationSpeakerEvidenceMode::None => None,
+        DiarizationSpeakerEvidenceMode::SortformerActivity
+        | DiarizationSpeakerEvidenceMode::External
+        | DiarizationSpeakerEvidenceMode::None => None,
     }
 }
 
@@ -24346,6 +24800,7 @@ fn clusters_have_robust_different_speaker_evidence(
                     >= MIN_SPEAKER_SEPARATION_LANES
             }
             DiarizationSpeakerEvidenceMode::AcousticV2
+            | DiarizationSpeakerEvidenceMode::SortformerActivity
             | DiarizationSpeakerEvidenceMode::External
             | DiarizationSpeakerEvidenceMode::None => false,
         };
@@ -24561,15 +25016,13 @@ where
             .ok_or(SupportedProfileRedecodeFallbackReason::InvalidInput)?;
         if let Some(representation) =
             neural_embeddings.and_then(|embeddings| embeddings.get(&tracklet.tracklet_index))
-        {
-            if representation
+            && (representation
                 .assignment_embedding()
                 .iter()
                 .any(|coordinate| !coordinate.is_finite())
-                || !representation.assignment_weight().is_finite()
-            {
-                return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
-            }
+                || !representation.assignment_weight().is_finite())
+        {
+            return Err(SupportedProfileRedecodeFallbackReason::NonFiniteScore);
         }
         if cluster.neural_voice.as_ref().is_some_and(|centroid| {
             centroid.iter().any(|coordinate| !coordinate.is_finite())
@@ -25191,7 +25644,7 @@ where
             || supported_profile_redecode_assignment_state(
                 assignment,
                 labels,
-                &supported_cluster_indices,
+                supported_cluster_indices,
             )
             .is_none()
             || enrollment
@@ -25251,7 +25704,7 @@ where
     let first_incumbent_state = supported_profile_redecode_assignment_state(
         &assignments[0],
         labels,
-        &supported_cluster_indices,
+        supported_cluster_indices,
     )
     .unwrap_or(state_count);
     let first_forced = (assignments[0].hard_attribution || assignments[0].overlap_suspected)
@@ -25260,7 +25713,7 @@ where
         &tracklets[0],
         clusters,
         labels,
-        &supported_cluster_indices,
+        supported_cluster_indices,
         enrollment,
         neural_embeddings,
         first_forced,
@@ -25287,13 +25740,13 @@ where
         let incumbent_previous_state = supported_profile_redecode_assignment_state(
             &assignments[time - 1],
             labels,
-            &supported_cluster_indices,
+            supported_cluster_indices,
         )
         .unwrap_or(state_count);
         let incumbent_state = supported_profile_redecode_assignment_state(
             &assignments[time],
             labels,
-            &supported_cluster_indices,
+            supported_cluster_indices,
         )
         .unwrap_or(state_count);
         let forced = (assignments[time].hard_attribution || assignments[time].overlap_suspected)
@@ -25302,7 +25755,7 @@ where
             &tracklets[time],
             clusters,
             labels,
-            &supported_cluster_indices,
+            supported_cluster_indices,
             enrollment,
             neural_embeddings,
             forced,
@@ -25480,7 +25933,7 @@ where
         let incumbent_state = supported_profile_redecode_assignment_state(
             incumbent,
             labels,
-            &supported_cluster_indices,
+            supported_cluster_indices,
         )
         .unwrap_or(state_count);
         if (incumbent.hard_attribution || incumbent.overlap_suspected) && state != incumbent_state {
@@ -25568,9 +26021,8 @@ where
             );
         }
     }
-    let changed_label_byte_cap = changed_assignment_count
-        .checked_mul(crate::model::MAX_SPEAKER_REF_BYTES as u64)
-        .unwrap_or(u64::MAX);
+    let changed_label_byte_cap =
+        changed_assignment_count.saturating_mul(crate::model::MAX_SPEAKER_REF_BYTES as u64);
     if persistent_output_label_bytes > changed_label_byte_cap
         || persistent_output_label_bytes
             > SUPPORTED_PROFILE_REDECODE_MAX_PERSISTENT_OUTPUT_LABEL_BYTES
@@ -25582,7 +26034,7 @@ where
     }
     let structural_output_sha256 = supported_profile_redecode_structural_sha256(
         common_observation_sha256,
-        &supported_cluster_indices,
+        supported_cluster_indices,
         tracklets,
         &candidate_states,
     );
@@ -25914,6 +26366,7 @@ mod tests {
                 skipped_tracklet_count: 1,
                 reasons: vec![NeuralSpeakerRepresentationReason::ShortTracklet],
             }),
+            speaker_segments: Vec::new(),
             diagnostics: vec![
                 crate::model::DIARIZATION_DIAGNOSTIC_NEURAL_IDENTITY_UNAVAILABLE.to_owned(),
             ],
@@ -33122,9 +33575,7 @@ mod tests {
 
     fn residual_birth_basis(slot: usize) -> super::EcapaSpeakerEmbedding {
         let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
-        for dimension in slot * 4..slot * 4 + 4 {
-            embedding[dimension] = 0.5;
-        }
+        embedding[slot * 4..slot * 4 + 4].fill(0.5);
         embedding
     }
 
@@ -38859,6 +39310,16 @@ mod tests {
                 .iter()
                 .all(|turn| turn.start_ms == 0 && turn.end_ms == 500 && turn.overlap_suspected)
         );
+
+        let segments = vec![transcript_segment(
+            Some(0.0),
+            Some(0.5),
+            "simultaneous speech",
+            Some(0.9),
+        )];
+        let projection = project_diarization_onto_segments(&segments, &turns, true)
+            .expect("an explicitly marked cross-speaker overlap is a valid turn timeline");
+        assert_eq!(projection.overlap_suspected_segment_indices, vec![0]);
     }
 
     #[test]
@@ -38948,6 +39409,55 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].end_ms <= pair[1].start_ms)
         );
+    }
+
+    #[test]
+    fn separated_secondary_overlap_does_not_bridge_unmarked_speech() {
+        let mut first = assignment(0, 0, 500, Some("alice"), 0.8);
+        first.overlap_suspected = true;
+        first.secondary_speaker_ref = Some("bob".to_owned());
+        first.secondary_speaker_confidence = Some(0.65);
+        let middle = assignment(1, 500, 525, Some("carol"), 0.9);
+        let mut last = assignment(2, 525, 1_025, Some("alice"), 0.8);
+        last.overlap_suspected = true;
+        last.secondary_speaker_ref = Some("bob".to_owned());
+        last.secondary_speaker_confidence = Some(0.65);
+
+        let turns = diarization_turns_from_assignments(&[first, middle, last], 1_025)
+            .expect("separated overlap timeline");
+        let bob = turns
+            .iter()
+            .filter(|turn| turn.speaker_ref.as_deref() == Some("bob"))
+            .collect::<Vec<_>>();
+        assert_eq!(bob.len(), 2, "{turns:#?}");
+        assert_eq!((bob[0].start_ms, bob[0].end_ms), (0, 500));
+        assert_eq!((bob[1].start_ms, bob[1].end_ms), (525, 1_025));
+        project_diarization_onto_segments(&[], &turns, true)
+            .expect("the unmarked middle turn must not be covered by synthetic overlap");
+    }
+
+    #[test]
+    fn clipped_primary_boundary_also_clips_its_secondary_overlap() {
+        let mut overlapped = assignment(0, 0, 525, Some("alice"), 0.8);
+        overlapped.overlap_suspected = true;
+        overlapped.secondary_speaker_ref = Some("bob".to_owned());
+        overlapped.secondary_speaker_confidence = Some(0.65);
+        let following = assignment(1, 500, 1_025, Some("carol"), 0.9);
+
+        let turns = diarization_turns_from_assignments(&[overlapped, following], 1_025)
+            .expect("analysis-frame overlap must have one shared clipped boundary");
+        let bob = turns
+            .iter()
+            .find(|turn| turn.speaker_ref.as_deref() == Some("bob"))
+            .expect("secondary overlap turn");
+        let carol = turns
+            .iter()
+            .find(|turn| turn.speaker_ref.as_deref() == Some("carol"))
+            .expect("following primary turn");
+        assert_eq!(bob.end_ms, carol.start_ms, "{turns:#?}");
+        assert_eq!(bob.end_ms, 512);
+        project_diarization_onto_segments(&[], &turns, true)
+            .expect("the clipped secondary must not overlap the unmarked next turn");
     }
 
     #[test]
@@ -39058,7 +39568,11 @@ mod tests {
     }
 
     #[test]
-    fn tied_word_uses_earlier_speaker_only_above_confidence_policy() {
+    fn tied_word_is_attributed_even_below_primary_confidence_gate() {
+        // projection-fusion-v1 (bd-d4py): the primary pass still refuses a
+        // sub-0.30-confidence turn, but the fusion pass fills the label from
+        // the same max-overlap evidence instead of returning `null` for a
+        // word that plainly overlaps a labeled turn.
         let low_confidence_turns = vec![
             turn(0, 1_000, Some("alice"), Some(0.2)),
             turn(1_000, 2_000, Some("bob"), Some(0.9)),
@@ -39071,7 +39585,7 @@ mod tests {
         )];
         let low =
             project_diarization_onto_segments(&word, &low_confidence_turns, true).expect("low");
-        assert_eq!(low.segments[0].speaker, None);
+        assert_eq!(low.segments[0].speaker.as_deref(), Some("alice"));
 
         let high_confidence_turns = vec![
             turn(0, 1_000, Some("alice"), Some(0.8)),
@@ -39080,6 +39594,123 @@ mod tests {
         let high =
             project_diarization_onto_segments(&word, &high_confidence_turns, true).expect("high");
         assert_eq!(high.segments[0].speaker.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn gap_word_takes_nearest_labeled_neighbor_within_bound() {
+        // projection-fusion-v1 (bd-d4py): a timed word in a silence gap
+        // between turns takes the nearest labeled turn within 2 s; a word
+        // farther than the bound stays honestly unknown.
+        let turns = vec![
+            turn(0, 1_000, Some("alice"), Some(0.9)),
+            turn(10_000, 11_000, Some("bob"), Some(0.9)),
+        ];
+        let near_gap = vec![transcript_segment(Some(1.5), Some(1.8), "uh", Some(0.5))];
+        let projection =
+            project_diarization_onto_segments(&near_gap, &turns, true).expect("projection");
+        assert_eq!(projection.segments[0].speaker.as_deref(), Some("alice"));
+
+        let far_gap = vec![transcript_segment(Some(5.0), Some(5.3), "uh", Some(0.5))];
+        let projection =
+            project_diarization_onto_segments(&far_gap, &turns, true).expect("projection");
+        assert_eq!(projection.segments[0].speaker, None);
+    }
+
+    #[test]
+    fn speaker_change_snaps_to_sentence_punctuation_within_window() {
+        // projection-fusion-v1 (bd-d4py): the diarizer's quantized boundary
+        // lands one word late ("Jeff. Hey" split as "Jeff. Hey|," instead of
+        // "Jeff.|Hey"); the transcript's own punctuation re-anchors it.
+        let turns = vec![
+            turn(0, 2_200, Some("jeff"), Some(0.9)),
+            turn(2_200, 4_000, Some("hang"), Some(0.9)),
+        ];
+        let words = vec![
+            transcript_segment(Some(0.0), Some(0.7), "how", Some(0.9)),
+            transcript_segment(Some(0.7), Some(1.4), "are", Some(0.9)),
+            transcript_segment(Some(1.4), Some(2.0), "you?", Some(0.9)),
+            // The diarizer boundary (2.2 s) falls after this word, but the
+            // sentence ended at "you?" — the change must snap back to it.
+            transcript_segment(Some(2.0), Some(2.4), "good,", Some(0.9)),
+            transcript_segment(Some(2.4), Some(3.0), "thanks", Some(0.9)),
+            transcript_segment(Some(3.0), Some(3.6), "Jeff.", Some(0.9)),
+        ];
+        let projection =
+            project_diarization_onto_segments(&words, &turns, true).expect("projection");
+        assert_eq!(
+            projection
+                .segments
+                .iter()
+                .map(|segment| segment.speaker.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("jeff"),
+                Some("jeff"),
+                Some("jeff"),
+                Some("hang"),
+                Some("hang"),
+                Some("hang"),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapping_never_erases_a_short_interjection_turn() {
+        // projection-fusion-v1 (bd-d4py): a one-word interjection ("yeah.")
+        // whose sentence boundary sits just past it must survive snapping —
+        // the boundary may move, the turn may not disappear.
+        let turns = vec![
+            turn(0, 2_000, Some("alice"), Some(0.9)),
+            turn(2_000, 2_400, Some("bob"), Some(0.9)),
+            turn(2_400, 4_000, Some("alice"), Some(0.9)),
+        ];
+        let words = vec![
+            transcript_segment(Some(0.0), Some(0.8), "so", Some(0.9)),
+            transcript_segment(Some(0.8), Some(1.9), "anyway,", Some(0.9)),
+            transcript_segment(Some(2.0), Some(2.35), "yeah.", Some(0.9)),
+            transcript_segment(Some(2.5), Some(3.0), "right", Some(0.9)),
+        ];
+        let projection =
+            project_diarization_onto_segments(&words, &turns, true).expect("projection");
+        assert_eq!(
+            projection
+                .segments
+                .iter()
+                .map(|segment| segment.speaker.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("alice"), Some("alice"), Some("bob"), Some("alice")],
+            "the one-word bob turn must not be swallowed by boundary snapping"
+        );
+    }
+
+    #[test]
+    fn merged_speaker_segments_cover_transcript_and_carry_confidence() {
+        // bd-d4py: the merged view collapses consecutive same-speaker words,
+        // keeps byte-faithful text, and reports duration-weighted turn
+        // confidence.
+        let turns = vec![
+            turn(0, 2_000, Some("alice"), Some(0.9)),
+            turn(2_000, 4_000, Some("bob"), Some(0.7)),
+        ];
+        let segments = vec![
+            transcript_segment(Some(0.0), Some(1.0), "hello", Some(0.9)),
+            transcript_segment(Some(1.0), Some(1.9), "there,", Some(0.9)),
+            transcript_segment(Some(2.1), Some(3.0), "hi!", Some(0.9)),
+        ];
+        let projection =
+            project_diarization_onto_segments(&segments, &turns, true).expect("projection");
+        let merged =
+            crate::diarization::build_speaker_attributed_segments(&projection.segments, &turns);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].speaker.as_deref(), Some("alice"));
+        assert_eq!(merged[0].text, "hello there,");
+        assert_eq!(merged[0].segment_count, 2);
+        assert_eq!(merged[0].start_sec, Some(0.0));
+        assert_eq!(merged[0].end_sec, Some(1.9));
+        assert!((merged[0].speaker_confidence.expect("confidence") - 0.9).abs() < 1e-9);
+        assert_eq!(merged[1].speaker.as_deref(), Some("bob"));
+        assert_eq!(merged[1].text, "hi!");
+        assert!((merged[1].speaker_confidence.expect("confidence") - 0.7).abs() < 1e-9);
     }
 
     #[test]
@@ -39096,7 +39727,10 @@ mod tests {
         )];
         let mixed =
             project_diarization_onto_segments(&segment, &mixed_turns, false).expect("mixed");
-        assert_eq!(mixed.segments[0].speaker, None);
+        // projection-fusion-v1 (bd-d4py): the primary pass still records the
+        // segment as mixed (no 70% dominance), but the fusion pass attributes
+        // the max-overlap labeled turn instead of leaving `null`.
+        assert_eq!(mixed.segments[0].speaker.as_deref(), Some("alice"));
         assert_eq!(mixed.mixed_speaker_segment_indices, vec![0]);
         assert_eq!(mixed.segments[0].confidence, Some(0.83));
 
@@ -39274,6 +39908,124 @@ mod tests {
     }
 
     #[test]
+    fn malformed_turn_overlap_provenance_fails_closed() {
+        let segments = vec![transcript_segment(Some(0.0), Some(1.0), "word", None)];
+
+        let unmarked_cross_speaker = vec![
+            turn(0, 1_000, Some("alice"), Some(0.9)),
+            turn(500, 1_500, Some("bob"), Some(0.9)),
+        ];
+        assert!(
+            project_diarization_onto_segments(&segments, &unmarked_cross_speaker, true)
+                .expect_err("unmarked cross-speaker overlap")
+                .to_string()
+                .contains("diarization turns")
+        );
+
+        let mut marked_second = turn(500, 1_500, Some("bob"), Some(0.9));
+        marked_second.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(
+                &segments,
+                &[turn(0, 1_000, Some("alice"), Some(0.9)), marked_second],
+                true,
+            )
+            .expect_err("both cross-speaker turns must carry overlap provenance")
+            .to_string()
+            .contains("diarization turns")
+        );
+
+        let mut marked_first = turn(0, 1_000, Some("alice"), Some(0.9));
+        marked_first.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(
+                &segments,
+                &[marked_first, turn(500, 1_500, Some("bob"), Some(0.9))],
+                true,
+            )
+            .expect_err("overlap provenance must be symmetric")
+            .to_string()
+            .contains("diarization turns")
+        );
+
+        let mut alice_first = turn(0, 1_000, Some("alice"), Some(0.9));
+        alice_first.overlap_suspected = true;
+        let mut alice_second = turn(500, 1_500, Some("alice"), Some(0.8));
+        alice_second.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(&segments, &[alice_first, alice_second], true,)
+                .expect_err("same-speaker overlap must be canonicalized before projection")
+                .to_string()
+                .contains("diarization turns")
+        );
+
+        let mut later = turn(500, 1_500, Some("alice"), Some(0.9));
+        later.overlap_suspected = true;
+        let mut earlier = turn(0, 1_000, Some("bob"), Some(0.9));
+        earlier.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(&segments, &[later, earlier], true)
+                .expect_err("turn starts must be nondecreasing")
+                .to_string()
+                .contains("diarization turns")
+        );
+
+        let mut labeled_first = turn(0, 1_000, Some("alice"), Some(0.9));
+        labeled_first.overlap_suspected = true;
+        let mut unlabeled_second = turn(500, 1_500, None, None);
+        unlabeled_second.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(&segments, &[labeled_first, unlabeled_second], true,)
+                .expect_err("overlap requires two labeled speakers")
+                .to_string()
+                .contains("diarization turns")
+        );
+
+        let mut unlabeled_first = turn(0, 1_000, None, None);
+        unlabeled_first.overlap_suspected = true;
+        let mut labeled_second = turn(500, 1_500, Some("alice"), Some(0.9));
+        labeled_second.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(&segments, &[unlabeled_first, labeled_second], true,)
+                .expect_err("a labeled speaker cannot overlap an anonymous turn")
+                .to_string()
+                .contains("diarization turns")
+        );
+
+        let mut bob = turn(0, 1_000, Some("bob"), Some(0.9));
+        bob.overlap_suspected = true;
+        let mut alice = turn(0, 1_000, Some("alice"), Some(0.9));
+        alice.overlap_suspected = true;
+        assert!(
+            project_diarization_onto_segments(&segments, &[bob, alice], true)
+                .expect_err("equal-time turns must use deterministic speaker ordering")
+                .to_string()
+                .contains("diarization turns")
+        );
+
+        let mut anonymous_hard = turn(0, 1_000, None, None);
+        anonymous_hard.hard_hint_attributed = true;
+        let mut uncertain_hard = turn(0, 1_000, Some("alice"), Some(0.9));
+        uncertain_hard.hard_hint_attributed = true;
+        let overlong = "s".repeat(crate::model::MAX_SPEAKER_REF_BYTES + 1);
+        for (invalid, reason) in [
+            (anonymous_hard, "anonymous hard hint"),
+            (uncertain_hard, "non-authoritative hard-hint confidence"),
+            (
+                turn(0, 1_000, Some(&overlong), Some(0.9)),
+                "overlong speaker reference",
+            ),
+        ] {
+            assert!(
+                project_diarization_onto_segments(&segments, &[invalid], true)
+                    .expect_err(reason)
+                    .to_string()
+                    .contains("diarization turns")
+            );
+        }
+    }
+
+    #[test]
     fn projection_accepts_only_sub_epsilon_adjacency_noise() {
         let turns = vec![turn(0, 2_000, Some("alice"), Some(0.9))];
         let harmless = vec![
@@ -39421,11 +40173,11 @@ mod tests {
         embedding[3] = 1.0;
         let valid = ecapa_representation(embedding, None, 50.0, 0.0);
 
-        let mut zero_norm = valid.clone();
+        let mut zero_norm = valid;
         zero_norm.discovery.fill(0.0);
-        let mut non_finite = valid.clone();
+        let mut non_finite = valid;
         non_finite.discovery[7] = f32::NAN;
-        let mut non_finite_weight = valid.clone();
+        let mut non_finite_weight = valid;
         non_finite_weight.discovery_weight = f32::INFINITY;
         let invalid_validation_weight = ecapa_representation(embedding, Some(embedding), 50.0, 0.0);
         let invalid_absent_validation_weight = ecapa_representation(embedding, None, 50.0, 1.0);
@@ -40707,12 +41459,19 @@ mod tests {
         let audio_bytes = std::fs::read(audio_path).expect("read public WAV");
         let mut samples = crate::native_engine::decode::read_wav_16k_mono(&audio_bytes)
             .expect("decode 16 kHz mono WAV");
-        samples.truncate(samples.len().min(16_000 * 10));
+        if std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_FULL_AUDIO").is_none() {
+            samples.truncate(samples.len().min(16_000 * 10));
+        }
         let duration_ms = u64::try_from(samples.len()).expect("sample count fits") / 16;
-        let boundary_hints = super::AcousticBoundaryHints {
-            speech_regions_ms: vec![(0, duration_ms)],
-            ..super::AcousticBoundaryHints::default()
-        };
+        let boundary_hints =
+            if std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_DEFAULT_BOUNDARIES").is_some() {
+                super::AcousticBoundaryHints::default()
+            } else {
+                super::AcousticBoundaryHints {
+                    speech_regions_ms: vec![(0, duration_ms)],
+                    ..super::AcousticBoundaryHints::default()
+                }
+            };
         for (engine, expected_implementation, expected_evidence_mode) in [
             (
                 crate::model::DiarizationEngine::Ecapa,

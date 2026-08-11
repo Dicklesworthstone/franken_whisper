@@ -4,9 +4,11 @@
 //! `project_sampler_exp_measured` sized ONLY the sampler's vocab-wide exp (51866/token)
 //! and concluded "pipelining-hidden ⇒ ~0 e2e". But per token the decoder also runs
 //! `nn::softmax_rows` (scalar libm `.exp()`) for:
-//!   - CROSS-attn: 4 layers × 20 heads × 1500 enc frames = 120000 exp/token  (decoder.rs:1281/1312)
-//!   - SELF-attn : 4 layers × 20 heads × seq_len (grows; ~avg 128)           (attention_decode_step)
-//!   - sampler   : 51866 exp/token                                           (compute_logprobs)
+//!
+//! - Cross-attention: 4 layers × 20 heads × 1500 encoder frames = 120000 exponentials/token.
+//! - Self-attention: 4 layers × 20 heads × a growing sequence, averaging about 128.
+//! - Sampling: 51866 exponentials/token.
+//!
 //! Cross-attn alone is ~2.3× the sampler. This probe times franken's exact scalar
 //! `softmax_rows` vs an AVX2 poly-exp softmax on the REAL per-token decode shapes, to size
 //! the true owner-gated SIMD-exp headroom — and confirms it's exposed in TIMESTAMP mode
@@ -26,7 +28,7 @@ fn softmax_row_scalar(row: &mut [f32]) {
         return;
     }
     let mut sum = 0.0f32;
-    for v in row.iter_mut() {
+    for v in &mut *row {
         let e = (*v - max).exp();
         let e = if e.is_finite() { e } else { 0.0 };
         *v = e;
@@ -34,7 +36,7 @@ fn softmax_row_scalar(row: &mut [f32]) {
     }
     if sum > 0.0 {
         let inv = 1.0 / sum;
-        for v in row.iter_mut() {
+        for v in &mut *row {
             *v *= inv;
         }
     }
@@ -47,12 +49,12 @@ unsafe fn exp8(x: __m256) -> __m256 {
     let lo = _mm256_set1_ps(-88.0);
     let hi = _mm256_set1_ps(88.0);
     let x = _mm256_max_ps(_mm256_min_ps(x, hi), lo);
-    let log2ef = _mm256_set1_ps(1.442_695_04);
+    let log2ef = _mm256_set1_ps(std::f32::consts::LOG2_E);
     let fx = _mm256_round_ps(
         _mm256_mul_ps(x, log2ef),
         _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
     );
-    let c1 = _mm256_set1_ps(0.693_359_38);
+    let c1 = _mm256_set1_ps(0.693_359_4);
     let c2 = _mm256_set1_ps(-2.121_944_4e-4);
     let mut xr = _mm256_fnmadd_ps(fx, c1, x);
     xr = _mm256_fnmadd_ps(fx, c2, xr);
@@ -61,7 +63,7 @@ unsafe fn exp8(x: __m256) -> __m256 {
     p = _mm256_fmadd_ps(p, xr, _mm256_set1_ps(8.333_452e-3));
     p = _mm256_fmadd_ps(p, xr, _mm256_set1_ps(4.166_579_6e-2));
     p = _mm256_fmadd_ps(p, xr, _mm256_set1_ps(1.666_666_5e-1));
-    p = _mm256_fmadd_ps(p, xr, _mm256_set1_ps(5.000_000_1e-1));
+    p = _mm256_fmadd_ps(p, xr, _mm256_set1_ps(5e-1));
     let xr2 = _mm256_mul_ps(xr, xr);
     p = _mm256_fmadd_ps(p, xr2, _mm256_add_ps(xr, _mm256_set1_ps(1.0)));
     // scale by 2^fx: (int(fx)+127) << 23
@@ -180,7 +182,11 @@ fn main() {
     ] {
         let base: Vec<f32> = (0..rows * cols).map(|_| nf()).collect();
         // byte-exactness delta on this shape
-        let (mut a, mut b) = (base.clone(), base.clone());
+        let mut a = base.clone();
+        #[cfg(target_arch = "x86_64")]
+        let mut b = base.clone();
+        #[cfg(not(target_arch = "x86_64"))]
+        let b = base.clone();
         for r in a.chunks_mut(cols) {
             softmax_row_scalar(r);
         }

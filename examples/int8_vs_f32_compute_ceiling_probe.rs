@@ -13,38 +13,45 @@
 #![allow(unsafe_code)]
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
+#[cfg(target_arch = "x86_64")]
 const K: usize = 4096; // per-buffer length; int8 = 4 KB, f32 = 16 KB (L1/L2-resident)
 
 /// Peak f32 MAC/s: 8 independent FMA accumulators over an L1-resident buffer.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn f32_peak(a: &[f32], b: &[f32], iters: usize) -> f32 {
-    let mut acc = [_mm256_setzero_ps(); 8];
-    let (pa, pb) = (a.as_ptr(), b.as_ptr());
-    for _ in 0..iters {
-        let mut k = 0;
-        while k + 64 <= K {
-            for (j, ac) in acc.iter_mut().enumerate() {
-                let off = k + j * 8;
-                *ac = _mm256_fmadd_ps(
-                    _mm256_loadu_ps(pa.add(off)),
-                    _mm256_loadu_ps(pb.add(off)),
-                    *ac,
-                );
+    // SAFETY: callers gate AVX2/FMA and supply K readable elements in each
+    // slice; every pointer offset below remains within those K elements.
+    unsafe {
+        let mut acc = [_mm256_setzero_ps(); 8];
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        for _ in 0..iters {
+            let mut k = 0;
+            while k + 64 <= K {
+                for (j, ac) in acc.iter_mut().enumerate() {
+                    let off = k + j * 8;
+                    *ac = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(pa.add(off)),
+                        _mm256_loadu_ps(pb.add(off)),
+                        *ac,
+                    );
+                }
+                k += 64;
             }
-            k += 64;
         }
+        let mut s = _mm256_setzero_ps();
+        for ac in acc {
+            s = _mm256_add_ps(s, ac);
+        }
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), s);
+        tmp.iter().sum()
     }
-    let mut s = _mm256_setzero_ps();
-    for ac in acc {
-        s = _mm256_add_ps(s, ac);
-    }
-    let mut tmp = [0.0f32; 8];
-    _mm256_storeu_ps(tmp.as_mut_ptr(), s);
-    tmp.iter().sum()
 }
 
 /// Peak int8 MAC/s: VPMADDUBSW + VPMADDWD (the best AVX2-no-VNNI int8 GEMM inner op),
@@ -52,31 +59,35 @@ unsafe fn f32_peak(a: &[f32], b: &[f32], iters: usize) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn i8_peak(a: &[i8], b: &[i8], iters: usize) -> i32 {
-    let ones = _mm256_set1_epi16(1);
-    let mut acc = [_mm256_setzero_si256(); 8];
-    let (pa, pb) = (a.as_ptr(), b.as_ptr());
-    for _ in 0..iters {
-        let mut k = 0;
-        // each 32-byte load = 32 int8; maddubs → 16 int16 partial sums; madd(·,1) → 8 int32.
-        while k + 256 <= K {
-            for (j, ac) in acc.iter_mut().enumerate() {
-                let off = k + j * 32;
-                let va = _mm256_loadu_si256(pa.add(off).cast());
-                let vb = _mm256_loadu_si256(pb.add(off).cast());
-                let p16 = _mm256_maddubs_epi16(va, vb); // 32×(u8·i8)→16×i16
-                let p32 = _mm256_madd_epi16(p16, ones); // 16×i16 → 8×i32
-                *ac = _mm256_add_epi32(*ac, p32);
+    // SAFETY: callers gate AVX2 and supply K readable elements in each slice;
+    // every pointer offset below remains within those K elements.
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_si256(); 8];
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        for _ in 0..iters {
+            let mut k = 0;
+            // each 32-byte load = 32 int8; maddubs → 16 int16 partial sums; madd(·,1) → 8 int32.
+            while k + 256 <= K {
+                for (j, ac) in acc.iter_mut().enumerate() {
+                    let off = k + j * 32;
+                    let va = _mm256_loadu_si256(pa.add(off).cast());
+                    let vb = _mm256_loadu_si256(pb.add(off).cast());
+                    let p16 = _mm256_maddubs_epi16(va, vb); // 32×(u8·i8)→16×i16
+                    let p32 = _mm256_madd_epi16(p16, ones); // 16×i16 → 8×i32
+                    *ac = _mm256_add_epi32(*ac, p32);
+                }
+                k += 256;
             }
-            k += 256;
         }
+        let mut s = _mm256_setzero_si256();
+        for ac in acc {
+            s = _mm256_add_epi32(s, ac);
+        }
+        let mut tmp = [0i32; 8];
+        _mm256_storeu_si256(tmp.as_mut_ptr().cast(), s);
+        tmp.iter().sum()
     }
-    let mut s = _mm256_setzero_si256();
-    for ac in acc {
-        s = _mm256_add_epi32(s, ac);
-    }
-    let mut tmp = [0i32; 8];
-    _mm256_storeu_si256(tmp.as_mut_ptr().cast(), s);
-    tmp.iter().sum()
 }
 
 /// int8 via VPMOVSXBW + VPMADDWD — the WIDENING path `nn::dot_i8` and the prior TILED encoder
@@ -85,31 +96,40 @@ unsafe fn i8_peak(a: &[i8], b: &[i8], iters: usize) -> i32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn i8_peak_widening(a: &[i8], b: &[i8], iters: usize) -> i32 {
-    let mut acc = [_mm256_setzero_si256(); 8];
-    let (pa, pb) = (a.as_ptr(), b.as_ptr());
-    for _ in 0..iters {
-        let mut k = 0;
-        // each 128-bit load = 16 int8 → sign-extend to 16 int16 → madd → 8 int32.
-        while k + 128 <= K {
-            for (j, ac) in acc.iter_mut().enumerate() {
-                let off = k + j * 16;
-                let va = _mm256_cvtepi8_epi16(_mm_loadu_si128(pa.add(off).cast()));
-                let vb = _mm256_cvtepi8_epi16(_mm_loadu_si128(pb.add(off).cast()));
-                *ac = _mm256_add_epi32(*ac, _mm256_madd_epi16(va, vb));
+    // SAFETY: callers gate AVX2 and supply K readable elements in each slice;
+    // every pointer offset below remains within those K elements.
+    unsafe {
+        let mut acc = [_mm256_setzero_si256(); 8];
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        for _ in 0..iters {
+            let mut k = 0;
+            // each 128-bit load = 16 int8 → sign-extend to 16 int16 → madd → 8 int32.
+            while k + 128 <= K {
+                for (j, ac) in acc.iter_mut().enumerate() {
+                    let off = k + j * 16;
+                    let va = _mm256_cvtepi8_epi16(_mm_loadu_si128(pa.add(off).cast()));
+                    let vb = _mm256_cvtepi8_epi16(_mm_loadu_si128(pb.add(off).cast()));
+                    *ac = _mm256_add_epi32(*ac, _mm256_madd_epi16(va, vb));
+                }
+                k += 128;
             }
-            k += 128;
         }
+        let mut s = _mm256_setzero_si256();
+        for ac in acc {
+            s = _mm256_add_epi32(s, ac);
+        }
+        let mut tmp = [0i32; 8];
+        _mm256_storeu_si256(tmp.as_mut_ptr().cast(), s);
+        tmp.iter().sum()
     }
-    let mut s = _mm256_setzero_si256();
-    for ac in acc {
-        s = _mm256_add_epi32(s, ac);
-    }
-    let mut tmp = [0i32; 8];
-    _mm256_storeu_si256(tmp.as_mut_ptr().cast(), s);
-    tmp.iter().sum()
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
+    if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+        eprintln!("int8_vs_f32_compute_ceiling_probe requires AVX2 and FMA support");
+        return;
+    }
     let iters: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -183,4 +203,9 @@ fn main() {
             "   real blocked int8 GEMM would be <= this; multi-thread clock-throttle applies to all.)"
         );
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("int8_vs_f32_compute_ceiling_probe requires an x86_64 processor");
 }

@@ -131,6 +131,9 @@ pub struct EncoderWeights {
     n_head: usize,
     /// Maximum audio context (`hparams.n_audio_ctx`, e.g. 1500).
     n_ctx: usize,
+    /// Model-specific admission decision for FrankenTorch's non-byte-exact
+    /// polynomial SDPA softmax.
+    sdpa_poly_exp: bool,
     /// `conv1` weight PRE-TRANSPOSED to `[n_mels*K, n_state]` (the `[Cin*K, Cout]` layout
     /// `nn::conv1d_wt` / `matmul_bias` consume) + bias `[n_state]`. Transposed once at load
     /// so the per-window encode never re-transposes it.
@@ -146,6 +149,53 @@ pub struct EncoderWeights {
     /// Final `ln_post` scale/shift, length `n_state`.
     ln_post_w: Vec<f32>,
     ln_post_b: Vec<f32>,
+}
+
+/// Read guard that pins FrankenTorch's process-global SDPA policy for one CPU
+/// encoder forward.
+struct SdpaPolyExpPolicyGuard {
+    _guard: std::sync::RwLockReadGuard<'static, ()>,
+}
+
+struct SdpaPolyExpPolicyState {
+    gate: std::sync::RwLock<()>,
+    current: std::sync::atomic::AtomicBool,
+}
+
+fn sdpa_poly_exp_policy_state() -> &'static SdpaPolyExpPolicyState {
+    static STATE: std::sync::OnceLock<SdpaPolyExpPolicyState> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| SdpaPolyExpPolicyState {
+        gate: std::sync::RwLock::new(()),
+        current: std::sync::atomic::AtomicBool::new(ft_kernel_cpu::sdpa_poly_exp()),
+    })
+}
+
+fn enter_sdpa_poly_exp_policy(want: bool) -> SdpaPolyExpPolicyGuard {
+    use std::sync::atomic::Ordering;
+
+    let state = sdpa_poly_exp_policy_state();
+    loop {
+        let read = state
+            .gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.current.load(Ordering::Acquire) == want {
+            return SdpaPolyExpPolicyGuard { _guard: read };
+        }
+        drop(read);
+
+        let write = state
+            .gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.current.load(Ordering::Acquire) != want {
+            ft_kernel_cpu::set_sdpa_poly_exp(want);
+            state.current.store(want, Ordering::Release);
+        }
+        drop(write);
+        // Re-acquire a read guard. If an opposing waiter won the interval after
+        // the write guard was released, the loop observes it and retries.
+    }
 }
 
 /// Decoder-owned cross-attention K/V cache (see module docs).
@@ -672,10 +722,10 @@ impl EncoderWeights {
         // grew into, are gone. Fusing lets FW_ENC_FREE_F32 free each f32 while only
         // ~one linear per worker is transient, dropping PEAK below the f32 floor.)
 
-        // bd-bcm7: enable ft_kernel_cpu's poly softmax for large-v3-turbo (proven WER-neutral:
-        // byte-identical transcript, WER Δ 0.000, 1.0722× e2e). tiny.en stays off (uncertified).
-        // Kill-switch FW_SDPA_POLY_EXP=0; operator force FT_SDPA_POLY_EXP=1.
-        super::configure_sdpa_poly_exp(&model.hparams);
+        // bd-bcm7: large-v3-turbo admits the polynomial SDPA softmax (proven
+        // WER-neutral); tiny.en does not. Retain this on the model rather than
+        // mutating FrankenTorch's process-global switch during model loading.
+        let sdpa_poly_exp = super::sdpa_poly_exp_for(&model.hparams);
 
         // FEASIBILITY HARNESS (off by default): `FW_ENC_WEIGHT_ROUNDTRIP=row|<N>` replaces
         // every f32 GEMM weight with its i7 quantize→dequantize roundtrip, so the EXISTING
@@ -704,6 +754,7 @@ impl EncoderWeights {
             n_state,
             n_head,
             n_ctx,
+            sdpa_poly_exp,
             conv1_wt,
             conv1_b,
             conv2_wt,
@@ -1127,6 +1178,11 @@ fn forward_time_major(
     // per layer instead of per-op CPU<->GPU ping-pong); every other case uses the
     // CPU blocks. `FRANKEN_WHISPER_GPU=0` forces the CPU path.
     if !gpu_encode_stack(&mut x, w) {
+        // FrankenTorch currently exposes the polynomial-softmax choice as a
+        // process-global switch. Hold a shared guard for this model's complete
+        // CPU encoder forward so same-policy encoders can run concurrently but
+        // an opposing model cannot flip the switch between transformer layers.
+        let _sdpa_policy = enter_sdpa_poly_exp_policy(w.sdpa_poly_exp);
         // Optional depth truncation (`FW_ENCODER_LAYERS=N`): run only the first N
         // of the model's encoder transformer blocks. NON-byte-exact (fewer
         // refinements → different encoder output) — a VIABILITY PROBE for encoder
@@ -1249,9 +1305,15 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
         std::env::var("FRANKEN_WHISPER_FUSED_ENC").ok().as_deref(),
         Some("0")
     ) {
+        record_encoder_route("cpu:fused_disabled");
         return false;
     }
-    if w.n_state < GPU_ENCODER_MIN_N_STATE || !gpu_encoder_enabled() {
+    if w.n_state < GPU_ENCODER_MIN_N_STATE {
+        record_encoder_route("cpu:model_below_gpu_width_gate");
+        return false;
+    }
+    if !gpu_encoder_enabled() {
+        record_encoder_route("cpu:gpu_unavailable_or_disabled");
         return false;
     }
 
@@ -1292,53 +1354,91 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
     let enc = {
         let mut guard = match cache.lock() {
             Ok(g) => g,
-            Err(_) => return false,
+            Err(_) => {
+                record_encoder_route("cpu:gpu_cache_poisoned");
+                return false;
+            }
         };
-        if !guard.contains_key(&key) {
-            let refs: Vec<ft_kernel_metal::fused::LayerWeightsRef> = w
-                .layers
-                .iter()
-                .map(|l| ft_kernel_metal::fused::LayerWeightsRef {
-                    ln1_g: &l.attn_ln_w,
-                    ln1_b: &l.attn_ln_b,
-                    wq: &l.attn_q_w.data,
-                    bq: &l.attn_q_b,
-                    wk: &l.attn_k_w.data,
-                    wv: &l.attn_v_w.data,
-                    bv: &l.attn_v_b,
-                    wo: &l.attn_out_w.data,
-                    bo: &l.attn_out_b,
-                    ln2_g: &l.mlp_ln_w,
-                    ln2_b: &l.mlp_ln_b,
-                    w1: &l.mlp_fc_w.data,
-                    b1: &l.mlp_fc_b,
-                    w2: &l.mlp_proj_w.data,
-                    b2: &l.mlp_proj_b,
-                })
-                .collect();
-            match ft_kernel_metal::fused::EncoderGpu::new(w.n_state, w.n_head, w.n_state * 4, &refs)
-            {
-                Ok(enc) => {
-                    guard.insert(key, Arc::new(enc));
+        match guard.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let refs: Vec<ft_kernel_metal::fused::LayerWeightsRef> = w
+                    .layers
+                    .iter()
+                    .map(|l| ft_kernel_metal::fused::LayerWeightsRef {
+                        ln1_g: &l.attn_ln_w,
+                        ln1_b: &l.attn_ln_b,
+                        wq: &l.attn_q_w.data,
+                        bq: &l.attn_q_b,
+                        wk: &l.attn_k_w.data,
+                        wv: &l.attn_v_w.data,
+                        bv: &l.attn_v_b,
+                        wo: &l.attn_out_w.data,
+                        bo: &l.attn_out_b,
+                        ln2_g: &l.mlp_ln_w,
+                        ln2_b: &l.mlp_ln_b,
+                        w1: &l.mlp_fc_w.data,
+                        b1: &l.mlp_fc_b,
+                        w2: &l.mlp_proj_w.data,
+                        b2: &l.mlp_proj_b,
+                    })
+                    .collect();
+                match ft_kernel_metal::fused::EncoderGpu::new(
+                    w.n_state,
+                    w.n_head,
+                    w.n_state * 4,
+                    &refs,
+                ) {
+                    Ok(enc) => Arc::clone(entry.insert(Arc::new(enc))),
+                    Err(_) => {
+                        record_encoder_route("cpu:gpu_encoder_init_failed");
+                        return false;
+                    }
                 }
-                Err(_) => return false,
             }
         }
-        Arc::clone(guard.get(&key).expect("just inserted"))
     };
 
     match enc.forward(&x.data, x.rows) {
         Ok(out) => {
             x.data = out;
+            record_encoder_route("gpu_fused");
             true
         }
-        Err(_) => false,
+        Err(_) => {
+            record_encoder_route("cpu:gpu_forward_failed");
+            false
+        }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn gpu_encode_stack(_x: &mut Mat, _w: &EncoderWeights) -> bool {
+    record_encoder_route("cpu:no_gpu_backend");
     false
+}
+
+/// Last encoder route actually executed, with the decline reason when the GPU
+/// stack was skipped: `"gpu_fused"` or `"cpu:<reason>"`. `"unknown"` before the
+/// first encode. Route introspection exists because every GPU failure path
+/// returns `false` silently — without it, a fused encoder that is built,
+/// dispatchable, and never dispatched is invisible (the silent-fallback trap).
+static ENCODER_ROUTE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("unknown");
+
+fn record_encoder_route(route: &'static str) {
+    if let Ok(mut guard) = ENCODER_ROUTE.lock() {
+        *guard = route;
+    }
+}
+
+/// The last executed encoder route (`"gpu_fused"` / `"cpu:<reason>"` /
+/// `"unknown"`), for raw-output provenance and perf-pass route assertions.
+#[must_use]
+pub fn last_encoder_route() -> &'static str {
+    ENCODER_ROUTE
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or("unknown")
 }
 
 /// Minimum `n_state` (model width) for the GPU encoder: medium/large whisper
@@ -1634,8 +1734,9 @@ fn dot_i8_enc(w: &[i8], x: &[i8]) -> i32 {
 }
 
 /// M4×N2 register-blocked i8×i8 → i32: 4 activation rows × 2 weight rows = 8 dots,
-/// each 16-i8 chunk sign-extended ONCE and reused across all 8 dots (8 accumulators
-/// + 4 act + 2 weight = 14 ymm, fits Zen3's 16). This amortizes the vpmovsxbw
+/// each 16-i8 chunk sign-extended ONCE and reused across all 8 dots (8 accumulators,
+/// 4 activation registers, and 2 weight registers = 14 ymm, fitting Zen3's 16).
+/// This amortizes the vpmovsxbw
 /// sign-extend + the loads that make the per-call [`dot_i8_enc`] effectively M1
 /// (it re-loads+re-extends the weight row for every activation row). Mirrors the
 /// maddubs `dot_maddubs_i7_m4n2`; integer-EXACT (associative i32 add ⇒ bit-identical
@@ -2146,6 +2247,7 @@ mod tests {
             n_state,
             n_head,
             n_ctx: pe_ctx,
+            sdpa_poly_exp: false,
             conv1_wt: rng.mat(n_mels * CONV_K, n_state, s),
             conv1_b: rng.vec(n_state, s),
             conv2_wt: rng.mat(n_state * CONV_K, n_state, s),
@@ -2398,7 +2500,9 @@ mod tests {
         for &(out, inp) in &[(40usize, 24usize), (17, 31), (64, 16), (1, 8), (8, 1)] {
             // Synthetic ggml [out, inp] f16 raw bytes (finite, varied).
             let mut raw = vec![0u8; out * inp * 2];
-            for b2 in raw.chunks_exact_mut(2) {
+            let (f16_values, remainder) = raw.as_chunks_mut::<2>();
+            debug_assert!(remainder.is_empty());
+            for b2 in f16_values {
                 let v = rng.next_f32() * 4.0;
                 b2.copy_from_slice(&Float16::from_f32(v).to_bits().to_le_bytes());
             }

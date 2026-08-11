@@ -24,14 +24,20 @@
 //! Usage: `self_attn_score_dot_probe [iters]`  (turbo shapes: n_head=20, d_head=64).
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
+#[cfg(target_arch = "x86_64")]
 const N_STATE: usize = 1280;
+#[cfg(target_arch = "x86_64")]
 const N_HEAD: usize = 20;
+#[cfg(target_arch = "x86_64")]
 const D_HEAD: usize = N_STATE / N_HEAD; // 64
 
 /// Current engine code: scalar sequential dot (byte-exact reference).
+#[cfg(target_arch = "x86_64")]
 fn scalar_scores(qh: &[f32], k: &[f32], scale: f32, base: usize, tk: usize, out: &mut [f32]) {
     debug_assert_eq!(qh.len(), D_HEAD);
     debug_assert!(k.len() >= tk * N_STATE);
@@ -71,7 +77,7 @@ unsafe fn avx2_scores_4acc(
     unsafe {
         let vscale = _mm256_set1_ps(scale);
         let qp = qh.as_ptr();
-        for j in 0..tk {
+        for (j, sj) in out.iter_mut().take(tk).enumerate() {
             let kp = k.as_ptr().add(j * N_STATE + base);
             let mut a0 = _mm256_setzero_ps();
             let mut a1 = _mm256_setzero_ps();
@@ -101,7 +107,7 @@ unsafe fn avx2_scores_4acc(
             let mut sum128 = _mm_add_ps(hi, lo);
             sum128 = _mm_hadd_ps(sum128, sum128);
             sum128 = _mm_hadd_ps(sum128, sum128);
-            out[j] = _mm_cvtss_f32(sum128);
+            *sj = _mm_cvtss_f32(sum128);
         }
     }
 }
@@ -120,6 +126,7 @@ impl Avx2Fma {
     #[inline]
     #[allow(unsafe_code)]
     fn scores(self, qh: &[f32], k: &[f32], scale: f32, base: usize, tk: usize, out: &mut [f32]) {
+        debug_assert_eq!(std::mem::size_of_val(&self), 0);
         let required_k = tk
             .checked_mul(N_STATE)
             .expect("self-attention key-cache length overflow");
@@ -133,6 +140,7 @@ impl Avx2Fma {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)

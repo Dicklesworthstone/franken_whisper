@@ -4,7 +4,7 @@
 //! to f16 indices, then **`_mm256_i32gather_ps`** from a 1<<16 f32 table, then the
 //! `x<=-10 -> 0`, `x>=10 -> x` clamp blends. The existing code chose the gather
 //! after comparing it to the FULL-SCALAR fallback (per-element `Float16::from_f32`
-//! + table load) and won 1.38x. But it NEVER compared the gather to keeping the
+//! followed by a table load) and won 1.38x. But it NEVER compared the gather to keeping the
 //! fast 8-wide `vcvtps2ph` and replacing ONLY the gather with 8 explicit scalar
 //! table-loads.
 //!
@@ -21,14 +21,20 @@
 //! wrapper is orthogonal), best-of-N so it is load-insensitive on a shared box.
 //! Usage: `gelu_gather_probe [iters]` (default 60).
 #![allow(unsafe_code)]
+#[cfg(target_arch = "x86_64")]
 use ft_core::Float16;
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
+#[cfg(target_arch = "x86_64")]
 const GELU_SQRT_2_OVER_PI: f32 = 0.797_884_6;
+#[cfg(target_arch = "x86_64")]
 const GELU_COEF_A: f32 = 0.044_715;
 
 /// Rebuild the exact `nn::gelu_table` (GGML_GELU_FP16 f16-indexed table).
+#[cfg(target_arch = "x86_64")]
 fn gelu_table() -> Box<[f32; 1 << 16]> {
     let mut t = vec![0.0f32; 1 << 16].into_boxed_slice();
     for (i, slot) in t.iter_mut().enumerate() {
@@ -40,6 +46,7 @@ fn gelu_table() -> Box<[f32; 1 << 16]> {
 }
 
 /// Baseline: exact copy of `nn::gelu_slice` (AVX2 `vgatherdps`).
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c")]
 #[allow(unsafe_code)]
 unsafe fn gelu_gather(data: &mut [f32], table: &[f32; 1 << 16]) {
@@ -78,6 +85,7 @@ unsafe fn gelu_gather(data: &mut [f32], table: &[f32; 1 << 16]) {
 
 /// Variant: keep the 8-wide `vcvtps2ph`, replace the gather with 8 scalar loads.
 /// Lane order preserved (`_mm256_set_ps` lane j = table[idxs[j]]) => byte-identical.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c")]
 #[allow(unsafe_code)]
 unsafe fn gelu_scalar_loads(data: &mut [f32], table: &[f32; 1 << 16]) {
@@ -124,6 +132,7 @@ unsafe fn gelu_scalar_loads(data: &mut [f32], table: &[f32; 1 << 16]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
     let iters: usize = std::env::args()
         .nth(1)
@@ -211,4 +220,9 @@ fn main() {
         tg / ts,
         if ts < tg { "WIN" } else { "loss" }
     );
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("gelu_gather_probe requires an x86_64 processor with AVX2 and F16C support");
 }

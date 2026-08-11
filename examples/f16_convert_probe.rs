@@ -11,102 +11,119 @@
 //! resolves which, asserting the u16 output bits match exactly.
 //! Usage: `f16_convert_probe [iters]` (default 3000).
 #![allow(unsafe_code)]
-use ft_core::Float16;
-use std::hint::black_box;
-use std::time::Instant;
-
 #[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::*;
+mod x86_probe {
+    use ft_core::Float16;
+    use std::hint::black_box;
+    use std::time::Instant;
 
-/// Exact replica: the code's per-element `Float16::from_f32` into a contiguous f16 buf.
-fn convert_scalar(x: &[f32]) -> Vec<Float16> {
-    x.iter().map(|&s| Float16::from_f32(s)).collect()
-}
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
 
-/// Batched F16C: 8 f32→f16 per `_mm256_cvtps_ph::<0>` (round-to-nearest-even).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "f16c,avx")]
-unsafe fn convert_f16c(x: &[f32], out: &mut [u16]) {
-    unsafe {
-        let n = x.len();
-        let xp = x.as_ptr();
-        let mut i = 0;
-        while i + 8 <= n {
-            let v = _mm256_loadu_ps(xp.add(i));
-            let h = _mm256_cvtps_ph::<0>(v); // 0 = _MM_FROUND_TO_NEAREST_INT (RNE)
-            _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, h);
-            i += 8;
+    /// Exact replica: the code's per-element `Float16::from_f32` into a contiguous f16 buf.
+    fn convert_scalar(x: &[f32]) -> Vec<Float16> {
+        x.iter().map(|&s| Float16::from_f32(s)).collect()
+    }
+
+    /// Batched F16C: 8 f32→f16 per `_mm256_cvtps_ph::<0>` (round-to-nearest-even).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "f16c,avx")]
+    unsafe fn convert_f16c(x: &[f32], out: &mut [u16]) {
+        unsafe {
+            let n = x.len();
+            let xp = x.as_ptr();
+            let mut i = 0;
+            while i + 8 <= n {
+                let v = _mm256_loadu_ps(xp.add(i));
+                let h = _mm256_cvtps_ph::<0>(v); // 0 = _MM_FROUND_TO_NEAREST_INT (RNE)
+                _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, h);
+                i += 8;
+            }
+            while i < n {
+                *out.get_unchecked_mut(i) = Float16::from_f32(*x.get_unchecked(i)).to_bits();
+                i += 1;
+            }
         }
-        while i < n {
-            *out.get_unchecked_mut(i) = Float16::from_f32(*x.get_unchecked(i)).to_bits();
-            i += 1;
-        }
+    }
+
+    fn bench(n: usize, iters: usize) {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut nf = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 8.0 // encoder-output-ish range
+        };
+        let x: Vec<f32> = (0..n).map(|_| nf()).collect();
+
+        let a = convert_scalar(&x);
+        let mut b = vec![0u16; n];
+        unsafe { convert_f16c(&x, &mut b) };
+        let bad = a.iter().zip(&b).filter(|(p, q)| p.to_bits() != **q).count();
+
+        let ts = {
+            for _ in 0..3 {
+                black_box(convert_scalar(&x));
+            }
+            let mut best = f64::INFINITY;
+            for _ in 0..iters {
+                let t = Instant::now();
+                black_box(convert_scalar(&x));
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best
+        };
+        let ta = {
+            let mut buf = vec![0u16; n];
+            for _ in 0..3 {
+                unsafe { convert_f16c(&x, &mut buf) };
+                black_box(&buf);
+            }
+            let mut best = f64::INFINITY;
+            for _ in 0..iters {
+                let t = Instant::now();
+                unsafe { convert_f16c(&x, &mut buf) };
+                best = best.min(t.elapsed().as_secs_f64());
+                black_box(&buf);
+            }
+            best
+        };
+        println!("n={n}  best-of-{iters}");
+        println!(
+            "  byte-exact: {bad} differing of {n}  [{}]",
+            if bad == 0 { "IDENTICAL" } else { "DIVERGENT" }
+        );
+        println!("  scalar from_f32 (+alloc) : {:>8.3} µs", ts * 1e6);
+        println!(
+            "  F16C _mm256_cvtps_ph     : {:>8.3} µs  {:.2}x  [{}]",
+            ta * 1e6,
+            ts / ta,
+            if ta < ts { "WIN" } else { "loss" }
+        );
+    }
+
+    pub fn run() {
+        let iters: usize = std::env::args()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3000);
+        println!("=== cross-build f32→f16: scalar half::from_f32 vs batched F16C (1 thread) ===");
+        bench(64, iters); // one k_nat row (d_head)
+        bench(1500, iters); // one head's k_nat column-run (enc_frames)
+        bench(96000, iters / 4); // full (li,h) pair k_nat: enc_frames*d_head
     }
 }
 
-fn bench(n: usize, iters: usize) {
-    let mut s = 0x9E37_79B9_7F4A_7C15u64;
-    let mut nf = || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 8.0 // encoder-output-ish range
-    };
-    let x: Vec<f32> = (0..n).map(|_| nf()).collect();
-
-    let a = convert_scalar(&x);
-    let mut b = vec![0u16; n];
-    unsafe { convert_f16c(&x, &mut b) };
-    let bad = a.iter().zip(&b).filter(|(p, q)| p.to_bits() != **q).count();
-
-    let ts = {
-        for _ in 0..3 {
-            black_box(convert_scalar(&x));
-        }
-        let mut best = f64::INFINITY;
-        for _ in 0..iters {
-            let t = Instant::now();
-            black_box(convert_scalar(&x));
-            best = best.min(t.elapsed().as_secs_f64());
-        }
-        best
-    };
-    let ta = {
-        let mut buf = vec![0u16; n];
-        for _ in 0..3 {
-            unsafe { convert_f16c(&x, &mut buf) };
-            black_box(&buf);
-        }
-        let mut best = f64::INFINITY;
-        for _ in 0..iters {
-            let t = Instant::now();
-            unsafe { convert_f16c(&x, &mut buf) };
-            best = best.min(t.elapsed().as_secs_f64());
-            black_box(&buf);
-        }
-        best
-    };
-    println!("n={n}  best-of-{iters}");
-    println!(
-        "  byte-exact: {bad} differing of {n}  [{}]",
-        if bad == 0 { "IDENTICAL" } else { "DIVERGENT" }
-    );
-    println!("  scalar from_f32 (+alloc) : {:>8.3} µs", ts * 1e6);
-    println!(
-        "  F16C _mm256_cvtps_ph     : {:>8.3} µs  {:.2}x  [{}]",
-        ta * 1e6,
-        ts / ta,
-        if ta < ts { "WIN" } else { "loss" }
-    );
+#[cfg(target_arch = "x86_64")]
+fn main() {
+    if !std::is_x86_feature_detected!("f16c") || !std::is_x86_feature_detected!("avx") {
+        eprintln!("f16_convert_probe requires F16C and AVX support");
+        return;
+    }
+    x86_probe::run();
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn main() {
-    let iters: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3000);
-    println!("=== cross-build f32→f16: scalar half::from_f32 vs batched F16C (1 thread) ===");
-    bench(64, iters); // one k_nat row (d_head)
-    bench(1500, iters); // one head's k_nat column-run (enc_frames)
-    bench(96000, iters / 4); // full (li,h) pair k_nat: enc_frames*d_head
+    eprintln!("f16_convert_probe requires an x86_64 processor");
 }

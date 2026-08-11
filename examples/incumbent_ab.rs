@@ -849,12 +849,16 @@ fn compare_word_timings(franken: &[TimedWord], incumbent: &[TimedWord]) -> WordT
     } else {
         matched_words as f64 / denominator as f64
     };
-    let start_delta_p50_ms = (!deltas.is_empty())
-        .then(|| percentile_u64(&deltas, 0.50))
-        .unwrap_or(u64::MAX);
-    let start_delta_p95_ms = (!deltas.is_empty())
-        .then(|| percentile_u64(&deltas, 0.95))
-        .unwrap_or(u64::MAX);
+    let start_delta_p50_ms = if deltas.is_empty() {
+        u64::MAX
+    } else {
+        percentile_u64(&deltas, 0.50)
+    };
+    let start_delta_p95_ms = if deltas.is_empty() {
+        u64::MAX
+    } else {
+        percentile_u64(&deltas, 0.95)
+    };
     let start_delta_max_ms = deltas.last().copied().unwrap_or(u64::MAX);
     let franken_monotonic = timed_words_monotonic(franken);
     let incumbent_monotonic = timed_words_monotonic(incumbent);
@@ -1243,6 +1247,18 @@ fn runtime_isa() -> Vec<&'static str> {
         }
         if std::is_x86_feature_detected!("aes") {
             features.push("aes");
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            features.push("neon");
+        }
+        if std::arch::is_aarch64_feature_detected!("fp16") {
+            features.push("fp16");
+        }
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            features.push("dotprod");
         }
     }
     features
@@ -2083,6 +2099,10 @@ fn run_incumbent_normalizer(
 /// `transcribe_only` measures the incumbent's self-reported `total − load`.
 /// `whole_job` measures parent-observed process wall, including process startup,
 /// model/audio I/O, inference, output formatting, and teardown.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the benchmark arm keeps every matched-decode and process parameter explicit"
+)]
 fn run_incumbent(
     bin: &Path,
     model: &Path,
@@ -2286,6 +2306,10 @@ fn run_franken_resident(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the benchmark arm keeps every matched-decode and process parameter explicit"
+)]
 fn run_franken_whole(
     model: &Path,
     model_short: &str,
@@ -2423,12 +2447,16 @@ fn run_franken_whole(
         normalizer_exe_sha256,
         // Native normalization runs in this same observed worker process, so
         // the job-level active/peak census is also the normalizer census.
-        normalizer_observed_active_threads: (input_mode == InputMode::Codec)
-            .then(|| thread_probe.observed_active_threads())
-            .unwrap_or(0),
-        normalizer_peak_process_threads: (input_mode == InputMode::Codec)
-            .then_some(thread_probe.peak_process_threads)
-            .unwrap_or(0),
+        normalizer_observed_active_threads: if input_mode == InputMode::Codec {
+            thread_probe.observed_active_threads()
+        } else {
+            0
+        },
+        normalizer_peak_process_threads: if input_mode == InputMode::Codec {
+            thread_probe.peak_process_threads
+        } else {
+            0
+        },
         actual_threads: field_u64("actual_threads"),
         observed_active_threads: thread_probe.observed_active_threads(),
         peak_process_threads: thread_probe.peak_process_threads,
@@ -3320,8 +3348,6 @@ fn main() {
         fw_ms.push(fw_a.measured_ms);
         wc_ms.push(wc_a.measured_ms);
     }
-    drop(checkpoint);
-
     let host_post_measurement =
         sample_host_wide_quiescence("post_measurement", &host_online_cpus, &host_allowed_cpus);
     let host_wide_clear = host_preflight.is_clear()

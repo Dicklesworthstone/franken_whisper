@@ -1,0 +1,31 @@
+# Response headers for the franken_whisper site (Cloudflare Pages).
+#
+# COOP/COEP are set now even though the current page needs neither, so the
+# planned in-browser wasm demo (bd-m2jm) can use SharedArrayBuffer without a
+# headers migration. `no-cache` on scripts pairs with the `?v=@SITEV@` stamp
+# in deploy.sh — CDN zone TTL overrides can ignore origin no-cache, so the
+# stamp is the real freshness mechanism.
+
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+
+/
+  Cache-Control: no-cache
+
+/index.html
+  Cache-Control: no-cache
+
+/chrome.js
+  Cache-Control: no-cache
+
+/assets/css/site.css
+  Cache-Control: public, max-age=86400
+
+/assets/fonts/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/assets/img/*
+  Cache-Control: public, max-age=604800

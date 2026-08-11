@@ -1024,15 +1024,16 @@ impl GgmlModel {
     /// values are in the tensor's flat (row-major contiguous) order, matching
     /// the reversed logical shape.
     ///
-    /// # Errors
-    ///
-    /// - [`FwError::InvalidRequest`] if `name` is unknown or the stored byte
-    ///   length is inconsistent with the shape/dtype (corruption).
     /// Raw little-endian bytes of a tensor entry — the SINGLE byte-access choke
     /// point for every tensor accessor. On the resident source it borrows a blob
     /// sub-slice (`Cow::Borrowed`, zero-copy); on the gated streaming source
     /// (`FW_STREAM_LOAD`) it preads the payload into an owned buffer
     /// (`Cow::Owned`). `Cow` lets both share one call site with no caller churn.
+    ///
+    /// # Errors
+    ///
+    /// - [`FwError::InvalidRequest`] if `name` is unknown or the stored byte
+    ///   length is inconsistent with the shape/dtype (corruption).
     fn tensor_raw(&self, name: &str, entry: &TensorEntry) -> FwResult<Cow<'_, [u8]>> {
         match &self.source {
             TensorSource::Resident(blob) => blob

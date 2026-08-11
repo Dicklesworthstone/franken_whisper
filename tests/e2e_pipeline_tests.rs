@@ -189,20 +189,26 @@ fn e2e_pipeline_with_mock_whisper_cpp() {
         BackendKind::WhisperCpp,
         "resolved backend should be whisper_cpp"
     );
-    let align_event = report
+    let align_events: Vec<_> = report
         .events
         .iter()
-        .find(|event| event.code == "align.ok" || event.code == "align.fallback")
-        .expect("full pipeline should report the alignment outcome");
+        .filter(|event| event.stage == "align")
+        .collect();
     assert_eq!(
-        align_event.payload["method"].as_str(),
-        Some("char_density_heuristic"),
-        "bridge output without typed DTW proof must retain its honest fallback label"
+        align_events.len(),
+        1,
+        "a non-diarized pipeline must emit exactly one alignment-stage result"
+    );
+    let align_event = align_events[0];
+    assert_eq!(align_event.code, "align.skip");
+    assert_eq!(
+        align_event.payload["reason"].as_str(),
+        Some("alignment_not_requested"),
+        "alignment must not run unless diarization requested it"
     );
     assert_eq!(
-        align_event.payload["energy_evidence_available"].as_bool(),
-        Some(true),
-        "the normalized public synthetic WAV should provide transient RMS evidence"
+        align_event.payload["details"]["diarize"].as_bool(),
+        Some(false)
     );
 }
 
@@ -725,13 +731,26 @@ fn e2e_pipeline_no_persist_skips_db_creation() {
         db_path.display()
     );
 
-    // Verify no persist-stage event was emitted
-    let has_persist_event = report
+    // The canonical stage graph remains observable even when persistence is
+    // disabled, but it must record a typed skip rather than a write attempt.
+    let persist_events: Vec<_> = report
         .events
         .iter()
-        .any(|e| e.stage == "persist" && e.code.contains("persist"));
-    assert!(
-        !has_persist_event,
-        "events should NOT include a persist-stage event when persist=false"
+        .filter(|event| event.stage == "persist")
+        .collect();
+    assert_eq!(
+        persist_events.len(),
+        1,
+        "disabled persistence must retain exactly one explicit stage result"
+    );
+    let persist_event = persist_events[0];
+    assert_eq!(persist_event.code, "persist.skip");
+    assert_eq!(
+        persist_event.payload["reason"].as_str(),
+        Some("persist_disabled")
+    );
+    assert_eq!(
+        persist_event.payload["details"]["persist"].as_bool(),
+        Some(false)
     );
 }

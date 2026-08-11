@@ -15,6 +15,7 @@
 use core::arch::x86_64::*;
 
 /// Exact replica of `nn::quantize_act_i7`'s inner (scalar `.round()`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn quant_scalar(x: &[f32], rows: usize, cols: usize, out: &mut [u8], scales: &mut [f32]) {
     for r in 0..rows {
         let xr = &x[r * cols..(r + 1) * cols];
@@ -94,10 +95,12 @@ fn quant_avx2(x: &[f32], rows: usize, cols: usize, out: &mut [u8], scales: &mut 
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn now() -> std::time::Instant {
     std::time::Instant::now()
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn main() {
     let shapes = [
         (1500usize, 1280usize, "fc1/qkv [1500,1280]"),
@@ -108,7 +111,7 @@ fn main() {
         let n = rows * cols;
         let mut x = vec![0.0f32; n];
         let mut s: u64 = 0x9e3779b97f4a7c15;
-        for v in x.iter_mut() {
+        for v in &mut x {
             s = s
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
@@ -142,14 +145,14 @@ fn main() {
         let mut best_s = f64::MAX;
         let mut best_a = f64::MAX;
         for _ in 0..reps {
-            for e in evict.iter_mut() {
+            for e in &mut evict {
                 *e *= 1.0000001;
             }
             let t = now();
             quant_scalar(&x, rows, cols, &mut out_s, &mut sc_s);
             best_s = best_s.min(t.elapsed().as_secs_f64() * 1e3);
 
-            for e in evict.iter_mut() {
+            for e in &mut evict {
                 *e *= 1.0000001;
             }
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -174,7 +177,7 @@ fn main() {
             let mut best_ps = f64::MAX;
             let mut best_pa = f64::MAX;
             for _ in 0..reps {
-                for e in evict.iter_mut() {
+                for e in &mut evict {
                     *e *= 1.0000001;
                 }
                 let t = now();
@@ -193,7 +196,7 @@ fn main() {
                     });
                 best_ps = best_ps.min(t.elapsed().as_secs_f64() * 1e3);
 
-                for e in evict.iter_mut() {
+                for e in &mut evict {
                     *e *= 1.0000001;
                 }
                 let t = now();
@@ -215,4 +218,9 @@ fn main() {
             );
         }
     }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn main() {
+    eprintln!("quant_round_probe requires an x86_64 processor with AVX2 support");
 }

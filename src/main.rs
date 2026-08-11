@@ -3,20 +3,21 @@ use std::time::Duration;
 
 use clap::Parser;
 use franken_whisper::cli::{
-    Cli, Command, ControlFrameKind, DifferentialOracleCommand, PublicCorpusCommand, RobotCommand,
-    RunsOutputFormat, ShutdownController, SyncCommand, TtyAudioCommand, TtyAudioControlCommand,
+    Cli, Command, ControlFrameKind, DifferentialOracleCommand, PublicCorpusCommand, PullModelArg,
+    RobotCommand, RobotDocsCommand, RunsOutputFormat, ShutdownController, SyncCommand,
+    TtyAudioCommand, TtyAudioControlCommand,
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
     backends_discovery_value, build_backends_report, build_health_report, emit_health_report,
-    emit_pretty_run_report, emit_robot_complete, emit_robot_error, emit_robot_stage,
+    emit_pretty_run_report, emit_robot_complete, emit_robot_error_from_fw, emit_robot_stage,
     emit_robot_start, robot_schema_value, routing_decision_line,
 };
 use franken_whisper::storage::RunStore;
 use franken_whisper::tty_audio;
 use franken_whisper::{FrankenWhisperEngine, FwError, FwResult};
 
-fn main() {
+pub(crate) fn main() {
     franken_whisper::logging::init();
 
     // bd-38c.6: Install graceful Ctrl+C shutdown handler.
@@ -24,18 +25,33 @@ fn main() {
         tracing::warn!("failed to install Ctrl+C handler: {e}");
     }
 
-    let cli = Cli::parse();
-    let is_robot = matches!(cli.command, Command::Robot { .. });
+    let cli = parse_cli();
+    let machine_output = command_uses_machine_output(&cli.command);
+    let is_sortformer = matches!(cli.command, Command::SortformerDiarize(_));
 
     if let Err(error) = run(cli) {
+        if is_sortformer {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": "sortformer-diarization-v1",
+                    "certification": franken_whisper::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS,
+                    "status": "error",
+                    "code": error.error_code(),
+                    "message": "native Sortformer diarization failed",
+                    "local_paths_emitted": false,
+                }))
+                .expect("the fixed Sortformer error envelope must serialize")
+            );
+        }
         // If shutdown was triggered via Ctrl+C, exit with signal code.
         if ShutdownController::is_shutting_down() {
-            if !is_robot {
+            if !machine_output {
                 eprintln!("interrupted");
             }
             std::process::exit(ShutdownController::signal_exit_code());
         }
-        if !is_robot {
+        if !machine_output {
             eprintln!("error: {error}");
         }
         std::process::exit(1);
@@ -45,6 +61,231 @@ fn main() {
     // use the signal exit code.
     if ShutdownController::is_shutting_down() {
         std::process::exit(ShutdownController::signal_exit_code());
+    }
+}
+
+/// Parse Clap under program control so a syntactically invalid `robot`
+/// invocation still emits one path-free JSON error object instead of human
+/// prose on stderr. Other commands retain Clap's normal, high-quality errors.
+fn parse_cli() -> Cli {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let command = args.get(1).and_then(|arg| arg.to_str());
+    let robot_intent = command.is_some_and(|arg| matches!(arg, "robot" | "agent"));
+    let sortformer_intent =
+        command.is_some_and(|arg| matches!(arg, "sortformer-diarize" | "sortformer"));
+    let json_pull_intent = command == Some("pull")
+        && args
+            .iter()
+            .skip(2)
+            .any(|arg| arg.to_str() == Some("--json"));
+    match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error)
+            if robot_intent
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            let value = serde_json::json!({
+                "event": "run_error",
+                "schema_version": franken_whisper::robot::ROBOT_SCHEMA_VERSION,
+                "code": "FW-INVALID-REQUEST",
+                "message": "invalid robot command-line arguments; run `fw robot --help` or the selected subcommand with `--help`",
+                "clap_error_kind": format!("{:?}", error.kind()),
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&value)
+                    .expect("the fixed robot parse-error envelope must serialize")
+            );
+            std::process::exit(error.exit_code());
+        }
+        Err(error)
+            if sortformer_intent
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": "sortformer-diarization-v1",
+                    "certification": franken_whisper::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS,
+                    "status": "error",
+                    "code": "FW-INVALID-REQUEST",
+                    "message": "invalid native Sortformer command-line arguments; run `fw sortformer-diarize --help`",
+                    "clap_error_kind": format!("{:?}", error.kind()),
+                    "local_paths_emitted": false,
+                }))
+                .expect("the fixed Sortformer parse-error envelope must serialize")
+            );
+            std::process::exit(error.exit_code());
+        }
+        Err(error)
+            if json_pull_intent
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": "franken-whisper-model-pull-v2",
+                    "command": "pull",
+                    "model": null,
+                    "status": "error",
+                    "code": "FW-INVALID-REQUEST",
+                    "message": "invalid model-pull command-line arguments; run `fw pull --help`",
+                    "clap_error_kind": format!("{:?}", error.kind()),
+                    "local_paths_emitted": false,
+                }))
+                .expect("the fixed model-pull parse-error envelope must serialize")
+            );
+            std::process::exit(error.exit_code());
+        }
+        Err(error) => error.exit(),
+    }
+}
+
+fn command_uses_machine_output(command: &Command) -> bool {
+    match command {
+        Command::Robot { .. } => true,
+        Command::Capabilities(args) => args.json,
+        Command::Models(args) => args.json,
+        Command::Pull(args) => args.json,
+        Command::SortformerDiarize(_) => true,
+        Command::ComparisonWorker => true,
+        Command::ComparisonCancelProbe(_) => true,
+        Command::Doctor(args) => args.json,
+        _ => false,
+    }
+}
+
+fn sortformer_audio_duration_ms(sample_count: usize) -> FwResult<u64> {
+    let samples = u64::try_from(sample_count).map_err(|_| {
+        FwError::InvalidRequest("native Sortformer sample count exceeds u64".to_owned())
+    })?;
+    let sample_rate = u64::try_from(
+        franken_whisper::sortformer_inference::SORTFORMER_SAMPLE_RATE_HZ,
+    )
+    .map_err(|_| FwError::InvalidRequest("native Sortformer sample rate exceeds u64".to_owned()))?;
+    samples
+        .checked_mul(1_000)
+        .ok_or_else(|| {
+            FwError::InvalidRequest("native Sortformer audio duration overflows u64".to_owned())
+        })
+        .map(|milliseconds| milliseconds.div_ceil(sample_rate))
+}
+
+fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
+    let pull_whisper = matches!(model, PullModelArg::All | PullModelArg::Whisper);
+    let pull_sortformer = matches!(model, PullModelArg::All | PullModelArg::Sortformer);
+    let requested_model = match model {
+        PullModelArg::All => "all",
+        PullModelArg::Whisper => "whisper",
+        PullModelArg::Sortformer => "sortformer",
+    };
+    let result = (|| {
+        let mut pulled = Vec::new();
+        if pull_whisper {
+            let outcome = franken_whisper::model_distribution::pull_whisper(
+                ShutdownController::is_shutting_down,
+                |line| {
+                    if !json_output {
+                        eprintln!("fw pull whisper: {line}");
+                    }
+                },
+            )?;
+            if !json_output {
+                eprintln!(
+                    "fw pull whisper: ready ({})",
+                    if outcome.from_cache {
+                        "already cached"
+                    } else {
+                        "downloaded and verified"
+                    }
+                );
+            }
+            pulled.push(serde_json::json!({
+                "model": "whisper",
+                "status": "ready",
+                "from_cache": outcome.from_cache,
+                "artifact_version": outcome.package.artifact_version,
+                "package_sha256": outcome.package.weights_sha256,
+                "distribution_policy": franken_whisper::model_distribution::WHISPER_DISTRIBUTION_POLICY,
+                "license": "MIT",
+                "weight_bytes_identity_preserved": true,
+                "preparation_recipe": franken_whisper::model_distribution::WHISPER_PREPARATION_RECIPE,
+            }));
+        }
+        if pull_sortformer {
+            let outcome = franken_whisper::model_distribution::pull_sortformer(
+                ShutdownController::is_shutting_down,
+                |line| {
+                    if !json_output {
+                        eprintln!("fw pull sortformer: {line}");
+                    }
+                },
+            )?;
+            if !json_output {
+                eprintln!(
+                    "fw pull sortformer: ready ({})",
+                    if outcome.from_cache {
+                        "already cached"
+                    } else {
+                        "downloaded and verified"
+                    }
+                );
+            }
+            pulled.push(serde_json::json!({
+                "model": "sortformer",
+                "status": "ready",
+                "from_cache": outcome.from_cache,
+                "artifact_version": outcome.package.artifact_version,
+                "package_sha256": outcome.package.package_sha256,
+                "distribution_policy": franken_whisper::model_distribution::SORTFORMER_DISTRIBUTION_POLICY,
+                "model_license_notice": franken_whisper::model_distribution::SORTFORMER_REQUIRED_NOTICE,
+            }));
+        }
+        Ok::<_, FwError>(pulled)
+    })();
+
+    match result {
+        Ok(pulled) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "schema_version": "franken-whisper-model-pull-v2",
+                        "command": "pull",
+                        "model": requested_model,
+                        "status": "ready",
+                        "models": pulled,
+                        "local_paths_emitted": false,
+                    }))?
+                );
+            }
+            Ok(())
+        }
+        Err(error) if json_output => {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": "franken-whisper-model-pull-v2",
+                    "command": "pull",
+                    "model": requested_model,
+                    "status": "error",
+                    "code": error.error_code(),
+                    "message": "model provisioning failed",
+                    "local_paths_emitted": false,
+                }))?
+            );
+            Err(error)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -69,7 +310,7 @@ fn run(cli: Cli) -> FwResult<()> {
                 let request = match (*args).into_request() {
                     Ok(request) => request,
                     Err(error) => {
-                        emit_robot_error(&error.to_string(), error.robot_error_code())?;
+                        emit_robot_error_from_fw(&error)?;
                         return Err(error);
                     }
                 };
@@ -99,18 +340,19 @@ fn run(cli: Cli) -> FwResult<()> {
                 match worker.join() {
                     Ok(Ok(report)) => emit_robot_complete(&report),
                     Ok(Err(error)) => {
-                        emit_robot_error(&error.to_string(), error.robot_error_code())?;
+                        emit_robot_error_from_fw(&error)?;
                         Err(error)
                     }
                     Err(_) => {
-                        let error = FwError::Unsupported("robot worker thread panicked".to_owned());
-                        emit_robot_error(&error.to_string(), error.robot_error_code())?;
+                        let error =
+                            FwError::ContractViolation("robot worker thread panicked".to_owned());
+                        emit_robot_error_from_fw(&error)?;
                         Err(error)
                     }
                 }
             }
             RobotCommand::Schema => {
-                println!("{}", serde_json::to_string_pretty(&robot_schema_value())?);
+                println!("{}", serde_json::to_string(&robot_schema_value())?);
                 Ok(())
             }
             RobotCommand::RoutingHistory(args) => {
@@ -118,12 +360,14 @@ fn run(cli: Cli) -> FwResult<()> {
                 let details_list =
                     load_routing_history_details(&store, args.run_id.as_deref(), args.limit)?;
 
+                let mut records = 0_usize;
                 for details in details_list {
                     for event in &details.events {
                         if event.code == "backend.routing.decision_contract"
                             || event.code == "backend.routing.safe_mode"
                             || event.code == "backend.routing.calibration_guardrail"
                         {
+                            records += 1;
                             println!(
                                 "{}",
                                 routing_decision_line(
@@ -136,14 +380,114 @@ fn run(cli: Cli) -> FwResult<()> {
                         }
                     }
                 }
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "event": "routing_history.complete",
+                        "schema_version": franken_whisper::robot::ROBOT_SCHEMA_VERSION,
+                        "records": records,
+                    }))?
+                );
                 Ok(())
             }
             RobotCommand::Health(args) => {
                 let report = build_health_report(&args.db);
-                emit_health_report(&report)
+                let healthy = report.overall_status == franken_whisper::robot::CheckStatus::Ok;
+                emit_health_report(&report)?;
+                if args.strict && !healthy {
+                    return Err(FwError::BackendUnavailable(
+                        "health report is not ok; run `fw robot triage` for exact next commands"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            RobotCommand::Triage(args) => {
+                let value = franken_whisper::robot::triage_report_value_with_cancel(
+                    &args.db,
+                    ShutdownController::is_shutting_down,
+                )?;
+                let ready = value["quick_ref"]["ready"].as_bool().unwrap_or(false);
+                println!("{}", serde_json::to_string(&value)?);
+                if args.strict && !ready {
+                    return Err(FwError::BackendUnavailable(
+                        "no transcription path is ready; follow the triage recommendation"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
             }
             RobotCommand::Backends => {
                 println!("{}", backends_command_output()?);
+                Ok(())
+            }
+        },
+        Command::Capabilities(args) => {
+            let value = franken_whisper::robot::capabilities_value();
+            if args.json {
+                println!("{}", serde_json::to_string(&value)?);
+            } else {
+                println!("franken_whisper {}", env!("CARGO_PKG_VERSION"));
+                println!("Agent orientation: fw robot triage");
+                println!("Machine contract: fw capabilities --json");
+                println!("Model readiness: fw models --json");
+                println!("Robot schema: fw robot schema");
+            }
+            Ok(())
+        }
+        Command::Models(args) => {
+            let value = franken_whisper::robot::models_report_value_with_cancel(
+                ShutdownController::is_shutting_down,
+            )?;
+            if args.json {
+                println!("{}", serde_json::to_string(&value)?);
+            } else {
+                println!("FrankenWhisper model readiness (no network access performed)");
+                for entry in value["models"].as_array().into_iter().flatten() {
+                    println!(
+                        "- {}: {}",
+                        entry["id"].as_str().unwrap_or("unknown"),
+                        entry["runtime_status"].as_str().unwrap_or("unknown")
+                    );
+                }
+                println!("Details: fw models --json");
+            }
+            Ok(())
+        }
+        Command::Pull(args) => pull_models(args.model, args.json),
+        Command::Doctor(args) => {
+            let value = franken_whisper::robot::doctor_report_value_with_cancel(
+                &args.db,
+                ShutdownController::is_shutting_down,
+            )?;
+            let ready = value["ready"].as_bool().unwrap_or(false);
+            if args.json {
+                println!("{}", serde_json::to_string(&value)?);
+            } else {
+                println!(
+                    "FrankenWhisper doctor: {}",
+                    value["status"].as_str().unwrap_or("unknown")
+                );
+                for recommendation in value["recommendations"].as_array().into_iter().flatten() {
+                    println!(
+                        "- {}",
+                        recommendation["command"]
+                            .as_str()
+                            .unwrap_or("fw robot triage")
+                    );
+                }
+            }
+            if args.strict && !ready {
+                return Err(FwError::BackendUnavailable(
+                    "installation is not ready for transcription; follow the doctor recommendation"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        Command::RobotDocs { command } => match command {
+            RobotDocsCommand::Guide => {
+                print!("{}", franken_whisper::robot::robot_docs_guide());
                 Ok(())
             }
         },
@@ -223,6 +567,32 @@ fn run(cli: Cli) -> FwResult<()> {
                         &franken_whisper::public_corpus::public_corpus_registry()
                     )?
                 );
+                Ok(())
+            }
+            PublicCorpusCommand::PrepareVoxconverse(args) => {
+                let current_dir = std::env::current_dir().map_err(|_| {
+                    FwError::InvalidRequest(
+                        "public_corpus.project_root: current directory could not be resolved"
+                            .to_owned(),
+                    )
+                })?;
+                let project_root =
+                    franken_whisper::confidential_evaluation::discover_project_root(&current_dir)?;
+                let summary =
+                    franken_whisper::public_corpus::prepare_voxconverse_descriptor_with_cancel(
+                        franken_whisper::public_corpus::VoxconverseDescriptorPreparationRequest {
+                            project_root: &project_root,
+                            input_root: &args.input_root,
+                            development_audio_root: &args.development_audio_root,
+                            test_audio_root: &args.test_audio_root,
+                            annotation_root: &args.annotation_root,
+                            output_path: &args.output,
+                            source_version: &args.source_version,
+                            license_acknowledgement_id: &args.license_ack,
+                        },
+                        ShutdownController::is_shutting_down,
+                    )?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
                 Ok(())
             }
             PublicCorpusCommand::Build(args) => {
@@ -324,8 +694,8 @@ fn run(cli: Cli) -> FwResult<()> {
                             license_acknowledgement_id: &args.license_ack,
                             evaluation_split:
                                 franken_whisper::diarization::EvaluationSplit::Development,
-                            sortformer_hard_timeout: Duration::from_secs(
-                                franken_whisper::public_corpus::PUBLIC_MODEL_COMPARISON_SORTFORMER_TIMEOUT_SECONDS,
+                            attempt_hard_timeout: Duration::from_secs(
+                                franken_whisper::public_corpus::PUBLIC_MODEL_COMPARISON_ATTEMPT_TIMEOUT_SECONDS,
                             ),
                         },
                         ShutdownController::is_shutting_down,
@@ -370,6 +740,176 @@ fn run(cli: Cli) -> FwResult<()> {
                 Ok(())
             }
         },
+        Command::SortformerDiarize(args) => {
+            let cancellation = franken_whisper::orchestrator::CancellationToken::unbounded();
+            let checkpoint = || {
+                cancellation.checkpoint().map_err(|_| {
+                    FwError::Cancelled("native Sortformer diarization interrupted".to_owned())
+                })
+            };
+            checkpoint()?;
+            let speaker_hints = args.load_speaker_hints()?;
+            franken_whisper::sortformer_identity::validate_sortformer_hint_structure(
+                &speaker_hints,
+            )?;
+            let (receipt_path, package_path, artifact_source, distribution_policy) = match (
+                args.receipt.as_ref(),
+                args.package.as_ref(),
+            ) {
+                (Some(receipt), Some(package)) => {
+                    (receipt.clone(), package.clone(), "explicit_paths", None)
+                }
+                (None, None) => {
+                    let cached =
+                        franken_whisper::model_distribution::resolve_cached_sortformer_with_cancel(
+                            ShutdownController::is_shutting_down,
+                        )?;
+                    (
+                        cached.receipt_path,
+                        cached.package_path,
+                        "verified_release_cache",
+                        Some(franken_whisper::model_distribution::SORTFORMER_DISTRIBUTION_POLICY),
+                    )
+                }
+                _ => {
+                    return Err(FwError::InvalidRequest(
+                            "--receipt and --package must be supplied together, or both omitted to use `fw pull sortformer` cache"
+                                .to_owned(),
+                        ));
+                }
+            };
+            let package_admission_started = std::time::Instant::now();
+            let package = franken_whisper::sortformer_conformance::load_verified_sortformer_package_with_checkpoint(
+                    &receipt_path,
+                    &package_path,
+                    &checkpoint,
+                )?;
+            let package_admission_seconds = package_admission_started.elapsed().as_secs_f64();
+            let work_dir = tempfile::tempdir()?;
+            let normalized = franken_whisper::audio::normalize_to_wav_with_cancel(
+                &args.input,
+                work_dir.path(),
+                &cancellation,
+            )?;
+            let samples = franken_whisper::audio::read_normalized_wav_16k_mono_with_checkpoint(
+                &normalized,
+                &checkpoint,
+            )?;
+            let audio_duration_ms = sortformer_audio_duration_ms(samples.len())?;
+            franken_whisper::sortformer_identity::validate_sortformer_hints(
+                &speaker_hints,
+                audio_duration_ms,
+            )?;
+            let session_materialization_started = std::time::Instant::now();
+            let session = franken_whisper::sortformer_inference::SortformerSession::from_verified_package_with_checkpoint(
+                &package,
+                &checkpoint,
+            )?;
+            let session_materialization_seconds =
+                session_materialization_started.elapsed().as_secs_f64();
+            let inference_started = std::time::Instant::now();
+            let output = session.diarize_with_checkpoint(
+                franken_whisper::sortformer_inference::SortformerPcm::mono_16khz(&samples),
+                &checkpoint,
+            )?;
+            let inference_seconds = inference_started.elapsed().as_secs_f64();
+            let audio_seconds = samples.len() as f64
+                / franken_whisper::sortformer_inference::SORTFORMER_SAMPLE_RATE_HZ as f64;
+            let real_time_factor = (audio_seconds > 0.0).then(|| inference_seconds / audio_seconds);
+            let mut active_speakers = std::collections::BTreeSet::new();
+            for (index, turn) in output.turns.iter().enumerate() {
+                if index.is_multiple_of(1_024) {
+                    checkpoint()?;
+                }
+                active_speakers.insert(turn.speaker);
+            }
+            let identity_mapping =
+                franken_whisper::sortformer_identity::map_sortformer_lanes_with_checkpoint(
+                    &output.turns,
+                    &speaker_hints,
+                    audio_duration_ms,
+                    &checkpoint,
+                )?;
+            let turns = output
+                .turns
+                .iter()
+                .enumerate()
+                .map(|(index, turn)| {
+                    if index.is_multiple_of(1_024) {
+                        checkpoint()?;
+                    }
+                    let hard_speaker_ref = identity_mapping.hard_speaker_ref(turn.speaker);
+                    Ok(serde_json::json!({
+                        "start_seconds": turn.start_seconds,
+                        "end_seconds": turn.end_seconds,
+                        "speaker_lane": turn.speaker,
+                        "speaker_ref": hard_speaker_ref,
+                        "speaker_ref_authority": if hard_speaker_ref.is_some() { "derived_from_caller_hard_interval" } else { "anonymous" },
+                        "soft_speaker_suggestion": identity_mapping.soft_speaker_suggestion(turn.speaker),
+                    }))
+                })
+                .collect::<FwResult<Vec<_>>>()?;
+            checkpoint()?;
+            let receipt = package.receipt();
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": "sortformer-diarization-v1",
+                    "certification": franken_whisper::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS,
+                    "status": "ok",
+                    "network_access_performed": false,
+                    "local_paths_emitted": false,
+                    "model": {
+                        "id": receipt.model.model_id,
+                        "revision": receipt.model.model_revision,
+                        "package_sha256": receipt.package.sha256,
+                        "package_bytes": receipt.package.bytes,
+                        "distribution_policy": distribution_policy,
+                        "artifact_source": artifact_source,
+                    },
+                    "audio": {
+                        "duration_seconds": audio_seconds,
+                        "sample_rate_hz": franken_whisper::sortformer_inference::SORTFORMER_SAMPLE_RATE_HZ,
+                        "channels": 1,
+                    },
+                    "result": {
+                        "model_frames": output.frames,
+                        "active_lane_count": active_speakers.len(),
+                        "capacity": {
+                            "speaker_lane_capacity": franken_whisper::sortformer_inference::SORTFORMER_SPEAKER_LANES,
+                            "status": "four_lane_capped_output_true_speaker_count_unknown",
+                            "true_speaker_count_certified": false,
+                        },
+                        "speech_frames": output.activity.speech.iter().sum::<i64>(),
+                        "overlap_frames": output.activity.overlap.iter().sum::<i64>(),
+                        "turns": turns,
+                        "identity_mapping": identity_mapping,
+                    },
+                    "performance": {
+                        "package_admission_seconds": package_admission_seconds,
+                        "session_materialization_seconds": session_materialization_seconds,
+                        "model_load_seconds": package_admission_seconds + session_materialization_seconds,
+                        "inference_seconds": inference_seconds,
+                        "real_time_factor": real_time_factor,
+                    },
+                }))?
+            );
+            Ok(())
+        }
+        Command::ComparisonWorker => {
+            let response =
+                franken_whisper::public_corpus::run_model_comparison_worker_from_stdio()?;
+            println!("{response}");
+            Ok(())
+        }
+        Command::ComparisonCancelProbe(args) => {
+            franken_whisper::public_corpus::run_model_comparison_cancel_probe(
+                args.descendant,
+                args.lease_parent,
+                args.root_pid_file.as_deref(),
+                args.descendant_pid_file.as_deref(),
+            )
+        }
         Command::Sync { command } => match command {
             SyncCommand::Export(args) => {
                 let manifest =
@@ -639,6 +1179,23 @@ mod tests {
             franken_whisper::robot::ROBOT_SCHEMA_VERSION
         );
         assert!(parsed["backends"].is_array());
+    }
+
+    #[test]
+    fn sortformer_audio_duration_uses_an_inclusive_millisecond_ceiling() {
+        assert_eq!(super::sortformer_audio_duration_ms(0).expect("zero"), 0);
+        assert_eq!(
+            super::sortformer_audio_duration_ms(1).expect("one sample"),
+            1
+        );
+        assert_eq!(
+            super::sortformer_audio_duration_ms(16_000).expect("one second"),
+            1_000
+        );
+        assert_eq!(
+            super::sortformer_audio_duration_ms(16_001).expect("one second plus one sample"),
+            1_001
+        );
     }
 
     #[test]

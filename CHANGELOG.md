@@ -8,6 +8,190 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ---
 
+## [Unreleased]
+
+No unreleased changes yet.
+
+## [0.8.0] - 2026-08-11
+
+This release closes four reproduced transcription-path defects filed against
+v0.7.2: silent long-form content loss, diarization that never reached the
+transcript, inert audio-window flags, and lossy per-segment text.
+
+### Added
+
+- Diarization is now fused with the transcript (`projection-fusion-v1`,
+  bd-d4py). After the conservative projection pass, a fusion pass labels every
+  segment that overlaps a labeled turn with the max-overlap turn, and timed
+  segments in turn gaps take the nearest labeled turn within 2 seconds.
+  Hard-hint turns are never extrapolated beyond their own intervals, and
+  untimed segments stay honestly unknown. On a 45-minute two-person call this
+  removes the 61% `speaker: null` segment rate.
+- Word-level speaker changes snap to the nearest sentence-final punctuation
+  boundary within four words, using the transcript's own punctuation as the
+  boundary oracle. This corrects the one-word attribution lag caused by
+  quantized diarizer boundaries (Sortformer's 80 ms lanes) and measurably
+  outperformed every global time-shift candidate on real audio. Snapping moves
+  a boundary; it can never erase a short interjection turn.
+- `result.diarization.speaker_segments`: merged consecutive same-speaker runs
+  with byte-faithful joined text, per-run segment counts, and duration-weighted
+  turn confidence. Callers no longer rebuild the turn/segment join themselves.
+- Dropped long-form decode windows are machine-addressable (bd-nqzf). The
+  native engine records every discarded window in `raw_output.dropped_windows`
+  (start, end, reason, `no_speech_prob`, `avg_logprob`, whether the
+  prompt-reset retry already ran) plus `raw_output.decode_work` retry counters.
+  The orchestrator mirrors each drop into `RunReport.warnings`, the evidence
+  ledger, and a `backend.dropped_windows` stage event, so `--json` and robot
+  NDJSON consumers see the content gap instead of a stderr-only log.
+- The native whisper.cpp engine honors `--offset-ms` and `--duration-ms`
+  (bd-vgod): the normalized PCM is sliced before decode, so wall-clock scales
+  with the requested region instead of the whole file. Emitted segment, DTW
+  word, and window timestamps stay in the source-file timebase, keeping
+  diarization, VAD, and alignment consistent. `raw_output.audio_window` records
+  the applied window; an offset at or past EOF returns an empty result tagged
+  `empty_slice` rather than an error.
+- `--normalize-segment-text` opts in to the rule-based sentence-casing and
+  terminal-period rewriting that previously ran unconditionally whenever
+  diarization was on.
+
+### Changed
+
+- `segments[].text` is byte-faithful by default (bd-c3of). The punctuate
+  stage's rewriting (uppercase first character, appended period) no longer runs
+  merely because diarization is enabled, so joining segment texts reproduces
+  `result.transcript` modulo whitespace, and `--split-on-word` no longer emits
+  every word as `Word.` The rewriting remains available behind
+  `--normalize-segment-text`.
+- Backends that cannot honor `--offset-ms`/`--duration-ms` (insanely-fast,
+  whisper-diarization, and speculative mode) now record the ignored flags in
+  `RunReport.warnings` and in `robot backends` `unsupported_options` instead of
+  silently transcribing the full file.
+- The long-form drop log no longer tells operators to set
+  `FW_RETRY_FAILED_WINDOW=1`; that retry has been default-on since 2026-07-24.
+  The message now points at `FW_TEMP_FALLBACK=1` for sampling-ladder recovery,
+  and `DISCREPANCIES.md` records the corrected default.
+
+### Contracts
+
+- `raw_output` schema stays `native-v2`; `dropped_windows`, `decode_work`, and
+  `audio_window` are additive fields documented in
+  `docs/native_engine_contract.md` §9.
+- `docs/acoustic_diarization_contract.md` §6 documents `projection-fusion-v1`,
+  including the hard-hint non-extrapolation rule and the snapping guarantees.
+
+## [0.7.2] - 2026-08-10
+
+### Fixed
+
+- The installer now checks the model-cache filesystem for at least 2.25 GB of
+  free space before beginning the default 2.12 GB model pull. A complete
+  low-free-space cache is still accepted after both compiled trust roots pass.
+- The auxiliary-model recovery text now says specifically that operator-local
+  auxiliary models are not downloaded automatically, without contradicting the
+  installer's default pinned Whisper and Sortformer provisioning.
+
+## [0.7.1] - 2026-08-09
+
+This is the first published release after v0.5.0. The planned v0.6.0 snapshot
+was never tagged or released; its work is included here. The v0.7.0 tag was a
+pre-publication candidate and has no GitHub Release or crates.io publication.
+
+### Added
+
+- Added a fully native, bounded-memory speaker-diarization stack with acoustic
+  regime-change features, ECAPA speaker representations, overlap-aware turn
+  projection, inferred speaker-count evidence, and typed hard/soft known-speaker
+  intervals.
+- Added a memory-safe Rust Streaming Sortformer implementation for the pinned
+  NVIDIA model, including overlapping four-lane activity, anonymous turns,
+  segment projection, a focused diagnostic command, and an explicit
+  development-uncertified certification state.
+- Added `fw pull all`, `fw pull whisper`, `fw pull sortformer`,
+  `fw models --json`, `fw doctor --json`,
+  `fw capabilities --json`, `fw robot triage`, and `fw robot-docs guide` for
+  agent-controlled discovery, provisioning, and diagnostics.
+- Added the `fw` binary alias alongside `franken_whisper` and path-safe robot
+  error envelopes for invalid arguments and runtime failures.
+- Added public-corpus preparation, model-comparison evidence, replay and
+  conformance tooling without copying source media into the repository.
+
+### Changed
+
+- Native Rust execution is now the default (`sole` rollout) for every backend
+  family. Bridge subprocesses require an explicit compatibility configuration;
+  native failures do not silently cross that boundary.
+- Speaker diarization is enabled by default and `auto` selects native
+  Sortformer. `--no-diarize` provides transcript-only operation. Missing,
+  known-identity, and capacity-ineligible Sortformer requests use the explicit
+  native acoustic fallback policy. Sortformer remains capped at four anonymous
+  lanes and development-uncertified despite being the product default.
+- The default Whisper resolver requires the hash-pinned release package rather
+  than substituting an unrelated discovered model. Explicit operator model
+  paths remain supported as a separate trust boundary.
+- Packages now declare registry versions for FrankenSQLite and FrankenTorch so
+  the crates.io artifact resolves without adjacent source checkouts. The source
+  tree retains versioned paths for exact sibling development builds.
+- Retired the high-level `gpu-frankentorch` and `gpu-frankenjax` feature
+  adapters. Their registry names resolve to unrelated publishers; native
+  Whisper continues to use the required FrankenTorch CPU kernels and the
+  target-gated Metal kernel on macOS.
+- Removed the unused descriptor-cache API that was labeled as JIT compilation
+  even though it never compiled or accelerated a graph.
+- The installer now validates both binary names before replacing either,
+  performs each replacement with an atomic rename, verifies checksums and
+  self-reported versions, and provisions both pinned native model packages
+  (about 2.12 GB combined). Interactive installs default the visible prompt to
+  Yes; quiet/headless installs provision automatically; `--no-pull` opts out.
+  Offline installs accept only a preseeded verified cache or explicit opt-out.
+- Beam-search conformance now preserves the byte-exact greedy oracle while
+  requiring beam output to have zero WER and one of two reviewed punctuation
+  forms. It no longer asserts the false premise that beam must equal greedy.
+- Tightened all-target Clippy hygiene across library, binaries, examples,
+  benches, and tests without changing release gates.
+
+### Fixed
+
+- Aligned public diarization projection validation with persisted report
+  invariants for overlap labels, hard-hint authority, confidence, ordering, and
+  bounded speaker references.
+- Raised the bounded default diarization-stage budget from 30 seconds to 15
+  minutes so long-form native Sortformer jobs are not cancelled by a legacy
+  short-stage default; the environment override remains available.
+- Unified model admission and execution resolution so corrupt higher-priority
+  GGML candidates cannot shadow a valid lower-priority model, and kept model
+  pull syntax/runtime errors on the same v2 robot schema.
+- Corrected the confidence-normalization stage to report its authoritative CPU
+  implementation as `acceleration.ok` instead of a spurious GPU-fallback
+  warning.
+- Corrected Sortformer registry and focused-command metadata to report
+  `development_uncertified` instead of the contradictory `evaluation_only`
+  label now that the native runtime is the default diarization route.
+- Aligned installer checksum discovery with DSR releases: verified installs
+  now prefer the archive-specific `.sha256` sidecar and fall back to the
+  exact-name entry in `SHA256SUMS`.
+- Aligned the installer's strict flat-archive allowlist with the DSR package by
+  admitting the required `NOTICE.sortformer.txt` license notice while retaining
+  duplicate, symlink, non-regular-entry, and unknown-member rejection.
+- Hardened model distribution, archive admission, cancellation, path safety,
+  deterministic evidence commitments, and confidential-evaluation boundaries.
+- Excluded repository metadata, local caches, private media/transcripts, test
+  fixtures, and audit state from the crates.io package.
+
+### Distribution
+
+- DSR is the sole v0.7.1 binary-build authority for Linux x86_64/aarch64,
+  macOS Intel/Apple Silicon, and Windows x86_64. GitHub Actions is not used.
+- The 491,570,584-byte Sortformer package remains a separately licensed,
+  SHA-256-pinned GitHub Release artifact and is never bundled in the crate,
+  binary archive, Homebrew formula, or Git repository.
+- The 1,624,555,275-byte Whisper large-v3-turbo GGML f16 package is distributed
+  as the `whisper-large-v3-turbo-f16-v1` GitHub Release artifact. Its bytes are
+  identity-preserved from the pinned upstream revision, compiled-hash verified,
+  and selected for the native Rust loader and FrankenTorch kernels; it is not
+  stored in Git or bundled in binary archives.
+
+Compare: [`v0.5.0...v0.7.1`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.5.0...v0.7.1)
+
 ## [0.5.0] - 2026-07-11
 
 ### CPU int8 encoder + SDPA poly-exp — measured, quality-gated maintenance self-speedups on x86-64
@@ -63,11 +247,38 @@ Compare: [`v0.4.0...v0.5.0`](https://github.com/Dicklesworthstone/franken_whispe
 
 Everything in v0.2.1 (native-default engine, NaN-hardening, the aarch64 `target-cpu` codegen fix, the routing fallback fix, and the CPU int8/GELU perf work) is included.
 
-## [Unreleased] (since v0.1.0)
+## Planned 0.6.0 development snapshot (never released)
 
-152 commits since v0.1.0
+Native learned-diarization evaluation, explicit model distribution, and the
+agent-first packaging tranche. These changes ship in v0.7.1.
 
-Compare: [`v0.1.0...main`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.1.0...main)
+There is intentionally no v0.6.0 comparison link because no v0.6.0 tag or
+GitHub Release exists.
+
+### Agent-first packaging and local release automation (post-2026-08-07)
+
+- Added explicit `fw pull sortformer` distribution backed by a compiled,
+  hash-pinned GitHub model-release manifest. The native Rust downloader streams
+  into an isolated per-user cache, verifies the weights, conversion receipt,
+  NVIDIA license, and required notice, and emits path-free JSON. Transcription
+  remains offline; model bytes remain outside Git.
+- Added cached `sortformer-diarize` operation plus typed hard/soft known-interval
+  lane mapping. Hard caller assertions fail closed on ambiguity or
+  contradiction; soft references remain suggestions and never make an
+  anonymous lane authoritative. Four-lane capacity is reported explicitly.
+- Added the compact `fw` binary alias and machine-readable `capabilities`,
+  `models`, `doctor`, `robot triage`, and `robot-docs guide` entry points. Robot
+  argument failures now remain single-line JSON without echoing private paths.
+- Made native Whisper model discovery and execution share one deterministic
+  resolver, while reporting acoustic diarization and Sortformer certification
+  boundaries explicitly instead of treating file presence as runtime proof.
+- Hardened `install.sh` around exact versions, SHA-256 verification, strict
+  archive allowlisting, paired `franken_whisper`/`fw` replacement, live-lock
+  ownership, and pinned source builds.
+- Added five-target DSR staging with exact sibling revisions. GitHub workflows
+  remain manually dispatched fallbacks; Sortformer weights are excluded from
+  Git and distributed only through the dedicated model release with their
+  license and notice sidecars.
 
 ### Native decode-quality surface — whisper.cpp-faithful fallback + beam (post-2026-07-11)
 
@@ -75,7 +286,7 @@ The native engine's greedy/temperature-0 decoder gains whisper.cpp's full decode
 
 - **Temperature-fallback ladder** (`FW_TEMP_FALLBACK`) — a window that closes no timestamp, averages below `logprob_thold` (−1.0), or loops into a low-entropy repetitive tail (`entropy_thold` 2.4) is re-decoded up the whisper.cpp temperature ladder `[0.2 … 1.0]` with deterministic seeded multinomial sampling (prompt dropped above t=0.5), `greedy.best_of=5` candidates per rung selected by length-normalized sequence score (`FW_TEMP_BEST_OF`). Recovers the long-form content-drop (bd-r0qd): on `example_audio_track_01` (tiny.en, timestamps) it lifts WER **0.528 → 0.192** vs the whisper.cpp oracle, deterministically.
 - **Targeted prompt-reset retry** (`FW_RETRY_FAILED_WINDOW`) — the minimal, deterministic recovery for the carried-prompt × int8 early-EOT drop: retry a failed window once with the prompt cleared, byte-exact on every non-failed window. **The best-measured recovery: WER 0.164** (246/250 words) on the same clip — lower than the full sampling ladder.
-- **Beam search** (`FW_BEAM_SIZE`, default 1 = greedy) — whisper.cpp-style beam over the temperature-0 pass, per-hypothesis KV forking via a proven `DecoderState` clone primitive that shares the window-constant cross-K/V. Verified to converge to `whisper-cli` output on jfk (beam=5 == greedy == whisper.cpp, deterministic), and **measured to reduce WER on hard audio**: on the Steve Jobs iPhone keynote (tiny.en, drop removed via `FW_RETRY_FAILED_WINDOW`) `FW_BEAM_SIZE=5` cuts WER **0.1044 → 0.0984**, crossing below the 0.10 native-rollout gate that greedy fails. The full long-form quality stack is `FW_RETRY_FAILED_WINDOW=1 FW_BEAM_SIZE=5`.
+- **Beam search** (`FW_BEAM_SIZE`, default 1 = greedy) — whisper.cpp-style beam over the temperature-0 pass, per-hypothesis KV forking via a proven `DecoderState` clone primitive that shares the window-constant cross-K/V. On the JFK fixture beam=5 is deterministic and has zero WER, but may choose one reviewed punctuation variant rather than the byte-exact greedy string. On the Steve Jobs iPhone keynote (tiny.en, drop removed via `FW_RETRY_FAILED_WINDOW`) `FW_BEAM_SIZE=5` cuts WER **0.1044 → 0.0984**, crossing below the 0.10 native-rollout gate that greedy fails. The full long-form quality stack is `FW_RETRY_FAILED_WINDOW=1 FW_BEAM_SIZE=5`.
 - **First-class WER in conformance** — `conformance::word_error_rate` (edit-distance, ASR-normalized) now implements the "WER ≤ 0.10" gate the epic is defined against, and the native-vs-bridge comparator's WER metric was corrected from a positional counter (which cascaded a single word deletion to ~1.0) to real edit distance.
 
 Default-on decisions for these knobs are deliberately reserved (they change golden transcripts on repetitive/tiled audio); the measured WER evidence for that call lives in [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
@@ -142,7 +353,7 @@ Default-on decisions for these knobs are deliberately reserved (they change gold
 
 - **README comprehensive rewrite** ([`9ddb9db`](https://github.com/Dicklesworthstone/franken_whisper/commit/9ddb9dbab2528fdd2c2f2b10cc82ff6bd74de6a3)) — full top-to-bottom rewrite (~4,300 lines) reflecting the current architecture and capabilities, with worked examples (Bayesian routing arithmetic, mu-law encoding, Brier-score decomposition), anatomy walkthroughs (routing decision, TTY audio session, conformance check, speculative window), operational topics (state directory layout, CLI exit codes, threat model, performance tuning, disk usage growth, extension guides, debugging recipes), a use-cases gallery, JSON schema reference, and embedding-in-other-languages patterns.
 - **Removed stale "frankensqlite MVCC limitation" Limitations entry** from the README, since the underlying bug has been resolved upstream in the current `/dp/frankensqlite` checkout that the path dependency picks up.
-- **README test count corrected** from the marker-derived 3,860 to the runner-derived 3,668 (3,030 library + 638 integration across 26 integration test files).
+- **README test count methodology corrected** to use the test runner rather than source markers; the README no longer freezes a count that drifts as tests are added.
 
 ### Workspace Hygiene (post-2026-03-21)
 
@@ -404,7 +615,7 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ### Testing
 
-- 2,939 tests passing at release (now ~3,668 unit + integration tests at HEAD; see `[Unreleased] → Documentation Refresh` for the marker-vs-runner count correction)
+- 2,939 tests passed for that historical release.
 - Unit test coverage expanded across orchestrator, error, model, accelerate, robot, and process modules ([`1ed8429`](https://github.com/Dicklesworthstone/franken_whisper/commit/1ed8429b9e751190566b080cc5b294fcfaa29793))
 - Conformance harness with 50ms cross-engine timestamp tolerance and drift detection
 
@@ -421,32 +632,11 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ---
 
-<!-- agent-metadata
-  repo: Dicklesworthstone/franken_whisper
-  generated: 2026-05-18
-  commits_analyzed: 211
-  commits_since_v0.1.0: 152
-  added_since_prior_generation:
-    - speculative_cli_integration (4f54fbd + hardening 2dbab6f)
-    - storage_durability_test_tightening (eede00a; fsqlite MVCC fixed upstream)
-    - readme_rewrite_and_drift_corrections (9ddb9db + README test-count + stale-MVCC-limit removal)
-    - workspace_hygiene (47fe23b clippy + 7855910 Cargo.lock)
-  tags: v0.1.0 (lightweight, on 6a51618)
-  releases: v0.1.0 (GitHub Release, published 2026-03-04)
-  schema_version_at_HEAD: 3
-  workstreams_added_since_2026-03-21:
-    - release_pipeline (dist.yml + release-automation.yml)
-    - crates_io_migration (asupersync/franken-kernel/evidence/decision 0.3.1)
-    - conformance_native_rollout_governance (c72eed3, NativeEngineRolloutStage)
-    - word_level_timestamps + cancellation_threading (f1cbd31)
-    - adaptive_router_calibration (ef80eb8, ed91ddd)
-    - metamorphic_test_suites (audio + speculation + accelerate)
-    - health_probe_diagnostics_hardening
-    - sync_lock_pid_liveness (bd-3jfj/bd-pvol/bd-aijz/bd-7xh8/bd-ht0i/bd-qxf6/bd-uczx)
-    - ffmpeg_bundle_stdin_hardening (bd-wk8p/bd-o8fo/bd-g7b2)
-    - secrets_redaction_in_logs
-    - structured_run_error_for_invalid_robot_requests
--->
-
-[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.1.0...main
+[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.8.0...main
+[0.8.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.8.0
+[0.7.2]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.2
+[0.7.1]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.1
+[0.5.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.5.0
+[0.4.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.4.0
+[0.3.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.3.0
 [v0.1.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.1.0

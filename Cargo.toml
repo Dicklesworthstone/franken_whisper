@@ -1,9 +1,32 @@
 [package]
 name = "franken_whisper"
-version = "0.5.0"
+version = "0.8.0"
 edition = "2024"
 license-file = "LICENSE"
-description = "Agent-first Rust ASR orchestration stack with ffmpeg normalization and frankensqlite-backed persistence"
+description = "Native Rust Whisper ASR and speaker diarization with agent-first NDJSON and durable local workflows"
+repository = "https://github.com/Dicklesworthstone/franken_whisper"
+homepage = "https://github.com/Dicklesworthstone/franken_whisper"
+documentation = "https://docs.rs/franken_whisper"
+readme = "README.md"
+keywords = ["whisper", "speech-to-text", "diarization", "asr", "audio"]
+categories = ["command-line-utilities", "multimedia::audio"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/rust-toolchain.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/NOTICE.sortformer.txt",
+    "/THIRD_PARTY_NOTICES.md",
+    "/src/**",
+    "!/src/.DS_Store",
+    "/models/**",
+    "/scripts/convert_to_safetensors.py",
+    "/scripts/export_sortformer_activations.py",
+    "/docs/native_engine_contract.md",
+    "/docs/NEGATIVE_EVIDENCE.md",
+]
 
 [features]
 default = []
@@ -16,7 +39,7 @@ gpu-frankenjax = ["dep:fj-api", "dep:fj-core"]
 # implicit package-named bin, so both are declared here.
 #
 # NOTE: cargo emits `warning: src/main.rs found to be present in multiple build
-# targets` — this is EXPECTED and INTENTIONAL (one 518-line entry point, two
+# targets` — this is EXPECTED and INTENTIONAL (one shared entry point, two
 # installable names). Do NOT "fix" it by dropping a bin (breaks the `fw`/
 # `franken_whisper` dual name that installers + docs rely on) or by refactoring
 # main into the lib behind thin per-bin wrappers (a large, CLI-risky change for a
@@ -27,7 +50,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "fw"
-path = "src/main.rs"
+path = "src/bin/fw.rs"
 
 [dependencies]
 ctrlc = "3.4"
@@ -53,34 +76,37 @@ symphonia = { version = "0.5.5", features = ["mp3", "aac", "isomp4", "ogg", "fla
 # ft-kernel-cpu; pinned to the same minor.
 rayon = "1.10"
 
-asupersync = { version = "0.3.4", default-features = false }
+asupersync = { version = "0.3.4", default-features = false, features = ["tls-webpki-roots"] }
 franken-kernel = "0.3.4"
 franken-evidence = "0.3.4"
 franken-decision = "0.3.4"
-fsqlite = { path = "../frankensqlite/crates/fsqlite" }
-fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
+fsqlite = { version = "0.2.0", path = "../frankensqlite/crates/fsqlite" }
+fsqlite-types = { version = "0.2.0", path = "../frankensqlite/crates/fsqlite-types" }
 
 # FrankenTorch compute kernels for the in-process native whisper engine
 # (rayon-parallel GEMM, softmax, gelu; f16 storage types). These are
 # first-party FrankenSuite crates — see the bd-frp7 epic.
-ft-kernel-cpu = { path = "../frankentorch/crates/ft-kernel-cpu" }
-ft-core = { path = "../frankentorch/crates/ft-core" }
+ft-kernel-cpu = { version = "0.1.0", path = "../frankentorch/crates/ft-kernel-cpu" }
+ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core" }
 # Direct dep on `half` (same crate ft-core re-exports as `Float16`) for its
 # `HalfFloatSliceExt::convert_to_f32_slice` SIMD bulk f16->f32 dequant — the
 # `std` feature enables runtime aarch64 `fp16` / x86 `f16c` vector paths used
 # by the f16-compute GEMV kernels (nn::gemv_f16). Pinned to ft-core's version.
 half = { version = "2.7", features = ["std"] }
 
-ftui = { path = "../frankentui/crates/ftui", default-features = false, features = ["crossterm"], optional = true }
-ft-api = { path = "../frankentorch/crates/ft-api", optional = true }
-fj-api = { path = "../frankenjax/crates/fj-api", optional = true }
-fj-core = { path = "../frankenjax/crates/fj-core", optional = true }
+ftui = { version = "0.5.0", path = "../frankentui/crates/ftui", default-features = false, features = ["crossterm"], optional = true }
 
 # Safe handle-relative openat, ownership checks, and no-clobber rename
 # publication are unavailable in std. This narrowly featured target-specific
 # edge closes that capability gap while preserving the unsafe-code prohibition.
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
 rustix = { version = "1.1.4", features = ["fs", "process"] }
+
+# std does not expose race-free Windows Job Object assignment. This narrowly
+# featured safe wrapper spawns suspended, assigns the child before it can create
+# descendants, and retains the job handle after the root exits.
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "9.1.0", default-features = false, features = ["std", "job-object"] }
 
 [lints.rust]
 unsafe_code = "deny"
@@ -101,12 +127,12 @@ unused_self = "warn"
 # so franken_whisper keeps `#![deny(unsafe_code)]`. Non-macOS targets never see
 # this dep and stay on the optimized CPU path.
 [target.'cfg(target_os = "macos")'.dependencies]
-ft-kernel-metal = { path = "../frankentorch/crates/ft-kernel-metal" }
+ft-kernel-metal = { version = "0.1.0", path = "../frankentorch/crates/ft-kernel-metal" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 # For the f16_gemv_dequant bench to construct `Float16` weights directly.
-ft-core = { path = "../frankentorch/crates/ft-core" }
+ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core" }
 # For the hugepage_gemv_probe (madvise(MADV_HUGEPAGE) A/B on weight streaming).
 # Already a transitive dependency; dev-only, does not affect the shipped binary.
 libc = "0.2"

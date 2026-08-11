@@ -1,0 +1,18 @@
+{
+  "target_path": "/Users/jemanuel/projects/franken_whisper",
+  "discovered_at": "2026-08-07T12:22:28Z",
+  "languages": [
+    "rust"
+  ],
+  "binaries": [
+    "franken_whisper",
+    "fw"
+  ],
+  "env_var_prefix": "FRANKEN_WHISPER",
+  "existing_surfaces": {
+    "robot_mode": false,
+    "capabilities": true,
+    "robot_docs": false
+  },
+  "recommended_mode": "full"
+}

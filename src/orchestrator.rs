@@ -69,7 +69,7 @@ pub enum PipelineStage {
     Separate,
     /// Execute the transcription backend (whisper-cpp, insanely-fast-whisper, etc.).
     Backend,
-    /// Run native acceleration pass (GPU confidence normalization).
+    /// Normalize per-segment confidence mass on the CPU.
     Accelerate,
     /// Evidence-gated timestamp alignment: canonical attention-DTW when
     /// available, otherwise an explicitly labeled character-density fallback.
@@ -560,11 +560,11 @@ impl CancellationToken {
     /// Create a token with no deadline (never cancels on its own; still honors
     /// the global Ctrl+C shutdown).
     ///
-    /// `pub(crate)` so native backends can synthesize a token when a caller did
-    /// not supply one (e.g. the diarization stage inside
-    /// `whisper_diarization_native::run`).
+    /// This remains cancellation-aware because it always honors the process
+    /// Ctrl+C shutdown flag; "unbounded" means only that no time deadline is
+    /// added.
     #[must_use]
-    pub(crate) fn unbounded() -> Self {
+    pub fn unbounded() -> Self {
         Self { deadline: None }
     }
 
@@ -628,6 +628,7 @@ pub(crate) struct FinalizerRegistry {
     entries: Vec<(String, Finalizer)>,
 }
 
+#[cfg(any(unix, test))]
 fn sanitize_process_pid(pid: u32) -> Option<u32> {
     if pid == 0 || pid > i32::MAX as u32 {
         None
@@ -835,7 +836,11 @@ impl StageBudgetPolicy {
             acceleration_ms: budget_from_source(&mut source, STAGE_BUDGET_ACCELERATION_ENV, 20_000),
             align_ms: budget_from_source(&mut source, STAGE_BUDGET_ALIGN_ENV, 30_000),
             punctuate_ms: budget_from_source(&mut source, STAGE_BUDGET_PUNCTUATE_ENV, 10_000),
-            diarize_ms: budget_from_source(&mut source, STAGE_BUDGET_DIARIZE_ENV, 30_000),
+            // Native Sortformer runs at a small fraction of real time on the
+            // reference desktop, but an hour-long recording still needs
+            // minutes rather than seconds. Keep the stage bounded while
+            // allowing normal long-form jobs to finish by default.
+            diarize_ms: budget_from_source(&mut source, STAGE_BUDGET_DIARIZE_ENV, 900_000),
             persist_ms: budget_from_source(&mut source, STAGE_BUDGET_PERSIST_ENV, 20_000),
             cleanup_budget_ms: budget_from_source(&mut source, STAGE_BUDGET_CLEANUP_ENV, 5_000),
         }
@@ -1245,7 +1250,7 @@ fn acceleration_context_payload(
     cancellation_fence: Value,
 ) -> serde_json::Value {
     let acceleration_mode = if acceleration_backend == "none" {
-        "cpu_fallback"
+        "cpu_normalization"
     } else {
         "accelerated"
     };
@@ -1261,8 +1266,6 @@ fn acceleration_context_payload(
         "logical_stream_owner_id": stream_owner_id,
         "requested_gpu_device": request.backend_params.gpu_device,
         "flash_attention_requested": request.backend_params.flash_attention,
-        "frankentorch_feature": cfg!(feature = "gpu-frankentorch"),
-        "frankenjax_feature": cfg!(feature = "gpu-frankenjax"),
         "cancellation_fence": cancellation_fence,
     })
 }
@@ -1603,24 +1606,11 @@ fn resolved_diarization_engine(
 
 fn resolved_diarization_engine_for_rollout(
     request: &TranscribeRequest,
-    result: &crate::model::TranscriptionResult,
-    rollout: crate::model::AcousticDiarizationRolloutStage,
+    _result: &crate::model::TranscriptionResult,
+    _rollout: crate::model::AcousticDiarizationRolloutStage,
 ) -> DiarizationEngine {
-    use crate::model::AcousticDiarizationRolloutStage;
-
     match selected_diarization_engine(request) {
-        DiarizationEngine::Auto => match rollout {
-            AcousticDiarizationRolloutStage::Shadow
-            | AcousticDiarizationRolloutStage::Validated => DiarizationEngine::External,
-            AcousticDiarizationRolloutStage::Fallback
-                if result_has_external_diarization(result) =>
-            {
-                DiarizationEngine::External
-            }
-            AcousticDiarizationRolloutStage::Fallback
-            | AcousticDiarizationRolloutStage::Primary
-            | AcousticDiarizationRolloutStage::Sole => DiarizationEngine::Acoustic,
-        },
+        DiarizationEngine::Auto => DiarizationEngine::Sortformer,
         explicit => explicit,
     }
 }
@@ -1665,7 +1655,9 @@ fn optional_stage_skip(
                 ))
             } else if matches!(
                 engine,
-                DiarizationEngine::Auto | DiarizationEngine::Acoustic
+                DiarizationEngine::Auto
+                    | DiarizationEngine::Sortformer
+                    | DiarizationEngine::Acoustic
             ) {
                 Some((
                     "native_acoustic_preserves_waveform".to_owned(),
@@ -1702,7 +1694,7 @@ fn optional_stage_skip(
                 .punctuation
                 .as_ref()
                 .is_some_and(|config| config.enabled);
-            if !request.diarize && !punctuation_enabled {
+            if !punctuation_enabled {
                 Some((
                     "punctuation_not_requested".to_owned(),
                     stage_skip_payload(
@@ -2329,8 +2321,96 @@ async fn execute_backend(
 
     inter.backend_output_sha256 = backend_output_sha256;
     inter.backend_runtime = Some(backend_runtime);
+    surface_backend_result_diagnostics(pcx, log, request, &execution.result, inter);
     inter.result = Some(execution.result);
     Ok(())
+}
+
+/// Surface machine-readable diagnostics from the backend result into
+/// `RunReport.warnings`, the evidence ledger, and the event stream.
+///
+/// Two classes today:
+///
+/// * **Dropped long-form decode windows (bd-nqzf).** The native engine records
+///   every window it discarded in `raw_output.dropped_windows`; silent content
+///   loss must never stay stderr-only.
+/// * **Ignored audio-window flags (bd-vgod).** `--offset-ms` / `--duration-ms`
+///   are honored only by the whisper.cpp family; any other resolved backend
+///   silently transcribes the full file, which must be loud.
+fn surface_backend_result_diagnostics(
+    pcx: &mut PipelineCx,
+    log: &mut EventLog,
+    request: &TranscribeRequest,
+    result: &crate::model::TranscriptionResult,
+    inter: &mut PipelineIntermediate,
+) {
+    // Dropped long-form windows: warning + evidence + stage event.
+    if let Some(dropped) = result
+        .raw_output
+        .get("dropped_windows")
+        .and_then(Value::as_array)
+        .filter(|windows| !windows.is_empty())
+    {
+        let total_sec: f64 = dropped
+            .iter()
+            .map(|w| {
+                let start = w.get("start_sec").and_then(Value::as_f64).unwrap_or(0.0);
+                let end = w.get("end_sec").and_then(Value::as_f64).unwrap_or(start);
+                (end - start).max(0.0)
+            })
+            .sum();
+        let ranges: Vec<String> = dropped
+            .iter()
+            .map(|w| {
+                format!(
+                    "{:.1}-{:.1}s",
+                    w.get("start_sec").and_then(Value::as_f64).unwrap_or(0.0),
+                    w.get("end_sec").and_then(Value::as_f64).unwrap_or(0.0)
+                )
+            })
+            .collect();
+        inter.warnings.push(format!(
+            "native decode dropped {} window(s) (~{:.0}s of audio) without emitting a transcript: {}; \
+             the audio in these ranges is missing from the transcript \
+             (re-transcribe the ranges individually to recover; FW_TEMP_FALLBACK=1 enables sampling-ladder recovery)",
+            dropped.len(),
+            total_sec,
+            ranges.join(", ")
+        ));
+        pcx.record_evidence_values(&[json!({
+            "kind": "native_decode_dropped_windows",
+            "count": dropped.len(),
+            "total_dropped_sec": total_sec,
+            "windows": dropped,
+        })]);
+        log.push(
+            "backend",
+            "backend.dropped_windows",
+            "native decode dropped long-form windows without transcript output",
+            json!({
+                "count": dropped.len(),
+                "total_dropped_sec": total_sec,
+                "windows": dropped,
+            }),
+        );
+    }
+
+    // Audio-window flags on a backend that does not honor them: loud ignore.
+    let window_requested = request.backend_params.offset_ms.is_some_and(|v| v > 0)
+        || request.backend_params.duration_ms.is_some_and(|v| v > 0);
+    if window_requested && result.backend != BackendKind::WhisperCpp {
+        inter.warnings.push(format!(
+            "--offset-ms/--duration-ms are not supported by backend `{}`; the full input was transcribed",
+            result.backend.as_str()
+        ));
+    }
+    if window_requested && result.backend == BackendKind::WhisperCpp && request.diarize {
+        inter.warnings.push(
+            "audio window applied to transcription only; diarization/VAD still cover the full \
+             normalized clip"
+                .to_owned(),
+        );
+    }
 }
 
 /// Speculative replacement for [`execute_backend`].
@@ -2381,6 +2461,18 @@ async fn execute_backend_speculative(
             "execute_backend_speculative invoked without BackendParams.speculative".to_owned(),
         )
     })?;
+
+    // Loud ignore (bd-vgod): the speculative window manager slices audio on
+    // its own schedule and does not honor the audio-window flags.
+    if request.backend_params.offset_ms.is_some_and(|v| v > 0)
+        || request.backend_params.duration_ms.is_some_and(|v| v > 0)
+    {
+        inter.warnings.push(
+            "--offset-ms/--duration-ms are not supported in speculative mode; the full input \
+             was transcribed"
+                .to_owned(),
+        );
+    }
 
     // Resolve the speculative run's backend ONCE so every window invocation
     // talks to the same engine (per design note above). Failures here surface
@@ -2655,10 +2747,9 @@ async fn execute_accelerate(
     log.push(
         "acceleration",
         "acceleration.start",
-        "running native acceleration pass",
+        "running confidence normalization",
         json!({
-            "frankentorch_feature": cfg!(feature = "gpu-frankentorch"),
-            "frankenjax_feature": cfg!(feature = "gpu-frankenjax"),
+            "implementation": "cpu_mass_normalization",
             "segments": result.segments.len(),
             "budget_ms": stage_budgets.acceleration_ms,
         }),
@@ -2669,7 +2760,7 @@ async fn execute_accelerate(
     let (updated_result, acceleration) =
         match run_stage_with_budget("acceleration", acceleration_budget_ms, move || {
             let mut local = result;
-            let acceleration = accelerate::apply_with_token(&mut local, Some(&acceleration_token));
+            let acceleration = accelerate::apply_with_token(&mut local, Some(&acceleration_token))?;
             Ok((local, acceleration))
         }) {
             Ok(output) => output,
@@ -2710,22 +2801,12 @@ async fn execute_accelerate(
         acceleration_context,
     );
 
-    let acceleration_code = if acceleration.backend.as_str() == "none" {
-        tracing::warn!(
-            stage = "acceleration",
-            fallback = "none",
-            "Acceleration fallback: no acceleration backend available"
-        );
-        "acceleration.fallback"
-    } else {
-        tracing::debug!(stage = "acceleration", "Pipeline stage complete");
-        "acceleration.ok"
-    };
+    tracing::debug!(stage = "acceleration", "Pipeline stage complete");
 
     log.push(
         "acceleration",
-        acceleration_code,
-        "acceleration pass finished",
+        "acceleration.ok",
+        "confidence normalization finished",
         json!({
             "backend": acceleration.backend.as_str(),
             "normalized": acceleration.normalized_confidences,
@@ -4303,8 +4384,7 @@ fn silhouette_score(
     // double-scan below-superseded form. ~2.9x faster (see benches/silhouette_perf).
     let mut cluster_sum = vec![0.0_f64; n * num_clusters];
     let mut cluster_count = vec![0u64; n * num_clusters];
-    for i in 0..n {
-        let ci = assignments[i];
+    for (i, &ci) in assignments.iter().enumerate() {
         for j in (i + 1)..n {
             let d = embeddings[i].euclidean_distance(&embeddings[j]);
             let cj = assignments[j];
@@ -4316,8 +4396,7 @@ fn silhouette_score(
     }
 
     let mut sum = 0.0_f64;
-    for i in 0..n {
-        let ci = assignments[i];
+    for (i, &ci) in assignments.iter().enumerate() {
         let base = i * num_clusters;
 
         // a(i): mean distance to other points in same cluster.
@@ -4659,6 +4738,98 @@ async fn execute_diarize(
                 normalized_duration_ms,
             )?;
             match engine {
+                DiarizationEngine::Sortformer => {
+                    let segments_total = result.segments.len();
+                    let wav_bytes = std::fs::read(&normalized_wav)?;
+                    let normalized_input_sha256 = sha256_bytes_hex(&wav_bytes);
+                    let samples = crate::native_engine::decode::read_wav_16k_mono(&wav_bytes)?;
+                    let word_aligned = has_canonical_word_alignment(&result.raw_output);
+                    let word_boundaries_ms = if word_aligned {
+                        transcript_boundaries_ms(&result.segments)
+                    } else {
+                        Vec::new()
+                    };
+                    let (tiny_diarize_boundaries_ms, tiny_diarize_hint_evidence) =
+                        tiny_diarize_boundary_hints(
+                            tiny_diarize_requested,
+                            result.backend == BackendKind::WhisperCpp,
+                            &result.raw_output,
+                            normalized_duration_ms,
+                        );
+                    let boundary_hints = AcousticBoundaryHints {
+                        speech_regions_ms,
+                        word_boundaries_ms,
+                        tiny_diarize_boundaries_ms,
+                    };
+                    let sortformer_attempt = if acoustic_request.known_intervals.is_empty()
+                        && sortformer_count_request_is_capacity_eligible(
+                            &acoustic_request.speaker_count,
+                        ) {
+                        run_native_sortformer_diarization(
+                            &samples,
+                            &normalized_input_sha256,
+                            &result.segments,
+                            word_aligned,
+                            &acoustic_request,
+                            &|| diarize_token.checkpoint(),
+                        )
+                    } else {
+                        Err(FwError::InvalidRequest(
+                            "native Sortformer cannot authoritatively apply this hint or greater-than-four-speaker request"
+                                .to_owned(),
+                        ))
+                    };
+                    let (diarization_report, projection) = match sortformer_attempt {
+                        Ok(output) => output,
+                        Err(error)
+                            if fallback_policy == DiarizationFallbackPolicy::Acoustic
+                                && sortformer_acoustic_fallback_eligible(&error) =>
+                        {
+                            run_native_acoustic_fallback(
+                                diarization::AcousticDiarizationInput {
+                                    samples: &samples,
+                                    normalized_input_sha256: &normalized_input_sha256,
+                                    segments: &result.segments,
+                                    word_aligned,
+                                    request: &acoustic_request,
+                                    boundary_hints: &boundary_hints,
+                                },
+                                None,
+                                &|| diarize_token.checkpoint(),
+                            )?
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let notes = diarization_report.diagnostics.clone();
+                    let speakers_detected =
+                        usize::try_from(diarization_report.speaker_count.supported_speaker_count)
+                            .map_err(|_| {
+                            FwError::InvalidRequest(
+                                "diarization speaker count does not fit this platform".to_owned(),
+                            )
+                        })?;
+                    apply_native_diarization_projection(
+                        &mut result,
+                        projection,
+                        diarization_report,
+                    );
+                    let segments_labeled = result
+                        .segments
+                        .iter()
+                        .filter(|segment| segment.speaker.is_some())
+                        .count();
+                    Ok((
+                        result,
+                        DiarizeReport {
+                            segments_total,
+                            speakers_detected,
+                            segments_labeled,
+                            silhouette_score: None,
+                            notes,
+                        },
+                        Some(tiny_diarize_hint_evidence),
+                    ))
+                }
                 DiarizationEngine::Auto | DiarizationEngine::Acoustic => {
                     let segments_total = result.segments.len();
                     let wav_bytes = std::fs::read(&normalized_wav)?;
@@ -5288,13 +5459,290 @@ fn validate_diarization_execution_request(
 fn apply_native_diarization_projection(
     result: &mut crate::model::TranscriptionResult,
     projection: diarization::DiarizationProjection,
-    report: DiarizationReport,
+    mut report: DiarizationReport,
 ) {
     // Speaker projection may alter only the legacy per-segment speaker field.
     // The backend's top-level transcript remains byte-authoritative even when
     // its spacing differs from a reconstruction of the segment list.
     result.segments = projection.segments;
+    // First-class merged view (bd-d4py): consumers get the speaker-attributed
+    // transcript directly instead of re-deriving the turn/segment join.
+    report.speaker_segments =
+        diarization::build_speaker_attributed_segments(&result.segments, &report.turns);
     result.diarization = Some(report);
+}
+
+fn sortformer_count_request_is_capacity_eligible(request: &SpeakerCountRequest) -> bool {
+    match request {
+        SpeakerCountRequest::Infer => true,
+        SpeakerCountRequest::HardConstraint { count } => *count <= 4,
+        SpeakerCountRequest::Range { minimum, .. } => *minimum <= 4,
+        // Sortformer does not fuse the caller's probability mass into its
+        // activity head. Preserve that request semantic through the acoustic
+        // path instead of returning an unrelated capped lane count.
+        SpeakerCountRequest::Prior { .. } => false,
+    }
+}
+
+fn sortformer_acoustic_fallback_eligible(error: &FwError) -> bool {
+    matches!(
+        error,
+        FwError::MissingArtifact(_) | FwError::BackendUnavailable(_) | FwError::InvalidRequest(_)
+    )
+}
+
+fn run_native_sortformer_diarization(
+    samples: &[f32],
+    normalized_input_sha256: &str,
+    segments: &[crate::model::TranscriptionSegment],
+    word_aligned: bool,
+    request: &DiarizationRequest,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<(DiarizationReport, diarization::DiarizationProjection)> {
+    checkpoint()?;
+    if !request.known_intervals.is_empty() {
+        return Err(FwError::InvalidRequest(
+            "native Sortformer report construction requires the acoustic hint-preserving fallback"
+                .to_owned(),
+        ));
+    }
+    let cached =
+        crate::model_distribution::resolve_cached_sortformer_with_cancel(|| checkpoint().is_err())?;
+    checkpoint()?;
+    let package = crate::sortformer_conformance::load_verified_sortformer_package_with_checkpoint(
+        &cached.receipt_path,
+        &cached.package_path,
+        checkpoint,
+    )?;
+    let session =
+        crate::sortformer_inference::SortformerSession::from_verified_package_with_checkpoint(
+            &package, checkpoint,
+        )?;
+    let output = session.diarize_with_checkpoint(
+        crate::sortformer_inference::SortformerPcm::mono_16khz(samples),
+        checkpoint,
+    )?;
+    checkpoint()?;
+
+    const FRAME_MS: u64 = 80;
+    const LANES: usize = crate::sortformer_inference::SORTFORMER_SPEAKER_LANES;
+    let mut active_lanes = BTreeSet::new();
+    for turn in &output.turns {
+        active_lanes.insert(turn.speaker);
+    }
+    let labels = active_lanes
+        .iter()
+        .map(|lane| (*lane, format!("SPEAKER_{lane:02}")))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut turns = Vec::with_capacity(output.turns.len());
+    for (index, turn) in output.turns.iter().enumerate() {
+        if index.is_multiple_of(1_024) {
+            checkpoint()?;
+        }
+        let (start_ms, end_ms) = finite_seconds_interval_to_ms(
+            f64::from(turn.start_seconds),
+            f64::from(turn.end_seconds),
+        )
+        .ok_or_else(|| {
+            FwError::ContractViolation(
+                "native Sortformer emitted a non-finite or empty speaker turn".to_owned(),
+            )
+        })?;
+        let start_frame = usize::try_from(start_ms / FRAME_MS).unwrap_or(usize::MAX);
+        let end_frame = usize::try_from(end_ms.div_ceil(FRAME_MS)).unwrap_or(usize::MAX);
+        let frame_end = end_frame.min(output.frames);
+        let frame_start = start_frame.min(frame_end);
+        let mut probability_sum = 0.0_f64;
+        let mut probability_count = 0_u64;
+        let mut overlap_suspected = false;
+        for frame in frame_start..frame_end {
+            let offset = frame
+                .checked_mul(LANES)
+                .and_then(|base| base.checked_add(turn.speaker))
+                .ok_or_else(|| {
+                    FwError::ContractViolation(
+                        "native Sortformer probability index overflowed".to_owned(),
+                    )
+                })?;
+            if let Some(probability) = output.probabilities.get(offset) {
+                probability_sum += f64::from(*probability);
+                probability_count = probability_count.saturating_add(1);
+            }
+            overlap_suspected |= output
+                .activity
+                .overlap
+                .get(frame)
+                .is_some_and(|value| *value != 0);
+        }
+        let speaker_confidence = if probability_count == 0 {
+            0.5
+        } else {
+            (probability_sum / probability_count as f64).clamp(0.0, 1.0)
+        };
+        turns.push(DiarizationTurn {
+            start_ms,
+            end_ms,
+            speaker_ref: labels.get(&turn.speaker).cloned(),
+            speaker_confidence: Some(speaker_confidence),
+            change_confidence: None,
+            overlap_suspected,
+            hard_hint_attributed: false,
+        });
+    }
+    turns.sort_by(|left, right| {
+        (left.start_ms, left.end_ms, left.speaker_ref.as_deref()).cmp(&(
+            right.start_ms,
+            right.end_ms,
+            right.speaker_ref.as_deref(),
+        ))
+    });
+
+    let mut speaker_evidence = Vec::with_capacity(active_lanes.len());
+    let mut profiles = Vec::with_capacity(active_lanes.len());
+    for lane in active_lanes {
+        checkpoint()?;
+        let speaker_ref = labels.get(&lane).cloned().ok_or_else(|| {
+            FwError::ContractViolation("active Sortformer lane lacks a label".to_owned())
+        })?;
+        let lane_turns = turns
+            .iter()
+            .filter(|turn| turn.speaker_ref.as_ref() == Some(&speaker_ref))
+            .collect::<Vec<_>>();
+        let voiced_duration_ms = lane_turns
+            .iter()
+            .try_fold(0_u64, |total, turn| {
+                total.checked_add(turn.end_ms - turn.start_ms)
+            })
+            .ok_or_else(|| {
+                FwError::ContractViolation("Sortformer lane duration overflowed".to_owned())
+            })?;
+        let voiced_frame_count = output
+            .activity
+            .activity
+            .as_chunks::<LANES>()
+            .0
+            .iter()
+            .filter(|frame| frame.get(lane).is_some_and(|value| *value != 0))
+            .count() as u64;
+        let mean_assignment_confidence = lane_turns
+            .iter()
+            .filter_map(|turn| turn.speaker_confidence)
+            .sum::<f64>()
+            / lane_turns.len().max(1) as f64;
+        let assigned_tracklet_count = lane_turns.len() as u64;
+        speaker_evidence.push(SpeakerEvidenceSummary {
+            speaker_ref: speaker_ref.clone(),
+            assigned_tracklet_count,
+            independent_tracklet_count: assigned_tracklet_count,
+            recurrence_episode_count: assigned_tracklet_count,
+            voiced_frame_count,
+            independent_voiced_frame_count: voiced_frame_count,
+            voiced_duration_ms,
+            mean_assignment_confidence,
+            profile_reliability: mean_assignment_confidence,
+            hard_anchored: false,
+            separated_from_supported_speakers: true,
+            reasons: vec![SpeakerEvidenceReason::SupportedByLearnedModelActivity],
+            supported: true,
+        });
+        profiles.push(SpeakerProfileSummary {
+            speaker_ref,
+            frame_count: voiced_frame_count,
+            voiced_duration_ms,
+            reliability: mean_assignment_confidence,
+            voice_profile_count: 1,
+            channel_profile_count: 0,
+            training_accepted_count: u32::try_from(assigned_tracklet_count).unwrap_or(u32::MAX),
+            training_downweighted_count: 0,
+            training_quarantined_count: 0,
+            anchored: false,
+            soft_hint_contradiction: None,
+        });
+    }
+    let active_speaker_refs = profiles
+        .iter()
+        .map(|profile| profile.speaker_ref.clone())
+        .collect::<Vec<_>>();
+    let supported_speaker_count = u32::try_from(active_speaker_refs.len()).map_err(|_| {
+        FwError::ContractViolation("Sortformer active lane count exceeds u32".to_owned())
+    })?;
+    let (status, status_reason, fallback_status) = match &request.speaker_count {
+        SpeakerCountRequest::HardConstraint { count } if *count == supported_speaker_count => (
+            SpeakerCountOutcomeStatus::Satisfied,
+            SpeakerCountOutcomeReason::RequestedCountMatched,
+            DiarizationFallbackStatus::NotNeeded,
+        ),
+        SpeakerCountRequest::HardConstraint { .. } => (
+            SpeakerCountOutcomeStatus::Unsatisfied,
+            SpeakerCountOutcomeReason::RequestedCountMismatch,
+            DiarizationFallbackStatus::UnsatisfiedConstraints,
+        ),
+        _ if supported_speaker_count == 0 => (
+            SpeakerCountOutcomeStatus::Unresolved,
+            SpeakerCountOutcomeReason::NoSupportedSpeakers,
+            DiarizationFallbackStatus::SpeakerCountUnresolved,
+        ),
+        SpeakerCountRequest::Prior { .. } => (
+            SpeakerCountOutcomeStatus::Unresolved,
+            SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable,
+            DiarizationFallbackStatus::SpeakerCountUnresolved,
+        ),
+        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } => (
+            SpeakerCountOutcomeStatus::Unresolved,
+            SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved,
+            DiarizationFallbackStatus::SpeakerCountUnresolved,
+        ),
+    };
+    let timed_speech_ms = interval_union_duration_ms(
+        segments
+            .iter()
+            .filter_map(|segment| {
+                segment
+                    .start_sec
+                    .zip(segment.end_sec)
+                    .and_then(|(start_sec, end_sec)| {
+                        finite_seconds_interval_to_ms(start_sec, end_sec)
+                    })
+            })
+            .collect(),
+    )?;
+    let (dominant_speaker_share, unknown_voiced_share) =
+        sortformer_activity_shares(&turns, timed_speech_ms)?;
+    let report = DiarizationReport {
+        implementation: "native-sortformer-v1".to_owned(),
+        contract_version: "sortformer-diarization-v1".to_owned(),
+        feature_schema: "sortformer-activity-80ms-v1".to_owned(),
+        speaker_evidence_mode: DiarizationSpeakerEvidenceMode::SortformerActivity,
+        normalized_input_sha256: normalized_input_sha256.to_owned(),
+        hint_document_sha256: None,
+        turns,
+        profiles,
+        hint_evidence: Vec::new(),
+        speaker_queries: Vec::new(),
+        speaker_count: SpeakerCountOutcome {
+            request: request.speaker_count.clone(),
+            estimate: None,
+            status,
+            supported_speaker_count,
+            active_speaker_refs,
+            dominant_speaker_share,
+            unknown_voiced_share,
+            reasons: vec![status_reason],
+            speaker_evidence,
+        },
+        fallback_status,
+        operational_partition: None,
+        neural_representation: None,
+        speaker_segments: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    report
+        .validate_against_request(request, Some(normalized_pcm_duration_ms(samples.len())?))
+        .map_err(FwError::ContractViolation)?;
+    let projection =
+        diarization::project_diarization_onto_segments(segments, &report.turns, word_aligned)?;
+    Ok((report, projection))
 }
 
 fn run_native_acoustic_fallback(
@@ -5433,6 +5881,53 @@ fn interval_union_duration_ms(mut intervals: Vec<(u64, u64)>) -> FwResult<u64> {
         })?;
     }
     Ok(total)
+}
+
+fn sortformer_activity_shares(
+    turns: &[DiarizationTurn],
+    timed_speech_ms: u64,
+) -> FwResult<(f64, f64)> {
+    let mut speaker_durations = BTreeMap::<&str, u64>::new();
+    for turn in turns {
+        let speaker_ref = turn.speaker_ref.as_deref().ok_or_else(|| {
+            FwError::ContractViolation(
+                "native Sortformer emitted an attributed turn without a speaker label".to_owned(),
+            )
+        })?;
+        let duration = turn.end_ms.checked_sub(turn.start_ms).ok_or_else(|| {
+            FwError::ContractViolation(
+                "native Sortformer emitted a reversed speaker turn".to_owned(),
+            )
+        })?;
+        if duration == 0 {
+            return Err(FwError::ContractViolation(
+                "native Sortformer emitted an empty speaker turn".to_owned(),
+            ));
+        }
+        let total = speaker_durations.entry(speaker_ref).or_default();
+        *total = total.checked_add(duration).ok_or_else(|| {
+            FwError::ContractViolation(
+                "native Sortformer speaker duration exceeds the report schema".to_owned(),
+            )
+        })?;
+    }
+    let attributed_speech_ms = interval_union_duration_ms(
+        turns
+            .iter()
+            .map(|turn| (turn.start_ms, turn.end_ms))
+            .collect(),
+    )?;
+
+    // Per-speaker duration intentionally includes overlap, while attribution
+    // coverage uses the turn union. This keeps overlap from hiding genuinely
+    // uncovered ASR-timed speech or pushing either share above one.
+    let evidence_duration_ms = timed_speech_ms.max(attributed_speech_ms).max(1);
+    let dominant_duration_ms = speaker_durations.values().copied().max().unwrap_or(0);
+    Ok((
+        dominant_duration_ms as f64 / evidence_duration_ms as f64,
+        evidence_duration_ms.saturating_sub(attributed_speech_ms) as f64
+            / evidence_duration_ms as f64,
+    ))
 }
 
 fn transcript_boundaries_ms(segments: &[crate::model::TranscriptionSegment]) -> Vec<u64> {
@@ -5670,7 +6165,7 @@ fn unavailable_neural_representation_summary(
     };
     summary
         .validate()
-        .map_err(|error| FwError::ContractViolation(error.to_owned()))?;
+        .map_err(|error| FwError::ContractViolation(error.clone()))?;
     Ok(summary)
 }
 
@@ -5724,6 +6219,7 @@ fn unknown_diarization_report(
         },
         operational_partition: None,
         neural_representation: None,
+        speaker_segments: Vec::new(),
         diagnostics: vec![diagnostic_code.to_owned()],
     }
 }
@@ -6169,6 +6665,7 @@ fn external_diarization_report(
         fallback_status: DiarizationFallbackStatus::ExternalBackend,
         operational_partition: None,
         neural_representation,
+        speaker_segments: Vec::new(),
         diagnostics,
     };
     report
@@ -6296,9 +6793,10 @@ mod tests {
         recommended_budget, resolved_diarization_engine, resolved_diarization_engine_for_rollout,
         result_has_external_diarization, run_pipeline, run_stage_with_budget, sanitize_process_pid,
         selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_file_with_checkpoint,
-        sha256_json_value, silhouette_score, source_separate, source_separate_with_analysis,
-        split_long_regions, stage_budget_ms, stage_failure_code, stage_failure_message,
-        stage_latency_profile, state_root, tiny_diarize_boundary_hints,
+        sha256_json_value, silhouette_score, sortformer_acoustic_fallback_eligible,
+        sortformer_activity_shares, sortformer_count_request_is_capacity_eligible, source_separate,
+        source_separate_with_analysis, split_long_regions, stage_budget_ms, stage_failure_code,
+        stage_failure_message, stage_latency_profile, state_root, tiny_diarize_boundary_hints,
         tiny_diarize_hint_evidence_payload, transcript_boundaries_ms,
         unknown_neural_diarization_with_hard_hints, vad_energy_detect,
         vad_energy_detect_with_analysis, validate_diarization_execution_request,
@@ -7859,11 +8357,11 @@ mod tests {
         assert_eq!(accelerated["flash_attention_requested"], true);
         assert_eq!(accelerated["cancellation_fence"], fence);
 
-        let fallback =
+        let cpu =
             acceleration_context_payload(&request, "none", "trace:acceleration:none:cpu", fence);
-        assert_eq!(fallback["mode"], "cpu_fallback");
-        assert_eq!(fallback["logical_stream_kind"], "cpu_lane");
-        assert_eq!(fallback["acceleration_backend"], "none");
+        assert_eq!(cpu["mode"], "cpu_normalization");
+        assert_eq!(cpu["logical_stream_kind"], "cpu_lane");
+        assert_eq!(cpu["acceleration_backend"], "none");
     }
 
     #[test]
@@ -8073,7 +8571,7 @@ mod tests {
         assert_eq!(j["acceleration_ms"], 20_000);
         assert_eq!(j["align_ms"], 30_000);
         assert_eq!(j["punctuate_ms"], 10_000);
-        assert_eq!(j["diarize_ms"], 30_000);
+        assert_eq!(j["diarize_ms"], 900_000);
         assert_eq!(j["persist_ms"], 20_000);
         assert_eq!(j["cleanup_budget_ms"], 5_000);
 
@@ -9297,7 +9795,8 @@ mod tests {
 
     #[test]
     fn cx_accelerate_respects_cancellation() {
-        // apply_with_token should return early when given expired token
+        // apply_with_token should return a typed cancellation error when given
+        // an expired token.
         let token = super::CancellationToken::with_deadline_from_now(Duration::from_millis(0)); // ubs:ignore — cancellation token is not a secret
         std::thread::sleep(Duration::from_millis(5));
 
@@ -9318,16 +9817,10 @@ mod tests {
             artifact_paths: vec![],
         };
 
-        let report = crate::accelerate::apply_with_token(&mut result, Some(&token));
-        assert_eq!(
-            report.backend.as_str(),
-            "none",
-            "cancelled acceleration should return None backend"
-        );
-        assert!(
-            report.notes.iter().any(|n| n.contains("cancelled")),
-            "notes should mention cancellation"
-        );
+        let error = crate::accelerate::apply_with_token(&mut result, Some(&token))
+            .expect_err("cancelled acceleration must not return a success report");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert!(result.acceleration.is_none());
     }
 
     #[test]
@@ -10199,9 +10692,19 @@ mod tests {
 
         let punctuate_skip = optional_stage_skip(PipelineStage::Punctuate, &request);
         assert!(
-            punctuate_skip.is_none(),
-            "diarize=true should enable punctuation stage through the diarization packet"
+            punctuate_skip.is_some(),
+            "diarize=true alone must not rewrite segment text; punctuation is explicit opt-in"
         );
+
+        request.backend_params.punctuation = Some(crate::model::PunctuationConfig {
+            model: None,
+            enabled: true,
+        });
+        assert!(
+            optional_stage_skip(PipelineStage::Punctuate, &request).is_none(),
+            "explicit punctuation opt-in enables the stage"
+        );
+        request.backend_params.punctuation = None;
 
         request.backend_params.acoustic_diarization = Some(DiarizationRequest {
             engine: DiarizationEngine::External,
@@ -10330,7 +10833,7 @@ mod tests {
     }
 
     #[test]
-    fn acoustic_rollout_parser_and_auto_resolution_are_fail_closed() {
+    fn acoustic_rollout_parser_and_auto_resolution_select_native_sortformer() {
         assert_eq!(
             parse_acoustic_diarization_rollout(" shadow "),
             Some(AcousticDiarizationRolloutStage::Shadow)
@@ -10393,37 +10896,19 @@ mod tests {
         for stage in [
             AcousticDiarizationRolloutStage::Shadow,
             AcousticDiarizationRolloutStage::Validated,
-        ] {
-            assert_eq!(
-                resolved_diarization_engine_for_rollout(&request, &without_external, stage),
-                DiarizationEngine::External,
-                "{stage:?} must not expose acoustic output through auto"
-            );
-        }
-        assert_eq!(
-            resolved_diarization_engine_for_rollout(
-                &request,
-                &external,
-                AcousticDiarizationRolloutStage::Fallback,
-            ),
-            DiarizationEngine::External
-        );
-        assert_eq!(
-            resolved_diarization_engine_for_rollout(
-                &request,
-                &without_external,
-                AcousticDiarizationRolloutStage::Fallback,
-            ),
-            DiarizationEngine::Acoustic
-        );
-        for stage in [
+            AcousticDiarizationRolloutStage::Fallback,
             AcousticDiarizationRolloutStage::Primary,
             AcousticDiarizationRolloutStage::Sole,
         ] {
             assert_eq!(
+                resolved_diarization_engine_for_rollout(&request, &without_external, stage),
+                DiarizationEngine::Sortformer,
+                "{stage:?} must select the native Sortformer path through auto"
+            );
+            assert_eq!(
                 resolved_diarization_engine_for_rollout(&request, &external, stage),
-                DiarizationEngine::Acoustic,
-                "{stage:?} must select acoustic through auto"
+                DiarizationEngine::Sortformer,
+                "pre-existing external labels must not silently replace the native default"
             );
         }
         assert!(
@@ -10462,6 +10947,115 @@ mod tests {
             ),
             "sole limits auto admission, not an explicit acoustic request's fallback policy"
         );
+    }
+
+    #[test]
+    fn sortformer_fallback_conceals_only_recoverable_admission_failures() {
+        assert!(sortformer_acoustic_fallback_eligible(
+            &FwError::MissingArtifact(PathBuf::from("model.bin"))
+        ));
+        assert!(sortformer_acoustic_fallback_eligible(
+            &FwError::BackendUnavailable("unsupported host".to_owned())
+        ));
+        assert!(sortformer_acoustic_fallback_eligible(
+            &FwError::InvalidRequest("capacity-ineligible request".to_owned())
+        ));
+
+        assert!(!sortformer_acoustic_fallback_eligible(
+            &FwError::ContractViolation("invalid native output".to_owned())
+        ));
+        assert!(!sortformer_acoustic_fallback_eligible(&FwError::Cancelled(
+            "operator requested cancellation".to_owned()
+        )));
+        assert!(!sortformer_acoustic_fallback_eligible(
+            &FwError::StageTimeout {
+                stage: "diarize".to_owned(),
+                budget_ms: 1,
+            }
+        ));
+        assert!(!sortformer_acoustic_fallback_eligible(&FwError::Io(
+            std::io::Error::other("read failed")
+        )));
+    }
+
+    #[test]
+    fn sortformer_capacity_admission_preserves_count_request_semantics() {
+        assert!(sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::Infer
+        ));
+        assert!(sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::HardConstraint { count: 4 }
+        ));
+        assert!(!sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::HardConstraint { count: 5 }
+        ));
+        assert!(sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 8,
+            }
+        ));
+        assert!(!sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::Range {
+                minimum: 5,
+                maximum: 8,
+            }
+        ));
+        assert!(!sortformer_count_request_is_capacity_eligible(
+            &SpeakerCountRequest::Prior { bins: Vec::new() }
+        ));
+    }
+
+    #[test]
+    fn sortformer_activity_shares_use_union_for_overlap_coverage() {
+        let turns = vec![
+            DiarizationTurn {
+                start_ms: 0,
+                end_ms: 400,
+                speaker_ref: Some("SPEAKER_00".to_owned()),
+                speaker_confidence: Some(0.9),
+                change_confidence: None,
+                overlap_suspected: true,
+                hard_hint_attributed: false,
+            },
+            DiarizationTurn {
+                start_ms: 0,
+                end_ms: 400,
+                speaker_ref: Some("SPEAKER_01".to_owned()),
+                speaker_confidence: Some(0.8),
+                change_confidence: None,
+                overlap_suspected: true,
+                hard_hint_attributed: false,
+            },
+        ];
+        let (dominant, unknown) = sortformer_activity_shares(&turns, 1_000).unwrap();
+        assert!((dominant - 0.4).abs() < f64::EPSILON);
+        assert!((unknown - 0.6).abs() < f64::EPSILON);
+
+        let (dominant, unknown) = sortformer_activity_shares(&[], 1_000).unwrap();
+        assert_eq!(dominant, 0.0);
+        assert_eq!(unknown, 1.0);
+
+        let mut unlabeled = turns;
+        unlabeled[0].speaker_ref = None;
+        assert!(matches!(
+            sortformer_activity_shares(&unlabeled, 1_000),
+            Err(FwError::ContractViolation(_))
+        ));
+
+        let invalid_interval = vec![DiarizationTurn {
+            start_ms: 500,
+            end_ms: 400,
+            speaker_ref: Some("SPEAKER_00".to_owned()),
+            speaker_confidence: Some(0.9),
+            change_confidence: None,
+            overlap_suspected: false,
+            hard_hint_attributed: false,
+        }];
+        assert!(matches!(
+            sortformer_activity_shares(&invalid_interval, 1_000),
+            Err(FwError::ContractViolation(_))
+        ));
     }
 
     #[test]
@@ -10581,6 +11175,7 @@ mod tests {
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             operational_partition: None,
             neural_representation: None,
+            speaker_segments: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -10945,6 +11540,7 @@ mod tests {
     fn neural_unknown_fallback_preserves_only_hard_hint_attribution() {
         let request = DiarizationRequest {
             engine: DiarizationEngine::EcapaFused,
+            fallback: DiarizationFallbackPolicy::Unknown,
             known_intervals: vec![
                 KnownSpeakerInterval {
                     speaker_ref: "alice".to_owned(),
@@ -12894,7 +13490,7 @@ mod tests {
         let sample_rate = sample_rate as usize;
         (0..sample_rate * seconds)
             .map(|index| {
-                if (index / (sample_rate / 2)) % 4 == 0 {
+                if (index / (sample_rate / 2)).is_multiple_of(4) {
                     0
                 } else {
                     let phase = index as f64 * 330.0 * std::f64::consts::TAU / sample_rate as f64;
@@ -13541,7 +14137,7 @@ mod tests {
     #[test]
     fn stage_budget_ms_returns_diarize_budget() {
         let budgets = StageBudgetPolicy::from_source(|_| None);
-        assert_eq!(stage_budget_ms("diarize", budgets), Some(30_000));
+        assert_eq!(stage_budget_ms("diarize", budgets), Some(900_000));
     }
 
     #[test]

@@ -72,6 +72,344 @@ fn private_external_temp_root(prefix: &str) -> tempfile::TempDir {
     private_tempdir_in(project_parent, prefix)
 }
 
+fn run_agent_command(binary: &str, args: &[&str]) -> std::process::Output {
+    ProcessCommand::new(binary)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("agent command {args:?} failed to execute: {error}"))
+}
+
+#[cfg(unix)]
+fn wait_for_pid_witness(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+    parent: &mut std::process::Child,
+) -> rustix::process::Pid {
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(raw) = text.parse::<i32>()
+            && let Some(pid) = rustix::process::Pid::from_raw(raw)
+        {
+            return pid;
+        }
+        match parent.try_wait() {
+            Ok(Some(status)) => panic!(
+                "PID-witness fixture exited before publishing {}: {status}",
+                path.display()
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = parent.kill();
+                let _ = parent.wait();
+                panic!(
+                    "could not inspect PID-witness fixture while waiting for {}: {error}",
+                    path.display()
+                );
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = parent.kill();
+            let _ = parent.wait();
+            panic!(
+                "PID witness was not published before the deadline: {}",
+                path.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn comparison_cancel_probe_rejects_an_unleased_process_group_root() {
+    use std::os::unix::process::CommandExt as _;
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .arg("__comparison-cancel-probe")
+        .process_group(0)
+        .env_remove("FRANKEN_WHISPER_PARENT_LIVENESS_FD")
+        .env_remove("FRANKEN_WHISPER_PARENT_LIVENESS_PID")
+        .output()
+        .expect("run unleased cancellation-probe root");
+    assert!(
+        !output.status.success(),
+        "a fresh process-group root must not authenticate without the inherited liveness lease"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn abrupt_comparison_parent_death_terminates_the_complete_worker_group() {
+    let directory = private_external_temp_root("fw-abrupt-parent-");
+    let root_pid_path = directory.path().join("root.pid");
+    let descendant_pid_path = directory.path().join("descendant.pid");
+    let mut parent = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args([
+            "__comparison-cancel-probe",
+            "--lease-parent",
+            "--root-pid-file",
+            root_pid_path.to_str().expect("UTF-8 root PID path"),
+            "--descendant-pid-file",
+            descendant_pid_path
+                .to_str()
+                .expect("UTF-8 descendant PID path"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn abrupt-parent fixture");
+
+    // Debug builds on macOS may spend several seconds initializing each of the
+    // three nested CLI processes. The complete integration suite also launches
+    // many agent-discovery subprocesses concurrently, so setup gets a generous
+    // scheduling window; the post-kill cleanup contract remains two seconds.
+    let root_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let root_pid = wait_for_pid_witness(&root_pid_path, root_deadline, &mut parent);
+    let descendant_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let descendant_pid =
+        wait_for_pid_witness(&descendant_pid_path, descendant_deadline, &mut parent);
+    assert_eq!(
+        rustix::process::getpgid(Some(root_pid)).expect("worker process group"),
+        root_pid
+    );
+    assert_eq!(
+        rustix::process::getpgid(Some(descendant_pid)).expect("descendant process group"),
+        root_pid
+    );
+    assert!(
+        parent.try_wait().expect("inspect fixture parent").is_none(),
+        "fixture parent exited before abrupt termination"
+    );
+
+    parent.kill().expect("abruptly terminate fixture parent");
+    parent.wait().expect("reap fixture parent");
+
+    let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match rustix::process::test_kill_process_group(root_pid) {
+            Err(error) if error == rustix::io::Errno::SRCH => break,
+            _ if std::time::Instant::now() < cleanup_deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => {
+                let _ =
+                    rustix::process::kill_process_group(root_pid, rustix::process::Signal::KILL);
+                panic!("worker group survived abrupt parent death: {result:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn packaged_binary_names_share_version_help_and_schema_contracts() {
+    let long = env!("CARGO_BIN_EXE_franken_whisper");
+    let short = env!("CARGO_BIN_EXE_fw");
+
+    for args in [
+        &["--version"][..],
+        &["--help"][..],
+        &["robot", "schema"][..],
+    ] {
+        let long_output = run_agent_command(long, args);
+        let short_output = run_agent_command(short, args);
+        assert!(
+            long_output.status.success(),
+            "long binary failed for {args:?}"
+        );
+        assert!(
+            short_output.status.success(),
+            "short binary failed for {args:?}"
+        );
+        if args == ["--help"] {
+            let long_help = std::str::from_utf8(&long_output.stdout)
+                .expect("long-form help must be valid UTF-8");
+            let short_help = std::str::from_utf8(&short_output.stdout)
+                .expect("short-form help must be valid UTF-8");
+            assert!(long_help.contains("Usage: franken_whisper <COMMAND>"));
+            assert!(short_help.contains("Usage: fw <COMMAND>"));
+            assert_eq!(
+                long_help.replace(
+                    "Usage: franken_whisper <COMMAND>",
+                    "Usage: <BINARY> <COMMAND>"
+                ),
+                short_help.replace("Usage: fw <COMMAND>", "Usage: <BINARY> <COMMAND>"),
+                "help contract drift beyond the intentionally invoked binary name"
+            );
+        } else {
+            assert_eq!(
+                long_output.stdout, short_output.stdout,
+                "stdout drift for {args:?}"
+            );
+        }
+        assert_eq!(
+            long_output.stderr, short_output.stderr,
+            "stderr drift for {args:?}"
+        );
+        if args == ["--version"] {
+            let version =
+                String::from_utf8(long_output.stdout).expect("version report must be valid UTF-8");
+            assert_eq!(
+                version.lines().next(),
+                Some(concat!("franken_whisper ", env!("CARGO_PKG_VERSION"))),
+                "Clap must add the command name exactly once"
+            );
+        }
+    }
+}
+
+#[test]
+fn robot_help_remains_human_help_for_both_binary_names() {
+    for binary in [
+        env!("CARGO_BIN_EXE_franken_whisper"),
+        env!("CARGO_BIN_EXE_fw"),
+    ] {
+        let output = run_agent_command(binary, &["robot", "--help"]);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8(output.stdout).expect("help must be UTF-8");
+        assert!(stdout.contains("Usage:"));
+        assert!(stdout.contains("triage"));
+        assert!(!stdout.contains("\"event\":\"run_error\""));
+    }
+}
+
+#[test]
+fn agent_discovery_json_commands_are_single_line_and_path_safe() {
+    let binary = env!("CARGO_BIN_EXE_fw");
+    for args in [
+        &["capabilities", "--json"][..],
+        &["models", "--json"][..],
+        &["doctor", "--json"][..],
+        &["robot", "triage"][..],
+        &["robot", "schema"][..],
+    ] {
+        let output = run_agent_command(binary, args);
+        assert!(
+            output.status.success(),
+            "agent discovery command {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty(), "stderr pollution for {args:?}");
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 agent JSON");
+        assert_eq!(
+            stdout.lines().count(),
+            1,
+            "expected one JSON line for {args:?}"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("valid agent discovery JSON");
+        assert!(value.is_object(), "object response for {args:?}");
+        if args == ["models", "--json"] {
+            assert_eq!(value["local_paths_emitted"], false);
+            let encoded = serde_json::to_string(&value).expect("re-encode model registry");
+            assert!(!encoded.contains("/Users/"));
+            assert!(!encoded.contains("/home/"));
+            assert!(encoded.contains("github_release_with_license_and_notice"));
+        }
+    }
+}
+
+#[test]
+fn robot_syntax_errors_are_one_json_line_with_usage_exit_code() {
+    let output = run_agent_command(
+        env!("CARGO_BIN_EXE_fw"),
+        &["robot", "run", "--inpt", "private-call.m4a"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 robot syntax error");
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON syntax error");
+    assert_eq!(value["event"], "run_error");
+    assert_eq!(value["code"], "FW-INVALID-REQUEST");
+    assert!(!stdout.contains("private-call.m4a"));
+}
+
+#[test]
+fn sortformer_runtime_errors_are_one_path_safe_json_line() {
+    let cache = tempfile::tempdir().expect("isolated model cache");
+    let private_input = "/private/confidential/customer-call.m4a";
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args(["sortformer-diarize", "--input", private_input])
+        .env("FRANKEN_WHISPER_MODEL_DIR", cache.path())
+        .output()
+        .expect("run Sortformer command");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 Sortformer error");
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON runtime error");
+    assert_eq!(value["schema_version"], "sortformer-diarization-v1");
+    assert_eq!(
+        value["certification"],
+        franken_whisper::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS
+    );
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["local_paths_emitted"], false);
+    assert!(!stdout.contains(private_input));
+    assert!(!stdout.contains(cache.path().to_string_lossy().as_ref()));
+}
+
+#[test]
+fn sortformer_syntax_errors_are_one_path_safe_json_line() {
+    let private_input = "/private/confidential/customer-call.m4a";
+    let output = run_agent_command(
+        env!("CARGO_BIN_EXE_fw"),
+        &["sortformer-diarize", "--inpt", private_input],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 Sortformer syntax error");
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON syntax error");
+    assert_eq!(value["schema_version"], "sortformer-diarization-v1");
+    assert_eq!(
+        value["certification"],
+        franken_whisper::sortformer_conformance::SORTFORMER_CERTIFICATION_STATUS
+    );
+    assert_eq!(value["code"], "FW-INVALID-REQUEST");
+    assert_eq!(value["local_paths_emitted"], false);
+    assert!(!stdout.contains(private_input));
+}
+
+#[test]
+fn json_model_pull_syntax_errors_are_one_path_safe_json_line() {
+    let output = run_agent_command(
+        env!("CARGO_BIN_EXE_fw"),
+        &["pull", "sortformer", "--json", "--unknown-private-flag"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 pull syntax error");
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON syntax error");
+    assert_eq!(value["schema_version"], "franken-whisper-model-pull-v2");
+    assert!(value["model"].is_null());
+    assert_eq!(value["code"], "FW-INVALID-REQUEST");
+    assert_eq!(value["local_paths_emitted"], false);
+    assert!(!stdout.contains("unknown-private-flag"));
+}
+
+#[test]
+fn json_model_pull_runtime_errors_are_one_path_safe_json_line() {
+    let private_relative_cache = "private/customer/cache";
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args(["pull", "sortformer", "--json"])
+        .env("FRANKEN_WHISPER_MODEL_DIR", private_relative_cache)
+        .output()
+        .expect("run model-pull command");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 pull runtime error");
+    assert_eq!(stdout.lines().count(), 1);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON runtime error");
+    assert_eq!(value["schema_version"], "franken-whisper-model-pull-v2");
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["local_paths_emitted"], false);
+    assert!(!stdout.contains(private_relative_cache));
+}
+
 // ---------------------------------------------------------------------------
 // Storage: runs get --id
 // ---------------------------------------------------------------------------
@@ -277,27 +615,6 @@ printf '%s\n' '{"text":"stub transcript","language":"en","segments":[{"start":0.
 }
 
 #[cfg(unix)]
-fn generate_silent_wav(path: &std::path::Path) {
-    let status = ProcessCommand::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=r=16000:cl=mono",
-            "-t",
-            "0.3",
-        ])
-        .arg(path)
-        .status()
-        .expect("spawn ffmpeg");
-    assert!(status.success(), "ffmpeg should synthesize silent wav");
-}
-
-#[cfg(unix)]
 fn generate_voiced_wav(path: &std::path::Path) {
     let status = ProcessCommand::new("ffmpeg")
         .args([
@@ -367,6 +684,9 @@ fi
 if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_MARKER:-}" ]]; then
   printf '%s\n' "$input -> $output" >> "${FRANKEN_WHISPER_TEST_FFMPEG_MARKER}"
 fi
+if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS:-}" ]]; then
+  /bin/sleep "${FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS}"
+fi
 if [[ -n "$input" && -f "$input" ]]; then
   /bin/cp "$input" "$output"
 else
@@ -434,7 +754,17 @@ fn run_transcribe_json_with_stub_env(
     let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
     cmd.arg("transcribe");
     cmd.args(args);
+    // This helper owns the external bridge fixture contract. Keep the
+    // independent default Sortformer stage out of these focused ingest,
+    // normalization, backend, and persistence tests; the actual all-native
+    // default is covered by native_engine_e2e.
+    cmd.arg("--no-diarize");
     cmd.env("FRANKEN_WHISPER_WHISPER_CPP_BIN", stub_bin);
+    // These tests assert the external stub's exact transcript and bridge
+    // metadata. A locally cached native model must not silently bypass the
+    // fixture and make the result depend on developer-machine state.
+    cmd.env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0");
+    cmd.env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0");
     cmd.env("FRANKEN_WHISPER_STATE_DIR", state_root);
     for (key, value) in extra_env {
         cmd.env(key, value);
@@ -591,6 +921,14 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
         .prefix("fw-confidential-output-")
         .tempdir_in(external_temp_root)
         .expect("external output");
+    let runtime_project =
+        private_tempdir_in(external_temp_root, "fw-confidential-evaluation-project-");
+    std::fs::create_dir(runtime_project.path().join(".git")).expect("project marker");
+    std::fs::write(
+        runtime_project.path().join("Cargo.toml"),
+        "[package]\nname = \"confidential-evaluation-e2e-root\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("project manifest");
     let audio_path = input.path().join("PRIVATE_AUDIO_CLI_SENTINEL.m4a");
     let reference_path = input.path().join("PRIVATE_REFERENCE_CLI_SENTINEL.json");
     let hypothesis_path = input.path().join("PRIVATE_HYPOTHESIS_CLI_SENTINEL.json");
@@ -644,15 +982,8 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
     )
     .expect("manifest");
 
-    let runtime_directory = std::env::current_dir().expect("test runtime directory");
-    let test_executable = std::env::current_exe().expect("test executable");
-    let runtime_project_root = runtime_directory
-        .ancestors()
-        .chain(test_executable.ancestors())
-        .find(|ancestor| ancestor.join(".git").exists() && ancestor.join("Cargo.toml").is_file())
-        .expect("runtime project checkout");
     let result = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
-        .current_dir(runtime_project_root)
+        .current_dir(runtime_project.path())
         .args([
             "diarization-eval",
             "--input-root",
@@ -994,7 +1325,7 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
     );
     assert_eq!(
         evidence.schema_version,
-        "public-diarization-acoustic-sidecar-study-v3"
+        "public-diarization-acoustic-sidecar-study-v6"
     );
     assert_eq!(
         evidence.runner_version,
@@ -1002,7 +1333,7 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
     );
     assert_eq!(
         evidence.runner_version,
-        "public-diarization-acoustic-sidecar-study-runner-v3"
+        "public-diarization-acoustic-sidecar-study-runner-v8"
     );
     assert_eq!(
         evidence.protocol.pair_calibration_fit_id,
@@ -1619,7 +1950,7 @@ fn robot_run_invalid_request_emits_run_error() {
         .find(|line| line["event"] == "run_error")
         .expect("run_error envelope should be emitted");
 
-    assert_eq!(run_error["code"], "FW-ROBOT-REQUEST");
+    assert_eq!(run_error["code"], "FW-INVALID-REQUEST");
     let message = run_error["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("--input") && message.contains("--stdin") && message.contains("--mic"),
@@ -1700,7 +2031,7 @@ fn robot_run_emits_cancelled_stage_before_terminal_run_error() {
 
     assert!(budgets_idx < cancelled_idx);
     assert!(cancelled_idx < error_idx);
-    assert_eq!(parsed[error_idx]["code"], "FW-ROBOT-CANCELLED");
+    assert_eq!(parsed[error_idx]["code"], "FW-CANCELLED");
     assert_eq!(
         parsed[cancelled_idx]["payload"]["cancellation_evidence"]["reason"],
         "checkpoint deadline exceeded"
@@ -1710,16 +2041,13 @@ fn robot_run_emits_cancelled_stage_before_terminal_run_error() {
 #[cfg(unix)]
 #[test]
 fn robot_run_normalize_stage_timeout_maps_to_timeout_error_code() {
-    if !ffmpeg_available() {
-        return;
-    }
-
     let dir = tempdir().expect("tempdir");
     let state_root = dir.path().join("state");
     let db_path = dir.path().join("storage.sqlite3");
     let stub_bin = write_whisper_cpp_stub_binary(dir.path());
+    let ffmpeg_stub = write_provisioned_ffmpeg_stub(dir.path());
     let input_wav = dir.path().join("timeout-input.wav");
-    generate_silent_wav(&input_wav);
+    generate_voiced_wav_without_ffmpeg(&input_wav, 300);
 
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
         .args([
@@ -1735,7 +2063,10 @@ fn robot_run_normalize_stage_timeout_maps_to_timeout_error_code() {
         ])
         .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
         .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
-        .env("FRANKEN_WHISPER_STAGE_BUDGET_NORMALIZE_MS", "1")
+        .env("FRANKEN_WHISPER_FFMPEG_BIN", &ffmpeg_stub)
+        .env("FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE", "1")
+        .env("FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS", "0.2")
+        .env("FRANKEN_WHISPER_STAGE_BUDGET_NORMALIZE_MS", "10")
         .output()
         .expect("robot command should execute");
 
@@ -1776,7 +2107,7 @@ fn robot_run_normalize_stage_timeout_maps_to_timeout_error_code() {
         .iter()
         .find(|line| line["event"] == "run_error")
         .expect("run_error envelope should be emitted");
-    assert_eq!(run_error["code"], "FW-ROBOT-TIMEOUT");
+    assert_eq!(run_error["code"], "FW-STAGE-TIMEOUT");
 }
 
 #[test]
@@ -1858,6 +2189,7 @@ fn transcribe_args_rejects_no_input() {
         language: None,
         translate: false,
         diarize: false,
+        no_diarize: false,
         diarization_engine: DiarizationEngine::Auto,
         diarization_fallback: DiarizationFallbackPolicy::Unknown,
         speaker_hints: None,
@@ -1914,6 +2246,7 @@ fn transcribe_args_rejects_no_input() {
         no_fallback: false,
         suppress_nst: false,
         tiny_diarize: false,
+        normalize_segment_text: false,
         offset_ms: None,
         duration_ms: None,
         audio_ctx: None,
@@ -1951,6 +2284,7 @@ fn transcribe_args_rejects_multiple_inputs() {
         language: None,
         translate: false,
         diarize: false,
+        no_diarize: false,
         diarization_engine: DiarizationEngine::Auto,
         diarization_fallback: DiarizationFallbackPolicy::Unknown,
         speaker_hints: None,
@@ -2007,6 +2341,7 @@ fn transcribe_args_rejects_multiple_inputs() {
         no_fallback: false,
         suppress_nst: false,
         tiny_diarize: false,
+        normalize_segment_text: false,
         offset_ms: None,
         duration_ms: None,
         audio_ctx: None,
@@ -2759,6 +3094,7 @@ fn transcribe_args_maps_output_formats_to_backend_params() {
         language: None,
         translate: false,
         diarize: true,
+        no_diarize: false,
         diarization_engine: DiarizationEngine::Auto,
         diarization_fallback: DiarizationFallbackPolicy::Unknown,
         speaker_hints: None,
@@ -2815,6 +3151,7 @@ fn transcribe_args_maps_output_formats_to_backend_params() {
         no_fallback: false,
         suppress_nst: false,
         tiny_diarize: false,
+        normalize_segment_text: false,
         offset_ms: None,
         duration_ms: None,
         audio_ctx: None,
@@ -3084,6 +3421,10 @@ fn robot_tiny_diarize_emits_redacted_hint_evidence_and_native_acoustic_report() 
         ])
         .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
         .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        // This fixture proves propagation of whisper.cpp's TinyDiarize turn
+        // markers into the acoustic report. A cached native Whisper model must
+        // not bypass the purpose-built bridge response on developer machines.
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
         .output()
         .expect("robot TinyDiarize acoustic run must execute");
 
@@ -3216,7 +3557,7 @@ fn robot_tiny_diarize_emits_redacted_hint_evidence_and_native_acoustic_report() 
 
 #[cfg(unix)]
 #[test]
-fn transcribe_without_optional_flags_emits_skip_events_and_preserves_backend_segments() {
+fn transcribe_bridge_fixture_with_no_diarize_emits_skip_events_and_preserves_segments() {
     if !ffmpeg_available() {
         return;
     }
@@ -3246,7 +3587,7 @@ fn transcribe_without_optional_flags_emits_skip_events_and_preserves_backend_seg
     assert_eq!(report["result"]["segments"][0]["text"], "stub transcript");
     assert!(
         report["result"]["segments"][0]["speaker"].is_null(),
-        "speaker should remain null when --diarize was not requested"
+        "speaker should remain null when the fixture helper disables pipeline diarization"
     );
 
     let events = report["events"].as_array().expect("events");
@@ -3399,8 +3740,8 @@ fn transcribe_file_input_uses_state_dir_provisioned_ffmpeg_when_path_is_missing(
         "state-dir provisioned ffmpeg should be invoked when PATH ffmpeg is unavailable"
     );
     assert!(
-        ffprobe_marker.is_file(),
-        "state-dir provisioned ffprobe should be invoked when PATH ffprobe is unavailable"
+        !ffprobe_marker.exists(),
+        "normalized PCM WAV duration should use the exact header probe without spawning ffprobe"
     );
 }
 
@@ -3576,23 +3917,11 @@ fn transcribe_happy_path_stage_sequence_contract_is_stable() {
         );
         position.unwrap()
     };
-    let code_index_any = |codes: &[&str]| -> usize {
-        let position = events.iter().position(|event| {
-            let code = event["code"].as_str().unwrap_or_default();
-            codes.contains(&code)
-        });
-        assert!(
-            position.is_some(),
-            "expected any code {codes:?} in {events:?}"
-        );
-        position.unwrap()
-    };
-
     let ingest_start = code_index("ingest.start");
     let normalize_start = code_index("normalize.start");
     let backend_start = code_index("backend.start");
     let acceleration_start = code_index("acceleration.start");
-    let acceleration_terminal = code_index_any(&["acceleration.ok", "acceleration.fallback"]);
+    let acceleration_terminal = code_index("acceleration.ok");
     let persist_start = code_index("persist.start");
     let persist_ok = code_index("persist.ok");
 
@@ -3617,7 +3946,7 @@ fn transcribe_backend_stage_payload_exposes_execution_metadata() {
     let input_wav = dir.path().join("backend_meta.wav");
     generate_voiced_wav(&input_wav);
 
-    let report = run_transcribe_json_with_stub(
+    let report = run_transcribe_json_with_stub_env(
         &[
             "--input",
             input_wav.to_str().expect("utf8"),
@@ -3629,6 +3958,7 @@ fn transcribe_backend_stage_payload_exposes_execution_metadata() {
         None,
         &stub_bin,
         &state_root,
+        &[("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")],
     );
 
     let events = report["events"].as_array().expect("events should be array");
@@ -3641,7 +3971,7 @@ fn transcribe_backend_stage_payload_exposes_execution_metadata() {
     assert_eq!(backend_payload["resolved_backend"], "whisper_cpp");
     assert_eq!(backend_payload["implementation"], "bridge");
     assert_eq!(backend_payload["execution_mode"], "bridge_only");
-    assert_eq!(backend_payload["native_rollout_stage"], "primary");
+    assert_eq!(backend_payload["native_rollout_stage"], "sole");
     assert!(backend_payload["engine_identity"].is_string());
     assert!(
         backend_payload["engine_version"].is_string()
@@ -3710,6 +4040,7 @@ fn transcribe_bridge_only_mode_recovers_with_native_when_bridge_binary_missing()
                 missing_bridge_bin.to_str().expect("utf8"),
             ),
             ("FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL", "tiny.en"),
+            ("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "1"),
         ],
     );
 
@@ -3726,7 +4057,7 @@ fn transcribe_bridge_only_mode_recovers_with_native_when_bridge_binary_missing()
         backend_payload["execution_mode"],
         "bridge_only_native_recovery"
     );
-    assert_eq!(backend_payload["native_rollout_stage"], "primary");
+    assert_eq!(backend_payload["native_rollout_stage"], "sole");
     assert!(backend_payload["native_fallback_error"].is_string());
 
     let replay_event = events
@@ -3792,9 +4123,6 @@ fn transcribe_acceleration_context_telemetry_round_trips_in_run_artifacts() {
     assert!(payload["logical_stream_kind"].is_string());
     assert!(payload["acceleration_backend"].is_string());
     assert!(payload["mode"].is_string());
-    assert!(payload["frankentorch_feature"].is_boolean());
-    assert!(payload["frankenjax_feature"].is_boolean());
-
     let fence = &payload["cancellation_fence"];
     assert_eq!(fence["status"], "open");
     assert!(fence["checked_at_rfc3339"].is_string());
@@ -3950,6 +4278,7 @@ fn transcribe_args_maps_mic_line_in_envelope_into_request() {
         language: Some("en".to_owned()),
         translate: false,
         diarize: false,
+        no_diarize: false,
         diarization_engine: DiarizationEngine::Auto,
         diarization_fallback: DiarizationFallbackPolicy::Unknown,
         speaker_hints: None,
@@ -4006,6 +4335,7 @@ fn transcribe_args_maps_mic_line_in_envelope_into_request() {
         no_fallback: false,
         suppress_nst: false,
         tiny_diarize: false,
+        normalize_segment_text: false,
         offset_ms: None,
         duration_ms: None,
         audio_ctx: None,
@@ -4695,7 +5025,7 @@ fn robot_schema_event_entries_have_required_and_example() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn robot_routing_history_empty_db_returns_no_events() {
+fn robot_routing_history_empty_db_emits_terminal_count() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("empty_routing.sqlite3");
     let store = RunStore::open(&db_path).expect("store open");
@@ -4703,6 +5033,23 @@ fn robot_routing_history_empty_db_returns_no_events() {
     // Query with no runs — should return empty.
     let runs = store.list_recent_runs(10).expect("list runs");
     assert!(runs.is_empty(), "fresh DB should have no runs");
+
+    let output = run_agent_command(
+        env!("CARGO_BIN_EXE_fw"),
+        &[
+            "robot",
+            "routing-history",
+            "--db",
+            db_path.to_str().expect("UTF-8 database path"),
+        ],
+    );
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 routing history");
+    assert_eq!(stdout.lines().count(), 1);
+    let terminal: serde_json::Value = serde_json::from_str(stdout.trim()).expect("terminal JSON");
+    assert_eq!(terminal["event"], "routing_history.complete");
+    assert_eq!(terminal["records"], 0);
 }
 
 #[test]
@@ -4775,6 +5122,7 @@ fn speculative_cli_dispatch_emits_partial_confirm_and_stats_events() {
             input_wav.to_str().expect("utf-8 path"),
             "--backend",
             "whisper-cpp",
+            "--no-diarize",
             "--no-persist",
             // Single window so the stub only fires twice (fast + quality).
             "--speculative",
@@ -4789,6 +5137,8 @@ fn speculative_cli_dispatch_emits_partial_confirm_and_stats_events() {
         ])
         .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
         .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
+        .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0")
         .output()
         .expect("robot transcribe should execute");
 
@@ -4944,10 +5294,13 @@ fn speculative_cli_without_flag_uses_single_backend_dispatch() {
             input_wav.to_str().expect("utf-8"),
             "--backend",
             "whisper-cpp",
+            "--no-diarize",
             "--no-persist",
         ])
         .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
         .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
+        .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0")
         .output()
         .expect("robot transcribe should execute");
 

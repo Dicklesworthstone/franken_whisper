@@ -72,6 +72,10 @@ fn scatter(
         });
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the probe exposes every SDPA buffer and geometry operand independently"
+)]
 fn full_op(
     q: &[f32],
     k: &[f32],
@@ -111,7 +115,7 @@ fn main() {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5)
+        (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
     };
     let qs: Vec<Vec<f32>> = (0..pool_n)
         .map(|_| (0..one).map(|_| nf()).collect())

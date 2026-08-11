@@ -167,6 +167,13 @@ pub fn assert_events_ordered(events: &[RunEvent]) {
 pub fn mock_backend_env() -> HashMap<String, String> {
     let mocks = mocks_dir();
     let mut env = HashMap::new();
+    // These helpers prove the external bridge contract. A cached native model
+    // must not silently bypass the mock executable and turn the test into a
+    // host-dependent native inference run.
+    env.insert(
+        "FRANKEN_WHISPER_NATIVE_EXECUTION".to_owned(),
+        "0".to_owned(),
+    );
     env.insert(
         "FRANKEN_WHISPER_WHISPER_CPP_BIN".to_owned(),
         mocks.join("mock_whisper_cpp.sh").display().to_string(),

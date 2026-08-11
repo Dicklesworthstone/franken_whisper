@@ -1,10 +1,252 @@
-use std::io::Read;
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{FwError, FwResult};
+
+#[cfg(not(windows))]
+type ManagedChild = std::process::Child;
+#[cfg(windows)]
+type ManagedChild = Box<dyn process_wrap::std::ChildWrapper>;
+
+#[cfg(not(windows))]
+fn spawn_managed_child(mut command: Command) -> std::io::Result<ManagedChild> {
+    command.spawn()
+}
+
+#[cfg(windows)]
+fn spawn_managed_child(command: Command) -> std::io::Result<ManagedChild> {
+    use process_wrap::std::{CommandWrap, JobObject};
+
+    let mut command = CommandWrap::from(command);
+    command.wrap(JobObject);
+    let mut spawned_pid = None;
+    let spawn = command.spawn_with(|command| {
+        let child = command.spawn()?;
+        spawned_pid = Some(child.id());
+        Ok(child)
+    });
+    match spawn {
+        Ok(child) => Ok(child),
+        Err(error) => {
+            if let Some(pid) = spawned_pid {
+                terminate_failed_windows_job_assignment(pid).map_err(|cleanup| {
+                    std::io::Error::other(format!(
+                        "Windows Job Object setup failed ({error}); suspended-root cleanup also failed ({cleanup})"
+                    ))
+                })?;
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminate_failed_windows_job_assignment(pid: u32) -> std::io::Result<()> {
+    const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let pid = pid.to_string();
+    let mut cleanup = Command::new("taskkill")
+        .args(["/PID", pid.as_str(), "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let started_at = Instant::now();
+    let status = loop {
+        match cleanup.try_wait()? {
+            Some(status) => break status,
+            None if started_at.elapsed() < CLEANUP_TIMEOUT => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            None => {
+                let _ = cleanup.kill();
+                let _ = cleanup.wait();
+                return Err(std::io::Error::other(
+                    "taskkill exceeded the suspended-root cleanup deadline",
+                ));
+            }
+        }
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "taskkill rejected suspended-root cleanup",
+        ))
+    }
+}
+
+#[cfg(unix)]
+static PROCESS_TREE_EXTERNALLY_OWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+const PARENT_LIVENESS_FD_ENV: &str = "FRANKEN_WHISPER_PARENT_LIVENESS_FD";
+#[cfg(unix)]
+const PARENT_LIVENESS_PID_ENV: &str = "FRANKEN_WHISPER_PARENT_LIVENESS_PID";
+
+#[cfg(unix)]
+struct PreparedParentLivenessLease {
+    reader: std::os::fd::OwnedFd,
+    writer: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl PreparedParentLivenessLease {
+    fn activate(self) -> std::os::fd::OwnedFd {
+        let Self { reader, writer } = self;
+        drop(reader);
+        writer
+    }
+}
+
+#[cfg(unix)]
+fn prepare_parent_liveness_lease(command: &mut Command) -> FwResult<PreparedParentLivenessLease> {
+    use std::os::fd::AsRawFd as _;
+
+    let (reader, writer) = rustix::pipe::pipe().map_err(std::io::Error::from)?;
+    if reader.as_raw_fd() <= 2 {
+        return Err(FwError::Unsupported(
+            "parent-liveness authority requires an inherited descriptor above standard I/O"
+                .to_owned(),
+        ));
+    }
+    rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::empty()).map_err(std::io::Error::from)?;
+    rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC).map_err(std::io::Error::from)?;
+    command.env(PARENT_LIVENESS_FD_ENV, reader.as_raw_fd().to_string());
+    command.env(PARENT_LIVENESS_PID_ENV, std::process::id().to_string());
+    Ok(PreparedParentLivenessLease { reader, writer })
+}
+
+#[cfg(not(unix))]
+fn prepare_parent_liveness_lease(_command: &mut Command) -> FwResult<()> {
+    Err(FwError::Unsupported(
+        "parent-liveness authority is unsupported on this platform".to_owned(),
+    ))
+}
+
+#[cfg(unix)]
+fn inherited_parent_liveness_reader() -> FwResult<std::fs::File> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let fd_text = std::env::var(PARENT_LIVENESS_FD_ENV).map_err(|_| {
+        FwError::ContractViolation(
+            "an externally owned subprocess tree requires an inherited parent-liveness descriptor"
+                .to_owned(),
+        )
+    })?;
+    let fd = fd_text
+        .parse::<i32>()
+        .ok()
+        .filter(|fd| *fd > 2)
+        .ok_or_else(|| {
+            FwError::ContractViolation(
+                "the inherited parent-liveness descriptor is outside the accepted range".to_owned(),
+            )
+        })?;
+    let expected_parent = std::env::var(PARENT_LIVENESS_PID_ENV)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| {
+            FwError::ContractViolation(
+                "the inherited parent-liveness authority has an invalid parent identity".to_owned(),
+            )
+        })?;
+    if rustix::process::getppid() != Some(expected_parent) {
+        return Err(FwError::ContractViolation(
+            "the inherited parent-liveness authority does not belong to the direct parent"
+                .to_owned(),
+        ));
+    }
+
+    let mut last_error = None;
+    for root in ["/dev/fd", "/proc/self/fd"] {
+        match std::fs::File::open(Path::new(root).join(fd.to_string())) {
+            Ok(file) => {
+                let metadata = file.metadata().map_err(FwError::Io)?;
+                if !metadata.file_type().is_fifo() {
+                    return Err(FwError::ContractViolation(
+                        "the inherited parent-liveness descriptor is not a kernel pipe".to_owned(),
+                    ));
+                }
+                return Ok(file);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(FwError::ContractViolation(format!(
+        "the inherited parent-liveness descriptor could not be opened: {}",
+        last_error
+            .map(|error| error.kind().to_string())
+            .unwrap_or_else(|| "unavailable".to_owned())
+    )))
+}
+
+#[cfg(unix)]
+fn start_parent_liveness_watcher(mut reader: std::fs::File) -> FwResult<()> {
+    thread::Builder::new()
+        .name("fw-parent-liveness".to_owned())
+        .spawn(move || {
+            let mut byte = [0u8; 1];
+            loop {
+                match reader.read(&mut byte) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Ok(0) | Ok(_) | Err(_) => {
+                        let process_group = rustix::process::getpgrp();
+                        let _ = rustix::process::kill_process_group(
+                            process_group,
+                            rustix::process::Signal::KILL,
+                        );
+                        std::process::exit(125);
+                    }
+                }
+            }
+        })
+        .map(drop)
+        .map_err(|_| {
+            FwError::ContractViolation(
+                "the parent-liveness watcher could not be started".to_owned(),
+            )
+        })
+}
+
+/// Authenticate that this process belongs to a bounded parent-owned Unix
+/// process group and start the inherited parent-liveness watcher. Nested
+/// subprocesses then inherit that group instead of escaping into a new one;
+/// their direct child is still reaped locally, while the outer owner remains
+/// authoritative for recursive termination. Parent death closes the sole
+/// lease writer and makes the group root terminate the complete group.
+#[cfg(unix)]
+pub(crate) fn mark_process_tree_externally_owned() -> FwResult<()> {
+    if rustix::process::getpgrp() != rustix::process::getpid() {
+        return Err(FwError::ContractViolation(
+            "an externally owned subprocess tree must enter through a fresh process-group root"
+                .to_owned(),
+        ));
+    }
+    let reader = inherited_parent_liveness_reader()?;
+    if PROCESS_TREE_EXTERNALLY_OWNED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return Err(FwError::ContractViolation(
+            "the externally owned subprocess tree was already initialized".to_owned(),
+        ));
+    }
+    if let Err(error) = start_parent_liveness_watcher(reader) {
+        PROCESS_TREE_EXTERNALLY_OWNED.store(false, std::sync::atomic::Ordering::Release);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn mark_process_tree_externally_owned() -> FwResult<()> {
+    Err(FwError::Unsupported(
+        "parent-liveness authority is unsupported on this platform".to_owned(),
+    ))
+}
 
 #[must_use]
 pub fn command_exists(program: &str) -> bool {
@@ -104,50 +346,89 @@ pub fn run_command_with_timeout(
     let rendered = render_command_for_log(program, args);
     let mut command = Command::new(program);
     command.args(args);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
 
     if let Some(limit) = timeout {
-        let mut child = command.spawn()?;
+        if bounded_process_tree_unsupported() {
+            return Err(FwError::Unsupported(
+                "bounded subprocess trees are unsupported on this platform".to_owned(),
+            ));
+        }
+        let prepared_capture = prepare_bounded_output_capture(&mut command)?;
+        let owns_process_group = configure_descendant_process_tree(&mut command);
+        let mut child = spawn_managed_child(command)?;
         let started_at = Instant::now();
-
-        let stdout_pipe = child.stdout.take().ok_or_else(|| {
-            FwError::Io(std::io::Error::other(format!(
-                "failed to capture stdout for `{rendered}`"
-            )))
-        })?;
-        let stderr_pipe = child.stderr.take().ok_or_else(|| {
-            FwError::Io(std::io::Error::other(format!(
-                "failed to capture stderr for `{rendered}`"
-            )))
-        })?;
-
-        let stdout_reader = spawn_pipe_reader(stdout_pipe);
-        let stderr_reader = spawn_pipe_reader(stderr_pipe);
+        let (stdout_reader, stderr_reader) =
+            match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
+                Ok(readers) => readers,
+                Err(error) => {
+                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                    return Err(merge_process_tree_cleanup_result(error, cleanup));
+                }
+            };
 
         loop {
-            if let Some(status) = child.try_wait()? {
-                let stdout = stdout_reader.finish()?;
-                let stderr = stderr_reader.finish()?;
-                return validate_captured_command_output(&rendered, status, stdout, stderr);
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // A bounded command owns its complete process tree. Even
+                    // after the root exits successfully, descendants must not
+                    // retain inherited pipes or continue operator-local work.
+                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                    let stdout_result = stdout_reader.finish();
+                    let stderr_result = stderr_reader.finish();
+                    cleanup?;
+                    let stdout = stdout_result?;
+                    let stderr = stderr_result?;
+                    return validate_captured_command_output(&rendered, status, stdout, stderr);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                    let _ = stdout_reader.finish();
+                    let _ = stderr_reader.finish();
+                    return Err(merge_process_tree_cleanup_result(
+                        FwError::Io(error),
+                        cleanup,
+                    ));
+                }
+            }
+
+            match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
+                Ok(Some(stream)) => {
+                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                    let _ = stdout_reader.finish();
+                    let _ = stderr_reader.finish();
+                    return Err(merge_process_tree_cleanup_result(
+                        capture_limit_error(stream),
+                        cleanup,
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                    let _ = stdout_reader.finish();
+                    let _ = stderr_reader.finish();
+                    return Err(merge_process_tree_cleanup_result(error, cleanup));
+                }
             }
 
             if started_at.elapsed() >= limit {
-                let _ = child.kill();
-                let _ = child.wait();
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
                 let _ = stdout_reader.finish();
                 let stderr = stderr_reader
                     .finish()
                     .map(|capture| capture.bytes)
                     .unwrap_or_default();
                 let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
-                return Err(FwError::from_command_timeout(
-                    rendered,
-                    saturating_duration_ms(limit),
-                    stderr_str,
+                return Err(merge_process_tree_cleanup_result(
+                    FwError::from_command_timeout(
+                        rendered,
+                        saturating_duration_ms(limit),
+                        stderr_str,
+                    ),
+                    cleanup,
                 ));
             }
 
@@ -155,6 +436,8 @@ pub fn run_command_with_timeout(
         }
     }
 
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     let output = command.output()?;
     validate_command_output(&rendered, output)
 }
@@ -200,6 +483,85 @@ pub(crate) fn run_command_cancellable_with_probe(
     hard_timeout: Option<Duration>,
     additional_cancel: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> FwResult<Output> {
+    run_command_cancellable_with_optional_input(
+        program,
+        args,
+        cwd,
+        token,
+        hard_timeout,
+        additional_cancel,
+        None,
+        None,
+    )
+}
+
+/// Run a cancellable subprocess with one bounded stdin document. The payload
+/// is staged in an anonymous temporary file before launch, so a child that
+/// stops reading cannot leave a blocked writer thread behind after timeout or
+/// cancellation.
+#[cfg(test)]
+pub(crate) fn run_command_cancellable_with_input_and_probe(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    token: &crate::orchestrator::CancellationToken,
+    hard_timeout: Option<Duration>,
+    additional_cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stdin_payload: &[u8],
+) -> FwResult<Output> {
+    run_command_cancellable_with_optional_input(
+        program,
+        args,
+        cwd,
+        token,
+        hard_timeout,
+        additional_cancel,
+        Some(stdin_payload),
+        None,
+    )
+}
+
+/// Run a cancellable subprocess with bounded stdin while observing the complete
+/// child process group at the normal polling cadence.
+///
+/// The observer receives the root child PID. On Unix this API fails closed if
+/// the caller is already inside an externally owned process group; otherwise
+/// the child PID is also the fresh process-group identifier created with
+/// `process_group(0)`. The child also inherits the read end of a liveness pipe
+/// whose sole writer remains in this direct parent. Returning an error
+/// terminates and reaps the entire tree.
+pub(crate) fn run_command_cancellable_with_input_probe_and_observer(
+    program: &str,
+    args: &[String],
+    token: &crate::orchestrator::CancellationToken,
+    hard_timeout: Option<Duration>,
+    additional_cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stdin_payload: &[u8],
+    observer: &mut dyn FnMut(u32) -> FwResult<()>,
+) -> FwResult<Output> {
+    run_command_cancellable_with_optional_input(
+        program,
+        args,
+        None,
+        token,
+        hard_timeout,
+        additional_cancel,
+        Some(stdin_payload),
+        Some(observer),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_command_cancellable_with_optional_input(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    token: &crate::orchestrator::CancellationToken,
+    hard_timeout: Option<Duration>,
+    additional_cancel: Option<&(dyn Fn() -> bool + Sync)>,
+    stdin_payload: Option<&[u8]>,
+    mut observer: Option<&mut dyn FnMut(u32) -> FwResult<()>>,
+) -> FwResult<Output> {
     token.checkpoint()?;
     if additional_cancel.is_some_and(|probe| probe()) {
         return Err(FwError::Cancelled(
@@ -215,52 +577,70 @@ pub(crate) fn run_command_cancellable_with_probe(
     let rendered = render_command_for_log(program, args);
     let mut command = Command::new(program);
     command.args(args);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
+    if bounded_process_tree_unsupported() {
+        return Err(FwError::Unsupported(
+            "bounded subprocess trees are unsupported on this platform".to_owned(),
+        ));
+    }
+    if let Some(payload) = stdin_payload {
+        let mut stdin_file = tempfile::tempfile()?;
+        stdin_file.write_all(payload)?;
+        stdin_file.flush()?;
+        stdin_file.seek(std::io::SeekFrom::Start(0))?;
+        command.stdin(Stdio::from(stdin_file));
+    } else {
+        command.stdin(Stdio::null());
+    }
+    let prepared_capture = prepare_bounded_output_capture(&mut command)?;
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
 
-    let mut child = command.spawn()?;
+    #[cfg(unix)]
+    let prepared_parent_liveness_lease = observer
+        .is_some()
+        .then(|| prepare_parent_liveness_lease(&mut command))
+        .transpose()?;
+    #[cfg(not(unix))]
+    if observer.is_some() {
+        prepare_parent_liveness_lease(&mut command)?;
+    }
+
+    let owns_process_group = configure_descendant_process_tree(&mut command);
+    #[cfg(unix)]
+    if observer.is_some() && !owns_process_group {
+        return Err(FwError::Unsupported(
+            "process-tree observation requires a fresh caller-owned process group".to_owned(),
+        ));
+    }
+    let mut child = spawn_managed_child(command)?;
+    #[cfg(unix)]
+    let _parent_liveness_lease =
+        prepared_parent_liveness_lease.map(PreparedParentLivenessLease::activate);
     let started_at = Instant::now();
     let mut poll_iteration = 0usize;
-
-    let stdout_pipe = child.stdout.take().ok_or_else(|| {
-        FwError::Io(std::io::Error::other(format!(
-            "failed to capture stdout for `{rendered}`"
-        )))
-    })?;
-    let stderr_pipe = child.stderr.take().ok_or_else(|| {
-        FwError::Io(std::io::Error::other(format!(
-            "failed to capture stderr for `{rendered}`"
-        )))
-    })?;
-
-    let stdout_reader = spawn_pipe_reader(stdout_pipe);
-    let stderr_reader = spawn_pipe_reader(stderr_pipe);
-
+    let (stdout_reader, stderr_reader) =
+        match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
+            Ok(readers) => readers,
+            Err(error) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                return Err(merge_process_tree_cleanup_result(error, cleanup));
+            }
+        };
     loop {
-        if let Some(status) = child.try_wait()? {
-            let stdout = stdout_reader.finish()?;
-            let stderr = stderr_reader.finish()?;
-            return validate_captured_command_output(&rendered, status, stdout, stderr);
-        }
-
-        // Check pipeline deadline via cancellation token.
         if let Err(err) = token.checkpoint() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
             let _ = stdout_reader.finish();
             let _ = stderr_reader.finish();
-            return Err(err);
+            return Err(merge_process_tree_cleanup_result(err, cleanup));
         }
         if additional_cancel.is_some_and(|probe| probe()) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
             let _ = stdout_reader.finish();
             let _ = stderr_reader.finish();
-            return Err(FwError::Cancelled(
-                "subprocess cancelled by caller predicate".to_owned(),
+            return Err(merge_process_tree_cleanup_result(
+                FwError::Cancelled("subprocess cancelled by caller predicate".to_owned()),
+                cleanup,
             ));
         }
 
@@ -268,24 +648,229 @@ pub(crate) fn run_command_cancellable_with_probe(
         if let Some(limit) = hard_timeout
             && started_at.elapsed() >= limit
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
             let _ = stdout_reader.finish();
             let stderr = stderr_reader
                 .finish()
                 .map(|capture| capture.bytes)
                 .unwrap_or_default();
             let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
-            return Err(FwError::from_command_timeout(
-                rendered,
-                saturating_duration_ms(limit),
-                stderr_str,
+            return Err(merge_process_tree_cleanup_result(
+                FwError::from_command_timeout(rendered, saturating_duration_ms(limit), stderr_str),
+                cleanup,
             ));
+        }
+
+        match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
+            Ok(Some(stream)) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let _ = stdout_reader.finish();
+                let _ = stderr_reader.finish();
+                return Err(merge_process_tree_cleanup_result(
+                    capture_limit_error(stream),
+                    cleanup,
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let _ = stdout_reader.finish();
+                let _ = stderr_reader.finish();
+                return Err(merge_process_tree_cleanup_result(error, cleanup));
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Close inherited stdin/stdout/stderr in any descendants before
+                // joining I/O helpers; otherwise a successful root could leave
+                // the bounded caller blocked forever.
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let stdout_result = stdout_reader.finish();
+                let stderr_result = stderr_reader.finish();
+                cleanup?;
+                let stdout = stdout_result?;
+                let stderr = stderr_result?;
+                return validate_captured_command_output(&rendered, status, stdout, stderr);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let _ = stdout_reader.finish();
+                let _ = stderr_reader.finish();
+                return Err(merge_process_tree_cleanup_result(
+                    FwError::Io(error),
+                    cleanup,
+                ));
+            }
+        }
+
+        if let Some(observer) = observer.as_deref_mut()
+            && let Err(error) = observer(child.id())
+        {
+            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let _ = stdout_reader.finish();
+            let _ = stderr_reader.finish();
+            return Err(merge_process_tree_cleanup_result(error, cleanup));
         }
 
         thread::sleep(cancellable_poll_delay(poll_iteration));
         poll_iteration = poll_iteration.saturating_add(1);
     }
+}
+
+/// Put each bounded child at the root of a process tree that cancellation can
+/// terminate as one unit. On Unix, `process_group(0)` creates a group whose id
+/// is the child pid. Windows tree ownership is established later by
+/// `spawn_managed_child`, which assigns the suspended root to a Job Object
+/// before allowing it to run.
+fn configure_descendant_process_tree(command: &mut Command) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        let externally_owned =
+            PROCESS_TREE_EXTERNALLY_OWNED.load(std::sync::atomic::Ordering::Acquire);
+        if !externally_owned {
+            command.process_group(0);
+        }
+        !externally_owned
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        false
+    }
+}
+
+const fn bounded_process_tree_unsupported() -> bool {
+    !cfg!(any(unix, windows))
+}
+
+#[cfg(not(windows))]
+const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn process_tree_cleanup_error(detail: &str) -> FwError {
+    FwError::ContractViolation(format!(
+        "bounded subprocess cleanup could not certify the complete process tree: {detail}"
+    ))
+}
+
+fn combine_process_tree_cleanup_error(primary: FwError, cleanup: FwError) -> FwError {
+    FwError::ContractViolation(format!(
+        "{cleanup}; the original subprocess outcome was: {primary}"
+    ))
+}
+
+fn merge_process_tree_cleanup_result(primary: FwError, cleanup: FwResult<()>) -> FwError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => combine_process_tree_cleanup_error(primary, cleanup),
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_child_reap(child: &mut ManagedChild, deadline: Instant) -> FwResult<()> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                return Err(process_tree_cleanup_error(
+                    "the root child did not terminate before the cleanup deadline",
+                ));
+            }
+            Err(_) => {
+                return Err(process_tree_cleanup_error(
+                    "the root child could not be monitored while being reaped",
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminate_descendant_process_tree(
+    child: &mut ManagedChild,
+    owns_process_group: bool,
+) -> FwResult<()> {
+    let deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
+    let process_group = owns_process_group.then(|| rustix::process::Pid::from_child(child));
+    let mut group_signal_error = None;
+    if let Some(process_group) = process_group
+        && let Err(error) =
+            rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL)
+        && error != rustix::io::Errno::SRCH
+    {
+        group_signal_error = Some(error);
+    }
+
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if let Err(error) = child.kill()
+                && error.kind() != std::io::ErrorKind::InvalidInput
+            {
+                return Err(process_tree_cleanup_error(
+                    "the root child rejected direct termination",
+                ));
+            }
+        }
+        Err(_) => {
+            return Err(process_tree_cleanup_error(
+                "the root child could not be inspected before termination",
+            ));
+        }
+    }
+    wait_for_child_reap(child, deadline)?;
+
+    if let Some(process_group) = process_group {
+        loop {
+            match rustix::process::test_kill_process_group(process_group) {
+                Err(error) if error == rustix::io::Errno::SRCH => break,
+                Err(_) => {
+                    return Err(process_tree_cleanup_error(
+                        "the owned Unix process group could not be inspected after termination",
+                    ));
+                }
+                Ok(()) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(()) => {
+                    if let Some(error) = group_signal_error {
+                        return Err(process_tree_cleanup_error(&format!(
+                            "the owned Unix process group rejected termination ({error}) and remained alive"
+                        )));
+                    }
+                    return Err(process_tree_cleanup_error(
+                        "the owned Unix process group remained alive after termination",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminate_descendant_process_tree(
+    child: &mut ManagedChild,
+    _owns_process_group: bool,
+) -> FwResult<()> {
+    child.kill().map_err(|_| {
+        process_tree_cleanup_error("the owned Windows Job Object rejected termination")
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_descendant_process_tree(
+    child: &mut ManagedChild,
+    _owns_process_group: bool,
+) -> FwResult<()> {
+    child
+        .kill()
+        .map_err(|_| process_tree_cleanup_error("the root child rejected direct termination"))?;
+    wait_for_child_reap(child, Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT)
 }
 
 fn validate_command_output(rendered: &str, output: Output) -> FwResult<Output> {
@@ -307,9 +892,8 @@ fn saturating_duration_ms(duration: Duration) -> u64 {
 }
 
 pub(crate) const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 const PIPE_CAPTURE_STOP_DRAIN_GRACE: Duration = Duration::from_millis(100);
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-const PIPE_CAPTURE_FALLBACK_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct PipeCapture {
@@ -318,14 +902,16 @@ struct PipeCapture {
     drain_incomplete: bool,
 }
 
-struct PipeReader {
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+struct BoundedOutputReader {
     receiver: std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    limit_exceeded: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: thread::JoinHandle<()>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-impl PipeReader {
+impl BoundedOutputReader {
     fn finish(self) -> FwResult<PipeCapture> {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         let result = recv_pipe_output(self.receiver);
@@ -338,104 +924,159 @@ impl PipeReader {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-impl PipeReader {
-    fn finish(self) -> FwResult<PipeCapture> {
-        let result = match self.receiver.recv_timeout(PIPE_CAPTURE_FALLBACK_GRACE) {
-            Ok(result) => result.map_err(FwError::Io),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                self.stop.store(true, std::sync::atomic::Ordering::Release);
-                return Err(FwError::ContractViolation(
-                    "subprocess output pipe remained open after the child terminated".to_owned(),
-                ));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(FwError::Io(std::io::Error::other(
-                    "subprocess pipe reader terminated",
-                )));
-            }
-        };
-        if self.handle.join().is_err() {
-            return Err(FwError::Io(std::io::Error::other(
-                "subprocess pipe reader panicked",
-            )));
-        }
-        result
+fn bounded_output_limit_stream(
+    stdout: &BoundedOutputReader,
+    stderr: &BoundedOutputReader,
+) -> FwResult<Option<&'static str>> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        let stdout_exceeded = stdout
+            .limit_exceeded
+            .load(std::sync::atomic::Ordering::Acquire);
+        let stderr_exceeded = stderr
+            .limit_exceeded
+            .load(std::sync::atomic::Ordering::Acquire);
+        Ok(match (stdout_exceeded, stderr_exceeded) {
+            (true, true) => Some("stdout and stderr"),
+            (true, false) => Some("stdout"),
+            (false, true) => Some("stderr"),
+            (false, false) => None,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let stdout_exceeded = regular_file_exceeds_capture_limit(&stdout.file)?;
+        let stderr_exceeded = regular_file_exceeds_capture_limit(&stderr.file)?;
+        Ok(match (stdout_exceeded, stderr_exceeded) {
+            (true, true) => Some("stdout and stderr"),
+            (true, false) => Some("stdout"),
+            (false, true) => Some("stderr"),
+            (false, false) => None,
+        })
     }
 }
 
+#[cfg(any(
+    test,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn regular_file_exceeds_capture_limit(file: &std::fs::File) -> FwResult<bool> {
+    Ok(file.metadata()?.len() > MAX_CAPTURED_OUTPUT_BYTES as u64)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+struct BoundedOutputReader {
+    file: std::fs::File,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+impl BoundedOutputReader {
+    fn finish(self) -> FwResult<PipeCapture> {
+        read_bounded_output_file(self.file)
+    }
+}
+
+#[cfg(any(
+    test,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn read_bounded_output_file(mut file: std::fs::File) -> FwResult<PipeCapture> {
+    if regular_file_exceeds_capture_limit(&file)? {
+        return Ok(PipeCapture {
+            bytes: Vec::new(),
+            limit_exceeded: true,
+            drain_incomplete: false,
+        });
+    }
+    file.seek(std::io::SeekFrom::Start(0))?;
+    read_pipe_with_limit(file).map_err(FwError::Io)
+}
+
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn spawn_pipe_reader<R>(pipe: R) -> PipeReader
+struct PreparedBoundedOutputCapture;
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+struct PreparedBoundedOutputCapture {
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn prepare_bounded_output_capture(command: &mut Command) -> FwResult<PreparedBoundedOutputCapture> {
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    Ok(PreparedBoundedOutputCapture)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn prepare_bounded_output_capture(command: &mut Command) -> FwResult<PreparedBoundedOutputCapture> {
+    let stdout = tempfile::tempfile()?;
+    let stderr = tempfile::tempfile()?;
+    command.stdout(Stdio::from(stdout.try_clone()?));
+    command.stderr(Stdio::from(stderr.try_clone()?));
+    Ok(PreparedBoundedOutputCapture { stdout, stderr })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn start_bounded_output_capture(
+    child: &mut ManagedChild,
+    _prepared: PreparedBoundedOutputCapture,
+    rendered: &str,
+) -> FwResult<(BoundedOutputReader, BoundedOutputReader)> {
+    let stdout_pipe = child.stdout.take().ok_or_else(|| {
+        FwError::Io(std::io::Error::other(format!(
+            "failed to capture stdout for `{rendered}`"
+        )))
+    })?;
+    let stderr_pipe = child.stderr.take().ok_or_else(|| {
+        FwError::Io(std::io::Error::other(format!(
+            "failed to capture stderr for `{rendered}`"
+        )))
+    })?;
+    Ok((
+        spawn_pipe_reader(stdout_pipe),
+        spawn_pipe_reader(stderr_pipe),
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn start_bounded_output_capture(
+    _child: &mut ManagedChild,
+    prepared: PreparedBoundedOutputCapture,
+    _rendered: &str,
+) -> FwResult<(BoundedOutputReader, BoundedOutputReader)> {
+    Ok((
+        BoundedOutputReader {
+            file: prepared.stdout,
+        },
+        BoundedOutputReader {
+            file: prepared.stderr,
+        },
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn spawn_pipe_reader<R>(pipe: R) -> BoundedOutputReader
 where
     R: Read + Send + std::os::fd::AsFd + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let limit_exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_stop = std::sync::Arc::clone(&stop);
+    let reader_limit_exceeded = std::sync::Arc::clone(&limit_exceeded);
     let handle = thread::spawn(move || {
-        let result = set_pipe_nonblocking(&pipe)
-            .and_then(|()| read_pipe_with_limit_until_stopped(pipe, &reader_stop));
+        let result = set_pipe_nonblocking(&pipe).and_then(|()| {
+            read_pipe_with_limit_until_stopped(pipe, &reader_stop, &reader_limit_exceeded)
+        });
         let _ = tx.send(result);
     });
-    PipeReader {
+    BoundedOutputReader {
         receiver: rx,
         stop,
-        handle,
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn spawn_pipe_reader<R>(pipe: R) -> PipeReader
-where
-    R: Read + Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reader_stop = std::sync::Arc::clone(&stop);
-    let handle = thread::spawn(move || {
-        let _ = tx.send(read_pipe_with_limit_fallback(pipe, &reader_stop));
-    });
-    PipeReader {
-        receiver: rx,
-        stop,
-        handle,
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn read_pipe_with_limit_fallback<R: Read>(
-    mut pipe: R,
-    stop: &std::sync::atomic::AtomicBool,
-) -> std::io::Result<PipeCapture> {
-    let mut buf = [0u8; 8192];
-    let mut bytes = Vec::new();
-    let mut limit_exceeded = false;
-
-    loop {
-        let read = pipe.read(&mut buf)?;
-        if read == 0 {
-            break;
-        }
-        let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(bytes.len());
-        let retained = remaining.min(read);
-        bytes.extend_from_slice(&buf[..retained]);
-        if retained < read {
-            limit_exceeded = true;
-        }
-        if stop.load(std::sync::atomic::Ordering::Acquire) {
-            return Ok(PipeCapture {
-                bytes,
-                limit_exceeded,
-                drain_incomplete: true,
-            });
-        }
-    }
-
-    Ok(PipeCapture {
-        bytes,
         limit_exceeded,
-        drain_incomplete: false,
-    })
+        handle,
+    }
 }
 
 #[cfg(any(
@@ -482,14 +1123,21 @@ fn errno_to_io_error(error: rustix::io::Errno) -> std::io::Error {
 fn read_pipe_with_limit_until_stopped<R: Read>(
     pipe: R,
     stop: &std::sync::atomic::AtomicBool,
+    limit_exceeded: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<PipeCapture> {
-    read_pipe_with_limit_until_stopped_with_grace(pipe, stop, PIPE_CAPTURE_STOP_DRAIN_GRACE)
+    read_pipe_with_limit_until_stopped_with_grace(
+        pipe,
+        stop,
+        limit_exceeded,
+        PIPE_CAPTURE_STOP_DRAIN_GRACE,
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn read_pipe_with_limit_until_stopped_with_grace<R: Read>(
     mut pipe: R,
     stop: &std::sync::atomic::AtomicBool,
+    limit_exceeded_signal: &std::sync::atomic::AtomicBool,
     stop_drain_grace: Duration,
 ) -> std::io::Result<PipeCapture> {
     let mut buf = [0u8; 8192];
@@ -507,6 +1155,7 @@ fn read_pipe_with_limit_until_stopped_with_grace<R: Read>(
                 bytes.extend_from_slice(&buf[..retained]);
                 if retained < read {
                     limit_exceeded = true;
+                    limit_exceeded_signal.store(true, std::sync::atomic::Ordering::Release);
                 }
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     let observed_at = stop_observed_at.get_or_insert_with(Instant::now);
@@ -519,8 +1168,11 @@ fn read_pipe_with_limit_until_stopped_with_grace<R: Read>(
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
-                    drain_incomplete = true;
-                    break;
+                    let observed_at = stop_observed_at.get_or_insert_with(Instant::now);
+                    if observed_at.elapsed() >= stop_drain_grace {
+                        drain_incomplete = true;
+                        break;
+                    }
                 }
                 thread::sleep(Duration::from_millis(1));
             }
@@ -535,6 +1187,7 @@ fn read_pipe_with_limit_until_stopped_with_grace<R: Read>(
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn recv_pipe_output(
     rx: std::sync::mpsc::Receiver<std::io::Result<PipeCapture>>,
 ) -> FwResult<PipeCapture> {
@@ -592,14 +1245,28 @@ pub(crate) fn is_stdout_capture_limit_error(error: &FwError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Duration;
 
     use crate::orchestrator::CancellationToken;
 
+    #[cfg(unix)]
+    use super::run_command_cancellable_with_input_probe_and_observer;
     use super::{
         cancellable_poll_delay, render_command_for_log, run_command_cancellable,
-        run_command_cancellable_with_probe,
+        run_command_cancellable_with_input_and_probe, run_command_cancellable_with_probe,
     };
+
+    fn assert_reported_cwd(stdout: &[u8], expected: &Path) {
+        let reported_text = String::from_utf8_lossy(stdout);
+        let reported = Path::new(reported_text.trim())
+            .canonicalize()
+            .expect("reported cwd should resolve");
+        let expected = expected
+            .canonicalize()
+            .expect("expected cwd should resolve");
+        assert_eq!(reported, expected, "reported cwd: {reported_text}");
+    }
 
     #[test]
     fn cancellable_poll_schedule_rejoins_fixed_cadence() {
@@ -617,6 +1284,102 @@ mod tests {
         let result =
             run_command_cancellable("true", &[], None, &cancel, Some(Duration::from_secs(10)));
         assert!(result.is_ok(), "true should succeed: {result:?}");
+    }
+
+    #[test]
+    fn cancellable_stdin_payload_reaches_the_child_exactly() {
+        let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
+        let payload = b"strict worker request\n";
+        let output = run_command_cancellable_with_input_and_probe(
+            "cat",
+            &[],
+            None,
+            &cancel,
+            Some(Duration::from_secs(10)),
+            None,
+            payload,
+        )
+        .expect("cat must receive the bounded stdin payload");
+        assert_eq!(output.stdout, payload);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_process_observer_receives_the_stable_group_root() {
+        let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
+        let mut observed = Vec::new();
+        let mut observer = |root_pid| {
+            observed.push(root_pid);
+            Ok(())
+        };
+        let output = run_command_cancellable_with_input_probe_and_observer(
+            "sh",
+            &["-c".to_owned(), "sleep 0.15".to_owned()],
+            &cancel,
+            Some(Duration::from_secs(10)),
+            None,
+            &[],
+            &mut observer,
+        )
+        .expect("observed command must complete");
+        assert!(output.status.success());
+        assert!(!observed.is_empty());
+        assert!(observed[0] > 0);
+        assert!(observed.iter().all(|pid| *pid == observed[0]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_observer_failure_terminates_the_complete_group() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("observer-descendant.pid");
+        let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
+        let mut polls = 0usize;
+        let mut observer = |_root_pid| {
+            polls = polls.saturating_add(1);
+            if polls >= 2 && pid_path.is_file() {
+                Err(crate::error::FwError::ContractViolation(
+                    "observer fixture failure".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        let result = run_command_cancellable_with_input_probe_and_observer(
+            "sh",
+            &[
+                "-c".to_owned(),
+                "sleep 60 & child=$!; printf '%s' \"$child\" > \"$1\"; wait".to_owned(),
+                "fw-process-observer-test".to_owned(),
+                pid_path.to_string_lossy().into_owned(),
+            ],
+            &cancel,
+            Some(Duration::from_secs(10)),
+            None,
+            &[],
+            &mut observer,
+        );
+        assert!(
+            matches!(result, Err(crate::error::FwError::ContractViolation(_))),
+            "observer failure must escape after reaping the process tree: {result:?}"
+        );
+
+        let descendant_pid: i32 = std::fs::read_to_string(&pid_path)
+            .expect("descendant pid fixture")
+            .parse()
+            .expect("numeric descendant pid");
+        let descendant_pid =
+            rustix::process::Pid::from_raw(descendant_pid).expect("positive descendant process id");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(descendant_pid).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(descendant_pid).is_err(),
+            "observer failure left a descendant process alive"
+        );
     }
 
     #[test]
@@ -702,6 +1465,7 @@ mod tests {
         assert!(output.status.success());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn recv_pipe_output_reports_disconnect() {
         use super::{PipeCapture, recv_pipe_output};
@@ -727,17 +1491,69 @@ mod tests {
         assert!(started_at.elapsed() < Duration::from_secs(1));
     }
 
+    #[test]
+    fn regular_file_capture_finishes_while_inherited_writer_stays_open() {
+        use std::io::Write as _;
+
+        let reader = tempfile::tempfile().expect("temporary capture file");
+        let mut inherited_writer = reader.try_clone().expect("inherited writer fixture");
+        inherited_writer
+            .write_all(b"complete output")
+            .expect("write fixture");
+        inherited_writer.flush().expect("flush fixture");
+        let started_at = std::time::Instant::now();
+        let capture = super::read_bounded_output_file(reader)
+            .expect("regular-file capture with open inherited writer");
+        assert_eq!(capture.bytes, b"complete output");
+        assert!(!capture.limit_exceeded);
+        assert!(!capture.drain_incomplete);
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn regular_file_capture_limit_is_detected_without_waiting_for_writer_close() {
+        let file = tempfile::tempfile().expect("temporary capture file");
+        file.set_len(super::MAX_CAPTURED_OUTPUT_BYTES as u64 + 1)
+            .expect("extend capture fixture");
+        assert!(
+            super::regular_file_exceeds_capture_limit(&file).expect("inspect regular-file capture")
+        );
+        let capture = super::read_bounded_output_file(file).expect("bounded regular-file capture");
+        assert!(capture.bytes.is_empty());
+        assert!(capture.limit_exceeded);
+        assert!(!capture.drain_incomplete);
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn stopped_reader_reports_incomplete_continuous_drain() {
         let stop = std::sync::atomic::AtomicBool::new(true);
+        let limit_exceeded = std::sync::atomic::AtomicBool::new(false);
         let capture = super::read_pipe_with_limit_until_stopped_with_grace(
             std::io::repeat(b'x'),
             &stop,
+            &limit_exceeded,
             Duration::ZERO,
         )
         .expect("bounded continuous drain");
         assert!(capture.drain_incomplete);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn nonblocking_reader_publishes_the_live_capture_limit() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let limit_exceeded = std::sync::atomic::AtomicBool::new(false);
+        let input = vec![b'x'; super::MAX_CAPTURED_OUTPUT_BYTES + 1];
+        let capture = super::read_pipe_with_limit_until_stopped_with_grace(
+            std::io::Cursor::new(input),
+            &stop,
+            &limit_exceeded,
+            Duration::from_secs(1),
+        )
+        .expect("bounded nonblocking-reader fixture");
+        assert!(capture.limit_exceeded);
+        assert!(limit_exceeded.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
@@ -793,6 +1609,238 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn run_command_stops_a_live_output_flood_at_the_capture_limit() {
+        let started_at = std::time::Instant::now();
+        let error = run_command_with_timeout("yes", &[], None, Some(Duration::from_secs(10)))
+            .expect_err("unbounded stdout must trip the live capture limit");
+        assert!(super::is_stdout_capture_limit_error(&error));
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "capture limiting must terminate output floods before the hard timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_the_complete_descendant_process_group() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("descendant.pid");
+        let args = vec![
+            "-c".to_owned(),
+            "sleep 60 & child=$!; printf '%s' \"$child\" > \"$1\"; wait".to_owned(),
+            "fw-process-tree-test".to_owned(),
+            pid_path.to_string_lossy().into_owned(),
+        ];
+        let result = run_command_with_timeout("sh", &args, None, Some(Duration::from_millis(250)));
+        assert!(result.is_err(), "forking fixture must hit the timeout");
+
+        let descendant_pid: i32 = std::fs::read_to_string(&pid_path)
+            .expect("descendant pid fixture")
+            .parse()
+            .expect("numeric descendant pid");
+        let descendant_pid =
+            rustix::process::Pid::from_raw(descendant_pid).expect("positive descendant process id");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(descendant_pid).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(descendant_pid).is_err(),
+            "timeout left a descendant process alive"
+        );
+    }
+
+    #[cfg(windows)]
+    fn windows_descendant_fixture(pid_path: &std::path::Path, root_tail: &str) -> Vec<String> {
+        let escaped_pid_path = pid_path.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$child = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60') -PassThru; $identity = '{{0}},{{1}}' -f $child.Id,$child.StartTime.ToFileTimeUtc(); Set-Content -LiteralPath '{escaped_pid_path}' -NoNewline -Value $identity; {root_tail}"
+        );
+        vec![
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            script,
+        ]
+    }
+
+    #[cfg(windows)]
+    fn windows_descendant_identity(pid_path: &std::path::Path) -> (u32, i64) {
+        let identity = std::fs::read_to_string(pid_path).expect("descendant identity fixture");
+        let (pid, start_time) = identity
+            .split_once(',')
+            .expect("pid and start-time identity");
+        (
+            pid.parse().expect("numeric descendant pid"),
+            start_time.parse().expect("numeric descendant start time"),
+        )
+    }
+
+    #[cfg(windows)]
+    fn windows_process_identity_is_alive(pid: u32, start_time: i64) -> bool {
+        let script = format!(
+            "$process = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($process -and $process.StartTime.ToFileTimeUtc() -eq {start_time}) {{ exit 0 }} else {{ exit 1 }}"
+        );
+        std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_descendant_reaped(pid_path: &std::path::Path) {
+        let (pid, start_time) = windows_descendant_identity(pid_path);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while windows_process_identity_is_alive(pid, start_time)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !windows_process_identity_is_alive(pid, start_time),
+            "Windows Job Object left the exact descendant process alive"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_identity_probe_rejects_a_reused_pid() {
+        let pid = std::process::id();
+        let query =
+            format!("[Console]::Out.Write((Get-Process -Id {pid}).StartTime.ToFileTimeUtc())");
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", query.as_str()])
+            .output()
+            .expect("query current Windows process identity");
+        assert!(output.status.success());
+        let start_time: i64 = String::from_utf8(output.stdout)
+            .expect("PowerShell identity is UTF-8")
+            .parse()
+            .expect("PowerShell identity is a FileTime integer");
+        assert!(
+            windows_process_identity_is_alive(pid, start_time),
+            "the exact live process identity must match"
+        );
+        assert!(
+            !windows_process_identity_is_alive(pid, start_time.saturating_sub(1)),
+            "an existing PID with a different creation time must not match"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn successful_windows_root_cannot_leave_a_descendant_process_alive() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("windows-success-descendant.pid");
+        let args = windows_descendant_fixture(&pid_path, "exit 0");
+        let output =
+            run_command_with_timeout("powershell.exe", &args, None, Some(Duration::from_secs(20)))
+                .expect("successful root must retain Job Object cleanup authority");
+        assert!(output.status.success());
+        assert_windows_descendant_reaped(&pid_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_windows_job_assignment_cleanup_fails_closed() {
+        let error = super::terminate_failed_windows_job_assignment(u32::MAX)
+            .expect_err("an impossible process id must not receive cleanup authority");
+        assert!(
+            error.to_string().contains("taskkill"),
+            "cleanup failure must remain explicit: {error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_timeout_terminates_the_complete_descendant_process_tree() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("windows-timeout-descendant.pid");
+        let args = windows_descendant_fixture(&pid_path, "Wait-Process -Id $child.Id");
+        let error =
+            run_command_with_timeout("powershell.exe", &args, None, Some(Duration::from_secs(5)))
+                .expect_err("long-running Windows fixture must time out");
+        assert!(error.to_string().contains("timed out"));
+        assert_windows_descendant_reaped(&pid_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_output_cap_terminates_the_complete_descendant_process_tree() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("windows-output-cap-descendant.pid");
+        let args = windows_descendant_fixture(
+            &pid_path,
+            "$chunk = 'x' * 65536; while ($true) { [Console]::Out.Write($chunk) }",
+        );
+        let error =
+            run_command_with_timeout("powershell.exe", &args, None, Some(Duration::from_secs(20)))
+                .expect_err("unbounded Windows stdout must trip the capture cap");
+        assert!(super::is_stdout_capture_limit_error(&error));
+        assert_windows_descendant_reaped(&pid_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_terminates_the_complete_windows_descendant_process_tree() {
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("windows-descendant.pid");
+        let args = windows_descendant_fixture(&pid_path, "Wait-Process -Id $child.Id");
+        let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(30));
+        let descendant_started = || pid_path.is_file();
+        let result = run_command_cancellable_with_probe(
+            "powershell.exe",
+            &args,
+            None,
+            &cancel,
+            Some(Duration::from_secs(20)),
+            Some(&descendant_started),
+        );
+        assert!(
+            matches!(result, Err(crate::error::FwError::Cancelled(_))),
+            "fixture cancellation must escape after reaping the process tree: {result:?}"
+        );
+        assert_windows_descendant_reaped(&pid_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_root_cannot_leave_a_descendant_process_alive() {
+        let output = run_command_with_timeout(
+            "sh",
+            &[
+                "-c".to_owned(),
+                "sleep 60 & child=$!; printf '%s' \"$child\"; exit 0".to_owned(),
+            ],
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .expect("successful root command");
+        let descendant_pid: i32 = String::from_utf8(output.stdout)
+            .expect("UTF-8 descendant pid")
+            .parse()
+            .expect("numeric descendant pid");
+        let descendant_pid =
+            rustix::process::Pid::from_raw(descendant_pid).expect("positive descendant pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(descendant_pid).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(descendant_pid).is_err(),
+            "successful bounded command left a descendant process alive"
+        );
+    }
+
     #[test]
     fn run_command_captures_stderr() {
         // `ls` on a nonexistent path writes to stderr and exits non-zero.
@@ -809,11 +1857,7 @@ mod tests {
     fn run_command_with_cwd() {
         let dir = tempfile::tempdir().expect("tempdir");
         let output = run_command("pwd", &[], Some(dir.path())).expect("pwd should succeed");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains(dir.path().to_str().unwrap()),
-            "expected cwd in stdout, got: {stdout}"
-        );
+        assert_reported_cwd(&output.stdout, dir.path());
     }
 
     #[test]
@@ -884,12 +1928,25 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use super::validate_command_output;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
+
+    #[cfg(unix)]
+    fn fake_exit_status(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn fake_exit_status(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code as u32)
+    }
 
     fn fake_output(code: i32, stderr: &str) -> std::process::Output {
         std::process::Output {
-            status: ExitStatus::from_raw(code << 8), // raw wait status: exit code in upper byte
+            status: fake_exit_status(code),
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
         }
@@ -1017,11 +2074,7 @@ mod tests {
         let cancel = CancellationToken::no_deadline();
         let output = run_command_cancellable("pwd", &[], Some(dir.path()), &cancel, None)
             .expect("pwd should succeed");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains(dir.path().to_str().unwrap()),
-            "expected cwd in stdout, got: {stdout}"
-        );
+        assert_reported_cwd(&output.stdout, dir.path());
     }
 
     #[test]
@@ -1077,6 +2130,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn validate_command_output_signal_terminated_uses_negative_one() {
         // When a process is killed by a signal, exit code may not be available.

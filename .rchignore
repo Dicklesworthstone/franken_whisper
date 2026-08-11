@@ -1,0 +1,61 @@
+# Never transfer confidential recordings or transcript artifacts to RCH workers,
+# including files that may already be tracked and therefore bypass .gitignore.
+**/*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*
+**/*.[wW][aA][vV]
+**/*.[uU][lL][aA][wW]
+**/*.[mM][pP]3
+**/*.[fF][lL][aA][cC]
+**/*.[oO][gG][gG]
+**/*.[mM]4[aA]
+**/*.[aA][aA][cC]
+**/*.[aA][iI][fF]
+**/*.[aA][iI][fF][fF]
+**/*.[aA][mM][rR]
+**/*.[aA][wW][bB]
+**/*.[cC][aA][fF]
+**/*.[oO][pP][uU][sS]
+**/*.[wW][mM][aA]
+**/*.[3][gG][pP]
+**/*.[mM][pP]4
+**/*.[mM][oO][vV]
+**/*.[wW][eE][bB][mM]
+**/*.[wW][vV]
+**/*.[oO][gG][aA]
+**/*.[mM][kK][aA]
+**/*.[mM][kK][vV]
+**/*.[aA][dD][tT][sS]
+**/*.[aA][cC]3
+**/*.[eE][aA][cC]3
+**/*.[dD][tT][sS]
+**/*.[aA][pP][eE]
+**/*.[aA][lL][aA][cC]
+**/*.[aA][uU]
+**/*.[sS][nN][dD]
+**/*.[mM][pP]2
+**/*.[mM][pP][aA]
+**/*.[mM]4[bBpP]
+**/*.[3][gG]2
+**/*.[rR][aA]
+**/*.[rR][mM]
+**/*.[wW][eE][bB][aA]
+**/*.[rR][aA][wW]
+**/*.[pP][cC][mM]
+
+# Performance evidence is not a compilation input. Never copy local decoder
+# outputs or evaluation corpora from this tree to remote build workers.
+tests/artifacts/perf/**
+
+# Licensed model packages, converted tensors, and path-bearing receipts are
+# operator-local proof inputs, never remote-build inputs.
+**/*.[nN][eE][mM][oO]
+**/*.[pP][tT]
+**/*.[pP][tT][hH]
+**/*.[cC][kK][pP][tT]
+**/*.[sS][aA][fF][eE][tT][eE][nN][sS][oO][rR][sS]
+**/*.[oO][nN][nN][xX]
+**/*.[nN][pP][yY]
+**/*.[nN][pP][zZ]
+**/*.[gG][gG][uU][fF]
+**/*.[gG][gG][mM][lL]
+**/*[aA][cC][tT][iI][vV][aA][tT][iI][oO][nN][-_][rR][eE][cC][eE][iI][pP][tT]*.[jJ][sS][oO][nN]
+**/*[cC][oO][nN][vV][eE][rR][sS][iI][oO][nN][-_][rR][eE][cC][eE][iI][pP][tT]*.[jJ][sS][oO][nN]

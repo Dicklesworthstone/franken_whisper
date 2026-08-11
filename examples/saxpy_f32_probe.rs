@@ -9,14 +9,17 @@
 //! SIMD'd byte-exactly and stays scalar — see NEGATIVE_EVIDENCE / kv_f16c_probe.)
 //! Usage: `saxpy_f32_probe [iters]` (default 8000).
 #![allow(unsafe_code)]
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
 /// Replica of the live scalar output loop: for each key j, out[d] += scores[j]*v[j,d].
-fn out_scalar(scores: &[f32], v: &[f32], tk: usize, d: usize) -> Vec<f32> {
+#[cfg(target_arch = "x86_64")]
+fn out_scalar(scores: &[f32], v: &[f32], _tk: usize, d: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; d];
     for (j, &sj) in scores.iter().enumerate() {
         let vrow = &v[j * d..(j + 1) * d];
@@ -30,7 +33,7 @@ fn out_scalar(scores: &[f32], v: &[f32], tk: usize, d: usize) -> Vec<f32> {
 /// AVX2 mul+add (byte-identical: two roundings, vectorized over independent d slots).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn out_avx2(scores: &[f32], v: &[f32], tk: usize, d: usize) -> Vec<f32> {
+unsafe fn out_avx2(scores: &[f32], v: &[f32], _tk: usize, d: usize) -> Vec<f32> {
     unsafe {
         let mut out = vec![0.0f32; d];
         let op = out.as_mut_ptr();
@@ -53,6 +56,7 @@ unsafe fn out_avx2(scores: &[f32], v: &[f32], tk: usize, d: usize) -> Vec<f32> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn bench(tk: usize, d: usize, iters: usize) {
     let mut st = 0x243F_6A88_85A3_08D3u64;
     let mut nf = || {
@@ -102,7 +106,12 @@ fn bench(tk: usize, d: usize, iters: usize) {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
+    if !std::is_x86_feature_detected!("avx2") {
+        eprintln!("saxpy_f32_probe requires AVX2 support");
+        return;
+    }
     let iters: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -113,4 +122,9 @@ fn main() {
     bench(64, 64, iters);
     bench(256, 64, iters);
     bench(448, 64, iters);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("saxpy_f32_probe requires an x86_64 processor");
 }

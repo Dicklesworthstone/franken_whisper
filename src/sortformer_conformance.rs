@@ -1,10 +1,11 @@
 //! Fail-closed L0 artifact verifier for the native Streaming Sortformer port.
 //!
-//! This module does not run the model and does not admit a production route.
-//! It authenticates an operator-local, non-executable safetensors conversion
-//! against an independently reviewed canonical receipt. Production admission
-//! uses compiled converter, topology-manifest, receipt, and package trust
-//! roots; arbitrary caller-supplied digests are not an admissible authority.
+//! This module does not run the model and does not by itself admit an automatic
+//! production route. It authenticates the non-executable safetensors conversion
+//! against an independently reviewed canonical receipt. The package may arrive
+//! through the hash-pinned release cache or explicit offline paths; admission
+//! uses compiled converter, topology-projection, receipt, and package trust
+//! roots, never arbitrary caller-supplied digests.
 
 #![forbid(unsafe_code)]
 
@@ -20,21 +21,25 @@ use sha2::{Digest, Sha256};
 use crate::error::{FwError, FwResult};
 use crate::native_engine::weights::SafetensorsFile;
 
-pub use crate::differential_oracle::SORTFORMER_ORACLE_ADAPTER_SHA256;
-
 pub const SORTFORMER_RECEIPT_SCHEMA: &str = "franken-whisper-sortformer-conversion-receipt-v1";
-pub const SORTFORMER_TENSOR_MANIFEST_SCHEMA: &str =
-    "franken-whisper-sortformer-tensor-manifest-v1";
+pub const SORTFORMER_TENSOR_MANIFEST_SCHEMA: &str = "franken-whisper-sortformer-tensor-manifest-v1";
 /// Receipt schema label only. The compiled converter-source and canonical
 /// receipt digests below are the executable and instance trust roots.
 pub const SORTFORMER_CONVERTER_ID: &str = "franken-whisper-native-sortformer-converter";
 pub const SORTFORMER_CONVERTER_VERSION: &str = "1";
 pub const SORTFORMER_CONVERTER_SOURCE_SHA256: &str =
-    "a85431fa6d609c6a8bc5607e108326fcd9b0dd280370302f9064f5c68fce0357";
+    "3ce885d1dcb0aeeebf2bb73c165f501a1d240e01ad70354c65cf43d8a3c6d8ce";
 pub const SORTFORMER_CONVERSION_RECEIPT_SHA256: &str =
-    "1f4129f65d846647a25dca16590c1fc39e466ca317a6bad39cd5428809fbf052";
+    "407c642f3d51b399514f6a35227b1c80886387472a44fb78f01b824d26318fb0";
+/// Historical external adapter identity used when the immutable converted
+/// package and receipt were produced. Runtime comparison adapters are
+/// independently versioned and bound by the comparison protocol; changing
+/// their post-processing must not invalidate this conversion provenance.
+pub const SORTFORMER_CONVERSION_ORACLE_ADAPTER_SHA256: &str =
+    "8f376c979b7eaca41dc0a438d9aaa41c1c723052b97c45eb2acc59b6d6f00bde";
 pub const SORTFORMER_MODEL_ID: &str = "nvidia/diar_streaming_sortformer_4spk-v2.1";
 pub const SORTFORMER_MODEL_REVISION: &str = "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d";
+pub const SORTFORMER_CERTIFICATION_STATUS: &str = "development_uncertified";
 pub const SORTFORMER_NEMO_BYTES: u64 = 471_367_680;
 pub const SORTFORMER_NEMO_SHA256: &str =
     "8abd32832159c6ac1148c926b7276f35ba34582c444e559dce1f1253fea42ef8";
@@ -70,6 +75,37 @@ pub const SORTFORMER_PACKAGE_BYTES: u64 = 491_570_584;
 pub const SORTFORMER_PACKAGE_SHA256: &str =
     "487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a";
 
+pub const SORTFORMER_ACTIVATION_RECEIPT_SCHEMA: &str =
+    "franken-whisper-sortformer-activation-receipt-v1";
+pub const SORTFORMER_ACTIVATION_FLOOR_SCHEMA: &str = "franken-whisper-sortformer-oracle-floor-v1";
+pub const SORTFORMER_ACTIVATION_RECEIPT_SHA256: &str =
+    "ac3dab6f7ad48ccaeeee0ba8e1f4932b5377736e28fa471fa7d43020922df2a9";
+pub const SORTFORMER_ACTIVATION_PACKAGE_SHA256: &str =
+    "294edcc0a9d80fa9470c2cd45f2c1556a47a56b7c98ba444984f764a1f398a8b";
+pub const SORTFORMER_ACTIVATION_EXPORTER_SHA256: &str =
+    "b3020f1e6c136343adecabc3209f3b1ef70f40a7e36d2b2ed9b25fbbd439b6dd";
+pub const SORTFORMER_PUBLIC_ACTIVATION_EXPORTER_SHA256: &str =
+    "af752ee007d46eb010d69109cc8c6f4f753f0304d30add401e114066a4a2f877";
+pub const SORTFORMER_ACTIVATION_PACKAGE_BYTES: u64 = 282_716;
+pub const SORTFORMER_ACTIVATION_PAYLOAD_BYTES: u64 = 278_076;
+pub const SORTFORMER_ACTIVATION_F32_ELEMENTS: u64 = 69_503;
+pub const SORTFORMER_ACTIVATION_I64_ELEMENTS: u64 = 8;
+pub const SORTFORMER_ACTIVATION_TENSORS: u64 = 46;
+
+pub const SORTFORMER_PUBLIC_ACTIVATION_RECEIPT_SCHEMA: &str =
+    "franken-whisper-sortformer-public-activation-receipt-v2";
+pub const SORTFORMER_PUBLIC_ACTIVATION_FLOOR_SCHEMA: &str =
+    "franken-whisper-sortformer-public-oracle-floor-v1";
+pub const SORTFORMER_PUBLIC_ACTIVATION_RECEIPT_SHA256: &str =
+    "8dd949aeccc0754338c3c777e8ef596f043387a2a38543f0a91353d06f70234f";
+pub const SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_SHA256: &str =
+    "4ec66cf29e4286fed21fdf3d9c170293aafb26ba9783b9e0eea4d245b4630a6d";
+pub const SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_BYTES: u64 = 72_590_196;
+pub const SORTFORMER_PUBLIC_ACTIVATION_PAYLOAD_BYTES: u64 = 71_906_004;
+pub const SORTFORMER_PUBLIC_ACTIVATION_F32_ELEMENTS: u64 = 17_934_361;
+pub const SORTFORMER_PUBLIC_ACTIVATION_I64_ELEMENTS: u64 = 21_070;
+pub const SORTFORMER_PUBLIC_ACTIVATION_TENSORS: u64 = 4_540;
+
 pub const SORTFORMER_POSITION_TENSOR: &str = "encoder.pos_enc.pe";
 pub const SORTFORMER_DTYPE_SENTINEL: &str = "preprocessor.dtype_sentinel_tensor";
 pub const SORTFORMER_LICENSE_URL: &str =
@@ -84,6 +120,10 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PACKAGE_BYTES: u64 = 640 * 1024 * 1024;
 const MAX_PACKAGE_HEADER_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ACTIVATION_RECEIPT_BYTES: u64 = 1024 * 1024;
+const MAX_ACTIVATION_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PUBLIC_ACTIVATION_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PUBLIC_ACTIVATION_PACKAGE_BYTES: u64 = 96 * 1024 * 1024;
 const F32_BYTES: u64 = 4;
 const I64_BYTES: u64 = 8;
 const SOURCE_LAYOUT: &str = "pytorch_contiguous_row_major";
@@ -93,7 +133,11 @@ const PACKAGE_BYTE_ORDER: &str = "little_endian";
 const PACKAGE_TENSOR_ORDER: &str = "lexicographic_name_order";
 const PACKAGE_METADATA_POLICY: &str = "absent";
 const LICENSE_ID: &str = "NVIDIA Open Model License";
-const LICENSE_POLICY: &str = "operator_local_no_git_no_release";
+// Historical conversion-time policy embedded in the immutable v1 receipt. The
+// separately versioned distribution manifest supersedes this transport policy
+// after distribution-license review without rewriting or weakening the
+// conversion trust root.
+const CONVERSION_RECEIPT_LICENSE_POLICY: &str = "github_release_with_license_and_notice";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// Complete canonical conversion receipt. The receipt intentionally contains
@@ -279,6 +323,320 @@ pub struct SortformerDestinationTensor {
     pub bytes: u64,
 }
 
+/// Canonical receipt for the deterministic, non-human L1 frontend truth pack.
+/// The receipt and tensor payload remain operator-local; only their independent
+/// trust roots are compiled into the library.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerActivationReceipt {
+    pub schema_version: String,
+    pub canonical_json_version: String,
+    pub authority: String,
+    pub equivalence_level: String,
+    pub fixture_set: String,
+    pub model: SortformerActivationModelIdentity,
+    pub exporter: SortformerActivationExporterIdentity,
+    pub runtime: SortformerRuntimeIdentity,
+    pub source_files: Vec<SortformerSourceFileIdentity>,
+    pub execution: SortformerActivationExecutionIdentity,
+    pub fixtures: Vec<SortformerActivationFixture>,
+    pub oracle_floor: SortformerActivationOracleFloor,
+    pub package: SortformerActivationPackageIdentity,
+    pub records: Vec<SortformerActivationTensorRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerActivationModelIdentity {
+    pub model_id: String,
+    pub model_revision: String,
+    pub nemo_sha256: String,
+    pub nemo_bytes: u64,
+    pub config_sha256: String,
+    pub checkpoint_sha256: String,
+    pub state_inventory_sha256: String,
+    pub nemo_source_revision: String,
+    pub external_contract_sha256: String,
+    pub conversion_receipt_sha256: String,
+    pub converted_package_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerActivationExporterIdentity {
+    pub exporter_id: String,
+    pub exporter_version: String,
+    pub source_sha256: String,
+    pub conversion_helper_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerActivationExecutionIdentity {
+    pub operating_system: String,
+    pub machine_architecture: String,
+    pub device: String,
+    pub compute_dtype: String,
+    pub autocast: bool,
+    pub quantization: String,
+    pub deterministic_algorithms: bool,
+    pub torch_intraop_thread_counts: Vec<u64>,
+    pub torch_interop_threads: u64,
+    pub data_loader_workers: u64,
+    pub torch_blas_backend: String,
+    pub torch_configuration_sha256: String,
+    pub numpy_configuration_sha256: String,
+    pub python_executable_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerActivationFixture {
+    pub name: String,
+    pub generator: String,
+    pub generator_parameters_sha256: String,
+    pub sample_rate_hz: u64,
+    pub channels: u64,
+    pub sample_count: u64,
+    pub valid_frames: u64,
+    pub physical_frames: u64,
+    pub pcm16_sha256: String,
+    pub decoded_f32_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerActivationOracleFloor {
+    pub schema_version: String,
+    pub baseline_threads: u64,
+    pub baseline_repetition: u64,
+    pub thread_counts: Vec<u64>,
+    pub repetitions_per_thread: u64,
+    pub all_byte_exact: bool,
+    pub mismatch_count: u64,
+    pub comparison_rule: String,
+    pub absolute_tolerance_f32_bits: String,
+    pub relative_tolerance_f32_bits: String,
+    pub margin_basis: String,
+    pub observations: Vec<SortformerActivationFloorObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerActivationFloorObservation {
+    pub fixture: String,
+    pub stage: String,
+    pub run_count: u64,
+    pub pair_count: u64,
+    pub compared_values: u64,
+    pub mismatch_count: u64,
+    pub byte_exact: bool,
+    pub max_abs_diff_f32_bits: String,
+    pub mean_abs_diff_f64_bits: String,
+    pub relative_l2_f64_bits: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerActivationPackageIdentity {
+    pub format: String,
+    pub dtype_set: Vec<SortformerTensorDtype>,
+    pub byte_order: String,
+    pub tensor_order: String,
+    pub logical_layout: String,
+    pub metadata_policy: String,
+    pub tensor_count: u64,
+    pub f32_elements: u64,
+    pub i64_elements: u64,
+    pub payload_bytes: u64,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerActivationTensorRecord {
+    pub name: String,
+    pub dtype: SortformerTensorDtype,
+    pub shape: Vec<u64>,
+    pub logical_layout: String,
+    pub elements: u64,
+    pub bytes: u64,
+    pub value_sha256: String,
+}
+
+/// Canonical receipt for the licensed-public L1-L8 source truth pack. Voice
+/// values remain operator-local; Git carries only this schema and independent
+/// top-level trust roots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicActivationReceipt {
+    pub schema_version: String,
+    pub canonical_json_version: String,
+    pub authority: String,
+    pub equivalence_level: String,
+    pub fixture_set: String,
+    pub model: SortformerActivationModelIdentity,
+    pub exporter: SortformerActivationExporterIdentity,
+    pub runtime: SortformerRuntimeIdentity,
+    pub source_files: Vec<SortformerSourceFileIdentity>,
+    pub execution: SortformerPublicActivationExecutionIdentity,
+    pub corpus: SortformerPublicActivationCorpus,
+    pub fixtures: Vec<SortformerPublicActivationFixture>,
+    pub streaming_transitions: BTreeMap<String, Vec<SortformerPublicStreamingTransition>>,
+    pub seam_contracts: Vec<SortformerPublicSeamContract>,
+    pub oracle_floor: SortformerPublicActivationOracleFloor,
+    pub package: SortformerActivationPackageIdentity,
+    pub records: Vec<SortformerActivationTensorRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicActivationExecutionIdentity {
+    pub operating_system: String,
+    pub machine_architecture: String,
+    pub device: String,
+    pub compute_dtype: String,
+    pub autocast: bool,
+    pub quantization: String,
+    pub deterministic_algorithms: bool,
+    pub torch_intraop_thread_counts: Vec<u64>,
+    pub torch_interop_threads: u64,
+    pub data_loader_workers: u64,
+    pub torch_blas_backend: String,
+    pub torch_configuration_sha256: String,
+    pub numpy_configuration_sha256: String,
+    pub python_executable_sha256: String,
+    pub effective_frontend_dither: f64,
+    pub effective_frontend_pad_to: u64,
+    pub inference_mode: String,
+    pub activity_threshold_f32_bits: String,
+    pub streaming_profile: SortformerPublicStreamingProfile,
+    pub postprocessing: SortformerPublicPostprocessing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicStreamingProfile {
+    pub spkcache_len: u64,
+    pub fifo_len: u64,
+    pub chunk_len: u64,
+    pub spkcache_update_period: u64,
+    pub chunk_left_context: u64,
+    pub chunk_right_context: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicPostprocessing {
+    pub onset: f64,
+    pub offset: f64,
+    pub pad_onset: f64,
+    pub pad_offset: f64,
+    pub min_duration_on: f64,
+    pub min_duration_off: f64,
+    pub filter_speech_first: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicActivationCorpus {
+    pub descriptor_schema: String,
+    pub descriptor_sha256: String,
+    pub corpus_key: String,
+    pub source_version: String,
+    pub authoritative_url: String,
+    pub license_id: String,
+    pub license_acknowledgement_id: String,
+    pub retrieval_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicActivationFixture {
+    pub name: String,
+    pub recording_id: String,
+    pub start_sample: u64,
+    pub sample_count: u64,
+    pub expected_speaker_count: u64,
+    pub contains_overlap: bool,
+    pub coverage: Vec<String>,
+    pub sample_rate_hz: u64,
+    pub channels: u64,
+    pub audio_sha256: String,
+    pub annotation_sha256: String,
+    pub full_recording_sample_count: u64,
+    pub clip_pcm16_sha256: String,
+    pub clip_decoded_f32_sha256: String,
+    pub valid_frames: u64,
+    pub physical_frames: u64,
+    pub diarization_chunks: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicStreamingTransition {
+    pub step: u64,
+    pub left_offset: u64,
+    pub right_offset: u64,
+    pub input_feature_frames: u64,
+    pub valid_feature_frames: u64,
+    pub output_frames: u64,
+    pub before_options: BTreeMap<String, bool>,
+    pub after_options: BTreeMap<String, bool>,
+    pub before_cache_frames: u64,
+    pub after_cache_frames: u64,
+    pub compression_transition: bool,
+    pub cache_compression: bool,
+    pub speaker_permutation_absent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicSeamContract {
+    pub stage: String,
+    pub dtype: SortformerTensorDtype,
+    pub full_shape: Vec<u64>,
+    pub full_elements: u64,
+    pub full_bytes: u64,
+    pub baseline_full_value_sha256: String,
+    pub probe_shape: Vec<u64>,
+    pub probe_elements: u64,
+    pub probe_selection: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicActivationOracleFloor {
+    pub schema_version: String,
+    pub baseline_threads: u64,
+    pub baseline_repetition: u64,
+    pub thread_counts: Vec<u64>,
+    pub repetitions_per_thread: u64,
+    pub comparison_rule: String,
+    pub margin_rule: String,
+    pub all_discrete_byte_exact: bool,
+    pub observations: Vec<SortformerPublicActivationFloorObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortformerPublicActivationFloorObservation {
+    pub stage: String,
+    pub dtype: SortformerTensorDtype,
+    pub run_count: u64,
+    pub comparison_count: u64,
+    pub compared_values: u64,
+    pub mismatch_count: u64,
+    pub byte_exact: bool,
+    pub full_value_byte_exact: bool,
+    pub max_abs_diff_f32_bits: String,
+    pub mean_abs_diff_f64_bits: String,
+    pub relative_l2_f64_bits: String,
+    pub accepted_abs_tolerance_f32_bits: String,
+    pub accepted_relative_l2_f64_bits: String,
+}
+
 /// Authenticated receipt and the exact owned package bytes it authorized.
 pub struct VerifiedSortformerPackage {
     receipt: SortformerConversionReceipt,
@@ -312,17 +670,237 @@ impl VerifiedSortformerPackage {
     }
 }
 
+/// Authenticated synthetic frontend truth pack. Debug output never exposes
+/// activation values, even though the frozen fixtures contain no human audio.
+pub struct VerifiedSortformerActivationPack {
+    receipt: SortformerActivationReceipt,
+    package: SafetensorsFile,
+}
+
+impl fmt::Debug for VerifiedSortformerActivationPack {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedSortformerActivationPack")
+            .field("receipt_schema", &self.receipt.schema_version)
+            .field("fixture_set", &self.receipt.fixture_set)
+            .field("package_sha256", &self.receipt.package.sha256)
+            .field("tensor_count", &self.receipt.package.tensor_count)
+            .field("package", &"<authenticated synthetic activations redacted>")
+            .finish()
+    }
+}
+
+impl VerifiedSortformerActivationPack {
+    /// Borrow the immutable authenticated diagnostic receipt.
+    pub const fn receipt(&self) -> &SortformerActivationReceipt {
+        &self.receipt
+    }
+
+    /// Borrow the exact authenticated tensors for an in-crate parity probe.
+    pub(crate) const fn safetensors(&self) -> &SafetensorsFile {
+        &self.package
+    }
+}
+
+/// Authenticated public-real-voice source truth pack. Debug output never
+/// exposes activation values or local corpus paths.
+pub struct VerifiedSortformerPublicActivationPack {
+    receipt: SortformerPublicActivationReceipt,
+    #[allow(dead_code)] // consumed by the Rust f32 seam comparator after this admission gate
+    package: SafetensorsFile,
+}
+
+impl fmt::Debug for VerifiedSortformerPublicActivationPack {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedSortformerPublicActivationPack")
+            .field("receipt_schema", &self.receipt.schema_version)
+            .field("fixture_set", &self.receipt.fixture_set)
+            .field("package_sha256", &self.receipt.package.sha256)
+            .field("tensor_count", &self.receipt.package.tensor_count)
+            .field("package", &"<authenticated public activations redacted>")
+            .finish()
+    }
+}
+
+impl VerifiedSortformerPublicActivationPack {
+    /// Borrow the immutable authenticated public-source receipt.
+    pub const fn receipt(&self) -> &SortformerPublicActivationReceipt {
+        &self.receipt
+    }
+
+    /// Borrow authenticated probes only for in-crate parity evaluation.
+    #[allow(dead_code)] // consumed by the Rust f32 seam comparator after this admission gate
+    pub(crate) const fn safetensors(&self) -> &SafetensorsFile {
+        &self.package
+    }
+}
+
+/// Authenticate the frozen licensed-public L1-L8 source truth pack.
+pub fn load_verified_sortformer_public_activation_pack(
+    receipt_path: &Path,
+    package_path: &Path,
+) -> FwResult<VerifiedSortformerPublicActivationPack> {
+    load_verified_sortformer_public_activation_pack_with_checkpoint(
+        receipt_path,
+        package_path,
+        &|| Ok(()),
+    )
+}
+
+/// Authenticate the public pack with cooperative cancellation between bounded
+/// reads and individual tensor checks.
+pub fn load_verified_sortformer_public_activation_pack_with_checkpoint(
+    receipt_path: &Path,
+    package_path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<VerifiedSortformerPublicActivationPack> {
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Activation)?;
+    let receipt_bytes = read_bounded_file(
+        receipt_path,
+        "public_activation_receipt",
+        MAX_PUBLIC_ACTIVATION_RECEIPT_BYTES,
+        None,
+        SortformerArtifactDomain::Activation,
+        checkpoint,
+    )?;
+    if sha256_bytes(&receipt_bytes) != SORTFORMER_PUBLIC_ACTIVATION_RECEIPT_SHA256 {
+        return Err(sortformer_activation_error(
+            "public_receipt_identity",
+            "public activation receipt checksum does not match the independent trust root",
+        ));
+    }
+    let receipt: SortformerPublicActivationReceipt = serde_json::from_slice(&receipt_bytes)
+        .map_err(|_| {
+            sortformer_activation_error(
+                "public_receipt_schema",
+                "public activation receipt is not valid strict receipt JSON",
+            )
+        })?;
+    let canonical = canonical_json_bytes(&receipt).map_err(|_| {
+        sortformer_activation_error(
+            "public_receipt_schema",
+            "public activation receipt could not be serialized canonically",
+        )
+    })?;
+    if canonical != receipt_bytes {
+        return Err(sortformer_activation_error(
+            "public_receipt_canonical",
+            "public activation receipt bytes are not canonical JSON",
+        ));
+    }
+    verify_public_activation_receipt(&receipt, checkpoint)?;
+    let package_bytes = read_bounded_file(
+        package_path,
+        "public_activation_package",
+        MAX_PUBLIC_ACTIVATION_PACKAGE_BYTES,
+        Some((receipt.package.bytes, receipt.package.sha256.as_str())),
+        SortformerArtifactDomain::Activation,
+        checkpoint,
+    )?;
+    verify_compact_safetensors_layout(
+        &package_bytes,
+        receipt.package.payload_bytes,
+        SortformerArtifactDomain::Activation,
+        checkpoint,
+    )?;
+    let package = SafetensorsFile::from_owned_bytes(package_bytes).map_err(|_| {
+        sortformer_activation_error(
+            "public_package_structure",
+            "public activation package is not structurally valid safetensors",
+        )
+    })?;
+    verify_public_activation_package(&package, &receipt, checkpoint)?;
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Activation)?;
+    Ok(VerifiedSortformerPublicActivationPack { receipt, package })
+}
+
+/// Authenticate the frozen, synthetic-only L1 frontend truth pack.
+///
+/// This does not promote the Sortformer route and does not accept a caller-
+/// selected checksum. Both files must match independently compiled trust roots.
+pub fn load_verified_sortformer_activation_pack(
+    receipt_path: &Path,
+    package_path: &Path,
+) -> FwResult<VerifiedSortformerActivationPack> {
+    load_verified_sortformer_activation_pack_with_checkpoint(receipt_path, package_path, &|| Ok(()))
+}
+
+/// Authenticate the frozen truth pack with cooperative cancellation between
+/// bounded reads and tensor validations.
+pub fn load_verified_sortformer_activation_pack_with_checkpoint(
+    receipt_path: &Path,
+    package_path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<VerifiedSortformerActivationPack> {
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Activation)?;
+    let receipt_bytes = read_bounded_file(
+        receipt_path,
+        "activation_receipt",
+        MAX_ACTIVATION_RECEIPT_BYTES,
+        None,
+        SortformerArtifactDomain::Activation,
+        checkpoint,
+    )?;
+    if sha256_bytes(&receipt_bytes) != SORTFORMER_ACTIVATION_RECEIPT_SHA256 {
+        return Err(sortformer_activation_error(
+            "receipt_identity",
+            "activation receipt checksum does not match the independent trust root",
+        ));
+    }
+    let receipt: SortformerActivationReceipt =
+        serde_json::from_slice(&receipt_bytes).map_err(|_| {
+            sortformer_activation_error(
+                "receipt_schema",
+                "activation receipt is not valid strict receipt JSON",
+            )
+        })?;
+    let canonical = canonical_json_bytes(&receipt).map_err(|_| {
+        sortformer_activation_error(
+            "receipt_schema",
+            "activation receipt could not be serialized canonically",
+        )
+    })?;
+    if canonical != receipt_bytes {
+        return Err(sortformer_activation_error(
+            "receipt_canonical",
+            "activation receipt bytes are not the canonical JSON encoding",
+        ));
+    }
+    verify_activation_receipt(&receipt, checkpoint)?;
+
+    let package_bytes = read_bounded_file(
+        package_path,
+        "activation_package",
+        MAX_ACTIVATION_PACKAGE_BYTES,
+        Some((receipt.package.bytes, receipt.package.sha256.as_str())),
+        SortformerArtifactDomain::Activation,
+        checkpoint,
+    )?;
+    verify_compact_safetensors_layout(
+        &package_bytes,
+        receipt.package.payload_bytes,
+        SortformerArtifactDomain::Activation,
+        checkpoint,
+    )?;
+    let package = SafetensorsFile::from_owned_bytes(package_bytes).map_err(|_| {
+        sortformer_activation_error(
+            "package_structure",
+            "activation package is not structurally valid safetensors",
+        )
+    })?;
+    verify_activation_package(&package, &receipt, checkpoint)?;
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Activation)?;
+    Ok(VerifiedSortformerActivationPack { receipt, package })
+}
+
 /// Authenticate the frozen pinned-model census using the compiled, independently
 /// reviewed canonical-receipt digest.
 pub fn load_verified_sortformer_package(
     receipt_path: &Path,
     package_path: &Path,
 ) -> FwResult<VerifiedSortformerPackage> {
-    load_verified_sortformer_package_with_checkpoint(
-        receipt_path,
-        package_path,
-        &|| Ok(()),
-    )
+    load_verified_sortformer_package_with_checkpoint(receipt_path, package_path, &|| Ok(()))
 }
 
 /// Authenticate the frozen pinned-model census with cooperative cancellation.
@@ -424,7 +1002,7 @@ fn frozen_model_identity() -> SortformerModelIdentity {
         nemo_source_revision: SORTFORMER_NEMO_SOURCE_REVISION.to_owned(),
         external_contract_sha256: SORTFORMER_EXTERNAL_CONTRACT_SHA256.to_owned(),
         runtime_fingerprint_sha256: SORTFORMER_RUNTIME_FINGERPRINT_SHA256.to_owned(),
-        oracle_adapter_sha256: SORTFORMER_ORACLE_ADAPTER_SHA256.to_owned(),
+        oracle_adapter_sha256: SORTFORMER_CONVERSION_ORACLE_ADAPTER_SHA256.to_owned(),
         trainable_parameters: SORTFORMER_TRAINABLE_PARAMETERS,
         parameter_tensors: SORTFORMER_PARAMETER_TENSORS,
         state_tensors: SORTFORMER_STATE_TENSORS,
@@ -463,7 +1041,7 @@ fn frozen_license_identity() -> SortformerLicenseIdentity {
         model_license_last_modified: "Mon, 03 Aug 2026 17:46:28 GMT".to_owned(),
         model_license_etag: "4b001-658281e31650b".to_owned(),
         model_license_payload_sha256: SORTFORMER_MODEL_LICENSE_SNAPSHOT_SHA256.to_owned(),
-        model_weight_distribution_policy: LICENSE_POLICY.to_owned(),
+        model_weight_distribution_policy: CONVERSION_RECEIPT_LICENSE_POLICY.to_owned(),
         nemo_source_license_spdx: "Apache-2.0".to_owned(),
         nemo_source_license_sha256: SORTFORMER_NEMO_LICENSE_SHA256.to_owned(),
         embedded_notice_source_path: "nemo/collections/asr/parts/preprocessing/features.py"
@@ -555,6 +1133,1500 @@ fn frozen_source_files() -> Vec<SortformerSourceFileIdentity> {
     .collect()
 }
 
+fn frozen_activation_model_identity() -> SortformerActivationModelIdentity {
+    SortformerActivationModelIdentity {
+        model_id: SORTFORMER_MODEL_ID.to_owned(),
+        model_revision: SORTFORMER_MODEL_REVISION.to_owned(),
+        nemo_sha256: SORTFORMER_NEMO_SHA256.to_owned(),
+        nemo_bytes: SORTFORMER_NEMO_BYTES,
+        config_sha256: SORTFORMER_CONFIG_SHA256.to_owned(),
+        checkpoint_sha256: SORTFORMER_CHECKPOINT_SHA256.to_owned(),
+        state_inventory_sha256: SORTFORMER_STATE_INVENTORY_SHA256.to_owned(),
+        nemo_source_revision: SORTFORMER_NEMO_SOURCE_REVISION.to_owned(),
+        external_contract_sha256: SORTFORMER_EXTERNAL_CONTRACT_SHA256.to_owned(),
+        conversion_receipt_sha256: SORTFORMER_CONVERSION_RECEIPT_SHA256.to_owned(),
+        converted_package_sha256: SORTFORMER_PACKAGE_SHA256.to_owned(),
+    }
+}
+
+fn frozen_activation_execution_identity() -> SortformerActivationExecutionIdentity {
+    SortformerActivationExecutionIdentity {
+        operating_system: "macOS-26.2-arm64-arm-64bit".to_owned(),
+        machine_architecture: "arm64".to_owned(),
+        device: "cpu".to_owned(),
+        compute_dtype: "float32".to_owned(),
+        autocast: false,
+        quantization: "none".to_owned(),
+        deterministic_algorithms: true,
+        torch_intraop_thread_counts: vec![1, 8],
+        torch_interop_threads: 1,
+        data_loader_workers: 0,
+        torch_blas_backend: "accelerate".to_owned(),
+        torch_configuration_sha256:
+            "ffc2f8b252a5c30391e838728b510b913f0063309951158cc33b7d363d345f2b".to_owned(),
+        numpy_configuration_sha256:
+            "b426b1270fa4f246379b5567f7c96ac171017279a8a3dfa8887b2eb51b455882".to_owned(),
+        python_executable_sha256:
+            "93c469a68969bd462e2ae6ebdcb595a1afe73aa7be31866de7a3e257948de9a0".to_owned(),
+    }
+}
+
+fn frozen_activation_fixtures() -> Vec<SortformerActivationFixture> {
+    [
+        (
+            "silence_320",
+            "all_zero_i16_v1",
+            "ebfc9c10ec42c1f6d524ebde6539160f344219286dee207f102e07fdd410ecac",
+            320,
+            2,
+            3,
+            "9e132485d5107211de325a45e7917cbe3e4b5b9cde3e4ee91d7d2102317759ee",
+            "bfe492baf731a0dbf6e1e050f5bc3fe8c1b049383194dcdf82f023bfa409f462",
+        ),
+        (
+            "impulse_480",
+            "three_exact_impulses_i16_v1",
+            "bfc0a95306d9e2bbf08d7c15838197bfa863b135d3001edb48d7ff2efe71fd2a",
+            480,
+            3,
+            4,
+            "b22c0f4537971eafdd326ea466245567f4506d051bcbae5fcfe710ad41a53212",
+            "b3d74f0a8436daa0671e91fc16173a39eee5291df2b68ef12a911c26de9d5144",
+        ),
+        (
+            "tone_640",
+            "exact_i16_cycle_v1",
+            "b4d07daaff3e5a9dff103fe461c0f15f4ffa50ea275eb97d18a63b33b52a68e2",
+            640,
+            4,
+            5,
+            "a7437b32c5d0d92d8f76be7848ad77379b505ce30490a5d035a92444a10f82b2",
+            "f9cc66972a50c4007baf5a18e6e3337371a3c1a3980bb0a9b27208514ea3cdd8",
+        ),
+        (
+            "partial_tail_321",
+            "exact_integer_lcg_i16_v1",
+            "8167c861a0da0339ec0762cc1e26452ed26060cc7a63079b1788b639a0406fdf",
+            321,
+            2,
+            3,
+            "3eb7dafa8d83ab68e1f82cb6fe9cdb8bf10547978828b93334a310649ed0a70e",
+            "593f11442a170edf264f0b8b7ad6ab2615007550fbe486fc2885cc7d3e2c0e32",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(
+            name,
+            generator,
+            generator_parameters_sha256,
+            sample_count,
+            valid_frames,
+            physical_frames,
+            pcm16_sha256,
+            decoded_f32_sha256,
+        )| SortformerActivationFixture {
+            name: name.to_owned(),
+            generator: generator.to_owned(),
+            generator_parameters_sha256: generator_parameters_sha256.to_owned(),
+            sample_rate_hz: 16_000,
+            channels: 1,
+            sample_count,
+            valid_frames,
+            physical_frames,
+            pcm16_sha256: pcm16_sha256.to_owned(),
+            decoded_f32_sha256: decoded_f32_sha256.to_owned(),
+        },
+    )
+    .collect()
+}
+
+#[derive(Debug, Clone)]
+struct ActivationTensorContract {
+    dtype: SortformerTensorDtype,
+    shape: Vec<u64>,
+    value_sha256: Option<String>,
+}
+
+fn expected_activation_tensor_contracts(
+    fixtures: &[SortformerActivationFixture],
+) -> BTreeMap<String, ActivationTensorContract> {
+    let mut expected = BTreeMap::new();
+    expected.insert(
+        "analysis_window_f32".to_owned(),
+        ActivationTensorContract {
+            dtype: SortformerTensorDtype::F32,
+            shape: vec![400],
+            value_sha256: Some(
+                "7d6b2ab4944b0b65650e1bba1132821fd1d2ed000df84dbd893316788d0ef062".to_owned(),
+            ),
+        },
+    );
+    expected.insert(
+        "mel_filterbank_f32".to_owned(),
+        ActivationTensorContract {
+            dtype: SortformerTensorDtype::F32,
+            shape: vec![1, 128, 257],
+            value_sha256: Some(
+                "82663f1145f6965d8b27a85f32a44fa4f3bffef9bd0d6c2d1902b334a012367b".to_owned(),
+            ),
+        },
+    );
+
+    for fixture in fixtures {
+        let prefix = format!("fixture.{}", fixture.name);
+        let definitions = [
+            (
+                "decoded_pcm_f32",
+                SortformerTensorDtype::F32,
+                vec![1, fixture.sample_count],
+                Some(fixture.decoded_f32_sha256.clone()),
+            ),
+            (
+                "frontend_padded_f32",
+                SortformerTensorDtype::F32,
+                vec![1, 128, 16],
+                None,
+            ),
+            (
+                "input_length_i64",
+                SortformerTensorDtype::I64,
+                vec![1],
+                None,
+            ),
+            (
+                "log_mel_f32",
+                SortformerTensorDtype::F32,
+                vec![1, 128, fixture.valid_frames],
+                None,
+            ),
+            (
+                "log_mel_physical_f32",
+                SortformerTensorDtype::F32,
+                vec![1, 128, fixture.physical_frames],
+                None,
+            ),
+            (
+                "mel_energy_f32",
+                SortformerTensorDtype::F32,
+                vec![1, 128, fixture.physical_frames],
+                None,
+            ),
+            (
+                "power_f32",
+                SortformerTensorDtype::F32,
+                vec![1, 257, fixture.physical_frames],
+                None,
+            ),
+            (
+                "preemphasis_f32",
+                SortformerTensorDtype::F32,
+                vec![1, fixture.sample_count],
+                None,
+            ),
+            (
+                "stft_complex_ri_f32",
+                SortformerTensorDtype::F32,
+                vec![1, 257, fixture.physical_frames, 2],
+                None,
+            ),
+            (
+                "valid_length_i64",
+                SortformerTensorDtype::I64,
+                vec![1],
+                None,
+            ),
+            (
+                "windowed_frames_f32",
+                SortformerTensorDtype::F32,
+                vec![1, fixture.physical_frames, 512],
+                None,
+            ),
+        ];
+        for (stage, dtype, shape, value_sha256) in definitions {
+            expected.insert(
+                format!("{prefix}.{stage}"),
+                ActivationTensorContract {
+                    dtype,
+                    shape,
+                    value_sha256,
+                },
+            );
+        }
+    }
+    expected
+}
+
+fn verify_activation_receipt(
+    receipt: &SortformerActivationReceipt,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<()> {
+    if receipt.schema_version != SORTFORMER_ACTIVATION_RECEIPT_SCHEMA
+        || receipt.canonical_json_version != "lexicographic-json-v1"
+    {
+        return Err(sortformer_activation_error(
+            "receipt_schema",
+            "activation receipt is not the frozen canonical v1 schema",
+        ));
+    }
+    if receipt.authority != "diagnostic_only"
+        || receipt.equivalence_level != "partial_l1_synthetic_frontend"
+        || receipt.fixture_set != "sortformer-synthetic-frontend-v1"
+    {
+        return Err(sortformer_activation_error(
+            "authority",
+            "activation receipt overstates or changes its diagnostic authority",
+        ));
+    }
+    if receipt.model != frozen_activation_model_identity() {
+        return Err(sortformer_activation_error(
+            "model_identity",
+            "activation receipt model identity does not match the converted-model trust chain",
+        ));
+    }
+    if receipt.exporter
+        != (SortformerActivationExporterIdentity {
+            exporter_id: "franken-whisper-sortformer-activation-exporter".to_owned(),
+            exporter_version: "2".to_owned(),
+            source_sha256: SORTFORMER_ACTIVATION_EXPORTER_SHA256.to_owned(),
+            conversion_helper_sha256: SORTFORMER_CONVERTER_SOURCE_SHA256.to_owned(),
+        })
+    {
+        return Err(sortformer_activation_error(
+            "exporter_identity",
+            "activation exporter identity does not match the frozen executable source",
+        ));
+    }
+    if receipt.runtime != frozen_runtime_identity()
+        || receipt.source_files != frozen_source_files()
+        || receipt.execution != frozen_activation_execution_identity()
+    {
+        return Err(sortformer_activation_error(
+            "runtime_identity",
+            "activation source or runtime identity does not match the frozen oracle",
+        ));
+    }
+    let fixtures = frozen_activation_fixtures();
+    if receipt.fixtures != fixtures {
+        return Err(sortformer_activation_error(
+            "fixture_identity",
+            "activation fixtures do not match the predeclared non-human corpus",
+        ));
+    }
+    verify_activation_package_identity(&receipt.package)?;
+    let contracts = expected_activation_tensor_contracts(&fixtures);
+    verify_activation_records(&receipt.records, &contracts, checkpoint)?;
+    verify_activation_floor(&receipt.oracle_floor, &receipt.records, &contracts)
+}
+
+fn verify_activation_package_identity(
+    package: &SortformerActivationPackageIdentity,
+) -> FwResult<()> {
+    require_sha256(
+        "activation_package_identity",
+        &package.sha256,
+        SortformerArtifactDomain::Activation,
+    )?;
+    if package.format != PACKAGE_FORMAT
+        || package.dtype_set != [SortformerTensorDtype::F32, SortformerTensorDtype::I64]
+        || package.byte_order != PACKAGE_BYTE_ORDER
+        || package.tensor_order != PACKAGE_TENSOR_ORDER
+        || package.logical_layout != SOURCE_LAYOUT
+        || package.metadata_policy != PACKAGE_METADATA_POLICY
+        || package.tensor_count != SORTFORMER_ACTIVATION_TENSORS
+        || package.f32_elements != SORTFORMER_ACTIVATION_F32_ELEMENTS
+        || package.i64_elements != SORTFORMER_ACTIVATION_I64_ELEMENTS
+        || package.payload_bytes != SORTFORMER_ACTIVATION_PAYLOAD_BYTES
+        || package.bytes != SORTFORMER_ACTIVATION_PACKAGE_BYTES
+        || package.sha256 != SORTFORMER_ACTIVATION_PACKAGE_SHA256
+    {
+        return Err(sortformer_activation_error(
+            "package_identity",
+            "activation package identity does not match the frozen synthetic truth pack",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_activation_records(
+    records: &[SortformerActivationTensorRecord],
+    contracts: &BTreeMap<String, ActivationTensorContract>,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<()> {
+    if records.len() != contracts.len()
+        || u64::try_from(records.len()).ok() != Some(SORTFORMER_ACTIVATION_TENSORS)
+    {
+        return Err(sortformer_activation_error(
+            "record_census",
+            "activation record count does not match the frozen stage census",
+        ));
+    }
+    let mut previous_name: Option<&str> = None;
+    let mut f32_elements = 0u64;
+    let mut i64_elements = 0u64;
+    let mut payload_bytes = 0u64;
+    for record in records {
+        sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Activation)?;
+        validate_tensor_name(&record.name, SortformerArtifactDomain::Activation)?;
+        if previous_name.is_some_and(|previous| previous >= record.name.as_str()) {
+            return Err(sortformer_activation_error(
+                "record_order",
+                "activation records are not strictly lexicographic and unique",
+            ));
+        }
+        previous_name = Some(&record.name);
+        let contract = contracts.get(&record.name).ok_or_else(|| {
+            sortformer_activation_error(
+                "record_census",
+                "activation record is outside the frozen stage census",
+            )
+        })?;
+        if record.dtype != contract.dtype
+            || record.shape != contract.shape
+            || record.logical_layout != SOURCE_LAYOUT
+        {
+            return Err(sortformer_activation_error(
+                "record_contract",
+                "activation record dtype, shape, or layout changed",
+            ));
+        }
+        require_sha256(
+            "activation_record_identity",
+            &record.value_sha256,
+            SortformerArtifactDomain::Activation,
+        )?;
+        if contract
+            .value_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &record.value_sha256)
+        {
+            return Err(sortformer_activation_error(
+                "record_identity",
+                "activation record checksum changed from its independent fixture root",
+            ));
+        }
+        let elements = checked_elements(&record.shape, SortformerArtifactDomain::Activation)?;
+        let width = match record.dtype {
+            SortformerTensorDtype::F32 => F32_BYTES,
+            SortformerTensorDtype::I64 => I64_BYTES,
+        };
+        let bytes = elements.checked_mul(width).ok_or_else(|| {
+            sortformer_activation_error("record_census", "activation record byte count overflows")
+        })?;
+        if record.elements != elements || record.bytes != bytes {
+            return Err(sortformer_activation_error(
+                "record_census",
+                "activation record shape does not account for its element and byte counts",
+            ));
+        }
+        match record.dtype {
+            SortformerTensorDtype::F32 => {
+                f32_elements = f32_elements.checked_add(elements).ok_or_else(|| {
+                    sortformer_activation_error(
+                        "record_census",
+                        "activation F32 element census overflows",
+                    )
+                })?;
+            }
+            SortformerTensorDtype::I64 => {
+                i64_elements = i64_elements.checked_add(elements).ok_or_else(|| {
+                    sortformer_activation_error(
+                        "record_census",
+                        "activation I64 element census overflows",
+                    )
+                })?;
+            }
+        }
+        payload_bytes = payload_bytes.checked_add(bytes).ok_or_else(|| {
+            sortformer_activation_error("record_census", "activation payload census overflows")
+        })?;
+    }
+    if f32_elements != SORTFORMER_ACTIVATION_F32_ELEMENTS
+        || i64_elements != SORTFORMER_ACTIVATION_I64_ELEMENTS
+        || payload_bytes != SORTFORMER_ACTIVATION_PAYLOAD_BYTES
+    {
+        return Err(sortformer_activation_error(
+            "record_census",
+            "activation record totals do not match the frozen package census",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_activation_floor(
+    floor: &SortformerActivationOracleFloor,
+    records: &[SortformerActivationTensorRecord],
+    contracts: &BTreeMap<String, ActivationTensorContract>,
+) -> FwResult<()> {
+    if floor.schema_version != SORTFORMER_ACTIVATION_FLOOR_SCHEMA
+        || floor.baseline_threads != 1
+        || floor.baseline_repetition != 0
+        || floor.thread_counts != [1, 8]
+        || floor.repetitions_per_thread != 5
+        || !floor.all_byte_exact
+        || floor.mismatch_count != 0
+        || floor.comparison_rule != "exact_ieee_bits"
+        || floor.absolute_tolerance_f32_bits != "0x00000000"
+        || floor.relative_tolerance_f32_bits != "0x00000000"
+        || floor.margin_basis != "deterministic_synthetic_preprocessing_zero_floor_no_margin"
+    {
+        return Err(sortformer_activation_error(
+            "oracle_floor",
+            "activation oracle floor is not the predeclared byte-exact thread-regime result",
+        ));
+    }
+
+    let record_by_name = records
+        .iter()
+        .map(|record| (record.name.as_str(), record))
+        .collect::<BTreeMap<_, _>>();
+    let expected_pairs = contracts
+        .keys()
+        .filter_map(|name| {
+            name.strip_prefix("fixture.")
+                .and_then(|suffix| suffix.split_once('.'))
+                .map(|(fixture, stage)| (fixture.to_owned(), stage.to_owned()))
+        })
+        .collect::<BTreeSet<_>>();
+    if floor.observations.len() != expected_pairs.len() || expected_pairs.len() != 44 {
+        return Err(sortformer_activation_error(
+            "oracle_floor_census",
+            "activation oracle floor does not cover every fixture stage exactly once",
+        ));
+    }
+
+    let mut observed_pairs = BTreeSet::new();
+    let mut previous_pair: Option<(&str, &str)> = None;
+    for observation in &floor.observations {
+        let pair = (observation.fixture.as_str(), observation.stage.as_str());
+        if previous_pair.is_some_and(|previous| previous >= pair) {
+            return Err(sortformer_activation_error(
+                "oracle_floor_order",
+                "activation floor observations are not strictly lexicographic and unique",
+            ));
+        }
+        previous_pair = Some(pair);
+        if !observed_pairs.insert((observation.fixture.clone(), observation.stage.clone())) {
+            return Err(sortformer_activation_error(
+                "oracle_floor_census",
+                "activation floor repeats a fixture stage",
+            ));
+        }
+        let record_name = format!("fixture.{}.{}", observation.fixture, observation.stage);
+        let record = record_by_name.get(record_name.as_str()).ok_or_else(|| {
+            sortformer_activation_error(
+                "oracle_floor_census",
+                "activation floor names a stage absent from the tensor records",
+            )
+        })?;
+        let compared_values = record.elements.checked_mul(45).ok_or_else(|| {
+            sortformer_activation_error(
+                "oracle_floor_census",
+                "activation floor comparison count overflows",
+            )
+        })?;
+        if observation.run_count != 10
+            || observation.pair_count != 45
+            || observation.compared_values != compared_values
+            || observation.mismatch_count != 0
+            || !observation.byte_exact
+            || observation.max_abs_diff_f32_bits != "0x00000000"
+            || observation.mean_abs_diff_f64_bits != "0x0000000000000000"
+            || observation.relative_l2_f64_bits != "0x0000000000000000"
+        {
+            return Err(sortformer_activation_error(
+                "oracle_floor_metric",
+                "activation floor observation is not the exact ten-run zero floor",
+            ));
+        }
+    }
+    if observed_pairs != expected_pairs {
+        return Err(sortformer_activation_error(
+            "oracle_floor_census",
+            "activation oracle floor fixture-stage coverage changed",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_activation_package(
+    package: &SafetensorsFile,
+    receipt: &SortformerActivationReceipt,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<()> {
+    if package.metadata().is_some() {
+        return Err(sortformer_activation_error(
+            "package_metadata",
+            "activation package must not carry unaudited safetensors metadata",
+        ));
+    }
+    if package.len() != receipt.records.len()
+        || u64::try_from(package.len()).ok() != Some(SORTFORMER_ACTIVATION_TENSORS)
+        || !package
+            .names()
+            .eq(receipt.records.iter().map(|record| record.name.as_str()))
+    {
+        return Err(sortformer_activation_error(
+            "package_census",
+            "activation package names do not exactly match the receipt records",
+        ));
+    }
+
+    let fixtures = receipt
+        .fixtures
+        .iter()
+        .map(|fixture| (fixture.name.as_str(), fixture))
+        .collect::<BTreeMap<_, _>>();
+    let mut f32_elements = 0u64;
+    let mut i64_elements = 0u64;
+    let mut payload_bytes = 0u64;
+    for record in &receipt.records {
+        sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Activation)?;
+        let expected_dtype = match record.dtype {
+            SortformerTensorDtype::F32 => "F32",
+            SortformerTensorDtype::I64 => "I64",
+        };
+        if package.dtype_name(&record.name).map_err(|_| {
+            sortformer_activation_error("package_census", "activation tensor dtype is unavailable")
+        })? != expected_dtype
+        {
+            return Err(sortformer_activation_error(
+                "package_dtype",
+                "activation tensor dtype does not match its receipt record",
+            ));
+        }
+        let shape = package.shape(&record.name).map_err(|_| {
+            sortformer_activation_error("package_census", "activation tensor shape is unavailable")
+        })?;
+        if shape.len() != record.shape.len()
+            || !shape
+                .iter()
+                .zip(&record.shape)
+                .all(|(left, right)| u64::try_from(*left).ok() == Some(*right))
+        {
+            return Err(sortformer_activation_error(
+                "package_shape",
+                "activation tensor shape does not match its receipt record",
+            ));
+        }
+        let raw = package.tensor_raw_bytes(&record.name).map_err(|_| {
+            sortformer_activation_error(
+                "package_payload",
+                "activation tensor payload could not be borrowed safely",
+            )
+        })?;
+        if u64::try_from(raw.len()).ok() != Some(record.bytes) {
+            return Err(sortformer_activation_error(
+                "package_payload",
+                "activation tensor byte length does not match its receipt record",
+            ));
+        }
+        let observed_sha256 = match record.dtype {
+            SortformerTensorDtype::F32 => {
+                f32_elements = f32_elements.checked_add(record.elements).ok_or_else(|| {
+                    sortformer_activation_error(
+                        "package_census",
+                        "activation F32 package census overflows",
+                    )
+                })?;
+                finite_f32_sha256(raw, SortformerArtifactDomain::Activation, checkpoint)?
+            }
+            SortformerTensorDtype::I64 => {
+                i64_elements = i64_elements.checked_add(record.elements).ok_or_else(|| {
+                    sortformer_activation_error(
+                        "package_census",
+                        "activation I64 package census overflows",
+                    )
+                })?;
+                verify_activation_i64_value(&record.name, raw, &fixtures)?;
+                sha256_bytes(raw)
+            }
+        };
+        if observed_sha256 != record.value_sha256 {
+            return Err(sortformer_activation_error(
+                "package_payload",
+                "activation tensor bytes do not match the authenticated receipt",
+            ));
+        }
+        payload_bytes = payload_bytes.checked_add(record.bytes).ok_or_else(|| {
+            sortformer_activation_error("package_census", "activation package bytes overflow")
+        })?;
+    }
+    if f32_elements != receipt.package.f32_elements
+        || i64_elements != receipt.package.i64_elements
+        || payload_bytes != receipt.package.payload_bytes
+    {
+        return Err(sortformer_activation_error(
+            "package_census",
+            "verified activation payload does not match the receipt totals",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_activation_i64_value(
+    name: &str,
+    raw: &[u8],
+    fixtures: &BTreeMap<&str, &SortformerActivationFixture>,
+) -> FwResult<()> {
+    let (fixture_name, stage) = name
+        .strip_prefix("fixture.")
+        .and_then(|suffix| suffix.split_once('.'))
+        .ok_or_else(|| {
+            sortformer_activation_error(
+                "package_i64",
+                "activation I64 tensor name is outside the fixture-stage grammar",
+            )
+        })?;
+    let fixture = fixtures.get(fixture_name).ok_or_else(|| {
+        sortformer_activation_error(
+            "package_i64",
+            "activation I64 tensor names an unknown fixture",
+        )
+    })?;
+    let expected = match stage {
+        "input_length_i64" => fixture.sample_count,
+        "valid_length_i64" => fixture.valid_frames,
+        _ => {
+            return Err(sortformer_activation_error(
+                "package_i64",
+                "activation package contains an unrecognized I64 stage",
+            ));
+        }
+    };
+    let bytes: [u8; 8] = raw.try_into().map_err(|_| {
+        sortformer_activation_error(
+            "package_i64",
+            "activation I64 length tensor must contain exactly one value",
+        )
+    })?;
+    let expected = i64::try_from(expected).map_err(|_| {
+        sortformer_activation_error(
+            "package_i64",
+            "activation I64 fixture length does not fit its storage type",
+        )
+    })?;
+    if i64::from_le_bytes(bytes) != expected {
+        return Err(sortformer_activation_error(
+            "package_i64",
+            "activation I64 length value does not match its fixture contract",
+        ));
+    }
+    Ok(())
+}
+
+fn frozen_public_activation_corpus() -> SortformerPublicActivationCorpus {
+    let source_version = concat!(
+        "voxconverse-v0.3-labels-24bf60be-dev-wav-md5-",
+        "2a6e07e7473d9841abb132554a698a36-balanced4"
+    );
+    SortformerPublicActivationCorpus {
+        descriptor_schema: "public-diarization-corpus-input-v2".to_owned(),
+        descriptor_sha256: "befd93742d6154175adceaf98c2e80db94ec9f144bc4a18669331f2a83a01ded"
+            .to_owned(),
+        corpus_key: "voxconverse-v1".to_owned(),
+        source_version: source_version.to_owned(),
+        authoritative_url: "https://mm.kaist.ac.kr/datasets/voxconverse/".to_owned(),
+        license_id: "CC-BY-4.0-ORIGINAL-COPYRIGHT".to_owned(),
+        license_acknowledgement_id: "accept-voxconverse-cc-by-4.0-and-original-copyright"
+            .to_owned(),
+        retrieval_identity: source_version.to_owned(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn frozen_public_activation_fixtures() -> Vec<SortformerPublicActivationFixture> {
+    vec![
+        SortformerPublicActivationFixture {
+            name: "hiyis_exact_two_chunks".to_owned(),
+            recording_id: "hiyis".to_owned(),
+            start_sample: 0,
+            sample_count: 481_280,
+            expected_speaker_count: 1,
+            contains_overlap: false,
+            coverage: vec![
+                "exact_two_chunks".to_owned(),
+                "cache_fill".to_owned(),
+                "cache_compression".to_owned(),
+            ],
+            sample_rate_hz: 16_000,
+            channels: 1,
+            audio_sha256: "6e920278aacfcf34074c56bc0106b9f7d79fa1b8877e593c8ad45ed3361d7b22"
+                .to_owned(),
+            annotation_sha256: "b8b621cc41a1f8ea6b7181554f014874f853bac64074834d0a6323ef24c76f00"
+                .to_owned(),
+            full_recording_sample_count: 1_391_232,
+            clip_pcm16_sha256: "a2bd64426398e6ab02de36f9196f0d589d34182b10c562fd03e06e8fb1eacd43"
+                .to_owned(),
+            clip_decoded_f32_sha256:
+                "ee495d86406703ce8bff366c76fb417049616262da21b75cef6cfd12d9d7d9b7".to_owned(),
+            valid_frames: 3_008,
+            physical_frames: 3_009,
+            diarization_chunks: 2,
+        },
+        SortformerPublicActivationFixture {
+            name: "mevkw_complete_three_speakers".to_owned(),
+            recording_id: "mevkw".to_owned(),
+            start_sample: 0,
+            sample_count: 1_632_000,
+            expected_speaker_count: 3,
+            contains_overlap: true,
+            coverage: vec![
+                "complete_recording".to_owned(),
+                "overlap".to_owned(),
+                "three_speakers".to_owned(),
+                "multiple_cache_compressions".to_owned(),
+            ],
+            sample_rate_hz: 16_000,
+            channels: 1,
+            audio_sha256: "6719b182cff63dc4b6f1abbc5df06ee07367da7046612419aadfabd29f1eecc0"
+                .to_owned(),
+            annotation_sha256: "d875474325126b6d573577c79a60a3f9f1019f16a04d46b0b85b34185f98fc91"
+                .to_owned(),
+            full_recording_sample_count: 1_632_000,
+            clip_pcm16_sha256: "5c091538e34a8cbf2b5e9b226cba6f3fcbdd87b9f3480c316e54d43ab1867f59"
+                .to_owned(),
+            clip_decoded_f32_sha256:
+                "742bb2084c28f526ab30874d6748a802c21e9a6865a3d8040376c164ee739a52".to_owned(),
+            valid_frames: 10_200,
+            physical_frames: 10_201,
+            diarization_chunks: 4,
+        },
+        SortformerPublicActivationFixture {
+            name: "syiwe_complete_three_speakers".to_owned(),
+            recording_id: "syiwe".to_owned(),
+            start_sample: 0,
+            sample_count: 1_106_338,
+            expected_speaker_count: 3,
+            contains_overlap: false,
+            coverage: vec![
+                "three_speakers".to_owned(),
+                "multiple_chunks".to_owned(),
+                "short_tail".to_owned(),
+            ],
+            sample_rate_hz: 16_000,
+            channels: 1,
+            audio_sha256: "32d3950fc245e8f3eb7d997349c9aca7d2ab9b6cfdcd0907e817f56194911c65"
+                .to_owned(),
+            annotation_sha256: "06aef7558c36a6e486c19d674da1edc0f19652ff85fab5f7de802574a18b7a5e"
+                .to_owned(),
+            full_recording_sample_count: 1_106_338,
+            clip_pcm16_sha256: "78bf5f55430b60adf0bc541a29d2c9fa392fc05419744641c9be086c0f03c9c2"
+                .to_owned(),
+            clip_decoded_f32_sha256:
+                "828c6fc75d173c20ce8bb357a225e471edfb71ed5814cd04237a7d56478fba22".to_owned(),
+            valid_frames: 6_914,
+            physical_frames: 6_915,
+            diarization_chunks: 3,
+        },
+        SortformerPublicActivationFixture {
+            name: "iqtde_complete_four_speakers".to_owned(),
+            recording_id: "iqtde".to_owned(),
+            start_sample: 0,
+            sample_count: 1_756_416,
+            expected_speaker_count: 4,
+            contains_overlap: false,
+            coverage: vec![
+                "four_speakers".to_owned(),
+                "multiple_cache_compressions".to_owned(),
+                "partial_tail".to_owned(),
+            ],
+            sample_rate_hz: 16_000,
+            channels: 1,
+            audio_sha256: "f3170c60f5d34ce939bce8313be34fb47f0f759f1f1ff4a2d25e8407dad844d1"
+                .to_owned(),
+            annotation_sha256: "0dd797580f5a41edec6919db1a37fb9691627f7a56d4559ec741028ed4beaa6b"
+                .to_owned(),
+            full_recording_sample_count: 1_756_416,
+            clip_pcm16_sha256: "12b5d6f6d8addd3fa82695772c95cefcac735ad739fcda8cb2078c5b29efa8f1"
+                .to_owned(),
+            clip_decoded_f32_sha256:
+                "04c6eed039c7774fe16ebd264e6961e683dc84b942577f56357efe10b5038851".to_owned(),
+            valid_frames: 10_977,
+            physical_frames: 10_978,
+            diarization_chunks: 5,
+        },
+    ]
+}
+
+fn frozen_public_activation_execution() -> SortformerPublicActivationExecutionIdentity {
+    let base = frozen_activation_execution_identity();
+    SortformerPublicActivationExecutionIdentity {
+        operating_system: base.operating_system,
+        machine_architecture: base.machine_architecture,
+        device: base.device,
+        compute_dtype: base.compute_dtype,
+        autocast: base.autocast,
+        quantization: base.quantization,
+        deterministic_algorithms: base.deterministic_algorithms,
+        torch_intraop_thread_counts: base.torch_intraop_thread_counts,
+        torch_interop_threads: base.torch_interop_threads,
+        data_loader_workers: base.data_loader_workers,
+        torch_blas_backend: base.torch_blas_backend,
+        torch_configuration_sha256: base.torch_configuration_sha256,
+        numpy_configuration_sha256: base.numpy_configuration_sha256,
+        python_executable_sha256: base.python_executable_sha256,
+        effective_frontend_dither: 0.0,
+        effective_frontend_pad_to: 0,
+        inference_mode: "eval_no_grad_synchronous_streaming".to_owned(),
+        activity_threshold_f32_bits: "0x3f000000".to_owned(),
+        streaming_profile: SortformerPublicStreamingProfile {
+            spkcache_len: 188,
+            fifo_len: 40,
+            chunk_len: 340,
+            spkcache_update_period: 300,
+            chunk_left_context: 1,
+            chunk_right_context: 40,
+        },
+        postprocessing: SortformerPublicPostprocessing {
+            onset: 0.5,
+            offset: 0.5,
+            pad_onset: 0.0,
+            pad_offset: 0.0,
+            min_duration_on: 0.0,
+            min_duration_off: 0.0,
+            filter_speech_first: true,
+        },
+    }
+}
+
+fn verify_public_activation_receipt(
+    receipt: &SortformerPublicActivationReceipt,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<()> {
+    if receipt.schema_version != SORTFORMER_PUBLIC_ACTIVATION_RECEIPT_SCHEMA
+        || receipt.canonical_json_version != "lexicographic-json-v1"
+    {
+        return Err(sortformer_activation_error(
+            "public_receipt_schema",
+            "public activation receipt is not the frozen canonical schema",
+        ));
+    }
+    if receipt.authority != "diagnostic_only"
+        || receipt.equivalence_level != "l1_through_l8_public_source_truth_pack"
+        || receipt.fixture_set != "sortformer-voxconverse-recommended-streaming-seams-v2"
+    {
+        return Err(sortformer_activation_error(
+            "public_authority",
+            "public activation receipt overstates or changes its diagnostic authority",
+        ));
+    }
+    if receipt.model != frozen_activation_model_identity()
+        || receipt.runtime != frozen_runtime_identity()
+        || receipt.source_files != frozen_source_files()
+        || receipt.execution != frozen_public_activation_execution()
+        || receipt.corpus != frozen_public_activation_corpus()
+        || receipt.fixtures != frozen_public_activation_fixtures()
+    {
+        return Err(sortformer_activation_error(
+            "public_identity",
+            "public model, runtime, corpus, or fixture identity changed",
+        ));
+    }
+    if receipt.exporter
+        != (SortformerActivationExporterIdentity {
+            exporter_id: "franken-whisper-sortformer-activation-exporter".to_owned(),
+            exporter_version: "3".to_owned(),
+            source_sha256: SORTFORMER_PUBLIC_ACTIVATION_EXPORTER_SHA256.to_owned(),
+            conversion_helper_sha256: SORTFORMER_CONVERTER_SOURCE_SHA256.to_owned(),
+        })
+    {
+        return Err(sortformer_activation_error(
+            "public_exporter_identity",
+            "public activation exporter identity changed",
+        ));
+    }
+    verify_public_activation_package_identity(&receipt.package)?;
+    verify_public_streaming_transitions(receipt)?;
+    verify_public_activation_records(receipt, checkpoint)?;
+    verify_public_activation_floor(receipt)
+}
+
+fn verify_public_activation_package_identity(
+    package: &SortformerActivationPackageIdentity,
+) -> FwResult<()> {
+    require_sha256(
+        "public_package_identity",
+        &package.sha256,
+        SortformerArtifactDomain::Activation,
+    )?;
+    if package.format != PACKAGE_FORMAT
+        || package.dtype_set != [SortformerTensorDtype::F32, SortformerTensorDtype::I64]
+        || package.byte_order != PACKAGE_BYTE_ORDER
+        || package.tensor_order != PACKAGE_TENSOR_ORDER
+        || package.logical_layout != SOURCE_LAYOUT
+        || package.metadata_policy != PACKAGE_METADATA_POLICY
+        || package.tensor_count != SORTFORMER_PUBLIC_ACTIVATION_TENSORS
+        || package.f32_elements != SORTFORMER_PUBLIC_ACTIVATION_F32_ELEMENTS
+        || package.i64_elements != SORTFORMER_PUBLIC_ACTIVATION_I64_ELEMENTS
+        || package.payload_bytes != SORTFORMER_PUBLIC_ACTIVATION_PAYLOAD_BYTES
+        || package.bytes != SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_BYTES
+        || package.sha256 != SORTFORMER_PUBLIC_ACTIVATION_PACKAGE_SHA256
+    {
+        return Err(sortformer_activation_error(
+            "public_package_identity",
+            "public activation package identity does not match the frozen truth pack",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_public_streaming_transitions(
+    receipt: &SortformerPublicActivationReceipt,
+) -> FwResult<()> {
+    let option_keys = [
+        "fifo",
+        "fifo_lengths",
+        "fifo_preds",
+        "mean_sil_emb",
+        "n_sil_frames",
+        "spk_perm",
+        "spkcache",
+        "spkcache_lengths",
+        "spkcache_preds",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    if receipt.streaming_transitions.len() != receipt.fixtures.len() {
+        return Err(sortformer_activation_error(
+            "public_streaming_census",
+            "public streaming transition fixture census changed",
+        ));
+    }
+    for fixture in &receipt.fixtures {
+        let transitions = receipt
+            .streaming_transitions
+            .get(&fixture.name)
+            .ok_or_else(|| {
+                sortformer_activation_error(
+                    "public_streaming_census",
+                    "public fixture lacks streaming transitions",
+                )
+            })?;
+        if u64::try_from(transitions.len()).ok() != Some(fixture.diarization_chunks) {
+            return Err(sortformer_activation_error(
+                "public_streaming_census",
+                "public streaming chunk census changed",
+            ));
+        }
+        for (index, transition) in transitions.iter().enumerate() {
+            let step = u64::try_from(index).map_err(|_| {
+                sortformer_activation_error(
+                    "public_streaming_census",
+                    "public streaming step index overflowed",
+                )
+            })?;
+            let before_keys = transition
+                .before_options
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let after_keys = transition
+                .after_options
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let expected_preds_before = step >= 1;
+            let expected_preds_after = true;
+            let before_option = |name| transition.before_options.get(name).copied();
+            let after_option = |name| transition.after_options.get(name).copied();
+            if transition.step != step
+                || before_keys != option_keys
+                || after_keys != option_keys
+                || transition.input_feature_frames == 0
+                || transition.valid_feature_frames > transition.input_feature_frames
+                || transition.output_frames == 0
+                || transition.before_cache_frames != if step == 0 { 0 } else { 188 }
+                || transition.after_cache_frames != 188
+                || transition.compression_transition != (step == 0)
+                || !transition.cache_compression
+                || !transition.speaker_permutation_absent
+                || before_option("spk_perm") != Some(false)
+                || after_option("spk_perm") != Some(false)
+                || before_option("spkcache_preds") != Some(expected_preds_before)
+                || after_option("spkcache_preds") != Some(expected_preds_after)
+                || before_option("spkcache") != Some(true)
+                || after_option("spkcache") != Some(true)
+                || before_option("fifo") != Some(true)
+                || after_option("fifo") != Some(true)
+                || before_option("mean_sil_emb") != Some(true)
+                || after_option("mean_sil_emb") != Some(true)
+                || before_option("n_sil_frames") != Some(true)
+                || after_option("n_sil_frames") != Some(true)
+                || before_option("spkcache_lengths") != Some(false)
+                || after_option("spkcache_lengths") != Some(false)
+                || before_option("fifo_lengths") != Some(false)
+                || after_option("fifo_lengths") != Some(false)
+            {
+                return Err(sortformer_activation_error(
+                    "public_streaming_contract",
+                    "public cache/FIFO Option or compression transition changed",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_public_activation_records(
+    receipt: &SortformerPublicActivationReceipt,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<()> {
+    if receipt.records.len() != receipt.seam_contracts.len()
+        || u64::try_from(receipt.records.len()).ok() != Some(SORTFORMER_PUBLIC_ACTIVATION_TENSORS)
+    {
+        return Err(sortformer_activation_error(
+            "public_record_census",
+            "public activation record and full-seam census changed",
+        ));
+    }
+    let fixture_names = receipt
+        .fixtures
+        .iter()
+        .map(|fixture| fixture.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut previous_name: Option<&str> = None;
+    let mut f32_elements = 0u64;
+    let mut i64_elements = 0u64;
+    let mut payload_bytes = 0u64;
+    for (record, seam) in receipt.records.iter().zip(&receipt.seam_contracts) {
+        sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Activation)?;
+        validate_tensor_name(&record.name, SortformerArtifactDomain::Activation)?;
+        if previous_name.is_some_and(|previous| previous >= record.name.as_str())
+            || seam.stage != record.name
+        {
+            return Err(sortformer_activation_error(
+                "public_record_order",
+                "public activation records and seam contracts are not aligned and ordered",
+            ));
+        }
+        previous_name = Some(&record.name);
+        let fixture_name = record
+            .name
+            .strip_prefix("fixture.")
+            .and_then(|suffix| suffix.split_once('.'))
+            .map(|(fixture, _)| fixture)
+            .ok_or_else(|| {
+                sortformer_activation_error(
+                    "public_record_name",
+                    "public activation record is outside the fixture-stage grammar",
+                )
+            })?;
+        if !fixture_names.contains(fixture_name) {
+            return Err(sortformer_activation_error(
+                "public_record_name",
+                "public activation record names an unknown fixture",
+            ));
+        }
+        require_sha256(
+            "public_record_identity",
+            &record.value_sha256,
+            SortformerArtifactDomain::Activation,
+        )?;
+        require_sha256(
+            "public_full_seam_identity",
+            &seam.baseline_full_value_sha256,
+            SortformerArtifactDomain::Activation,
+        )?;
+        let probe_elements = checked_elements(&record.shape, SortformerArtifactDomain::Activation)?;
+        let full_elements =
+            checked_elements(&seam.full_shape, SortformerArtifactDomain::Activation)?;
+        let width = match record.dtype {
+            SortformerTensorDtype::F32 => F32_BYTES,
+            SortformerTensorDtype::I64 => I64_BYTES,
+        };
+        let probe_bytes = probe_elements.checked_mul(width).ok_or_else(|| {
+            sortformer_activation_error(
+                "public_record_census",
+                "public probe byte count overflowed",
+            )
+        })?;
+        let full_bytes = full_elements.checked_mul(width).ok_or_else(|| {
+            sortformer_activation_error(
+                "public_record_census",
+                "public full-seam byte count overflowed",
+            )
+        })?;
+        let expected_selection = if full_elements <= 4_096 {
+            "complete_tensor"
+        } else {
+            "linear_index_endpoints_inclusive_v1"
+        };
+        if record.dtype != seam.dtype
+            || record.shape != seam.probe_shape
+            || record.logical_layout != SOURCE_LAYOUT
+            || record.elements != probe_elements
+            || record.bytes != probe_bytes
+            || seam.probe_elements != probe_elements
+            || seam.full_elements != full_elements
+            || seam.full_bytes != full_bytes
+            || seam.probe_selection != expected_selection
+            || (full_elements <= 4_096 && seam.full_shape != seam.probe_shape)
+            || (full_elements > 4_096 && seam.probe_shape != [4_096])
+        {
+            return Err(sortformer_activation_error(
+                "public_record_contract",
+                "public activation probe or full-seam contract changed",
+            ));
+        }
+        match record.dtype {
+            SortformerTensorDtype::F32 => {
+                f32_elements = f32_elements.checked_add(probe_elements).ok_or_else(|| {
+                    sortformer_activation_error(
+                        "public_record_census",
+                        "public F32 element census overflowed",
+                    )
+                })?;
+            }
+            SortformerTensorDtype::I64 => {
+                i64_elements = i64_elements.checked_add(probe_elements).ok_or_else(|| {
+                    sortformer_activation_error(
+                        "public_record_census",
+                        "public I64 element census overflowed",
+                    )
+                })?;
+            }
+        }
+        payload_bytes = payload_bytes.checked_add(probe_bytes).ok_or_else(|| {
+            sortformer_activation_error(
+                "public_record_census",
+                "public activation payload census overflowed",
+            )
+        })?;
+    }
+    if f32_elements != SORTFORMER_PUBLIC_ACTIVATION_F32_ELEMENTS
+        || i64_elements != SORTFORMER_PUBLIC_ACTIVATION_I64_ELEMENTS
+        || payload_bytes != SORTFORMER_PUBLIC_ACTIVATION_PAYLOAD_BYTES
+    {
+        return Err(sortformer_activation_error(
+            "public_record_census",
+            "public activation record totals changed",
+        ));
+    }
+    verify_public_stage_coverage(receipt)
+}
+
+fn verify_public_stage_coverage(receipt: &SortformerPublicActivationReceipt) -> FwResult<()> {
+    let names = receipt
+        .records
+        .iter()
+        .map(|record| record.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for fixture in &receipt.fixtures {
+        let prefix = format!("fixture.{}.", fixture.name);
+        for required in [
+            "decoded_pcm_f32",
+            "log_mel_f32",
+            "l5.final_probabilities_f32",
+            "l7.activity_i64",
+            "l7.speech_i64",
+            "l7.overlap_i64",
+            "l7.change_indices_i64",
+            "l8.turns_f32",
+        ] {
+            if !names.contains(format!("{prefix}{required}").as_str()) {
+                return Err(sortformer_activation_error(
+                    "public_stage_coverage",
+                    "public L1, L5, L7, or L8 seam is absent",
+                ));
+            }
+        }
+        for block in 0..17 {
+            let needle = format!(".l3.fastconformer.block.{block:02}.output");
+            if !names
+                .iter()
+                .any(|name| name.starts_with(&prefix) && name.ends_with(&needle))
+            {
+                return Err(sortformer_activation_error(
+                    "public_stage_coverage",
+                    "public FastConformer block coverage is incomplete",
+                ));
+            }
+        }
+        for block in 0..18 {
+            let needle = format!(".l4.transformer.block.{block:02}.output");
+            if !names
+                .iter()
+                .any(|name| name.starts_with(&prefix) && name.ends_with(&needle))
+            {
+                return Err(sortformer_activation_error(
+                    "public_stage_coverage",
+                    "public transformer block coverage is incomplete",
+                ));
+            }
+        }
+        for step in 0..fixture.diarization_chunks {
+            for boundary in ["before", "after"] {
+                let state_prefix = format!("{prefix}step.{step:03}.l6.{boundary}.");
+                if !names.iter().any(|name| name.starts_with(&state_prefix)) {
+                    return Err(sortformer_activation_error(
+                        "public_stage_coverage",
+                        "public streaming-state boundary coverage is incomplete",
+                    ));
+                }
+            }
+        }
+    }
+    for subsampling in ["0", "2", "3", "5", "6", "projection"] {
+        let needle = format!(".l2.subsampling.{subsampling}");
+        if !names.iter().any(|name| name.ends_with(&needle)) {
+            return Err(sortformer_activation_error(
+                "public_stage_coverage",
+                "public depthwise-subsampling coverage is incomplete",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_f32_bits(bits: &str) -> FwResult<f32> {
+    let raw = bits.strip_prefix("0x").ok_or_else(|| {
+        sortformer_activation_error("public_floor_bits", "F32 floor value lacks 0x prefix")
+    })?;
+    if raw.len() != 8 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(sortformer_activation_error(
+            "public_floor_bits",
+            "F32 floor value is not eight hexadecimal digits",
+        ));
+    }
+    let value = u32::from_str_radix(raw, 16)
+        .map(f32::from_bits)
+        .map_err(|_| {
+            sortformer_activation_error("public_floor_bits", "F32 floor bits are invalid")
+        })?;
+    if !value.is_finite() || value.is_sign_negative() {
+        return Err(sortformer_activation_error(
+            "public_floor_bits",
+            "F32 floor value must be finite and nonnegative",
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_f64_bits(bits: &str) -> FwResult<f64> {
+    let raw = bits.strip_prefix("0x").ok_or_else(|| {
+        sortformer_activation_error("public_floor_bits", "F64 floor value lacks 0x prefix")
+    })?;
+    if raw.len() != 16 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(sortformer_activation_error(
+            "public_floor_bits",
+            "F64 floor value is not sixteen hexadecimal digits",
+        ));
+    }
+    let value = u64::from_str_radix(raw, 16)
+        .map(f64::from_bits)
+        .map_err(|_| {
+            sortformer_activation_error("public_floor_bits", "F64 floor bits are invalid")
+        })?;
+    if !value.is_finite() || value.is_sign_negative() {
+        return Err(sortformer_activation_error(
+            "public_floor_bits",
+            "F64 floor value must be finite and nonnegative",
+        ));
+    }
+    Ok(value)
+}
+
+fn valid_margin_f32(floor: f32, accepted: f32) -> bool {
+    if floor == 0.0 {
+        accepted == 0.0
+    } else {
+        accepted.is_normal()
+            && accepted.to_bits() & 0x007f_ffff == 0
+            && accepted >= floor * 2.0
+            && accepted / 2.0 < floor * 2.0
+    }
+}
+
+fn valid_margin_f64(floor: f64, accepted: f64) -> bool {
+    if floor == 0.0 {
+        accepted == 0.0
+    } else {
+        accepted.is_normal()
+            && accepted.to_bits() & 0x000f_ffff_ffff_ffff == 0
+            && accepted >= floor * 2.0
+            && accepted / 2.0 < floor * 2.0
+    }
+}
+
+fn verify_public_activation_floor(receipt: &SortformerPublicActivationReceipt) -> FwResult<()> {
+    let floor = &receipt.oracle_floor;
+    if floor.schema_version != SORTFORMER_PUBLIC_ACTIVATION_FLOOR_SCHEMA
+        || floor.baseline_threads != 1
+        || floor.baseline_repetition != 0
+        || floor.thread_counts != [1, 8]
+        || floor.repetitions_per_thread != 5
+        || floor.comparison_rule != "fixed_baseline_against_each_replay"
+        || floor.margin_rule
+            != "zero_if_exact_otherwise_smallest_power_of_two_at_least_twice_source_floor"
+        || !floor.all_discrete_byte_exact
+        || floor.observations.len() != receipt.records.len()
+    {
+        return Err(sortformer_activation_error(
+            "public_oracle_floor",
+            "public oracle replay or margin contract changed",
+        ));
+    }
+    for (record, observation) in receipt.records.iter().zip(&floor.observations) {
+        let expected_compared_values = record.elements.checked_mul(9).ok_or_else(|| {
+            sortformer_activation_error(
+                "public_oracle_floor_census",
+                "public oracle compared-value census overflowed",
+            )
+        })?;
+        if observation.stage != record.name
+            || observation.dtype != record.dtype
+            || observation.run_count != 10
+            || observation.comparison_count != 9
+            || observation.compared_values != expected_compared_values
+            || observation.byte_exact != (observation.mismatch_count == 0)
+        {
+            return Err(sortformer_activation_error(
+                "public_oracle_floor_census",
+                "public oracle observation does not match its probe record",
+            ));
+        }
+        let max_abs = parse_f32_bits(&observation.max_abs_diff_f32_bits)?;
+        let mean_abs = parse_f64_bits(&observation.mean_abs_diff_f64_bits)?;
+        let relative_l2 = parse_f64_bits(&observation.relative_l2_f64_bits)?;
+        let accepted_abs = parse_f32_bits(&observation.accepted_abs_tolerance_f32_bits)?;
+        let accepted_relative = parse_f64_bits(&observation.accepted_relative_l2_f64_bits)?;
+        if !valid_margin_f32(max_abs, accepted_abs)
+            || !valid_margin_f64(relative_l2, accepted_relative)
+            || (observation.byte_exact && (max_abs != 0.0 || mean_abs != 0.0 || relative_l2 != 0.0))
+            || (record.dtype == SortformerTensorDtype::I64
+                && (!observation.byte_exact
+                    || !observation.full_value_byte_exact
+                    || accepted_abs != 0.0
+                    || accepted_relative != 0.0))
+        {
+            return Err(sortformer_activation_error(
+                "public_oracle_floor_metric",
+                "public source floor or predeclared tolerance margin changed",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_public_activation_package(
+    package: &SafetensorsFile,
+    receipt: &SortformerPublicActivationReceipt,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<()> {
+    if package.metadata().is_some() {
+        return Err(sortformer_activation_error(
+            "public_package_metadata",
+            "public activation package must not carry safetensors metadata",
+        ));
+    }
+    if package.len() != receipt.records.len()
+        || u64::try_from(package.len()).ok() != Some(SORTFORMER_PUBLIC_ACTIVATION_TENSORS)
+        || !package
+            .names()
+            .eq(receipt.records.iter().map(|record| record.name.as_str()))
+    {
+        return Err(sortformer_activation_error(
+            "public_package_census",
+            "public activation package names do not match the receipt",
+        ));
+    }
+    let mut f32_elements = 0u64;
+    let mut i64_elements = 0u64;
+    let mut payload_bytes = 0u64;
+    for record in &receipt.records {
+        sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Activation)?;
+        let expected_dtype = match record.dtype {
+            SortformerTensorDtype::F32 => "F32",
+            SortformerTensorDtype::I64 => "I64",
+        };
+        if package.dtype_name(&record.name).map_err(|_| {
+            sortformer_activation_error(
+                "public_package_census",
+                "public activation tensor dtype is unavailable",
+            )
+        })? != expected_dtype
+        {
+            return Err(sortformer_activation_error(
+                "public_package_dtype",
+                "public activation tensor dtype changed",
+            ));
+        }
+        let shape = package.shape(&record.name).map_err(|_| {
+            sortformer_activation_error(
+                "public_package_census",
+                "public activation tensor shape is unavailable",
+            )
+        })?;
+        if shape.len() != record.shape.len()
+            || !shape
+                .iter()
+                .zip(&record.shape)
+                .all(|(left, right)| u64::try_from(*left).ok() == Some(*right))
+        {
+            return Err(sortformer_activation_error(
+                "public_package_shape",
+                "public activation tensor shape changed",
+            ));
+        }
+        let raw = package.tensor_raw_bytes(&record.name).map_err(|_| {
+            sortformer_activation_error(
+                "public_package_payload",
+                "public activation payload is unavailable",
+            )
+        })?;
+        if u64::try_from(raw.len()).ok() != Some(record.bytes) {
+            return Err(sortformer_activation_error(
+                "public_package_payload",
+                "public activation tensor byte count changed",
+            ));
+        }
+        let observed_sha256 = match record.dtype {
+            SortformerTensorDtype::F32 => {
+                f32_elements = f32_elements.checked_add(record.elements).ok_or_else(|| {
+                    sortformer_activation_error(
+                        "public_package_census",
+                        "public package F32 element census overflowed",
+                    )
+                })?;
+                finite_f32_sha256(raw, SortformerArtifactDomain::Activation, checkpoint)?
+            }
+            SortformerTensorDtype::I64 => {
+                i64_elements = i64_elements.checked_add(record.elements).ok_or_else(|| {
+                    sortformer_activation_error(
+                        "public_package_census",
+                        "public package I64 element census overflowed",
+                    )
+                })?;
+                sha256_bytes(raw)
+            }
+        };
+        if observed_sha256 != record.value_sha256 {
+            return Err(sortformer_activation_error(
+                "public_package_payload",
+                "public activation bytes do not match the authenticated receipt",
+            ));
+        }
+        payload_bytes = payload_bytes.checked_add(record.bytes).ok_or_else(|| {
+            sortformer_activation_error(
+                "public_package_census",
+                "public activation package byte census overflowed",
+            )
+        })?;
+    }
+    if f32_elements != receipt.package.f32_elements
+        || i64_elements != receipt.package.i64_elements
+        || payload_bytes != receipt.package.payload_bytes
+    {
+        return Err(sortformer_activation_error(
+            "public_package_census",
+            "verified public activation payload totals changed",
+        ));
+    }
+    Ok(())
+}
+
 fn load_verified_sortformer_package_against(
     receipt_path: &Path,
     package_path: &Path,
@@ -562,17 +2634,27 @@ fn load_verified_sortformer_package_against(
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
     expected: &ReceiptExpectations,
 ) -> FwResult<VerifiedSortformerPackage> {
-    require_sha256("receipt_trust_root", expected_receipt_sha256)?;
-    sortformer_checkpoint(checkpoint)?;
-    let receipt_bytes =
-        read_bounded_file(receipt_path, "receipt", MAX_RECEIPT_BYTES, None, checkpoint)?;
+    require_sha256(
+        "receipt_trust_root",
+        expected_receipt_sha256,
+        SortformerArtifactDomain::Conversion,
+    )?;
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
+    let receipt_bytes = read_bounded_file(
+        receipt_path,
+        "receipt",
+        MAX_RECEIPT_BYTES,
+        None,
+        SortformerArtifactDomain::Conversion,
+        checkpoint,
+    )?;
     if sha256_bytes(&receipt_bytes) != expected_receipt_sha256 {
         return Err(sortformer_error(
             "receipt_identity",
             "conversion receipt checksum does not match the independent trust root",
         ));
     }
-    sortformer_checkpoint(checkpoint)?;
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
     let receipt: SortformerConversionReceipt =
         serde_json::from_slice(&receipt_bytes).map_err(|_| {
             sortformer_error(
@@ -599,10 +2681,16 @@ fn load_verified_sortformer_package_against(
         "package",
         MAX_PACKAGE_BYTES,
         Some((receipt.package.bytes, receipt.package.sha256.as_str())),
+        SortformerArtifactDomain::Conversion,
         checkpoint,
     )?;
-    verify_compact_safetensors_layout(&package_bytes, receipt.package.payload_bytes, checkpoint)?;
-    sortformer_checkpoint(checkpoint)?;
+    verify_compact_safetensors_layout(
+        &package_bytes,
+        receipt.package.payload_bytes,
+        SortformerArtifactDomain::Conversion,
+        checkpoint,
+    )?;
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
     let package = SafetensorsFile::from_owned_bytes(package_bytes).map_err(|_| {
         sortformer_error(
             "package_structure",
@@ -610,69 +2698,68 @@ fn load_verified_sortformer_package_against(
         )
     })?;
     verify_package(&package, &receipt, expected, checkpoint)?;
-    sortformer_checkpoint(checkpoint)?;
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
     Ok(VerifiedSortformerPackage { receipt, package })
 }
 
 fn verify_compact_safetensors_layout(
     bytes: &[u8],
     expected_payload_bytes: u64,
+    domain: SortformerArtifactDomain,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<()> {
-    sortformer_checkpoint(checkpoint)?;
+    sortformer_checkpoint(checkpoint, domain)?;
     let length_prefix: [u8; 8] = bytes
         .get(..8)
         .and_then(|prefix| prefix.try_into().ok())
         .ok_or_else(|| {
-            sortformer_error(
+            domain.error(
                 "package_structure",
                 "safetensors package lacks a complete header-length prefix",
             )
         })?;
     let header_bytes_u64 = u64::from_le_bytes(length_prefix);
     if header_bytes_u64 == 0 || header_bytes_u64 > MAX_PACKAGE_HEADER_BYTES {
-        return Err(sortformer_error(
+        return Err(domain.error(
             "package_structure",
             "safetensors header size is outside the Sortformer envelope",
         ));
     }
     let header_bytes = usize::try_from(header_bytes_u64).map_err(|_| {
-        sortformer_error(
+        domain.error(
             "package_structure",
             "safetensors header size does not fit this platform",
         )
     })?;
     let data_start = 8usize.checked_add(header_bytes).ok_or_else(|| {
-        sortformer_error(
+        domain.error(
             "package_structure",
             "safetensors header offset overflows this platform",
         )
     })?;
     let data_len = bytes.len().checked_sub(data_start).ok_or_else(|| {
-        sortformer_error(
+        domain.error(
             "package_structure",
             "safetensors header extends past the package bytes",
         )
     })?;
     if u64::try_from(data_len).ok() != Some(expected_payload_bytes) {
-        return Err(sortformer_error(
+        return Err(domain.error(
             "package_layout",
             "safetensors data section is not exactly the frozen payload size",
         ));
     }
     let header: serde_json::Value =
         serde_json::from_slice(bytes.get(8..data_start).ok_or_else(|| {
-            sortformer_error(
+            domain.error(
                 "package_structure",
                 "safetensors header span is unavailable",
             )
         })?)
-        .map_err(|_| {
-            sortformer_error("package_structure", "safetensors header is not valid JSON")
-        })?;
-    sortformer_checkpoint(checkpoint)?;
+        .map_err(|_| domain.error("package_structure", "safetensors header is not valid JSON"))?;
+    sortformer_checkpoint(checkpoint, domain)?;
     let entries = header.as_object().ok_or_else(|| {
-        sortformer_error(
+        domain.error(
             "package_structure",
             "safetensors header is not a JSON object",
         )
@@ -687,7 +2774,7 @@ fn verify_compact_safetensors_layout(
             .and_then(serde_json::Value::as_array)
             .filter(|offsets| offsets.len() == 2)
             .ok_or_else(|| {
-                sortformer_error(
+                domain.error(
                     "package_structure",
                     "safetensors tensor has invalid data offsets",
                 )
@@ -696,7 +2783,7 @@ fn verify_compact_safetensors_layout(
             .first()
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| {
-                sortformer_error(
+                domain.error(
                     "package_structure",
                     "safetensors tensor begin offset is invalid",
                 )
@@ -705,7 +2792,7 @@ fn verify_compact_safetensors_layout(
             .get(1)
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| {
-                sortformer_error(
+                domain.error(
                     "package_structure",
                     "safetensors tensor end offset is invalid",
                 )
@@ -715,9 +2802,9 @@ fn verify_compact_safetensors_layout(
     spans.sort_unstable_by_key(|(name, _, _)| *name);
     let mut cursor = 0u64;
     for (_, begin, end) in spans {
-        sortformer_checkpoint(checkpoint)?;
+        sortformer_checkpoint(checkpoint, domain)?;
         if begin != cursor || end < begin || end > expected_payload_bytes {
-            return Err(sortformer_error(
+            return Err(domain.error(
                 "package_layout",
                 "safetensors tensor spans are not a compact non-overlapping payload",
             ));
@@ -725,7 +2812,7 @@ fn verify_compact_safetensors_layout(
         cursor = end;
     }
     if cursor != expected_payload_bytes {
-        return Err(sortformer_error(
+        return Err(domain.error(
             "package_layout",
             "safetensors tensor spans do not cover the complete payload",
         ));
@@ -770,7 +2857,11 @@ fn verify_receipt(
             "conversion receipt converter identity is not the frozen v1 converter",
         ));
     }
-    require_sha256("converter_identity", &receipt.converter.source_sha256)?;
+    require_sha256(
+        "converter_identity",
+        &receipt.converter.source_sha256,
+        SortformerArtifactDomain::Conversion,
+    )?;
     if receipt.converter.source_sha256 != expected.converter_source_sha256 {
         return Err(sortformer_error(
             "converter_identity",
@@ -797,7 +2888,11 @@ fn verify_package_identity(
     package: &SortformerPackageIdentity,
     expected: &ReceiptExpectations,
 ) -> FwResult<()> {
-    require_sha256("package_identity", &package.sha256)?;
+    require_sha256(
+        "package_identity",
+        &package.sha256,
+        SortformerArtifactDomain::Conversion,
+    )?;
     if package.sha256 != expected.package_sha256
         || package.bytes != expected.package_bytes
         || package.format != PACKAGE_FORMAT
@@ -869,8 +2964,8 @@ fn verify_records(
     let mut census = ObservedCensus::default();
 
     for record in records {
-        sortformer_checkpoint(checkpoint)?;
-        validate_tensor_name(&record.source_name)?;
+        sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
+        validate_tensor_name(&record.source_name, SortformerArtifactDomain::Conversion)?;
         if let Some(previous) = previous_name
             && previous >= record.source_name.as_str()
         {
@@ -885,14 +2980,19 @@ fn verify_records(
             ));
         }
         previous_name = Some(&record.source_name);
-        require_sha256("record_hash", &record.source_value_sha256)?;
+        require_sha256(
+            "record_hash",
+            &record.source_value_sha256,
+            SortformerArtifactDomain::Conversion,
+        )?;
         if record.source_logical_layout != SOURCE_LAYOUT {
             return Err(sortformer_error(
                 "record_layout",
                 "source tensor layout is not the frozen contiguous row-major layout",
             ));
         }
-        let source_elements = checked_elements(&record.source_shape)?;
+        let source_elements =
+            checked_elements(&record.source_shape, SortformerArtifactDomain::Conversion)?;
         let element_bytes = match record.source_dtype {
             SortformerTensorDtype::F32 => F32_BYTES,
             SortformerTensorDtype::I64 => I64_BYTES,
@@ -1112,7 +3212,11 @@ fn verify_exported_record(
             "v1 permits only byte-preserving identity-contiguous F32 exports",
         ));
     }
-    require_sha256("record_hash", &destination.value_sha256)?;
+    require_sha256(
+        "record_hash",
+        &destination.value_sha256,
+        SortformerArtifactDomain::Conversion,
+    )?;
     if !destination_names.insert(destination.name.clone()) {
         return Err(sortformer_error(
             "destination_duplicate",
@@ -1175,7 +3279,7 @@ fn verify_package(
     let mut observed_elements = 0u64;
     let mut observed_bytes = 0u64;
     for (name, destination) in exported {
-        sortformer_checkpoint(checkpoint)?;
+        sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
         if package.dtype_name(name).map_err(|_| {
             sortformer_error(
                 "package_census",
@@ -1217,7 +3321,8 @@ fn verify_package(
                 "safetensors tensor byte length does not match the authenticated receipt",
             ));
         }
-        let observed_sha256 = finite_f32_sha256(raw, checkpoint)?;
+        let observed_sha256 =
+            finite_f32_sha256(raw, SortformerArtifactDomain::Conversion, checkpoint)?;
         if observed_sha256 != destination.value_sha256 {
             return Err(sortformer_error(
                 "package_payload",
@@ -1240,30 +3345,28 @@ fn verify_package(
 
 fn finite_f32_sha256(
     raw: &[u8],
+    domain: SortformerArtifactDomain,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<String> {
     if !raw.len().is_multiple_of(4) {
-        return Err(sortformer_error(
+        return Err(domain.error(
             "package_payload",
             "F32 tensor payload is not four-byte aligned",
         ));
     }
     let mut hasher = Sha256::new();
     for block in raw.chunks(READ_CHUNK_BYTES) {
-        sortformer_checkpoint(checkpoint)?;
+        sortformer_checkpoint(checkpoint, domain)?;
         hasher.update(block);
         let (chunks, remainder) = block.as_chunks::<4>();
         if !remainder.is_empty() {
-            return Err(sortformer_error(
-                "package_payload",
-                "F32 tensor chunk has invalid width",
-            ));
+            return Err(domain.error("package_payload", "F32 tensor chunk has invalid width"));
         }
         for &bytes in chunks {
             if !f32::from_le_bytes(bytes).is_finite() {
-                return Err(sortformer_error(
+                return Err(domain.error(
                     "package_nonfinite",
-                    "converted package contains a non-finite F32 value",
+                    "authenticated package contains a non-finite F32 value",
                 ));
             }
         }
@@ -1271,58 +3374,160 @@ fn finite_f32_sha256(
     Ok(hex_digest(hasher.finalize()))
 }
 
+fn open_regular_artifact(
+    path: &Path,
+    kind: &str,
+    domain: SortformerArtifactDomain,
+) -> FwResult<(File, u64)> {
+    let before = std::fs::symlink_metadata(path).map_err(|_| {
+        domain.error(
+            &format!("{kind}_open"),
+            &format!("{kind} artifact could not be opened"),
+        )
+    })?;
+    if metadata_is_indirection(&before) || !before.file_type().is_file() {
+        return Err(domain.error(
+            &format!("{kind}_type"),
+            &format!("{kind} artifact must be a regular file"),
+        ));
+    }
+    open_prechecked_regular_artifact(path, kind, &before, domain)
+}
+
+fn open_prechecked_regular_artifact(
+    path: &Path,
+    kind: &str,
+    before: &std::fs::Metadata,
+    domain: SortformerArtifactDomain,
+) -> FwResult<(File, u64)> {
+    #[cfg(not(target_family = "unix"))]
+    let _ = before;
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+
+        let descriptor = open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| {
+            domain.error(
+                &format!("{kind}_open"),
+                &format!("{kind} artifact could not be opened"),
+            )
+        })?;
+        File::from(descriptor)
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| {
+                domain.error(
+                    &format!("{kind}_open"),
+                    &format!("{kind} artifact could not be opened"),
+                )
+            })?
+    };
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )))]
+    let file = File::open(path).map_err(|_| {
+        domain.error(
+            &format!("{kind}_open"),
+            &format!("{kind} artifact could not be opened"),
+        )
+    })?;
+
+    let after = file.metadata().map_err(|_| {
+        domain.error(
+            &format!("{kind}_metadata"),
+            &format!("{kind} artifact metadata is unavailable"),
+        )
+    })?;
+    if !after.file_type().is_file() || metadata_is_indirection(&after) {
+        return Err(domain.error(
+            &format!("{kind}_type"),
+            &format!("{kind} artifact must be a regular file"),
+        ));
+    }
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(domain.error(
+                &format!("{kind}_identity"),
+                &format!("{kind} artifact identity changed while it was opened"),
+            ));
+        }
+    }
+    Ok((file, after.len()))
+}
+
+fn metadata_is_indirection(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 fn read_bounded_file(
     path: &Path,
     kind: &str,
     maximum_bytes: u64,
     expected: Option<(u64, &str)>,
+    domain: SortformerArtifactDomain,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<Vec<u8>> {
-    sortformer_checkpoint(checkpoint)?;
-    let file = File::open(path).map_err(|_| {
-        sortformer_error(
-            &format!("{kind}_open"),
-            &format!("{kind} artifact could not be opened"),
-        )
-    })?;
-    let metadata_bytes = file
-        .metadata()
-        .map_err(|_| {
-            sortformer_error(
-                &format!("{kind}_metadata"),
-                &format!("{kind} artifact metadata is unavailable"),
-            )
-        })?
-        .len();
+    sortformer_checkpoint(checkpoint, domain)?;
+    let (file, metadata_bytes) = open_regular_artifact(path, kind, domain)?;
     if metadata_bytes == 0 || metadata_bytes > maximum_bytes {
-        return Err(sortformer_error(
+        return Err(domain.error(
             &format!("{kind}_size"),
             &format!("{kind} artifact size is outside its bounded envelope"),
         ));
     }
     if let Some((expected_bytes, expected_sha256)) = expected {
-        require_sha256(&format!("{kind}_identity"), expected_sha256)?;
+        require_sha256(&format!("{kind}_identity"), expected_sha256, domain)?;
         if metadata_bytes != expected_bytes {
-            return Err(sortformer_error(
+            return Err(domain.error(
                 &format!("{kind}_identity"),
                 &format!("{kind} artifact length does not match the authenticated receipt"),
             ));
         }
     }
     let capacity = usize::try_from(metadata_bytes).map_err(|_| {
-        sortformer_error(
+        domain.error(
             &format!("{kind}_size"),
             &format!("{kind} artifact size does not fit this platform"),
         )
     })?;
-    let mut bytes = reserved_byte_buffer(capacity, kind, checkpoint)?;
+    let mut bytes = reserved_byte_buffer(capacity, kind, domain, checkpoint)?;
     let mut hasher = Sha256::new();
     let mut reader = file;
     let mut buffer = [0u8; READ_CHUNK_BYTES];
     loop {
-        sortformer_checkpoint(checkpoint)?;
+        sortformer_checkpoint(checkpoint, domain)?;
         let read = reader.read(&mut buffer).map_err(|_| {
-            sortformer_error(
+            domain.error(
                 &format!("{kind}_read"),
                 &format!("{kind} artifact could not be read"),
             )
@@ -1331,13 +3536,13 @@ fn read_bounded_file(
             break;
         }
         if read > capacity.saturating_sub(bytes.len()) {
-            return Err(sortformer_error(
+            return Err(domain.error(
                 &format!("{kind}_identity"),
                 &format!("{kind} artifact length changed while it was read"),
             ));
         }
         let chunk = buffer.get(..read).ok_or_else(|| {
-            sortformer_error(
+            domain.error(
                 &format!("{kind}_read"),
                 &format!("{kind} artifact read returned an invalid span"),
             )
@@ -1346,7 +3551,7 @@ fn read_bounded_file(
         bytes.extend_from_slice(chunk);
     }
     if bytes.len() != capacity {
-        return Err(sortformer_error(
+        return Err(domain.error(
             &format!("{kind}_identity"),
             &format!("{kind} artifact length changed while it was read"),
         ));
@@ -1355,35 +3560,36 @@ fn read_bounded_file(
     if let Some((_, expected_sha256)) = expected
         && observed_sha256 != expected_sha256
     {
-        return Err(sortformer_error(
+        return Err(domain.error(
             &format!("{kind}_identity"),
             &format!("{kind} artifact checksum does not match the authenticated receipt"),
         ));
     }
-    sortformer_checkpoint(checkpoint)?;
+    sortformer_checkpoint(checkpoint, domain)?;
     Ok(bytes)
 }
 
 fn reserved_byte_buffer(
     capacity: usize,
     kind: &str,
+    domain: SortformerArtifactDomain,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<Vec<u8>> {
-    sortformer_checkpoint(checkpoint)?;
+    sortformer_checkpoint(checkpoint, domain)?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(capacity).map_err(|_| {
-        sortformer_error(
+        domain.error(
             &format!("{kind}_allocation"),
             &format!("{kind} artifact buffer could not be allocated within its bounded envelope"),
         )
     })?;
-    sortformer_checkpoint(checkpoint)?;
+    sortformer_checkpoint(checkpoint, domain)?;
     Ok(bytes)
 }
 
-fn checked_elements(shape: &[u64]) -> FwResult<u64> {
+fn checked_elements(shape: &[u64], domain: SortformerArtifactDomain) -> FwResult<u64> {
     if shape.len() > 8 {
-        return Err(sortformer_error(
+        return Err(domain.error(
             "record_shape",
             "tensor rank exceeds the bounded receipt schema",
         ));
@@ -1391,7 +3597,7 @@ fn checked_elements(shape: &[u64]) -> FwResult<u64> {
     shape.iter().try_fold(1u64, |product, dimension| {
         product
             .checked_mul(*dimension)
-            .ok_or_else(|| sortformer_error("record_shape", "tensor element count overflows"))
+            .ok_or_else(|| domain.error("record_shape", "tensor element count overflows"))
     })
 }
 
@@ -1400,16 +3606,100 @@ fn checked_add(left: u64, right: u64, code: &str) -> FwResult<u64> {
         .ok_or_else(|| sortformer_error(code, "tensor census sum overflows"))
 }
 
-fn validate_tensor_name(name: &str) -> FwResult<()> {
+fn tensor_manifest_sha256(
+    model: &SortformerModelIdentity,
+    records: &[SortformerTensorRecord],
+) -> FwResult<String> {
+    let projected_records = records
+        .iter()
+        .map(tensor_manifest_record)
+        .collect::<Vec<_>>();
+    let manifest = serde_json::json!({
+        "schema_version": SORTFORMER_TENSOR_MANIFEST_SCHEMA,
+        "model_id": model.model_id.as_str(),
+        "model_revision": model.model_revision.as_str(),
+        "nemo_sha256": model.nemo_sha256.as_str(),
+        "config_sha256": model.config_sha256.as_str(),
+        "checkpoint_sha256": model.checkpoint_sha256.as_str(),
+        "records": projected_records,
+    });
+    canonical_json_bytes(&manifest)
+        .map(|bytes| sha256_bytes(&bytes))
+        .map_err(|_| {
+            sortformer_error(
+                "tensor_manifest",
+                "tensor topology could not be encoded canonically",
+            )
+        })
+}
+
+fn tensor_manifest_record(record: &SortformerTensorRecord) -> serde_json::Value {
+    let disposition = match &record.disposition {
+        SortformerTensorDisposition::Exported {
+            transform,
+            destination,
+        } => serde_json::json!({
+            "kind": "exported",
+            "transform": tensor_transform_name(*transform),
+            "destination": {
+                "name": destination.name.as_str(),
+                "dtype": tensor_dtype_name(destination.dtype),
+                "shape": &destination.shape,
+                "logical_layout": destination.logical_layout.as_str(),
+                "elements": destination.elements,
+                "bytes": destination.bytes,
+            },
+        }),
+        SortformerTensorDisposition::DroppedTrainOnly => {
+            serde_json::json!({"kind": "dropped_train_only"})
+        }
+        SortformerTensorDisposition::DroppedRuntimeSentinel => {
+            serde_json::json!({"kind": "dropped_runtime_sentinel"})
+        }
+    };
+    serde_json::json!({
+        "source_name": record.source_name.as_str(),
+        "source_origin": tensor_origin_name(record.source_origin),
+        "source_dtype": tensor_dtype_name(record.source_dtype),
+        "source_shape": &record.source_shape,
+        "source_logical_layout": record.source_logical_layout.as_str(),
+        "source_elements": record.source_elements,
+        "source_bytes": record.source_bytes,
+        "disposition": disposition,
+    })
+}
+
+const fn tensor_origin_name(origin: SortformerTensorOrigin) -> &'static str {
+    match origin {
+        SortformerTensorOrigin::StateDict => "state_dict",
+        SortformerTensorOrigin::NonpersistentBuffer => "nonpersistent_buffer",
+    }
+}
+
+const fn tensor_dtype_name(dtype: SortformerTensorDtype) -> &'static str {
+    match dtype {
+        SortformerTensorDtype::F32 => "f32",
+        SortformerTensorDtype::I64 => "i64",
+    }
+}
+
+const fn tensor_transform_name(transform: SortformerTensorTransform) -> &'static str {
+    match transform {
+        SortformerTensorTransform::IdentityContiguousF32 => "identity_contiguous_f32",
+    }
+}
+
+fn validate_tensor_name(name: &str, domain: SortformerArtifactDomain) -> FwResult<()> {
     if name.is_empty()
         || name.len() > 512
         || name.starts_with('.')
         || name.ends_with('.')
+        || name.contains("..")
         || name
             .bytes()
             .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_')))
     {
-        return Err(sortformer_error(
+        return Err(domain.error(
             "record_name",
             "tensor name is outside the bounded dotted-identifier grammar",
         ));
@@ -1417,13 +3707,13 @@ fn validate_tensor_name(name: &str) -> FwResult<()> {
     Ok(())
 }
 
-fn require_sha256(code: &str, value: &str) -> FwResult<()> {
+fn require_sha256(code: &str, value: &str, domain: SortformerArtifactDomain) -> FwResult<()> {
     if value.len() != HASH_HEX_LEN
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(sortformer_error(
+        return Err(domain.error(
             code,
             "SHA-256 identity must be exactly 64 lowercase hexadecimal characters",
         ));
@@ -1431,14 +3721,39 @@ fn require_sha256(code: &str, value: &str) -> FwResult<()> {
     Ok(())
 }
 
-fn sortformer_checkpoint(checkpoint: &(dyn Fn() -> FwResult<()> + Sync)) -> FwResult<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortformerArtifactDomain {
+    Conversion,
+    Activation,
+}
+
+impl SortformerArtifactDomain {
+    fn error(self, code: &str, message: &str) -> FwError {
+        match self {
+            Self::Conversion => sortformer_error(code, message),
+            Self::Activation => sortformer_activation_error(code, message),
+        }
+    }
+
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Conversion => "sortformer_conversion",
+            Self::Activation => "sortformer_activation",
+        }
+    }
+}
+
+fn sortformer_checkpoint(
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    domain: SortformerArtifactDomain,
+) -> FwResult<()> {
     match checkpoint() {
         Ok(()) => Ok(()),
-        Err(FwError::Cancelled(_)) => Err(FwError::Cancelled(
-            "sortformer_conversion.load_cancelled: cooperative checkpoint requested cancellation"
-                .to_owned(),
-        )),
-        Err(_) => Err(sortformer_error(
+        Err(FwError::Cancelled(_)) => Err(FwError::Cancelled(format!(
+            "{}.load_cancelled: cooperative checkpoint requested cancellation",
+            domain.prefix()
+        ))),
+        Err(_) => Err(domain.error(
             "checkpoint_failure",
             "caller checkpoint returned a non-cancellation failure",
         )),
@@ -1447,6 +3762,10 @@ fn sortformer_checkpoint(checkpoint: &(dyn Fn() -> FwResult<()> + Sync)) -> FwRe
 
 fn sortformer_error(code: &str, message: &str) -> FwError {
     FwError::InvalidRequest(format!("sortformer_conversion.{code}: {message}"))
+}
+
+fn sortformer_activation_error(code: &str, message: &str) -> FwError {
+    FwError::InvalidRequest(format!("sortformer_activation.{code}: {message}"))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -1515,33 +3834,190 @@ mod tests {
 
     use super::*;
 
+    const TINY_TENSOR_MANIFEST_SHA256: &str =
+        "f408e382179658671178ba767d2c27737f551c426543fea14e2cbddac53abfc8";
+
     struct TinyBundle {
         receipt: SortformerConversionReceipt,
         package_bytes: Vec<u8>,
         expected: ReceiptExpectations,
     }
 
+    type CheckpointLoader =
+        fn(&Path, &Path, &(dyn Fn() -> FwResult<()> + Sync)) -> FwResult<VerifiedSortformerPackage>;
+    type ActivationCheckpointLoader = fn(
+        &Path,
+        &Path,
+        &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<VerifiedSortformerActivationPack>;
+    type PublicActivationCheckpointLoader = fn(
+        &Path,
+        &Path,
+        &(dyn Fn() -> FwResult<()> + Sync),
+    )
+        -> FwResult<VerifiedSortformerPublicActivationPack>;
+
     #[test]
     fn bounded_file_buffer_allocation_fails_closed() {
-        let error = reserved_byte_buffer(usize::MAX, "package", &|| Ok(()))
-            .expect_err("an impossible package capacity must not abort");
+        let error = reserved_byte_buffer(
+            usize::MAX,
+            "package",
+            SortformerArtifactDomain::Conversion,
+            &|| Ok(()),
+        )
+        .expect_err("an impossible package capacity must not abort");
         assert_error(&error, "package_allocation");
     }
 
     #[test]
     fn bounded_file_buffer_checks_cancellation_after_reservation() {
         let checkpoints = AtomicUsize::new(0);
-        let error = reserved_byte_buffer(16, "package", &|| {
-            if checkpoints.fetch_add(1, Ordering::SeqCst) == 0 {
-                Ok(())
-            } else {
-                Err(FwError::Cancelled("sensitive test reason".to_owned()))
-            }
-        })
-        .expect_err("post-reservation cancellation must be observed");
+        let error =
+            reserved_byte_buffer(16, "package", SortformerArtifactDomain::Conversion, &|| {
+                if checkpoints.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(FwError::Cancelled("sensitive test reason".to_owned()))
+                }
+            })
+            .expect_err("post-reservation cancellation must be observed");
         assert_eq!(checkpoints.load(Ordering::SeqCst), 2);
         assert!(matches!(error, FwError::Cancelled(_)));
         assert!(!error.to_string().contains("sensitive test reason"));
+    }
+
+    #[test]
+    fn bounded_file_rejects_directory_artifact() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let error = read_bounded_file(
+            directory.path(),
+            "receipt",
+            MAX_RECEIPT_BYTES,
+            None,
+            SortformerArtifactDomain::Conversion,
+            &|| Ok(()),
+        )
+        .expect_err("a directory must not be admitted as an artifact");
+        assert_error(&error, "sortformer_conversion.receipt_type");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn bounded_file_rejects_symlink_artifact() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("receipt.json");
+        let link = directory.path().join("receipt-link.json");
+        std::fs::write(&target, b"{}").expect("write symlink target");
+        symlink(&target, &link).expect("create artifact symlink");
+
+        let error = read_bounded_file(
+            &link,
+            "receipt",
+            MAX_RECEIPT_BYTES,
+            None,
+            SortformerArtifactDomain::Conversion,
+            &|| Ok(()),
+        )
+        .expect_err("a symlink must not be admitted as an artifact");
+        assert_error(&error, "sortformer_conversion.receipt_type");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn prechecked_open_rejects_fifo_swap_without_blocking() -> Result<(), String> {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let sentinel = directory.path().join("receipt-before.json");
+        let fifo = directory.path().join("receipt.fifo");
+        std::fs::write(&sentinel, b"{}").expect("write regular sentinel");
+        let before = std::fs::symlink_metadata(&sentinel).expect("sentinel metadata");
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use rustix::fs::{Mode, mkfifoat};
+
+            let directory_handle = File::open(directory.path()).expect("directory handle");
+            mkfifoat(&directory_handle, "receipt.fifo", Mode::RUSR | Mode::WUSR)
+                .expect("create FIFO fixture");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let status = std::process::Command::new("/usr/bin/mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .expect("run system mkfifo for fixture");
+            assert!(status.success(), "system mkfifo failed: {status}");
+        }
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let fifo_for_reader = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            let outcome = open_prechecked_regular_artifact(
+                &fifo_for_reader,
+                "receipt",
+                &before,
+                SortformerArtifactDomain::Conversion,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+            let _ = sender.send(outcome);
+        });
+        let outcome = match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                use rustix::fs::{Mode, OFlags, open};
+
+                let rescue = open(
+                    &fifo,
+                    OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .expect("rescue a reader blocked by a regressed open flag");
+                let _ = receiver.recv_timeout(std::time::Duration::from_secs(1));
+                reader.join().expect("join rescued FIFO reader");
+                drop(rescue);
+                return Err(
+                    "prechecked FIFO open blocked instead of failing immediately".to_owned(),
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                reader.join().expect("join failed FIFO reader");
+                return Err("prechecked FIFO reader exited without reporting an outcome".to_owned());
+            }
+        };
+        reader.join().expect("join FIFO reader");
+        let error = outcome
+            .err()
+            .ok_or_else(|| "a FIFO path swap was accepted".to_owned())?;
+        assert!(
+            error.contains("sortformer_conversion.receipt_type"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn prechecked_open_rejects_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let original = directory.path().join("receipt.json");
+        let held = directory.path().join("receipt-held.json");
+        std::fs::write(&original, b"{}").expect("write regular artifact");
+        let before = std::fs::symlink_metadata(&original).expect("artifact metadata");
+        std::fs::rename(&original, &held).expect("hold original artifact inode");
+        symlink(&held, &original).expect("replace artifact path with symlink");
+
+        let error = open_prechecked_regular_artifact(
+            &original,
+            "receipt",
+            &before,
+            SortformerArtifactDomain::Conversion,
+        )
+        .expect_err("a symlink path swap must not follow the held original inode");
+        assert_error(&error, "sortformer_conversion.receipt_open");
     }
 
     #[test]
@@ -1566,6 +4042,64 @@ mod tests {
         assert!(rendered.contains("<authenticated model bytes redacted>"));
         assert!(!rendered.contains("SafetensorsFile"));
         assert!(!rendered.contains("package_bytes"));
+    }
+
+    #[test]
+    fn missing_package_tensor_is_rejected() {
+        let mut bundle = tiny_bundle();
+        let merged_values = [0.25f32, 0.5, 0.75, 1.0, 1.5, -2.0];
+        bundle.package_bytes = make_safetensors(&[(
+            SORTFORMER_POSITION_TENSOR,
+            vec![1, 3, 2],
+            merged_values.as_slice(),
+        )]);
+        bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("a package missing one receipt tensor must fail");
+        assert_error(&error, "sortformer_conversion.package_census");
+    }
+
+    #[test]
+    fn extra_package_tensor_is_rejected() {
+        let mut bundle = tiny_bundle();
+        let position_values = [0.25f32, 0.5, 0.75, 1.0];
+        let weight_values = [1.5f32];
+        let extra_values = [-2.0f32];
+        bundle.package_bytes = make_safetensors(&[
+            (
+                SORTFORMER_POSITION_TENSOR,
+                vec![1, 2, 2],
+                position_values.as_slice(),
+            ),
+            ("encoder.weight", vec![1], weight_values.as_slice()),
+            ("encoder.zzz", vec![1], extra_values.as_slice()),
+        ]);
+        bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("a package with an extra tensor must fail");
+        assert_error(&error, "sortformer_conversion.package_census");
     }
 
     #[test]
@@ -1725,6 +4259,261 @@ mod tests {
     }
 
     #[test]
+    fn renamed_f32_tensor_cannot_hide_behind_aggregate_census() -> Result<(), String> {
+        let mut bundle = tiny_bundle();
+        let record = bundle
+            .receipt
+            .records
+            .iter_mut()
+            .find(|record| record.source_name == "encoder.weight")
+            .expect("tiny weight record");
+        record.source_name = "encoder.xeight".to_owned();
+        let destination = match &mut record.disposition {
+            SortformerTensorDisposition::Exported { destination, .. } => destination,
+            _ => return Err("tiny weight must be exported".to_owned()),
+        };
+        destination.name = "encoder.xeight".to_owned();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("renamed tensor must not inherit the topology trust root");
+        assert_error(&error, "sortformer_conversion.tensor_manifest");
+        Ok(())
+    }
+
+    #[test]
+    fn reshaped_f32_tensor_cannot_hide_behind_aggregate_census() -> Result<(), String> {
+        let mut bundle = tiny_bundle();
+        let record = bundle
+            .receipt
+            .records
+            .iter_mut()
+            .find(|record| record.source_name == "encoder.weight")
+            .expect("tiny weight record");
+        record.source_shape = vec![1, 2];
+        let destination = match &mut record.disposition {
+            SortformerTensorDisposition::Exported { destination, .. } => destination,
+            _ => return Err("tiny weight must be exported".to_owned()),
+        };
+        destination.shape = vec![1, 2];
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("reshaped tensor must not inherit the topology trust root");
+        assert_error(&error, "sortformer_conversion.tensor_manifest");
+        Ok(())
+    }
+
+    #[test]
+    fn consecutive_dot_tensor_name_is_rejected() {
+        let mut bundle = tiny_bundle();
+        let record = bundle
+            .receipt
+            .records
+            .iter_mut()
+            .find(|record| record.source_name == "encoder.weight")
+            .expect("tiny weight record");
+        record.source_name = "encoder..weight".to_owned();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("empty tensor-name component must fail");
+        assert_error(&error, "sortformer_conversion.record_name");
+    }
+
+    #[test]
+    fn reviewed_converter_source_digest_is_mandatory() {
+        let mut bundle = tiny_bundle();
+        bundle.receipt.converter.source_sha256 = sha256_bytes(b"unreviewed converter source");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (receipt_path, package_path, receipt_sha256) =
+            write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
+
+        let error = load_verified_sortformer_package_against(
+            &receipt_path,
+            &package_path,
+            &receipt_sha256,
+            &|| Ok(()),
+            &bundle.expected,
+        )
+        .expect_err("unreviewed converter source must fail");
+        assert_error(&error, "sortformer_conversion.converter_identity");
+    }
+
+    #[test]
+    fn production_loader_exposes_no_caller_supplied_trust_root() {
+        let _: fn(&Path, &Path) -> FwResult<VerifiedSortformerPackage> =
+            load_verified_sortformer_package;
+        let _: CheckpointLoader = load_verified_sortformer_package_with_checkpoint;
+        let _: fn(&Path, &Path) -> FwResult<VerifiedSortformerActivationPack> =
+            load_verified_sortformer_activation_pack;
+        let _: ActivationCheckpointLoader =
+            load_verified_sortformer_activation_pack_with_checkpoint;
+        let _: fn(&Path, &Path) -> FwResult<VerifiedSortformerPublicActivationPack> =
+            load_verified_sortformer_public_activation_pack;
+        let _: PublicActivationCheckpointLoader =
+            load_verified_sortformer_public_activation_pack_with_checkpoint;
+    }
+
+    #[test]
+    fn conversion_receipt_keeps_historical_adapter_provenance() {
+        assert_ne!(
+            SORTFORMER_CONVERSION_ORACLE_ADAPTER_SHA256,
+            crate::differential_oracle::SORTFORMER_ORACLE_ADAPTER_SHA256,
+            "a runtime adapter revision must not rewrite immutable conversion provenance"
+        );
+        assert_eq!(
+            frozen_model_identity().oracle_adapter_sha256,
+            SORTFORMER_CONVERSION_ORACLE_ADAPTER_SHA256
+        );
+    }
+
+    #[test]
+    #[ignore = "requires operator-local licensed Sortformer package and receipt"]
+    fn operator_local_real_sortformer_package_is_admitted() {
+        let receipt = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_RECEIPT")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_RECEIPT");
+        let package = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PACKAGE")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_PACKAGE");
+        let verified = load_verified_sortformer_package(Path::new(&receipt), Path::new(&package))
+            .expect("operator-local frozen package must pass exact admission");
+        assert_eq!(verified.receipt().records.len(), 992);
+        assert_eq!(verified.safetensors().len(), 974);
+        assert_eq!(
+            verified.receipt().model.tensor_manifest_sha256,
+            SORTFORMER_TENSOR_MANIFEST_SHA256
+        );
+    }
+
+    #[test]
+    #[ignore = "requires operator-local synthetic activation package and receipt"]
+    fn operator_local_sortformer_activation_pack_is_admitted() {
+        let receipt = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_ACTIVATION_RECEIPT")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_ACTIVATION_RECEIPT");
+        let package = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_ACTIVATION_PACKAGE")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_ACTIVATION_PACKAGE");
+        let verified =
+            load_verified_sortformer_activation_pack(Path::new(&receipt), Path::new(&package))
+                .expect("operator-local synthetic activation pack must pass exact admission");
+        assert_eq!(verified.receipt().records.len(), 46);
+        assert_eq!(verified.safetensors().len(), 46);
+        assert!(verified.receipt().oracle_floor.all_byte_exact);
+        assert_eq!(verified.receipt().oracle_floor.observations.len(), 44);
+        let rendered = format!("{verified:?}");
+        assert!(rendered.contains("activations redacted"));
+        assert!(!rendered.contains("decoded_pcm_f32"));
+    }
+
+    #[test]
+    #[ignore = "requires operator-local licensed-public activation package and receipt"]
+    fn operator_local_sortformer_public_activation_pack_is_admitted() {
+        let receipt = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PUBLIC_ACTIVATION_RECEIPT")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_PUBLIC_ACTIVATION_RECEIPT");
+        let package = std::env::var_os("FRANKEN_WHISPER_SORTFORMER_PUBLIC_ACTIVATION_PACKAGE")
+            .expect("set FRANKEN_WHISPER_SORTFORMER_PUBLIC_ACTIVATION_PACKAGE");
+        let verified = load_verified_sortformer_public_activation_pack(
+            Path::new(&receipt),
+            Path::new(&package),
+        )
+        .expect("operator-local public L1-L8 activation pack must pass exact admission");
+        assert_eq!(verified.receipt().records.len(), 4_540);
+        assert_eq!(verified.receipt().seam_contracts.len(), 4_540);
+        assert_eq!(verified.safetensors().len(), 4_540);
+        assert_eq!(verified.receipt().fixtures.len(), 4);
+        assert!(verified.receipt().oracle_floor.all_discrete_byte_exact);
+        let rendered = format!("{verified:?}");
+        assert!(rendered.contains("public activations redacted"));
+        assert!(!rendered.contains("decoded_pcm_f32"));
+        assert!(!rendered.contains("voxconverse-v1-balanced4"));
+    }
+
+    #[test]
+    fn public_floor_bit_and_margin_parsers_fail_closed() {
+        assert_eq!(parse_f32_bits("0x00000000").unwrap(), 0.0);
+        assert_eq!(parse_f64_bits("0x0000000000000000").unwrap(), 0.0);
+        assert!(parse_f32_bits("nan").is_err());
+        assert!(parse_f64_bits("0xffffffffffffffff").is_err());
+        assert!(valid_margin_f32(0.000_1, 0.000_244_140_63));
+        assert!(!valid_margin_f32(0.000_1, 0.000_122_070_31));
+        assert!(valid_margin_f64(0.000_1, 0.000_244_140_625));
+        assert!(!valid_margin_f64(0.000_1, 0.000_122_070_312_5));
+    }
+
+    #[test]
+    fn public_activation_loader_preserves_cancellation_domain_and_redacts_reason() {
+        let error = load_verified_sortformer_public_activation_pack_with_checkpoint(
+            Path::new("unused-public-activation-receipt"),
+            Path::new("unused-public-activation-package"),
+            &|| {
+                Err(FwError::Cancelled(
+                    "private public-corpus reason".to_owned(),
+                ))
+            },
+        )
+        .expect_err("public activation admission must honor its first checkpoint");
+        assert_error(&error, "sortformer_activation.load_cancelled");
+        assert!(!error.to_string().contains("private public-corpus reason"));
+    }
+
+    #[test]
+    fn public_activation_loader_rejects_untrusted_receipt_before_package_open() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let receipt_path = directory.path().join("public-activation-receipt.json");
+        let absent_package = directory
+            .path()
+            .join("absent-public-activations.safetensors");
+        std::fs::write(&receipt_path, b"{}").expect("write untrusted public receipt");
+        let error = load_verified_sortformer_public_activation_pack(&receipt_path, &absent_package)
+            .expect_err("caller bytes must not select the public activation trust root");
+        assert_error(&error, "sortformer_activation.public_receipt_identity");
+    }
+
+    #[test]
+    fn public_activation_loader_rejects_oversize_receipt_before_package_open() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let receipt_path = directory
+            .path()
+            .join("oversize-public-activation-receipt.json");
+        let absent_package = directory
+            .path()
+            .join("absent-public-activations.safetensors");
+        let oversize_len = usize::try_from(MAX_PUBLIC_ACTIVATION_RECEIPT_BYTES + 1)
+            .expect("receipt bound fits test platform");
+        std::fs::write(&receipt_path, vec![b' '; oversize_len])
+            .expect("write bounded oversize public receipt");
+        let error = load_verified_sortformer_public_activation_pack(&receipt_path, &absent_package)
+            .expect_err("oversize public receipt must fail before package access");
+        assert_error(
+            &error,
+            "sortformer_activation.public_activation_receipt_size",
+        );
+    }
+
+    #[test]
     fn package_payload_swap_fails_against_unchanged_trust_root() {
         let mut bundle = tiny_bundle();
         let data_start = safetensors_data_start(&bundle.package_bytes);
@@ -1758,6 +4547,7 @@ mod tests {
         let data_start = safetensors_data_start(&bundle.package_bytes);
         bundle.package_bytes[data_start] ^= 1;
         bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
         let directory = tempfile::tempdir().expect("temporary directory");
         let (receipt_path, package_path, receipt_sha256) =
             write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
@@ -1778,6 +4568,7 @@ mod tests {
         let mut bundle = tiny_bundle();
         bundle.package_bytes = duplicate_header_package();
         bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
         let directory = tempfile::tempdir().expect("temporary directory");
         let (receipt_path, package_path, receipt_sha256) =
             write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
@@ -1799,6 +4590,7 @@ mod tests {
             let mut bundle = tiny_bundle();
             bundle.package_bytes = ambiguous_tensor_entry_package(violation);
             bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+            trust_test_package_identity(&mut bundle);
             let directory = tempfile::tempdir().expect("temporary directory");
             let (receipt_path, package_path, receipt_sha256) =
                 write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
@@ -1820,6 +4612,7 @@ mod tests {
         let mut bundle = tiny_bundle();
         bundle.package_bytes = nonlexicographic_payload_package();
         bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
         let directory = tempfile::tempdir().expect("temporary directory");
         let (receipt_path, package_path, receipt_sha256) =
             write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
@@ -1858,6 +4651,7 @@ mod tests {
         .expect("tiny position fixture must be exported");
         destination.value_sha256 = position_sha256;
         bind_package_file_identity(&mut bundle.receipt, &bundle.package_bytes);
+        trust_test_package_identity(&mut bundle);
         let directory = tempfile::tempdir().expect("temporary directory");
         let (receipt_path, package_path, receipt_sha256) =
             write_bundle(directory.path(), &bundle.receipt, &bundle.package_bytes);
@@ -1912,7 +4706,16 @@ mod tests {
     #[test]
     fn production_census_constants_are_internally_consistent() {
         let expected = pinned_model_expectations();
-        assert!(expected.converter_source_sha256.is_none());
+        assert_eq!(
+            expected.converter_source_sha256,
+            SORTFORMER_CONVERTER_SOURCE_SHA256
+        );
+        assert_eq!(expected.package_sha256, SORTFORMER_PACKAGE_SHA256);
+        assert_eq!(expected.package_bytes, SORTFORMER_PACKAGE_BYTES);
+        assert_eq!(
+            expected.model.tensor_manifest_sha256,
+            SORTFORMER_TENSOR_MANIFEST_SHA256
+        );
         assert_eq!(expected.source_files.len(), 17);
         assert!(
             expected
@@ -1937,7 +4740,11 @@ mod tests {
         }));
         assert_eq!(expected.counter_names.len(), 17);
         assert_eq!(
-            checked_elements(&expected.position_shape).unwrap(),
+            checked_elements(
+                &expected.position_shape,
+                SortformerArtifactDomain::Conversion,
+            )
+            .unwrap(),
             5_119_488
         );
         assert_eq!(
@@ -1955,6 +4762,231 @@ mod tests {
             expected.state_f32_bytes + expected.state_i64_tensors * I64_BYTES,
             expected.state_payload_bytes
         );
+    }
+
+    #[test]
+    fn checked_in_converter_matches_the_compiled_trust_root() {
+        assert_eq!(
+            sha256_bytes(include_bytes!("../scripts/convert_to_safetensors.py")),
+            SORTFORMER_CONVERTER_SOURCE_SHA256
+        );
+    }
+
+    #[test]
+    fn checked_in_activation_exporter_matches_the_public_compiled_trust_root() {
+        assert_eq!(
+            sha256_bytes(include_bytes!(
+                "../scripts/export_sortformer_activations.py"
+            )),
+            SORTFORMER_PUBLIC_ACTIVATION_EXPORTER_SHA256
+        );
+    }
+
+    #[test]
+    fn activation_receipt_semantics_cover_every_frozen_frontend_stage() {
+        let receipt = synthetic_activation_receipt();
+        verify_activation_receipt(&receipt, &|| Ok(())).expect("frozen activation semantics");
+        assert_eq!(receipt.records.len(), 46);
+        assert_eq!(receipt.oracle_floor.observations.len(), 44);
+    }
+
+    #[test]
+    fn activation_receipt_rejects_authority_stage_and_floor_drift() {
+        let mut receipt = synthetic_activation_receipt();
+        receipt.authority = "production".to_owned();
+        let error = verify_activation_receipt(&receipt, &|| Ok(()))
+            .expect_err("diagnostic authority must not be promoted");
+        assert_error(&error, "sortformer_activation.authority");
+
+        let mut receipt = synthetic_activation_receipt();
+        assert!(receipt.records.pop().is_some());
+        let error =
+            verify_activation_receipt(&receipt, &|| Ok(())).expect_err("missing stage must fail");
+        assert_error(&error, "sortformer_activation.record_census");
+
+        let mut receipt = synthetic_activation_receipt();
+        receipt.oracle_floor.observations[0].mismatch_count = 1;
+        let error = verify_activation_receipt(&receipt, &|| Ok(()))
+            .expect_err("nonzero source floor must fail");
+        assert_error(&error, "sortformer_activation.oracle_floor_metric");
+
+        let mut receipt = synthetic_activation_receipt();
+        receipt.records[0].shape = vec![401];
+        let error = verify_activation_receipt(&receipt, &|| Ok(()))
+            .expect_err("wrong activation shape must fail");
+        assert_error(&error, "sortformer_activation.record_contract");
+    }
+
+    #[test]
+    fn activation_i64_lengths_require_exact_little_endian_values() {
+        let receipt = synthetic_activation_receipt();
+        let fixtures = receipt
+            .fixtures
+            .iter()
+            .map(|fixture| (fixture.name.as_str(), fixture))
+            .collect::<BTreeMap<_, _>>();
+        let fixture = receipt.fixtures.first().expect("frozen fixture");
+        let input_name = format!("fixture.{}.input_length_i64", fixture.name);
+        let valid_name = format!("fixture.{}.valid_length_i64", fixture.name);
+        let input_length = i64::try_from(fixture.sample_count).expect("sample count fits I64");
+        let valid_length = i64::try_from(fixture.valid_frames).expect("frame count fits I64");
+
+        verify_activation_i64_value(&input_name, &input_length.to_le_bytes(), &fixtures)
+            .expect("exact little-endian input length");
+        verify_activation_i64_value(&valid_name, &valid_length.to_le_bytes(), &fixtures)
+            .expect("exact little-endian valid length");
+
+        let error =
+            verify_activation_i64_value(&input_name, &input_length.to_be_bytes(), &fixtures)
+                .expect_err("big-endian control data must fail");
+        assert_error(&error, "sortformer_activation.package_i64");
+
+        let error = verify_activation_i64_value(&input_name, &[0u8; 7], &fixtures)
+            .expect_err("truncated I64 control data must fail");
+        assert_error(&error, "sortformer_activation.package_i64");
+    }
+
+    #[test]
+    fn activation_shared_failures_keep_the_activation_error_domain() {
+        let mut receipt = synthetic_activation_receipt();
+        receipt.records[0].name = "invalid..stage".to_owned();
+        let error = verify_activation_receipt(&receipt, &|| Ok(()))
+            .expect_err("invalid activation tensor names must fail");
+        assert_error(&error, "sortformer_activation.record_name");
+
+        let error = finite_f32_sha256(
+            &f32::NAN.to_le_bytes(),
+            SortformerArtifactDomain::Activation,
+            &|| Ok(()),
+        )
+        .expect_err("non-finite activation data must fail");
+        assert_error(&error, "sortformer_activation.package_nonfinite");
+
+        let error = sortformer_checkpoint(
+            &|| Err(FwError::Cancelled("sensitive reason".to_owned())),
+            SortformerArtifactDomain::Activation,
+        )
+        .expect_err("activation cancellation must be normalized");
+        assert_error(&error, "sortformer_activation.load_cancelled");
+        assert!(!error.to_string().contains("sensitive reason"));
+
+        let error = load_verified_sortformer_activation_pack_with_checkpoint(
+            Path::new("unused-activation-receipt"),
+            Path::new("unused-activation-package"),
+            &|| Err(FwError::Cancelled("private caller reason".to_owned())),
+        )
+        .expect_err("public activation admission must preserve its error domain");
+        assert_error(&error, "sortformer_activation.load_cancelled");
+        assert!(!error.to_string().contains("private caller reason"));
+    }
+
+    #[test]
+    fn activation_loader_rejects_untrusted_receipt_before_package_open() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let receipt_path = directory.path().join("activation-receipt.json");
+        let absent_package = directory.path().join("absent.safetensors");
+        std::fs::write(&receipt_path, b"{}").expect("write untrusted receipt");
+        let error = load_verified_sortformer_activation_pack(&receipt_path, &absent_package)
+            .expect_err("caller bytes must not select their own activation trust root");
+        assert_error(&error, "sortformer_activation.receipt_identity");
+    }
+
+    fn synthetic_activation_receipt() -> SortformerActivationReceipt {
+        let fixtures = frozen_activation_fixtures();
+        let contracts = expected_activation_tensor_contracts(&fixtures);
+        let records = contracts
+            .iter()
+            .map(|(name, contract)| {
+                let elements =
+                    checked_elements(&contract.shape, SortformerArtifactDomain::Activation)
+                        .expect("activation elements");
+                let width = match contract.dtype {
+                    SortformerTensorDtype::F32 => F32_BYTES,
+                    SortformerTensorDtype::I64 => I64_BYTES,
+                };
+                SortformerActivationTensorRecord {
+                    name: name.clone(),
+                    dtype: contract.dtype,
+                    shape: contract.shape.clone(),
+                    logical_layout: SOURCE_LAYOUT.to_owned(),
+                    elements,
+                    bytes: elements.checked_mul(width).expect("activation bytes"),
+                    value_sha256: contract
+                        .value_sha256
+                        .clone()
+                        .unwrap_or_else(|| EMPTY_SHA256.to_owned()),
+                }
+            })
+            .collect::<Vec<_>>();
+        let observations = records
+            .iter()
+            .filter_map(|record| {
+                record
+                    .name
+                    .strip_prefix("fixture.")
+                    .and_then(|suffix| suffix.split_once('.'))
+                    .map(|(fixture, stage)| SortformerActivationFloorObservation {
+                        fixture: fixture.to_owned(),
+                        stage: stage.to_owned(),
+                        run_count: 10,
+                        pair_count: 45,
+                        compared_values: record.elements.checked_mul(45).expect("comparisons"),
+                        mismatch_count: 0,
+                        byte_exact: true,
+                        max_abs_diff_f32_bits: "0x00000000".to_owned(),
+                        mean_abs_diff_f64_bits: "0x0000000000000000".to_owned(),
+                        relative_l2_f64_bits: "0x0000000000000000".to_owned(),
+                    })
+            })
+            .collect();
+        SortformerActivationReceipt {
+            schema_version: SORTFORMER_ACTIVATION_RECEIPT_SCHEMA.to_owned(),
+            canonical_json_version: "lexicographic-json-v1".to_owned(),
+            authority: "diagnostic_only".to_owned(),
+            equivalence_level: "partial_l1_synthetic_frontend".to_owned(),
+            fixture_set: "sortformer-synthetic-frontend-v1".to_owned(),
+            model: frozen_activation_model_identity(),
+            exporter: SortformerActivationExporterIdentity {
+                exporter_id: "franken-whisper-sortformer-activation-exporter".to_owned(),
+                exporter_version: "2".to_owned(),
+                source_sha256: SORTFORMER_ACTIVATION_EXPORTER_SHA256.to_owned(),
+                conversion_helper_sha256: SORTFORMER_CONVERTER_SOURCE_SHA256.to_owned(),
+            },
+            runtime: frozen_runtime_identity(),
+            source_files: frozen_source_files(),
+            execution: frozen_activation_execution_identity(),
+            fixtures,
+            oracle_floor: SortformerActivationOracleFloor {
+                schema_version: SORTFORMER_ACTIVATION_FLOOR_SCHEMA.to_owned(),
+                baseline_threads: 1,
+                baseline_repetition: 0,
+                thread_counts: vec![1, 8],
+                repetitions_per_thread: 5,
+                all_byte_exact: true,
+                mismatch_count: 0,
+                comparison_rule: "exact_ieee_bits".to_owned(),
+                absolute_tolerance_f32_bits: "0x00000000".to_owned(),
+                relative_tolerance_f32_bits: "0x00000000".to_owned(),
+                margin_basis: "deterministic_synthetic_preprocessing_zero_floor_no_margin"
+                    .to_owned(),
+                observations,
+            },
+            package: SortformerActivationPackageIdentity {
+                format: PACKAGE_FORMAT.to_owned(),
+                dtype_set: vec![SortformerTensorDtype::F32, SortformerTensorDtype::I64],
+                byte_order: PACKAGE_BYTE_ORDER.to_owned(),
+                tensor_order: PACKAGE_TENSOR_ORDER.to_owned(),
+                logical_layout: SOURCE_LAYOUT.to_owned(),
+                metadata_policy: PACKAGE_METADATA_POLICY.to_owned(),
+                tensor_count: SORTFORMER_ACTIVATION_TENSORS,
+                f32_elements: SORTFORMER_ACTIVATION_F32_ELEMENTS,
+                i64_elements: SORTFORMER_ACTIVATION_I64_ELEMENTS,
+                payload_bytes: SORTFORMER_ACTIVATION_PAYLOAD_BYTES,
+                bytes: SORTFORMER_ACTIVATION_PACKAGE_BYTES,
+                sha256: SORTFORMER_ACTIVATION_PACKAGE_SHA256.to_owned(),
+            },
+            records,
+        }
     }
 
     fn tiny_bundle() -> TinyBundle {
@@ -2034,11 +5066,23 @@ mod tests {
                 },
             ],
         };
+        let tiny_manifest_sha256 =
+            tensor_manifest_sha256(&model, &receipt.records).expect("tiny tensor manifest");
+        assert_eq!(tiny_manifest_sha256, TINY_TENSOR_MANIFEST_SHA256);
+        model
+            .tensor_manifest_sha256
+            .clone_from(&tiny_manifest_sha256);
+        receipt
+            .model
+            .tensor_manifest_sha256
+            .clone_from(&tiny_manifest_sha256);
         bind_package_file_identity(&mut receipt, &package_bytes);
         let expected = ReceiptExpectations {
             model,
             execution: frozen_execution_config(),
-            converter_source_sha256: Some(receipt.converter.source_sha256.clone()),
+            converter_source_sha256: receipt.converter.source_sha256.clone(),
+            package_sha256: receipt.package.sha256.clone(),
+            package_bytes: receipt.package.bytes,
             source_files: frozen_source_files(),
             runtime: frozen_runtime_identity(),
             license: frozen_license_identity(),
@@ -2070,7 +5114,8 @@ mod tests {
         shape: Vec<u64>,
         raw: &[u8],
     ) -> SortformerTensorRecord {
-        let elements = checked_elements(&shape).expect("tiny shape");
+        let elements =
+            checked_elements(&shape, SortformerArtifactDomain::Conversion).expect("tiny shape");
         let bytes = u64::try_from(raw.len()).expect("tiny bytes");
         let value_sha256 = sha256_bytes(raw);
         SortformerTensorRecord {
@@ -2213,6 +5258,14 @@ mod tests {
     fn bind_package_file_identity(receipt: &mut SortformerConversionReceipt, package_bytes: &[u8]) {
         receipt.package.bytes = u64::try_from(package_bytes.len()).expect("tiny package");
         receipt.package.sha256 = sha256_bytes(package_bytes);
+    }
+
+    fn trust_test_package_identity(bundle: &mut TinyBundle) {
+        bundle
+            .expected
+            .package_sha256
+            .clone_from(&bundle.receipt.package.sha256);
+        bundle.expected.package_bytes = bundle.receipt.package.bytes;
     }
 
     fn safetensors_data_start(bytes: &[u8]) -> usize {

@@ -1922,37 +1922,23 @@ mod tests {
 
     // ---- stub-driven error injection (end-to-end through run_ytdlp) -------
 
-    /// Build a small wrapper script that exports STUB_FAIL_MODE then execs the
-    /// real stub, so we exercise the full run_ytdlp -> map_ytdlp_error path
-    /// without mutating this process's environment.
-    fn failing_info(mode: &str) -> (tempfile::TempDir, YtdlpInfo) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let wrapper = dir.path().join("ytdlp_fail.sh");
-        let script = format!(
-            "#!/usr/bin/env bash\nexport STUB_FAIL_MODE={mode}\nexec {} \"$@\"\n",
-            stub_path().display()
-        );
-        std::fs::write(&wrapper, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&wrapper, perms).unwrap();
-        }
-        let info = YtdlpInfo {
-            path: wrapper,
-            version: "2025.01.01".to_owned(),
-            stale: false,
-        };
-        (dir, info)
+    /// Select an error mode through the stable stub's URL-query test hook.
+    ///
+    /// This avoids creating and immediately executing a temporary script,
+    /// which can fail with ETXTBSY on Linux/network-backed filesystems under
+    /// parallel test load even after the writer has closed the file.
+    fn failing_case(mode: &str) -> (YtdlpInfo, String) {
+        (
+            stub_info(),
+            format!("https://youtu.be/x?fw_stub_fail={mode}"),
+        )
     }
 
     #[test]
     fn fetch_metadata_private_mode_maps_to_invalid_request() {
-        let (_dir, info) = failing_info("private");
+        let (info, url) = failing_case("private");
         let token = CancellationToken::unbounded();
-        let err = fetch_metadata(&info, "https://youtu.be/x", &token).expect_err("should fail");
+        let err = fetch_metadata(&info, &url, &token).expect_err("should fail");
         match err {
             FwError::InvalidRequest(msg) => assert!(msg.contains("private")),
             other => panic!("expected InvalidRequest, got {other:?}"),
@@ -1961,9 +1947,9 @@ mod tests {
 
     #[test]
     fn fetch_metadata_geo_mode_maps_to_invalid_request() {
-        let (_dir, info) = failing_info("geo");
+        let (info, url) = failing_case("geo");
         let token = CancellationToken::unbounded();
-        let err = fetch_metadata(&info, "https://youtu.be/x", &token).expect_err("should fail");
+        let err = fetch_metadata(&info, &url, &token).expect_err("should fail");
         match err {
             FwError::InvalidRequest(msg) => assert!(msg.contains("geo-blocked")),
             other => panic!("expected InvalidRequest, got {other:?}"),
@@ -1972,9 +1958,9 @@ mod tests {
 
     #[test]
     fn fetch_metadata_429_mode_maps_to_invalid_request() {
-        let (_dir, info) = failing_info("429");
+        let (info, url) = failing_case("429");
         let token = CancellationToken::unbounded();
-        let err = fetch_metadata(&info, "https://youtu.be/x", &token).expect_err("should fail");
+        let err = fetch_metadata(&info, &url, &token).expect_err("should fail");
         match err {
             FwError::InvalidRequest(msg) => assert!(msg.contains("429")),
             other => panic!("expected InvalidRequest, got {other:?}"),
@@ -1983,9 +1969,9 @@ mod tests {
 
     #[test]
     fn fetch_metadata_generic_exit1_passes_through_as_command_failed() {
-        let (_dir, info) = failing_info("exit1");
+        let (info, url) = failing_case("exit1");
         let token = CancellationToken::unbounded();
-        let err = fetch_metadata(&info, "https://youtu.be/x", &token).expect_err("should fail");
+        let err = fetch_metadata(&info, &url, &token).expect_err("should fail");
         assert!(
             matches!(err, FwError::CommandFailed { .. }),
             "generic failure should remain CommandFailed, got: {err:?}"

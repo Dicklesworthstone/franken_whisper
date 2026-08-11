@@ -22,7 +22,7 @@ Generating the full ECAPA oracle additionally requires exactly:
 
 The frozen Streaming Sortformer profile requires exactly the runtime recorded
 in ``SORTFORMER_REQUIRED_PACKAGES`` below. It reads the two members of the
-identity-bound ``.nemo`` archive through one already-hashed file descriptor,
+identity-bound ``.nemo`` archive from one owned, hash-verified byte buffer,
 instantiates the pinned NeMo graph without ``restore_from`` temporary files,
 and emits both a metadata-free package and a canonical conversion receipt.
 
@@ -56,6 +56,7 @@ import io
 import json
 import math
 import os
+import stat
 import struct
 import sys
 import tarfile
@@ -154,8 +155,15 @@ SORTFORMER_STATE_PAYLOAD_BYTES = 470_978_792
 SORTFORMER_SOURCE_RECORDS = 992
 SORTFORMER_EXPORTED_TENSORS = 974
 SORTFORMER_DROPPED_TENSORS = 18
+SORTFORMER_TENSOR_MANIFEST_SHA256 = (
+    "2c32b0b9e48bb296e66615b038827d0fdde4b4fda2ce044a6c30cd317456c8d7"
+)
 SORTFORMER_PACKAGE_F32_ELEMENTS = 122_864_152
 SORTFORMER_PACKAGE_PAYLOAD_BYTES = 491_456_608
+SORTFORMER_PACKAGE_BYTES = 491_570_584
+SORTFORMER_PACKAGE_SHA256 = (
+    "487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a"
+)
 SORTFORMER_POSITION_TENSOR = "encoder.pos_enc.pe"
 SORTFORMER_DTYPE_SENTINEL = "preprocessor.dtype_sentinel_tensor"
 SORTFORMER_SOURCE_LAYOUT = "pytorch_contiguous_row_major"
@@ -203,6 +211,32 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _stable_file_identity(path: Path) -> tuple[int, int, int, int, int, int, str]:
+    """Hash one regular file and bind the digest to its stable open inode."""
+    with path.open("rb") as source:
+        initial = os.fstat(source.fileno())
+        hasher = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            hasher.update(chunk)
+        final = os.fstat(source.fileno())
+    path_final = path.stat()
+    fields = (
+        "st_dev",
+        "st_ino",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+        "st_mode",
+    )
+    initial_fields = tuple(getattr(initial, field) for field in fields)
+    if (
+        tuple(getattr(final, field) for field in fields) != initial_fields
+        or tuple(getattr(path_final, field) for field in fields) != initial_fields
+    ):
+        raise RuntimeError("file identity changed while it was hashed")
+    return (*initial_fields, hasher.hexdigest())
+
+
 def _read_exact_ecapa_source(path: Path) -> bytes:
     """Read the frozen checkpoint once into an exact, bounded owned buffer."""
     source_bytes = bytearray()
@@ -238,7 +272,8 @@ def _read_exact_member(archive: tarfile.TarFile, name: str, expected_bytes: int)
 
 
 def _read_exact_sortformer_archive(path: Path) -> tuple[bytes, bytes]:
-    """Authenticate one open archive inode and retain only its two members."""
+    """Authenticate one owned archive byte stream and retain only its members."""
+    archive_buffer = io.BytesIO()
     with path.open("rb") as source:
         initial = os.fstat(source.fileno())
         if initial.st_size != SORTFORMER_NEMO_BYTES:
@@ -246,28 +281,24 @@ def _read_exact_sortformer_archive(path: Path) -> tuple[bytes, bytes]:
                 f"{SORTFORMER_PROFILE} input size mismatch "
                 f"(got {initial.st_size}, want {SORTFORMER_NEMO_BYTES})"
             )
-        archive_hasher = hashlib.sha256()
-        for chunk in iter(lambda: source.read(1 << 20), b""):
-            archive_hasher.update(chunk)
-        if not hmac.compare_digest(
-            archive_hasher.hexdigest(), SORTFORMER_NEMO_SHA256
-        ):
-            raise RuntimeError(f"{SORTFORMER_PROFILE} input sha256 mismatch")
-        source.seek(0)
-        with tarfile.open(fileobj=source, mode="r:*") as archive:
-            if sorted(member.name for member in archive.getmembers()) != [
-                "model_config.yaml",
-                "model_weights.ckpt",
-            ]:
-                raise RuntimeError(
-                    f"{SORTFORMER_PROFILE} archive member set is not frozen"
-                )
-            config_bytes = _read_exact_member(
-                archive, "model_config.yaml", SORTFORMER_CONFIG_BYTES
-            )
-            checkpoint_bytes = _read_exact_member(
-                archive, "model_weights.ckpt", SORTFORMER_CHECKPOINT_BYTES
-            )
+        archive_bytes = 0
+        maximum_bytes = SORTFORMER_NEMO_BYTES + 1
+        while archive_bytes < maximum_bytes:
+            chunk = source.read(min(1 << 20, maximum_bytes - archive_bytes))
+            if not chunk:
+                break
+            archive_buffer.write(chunk)
+            archive_bytes += len(chunk)
+        if archive_bytes != SORTFORMER_NEMO_BYTES:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} input size changed during read")
+        archive_view = archive_buffer.getbuffer()
+        try:
+            if not hmac.compare_digest(
+                hashlib.sha256(archive_view).hexdigest(), SORTFORMER_NEMO_SHA256
+            ):
+                raise RuntimeError(f"{SORTFORMER_PROFILE} input sha256 mismatch")
+        finally:
+            archive_view.release()
         final = os.fstat(source.fileno())
         if (
             final.st_dev != initial.st_dev
@@ -276,6 +307,20 @@ def _read_exact_sortformer_archive(path: Path) -> tuple[bytes, bytes]:
             or final.st_mtime_ns != initial.st_mtime_ns
         ):
             raise RuntimeError(f"{SORTFORMER_PROFILE} input inode changed during read")
+    archive_buffer.seek(0)
+    with tarfile.open(fileobj=archive_buffer, mode="r:*") as archive:
+        if sorted(member.name for member in archive.getmembers()) != [
+            "model_config.yaml",
+            "model_weights.ckpt",
+        ]:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} archive member set is not frozen")
+        config_bytes = _read_exact_member(
+            archive, "model_config.yaml", SORTFORMER_CONFIG_BYTES
+        )
+        checkpoint_bytes = _read_exact_member(
+            archive, "model_weights.ckpt", SORTFORMER_CHECKPOINT_BYTES
+        )
+    archive_buffer.close()
     if not hmac.compare_digest(
         hashlib.sha256(config_bytes).hexdigest(), SORTFORMER_CONFIG_SHA256
     ):
@@ -317,12 +362,16 @@ def _build_deterministic_safetensors(
     ).encode("utf-8")
     header_json += b" " * (-len(header_json) % 8)
 
-    serialized = bytearray(struct.pack("<Q", len(header_json)))
-    serialized.extend(header_json)
+    # BytesIO owns one mutable backing store and hands that store to the
+    # immutable result on CPython, avoiding the prior bytearray-to-bytes peak.
+    serialized = io.BytesIO()
+    serialized.write(struct.pack("<Q", len(header_json)))
+    serialized.write(header_json)
     for name in sorted(tensors):
         array = tensors[name].numpy().astype("<f4", copy=False)
-        serialized.extend(array.tobytes(order="C"))
-    file_bytes = bytes(serialized)
+        serialized.write(array.tobytes(order="C"))
+    file_bytes = serialized.getvalue()
+    serialized.close()
 
     # Exercise an independent safetensors parser before any output is
     # published. The Rust runtime repeats stricter model-specific checks.
@@ -340,8 +389,11 @@ def _build_deterministic_safetensors(
             _f32_tensor_sha256(expected),
         ):
             raise RuntimeError("serialized safetensors tensor payload changed")
+    if len(file_bytes) < 8:
+        raise RuntimeError("serialized safetensors header is absent")
+    header_bytes = struct.unpack("<Q", file_bytes[:8])[0]
     try:
-        decoded_header = json.loads(file_bytes[8 : 8 + len(header_json)])
+        decoded_header = json.loads(file_bytes[8 : 8 + header_bytes])
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("serialized safetensors header could not be decoded") from exc
     if metadata is None:
@@ -352,13 +404,44 @@ def _build_deterministic_safetensors(
     return file_bytes
 
 
+def _require_existing_output(output: Path, expected_bytes: bytes) -> None:
+    """Accept only an owner-private, byte-identical retry artifact."""
+    if output.is_symlink() or not output.is_file():
+        raise OSError("existing output is not a regular file")
+    identity = _stable_file_identity(output)
+    if identity[2] != len(expected_bytes) or not hmac.compare_digest(
+        identity[-1], hashlib.sha256(expected_bytes).hexdigest()
+    ):
+        raise OSError("existing output identity does not match this conversion")
+    if not stat.S_ISREG(identity[-2]) or stat.S_IMODE(identity[-2]) != 0o600:
+        raise OSError("existing output permissions are not owner-only mode 0600")
+
+
 def _publish_new_file(output: Path, file_bytes: bytes) -> None:
-    """Publish validated bytes through an exclusive-create final path."""
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("x+b") as destination:
-        written = destination.write(file_bytes)
-        if written != len(file_bytes):
-            raise OSError("short exclusive output write")
+    """Publish or reuse exact validated bytes at an owner-only final path."""
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            output,
+            os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    except FileExistsError:
+        _require_existing_output(output, file_bytes)
+        return
+
+    with os.fdopen(descriptor, "w+b") as destination:
+        os.fchmod(destination.fileno(), 0o600)
+        view = memoryview(file_bytes)
+        try:
+            written = 0
+            while written < len(view):
+                count = destination.write(view[written:])
+                if count is None or count <= 0:
+                    raise OSError("short exclusive output write")
+                written += count
+        finally:
+            view.release()
         destination.flush()
         os.fsync(destination.fileno())
         destination.seek(0)
@@ -369,6 +452,7 @@ def _publish_new_file(output: Path, file_bytes: bytes) -> None:
             written_hasher.hexdigest(), hashlib.sha256(file_bytes).hexdigest()
         ):
             raise OSError("written output checksum changed")
+    _require_existing_output(output, file_bytes)
 
 
 def _base_version(version: str) -> str:
@@ -389,7 +473,28 @@ def _canonical_json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _require_sortformer_runtime() -> tuple[dict[str, str], Path]:
+def _sortformer_source_identities(
+    source_root: Path,
+) -> tuple[tuple[str, int, int, int, int, int, int, str], ...]:
+    """Bind every selected NeMo source path to stable, expected bytes."""
+    canonical_root = source_root.resolve(strict=True)
+    identities = []
+    for relative, expected_sha256 in SORTFORMER_SOURCE_FILES:
+        source_path = canonical_root / relative
+        if source_path.resolve(strict=True) != source_path:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} NeMo source path is indirect")
+        identity = _stable_file_identity(source_path)
+        if not hmac.compare_digest(identity[-1], expected_sha256):
+            raise RuntimeError(f"{SORTFORMER_PROFILE} NeMo source identity mismatch")
+        identities.append((relative, *identity))
+    return tuple(identities)
+
+
+def _require_sortformer_runtime() -> tuple[
+    dict[str, str],
+    Path,
+    tuple[tuple[str, int, int, int, int, int, int, str], ...],
+]:
     if sys.version_info[:3] != REQUIRED_PYTHON_VERSION:
         raise RuntimeError(
             f"{SORTFORMER_PROFILE} requires Python {REQUIRED_PYTHON_VERSION_TEXT}"
@@ -421,16 +526,9 @@ def _require_sortformer_runtime() -> tuple[dict[str, str], Path]:
 
     nemo_root = Path(nemo.__file__).resolve().parent
     source_root = nemo_root.parent
-    source_files = []
-    for relative, expected_sha256 in SORTFORMER_SOURCE_FILES:
-        source_path = source_root / relative
-        if not source_path.is_file() or not hmac.compare_digest(
-            _sha256(source_path), expected_sha256
-        ):
-            raise RuntimeError(f"{SORTFORMER_PROFILE} NeMo source identity mismatch")
-        source_files.append({"path": relative, "sha256": expected_sha256})
-    if [entry["path"] for entry in source_files] != sorted(
-        entry["path"] for entry in source_files
+    source_identities = _sortformer_source_identities(source_root)
+    if [identity[0] for identity in source_identities] != sorted(
+        identity[0] for identity in source_identities
     ):
         raise RuntimeError(f"{SORTFORMER_PROFILE} source identities are not canonical")
 
@@ -449,7 +547,7 @@ def _require_sortformer_runtime() -> tuple[dict[str, str], Path]:
         "hydra_core": observed["hydra-core"],
         "lightning": observed["lightning"],
     }
-    return runtime, source_root
+    return runtime, source_root, source_identities
 
 
 def _sortformer_tensor_bytes(
@@ -739,7 +837,7 @@ def _build_sortformer_receipt(
             "model_license_last_modified": "Mon, 03 Aug 2026 17:46:28 GMT",
             "model_license_etag": "4b001-658281e31650b",
             "model_license_payload_sha256": "13c9c998e24abd5211cff4b5c912902f566bd710294da98580be7b3376626f04",
-            "model_weight_distribution_policy": "operator_local_no_git_no_release",
+            "model_weight_distribution_policy": "github_release_with_license_and_notice",
             "nemo_source_license_spdx": "Apache-2.0",
             "nemo_source_license_sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1",
             "embedded_notice_source_path": "nemo/collections/asr/parts/preprocessing/features.py",
@@ -930,7 +1028,10 @@ def _run_sortformer_export(
     torch: Any,
 ) -> int:
     try:
-        runtime, _source_root = _require_sortformer_runtime()
+        converter_path = Path(__file__).resolve(strict=True)
+        converter_identity = _stable_file_identity(converter_path)
+        converter_sha256 = converter_identity[-1]
+        runtime, source_root, source_identities = _require_sortformer_runtime()
         config_bytes, checkpoint_bytes = _read_exact_sortformer_archive(args.input)
         tensors, records, manifest_sha256 = _build_sortformer_state(
             config_bytes,
@@ -940,10 +1041,20 @@ def _run_sortformer_export(
         )
         config_bytes = b""
         checkpoint_bytes = b""
+        if not hmac.compare_digest(
+            manifest_sha256, SORTFORMER_TENSOR_MANIFEST_SHA256
+        ):
+            raise RuntimeError(f"{SORTFORMER_PROFILE} topology projection changed")
         package_bytes = _build_deterministic_safetensors(tensors, None)
-        if len(package_bytes) <= SORTFORMER_PACKAGE_PAYLOAD_BYTES:
-            raise RuntimeError(f"{SORTFORMER_PROFILE} package header is absent")
-        converter_sha256 = _sha256(Path(__file__).resolve())
+        package_sha256 = hashlib.sha256(package_bytes).hexdigest()
+        if len(package_bytes) != SORTFORMER_PACKAGE_BYTES or not hmac.compare_digest(
+            package_sha256, SORTFORMER_PACKAGE_SHA256
+        ):
+            raise RuntimeError(f"{SORTFORMER_PROFILE} package identity changed")
+        if _sortformer_source_identities(source_root) != source_identities:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} NeMo sources changed during export")
+        if _stable_file_identity(converter_path) != converter_identity:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} converter changed during export")
         receipt = _build_sortformer_receipt(
             records,
             manifest_sha256,
@@ -954,9 +1065,19 @@ def _run_sortformer_export(
         receipt_bytes = _canonical_json_bytes(receipt)
 
         # All source, runtime, tensor, and complete byte-stream checks finish
-        # before either exclusive-create final path is opened.
-        _publish_new_file(args.output, package_bytes)
+        # before either exclusive-create final path is opened. Publish the small
+        # receipt first: an interrupted package write can be retried at a fresh
+        # package path while reusing the exact content-addressed receipt.
+        if _sortformer_source_identities(source_root) != source_identities:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} NeMo sources changed before publish")
+        if _stable_file_identity(converter_path) != converter_identity:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} converter changed before publish")
         _publish_new_file(args.receipt_output, receipt_bytes)
+        _publish_new_file(args.output, package_bytes)
+        if _sortformer_source_identities(source_root) != source_identities:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} NeMo sources changed during publish")
+        if _stable_file_identity(converter_path) != converter_identity:
+            raise RuntimeError(f"{SORTFORMER_PROFILE} converter changed during publish")
     except (
         ImportError,
         OSError,
@@ -1045,7 +1166,7 @@ def main() -> int:
     if not args.input.is_file():
         print(f"error: input not found: {args.input}", file=sys.stderr)
         return 2
-    if args.output.exists():
+    if args.profile != SORTFORMER_PROFILE and args.output.exists():
         print(f"error: refusing to overwrite existing output: {args.output}", file=sys.stderr)
         return 2
     if args.profile == SORTFORMER_PROFILE:
@@ -1064,14 +1185,17 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-        if args.receipt_output.exists():
+        package_output = args.output.resolve()
+        receipt_output = args.receipt_output.resolve()
+        if (
+            package_output == receipt_output
+            or package_output in receipt_output.parents
+            or receipt_output in package_output.parents
+        ):
             print(
-                f"error: refusing to overwrite existing receipt: {args.receipt_output}",
+                "error: package and receipt output paths must neither match nor contain one another",
                 file=sys.stderr,
             )
-            return 2
-        if args.output.resolve() == args.receipt_output.resolve():
-            print("error: package and receipt output paths must differ", file=sys.stderr)
             return 2
     elif args.receipt_output is not None:
         print(

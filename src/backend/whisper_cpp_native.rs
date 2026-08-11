@@ -270,14 +270,11 @@ pub(crate) fn word_timestamp_mode(params: Option<&WordTimestampParams>) -> WordT
 /// Availability is probed **without a request context** (the router calls this
 /// before dispatch), so the policy is:
 ///
-/// 1. If `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` is set and its model header
-///    validates, report `true`.
-/// 2. Otherwise, report `true` iff **any** `ggml-*.bin` with a valid header
-///    exists in the model search dirs — a cheap directory scan. This keeps a
-///    request that names an explicit model (with no default configured) from
-///    being refused at the dispatch gate while still being honest: with zero
-///    usable model files on disk, the engine reports itself unavailable and the
-///    router stays bridge-only.
+/// 1. If `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` is set, report the validity of
+///    that exact operator choice. An invalid explicit default never falls
+///    through to a different model.
+/// 2. Otherwise, use the native engine's canonical resolver, which prefers the
+///    hash-pinned release package and then considers valid local GGML files.
 ///
 /// Never panics or performs any network access (header-only sniffing).
 ///
@@ -343,12 +340,7 @@ pub(crate) fn reset_availability_cache() {
 /// The uncached availability probe. Performs the actual directory scan and
 /// header sniffing; see [`is_available`] for the memoizing wrapper.
 fn is_available_uncached() -> bool {
-    if let Some(spec) = native_engine::default_model_spec()
-        && native_engine::native_model_available(&spec)
-    {
-        return true;
-    }
-    any_model_in_search_dirs()
+    native_engine::configured_or_release_model_available()
 }
 
 /// Number of leading bytes covering the ggml magic plus the eleven `i32`
@@ -358,81 +350,6 @@ const HEADER_SNIFF_LEN: usize = 48;
 
 /// ggml file magic (`"ggml"` as a little-endian `u32`).
 const GGML_MAGIC: u32 = 0x6767_6d6c;
-
-/// The directories scanned for `ggml-*.bin` model files, mirroring
-/// [`crate::native_engine`]'s precedence so availability never disagrees with
-/// resolution.
-///
-/// 1. `$FRANKEN_WHISPER_MODEL_DIR`
-/// 2. `$FRANKEN_WHISPER_TEST_MODEL_DIR`
-/// 3. `~/.cache/franken_whisper/models`
-/// 4. `~/.cache/franken_whisper/test-models`
-/// 5. `~/models/whisper`
-fn model_search_dirs() -> Vec<std::path::PathBuf> {
-    use std::path::PathBuf;
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for var in [
-        "FRANKEN_WHISPER_MODEL_DIR",
-        "FRANKEN_WHISPER_TEST_MODEL_DIR",
-    ] {
-        if let Ok(dir) = std::env::var(var)
-            && !dir.is_empty()
-        {
-            dirs.push(PathBuf::from(dir));
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        dirs.push(home.join(".cache").join("franken_whisper").join("models"));
-        dirs.push(
-            home.join(".cache")
-                .join("franken_whisper")
-                .join("test-models"),
-        );
-        dirs.push(home.join("models").join("whisper"));
-    }
-    dirs
-}
-
-/// Honestly report whether **any** `ggml-*.bin` with a valid header exists in a
-/// search dir. A cheap directory scan (header-only sniff per candidate, no
-/// network, never panics). Used by [`is_available`] when no default model is
-/// configured so a request that names an explicit model is not refused at the
-/// dispatch gate — while still keeping availability honest (zero usable model
-/// files => `false`).
-fn any_model_in_search_dirs() -> bool {
-    first_model_in_search_dirs().is_some()
-}
-
-/// The first `ggml-*.bin` with a valid header found by scanning the search dirs
-/// in [`model_search_dirs`] precedence order. Directory iteration order within a
-/// single dir is filesystem-defined, so this is only a "some usable model
-/// exists, here is one of them" answer — exactly what the availability probe and
-/// the capability probe need when no default model is configured.
-fn first_model_in_search_dirs() -> Option<std::path::PathBuf> {
-    for dir in model_search_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_ggml = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("ggml-") && n.ends_with(".bin"));
-            if is_ggml && header_ftype_ok(&path) {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
-/// Read the first 48 bytes of `path` and validate the ggml magic + a supported
-/// dense `ftype` (`0` = f32, `1` = f16). Any failure yields `false`.
-fn header_ftype_ok(path: &Path) -> bool {
-    header_hparams(path).is_some()
-}
 
 /// Sniff `path`'s 48-byte ggml header into [`WhisperHParams`], or `None` when the
 /// file is unreadable, too short, carries the wrong magic, or declares an
@@ -511,20 +428,18 @@ impl NativeProbe {
 
 /// Probe what the native engine can actually do (see [`NativeProbe`]).
 ///
-/// Resolves the same model [`run`] would: `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`
-/// first, else any usable `ggml-*.bin` in a search dir — mirroring
-/// [`is_available`]'s policy so capabilities never contradict availability.
+/// Selects the same model specification [`run`] would:
+/// `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` first, otherwise the default release
+/// package. Discovery validates only the bounded header; execution separately
+/// authenticates the complete release artifact before loading tensors.
 pub(crate) fn capability_probe() -> NativeProbe {
     let gpu = native_engine::encoder::gpu_encoder_available();
 
-    // The spec doubles as the alignment-head preset hint (e.g. "large-v3-turbo"),
-    // exactly as `decode_params` passes it to the engine.
-    let spec = native_engine::default_model_spec();
-    let path = match spec.as_deref() {
-        Some(spec) => native_engine::resolve_model(spec).ok(),
-        None => None,
-    }
-    .or_else(first_model_in_search_dirs);
+    // Mirror execution selection while retaining discovery's header-only
+    // authority. Full release-package authentication remains mandatory in
+    // `effective_model_spec` immediately before tensors are loaded.
+    let spec = native_engine::default_model_spec().unwrap_or_else(|| "large-v3-turbo".to_owned());
+    let path = native_engine::model_probe_path(&spec);
 
     let Some(path) = path else {
         return NativeProbe::without_model(gpu);
@@ -536,11 +451,7 @@ pub(crate) fn capability_probe() -> NativeProbe {
     // Fall back to the file stem as the preset hint when no spec was configured;
     // `alignment_heads` normalizes it and drops back to the openai "top half of
     // layers" rule for anything it does not recognize.
-    let hint = spec.or_else(|| {
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.trim_start_matches("ggml-").to_owned())
-    });
+    let hint = Some(spec);
 
     NativeProbe {
         multilingual: hparams.is_multilingual(),
@@ -552,29 +463,20 @@ pub(crate) fn capability_probe() -> NativeProbe {
 /// Resolve the effective model spec for a request, or a [`FwError`] explaining
 /// how to provision one.
 ///
-/// Precedence: `request.model` (when set) then
-/// `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`. With neither set, returns
-/// [`FwError::BackendUnavailable`] whose message names the env var and reuses
-/// [`native_engine::resolve_model`]'s search-dir listing so the fix is obvious.
+/// Precedence: `request.model` (when set), then
+/// `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then the authenticated default
+/// release package. If none resolves, returns an actionable
+/// [`FwError::BackendUnavailable`].
 fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
         return Ok(model);
     }
-    if let Some(spec) = native_engine::default_model_spec() {
-        return Ok(spec);
-    }
-    // No request model and no default: produce an actionable message that
-    // reuses the resolver's search-dir listing (by attempting a resolution of a
-    // placeholder, whose error text enumerates the searched directories).
-    let dirs_hint = native_engine::resolve_model("default")
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-    Err(FwError::BackendUnavailable(format!(
-        "native whisper.cpp engine has no model: pass --model, or set \
-         $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. \
-         {dirs_hint}"
-    )))
+    native_engine::configured_or_release_model_spec().map_err(|error| {
+        FwError::BackendUnavailable(format!(
+            "native whisper.cpp engine has no usable local model: pass --model, or set \
+             $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
+        ))
+    })
 }
 
 /// Build the [`decode::DecodeParams`] for a request.
@@ -670,13 +572,21 @@ pub fn run(
     // before any expensive work.
     let spec = effective_model_spec(request)?;
 
+    // Requested audio window (bd-vgod): `--offset-ms` / `--duration-ms` slice
+    // the normalized PCM before decode, so wall-clock scales with the slice.
+    let audio_window = requested_audio_window(request);
+
     // Silence pre-gate: the energy analyzer is cheap; loading a (potentially
     // multi-GB) model is not. Pure-silence clips skip the load entirely.
-    let analysis = analyze_wav(normalized_wav, request.backend_params.duration_ms).ok();
-    if let Some(analysis) = analysis.as_ref()
-        && analysis.active_regions.is_empty()
-    {
-        return Ok(silence_result(request, &spec, analysis.duration_ms));
+    // A windowed request skips the whole-file pre-gate: the analyzer scans
+    // the full clip, so its verdict would not describe the requested slice.
+    if audio_window.is_none() {
+        let analysis = analyze_wav(normalized_wav, request.backend_params.duration_ms).ok();
+        if let Some(analysis) = analysis.as_ref()
+            && analysis.active_regions.is_empty()
+        {
+            return Ok(silence_result(request, &spec, analysis.duration_ms));
+        }
     }
 
     if let Some(tok) = token {
@@ -688,8 +598,35 @@ pub fn run(
         .map_err(|e| FwError::BackendUnavailable(e.to_string()))?;
     let model = NativeWhisperModel::load(&model_path)?;
 
-    // Read the normalized WAV to f32 mono samples.
-    let samples = read_normalized_wav(normalized_wav)?;
+    // Read the normalized WAV to f32 mono samples, then apply the requested
+    // window. Timestamps are shifted back into the source timebase after
+    // decode so diarization/VAD/alignment stay consistent with the full clip.
+    let full_samples = read_normalized_wav(normalized_wav)?;
+    let (samples, window_offset_ms) = match audio_window {
+        Some((offset_ms, duration_ms)) => {
+            let (start, end) = window_sample_bounds(full_samples.len(), offset_ms, duration_ms);
+            if start >= end {
+                // Offset at/past EOF: an empty-but-valid result, honestly
+                // tagged with the requested (empty) window, beats a decode
+                // error for a region probe.
+                let mut result = silence_result(request, &spec, 0);
+                if let Value::Object(map) = &mut result.raw_output {
+                    map.insert(
+                        "audio_window".to_owned(),
+                        json!({
+                            "offset_ms": offset_ms,
+                            "duration_ms": duration_ms,
+                            "timebase": "source",
+                            "empty_slice": true,
+                        }),
+                    );
+                }
+                return Ok(result);
+            }
+            (full_samples[start..end].to_vec(), offset_ms)
+        }
+        None => (full_samples, 0),
+    };
 
     if let Some(tok) = token {
         tok.checkpoint()?;
@@ -709,7 +646,14 @@ pub fn run(
 
     let params = decode_params(request, want_dtw, &spec);
     let checkpoint = checkpoint_for(token);
-    let output = model.transcribe(&samples, &params, &checkpoint)?;
+    let mut output = model.transcribe(&samples, &params, &checkpoint)?;
+
+    // Shift every emitted timestamp back into the source-file timebase so a
+    // windowed run stays aligned with diarization, VAD, and alignment stages
+    // that operate on the full normalized clip.
+    if window_offset_ms > 0 {
+        shift_decode_output(&mut output, window_offset_ms as f64 / 1000.0);
+    }
 
     // Prefer real DTW word timings when the engine produced them; otherwise fall
     // back to the linear-interpolation word split (keeping its existing tag).
@@ -745,17 +689,38 @@ pub fn run(
     let version_tag = model.version_tag();
     crate::native_engine::perf_span("version_tag", t_tag.elapsed().as_secs_f64() * 1e3, "");
     crate::native_engine::perf_span("backend_run", t_backend.elapsed().as_secs_f64() * 1e3, "");
-    let raw_output = raw_output_json(
+    let mut raw_output = raw_output_json(
         &spec,
         &model_path,
         version_tag,
         native_engine::encoder_int8_effective_policy_decision(&model.loaded().hparams),
         &output.windows,
+        &output.dropped_windows,
+        &output.work,
         word_mode,
         request.backend_params.split_on_word,
         false,
         dtw_projection.as_ref(),
     );
+    if let (Value::Object(map), Some((offset_ms, duration_ms))) = (&mut raw_output, audio_window) {
+        map.insert(
+            "audio_window".to_owned(),
+            json!({
+                "offset_ms": offset_ms,
+                "duration_ms": duration_ms,
+                "timebase": "source",
+            }),
+        );
+    }
+    // Additive native-v2 route provenance: which encoder route actually ran
+    // (gpu_fused vs cpu:<decline reason>). A silent GPU->CPU fallback is
+    // invisible without this.
+    if let Value::Object(map) = &mut raw_output {
+        map.insert(
+            "encoder_route".to_owned(),
+            json!(native_engine::encoder::last_encoder_route()),
+        );
+    }
 
     Ok(TranscriptionResult {
         backend: BackendKind::WhisperCpp,
@@ -1429,6 +1394,67 @@ fn read_normalized_wav(path: &Path) -> FwResult<Vec<f32>> {
     decode::read_wav_16k_mono(&bytes)
 }
 
+/// The requested `--offset-ms` / `--duration-ms` audio window, if any.
+///
+/// Returns `None` when neither flag is set (or both are zero-effect), so the
+/// unwindowed path stays byte-identical to the pre-window behavior.
+fn requested_audio_window(request: &TranscribeRequest) -> Option<(u64, Option<u64>)> {
+    let offset_ms = request.backend_params.offset_ms.unwrap_or(0);
+    let duration_ms = request.backend_params.duration_ms.filter(|d| *d > 0);
+    if offset_ms == 0 && duration_ms.is_none() {
+        None
+    } else {
+        Some((offset_ms, duration_ms))
+    }
+}
+
+/// Convert a ms-domain window into clamped sample bounds over 16 kHz PCM.
+fn window_sample_bounds(len: usize, offset_ms: u64, duration_ms: Option<u64>) -> (usize, usize) {
+    const SAMPLES_PER_MS: u64 = (native_engine::mel::SAMPLE_RATE as u64) / 1000;
+    let start = usize::try_from(offset_ms.saturating_mul(SAMPLES_PER_MS))
+        .unwrap_or(usize::MAX)
+        .min(len);
+    let end = match duration_ms {
+        Some(duration_ms) => usize::try_from(
+            offset_ms
+                .saturating_add(duration_ms)
+                .saturating_mul(SAMPLES_PER_MS),
+        )
+        .unwrap_or(usize::MAX)
+        .min(len),
+        None => len,
+    };
+    (start, end.max(start))
+}
+
+/// Shift every emitted timestamp in a decode output by a uniform offset,
+/// keeping windowed runs in the source-file timebase.
+fn shift_decode_output(output: &mut decode::DecodeOutput, offset_sec: f64) {
+    for segment in &mut output.segments {
+        if let Some(start) = segment.start_sec.as_mut() {
+            *start += offset_sec;
+        }
+        if let Some(end) = segment.end_sec.as_mut() {
+            *end += offset_sec;
+        }
+    }
+    if let Some(word_timings) = output.word_timings.as_mut() {
+        for words in word_timings.iter_mut() {
+            for word in words.iter_mut() {
+                word.start_sec += offset_sec;
+                word.end_sec += offset_sec;
+            }
+        }
+    }
+    for window in &mut output.windows {
+        window.window_offset_sec += offset_sec;
+    }
+    for dropped in &mut output.dropped_windows {
+        dropped.start_sec += offset_sec;
+        dropped.end_sec += offset_sec;
+    }
+}
+
 /// The honest raw-output metadata JSON for a real-inference run.
 #[allow(clippy::too_many_arguments)]
 fn raw_output_json(
@@ -1437,6 +1463,8 @@ fn raw_output_json(
     version_tag: String,
     encoder_policy: native_engine::EncoderInt8PolicyDecision,
     windows: &[decode::WindowStats],
+    dropped_windows: &[decode::DroppedWindow],
+    decode_work: &decode::DecodeWorkStats,
     word_mode: WordTimestampMode,
     split_on_word: bool,
     silence: bool,
@@ -1461,6 +1489,21 @@ fn raw_output_json(
             })
         })
         .collect();
+    // Additive native-v2 fields (bd-nqzf): every discarded long-form window is
+    // a real content gap and must be machine-addressable, not stderr-only.
+    let dropped_windows_json: Vec<Value> = dropped_windows
+        .iter()
+        .map(|w| {
+            json!({
+                "start_sec": w.start_sec,
+                "end_sec": w.end_sec,
+                "reason": w.reason,
+                "no_speech_prob": w.no_speech_prob,
+                "avg_logprob": w.avg_logprob,
+                "retried": w.retried,
+            })
+        })
+        .collect();
     let mut output = json!({
         "engine": "whisper.cpp-native",
         "schema_version": SCHEMA_VERSION,
@@ -1481,6 +1524,11 @@ fn raw_output_json(
             "quant_rel_rmse_budget": encoder_policy.quant_rel_rmse_budget,
         },
         "windows": windows_json,
+        "dropped_windows": dropped_windows_json,
+        "decode_work": {
+            "prompt_reset_retries": decode_work.prompt_reset_retries,
+            "temperature_fallback_retries": decode_work.temperature_fallback_retries,
+        },
         "word_timestamps": word_timestamps,
     });
     if let (Value::Object(map), Some(report)) = (&mut output, dtw_projection) {
@@ -1550,6 +1598,104 @@ mod tests {
             timeout_ms: None,
             backend_params: BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn requested_audio_window_none_without_flags() {
+        let request = native_request();
+        assert!(requested_audio_window(&request).is_none());
+
+        let mut zeroed = native_request();
+        zeroed.backend_params.offset_ms = Some(0);
+        zeroed.backend_params.duration_ms = Some(0);
+        assert!(
+            requested_audio_window(&zeroed).is_none(),
+            "zero-effect flags must keep the unwindowed path byte-identical"
+        );
+    }
+
+    #[test]
+    fn requested_audio_window_captures_offset_and_duration() {
+        let mut request = native_request();
+        request.backend_params.offset_ms = Some(60_000);
+        assert_eq!(requested_audio_window(&request), Some((60_000, None)));
+
+        request.backend_params.duration_ms = Some(20_000);
+        assert_eq!(
+            requested_audio_window(&request),
+            Some((60_000, Some(20_000)))
+        );
+
+        request.backend_params.offset_ms = None;
+        assert_eq!(requested_audio_window(&request), Some((0, Some(20_000))));
+    }
+
+    #[test]
+    fn window_sample_bounds_slices_and_clamps() {
+        // 120 s of 16 kHz audio.
+        let len = 120 * 16_000;
+        assert_eq!(window_sample_bounds(len, 0, Some(20_000)), (0, 320_000));
+        assert_eq!(
+            window_sample_bounds(len, 60_000, None),
+            (960_000, 1_920_000)
+        );
+        assert_eq!(
+            window_sample_bounds(len, 60_000, Some(20_000)),
+            (960_000, 1_280_000)
+        );
+        // Duration past EOF clamps to EOF.
+        assert_eq!(
+            window_sample_bounds(len, 110_000, Some(60_000)),
+            (1_760_000, 1_920_000)
+        );
+        // Offset at/past EOF collapses to an empty slice.
+        let (start, end) = window_sample_bounds(len, 120_000, Some(1_000));
+        assert!(start >= end);
+        let (start, end) = window_sample_bounds(len, u64::MAX, None);
+        assert!(start >= end);
+    }
+
+    #[test]
+    fn shift_decode_output_moves_all_timestamps_uniformly() {
+        let mut output = decode::DecodeOutput {
+            segments: vec![TranscriptionSegment {
+                start_sec: Some(0.5),
+                end_sec: Some(2.0),
+                text: "hello".to_owned(),
+                speaker: None,
+                confidence: Some(0.9),
+            }],
+            language: Some("en".to_owned()),
+            windows: vec![decode::WindowStats {
+                avg_logprob: -0.1,
+                no_speech_prob: 0.01,
+                tokens: 3,
+                window_offset_sec: 0.0,
+            }],
+            dropped_windows: vec![decode::DroppedWindow {
+                start_sec: 30.0,
+                end_sec: 60.0,
+                reason: "window_closed_no_timestamp",
+                no_speech_prob: 1e-9,
+                avg_logprob: -0.1,
+                retried: true,
+            }],
+            work: decode::DecodeWorkStats::default(),
+            word_timings: Some(vec![vec![WordTiming {
+                text: "hello".to_owned(),
+                start_sec: 0.5,
+                end_sec: 2.0,
+            }]]),
+        };
+        shift_decode_output(&mut output, 60.0);
+        assert_eq!(output.segments[0].start_sec, Some(60.5));
+        assert_eq!(output.segments[0].end_sec, Some(62.0));
+        let words = output.word_timings.as_ref().expect("word timings");
+        assert!((words[0][0].start_sec - 60.5).abs() < 1e-9);
+        assert!((words[0][0].end_sec - 62.0).abs() < 1e-9);
+        assert!((output.windows[0].window_offset_sec - 60.0).abs() < 1e-9);
+        assert!((output.dropped_windows[0].start_sec - 90.0).abs() < 1e-9);
+        assert!((output.dropped_windows[0].end_sec - 120.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1705,12 +1851,12 @@ mod tests {
     // ── Model resolution / availability ───────────────────────────────────
 
     #[test]
-    fn run_without_model_or_default_is_backend_unavailable() {
+    fn run_without_any_configured_or_release_model_is_backend_unavailable() {
         let mut req = native_request();
         req.model = None;
-        // If the operator has a default model configured in this environment we
-        // cannot assert the unavailable path; only assert when truly unset.
-        if native_engine::default_model_spec().is_some() {
+        // This failure path exists only when neither an explicit default nor a
+        // deterministically discoverable local model is present.
+        if native_engine::configured_or_release_model_available() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2050,6 +2196,8 @@ mod tests {
             "fw-native-v1+sha256:abc".to_owned(),
             f32_encoder_policy_fixture(),
             &[],
+            &[],
+            &decode::DecodeWorkStats::default(),
             WordTimestampMode::Word,
             false,
             false,
@@ -2059,6 +2207,44 @@ mod tests {
         assert_eq!(json["implementation"].as_str(), Some("real-inference"));
         assert_eq!(json["schema_version"].as_str(), Some(SCHEMA_VERSION));
         assert_eq!(json["in_process"].as_bool(), Some(true));
+        assert_eq!(json["dropped_windows"], json!([]));
+        assert_eq!(json["decode_work"]["prompt_reset_retries"], json!(0));
+    }
+
+    #[test]
+    fn raw_output_surfaces_dropped_windows_structurally() {
+        let dropped = vec![decode::DroppedWindow {
+            start_sec: 514.0,
+            end_sec: 544.0,
+            reason: "window_closed_no_timestamp",
+            no_speech_prob: 5.6e-10,
+            avg_logprob: -0.111,
+            retried: true,
+        }];
+        let work = decode::DecodeWorkStats {
+            prompt_reset_retries: 1,
+            ..decode::DecodeWorkStats::default()
+        };
+        let json = raw_output_json(
+            "large-v3-turbo",
+            Path::new("/models/ggml-large-v3-turbo.bin"),
+            "fw-native-v1+sha256:abc".to_owned(),
+            f32_encoder_policy_fixture(),
+            &[],
+            &dropped,
+            &work,
+            WordTimestampMode::None,
+            false,
+            false,
+            None,
+        );
+        let windows = json["dropped_windows"].as_array().expect("array");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0]["start_sec"], json!(514.0));
+        assert_eq!(windows[0]["end_sec"], json!(544.0));
+        assert_eq!(windows[0]["reason"], json!("window_closed_no_timestamp"));
+        assert_eq!(windows[0]["retried"], json!(true));
+        assert_eq!(json["decode_work"]["prompt_reset_retries"], json!(1));
     }
 
     #[test]
@@ -2084,6 +2270,8 @@ mod tests {
             "fw-native-v1+sha256:abc".to_owned(),
             f32_encoder_policy_fixture(),
             &[],
+            &[],
+            &decode::DecodeWorkStats::default(),
             WordTimestampMode::Word,
             false,
             false,

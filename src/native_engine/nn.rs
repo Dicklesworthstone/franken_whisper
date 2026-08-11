@@ -141,8 +141,8 @@ fn gemv_worker_count(out: usize) -> usize {
 /// (`qkv` 3840x1280, `mlp_0` 5120x1280, `mlp_2` 1280x5120, `attn_out`/`cross_q`/
 /// `cross_out` 1280x1280). Overridable via `FW_MID_GEMV_CAP`.
 ///
-/// The 8 it defaults to came from criterion runs on an **M4 Pro (10 performance
-/// + 4 efficiency cores)**, where widening past 8 recruited the efficiency cores
+/// The 8 it defaults to came from criterion runs on an **M4 Pro with 10 performance
+/// and 4 efficiency cores**, where widening past 8 recruited the efficiency cores
 /// and measured +29% on `f16_gemv_dequant_1280x1280`. That is a statement about
 /// a heterogeneous 14-core laptop, not about an 8-CCD server part, and it is the
 /// same reasoning the vocab head already outgrew when its own cap went 12 -> 32
@@ -3363,7 +3363,7 @@ fn quantize_f16_row_blocked_to_int_into(
 ) {
     let inp = wrow.len();
     let n_blocks = inp.div_ceil(block);
-    for b in 0..n_blocks {
+    for (b, scale) in srow.iter_mut().enumerate().take(n_blocks) {
         let s = b * block;
         let e = ((b + 1) * block).min(inp);
         let amax = wrow[s..e]
@@ -3372,7 +3372,7 @@ fn quantize_f16_row_blocked_to_int_into(
             .fold(0.0f32, f32::max)
             .max(1e-9);
         let sc = amax / max_level;
-        srow[b] = sc;
+        *scale = sc;
         let inv = 1.0 / sc;
         for i in s..e {
             drow[i] = (wrow[i].to_f32() * inv)
@@ -4166,12 +4166,12 @@ fn norm_rows_into(src: &[f32], dst: &mut [f32], cols: usize, w: &[f32], b: &[f32
         let srow = &src[r * cols..(r + 1) * cols];
         let drow = &mut dst[r * cols..(r + 1) * cols];
         let mut sum = 0.0f64;
-        for &v in srow.iter() {
+        for &v in srow {
             sum += f64::from(v);
         }
         let mean = sum / n;
         let mut var = 0.0f64;
-        for &v in srow.iter() {
+        for &v in srow {
             let d = f64::from(v) - mean;
             var += d * d;
         }
@@ -5339,7 +5339,12 @@ fn maddubs_i7_qkv_headmajor(
 /// floor. `hq` is the shared quantized activation; `*_bias` mirror q/k/v (k has none).
 ///
 /// # Errors
+///
 /// [`FwError::InvalidRequest`] on shape mismatch.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the three Q/K/V weight-bias pairs are distinct kernel operands"
+)]
 pub fn attention_from_i7_qkv(
     hq: &I7Activation,
     qw: &I7Mat,
@@ -6161,7 +6166,9 @@ mod tests {
         for &(out, inp) in &[(40usize, 24usize), (17, 31), (64, 16), (1, 8), (8, 1)] {
             // Synthetic ggml [out, inp] f16 raw bytes (finite, varied).
             let mut raw = vec![0u8; out * inp * 2];
-            for b2 in raw.chunks_exact_mut(2) {
+            let (f16_values, remainder) = raw.as_chunks_mut::<2>();
+            debug_assert!(remainder.is_empty());
+            for b2 in f16_values {
                 let v = rng.next_f32() * 4.0; // finite f16 range
                 b2.copy_from_slice(&Float16::from_f32(v).to_bits().to_le_bytes());
             }
@@ -6754,7 +6761,7 @@ mod tests {
             let n_blocks = inp.div_ceil(block);
             let mut drow = vec![0i8; inp];
             let mut srow = vec![0.0f32; n_blocks];
-            for b in 0..n_blocks {
+            for (b, scale) in srow.iter_mut().enumerate().take(n_blocks) {
                 let s = b * block;
                 let e = ((b + 1) * block).min(inp);
                 let amax = wrow[s..e]
@@ -6763,7 +6770,7 @@ mod tests {
                     .fold(0.0f32, f32::max)
                     .max(1e-9);
                 let sc = amax / max_level;
-                srow[b] = sc;
+                *scale = sc;
                 let inv = 1.0 / sc;
                 for i in s..e {
                     drow[i] = (wrow[i].to_f32() * inv)
@@ -6818,7 +6825,7 @@ mod tests {
         let mut drow = vec![0i8; rows * cols];
         let mut srow = vec![0.0f32; rows * n_blocks];
         let scalar = |wrow: &[Float16], drow: &mut [i8], srow: &mut [f32]| {
-            for b in 0..n_blocks {
+            for (b, scale) in srow.iter_mut().enumerate().take(n_blocks) {
                 let (st, e) = (b * block, ((b + 1) * block).min(cols));
                 let amax = wrow[st..e]
                     .iter()
@@ -6826,7 +6833,7 @@ mod tests {
                     .fold(0.0f32, f32::max)
                     .max(1e-9);
                 let inv = 127.0 / amax;
-                srow[b] = amax / 127.0;
+                *scale = amax / 127.0;
                 for i in st..e {
                     drow[i] = (wrow[i].to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
                 }

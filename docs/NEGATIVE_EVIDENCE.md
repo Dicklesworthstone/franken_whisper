@@ -1031,6 +1031,16 @@ of greedy on unambiguous audio; also proves the field→beam decode wiring). Bac
 25/0, no in-lane clippy. NOTE: a transient frankensqlite `codegen.rs` mid-edit (another
 repo's active WIP) briefly red-built here and self-resolved in ~30 s — not a blocker.
 
+**2026-08-08 correction.** The byte-identical conclusion above was host-specific,
+and its "beam is a superset, therefore the winner equals greedy" premise was
+invalid. On Apple Silicon, native beam-5 inserts one comma after `so`, while native
+greedy and current Metal whisper.cpp omit it; current CPU-only whisper.cpp produces
+another capitalization/segment-closure variant. Every observed transcript has WER
+0.0. The repaired gate keeps greedy byte-exact, requires beam WER 0.0, and admits
+only the two reviewed native punctuation strings. This changes the old gate's
+admitted set by exactly one known zero-WER string; word substitutions, omissions,
+insertions, and any third punctuation form still fail. See DISC-003.
+
 ---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (initial_prompt is now a real per-request API) — promoted `initial_prompt` from the FW_INITIAL_PROMPT env-hatch to a proper `DecodeParams` field, wired through the native backend so a request's `--prompt` reaches the engine end to end.**
 
@@ -26621,7 +26631,7 @@ never as verdict gates. Until that predicate holds, **do not ship and do not
 record this as a rejection**; the measured hotspot remains open.
 
 ---
-## 2026-07-28 - MistyDog: **NO-SHIP CERTIFICATION / NO-DATA — Rust acoustic diarization has focused synthetic proof, but no admissible public-corpus DER/JER or calibration artifact.**
+## 2026-07-28 - MistyDog: **NO-PROMOTION CERTIFICATION / NO-DATA — Rust acoustic diarization has focused synthetic proof, but no admissible public-corpus DER/JER or calibration artifact.**
 
 `bd-odj7` now has a typed waveform implementation, permutation-invariant
 scorers, deterministic replay checks, bounded-memory tests, hard/soft enrollment

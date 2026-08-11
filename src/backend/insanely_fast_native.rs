@@ -162,25 +162,19 @@ pub fn is_available() -> bool {
 
 /// Resolve the effective model spec for a request, or a [`FwError`] explaining
 /// how to provision one. Identical precedence to the whisper.cpp native engine:
-/// `request.model` then `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, else an
-/// actionable [`FwError::BackendUnavailable`] naming the env var and reusing the
-/// resolver's search-dir listing.
+/// `request.model`, then `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then the
+/// authenticated default release package, else an actionable
+/// [`FwError::BackendUnavailable`].
 fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
         return Ok(model);
     }
-    if let Some(spec) = native_engine::default_model_spec() {
-        return Ok(spec);
-    }
-    let dirs_hint = native_engine::resolve_model("default")
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-    Err(FwError::BackendUnavailable(format!(
-        "native insanely-fast engine has no model: pass --model, or set \
-         $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. \
-         {dirs_hint}"
-    )))
+    native_engine::configured_or_release_model_spec().map_err(|error| {
+        FwError::BackendUnavailable(format!(
+            "native insanely-fast engine has no usable local model: pass --model, or set \
+             $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
+        ))
+    })
 }
 
 /// The number of 30 s windows `samples` spans (`ceil(len / N_SAMPLES_30S)`),
@@ -970,6 +964,7 @@ mod tests {
                 tokens: 3,
                 window_offset_sec: offset_sec,
             }],
+            dropped_windows: Vec::new(),
             work: decode::DecodeWorkStats::default(),
             word_timings: None,
         }
@@ -1006,10 +1001,10 @@ mod tests {
     // ── Model resolution / availability ───────────────────────────────────
 
     #[test]
-    fn run_without_model_or_default_is_backend_unavailable() {
+    fn run_without_any_configured_or_release_model_is_backend_unavailable() {
         let mut req = request();
         req.model = None;
-        if native_engine::default_model_spec().is_some() {
+        if native_engine::configured_or_release_model_available() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");

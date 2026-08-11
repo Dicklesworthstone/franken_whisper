@@ -1,0 +1,13 @@
+# Pass-local scratch
+audit/partial/
+audit/.archive/
+
+# Don't ignore other audit/ contents — they're the durable artifacts
+!audit/
+!audit/regression_tests/
+!audit/agent_simulations/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.tmp

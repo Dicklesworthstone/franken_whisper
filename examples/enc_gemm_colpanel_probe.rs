@@ -82,7 +82,7 @@ fn bench(name: &str, k: usize, n: usize, seq: usize, panels: &[usize], iters: us
     );
 
     for &p in panels {
-        if n % p != 0 {
+        if !n.is_multiple_of(p) {
             println!("  P={p}: skip (N={n} not divisible)");
             continue;
         }

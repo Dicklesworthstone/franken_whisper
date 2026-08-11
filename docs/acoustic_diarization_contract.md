@@ -761,7 +761,11 @@ value. These limits are validated before the hard-hint overlap check.
 
 ## 6. Output and confidence
 
-The diarized-turn timeline is the acoustic source of truth. Each turn contains:
+The diarized-turn timeline is the acoustic source of truth. Turns use
+deterministic `(start_ms, end_ms, speaker_ref)` order, each individual speaker's
+turns do not overlap, and simultaneous turns for distinct speakers are legal
+only when every participating turn is labeled and carries explicit overlap
+evidence. Each turn contains:
 
 - finite monotonic start and end;
 - optional speaker ID, where absence means unknown;
@@ -773,6 +777,25 @@ The diarized-turn timeline is the acoustic source of truth. Each turn contains:
 ASR segment `confidence` remains ASR confidence. Speaker confidence is a
 separate field. Transcript projection may split only at legal DTW word
 boundaries and cannot invent, drop, duplicate, or reorder text.
+
+**Projection fusion (`projection-fusion-v1`, bd-d4py).** Projection runs in
+two passes. The primary pass keeps the historical conservative gates
+(70% duration dominance for non-word segments, the 0.30 turn-confidence gate
+for words). A second fusion pass then attributes segments the primary pass
+left `null` using the same turn evidence: a segment overlapping any labeled
+turn takes the max-overlap labeled turn, and a timed segment in a turn gap
+takes the nearest labeled turn within 2 s (hard-hint turns are never
+extrapolated into gaps: a `hard_must_link` interval asserts identity only for
+its own audio). Word-granularity speaker changes
+that land mid-clause are re-anchored to the nearest sentence-final
+punctuation boundary within ±4 words, using the transcript's own punctuation
+as the boundary oracle (quantized diarizer boundaries — e.g. Sortformer's
+80 ms lanes — otherwise misattribute the first/last word of each turn).
+Fusion rewrites only the projected per-segment speaker labels: turn
+timelines, text bytes, timing, and ASR confidence are untouched, untimed
+segments stay `UNKNOWN`, and the report additionally carries the merged
+`speaker_segments` view (consecutive same-speaker runs with joined text and
+duration-weighted turn confidence).
 
 ### 6.1 Speaker-count and evidence result
 
@@ -1297,12 +1320,19 @@ access.
 `public-diarization-corpus-input-v2` from an absolute root outside the checkout.
 Every selected input is a relative path under that canonical root. Symlink
 escapes, traversal, absolute descriptor paths, wrong SHA-256 values, unexpected
-WAV sample rate/channel count, invalid selected channels, malformed RTTM,
-unmapped speakers, and out-of-bounds turns fail closed. RTTM is the deliberately
-small interchange surface: exactly ten `SPEAKER` fields, plain decimal seconds,
-one selected recording/channel, and an explicit source-label to path-free
-speaker-ID map. Concurrent different-speaker turns are preserved and marked as
-overlap. Ignored regions remain explicit scorer inputs.
+WAV sample rate/channel count, invalid selected channels, malformed RTTM, and
+unmapped speakers fail closed. Out-of-bounds turns also fail closed except for
+one corpus-specific conversion rule: an official VoxConverse turn that begins
+before WAV EOF and ends no more than 100 ms after EOF is clipped to EOF, with
+the clipped-turn count and clipped milliseconds retained in path-free evidence.
+The pinned archive audit admitted 61 test turns (zero development turns), with
+a maximum 92 ms overrun; counterexamples at 101 ms or beginning at EOF remain
+rejected. This is a frozen source-normalization rule, not a scorer-tolerance
+change. RTTM is the deliberately small interchange surface: exactly ten
+`SPEAKER` fields, plain decimal seconds, one selected recording/channel, and an
+explicit source-label to path-free speaker-ID map. Concurrent different-speaker
+turns are preserved and marked as overlap. Ignored regions remain explicit
+scorer inputs.
 
 Each recording may bind an optional external
 `public-diarization-word-annotation-v1` document by relative path and exact
@@ -1311,10 +1341,11 @@ opaque word IDs, integer-millisecond intervals, and reference speaker IDs.
 The adapter validates every word against active reference speech, caps
 per-recording and corpus totals, and never imports lexical text.
 
-The generated `public-diarization-corpus-bundle-v2` contains the path-free
+The generated `public-diarization-corpus-bundle-v3` contains the path-free
 manifest, canonical reference documents, media/annotation/reference SHA-256
 values, optional word-annotation SHA-256 values and counts, checked WAV
-geometry, and a passing self-hashed leakage audit. It never contains local
+geometry, annotation-tail normalization counts, and a passing self-hashed
+leakage audit. It never contains local
 paths, URIs, transcripts, or media bytes. The output is created once in a
 directory outside both the checkout and input root; source media is never
 copied. Entire output file names use lowercase ASCII letters, digits, period,
@@ -1405,40 +1436,137 @@ change the default-off acoustic-v2 path.
 `diarization-corpus compare-models` is a separate development-only diagnostic.
 One invocation runs the same validated mono signed-PCM 16 kHz WAV bytes and the
 same frozen scorer over `native_acoustic`, `native_ecapa`,
-`native_ecapa_fused`, and the pinned operator-installed `external_sortformer`
-oracle. The headline uses inferred speaker count; a reference count above the
-Sortformer four-speaker contract is declared capacity-ineligible and is never
-passed to the model. Consecutive sorted observations follow a four-row Williams
-schedule, and `order_balance_complete` is true only after a complete schedule.
-Every declared lane is retained as completed, skipped, or failed with a stable
-reason. Protocol v2 binds each complete effective native request, the ordered
-payload-free outcome taxonomy, and the protocol body to a pinned canonical
-SHA-256 identity; changing any of them requires a new version-and-digest pair.
-The command requires eight native
-Rayon workers to match the pinned Sortformer intra-op thread count and applies
-a frozen 1800-second limit to each Sortformer `OracleRun` subprocess. That
-value is not a whole-observation cap:
-the version probe has a separate 15-second limit. Top-level and per-row
-checkpoints, WAV decoding, native acoustic and ECAPA execution, and Sortformer
-subprocess polling observe caller cancellation. Hashing plus portions of input
-and output validation and scoring have no declared whole-attempt deadline, so
-whole-attempt cancellation latency remains unavailable rather than certified.
+`native_ecapa_fused`, the release-bound `native_sortformer`, and the pinned
+operator-installed `external_sortformer` oracle. The headline uses inferred
+speaker count; a reference count above the Sortformer four-speaker contract is
+declared capacity-ineligible and is never passed to either Sortformer lane.
+Consecutive sorted observations follow a ten-row balanced Williams schedule,
+and `order_balance_complete` is true only after a complete schedule. Every
+declared lane is retained as completed, skipped, or failed with a stable
+reason. Protocol v7 binds each complete effective native request, the ordered
+payload-free outcome taxonomy, the external Sortformer adapter version and
+executable SHA-256, and the protocol body to a pinned canonical SHA-256
+identity; changing any of them requires a new version-and-digest pair.
+The command requires eight native Rayon workers to match the pinned Sortformer
+intra-op thread count and applies the same frozen 1800-second whole-attempt
+limit to every lane. Each lane/observation runs in a fresh bounded worker
+process. Its request binds the executable, source WAV, normalized PCM,
+reference, scorer, protocol, and applicable model artifacts. Cancellation and
+timeout terminate the worker's complete process group, including a nested
+external adapter, and a live recursive-descendant probe measures the process-
+tree cancellation path. A group-signal error is not itself success: it is
+accepted only if direct-root reap and the subsequent absence probe certify that
+the complete group is gone.
+Before reading that request, the process-group root authenticates an inherited
+kernel-pipe capability against its direct parent and starts a liveness watcher.
+The parent retains the only write end. If the parent crashes or is killed, EOF
+makes the worker kill its complete group, including nested adapters; platforms
+without this capability fail before an observed worker is launched.
 
 The aggregate comparison evidence is `diagnostic_only`,
 `development_uncertified`, forbids a superiority claim, and records
 `production_route_changed=false`. Absolute DER/JER values use the project
 scorer and must not be compared directly with published md-eval numbers without
 an explicit scorer-equivalence probe. Timing is retained for deployment
-observation only: native acoustic includes pipeline plus scorer; ECAPA lanes
-exclude one shared model load; Sortformer includes executable and input
-attestation, a version-probe subprocess, a cold oracle subprocess, output
-validation, and scoring per recording. Those scopes are not cross-lane
-comparable, and the current artifact intentionally reports isolated peak RSS
-and cancellation latency as unavailable. Neither ECAPA nor Sortformer weights
-are downloaded or vendored by this command; unavailable operator components
-produce typed skips.
+observation only. Parent-observed time for every lane includes process launch,
+bounded IPC, identity validation, audio decode, model load, inference, output
+validation, scoring, post-run identity validation, and resource-probe parsing.
+Those fresh-process scopes are cross-lane comparable. The artifact reports an
+approximate sampled maximum of the concurrent RSS sum across the complete
+worker process group, including nested subprocess adapters. Sample starts are
+separated by at least 50 ms and each probe is bounded; probe work makes the
+actual start-to-start cadence longer, so this is neither an exact high-water
+mark nor an exactly-50-ms sampler. Cancellation, timeout, and output-limit
+checks precede observation. The retained cancellation probe exercises this same
+observer path. On Unix, cleanup reaps the root and confirms that the owned
+process group disappeared; cleanup failure overrides the nominal lane result.
+A fast exit without a sample is explicitly unavailable, while repeated loss of
+a still-live group fails the resource probe. Platform scans check cancellation
+and the enclosing attempt deadline. A matched live Linux group member cannot be
+silently omitted: it must expose a valid RSS field. A complete zero-only scan is
+missing rather than a measured zero, and repeated zero-only scans fail closed.
+Recursive-process cancellation
+latency is retained separately; unavailable platform probes remain explicitly
+unavailable rather than becoming zero. The comparison command downloads no
+model. `native_sortformer` uses only the release-bound cache installed by the
+explicit `fw pull sortformer` command; unavailable ECAPA, native Sortformer,
+or external-adapter components produce typed skips.
 The command does not alter transcription routing or the default-off acoustic
 sidecar.
+
+`verify_public_model_comparison_bundle_identity_pair` is deliberately an
+artifact-identity verifier. It validates each artifact structurally and checks
+the shared corpus, source, descriptor, bundle, split, and recording-count tuple.
+Aggregate-only evidence omits the per-record normalized-input and outcome rows,
+so this verifier cannot recompute the observation-set commitment or aggregate
+metrics. Derivation proof requires source reconstruction and a fresh comparison
+run.
+
+ReDimNet2-B2 is a compact evaluation-only representation provider, not a
+segmentation, overlap, speaker-count, or clustering authority. Its pinned
+upstream identity is PalabraAI/redimnet2 v1.0.0 at peeled revision
+`5294667e806ac3b0f27abc301a114ef132b64b42`, with checkpoint size 15,897,450
+bytes and SHA-256
+`0545a29679a87fe1c662d2bbd05e3b3fe0d1b392832729abaa135e4079a2f77a`.
+The checkpoint configuration, not paper prose, is authoritative: 72 mel bands,
+six reshape stages, a 1,440-channel weighted 1D path, attentive-statistics
+pooling, and a raw 192-dimensional embedding that is not L2-normalized. The
+model contains 3,677,760 parameters: 3,676,320 trainable plus the frozen
+1,440-element first-stage weighting tensor.
+
+`scripts/export_redimnet2.py` is the only accepted raw-checkpoint boundary. Its
+current exporter and conversion-receipt schemas are v2; the synthetic truth
+tensor contract remains v1. It requires the exact Python/package tuple and
+14-file source manifest. Before
+import, it requires the executable `redimnet2` package-file census to equal the
+manifest exactly, rejecting unmanifested bytecode, native extensions, regular
+files, special entries, and symlinks; it disables bytecode writes, invalidates
+import caches, and rejects preloaded ReDimNet modules. It loads the
+checkpoint with `weights_only=True` from an already hash-verified owned byte
+buffer, strictly loads the upstream graph, drops exactly 68 scalar int64 batch
+counters, and retains 661 finite contiguous f32 tensors containing 3,918,794
+elements. The receipt binds the interpreter binary, Python implementation and
+cache tag, package RECORD/METADATA digests, and a path-free file-set commitment
+after verifying every hashed RECORD entry. It also binds Torch
+Git/build/configuration identity. A Python audit hook denies socket and
+child-process events; the exporter verifies source-module provenance and
+source/exporter stability before
+publication. It creates a new external mode-0700 directory and three mode-0600
+files through a stable directory handle using no-follow and exclusive creation,
+then verifies inode identity and fsyncs the directory; repository-contained
+input or output paths fail closed. Neither the Rust runtime nor this exporter
+downloads a model.
+
+The canonical converted package is 15,745,544 bytes with SHA-256
+`d41a729f5ef008d70c6d6bf4ab7ca27e299a478ff665665a4e31afff7f46ddeb`.
+The synthetic oracle package is 8,828,392 bytes with SHA-256
+`21042537873c3dacafafd134d7c9e296318458f55f1a429c00bc9542f95f3238`.
+It binds waveform, frontend, stem, stage 0, stage 3, final weighted 1D,
+backbone 2D, attentive pooling, pooled batch normalization, raw embedding, and
+consumer-normalized embedding seams. Five source replays at each of one and
+eight PyTorch threads were deterministic within a thread count. The cross-
+thread source floor peaked at max-absolute `3.147125244140625e-4` in the
+frontend and relative-L2 `1.4254854456195043e-5` in the final weighted path;
+the receipt retains every seam floor, ceiling, absolute headroom, floor
+multiplier, and pre-native rounding rationale. The manual terminal seam is
+accepted only when it is bit-exact to the authoritative upstream `forward`.
+Known upstream deprecation warnings and the one pinned initialization message
+are captured and retained only as path-free code, count, byte, and message
+digests; unknown warnings or console output fail. The
+initial frontend ceiling of `2e-5`/`2e-6` was rejected before native work and
+is preserved in the receipt rather than erased. Two independent final hardened
+exports were byte-identical, including the path-free receipt at SHA-256
+`e4e5aab1838dd386895425acc11e3405191e30ce2111c313c2734bfc2bccd77e`.
+
+The v1.0.0 tag contains no top-level repository license file even though a
+later main revision has an MIT file and individual pinned sources carry MIT or
+Apache notices. Model-weight redistribution scope is therefore unresolved.
+The receipt fixes distribution status to `operator_local_no_release`; no
+converted package, checkpoint, truth tensors, feature values, local paths,
+audio, transcripts, or biometric vectors may enter Git, a public release, or
+runtime evidence. This licensing boundary does not prevent local parity and
+comparison work, but it does prevent artifact publication or a distributable
+product claim.
 
 The AMI adapter enforces the corpus site's scenario-only training,
 development, and unseen-test meeting-family split. Other corpora use an
@@ -1556,12 +1684,17 @@ size one, inferred count up to four, and untuned onset/offset 0.5 with zero padd
 and minimum-duration filtering. The canonical adapter labels are
 `speaker_0` through `speaker_3`; arrival order is determined by each label's
 minimum onset and tied first onsets are allowed. Turns start and end on 80 ms
-frames, except that an end may equal the document duration. Sortformer overlap
-is represented only by concurrent labeled turns, never by
+frames, except that an end may equal the document duration. NeMo expands each
+80 ms prediction into eight 10 ms VAD frames; if activity remains live at EOF,
+its binarizer reports the final repeated subframe and therefore an end with a
+70 ms residue. The adapter may canonicalize only that residue to the physical
+document duration, and only when the gap is at most 79 ms. All starts and every
+other non-document end remain strict 80 ms grid points. Sortformer overlap is
+represented only by concurrent labeled turns, never by
 `overlap_suspected`. Speech activity, overlap, and speaker-change boundaries
 must exactly equal the O(n log n) event-sweep derivation from the final turns.
 
-The accepted `franken-whisper-sortformer-oracle-v2` adapter must verify the
+The accepted `franken-whisper-sortformer-oracle-v3` adapter must verify the
 installed `nemo-toolkit` distribution's `direct_url.json` commit and requested
 revision rather than repeating the expected tool revision as an unchecked
 constant. It also fails closed on drift from the qualified Python 3.12.12,
@@ -1572,11 +1705,20 @@ profile plus the derived first/steady FIFO-pop schedule after NeMo's parameter
 validator runs. The host binds the
 resulting version document and exact adapter executable hash into evidence.
 This operator override is a declared trust boundary, not remote attestation.
-The host validates the version schema and internal hashes, but it does not
-allowlist executable digests or prove that an arbitrary replacement really ran
-the stated checks. A qualified row must therefore cite the reviewed adapter
-digest, and acceptance of a self-consistent v2 version document alone must not
-be inflated into certification of its implementation.
+The host validates the version schema and internal hashes and allowlists the
+reviewed executable digest, but it cannot remotely attest that the external
+runtime honored its source-level checks. The same-invocation comparison
+protocol separately binds the exact adapter version and executable digest, so
+changing operator code cannot silently reuse an older protocol identity.
+Acceptance of a self-consistent version document alone must not be inflated
+into certification of its implementation.
+
+The immutable native conversion receipt records the v2 adapter digest that was
+used when that package was produced. That historical conversion provenance is
+deliberately distinct from the current v3 runtime comparison adapter identity:
+revising output canonicalization must not rewrite or invalidate an already
+published conversion receipt, while protocol v7 still prevents a runtime
+adapter revision from silently reusing prior comparison evidence.
 
 The frozen execution profile is CPU-only float32, with autocast disabled,
 quantization disabled, deterministic algorithms enabled, batch size one, zero

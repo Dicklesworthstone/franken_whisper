@@ -5,8 +5,8 @@
 //! The ledger (2026-07-07, NE:830) concluded "the encoder attention is NOT
 //! exp-bound; the exp is a negligible fraction" — but the experiment behind that
 //! claim swapped the WHOLE fused kernel for a franken per-head rewrite that
-//! materializes the [1500,1500] scores. That rewrite lost 34% on materialization
-//! + transpose + alloc overhead, which MASKS the exp term. Adding poly-exp to the
+//! materializes the `[1500,1500]` scores. That rewrite lost 34% on materialization,
+//! transpose, and allocation overhead, which MASKS the exp term. Adding poly-exp to the
 //! slow rewrite moved nothing, and the corollary "no softmax-exp optimization can
 //! speed encoder attention" was drawn from that.
 //!
@@ -75,6 +75,10 @@ fn blocks() -> Vec<usize> {
 /// `exp(x)` for `x <= 0`, 5th-order minimax on the reduced argument — the same
 /// scheme as the crate's landed `softmax_row_poly_numer` (FW_SIMD_EXP).
 #[inline]
+#[allow(
+    clippy::approx_constant,
+    reason = "the attribution probe mirrors the production polynomial coefficients exactly"
+)]
 fn exp_poly(x: F32s) -> F32s {
     const LOG2E: f32 = 1.442_695;
     const LN2: f32 = 0.693_147_2;
@@ -104,19 +108,19 @@ fn softmax_libm(sc: &mut [f32], br: usize, scale: f32) {
     for r in 0..br {
         let row = &mut sc[r * SEQ..(r + 1) * SEQ];
         let mut m = f32::NEG_INFINITY;
-        for s in row.iter_mut() {
+        for s in &mut *row {
             *s *= scale;
             if *s > m {
                 m = *s;
             }
         }
         let mut sum = 0.0f32;
-        for s in row.iter_mut() {
+        for s in &mut *row {
             let e = (*s - m).exp();
             *s = e;
             sum += e;
         }
-        for s in row.iter_mut() {
+        for s in &mut *row {
             *s /= sum;
         }
     }
@@ -128,19 +132,19 @@ fn softmax_noexp(sc: &mut [f32], br: usize, scale: f32) {
     for r in 0..br {
         let row = &mut sc[r * SEQ..(r + 1) * SEQ];
         let mut m = f32::NEG_INFINITY;
-        for s in row.iter_mut() {
+        for s in &mut *row {
             *s *= scale;
             if *s > m {
                 m = *s;
             }
         }
         let mut sum = 0.0f32;
-        for s in row.iter_mut() {
+        for s in &mut *row {
             let e = *s - m;
             *s = e;
             sum += e;
         }
-        for s in row.iter_mut() {
+        for s in &mut *row {
             *s /= sum;
         }
     }
@@ -160,7 +164,7 @@ fn softmax_poly(sc: &mut [f32], br: usize, scale: f32) {
             i += LANES;
         }
         let mut m = vmax.reduce_max();
-        for s in row[i..].iter_mut() {
+        for s in &mut row[i..] {
             *s *= scale;
             if *s > m {
                 m = *s;
@@ -177,7 +181,7 @@ fn softmax_poly(sc: &mut [f32], br: usize, scale: f32) {
             i += LANES;
         }
         let mut sum = vsum.reduce_sum();
-        for s in row[i..].iter_mut() {
+        for s in &mut row[i..] {
             let e = (*s - m).exp();
             *s = e;
             sum += e;
@@ -189,7 +193,7 @@ fn softmax_poly(sc: &mut [f32], br: usize, scale: f32) {
             (F32s::from_slice(&row[i..]) * vinv).copy_to_slice(&mut row[i..]);
             i += LANES;
         }
-        for s in row[i..].iter_mut() {
+        for s in &mut row[i..] {
             *s /= sum;
         }
     }
@@ -207,7 +211,7 @@ fn softmax_poly_recip(sc: &mut [f32], br: usize, scale: f32) {
             (F32s::from_slice(&row[i..]) * vinv).copy_to_slice(&mut row[i..]);
             i += LANES;
         }
-        for s in row[i..].iter_mut() {
+        for s in &mut row[i..] {
             *s *= 1.0 / sum;
         }
     }
@@ -229,7 +233,7 @@ fn softmax_poly_2pass(sc: &mut [f32], br: usize, _scale: f32) {
             i += LANES;
         }
         let mut m = vmax.reduce_max();
-        for s in row[i..].iter() {
+        for s in &row[i..] {
             if *s > m {
                 m = *s;
             }
@@ -245,7 +249,7 @@ fn softmax_poly_2pass(sc: &mut [f32], br: usize, _scale: f32) {
             i += LANES;
         }
         let mut sum = vsum.reduce_sum();
-        for s in row[i..].iter_mut() {
+        for s in &mut row[i..] {
             let e = (*s - m).exp();
             *s = e;
             sum += e;
@@ -274,7 +278,7 @@ fn softmax_poly_row_unnorm(row: &mut [f32], scale: f32) -> f32 {
         i += LANES;
     }
     let mut m = vmax.reduce_max();
-    for s in row[i..].iter_mut() {
+    for s in &mut row[i..] {
         *s *= scale;
         if *s > m {
             m = *s;
@@ -290,7 +294,7 @@ fn softmax_poly_row_unnorm(row: &mut [f32], scale: f32) -> f32 {
         i += LANES;
     }
     let mut sum = vsum.reduce_sum();
-    for s in row[i..].iter_mut() {
+    for s in &mut row[i..] {
         let e = (*s - m).exp();
         *s = e;
         sum += e;
@@ -379,7 +383,7 @@ fn main() {
     let (fill_min, _, fill_cv) = bench(reps, || {
         over_blocks(&bs, &src, |sc, _| {
             black_box(&*sc);
-        })
+        });
     });
     let (libm_min, _, libm_cv) = bench(reps, || {
         over_blocks(&bs, &src, |sc, br| softmax_libm(sc, br, scale));

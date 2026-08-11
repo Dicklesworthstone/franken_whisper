@@ -21,11 +21,14 @@
 //! bound as the comment claims.
 //! Usage: `dot_i8_probe [iters]` (default 30).
 #![allow(unsafe_code)]
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
 /// Exact replica of `nn::dot_i8` (scalar; LLVM auto-vectorizes).
 #[inline]
+#[cfg(target_arch = "x86_64")]
 fn dot_i8_scalar(w: &[i8], x: &[i8]) -> i32 {
     let mut acc: i32 = 0;
     for (a, b) in w.iter().zip(x.iter()) {
@@ -36,6 +39,7 @@ fn dot_i8_scalar(w: &[i8], x: &[i8]) -> i32 {
 
 /// Hand-written AVX2: 32 i8/iter via 2x (vpmovsxbw + vpmaddwd), 4 i32 accumulators
 /// to hide the ~4-cyc madd latency. Byte-identical to the scalar loop (exact i32).
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 unsafe fn dot_i8_avx2(w: &[i8], x: &[i8]) -> i32 {
@@ -47,7 +51,7 @@ unsafe fn dot_i8_avx2(w: &[i8], x: &[i8]) -> i32 {
         let mut a0 = _mm256_setzero_si256();
         let mut a1 = _mm256_setzero_si256();
         let mut a2 = _mm256_setzero_si256();
-        let mut a3 = _mm256_setzero_si256();
+        let a3 = _mm256_setzero_si256();
         let mut i = 0;
         // 32 elements per iteration (two 16-wide madd chains).
         while i + 32 <= n {
@@ -85,6 +89,7 @@ unsafe fn dot_i8_avx2(w: &[i8], x: &[i8]) -> i32 {
 
 /// 4-accumulator / 64-elem-per-iter variant (test whether the landed 2-acc dot_i8
 /// is vpmovsxbw-bound or accumulator-latency-bound). Byte-identical (integer sum).
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 unsafe fn dot_i8_avx2_4acc(w: &[i8], x: &[i8]) -> i32 {
@@ -127,6 +132,7 @@ unsafe fn dot_i8_avx2_4acc(w: &[i8], x: &[i8]) -> i32 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn gemv_4acc(w: &[i8], x: &[i8], n: usize, k: usize, out: &mut [i32]) {
     for (o, slot) in out.iter_mut().enumerate() {
         *slot = unsafe { dot_i8_avx2_4acc(&w[o * k..(o + 1) * k], x) };
@@ -137,6 +143,7 @@ fn gemv_4acc(w: &[i8], x: &[i8], n: usize, k: usize, out: &mut [i32]) {
 /// 2-row dot: convert the activation `x` sign-extension ONCE and reuse it for two
 /// weight rows (dot_i8 is vpmovsxbw-bound; ~half its conversions are the re-loaded x).
 /// Each result is integer-identical to `dot_i8_avx2` (same per-row madd + sum).
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
 unsafe fn dot_i8_avx2_2row(w0: &[i8], w1: &[i8], x: &[i8]) -> (i32, i32) {
@@ -182,6 +189,7 @@ unsafe fn dot_i8_avx2_2row(w0: &[i8], w1: &[i8], x: &[i8]) -> (i32, i32) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn gemv_2row(w: &[i8], x: &[i8], n: usize, k: usize, out: &mut [i32]) {
     let mut o = 0;
     while o + 2 <= n {
@@ -196,12 +204,14 @@ fn gemv_2row(w: &[i8], x: &[i8], n: usize, k: usize, out: &mut [i32]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn gemv_scalar(w: &[i8], x: &[i8], n: usize, k: usize, out: &mut [i32]) {
     for (o, slot) in out.iter_mut().enumerate() {
         *slot = dot_i8_scalar(&w[o * k..(o + 1) * k], x);
     }
     let _ = n;
 }
+#[cfg(target_arch = "x86_64")]
 fn gemv_avx2(w: &[i8], x: &[i8], n: usize, k: usize, out: &mut [i32]) {
     for (o, slot) in out.iter_mut().enumerate() {
         *slot = unsafe { dot_i8_avx2(&w[o * k..(o + 1) * k], x) };
@@ -209,6 +219,7 @@ fn gemv_avx2(w: &[i8], x: &[i8], n: usize, k: usize, out: &mut [i32]) {
     let _ = n;
 }
 
+#[cfg(target_arch = "x86_64")]
 fn bench(name: &str, n: usize, k: usize, iters: usize) {
     let mut s = 0x9E37_79B9_7F4A_7C15u64;
     let mut ni8 = || {
@@ -294,7 +305,12 @@ fn bench(name: &str, n: usize, k: usize, iters: usize) {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
+    if !std::is_x86_feature_detected!("avx2") {
+        eprintln!("dot_i8_probe requires AVX2 support");
+        return;
+    }
     let iters: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -303,4 +319,9 @@ fn main() {
     bench("logits", 51866, 1280, iters);
     bench("mlp_0 ", 5120, 1280, iters * 4);
     bench("qkv   ", 1280, 1280, iters * 8);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("dot_i8_probe requires an x86_64 processor");
 }

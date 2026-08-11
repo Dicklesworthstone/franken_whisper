@@ -20,7 +20,7 @@
 		"ftype": 1
 	},
 	"params": {
-		"model": "/Users/jemanuel/models/whisper/ggml-tiny.en.bin",
+		"model": "ggml-tiny.en.bin",
 		"language": "en",
 		"translate": false
 	},

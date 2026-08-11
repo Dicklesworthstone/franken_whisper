@@ -211,10 +211,8 @@ impl Linear {
     /// Attach the int8 copy iff `enabled`. Lets attention projections gate on
     /// [`super::int8_attn_enabled`] while the MLP gates on [`super::int8_mlp_enabled`].
     fn quantize_if(mut self, enabled: bool) -> Self {
-        if enabled {
-            if let WeightMat::F16 { data, out, inp } = &self.w {
-                self.w_i8 = Some(nn::quantize_f16_to_i8(data, *out, *inp));
-            }
+        if enabled && let WeightMat::F16 { data, out, inp } = &self.w {
+            self.w_i8 = Some(nn::quantize_f16_to_i8(data, *out, *inp));
         }
         self
     }
@@ -224,10 +222,8 @@ impl Linear {
     /// Block size 32 matches whisper.cpp's Q8_0.
     fn quantize_i8w_f32a_blocked_if(mut self, enabled: bool) -> Self {
         const BLOCK: usize = 32;
-        if enabled {
-            if let WeightMat::F16 { data, out, inp } = &self.w {
-                self.w_i8_block = Some(nn::quantize_f16_to_i8_blocked(data, *out, *inp, BLOCK));
-            }
+        if enabled && let WeightMat::F16 { data, out, inp } = &self.w {
+            self.w_i8_block = Some(nn::quantize_f16_to_i8_blocked(data, *out, *inp, BLOCK));
         }
         self
     }
@@ -239,10 +235,8 @@ impl Linear {
     /// priority over `w_i8_block`/`w_i8` in `forward`. For `mlp_0`/fc1 only — its
     /// GELU output absorbs the 4-bit error (see `int4_mlp0_enabled`).
     fn quantize_i4_packed_if(mut self, enabled: bool) -> Self {
-        if enabled {
-            if let WeightMat::F16 { data, out, inp } = &self.w {
-                self.w_i4_pack = Some(nn::quantize_f16_to_i4_packed(data, *out, *inp));
-            }
+        if enabled && let WeightMat::F16 { data, out, inp } = &self.w {
+            self.w_i4_pack = Some(nn::quantize_f16_to_i4_packed(data, *out, *inp));
         }
         self
     }
@@ -255,11 +249,9 @@ impl Linear {
     /// from dequant-once-to-f32. NOT bit-exact (different accumulation, max|Δ|
     /// ~6.9e-6), so gated by [`super::cross_proj_f32_enabled`] + golden-checked.
     fn dequant_to_f32_if(mut self, enabled: bool) -> Self {
-        if enabled {
-            if let WeightMat::F16 { data, out, inp } = &self.w {
-                let natural: Vec<f32> = data.iter().map(|h| h.to_f32()).collect();
-                self.w = WeightMat::F32(transpose(&Mat::from_vec(*out, *inp, natural)));
-            }
+        if enabled && let WeightMat::F16 { data, out, inp } = &self.w {
+            let natural: Vec<f32> = data.iter().map(|h| h.to_f32()).collect();
+            self.w = WeightMat::F32(transpose(&Mat::from_vec(*out, *inp, natural)));
         }
         self
     }
@@ -320,18 +312,17 @@ impl Linear {
             && super::i8_batch_enabled()
             && self.w_i4_pack.is_none()
             && self.w_i8_block.is_none()
+            && let Some(w_i8) = &self.w_i8
         {
-            if let Some(w_i8) = &self.w_i8 {
-                if x.cols != w_i8.inp {
-                    return Err(FwError::InvalidRequest(format!(
-                        "Linear(i8-batch) forward: x.cols {} != in {}",
-                        x.cols, w_i8.inp
-                    )));
-                }
-                let mut y = nn::gemv_out_buf(x.rows * w_i8.out);
-                nn::gemv_i8_batch(w_i8, &x.data, x.rows, self.bias.as_deref(), &mut y);
-                return Ok(Mat::from_vec(x.rows, w_i8.out, y));
+            if x.cols != w_i8.inp {
+                return Err(FwError::InvalidRequest(format!(
+                    "Linear(i8-batch) forward: x.cols {} != in {}",
+                    x.cols, w_i8.inp
+                )));
             }
+            let mut y = nn::gemv_out_buf(x.rows * w_i8.out);
+            nn::gemv_i8_batch(w_i8, &x.data, x.rows, self.bias.as_deref(), &mut y);
+            return Ok(Mat::from_vec(x.rows, w_i8.out, y));
         }
         match &self.w {
             WeightMat::F32(w_t) => nn::matmul_bias(x, w_t, self.bias.as_deref()),
@@ -1076,7 +1067,8 @@ impl DecoderState {
         // bit-identical. `need_f32` mirrors the exact `use_f16` gate in `cross_step`, so the
         // (empty) kh_t/vh are never read.
         let need_f32 = !cross_f16_enabled();
-        let built: Vec<(Vec<f32>, Vec<Float16>, Vec<f32>, Vec<Float16>)> = (0..n_layer * n_head)
+        type CrossHeadBuffers = (Vec<f32>, Vec<Float16>, Vec<f32>, Vec<Float16>);
+        let built: Vec<CrossHeadBuffers> = (0..n_layer * n_head)
             .into_par_iter()
             .map(|idx| {
                 let (li, h) = (idx / n_head, idx % n_head);
@@ -2230,29 +2222,29 @@ fn project_qkv(
     // byte-identical to quantize-then-concatenate because `I8Mat` scales are
     // per-output-row. Bit-identical to the separate projections (same per-row dot
     // + bias), and no per-call OS-thread spawn. bd-b4hp.
-    if let Some(qkv) = fused {
-        if !qkv_fuse_disabled() {
-            let out = if cohort {
-                qkv.forward_cohort(h)?
-            } else {
-                qkv.forward(h)?
-            }; // [tq, 3*n_state]
-            let tq = out.rows;
-            let mut qd = Vec::with_capacity(tq * n_state);
-            let mut kd = Vec::with_capacity(tq * n_state);
-            let mut vd = Vec::with_capacity(tq * n_state);
-            for r in 0..tq {
-                let base = r * 3 * n_state;
-                qd.extend_from_slice(&out.data[base..base + n_state]);
-                kd.extend_from_slice(&out.data[base + n_state..base + 2 * n_state]);
-                vd.extend_from_slice(&out.data[base + 2 * n_state..base + 3 * n_state]);
-            }
-            return Ok((
-                Mat::from_vec(tq, n_state, qd),
-                Mat::from_vec(tq, n_state, kd),
-                Mat::from_vec(tq, n_state, vd),
-            ));
+    if let Some(qkv) = fused
+        && !qkv_fuse_disabled()
+    {
+        let out = if cohort {
+            qkv.forward_cohort(h)?
+        } else {
+            qkv.forward(h)?
+        }; // [tq, 3*n_state]
+        let tq = out.rows;
+        let mut qd = Vec::with_capacity(tq * n_state);
+        let mut kd = Vec::with_capacity(tq * n_state);
+        let mut vd = Vec::with_capacity(tq * n_state);
+        for r in 0..tq {
+            let base = r * 3 * n_state;
+            qd.extend_from_slice(&out.data[base..base + n_state]);
+            kd.extend_from_slice(&out.data[base + n_state..base + 2 * n_state]);
+            vd.extend_from_slice(&out.data[base + 2 * n_state..base + 3 * n_state]);
         }
+        return Ok((
+            Mat::from_vec(tq, n_state, qd),
+            Mat::from_vec(tq, n_state, kd),
+            Mat::from_vec(tq, n_state, vd),
+        ));
     }
 
     // Fallback (f32 path / fusion disabled): k and v on spawned threads while q
@@ -2473,8 +2465,8 @@ mod tests {
         // logits_last on each row — for BOTH the default f16 embedding path and the f32
         // path. (This is the byte-exactness the whole speculative-decode scheme rests on:
         // the verify's argmax per position must equal greedy's.)
-        let mut w = synthetic_weights(0x106175_A11);
-        let mut rng = Lcg::new(0x5EED_106);
+        let mut w = synthetic_weights(0x0001_0617_5A11);
+        let mut rng = Lcg::new(0x05EE_D106);
         let tq = 5;
         let x = rng.mat(tq, N_STATE);
         let check = |w: &DecoderWeights, tag: &str| {
@@ -2514,7 +2506,7 @@ mod tests {
     fn logits_all_amortization_perf() {
         use std::time::Instant;
         let (n_vocab, n_state, k) = (51865usize, 1280usize, 8usize); // turbo vocab, K=8 verify batch
-        let mut rng = Lcg::new(0x106175_BE);
+        let mut rng = Lcg::new(0x1061_75BE);
         let emb: Vec<Float16> = (0..n_vocab * n_state)
             .map(|_| Float16::from_f32((rng.next_f32() - 0.5) * 0.1))
             .collect();

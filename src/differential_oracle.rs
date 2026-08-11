@@ -51,12 +51,12 @@ pub const SORTFORMER_ORACLE_OUTPUT_FRAME_MS: u32 = 80;
 /// Maximum end-of-file rounding difference accepted between PCM and stage duration.
 pub const SORTFORMER_AUDIO_DURATION_TOLERANCE_MS: u32 = 79;
 /// Exact operator adapter version accepted by the frozen contract.
-pub const SORTFORMER_ORACLE_ADAPTER_VERSION: &str = "franken-whisper-sortformer-oracle-v2";
-/// SHA-256 of the exact operator adapter executable admitted to oracle-floor
-/// and activation-seam evidence. Self-reported version strings are not an
-/// executable identity.
+pub const SORTFORMER_ORACLE_ADAPTER_VERSION: &str = "franken-whisper-sortformer-oracle-v3";
+/// SHA-256 required by final-output Sortformer diagnostic evidence. Accepted
+/// activation-seam authority requires a separately reviewed exporter identity
+/// and closure of the executable race; self-reported versions are not identities.
 pub const SORTFORMER_ORACLE_ADAPTER_SHA256: &str =
-    "8f376c979b7eaca41dc0a438d9aaa41c1c723052b97c45eb2acc59b6d6f00bde";
+    "d8ced65ea4fa48e7f238005bf81659f57b9b575ddf6e04a75a835313ac0bf4eb";
 /// Pinned NeMo Speech source revision expected behind the operator adapter.
 pub const SORTFORMER_ORACLE_TOOL_VERSION: &str =
     "nemo-speech-40ace43c7cf151af78dc22027c02feeca7e06b6a";
@@ -1603,6 +1603,14 @@ enum ExternalRunError {
     Skipped(ExternalSkip),
 }
 
+// The full Rust test suite runs thousands of tests concurrently. Each external
+// oracle invocation owns a child process and two pipe-reader threads, so letting
+// all oracle fixtures run at once can exhaust the worker's process/thread quota
+// before a fixture reaches the protocol condition it is meant to assert. Keep
+// this serialization test-only; production calls retain their normal concurrency.
+#[cfg(test)]
+static EXTERNAL_ORACLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Clone, Copy)]
 struct ExternalRunLimits<'a> {
     hard_timeout: Duration,
@@ -1647,6 +1655,11 @@ fn execute_external(
     recording_key: &str,
     limits: ExternalRunLimits<'_>,
 ) -> Result<ExternalSuccess, ExternalRunError> {
+    #[cfg(test)]
+    let _external_oracle_test_guard = EXTERNAL_ORACLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let ExternalRunLimits {
         hard_timeout,
         token,

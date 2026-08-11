@@ -14,11 +14,15 @@
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use core::arch::x86_64::*;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 const M: usize = 1500; // frames
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 const K: usize = 1280; // n_state (contraction)
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 const N: usize = 1280; // n_state (output)
 
 /// Scalar reference i32 dot of one output (o) for one activation row (r): Σ a[r,k]·w[o,k].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn ref_dot(a: &[i8], w: &[i8], r: usize, o: usize) -> i32 {
     let ar = &a[r * K..r * K + K];
     let wr = &w[o * K..o * K + K];
@@ -171,10 +175,10 @@ fn main() {
                 .wrapping_add(1442695040888963407);
             (((s >> 33) as u32) & 0xff) as i32
         };
-        for v in a.iter_mut() {
+        for v in &mut a {
             *v = (nextb() - 128).clamp(-127, 127) as i8;
         }
-        for v in w.iter_mut() {
+        for v in &mut w {
             *v = (nextb() - 128).clamp(-127, 127) as i8;
         }
         // u8 activation (+128) and weight split w = w_a + w_b, |w_a|≤63, |w_b|≤64
@@ -226,13 +230,13 @@ fn main() {
         let mut evict = vec![1.0f32; 48 * 1024 * 1024 / 4];
         let (mut bv, mut bm) = (f64::MAX, f64::MAX);
         for _ in 0..reps {
-            for e in evict.iter_mut() {
+            for e in &mut evict {
                 *e *= 1.0000001;
             }
             let t = std::time::Instant::now();
             gemm_vpmaddwd(&a, &w, &mut out_v);
             bv = bv.min(t.elapsed().as_secs_f64() * 1e3);
-            for e in evict.iter_mut() {
+            for e in &mut evict {
                 *e *= 1.0000001;
             }
             let t = std::time::Instant::now();

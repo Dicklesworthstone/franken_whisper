@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "model_id": "openai/whisper-large-v3-turbo",
+  "upstream_repository": "ggerganov/whisper.cpp",
+  "upstream_revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+  "artifact_version": "whisper-large-v3-turbo-f16-v1",
+  "preparation_recipe": "franken-whisper-native-ggml-selection-v1-identity",
+  "distribution_policy": "github_release_with_compiled_sha256",
+  "license_id": "MIT",
+  "license_url": "https://github.com/openai/whisper/blob/main/LICENSE",
+  "weight_precision": "f16",
+  "files": [
+    {
+      "role": "weights",
+      "filename": "ggml-large-v3-turbo.bin",
+      "size": 1624555275,
+      "sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+      "url": "https://github.com/Dicklesworthstone/franken_whisper/releases/download/whisper-large-v3-turbo-f16-v1/ggml-large-v3-turbo.bin"
+    }
+  ]
+}

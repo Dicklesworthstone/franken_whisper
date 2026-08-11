@@ -106,13 +106,26 @@ storage.sqlite3-shm
 *.[oO][nN][nN][xX]
 *.[nN][pP][yY]
 *.[nN][pP][zZ]
+*.[nN][eE][mM][oO]
+*.[sS][aA][fF][eE][tT][eE][nN][sS][oO][rR][sS]
 *.[gG][gG][uU][fF]
 *.[gG][gG][mM][lL]
 [gG][gG][mM][lL]-*.[bB][iI][nN]
 [pP][yY][tT][oO][rR][cC][hH]_[mM][oO][dD][eE][lL]*.[bB][iI][nN]
+*[aA][cC][tT][iI][vV][aA][tT][iI][oO][nN]-[rR][eE][cC][eE][iI][pP][tT]*.[jJ][sS][oO][nN]
+*[aA][cC][tT][iI][vV][aA][tT][iI][oO][nN]_[rR][eE][cC][eE][iI][pP][tT]*.[jJ][sS][oO][nN]
+*[cC][oO][nN][vV][eE][rR][sS][iI][oO][nN]-[rR][eE][cC][eE][iI][pP][tT]*.[jJ][sS][oO][nN]
+*[cC][oO][nN][vV][eE][rR][sS][iI][oO][nN]_[rR][eE][cC][eE][iI][pP][tT]*.[jJ][sS][oO][nN]
 
 # Confidential transcript sidecars must remain outside the repository
 *transcript*.md
+
+# Downloaded Sortformer release assets belong in the per-user model cache,
+# never in the source checkout. The small hash-pinned manifest and notice are
+# the only model-distribution artifacts intentionally tracked here.
+weights.safetensors
+conversion-receipt.json
+NVIDIA-OPEN-MODEL-LICENSE.html
 *[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[mM][dD]
 *[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[tT][xX][tT]
 *[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[jJ][sS][oO][nN]
@@ -130,6 +143,9 @@ tests/artifacts/perf/**/*_seq.txt
 tests/artifacts/perf/**/*sample*.txt
 tests/artifacts/perf/**/*spans*.txt
 tests/artifacts/perf/**/*spans*.jsonl
+# Permanently keep the retired local scale evaluation corpus out of Git,
+# including aliases whose names do not reveal that they contain decoded text.
+tests/artifacts/perf/20260606T2341Z-scale-baseline/
 
 # Images (keep .webp for README illustration, .png for GitHub social preview)
 *.png
@@ -214,6 +230,7 @@ storage.sqlite3-wal.corrupt-*
 *.log
 nohup.out
 /*.txt
+!/NOTICE.sortformer.txt
 /*.py
 /*.sh
 /*.json
@@ -272,3 +289,26 @@ __pycache__/
 /rust_out
 # br doctor per-run artifacts
 .doctor/
+
+# === multi-repo ephemeral hygiene 2026-08-06 ===
+# br recovery intermediate / failed rebuild artifacts
+.beads/.br_recovery/
+*.rebuild-failed
+
+# Beads history snapshots — local rotation only; never commit
+.beads/.br_history/
+
+# === multi-repo ephemeral patterns 2026-08-10 ===
+# Recoverable Beads write-lock snapshots moved aside when stale
+.beads/.write.lock.stale-*
+# br fsqlite-ns VFS sidecars
+.beads/beads.db-fsqlite-ns-*
+# Eidetic / Wrangler / Claude local runtime
+.ee/
+.wrangler/
+.claude/
+.repo_janitor_workspace/
+.skill-loop-progress.md
+.skill-loop-progress-*.md
+# Local one-off audio probe dumps
+/test.m4a

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="180" viewBox="0 0 760 180" role="img" aria-labelledby="title desc">
+  <title id="title">Pre-pass agent ergonomics heatmap</title>
+  <desc id="desc">Five critical surfaces scored from low red to higher green; post-pass values are pending.</desc>
+  <rect width="760" height="180" fill="#111827"/>
+  <g font-family="monospace" font-size="14" fill="#f9fafb">
+    <text x="20" y="28">surface</text><text x="260" y="28">pre median / 1000</text>
+    <text x="20" y="58">CLI root</text><rect x="260" y="43" width="176" height="18" fill="#d97706"/><text x="450" y="58">400</text>
+    <text x="20" y="86">Robot run</text><rect x="260" y="71" width="242" height="18" fill="#ca8a04"/><text x="516" y="86">550</text>
+    <text x="20" y="114">Model discovery</text><rect x="260" y="99" width="110" height="18" fill="#dc2626"/><text x="384" y="114">250</text>
+    <text x="20" y="142">Installer</text><rect x="260" y="127" width="132" height="18" fill="#ea580c"/><text x="406" y="142">300</text>
+    <text x="20" y="170">Release packaging</text><rect x="260" y="155" width="66" height="18" fill="#b91c1c"/><text x="340" y="170">150</text>
+  </g>
+</svg>
