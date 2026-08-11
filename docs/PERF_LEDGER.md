@@ -84,6 +84,19 @@ transcript byte-identical to the pure-CPU path (`FRANKEN_WHISPER_GPU=0`) on
 this clip. ft-kernel-metal parity suite (16 tests incl. per-op CPU refs and
 whole-layer 2e-2 check) green; fmt+clippy clean.
 
+**Addendum (later 2026-08-11):** two more levers on the same axis. (a)
+**GPU-resident f16 weights** (frankentorch `e0a61c25`): the six projection
+weights upload once as f16 — bit-identical to the per-tile conversion the
+GEMM kernels already performed — halving resident encoder weight memory
+(~2.5 GB -> ~1.26 GB on turbo) and per-window weight bandwidth; strictly
+less work, transcript identical, e2e timing at-or-better within host noise.
+(b) A two-row-block simdgroup GEMM variant measured DEAD (918-1529 vs
+1586-2228 GFLOPS) and is graveyarded with a retry predicate in
+NEGATIVE_EVIDENCE. Remaining levers on bd-453z: conv stem on CPU, per-op
+buffer allocation churn, f16 activations, flash-attention occupancy, and the
+~3 s model load; a decidable competitive row still needs a quiet M-series
+host plus a pinned darwin whisper.cpp Metal incumbent contract.
+
 **Cumulative platform picture:** first measurement this morning had
 `encoder_window` at 15.4 s (heavily loaded window); today's quietest windows
 now measure 2.47–2.81 s with the new kernels. The honest cross-load claim is

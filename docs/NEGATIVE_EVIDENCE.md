@@ -4,6 +4,21 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-08-11 - M4 Pro dev host: **REJECT — two-row-block simdgroup GEMM (128 threads / 4 simdgroups) loses to the 256-thread / 8-simdgroup layout.**
+
+Lever: amortize B-tile `simdgroup_load`s by giving each simdgroup TWO 8-row
+blocks (`acc[2][8]`, threadgroup width 256 -> 128) in `matmul_bias_sg`
+(ft-kernel-metal). Same-harness `gemm_bench` at turbo shapes, best-of-9:
+918/1367/1529 GFLOPS vs the shipped layout's 1586/2228/2087 (re-confirmed
+1490/2014/1906 after revert). Direction consistent across all three shapes:
+halving threadgroup width costs more occupancy than the doubled B-reuse
+returns on M4 Pro. Reverted; the 64x64x32 half-tile, 8-simdgroup kernel
+stays. Host carried multi-agent load — best-of-N filtering only.
+
+Do-not-retry predicate: retry only with a layout that keeps >=256 threads
+per threadgroup while widening per-simdgroup output (e.g. 128x64 tiles with
+8 simdgroups x 2 row-blocks), or on different Apple GPU generations.
+
 ## 2026-07-31 - BlackThrush: **NO ADMISSIBLE FLAC RATIO — three otherwise-clean whole-job runs were vetoed by the unchanged external-process gate.**
 
 The first real-codec whole-job cell is still `UNDECIDABLE`. All three completed
