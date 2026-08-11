@@ -453,7 +453,17 @@ The default path runs the native four-lane Sortformer package and returns
 anonymous `SPEAKER_NN` turns. It is fast, in-process, and development-
 uncertified: a lane count is not a calibrated estimate of the true number of
 speakers, and recordings with more than four speakers exceed the model's
-capacity. Use `--no-diarize` for transcription only. Requests with known
+capacity. Use `--no-diarize` for transcription only.
+
+Turn evidence is fused into the transcript (`projection-fusion-v1`): every
+segment that overlaps a labeled turn gets that speaker, segments in short turn
+gaps take the nearest labeled turn within 2 seconds, and word-level speaker
+changes snap to the nearest sentence-final punctuation within four words so
+turn-initial words land on the speaker who says them. The result also carries
+`diarization.speaker_segments`, a merged view of consecutive same-speaker runs
+with joined text and duration-weighted turn confidence, so consumers do not
+rebuild the turn/segment join. Untimed segments and audio beyond the gap bound
+stay `speaker: null`. Requests with known
 intervals or count constraints beyond the four-lane boundary fall back to the
 native acoustic engine under the default `acoustic` fallback policy.
 
@@ -1316,7 +1326,12 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 
 **Stage Codes.** Each pipeline stage emits paired `*.start` / `*.ok` codes (or `*.error` on failure, `*.skip` when not needed, `*.cancelled` on token fire, `*.timeout` on budget overrun):
 
-`ingest.start`, `ingest.ok`, `normalize.start`, `normalize.ok`, `vad.start`, `vad.ok`, `separate.start`, `separate.ok`, `backend.start`, `backend.ok`, `backend.routing.decision_contract`, `acceleration.start`, `acceleration.ok`, `align.start`, `align.ok`, `punctuate.start`, `punctuate.ok`, `diarize.rollout`, `diarize.start`, `diarize.ok`, `persist.start`, `persist.ok`, `orchestration.budgets`, `orchestration.latency_profile`
+`ingest.start`, `ingest.ok`, `normalize.start`, `normalize.ok`, `vad.start`, `vad.ok`, `separate.start`, `separate.ok`, `backend.start`, `backend.ok`, `backend.routing.decision_contract`, `backend.dropped_windows`, `acceleration.start`, `acceleration.ok`, `align.start`, `align.ok`, `punctuate.start`, `punctuate.ok`, `diarize.rollout`, `diarize.start`, `diarize.ok`, `persist.start`, `persist.ok`, `orchestration.budgets`, `orchestration.latency_profile`
+
+`backend.dropped_windows` fires when the native engine discards a long-form
+decode window without emitting a transcript; the same drop is recorded in
+`result.raw_output.dropped_windows` and in the run's `warnings`, so a content
+gap is never stderr-only.
 
 **Health Report.** `robot health` probes every subsystem and returns a structured diagnostic:
 
@@ -3401,13 +3416,13 @@ hosts; packages both `franken_whisper` and `fw`; and syncs the exact pinned
 tree.
 
 ```bash
-dsr build franken_whisper --version 0.7.2 --dry-run \
+dsr build franken_whisper --version 0.8.0 --dry-run \
   --targets darwin/arm64,darwin/amd64,linux/amd64,linux/arm64,windows/amd64
-dsr build franken_whisper --version 0.7.2 \
+dsr build franken_whisper --version 0.8.0 \
   --targets darwin/arm64,darwin/amd64,linux/amd64,linux/arm64,windows/amd64
 ```
 
-No GitHub Actions workflow participates in the v0.7.2 release. DSR is the build
+No GitHub Actions workflow participates in the v0.8.0 release. DSR is the build
 and packaging authority; the tag and release assets are verified against its
 local receipts before publication.
 

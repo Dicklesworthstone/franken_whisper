@@ -12,6 +12,73 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 No unreleased changes yet.
 
+## [0.8.0] - 2026-08-11
+
+This release closes four reproduced transcription-path defects filed against
+v0.7.2: silent long-form content loss, diarization that never reached the
+transcript, inert audio-window flags, and lossy per-segment text.
+
+### Added
+
+- Diarization is now fused with the transcript (`projection-fusion-v1`,
+  bd-d4py). After the conservative projection pass, a fusion pass labels every
+  segment that overlaps a labeled turn with the max-overlap turn, and timed
+  segments in turn gaps take the nearest labeled turn within 2 seconds.
+  Hard-hint turns are never extrapolated beyond their own intervals, and
+  untimed segments stay honestly unknown. On a 45-minute two-person call this
+  removes the 61% `speaker: null` segment rate.
+- Word-level speaker changes snap to the nearest sentence-final punctuation
+  boundary within four words, using the transcript's own punctuation as the
+  boundary oracle. This corrects the one-word attribution lag caused by
+  quantized diarizer boundaries (Sortformer's 80 ms lanes) and measurably
+  outperformed every global time-shift candidate on real audio. Snapping moves
+  a boundary; it can never erase a short interjection turn.
+- `result.diarization.speaker_segments`: merged consecutive same-speaker runs
+  with byte-faithful joined text, per-run segment counts, and duration-weighted
+  turn confidence. Callers no longer rebuild the turn/segment join themselves.
+- Dropped long-form decode windows are machine-addressable (bd-nqzf). The
+  native engine records every discarded window in `raw_output.dropped_windows`
+  (start, end, reason, `no_speech_prob`, `avg_logprob`, whether the
+  prompt-reset retry already ran) plus `raw_output.decode_work` retry counters.
+  The orchestrator mirrors each drop into `RunReport.warnings`, the evidence
+  ledger, and a `backend.dropped_windows` stage event, so `--json` and robot
+  NDJSON consumers see the content gap instead of a stderr-only log.
+- The native whisper.cpp engine honors `--offset-ms` and `--duration-ms`
+  (bd-vgod): the normalized PCM is sliced before decode, so wall-clock scales
+  with the requested region instead of the whole file. Emitted segment, DTW
+  word, and window timestamps stay in the source-file timebase, keeping
+  diarization, VAD, and alignment consistent. `raw_output.audio_window` records
+  the applied window; an offset at or past EOF returns an empty result tagged
+  `empty_slice` rather than an error.
+- `--normalize-segment-text` opts in to the rule-based sentence-casing and
+  terminal-period rewriting that previously ran unconditionally whenever
+  diarization was on.
+
+### Changed
+
+- `segments[].text` is byte-faithful by default (bd-c3of). The punctuate
+  stage's rewriting (uppercase first character, appended period) no longer runs
+  merely because diarization is enabled, so joining segment texts reproduces
+  `result.transcript` modulo whitespace, and `--split-on-word` no longer emits
+  every word as `Word.` The rewriting remains available behind
+  `--normalize-segment-text`.
+- Backends that cannot honor `--offset-ms`/`--duration-ms` (insanely-fast,
+  whisper-diarization, and speculative mode) now record the ignored flags in
+  `RunReport.warnings` and in `robot backends` `unsupported_options` instead of
+  silently transcribing the full file.
+- The long-form drop log no longer tells operators to set
+  `FW_RETRY_FAILED_WINDOW=1`; that retry has been default-on since 2026-07-24.
+  The message now points at `FW_TEMP_FALLBACK=1` for sampling-ladder recovery,
+  and `DISCREPANCIES.md` records the corrected default.
+
+### Contracts
+
+- `raw_output` schema stays `native-v2`; `dropped_windows`, `decode_work`, and
+  `audio_window` are additive fields documented in
+  `docs/native_engine_contract.md` §9.
+- `docs/acoustic_diarization_contract.md` §6 documents `projection-fusion-v1`,
+  including the hard-hint non-extrapolation rule and the snapping guarantees.
+
 ## [0.7.2] - 2026-08-10
 
 ### Fixed
@@ -565,7 +632,8 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.7.2...main
+[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.8.0...main
+[0.8.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.8.0
 [0.7.2]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.2
 [0.7.1]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.1
 [0.5.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.5.0
