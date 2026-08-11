@@ -66,9 +66,14 @@ host). Three levers landed in `ft-kernel-metal` (frankentorch
    checkpoint stores f16 weights; this is whisper.cpp's Metal precision):
    64×64×32 tiles, 256 threads/TG. MLP GEMMs 15.75/17.12 → 8.82/9.42 ms
    (~1.1 → ~2.1 TFLOPS). Kill switch `FT_METAL_SG_GEMM=0`.
-3. **One command buffer for the whole 32-layer stack** (was one commit+wait
-   per layer): intermediates kept alive to `finish`, Metal hazard-tracking
-   orders the 384 encoders.
+3. **Chunked command buffers** (was one commit+wait per layer): layers encode
+   in chunks of 8 (`FT_METAL_ENC_CHUNK`), cutting 32 syncs to 4. The chunk
+   size exists because Metal retains every encoded buffer until its command
+   buffer completes — a single whole-stack buffer would commit ~4.2 GB of
+   turbo activations at once (a paging/jetsam hazard on 16 GB machines);
+   chunking bounds live intermediates to ~1 GB. Fresh-eyes review also
+   clamped edge-tile device loads in the new kernels (a guarded-ternary OOB
+   address can still be speculated by the compiler).
 
 **e2e proof, same ELF, interleaved arms (new default vs
 `FT_METAL_FLASH_V1=1 FT_METAL_SG_GEMM=0`), jfk.wav turbo, 5 pairs:**

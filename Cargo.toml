@@ -78,8 +78,8 @@ asupersync = { version = "0.3.4", default-features = false, features = ["tls-web
 franken-kernel = "0.3.4"
 franken-evidence = "0.3.4"
 franken-decision = "0.3.4"
-fsqlite = { version = "0.2.0", path = "../frankensqlite/crates/fsqlite" }
-fsqlite-types = { version = "0.2.0", path = "../frankensqlite/crates/fsqlite-types" }
+fsqlite = { version = "0.3.0", path = "../frankensqlite/crates/fsqlite" }
+fsqlite-types = { version = "0.3.0", path = "../frankensqlite/crates/fsqlite-types" }
 
 # FrankenTorch compute kernels for the in-process native whisper engine
 # (rayon-parallel GEMM, softmax, gelu; f16 storage types). These are
