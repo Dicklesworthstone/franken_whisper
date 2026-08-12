@@ -266,6 +266,11 @@ mod wasm_api {
     ///   audio_sec}` where `segments[].speaker` is filled by the projection
     /// and `speaker_segments` are the merged per-speaker runs.
     ///
+    /// `initial_prompt` is the CLI's `--prompt`: optional context text (for
+    /// the playground, the speakers' names and titles) that biases decoding
+    /// so names and jargon come out spelled right. `None`/empty is a no-op,
+    /// byte-identical to no prompt.
+    ///
     /// Projection runs at segment granularity (`word_aligned = false`); the
     /// CLI's word-aligned snap path needs word timestamps, which stay off in
     /// the browser build for now.
@@ -275,7 +280,11 @@ mod wasm_api {
     /// "no model loaded" / "no diarizer loaded", audio decode failures, or
     /// any engine error — each naming the failing stage.
     #[wasm_bindgen]
-    pub fn transcribe_and_diarize(audio: Vec<u8>, ext: &str) -> Result<String, JsValue> {
+    pub fn transcribe_and_diarize(
+        audio: Vec<u8>,
+        ext: &str,
+        initial_prompt: Option<String>,
+    ) -> Result<String, JsValue> {
         fw_stage("audio:decode");
         let samples = crate::audio_decode::decode_to_16k_mono(audio, ext).map_err(js_err)?;
         let audio_sec = samples.len() as f64 / 16_000.0;
@@ -288,6 +297,7 @@ mod wasm_api {
             let params = DecodeParams {
                 timestamps: true,
                 n_threads: 1,
+                initial_prompt: initial_prompt.filter(|p| !p.trim().is_empty()),
                 ..DecodeParams::default()
             };
             fw_stage("whisper:decode");

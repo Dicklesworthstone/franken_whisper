@@ -113,7 +113,7 @@ async function route(e) {
       feedClock();
       const t0 = performance.now();
       const result = JSON.parse(
-        wasm.transcribe_and_diarize(new Uint8Array(m.audio), m.ext ?? ""),
+        wasm.transcribe_and_diarize(new Uint8Array(m.audio), m.ext ?? "", m.prompt ?? undefined),
       );
       feedClock();
       post("result", { result, wall_ms: Math.round(performance.now() - t0) });

@@ -14,6 +14,7 @@ const state = {
   file: null,
   result: null,
   wallMs: 0,
+  nameMap: new Map(),
   progressBase: { whisper: 0, sortformer: 0 },
 };
 
@@ -53,6 +54,36 @@ function fmtTime(sec) {
 function speakerClass(speaker) {
   const m = /^SPEAKER_(\d+)$/.exec(speaker ?? "");
   return m ? `spk-${Number(m[1]) % 4}` : "spk-x";
+}
+
+// ---- speaker naming --------------------------------------------------------
+
+// Parse the optional "names/titles" field: comma- or newline-separated,
+// trimmed, empties dropped.
+function parseSpeakerNames(raw) {
+  return (raw ?? "")
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+// Assign the user's names to detected SPEAKER_NN labels in order of first
+// appearance in the merged transcript. Returns a Map from raw label to
+// display name; labels beyond the provided names keep their raw form.
+function buildSpeakerNameMap(result, names) {
+  const map = new Map();
+  if (!names.length) return map;
+  for (const seg of result.speaker_segments) {
+    const label = seg.speaker;
+    if (label == null || map.has(label)) continue;
+    if (map.size < names.length) map.set(label, names[map.size]);
+  }
+  return map;
+}
+
+function displaySpeaker(label, nameMap) {
+  if (label == null) return "UNKNOWN";
+  return nameMap.get(label) ?? label;
 }
 
 // ---- worker wiring ---------------------------------------------------------
@@ -115,6 +146,7 @@ function handle(m) {
       state.busy = false;
       state.result = m.result;
       state.wallMs = m.wall_ms;
+      state.nameMap = buildSpeakerNameMap(m.result, parseSpeakerNames($("speakers").value));
       $("stage-line").hidden = true;
       renderResult();
       maybeEnableRun();
@@ -150,10 +182,12 @@ function renderResult() {
   );
   $("result-placeholder").hidden = true;
   $("result-wrap").hidden = false;
+  const named = state.nameMap.size > 0;
   $("result-meta").textContent =
     `${fmtTime(r.audio_sec)} of audio · ${(state.wallMs / 1000).toFixed(1)} s wall ` +
     `(${rt}× realtime on this machine) · ${speakers.size} speaker(s) · ` +
     `${r.turns.length} turns` +
+    (named ? " · names assigned by first appearance" : "") +
     (r.dropped_windows > 0 ? ` · ⚠ ${r.dropped_windows} dropped window(s)` : "");
 
   const box = $("output");
@@ -166,7 +200,10 @@ function renderResult() {
     t.textContent = `${fmtTime(seg.start_sec)}–${fmtTime(seg.end_sec)}`;
     const spk = document.createElement("span");
     spk.className = `spk ${speakerClass(seg.speaker)}`;
-    spk.textContent = seg.speaker ?? "UNKNOWN";
+    spk.textContent = displaySpeaker(seg.speaker, state.nameMap);
+    if (seg.speaker != null && state.nameMap.has(seg.speaker)) {
+      spk.title = `detected as ${seg.speaker}`;
+    }
     const txt = document.createElement("span");
     txt.textContent = seg.text;
     row.append(t, spk, txt);
@@ -187,6 +224,9 @@ function exportMd() {
     "",
     `- Engine: franken_whisper wasm (Whisper large-v3-turbo + Sortformer diarization)`,
     `- Audio: ${r.audio_sec.toFixed(1)} s · transcribed + diarized in ${(state.wallMs / 1000).toFixed(1)} s in this browser`,
+    state.nameMap.size > 0
+      ? `- Speaker names were assigned to detected voices in order of first appearance (${[...state.nameMap.entries()].map(([k, v]) => `${k} = ${v}`).join(", ")})`
+      : null,
     r.dropped_windows > 0
       ? `- **Warning: ${r.dropped_windows} window(s) dropped without output**`
       : null,
@@ -194,7 +234,7 @@ function exportMd() {
   ].filter((l) => l !== null);
   for (const seg of r.speaker_segments) {
     lines.push(
-      `**[${fmtTime(seg.start_sec)}–${fmtTime(seg.end_sec)}] ${seg.speaker ?? "UNKNOWN"}:** ${seg.text.trim()}`,
+      `**[${fmtTime(seg.start_sec)}–${fmtTime(seg.end_sec)}] ${displaySpeaker(seg.speaker, state.nameMap)}:** ${seg.text.trim()}`,
     );
     lines.push("");
   }
@@ -213,7 +253,7 @@ function exportHtml() {
     .map((seg) => {
       const m = /^SPEAKER_(\d+)$/.exec(seg.speaker ?? "");
       const color = m ? SPK_COLORS[Number(m[1]) % 4] : "#94a3b8";
-      return `      <div class="seg"><span class="t">${fmtTime(seg.start_sec)}–${fmtTime(seg.end_sec)}</span> <span class="spk" style="color:${color};border-color:${color}66">${esc(seg.speaker ?? "UNKNOWN")}</span> ${esc(seg.text.trim())}</div>`;
+      return `      <div class="seg"><span class="t">${fmtTime(seg.start_sec)}–${fmtTime(seg.end_sec)}</span> <span class="spk" style="color:${color};border-color:${color}66">${esc(displaySpeaker(seg.speaker, state.nameMap))}</span> ${esc(seg.text.trim())}</div>`;
     })
     .join("\n");
   const html = `<!doctype html>
@@ -305,8 +345,13 @@ function init() {
     $("download-html").hidden = true;
     setStatus("running…");
     const ext = (state.file.name.split(".").pop() || "").toLowerCase();
+    // The names field feeds Whisper's decoding prompt (the CLI's --prompt)
+    // so names and titles come out spelled right; the same list later maps
+    // onto detected speakers in order of first appearance.
+    const names = parseSpeakerNames($("speakers").value);
+    const prompt = names.length ? `Speakers: ${names.join(", ")}.` : undefined;
     const buf = await state.file.arrayBuffer();
-    state.worker.postMessage({ type: "transcribe", audio: buf, ext }, [buf]);
+    state.worker.postMessage({ type: "transcribe", audio: buf, ext, prompt }, [buf]);
   });
 
   $("download-md").addEventListener("click", exportMd);

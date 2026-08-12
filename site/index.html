@@ -141,7 +141,20 @@
           </div>
 
           <div class="pg-step">
-            <p class="label">03 · Run</p>
+            <p class="label">03 · The speakers (optional)</p>
+            <input id="speakers" class="text-input" type="text" maxlength="300"
+              placeholder="e.g. Jeff Emanuel (host), Dr. Sarah Chen (guest)"
+              aria-label="Speaker names and titles, comma-separated, in speaking order if known">
+            <p class="micro">Names help twice. They feed Whisper's decoding prompt, the same
+              mechanism as the CLI's <code>--prompt</code>, so names and titles come out
+              spelled right. They also replace the anonymous <code>SPEAKER_00…03</code> labels,
+              assigned in order of first appearance. The voices themselves are matched by
+              sound alone, so if the first person to talk is not the first name you listed,
+              swap the order and export again.</p>
+          </div>
+
+          <div class="pg-step">
+            <p class="label">04 · Run</p>
             <div class="row">
               <button id="run" class="btn primary" disabled>Transcribe + diarize</button>
             </div>
