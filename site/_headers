@@ -1,15 +1,17 @@
 # Response headers for the franken_whisper site (Cloudflare Pages).
 #
-# COOP/COEP are set now even though the current page needs neither, so the
-# planned in-browser wasm demo (bd-m2jm) can use SharedArrayBuffer without a
-# headers migration. `no-cache` on scripts pairs with the `?v=@SITEV@` stamp
-# in deploy.sh — CDN zone TTL overrides can ignore origin no-cache, so the
-# stamp is the real freshness mechanism.
+# connect-src 'self' is load-bearing product copy: the hero promises audio
+# never leaves the tab, and model weights arrive through the same-origin
+# /model/* proxy (functions/model/[[path]].js), so the browser enforces the
+# promise. COOP/COEP stay on so the future threaded wasm build needs no
+# headers migration. `no-cache` pairs with the ?v=@SITEV@ stamp in deploy.sh —
+# CDN zone TTL overrides can ignore origin no-cache, so the stamp is the real
+# freshness mechanism.
 
 /*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
   X-Content-Type-Options: nosniff
 
 /
@@ -18,24 +20,34 @@
 /index.html
   Cache-Control: no-cache
 
-/chrome.js
-  Cache-Control: no-cache
-
 /demo.html
   Cache-Control: no-cache
 
-/demo.js
+/app.js
   Cache-Control: no-cache
 
-/fw-worker.js
+/chrome.js
   Cache-Control: no-cache
 
-# The wasm module + JS glue: no-cache rather than stamped URLs because the
-# worker imports ./pkg/fw_wasm.js by fixed name (a stale 3 MB module behind a
-# CDN TTL override is the 79-commits-stale failure mode; no-cache + ETag keeps
-# revalidation cheap).
+/engine-worker.js
+  Cache-Control: no-cache
+
+/loader.js
+  Cache-Control: no-cache
+
+/sha256.js
+  Cache-Control: no-cache
+
+/model-manifest.js
+  Cache-Control: no-cache
+
+# The wasm module + JS glue rotate via the ?v= stamp; no-cache keeps
+# revalidation honest even where the stamp is bypassed.
 /pkg/*
   Cache-Control: no-cache
+
+# The model proxy serves immutable pinned release assets (cache-control is
+# set by the function itself; this block documents intent).
 
 /assets/css/site.css
   Cache-Control: public, max-age=86400

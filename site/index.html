@@ -1,348 +1,345 @@
 <!doctype html>
-<html lang="en" class="scroll-smooth">
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>franken_whisper — Whisper and speaker diarization, rebuilt in pure Rust</title>
-  <meta name="description" content="An agent-first Rust ASR stack with a real in-process Whisper engine (no FFI, no Python, no subprocess), native four-speaker diarization, NDJSON streaming, and measured 2.99x speed vs whisper.cpp at matched decode settings." />
-  <link rel="canonical" href="https://franken-whisper.com/" />
-
-  <meta property="og:type" content="website" />
-  <meta property="og:title" content="franken_whisper — Whisper, rebuilt in pure Rust" />
-  <meta property="og:description" content="Real in-process Rust Whisper engine + native speaker diarization. 2.99x faster than whisper.cpp at matched greedy decode, measured side-by-side in one harness." />
-  <meta property="og:image" content="https://franken-whisper.com/assets/img/og.png" />
-  <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="franken_whisper — Whisper, rebuilt in pure Rust" />
-  <meta name="twitter:image" content="https://franken-whisper.com/assets/img/og.png" />
-
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%99%3C/text%3E%3C/svg%3E" />
-
-  <link rel="preload" href="assets/fonts/inter-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin />
-  <link rel="preload" href="assets/fonts/jetbrains-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin />
-  <link rel="stylesheet" href="assets/css/site.css?v=1" />
-
-  <style>
-    /* Page-local classes; the compiled Tailwind build is frozen, so anything new lives here. */
-    .pg-btn{border-radius:9999px;padding:.6rem 1.2rem;font-size:.78rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase;border:1px solid rgba(255,255,255,.1);color:#94a3b8;display:inline-flex;align-items:center;gap:.5rem;transition:all .2s ease;cursor:pointer;text-decoration:none}
-    .pg-btn:hover{color:#e2e8f0;border-color:rgba(52,211,153,.35)}
-    .pg-btn.primary{background:linear-gradient(135deg,#004225,#059669);color:#eafff5;border-color:rgba(52,211,153,.35)}
-    .pg-btn.primary:hover{filter:brightness(1.15)}
-    .pg-chip{border:1px solid rgba(52,211,153,.2);border-radius:9999px;background:rgba(16,185,129,.05);font-family:"JetBrains Mono Variable","JetBrains Mono",monospace;font-size:.72rem;padding:.35rem .8rem;color:#a7f3d0;display:inline-flex;align-items:center;gap:.45rem}
-    .pg-label{font-size:.7rem;font-weight:900;letter-spacing:.25em;text-transform:uppercase;color:#10b981}
-    .pg-card{border-radius:1rem;border:1px solid rgba(255,255,255,.05);background:rgba(0,0,0,.4);padding:1.5rem}
-    .pg-panel{position:relative;border-radius:1.25rem;border:1px solid rgba(16,185,129,.12);background:rgba(6,20,13,.6);padding:2rem}
-    .pg-panel::before,.pg-panel::after{content:"";position:absolute;width:14px;height:14px;border-radius:9999px;background:radial-gradient(circle at 35% 35%,#34d399,#065f46 65%,#022c22);opacity:.7}
-    .pg-panel::before{top:-6px;left:-6px}
-    .pg-panel::after{top:-6px;right:-6px}
-    .code-block{background:rgba(1,5,3,.85);border:1px solid rgba(255,255,255,.06);border-radius:.9rem;padding:1.1rem 1.3rem;font-family:"JetBrains Mono Variable","JetBrains Mono",monospace;font-size:.8rem;line-height:1.7;color:#d1fae5;overflow-x:auto;white-space:pre;text-align:left}
-    .code-block .c{color:#64748b}
-    .code-block .k{color:#34d399}
-    .code-block .s{color:#fbbf24}
-    .tbl{width:100%;border-collapse:collapse;font-size:.85rem}
-    .tbl th{font-size:.68rem;font-weight:900;letter-spacing:.18em;text-transform:uppercase;color:#10b981;text-align:left;padding:.6rem .8rem;border-bottom:1px solid rgba(16,185,129,.2)}
-    .tbl td{padding:.6rem .8rem;border-bottom:1px solid rgba(255,255,255,.04);color:#cbd5e1}
-    .tbl td.num{font-family:"JetBrains Mono Variable","JetBrains Mono",monospace;color:#6ee7b7;font-weight:700}
-    .stage-pill{border:1px solid rgba(255,255,255,.07);border-radius:.7rem;background:rgba(2,10,6,.6);padding:.7rem .9rem;font-family:"JetBrains Mono Variable","JetBrains Mono",monospace;font-size:.75rem;color:#a7f3d0}
-    .stage-pill span{display:block;font-size:.62rem;color:#64748b;font-family:Inter,system-ui,sans-serif;letter-spacing:.02em;margin-top:.25rem}
-    /* Utilities absent from the frozen Tailwind build (checked with grep). */
-    .z-40{z-index:40}
-    .tracking-\[0\.18em\]{letter-spacing:.18em}
-    @media (min-width:768px){
-      .md\:py-24{padding-top:6rem;padding-bottom:6rem}
-      .md\:pt-44{padding-top:11rem}
-      .md\:grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
-      .md\:grid-cols-5{grid-template-columns:repeat(5,minmax(0,1fr))}
-    }
-    audio{width:100%;filter:invert(.9) hue-rotate(150deg)}
-    :focus-visible{outline:2px solid rgba(52,211,153,.6);outline-offset:2px}
-    html,body{overflow-x:hidden}
-    section[id],footer{scroll-margin-top:96px}
-    @media (prefers-reduced-motion: reduce){.glow-orb{animation:none}}
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>franken_whisper: Whisper and speaker diarization, in your browser tab</title>
+<meta name="description" content="A pure-Rust speech-to-text and speaker-diarization engine. Whisper large-v3-turbo and NVIDIA's Sortformer run fused, entirely in your browser — the same code that ships as the fw CLI. No server, no upload, no Python, no GPU.">
+<meta name="theme-color" content="#060b09">
+<link rel="canonical" href="https://franken-whisper.com/">
+<meta property="og:title" content="franken_whisper: Whisper and speaker diarization, in your browser tab">
+<meta property="og:description" content="Whisper large-v3-turbo + Sortformer diarization, hand-built in Rust, compiled to WebAssembly. Who said what, computed entirely on your CPU. Your audio never leaves the page.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="https://franken-whisper.com/assets/img/og.png">
+<meta property="og:url" content="https://franken-whisper.com/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://franken-whisper.com/assets/img/og.png">
+<link rel="preload" href="./assets/fonts/inter-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="./assets/fonts/jetbrains-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="./assets/css/site.css?v=@SITEV@">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23060b09'/%3E%3Crect x='1' y='1' width='62' height='62' rx='13' fill='none' stroke='%2310b981' stroke-opacity='0.55' stroke-width='2'/%3E%3Ctext x='32' y='45' font-family='monospace' font-size='34' font-weight='900' fill='%2334d399' text-anchor='middle'%3EW%3C/text%3E%3C/svg%3E">
 </head>
-<body class="min-h-screen">
-  <a href="#top" class="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:m-4 focus:rounded focus:bg-emerald-600 focus:px-4 focus:py-2 focus:text-white">Skip to content</a>
+<body>
 
-  <div class="glow-orb" style="width:520px;height:520px;top:-140px;left:-120px;background:rgba(16,185,129,.14)"></div>
-  <div class="glow-orb" style="width:420px;height:420px;top:38%;right:-160px;background:rgba(4,120,87,.16);animation-delay:-9s"></div>
-  <div class="glow-orb" style="width:380px;height:380px;bottom:-120px;left:22%;background:rgba(110,231,183,.08);animation-delay:-17s"></div>
+<a class="skip-link" href="#playground">Skip to the playground</a>
 
-  <header id="site-header" class="fixed top-4 left-1/2 -translate-x-1/2 z-40 rounded-full border border-transparent px-5 py-2.5 transition-all duration-300">
-    <nav class="flex items-center gap-5 text-[11px] font-black uppercase tracking-[0.18em]">
-      <a href="#top" class="text-emerald-400">franken_whisper</a>
-      <a href="#engine" class="text-slate-400 hover:text-emerald-300">Engine</a>
-      <a href="#speed" class="text-slate-400 hover:text-emerald-300">Speed</a>
-      <a href="#speakers" class="text-slate-400 hover:text-emerald-300">Speakers</a>
-      <a href="#agents" class="text-slate-400 hover:text-emerald-300">Agents</a>
-      <a href="#install" class="text-slate-400 hover:text-emerald-300">Install</a>
-      <a href="/demo" class="text-slate-400 hover:text-emerald-300">Demo</a>
-      <a href="https://github.com/Dicklesworthstone/franken_whisper" class="text-slate-400 hover:text-emerald-300">GitHub</a>
-    </nav>
-  </header>
+<!-- ============================== HEADER ============================== -->
+<header class="top" id="site-header">
+  <a class="brand" href="#top">
+    <span class="brand-mark" aria-hidden="true">W</span>
+    <span class="brand-text">
+      <span class="brand-name">franken_whisper</span>
+      <span class="brand-tag">hears_locally</span>
+    </span>
+  </a>
+  <nav aria-label="Primary">
+    <a href="#playground">Playground</a>
+    <a href="#engine">Engine</a>
+    <a href="#speakers">Speakers</a>
+    <a href="#speed">Speed</a>
+    <a href="#agents">Agents</a>
+    <a href="#install">Install</a>
+  </nav>
+  <a class="btn" href="https://github.com/Dicklesworthstone/franken_whisper" target="_blank" rel="noopener">GitHub</a>
+</header>
 
-  <!-- ============================== HERO ============================== -->
-  <section id="top" class="relative px-4 md:px-6 pt-36 md:pt-44 pb-16 md:pb-24 max-w-7xl mx-auto text-center">
-    <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-6 reveal">
-      <span class="h-px w-8 bg-emerald-500/40"></span> SPEECH-TO-TEXT, NO STRINGS ATTACHED <span class="h-px w-8 bg-emerald-500/40"></span>
-    </div>
-    <h1 class="font-black tracking-tight mb-6 reveal" style="font-size:clamp(3.2rem,8.5vw,7rem);line-height:1.02">
-      Whisper, rebuilt<br /><span class="text-gradient-franken" style="background:linear-gradient(90deg,#34d399,#10b981,#fbbf24);-webkit-background-clip:text;background-clip:text;color:transparent">in pure Rust</span>.
-    </h1>
-    <p class="text-slate-400 max-w-3xl mx-auto text-lg md:text-xl mb-9 reveal">
-      A real in-process Whisper engine — ggml parser, log-mel frontend, encoder, decoder, word-level
-      timestamps — with native four-speaker diarization. No FFI. No Python. No subprocess.
-      One binary that answers to agents first.
+<main>
+
+<!-- ============================== HERO ============================== -->
+<section class="hero" id="top">
+  <div class="wrap">
+    <p class="eyebrow">It listens · entirely in your browser</p>
+    <h1>Whisper, and <em>who said it.</em><br>In this tab.</h1>
+    <p class="lede">
+      <strong>franken_whisper</strong> rebuilds OpenAI's Whisper and NVIDIA's Streaming
+      Sortformer speaker diarizer in pure, memory-safe Rust — ggml parser, log-mel frontend,
+      encoder, decoder, word timestamps, four-speaker diarization, and the fusion that stitches
+      them into <em>who said what</em>. No PyTorch, no Python, no FFI, no subprocess. The same
+      code that ships as the <code>fw</code> CLI compiles to WebAssembly, so
+      <strong>large-v3-turbo</strong> — the full 809-million-parameter model, not a demo-sized
+      stand-in — transcribes and diarizes your recordings <strong>entirely on your CPU, in this
+      page</strong>. Your audio never leaves the tab, and the CSP's
+      <code>connect-src 'self'</code> makes that a browser-enforced promise rather than a
+      privacy-policy one.
     </p>
-    <div class="flex flex-wrap items-center justify-center gap-4 mb-10 reveal">
-      <a class="pg-btn primary" href="#install">Install in one line</a>
-      <a class="pg-btn" href="/demo">Try it in your browser</a>
-      <a class="pg-btn" href="https://github.com/Dicklesworthstone/franken_whisper">Source on GitHub</a>
+    <p class="hero-cta">
+      <a class="btn primary" href="#playground">Try it in your browser</a>
+      <a class="btn" href="#install">Install the CLI</a>
+    </p>
+    <div class="chips" aria-label="Key measured facts">
+      <span class="chip"><b>100%</b> Rust</span>
+      <span class="chip"><b>809M + 123M</b> parameters, in-tab</span>
+      <span class="chip"><b>2.0 GB</b> of weights, SHA-256-pinned</span>
+      <span class="chip"><b>4</b> speakers, turn by turn</span>
+      <span class="chip"><b>0 bytes</b> uploaded</span>
     </div>
-    <div class="flex flex-wrap items-center justify-center gap-3 mb-14 reveal">
-      <span class="pg-chip">100% Rust · zero FFI</span>
-      <span class="pg-chip">2.99&times; faster than whisper.cpp*</span>
-      <span class="pg-chip">4-speaker native diarization</span>
-      <span class="pg-chip">NDJSON robot mode</span>
-      <span class="pg-chip">13 exact error codes</span>
-    </div>
-    <div class="max-w-4xl mx-auto reveal">
-      <img src="assets/img/franken_whisper_illustration.webp" alt="franken_whisper illustration" width="1024" height="574"
-           class="rounded-2xl border border-white/5 w-full h-auto" style="box-shadow:0 0 60px rgba(16,185,129,.12)" />
-    </div>
-  </section>
+    <figure class="hero-art reveal">
+      <img src="./assets/img/franken_whisper_illustration.webp" width="1024" height="1024"
+        alt="The franken_whisper monster listening with a stitched ear horn, sorting voices into labeled threads"
+        loading="lazy" decoding="async">
+    </figure>
+  </div>
+</section>
 
-  <!-- ============================== ENGINE ============================== -->
-  <section id="engine" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
-    <div class="text-center mb-12 reveal">
-      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
-        <span class="h-px w-8 bg-emerald-500/40"></span> THE NATIVE ENGINE <span class="h-px w-8 bg-emerald-500/40"></span>
-      </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">The model runs <span class="text-emerald-400">in your process</span>.</h2>
-      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        Most "Rust Whisper" projects wrap whisper.cpp over FFI or shell out to Python.
-        franken_whisper implements the entire forward pass in safe Rust on
-        <a href="https://github.com/Dicklesworthstone/frankentorch" class="text-emerald-400 underline decoration-emerald-800 hover:decoration-emerald-400">FrankenTorch</a> CPU kernels.
+<!-- ============================== PLAYGROUND ============================== -->
+<section id="playground">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="eyebrow">Live · in this tab</p>
+      <h2>Run it <em>right now</em>.</h2>
+      <p class="lede">
+        The real pipeline, not a mock: Whisper <strong>large-v3-turbo</strong> (1.5 GB, f16)
+        transcribes, <strong>Sortformer</strong> (469 MB, f32) works out who is speaking when,
+        and the CLI's own projection-fusion attributes every line — all in hand-written Rust
+        kernels compiled to wasm, running on your CPU. Both downloads are SHA-256-verified
+        against pinned manifests, cached in browser storage, and re-verified on every visit.
+        The Sortformer package is additionally re-authenticated <em>inside the engine</em>
+        against its conversion receipt, exactly as the CLI does it. There is no server behind
+        this panel.
       </p>
     </div>
-    <div class="grid md:grid-cols-3 gap-5">
-      <div class="pg-card reveal">
-        <div class="pg-label mb-3">FRONTEND</div>
-        <p class="text-slate-300 text-sm leading-relaxed">ggml model parser, log-mel spectrogram, and the exact BPE tokenizer — byte-for-byte compatible with whisper.cpp's model files. Drop a <code class="text-emerald-300">ggml-*.bin</code> in place and transcribe.</p>
-      </div>
-      <div class="pg-card reveal">
-        <div class="pg-label mb-3">TRANSFORMER</div>
-        <p class="text-slate-300 text-sm leading-relaxed">Encoder and decoder with whisper.cpp's full timestamp-rule suite, greedy and beam decode, int8 quantization under a calibrated quality policy, and token-merging (ToMe) on the encoder — the lever behind the 2.99&times; row.</p>
-      </div>
-      <div class="pg-card reveal">
-        <div class="pg-label mb-3">WORD TIMESTAMPS</div>
-        <p class="text-slate-300 text-sm leading-relaxed">Cross-attention DTW word alignment — real per-word times from the model's own attention, not linear interpolation. Metal acceleration engages automatically on macOS.</p>
-      </div>
-    </div>
-  </section>
 
-  <!-- ============================== SPEED ============================== -->
-  <section id="speed" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
-    <div class="text-center mb-12 reveal">
-      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
-        <span class="h-px w-8 bg-emerald-500/40"></span> MEASURED, NOT MARKETED <span class="h-px w-8 bg-emerald-500/40"></span>
-      </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Faster, with <span class="text-emerald-400">receipts</span>.</h2>
-      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        Every row below ran the real <code class="text-emerald-300">whisper-cli</code> incumbent side-by-side in the same
-        harness invocation, at matched greedy decode settings, with paired A/A null controls.
-      </p>
-    </div>
-    <div class="pg-panel max-w-4xl mx-auto reveal">
-      <table class="tbl">
-        <thead><tr><th>Model / workload</th><th>Mode</th><th>Result</th><th>Transcript</th></tr></thead>
-        <tbody>
-          <tr><td>large-v3-turbo, 124.5 s / 5 windows</td><td>whole job, no timestamps</td><td class="num">2.99&times; faster</td><td class="num">WER 0.011</td></tr>
-          <tr><td>tiny.en, 124.5 s / 5 windows</td><td>transcribe only</td><td class="num">1.52&times; faster</td><td class="num">WER 0.0000</td></tr>
-          <tr><td>tiny.en, 300 s / 10 windows</td><td>transcribe only</td><td class="num">1.51&times; faster</td><td class="num">WER 0.0000</td></tr>
-        </tbody>
-      </table>
-      <p class="text-slate-500 text-xs mt-5 leading-relaxed">
-        *Matched-greedy CPU comparisons (<code>whisper-cli -bs 1 -bo 1</code>), 32 threads, quiet x86-64 Threadripper host,
-        order-alternating pairs, per-engine A/A controls, CI95 gates. A result is admitted only when both same-invocation
-        A/A null medians sit in [0.98,&nbsp;1.02] and the effect clears twice the widest null-CI edge. The full measurement
-        record, including every rejected optimization, lives in
-        <a href="https://github.com/Dicklesworthstone/franken_whisper/blob/main/docs/PERF_LEDGER.md" class="text-emerald-400 underline decoration-emerald-800">docs/PERF_LEDGER.md</a>.
-      </p>
-    </div>
-  </section>
+    <div class="panel reveal">
+      <div class="pg">
+        <!-- Left column: the recording -->
+        <div class="pg-col">
+          <div class="pg-step">
+            <p class="label">01 · The models</p>
+            <div class="row">
+              <button id="load-models" class="btn primary" disabled><span>Load both models (2.0 GB)</span></button>
+              <button id="clear-cache" class="btn danger" title="Remove the downloaded models from this browser's cache">Clear cache</button>
+            </div>
+            <div id="consent" class="consent" hidden>
+              <p id="consent-text">This downloads 2.0 GB of model weights (Whisper large-v3-turbo
+                + Sortformer) into this browser's storage, once. They are fetched from this
+                site's own origin, verified against SHA-256 pins, and cached for next time.
+                Desktop recommended: the engine needs roughly 2.5 GB of tab memory.</p>
+              <div class="row">
+                <button id="consent-yes" class="btn primary">Download</button>
+                <button id="consent-no" class="btn">Not now</button>
+              </div>
+            </div>
+            <div id="progress-wrap" hidden>
+              <div class="progress"><div id="progress-bar"></div></div>
+              <div id="progress-text" class="kv"></div>
+            </div>
+            <div id="status" class="status">Starting engine…</div>
+          </div>
 
-  <!-- ============================== SPEAKERS ============================== -->
-  <section id="speakers" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
-    <div class="text-center mb-12 reveal">
-      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
-        <span class="h-px w-8 bg-emerald-500/40"></span> WHO SAID WHAT <span class="h-px w-8 bg-emerald-500/40"></span>
-      </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Diarization that reaches <span class="text-emerald-400">the transcript</span>.</h2>
-      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        A memory-safe Rust port of NVIDIA's Sortformer runs in-process by default, tracking up to four
-        overlapping speakers. Turn evidence is fused into every segment, and speaker changes snap to the
-        transcript's own punctuation.
-      </p>
-    </div>
-    <div class="grid md:grid-cols-2 gap-5 max-w-5xl mx-auto">
-      <div class="pg-card reveal">
-        <div class="pg-label mb-3">ONE PAYLOAD, ALREADY JOINED</div>
-        <p class="text-slate-300 text-sm leading-relaxed mb-4">Every segment carries its speaker, and <code class="text-emerald-300">speaker_segments</code> gives you merged same-speaker runs with byte-faithful text and per-run confidence — no client-side join required.</p>
-        <div class="code-block">{
-  <span class="s">"speaker"</span>: <span class="s">"SPEAKER_00"</span>,
-  <span class="s">"start_sec"</span>: 45.8, <span class="s">"end_sec"</span>: 51.2,
-  <span class="s">"text"</span>: <span class="s">"Hey Jeff. How are you doing?"</span>,
-  <span class="s">"segment_count"</span>: 6,
-  <span class="s">"speaker_confidence"</span>: 0.93
-}</div>
-      </div>
-      <div class="pg-card reveal">
-        <div class="pg-label mb-3">HONEST ABOUT ITS LIMITS</div>
-        <p class="text-slate-300 text-sm leading-relaxed">Four lanes are a hard capacity boundary, not proof a recording has four speakers — the output says so explicitly (<code class="text-emerald-300">development_uncertified</code>). Untimed audio stays <code class="text-emerald-300">unknown</code> rather than guessed. Recordings past the boundary fall back to a bounded acoustic engine, and the report names which engine ran and why.</p>
-      </div>
-    </div>
-  </section>
+          <div class="pg-step">
+            <p class="label">02 · The recording</p>
+            <div id="drop" class="drop" role="button" tabindex="0"
+              aria-label="Drop an audio file here or click to pick one">
+              <span id="drop-hint">Drop an audio file here (mp3, m4a, wav), or click to pick one.
+                A meeting, an interview, a voice memo — anything with people talking.</span>
+            </div>
+            <input type="file" id="file-input" accept=".mp3,.m4a,.mp4,.aac,.wav,audio/*" hidden>
+            <p class="micro">Decoded in-tab by Symphonia (pure Rust), downmixed and resampled to
+              16 kHz mono. Long files work; a single-threaded wasm build transcribes at a few
+              times real time, so start with minutes, not hours.</p>
+          </div>
 
-  <!-- ============================== AGENTS ============================== -->
-  <section id="agents" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
-    <div class="text-center mb-12 reveal">
-      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
-        <span class="h-px w-8 bg-emerald-500/40"></span> BUILT FOR MACHINES <span class="h-px w-8 bg-emerald-500/40"></span>
-      </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Agents are the <span class="text-emerald-400">primary interface</span>.</h2>
-      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        Robot mode streams sequenced, schema-versioned NDJSON. Errors are thirteen exact codes, not prose.
-        Even argument-parsing failures come back as one parseable JSON object.
-      </p>
-    </div>
-    <div class="pg-panel max-w-4xl mx-auto reveal">
-      <div class="code-block"><span class="c"># one JSON object per line, schema 1.0.0</span>
-$ fw robot run --input meeting.mp3 --backend auto
-
-{<span class="s">"event"</span>:<span class="s">"run_start"</span>,<span class="s">"schema_version"</span>:<span class="s">"1.0.0"</span>, ...}
-{<span class="s">"event"</span>:<span class="s">"stage"</span>,<span class="s">"stage"</span>:<span class="s">"normalize"</span>,<span class="s">"code"</span>:<span class="s">"normalize.ok"</span>, ...}
-{<span class="s">"event"</span>:<span class="s">"stage"</span>,<span class="s">"stage"</span>:<span class="s">"backend"</span>,<span class="s">"code"</span>:<span class="s">"backend.ok"</span>, ...}
-{<span class="s">"event"</span>:<span class="s">"stage"</span>,<span class="s">"stage"</span>:<span class="s">"diarize"</span>,<span class="s">"code"</span>:<span class="s">"diarize.ok"</span>, ...}
-{<span class="s">"event"</span>:<span class="s">"run_complete"</span>,<span class="s">"transcript"</span>:<span class="s">"..."</span>,<span class="s">"segments"</span>:[...],<span class="s">"warnings"</span>:[]}</div>
-      <div class="grid md:grid-cols-3 gap-4 mt-6">
-        <div class="stage-pill">fw robot triage<span>live machine-readable starting point</span></div>
-        <div class="stage-pill">fw capabilities --json<span>exact error codes, exit codes, schemas</span></div>
-        <div class="stage-pill">fw doctor --json<span>model cache and readiness preflight</span></div>
-      </div>
-      <p class="text-slate-500 text-xs mt-5 leading-relaxed">
-        Dropped decode windows, ignored flags, and every non-fatal anomaly surface in
-        <code>warnings</code> and structured events — nothing important is stderr-only. Runs persist to
-        SQLite with replay envelopes; identical input and engine must produce an identical output hash.
-      </p>
-    </div>
-  </section>
-
-  <!-- ============================== PIPELINE ============================== -->
-  <section id="pipeline" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
-    <div class="text-center mb-12 reveal">
-      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
-        <span class="h-px w-8 bg-emerald-500/40"></span> TEN COMPOSABLE STAGES <span class="h-px w-8 bg-emerald-500/40"></span>
-      </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">A pipeline, <span class="text-emerald-400">not a monolith</span>.</h2>
-      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        Each stage has an independent time budget and emits paired start/ok events.
-        Skipped stages say so — agents can tell "not needed" from "failed".
-      </p>
-    </div>
-    <div class="grid grid-cols-2 md:grid-cols-5 gap-3 max-w-5xl mx-auto reveal">
-      <div class="stage-pill">ingest<span>file · stdin · microphone</span></div>
-      <div class="stage-pill">normalize<span>in-process decode: MP3/AAC/FLAC/OGG</span></div>
-      <div class="stage-pill">vad<span>optional silence skip</span></div>
-      <div class="stage-pill">separate<span>optional vocal isolation</span></div>
-      <div class="stage-pill">backend<span>native engine or bridges</span></div>
-      <div class="stage-pill">accelerate<span>confidence normalization</span></div>
-      <div class="stage-pill">align<span>forced alignment</span></div>
-      <div class="stage-pill">punctuate<span>opt-in text normalization</span></div>
-      <div class="stage-pill">diarize<span>native Sortformer default</span></div>
-      <div class="stage-pill">persist<span>SQLite + JSONL replay</span></div>
-    </div>
-  </section>
-
-  <!-- ============================== RECEIPTS ============================== -->
-  <section id="receipts" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
-    <div class="text-center mb-12 reveal">
-      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
-        <span class="h-px w-8 bg-emerald-500/40"></span> EVIDENCE OVER VIBES <span class="h-px w-8 bg-emerald-500/40"></span>
-      </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Every claim has a <span class="text-emerald-400">paper trail</span>.</h2>
-    </div>
-    <div class="grid md:grid-cols-3 gap-5 max-w-5xl mx-auto">
-      <div class="pg-card reveal">
-        <div class="pg-label mb-3">THE GRAVEYARD</div>
-        <p class="text-slate-300 text-sm leading-relaxed">A 26,000-line negative-evidence ledger records every optimization that <em>didn't</em> work — with the measurement that killed it and the predicate under which it may be retried. Failed ideas are data, not embarrassments.</p>
-      </div>
-      <div class="pg-card reveal">
-        <div class="pg-label mb-3">BYTE-EXACT OR LEDGERED</div>
-        <p class="text-slate-300 text-sm leading-relaxed">Performance levers must prove bit-identical output before their speed is even measured. The few accepted divergences live in <code class="text-emerald-300">DISCREPANCIES.md</code> with kill switches and review dates.</p>
-      </div>
-      <div class="pg-card reveal">
-        <div class="pg-label mb-3">REPLAY PACKS</div>
-        <p class="text-slate-300 text-sm leading-relaxed">Every run produces SHA-256 replay envelopes; a four-artifact replay pack reproduces any run byte-for-byte on another machine. Drift between engine versions is detected, never assumed away.</p>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================== INSTALL ============================== -->
-  <section id="install" class="relative px-4 md:px-6 py-16 md:py-24 max-w-7xl mx-auto">
-    <div class="text-center mb-12 reveal">
-      <div class="inline-flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.3em] text-emerald-500 mb-4">
-        <span class="h-px w-8 bg-emerald-500/40"></span> SIXTY SECONDS TO FIRST TRANSCRIPT <span class="h-px w-8 bg-emerald-500/40"></span>
-      </div>
-      <h2 class="text-4xl md:text-6xl font-black tracking-tight mb-5">Install <span class="text-emerald-400">it</span>.</h2>
-      <p class="text-slate-400 max-w-2xl mx-auto text-base md:text-lg">
-        SHA-256-verified binaries for Linux (x86_64/arm64), macOS (Intel/Apple&nbsp;Silicon), and Windows.
-        The installer also provisions both pinned model packages (~2.1&nbsp;GB) so the default pipeline works offline.
-      </p>
-    </div>
-    <div class="max-w-3xl mx-auto space-y-5">
-      <div class="pg-panel reveal">
-        <div class="pg-label mb-3">ONE LINE</div>
-        <div class="code-block">curl -fsSL <span class="s">"https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/main/install.sh"</span> | bash</div>
-      </div>
-      <div class="grid md:grid-cols-2 gap-5">
-        <div class="pg-card reveal">
-          <div class="pg-label mb-3">HOMEBREW</div>
-          <div class="code-block">brew install dicklesworthstone/tap/franken-whisper
-fw pull all   <span class="c"># one-time model download</span></div>
+          <div class="pg-step">
+            <p class="label">03 · Run</p>
+            <div class="row">
+              <button id="run" class="btn primary" disabled>Transcribe + diarize</button>
+            </div>
+            <p class="kv" id="stage-line" hidden></p>
+          </div>
         </div>
-        <div class="pg-card reveal">
-          <div class="pg-label mb-3">CARGO</div>
-          <div class="code-block">cargo install franken_whisper
-fw pull all</div>
+
+        <!-- Right column: the transcript -->
+        <div class="pg-col">
+          <p class="label">The transcript</p>
+          <p class="note" id="result-placeholder">
+            Results land here: every line timestamped and speaker-attributed, with the same
+            <code>SPEAKER_00…03</code> labels and fusion rules the CLI emits. The measured
+            wall-clock and realtime ratio print with each run — numbers from <em>your</em>
+            hardware, not marketing.
+          </p>
+          <div id="result-wrap" hidden>
+            <div class="row">
+              <div id="result-meta" class="kv"></div>
+            </div>
+            <div id="output" class="output transcript" aria-live="polite"></div>
+            <div class="row">
+              <button id="download-md" class="btn" hidden>Download .md</button>
+              <button id="download-html" class="btn" hidden>Styled HTML (.html)</button>
+            </div>
+          </div>
         </div>
       </div>
-      <div class="pg-card reveal">
-        <div class="pg-label mb-3">THEN</div>
-        <div class="code-block"><span class="c"># transcribe + diarize a meeting, full JSON report</span>
-fw transcribe --input meeting.mp3 --json
+      <div id="license" class="kv"></div>
+    </div>
+  </div>
+</section>
 
-<span class="c"># transcript only</span>
-fw transcribe --input meeting.mp3 --no-diarize
+<!-- ============================== ENGINE ============================== -->
+<section id="engine">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="eyebrow">Anatomy · one code path</p>
+      <h2>The <em>same bytes</em> as the CLI.</h2>
+      <p class="lede">
+        The browser build is not a port of a port. The wasm crate mounts the native engine's
+        source files directly — the identical Rust that decodes on a workstation — behind one
+        platform seam: a host-fed clock and a serial thread scope. What differs is honest and
+        named; everything else is the same pipeline, stage for stage.
+      </p>
+    </div>
 
-<span class="c"># stream NDJSON events for your agent</span>
-fw robot run --input meeting.mp3 --backend auto</div>
+    <ol class="stack reveal">
+      <li><strong>ggml parser.</strong> The 1.5 GB turbo file is scanned once for its tensor
+        directory, then each tensor hydrates straight from browser storage through a positioned
+        reader — the file never exists as one in-memory blob. f16 tensors stay f16-resident;
+        that residency is what fits an 809M-parameter encoder in a 32-bit address space.</li>
+      <li><strong>Log-mel frontend.</strong> The reference mel pipeline, bit-faithful to the
+        native engine: 25 ms windows, 10 ms hop, 128 mel bins for turbo.</li>
+      <li><strong>Encoder + decoder.</strong> 32 encoder layers, 4 decoder layers, greedy
+        temperature-0 decode with the CLI's window retry and context-carry policies. The wasm
+        build multiplies f16 weights with the same batched dequant-GEMV kernels the native
+        decoder ships by default.</li>
+      <li><strong>Sortformer diarizer.</strong> NVIDIA's streaming four-speaker model —
+        FastConformer frontend, transformer stack, per-frame speaker lanes — hand-ported to the
+        same Rust, verified in-engine against its conversion receipt before a single frame is
+        scored.</li>
+      <li><strong>Projection fusion.</strong> The CLI's projection-fusion-v1 attributes each
+        transcript segment to the dominant speaker turn, fills gap segments from the turn
+        timeline, and merges runs into speaker-attributed blocks. The wasm build calls the very
+        function the CLI calls — relocated, not re-implemented.</li>
+    </ol>
+  </div>
+</section>
+
+<!-- ============================== SPEAKERS ============================== -->
+<section id="speakers">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="eyebrow">Diarization · who said what</p>
+      <h2>Names on <em>every line</em>.</h2>
+      <p class="lede">
+        Transcription without attribution is half an answer. franken_whisper runs diarization as
+        a first-class stage, not an afterthought: Sortformer scores four speaker lanes at 80 ms
+        resolution, turns become a timeline with per-turn confidence and overlap suspicion, and
+        the fusion pass projects that timeline onto the transcript so consecutive same-speaker
+        segments merge into readable blocks. The CLI exposes the same result as
+        <code>speaker_segments</code> in its JSON envelope; the playground renders it directly.
+      </p>
+    </div>
+    <div class="grid grid-3 reveal">
+      <div class="card">
+        <p class="label">Turn timeline</p>
+        <p>Start, end, speaker, confidence, and overlap suspicion for every detected turn —
+          the raw evidence, preserved alongside the merged view.</p>
+      </div>
+      <div class="card">
+        <p class="label">Conservative first</p>
+        <p>A segment is labeled only when one speaker owns at least 70% of it at calibrated
+          confidence; the fusion pass then fills the gaps from the same evidence instead of
+          returning <code>null</code>.</p>
+      </div>
+      <div class="card">
+        <p class="label">Receipt-verified</p>
+        <p>The diarizer's weight package re-authenticates against its frozen conversion receipt
+          (SHA-256 chain, tensor census) inside the engine, in the browser, every load.</p>
       </div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <footer class="relative px-4 md:px-6 py-12 max-w-7xl mx-auto border-t border-white/5 text-center">
-    <p class="text-slate-500 text-sm mb-3">
-      MIT licensed (with OpenAI/Anthropic rider) ·
-      <a href="https://github.com/Dicklesworthstone/franken_whisper" class="text-emerald-400 hover:underline">GitHub</a> ·
-      <a href="https://github.com/Dicklesworthstone/franken_whisper/blob/main/CHANGELOG.md" class="text-emerald-400 hover:underline">Changelog</a> ·
-      <a href="https://crates.io/crates/franken_whisper" class="text-emerald-400 hover:underline">crates.io</a>
-    </p>
-    <p class="text-slate-600 text-xs max-w-2xl mx-auto">
-      Model weights are distributed separately under their own licenses (Whisper: MIT; Sortformer: NVIDIA Open
-      Model License). Audio never leaves your machine: the core performs no network I/O during transcription.
-    </p>
-  </footer>
+<!-- ============================== SPEED ============================== -->
+<section id="speed">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="eyebrow">Speed · measured, not promised</p>
+      <h2>Honest <em>numbers</em>.</h2>
+      <p class="lede">
+        On native CPU, franken_whisper's engine measures <strong>2.99× faster than
+        whisper.cpp</strong> at matched greedy decode settings, side-by-side in one interleaved
+        harness — the methodology and evidence hashes live in the repo's performance ledger.
+        On Apple-silicon GPU, the Metal encoder went from 15.4 s to 1.85 s per window across
+        one ledgered kernel campaign. The wasm build in this page is the same engine on one
+        browser thread with SIMD128: expect a few times real time, and read the exact ratio the
+        page prints after each run — it is measured on your machine, not quoted from ours.
+        Threaded wasm is the next lever, and it will land the same way everything here landed:
+        behind a measured, ledgered gate.
+      </p>
+    </div>
+    <div class="grid grid-3 reveal">
+      <div class="card">
+        <p class="label">2.99× vs whisper.cpp</p>
+        <p>Native CPU, matched greedy settings, interleaved A/B pairs, transcript-equality gate,
+          evidence bundle hashed in the ledger.</p>
+      </div>
+      <div class="card">
+        <p class="label">Every claim gated</p>
+        <p>One lever per pass, kill-switch env for every optimization, byte-identical or
+          ledgered — the repo's PERF_LEDGER.md and NEGATIVE_EVIDENCE.md are the record.</p>
+      </div>
+      <div class="card">
+        <p class="label">This page tells the truth</p>
+        <p>The playground prints wall-clock and realtime ratio per run. If it is slow on your
+          hardware, it says so, in numbers.</p>
+      </div>
+    </div>
+  </div>
+</section>
 
-  <script type="module" src="./chrome.js?v=@SITEV@"></script>
+<!-- ============================== AGENTS ============================== -->
+<section id="agents">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="eyebrow">Agent-first · scriptable to the bone</p>
+      <h2>Built for <em>robots</em> too.</h2>
+      <p class="lede">
+        The CLI answers to agents first: NDJSON streaming events, a stable JSON envelope with
+        <code>raw_output</code> introspection (which encoder route actually ran, window stats,
+        dropped-window accounting), durable SQLite job storage, and exit codes that mean
+        things. If you are wiring transcription into a pipeline, the contract is the product.
+      </p>
+    </div>
+    <pre class="code reveal"><code>fw transcribe meeting.m4a --diarize --robot | jq -r '
+  .result.speaker_segments[]
+  | "[\(.speaker // "?")] \(.text)"'</code></pre>
+  </div>
+</section>
+
+<!-- ============================== INSTALL ============================== -->
+<section id="install">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="eyebrow">Install · one line</p>
+      <h2>Take it <em>home</em>.</h2>
+      <p class="lede">
+        The native CLI is faster than this tab will ever be, runs every model tier, and speaks
+        NDJSON. One line, no Python environment, no CUDA archaeology.
+      </p>
+    </div>
+    <pre class="code reveal"><code># macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/main/install.sh | bash
+
+# or Homebrew
+brew install dicklesworthstone/tap/franken-whisper
+
+# or cargo
+cargo install franken_whisper</code></pre>
+    <p class="kv reveal">Then: <code>fw transcribe recording.mp3 --diarize</code></p>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <p>franken_whisper — Whisper + Sortformer, rebuilt in Rust. MIT-licensed engine;
+      model weights under their respective licenses (Whisper: MIT; Sortformer:
+      <a href="https://developer.download.nvidia.com/licenses/nvidia-open-model-license-agreement-june-2024.pdf">NVIDIA Open Model License</a>).
+      Built by <a href="https://github.com/Dicklesworthstone">Jeffrey Emanuel</a>.
+      <a href="https://github.com/Dicklesworthstone/franken_whisper">Source, ledgers, and receipts on GitHub</a>.</p>
+  </div>
+</footer>
+
+<script type="module" src="./chrome.js?v=@SITEV@"></script>
+<script type="module" src="./app.js?v=@SITEV@"></script>
 </body>
 </html>
