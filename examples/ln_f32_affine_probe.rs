@@ -95,20 +95,20 @@ fn main() {
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
 
-    let run =
-        |f: &dyn Fn(&[f32], &[f32], &[f32], usize, usize, &mut [f32]), out: &mut [f32]| -> f64 {
-            for _ in 0..3 {
-                f(&x, &w, &b, rows, cols, out);
-            }
-            let mut best = f64::INFINITY;
-            for _ in 0..iters {
-                let t = Instant::now();
-                f(&x, &w, &b, rows, cols, out);
-                best = best.min(t.elapsed().as_secs_f64());
-                black_box(&out[0]);
-            }
-            best
-        };
+    type LnFn<'a> = &'a dyn Fn(&[f32], &[f32], &[f32], usize, usize, &mut [f32]);
+    let run = |f: LnFn, out: &mut [f32]| -> f64 {
+        for _ in 0..3 {
+            f(&x, &w, &b, rows, cols, out);
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..iters {
+            let t = Instant::now();
+            f(&x, &w, &b, rows, cols, out);
+            best = best.min(t.elapsed().as_secs_f64());
+            black_box(&out[0]);
+        }
+        best
+    };
     let t64 = run(&ln_f64, &mut o64);
     let t32 = run(&ln_f32affine, &mut o32);
     println!(

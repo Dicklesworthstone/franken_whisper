@@ -1307,9 +1307,6 @@ fn add_pos_emb(x: &mut Mat, pos_emb: &Mat, n_ctx: usize) {
 /// `ft-kernel-metal`, so this crate keeps `#![deny(unsafe_code)]`.
 #[cfg(target_os = "macos")]
 fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
-
     // `FRANKEN_WHISPER_FUSED_ENC=0` disables just the fused encoder (the per-matmul
     // GEMM offload in `nn` still applies) — for A/B against the fused path.
     if matches!(

@@ -90,7 +90,7 @@ fn range_find(wt: &Mat, wt_t_as_ggml: &Mat, r: usize, seed: u64) -> (Mat, f64) {
         let nrm = frob(&v);
         if nrm > 1e-6 {
             let inv = (1.0 / nrm) as f32;
-            for vi in v.iter_mut() {
+            for vi in &mut v {
                 *vi *= inv;
             }
             qcols.push(v);

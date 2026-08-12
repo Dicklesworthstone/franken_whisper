@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..runs {
         let t = Instant::now();
         let b = ggml_model.tensor_f16(emb)?.1; // serial bytes->u16
-        let conv: Vec<u16> = b.iter().copied().collect(); // serial 2nd pass (== bits_to_halves traffic)
+        let conv: Vec<u16> = b.clone(); // serial 2nd pass (== bits_to_halves traffic)
         let old_ms = t.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box((b.len(), conv.len()));
 

@@ -17,7 +17,8 @@
 //! project_draft_decoding_amortization. So this probe measures BOTH endpoints:
 //!   - WARM: same matrix reused (all-L3 where it fits) — the earlier, mixed-regime number.
 //!   - COLD: each timed call reads a FRESH matrix from a rotating pool sized > L3 (128 MiB),
-//!           so every op is DRAM-bandwidth-bound → the time ratio ≈ the byte ratio.
+//!     so every op is DRAM-bandwidth-bound → the time ratio ≈ the byte ratio.
+//!
 //! Real per-token decode is between the two (per-CCD working set 39 MB slightly exceeds the
 //! 32 MB CCD L3, so the oversized logits weight leans COLD). Report both; the honest per-token
 //! fraction is the COLD one.

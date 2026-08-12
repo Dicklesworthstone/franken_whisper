@@ -9,10 +9,12 @@
 //!   - f32:  `nn::matmul` (matrixmultiply, BLOCKED)      [current encoder path]
 //!   - int8: `gemv_i8_batch` (naive row×row int8 dot)    [tq=1500 = encoder GEMM]
 //!   - f16:  `gemv_f16_batch` (naive row×row f16 dot)     [reference]
+//!
 //! If naive int8 already beats blocked f32, the encoder int8 lever is worth the
 //! transcript work; if it loses (naive has no cache-blocking, cf. cross_kv where
 //! blocked-f32 beat naive-f16 2.25×), a blocked int8 microkernel is required
 //! (bigger, owner-scoped). Run at RAYON_NUM_THREADS=32.
+//!
 //! Usage: `encoder_i8_gemm_probe [iters]` (default 40).
 use franken_whisper::native_engine::Mat;
 use franken_whisper::native_engine::nn;
