@@ -183,22 +183,27 @@ mod wasm_impl {
     #[cfg(target_feature = "atomics")]
     impl<'env, T: std::any::Any + Send> ScopedJoinHandle<'env, T> {
         /// Ensure the banked batch has run, then take this handle's result.
+        /// If a concurrent `run_batch` (a handle joined from a pool task)
+        /// drained this handle's job but has not finished it, cooperate with
+        /// the pool until the slot fills instead of panicking.
         #[allow(clippy::missing_errors_doc)]
         pub fn join(self) -> std::thread::Result<T> {
-            if self
-                .slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none()
-            {
+            let take = || {
+                self.slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            };
+            let mut boxed = take();
+            if boxed.is_none() {
                 run_batch(&self.batch);
+                boxed = take();
             }
-            let boxed = self
-                .slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-                .expect("banked scope job did not produce a result");
+            while boxed.is_none() {
+                std::thread::yield_now();
+                boxed = take();
+            }
+            let boxed = boxed.expect("checked Some above");
             Ok(*boxed
                 .downcast::<T>()
                 .expect("banked scope job produced a mismatched type"))
