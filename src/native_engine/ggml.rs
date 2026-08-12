@@ -613,6 +613,97 @@ enum TensorSource {
     /// with no cursor, so concurrent per-tensor loads compose).
     #[cfg(unix)]
     Streamed(std::fs::File),
+    /// Caller-supplied positioned reader; payloads are fetched on demand
+    /// (bd-m2jm: OPFS sync-access-handle reads in a browser worker).
+    Host(HostReader),
+}
+
+/// Positioned-read seam for [`GgmlModel::load_from_host_reader`]: the host
+/// supplies the total byte length and a `read_exact_at(offset, buf)` closure.
+/// Mirrors the unix `Streamed` arm's contract (thread-safe, no cursor).
+pub struct HostReader {
+    len: u64,
+    read_at: Box<dyn Fn(u64, &mut [u8]) -> std::io::Result<()> + Send + Sync>,
+}
+
+impl HostReader {
+    /// `len` is the model's exact byte length; `read_at` must fill the whole
+    /// buffer from `offset` or return an error (short reads are errors).
+    pub fn new(
+        len: u64,
+        read_at: impl Fn(u64, &mut [u8]) -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            len,
+            read_at: Box::new(read_at),
+        }
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        (self.read_at)(offset, buf)
+    }
+}
+
+impl std::fmt::Debug for HostReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostReader")
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+/// `Read + Seek` adapter over a [`HostReader`] for the directory scan.
+struct HostStream<'a> {
+    reader: &'a HostReader,
+    pos: u64,
+}
+
+impl<'a> HostStream<'a> {
+    fn new(reader: &'a HostReader) -> Self {
+        Self { reader, pos: 0 }
+    }
+}
+
+impl std::io::Read for HostStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.reader.len.saturating_sub(self.pos);
+        let n = (buf.len() as u64).min(remaining) as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        self.reader.read_exact_at(self.pos, &mut buf[..n])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for HostStream<'_> {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target = match from {
+            std::io::SeekFrom::Start(offset) => Some(offset),
+            std::io::SeekFrom::End(delta) => self.reader.len.checked_add_signed(delta),
+            std::io::SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+        };
+        match target {
+            Some(pos) => {
+                self.pos = pos;
+                Ok(pos)
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek out of range",
+            )),
+        }
+    }
+}
+
+/// Output of the shared streamed directory scan (everything except the
+/// payload source, which each loader supplies).
+struct ScannedModel {
+    hparams: WhisperHParams,
+    filters: MelFilterbank,
+    vocab_tokens: Vec<Vec<u8>>,
+    tensors: HashMap<String, TensorEntry>,
 }
 
 /// Whether the gated streaming loader (`FW_STREAM_LOAD=1`) is enabled. Unix
@@ -858,8 +949,49 @@ impl GgmlModel {
         // The directory scan uses a SEPARATE buffered handle (dropped when the
         // scan ends); `file` is kept only for the on-demand payload preads.
         let scan = std::fs::File::open(path)?;
-        let mut cur = StreamCursor::new(std::io::BufReader::with_capacity(1 << 20, scan), len);
+        let cur = StreamCursor::new(std::io::BufReader::with_capacity(1 << 20, scan), len);
+        let scanned = Self::scan_streamed_inner(cur)?;
+        Ok(Self {
+            hparams: scanned.hparams,
+            filters: scanned.filters,
+            vocab_tokens: scanned.vocab_tokens,
+            tensors: scanned.tensors,
+            source: TensorSource::Streamed(file),
+        })
+    }
 
+    /// Parse a ggml model through a caller-supplied positioned reader,
+    /// keeping only the directory resident and reading each tensor payload
+    /// on demand (bd-m2jm: the wasm/browser entry, where the host supplies
+    /// reads against an OPFS sync-access handle; native tests exercise it
+    /// with a file-backed closure). Directory and validation are identical
+    /// to [`Self::load`]/[`Self::parse`] — same scan, same errors.
+    ///
+    /// # Errors
+    ///
+    /// Same classes as [`Self::load`]: reader failures surface as
+    /// [`FwError::Io`], malformed structure as [`FwError::InvalidRequest`],
+    /// unsupported dtypes as [`FwError::Unsupported`].
+    pub fn load_from_host_reader(reader: HostReader) -> FwResult<Self> {
+        let len = usize::try_from(reader.len).unwrap_or(usize::MAX);
+        let cur = StreamCursor::new(HostStream::new(&reader), len);
+        let scanned = Self::scan_streamed_inner(cur)?;
+        Ok(Self {
+            hparams: scanned.hparams,
+            filters: scanned.filters,
+            vocab_tokens: scanned.vocab_tokens,
+            tensors: scanned.tensors,
+            source: TensorSource::Host(reader),
+        })
+    }
+
+    /// Directory scan shared by the unix pread loader and the host-reader
+    /// loader: reads magic/hparams/filterbank/vocab and the tensor directory,
+    /// seeking over payloads. Extracted verbatim from `load_streamed` — the
+    /// directory it builds is byte-for-byte identical to [`Self::parse`]'s.
+    fn scan_streamed_inner<R: std::io::Read + std::io::Seek>(
+        mut cur: StreamCursor<R>,
+    ) -> FwResult<ScannedModel> {
         let magic = cur.read_u32()?;
         if magic != GGML_MAGIC {
             return Err(FwError::InvalidRequest(format!(
@@ -992,12 +1124,11 @@ impl GgmlModel {
             )));
         }
 
-        Ok(Self {
+        Ok(ScannedModel {
             hparams,
             filters,
             vocab_tokens,
             tensors,
-            source: TensorSource::Streamed(file),
         })
     }
 
@@ -1059,6 +1190,17 @@ impl GgmlModel {
                 read_exact_at(file, &mut buf, entry.byte_offset as u64).map_err(|e| {
                     FwError::InvalidRequest(format!("tensor '{name}' payload pread failed: {e}"))
                 })?;
+                Ok(Cow::Owned(buf))
+            }
+            TensorSource::Host(reader) => {
+                let mut buf = vec![0u8; entry.byte_len];
+                reader
+                    .read_exact_at(entry.byte_offset as u64, &mut buf)
+                    .map_err(|e| {
+                        FwError::InvalidRequest(format!(
+                            "tensor '{name}' payload host read failed: {e}"
+                        ))
+                    })?;
                 Ok(Cow::Owned(buf))
             }
         }
@@ -1557,14 +1699,12 @@ impl<'a> Cursor<'a> {
 /// buffered reader and tensor payloads are [`Self::skip`]ped with a `seek`. Every
 /// read is bounds-checked against the known file length so a crafted length
 /// cannot force a huge allocation before hitting EOF (matching [`Cursor`]).
-#[cfg(unix)]
 struct StreamCursor<R: std::io::Read + std::io::Seek> {
     inner: R,
     pos: usize,
     len: usize,
 }
 
-#[cfg(unix)]
 impl<R: std::io::Read + std::io::Seek> StreamCursor<R> {
     fn new(inner: R, len: usize) -> Self {
         Self { inner, pos: 0, len }

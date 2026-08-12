@@ -277,6 +277,84 @@ fn i7_qkv_headmajor_rowco_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("FW_I7_QKV_HEADMAJOR_ROWCO").ok().as_deref() != Some("0"))
 }
 
+/// Kill switch for the token-tiled two-pass batch GEMV below
+/// (`FW_F16_BATCH_TWOPASS=0` restores the legacy token-major loop for A/B).
+fn f16_batch_twopass_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_F16_BATCH_TWOPASS").as_deref() != Ok("0"))
+}
+
+/// Batched two-pass f16 GEMV for targets WITHOUT the fused f16c dot (aarch64
+/// native, wasm32): token-tiled so each weight row's f16→f32 conversion
+/// amortizes over `TILE` activation rows instead of repeating per token (the
+/// legacy token-major loop re-converted each row every 1–2 tokens; at the
+/// encoder's tq=1500 that conversion tax measured 45× realtime on wasm).
+///
+/// BYTE-IDENTICAL to the legacy loop: every output element is
+/// `dot8(convert(w_row), x_row) + bias` — the same conversion values and the
+/// same `dot8` reduction order per element; only the loop order over
+/// (token, row) changes, and no element is computed differently or twice.
+/// Output rows partition across `plat::scope` workers exactly like the other
+/// batch arms (disjoint column bands; private buffers merged by copy).
+#[allow(clippy::too_many_arguments)]
+fn gemv_f16_batch_twopass(
+    w_f16: &[Float16],
+    out: usize,
+    inp: usize,
+    x: &[f32],
+    tq: usize,
+    bias: Option<&[f32]>,
+    out_slice: &mut [f32],
+    workers: usize,
+) {
+    /// Activation rows per tile: 32 rows × 5120 cols × 4 B ≈ 640 KB worst
+    /// case stays cache-resident while a tile re-reads it `band` times.
+    const TILE: usize = 32;
+    let compute_band = |o0: usize, o1: usize, dst: &mut [f32]| {
+        let mut scratch = vec![0.0f32; inp];
+        let mut t0 = 0;
+        while t0 < tq {
+            let t1 = (t0 + TILE).min(tq);
+            for o in o0..o1 {
+                let w_row = &w_f16[o * inp..(o + 1) * inp];
+                let b = bias.map_or(0.0, |bb| bb[o]);
+                w_row.convert_to_f32_slice(&mut scratch);
+                for t in t0..t1 {
+                    let xr = &x[t * inp..(t + 1) * inp];
+                    dst[t * out + o] = dot8(&scratch, xr) + b;
+                }
+            }
+            t0 = t1;
+        }
+    };
+    if workers < 2 {
+        compute_band(0, out, out_slice);
+        return;
+    }
+    let band = out.div_ceil(workers).max(1);
+    let parts: Vec<(usize, usize, Vec<f32>)> = crate::native_engine::plat::scope(|s| {
+        let compute_band = &compute_band;
+        let mut handles = Vec::new();
+        let mut o0 = 0;
+        while o0 < out {
+            let o1 = (o0 + band).min(out);
+            handles.push(s.spawn(move || {
+                let mut local = vec![0.0f32; tq * out];
+                compute_band(o0, o1, &mut local);
+                (o0, o1, local)
+            }));
+            o0 = o1;
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (o0, o1, local) in parts {
+        for t in 0..tq {
+            let dst = &mut out_slice[t * out + o0..t * out + o1];
+            dst.copy_from_slice(&local[t * out + o0..t * out + o1]);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gemv_f16_batch_rows(
     w_f16: &[Float16],
@@ -1643,6 +1721,27 @@ pub enum WeightMat {
         /// Input dimension (contraction length; number of columns).
         inp: usize,
     },
+}
+
+impl WeightMat {
+    /// The pre-transposed f32 arm. The encoder's native construction ALWAYS
+    /// builds this arm (the F16 arm is wasm32-only, bd-m2jm), so the
+    /// macOS-GPU and roundtrip-harness call sites — which never compile or
+    /// run on wasm — can rely on it being present.
+    ///
+    /// # Panics
+    ///
+    /// If called on the F16 arm; on the paths above that is unreachable by
+    /// construction.
+    #[must_use]
+    pub(crate) fn f32_mat(&self) -> &Mat {
+        match self {
+            WeightMat::F32(mat) => mat,
+            WeightMat::F16 { .. } => {
+                unreachable!("WeightMat::f32_mat on the wasm-only F16 arm")
+            }
+        }
+    }
 }
 
 /// Vectorizable f32 dot product `sum(a[i] * b[i])` over equal-length slices,
@@ -3841,6 +3940,28 @@ pub fn gemv_f16_batch(
     // two-pass fallback re-dequants per token — a minor cost only on the rare
     // pre-f16c CPU that takes that path.)
     let use_fused = f16c_dot_available();
+
+    // Non-f16c targets (aarch64 native, wasm32): the fused in-register dequant
+    // does not exist, so the batch's win is amortizing each row's f16→f32
+    // conversion across tokens. The token-tiled two-pass kernel does exactly
+    // that, byte-identically (see its docs); the legacy loops below re-convert
+    // per 1–2 tokens, which measured 45× realtime on the wasm encoder at
+    // tq=1500. `FW_F16_BATCH_TWOPASS=0` restores the legacy path for A/B.
+    if !use_fused && tq >= 8 && f16_batch_twopass_enabled() {
+        let avail = avail_parallelism();
+        let work = tq.saturating_mul(out).saturating_mul(inp);
+        let workers = batch_gemv_cap().map(|c| avail.min(c)).unwrap_or_else(|| {
+            if work >= COMPUTE_BOUND_MACS {
+                avail.min(16)
+            } else {
+                gemv_worker_count(out)
+            }
+        });
+        let workers = if work < PAR_THRESHOLD { 1 } else { workers };
+        gemv_f16_batch_twopass(w_f16, out, inp, x, tq, bias, out_slice, workers);
+        return;
+    }
+
     let compute_band = |o0: usize, o1: usize, dst: &mut [f32]| {
         // dst is the FULL [tq, out] buffer in serial mode, or in parallel mode a
         // per-worker private [tq, out] buffer it later disjoint-merges. Either

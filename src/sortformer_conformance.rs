@@ -920,6 +920,94 @@ pub fn load_verified_sortformer_package_with_checkpoint(
     )
 }
 
+/// Authenticate the frozen pinned-model census from in-memory bytes (bd-m2jm:
+/// the wasm/browser entry, where the receipt and package arrive from
+/// OPFS/fetch instead of files). Runs the SAME verification chain as the
+/// path-based loader — trust-root receipt digest, canonical-JSON receipt
+/// identity, receipt expectations, package size + sha256 against the receipt
+/// pins, compact-layout check, and full tensor census — so a byte-loaded
+/// package is exactly as authenticated as a file-loaded one.
+pub fn load_verified_sortformer_package_from_bytes(
+    receipt_bytes: Vec<u8>,
+    package_bytes: Vec<u8>,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<VerifiedSortformerPackage> {
+    let expected = pinned_model_expectations();
+    require_sha256(
+        "receipt_trust_root",
+        SORTFORMER_CONVERSION_RECEIPT_SHA256,
+        SortformerArtifactDomain::Conversion,
+    )?;
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
+    // Bounds + digests that `read_bounded_file` enforces during the reads on
+    // the path-based flow, replicated over the supplied bytes.
+    if receipt_bytes.len() as u64 > MAX_RECEIPT_BYTES {
+        return Err(sortformer_error(
+            "receipt_bounds",
+            "conversion receipt exceeds the bounded receipt size",
+        ));
+    }
+    if sha256_bytes(&receipt_bytes) != SORTFORMER_CONVERSION_RECEIPT_SHA256 {
+        return Err(sortformer_error(
+            "receipt_identity",
+            "conversion receipt checksum does not match the independent trust root",
+        ));
+    }
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
+    let receipt: SortformerConversionReceipt =
+        serde_json::from_slice(&receipt_bytes).map_err(|_| {
+            sortformer_error(
+                "receipt_schema",
+                "conversion receipt is not valid strict receipt JSON",
+            )
+        })?;
+    let canonical = canonical_json_bytes(&receipt).map_err(|_| {
+        sortformer_error(
+            "receipt_schema",
+            "conversion receipt could not be serialized canonically",
+        )
+    })?;
+    if canonical != receipt_bytes {
+        return Err(sortformer_error(
+            "receipt_canonical",
+            "conversion receipt bytes are not the canonical JSON encoding",
+        ));
+    }
+    verify_receipt(&receipt, &expected, checkpoint)?;
+
+    if package_bytes.len() as u64 > MAX_PACKAGE_BYTES
+        || u64::try_from(package_bytes.len()).ok() != Some(receipt.package.bytes)
+    {
+        return Err(sortformer_error(
+            "package_bounds",
+            "weight package size does not match the receipt pin",
+        ));
+    }
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
+    if sha256_bytes(&package_bytes) != receipt.package.sha256 {
+        return Err(sortformer_error(
+            "package_identity",
+            "weight package checksum does not match the receipt pin",
+        ));
+    }
+    verify_compact_safetensors_layout(
+        &package_bytes,
+        receipt.package.payload_bytes,
+        SortformerArtifactDomain::Conversion,
+        checkpoint,
+    )?;
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
+    let package = SafetensorsFile::from_owned_bytes(package_bytes).map_err(|_| {
+        sortformer_error(
+            "package_structure",
+            "weight package is not structurally valid safetensors",
+        )
+    })?;
+    verify_package(&package, &receipt, &expected, checkpoint)?;
+    sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
+    Ok(VerifiedSortformerPackage { receipt, package })
+}
+
 #[derive(Debug, Clone)]
 struct ReceiptExpectations {
     model: SortformerModelIdentity,

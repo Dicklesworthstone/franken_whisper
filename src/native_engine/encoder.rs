@@ -79,25 +79,29 @@ struct EncoderLayer {
     /// `attn_ln` (pre-attention layer-norm) scale/shift, length `n_state`.
     attn_ln_w: Vec<f32>,
     attn_ln_b: Vec<f32>,
-    /// Query projection `[n_state, n_state]` (`[in, out]`) + bias.
-    attn_q_w: Mat,
+    /// Query projection: natively always the pre-transposed f32 arm
+    /// (`[in, out]`, [`nn::WeightMat::F32`] — byte-identical to the former
+    /// bare `Mat` fields); on wasm32 an f16-stored tensor takes the
+    /// f16-resident [`nn::WeightMat::F16`] arm (bd-m2jm) so a large model's
+    /// encoder fits the 4 GB address space. Plus bias.
+    attn_q_w: nn::WeightMat,
     attn_q_b: Vec<f32>,
-    /// Key projection `[n_state, n_state]` (`[in, out]`); **no bias** (whisper).
-    attn_k_w: Mat,
-    /// Value projection `[n_state, n_state]` (`[in, out]`) + bias.
-    attn_v_w: Mat,
+    /// Key projection (same storage rule); **no bias** (whisper).
+    attn_k_w: nn::WeightMat,
+    /// Value projection (same storage rule) + bias.
+    attn_v_w: nn::WeightMat,
     attn_v_b: Vec<f32>,
-    /// Output projection `[n_state, n_state]` (`[in, out]`) + bias.
-    attn_out_w: Mat,
+    /// Output projection (same storage rule) + bias.
+    attn_out_w: nn::WeightMat,
     attn_out_b: Vec<f32>,
     /// `mlp_ln` (pre-MLP layer-norm) scale/shift, length `n_state`.
     mlp_ln_w: Vec<f32>,
     mlp_ln_b: Vec<f32>,
-    /// MLP up projection `[n_state, 4*n_state]` (`[in, out]`) + bias.
-    mlp_fc_w: Mat,
+    /// MLP up projection (same storage rule) + bias.
+    mlp_fc_w: nn::WeightMat,
     mlp_fc_b: Vec<f32>,
-    /// MLP down projection `[4*n_state, n_state]` (`[in, out]`) + bias.
-    mlp_proj_w: Mat,
+    /// MLP down projection (same storage rule) + bias.
+    mlp_proj_w: nn::WeightMat,
     mlp_proj_b: Vec<f32>,
     /// Optional 7-bit int8 (maddubs) copies of the six linear weights, built ONCE
     /// at load iff [`super::enc_int8_enabled`]. `None` = f32 path = byte-identical.
@@ -331,7 +335,7 @@ fn load_linear_maybe_i7(
     in_dim: usize,
     to_i7: bool,
     free: bool,
-) -> FwResult<(Mat, Option<nn::I7Mat>)> {
+) -> FwResult<(nn::WeightMat, Option<nn::I7Mat>)> {
     if to_i7 && free {
         if let Ok((shape, raw)) = model.tensor_f16_bytes(name) {
             if shape != [out_dim, in_dim] {
@@ -341,24 +345,46 @@ fn load_linear_maybe_i7(
                 )));
             }
             return Ok((
-                Mat::from_vec(0, 0, Vec::new()),
+                nn::WeightMat::F32(Mat::from_vec(0, 0, Vec::new())),
                 Some(nn::quantize_f16_bytes_to_i7(&raw, out_dim, in_dim)),
             ));
         }
         // f32-stored fallback (no f16 bytes): materialize, quantize, drop.
         let w = load_linear_transposed(model, name, out_dim, in_dim)?;
         return Ok((
-            Mat::from_vec(0, 0, Vec::new()),
+            nn::WeightMat::F32(Mat::from_vec(0, 0, Vec::new())),
             Some(nn::quantize_mat_to_i7(&w)),
+        ));
+    }
+    // wasm32 (bd-m2jm): keep f16-stored linears f16-RESIDENT, natural
+    // `[out, in]`, multiplied by the same [`nn::gemv_f16_batch`] the decoder's
+    // shipped-default f16 path uses. Halves resident encoder bytes so
+    // large-v3-turbo fits the 4 GB wasm address space; the F16 arm exists
+    // only here, so every native path below is byte-identical to before.
+    #[cfg(target_arch = "wasm32")]
+    if !to_i7 && let Ok((shape, halves)) = model.tensor_f16_halves(name) {
+        if shape != [out_dim, in_dim] {
+            return Err(FwError::InvalidRequest(format!(
+                "encoder tensor '{name}' has shape {shape:?}, expected {:?}",
+                [out_dim, in_dim]
+            )));
+        }
+        return Ok((
+            nn::WeightMat::F16 {
+                data: halves,
+                out: out_dim,
+                inp: in_dim,
+            },
+            None,
         ));
     }
     let w = load_linear_transposed(model, name, out_dim, in_dim)?;
     if !to_i7 {
-        return Ok((w, None));
+        return Ok((nn::WeightMat::F32(w), None));
     }
     // to_i7 && !free: retain the f32 (shipping default / macOS / roundtrip harness).
     let i7 = nn::quantize_mat_to_i7(&w);
-    Ok((w, Some(i7)))
+    Ok((nn::WeightMat::F32(w), Some(i7)))
 }
 
 /// Fused dequant-transpose reading raw little-endian f16 bytes (`raw`,
@@ -646,11 +672,20 @@ impl EncoderWeights {
                     free_f32_now,
                 )?;
                 let (attn_out_w, attn_out_i7, attn_out_i8) = match plan.out {
-                    OutQuant::F32 => (
-                        load_linear_transposed(model, &p("attn.out.weight"), n_state, n_state)?,
-                        None,
-                        None,
-                    ),
+                    OutQuant::F32 => {
+                        // Same `load_linear_transposed` as before, via the
+                        // storage-aware loader (to_i7=false): natively an
+                        // identical F32 arm, on wasm32 the f16-resident arm.
+                        let (w, _none) = load_linear_maybe_i7(
+                            model,
+                            &p("attn.out.weight"),
+                            n_state,
+                            n_state,
+                            false,
+                            free_f32_now,
+                        )?;
+                        (w, None, None)
+                    }
                     OutQuant::I7 => {
                         let (w, i7) = load_linear_maybe_i7(
                             model,
@@ -736,13 +771,21 @@ impl EncoderWeights {
         // WITHOUT the block-wise maddubs kernel. Run with FRANKEN_WHISPER_ENC_INT8 unset.
         if let Some(mode) = super::enc_weight_roundtrip() {
             let block = mode; // None => per-column, Some(n) => n-block
+            // Native-harness path: the F16 arm never exists off-wasm, and the
+            // harness is a native measurement tool, so roundtrip the f32 arm.
             layers.par_iter_mut().for_each(|l| {
-                l.attn_q_w = nn::i7_roundtrip(&l.attn_q_w, block);
-                l.attn_k_w = nn::i7_roundtrip(&l.attn_k_w, block);
-                l.attn_v_w = nn::i7_roundtrip(&l.attn_v_w, block);
-                l.attn_out_w = nn::i7_roundtrip(&l.attn_out_w, block);
-                l.mlp_fc_w = nn::i7_roundtrip(&l.mlp_fc_w, block);
-                l.mlp_proj_w = nn::i7_roundtrip(&l.mlp_proj_w, block);
+                for w in [
+                    &mut l.attn_q_w,
+                    &mut l.attn_k_w,
+                    &mut l.attn_v_w,
+                    &mut l.attn_out_w,
+                    &mut l.mlp_fc_w,
+                    &mut l.mlp_proj_w,
+                ] {
+                    if let nn::WeightMat::F32(mat) = w {
+                        *w = nn::WeightMat::F32(nn::i7_roundtrip(mat, block));
+                    }
+                }
             });
         }
 
@@ -1373,10 +1416,10 @@ fn encoder_gpu_cache_key(w: &EncoderWeights) -> u64 {
     h = mix(h, w.layers.len() as u64);
     for l in [w.layers.first(), w.layers.last()].into_iter().flatten() {
         for s in [
-            l.attn_q_w.data.first(),
-            l.attn_q_w.data.last(),
-            l.mlp_fc_w.data.first(),
-            l.mlp_proj_w.data.last(),
+            l.attn_q_w.f32_mat().data.first(),
+            l.attn_q_w.f32_mat().data.last(),
+            l.mlp_fc_w.f32_mat().data.first(),
+            l.mlp_proj_w.f32_mat().data.last(),
             l.attn_ln_w.first(),
             l.attn_ln_w.last(),
         ]
@@ -1416,18 +1459,18 @@ fn cached_encoder_gpu(
                 .map(|l| ft_kernel_metal::fused::LayerWeightsRef {
                     ln1_g: &l.attn_ln_w,
                     ln1_b: &l.attn_ln_b,
-                    wq: &l.attn_q_w.data,
+                    wq: &l.attn_q_w.f32_mat().data,
                     bq: &l.attn_q_b,
-                    wk: &l.attn_k_w.data,
-                    wv: &l.attn_v_w.data,
+                    wk: &l.attn_k_w.f32_mat().data,
+                    wv: &l.attn_v_w.f32_mat().data,
                     bv: &l.attn_v_b,
-                    wo: &l.attn_out_w.data,
+                    wo: &l.attn_out_w.f32_mat().data,
                     bo: &l.attn_out_b,
                     ln2_g: &l.mlp_ln_w,
                     ln2_b: &l.mlp_ln_b,
-                    w1: &l.mlp_fc_w.data,
+                    w1: &l.mlp_fc_w.f32_mat().data,
                     b1: &l.mlp_fc_b,
-                    w2: &l.mlp_proj_w.data,
+                    w2: &l.mlp_proj_w.f32_mat().data,
                     b2: &l.mlp_proj_b,
                 })
                 .collect();
@@ -1649,16 +1692,36 @@ fn ln_into(x: &Mat, w: &[f32], b: &[f32]) -> Mat {
 /// was built at load (`FRANKEN_WHISPER_ENC_INT8=1`), else the f32 sgemm. The
 /// default (no i7) path is byte-identical to the pre-lever encoder.
 #[inline]
-fn enc_linear(x: &Mat, w_t: &Mat, w_i7: &Option<nn::I7Mat>, bias: Option<&[f32]>) -> FwResult<Mat> {
-    match w_i7 {
-        Some(w) => nn::matmul_bias_i7(x, w, bias),
-        None => match super::enc_act_roundtrip() {
+fn enc_linear(
+    x: &Mat,
+    w: &nn::WeightMat,
+    w_i7: &Option<nn::I7Mat>,
+    bias: Option<&[f32]>,
+) -> FwResult<Mat> {
+    if let Some(w) = w_i7 {
+        return nn::matmul_bias_i7(x, w, bias);
+    }
+    match w {
+        nn::WeightMat::F32(w_t) => match super::enc_act_roundtrip() {
             // Feasibility harness: roundtrip the ACTIVATION through the int8 path's u8 quant
             // (per-row or block-wise) before the f32 GEMM, isolating the activation-quant
             // effect on the transcript. Default (None) = the true f32 path, byte-identical.
             Some(block) => nn::matmul_bias(&nn::u8_act_roundtrip(x, block), w_t, bias),
             None => nn::matmul_bias(x, w_t, bias),
         },
+        // wasm32-only residency arm (bd-m2jm): same batched f16 GEMV the
+        // decoder's shipped f16 path uses, dequantizing rows on the fly.
+        nn::WeightMat::F16 { data, out, inp } => {
+            if x.cols != *inp {
+                return Err(FwError::InvalidRequest(format!(
+                    "enc_linear(f16): x.cols {} != in {inp}",
+                    x.cols
+                )));
+            }
+            let mut y = nn::gemv_out_buf(x.rows * out);
+            nn::gemv_f16_batch(data, *out, *inp, &x.data, x.rows, bias, &mut y);
+            Ok(Mat::from_vec(x.rows, *out, y))
+        }
     }
 }
 
@@ -1744,7 +1807,7 @@ fn load_linear_i8_direct(
     out_dim: usize,
     in_dim: usize,
     free: bool,
-) -> FwResult<(Mat, EncI8Mat)> {
+) -> FwResult<(nn::WeightMat, EncI8Mat)> {
     if free {
         if let Ok((shape, raw)) = model.tensor_f16_bytes(name) {
             if shape != [out_dim, in_dim] {
@@ -1754,16 +1817,19 @@ fn load_linear_i8_direct(
                 )));
             }
             return Ok((
-                Mat::from_vec(0, 0, Vec::new()),
+                nn::WeightMat::F32(Mat::from_vec(0, 0, Vec::new())),
                 quantize_enc_i8_f16_bytes(&raw, out_dim, in_dim),
             ));
         }
         let w = load_linear_transposed(model, name, out_dim, in_dim)?;
-        return Ok((Mat::from_vec(0, 0, Vec::new()), quantize_enc_i8(&w)));
+        return Ok((
+            nn::WeightMat::F32(Mat::from_vec(0, 0, Vec::new())),
+            quantize_enc_i8(&w),
+        ));
     }
     let w = load_linear_transposed(model, name, out_dim, in_dim)?;
     let i8 = quantize_enc_i8(&w);
-    Ok((w, i8))
+    Ok((nn::WeightMat::F32(w), i8))
 }
 
 /// AVX2 i8×i8 → i32 dot (vpmovsxbw + vpmaddwd, 2 accumulators; sign-extend both
@@ -2307,18 +2373,18 @@ mod tests {
             layers.push(EncoderLayer {
                 attn_ln_w: vec![1.0; n_state],
                 attn_ln_b: vec![0.0; n_state],
-                attn_q_w: rng.mat(n_state, n_state, s),
+                attn_q_w: nn::WeightMat::F32(rng.mat(n_state, n_state, s)),
                 attn_q_b: rng.vec(n_state, s),
-                attn_k_w: rng.mat(n_state, n_state, s),
-                attn_v_w: rng.mat(n_state, n_state, s),
+                attn_k_w: nn::WeightMat::F32(rng.mat(n_state, n_state, s)),
+                attn_v_w: nn::WeightMat::F32(rng.mat(n_state, n_state, s)),
                 attn_v_b: rng.vec(n_state, s),
-                attn_out_w: rng.mat(n_state, n_state, s),
+                attn_out_w: nn::WeightMat::F32(rng.mat(n_state, n_state, s)),
                 attn_out_b: rng.vec(n_state, s),
                 mlp_ln_w: vec![1.0; n_state],
                 mlp_ln_b: vec![0.0; n_state],
-                mlp_fc_w: rng.mat(n_state, mlp_hidden, s),
+                mlp_fc_w: nn::WeightMat::F32(rng.mat(n_state, mlp_hidden, s)),
                 mlp_fc_b: rng.vec(mlp_hidden, s),
-                mlp_proj_w: rng.mat(mlp_hidden, n_state, s),
+                mlp_proj_w: nn::WeightMat::F32(rng.mat(mlp_hidden, n_state, s)),
                 mlp_proj_b: rng.vec(n_state, s),
                 attn_q_i7: None,
                 attn_k_i7: None,

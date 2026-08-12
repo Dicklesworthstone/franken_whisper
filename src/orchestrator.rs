@@ -5524,79 +5524,13 @@ fn run_native_sortformer_diarization(
     )?;
     checkpoint()?;
 
-    const FRAME_MS: u64 = 80;
     const LANES: usize = crate::sortformer_inference::SORTFORMER_SPEAKER_LANES;
-    let mut active_lanes = BTreeSet::new();
-    for turn in &output.turns {
-        active_lanes.insert(turn.speaker);
-    }
-    let labels = active_lanes
-        .iter()
-        .map(|lane| (*lane, format!("SPEAKER_{lane:02}")))
-        .collect::<BTreeMap<_, _>>();
-
-    let mut turns = Vec::with_capacity(output.turns.len());
-    for (index, turn) in output.turns.iter().enumerate() {
-        if index.is_multiple_of(1_024) {
-            checkpoint()?;
-        }
-        let (start_ms, end_ms) = finite_seconds_interval_to_ms(
-            f64::from(turn.start_seconds),
-            f64::from(turn.end_seconds),
-        )
-        .ok_or_else(|| {
-            FwError::ContractViolation(
-                "native Sortformer emitted a non-finite or empty speaker turn".to_owned(),
-            )
-        })?;
-        let start_frame = usize::try_from(start_ms / FRAME_MS).unwrap_or(usize::MAX);
-        let end_frame = usize::try_from(end_ms.div_ceil(FRAME_MS)).unwrap_or(usize::MAX);
-        let frame_end = end_frame.min(output.frames);
-        let frame_start = start_frame.min(frame_end);
-        let mut probability_sum = 0.0_f64;
-        let mut probability_count = 0_u64;
-        let mut overlap_suspected = false;
-        for frame in frame_start..frame_end {
-            let offset = frame
-                .checked_mul(LANES)
-                .and_then(|base| base.checked_add(turn.speaker))
-                .ok_or_else(|| {
-                    FwError::ContractViolation(
-                        "native Sortformer probability index overflowed".to_owned(),
-                    )
-                })?;
-            if let Some(probability) = output.probabilities.get(offset) {
-                probability_sum += f64::from(*probability);
-                probability_count = probability_count.saturating_add(1);
-            }
-            overlap_suspected |= output
-                .activity
-                .overlap
-                .get(frame)
-                .is_some_and(|value| *value != 0);
-        }
-        let speaker_confidence = if probability_count == 0 {
-            0.5
-        } else {
-            (probability_sum / probability_count as f64).clamp(0.0, 1.0)
-        };
-        turns.push(DiarizationTurn {
-            start_ms,
-            end_ms,
-            speaker_ref: labels.get(&turn.speaker).cloned(),
-            speaker_confidence: Some(speaker_confidence),
-            change_confidence: None,
-            overlap_suspected,
-            hard_hint_attributed: false,
-        });
-    }
-    turns.sort_by(|left, right| {
-        (left.start_ms, left.end_ms, left.speaker_ref.as_deref()).cmp(&(
-            right.start_ms,
-            right.end_ms,
-            right.speaker_ref.as_deref(),
-        ))
-    });
+    // Turn mapping relocated VERBATIM to the portable projection module
+    // (bd-m2jm) so the wasm pipeline runs the exact same code; `labels` and
+    // the active-lane set feed the report machinery below unchanged.
+    let (turns, labels) =
+        crate::diarization_projection::sortformer_output_to_diarization_turns(&output, checkpoint)?;
+    let active_lanes: BTreeSet<usize> = labels.keys().copied().collect();
 
     let mut speaker_evidence = Vec::with_capacity(active_lanes.len());
     let mut profiles = Vec::with_capacity(active_lanes.len());
@@ -5829,19 +5763,9 @@ fn emit_diarization_report_events(log: &mut EventLog, report: &DiarizationReport
     }
 }
 
-fn finite_seconds_interval_to_ms(start_sec: f64, end_sec: f64) -> Option<(u64, u64)> {
-    if !start_sec.is_finite() || !end_sec.is_finite() || start_sec < 0.0 || end_sec <= start_sec {
-        return None;
-    }
-    let start_ms = (start_sec * 1_000.0).round();
-    let end_ms = (end_sec * 1_000.0).round();
-    if start_ms > u64::MAX as f64 || end_ms > u64::MAX as f64 {
-        return None;
-    }
-    let start_ms = start_ms as u64;
-    let end_ms = end_ms as u64;
-    (end_ms > start_ms).then_some((start_ms, end_ms))
-}
+// Relocated to the portable projection module (bd-m2jm); kept in scope here
+// for the existing report-construction call sites and tests.
+use crate::diarization_projection::finite_seconds_interval_to_ms;
 
 fn normalized_pcm_duration_ms(sample_count: usize) -> FwResult<u64> {
     let duration_ms = (sample_count as u128)

@@ -14,6 +14,7 @@ pub mod cli;
 pub mod confidential_evaluation;
 pub mod conformance;
 pub mod diarization;
+pub mod diarization_projection;
 pub mod differential_oracle;
 pub mod ecapa_conformance;
 pub mod ecapa_inference;
