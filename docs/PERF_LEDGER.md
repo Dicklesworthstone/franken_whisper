@@ -5363,3 +5363,37 @@ has been run for this v3 estimator. The retained 2026-07-30 v2 observation
 cannot certify a changed v3 solver. Therefore latency, RTF, peak RSS, and
 count/degree/tolerance sensitivity remain **NO-DATA** and cannot authorize
 default promotion.
+
+---
+## 2026-08-12 — KEEP (byte-identical, same-harness before/after) — **wasm turbo encoder: amortized two-pass batch GEMV, 45.3× → 8.35× realtime (5.4×)** (bd-m2jm)
+
+The first-ever wasm run of the FULL fused pipeline (whisper large-v3-turbo,
+f16-resident streamed load + Sortformer diarization + projection-fusion) on a
+synthesized 21.9 s two-speaker clip in Node/V8 (same engine as Chrome,
+simd128, one thread) measured **989 s (45.3× RT)**. Attribution: on non-f16c
+targets `gemv_f16_batch`'s inner loops re-convert each f16 weight row every
+1–2 tokens; at tq=1500 that is ~750 redundant f16→f32 conversions per row
+per GEMM — the conversion tax, not the MACs, dominated.
+
+Lever: `gemv_f16_batch_twopass` — token-tiled (32 rows) loop order so each
+row's conversion amortizes across the tile. BYTE-IDENTICAL by construction
+(same conversion values, same `dot8` reduction per element; only loop order
+changes) — the same argument already on record for `dequant_row_dot_2col`.
+Dispatched for non-f16c targets at tq≥8; kill switch `FW_F16_BATCH_TWOPASS=0`.
+
+Same harness, same clip, after: **182.6 s (8.35× RT)** — transcript
+byte-identical to the before-run, 0 dropped windows, and the fused output
+matches the native CLI on the same clip (1 speaker segment, SPEAKER_00 —
+Sortformer legitimately clusters the two synthetic `say` voices; the CLI
+agrees, so the wasm behavior is engine-faithful). Peak Node RSS 1.79 GB.
+All 309 native_engine lib tests green including the gated e2e decodes (the
+dispatch also covers native aarch64, byte-identically; its NATIVE perf
+effect is unmeasured — no native ratio is claimed here, and a decoder
+prefill A/B is the open follow-up).
+
+Remaining wasm gap to "quickly": one browser thread. The named next lever is
+the parked-worker team (frankentts `ftts-kernels/src/team.rs` is the
+reference implementation: persistent Workers parked on a shared-memory
+barrier, per-op job dispatch, dual serial/threaded artifacts, TLS-export
+build recipe in frankentts `site/build.sh`). Entry point is already built:
+every hot GEMM partitions through `plat::scope`.
