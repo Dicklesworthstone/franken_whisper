@@ -316,3 +316,6 @@ __pycache__/
 # wasm build output (site/build-wasm.sh regenerates; never commit the module)
 site/pkg/
 fw-wasm/target/
+
+# Threaded wasm-bindgen output (built by site/build-wasm.sh; same as site/pkg/)
+/site/pkg-threaded/

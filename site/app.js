@@ -16,7 +16,34 @@ const state = {
   wallMs: 0,
   nameMap: new Map(),
   progressBase: { whisper: 0, sortformer: 0 },
+  // Live-run progress model (see the "run progress" section below).
+  run: null,
+  // Download-rate estimator (EMA of bytes/second).
+  dl: { lastAt: 0, lastLoaded: 0, rate: 0, lastFile: null },
 };
+
+// Calibration learned from completed runs on THIS machine, persisted so the
+// second run's estimate is good from the first second. Values are seconds of
+// wall clock per second of audio for the two long stages.
+const CAL_KEY = "fw-run-calibration-v1";
+function loadCalibration() {
+  try {
+    const c = JSON.parse(localStorage.getItem(CAL_KEY) ?? "null");
+    if (c && Number.isFinite(c.whisperRate) && Number.isFinite(c.sortformerRate)) return c;
+  } catch {
+    /* fall through */
+  }
+  // Defaults measured on an M-series desktop, serial build (8.35x realtime
+  // total; the diarizer measured ~0.11x of it).
+  return { whisperRate: 8.0, sortformerRate: 0.12 };
+}
+function saveCalibration(cal) {
+  try {
+    localStorage.setItem(CAL_KEY, JSON.stringify(cal));
+  } catch {
+    /* storage may be denied; the defaults still work */
+  }
+}
 
 const STAGE_LABELS = {
   "whisper:scan": "scanning the model's tensor directory…",
@@ -29,6 +56,7 @@ const STAGE_LABELS = {
   "whisper:decode": "transcribing with large-v3-turbo on a single wasm thread (the long part)…",
   "sortformer:diarize": "diarizing (Sortformer, 80 ms frames)…",
   "fuse:project": "fusing speakers onto the transcript…",
+  "threads:arming": "starting the worker pool…",
   done: "finishing…",
 };
 
@@ -86,6 +114,110 @@ function displaySpeaker(label, nameMap) {
   return nameMap.get(label) ?? label;
 }
 
+// ---- run progress ----------------------------------------------------------
+//
+// The engine emits one "encoder_window" span per 30-second window, in order,
+// and whisper's decode is by far the dominant stage. The model:
+//   whisper remaining  = windows_left × observed mean seconds per window
+//                        (calibrated rate until the first window lands)
+//   sortformer         = audio_sec × calibrated rate (ticks prove liveness)
+//   bar percent        = elapsed / (elapsed + remaining estimate)
+// Every number shown is measured on this machine; the first-run defaults say
+// "about" and correct themselves as windows complete.
+
+function fmtDur(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return "…";
+  const s = Math.round(sec);
+  if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+
+function beginRun(audioSec) {
+  const cal = loadCalibration();
+  state.run = {
+    audioSec,
+    cal,
+    startedAt: performance.now(),
+    phase: "whisper",
+    windowsTotal: Math.max(1, Math.ceil(audioSec / 30)),
+    windowsDone: 0,
+    lastWindowAt: performance.now(),
+    windowSecs: [],
+    sortStartedAt: null,
+  };
+  updateRunProgress();
+}
+
+function runEstimates(run) {
+  const now = performance.now();
+  const elapsed = (now - run.startedAt) / 1000;
+  // Seconds of audio each window covers (the last window is usually short).
+  const secPerWindow = run.audioSec / run.windowsTotal;
+  const meanWindow =
+    run.windowSecs.length > 0
+      ? run.windowSecs.reduce((a, b) => a + b, 0) / run.windowSecs.length
+      : run.cal.whisperRate * secPerWindow;
+  const sortTotal = run.cal.sortformerRate * run.audioSec;
+  let remaining;
+  if (run.phase === "whisper") {
+    const windowsLeft = Math.max(0, run.windowsTotal - run.windowsDone);
+    // The in-flight window's spent time is not subtracted; the estimate
+    // stays a little conservative rather than optimistic.
+    remaining = windowsLeft * meanWindow + sortTotal;
+  } else if (run.phase === "sortformer") {
+    const sortElapsed = (now - (run.sortStartedAt ?? now)) / 1000;
+    remaining = Math.max(0, sortTotal - sortElapsed);
+  } else {
+    remaining = 0;
+  }
+  return { elapsed, remaining };
+}
+
+function updateRunProgress() {
+  const run = state.run;
+  if (!run) return;
+  const { elapsed, remaining } = runEstimates(run);
+  const pct = Math.min(99, Math.floor((elapsed / Math.max(1e-6, elapsed + remaining)) * 100));
+  $("progress-wrap").hidden = false;
+  $("progress-bar").style.width = `${pct}%`;
+  let detail;
+  if (run.phase === "whisper") {
+    const inWindow = Math.min(run.windowsDone + 1, run.windowsTotal);
+    const basis = run.windowSecs.length > 0 ? "measured on this run" : "estimated from calibration";
+    detail =
+      `transcribing window ${inWindow} of ${run.windowsTotal} · ` +
+      `elapsed ${fmtDur(elapsed)} · about ${fmtDur(remaining)} remaining (${basis})`;
+  } else if (run.phase === "sortformer") {
+    detail = `diarizing (Sortformer) · elapsed ${fmtDur(elapsed)} · about ${fmtDur(remaining)} remaining`;
+  } else {
+    detail = `fusing speakers onto the transcript · elapsed ${fmtDur(elapsed)}`;
+  }
+  $("progress-text").textContent = `${pct}% · ${detail}`;
+  $("stage-line").hidden = true;
+}
+
+// Refresh the countdown once a second even when no engine event arrives.
+setInterval(() => {
+  if (state.busy && state.run) updateRunProgress();
+}, 1000);
+
+function finishRunCalibration() {
+  const run = state.run;
+  if (!run) return;
+  const cal = { ...run.cal };
+  if (run.windowSecs.length > 0) {
+    const meanWindow = run.windowSecs.reduce((a, b) => a + b, 0) / run.windowSecs.length;
+    cal.whisperRate = meanWindow / (run.audioSec / run.windowsTotal);
+  }
+  if (run.sortStartedAt != null) {
+    const end = run.sortEndedAt ?? performance.now();
+    const sortSecs = (end - run.sortStartedAt) / 1000;
+    cal.sortformerRate = Math.max(0.01, sortSecs / run.audioSec);
+  }
+  saveCalibration(cal);
+}
+
 // ---- worker wiring ---------------------------------------------------------
 
 function bootWorker() {
@@ -113,16 +245,69 @@ function handle(m) {
       const pct = Math.min(100, Math.floor((done / COMBINED_TOTAL) * 100));
       bar.style.width = `${pct}%`;
       const phase = m.phase === "rehash" ? "resuming (re-hashing banked bytes)" : m.phase;
-      text.textContent = `${m.file}: ${fmtBytes(m.loaded)} of ${fmtBytes(m.total)} (${phase}); ${pct}% overall`;
+      // Live rate + remaining-time estimate (EMA over deltas, per file).
+      let eta = "";
+      if (m.phase === "download") {
+        const now = performance.now();
+        const d = state.dl;
+        if (d.lastFile !== m.file) {
+          d.lastFile = m.file;
+          d.lastAt = now;
+          d.lastLoaded = m.loaded;
+          d.rate = 0;
+        } else if (now > d.lastAt) {
+          const inst = ((m.loaded - d.lastLoaded) * 1000) / (now - d.lastAt);
+          d.rate = d.rate === 0 ? inst : d.rate * 0.8 + inst * 0.2;
+          d.lastAt = now;
+          d.lastLoaded = m.loaded;
+        }
+        if (d.rate > 1) {
+          const remainingBytes = COMBINED_TOTAL - done;
+          eta = ` · ${fmtBytes(d.rate)}/s · about ${fmtDur(remainingBytes / d.rate)} left`;
+        }
+      }
+      text.textContent =
+        `${m.file}: ${fmtBytes(m.loaded)} of ${fmtBytes(m.total)} (${phase}); ${pct}% overall${eta}`;
       break;
     }
     case "stage": {
       const label = STAGE_LABELS[m.stage] ?? m.stage;
       setStatus(label);
-      if (state.busy) {
+      if (state.run) {
+        if (m.stage === "sortformer:diarize") {
+          state.run.phase = "sortformer";
+          state.run.sortStartedAt = performance.now();
+        } else if (m.stage === "fuse:project") {
+          state.run.sortEndedAt = performance.now();
+          state.run.phase = "fuse";
+        }
+        updateRunProgress();
+      } else if (state.busy) {
         $("stage-line").hidden = false;
         $("stage-line").textContent = label;
       }
+      break;
+    }
+    case "audio-meta": {
+      beginRun(m.audio_sec);
+      setStatus(
+        `decoded ${fmtDur(m.audio_sec)} of audio; transcription starts now ` +
+          `(${state.run.windowsTotal} window${state.run.windowsTotal === 1 ? "" : "s"} of up to 30 s each)`,
+      );
+      break;
+    }
+    case "span": {
+      const run = state.run;
+      if (!run) break;
+      if (m.span === "encoder_window") {
+        const now = performance.now();
+        run.windowSecs.push((now - run.lastWindowAt) / 1000);
+        run.lastWindowAt = now;
+        run.windowsDone += 1;
+      }
+      // sortformer_tick needs no bookkeeping: the 1-second repaint shows the
+      // countdown, and the tick's arrival proves the stage is alive.
+      updateRunProgress();
       break;
     }
     case "whisper-ready": {
@@ -138,7 +323,11 @@ function handle(m) {
       $("progress-wrap").hidden = true;
       $("load-models").disabled = true;
       $("load-models").querySelector("span").textContent = "Models loaded ✓";
-      setStatus("Both models ready. Pick a recording.", "ok");
+      const laneNote =
+        m.lane === "threaded"
+          ? `threaded engine, ${m.threads} workers`
+          : "serial engine (this browser gets the single-thread build)";
+      setStatus(`Both models ready (${laneNote}). Pick a recording.`, "ok");
       maybeEnableRun();
       break;
     }
@@ -147,6 +336,9 @@ function handle(m) {
       state.result = m.result;
       state.wallMs = m.wall_ms;
       state.nameMap = buildSpeakerNameMap(m.result, parseSpeakerNames($("speakers").value));
+      finishRunCalibration();
+      state.run = null;
+      $("progress-wrap").hidden = true;
       $("stage-line").hidden = true;
       renderResult();
       maybeEnableRun();
@@ -162,6 +354,8 @@ function handle(m) {
     }
     case "error": {
       state.busy = false;
+      state.run = null;
+      $("progress-wrap").hidden = true;
       $("stage-line").hidden = true;
       setStatus(`error: ${m.message}`, "err");
       maybeEnableRun();
@@ -336,6 +530,18 @@ function init() {
     acceptFile(e.dataTransfer?.files?.[0]);
   });
   input.addEventListener("change", () => acceptFile(input.files?.[0]));
+
+  $("sample").addEventListener("click", async () => {
+    try {
+      const resp = await fetch("./assets/samples/jfk-1961.mp3");
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const blob = await resp.blob();
+      acceptFile(new File([blob], "jfk-1961.mp3", { type: "audio/mpeg" }));
+      setStatus("Sample loaded: JFK inaugural excerpt, 11 seconds, one speaker.", "ok");
+    } catch (e) {
+      setStatus(`could not fetch the sample: ${e.message ?? e}`, "err");
+    }
+  });
 
   $("run").addEventListener("click", async () => {
     if (!state.file || state.busy) return;

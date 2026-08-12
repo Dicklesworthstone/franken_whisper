@@ -11,7 +11,7 @@
 /*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
   X-Content-Type-Options: nosniff
 
 /
@@ -41,9 +41,14 @@
 /model-manifest.js
   Cache-Control: no-cache
 
-# The wasm module + JS glue rotate via the ?v= stamp; no-cache keeps
-# revalidation honest even where the stamp is bypassed.
+# The wasm modules + JS glue rotate via the ?v= stamp; no-cache keeps
+# revalidation honest even where the stamp is bypassed. worker-src blob: above
+# exists for the threaded lane: wasm-bindgen-rayon's no-bundler helper spawns
+# its pool workers from a blob URL.
 /pkg/*
+  Cache-Control: no-cache
+
+/pkg-threaded/*
   Cache-Control: no-cache
 
 # The model proxy serves immutable pinned release assets (cache-control is

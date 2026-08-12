@@ -80,10 +80,15 @@ async function cachedFileValid(dir, spec) {
   if (file.size !== spec.bytes) return false;
   const marker = await readMarker(dir, spec.name);
   if (!marker || marker.sha256 !== spec.sha256) return false;
-  if (!FULL_VERIFY && marker.head && marker.tail && spec.bytes >= 2 * ENDPOINT_BYTES) {
-    const head = await digestFileRange(file, 0, ENDPOINT_BYTES);
-    const tail = await digestFileRange(file, spec.bytes - ENDPOINT_BYTES, spec.bytes);
-    return head === marker.head && tail === marker.tail;
+  // Manifest-pinned endpoint digests beat the marker-recorded ones (they
+  // come from the same pinned artifact, computed offline); either way the
+  // marker only exists after a past FULL verification.
+  const head = spec.head ?? marker.head;
+  const tail = spec.tail ?? marker.tail;
+  if (!FULL_VERIFY && head && tail && spec.bytes >= 2 * ENDPOINT_BYTES) {
+    const gotHead = await digestFileRange(file, 0, ENDPOINT_BYTES);
+    const gotTail = await digestFileRange(file, spec.bytes - ENDPOINT_BYTES, spec.bytes);
+    return gotHead === head && gotTail === tail;
   }
   return (await digestFileRange(file, 0, spec.bytes)) === spec.sha256;
 }

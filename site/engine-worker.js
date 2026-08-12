@@ -64,6 +64,23 @@ globalThis.__fwModelReadAt = (offset, len) => {
 // "sortformer:diarize") — relayed so the page can narrate long operations.
 globalThis.__fwStage = (name) => post("stage", { stage: name });
 
+// Engine perf spans double as the progress heartbeat: "encoder_window" fires
+// once per 30-second window (the page counts them against the window total),
+// "sortformer_tick" is the diarizer's throttled liveness signal. Forward the
+// two the page uses, rate-limited so a fast run cannot flood the channel.
+let lastTickForward = 0;
+globalThis.__fwSpan = (name, ms) => {
+  if (name === "encoder_window") {
+    post("span", { span: name, ms });
+  } else if (name === "sortformer_tick") {
+    const now = performance.now();
+    if (now - lastTickForward > 250) {
+      lastTickForward = now;
+      post("span", { span: name, ms });
+    }
+  }
+};
+
 async function ensureWithProgress(modelId) {
   return loaderMod.ensureModel(modelId, (p) => post("model-progress", { model: modelId, ...p }));
 }
@@ -99,11 +116,16 @@ async function route(e) {
   const m = e.data;
   switch (m.type) {
     case "load-models": {
-      // Whisper first (the big one — its progress dominates), then the
-      // diarizer; the page shows one combined progress bar.
+      // The pool arms FIRST: the engine's model load touches rayon's global
+      // pool, which can only initialize once — arming later fails with
+      // "already initialized". Model loading itself never runs on the pool
+      // (tensor reads go through this worker's thread-confined OPFS handle;
+      // the engine keeps its load on the calling thread on wasm), so the
+      // parked workers only ever serve compute.
+      await armThreadPool();
       await loadWhisper();
       await loadSortformer();
-      post("ready", { version: wasm.version() });
+      post("ready", { version: wasm.version(), lane, threads });
       break;
     }
     case "transcribe": {
@@ -112,9 +134,13 @@ async function route(e) {
       }
       feedClock();
       const t0 = performance.now();
-      const result = JSON.parse(
-        wasm.transcribe_and_diarize(new Uint8Array(m.audio), m.ext ?? "", m.prompt ?? undefined),
-      );
+      // Two stages so the page can build its progress model (window total,
+      // remaining-time estimate) from the decoded duration before the long
+      // stage starts.
+      const meta = JSON.parse(wasm.decode_audio(new Uint8Array(m.audio), m.ext ?? ""));
+      post("audio-meta", { audio_sec: meta.audio_sec });
+      feedClock();
+      const result = JSON.parse(wasm.run_prepared(m.prompt ?? undefined));
       feedClock();
       post("result", { result, wall_ms: Math.round(performance.now() - t0) });
       break;
@@ -131,20 +157,100 @@ async function route(e) {
   }
 }
 
+// ---- lane selection --------------------------------------------------------
+//
+// `pkg-threaded` is linked `--shared-memory --import-memory` with atomics and
+// carries wasm-bindgen-rayon's worker pool. Sharedness is a LINK-TIME
+// property, so this is a choice of module, not a flag. The choice is an
+// ALLOW-LIST, not feature detection: SharedArrayBuffer also exists on
+// iOS/WebKit under COOP/COEP, but growing a shared memory toward 2 GB kills
+// the tab there, and this engine holds 2.4 GB of weights. Blink only, and
+// only when actually cross-origin isolated.
+function blinkAllowsThreads() {
+  if (typeof SharedArrayBuffer !== "function") return false;
+  if (self.crossOriginIsolated !== true) return false;
+  const ua = self.navigator?.userAgent ?? "";
+  // Every iOS browser is WebKit under the skin, whatever the brand in the UA.
+  if (/iPhone|iPad|iPod|CriOS|FxiOS|EdgiOS/.test(ua)) return false;
+  return /Chrom(e|ium)\/\d/.test(ua);
+}
+
+// The rayon workers spawn from a blob URL of wasm-bindgen-rayon's helper
+// script. A `worker-src` CSP without `blob:` kills that — and it would kill
+// it AFTER the 2 GB models are staged, when falling back is ruinous. Prove
+// the blob-module-worker path with a byte-sized canary at boot, before a
+// single weight byte is downloaded.
+async function blobModuleWorkerWorks() {
+  let url;
+  try {
+    url = URL.createObjectURL(new Blob(["self.postMessage('ok');"], { type: "text/javascript" }));
+    const w = new Worker(url, { type: "module" });
+    try {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("canary timeout")), 3000);
+        w.onmessage = () => {
+          clearTimeout(t);
+          resolve();
+        };
+        w.onerror = (e) => {
+          clearTimeout(t);
+          reject(e);
+        };
+      });
+      return true;
+    } finally {
+      w.terminate();
+    }
+  } catch {
+    return false;
+  } finally {
+    if (url) URL.revokeObjectURL(url);
+  }
+}
+
+let lane = "serial";
+let threads = 1;
+
+function targetThreads() {
+  return Math.max(1, Math.min((self.navigator?.hardwareConcurrency ?? 4) - 1, 8));
+}
+
+// Called from route("load-models") AFTER both models hydrate: a rayon worker
+// parked in `Atomics.wait` blocks a shared-memory `grow`, and everything up
+// to that point is nothing but grows. Arming after hydration costs nothing.
+async function armThreadPool() {
+  if (lane !== "threaded" || threads > 1) return;
+  post("stage", { stage: "threads:arming" });
+  await wasm.initThreadPool(targetThreads());
+  threads = wasm.thread_count();
+  post("stage", { stage: `threads:armed (${threads})` });
+}
+
 // Import AFTER the buffering handler is installed.
 (async () => {
   try {
+    const wantThreads = blinkAllowsThreads() && (await blobModuleWorkerWorks());
+    const pkgDir = wantThreads ? "./pkg-threaded" : "./pkg";
     const [engine, loader, mf] = await Promise.all([
-      import("./pkg/fw_wasm.js?v=@SITEV@"),
+      import(`${pkgDir}/fw_wasm.js?v=@SITEV@`),
       import("./loader.js?v=@SITEV@"),
       import("./model-manifest.js?v=@SITEV@"),
     ]);
     await engine.default(); // instantiate the wasm module
+    // The build flags are a claim; the instantiated memory is the receipt. A
+    // "threaded" module whose memory is a plain ArrayBuffer would run, run
+    // single-threaded, and never say so.
+    if (wantThreads) {
+      if (!(engine.wasm_memory().buffer instanceof SharedArrayBuffer)) {
+        throw new Error("pkg-threaded instantiated with a non-shared memory");
+      }
+      lane = "threaded";
+    }
     wasm = engine;
     loaderMod = loader;
     manifest = mf;
     ready = true;
-    post("booted", { version: wasm.version() });
+    post("booted", { version: wasm.version(), lane });
     for (const queued of pending.splice(0)) {
       route(queued).catch((err) => post("error", { message: describeError(err) }));
     }

@@ -1,0 +1,162 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>franken_whisper — wasm memory probe</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    margin: 0; padding: 1.25rem; max-width: 40rem;
+  }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; }
+  p  { margin: .25rem 0 1rem; opacity: .75; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  td { padding: .2rem .5rem .2rem 0; }
+  td:first-child { text-align: right; font-variant-numeric: tabular-nums; width: 11rem; }
+  .ok   { color: #0a7d32; }
+  .fail { color: #c0392b; }
+  @media (prefers-color-scheme: dark) { .ok { color: #4ade80; } .fail { color: #f87171; } }
+  .card { margin: 1rem 0; padding: .75rem; border: 1px solid currentColor; border-radius: .4rem; }
+  button { font: inherit; padding: .5rem 1rem; margin-right: .5rem; }
+</style>
+
+<h1>wasm memory probe</h1>
+<p>
+  One allocation at a time, each <b>freed before the next</b>, and every step written to
+  localStorage <i>before</i> it is attempted — so if the tab is killed, reloading this page reports
+  the exact step that killed it. Nothing is downloaded.
+</p>
+
+<div id="verdict" class="card">—</div>
+<div id="env"></div>
+<button id="run">run probe</button>
+<button id="reset">clear history</button>
+<table id="results"></table>
+
+<script type="module">
+  const PAGE = 65536;
+  const GB = 1024 * 1024 * 1024;
+  const KEY = "fw-memprobe";
+
+  const env = document.getElementById("env");
+  const results = document.getElementById("results");
+  const verdict = document.getElementById("verdict");
+
+  // ── crash-persistent breadcrumbs ────────────────────────────────────────────────────────────
+  //
+  // A tab killed by the OS runs no error handler, fires no unload, and takes the console with it.
+  // The only evidence that survives is what was already committed to storage BEFORE the dangerous
+  // operation. So each step is recorded as "attempted" first and upgraded to "survived" after; a
+  // step left at "attempted" on the next page load is, by construction, the one that killed us.
+  const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) ?? []; } catch { return []; } };
+  const save = (log) => { try { localStorage.setItem(KEY, JSON.stringify(log)); } catch {} };
+
+  const previous = load();
+  if (previous.length) {
+    const last = previous[previous.length - 1];
+    const dead = last.state === "attempted";
+    verdict.innerHTML = dead
+      ? `<b class="fail">previous run was KILLED at: ${last.label}</b><br>
+         it survived ${previous.filter((s) => s.state === "survived").length} earlier step(s).`
+      : `<b class="ok">previous run completed all ${previous.length} steps.</b>`;
+    for (const step of previous) {
+      const tr = document.createElement("tr");
+      const cls = step.state === "survived" ? (step.ok ? "ok" : "fail") : "fail";
+      const text = step.state === "attempted" ? "KILLED THE TAB" : step.ok ? "ok" : step.why;
+      tr.innerHTML = `<td>${step.label}</td><td class="${cls}">${text}</td>`;
+      results.append(tr);
+    }
+  } else {
+    verdict.textContent = 'no previous run — press "run probe".';
+  }
+
+  env.innerHTML = `
+    <table>
+      <tr><td>crossOriginIsolated</td><td>${self.crossOriginIsolated}</td></tr>
+      <tr><td>SharedArrayBuffer</td><td>${typeof SharedArrayBuffer !== "undefined"}</td></tr>
+      <tr><td>deviceMemory</td><td>${navigator.deviceMemory ?? "not reported"}</td></tr>
+      <tr><td>UA</td><td style="word-break:break-all">${navigator.userAgent}</td></tr>
+    </table><br>`;
+
+  document.getElementById("reset").onclick = () => { localStorage.removeItem(KEY); location.reload(); };
+
+  // Give the engine a real chance to collect the previous memory before asking for the next one.
+  const settle = () => new Promise((r) => setTimeout(r, 400));
+
+  document.getElementById("run").onclick = async () => {
+    const log = [];
+    save(log);
+    results.innerHTML = "";
+    verdict.textContent = "running…";
+
+    const step = async (label, run) => {
+      log.push({ label, state: "attempted" });
+      save(log);            // committed BEFORE the risky call
+      await settle();
+      let outcome;
+      try {
+        outcome = run();
+      } catch (error) {
+        outcome = { ok: false, why: `${error.name}: ${error.message}` };
+      }
+      Object.assign(log[log.length - 1], { state: "survived", ...outcome });
+      save(log);
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${label}</td><td class="${outcome.ok ? "ok" : "fail"}">${
+        outcome.ok ? "ok" : outcome.why
+      }</td>`;
+      results.append(tr);
+      return outcome.ok;
+    };
+
+    // Each probe scopes its memory to the call so it is unreachable the moment we return; `settle`
+    // above then gives the collector a turn. Without this the probe measures its own accumulation
+    // rather than the engine's ceiling — which is exactly how the previous version of this page
+    // managed to kill the tab.
+    const flat = (gb, shared) => () => {
+      const pages = Math.floor((gb * GB) / PAGE);
+      const memory = new WebAssembly.Memory({ initial: pages, maximum: pages, shared });
+      const view = new Uint8Array(memory.buffer);
+      for (let at = 0; at < view.length; at += 64 * 1024 * 1024) view[at] = 1;
+      view[view.length - 1] = 1;
+      return { ok: true };
+    };
+
+    const grown = (gb, shared, maxPages) => () => {
+      const memory = new WebAssembly.Memory({ initial: 512, maximum: maxPages, shared });
+      const want = Math.floor((gb * GB) / PAGE);
+      const stride = Math.floor((256 * 1024 * 1024) / PAGE);
+      let have = 512;
+      while (have < want) {
+        const by = Math.min(stride, want - have);
+        memory.grow(by);
+        have += by;
+        new Uint8Array(memory.buffer)[have * PAGE - 1] = 1;
+      }
+      return { ok: true };
+    };
+
+    const hasSab = typeof SharedArrayBuffer !== "undefined";
+
+    // Ordered cheapest-to-most-dangerous, and it STOPS at the first refusal in each family, so a
+    // kill lands on a precisely named configuration rather than somewhere in a batch.
+    for (const shared of hasSab ? [false, true] : [false]) {
+      const tag = shared ? "shared" : "unshared";
+      for (const gb of [1, 2, 2.5, 2.75, 3, 3.5]) {
+        if (!(await step(`flat ${gb}GB ${tag}`, flat(gb, shared)))) break;
+      }
+    }
+    for (const shared of hasSab ? [false, true] : [false]) {
+      for (const [name, maxPages] of [["max3GB", 49152], ["max4GB", 65536]]) {
+        const tag = `${shared ? "shared" : "unshared"} ${name}`;
+        for (const gb of [1, 2, 2.5, 2.75]) {
+          if (gb * GB > maxPages * PAGE) break;
+          if (!(await step(`grow→${gb}GB ${tag}`, grown(gb, shared, maxPages)))) break;
+        }
+      }
+    }
+
+    verdict.innerHTML = "<b class='ok'>probe finished without being killed.</b>";
+    save(log);
+  };
+</script>

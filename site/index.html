@@ -133,6 +133,9 @@
                 A meeting, an interview, a voice memo: anything with people talking.</span>
             </div>
             <input type="file" id="file-input" accept=".mp3,.m4a,.mp4,.aac,.wav,audio/*" hidden>
+            <div class="row">
+              <button id="sample" class="btn subtle">Use a sample clip (JFK, 11 s)</button>
+            </div>
             <p class="micro">Decoded in-tab by Symphonia (pure Rust), downmixed and resampled to
               16 kHz mono. Honest expectation: the current build is single-threaded and measured
               about 8 times real time on an M-series desktop, so a 1-minute clip takes about

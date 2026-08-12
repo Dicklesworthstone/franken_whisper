@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>fw threaded-lane harness</title>
+</head>
+<body>
+<pre id="result">RUNNING</pre>
+<script type="module">
+  // Auto-running harness: real turbo + Sortformer through the THREADED lane,
+  // results written into the DOM so `chrome --headless=new --timeout N
+  // --dump-dom` can collect them without CDP tooling.
+  const out = document.getElementById("result");
+  const t0 = performance.now();
+  const worker = new Worker("./threads-worker.js", { type: "module" });
+  const stages = [];
+  worker.onmessage = (e) => {
+    if (e.data.stage) {
+      stages.push(`${((performance.now() - t0) / 1000).toFixed(1)}s ${e.data.stage}`);
+      out.textContent = `RUNNING\n${stages.join("\n")}`;
+      return;
+    }
+    out.textContent = `HARNESS_RESULT ${JSON.stringify(e.data)}\n${stages.join("\n")}`;
+    document.title = e.data.ok ? "HARNESS-OK" : "HARNESS-FAIL";
+  };
+  worker.onerror = (e) => {
+    out.textContent = `HARNESS_RESULT ${JSON.stringify({ ok: false, error: String(e.message) })}`;
+    document.title = "HARNESS-FAIL";
+  };
+</script>
+</body>
+</html>

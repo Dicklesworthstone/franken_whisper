@@ -17,6 +17,12 @@ export const MODELS = {
       name: "ggml-large-v3-turbo.bin",
       bytes: 1624555275,
       sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+      // Precomputed SHA-256 of the first/last ENDPOINT_BYTES, so a warm start
+      // proves the cached file with a ~16 MB read instead of a full-file
+      // hash. The loader still full-hashes on first download and under
+      // `?fullverify`.
+      head: "d996847e6b5c831f4f51aac00469be269d0e98af082057b4ba63914ddb45c188",
+      tail: "1cbb0a5b9f9402c6188fc89a41f18420d325acbe809010fba8408cde634a005b",
     },
     sidecars: [],
   },
@@ -27,6 +33,8 @@ export const MODELS = {
       name: "weights.safetensors",
       bytes: 491570584,
       sha256: "487fa30cb0aa9799c77bd9985e6787962c3991fab8d4d576a4f1221d45298f6a",
+      head: "0e7073139cfb591596c1ee93f12db45ca4f3dd37dbf33119d7b0e4b9b10b2fb7",
+      tail: "1b81ffb92d6a0a57c69a37b7cd083527b8ed2685f1339c8db7b7296f0e98689a",
     },
     sidecars: [
       {
