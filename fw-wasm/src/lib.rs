@@ -51,10 +51,14 @@ mod wasm_api {
     use crate::sortformer_inference::{SortformerPcm, SortformerSession};
 
     thread_local! {
-        // Single-threaded wasm: the loaded models live in the worker that
-        // called the load entry points; everything below runs on that worker.
+        // The loaded models live in the worker that called the load entry
+        // points; every entry point below runs on that worker.
         static MODEL: RefCell<Option<LoadedModel>> = const { RefCell::new(None) };
         static DIARIZER: RefCell<Option<SortformerSession>> = const { RefCell::new(None) };
+        // Decoded 16 kHz mono PCM staged by `decode_audio`, consumed by
+        // `run_prepared` — split so the page learns the duration (and the
+        // window count its progress bar needs) before the long stage starts.
+        static PCM: RefCell<Option<Vec<f32>>> = const { RefCell::new(None) };
     }
 
     // Host-supplied positioned read against the whisper model file staged in
@@ -71,12 +75,18 @@ mod wasm_api {
     export function fw_stage(name) {
         const f = globalThis.__fwStage;
         if (f) f(name);
+    }
+    export function fw_span(name, ms) {
+        const f = globalThis.__fwSpan;
+        if (f) f(name, ms);
     }")]
     extern "C" {
         #[wasm_bindgen(catch)]
         fn fw_model_read_at(offset: f64, len: f64) -> Result<js_sys::Uint8Array, JsValue>;
         /// Optional host progress hook: names the stage currently running.
         fn fw_stage(name: &str);
+        /// Optional host span hook: one engine perf span (name, milliseconds).
+        fn fw_span(name: &str, ms: f64);
     }
 
     fn js_err(e: impl std::fmt::Display) -> JsValue {
@@ -84,12 +94,15 @@ mod wasm_api {
     }
 
     /// Doctrine: a panic in a tab must never surface as an opaque
-    /// `RuntimeError: unreachable`. Installed at module start.
+    /// `RuntimeError: unreachable`. Installed at module start, along with the
+    /// span hook that forwards the engine's perf spans to the host — the
+    /// page's progress bar counts `encoder_window` events through it.
     #[wasm_bindgen(start)]
     pub fn start() {
         std::panic::set_hook(Box::new(|info| {
             fw_console_error(&info.to_string());
         }));
+        crate::native_engine::plat::set_span_hook(Box::new(|span, ms| fw_span(span, ms)));
     }
 
     // console.error without a web-sys dependency. Also banks the message in
@@ -258,35 +271,67 @@ mod wasm_api {
         })
     }
 
-    /// The fused pipeline, mirroring the CLI's `--diarize` flow: whisper
-    /// transcription, native Sortformer diarization, the CLI's own
-    /// turn-mapping + projection-fusion-v1 (same relocated code, not a
-    /// mirror), and merged speaker-attributed runs. Returns JSON:
-    /// `{language, segments, turns, speaker_segments, dropped_windows,
-    ///   audio_sec}` where `segments[].speaker` is filled by the projection
-    /// and `speaker_segments` are the merged per-speaker runs.
-    ///
-    /// `initial_prompt` is the CLI's `--prompt`: optional context text (for
-    /// the playground, the speakers' names and titles) that biases decoding
-    /// so names and jargon come out spelled right. `None`/empty is a no-op,
-    /// byte-identical to no prompt.
-    ///
-    /// Projection runs at segment granularity (`word_aligned = false`); the
-    /// CLI's word-aligned snap path needs word timestamps, which stay off in
-    /// the browser build for now.
+    // The fused pipeline mirrors the CLI's `--diarize` flow: whisper
+    // transcription, native Sortformer diarization, the CLI's own
+    // turn-mapping + projection-fusion-v1 (the same relocated code, not a
+    // mirror), then merged speaker-attributed runs. The result JSON is
+    // `{language, segments, turns, speaker_segments, dropped_windows,
+    // audio_sec}`; `initial_prompt` is the CLI's `--prompt` (None/empty is
+    // byte-identical to no prompt). Projection runs at segment granularity
+    // (`word_aligned = false`) because word timestamps stay off in the
+    // browser build. Exposed as two stages so the page can build a progress
+    // model between them, plus a single-shot compatibility wrapper.
+
+    /// Stage one of the split pipeline: decode `audio` (mp3/m4a/wav bytes) to
+    /// 16 kHz mono PCM and hold it for [`run_prepared`]. Returns
+    /// `{"audio_sec": …}` so the page can size its progress model (whisper
+    /// processes 30-second windows sequentially, so `ceil(audio_sec / 30)` is
+    /// the window total its bar counts against) before the long stage starts.
     ///
     /// # Errors
     ///
-    /// "no model loaded" / "no diarizer loaded", audio decode failures, or
-    /// any engine error — each naming the failing stage.
+    /// Audio decode failures, each naming the failing stage.
+    #[wasm_bindgen]
+    pub fn decode_audio(audio: Vec<u8>, ext: &str) -> Result<String, JsValue> {
+        fw_stage("audio:decode");
+        let samples = crate::audio_decode::decode_to_16k_mono(audio, ext).map_err(js_err)?;
+        let audio_sec = samples.len() as f64 / 16_000.0;
+        PCM.with(|slot| *slot.borrow_mut() = Some(samples));
+        Ok(serde_json::json!({ "audio_sec": audio_sec }).to_string())
+    }
+
+    /// Stage two: run the fused whisper + Sortformer + fusion pipeline over
+    /// the PCM staged by [`decode_audio`] (consumed by this call).
+    ///
+    /// # Errors
+    ///
+    /// "no audio prepared" / "no model loaded" / "no diarizer loaded", or any
+    /// engine error, each naming the failing stage.
+    #[wasm_bindgen]
+    pub fn run_prepared(initial_prompt: Option<String>) -> Result<String, JsValue> {
+        let samples = PCM
+            .with(|slot| slot.borrow_mut().take())
+            .ok_or_else(|| js_err("no audio prepared: call decode_audio first"))?;
+        run_fused(&samples, initial_prompt)
+    }
+
+    /// Compatibility wrapper over [`decode_audio`] + [`run_prepared`] (the
+    /// Node harnesses call this single-shot form).
+    ///
+    /// # Errors
+    ///
+    /// Same classes as the two stages it wraps.
     #[wasm_bindgen]
     pub fn transcribe_and_diarize(
         audio: Vec<u8>,
         ext: &str,
         initial_prompt: Option<String>,
     ) -> Result<String, JsValue> {
-        fw_stage("audio:decode");
-        let samples = crate::audio_decode::decode_to_16k_mono(audio, ext).map_err(js_err)?;
+        decode_audio(audio, ext)?;
+        run_prepared(initial_prompt)
+    }
+
+    fn run_fused(samples: &[f32], initial_prompt: Option<String>) -> Result<String, JsValue> {
         let audio_sec = samples.len() as f64 / 16_000.0;
 
         let out = MODEL.with(|slot| {
@@ -301,7 +346,7 @@ mod wasm_api {
                 ..DecodeParams::default()
             };
             fw_stage("whisper:decode");
-            decode::transcribe_samples(model, &samples, &params, &|| Ok(())).map_err(js_err)
+            decode::transcribe_samples(model, samples, &params, &|| Ok(())).map_err(js_err)
         })?;
 
         let diarization = DIARIZER.with(|slot| {
@@ -310,8 +355,19 @@ mod wasm_api {
                 .as_ref()
                 .ok_or_else(|| js_err("no diarizer loaded: call load_sortformer first"))?;
             fw_stage("sortformer:diarize");
+            // The diarizer has no window structure to count, so its heartbeat
+            // is the cancellation checkpoint: one throttled span per 256
+            // calls tells the page the stage is alive and moving.
+            let ticks = std::sync::atomic::AtomicU64::new(0);
+            let checkpoint = move || {
+                let n = ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n % 256 == 0 {
+                    crate::native_engine::plat::emit_span("sortformer_tick", n as f64);
+                }
+                Ok(())
+            };
             session
-                .diarize(SortformerPcm::mono_16khz(&samples))
+                .diarize_with_checkpoint(SortformerPcm::mono_16khz(samples), &checkpoint)
                 .map_err(js_err)
         })?;
 

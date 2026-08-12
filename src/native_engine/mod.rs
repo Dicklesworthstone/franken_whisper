@@ -979,6 +979,12 @@ pub(crate) fn int8_attn_out_enabled() -> bool {
 
 /// Emit one measurement-only span line (see [`perf_spans_enabled`]).
 pub(crate) fn perf_span(span: &str, ms: f64, extra: &str) {
+    // wasm32 (bd-m2jm): spans double as the engine's progress heartbeat — the
+    // host registers a hook (`plat::set_span_hook`) and the page derives its
+    // window-counted progress bar and remaining-time estimate from
+    // `encoder_window` events. Native builds compile this away entirely.
+    #[cfg(target_arch = "wasm32")]
+    crate::native_engine::plat::emit_span(span, ms);
     if perf_spans_enabled() {
         static T0: std::sync::OnceLock<crate::native_engine::plat::Instant> =
             std::sync::OnceLock::new();

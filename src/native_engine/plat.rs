@@ -25,7 +25,8 @@ pub use std::time::Instant;
 
 #[cfg(target_arch = "wasm32")]
 pub use wasm_impl::{
-    Instant, Scope, ScopedJoinHandle, available_parallelism, scope, set_now_micros,
+    Instant, Scope, ScopedJoinHandle, available_parallelism, emit_span, scope, set_now_micros,
+    set_span_hook,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -106,6 +107,31 @@ mod wasm_impl {
     #[allow(clippy::missing_errors_doc, clippy::unnecessary_wraps)]
     pub fn available_parallelism() -> std::io::Result<std::num::NonZeroUsize> {
         Ok(std::num::NonZeroUsize::MIN)
+    }
+
+    /// Host span hook: the wasm embedding registers a callback and every
+    /// [`super::super::perf_span`] measurement is forwarded to it — the
+    /// engine's progress heartbeat for the page (window counts, tick counts).
+    /// Unregistered = the forward is a cheap lock + None check.
+    static SPAN_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str, f64) + Send + Sync>>> =
+        std::sync::Mutex::new(None);
+
+    /// Register the host span hook (replaces any previous hook).
+    pub fn set_span_hook(hook: Box<dyn Fn(&str, f64) + Send + Sync>) {
+        *SPAN_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Forward one span to the registered hook, if any.
+    pub fn emit_span(span: &str, ms: f64) {
+        if let Some(hook) = SPAN_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(span, ms);
+        }
     }
 }
 
