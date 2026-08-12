@@ -40,6 +40,13 @@ pub mod sortformer_inference;
 // bytes → 16 kHz mono f32 (symphonia; wasm-only).
 pub mod audio_decode;
 
+/// `initThreadPool(n)` — the rayon worker-pool constructor, exported ONLY by
+/// the threaded lane. The host MUST await it before any engine call in that
+/// lane; the serial lane has no such export, which is how the page tells the
+/// lanes apart.
+#[cfg(all(target_arch = "wasm32", feature = "threads"))]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 #[cfg(target_arch = "wasm32")]
 mod wasm_api {
     use std::cell::RefCell;
@@ -130,6 +137,28 @@ mod wasm_api {
     #[wasm_bindgen]
     pub fn version() -> String {
         env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// The instantiated linear memory, so the host can verify the threaded
+    /// lane really got a `SharedArrayBuffer`-backed memory (the build flags
+    /// are a claim; the instantiated memory is the receipt).
+    #[wasm_bindgen]
+    pub fn wasm_memory() -> JsValue {
+        wasm_bindgen::memory()
+    }
+
+    /// Rayon's actual worker count right now — a threaded module whose pool
+    /// never armed is visible as `1`, never silently serial.
+    #[wasm_bindgen]
+    pub fn thread_count() -> usize {
+        #[cfg(feature = "threads")]
+        {
+            rayon::current_num_threads()
+        }
+        #[cfg(not(feature = "threads"))]
+        {
+            1
+        }
     }
 
     fn model_info_json(loaded: &LoadedModel) -> String {

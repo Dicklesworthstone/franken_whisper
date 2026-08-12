@@ -61,18 +61,22 @@ mod wasm_impl {
         }
     }
 
-    /// Serial drop-in for `std::thread::Scope`: `spawn` runs the closure
-    /// immediately on the caller and stores the result in the handle.
+    /// Serial drop-in for `std::thread::Scope` (the non-atomics lane —
+    /// iOS/WebKit gets this build): `spawn` runs the closure immediately on
+    /// the caller and stores the result in the handle.
+    #[cfg(not(target_feature = "atomics"))]
     pub struct Scope<'scope, 'env: 'scope> {
         _marker: PhantomData<(&'scope mut &'scope (), &'env mut &'env ())>,
     }
 
     /// Serial drop-in for `std::thread::ScopedJoinHandle`.
+    #[cfg(not(target_feature = "atomics"))]
     pub struct ScopedJoinHandle<'scope, T> {
         result: T,
         _marker: PhantomData<&'scope ()>,
     }
 
+    #[cfg(not(target_feature = "atomics"))]
     impl<'scope, T> ScopedJoinHandle<'scope, T> {
         #[allow(clippy::missing_errors_doc)]
         pub fn join(self) -> std::thread::Result<T> {
@@ -80,6 +84,7 @@ mod wasm_impl {
         }
     }
 
+    #[cfg(not(target_feature = "atomics"))]
     impl<'scope, 'env> Scope<'scope, 'env> {
         pub fn spawn<F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope, T>
         where
@@ -94,6 +99,7 @@ mod wasm_impl {
     }
 
     /// Serial drop-in for `std::thread::scope`.
+    #[cfg(not(target_feature = "atomics"))]
     pub fn scope<'env, F, T>(f: F) -> T
     where
         F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
@@ -104,9 +110,149 @@ mod wasm_impl {
     }
 
     /// One logical core: the serial path.
+    #[cfg(not(target_feature = "atomics"))]
     #[allow(clippy::missing_errors_doc, clippy::unnecessary_wraps)]
     pub fn available_parallelism() -> std::io::Result<std::num::NonZeroUsize> {
         Ok(std::num::NonZeroUsize::MIN)
+    }
+
+    /// Threaded lane (`+atomics` build, desktop browsers with
+    /// crossOriginIsolated): `scope` runs over rayon's Web-Worker-backed
+    /// global pool (wasm-bindgen-rayon; the host arms it with
+    /// `initThreadPool` after the models hydrate).
+    ///
+    /// Deferred-batch semantics: `spawn` BANKS the closure (type-erased) and
+    /// returns a handle; the first `join` — or scope exit, for handles never
+    /// joined — executes every banked closure in parallel via
+    /// `rayon::in_place_scope` and fills the result slots. For fork-join
+    /// usage (spawn everything, then join everything), which is the only
+    /// pattern this engine's scopes use, the observable behavior matches
+    /// `std::thread::scope`: every spawned closure has completed by the time
+    /// its `join` returns, and all of them by the time `scope` returns. What
+    /// this deliberately does NOT support is a spawn that must run
+    /// CONCURRENTLY with the scope's own body (producer/consumer through a
+    /// channel) — the engine has no such scope, and one would deadlock
+    /// loudly, not corrupt data.
+    ///
+    /// Result types must be `'static` (they cross the type-erasure boundary
+    /// as `Box<dyn Any>`); every engine scope returns owned buffers, which
+    /// already are.
+    #[cfg(target_feature = "atomics")]
+    type BankedJob<'env> = Box<dyn FnOnce() + Send + 'env>;
+
+    #[cfg(target_feature = "atomics")]
+    type SharedBatch<'env> = std::sync::Arc<std::sync::Mutex<Vec<BankedJob<'env>>>>;
+
+    #[cfg(target_feature = "atomics")]
+    type ResultSlot = std::sync::Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
+
+    /// Deferred-batch drop-in for `std::thread::Scope` (threaded lane).
+    #[cfg(target_feature = "atomics")]
+    pub struct Scope<'env> {
+        batch: SharedBatch<'env>,
+    }
+
+    /// Handle to a banked closure's future result (threaded lane). Carries a
+    /// clone of the scope's batch so `join` can trigger execution without a
+    /// back-reference; its `'env` parameter keeps it from outliving the data
+    /// the banked closures borrow.
+    #[cfg(target_feature = "atomics")]
+    pub struct ScopedJoinHandle<'env, T> {
+        slot: ResultSlot,
+        batch: SharedBatch<'env>,
+        _t: PhantomData<T>,
+    }
+
+    #[cfg(target_feature = "atomics")]
+    fn run_batch(batch: &SharedBatch<'_>) {
+        let jobs = std::mem::take(
+            &mut *batch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if jobs.is_empty() {
+            return;
+        }
+        rayon::in_place_scope(|ray| {
+            for job in jobs {
+                ray.spawn(move |_| job());
+            }
+        });
+    }
+
+    #[cfg(target_feature = "atomics")]
+    impl<'env, T: std::any::Any + Send> ScopedJoinHandle<'env, T> {
+        /// Ensure the banked batch has run, then take this handle's result.
+        #[allow(clippy::missing_errors_doc)]
+        pub fn join(self) -> std::thread::Result<T> {
+            if self
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+            {
+                run_batch(&self.batch);
+            }
+            let boxed = self
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("banked scope job did not produce a result");
+            Ok(*boxed
+                .downcast::<T>()
+                .expect("banked scope job produced a mismatched type"))
+        }
+    }
+
+    #[cfg(target_feature = "atomics")]
+    impl<'env> Scope<'env> {
+        pub fn spawn<F, T>(&self, f: F) -> ScopedJoinHandle<'env, T>
+        where
+            F: FnOnce() -> T + Send + 'env,
+            T: std::any::Any + Send,
+        {
+            let slot: ResultSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let job_slot = std::sync::Arc::clone(&slot);
+            self.batch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(Box::new(move || {
+                    let value: Box<dyn std::any::Any + Send> = Box::new(f());
+                    *job_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value);
+                }));
+            ScopedJoinHandle {
+                slot,
+                batch: std::sync::Arc::clone(&self.batch),
+                _t: PhantomData,
+            }
+        }
+    }
+
+    /// Threaded drop-in for `std::thread::scope` (see [`Scope`]).
+    #[cfg(target_feature = "atomics")]
+    pub fn scope<'env, F, T>(f: F) -> T
+    where
+        F: FnOnce(&Scope<'env>) -> T,
+    {
+        let scope = Scope {
+            batch: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let result = f(&scope);
+        // Handles never joined still complete before scope returns, matching
+        // std::thread::scope.
+        run_batch(&scope.batch);
+        result
+    }
+
+    /// The armed pool size (1 until the host calls `initThreadPool`).
+    #[cfg(target_feature = "atomics")]
+    #[allow(clippy::missing_errors_doc)]
+    pub fn available_parallelism() -> std::io::Result<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(rayon::current_num_threads())
+            .ok_or_else(|| std::io::Error::other("rayon pool reported zero threads"))
     }
 
     /// Host span hook: the wasm embedding registers a callback and every

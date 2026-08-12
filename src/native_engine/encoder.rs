@@ -642,8 +642,17 @@ impl EncoderWeights {
         // esp. the owned pread buffers under FW_STREAM_LOAD) is bounded ONE level
         // up, at the encoder∥decoder `rayon::join` in `decode::LoadedModel::
         // from_ggml`, so both builds share a single FW_LOAD_WORKERS cap.
-        let mut layers = (0..n_layer)
-            .into_par_iter()
+        //
+        // wasm32 (bd-m2jm): the load must stay on the CALLING thread. Tensor
+        // payloads arrive through a host JS hook (an OPFS sync-access handle
+        // owned by the engine worker), and a rayon Web Worker's JS realm has
+        // no such hook — nor could it: the handle is thread-confined. The
+        // pool is a COMPUTE resource; loading serially costs ~2 s, measured.
+        #[cfg(target_arch = "wasm32")]
+        let layer_indices = (0..n_layer).collect::<Vec<_>>().into_iter();
+        #[cfg(not(target_arch = "wasm32"))]
+        let layer_indices = (0..n_layer).into_par_iter();
+        let mut layers = layer_indices
             .map(|i| -> FwResult<EncoderLayer> {
                 let p = |suffix: &str| format!("encoder.blocks.{i}.{suffix}");
                 let (attn_q_w, attn_q_i7) = load_linear_maybe_i7(

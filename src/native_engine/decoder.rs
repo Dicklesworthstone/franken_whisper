@@ -821,17 +821,21 @@ impl DecoderWeights {
         // (32×16 = 512 would thrash). Output is identical (layers independent;
         // `collect` preserves order).
         const MAX_PAR_LAYERS: usize = 8;
-        let layers: Vec<DecoderLayer> = if n_layer <= MAX_PAR_LAYERS {
-            use rayon::prelude::*;
-            (0..n_layer)
-                .into_par_iter()
-                .map(build_layer)
-                .collect::<FwResult<Vec<_>>>()?
-        } else {
-            (0..n_layer)
-                .map(build_layer)
-                .collect::<FwResult<Vec<_>>>()?
-        };
+        // wasm32 always takes the serial arm: tensor payloads arrive through
+        // a thread-confined host JS hook (see encoder::from_ggml's note), so
+        // load work must not hop to rayon's Web Workers.
+        let layers: Vec<DecoderLayer> =
+            if n_layer <= MAX_PAR_LAYERS && cfg!(not(target_arch = "wasm32")) {
+                use rayon::prelude::*;
+                (0..n_layer)
+                    .into_par_iter()
+                    .map(build_layer)
+                    .collect::<FwResult<Vec<_>>>()?
+            } else {
+                (0..n_layer)
+                    .map(build_layer)
+                    .collect::<FwResult<Vec<_>>>()?
+            };
 
         Ok(Self {
             token_embedding,

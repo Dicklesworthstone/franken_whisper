@@ -151,10 +151,20 @@ impl LoadedModel {
         // longer load. `FW_LOAD_WORKERS=0` restores the uncapped ambient join.
         // Byte-exact for any cap (thread count never changes the built weights).
         let build_weights = || {
-            rayon::join(
-                || EncoderWeights::from_ggml(&model),
-                || DecoderWeights::from_ggml(&model),
-            )
+            // wasm32: both builds stay on the calling thread (the tensor host
+            // hook is thread-confined; see encoder::from_ggml's note). A
+            // sequential pair, not a join that may hop one side to a Worker.
+            if cfg!(target_arch = "wasm32") {
+                (
+                    EncoderWeights::from_ggml(&model),
+                    DecoderWeights::from_ggml(&model),
+                )
+            } else {
+                rayon::join(
+                    || EncoderWeights::from_ggml(&model),
+                    || DecoderWeights::from_ggml(&model),
+                )
+            }
         };
         // wasm32: a dedicated pool cannot spawn OS threads (`build()` fails at
         // runtime), and rayon's wasm fallback already runs the ambient `join`

@@ -29,10 +29,29 @@ thiserror = "2.0"
 tracing = "0.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2"
+# Pinned EXACTLY to the installed wasm-bindgen CLI: the crate and the CLI
+# must match, and a 0.2.127-crate/0.2.126-CLI skew produced a threaded module
+# whose pool constructor failed at runtime with a bare unwrap_throw.
+wasm-bindgen = "=0.2.126"
 js-sys = "0.3"
 # In-crate mp3/m4a/wav decode for the browser demo (pure Rust, wasm-clean).
 symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "aac", "isomp4", "wav", "pcm"] }
+# The threaded browser lane. OFF by default so site/pkg (the serial module
+# iOS/WebKit gets) never pulls the shared-memory machinery: sharedness is a
+# LINK-TIME property, so the two lanes are two builds, not one build with a
+# runtime switch. `no-bundler` is mandatory for `wasm-bindgen --target web`:
+# it makes the crate's JS snippet spawn its workers from a module URL instead
+# of expecting a bundler to resolve `new Worker(new URL(...))` at build time.
+# The dep turns on `rayon/web_spin_lock`, which routes rayon-core's spin lock
+# through `Atomics.wait` — mandatory on the web, where a spinning worker
+# cannot be preempted. (Recipe proven on franken_ocr's pkg-threaded lane.)
+wasm-bindgen-rayon = { version = "1.3", features = ["no-bundler"], optional = true }
+
+[features]
+default = []
+# Build the shared-memory/atomics module (site/pkg-threaded). Requires the
+# matching RUSTFLAGS + `-Z build-std=std,panic_abort`; see site/build-wasm.sh.
+threads = ["dep:wasm-bindgen-rayon"]
 
 [lints.rust]
 unsafe_code = "deny"
