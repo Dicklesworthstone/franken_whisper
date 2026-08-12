@@ -8,9 +8,26 @@
 // handler FIRST, then import, then drain.
 const pending = [];
 let ready = false;
+
+// A wasm trap surfaces as an opaque `RuntimeError: unreachable`. The engine's
+// panic hook banks the real message in `globalThis.__fwLastPanic` first; an
+// allocation failure aborts without any message, which on this engine means
+// the 4 GB wasm ceiling — say so instead of shrugging.
+function describeError(err) {
+  const raw = String(err?.message ?? err);
+  if (!/unreachable/i.test(raw)) return raw;
+  const panic = globalThis.__fwLastPanic;
+  delete globalThis.__fwLastPanic;
+  if (panic) return `engine panic: ${panic}`;
+  return (
+    "the engine ran out of memory (wasm's 4 GB ceiling) or hit an internal trap. " +
+    "Try a shorter recording; details, if any, are in the browser console."
+  );
+}
+
 self.onmessage = (e) => {
   if (!ready) pending.push(e);
-  else route(e).catch((err) => post("error", { message: String(err?.message ?? err) }));
+  else route(e).catch((err) => post("error", { message: describeError(err) }));
 };
 
 function post(type, data) {
@@ -129,7 +146,7 @@ async function route(e) {
     ready = true;
     post("booted", { version: wasm.version() });
     for (const queued of pending.splice(0)) {
-      route(queued).catch((err) => post("error", { message: String(err?.message ?? err) }));
+      route(queued).catch((err) => post("error", { message: describeError(err) }));
     }
   } catch (err) {
     post("error", { message: `engine failed to boot: ${String(err?.message ?? err)}` });

@@ -25,7 +25,7 @@ const STAGE_LABELS = {
   "sortformer:weights": "building the Sortformer graph…",
   "sortformer:ready": "Sortformer ready.",
   "audio:decode": "decoding audio (Symphonia) and resampling to 16 kHz…",
-  "whisper:decode": "transcribing (large-v3-turbo, single wasm thread — this is the long part)…",
+  "whisper:decode": "transcribing with large-v3-turbo on a single wasm thread (the long part)…",
   "sortformer:diarize": "diarizing (Sortformer, 80 ms frames)…",
   "fuse:project": "fusing speakers onto the transcript…",
   done: "finishing…",
@@ -82,7 +82,7 @@ function handle(m) {
       const pct = Math.min(100, Math.floor((done / COMBINED_TOTAL) * 100));
       bar.style.width = `${pct}%`;
       const phase = m.phase === "rehash" ? "resuming (re-hashing banked bytes)" : m.phase;
-      text.textContent = `${m.file}: ${fmtBytes(m.loaded)} of ${fmtBytes(m.total)} (${phase}) — ${pct}% overall`;
+      text.textContent = `${m.file}: ${fmtBytes(m.loaded)} of ${fmtBytes(m.total)} (${phase}); ${pct}% overall`;
       break;
     }
     case "stage": {

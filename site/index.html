@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>franken_whisper: Whisper and speaker diarization, in your browser tab</title>
-<meta name="description" content="A pure-Rust speech-to-text and speaker-diarization engine. Whisper large-v3-turbo and NVIDIA's Sortformer run fused, entirely in your browser — the same code that ships as the fw CLI. No server, no upload, no Python, no GPU.">
+<meta name="description" content="A pure-Rust speech-to-text and speaker-diarization engine. Whisper large-v3-turbo and NVIDIA's Sortformer run fused, entirely in your browser, from the same code that ships as the fw CLI. No server, no upload, no Python, no GPU.">
 <meta name="theme-color" content="#060b09">
 <link rel="canonical" href="https://franken-whisper.com/">
 <meta property="og:title" content="franken_whisper: Whisper and speaker diarization, in your browser tab">
@@ -52,15 +52,14 @@
     <h1>Whisper, and <em>who said it.</em><br>In this tab.</h1>
     <p class="lede">
       <strong>franken_whisper</strong> rebuilds OpenAI's Whisper and NVIDIA's Streaming
-      Sortformer speaker diarizer in pure, memory-safe Rust — ggml parser, log-mel frontend,
+      Sortformer speaker diarizer in pure, memory-safe Rust: ggml parser, log-mel frontend,
       encoder, decoder, word timestamps, four-speaker diarization, and the fusion that stitches
       them into <em>who said what</em>. No PyTorch, no Python, no FFI, no subprocess. The same
-      code that ships as the <code>fw</code> CLI compiles to WebAssembly, so
-      <strong>large-v3-turbo</strong> — the full 809-million-parameter model, not a demo-sized
-      stand-in — transcribes and diarizes your recordings <strong>entirely on your CPU, in this
-      page</strong>. Your audio never leaves the tab, and the CSP's
-      <code>connect-src 'self'</code> makes that a browser-enforced promise rather than a
-      privacy-policy one.
+      code that ships as the <code>fw</code> CLI compiles to WebAssembly, so the full
+      809-million-parameter <strong>large-v3-turbo</strong> transcribes and diarizes your
+      recordings <strong>entirely on your CPU, in this page</strong>. Your audio never leaves
+      the tab. The CSP's <code>connect-src 'self'</code> makes that a browser-enforced promise
+      rather than a privacy-policy one.
     </p>
     <p class="hero-cta">
       <a class="btn primary" href="#playground">Try it in your browser</a>
@@ -88,14 +87,14 @@
       <p class="eyebrow">Live · in this tab</p>
       <h2>Run it <em>right now</em>.</h2>
       <p class="lede">
-        The real pipeline, not a mock: Whisper <strong>large-v3-turbo</strong> (1.5 GB, f16)
-        transcribes, <strong>Sortformer</strong> (469 MB, f32) works out who is speaking when,
-        and the CLI's own projection-fusion attributes every line — all in hand-written Rust
-        kernels compiled to wasm, running on your CPU. Both downloads are SHA-256-verified
-        against pinned manifests, cached in browser storage, and re-verified on every visit.
-        The Sortformer package is additionally re-authenticated <em>inside the engine</em>
-        against its conversion receipt, exactly as the CLI does it. There is no server behind
-        this panel.
+        This panel runs the real pipeline. Whisper <strong>large-v3-turbo</strong> (1.5 GB,
+        f16) transcribes, <strong>Sortformer</strong> (469 MB, f32) works out who is speaking
+        when, and the CLI's own projection-fusion attributes every line, all in hand-written
+        Rust kernels compiled to wasm and running on your CPU. Both downloads are
+        SHA-256-verified against pinned manifests, cached in browser storage, and re-verified
+        on every visit. The Sortformer package is additionally re-authenticated <em>inside the
+        engine</em> against its conversion receipt, exactly as the CLI does it. There is no
+        server behind this panel and no mocked demo.
       </p>
     </div>
 
@@ -131,14 +130,14 @@
             <div id="drop" class="drop" role="button" tabindex="0"
               aria-label="Drop an audio file here or click to pick one">
               <span id="drop-hint">Drop an audio file here (mp3, m4a, wav), or click to pick one.
-                A meeting, an interview, a voice memo — anything with people talking.</span>
+                A meeting, an interview, a voice memo: anything with people talking.</span>
             </div>
             <input type="file" id="file-input" accept=".mp3,.m4a,.mp4,.aac,.wav,audio/*" hidden>
             <p class="micro">Decoded in-tab by Symphonia (pure Rust), downmixed and resampled to
               16 kHz mono. Honest expectation: the current build is single-threaded and measured
-              ~8× real time on an M-series desktop — a 1-minute clip takes ~8 minutes. Start
-              short. The threaded build (the same parked-worker design the sibling projects
-              ship) is the tracked next lever.</p>
+              about 8 times real time on an M-series desktop, so a 1-minute clip takes about
+              8 minutes. Start short. The threaded build, the same parked-worker design the
+              sibling projects ship, is the tracked next lever.</p>
           </div>
 
           <div class="pg-step">
@@ -156,8 +155,7 @@
           <p class="note" id="result-placeholder">
             Results land here: every line timestamped and speaker-attributed, with the same
             <code>SPEAKER_00…03</code> labels and fusion rules the CLI emits. The measured
-            wall-clock and realtime ratio print with each run — numbers from <em>your</em>
-            hardware, not marketing.
+            wall-clock and realtime ratio print with each run, from <em>your</em> hardware.
           </p>
           <div id="result-wrap" hidden>
             <div class="row">
@@ -183,32 +181,34 @@
       <p class="eyebrow">Anatomy · one code path</p>
       <h2>The <em>same bytes</em> as the CLI.</h2>
       <p class="lede">
-        The browser build is not a port of a port. The wasm crate mounts the native engine's
-        source files directly — the identical Rust that decodes on a workstation — behind one
-        platform seam: a host-fed clock and a serial thread scope. What differs is honest and
-        named; everything else is the same pipeline, stage for stage.
+        The wasm crate mounts the native engine's source files directly, so the browser runs
+        the identical Rust that decodes on a workstation, behind one platform seam: a host-fed
+        clock and a serial thread scope. What differs is named and documented; everything else
+        is the same pipeline, stage for stage.
       </p>
     </div>
 
     <ol class="stack reveal">
       <li><strong>ggml parser.</strong> The 1.5 GB turbo file is scanned once for its tensor
         directory, then each tensor hydrates straight from browser storage through a positioned
-        reader — the file never exists as one in-memory blob. f16 tensors stay f16-resident;
-        that residency is what fits an 809M-parameter encoder in a 32-bit address space.</li>
+        reader; the file never exists as one in-memory blob. f16 tensors stay f16-resident,
+        and that residency is what fits an 809M-parameter encoder in a 32-bit address
+        space.</li>
       <li><strong>Log-mel frontend.</strong> The reference mel pipeline, bit-faithful to the
         native engine: 25 ms windows, 10 ms hop, 128 mel bins for turbo.</li>
       <li><strong>Encoder + decoder.</strong> 32 encoder layers, 4 decoder layers, greedy
         temperature-0 decode with the CLI's window retry and context-carry policies. The wasm
         build multiplies f16 weights with the same batched dequant-GEMV kernels the native
         decoder ships by default.</li>
-      <li><strong>Sortformer diarizer.</strong> NVIDIA's streaming four-speaker model —
-        FastConformer frontend, transformer stack, per-frame speaker lanes — hand-ported to the
-        same Rust, verified in-engine against its conversion receipt before a single frame is
-        scored.</li>
+      <li><strong>Sortformer diarizer.</strong> NVIDIA's streaming four-speaker model
+        (FastConformer frontend, transformer stack, per-frame speaker lanes), hand-ported to
+        the same Rust and verified in-engine against its conversion receipt before a single
+        frame is scored.</li>
       <li><strong>Projection fusion.</strong> The CLI's projection-fusion-v1 attributes each
         transcript segment to the dominant speaker turn, fills gap segments from the turn
         timeline, and merges runs into speaker-attributed blocks. The wasm build calls the very
-        function the CLI calls — relocated, not re-implemented.</li>
+        function the CLI calls; the code was relocated into a shared module so the two can
+        never drift apart.</li>
     </ol>
   </div>
 </section>
@@ -220,8 +220,8 @@
       <p class="eyebrow">Diarization · who said what</p>
       <h2>Names on <em>every line</em>.</h2>
       <p class="lede">
-        Transcription without attribution is half an answer. franken_whisper runs diarization as
-        a first-class stage, not an afterthought: Sortformer scores four speaker lanes at 80 ms
+        Transcription without attribution is half an answer, so diarization runs as a
+        first-class stage: Sortformer scores four speaker lanes at 80 ms
         resolution, turns become a timeline with per-turn confidence and overlap suspicion, and
         the fusion pass projects that timeline onto the transcript so consecutive same-speaker
         segments merge into readable blocks. The CLI exposes the same result as
@@ -231,7 +231,7 @@
     <div class="grid grid-3 reveal">
       <div class="card">
         <p class="label">Turn timeline</p>
-        <p>Start, end, speaker, confidence, and overlap suspicion for every detected turn —
+        <p>Start, end, speaker, confidence, and overlap suspicion for every detected turn:
           the raw evidence, preserved alongside the merged view.</p>
       </div>
       <div class="card">
@@ -253,19 +253,19 @@
 <section id="speed">
   <div class="wrap">
     <div class="section-head reveal">
-      <p class="eyebrow">Speed · measured, not promised</p>
+      <p class="eyebrow">Speed · every number measured</p>
       <h2>Honest <em>numbers</em>.</h2>
       <p class="lede">
         On native CPU, franken_whisper's engine measures <strong>2.99× faster than
         whisper.cpp</strong> at matched greedy decode settings, side-by-side in one interleaved
-        harness — the methodology and evidence hashes live in the repo's performance ledger.
+        harness; the methodology and evidence hashes live in the repo's performance ledger.
         On Apple-silicon GPU, the Metal encoder went from 15.4 s to 1.85 s per window across
         one ledgered kernel campaign. The wasm build in this page is the same engine on one
-        browser thread with SIMD128 — measured ~8× real time on an M-series desktop (down from
-        45× in one ledgered, byte-identical kernel pass) — and the page prints the exact ratio
-        after each run, measured on your machine, not quoted from ours. Threaded wasm is the
-        next lever, and it will land the same way everything here landed: behind a measured,
-        ledgered gate.
+        browser thread with SIMD128. It measured about 8 times real time on an M-series
+        desktop, down from 45 after one ledgered, byte-identical kernel pass, and the page
+        prints the exact ratio after each run so the number you read is from your machine.
+        Threaded wasm is the next lever, and it will land the way everything here landed:
+        behind a measured, ledgered gate.
       </p>
     </div>
     <div class="grid grid-3 reveal">
@@ -276,8 +276,8 @@
       </div>
       <div class="card">
         <p class="label">Every claim gated</p>
-        <p>One lever per pass, kill-switch env for every optimization, byte-identical or
-          ledgered — the repo's PERF_LEDGER.md and NEGATIVE_EVIDENCE.md are the record.</p>
+        <p>One lever per pass, a kill-switch env for every optimization, byte-identical or
+          ledgered. The repo's PERF_LEDGER.md and NEGATIVE_EVIDENCE.md are the record.</p>
       </div>
       <div class="card">
         <p class="label">This page tells the truth</p>
@@ -334,7 +334,7 @@ cargo install franken_whisper</code></pre>
 
 <footer class="foot">
   <div class="wrap">
-    <p>franken_whisper — Whisper + Sortformer, rebuilt in Rust. MIT-licensed engine;
+    <p>franken_whisper: Whisper + Sortformer, rebuilt in Rust. MIT-licensed engine;
       model weights under their respective licenses (Whisper: MIT; Sortformer:
       <a href="https://developer.download.nvidia.com/licenses/nvidia-open-model-license-agreement-june-2024.pdf">NVIDIA Open Model License</a>).
       Built by <a href="https://github.com/Dicklesworthstone">Jeffrey Emanuel</a>.

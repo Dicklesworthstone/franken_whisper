@@ -92,10 +92,15 @@ mod wasm_api {
         }));
     }
 
-    // console.error without a web-sys dependency.
-    #[wasm_bindgen(
-        inline_js = "export function fw_console_error(m) { console.error('fw-wasm panic:', m); }"
-    )]
+    // console.error without a web-sys dependency. Also banks the message in
+    // `globalThis.__fwLastPanic` so the host can attach the REAL reason to
+    // the opaque `RuntimeError: unreachable` the trap surfaces as. (Alloc
+    // failures abort without running the hook at all — the host treats a
+    // trap with no banked message as out-of-memory.)
+    #[wasm_bindgen(inline_js = "export function fw_console_error(m) {
+        globalThis.__fwLastPanic = m;
+        console.error('fw-wasm panic:', m);
+    }")]
     extern "C" {
         fn fw_console_error(m: &str);
     }
