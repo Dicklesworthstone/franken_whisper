@@ -294,7 +294,7 @@ function maybeEnableRun() {
 function acceptFile(file) {
   if (!file) return;
   state.file = file;
-  $("drop-hint").textContent = `${file.name} (${fmtBytes(file.size)}) — ready.`;
+  $("drop-hint").textContent = `${file.name} (${fmtBytes(file.size)}), ready.`;
   maybeEnableRun();
 }
 
@@ -308,7 +308,7 @@ function init() {
   });
   $("consent-yes").addEventListener("click", () => {
     $("consent").hidden = true;
-    setStatus("downloading models (verified, resumable — a reload picks up where it left off)…");
+    setStatus("downloading models (verified and resumable; a reload picks up where it left off)…");
     state.worker.postMessage({ type: "load-models" });
   });
   $("consent-no").addEventListener("click", () => {
