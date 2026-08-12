@@ -5397,3 +5397,32 @@ reference implementation: persistent Workers parked on a shared-memory
 barrier, per-op job dispatch, dual serial/threaded artifacts, TLS-export
 build recipe in frankentts `site/build.sh`). Entry point is already built:
 every hot GEMM partitions through `plat::scope`.
+
+---
+## 2026-08-12 — KEEP (real-browser harness, transcript-equality gate) — **wasm threaded lane: 8.35× → 1.56× realtime (5.4×) on the fused turbo+Sortformer pipeline** (bd-m2jm)
+
+Second wasm artifact (site/pkg-threaded): +atomics/+bulk-memory/
++mutable-globals, shared imported memory, TLS export set, -Z build-std;
+wasm-bindgen-rayon arms rayon's pool over Web Workers and plat's atomics-cfg
+Scope runs the engine's fork-join scopes over it (deferred-batch design,
+documented in plat.rs). Measured in HEADLESS CHROME via the CDP harness
+(site/harness/drive.mjs, COOP/COEP server, REAL turbo + Sortformer served
+locally): 21.9 s two-speaker clip, 8 workers, 34.2 s wall = **1.56×
+realtime**, transcript IDENTICAL to the serial lane, 0 dropped windows.
+Same-day serial baseline on the same clip: 8.35× (quiet window). Cumulative
+wasm campaign: 45.3× → 8.35× (byte-identical two-pass GEMV) → 1.56×
+(threads), a 29× total improvement, every step transcript-gated.
+
+Traps ledgered for the next reader: (a) wasm-bindgen crate/CLI version skew
+(0.2.127 vs 0.2.126) produced a pool constructor that failed at runtime with
+a bare unwrap_throw — pin exactly; (b) rayon's global pool initializes ONCE,
+and the engine's model load touches rayon, so the pool must arm BEFORE the
+first load; (c) model loads must stay on the calling thread on wasm — tensor
+payloads arrive through a thread-confined host hook (OPFS sync handle), and
+a rayon Web Worker's realm has no such hook (three cfg gates keep load
+serial; measured load cost ~2 s streamed).
+
+Lane policy: cross-origin-isolated Blink gets pkg-threaded (after a
+blob-worker CSP canary + SharedArrayBuffer receipt check); iOS/WebKit and
+non-isolated contexts keep the serial lane (shared-memory growth kills iOS
+tabs ~2 GB; this engine holds 2.4 GB).
