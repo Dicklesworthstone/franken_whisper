@@ -135,8 +135,10 @@
             </div>
             <input type="file" id="file-input" accept=".mp3,.m4a,.mp4,.aac,.wav,audio/*" hidden>
             <p class="micro">Decoded in-tab by Symphonia (pure Rust), downmixed and resampled to
-              16 kHz mono. Long files work; a single-threaded wasm build transcribes at a few
-              times real time, so start with minutes, not hours.</p>
+              16 kHz mono. Honest expectation: the current build is single-threaded and measured
+              ~8× real time on an M-series desktop — a 1-minute clip takes ~8 minutes. Start
+              short. The threaded build (the same parked-worker design the sibling projects
+              ship) is the tracked next lever.</p>
           </div>
 
           <div class="pg-step">
@@ -259,10 +261,11 @@
         harness — the methodology and evidence hashes live in the repo's performance ledger.
         On Apple-silicon GPU, the Metal encoder went from 15.4 s to 1.85 s per window across
         one ledgered kernel campaign. The wasm build in this page is the same engine on one
-        browser thread with SIMD128: expect a few times real time, and read the exact ratio the
-        page prints after each run — it is measured on your machine, not quoted from ours.
-        Threaded wasm is the next lever, and it will land the same way everything here landed:
-        behind a measured, ledgered gate.
+        browser thread with SIMD128 — measured ~8× real time on an M-series desktop (down from
+        45× in one ledgered, byte-identical kernel pass) — and the page prints the exact ratio
+        after each run, measured on your machine, not quoted from ours. Threaded wasm is the
+        next lever, and it will land the same way everything here landed: behind a measured,
+        ledgered gate.
       </p>
     </div>
     <div class="grid grid-3 reveal">
