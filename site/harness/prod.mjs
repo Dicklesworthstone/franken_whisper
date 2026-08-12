@@ -83,6 +83,9 @@ async function status() {
   return evalJs(
     "JSON.stringify({status: document.getElementById('status')?.textContent, " +
       "progress: document.getElementById('progress-text')?.textContent, " +
+      "runline: document.getElementById('stage-line')?.textContent, " +
+      "livePct: document.getElementById('run-pct')?.textContent, " +
+      "liveRows: document.querySelectorAll('#live-transcript .seg:not(#live-cue)').length, " +
       "meta: document.getElementById('result-meta')?.textContent, " +
       "runDisabled: document.getElementById('run')?.disabled})",
   ).then((s) => JSON.parse(s ?? "{}"));
@@ -130,17 +133,26 @@ await new Promise((r) => setTimeout(r, 1500));
 await evalJs("document.getElementById('run').click()");
 console.error("[prod] clicked run");
 
+let liveRowsSeen = 0;
 for (;;) {
   await new Promise((r) => setTimeout(r, 2000));
   const s = await status();
-  const line = `${s.status ?? ""} | ${s.progress ?? ""}`;
+  liveRowsSeen = Math.max(liveRowsSeen, s.liveRows ?? 0);
+  const line = `${s.status ?? ""} | ${s.livePct ?? ""} ${s.runline ?? ""} | live rows: ${s.liveRows ?? 0}`;
   if (line !== lastLine) {
     lastLine = line;
     console.error(`[prod] ${line.slice(0, 160)}`);
   }
   if (/^Done\./.test(s.status ?? "") && s.meta) {
     const text = await evalJs("document.getElementById('output')?.textContent");
-    console.log(JSON.stringify({ ok: true, meta: s.meta, text: (text ?? "").slice(0, 300) }));
+    console.log(
+      JSON.stringify({
+        ok: true,
+        live_rows_seen: liveRowsSeen,
+        meta: s.meta,
+        text: (text ?? "").slice(0, 300),
+      }),
+    );
     process.exit(0);
   }
   if (/^error:/.test(s.status ?? "")) {
