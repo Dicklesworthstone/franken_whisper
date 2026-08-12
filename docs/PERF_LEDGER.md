@@ -135,6 +135,35 @@ informal whisper-cli 1.8.6 Metal reference (1.2 s whole job) narrowed from
 still CPU, per-op buffer allocation churn, f16 activations end-to-end,
 MPS-class GEMM tiles (~2.1 of ~4–5 achievable TFLOPS), model load (~3 s).
 
+**Addendum 3 (2026-08-11): wide GEMM NEUTRAL; darwin incumbent harness built; two UNDECIDABLE competitive attempts.**
+
+1. **128×64 wide simdgroup GEMM tile (`matmul_bias_sgh_wide`) — NEUTRAL,
+   stays opt-in.** Interleaved default-vs-wide pairs at the fc shape
+   (1500×1280×5120): 11.66/14.00, 12.98/10.62, 10.60/11.06 ms — per-pair
+   ratios straddle 1.0 on this loaded host. Neutral-is-a-revert: the default
+   dispatch is unchanged; the kernel remains behind `FT_METAL_SG_WIDE=1` with
+   a bitwise-parity test (`wide_w16_kernel_matches_sgh_bitwise_or_unavailable`)
+   so a quiet-host retry is one env var, not a rebuild. Not a graveyard row:
+   the null is load-confounded, not a measured loss.
+2. **`examples/incumbent_ab_darwin.rs` (protocol darwin-incumbent-ab-v1)
+   built and exercised.** Gates: sha256 preflight vs
+   `docs/INCUMBENT_CONTRACT_DARWIN.json` (whisper-cli 1.8.6 Metal + turbo
+   model sha), thermal `pmset -g therm` CPU_Speed_Limit=100, process census
+   (>10% pcpu sustained pre AND post = veto), order-alternating interleaved
+   pairs, dual A/A nulls in [0.98,1.02], deterministic bootstrap CI95,
+   transcript word-diff conformance <10% (whisper-cli timestamp prefixes
+   stripped before normalization — first run exposed that bug; fixed and
+   re-verified word_diff = 0.0).
+3. **Two runs on this host, both `UNDECIDABLE` — the fail-closed result.**
+   Run 1 (3 pairs): census named 28 sustained competitors (incl. 12 rustc
+   jobs at 11–39% and frankenterm-gui at 96%), fw A/A null 1.056, wc A/A
+   null 0.906. Run 2 (1 pair): census veto again, nulls 0.803/1.152,
+   word_diff 0.0. Point estimates from these windows (cmp median ≈0.18,
+   i.e. fw ~5.5× slower whole-job incl. ~3 s model load) are provenance
+   only, NOT admissible ratios. **NO ADMISSIBLE RATIO (quiescence gate).**
+   The decidable competitive row still needs a quiet M-series window; the
+   harness, contract, and protocol are now one command away.
+
 ## 2026-08-11 — **NON-CAMPAIGN / INFORMATIONAL** — first darwin/arm64 stage split; the fused Metal encoder is the platform's dominant gap
 
 **No competitive claim; the host was NOT quiet** (Apple M4 Pro development
