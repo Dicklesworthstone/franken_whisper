@@ -11,7 +11,7 @@
 // downloads. The GitHub release stays as the fallback (and as the primary
 // for the Sortformer package until its Hugging Face upload lands — see
 // scripts/upload-sortformer-to-hf.sh).
-const HF_SORTFORMER = "https://huggingface.co/Dicklesworthstone/franken-whisper-sortformer/resolve/main/";
+const HF_SORTFORMER = "https://huggingface.co/eigenvalue/franken-whisper-sortformer/resolve/main/";
 const GH_SORTFORMER =
   "https://github.com/Dicklesworthstone/franken_whisper/releases/download/sortformer-v2.1-f32-v1/";
 

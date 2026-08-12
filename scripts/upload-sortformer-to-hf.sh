@@ -7,13 +7,13 @@
 #   ./scripts/upload-sortformer-to-hf.sh
 #
 # The proxy (site/functions/model/[[path]].js) already prefers
-# https://huggingface.co/Dicklesworthstone/franken-whisper-sortformer and
+# https://huggingface.co/eigenvalue/franken-whisper-sortformer and
 # falls back to the GitHub release, so it flips over automatically the
 # moment this upload lands. The site verifies sha256 pins client-side
 # regardless of which upstream served the bytes.
 set -euo pipefail
 
-REPO="${1:-Dicklesworthstone/franken-whisper-sortformer}"
+REPO="${1:-eigenvalue/franken-whisper-sortformer}"
 SRC="${FW_SF_DIR:-$HOME/.cache/franken_whisper/models/sortformer/sortformer-v2.1-f32-v1}"
 
 for f in weights.safetensors conversion-receipt.json NOTICE.sortformer.txt NVIDIA-OPEN-MODEL-LICENSE.html; do
