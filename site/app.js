@@ -59,7 +59,7 @@ const STAGE_LABELS = {
   "sortformer:weights": "building the Sortformer graph…",
   "sortformer:ready": "Sortformer ready.",
   "audio:decode": "decoding audio (Symphonia) and resampling to 16 kHz…",
-  "whisper:decode": "transcribing with large-v3-turbo on a single wasm thread (the long part)…",
+  "whisper:decode": "transcribing with large-v3-turbo (the long part)…",
   "sortformer:diarize": "diarizing (Sortformer, 80 ms frames)…",
   "fuse:project": "fusing speakers onto the transcript…",
   "threads:arming": "starting the worker pool…",
@@ -366,6 +366,14 @@ function handle(m) {
       $("progress-wrap").hidden = true;
       $("stage-line").hidden = true;
       setStatus(`error: ${m.message}`, "err");
+      // A failed model load must leave a way forward: re-enable the load
+      // button as a retry (already-verified files are skipped, a partial
+      // download resumes from its last byte).
+      if (!state.modelsReady) {
+        const btn = $("load-models");
+        btn.disabled = false;
+        btn.querySelector("span").textContent = "Retry loading models";
+      }
       maybeEnableRun();
       break;
     }

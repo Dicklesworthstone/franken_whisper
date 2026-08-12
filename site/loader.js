@@ -177,18 +177,42 @@ async function downloadVerified(dir, modelId, spec, onProgress) {
 }
 
 /** Ensure every file of `modelId` is present and verified in OPFS.
- * Returns the OPFS directory handle holding the files. */
+ * Returns the OPFS directory handle holding the files.
+ *
+ * Transient upstream failures are a certainty at 2 GB scale (a measured
+ * one-off 502 from the release host mid-pull stranded the page), so each
+ * file retries with backoff. Retries are cheap: the partial file survives in
+ * OPFS and the next attempt resumes from its last byte. A digest mismatch is
+ * NOT retried — that is a wrong-bytes signal, not a flaky network. */
 export async function ensureModel(modelId, onProgress) {
   const model = MODELS[modelId];
   if (!model) throw new Error(`unknown model: ${modelId}`);
   const dir = await opfsRoot();
   const files = [model.weights, ...model.sidecars];
+  const BACKOFF_MS = [2000, 8000, 30000];
   for (const spec of files) {
     if (await cachedFileValid(dir, spec)) {
       onProgress?.({ file: spec.name, loaded: spec.bytes, total: spec.bytes, phase: "cached" });
       continue;
     }
-    await downloadVerified(dir, modelId, spec, onProgress);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await downloadVerified(dir, modelId, spec, onProgress);
+        break;
+      } catch (err) {
+        const message = String(err?.message ?? err);
+        const transient = /HTTP (429|5\d\d)|network|fetch|load failed|will resume/i.test(message);
+        if (!transient || attempt >= BACKOFF_MS.length) throw err;
+        const wait = BACKOFF_MS[attempt];
+        onProgress?.({
+          file: spec.name,
+          loaded: 0,
+          total: spec.bytes,
+          phase: `retrying in ${Math.round(wait / 1000)}s (${message.slice(0, 80)})`,
+        });
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }
     onProgress?.({ file: spec.name, loaded: spec.bytes, total: spec.bytes, phase: "verified" });
   }
   return dir;

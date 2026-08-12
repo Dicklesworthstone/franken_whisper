@@ -29,6 +29,12 @@ const LOCAL = {
   "/local/sortformer.safetensors": join(SF_DIR, "weights.safetensors"),
   "/local/receipt.json": join(SF_DIR, "conversion-receipt.json"),
   "/local/clip.bin": CLIP,
+  // The production model proxy (functions/model/[[path]].js on Pages),
+  // mapped to the same local artifacts so the REAL page + loader + OPFS
+  // staging path runs against localhost.
+  "/model/whisper/ggml-large-v3-turbo.bin": TURBO,
+  "/model/sortformer/weights.safetensors": join(SF_DIR, "weights.safetensors"),
+  "/model/sortformer/conversion-receipt.json": join(SF_DIR, "conversion-receipt.json"),
 };
 
 const MIME = {
