@@ -86,6 +86,10 @@ mod wasm_api {
     export function fw_span(name, ms) {
         const f = globalThis.__fwSpan;
         if (f) f(name, ms);
+    }
+    export function fw_segments(json) {
+        const f = globalThis.__fwSegments;
+        if (f) f(json);
     }")]
     extern "C" {
         #[wasm_bindgen(catch)]
@@ -94,6 +98,8 @@ mod wasm_api {
         fn fw_stage(name: &str);
         /// Optional host span hook: one engine perf span (name, milliseconds).
         fn fw_span(name: &str, ms: f64);
+        /// Optional host live-transcript hook: one window's segments as JSON.
+        fn fw_segments(json: &str);
     }
 
     fn js_err(e: impl std::fmt::Display) -> JsValue {
@@ -110,6 +116,7 @@ mod wasm_api {
             fw_console_error(&info.to_string());
         }));
         crate::native_engine::plat::set_span_hook(Box::new(|span, ms| fw_span(span, ms)));
+        crate::native_engine::plat::set_segment_hook(Box::new(|json| fw_segments(json)));
     }
 
     // console.error without a web-sys dependency. Also banks the message in

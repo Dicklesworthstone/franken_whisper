@@ -25,8 +25,8 @@ pub use std::time::Instant;
 
 #[cfg(target_arch = "wasm32")]
 pub use wasm_impl::{
-    Instant, Scope, ScopedJoinHandle, available_parallelism, emit_span, scope, set_now_micros,
-    set_span_hook,
+    Instant, Scope, ScopedJoinHandle, available_parallelism, emit_partial_segments, emit_span,
+    scope, set_now_micros, set_segment_hook, set_span_hook,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -282,6 +282,30 @@ mod wasm_impl {
             .as_ref()
         {
             hook(span, ms);
+        }
+    }
+
+    /// Host partial-transcript hook: the decode loop feeds each finished
+    /// window's segments (as JSON) to the page while the run is still going,
+    /// so the transcript renders live instead of appearing all at once.
+    static SEGMENT_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>> =
+        std::sync::Mutex::new(None);
+
+    /// Register the host partial-transcript hook (replaces any previous).
+    pub fn set_segment_hook(hook: Box<dyn Fn(&str) + Send + Sync>) {
+        *SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Forward one window's segments (JSON array) to the registered hook.
+    pub fn emit_partial_segments(json: &str) {
+        if let Some(hook) = SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(json);
         }
     }
 }

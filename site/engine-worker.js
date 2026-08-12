@@ -64,6 +64,16 @@ globalThis.__fwModelReadAt = (offset, len) => {
 // "sortformer:diarize") — relayed so the page can narrate long operations.
 globalThis.__fwStage = (name) => post("stage", { stage: name });
 
+// Live transcript: each finished 30-second window's segments stream to the
+// page as they land, so words appear while the run is still going.
+globalThis.__fwSegments = (json) => {
+  try {
+    post("partial-segments", { segments: JSON.parse(json) });
+  } catch {
+    /* a malformed partial is display-only; the final result is authoritative */
+  }
+};
+
 // Engine perf spans double as the progress heartbeat: "encoder_window" fires
 // once per 30-second window (the page counts them against the window total),
 // "sortformer_tick" is the diarizer's throttled liveness signal. Forward the
