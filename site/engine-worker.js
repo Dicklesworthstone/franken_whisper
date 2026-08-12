@@ -90,11 +90,16 @@ async function loadWhisper() {
   const dir = await ensureWithProgress("whisper");
   const file = await dir.getFileHandle(manifest.MODELS.whisper.weights.name);
   whisperHandle = await file.createSyncAccessHandle();
-  feedClock();
-  const info = JSON.parse(wasm.load_whisper_streamed(manifest.MODELS.whisper.weights.bytes));
-  // Tensors are hydrated (f16-resident); the sync handle is no longer needed.
-  whisperHandle.close();
-  whisperHandle = null;
+  let info;
+  try {
+    feedClock();
+    info = JSON.parse(wasm.load_whisper_streamed(manifest.MODELS.whisper.weights.bytes));
+  } finally {
+    // Close on BOTH paths: a leaked sync handle makes every retry fail with
+    // "access handle already open" until the worker restarts.
+    whisperHandle.close();
+    whisperHandle = null;
+  }
   whisperReady = true;
   post("whisper-ready", { info });
 }
