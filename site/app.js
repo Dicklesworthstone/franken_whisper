@@ -152,8 +152,57 @@ function beginRun(audioSec) {
     windowSecs: [],
     sortStartedAt: null,
   };
+  // The live panel takes over the transcript column (feedback belongs where
+  // the result will land, next to the button that started it — not in the
+  // model-download area at the top of the page).
+  $("result-placeholder").hidden = true;
+  $("result-wrap").hidden = true;
+  const live = $("live-transcript");
+  live.textContent = "";
+  live.hidden = false;
+  appendListeningCue();
+  $("run-panel").hidden = false;
+  $("run-panel").scrollIntoView({ behavior: "smooth", block: "nearest" });
   updateRunProgress();
 }
+
+// The pulsing cue at the bottom of the live stream: proof of life between
+// windows, replaced each time real words arrive.
+function appendListeningCue() {
+  const cue = document.createElement("div");
+  cue.className = "seg";
+  cue.id = "live-cue";
+  const span = document.createElement("span");
+  span.className = "listening";
+  span.textContent = "decoding";
+  cue.appendChild(span);
+  $("live-transcript").appendChild(cue);
+}
+
+function appendLiveSegments(segments) {
+  const live = $("live-transcript");
+  if (live.hidden) return;
+  document.getElementById("live-cue")?.remove();
+  for (const seg of segments) {
+    const row = document.createElement("div");
+    row.className = "seg";
+    const t = document.createElement("span");
+    t.className = "t";
+    t.textContent = `${fmtTime(seg.start_sec)}–${fmtTime(seg.end_sec)}`;
+    const txt = document.createElement("span");
+    txt.textContent = seg.text;
+    row.append(t, txt);
+    live.appendChild(row);
+  }
+  appendListeningCue();
+  live.scrollTop = live.scrollHeight;
+}
+
+const PHASE_LABELS = {
+  whisper: "Transcribing with large-v3-turbo",
+  sortformer: "Identifying the speakers (Sortformer)",
+  fuse: "Attributing lines to speakers",
+};
 
 function runEstimates(run) {
   const now = performance.now();
@@ -185,22 +234,30 @@ function updateRunProgress() {
   if (!run) return;
   const { elapsed, remaining } = runEstimates(run);
   const pct = Math.min(99, Math.floor((elapsed / Math.max(1e-6, elapsed + remaining)) * 100));
-  $("progress-wrap").hidden = false;
-  $("progress-bar").style.width = `${pct}%`;
-  let detail;
+  $("run-pct").textContent = `${pct}%`;
+  $("run-bar-fill").style.width = `${pct}%`;
+  $("run-stage").textContent = PHASE_LABELS[run.phase] ?? run.phase;
+  let timing;
+  let short;
   if (run.phase === "whisper") {
     const inWindow = Math.min(run.windowsDone + 1, run.windowsTotal);
-    const basis = run.windowSecs.length > 0 ? "measured on this run" : "estimated from calibration";
-    detail =
-      `transcribing window ${inWindow} of ${run.windowsTotal} · ` +
-      `elapsed ${fmtDur(elapsed)} · about ${fmtDur(remaining)} remaining (${basis})`;
+    const basis = run.windowSecs.length > 0 ? "measured on this run" : "first estimate";
+    timing =
+      `window ${inWindow} of ${run.windowsTotal} · elapsed ${fmtDur(elapsed)} · ` +
+      `about ${fmtDur(remaining)} remaining (${basis})`;
+    short = `${pct}% · window ${inWindow}/${run.windowsTotal} · ~${fmtDur(remaining)} left`;
   } else if (run.phase === "sortformer") {
-    detail = `diarizing (Sortformer) · elapsed ${fmtDur(elapsed)} · about ${fmtDur(remaining)} remaining`;
+    timing = `elapsed ${fmtDur(elapsed)} · about ${fmtDur(remaining)} remaining`;
+    short = `${pct}% · diarizing · ~${fmtDur(remaining)} left`;
   } else {
-    detail = `fusing speakers onto the transcript · elapsed ${fmtDur(elapsed)}`;
+    timing = `elapsed ${fmtDur(elapsed)}`;
+    short = `${pct}% · finishing`;
   }
-  $("progress-text").textContent = `${pct}% · ${detail}`;
-  $("stage-line").hidden = true;
+  $("run-timing").textContent = timing;
+  // Compact echo directly under the Run button, so the click gets feedback
+  // exactly where it happened.
+  $("stage-line").hidden = false;
+  $("stage-line").textContent = short;
 }
 
 // Refresh the countdown once a second even when no engine event arrives.
@@ -284,6 +341,8 @@ function handle(m) {
         if (m.stage === "sortformer:diarize") {
           state.run.phase = "sortformer";
           state.run.sortStartedAt = performance.now();
+          const cue = document.querySelector("#live-cue .listening");
+          if (cue) cue.textContent = "identifying speakers";
         } else if (m.stage === "fuse:project") {
           state.run.sortEndedAt = performance.now();
           state.run.phase = "fuse";
@@ -301,6 +360,10 @@ function handle(m) {
         `decoded ${fmtDur(m.audio_sec)} of audio; transcription starts now ` +
           `(${state.run.windowsTotal} window${state.run.windowsTotal === 1 ? "" : "s"} of up to 30 s each)`,
       );
+      break;
+    }
+    case "partial-segments": {
+      appendLiveSegments(m.segments ?? []);
       break;
     }
     case "span": {
@@ -346,6 +409,7 @@ function handle(m) {
       state.nameMap = buildSpeakerNameMap(m.result, parseSpeakerNames($("speaker-names").value));
       finishRunCalibration();
       state.run = null;
+      $("run-panel").hidden = true;
       $("progress-wrap").hidden = true;
       $("stage-line").hidden = true;
       renderResult();
@@ -363,6 +427,7 @@ function handle(m) {
     case "error": {
       state.busy = false;
       state.run = null;
+      $("run-panel").hidden = true;
       $("progress-wrap").hidden = true;
       $("stage-line").hidden = true;
       setStatus(`error: ${m.message}`, "err");
