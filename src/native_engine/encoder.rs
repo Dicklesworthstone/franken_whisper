@@ -1139,7 +1139,7 @@ fn forward_time_major(
     macro_rules! et {
         ($i:expr, $b:expr) => {{
             if measure {
-                let __t = std::time::Instant::now();
+                let __t = crate::native_engine::plat::Instant::now();
                 let __r = $b;
                 enc_prof_add($i, __t.elapsed().as_nanos());
                 __r
@@ -2056,7 +2056,7 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
     macro_rules! et {
         ($i:expr, $b:expr) => {{
             if measure {
-                let __t = std::time::Instant::now();
+                let __t = crate::native_engine::plat::Instant::now();
                 let __r = $b;
                 enc_prof_add($i, __t.elapsed().as_nanos());
                 __r

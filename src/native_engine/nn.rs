@@ -83,7 +83,7 @@ fn avail_parallelism() -> usize {
     use std::sync::OnceLock;
     static A: OnceLock<usize> = OnceLock::new();
     *A.get_or_init(|| {
-        std::thread::available_parallelism()
+        crate::native_engine::plat::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1)
     })
@@ -290,7 +290,7 @@ fn gemv_f16_batch_rows(
     use_fused: bool,
 ) {
     let row_band = tq.div_ceil(workers).max(1);
-    std::thread::scope(|s| {
+    crate::native_engine::plat::scope(|s| {
         let mut t0 = 0;
         let mut remaining = out_slice;
         while t0 < tq {
@@ -3020,7 +3020,7 @@ pub fn gemv_i8_batch(w: &I8Mat, x: &[f32], tq: usize, bias: Option<&[f32]>, out_
     // Each worker fills a private [tq, out] buffer for its band, then disjoint-merge
     // (each column written by exactly one worker → `0.0 + x == x`), same as gemv_f16_batch.
     let band = out.div_ceil(workers).max(1);
-    let parts: Vec<(usize, usize, Vec<f32>)> = std::thread::scope(|s| {
+    let parts: Vec<(usize, usize, Vec<f32>)> = crate::native_engine::plat::scope(|s| {
         let compute_band = &compute_band;
         let mut handles = Vec::new();
         let mut o0 = 0;
@@ -3896,7 +3896,7 @@ pub fn gemv_f16_batch(
     // [tq, out] buffer (writing only its band), then we disjoint-merge them
     // (every column written by exactly one worker → `0.0 + x == x` exactly).
     let band = out.div_ceil(workers).max(1);
-    let parts: Vec<(usize, usize, Vec<f32>)> = std::thread::scope(|s| {
+    let parts: Vec<(usize, usize, Vec<f32>)> = crate::native_engine::plat::scope(|s| {
         let compute_band = &compute_band;
         let mut handles = Vec::new();
         let mut o0 = 0;
@@ -4567,7 +4567,7 @@ pub fn softmax_rows(x: &mut Mat) {
         return;
     }
     let band_rows = rows.div_ceil(worker_count()).max(1);
-    std::thread::scope(|s| {
+    crate::native_engine::plat::scope(|s| {
         let softmax_row = &softmax_row;
         for band in x.data.chunks_mut(band_rows * cols) {
             s.spawn(move || {
@@ -4717,7 +4717,7 @@ pub fn conv1d_wt(
         }
     } else {
         let band_rows = t_out.div_ceil(worker_count()).max(1);
-        std::thread::scope(|s| {
+        crate::native_engine::plat::scope(|s| {
             let fill_row = &fill_row;
             for (wi, band) in cols.chunks_mut(band_rows * patch).enumerate() {
                 let o_base = wi * band_rows;
@@ -5674,7 +5674,7 @@ fn attention_raw(
         macro_rules! st {
             ($i:expr, $b:expr) => {{
                 if split {
-                    let __t = std::time::Instant::now();
+                    let __t = crate::native_engine::plat::Instant::now();
                     let __r = $b;
                     sdpa_split_add($i, __t.elapsed().as_nanos());
                     __r
@@ -5729,7 +5729,7 @@ fn attention_raw(
 
     let workers = worker_count().min(n_head);
     let band = n_head.div_ceil(workers);
-    let results: Vec<FwResult<Vec<f32>>> = std::thread::scope(|s| {
+    let results: Vec<FwResult<Vec<f32>>> = crate::native_engine::plat::scope(|s| {
         let compute_head = &compute_head;
         let scatter = &scatter;
         let mut handles = Vec::with_capacity(workers);
@@ -6102,7 +6102,7 @@ pub(crate) fn transpose_parallel(data: &[f32], rows: usize, cols: usize) -> Vec<
     // Parallel split: each worker owns a contiguous band of OUTPUT rows
     // (= source columns c in [c0, c1)), so output slices are disjoint.
     let band = cols.div_ceil(workers);
-    std::thread::scope(|s| {
+    crate::native_engine::plat::scope(|s| {
         for (w, out_band) in out.chunks_mut(band * rows).enumerate() {
             let c_start = w * band;
             s.spawn(move || {
@@ -6586,7 +6586,7 @@ mod tests {
     #[test]
     #[ignore = "perf microbench, not a correctness gate"]
     fn quantize_row_i7_u8_perf() {
-        use std::time::Instant;
+        use crate::native_engine::plat::Instant;
         let cols = 1280usize; // turbo n_state (QKV + fc1 input row width)
         let rows = 1500usize; // n_ctx
         let mut s = 0x2545_F491_4F6C_DD1Du64;
@@ -6696,8 +6696,8 @@ mod tests {
     #[test]
     #[ignore = "perf microbench, not a correctness gate"]
     fn quantize_f16_row_to_i8_perf() {
+        use crate::native_engine::plat::Instant;
         use std::hint::black_box;
-        use std::time::Instant;
         let (rows, cols) = (1280usize, 1280usize); // decoder attn projection [out,in]
         let mut s = 0x14D4_9C2A_7B01_55F1u64;
         let mut nf = || {
@@ -6810,8 +6810,8 @@ mod tests {
     #[test]
     #[ignore = "perf microbench, not a correctness gate"]
     fn quantize_f16_row_blocked_perf() {
+        use crate::native_engine::plat::Instant;
         use std::hint::black_box;
-        use std::time::Instant;
         let (rows, cols, block) = (1280usize, 5120usize, 32usize); // decoder fc2 [out,in]
         let mut s = 0x6C62_272E_07BB_0142u64;
         let mut nf = || {

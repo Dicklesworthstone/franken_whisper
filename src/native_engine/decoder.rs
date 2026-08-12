@@ -999,7 +999,7 @@ impl DecoderState {
         } else {
             let workers = workers.min(n_layer);
             let band = n_layer.div_ceil(workers).max(1);
-            let bands: Vec<CrossKvBand> = std::thread::scope(|s| {
+            let bands: Vec<CrossKvBand> = crate::native_engine::plat::scope(|s| {
                 let compute_layer = &compute_layer;
                 let mut handles = Vec::new();
                 let mut l0 = 0;
@@ -1686,7 +1686,7 @@ pub fn forward_step_hidden(
     macro_rules! timed {
         ($sub:expr, $body:expr) => {{
             if measure {
-                let __t = std::time::Instant::now();
+                let __t = crate::native_engine::plat::Instant::now();
                 let __r = $body;
                 sub_add($sub, __t.elapsed().as_nanos());
                 __r
@@ -1964,7 +1964,7 @@ pub fn forward_step(
     // Logits timing (measurement-only; `timed!` is local to `forward_step_hidden`,
     // so inline the same span here). Default-off ⇒ a direct `logits_last` call.
     let logits = if super::perf_spans_enabled() {
-        let t = std::time::Instant::now();
+        let t = crate::native_engine::plat::Instant::now();
         let r = logits_last(w, &x_last)?;
         sub_add(Sub::Logits, t.elapsed().as_nanos());
         r
@@ -2044,7 +2044,7 @@ pub fn logits_last(w: &DecoderWeights, x_last: &Mat) -> FwResult<Vec<f32>> {
 
     let band = n_vocab.div_ceil(workers).max(1);
     let emb = &emb_mat.data; // [n_vocab, n_state], row-major
-    let bands: Vec<FwResult<(usize, Vec<f32>)>> = std::thread::scope(|s| {
+    let bands: Vec<FwResult<(usize, Vec<f32>)>> = crate::native_engine::plat::scope(|s| {
         let mut handles = Vec::new();
         let mut r0 = 0;
         while r0 < n_vocab {
@@ -2250,7 +2250,7 @@ fn project_qkv(
     // Fallback (f32 path / fusion disabled): k and v on spawned threads while q
     // computes here, so all three run concurrently. Kept for the f32 path and as
     // the `FW_NO_QKV_FUSE` escape hatch.
-    std::thread::scope(|s| {
+    crate::native_engine::plat::scope(|s| {
         let kh = s.spawn(move || {
             if cohort {
                 k_lin.forward_cohort(h)
@@ -2504,7 +2504,7 @@ mod tests {
     #[test]
     #[ignore = "perf microbench, not a correctness gate"]
     fn logits_all_amortization_perf() {
-        use std::time::Instant;
+        use crate::native_engine::plat::Instant;
         let (n_vocab, n_state, k) = (51865usize, 1280usize, 8usize); // turbo vocab, K=8 verify batch
         let mut rng = Lcg::new(0x1061_75BE);
         let emb: Vec<Float16> = (0..n_vocab * n_state)

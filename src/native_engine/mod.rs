@@ -36,6 +36,7 @@ pub mod encoder;
 pub mod ggml;
 pub mod mel;
 pub mod nn;
+pub mod plat;
 pub mod tokenizer;
 pub mod weights;
 
@@ -979,9 +980,10 @@ pub(crate) fn int8_attn_out_enabled() -> bool {
 /// Emit one measurement-only span line (see [`perf_spans_enabled`]).
 pub(crate) fn perf_span(span: &str, ms: f64, extra: &str) {
     if perf_spans_enabled() {
-        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static T0: std::sync::OnceLock<crate::native_engine::plat::Instant> =
+            std::sync::OnceLock::new();
         let at_ms = T0
-            .get_or_init(std::time::Instant::now)
+            .get_or_init(crate::native_engine::plat::Instant::now)
             .elapsed()
             .as_secs_f64()
             * 1e3;
@@ -1342,7 +1344,7 @@ pub(crate) fn host_parallelism() -> usize {
     use std::sync::OnceLock;
     static P: OnceLock<usize> = OnceLock::new();
     *P.get_or_init(|| {
-        std::thread::available_parallelism()
+        crate::native_engine::plat::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1)
     })
@@ -1565,10 +1567,10 @@ impl NativeWhisperModel {
     /// plain (non-deduped) path.
     fn do_parse_and_publish(canonical: PathBuf, keep_resident: bool) -> FwResult<Arc<Self>> {
         // Parse outside the lock so a slow load doesn't block other paths.
-        let t_parse = std::time::Instant::now();
+        let t_parse = crate::native_engine::plat::Instant::now();
         let ggml = ggml::GgmlModel::load(&canonical)?;
         perf_span("model_parse", t_parse.elapsed().as_secs_f64() * 1e3, "");
-        let t_weights = std::time::Instant::now();
+        let t_weights = crate::native_engine::plat::Instant::now();
         let inner = decode::LoadedModel::from_ggml(ggml)?;
         perf_span("model_weights", t_weights.elapsed().as_secs_f64() * 1e3, "");
         let model = Arc::new(Self {
@@ -2308,10 +2310,11 @@ mod tests {
         // `version_tag()` returned to us (it still has to return from its own
         // call and unwind). Poll with a deadline for the last strong ref to
         // drop so the `Weak` expires before we assert the reload is fresh.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            crate::native_engine::plat::Instant::now() + std::time::Duration::from_secs(5);
         while weak.upgrade().is_some() {
             assert!(
-                std::time::Instant::now() < deadline,
+                crate::native_engine::plat::Instant::now() < deadline,
                 "all strong refs dropped => Weak must expire (memory freed) within 5s"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));

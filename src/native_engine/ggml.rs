@@ -648,6 +648,17 @@ impl GgmlModel {
         Self::parse(blob)
     }
 
+    /// Parse a ggml model already in memory (bd-m2jm: the wasm/browser entry,
+    /// where weights arrive as bytes from OPFS/fetch instead of a file path).
+    /// Identical validation to [`Self::load`] — same parser, same errors.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::load`], minus the I/O class.
+    pub fn from_bytes(blob: Vec<u8>) -> FwResult<Self> {
+        Self::parse(blob)
+    }
+
     /// Parse an in-memory ggml blob (used by [`Self::load`] and tests).
     fn parse(blob: Vec<u8>) -> FwResult<Self> {
         let mut cur = Cursor::new(&blob);
@@ -1342,7 +1353,7 @@ pub fn read_blob_parallel(path: &Path) -> std::io::Result<Vec<u8>> {
     let band = len.div_ceil(workers);
     let file_ref = &file;
     let mut first_err: Option<std::io::Error> = None;
-    std::thread::scope(|s| {
+    crate::native_engine::plat::scope(|s| {
         let handles: Vec<_> = blob
             .chunks_mut(band)
             .enumerate()
@@ -1419,7 +1430,7 @@ fn dequant_f16_to_halves_parallel(raw: &[u8], n_elements: usize) -> Vec<Float16>
         return values;
     }
     let chunk = n_elements.div_ceil(workers);
-    std::thread::scope(|s| {
+    crate::native_engine::plat::scope(|s| {
         for (bytes, out) in raw.chunks(chunk * 2).zip(values.chunks_mut(chunk)) {
             s.spawn(move || serial(bytes, out));
         }
@@ -1451,7 +1462,7 @@ fn dequant_f16_parallel(raw: &[u8], n_elements: usize) -> Vec<f32> {
         return values;
     }
     let chunk = n_elements.div_ceil(workers);
-    std::thread::scope(|s| {
+    crate::native_engine::plat::scope(|s| {
         for (bytes, out) in raw.chunks(chunk * 2).zip(values.chunks_mut(chunk)) {
             s.spawn(move || serial(bytes, out));
         }

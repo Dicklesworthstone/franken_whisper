@@ -156,7 +156,13 @@ impl LoadedModel {
                 || DecoderWeights::from_ggml(&model),
             )
         };
-        let (encoder, decoder) = match super::load_worker_cap() {
+        // wasm32: a dedicated pool cannot spawn OS threads (`build()` fails at
+        // runtime), and rayon's wasm fallback already runs the ambient `join`
+        // inline, so the cap is meaningless there — always take the uncapped
+        // path. `cfg!` keeps both arms type-checked on every target.
+        let (encoder, decoder) = match super::load_worker_cap()
+            .filter(|_| cfg!(not(target_arch = "wasm32")))
+        {
             Some(cap) => rayon::ThreadPoolBuilder::new()
                 .num_threads(cap)
                 .build()
@@ -2033,7 +2039,7 @@ fn decode_independent_no_timestamp_window(
     };
     let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
 
-    let t_enc = std::time::Instant::now();
+    let t_enc = crate::native_engine::plat::Instant::now();
     let enc = encoder::forward_from_full_mel_window(
         &m.encoder,
         full_mel,
@@ -2045,14 +2051,14 @@ fn decode_independent_no_timestamp_window(
     work.encoder_calls = 1;
     super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
 
-    let t_xkv = std::time::Instant::now();
+    let t_xkv = crate::native_engine::plat::Instant::now();
     let mut st = DecoderState::new(&m.decoder, &enc)?;
     super::perf_span("cross_kv", t_xkv.elapsed().as_secs_f64() * 1e3, "");
 
     // This fast path is admitted only when cross-window prompt carry is
     // disabled, so the prompt is exactly the per-window SOT sequence.
     let prompt = tk.sot_sequence(Some(language), params.translate, false);
-    let t_prefill = std::time::Instant::now();
+    let t_prefill = crate::native_engine::plat::Instant::now();
     let prefill_logits = decoder::forward_step(&m.decoder, &mut st, &prompt, checkpoint)?;
     work.decoder_prefill_calls = 1;
     work.decoder_prefill_tokens = prompt.len();
@@ -2072,7 +2078,7 @@ fn decode_independent_no_timestamp_window(
             })
     };
 
-    let t_loop = std::time::Instant::now();
+    let t_loop = crate::native_engine::plat::Instant::now();
     let (decoded, plogs, seek_delta_cs, result_len) = if beam > 1 {
         // Beam search for this window. This is the SAME `beam_decode_window` the
         // sequential path calls, seeded from this window's own `st` / prefill
@@ -2276,7 +2282,7 @@ fn decode_independent_no_timestamp_windows(
     let results: Mutex<Vec<IndependentWindowResult>> =
         Mutex::new(Vec::with_capacity(offsets.len()));
 
-    std::thread::scope(|scope| {
+    crate::native_engine::plat::scope(|scope| {
         for _ in 0..lanes.min(offsets.len()) {
             scope.spawn(|| {
                 loop {
@@ -2439,7 +2445,7 @@ fn transcribe_samples_uncached(
     // regresses on this Zen box), so decouple it from the decode's `n_threads` hint.
     // `FW_MEL_THREADS` (inside `log_mel`) overrides.
     let mel_threads = super::host_parallelism().min(16);
-    let t_mel = std::time::Instant::now();
+    let t_mel = crate::native_engine::plat::Instant::now();
     let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
     super::perf_span("mel", t_mel.elapsed().as_secs_f64() * 1e3, "");
 
@@ -2633,7 +2639,7 @@ fn transcribe_samples_uncached(
     // `pipeline_windows_enabled`.
     let pipeline = pipeline_windows_enabled() && cfg.no_timestamps;
     let enc_n_threads = params.n_threads;
-    let pipe_result: FwResult<()> = std::thread::scope(|scope| {
+    let pipe_result: FwResult<()> = crate::native_engine::plat::scope(|scope| {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<(usize, usize)>();
         let (res_tx, res_rx) = std::sync::mpsc::channel::<FwResult<super::Mat>>();
         let _enc_worker = if pipeline {
@@ -2713,7 +2719,7 @@ fn transcribe_samples_uncached(
                     "tail-window encoder-context truncation engaged"
                 );
             }
-            let t_enc = std::time::Instant::now();
+            let t_enc = crate::native_engine::plat::Instant::now();
             // Reuse the encode from THIS seek's failed first attempt on a
             // FW_RETRY_FAILED_WINDOW retry — same audio/window ⇒ byte-identical enc, so
             // the retry skips a full re-encode. Only hit when the flag is on and a retry
@@ -2780,7 +2786,7 @@ fn transcribe_samples_uncached(
                 }
             }
             super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
-            let t_xkv = std::time::Instant::now();
+            let t_xkv = crate::native_engine::plat::Instant::now();
             let mut st = DecoderState::new(&m.decoder, &enc)?;
             super::perf_span("cross_kv", t_xkv.elapsed().as_secs_f64() * 1e3, "");
 
@@ -2825,7 +2831,7 @@ fn transcribe_samples_uncached(
 
             // Prefill the prompt; the first forward's softmax gives no_speech_prob
             // (whisper.cpp 7165-7182). Compute it BEFORE filtering.
-            let t_prefill = std::time::Instant::now();
+            let t_prefill = crate::native_engine::plat::Instant::now();
             let prefill_logits = decoder::forward_step(&m.decoder, &mut st, &prompt, checkpoint)?;
             work.decoder_prefill_calls += 1;
             work.decoder_prefill_tokens += prompt.len();
@@ -2851,7 +2857,7 @@ fn transcribe_samples_uncached(
             // temperature-0 pass; the `t > 0` fallback rungs (`window_temp > 0`)
             // stay on the greedy sampling path. `beam_size() == 1` (default) ⇒ the
             // greedy branch always runs ⇒ byte-identical to the pre-beam engine.
-            let t_loop = std::time::Instant::now();
+            let t_loop = crate::native_engine::plat::Instant::now();
             let (decoded, plogs, _has_ts, seek_delta_cs, result_len) = if effective_beam_size > 1
                 && window_temp == 0.0
             {
@@ -3226,7 +3232,7 @@ fn transcribe_samples_uncached(
                     // Span coverage for the word-timestamp stage (bd-vsg6): DTW
                     // was the one production stage with no `perf_span`, so its
                     // share of wall time was never attributable.
-                    let t_word_ts = std::time::Instant::now();
+                    let t_word_ts = crate::native_engine::plat::Instant::now();
                     let win_words = if align_heads.is_empty() {
                         vec![Vec::new(); win_segments.len()]
                     } else {
@@ -5126,7 +5132,7 @@ mod tests {
     /// foreground micro-bench (~4 M samples, both paths timed back-to-back).
     #[test]
     fn read_wav_mono_fast_path_byte_exact_and_faster() {
-        use std::time::Instant;
+        use crate::native_engine::plat::Instant;
         let n = 4_000_000usize; // ~4.2 min of 16 kHz audio; cycles the full i16 range 61×.
         let mut data = vec![0u8; n * 2];
         let (samples, remainder) = data.as_chunks_mut::<2>();
@@ -6122,7 +6128,7 @@ mod tests {
             return;
         };
         let params = e2e_params();
-        let t = std::time::Instant::now();
+        let t = crate::native_engine::plat::Instant::now();
         let out = transcribe_samples(&model, &samples, &params, &noop).expect("transcribe");
         let elapsed = t.elapsed();
         eprintln!(
@@ -6478,7 +6484,7 @@ mod tests {
         // only the full suite's heavy sibling mix triggers the flake.
         let sibling_mel = mel::log_mel(&samples, &model.filters, mel_threads).unwrap();
         let model_path = super::super::find_model_file("tiny.en");
-        std::thread::scope(|scope| {
+        crate::native_engine::plat::scope(|scope| {
             for _ in 0..2 {
                 let stopr = &stop;
                 let modelr = &model;

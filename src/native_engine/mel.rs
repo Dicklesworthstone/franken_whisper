@@ -1511,7 +1511,7 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
     // and deterministic, so the result is identical for any thread count.
     let frames_per_thread = n_frames.div_ceil(n_threads);
 
-    let columns: Vec<(usize, usize, Vec<f32>)> = std::thread::scope(|scope| {
+    let columns: Vec<(usize, usize, Vec<f32>)> = crate::native_engine::plat::scope(|scope| {
         let mut handles = Vec::with_capacity(n_threads);
         for t in 0..n_threads {
             let start = t * frames_per_thread;
