@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "Darwin (Apple Silicon) incumbent pin for future vs-incumbent Metal claims.",
+    "The x86 contract (INCUMBENT_CONTRACT.json) pins a vendored CPU build;",
+    "on macOS the honest incumbent is whisper.cpp's Metal path, which is the",
+    "deployment users actually compare against. No competitive ratio has been",
+    "published against this pin yet: the 2026-08-11 ledger rows using this",
+    "binary are explicitly NON-CAMPAIGN scale references taken on a loaded",
+    "multi-agent host. A decidable row additionally requires a quiet M-series",
+    "host (the same per-CPU quiescence discipline as the x86 harness) and an",
+    "A/A-nulled, order-alternating harness on darwin — examples/incumbent_ab.rs",
+    "is Linux-only today (procfs/sysfs quiescence gates), so a darwin harness",
+    "port is a prerequisite and is tracked on bd-453z.",
+    "Updating this incumbent is legal; updating it silently is not: bump the",
+    "digests here in the same commit."
+  ],
+  "incumbent": {
+    "project": "whisper.cpp",
+    "version": "1.8.6",
+    "cli": "whisper-cli",
+    "distribution": "homebrew whisper-cpp 1.8.6 (bottle, arm64)",
+    "default_path": "/opt/homebrew/bin/whisper-cli",
+    "binary_sha256": "56b37e5e2b369054af35883c5d728964304b48cb9592a0664a8d0b7c5972c3c5",
+    "binary_recorded": "2026-08-12",
+    "backend": {
+      "metal": true,
+      "blas": "ggml BLAS backend from /opt/homebrew/Cellar/ggml/0.13.1",
+      "_comment": [
+        "Metal-enabled: this is the incumbent at its strongest on Apple",
+        "Silicon. ggml_metal_device_init reports tensor API disabled for",
+        "pre-M5 devices on the recording host (M4 Pro)."
+      ]
+    },
+    "matched_decode_invocation": [
+      "whisper-cli -m <ggml-large-v3-turbo.bin> -f <clip.wav> -bs 1 -bo 1",
+      "_comment: matched greedy (-bs 1 -bo 1) per the measurement contract;",
+      "state decode parameters explicitly on every row."
+    ],
+    "model_sha256": {
+      "ggml-large-v3-turbo.bin": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+    }
+  },
+  "host": {
+    "recorded_on": "Apple M4 Pro (darwin/arm64), macOS (Darwin 25.x)",
+    "_comment": [
+      "Recording host only. Ratios published against this pin must name their",
+      "own host and carry the full quiescence + A/A packet."
+    ]
+  }
+}

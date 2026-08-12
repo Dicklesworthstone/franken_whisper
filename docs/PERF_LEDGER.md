@@ -84,6 +84,34 @@ transcript byte-identical to the pure-CPU path (`FRANKEN_WHISPER_GPU=0`) on
 this clip. ft-kernel-metal parity suite (16 tests incl. per-op CPU refs and
 whole-layer 2e-2 check) green; fmt+clippy clean.
 
+**Addendum 2 (2026-08-12):** three more levers, all e2e transcript-identical
+to the pure-CPU path on jfk turbo, all in ft-kernel-metal (`c5d2ede1`):
+
+1. **GPU conv stem** (`gpu_encode_full`, route `gpu_fused_stem`): im2col
+   kernel replicating `nn::conv1d_wt`'s exact `ci*k+kk` gather + f16 conv
+   weights + pos_emb add, so a window runs GPU-resident from the mel to
+   `ln_post`. Kill switch `FW_GPU_STEM=0`. Interleaved stem-vs-nostem pairs
+   sit inside host noise (the CPU stem was ~100-200 ms), but the mel upload
+   is 10x smaller than the post-conv upload and the CPU stem work is gone.
+2. **Half-precision flash K/V tiles + FBK 64** (whisper.cpp's Metal flash
+   precision): tile memory halves, barrier pairs halve; isolated mha row
+   12.7 -> 9.9 ms. This rounds K/V activations to f16 inside attention —
+   a real numerics change, admitted on e2e transcript equality (both routes
+   byte-identical transcripts on jfk turbo) under the GPU path's existing
+   tolerance-class contract.
+3. **Evaluated, not built:** a per-op GPU buffer pool (~2000 small
+   allocations/window, estimated tens of ms) is below this host's noise
+   floor; retry with profiler evidence on a quiet host. Model-load audit
+   found NO wasted work on aarch64 (int8 tables correctly skipped, dequant
+   already rayon-parallel; the 2954 ms is contention vs the quiet-x86
+   745 ms reference).
+
+`encoder_window` measured 1848/1862/1867 ms across three consecutive runs
+in this window (from 15,413 ms at the first-ever aarch64 measurement).
+`docs/INCUMBENT_CONTRACT_DARWIN.json` now pins homebrew whisper-cli 1.8.6
+(Metal, sha `56b37e5e…`) so a quiet M-series window can produce a decidable
+competitive row; the darwin quiescence harness port remains open on bd-453z.
+
 **Addendum (later 2026-08-11):** two more levers on the same axis. (a)
 **GPU-resident f16 weights** (frankentorch `e0a61c25`): the six projection
 weights upload once as f16 — bit-identical to the per-tile conversion the

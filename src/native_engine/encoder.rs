@@ -1148,6 +1148,17 @@ fn forward_time_major(
             }
         }};
     }
+    // Full-GPU path (Apple Silicon, large models): conv stem + pos_emb +
+    // transformer stack all resident on the GPU; only ln_post stays on CPU.
+    // Falls through to the CPU stem (and the post-conv GPU stack attempt)
+    // when unavailable. `FW_GPU_STEM=0` disables just this entry.
+    #[cfg(target_os = "macos")]
+    if let Some(mut gx) = gpu_encode_full(&x, w) {
+        checkpoint()?;
+        nn::layer_norm(&mut gx, &w.ln_post_w, &w.ln_post_b, LN_EPS);
+        return Ok(gx);
+    }
+
     // conv1: [3000, n_mel] -> [3000, n_state], +gelu.
     let x = et!(0, {
         let mut x = nn::conv1d_wt(&x, &w.conv1_wt, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD)?;
@@ -1317,86 +1328,8 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
         return false;
     }
 
-    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<ft_kernel_metal::fused::EncoderGpu>>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    // Identify the model by a cheap content fingerprint (shape + a few weight
-    // samples), NOT by `w`'s address: this static cache outlives the borrowed
-    // `EncoderWeights`, so a dropped model replaced by a DIFFERENT model reusing the
-    // same address would otherwise alias a stale resident encoder. The fingerprint
-    // also lets the same model loaded twice share one upload.
-    let key: u64 = {
-        fn mix(h: u64, v: u64) -> u64 {
-            (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
-        }
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        h = mix(h, w.n_state as u64);
-        h = mix(h, w.n_head as u64);
-        h = mix(h, w.layers.len() as u64);
-        for l in [w.layers.first(), w.layers.last()].into_iter().flatten() {
-            for s in [
-                l.attn_q_w.data.first(),
-                l.attn_q_w.data.last(),
-                l.mlp_fc_w.data.first(),
-                l.mlp_proj_w.data.last(),
-                l.attn_ln_w.first(),
-                l.attn_ln_w.last(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                h = mix(h, u64::from(s.to_bits()));
-            }
-        }
-        h
-    };
-
-    let enc = {
-        let mut guard = match cache.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                record_encoder_route("cpu:gpu_cache_poisoned");
-                return false;
-            }
-        };
-        match guard.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let refs: Vec<ft_kernel_metal::fused::LayerWeightsRef> = w
-                    .layers
-                    .iter()
-                    .map(|l| ft_kernel_metal::fused::LayerWeightsRef {
-                        ln1_g: &l.attn_ln_w,
-                        ln1_b: &l.attn_ln_b,
-                        wq: &l.attn_q_w.data,
-                        bq: &l.attn_q_b,
-                        wk: &l.attn_k_w.data,
-                        wv: &l.attn_v_w.data,
-                        bv: &l.attn_v_b,
-                        wo: &l.attn_out_w.data,
-                        bo: &l.attn_out_b,
-                        ln2_g: &l.mlp_ln_w,
-                        ln2_b: &l.mlp_ln_b,
-                        w1: &l.mlp_fc_w.data,
-                        b1: &l.mlp_fc_b,
-                        w2: &l.mlp_proj_w.data,
-                        b2: &l.mlp_proj_b,
-                    })
-                    .collect();
-                match ft_kernel_metal::fused::EncoderGpu::new(
-                    w.n_state,
-                    w.n_head,
-                    w.n_state * 4,
-                    &refs,
-                ) {
-                    Ok(enc) => Arc::clone(entry.insert(Arc::new(enc))),
-                    Err(_) => {
-                        record_encoder_route("cpu:gpu_encoder_init_failed");
-                        return false;
-                    }
-                }
-            }
-        }
+    let Some(enc) = cached_encoder_gpu(w, encoder_gpu_cache(), encoder_gpu_cache_key(w)) else {
+        return false;
     };
 
     match enc.forward(&x.data, x.rows) {
@@ -1408,6 +1341,164 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
         Err(_) => {
             record_encoder_route("cpu:gpu_forward_failed");
             false
+        }
+    }
+}
+
+/// One process-wide GPU-encoder cache shared by the post-conv stack path and
+/// the full-from-mel path (two caches would upload the weights twice).
+#[cfg(target_os = "macos")]
+fn encoder_gpu_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<u64, std::sync::Arc<ft_kernel_metal::fused::EncoderGpu>>,
+> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<u64, std::sync::Arc<ft_kernel_metal::fused::EncoderGpu>>,
+        >,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Cheap content fingerprint (shape + a few weight samples), NOT `w`'s
+/// address: the static cache outlives the borrowed `EncoderWeights`, so a
+/// dropped model replaced by a DIFFERENT model reusing the same address would
+/// otherwise alias a stale resident encoder. The fingerprint also lets the
+/// same model loaded twice share one upload.
+#[cfg(target_os = "macos")]
+fn encoder_gpu_cache_key(w: &EncoderWeights) -> u64 {
+    fn mix(h: u64, v: u64) -> u64 {
+        (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    h = mix(h, w.n_state as u64);
+    h = mix(h, w.n_head as u64);
+    h = mix(h, w.layers.len() as u64);
+    for l in [w.layers.first(), w.layers.last()].into_iter().flatten() {
+        for s in [
+            l.attn_q_w.data.first(),
+            l.attn_q_w.data.last(),
+            l.mlp_fc_w.data.first(),
+            l.mlp_proj_w.data.last(),
+            l.attn_ln_w.first(),
+            l.attn_ln_w.last(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            h = mix(h, u64::from(s.to_bits()));
+        }
+    }
+    h
+}
+
+/// Get-or-build the cached GPU encoder for this model (stem attached), or
+/// `None` with the decline reason recorded.
+#[cfg(target_os = "macos")]
+fn cached_encoder_gpu(
+    w: &EncoderWeights,
+    cache: &std::sync::Mutex<
+        std::collections::HashMap<u64, std::sync::Arc<ft_kernel_metal::fused::EncoderGpu>>,
+    >,
+    key: u64,
+) -> Option<std::sync::Arc<ft_kernel_metal::fused::EncoderGpu>> {
+    use std::sync::Arc;
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            record_encoder_route("cpu:gpu_cache_poisoned");
+            return None;
+        }
+    };
+    match guard.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => Some(Arc::clone(entry.get())),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let refs: Vec<ft_kernel_metal::fused::LayerWeightsRef> = w
+                .layers
+                .iter()
+                .map(|l| ft_kernel_metal::fused::LayerWeightsRef {
+                    ln1_g: &l.attn_ln_w,
+                    ln1_b: &l.attn_ln_b,
+                    wq: &l.attn_q_w.data,
+                    bq: &l.attn_q_b,
+                    wk: &l.attn_k_w.data,
+                    wv: &l.attn_v_w.data,
+                    bv: &l.attn_v_b,
+                    wo: &l.attn_out_w.data,
+                    bo: &l.attn_out_b,
+                    ln2_g: &l.mlp_ln_w,
+                    ln2_b: &l.mlp_ln_b,
+                    w1: &l.mlp_fc_w.data,
+                    b1: &l.mlp_fc_b,
+                    w2: &l.mlp_proj_w.data,
+                    b2: &l.mlp_proj_b,
+                })
+                .collect();
+            match ft_kernel_metal::fused::EncoderGpu::new(w.n_state, w.n_head, w.n_state * 4, &refs)
+            {
+                Ok(mut enc) => {
+                    // Attach the conv stem so windows can run entirely on the
+                    // GPU. A stem-attach failure keeps the stack usable — the
+                    // conv simply stays on the CPU for this model.
+                    let stem = ft_kernel_metal::fused::StemWeightsRef {
+                        conv1_wt: &w.conv1_wt.data,
+                        conv1_b: &w.conv1_b,
+                        conv2_wt: &w.conv2_wt.data,
+                        conv2_b: &w.conv2_b,
+                        pos_emb: &w.pos_emb.data,
+                    };
+                    let _ = enc.attach_stem(&stem, w.n_mels, w.n_ctx);
+                    Some(Arc::clone(entry.insert(Arc::new(enc))))
+                }
+                Err(_) => {
+                    record_encoder_route("cpu:gpu_encoder_init_failed");
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Run conv stem + pos_emb + transformer stack entirely on the GPU from the
+/// mel spectrogram. Returns the pre-`ln_post` activations, or `None` (with
+/// the decline reason recorded) so the caller falls back to the CPU stem.
+/// `FW_GPU_STEM=0` disables just the GPU stem (the post-conv GPU stack still
+/// applies) for A/B and rollback.
+#[cfg(target_os = "macos")]
+fn gpu_encode_full(mel: &Mat, w: &EncoderWeights) -> Option<Mat> {
+    if matches!(std::env::var("FW_GPU_STEM").ok().as_deref(), Some("0")) {
+        return None;
+    }
+    if matches!(
+        std::env::var("FRANKEN_WHISPER_FUSED_ENC").ok().as_deref(),
+        Some("0")
+    ) {
+        return None;
+    }
+    if w.n_state < GPU_ENCODER_MIN_N_STATE || !gpu_encoder_enabled() {
+        return None;
+    }
+    // Same conv geometry as the CPU path (k=3, pad=1; stride 1 then 2): the
+    // positional capacity must admit the conv output, else fall back to the
+    // CPU stem so the existing n_ctx error path fires.
+    let t1 = (mel.rows + 2).checked_sub(3)? + 1;
+    let t2 = (t1 + 2 - 3) / 2 + 1;
+    if t2 > w.n_ctx {
+        return None;
+    }
+
+    let enc = cached_encoder_gpu(w, encoder_gpu_cache(), encoder_gpu_cache_key(w))?;
+    if !enc.has_stem() {
+        return None;
+    }
+    match enc.forward_from_mel(&mel.data, mel.rows) {
+        Ok((out, rows)) => {
+            record_encoder_route("gpu_fused_stem");
+            Some(Mat::from_vec(rows, w.n_state, out))
+        }
+        Err(_) => {
+            record_encoder_route("cpu:gpu_stem_forward_failed");
+            None
         }
     }
 }
