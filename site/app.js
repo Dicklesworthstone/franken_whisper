@@ -15,7 +15,7 @@ const state = {
   result: null,
   wallMs: 0,
   nameMap: new Map(),
-  progressBase: { whisper: 0, sortformer: 0 },
+  lane: "serial",
   // Live-run progress model (see the "run progress" section below).
   run: null,
   // Download-rate estimator (EMA of bytes/second).
@@ -24,22 +24,28 @@ const state = {
 
 // Calibration learned from completed runs on THIS machine, persisted so the
 // second run's estimate is good from the first second. Values are seconds of
-// wall clock per second of audio for the two long stages.
-const CAL_KEY = "fw-run-calibration-v1";
+// wall clock per second of audio for the two long stages. Keyed per engine
+// lane: the threaded and serial builds differ ~5x, and a browser update can
+// flip which lane a machine gets.
+function calKey() {
+  return `fw-run-calibration-v1-${state.lane ?? "serial"}`;
+}
 function loadCalibration() {
   try {
-    const c = JSON.parse(localStorage.getItem(CAL_KEY) ?? "null");
+    const c = JSON.parse(localStorage.getItem(calKey()) ?? "null");
     if (c && Number.isFinite(c.whisperRate) && Number.isFinite(c.sortformerRate)) return c;
   } catch {
     /* fall through */
   }
-  // Defaults measured on an M-series desktop, serial build (8.35x realtime
-  // total; the diarizer measured ~0.11x of it).
-  return { whisperRate: 8.0, sortformerRate: 0.12 };
+  // First-run defaults measured on an M-series desktop: threaded lane 1.56x
+  // realtime overall, serial 8.35x; the diarizer measured ~0.11x of audio.
+  return state.lane === "threaded"
+    ? { whisperRate: 1.6, sortformerRate: 0.1 }
+    : { whisperRate: 8.0, sortformerRate: 0.12 };
 }
 function saveCalibration(cal) {
   try {
-    localStorage.setItem(CAL_KEY, JSON.stringify(cal));
+    localStorage.setItem(calKey(), JSON.stringify(cal));
   } catch {
     /* storage may be denied; the defaults still work */
   }
@@ -231,7 +237,8 @@ function handle(m) {
   switch (m.type) {
     case "booted": {
       state.booted = true;
-      setStatus(`engine booted (fw-wasm ${m.version}). Load the models to begin.`);
+      state.lane = m.lane ?? "serial";
+      setStatus(`engine booted (fw-wasm ${m.version}, ${state.lane} lane). Load the models to begin.`);
       $("load-models").disabled = false;
       break;
     }
@@ -320,6 +327,7 @@ function handle(m) {
     }
     case "ready": {
       state.modelsReady = true;
+      state.lane = m.lane ?? "serial";
       $("progress-wrap").hidden = true;
       $("load-models").disabled = true;
       $("load-models").querySelector("span").textContent = "Models loaded ✓";
@@ -335,7 +343,7 @@ function handle(m) {
       state.busy = false;
       state.result = m.result;
       state.wallMs = m.wall_ms;
-      state.nameMap = buildSpeakerNameMap(m.result, parseSpeakerNames($("speakers").value));
+      state.nameMap = buildSpeakerNameMap(m.result, parseSpeakerNames($("speaker-names").value));
       finishRunCalibration();
       state.run = null;
       $("progress-wrap").hidden = true;
@@ -554,7 +562,7 @@ function init() {
     // The names field feeds Whisper's decoding prompt (the CLI's --prompt)
     // so names and titles come out spelled right; the same list later maps
     // onto detected speakers in order of first appearance.
-    const names = parseSpeakerNames($("speakers").value);
+    const names = parseSpeakerNames($("speaker-names").value);
     const prompt = names.length ? `Speakers: ${names.join(", ")}.` : undefined;
     const buf = await state.file.arrayBuffer();
     state.worker.postMessage({ type: "transcribe", audio: buf, ext, prompt }, [buf]);
