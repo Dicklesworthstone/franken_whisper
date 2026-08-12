@@ -5,7 +5,10 @@
 // Transcribe + diarize, then watch #status / #progress-text until a result
 // or error. Prints a JSON verdict; exits 0 only on a rendered transcript.
 //
-//   node site/harness/prod.mjs [base-url] [deadline-seconds]
+//   node site/harness/prod.mjs [base-url] [deadline-seconds] [audio-file]
+//
+// With [audio-file], the clip enters through the REAL file picker
+// (DOM.setFileInputFiles) instead of the sample button.
 import { spawn } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,6 +16,7 @@ import { join } from "node:path";
 
 const BASE = process.argv[2] ?? "http://127.0.0.1:8791";
 const DEADLINE_S = Number(process.argv[3] ?? 480);
+const AUDIO_FILE = process.argv[4] ?? null;
 const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const PORT = 9700 + Math.floor(Math.random() * 200);
 
@@ -127,8 +131,21 @@ for (;;) {
     process.exit(1);
   }
 }
-console.error("[prod] models ready; loading sample clip");
-await evalJs("document.getElementById('sample').click()");
+if (AUDIO_FILE) {
+  console.error(`[prod] models ready; feeding ${AUDIO_FILE} through the file picker`);
+  const doc = await cdp("DOM.getDocument");
+  const input = await cdp("DOM.querySelector", {
+    nodeId: doc.result.root.nodeId,
+    selector: "#file-input",
+  });
+  await cdp("DOM.setFileInputFiles", {
+    files: [AUDIO_FILE],
+    nodeId: input.result.nodeId,
+  });
+} else {
+  console.error("[prod] models ready; loading sample clip");
+  await evalJs("document.getElementById('sample').click()");
+}
 await new Promise((r) => setTimeout(r, 1500));
 await evalJs("document.getElementById('run').click()");
 console.error("[prod] clicked run");
