@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>franken_whisper — in-browser demo</title>
+  <meta name="description" content="The franken_whisper native Rust Whisper engine compiled to WebAssembly: transcribe an mp3, m4a, or wav locally in your browser. No upload, no server." />
+  <link rel="canonical" href="https://frankenwhisper.com/demo.html" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%99%3C/text%3E%3C/svg%3E" />
+  <link rel="preload" href="assets/fonts/inter-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="assets/fonts/jetbrains-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="stylesheet" href="assets/css/site.css?v=1" />
+  <style>
+    .pg-btn{border-radius:9999px;padding:.6rem 1.2rem;font-size:.78rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase;border:1px solid rgba(255,255,255,.1);color:#94a3b8;display:inline-flex;align-items:center;gap:.5rem;transition:all .2s ease;cursor:pointer;text-decoration:none;background:transparent}
+    .pg-btn:hover:not(:disabled){color:#e2e8f0;border-color:rgba(52,211,153,.35)}
+    .pg-btn.primary{background:linear-gradient(135deg,#004225,#059669);color:#eafff5;border-color:rgba(52,211,153,.35)}
+    .pg-btn.primary:hover:not(:disabled){filter:brightness(1.15)}
+    .pg-btn:disabled{opacity:.4;cursor:not-allowed}
+    .pg-label{font-size:.7rem;font-weight:900;letter-spacing:.25em;text-transform:uppercase;color:#10b981}
+    .pg-card{border-radius:1rem;border:1px solid rgba(255,255,255,.05);background:rgba(0,0,0,.4);padding:1.5rem}
+    .pg-panel{position:relative;border-radius:1.25rem;border:1px solid rgba(16,185,129,.12);background:rgba(6,20,13,.6);padding:2rem}
+    #demo-status{font-family:"JetBrains Mono Variable","JetBrains Mono",monospace;font-size:.82rem;color:#94a3b8;min-height:1.4em}
+    #demo-status[data-kind="ok"]{color:#a7f3d0}
+    #demo-status[data-kind="err"]{color:#fca5a5}
+    #demo-output{background:rgba(1,5,3,.85);border:1px solid rgba(255,255,255,.06);border-radius:.9rem;padding:1.1rem 1.3rem;font-size:.9rem;line-height:1.8;color:#d1fae5;min-height:8rem;max-height:28rem;overflow-y:auto}
+    .demo-seg{margin:.35rem 0}
+    .demo-seg-time{color:#10b981;font-family:"JetBrains Mono Variable","JetBrains Mono",monospace;font-size:.72rem;margin-right:.6rem}
+    input[type="file"]{color:#94a3b8;font-size:.85rem}
+    input[type="file"]::file-selector-button{border-radius:9999px;padding:.5rem 1.1rem;font-size:.75rem;font-weight:900;letter-spacing:.1em;text-transform:uppercase;border:1px solid rgba(52,211,153,.35);background:rgba(16,185,129,.08);color:#a7f3d0;cursor:pointer;margin-right:1rem}
+    input[type="file"]:disabled::file-selector-button{opacity:.4;cursor:not-allowed}
+  </style>
+</head>
+<body class="bg-[#020604] text-slate-300 antialiased">
+  <main class="mx-auto max-w-3xl px-6 py-16">
+    <p class="pg-label mb-3"><a href="index.html" style="color:inherit;text-decoration:none">franken_whisper</a> · live demo</p>
+    <h1 class="text-3xl font-black text-emerald-50 mb-4">Whisper in your browser, from the same Rust source</h1>
+    <p class="mb-6 text-slate-400 leading-relaxed">
+      This page runs the franken_whisper native engine compiled to WebAssembly — the same
+      <code class="text-emerald-300">src/native_engine</code> sources the CLI ships, one code path.
+      Your audio never leaves this device: the model downloads once (78&nbsp;MB, cached and
+      SHA-256-verified in browser storage), then every transcription is local.
+    </p>
+
+    <div class="pg-panel mb-8">
+      <div class="flex flex-wrap items-center gap-4 mb-4">
+        <button id="demo-start" class="pg-btn primary">Load engine + tiny.en (78 MB)</button>
+        <input id="demo-file" type="file" accept=".mp3,.m4a,.mp4,.aac,.wav,audio/*" disabled />
+      </div>
+      <p id="demo-status" data-kind="info">Nothing downloads until you click.</p>
+    </div>
+
+    <div id="demo-output" class="mb-4" aria-live="polite"></div>
+    <div class="flex gap-3 mb-12">
+      <button id="demo-export-md" class="pg-btn" disabled>Export .md</button>
+      <button id="demo-export-html" class="pg-btn" disabled>Export .html</button>
+    </div>
+
+    <div class="pg-card text-sm leading-relaxed text-slate-400">
+      <p class="pg-label mb-3">What this is (and is not)</p>
+      <ul class="list-disc pl-5 space-y-2">
+        <li><strong class="text-slate-300">Model:</strong> Whisper tiny.en — English-only, the smallest tier.
+          The native CLI runs large-v3-turbo; the browser build starts small on purpose.</li>
+        <li><strong class="text-slate-300">Speed:</strong> single-threaded wasm with SIMD128. The measured
+          realtime ratio is shown after each run, on your hardware — no synthetic numbers.
+          The native engine is much faster; this demo trades speed for zero install.</li>
+        <li><strong class="text-slate-300">Diarization:</strong> not in the browser yet. The Sortformer
+          speaker model is 469&nbsp;MB of f32 weights; shipping it here is a quantization project,
+          tracked openly in the repo (bd-m2jm).</li>
+        <li><strong class="text-slate-300">Formats:</strong> mp3, m4a/aac, wav — decoded in wasm by
+          <a class="text-emerald-300" href="https://github.com/pdeljanov/Symphonia">Symphonia</a>, resampled to 16&nbsp;kHz mono.</li>
+        <li><strong class="text-slate-300">Privacy:</strong> no upload, no server, no analytics on this page.
+          The only network request is the one-time model download from Hugging Face.</li>
+      </ul>
+    </div>
+  </main>
+  <script type="module" src="demo.js"></script>
+</body>
+</html>

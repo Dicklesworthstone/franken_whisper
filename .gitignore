@@ -312,3 +312,7 @@ __pycache__/
 .skill-loop-progress-*.md
 # Local one-off audio probe dumps
 /test.m4a
+
+# wasm build output (site/build-wasm.sh regenerates; never commit the module)
+site/pkg/
+fw-wasm/target/
