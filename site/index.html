@@ -137,10 +137,11 @@
               <button id="sample" class="btn subtle">Use a sample clip (JFK, 11 s)</button>
             </div>
             <p class="micro">Decoded in-tab by Symphonia (pure Rust), downmixed and resampled to
-              16 kHz mono. Honest expectation: the current build is single-threaded and measured
-              about 8 times real time on an M-series desktop, so a 1-minute clip takes about
-              8 minutes. Start short. The threaded build, the same parked-worker design the
-              sibling projects ship, is the tracked next lever.</p>
+              16 kHz mono. Honest expectation, measured on an M-series desktop: Chrome gets the
+              threaded engine at about 1.6 times real time (a 1-minute clip takes about 100
+              seconds); browsers without cross-origin isolation, iPhones included, get the
+              single-thread build at about 8 times real time. The progress bar below shows the
+              live estimate either way.</p>
           </div>
 
           <div class="pg-step">
@@ -276,12 +277,13 @@
         whisper.cpp</strong> at matched greedy decode settings, side-by-side in one interleaved
         harness; the methodology and evidence hashes live in the repo's performance ledger.
         On Apple-silicon GPU, the Metal encoder went from 15.4 s to 1.85 s per window across
-        one ledgered kernel campaign. The wasm build in this page is the same engine on one
-        browser thread with SIMD128. It measured about 8 times real time on an M-series
-        desktop, down from 45 after one ledgered, byte-identical kernel pass, and the page
-        prints the exact ratio after each run so the number you read is from your machine.
-        Threaded wasm is the next lever, and it will land the way everything here landed:
-        behind a measured, ledgered gate.
+        one ledgered kernel campaign. The wasm build in this page started at 45 times real
+        time; one byte-identical kernel pass brought it to 8.4, and the threaded lane (rayon
+        over Web Workers, the same recipe the sibling projects ship) measured
+        <strong>1.56× real time</strong> in headless Chrome with 8 workers, transcript
+        unchanged. Chrome gets the threaded engine; everything else gets the serial build.
+        The page prints the exact ratio after each run, so the number you read is from your
+        machine.
       </p>
     </div>
     <div class="grid grid-3 reveal">
