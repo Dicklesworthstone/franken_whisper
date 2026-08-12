@@ -36,6 +36,13 @@
       } catch {
         out.push("no cached models found");
       }
+      try {
+        // The first-cut demo cached tiny.en at the OPFS root; clear it too.
+        await root.removeEntry("ggml-tiny.en.bin");
+        out.push("deleted a legacy cached model file");
+      } catch {
+        /* none left behind */
+      }
       for (const name of await caches.keys()) {
         await caches.delete(name);
         out.push(`deleted cache "${name}"`);
