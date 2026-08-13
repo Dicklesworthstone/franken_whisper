@@ -114,6 +114,16 @@ async function loadWhisper() {
   post("whisper-ready", { info });
 }
 
+let denoiserReady = false;
+async function loadDenoiser() {
+  if (denoiserReady) return;
+  const dir = await ensureWithProgress("denoiser");
+  const file = await (await dir.getFileHandle("fastenhancer-s-48k-denoise.safetensors")).getFile();
+  feedClock();
+  wasm.load_denoiser(new Uint8Array(await file.arrayBuffer()));
+  denoiserReady = true;
+}
+
 async function loadSortformer() {
   if (sortformerReady) return;
   const dir = await ensureWithProgress("sortformer");
@@ -140,6 +150,7 @@ async function route(e) {
       await armThreadPool();
       await loadWhisper();
       await loadSortformer();
+      await loadDenoiser();
       post("ready", { version: wasm.version(), lane, threads });
       break;
     }
@@ -152,10 +163,13 @@ async function route(e) {
       // Two stages so the page can build its progress model (window total,
       // remaining-time estimate) from the decoded duration before the long
       // stage starts.
-      const meta = JSON.parse(wasm.decode_audio(new Uint8Array(m.audio), m.ext ?? ""));
+      const meta = JSON.parse(
+        wasm.decode_audio(new Uint8Array(m.audio), m.ext ?? "", m.denoise !== false),
+      );
       post("audio-meta", {
         audio_sec: meta.audio_sec,
         skipped_leading_sec: meta.skipped_leading_sec ?? 0,
+        denoised: meta.denoised === true,
       });
       feedClock();
       const result = JSON.parse(wasm.run_prepared(m.prompt ?? undefined, m.language ?? undefined));

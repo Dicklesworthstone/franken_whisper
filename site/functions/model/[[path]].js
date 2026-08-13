@@ -36,6 +36,10 @@ const FILES = {
     `${HF_SORTFORMER}conversion-receipt.json`,
     `${GH_SORTFORMER}conversion-receipt.json`,
   ],
+  // FastEnhancer-S denoiser (838 KB; default pipeline stage, bd-z6kz).
+  "denoiser/fastenhancer-s-48k-denoise.safetensors": [
+    `${HF_SORTFORMER}fastenhancer-s-48k-denoise.safetensors`,
+  ],
 };
 
 export async function onRequest({ request, params }) {

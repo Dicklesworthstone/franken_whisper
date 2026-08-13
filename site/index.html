@@ -35,6 +35,7 @@
   <nav aria-label="Primary">
     <a href="#playground">Playground</a>
     <a href="#engine">Engine</a>
+    <a href="#denoise">Denoiser</a>
     <a href="#speakers">Speakers</a>
     <a href="#speed">Speed</a>
     <a href="#agents">Agents</a>
@@ -170,6 +171,11 @@
             <input id="speaker-names" class="text-input" type="text" maxlength="300"
               placeholder="e.g. Jeff Emanuel (host), Dr. Sarah Chen (guest)"
               aria-label="Speaker names and titles, comma-separated, in speaking order if known">
+            <label class="micro" style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
+              <input type="checkbox" id="denoise" checked>
+              Clean up the audio first (FastEnhancer neural denoiser; on by default, helps
+              noisy recordings and costs a few seconds)
+            </label>
             <p class="micro">Names help twice. They feed Whisper's decoding prompt, the same
               mechanism as the CLI's <code>--prompt</code>, so names and titles come out
               spelled right. They also replace the anonymous <code>SPEAKER_00…03</code> labels,
@@ -262,6 +268,72 @@
         function the CLI calls; the code was relocated into a shared module so the two can
         never drift apart.</li>
     </ol>
+  </div>
+</section>
+
+<!-- ============================== DENOISE ============================== -->
+<section id="denoise">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <p class="eyebrow">The denoiser · clean audio in, clean words out</p>
+      <h2>Noise makes Whisper <em>hallucinate</em>.</h2>
+      <p class="lede">
+        A transcription inherits the recording it came from, noise and all. Feed Whisper hiss,
+        rumble, or a silent stretch and it does something worse than missing words: it invents
+        them, sometimes in the wrong language. So every recording is cleaned automatically
+        before the model hears a sample, in the CLI and in this playground, using a pure-Rust
+        port of FastEnhancer&#8209;S, a 207&#8239;K-parameter speech-enhancement network. The same port
+        cleans voice enrollments in our sibling project
+        <a href="https://frankentts.com">franken_tts</a>; the weights are an 0.8&#8239;MB file that
+        loads alongside the models. It is on by default and one checkbox (or
+        <code>FW_DENOISE=0</code> in the CLI) turns it off.
+      </p>
+    </div>
+    <div class="grid grid-2 reveal">
+      <div class="card">
+        <p class="label">How it decides what is noise</p>
+        <p>The recording is sliced into overlapping 21&#8239;ms spectrogram frames. For every
+          time-frequency cell the network predicts a <strong>complex ratio mask</strong>: a
+          number that scales the cell toward zero if it looks like noise and leaves it alone if
+          it looks like speech. Two structural tricks let a model this small make that call
+          well. Small GRUs carry memory from frame to frame, so the network builds a running
+          picture of the steady background; hiss and rumble are steady, speech never is. And a
+          tiny attention layer compares frequency bands within each frame; voiced speech is a
+          comb of harmonics that move together, while broadband static has no such structure.
+          The mask is complex, so it corrects phase as well as loudness, avoiding the
+          underwater smearing that magnitude-only methods produce.</p>
+      </div>
+      <div class="card">
+        <p class="label">Why it matters for transcription</p>
+        <p>Whisper was trained mostly on reasonably clean speech, and its failure mode on noise
+          is not graceful: confidence drops, words vanish, and on the worst stretches the
+          decoder free-runs and invents text. The diarizer suffers too, since speaker identity
+          lives in exactly the spectral detail that noise buries. Cleaning first attacks both
+          problems at the source. The stage is length-preserving, so every timestamp stays
+          truthful to your original file, and it costs a few seconds even on long recordings
+          because it processes audio in one-minute chunks with carried state.</p>
+      </div>
+    </div>
+    <div class="grid grid-3 reveal">
+      <div class="card">
+        <p class="label">207 K parameters</p>
+        <p>The weights are an 0.8&#8239;MB pinned file, verified by SHA-256 like every other
+          artifact on this page. It loads in a blink next to the 874&#8239;MB transcription
+          model.</p>
+      </div>
+      <div class="card">
+        <p class="label">On by default</p>
+        <p>Zero flags to remember. The playground checkbox and the CLI's
+          <code>FW_DENOISE=0</code> both turn it off when you want the raw signal, and the run
+          metadata records which way it ran.</p>
+      </div>
+      <div class="card">
+        <p class="label">Same code, both surfaces</p>
+        <p>One Rust implementation serves the CLI and this page. In the CLI the stage engages
+          whenever the pinned artifact is present in the model cache; the browser ships the
+          artifact with the models, so it is simply always available.</p>
+      </div>
+    </div>
   </div>
 </section>
 

@@ -40,6 +40,11 @@ pub mod sortformer_inference;
 // bytes → 16 kHz mono f32 (symphonia; wasm-only).
 pub mod audio_decode;
 
+// The neural denoise stage, the parent's own module (FastEnhancer-S via
+// ftts-kernels; length-preserving 16 kHz in/out).
+#[path = "../../src/denoise.rs"]
+pub mod denoise;
+
 /// `initThreadPool(n)` — the rayon worker-pool constructor, exported ONLY by
 /// the threaded lane. The host MUST await it before any engine call in that
 /// lane; the serial lane has no such export, which is how the page tells the
@@ -67,6 +72,7 @@ mod wasm_api {
         // split so the page learns the duration (and the window count its
         // progress bar needs) before the long stage starts.
         static PCM: RefCell<Option<(Vec<f32>, f64)>> = const { RefCell::new(None) };
+        static DENOISER: RefCell<Option<crate::denoise::Denoiser>> = const { RefCell::new(None) };
     }
 
     // Host-supplied positioned read against the whisper model file staged in
@@ -319,6 +325,20 @@ mod wasm_api {
     // browser build. Exposed as two stages so the page can build a progress
     // model between them, plus a single-shot compatibility wrapper.
 
+    /// Hydrate the FastEnhancer denoiser from its pinned artifact bytes
+    /// (838 KB; the page verifies the sha256 pin before the bytes get here,
+    /// and hydration re-validates the tensor geometry).
+    ///
+    /// # Errors
+    ///
+    /// Malformed artifact bytes.
+    #[wasm_bindgen]
+    pub fn load_denoiser(bytes: Vec<u8>) -> Result<(), JsValue> {
+        let denoiser = crate::denoise::Denoiser::from_bytes(bytes).map_err(js_err)?;
+        DENOISER.with(|slot| *slot.borrow_mut() = Some(denoiser));
+        Ok(())
+    }
+
     /// Stage one of the split pipeline: decode `audio` (mp3/m4a/wav bytes) to
     /// 16 kHz mono PCM and hold it for [`run_prepared`]. Returns
     /// `{"audio_sec": …}` so the page can size its progress model (whisper
@@ -329,9 +349,23 @@ mod wasm_api {
     ///
     /// Audio decode failures, each naming the failing stage.
     #[wasm_bindgen]
-    pub fn decode_audio(audio: Vec<u8>, ext: &str) -> Result<String, JsValue> {
+    pub fn decode_audio(audio: Vec<u8>, ext: &str, denoise: bool) -> Result<String, JsValue> {
         fw_stage("audio:decode");
         let mut samples = crate::audio_decode::decode_to_16k_mono(audio, ext).map_err(js_err)?;
+        // Default neural denoise stage (bd-z6kz): before silence detection,
+        // so the trim sees the cleaned signal. Length-preserving; timestamps
+        // are untouched. The page's checkbox (default on) is the off switch.
+        let denoised = denoise
+            && DENOISER.with(|slot| {
+                if let Some(denoiser) = slot.borrow().as_ref() {
+                    fw_stage("audio:denoise");
+                    samples = denoiser.denoise_16k(&samples);
+                    true
+                } else {
+                    false
+                }
+            });
+
         // Trim leading silence before the model hears anything (whisper
         // hallucinates on a silent first window); every emitted timestamp
         // gets the offset added back, so output times stay file-truthful.
@@ -345,6 +379,7 @@ mod wasm_api {
         Ok(serde_json::json!({
             "audio_sec": audio_sec,
             "skipped_leading_sec": offset_sec,
+            "denoised": denoised,
         })
         .to_string())
     }
@@ -379,8 +414,9 @@ mod wasm_api {
         ext: &str,
         initial_prompt: Option<String>,
         language: Option<String>,
+        denoise: Option<bool>,
     ) -> Result<String, JsValue> {
-        decode_audio(audio, ext)?;
+        decode_audio(audio, ext, denoise.unwrap_or(true))?;
         run_prepared(initial_prompt, language)
     }
 

@@ -59,6 +59,7 @@ const STAGE_LABELS = {
   "sortformer:weights": "building the Sortformer graph…",
   "sortformer:ready": "Sortformer ready.",
   "audio:decode": "decoding audio (Symphonia) and resampling to 16 kHz…",
+  "audio:denoise": "cleaning up the audio (FastEnhancer denoiser)…",
   "whisper:decode": "transcribing with large-v3-turbo (the long part)…",
   "sortformer:diarize": "diarizing (Sortformer, 80 ms frames)…",
   "fuse:project": "fusing speakers onto the transcript…",
@@ -358,6 +359,7 @@ function handle(m) {
     case "audio-meta": {
       beginRun(m.audio_sec);
       state.run.offsetSec = m.skipped_leading_sec ?? 0;
+      state.run.denoised = m.denoised === true;
       const skipped =
         state.run.offsetSec > 0.5 ? `skipped ${fmtDur(state.run.offsetSec)} of leading silence; ` : "";
       setStatus(
@@ -645,8 +647,9 @@ function init() {
     const names = parseSpeakerNames($("speaker-names").value);
     const prompt = names.length ? `Speakers: ${names.join(", ")}.` : undefined;
     const language = $("language").value === "auto" ? undefined : $("language").value;
+    const denoise = $("denoise").checked;
     const buf = await state.file.arrayBuffer();
-    state.worker.postMessage({ type: "transcribe", audio: buf, ext, prompt, language }, [buf]);
+    state.worker.postMessage({ type: "transcribe", audio: buf, ext, prompt, language, denoise }, [buf]);
   });
 
   $("download-md").addEventListener("click", exportMd);

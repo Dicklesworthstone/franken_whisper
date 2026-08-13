@@ -86,6 +86,9 @@ fsqlite-types = { version = "0.3.0", path = "../frankensqlite/crates/fsqlite-typ
 # first-party FrankenSuite crates — see the bd-frp7 epic.
 ft-kernel-cpu = { version = "0.1.0", path = "../frankentorch/crates/ft-kernel-cpu" }
 ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core" }
+# FastEnhancer-S speech denoiser (default pipeline stage when its pinned
+# artifact is present; see src/denoise.rs). Zero required deps of its own.
+ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false }
 # Direct dep on `half` (same crate ft-core re-exports as `Float16`) for its
 # `HalfFloatSliceExt::convert_to_f32_slice` SIMD bulk f16->f32 dequant — the
 # `std` feature enables runtime aarch64 `fp16` / x86 `f16c` vector paths used
@@ -131,6 +134,9 @@ ft-kernel-metal = { version = "0.1.0", path = "../frankentorch/crates/ft-kernel-
 criterion = { version = "0.5", features = ["html_reports"] }
 # For the f16_gemv_dequant bench to construct `Float16` weights directly.
 ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core" }
+# FastEnhancer-S speech denoiser (default pipeline stage when its pinned
+# artifact is present; see src/denoise.rs). Zero required deps of its own.
+ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false }
 # For the hugepage_gemv_probe (madvise(MADV_HUGEPAGE) A/B on weight streaming).
 # Already a transitive dependency; dev-only, does not affect the shipped binary.
 libc = "0.2"

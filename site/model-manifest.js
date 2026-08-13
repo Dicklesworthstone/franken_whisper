@@ -51,6 +51,19 @@ export const MODELS = {
 };
 
 // Chunked-download + verification tuning (see loader.js).
+// FastEnhancer-S speech denoiser (MIT), the default clean-up stage before
+// transcription; tiny, so it loads with the models in a blink.
+MODELS.denoiser = {
+  label: "FastEnhancer-S denoiser (audio clean-up)",
+  license: "FastEnhancer - MIT",
+  weights: {
+    name: "fastenhancer-s-48k-denoise.safetensors",
+    bytes: 838440,
+    sha256: "28c1807fd9113e4ca09d3aacb2ecb07a742917321bfaced8b92598daffbd098b",
+  },
+  sidecars: [],
+};
+
 export const CHUNK_BYTES = 32 * 1024 * 1024;
 export const ENDPOINT_BYTES = 8 * 1024 * 1024;
 

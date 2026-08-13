@@ -209,6 +209,16 @@ pub fn read_normalized_wav_16k_mono_with_checkpoint(
     checkpoint()?;
     let samples = crate::native_engine::decode::read_wav_16k_mono(&bytes)?;
     checkpoint()?;
+    // Default neural denoise stage (bd-z6kz): applied whenever the pinned
+    // FastEnhancer artifact is present and `FW_DENOISE` has not disabled it.
+    // Absent artifact = byte-identical passthrough, which is what CI and the
+    // golden fixtures run under. Length-preserving, so every downstream
+    // timestamp is untouched.
+    if let Some(denoiser) = crate::denoise::shared() {
+        let denoised = denoiser.denoise_16k(&samples);
+        checkpoint()?;
+        return Ok(denoised);
+    }
     Ok(samples)
 }
 
