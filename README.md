@@ -3416,13 +3416,13 @@ hosts; packages both `franken_whisper` and `fw`; and syncs the exact pinned
 to the source tree.
 
 ```bash
-dsr build franken_whisper --version 0.9.1 --dry-run \
+dsr build franken_whisper --version 0.9.2 --dry-run \
   --targets darwin/arm64,darwin/amd64,linux/amd64,linux/arm64,windows/amd64
-dsr build franken_whisper --version 0.9.1 \
+dsr build franken_whisper --version 0.9.2 \
   --targets darwin/arm64,darwin/amd64,linux/amd64,linux/arm64,windows/amd64
 ```
 
-No GitHub Actions workflow participates in the v0.9.1 release. DSR is the build
+No GitHub Actions workflow participates in the v0.9.2 release. DSR is the build
 and packaging authority; the tag and release assets are verified against its
 local receipts before publication.
 

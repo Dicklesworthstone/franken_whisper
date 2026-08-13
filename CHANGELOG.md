@@ -12,6 +12,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 No unreleased changes yet.
 
+## [0.9.2] - 2026-08-13
+
+### Fixed
+
+- Align every release-only sibling pin with the clean public revisions used to
+  produce `Cargo.lock` and the mandatory Rust gate receipts. This restores
+  locked, offline Cargo metadata resolution in DSR's exact isolated source
+  closure before any platform build begins.
+
 ## [0.9.1] - 2026-08-13
 
 ### Fixed
@@ -681,7 +690,8 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.9.1...main
+[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.9.2...main
+[0.9.2]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.2
 [0.9.1]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.1
 [0.9.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.0
 [0.8.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.8.0
