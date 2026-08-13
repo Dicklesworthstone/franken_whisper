@@ -5426,3 +5426,30 @@ Lane policy: cross-origin-isolated Blink gets pkg-threaded (after a
 blob-worker CSP canary + SharedArrayBuffer receipt check); iOS/WebKit and
 non-isolated contexts keep the serial lane (shared-memory growth kills iOS
 tabs ~2 GB; this engine holds 2.4 GB).
+
+---
+## 2026-08-12 — KEEP (transcript-gated, one named diff) — **wasm q8_0 whisper lane: 874 MB download (−46%), 1.20 GB resident (−47%), ~20% faster** (bd-3be3 Phase 1)
+
+`WeightMat::Q8_0` keeps upstream ggml q8_0 blocks RESIDENT (wasm-only
+arm); rows dequantize in-kernel with the load path's exact `dequant_q8_0`
+math (`gemv_q8_batch_twopass`, token-tiled). Upstream artifact:
+`ggml-large-v3-turbo-q8_0.bin` sha `317eb69c…`, 874,188,075 bytes
+(ggerganov/whisper.cpp HF — no bytes of ours to host). Tied embedding
+dequantizes q8→f16 at load; native builds never construct the arm.
+
+Gate: jfk + meeting transcripts BYTE-IDENTICAL to the f16 lane (serial
+engine, same clips, same harness). Whisper load 1.4 s; resident after
+load 1.20 GB vs 2.25 GB; measured ~20% faster per clip (10.18× vs 12.74×
+RT jfk; 5.69× vs 6.38× meeting — memory-bandwidth-bound kernels shrink
+with the weights). NAMED DIFF: the 87 s multi-window gate clip differs in
+its FINAL window only — the clip is synthetically truncated mid-sentence
+(stream_loop cut), and the lanes resolve the impossible tail differently
+(f16's tail reads cleaner). jfk/meeting equality stands; recorded here
+rather than hidden. Live fresh-visitor gate on the deployed site: exit 0,
+2.18× RT threaded, downloads 100% Hugging Face (GitHub out of the hot
+path after its 5xx throttling stranded real users).
+
+Total wasm campaign to date: 45.3× → 8.35× → 1.56× RT (threaded) and
+2.1 GB → 1.3 GB download. Next (bd-3be3): byte census, Sortformer f16
+(−234 MB), then the calibrated mixed-precision artifact (AWQ clip search
++ GPTQ-style rounding) targeting ~600 MB whisper under the same gates.
