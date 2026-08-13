@@ -8,10 +8,14 @@
 //
 // Each file lists upstreams in preference order. Hugging Face first: its CDN
 // absorbs load that made GitHub releases return 5xx under concurrent
-// downloads. The GitHub release stays as the fallback (and as the primary
-// for the Sortformer package until its Hugging Face upload lands — see
-// scripts/upload-sortformer-to-hf.sh).
-const HF_SORTFORMER = "https://huggingface.co/eigenvalue/franken-whisper-sortformer/resolve/main/";
+// downloads. The org repo (Dicklesworthstone/franken-whisper-models) is the
+// canonical home; the eigenvalue user repo stays as a live fallback until
+// the org upload lands (creating the org repo needs an org-scoped token),
+// and the GitHub release remains the last resort. The proxy walks the list
+// in order, so the org repo becomes primary the moment it exists — no
+// redeploy needed.
+const HF_ORG = "https://huggingface.co/Dicklesworthstone/franken-whisper-models/resolve/main/";
+const HF_EIGEN = "https://huggingface.co/eigenvalue/franken-whisper-sortformer/resolve/main/";
 const GH_SORTFORMER =
   "https://github.com/Dicklesworthstone/franken_whisper/releases/download/sortformer-v2.1-f32-v1/";
 
@@ -29,16 +33,19 @@ const FILES = {
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin",
   ],
   "sortformer/weights.safetensors": [
-    `${HF_SORTFORMER}weights.safetensors`,
+    `${HF_ORG}weights.safetensors`,
+    `${HF_EIGEN}weights.safetensors`,
     `${GH_SORTFORMER}weights.safetensors`,
   ],
   "sortformer/conversion-receipt.json": [
-    `${HF_SORTFORMER}conversion-receipt.json`,
+    `${HF_ORG}conversion-receipt.json`,
+    `${HF_EIGEN}conversion-receipt.json`,
     `${GH_SORTFORMER}conversion-receipt.json`,
   ],
   // FastEnhancer-S denoiser (838 KB; default pipeline stage, bd-z6kz).
   "denoiser/fastenhancer-s-48k-denoise.safetensors": [
-    `${HF_SORTFORMER}fastenhancer-s-48k-denoise.safetensors`,
+    `${HF_ORG}fastenhancer-s-48k-denoise.safetensors`,
+    `${HF_EIGEN}fastenhancer-s-48k-denoise.safetensors`,
   ],
 };
 

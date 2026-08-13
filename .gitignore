@@ -151,6 +151,7 @@ tests/artifacts/perf/20260606T2341Z-scale-baseline/
 *.png
 !gh_og_share_image.png
 *.jpg
+!site/assets/img/og.jpg
 *.jpeg
 
 # beads viewer local config and caches
