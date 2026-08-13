@@ -1035,9 +1035,18 @@ impl GgmlModel {
             n_mels: cur.read_i32()?,
             ftype: cur.read_i32()?,
         };
-        if hparams.ftype != 0 && hparams.ftype != 1 {
+        // Same ftype envelope as [`Self::parse`] (the streamed scan predated
+        // quantized support; the per-tensor dtype gate below is the real
+        // arbiter either way — it rejects any GGML_TYPE we cannot decode).
+        let base_ftype = hparams.ftype.rem_euclid(GGML_QNT_VERSION_FACTOR);
+        if !matches!(
+            base_ftype,
+            0 | 1 | 2 | 3 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14
+        ) {
             return Err(FwError::Unsupported(format!(
-                "quantized ggml ftype {} is not supported (only ftype 0=f32, 1=f16)",
+                "quantized ggml ftype {} (base {base_ftype}) is not supported \
+                 (only base 0=f32, 1=f16, 2=q4_0, 3=q4_1, 7=q8_0, 8=q5_0, 9=q5_1, \
+                 10=q2_k, 11=q3_k, 12=q4_k, 13=q5_k, 14=q6_k)",
                 hparams.ftype
             )));
         }
