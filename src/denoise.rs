@@ -68,22 +68,44 @@ impl Denoiser {
     /// timestamps need no bookkeeping). Chunked; see module docs.
     #[must_use]
     pub fn denoise_16k(&self, samples: &[f32]) -> Vec<f32> {
+        self.denoise_16k_with_progress(samples, |_, _| {})
+    }
+
+    /// Denoise while reporting completed and total bounded chunks.
+    ///
+    /// The callback runs before work begins (`0, total`) and after every
+    /// completed chunk. Browser callers use it as a liveness heartbeat so a
+    /// long recording cannot look permanently wedged in an opaque stage.
+    #[must_use]
+    pub fn denoise_16k_with_progress(
+        &self,
+        samples: &[f32],
+        mut progress: impl FnMut(usize, usize),
+    ) -> Vec<f32> {
         if samples.is_empty() {
             return Vec::new();
         }
         let chunk = CHUNK_SEC * RATE_16K;
         let ctx = CTX_SEC * RATE_16K;
         if samples.len() <= chunk + ctx {
-            return self.denoise_16k_whole(samples);
+            progress(0, 1);
+            let denoised = self.denoise_16k_whole(samples);
+            progress(1, 1);
+            return denoised;
         }
+        let total_chunks = samples.len().div_ceil(chunk);
+        progress(0, total_chunks);
         let mut out = Vec::with_capacity(samples.len());
         let mut start = 0;
+        let mut completed_chunks = 0;
         while start < samples.len() {
             let end = (start + chunk).min(samples.len());
             let ctx_start = start.saturating_sub(ctx);
             let denoised = self.denoise_16k_whole(&samples[ctx_start..end]);
             out.extend_from_slice(&denoised[start - ctx_start..]);
             start = end;
+            completed_chunks += 1;
+            progress(completed_chunks, total_chunks);
         }
         debug_assert_eq!(out.len(), samples.len());
         out

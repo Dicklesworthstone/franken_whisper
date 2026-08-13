@@ -358,8 +358,9 @@ mod wasm_api {
         let denoised = denoise
             && DENOISER.with(|slot| {
                 if let Some(denoiser) = slot.borrow().as_ref() {
-                    fw_stage("audio:denoise");
-                    samples = denoiser.denoise_16k(&samples);
+                    samples = denoiser.denoise_16k_with_progress(&samples, |completed, total| {
+                        fw_stage(&format!("audio:denoise:{completed}/{total}"));
+                    });
                     true
                 } else {
                     false

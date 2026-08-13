@@ -61,6 +61,47 @@ fn installer_script_is_valid_bash() {
 }
 
 #[test]
+fn public_site_examples_match_the_cli_contract() {
+    let site = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("site")
+            .join("index.html"),
+    )
+    .expect("read public site");
+
+    assert!(site.contains("fw robot run --input meeting.m4a"));
+    assert!(site.contains("select(.event == \"run_complete\") | .segments[]"));
+    assert!(site.contains("fw transcribe --input recording.mp3 --json"));
+    assert!(site.contains("fw pull all --json"));
+    assert!(site.contains("fw doctor --json"));
+    assert!(!site.contains("fw transcribe meeting.m4a --diarize --robot"));
+    assert!(!site.contains("fw transcribe recording.mp3 --diarize"));
+}
+
+#[test]
+fn playground_uses_current_wasm_bindgen_initialization_contract() {
+    let app = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("site")
+            .join("app.js"),
+    )
+    .expect("read playground app");
+    let worker = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("site")
+            .join("engine-worker.js"),
+    )
+    .expect("read playground worker");
+
+    assert!(worker.contains("engine.default({ module_or_path: wasmUrl })"));
+    assert!(!worker.contains("await engine.default();"));
+    assert!(app.contains("const DENOISER_STALL_MS = 180_000"));
+    assert!(app.contains("state.activeStage.startsWith(\"audio:denoise\")"));
+    assert!(app.contains("stopUnresponsiveDenoiser()"));
+    assert!(app.contains("Reload cached models"));
+}
+
+#[test]
 fn installer_accepts_the_exact_dsr_release_archive_members() {
     let root = tempfile::tempdir().expect("temporary archive harness");
     let stage = root.path().join("stage");

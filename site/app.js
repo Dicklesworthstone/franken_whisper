@@ -5,6 +5,7 @@ import { MODELS, totalBytes } from "./model-manifest.js?v=@SITEV@";
 const $ = (id) => document.getElementById(id);
 
 const COMBINED_TOTAL = totalBytes("whisper") + totalBytes("sortformer");
+const DENOISER_STALL_MS = 180_000;
 
 const state = {
   worker: null,
@@ -16,6 +17,9 @@ const state = {
   wallMs: 0,
   nameMap: new Map(),
   lane: "serial",
+  activeStage: "idle",
+  lastWorkerMessageAt: 0,
+  recoveryNotice: null,
   // Live-run progress model (see the "run progress" section below).
   run: null,
   // Download-rate estimator (EMA of bytes/second).
@@ -265,6 +269,13 @@ function updateRunProgress() {
 // Refresh the countdown once a second even when no engine event arrives.
 setInterval(() => {
   if (state.busy && state.run) updateRunProgress();
+  if (
+    state.busy &&
+    state.activeStage.startsWith("audio:denoise") &&
+    performance.now() - state.lastWorkerMessageAt > DENOISER_STALL_MS
+  ) {
+    stopUnresponsiveDenoiser();
+  }
 }, 1000);
 
 function finishRunCalibration() {
@@ -288,8 +299,43 @@ function finishRunCalibration() {
 function bootWorker() {
   const worker = new Worker("./engine-worker.js?v=@SITEV@", { type: "module" });
   state.worker = worker;
-  worker.onmessage = (e) => handle(e.data);
-  worker.onerror = (e) => setStatus(`worker error: ${e.message}`, "err");
+  state.lastWorkerMessageAt = performance.now();
+  worker.onmessage = (e) => {
+    state.lastWorkerMessageAt = performance.now();
+    handle(e.data);
+  };
+  worker.onerror = (e) => {
+    state.busy = false;
+    state.modelsReady = false;
+    state.run = null;
+    state.activeStage = "idle";
+    $("run-panel").hidden = true;
+    $("stage-line").hidden = true;
+    setStatus(`worker error: ${e.message}`, "err");
+    maybeEnableRun();
+  };
+}
+
+function stopUnresponsiveDenoiser() {
+  state.worker?.terminate();
+  state.worker = null;
+  state.booted = false;
+  state.modelsReady = false;
+  state.busy = false;
+  state.run = null;
+  state.activeStage = "idle";
+  $("run-panel").hidden = true;
+  $("progress-wrap").hidden = true;
+  $("stage-line").hidden = true;
+  const button = $("load-models");
+  button.disabled = true;
+  button.querySelector("span").textContent = "Reload cached models";
+  state.recoveryNotice =
+    "The FastEnhancer denoiser stopped responding, so its worker was reset. " +
+    "Reload the cached models and retry with audio clean-up turned off.";
+  setStatus(`error: ${state.recoveryNotice}`, "err");
+  maybeEnableRun();
+  bootWorker();
 }
 
 function handle(m) {
@@ -297,7 +343,11 @@ function handle(m) {
     case "booted": {
       state.booted = true;
       state.lane = m.lane ?? "serial";
-      setStatus(`engine booted (fw-wasm ${m.version}, ${state.lane} lane). Load the models to begin.`);
+      if (state.recoveryNotice) {
+        setStatus(`error: ${state.recoveryNotice}`, "err");
+      } else {
+        setStatus(`engine booted (fw-wasm ${m.version}, ${state.lane} lane). Load the models to begin.`);
+      }
       $("load-models").disabled = false;
       break;
     }
@@ -337,7 +387,17 @@ function handle(m) {
       break;
     }
     case "stage": {
-      const label = STAGE_LABELS[m.stage] ?? m.stage;
+      state.activeStage = m.stage;
+      const denoiseProgress = /^audio:denoise:(\d+)\/(\d+)$/.exec(m.stage);
+      let label = STAGE_LABELS[m.stage] ?? m.stage;
+      if (denoiseProgress) {
+        const completed = Number(denoiseProgress[1]);
+        const total = Number(denoiseProgress[2]);
+        label =
+          completed >= total
+            ? `audio clean-up complete (${total} chunk${total === 1 ? "" : "s"}).`
+            : `cleaning up the audio (FastEnhancer denoiser), chunk ${completed + 1} of ${total}…`;
+      }
       setStatus(label);
       if (state.run) {
         if (m.stage === "sortformer:diarize") {
@@ -357,6 +417,7 @@ function handle(m) {
       break;
     }
     case "audio-meta": {
+      state.activeStage = "whisper:decode";
       beginRun(m.audio_sec);
       state.run.offsetSec = m.skipped_leading_sec ?? 0;
       state.run.denoised = m.denoised === true;
@@ -415,6 +476,7 @@ function handle(m) {
       state.nameMap = buildSpeakerNameMap(m.result, parseSpeakerNames($("speaker-names").value));
       finishRunCalibration();
       state.run = null;
+      state.activeStage = "idle";
       $("run-panel").hidden = true;
       $("progress-wrap").hidden = true;
       $("stage-line").hidden = true;
@@ -433,6 +495,7 @@ function handle(m) {
     case "error": {
       state.busy = false;
       state.run = null;
+      state.activeStage = "idle";
       $("run-panel").hidden = true;
       $("progress-wrap").hidden = true;
       $("stage-line").hidden = true;
@@ -592,6 +655,7 @@ function init() {
   });
   $("consent-yes").addEventListener("click", () => {
     $("consent").hidden = true;
+    state.recoveryNotice = null;
     setStatus("downloading models (verified and resumable; a reload picks up where it left off)…");
     state.worker.postMessage({ type: "load-models" });
   });
@@ -636,6 +700,8 @@ function init() {
   $("run").addEventListener("click", async () => {
     if (!state.file || state.busy) return;
     state.busy = true;
+    state.activeStage = "audio:decode";
+    state.lastWorkerMessageAt = performance.now();
     maybeEnableRun();
     $("download-md").hidden = true;
     $("download-html").hidden = true;

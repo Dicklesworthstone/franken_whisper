@@ -268,7 +268,11 @@ async function armThreadPool() {
       import("./loader.js?v=@SITEV@"),
       import("./model-manifest.js?v=@SITEV@"),
     ]);
-    await engine.default(); // instantiate the wasm module
+    // wasm-bindgen 0.2.105+ accepts one options object. Passing no argument
+    // still works today, but emits a deprecation warning and leaves the wasm
+    // URL outside this deploy's cache-busting contract.
+    const wasmUrl = new URL(`${pkgDir}/fw_wasm_bg.wasm?v=@SITEV@`, self.location.href);
+    await engine.default({ module_or_path: wasmUrl });
     // The build flags are a claim; the instantiated memory is the receipt. A
     // "threaded" module whose memory is a plain ArrayBuffer would run, run
     // single-threaded, and never say so.

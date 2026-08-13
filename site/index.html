@@ -178,7 +178,8 @@
             <label class="micro" style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
               <input type="checkbox" id="denoise" checked>
               Clean up the audio first (FastEnhancer neural denoiser; on by default, helps
-              noisy recordings and costs a few seconds)
+              noisy recordings; long recordings can spend roughly one quarter of their
+              duration here)
             </label>
             <p class="micro">Names help twice. They feed Whisper's decoding prompt, the same
               mechanism as the CLI's <code>--prompt</code>, so names and titles come out
@@ -318,8 +319,10 @@
           decoder free-runs and invents text. The diarizer suffers too, since speaker identity
           lives in exactly the spectral detail that noise buries. Cleaning first attacks both
           problems at the source. The stage is length-preserving, so every timestamp stays
-          truthful to your original file, and it costs a few seconds even on long recordings
-          because it processes audio in one-minute chunks with carried state.</p>
+          truthful to your original file. It processes audio in one-minute chunks with carried
+          context and reports each chunk as it finishes. On the measured single-thread path it
+          costs about 0.24&times; audio duration (roughly 11 minutes for a 45-minute call), so turn
+          the playground checkbox off when clean audio or turnaround time matters more.</p>
       </div>
     </div>
     <div class="grid grid-3 reveal">
@@ -434,8 +437,8 @@
         things. If you are wiring transcription into a pipeline, the contract is the product.
       </p>
     </div>
-    <pre class="code reveal"><code>fw transcribe meeting.m4a --diarize --robot | jq -r '
-  .result.speaker_segments[]
+    <pre class="code reveal"><code>fw robot run --input meeting.m4a | jq -r '
+  select(.event == "run_complete") | .segments[]
   | "[\(.speaker // "?")] \(.text)"'</code></pre>
   </div>
 </section>
@@ -458,8 +461,12 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/m
 brew install dicklesworthstone/tap/franken-whisper
 
 # or cargo
-cargo install franken_whisper</code></pre>
-    <p class="kv reveal">Then: <code>fw transcribe recording.mp3 --diarize</code></p>
+cargo install franken_whisper
+
+# Homebrew and cargo installs do not bundle the model packages
+fw pull all --json
+fw doctor --json</code></pre>
+    <p class="kv reveal">Then: <code>fw transcribe --input recording.mp3 --json</code></p>
   </div>
 </section>
 

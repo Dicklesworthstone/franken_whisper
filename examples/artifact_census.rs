@@ -124,7 +124,13 @@ struct Row {
     bytes: usize,
 }
 
-fn report(label: &str, path: &str, file_bytes: u64, rows: &[Row], class_of: fn(&str) -> &'static str) {
+fn report(
+    label: &str,
+    path: &str,
+    file_bytes: u64,
+    rows: &[Row],
+    class_of: fn(&str) -> &'static str,
+) {
     let mut classes: BTreeMap<&'static str, ClassStat> = BTreeMap::new();
     let mut dtypes: BTreeMap<String, usize> = BTreeMap::new();
     let mut payload = 0usize;
@@ -153,7 +159,10 @@ fn report(label: &str, path: &str, file_bytes: u64, rows: &[Row], class_of: fn(&
 
     let mut ordered: Vec<(&&str, &ClassStat)> = classes.iter().collect();
     ordered.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
-    println!("   {:<14} {:>7} {:>13} {:>13} {:>8} {:>6}", "class", "tensors", "params", "bytes", "MB", "%");
+    println!(
+        "   {:<14} {:>7} {:>13} {:>13} {:>8} {:>6}",
+        "class", "tensors", "params", "bytes", "MB", "%"
+    );
     for (class, s) in &ordered {
         println!(
             "   {:<14} {:>7} {:>13} {:>13} {:>8.1} {:>5.1}%",
@@ -227,7 +236,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .tensor(&name)
                     .ok_or_else(|| format!("tensor {name} vanished from directory"))?;
                 let params = entry.n_elements();
-                let bytes = ggml_payload_bytes(entry.dtype, params).map_err(|e| format!("{name}: {e}"))?;
+                let bytes =
+                    ggml_payload_bytes(entry.dtype, params).map_err(|e| format!("{name}: {e}"))?;
                 rows.push(Row {
                     name,
                     dtype: format!("{:?}", entry.dtype),
