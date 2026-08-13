@@ -252,6 +252,10 @@
         positioned reader; the file never exists as one in-memory blob. Quantized blocks stay
         block-RESIDENT and dequantize per row inside the kernels — bit-identical math to a
         dequantize-at-load reference, at less than half the memory.</li>
+      <li><strong>Neural clean-up.</strong> FastEnhancer&#8209;S denoises the 16 kHz signal before
+        anything downstream hears it (see the denoiser section below), and leading silence is
+        trimmed so Whisper never free-runs on an empty first window. Both are length-honest:
+        timestamps stay true to the original file.</li>
       <li><strong>Log-mel frontend.</strong> The reference mel pipeline, bit-faithful to the
         native engine: 25 ms windows, 10 ms hop, 128 mel bins for turbo.</li>
       <li><strong>Encoder + decoder.</strong> 32 encoder layers, 4 decoder layers, greedy
