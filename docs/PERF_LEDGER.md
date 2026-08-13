@@ -5453,3 +5453,30 @@ Total wasm campaign to date: 45.3× → 8.35× → 1.56× RT (threaded) and
 2.1 GB → 1.3 GB download. Next (bd-3be3): byte census, Sortformer f16
 (−234 MB), then the calibrated mixed-precision artifact (AWQ clip search
 + GPTQ-style rounding) targeting ~600 MB whisper under the same gates.
+
+---
+## 2026-08-13 — INFORMATIONAL (measurement only; no lever, no verdict) — **Phase 0 byte census: where the artifact bytes actually live** (bd-3be3.5)
+
+Result class: NON-CAMPAIGN / INFORMATIONAL. Header-level parse of all three
+shipping artifacts (independent Python parser cross-checked against
+`examples/artifact_census.rs`, which uses the engine's own directories).
+
+**Whisper turbo f16** (1,624,555,275 B, 587 tensors): enc.mlp **51.7%**
+(839.7 MB) · enc.attn **25.9%** (419.9 MB) · dec.tok_embed 8.2% (132.8 MB,
+one tied tensor) · dec.mlp 6.5% · dec self/cross attn 3.2% each ·
+conv stem + positions + norms ≈1.4%. **Q8_0 file** (874,188,075 B): same
+proportions (enc.mlp 51.1%); upstream quantizer leaves `encoder.conv2.weight`
+F16 and `encoder.positional_embedding` F32.
+
+**Sortformer f32** (491,570,584 B, 974 tensors): fc.feed_forward **58.1%**
+(285.6 MB) · fc.self_attn 18.2% · fc.conv 11.0% · transformer head stack
+6.6% · `encoder.pos_enc.pe` alone 4.2% (20.5 MB) · pre_encode 1.8%.
+
+Consequences for phase ordering (recorded on bd-3be3.5): whisper sub-q8
+effort goes encoder MLPs first, then encoder attention (77.6% of bytes
+combined); the tied token embedding is already q8 and logits-coupled —
+sensitive, not a lever. Sortformer int8 aims at the fastconformer body
+(87.3% of bytes) and never needs to touch the transformer head stack;
+`pos_enc.pe` is a standalone 4.2% candidate (f16 or synthesized). No
+frankentts-style cold-tensor monster exists in either model (their census
+found 47% in one tensor; our largest is 8.2%).
