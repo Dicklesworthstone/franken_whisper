@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>og source (1200x630) — screenshot me: scripts note in site/build-og.sh</title>
+<style>
+  @font-face {
+    font-family: "Inter Variable";
+    src: url("./fonts/inter-latin-wght-normal.woff2") format("woff2");
+    font-weight: 100 900;
+    font-display: block;
+  }
+  @font-face {
+    font-family: "JetBrains Mono Variable";
+    src: url("./fonts/jetbrains-mono-latin-wght-normal.woff2") format("woff2");
+    font-weight: 100 900;
+    font-display: block;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 1200px; height: 630px; overflow: hidden;
+    background:
+      radial-gradient(1000px 500px at 85% 10%, rgba(16, 185, 129, 0.14), transparent 60%),
+      linear-gradient(135deg, #04120b 0%, #020604 45%, #041008 100%);
+    font-family: "Inter Variable", -apple-system, sans-serif;
+    color: #e6f4ec;
+    display: flex;
+  }
+  .left { width: 620px; padding: 52px 20px 48px 56px; display: flex; flex-direction: column; }
+  .brand { display: flex; align-items: center; gap: 16px; margin-bottom: 42px; }
+  .mark {
+    width: 58px; height: 58px; border-radius: 14px;
+    background: linear-gradient(135deg, #065f46, #10b981);
+    border: 2px solid rgba(52, 211, 153, 0.55);
+    display: flex; align-items: center; justify-content: center;
+    font-family: "JetBrains Mono Variable", monospace; font-weight: 900; font-size: 32px;
+    color: #04110b;
+  }
+  .brand-name { font-family: "JetBrains Mono Variable", monospace; font-weight: 800; font-size: 30px; letter-spacing: -0.5px; }
+  .brand-domain { font-family: "JetBrains Mono Variable", monospace; font-weight: 600; font-size: 15px; color: #34d399; letter-spacing: 2px; margin-top: 3px; }
+  h1 { font-size: 63px; line-height: 1.06; font-weight: 860; letter-spacing: -2px; margin-bottom: 26px; }
+  h1 .em { color: #34d399; }
+  .lede { font-size: 25px; line-height: 1.42; color: #b7cfc2; margin-bottom: 34px; max-width: 540px; }
+  .lede b { color: #e6f4ec; font-weight: 750; }
+  .chips { display: flex; flex-wrap: wrap; gap: 12px; margin-top: auto; }
+  .chip {
+    font-family: "JetBrains Mono Variable", monospace; font-size: 16px; font-weight: 600;
+    color: #d7efe2; padding: 9px 18px; border-radius: 999px;
+    border: 1.5px solid rgba(52, 211, 153, 0.35); background: rgba(6, 30, 18, 0.7);
+  }
+  .chip b { color: #34d399; font-weight: 800; }
+  .right { flex: 1; padding: 28px 28px 28px 4px; display: flex; }
+  .art {
+    flex: 1; border-radius: 22px; overflow: hidden;
+    border: 2px solid rgba(52, 211, 153, 0.3);
+    box-shadow: 0 0 80px rgba(16, 185, 129, 0.18);
+    display: flex;
+  }
+  .art img { width: 100%; height: 100%; object-fit: cover; object-position: center; }
+</style>
+</head>
+<body>
+  <div class="left">
+    <div class="brand">
+      <div class="mark">W</div>
+      <div>
+        <div class="brand-name">franken_whisper</div>
+        <div class="brand-domain">franken-whisper.com</div>
+      </div>
+    </div>
+    <h1>Whisper, and<br>who said it.<br><span class="em">In your browser tab.</span></h1>
+    <div class="lede">Whisper large&#8209;v3&#8209;turbo and NVIDIA&#8217;s Sortformer diarizer,
+      hand&#8209;ported to <b>pure Rust</b>, quantized, compiled to WebAssembly.
+      Your audio never leaves the page.</div>
+    <div class="chips">
+      <div class="chip"><b>100%</b>&nbsp;Rust</div>
+      <div class="chip"><b>809M + 123M</b>&nbsp;params</div>
+      <div class="chip"><b>0 bytes</b>&nbsp;uploaded</div>
+      <div class="chip"><b>4</b>&nbsp;speakers &#183; live transcript</div>
+    </div>
+  </div>
+  <div class="right">
+    <div class="art"><img src="./img/franken_whisper_illustration.webp" alt=""></div>
+  </div>
+</body>
+</html>
