@@ -12,6 +12,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 No unreleased changes yet.
 
+## [0.9.1] - 2026-08-13
+
+### Fixed
+
+- Pin the release-only `frankensqlite` sibling checkout to the exact public
+  revision used by the tested build. The previous release helper selected an
+  older `fsqlite` 0.2.0 checkout even though this workspace requires 0.3.0,
+  causing strict multi-platform release builds to fail before compilation.
+
 ## [0.9.0] - 2026-08-13
 
 This release adds the native browser transcription path and makes neural audio
@@ -672,7 +681,8 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.9.0...main
+[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.9.1...main
+[0.9.1]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.1
 [0.9.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.0
 [0.8.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.8.0
 [0.7.2]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.2
