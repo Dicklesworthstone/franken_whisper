@@ -57,8 +57,9 @@
       encoder, decoder, word timestamps, four-speaker diarization, and the fusion that stitches
       them into <em>who said what</em>. No PyTorch, no Python, no FFI, no subprocess. The same
       code that ships as the <code>fw</code> CLI compiles to WebAssembly, so the full
-      809-million-parameter <strong>large-v3-turbo</strong> transcribes and diarizes your
-      recordings <strong>entirely on your CPU, in this page</strong>. Your audio never leaves
+      809-million-parameter <strong>large-v3-turbo</strong> transcribes your recordings and the
+      123-million-parameter <strong>Sortformer</strong> labels the speakers,
+      <strong>entirely on your CPU, in this page</strong>. Your audio never leaves
       the tab. The CSP's <code>connect-src 'self'</code> makes that a browser-enforced promise
       rather than a privacy-policy one.
     </p>
