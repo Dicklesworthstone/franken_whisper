@@ -171,6 +171,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftts-kernels"
+version = "0.1.8"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -200,6 +207,7 @@ version = "0.1.0"
 dependencies = [
  "ft-core",
  "ft-kernel-cpu",
+ "ftts-kernels",
  "half",
  "js-sys",
  "rayon",
