@@ -35,29 +35,6 @@ fn sum_normal(buf: &[i8]) -> i64 {
     acc.iter().sum()
 }
 
-/// Read `buf` via MOVNTDQA (`_mm256_stream_load_si256`). On WB memory the NT hint is
-/// architecturally IGNORED (behaves as a normal cached load) — this measures whether
-/// that is actually so on this Zen3.
-#[cfg(target_arch = "x86_64")]
-fn sum_stream(buf: &[i8]) -> i64 {
-    unsafe {
-        let n = buf.len();
-        let p = buf.as_ptr();
-        let mut acc = _mm256_setzero_si256();
-        let mut i = 0;
-        while i + 32 <= n {
-            let v = _mm256_stream_load_si256(p.add(i) as *const __m256i);
-            // widen i8->i16->i32 pairs and accumulate (values tiny, no overflow over this test)
-            let lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(lo, _mm256_set1_epi16(1)));
-            i += 32;
-        }
-        let mut t = [0i32; 8];
-        _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, acc);
-        t.iter().map(|&x| x as i64).sum()
-    }
-}
-
 /// Read `buf` with PREFETCHNTA ahead (non-temporal prefetch hint) + normal loads.
 #[cfg(target_arch = "x86_64")]
 fn sum_nta(buf: &[i8]) -> i64 {
@@ -68,7 +45,7 @@ fn sum_nta(buf: &[i8]) -> i64 {
         let mut i = 0;
         while i + 32 <= n {
             if i + 512 < n {
-                _mm_prefetch::<_MM_HINT_NTA>(p.add(i + 512) as *const i8);
+                _mm_prefetch::<_MM_HINT_NTA>(p.add(i + 512));
             }
             let v = _mm256_loadu_si256(p.add(i) as *const __m256i);
             let lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v));

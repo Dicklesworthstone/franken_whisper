@@ -1840,16 +1840,14 @@ pub enum WeightMat {
     },
 }
 
+#[cfg(target_os = "macos")]
 impl WeightMat {
-    /// The pre-transposed f32 arm. The encoder's native construction ALWAYS
-    /// builds this arm (the F16 arm is wasm32-only, bd-m2jm), so the
-    /// macOS-GPU and roundtrip-harness call sites — which never compile or
-    /// run on wasm — can rely on it being present.
+    /// The pre-transposed f32 arm. Native macOS construction always builds
+    /// this arm, so the Metal encoder upload path can borrow it directly.
     ///
     /// # Panics
     ///
-    /// If called on the F16 arm; on the paths above that is unreachable by
-    /// construction.
+    /// If a native macOS caller supplies a wasm-only quantized arm.
     #[must_use]
     pub(crate) fn f32_mat(&self) -> &Mat {
         match self {

@@ -49,12 +49,14 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
-## 2026-08-11 — KEEP (same-binary interleaved) — **NON-CAMPAIGN / MAINTENANCE** — Metal fused-encoder kernel levers: median **1.40×** on `encoder_window`, transcript identical (bd-453z)
+## 2026-08-11 — **NO ADMISSIBLE PERFORMANCE VERDICT** — Metal fused-encoder kernel observations: median **1.40×** on `encoder_window`, transcript identical (bd-453z)
 
-**Result class: self-speedup/maintenance** (fw-vs-fw, kill-switch arms in one
-binary; no pinned darwin incumbent contract exists yet, and the host carried
-multi-agent load — decidable competitive rows still require a quiet M-series
-host). Three levers landed in `ft-kernel-metal` (frankentorch
+**Result class: NON-CAMPAIGN / INFORMATIONAL.** The benchmark executable's
+SHA-256 was not recorded, so this row cannot support a KEEP or performance
+claim even though the kill-switch arms ran in one process and produced the
+same transcript. The measurements remain diagnostic only. No pinned Darwin
+incumbent contract existed yet, and the host carried multi-agent load.
+Three levers landed in `ft-kernel-metal` (frankentorch
 `3012f79a`/`3e0a830e` + follow-ups):
 
 1. **FlashAttention v2**: float4-vectorized q/K/V, 64-query threadgroups, and
@@ -5365,7 +5367,11 @@ count/degree/tolerance sensitivity remain **NO-DATA** and cannot authorize
 default promotion.
 
 ---
-## 2026-08-12 — KEEP (byte-identical, same-harness before/after) — **wasm turbo encoder: amortized two-pass batch GEMV, 45.3× → 8.35× realtime (5.4×)** (bd-m2jm)
+## 2026-08-12 — **NO ADMISSIBLE PERFORMANCE VERDICT** — wasm turbo encoder two-pass batch GEMV observation, 45.3× → 8.35× realtime (bd-m2jm)
+
+**Result class: NON-CAMPAIGN / INFORMATIONAL.** The exact benchmark WASM
+module SHA-256 was not recorded. The timing and transcript observations below
+therefore remain diagnostic and cannot support a KEEP or public speed claim.
 
 The first-ever wasm run of the FULL fused pipeline (whisper large-v3-turbo,
 f16-resident streamed load + Sortformer diarization + projection-fusion) on a
@@ -5399,7 +5405,12 @@ build recipe in frankentts `site/build.sh`). Entry point is already built:
 every hot GEMM partitions through `plat::scope`.
 
 ---
-## 2026-08-12 — KEEP (real-browser harness, transcript-equality gate) — **wasm threaded lane: 8.35× → 1.56× realtime (5.4×) on the fused turbo+Sortformer pipeline** (bd-m2jm)
+## 2026-08-12 — **NO ADMISSIBLE PERFORMANCE VERDICT** — wasm threaded-lane observation, 8.35× → 1.56× realtime on the fused turbo+Sortformer pipeline (bd-m2jm)
+
+**Result class: NON-CAMPAIGN / INFORMATIONAL.** The exact serial and threaded
+WASM module SHA-256 identities were not recorded. The browser timings and
+transcript comparison below remain diagnostic and cannot support a KEEP or
+public speed claim.
 
 Second wasm artifact (site/pkg-threaded): +atomics/+bulk-memory/
 +mutable-globals, shared imported memory, TLS export set, -Z build-std;
@@ -5428,7 +5439,12 @@ non-isolated contexts keep the serial lane (shared-memory growth kills iOS
 tabs ~2 GB; this engine holds 2.4 GB).
 
 ---
-## 2026-08-12 — KEEP (transcript-gated, one named diff) — **wasm q8_0 whisper lane: 874 MB download (−46%), 1.20 GB resident (−47%), ~20% faster** (bd-3be3 Phase 1)
+## 2026-08-12 — **NO ADMISSIBLE PERFORMANCE VERDICT** — wasm q8_0 Whisper lane size and timing observations (bd-3be3 Phase 1)
+
+**Result class: NON-CAMPAIGN / INFORMATIONAL.** The exact f16 and q8_0 WASM
+module SHA-256 identities were not recorded. Artifact byte counts remain
+directly checkable, but the timing comparison below cannot support a KEEP or
+public speed claim.
 
 `WeightMat::Q8_0` keeps upstream ggml q8_0 blocks RESIDENT (wasm-only
 arm); rows dequantize in-kernel with the load path's exact `dequant_q8_0`

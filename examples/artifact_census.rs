@@ -24,7 +24,7 @@ fn ggml_payload_bytes(dtype: GgmlDType, n: usize) -> Result<usize, String> {
         GgmlDType::F32 => Ok(n * 4),
         GgmlDType::F16 => Ok(n * 2),
         GgmlDType::Q8_0 => {
-            if n % 32 != 0 {
+            if !n.is_multiple_of(32) {
                 return Err(format!("q8_0 element count {n} not a multiple of 32"));
             }
             Ok(n / 32 * 34)
@@ -158,7 +158,7 @@ fn report(
     println!("   by dtype: {}", dtype_line.join(" | "));
 
     let mut ordered: Vec<(&&str, &ClassStat)> = classes.iter().collect();
-    ordered.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+    ordered.sort_by_key(|entry| std::cmp::Reverse(entry.1.bytes));
     println!(
         "   {:<14} {:>7} {:>13} {:>13} {:>8} {:>6}",
         "class", "tensors", "params", "bytes", "MB", "%"
@@ -176,7 +176,7 @@ fn report(
     }
 
     let mut top: Vec<&Row> = rows.iter().collect();
-    top.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    top.sort_by_key(|entry| std::cmp::Reverse(entry.bytes));
     println!("   largest tensors:");
     for r in top.iter().take(10) {
         println!(

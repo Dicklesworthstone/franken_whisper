@@ -3412,17 +3412,17 @@ A clause-to-test traceability table lives in [`tests/COVERAGE.md`](tests/COVERAG
 is the canonical release authority. Its local registration builds Linux x86_64
 and ARM64, macOS Intel and Apple Silicon, and Windows x86_64 on native/SSH
 hosts; packages both `franken_whisper` and `fw`; and syncs the exact pinned
-`frankensqlite`, `frankentorch`, and `frankentui` commits adjacent to the source
-tree.
+`frankensqlite`, `frankentorch`, `frankentui`, and `frankentts` commits adjacent
+to the source tree.
 
 ```bash
-dsr build franken_whisper --version 0.8.0 --dry-run \
+dsr build franken_whisper --version 0.9.0 --dry-run \
   --targets darwin/arm64,darwin/amd64,linux/amd64,linux/arm64,windows/amd64
-dsr build franken_whisper --version 0.8.0 \
+dsr build franken_whisper --version 0.9.0 \
   --targets darwin/arm64,darwin/amd64,linux/amd64,linux/arm64,windows/amd64
 ```
 
-No GitHub Actions workflow participates in the v0.8.0 release. DSR is the build
+No GitHub Actions workflow participates in the v0.9.0 release. DSR is the build
 and packaging authority; the tag and release assets are verified against its
 local receipts before publication.
 

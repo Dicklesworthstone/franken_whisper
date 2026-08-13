@@ -7,6 +7,7 @@ set -euo pipefail
 FRANKENSQLITE_REVISION="fc57211d59c61b3c695661a900e487687ba83040"
 FRANKENTORCH_REVISION="9c93f5fe314195a7bab6bf6daf72f199063d39bc"
 FRANKENTUI_REVISION="479436597890a14e82676d0067e3917b2a9de8f5"
+FRANKENTTS_REVISION="aa5ee59f48f9d48f3bcf9314f9bdca7aac2ea6d8"
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mode="checkout"
@@ -74,3 +75,7 @@ require_sibling \
     "frankentui" \
     "https://github.com/Dicklesworthstone/frankentui.git" \
     "$FRANKENTUI_REVISION"
+require_sibling \
+    "frankentts" \
+    "https://github.com/Dicklesworthstone/frankentts.git" \
+    "$FRANKENTTS_REVISION"

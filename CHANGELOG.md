@@ -12,6 +12,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 No unreleased changes yet.
 
+## [0.9.0] - 2026-08-13
+
+This release adds the native browser transcription path and makes neural audio
+cleanup part of the default pipeline. It also corrects the public CLI examples
+and hardens the browser's longest-running stage against silent stalls.
+
+### Added
+
+- A fully local browser playground powered by the shared Rust native engine,
+  with serial WebAssembly and cross-origin-isolated threaded lanes, OPFS model
+  caching, incremental segment delivery, live stage progress, and fused speaker
+  diarization. Audio and model data stay in the browser.
+- Quantized GGML `q8_0` model loading and block-resident dequantization for the
+  browser lane, plus verified organization-hosted mirrors and explicit fallback
+  download sources.
+- FastEnhancer-S neural denoising as the default cleanup stage for both the CLI
+  pipeline and browser playground, while preserving truthful source timestamps.
+- Browser language selection, optional speaker names/titles, leading-silence
+  trimming, retryable model loading, and a live transcript/run panel.
+
+### Changed
+
+- The website now presents the CLI's actual grammar: file transcription uses
+  `fw transcribe --input <file>`, while machine-readable streaming uses
+  `fw robot run --input <file>`. Setup examples use the real `pull`, `doctor`,
+  and `models` subcommands.
+- Public performance copy is limited to admitted, reproducible evidence. Browser
+  and Metal measurements without exact executable or WebAssembly provenance
+  remain diagnostic records rather than release claims.
+
+### Fixed
+
+- Browser denoising emits heartbeat progress, has bounded no-progress detection,
+  and can retry on the safe path instead of remaining indefinitely at
+  “Cleaning up the audio.”
+- The browser worker now calls wasm-bindgen's initializer with the current
+  object-form API, eliminating the deprecated-parameters warning in Chrome.
+- Strict all-target Clippy failures in native model loading, diarization tests,
+  and diagnostic examples were corrected without weakening the release gate.
+
 ## [0.8.0] - 2026-08-11
 
 This release closes four reproduced transcription-path defects filed against
@@ -632,7 +672,8 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.8.0...main
+[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.9.0...main
+[0.9.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.0
 [0.8.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.8.0
 [0.7.2]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.2
 [0.7.1]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.7.1

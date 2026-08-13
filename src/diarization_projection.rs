@@ -635,21 +635,6 @@ fn distinct_known_speakers(turns: &[DiarizationTurn]) -> usize {
         .len()
 }
 
-#[cfg(test)]
-mod tests {
-    /// The module-local epsilon must stay equal to the conformance-canonical
-    /// one (duplicated here so this module carries no conformance dep).
-    #[test]
-    fn projection_epsilon_matches_conformance() {
-        assert!(
-            (super::CANONICAL_PROJECTION_EPSILON_SEC
-                - crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC)
-                .abs()
-                == 0.0
-        );
-    }
-}
-
 /// Map a native Sortformer diarization output onto the report-shape
 /// [`DiarizationTurn`] timeline: `SPEAKER_NN` labels per active lane, mean
 /// per-turn lane probability as the speaker confidence, overlap suspicion
@@ -762,4 +747,19 @@ pub fn finite_seconds_interval_to_ms(start_sec: f64, end_sec: f64) -> Option<(u6
     let start_ms = start_ms as u64;
     let end_ms = end_ms as u64;
     (end_ms > start_ms).then_some((start_ms, end_ms))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The module-local epsilon must stay equal to the conformance-canonical
+    /// one (duplicated here so this module carries no conformance dep).
+    #[test]
+    fn projection_epsilon_matches_conformance() {
+        assert!(
+            (super::CANONICAL_PROJECTION_EPSILON_SEC
+                - crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC)
+                .abs()
+                == 0.0
+        );
+    }
 }

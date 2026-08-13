@@ -4,7 +4,11 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
-## 2026-08-11 - M4 Pro dev host: **REJECT — two-row-block simdgroup GEMM (128 threads / 4 simdgroups) loses to the 256-thread / 8-simdgroup layout.**
+## 2026-08-11 - M4 Pro dev host: **OBSERVED LOSS / NO ADMISSIBLE VERDICT — two-row-block simdgroup GEMM (128 threads / 4 simdgroups) trailed the 256-thread / 8-simdgroup layout.**
+
+No numerical same-invocation A/A null control was recorded, so the observation
+below is not a formal rejection. The candidate was reverted and may be retried
+only under the existing predicate with the required A/A control added.
 
 Lever: amortize B-tile `simdgroup_load`s by giving each simdgroup TWO 8-row
 blocks (`acc[2][8]`, threadgroup width 256 -> 128) in `matmul_bias_sg`

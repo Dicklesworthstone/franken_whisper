@@ -1,6 +1,6 @@
 [package]
 name = "franken_whisper"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 license-file = "LICENSE"
 description = "Native Rust Whisper ASR and speaker diarization with agent-first NDJSON and durable local workflows"

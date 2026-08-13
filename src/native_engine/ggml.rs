@@ -621,9 +621,11 @@ enum TensorSource {
 /// Positioned-read seam for [`GgmlModel::load_from_host_reader`]: the host
 /// supplies the total byte length and a `read_exact_at(offset, buf)` closure.
 /// Mirrors the unix `Streamed` arm's contract (thread-safe, no cursor).
+type ReadAt = dyn Fn(u64, &mut [u8]) -> std::io::Result<()> + Send + Sync;
+
 pub struct HostReader {
     len: u64,
-    read_at: Box<dyn Fn(u64, &mut [u8]) -> std::io::Result<()> + Send + Sync>,
+    read_at: Box<ReadAt>,
 }
 
 impl HostReader {

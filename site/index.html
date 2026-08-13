@@ -394,14 +394,11 @@
         On native CPU, franken_whisper's engine measures <strong>2.99× faster than
         whisper.cpp</strong> at matched greedy decode settings, side-by-side in one interleaved
         harness; the methodology and evidence hashes live in the repo's performance ledger.
-        On Apple-silicon GPU, the Metal encoder went from 15.4 s to 1.85 s per window across
-        one ledgered kernel campaign. The wasm build in this page started at 45 times real
-        time; one byte-identical kernel pass brought it to 8.4, and the threaded lane (rayon
-        over Web Workers, the same recipe the sibling projects ship) measured
-        <strong>1.56× real time</strong> in headless Chrome with 8 workers, transcript
-        unchanged. Chrome gets the threaded engine; everything else gets the serial build.
-        The page prints the exact ratio after each run, so the number you read is from your
-        machine.
+        Apple-silicon builds use the fused Metal encoder, while isolated desktop Chrome can
+        arm a shared-memory worker team for the browser pipeline. WebKit and non-isolated
+        contexts retain the serial lane. Exact performance depends on the model, recording,
+        browser, and host; the page prints the measured ratio after each completed run, so the
+        number you read is from your machine.
       </p>
     </div>
     <div class="grid grid-3 reveal">
