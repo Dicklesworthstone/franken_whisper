@@ -25,11 +25,12 @@ const FILES = {
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
     "https://github.com/Dicklesworthstone/franken_whisper/releases/download/whisper-large-v3-turbo-f16-v1/ggml-large-v3-turbo.bin",
   ],
-  // The q8_0 lane (bd-3be3): same upstream repo, quantized file, transcript-
-  // gated identical output. No GitHub fallback exists for this file; the
-  // loader's retry-with-resume covers transient upstream failures.
+  // The q8_0 lane (bd-3be3): canonical upstream first (the repo our manifest
+  // pin came from), then our org mirror (sha-verified byte-identical copy,
+  // uploaded 2026-08-13) so a ggerganov-repo outage can't strand the page.
   "whisper/ggml-large-v3-turbo-q8_0.bin": [
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin",
+    `${HF_ORG}ggml-large-v3-turbo-q8_0.bin`,
   ],
   "sortformer/weights.safetensors": [
     `${HF_ORG}weights.safetensors`,
