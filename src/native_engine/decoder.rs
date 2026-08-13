@@ -338,6 +338,31 @@ impl Linear {
                 nn::gemv_f16_batch(data, *out, *inp, &x.data, tq, self.bias.as_deref(), &mut y);
                 Ok(Mat::from_vec(tq, *out, y))
             }
+            // wasm32 q8_0 lane (bd-3be3): block-resident, row-dequant
+            // in-kernel; handles every tq including the single-token step
+            // (the fused f16 fast paths above simply don't match this arm).
+            WeightMat::Q8_0 { raw, out, inp } => {
+                if x.cols != *inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(q8_0) forward: x.cols {} != in {inp}",
+                        x.cols
+                    )));
+                }
+                let tq = x.rows;
+                let mut y = nn::gemv_out_buf(tq * out);
+                let workers = nn::q8_batch_workers(*out, *inp, tq);
+                nn::gemv_q8_batch_twopass(
+                    raw,
+                    *out,
+                    *inp,
+                    &x.data,
+                    tq,
+                    self.bias.as_deref(),
+                    &mut y,
+                    workers,
+                );
+                Ok(Mat::from_vec(tq, *out, y))
+            }
         }
     }
 
@@ -406,6 +431,7 @@ impl Linear {
         let out = match &self.w {
             WeightMat::F32(w_t) => w_t.cols,
             WeightMat::F16 { out, .. } => *out,
+            WeightMat::Q8_0 { out, .. } => *out,
         };
         let mut rows = Vec::with_capacity(x.rows * out);
         for row in 0..x.rows {
@@ -582,6 +608,16 @@ fn load_linear(
             .tensor(weight_name)
             .is_some_and(|t| t.dtype == crate::native_engine::GgmlDType::F16);
 
+    // wasm32 q8_0 lane (bd-3be3): quantized decoder linears stay
+    // block-resident; the general forward match dequantizes rows in-kernel.
+    #[cfg(target_arch = "wasm32")]
+    let want_q8 = in_dim.is_multiple_of(32)
+        && model
+            .tensor(weight_name)
+            .is_some_and(|t| t.dtype == crate::native_engine::GgmlDType::Q8_0);
+    #[cfg(not(target_arch = "wasm32"))]
+    let want_q8 = false;
+
     let w = if want_f16 {
         // Natural [out, in] f16 bits — skip the transpose entirely. Decode the
         // raw bytes straight to f16-resident `Vec<Float16>` in one parallel pass.
@@ -593,6 +629,18 @@ fn load_linear(
         }
         WeightMat::F16 {
             data,
+            out: out_dim,
+            inp: in_dim,
+        }
+    } else if want_q8 {
+        let (shape, raw) = model.tensor_q8_0_raw(weight_name)?;
+        if shape != [out_dim, in_dim] {
+            return Err(FwError::InvalidRequest(format!(
+                "decoder q8_0 tensor '{weight_name}' shape {shape:?} != expected [{out_dim}, {in_dim}]"
+            )));
+        }
+        WeightMat::Q8_0 {
+            raw,
             out: out_dim,
             inp: in_dim,
         }
@@ -637,14 +685,43 @@ fn load_embedding(
                 "decoder f16 tensor '{name}' shape {shape:?} != expected [{n_vocab}, {n_state}]"
             )));
         }
-        Ok(WeightMat::F16 {
+        return Ok(WeightMat::F16 {
             data,
             out: n_vocab,
             inp: n_state,
-        })
-    } else {
-        Ok(WeightMat::F32(load_mat(model, name, n_vocab, n_state)?))
+        });
     }
+    // wasm32 q8_0 lane (bd-3be3): the tied embedding dequantizes to f16 AT
+    // LOAD (one spot) so every existing lookup/logits path — including the
+    // int8 head — runs unchanged. A full-f32 dequant would cost 265 MB
+    // against the 4 GB ceiling; f16 halves that. The q8→f16 double rounding
+    // is a numerics change owned by the lane's transcript gate.
+    #[cfg(target_arch = "wasm32")]
+    if crate::native_engine::f16_compute_enabled()
+        && n_state.is_multiple_of(32)
+        && model
+            .tensor(name)
+            .is_some_and(|t| t.dtype == crate::native_engine::GgmlDType::Q8_0)
+    {
+        let (shape, raw) = model.tensor_q8_0_raw(name)?;
+        if shape != [n_vocab, n_state] {
+            return Err(FwError::InvalidRequest(format!(
+                "decoder q8_0 tensor '{name}' shape {shape:?} != expected [{n_vocab}, {n_state}]"
+            )));
+        }
+        let mut data = Vec::with_capacity(n_vocab * n_state);
+        let mut scratch = vec![0.0f32; n_state];
+        for row in 0..n_vocab {
+            nn::dequant_q8_row(&raw, row, n_state, &mut scratch);
+            data.extend(scratch.iter().map(|&v| ft_core::Float16::from_f32(v)));
+        }
+        return Ok(WeightMat::F16 {
+            data,
+            out: n_vocab,
+            inp: n_state,
+        });
+    }
+    Ok(WeightMat::F32(load_mat(model, name, n_vocab, n_state)?))
 }
 
 /// Load a layer-norm (`weight`, `bias`), each length `n_state`.
@@ -1278,6 +1355,14 @@ fn embed_tokens(w: &DecoderWeights, tokens: &[i32], cache_len: usize) -> FwResul
                 for ((d, &tb), &p) in dst.iter_mut().zip(row).zip(pe) {
                     *d = tb.to_f32() + p;
                 }
+            }
+            // The embedding is never stored Q8_0-resident: the q8_0 lane
+            // dequantizes it to f16 AT LOAD (see `load_embedding`) precisely
+            // so lookup/logits paths stay on the arms above.
+            WeightMat::Q8_0 { .. } => {
+                return Err(FwError::ContractViolation(
+                    "token embedding must not be q8_0-resident".to_owned(),
+                ));
             }
         }
     }
@@ -2163,15 +2248,15 @@ fn fuse_qkv(q: &Linear, k: &Linear, v: &Linear) -> Option<Linear> {
     // returning a borrow tied to its `&WeightMat` arg won't infer the lifetime).
     let (qd, qo, qi) = match &q.w {
         WeightMat::F16 { data, out, inp } => (data.as_slice(), *out, *inp),
-        WeightMat::F32(_) => return None,
+        WeightMat::F32(_) | WeightMat::Q8_0 { .. } => return None,
     };
     let (kd, ko, ki) = match &k.w {
         WeightMat::F16 { data, out, inp } => (data.as_slice(), *out, *inp),
-        WeightMat::F32(_) => return None,
+        WeightMat::F32(_) | WeightMat::Q8_0 { .. } => return None,
     };
     let (vd, vo, vi) = match &v.w {
         WeightMat::F16 { data, out, inp } => (data.as_slice(), *out, *inp),
-        WeightMat::F32(_) => return None,
+        WeightMat::F32(_) | WeightMat::Q8_0 { .. } => return None,
     };
     if qi != ki || qi != vi || qo != ko || qo != vo {
         return None;

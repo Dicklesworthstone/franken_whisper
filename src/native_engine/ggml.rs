@@ -750,6 +750,29 @@ impl GgmlModel {
         Self::parse(blob)
     }
 
+    /// Raw `q8_0` block bytes of a tensor, for quantized-RESIDENT compute
+    /// (bd-3be3): the caller keeps the blocks and dequantizes rows on the
+    /// fly (`nn::dequant_q8_row`, the same math as this module's load-time
+    /// `dequant_q8_0`). Errors if the tensor is not stored as `q8_0`.
+    ///
+    /// # Errors
+    ///
+    /// Unknown tensor, non-`q8_0` storage, or a payload read failure.
+    pub fn tensor_q8_0_raw(&self, name: &str) -> FwResult<(Vec<usize>, Vec<u8>)> {
+        let entry = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| FwError::InvalidRequest(format!("missing tensor '{name}'")))?;
+        if entry.dtype != GgmlDType::Q8_0 {
+            return Err(FwError::InvalidRequest(format!(
+                "tensor '{name}' is {:?}, not q8_0",
+                entry.dtype
+            )));
+        }
+        let raw = self.tensor_raw(name, entry)?;
+        Ok((entry.shape.clone(), raw.into_owned()))
+    }
+
     /// Parse an in-memory ggml blob (used by [`Self::load`] and tests).
     fn parse(blob: Vec<u8>) -> FwResult<Self> {
         let mut cur = Cursor::new(&blob);

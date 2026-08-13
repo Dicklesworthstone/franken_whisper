@@ -378,6 +378,29 @@ fn load_linear_maybe_i7(
             None,
         ));
     }
+    // wasm32 q8_0 lane (bd-3be3): quantized tensors stay block-RESIDENT and
+    // dequantize per row inside the batched GEMV — the smallest-download
+    // lane's whole point.
+    #[cfg(target_arch = "wasm32")]
+    if !to_i7
+        && in_dim.is_multiple_of(32)
+        && let Ok((shape, raw)) = model.tensor_q8_0_raw(name)
+    {
+        if shape != [out_dim, in_dim] {
+            return Err(FwError::InvalidRequest(format!(
+                "encoder tensor '{name}' has shape {shape:?}, expected {:?}",
+                [out_dim, in_dim]
+            )));
+        }
+        return Ok((
+            nn::WeightMat::Q8_0 {
+                raw,
+                out: out_dim,
+                inp: in_dim,
+            },
+            None,
+        ));
+    }
     let w = load_linear_transposed(model, name, out_dim, in_dim)?;
     if !to_i7 {
         return Ok((nn::WeightMat::F32(w), None));
@@ -1729,6 +1752,19 @@ fn enc_linear(
             }
             let mut y = nn::gemv_out_buf(x.rows * out);
             nn::gemv_f16_batch(data, *out, *inp, &x.data, x.rows, bias, &mut y);
+            Ok(Mat::from_vec(x.rows, *out, y))
+        }
+        // wasm32 q8_0 lane (bd-3be3): block-resident, row-dequant in-kernel.
+        nn::WeightMat::Q8_0 { raw, out, inp } => {
+            if x.cols != *inp {
+                return Err(FwError::InvalidRequest(format!(
+                    "enc_linear(q8_0): x.cols {} != in {inp}",
+                    x.cols
+                )));
+            }
+            let mut y = nn::gemv_out_buf(x.rows * out);
+            let workers = nn::q8_batch_workers(*out, *inp, x.rows);
+            nn::gemv_q8_batch_twopass(raw, *out, *inp, &x.data, x.rows, bias, &mut y, workers);
             Ok(Mat::from_vec(x.rows, *out, y))
         }
     }

@@ -355,6 +355,108 @@ fn gemv_f16_batch_twopass(
     }
 }
 
+/// Dequantize ONE natural `[out, in]` q8_0 row into `scratch` — the exact
+/// per-element math of the load path's `dequant_q8_0` (f16 scale from LE
+/// bits, `(q as i8) as f32 * scale`), so q8_0-resident compute is
+/// bit-identical to dequantize-at-load compute.
+pub(crate) fn dequant_q8_row(raw: &[u8], row: usize, inp: usize, scratch: &mut [f32]) {
+    const QK: usize = 32;
+    const BLOCK_BYTES: usize = 34;
+    let blocks_per_row = inp / QK;
+    let row_base = row * blocks_per_row * BLOCK_BYTES;
+    for b in 0..blocks_per_row {
+        let base = row_base + b * BLOCK_BYTES;
+        let scale = f32::from(Float16::from_bits(u16::from_le_bytes([
+            raw[base],
+            raw[base + 1],
+        ])));
+        let qs = &raw[base + 2..base + 2 + QK];
+        let dst = &mut scratch[b * QK..(b + 1) * QK];
+        for (slot, &q) in dst.iter_mut().zip(qs) {
+            *slot = (q as i8) as f32 * scale;
+        }
+    }
+}
+
+/// Batched q8_0-resident GEMV (bd-3be3): token-tiled like
+/// [`gemv_f16_batch_twopass`] — each row dequantizes ONCE per 32-token tile
+/// into a scratch, then `dot8`s against every activation row in the tile.
+/// Every output element is `dot8(dequant(row), x_row) + bias`; only the
+/// (token, row) loop order differs from a dequantize-at-load reference.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q8_batch_twopass(
+    raw: &[u8],
+    out: usize,
+    inp: usize,
+    x: &[f32],
+    tq: usize,
+    bias: Option<&[f32]>,
+    out_slice: &mut [f32],
+    workers: usize,
+) {
+    const TILE: usize = 32;
+    debug_assert_eq!(inp % 32, 0, "q8_0 rows must be a multiple of 32");
+    debug_assert_eq!(raw.len(), out * (inp / 32) * 34, "q8_0 raw size mismatch");
+    let compute_band = |o0: usize, o1: usize, dst: &mut [f32]| {
+        let mut scratch = vec![0.0f32; inp];
+        let mut t0 = 0;
+        while t0 < tq {
+            let t1 = (t0 + TILE).min(tq);
+            for o in o0..o1 {
+                let b = bias.map_or(0.0, |bb| bb[o]);
+                dequant_q8_row(raw, o, inp, &mut scratch);
+                for t in t0..t1 {
+                    let xr = &x[t * inp..(t + 1) * inp];
+                    dst[t * out + o] = dot8(&scratch, xr) + b;
+                }
+            }
+            t0 = t1;
+        }
+    };
+    if workers < 2 {
+        compute_band(0, out, out_slice);
+        return;
+    }
+    let band = out.div_ceil(workers).max(1);
+    let parts: Vec<(usize, usize, Vec<f32>)> = crate::native_engine::plat::scope(|s| {
+        let compute_band = &compute_band;
+        let mut handles = Vec::new();
+        let mut o0 = 0;
+        while o0 < out {
+            let o1 = (o0 + band).min(out);
+            handles.push(s.spawn(move || {
+                let mut local = vec![0.0f32; tq * out];
+                compute_band(o0, o1, &mut local);
+                (o0, o1, local)
+            }));
+            o0 = o1;
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (o0, o1, local) in parts {
+        for t in 0..tq {
+            let dst = &mut out_slice[t * out + o0..t * out + o1];
+            dst.copy_from_slice(&local[t * out + o0..t * out + o1]);
+        }
+    }
+}
+
+/// Worker count for the q8 batch (same policy as the f16 twopass dispatch).
+pub(crate) fn q8_batch_workers(out: usize, inp: usize, tq: usize) -> usize {
+    const PAR_THRESHOLD: usize = 1 << 21;
+    const COMPUTE_BOUND_MACS: usize = 1 << 26;
+    let avail = avail_parallelism();
+    let work = tq.saturating_mul(out).saturating_mul(inp);
+    let workers = batch_gemv_cap().map(|c| avail.min(c)).unwrap_or_else(|| {
+        if work >= COMPUTE_BOUND_MACS {
+            avail.min(16)
+        } else {
+            gemv_worker_count(out)
+        }
+    });
+    if work < PAR_THRESHOLD { 1 } else { workers }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gemv_f16_batch_rows(
     w_f16: &[Float16],
@@ -1721,6 +1823,21 @@ pub enum WeightMat {
         /// Input dimension (contraction length; number of columns).
         inp: usize,
     },
+    /// Natural `[out, in]` ggml `q8_0` blocks kept RESIDENT (bd-3be3: the
+    /// smallest-download browser lane). 34 bytes per 32 values (little-endian
+    /// f16 scale + 32 i8); rows dequantize on the fly inside
+    /// [`gemv_q8_batch_twopass`] with exactly the load-path `dequant_q8_0`
+    /// math, so a q8_0-resident multiply equals a dequantize-at-load-then-
+    /// multiply bit for bit. Constructed only on wasm32 (native keeps its
+    /// existing load-time dequant paths).
+    Q8_0 {
+        /// Raw block bytes, `(out * inp / 32) * 34`, row-major.
+        raw: Vec<u8>,
+        /// Output dimension (number of rows of the natural weight).
+        out: usize,
+        /// Input dimension (contraction length; multiple of 32).
+        inp: usize,
+    },
 }
 
 impl WeightMat {
@@ -1737,8 +1854,8 @@ impl WeightMat {
     pub(crate) fn f32_mat(&self) -> &Mat {
         match self {
             WeightMat::F32(mat) => mat,
-            WeightMat::F16 { .. } => {
-                unreachable!("WeightMat::f32_mat on the wasm-only F16 arm")
+            WeightMat::F16 { .. } | WeightMat::Q8_0 { .. } => {
+                unreachable!("WeightMat::f32_mat on a wasm-only quantized arm")
             }
         }
     }
