@@ -2483,7 +2483,9 @@ mod tests {
                         natural.cols,
                     ))
                 }
-                WeightMat::F16 { .. } => None,
+                // The fixture is f32/f16-only; the wasm-only q8_0 arm never
+                // appears here.
+                WeightMat::F16 { .. } | WeightMat::Q8_0 { .. } => None,
             };
             if let Some((data, out, inp)) = converted {
                 linear.w = WeightMat::F16 { data, out, inp };
