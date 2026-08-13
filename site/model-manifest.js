@@ -11,18 +11,22 @@
 // cross-origin.
 export const MODELS = {
   whisper: {
-    label: "Whisper large-v3-turbo (speech → text)",
+    label: "Whisper large-v3-turbo, q8_0 (speech → text)",
     license: "OpenAI Whisper - MIT",
+    // The q8_0 lane (bd-3be3 Phase 1): 46% smaller download and less than
+    // half the resident memory of the f16 file, transcript-gated IDENTICAL
+    // to the f16 lane (jfk + meeting + multi-window fixtures; the blocks
+    // stay resident and dequantize per row in-kernel).
     weights: {
-      name: "ggml-large-v3-turbo.bin",
-      bytes: 1624555275,
-      sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+      name: "ggml-large-v3-turbo-q8_0.bin",
+      bytes: 874188075,
+      sha256: "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
       // Precomputed SHA-256 of the first/last ENDPOINT_BYTES, so a warm start
       // proves the cached file with a ~16 MB read instead of a full-file
       // hash. The loader still full-hashes on first download and under
       // `?fullverify`.
-      head: "d996847e6b5c831f4f51aac00469be269d0e98af082057b4ba63914ddb45c188",
-      tail: "1cbb0a5b9f9402c6188fc89a41f18420d325acbe809010fba8408cde634a005b",
+      head: "6ed55aa6d0ab4f46c1708213e06d536e7e47a59c8cef868bbce705e57b0c15cf",
+      tail: "0f9a1f8417f5602ace4c9cf46c1181798409be0b81406f2576baad519364cfe0",
     },
     sidecars: [],
   },

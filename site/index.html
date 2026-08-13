@@ -68,7 +68,7 @@
     <div class="chips" aria-label="Key measured facts">
       <span class="chip"><b>100%</b> Rust</span>
       <span class="chip"><b>809M + 123M</b> parameters, in-tab</span>
-      <span class="chip"><b>2.0 GB</b> of weights, SHA-256-pinned</span>
+      <span class="chip"><b>1.3 GB</b> of weights, SHA-256-pinned</span>
       <span class="chip"><b>4</b> speakers, turn by turn</span>
       <span class="chip"><b>0 bytes</b> uploaded</span>
     </div>
@@ -87,9 +87,9 @@
       <p class="eyebrow">Live · in this tab</p>
       <h2>Run it <em>right now</em>.</h2>
       <p class="lede">
-        This panel runs the real pipeline. Whisper <strong>large-v3-turbo</strong> (1.5 GB,
-        f16) transcribes, <strong>Sortformer</strong> (469 MB, f32) works out who is speaking
-        when, and the CLI's own projection-fusion attributes every line, all in hand-written
+        This panel runs the real pipeline. Whisper <strong>large-v3-turbo</strong> (874 MB,
+        q8_0 — transcript-gated identical to the f16 reference) transcribes,
+        <strong>Sortformer</strong> (469 MB, f32) works out who is speaking when, and the CLI's own projection-fusion attributes every line, all in hand-written
         Rust kernels compiled to wasm and running on your CPU. Both downloads are
         SHA-256-verified against pinned manifests, cached in browser storage, and re-verified
         on every visit. The Sortformer package is additionally re-authenticated <em>inside the
@@ -105,14 +105,14 @@
           <div class="pg-step">
             <p class="label">01 · The models</p>
             <div class="row">
-              <button id="load-models" class="btn primary" disabled><span>Load both models (2.0 GB)</span></button>
+              <button id="load-models" class="btn primary" disabled><span>Load both models (1.3 GB)</span></button>
               <button id="clear-cache" class="btn danger" title="Remove the downloaded models from this browser's cache">Clear cache</button>
             </div>
             <div id="consent" class="consent" hidden>
-              <p id="consent-text">This downloads 2.0 GB of model weights (Whisper large-v3-turbo
-                + Sortformer) into this browser's storage, once. They are fetched from this
-                site's own origin, verified against SHA-256 pins, and cached for next time.
-                Desktop recommended: the engine needs roughly 2.5 GB of tab memory.</p>
+              <p id="consent-text">This downloads 1.3 GB of model weights (Whisper large-v3-turbo
+                q8_0 + Sortformer) into this browser's storage, once. They are fetched from
+                this site's own origin, verified against SHA-256 pins, and cached for next
+                time. Desktop recommended: the engine needs roughly 1.5 GB of tab memory.</p>
               <div class="row">
                 <button id="consent-yes" class="btn primary">Download</button>
                 <button id="consent-no" class="btn">Not now</button>
@@ -220,11 +220,11 @@
     </div>
 
     <ol class="stack reveal">
-      <li><strong>ggml parser.</strong> The 1.5 GB turbo file is scanned once for its tensor
-        directory, then each tensor hydrates straight from browser storage through a positioned
-        reader; the file never exists as one in-memory blob. f16 tensors stay f16-resident,
-        and that residency is what fits an 809M-parameter encoder in a 32-bit address
-        space.</li>
+      <li><strong>ggml parser.</strong> The 874 MB q8_0 turbo file is scanned once for its
+        tensor directory, then each tensor hydrates straight from browser storage through a
+        positioned reader; the file never exists as one in-memory blob. Quantized blocks stay
+        block-RESIDENT and dequantize per row inside the kernels — bit-identical math to a
+        dequantize-at-load reference, at less than half the memory.</li>
       <li><strong>Log-mel frontend.</strong> The reference mel pipeline, bit-faithful to the
         native engine: 25 ms windows, 10 ms hop, 128 mel bins for turbo.</li>
       <li><strong>Encoder + decoder.</strong> 32 encoder layers, 4 decoder layers, greedy

@@ -419,7 +419,7 @@ function handle(m) {
     case "cache-cleared": {
       state.modelsReady = false;
       $("load-models").disabled = false;
-      $("load-models").querySelector("span").textContent = "Load both models (2.0 GB)";
+      $("load-models").querySelector("span").textContent = "Load both models (1.3 GB)";
       setStatus("Cache cleared. Models will re-download on next load.");
       maybeEnableRun();
       break;
