@@ -9,11 +9,10 @@
 // Each file lists upstreams in preference order. Hugging Face first: its CDN
 // absorbs load that made GitHub releases return 5xx under concurrent
 // downloads. The org repo (Dicklesworthstone/franken-whisper-models) is the
-// canonical home; the eigenvalue user repo stays as a live fallback until
-// the org upload lands (creating the org repo needs an org-scoped token),
-// and the GitHub release remains the last resort. The proxy walks the list
-// in order, so the org repo becomes primary the moment it exists — no
-// redeploy needed.
+// canonical home (the eigenvalue repo was moved into the org via the HF
+// repos/move API on 2026-08-13; the old user-repo URLs redirect, so that
+// entry stays as a live fallback), and the GitHub release remains the last
+// resort.
 const HF_ORG = "https://huggingface.co/Dicklesworthstone/franken-whisper-models/resolve/main/";
 const HF_EIGEN = "https://huggingface.co/eigenvalue/franken-whisper-sortformer/resolve/main/";
 const GH_SORTFORMER =
