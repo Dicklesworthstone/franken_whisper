@@ -183,12 +183,13 @@ function appendLiveSegments(segments) {
   const live = $("live-transcript");
   if (live.hidden) return;
   document.getElementById("live-cue")?.remove();
+  const offset = state.run?.offsetSec ?? 0;
   for (const seg of segments) {
     const row = document.createElement("div");
     row.className = "seg";
     const t = document.createElement("span");
     t.className = "t";
-    t.textContent = `${fmtTime(seg.start_sec)}–${fmtTime(seg.end_sec)}`;
+    t.textContent = `${fmtTime((seg.start_sec ?? 0) + offset)}–${fmtTime((seg.end_sec ?? 0) + offset)}`;
     const txt = document.createElement("span");
     txt.textContent = seg.text;
     row.append(t, txt);
@@ -356,8 +357,11 @@ function handle(m) {
     }
     case "audio-meta": {
       beginRun(m.audio_sec);
+      state.run.offsetSec = m.skipped_leading_sec ?? 0;
+      const skipped =
+        state.run.offsetSec > 0.5 ? `skipped ${fmtDur(state.run.offsetSec)} of leading silence; ` : "";
       setStatus(
-        `decoded ${fmtDur(m.audio_sec)} of audio; transcription starts now ` +
+        `decoded ${fmtDur(m.audio_sec)} of audio; ${skipped}transcription starts now ` +
           `(${state.run.windowsTotal} window${state.run.windowsTotal === 1 ? "" : "s"} of up to 30 s each)`,
       );
       break;
@@ -463,6 +467,9 @@ function renderResult() {
     `(${rt}× realtime on this machine) · ${speakers.size} speaker(s) · ` +
     `${r.turns.length} turns` +
     (named ? " · names assigned by first appearance" : "") +
+    ((r.skipped_leading_sec ?? 0) > 0.5
+      ? ` · skipped ${fmtDur(r.skipped_leading_sec)} of leading silence`
+      : "") +
     (r.dropped_windows > 0 ? ` · ⚠ ${r.dropped_windows} dropped window(s)` : "");
 
   const box = $("output");
@@ -637,8 +644,9 @@ function init() {
     // onto detected speakers in order of first appearance.
     const names = parseSpeakerNames($("speaker-names").value);
     const prompt = names.length ? `Speakers: ${names.join(", ")}.` : undefined;
+    const language = $("language").value === "auto" ? undefined : $("language").value;
     const buf = await state.file.arrayBuffer();
-    state.worker.postMessage({ type: "transcribe", audio: buf, ext, prompt }, [buf]);
+    state.worker.postMessage({ type: "transcribe", audio: buf, ext, prompt, language }, [buf]);
   });
 
   $("download-md").addEventListener("click", exportMd);

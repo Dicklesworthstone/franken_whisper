@@ -62,10 +62,11 @@ mod wasm_api {
         // points; every entry point below runs on that worker.
         static MODEL: RefCell<Option<LoadedModel>> = const { RefCell::new(None) };
         static DIARIZER: RefCell<Option<SortformerSession>> = const { RefCell::new(None) };
-        // Decoded 16 kHz mono PCM staged by `decode_audio`, consumed by
-        // `run_prepared` — split so the page learns the duration (and the
-        // window count its progress bar needs) before the long stage starts.
-        static PCM: RefCell<Option<Vec<f32>>> = const { RefCell::new(None) };
+        // Decoded 16 kHz mono PCM staged by `decode_audio` (with the trimmed
+        // leading-silence offset in seconds), consumed by `run_prepared` —
+        // split so the page learns the duration (and the window count its
+        // progress bar needs) before the long stage starts.
+        static PCM: RefCell<Option<(Vec<f32>, f64)>> = const { RefCell::new(None) };
     }
 
     // Host-supplied positioned read against the whisper model file staged in
@@ -330,10 +331,22 @@ mod wasm_api {
     #[wasm_bindgen]
     pub fn decode_audio(audio: Vec<u8>, ext: &str) -> Result<String, JsValue> {
         fw_stage("audio:decode");
-        let samples = crate::audio_decode::decode_to_16k_mono(audio, ext).map_err(js_err)?;
+        let mut samples = crate::audio_decode::decode_to_16k_mono(audio, ext).map_err(js_err)?;
+        // Trim leading silence before the model hears anything (whisper
+        // hallucinates on a silent first window); every emitted timestamp
+        // gets the offset added back, so output times stay file-truthful.
+        let skip = crate::audio_decode::leading_silence_samples(&samples);
+        let offset_sec = skip as f64 / 16_000.0;
+        if skip > 0 {
+            samples.drain(..skip);
+        }
         let audio_sec = samples.len() as f64 / 16_000.0;
-        PCM.with(|slot| *slot.borrow_mut() = Some(samples));
-        Ok(serde_json::json!({ "audio_sec": audio_sec }).to_string())
+        PCM.with(|slot| *slot.borrow_mut() = Some((samples, offset_sec)));
+        Ok(serde_json::json!({
+            "audio_sec": audio_sec,
+            "skipped_leading_sec": offset_sec,
+        })
+        .to_string())
     }
 
     /// Stage two: run the fused whisper + Sortformer + fusion pipeline over
@@ -344,11 +357,14 @@ mod wasm_api {
     /// "no audio prepared" / "no model loaded" / "no diarizer loaded", or any
     /// engine error, each naming the failing stage.
     #[wasm_bindgen]
-    pub fn run_prepared(initial_prompt: Option<String>) -> Result<String, JsValue> {
-        let samples = PCM
+    pub fn run_prepared(
+        initial_prompt: Option<String>,
+        language: Option<String>,
+    ) -> Result<String, JsValue> {
+        let (samples, offset_sec) = PCM
             .with(|slot| slot.borrow_mut().take())
             .ok_or_else(|| js_err("no audio prepared: call decode_audio first"))?;
-        run_fused(&samples, initial_prompt)
+        run_fused(&samples, offset_sec, initial_prompt, language)
     }
 
     /// Compatibility wrapper over [`decode_audio`] + [`run_prepared`] (the
@@ -362,12 +378,18 @@ mod wasm_api {
         audio: Vec<u8>,
         ext: &str,
         initial_prompt: Option<String>,
+        language: Option<String>,
     ) -> Result<String, JsValue> {
         decode_audio(audio, ext)?;
-        run_prepared(initial_prompt)
+        run_prepared(initial_prompt, language)
     }
 
-    fn run_fused(samples: &[f32], initial_prompt: Option<String>) -> Result<String, JsValue> {
+    fn run_fused(
+        samples: &[f32],
+        offset_sec: f64,
+        initial_prompt: Option<String>,
+        language: Option<String>,
+    ) -> Result<String, JsValue> {
         let audio_sec = samples.len() as f64 / 16_000.0;
 
         let out = MODEL.with(|slot| {
@@ -375,10 +397,15 @@ mod wasm_api {
             let model = slot
                 .as_ref()
                 .ok_or_else(|| js_err("no model loaded: call load_whisper_streamed first"))?;
+            // `language`: the CLI's --language. None = auto-detect, which can
+            // misfire when the first window is music/noise (a real user got a
+            // Japanese guess on an English recording); the page exposes a
+            // selector so the user can pin it.
             let params = DecodeParams {
                 timestamps: true,
                 n_threads: 1,
                 initial_prompt: initial_prompt.filter(|p| !p.trim().is_empty()),
+                language: language.filter(|l| !l.trim().is_empty() && l != "auto"),
                 ..DecodeParams::default()
             };
             fw_stage("whisper:decode");
@@ -414,16 +441,35 @@ mod wasm_api {
                 &|| Ok(()),
             )
             .map_err(js_err)?;
-        let projection = crate::diarization_projection::project_diarization_onto_segments(
+        let mut projection = crate::diarization_projection::project_diarization_onto_segments(
             &out.segments,
             &turns,
             false,
         )
         .map_err(js_err)?;
-        let speaker_segments = crate::diarization_projection::build_speaker_attributed_segments(
+        let mut turns = turns;
+        let mut speaker_segments = crate::diarization_projection::build_speaker_attributed_segments(
             &projection.segments,
             &turns,
         );
+
+        // Add the trimmed leading-silence offset back to every emitted time,
+        // so output timestamps stay truthful to the ORIGINAL file.
+        if offset_sec > 0.0 {
+            let offset_ms = (offset_sec * 1_000.0).round() as u64;
+            for seg in &mut projection.segments {
+                seg.start_sec = seg.start_sec.map(|s| s + offset_sec);
+                seg.end_sec = seg.end_sec.map(|s| s + offset_sec);
+            }
+            for turn in &mut turns {
+                turn.start_ms += offset_ms;
+                turn.end_ms += offset_ms;
+            }
+            for run in &mut speaker_segments {
+                run.start_sec = run.start_sec.map(|s| s + offset_sec);
+                run.end_sec = run.end_sec.map(|s| s + offset_sec);
+            }
+        }
 
         fw_stage("done");
         Ok(serde_json::json!({
@@ -435,6 +481,7 @@ mod wasm_api {
             "overlap_suspected_segment_indices": projection.overlap_suspected_segment_indices,
             "dropped_windows": out.dropped_windows.len(),
             "audio_sec": audio_sec,
+            "skipped_leading_sec": offset_sec,
         })
         .to_string())
     }

@@ -145,7 +145,28 @@
           </div>
 
           <div class="pg-step">
-            <p class="label">03 · The speakers (optional)</p>
+            <p class="label">03 · Language and speakers (optional)</p>
+            <div class="row">
+              <select id="language" class="btn" aria-label="Spoken language">
+                <option value="auto">Auto-detect language</option>
+                <option value="en">English</option>
+                <option value="es">Spanish</option>
+                <option value="fr">French</option>
+                <option value="de">German</option>
+                <option value="it">Italian</option>
+                <option value="pt">Portuguese</option>
+                <option value="nl">Dutch</option>
+                <option value="ja">Japanese</option>
+                <option value="zh">Chinese</option>
+                <option value="ko">Korean</option>
+                <option value="ru">Russian</option>
+                <option value="ar">Arabic</option>
+                <option value="hi">Hindi</option>
+              </select>
+            </div>
+            <p class="micro">Auto-detection listens to the first 30 seconds; if a recording
+              opens with music or noise it can guess wrong (and then transcribe the whole file
+              in the wrong language). If you know the language, pin it.</p>
             <input id="speaker-names" class="text-input" type="text" maxlength="300"
               placeholder="e.g. Jeff Emanuel (host), Dr. Sarah Chen (guest)"
               aria-label="Speaker names and titles, comma-separated, in speaking order if known">

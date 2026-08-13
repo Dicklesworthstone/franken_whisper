@@ -153,9 +153,12 @@ async function route(e) {
       // remaining-time estimate) from the decoded duration before the long
       // stage starts.
       const meta = JSON.parse(wasm.decode_audio(new Uint8Array(m.audio), m.ext ?? ""));
-      post("audio-meta", { audio_sec: meta.audio_sec });
+      post("audio-meta", {
+        audio_sec: meta.audio_sec,
+        skipped_leading_sec: meta.skipped_leading_sec ?? 0,
+      });
       feedClock();
-      const result = JSON.parse(wasm.run_prepared(m.prompt ?? undefined));
+      const result = JSON.parse(wasm.run_prepared(m.prompt ?? undefined, m.language ?? undefined));
       feedClock();
       post("result", { result, wall_ms: Math.round(performance.now() - t0) });
       break;

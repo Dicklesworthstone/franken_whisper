@@ -274,3 +274,34 @@ pub fn decode_to_16k_mono(bytes: Vec<u8>, ext: &str) -> FwResult<Vec<f32>> {
     }
     Ok(out)
 }
+
+/// Leading-silence detection (bd-m2jm): whisper hallucinates on silence (a
+/// silent first window free-runs the decoder, often in a random language), so
+/// the playground trims leading silence BEFORE the model hears anything and
+/// adds the trimmed offset back to every emitted timestamp.
+///
+/// Energy-based and conservative: 100 ms RMS frames; a frame counts as sound
+/// above max(-60 dBFS, 2% of the loudest frame); half a second of pre-roll is
+/// kept before the first sound so onsets are never clipped; nothing is
+/// trimmed unless there is more than a second to skip.
+pub fn leading_silence_samples(samples: &[f32]) -> usize {
+    const FRAME: usize = 1_600; // 100 ms at 16 kHz
+    const PRE_ROLL: usize = 8_000; // 0.5 s
+    const MIN_TRIM: usize = 16_000; // only bother past 1 s
+    if samples.len() < 2 * FRAME {
+        return 0;
+    }
+    let mut rms = Vec::with_capacity(samples.len() / FRAME);
+    for frame in samples.chunks(FRAME) {
+        let energy: f64 = frame.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+        rms.push((energy / frame.len() as f64).sqrt());
+    }
+    let peak = rms.iter().copied().fold(0.0f64, f64::max);
+    let threshold = (peak * 0.02).max(1e-3); // 1e-3 ≈ -60 dBFS
+    let first_sound = match rms.iter().position(|&v| v >= threshold) {
+        Some(i) => i,
+        None => return 0, // all silence: trim nothing, let the engine see it
+    };
+    let start = (first_sound * FRAME).saturating_sub(PRE_ROLL);
+    if start < MIN_TRIM { 0 } else { start }
+}
