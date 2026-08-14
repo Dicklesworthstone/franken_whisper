@@ -57,6 +57,11 @@ final class LabModel {
     var denoise = true
     var wordTimestamps = false
     var language = "auto"
+    /// The website's speaker-names field: comma- or newline-separated names
+    /// and titles ("Jeff Emanuel (host), Dr. Sarah Chen (guest)"). Feeds
+    /// Whisper's decoding prompt so the names come out spelled right, then
+    /// maps onto detected SPEAKER_NN lanes in order of first appearance.
+    var speakerNamesRaw = ""
     static let languages: [(code: String, label: String)] = [
         ("auto", "Auto-detect"), ("en", "English"), ("es", "Spanish"), ("fr", "French"),
         ("de", "German"), ("it", "Italian"), ("pt", "Portuguese"), ("nl", "Dutch"),
@@ -73,6 +78,10 @@ final class LabModel {
         case failed(String)
     }
     var runState: RunState = .idle
+    /// Raw `SPEAKER_NN` lane → the user's display name, seeded from the
+    /// pre-run field when the result lands and editable afterwards through
+    /// the transcript card's rename rows.
+    var speakerNameMap: [String: String] = [:]
     var liveSegments: [TranscriptSegment] = []
     /// Live segments arrive in the trimmed timebase (fw_ios.h); add this to
     /// their times for display. The final result already has it added back.
@@ -232,9 +241,14 @@ final class LabModel {
         installHooks(gen: gen, forLoad: false)
 
         let input = self.input
+        // Names feed Whisper's decoding prompt (the CLI's --prompt) so names
+        // and titles come out spelled right; the same list later maps onto
+        // detected speakers in order of first appearance — exactly the
+        // website's behavior.
+        let names = Self.parseSpeakerNames(speakerNamesRaw)
         let options = RunOptions(
             language: language == "auto" ? nil : language,
-            initialPrompt: nil,
+            initialPrompt: names.isEmpty ? nil : "Speakers: \(names.joined(separator: ", ")).",
             translate: false,
             diarize: diarize && diarizerLoaded,
             wordTimestamps: wordTimestamps)
@@ -268,6 +282,7 @@ final class LabModel {
                 let result = try await engine.run(options: options)
                 guard self.generation == gen else { return }
                 self.result = result
+                self.speakerNameMap = Self.assignNames(names, to: result)
                 self.wallSeconds = Date().timeIntervalSince(self.runStarted ?? Date())
                 self.runState = .done
             } catch {
@@ -287,6 +302,65 @@ final class LabModel {
 
     func elapsed(at date: Date) -> TimeInterval {
         max(0, date.timeIntervalSince(runStarted ?? date))
+    }
+
+    // ── Speaker naming ─────────────────────────────────────────────────────
+
+    /// Comma- or newline-separated, trimmed, empties dropped (site parity).
+    static func parseSpeakerNames(_ raw: String) -> [String] {
+        raw.split(whereSeparator: { $0 == "," || $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Assign names to detected `SPEAKER_NN` lanes in order of first
+    /// appearance in the merged transcript; lanes beyond the provided names
+    /// keep their raw label (site parity).
+    static func assignNames(_ names: [String], to result: Transcription) -> [String: String] {
+        var map: [String: String] = [:]
+        guard !names.isEmpty else { return map }
+        for run in result.speakerSegments {
+            guard let lane = run.speaker, map[lane] == nil else { continue }
+            if map.count < names.count {
+                map[lane] = names[map.count]
+            }
+        }
+        return map
+    }
+
+    /// The distinct lanes of the current result, in first-appearance order —
+    /// the rows of the transcript card's rename editor.
+    var detectedSpeakers: [String] {
+        guard let result else { return [] }
+        var seen: [String] = []
+        for run in result.speakerSegments {
+            if let lane = run.speaker, !seen.contains(lane) {
+                seen.append(lane)
+            }
+        }
+        return seen
+    }
+
+    func displaySpeaker(_ lane: String?) -> String {
+        guard let lane else { return "UNKNOWN" }
+        return speakerNameMap[lane] ?? lane
+    }
+
+    func setSpeakerName(_ name: String, for lane: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty {
+            speakerNameMap.removeValue(forKey: lane)
+        } else {
+            speakerNameMap[lane] = trimmed
+        }
+    }
+
+    /// Everything an export needs beyond the result itself.
+    var exportContext: ExportContext {
+        ExportContext(
+            sourceName: inputName.isEmpty ? "recording" : inputName,
+            wallSeconds: wallSeconds,
+            names: speakerNameMap)
     }
 
     // ── Hook plumbing ──────────────────────────────────────────────────────

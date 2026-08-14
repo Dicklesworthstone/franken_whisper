@@ -183,3 +183,67 @@ struct LevelMeter: View {
         .accessibilityValue("\(Int(min(1, max(0, level)) * 100)) percent")
     }
 }
+
+/// Dark inset text field matching the site's `.text-input`: hairline border,
+/// monospaced, emerald caret.
+struct LabTextFieldModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .font(.system(size: 13, design: .monospaced))
+            .foregroundStyle(Lab.textPrimary)
+            .tint(Lab.emerald)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.1), lineWidth: 1))
+    }
+}
+
+extension View {
+    func labTextField() -> some View { modifier(LabTextFieldModifier()) }
+}
+
+/// The expanding ring behind an active recording.
+private struct PulseRing: View {
+    @State private var expanded = false
+    var body: some View {
+        Circle()
+            .stroke(Lab.danger.opacity(0.55), lineWidth: 2)
+            .scaleEffect(expanded ? 1.45 : 1)
+            .opacity(expanded ? 0 : 0.9)
+            .onAppear {
+                withAnimation(.easeOut(duration: 1.2).repeatForever(autoreverses: false)) {
+                    expanded = true
+                }
+            }
+    }
+}
+
+/// A proper record control: a big round mic button that flips to a stop
+/// square and pulses while capture is live.
+struct RecordButton: View {
+    let isRecording: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                if isRecording { PulseRing() }
+                Circle()
+                    .fill(isRecording ? Lab.danger.opacity(0.16) : Lab.emeraldDeep.opacity(0.55))
+                Circle()
+                    .stroke(isRecording ? Lab.danger : Lab.emerald, lineWidth: 2)
+                Image(systemName: isRecording ? "stop.fill" : "mic.fill")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(isRecording ? Lab.danger : Lab.emerald)
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .frame(width: 64, height: 64)
+            .shadow(
+                color: (isRecording ? Lab.danger : Lab.emerald).opacity(0.35), radius: 10)
+        }
+        .buttonStyle(.plain)
+        .animation(.snappy, value: isRecording)
+        .accessibilityLabel(isRecording ? "Stop recording" : "Start recording")
+    }
+}

@@ -65,6 +65,13 @@ number instead of letting App Store Connect renumber the binary.
   heartbeat (`src/native_engine/plat.rs`, `ios_hooks`) stream through the
   C callbacks into the UI, so text appears window by window and the progress
   bar counts real `encoder_window` events.
+- **Speaker names, like the website**: an optional pre-run names field feeds
+  Whisper's decoding prompt (so names come out spelled right) and then labels
+  the detected `SPEAKER_NN` lanes in order of first appearance; after a run,
+  each voice can be renamed in place. Names flow into every export.
+- **Exports**: a styled self-contained HTML page and GitHub-flavored Markdown
+  (both matching the browser demo's exports), plus plain text; SRT and JSON
+  live behind the "More" menu.
 - **Capture** is an `AVAudioEngine` tap converted to 16 kHz mono f32
   (`Sources/AudioRecorder.swift`); imported files decode in Rust via the same
   symphonia path the browser uses.

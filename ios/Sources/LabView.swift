@@ -10,7 +10,7 @@ struct LabView: View {
     @State private var showDownloadConsent = false
     @State private var showClearConfirmation = false
     @State private var showFileImporter = false
-    @State private var exportFormat: TranscriptFormat = .text
+    @State private var exportFormat: TranscriptFormat = .html
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -29,6 +29,7 @@ struct LabView: View {
                 .frame(maxWidth: .infinity)
             }
             .scrollIndicators(.hidden)
+            .scrollDismissesKeyboard(.interactively)
         }
         .tint(Lab.emerald)
         .alert(
@@ -91,6 +92,7 @@ struct LabView: View {
             }
         }
         .sensoryFeedback(.success, trigger: model.result?.transcript)
+        .sensoryFeedback(.impact(weight: .medium), trigger: model.recorder.isRecording)
     }
 
     // ── Header ─────────────────────────────────────────────────────────────
@@ -273,6 +275,8 @@ struct LabView: View {
                     StatusLine(kind: .err, text: reason)
                 }
             }
+            .animation(.snappy(duration: 0.3), value: model.runState)
+            .animation(.snappy(duration: 0.3), value: model.recorder.isRecording)
         }
     }
 
@@ -299,13 +303,26 @@ struct LabView: View {
                 }
                 .pickerStyle(.menu)
             }
-            if model.diarize && model.diarizerLoaded {
-                Text(
-                    "Speaker labels separate voices into anonymous lanes; they do not identify people by name."
-                )
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(Lab.textSecondary.opacity(0.8))
-            }
+
+            // The website's speaker-names field: feeds the decoding prompt so
+            // names come out spelled right, then labels the detected voices
+            // in speaking order. Editable per lane after the run too.
+            TextField(
+                "Speaker names — e.g. Jeff Emanuel (host), Dr. Sarah Chen (guest)",
+                text: $model.speakerNamesRaw,
+                axis: .vertical
+            )
+            .labTextField()
+            .textInputAutocapitalization(.words)
+            .autocorrectionDisabled()
+            .submitLabel(.done)
+            Text(
+                model.diarize && model.diarizerLoaded
+                    ? "Names help spelling and label the detected voices in speaking order — they assign labels, they don't identify anyone."
+                    : "Names help the model spell them correctly in the transcript."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(Lab.textSecondary.opacity(0.8))
         }
         .toggleStyle(SwitchToggleStyle(tint: Lab.emerald))
         .disabled(model.isBusy)
@@ -353,6 +370,7 @@ struct LabView: View {
                     .foregroundStyle(Lab.textSecondary)
             }
         }
+        .animation(.easeOut(duration: 0.25), value: model.liveSegments)
     }
 
     private func resultView(_ result: Transcription) -> some View {
@@ -370,6 +388,10 @@ struct LabView: View {
                 ForEach(Array(result.segments.enumerated()), id: \.offset) { _, segment in
                     segmentRow(segment)
                 }
+            }
+
+            if !model.detectedSpeakers.isEmpty {
+                speakerNameEditor
             }
 
             if let reason = result.diarizationError {
@@ -394,32 +416,88 @@ struct LabView: View {
         }
     }
 
+    /// A styled web page and GitHub Markdown are the headline exports (they
+    /// carry the speaker names and the lab look); SRT and JSON are niche
+    /// interchange formats and live behind "More".
     @ViewBuilder private func exportControls(_ result: Transcription) -> some View {
         Picker("Format", selection: $exportFormat) {
-            ForEach(TranscriptFormat.allCases) { format in
+            ForEach(TranscriptFormat.primary) { format in
                 Text(format.rawValue).tag(format)
             }
         }
         .pickerStyle(.segmented)
-        .frame(width: 200)
+        .frame(width: 190)
 
         ShareLink(
             item: TranscriptFile(
-                content: TranscriptExport.content(exportFormat, from: result),
+                content: TranscriptExport.content(
+                    exportFormat, from: result, context: model.exportContext),
                 baseName: "frankenwhisper-transcript",
                 format: exportFormat),
-            preview: SharePreview("Transcript")
+            preview: SharePreview("Transcript (\(exportFormat.rawValue))")
         ) {
-            Text("Share")
+            Label("Share", systemImage: "square.and.arrow.up")
         }
         .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
         .disabled(result.segments.isEmpty)
+
+        Menu {
+            ForEach(TranscriptFormat.niche) { format in
+                ShareLink(
+                    item: TranscriptFile(
+                        content: TranscriptExport.content(
+                            format, from: result, context: model.exportContext),
+                        baseName: "frankenwhisper-transcript",
+                        format: format),
+                    preview: SharePreview("Transcript (\(format.rawValue))")
+                ) {
+                    Label(format.menuLabel, systemImage: "doc.text")
+                }
+            }
+        } label: {
+            Label("More", systemImage: "ellipsis.circle")
+        }
+        .buttonStyle(GhostButtonStyle())
+        .disabled(result.segments.isEmpty)
+    }
+
+    /// One TextField per detected lane, in speaking order — rename the
+    /// voices after the fact without re-running anything.
+    private var speakerNameEditor: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("NAME THE VOICES")
+                .font(.system(size: 10, weight: .black, design: .monospaced))
+                .kerning(1.5)
+                .foregroundStyle(Lab.textSecondary)
+            ForEach(model.detectedSpeakers, id: \.self) { lane in
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(Lab.speakerColor(lane))
+                        .frame(width: 8, height: 8)
+                    Text(lane)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Lab.textSecondary)
+                        .frame(width: 90, alignment: .leading)
+                    TextField(
+                        "name this voice",
+                        text: Binding(
+                            get: { model.speakerNameMap[lane] ?? "" },
+                            set: { model.setSpeakerName($0, for: lane) })
+                    )
+                    .labTextField()
+                    .textInputAutocapitalization(.words)
+                    .autocorrectionDisabled()
+                    .submitLabel(.done)
+                }
+            }
+        }
+        .padding(.vertical, 4)
     }
 
     private func speakerRow(_ run: SpeakerRun) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
-                Text(run.speaker ?? "UNKNOWN")
+                Text(model.displaySpeaker(run.speaker))
                     .font(.system(size: 10, weight: .black, design: .monospaced))
                     .kerning(1.2)
                     .foregroundStyle(Lab.speakerColor(run.speaker))
@@ -484,17 +562,29 @@ struct LabView: View {
     }
 
     @ViewBuilder private var inputButtons: some View {
-        Button(model.recorder.isRecording ? "Stop" : "Record") {
-            model.toggleRecording()
-        }
-        .buttonStyle(PrimaryButtonStyle())
-        .disabled(
-            model.engineState != .ready
-                || (model.isBusy && !model.recorder.isRecording))
+        HStack(spacing: 16) {
+            RecordButton(isRecording: model.recorder.isRecording) {
+                model.toggleRecording()
+            }
+            .disabled(
+                model.engineState != .ready
+                    || (model.isBusy && !model.recorder.isRecording))
+            .opacity(model.engineState == .ready ? 1 : 0.35)
 
-        Button("Import audio") { showFileImporter = true }
-            .buttonStyle(GhostButtonStyle())
-            .disabled(model.recorder.isRecording || model.isBusy)
+            Text(model.recorder.isRecording ? "listening…" : "record")
+                .font(.system(size: 11, weight: .black, design: .monospaced))
+                .kerning(1.5)
+                .textCase(.uppercase)
+                .foregroundStyle(model.recorder.isRecording ? Lab.danger : Lab.textSecondary)
+        }
+
+        Button {
+            showFileImporter = true
+        } label: {
+            Label("Import audio", systemImage: "waveform.badge.plus")
+        }
+        .buttonStyle(GhostButtonStyle())
+        .disabled(model.recorder.isRecording || model.isBusy || model.engineState != .ready)
     }
 
     // ── Formatting ─────────────────────────────────────────────────────────
