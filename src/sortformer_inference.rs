@@ -1872,7 +1872,14 @@ impl SortformerSession {
         pcm: SortformerPcm<'_>,
         checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
     ) -> FwResult<SortformerDiarizationOutput> {
-        let duration_seconds = (pcm.samples.len() as f64 / pcm.sample_rate_hz as f64) as f32;
+        // Quantize the physical duration to the floor-truncated millisecond
+        // grid the report layer validates against. Clamping to the raw
+        // fractional duration would let a boundary turn round to 1 ms past
+        // the floored bound when the true duration carries a fractional
+        // millisecond of 0.5 or more (e.g. 97_919 samples = 6119.9375 ms).
+        let duration_ms =
+            (pcm.samples.len() as u128 * 1_000) / pcm.sample_rate_hz.max(1) as u128;
+        let duration_seconds = (duration_ms as f64 / 1_000.0) as f32;
         let features = self.frontend.compute_with_checkpoint(pcm, checkpoint)?;
         const CENTRAL_FEATURE_FRAMES: usize =
             SORTFORMER_CHUNK_FRAMES * SORTFORMER_SUBSAMPLING_FACTOR;

@@ -5528,9 +5528,27 @@ fn run_native_sortformer_diarization(
     // Turn mapping relocated VERBATIM to the portable projection module
     // (bd-m2jm) so the wasm pipeline runs the exact same code; `labels` and
     // the active-lane set feed the report machinery below unchanged.
-    let (turns, labels) =
+    let (mut turns, labels) =
         crate::diarization_projection::sortformer_output_to_diarization_turns(&output, checkpoint)?;
-    let active_lanes: BTreeSet<usize> = labels.keys().copied().collect();
+    // The authoritative report-layer duration, computed exactly once. Turn
+    // boundaries arrive as f32 seconds and are converted to milliseconds with
+    // round-to-nearest, while this bound floor-truncates from the sample
+    // count; when the true duration carries a fractional millisecond >= 0.5
+    // (e.g. 97_919 samples = 6119.9375 ms), the rounded final turn end lands
+    // 1 ms past the floored bound and `validate_against_request` rejects the
+    // report. Clamp every turn to the same value the validator receives and
+    // drop turns the clamp empties.
+    let audio_duration_ms = normalized_pcm_duration_ms(samples.len())?;
+    clamp_diarization_turns_to_duration_ms(&mut turns, audio_duration_ms);
+    let active_lanes: BTreeSet<usize> = labels
+        .iter()
+        .filter(|(_, label)| {
+            turns
+                .iter()
+                .any(|turn| turn.speaker_ref.as_deref() == Some(label.as_str()))
+        })
+        .map(|(lane, _)| *lane)
+        .collect();
 
     let mut speaker_evidence = Vec::with_capacity(active_lanes.len());
     let mut profiles = Vec::with_capacity(active_lanes.len());
@@ -5672,7 +5690,7 @@ fn run_native_sortformer_diarization(
         diagnostics: Vec::new(),
     };
     report
-        .validate_against_request(request, Some(normalized_pcm_duration_ms(samples.len())?))
+        .validate_against_request(request, Some(audio_duration_ms))
         .map_err(FwError::ContractViolation)?;
     let projection =
         diarization::project_diarization_onto_segments(segments, &report.turns, word_aligned)?;
@@ -5766,6 +5784,19 @@ fn emit_diarization_report_events(log: &mut EventLog, report: &DiarizationReport
 // Relocated to the portable projection module (bd-m2jm); kept in scope here
 // for the existing report-construction call sites and tests.
 use crate::diarization_projection::finite_seconds_interval_to_ms;
+
+/// Clamp report-shape diarization turns to the floor-truncated audio duration
+/// that `DiarizationReport::validate_against_request` is given, dropping any
+/// turn the clamp leaves empty. Round-to-nearest second→millisecond turn
+/// conversion may otherwise overshoot the floored bound by 1 ms when the true
+/// duration has a fractional millisecond of 0.5 or more.
+fn clamp_diarization_turns_to_duration_ms(turns: &mut Vec<DiarizationTurn>, duration_ms: u64) {
+    turns.retain_mut(|turn| {
+        turn.start_ms = turn.start_ms.min(duration_ms);
+        turn.end_ms = turn.end_ms.min(duration_ms);
+        turn.start_ms < turn.end_ms
+    });
+}
 
 fn normalized_pcm_duration_ms(sample_count: usize) -> FwResult<u64> {
     let duration_ms = (sample_count as u128)
@@ -6708,11 +6739,12 @@ mod tests {
         acceleration_cancellation_fence_payload, acceleration_context_payload,
         acceleration_stream_owner_id, align_transcription_result,
         apply_native_diarization_projection, apply_padding, budget_duration, checkpoint_or_emit,
-        ctc_forced_align, diarize_segments, emit_diarization_report_events, event_elapsed_ms,
+        clamp_diarization_turns_to_duration_ms, ctc_forced_align, diarize_segments,
+        emit_diarization_report_events, event_elapsed_ms,
         external_diarization_fallback_admitted, external_diarization_report,
         finite_seconds_interval_to_ms, has_canonical_word_alignment, is_abbreviation_period,
         is_decimal_period, is_ellipsis_period, load_energy_valley_evidence, merge_regions_by_gap,
-        ms_to_frames, nearest_energy_valley, optional_stage_skip,
+        ms_to_frames, nearest_energy_valley, normalized_pcm_duration_ms, optional_stage_skip,
         parse_acoustic_diarization_rollout, parse_budget_ms, parse_event_ts_ms, punctuate_segments,
         recommended_budget, resolved_diarization_engine, resolved_diarization_engine_for_rollout,
         result_has_external_diarization, run_pipeline, run_stage_with_budget, sanitize_process_pid,
@@ -10980,6 +11012,114 @@ mod tests {
             sortformer_activity_shares(&invalid_interval, 1_000),
             Err(FwError::ContractViolation(_))
         ));
+    }
+
+    /// Issue #2 regression: 97_919 samples at 16 kHz last 6119.9375 ms. The
+    /// validator bound floor-truncates that to 6119 ms while round-to-nearest
+    /// second→millisecond turn conversion lands a recording-end turn at
+    /// 6120 ms, so an unclamped report was rejected with "interval end 6120
+    /// exceeds audio duration 6119".
+    #[test]
+    fn sortformer_boundary_turn_rounding_never_exceeds_floored_duration() {
+        const SAMPLE_COUNT: usize = 97_919;
+        let audio_duration_ms = normalized_pcm_duration_ms(SAMPLE_COUNT).expect("duration fits");
+        assert_eq!(audio_duration_ms, 6_119);
+
+        // The f32 turn end a Sortformer session reports for the recording
+        // tail rounds to one millisecond past the floored duration.
+        let end_seconds = SAMPLE_COUNT as f64 / 16_000.0;
+        let (start_ms, end_ms) =
+            crate::diarization_projection::finite_seconds_interval_to_ms(0.0, end_seconds)
+                .expect("valid interval");
+        assert_eq!(
+            (start_ms, end_ms),
+            (0, 6_120),
+            "precondition: rounded turn end overshoots the floored duration"
+        );
+
+        let turn = |start_ms: u64, end_ms: u64| DiarizationTurn {
+            start_ms,
+            end_ms,
+            speaker_ref: Some("SPEAKER_00".to_owned()),
+            speaker_confidence: Some(0.9),
+            change_confidence: None,
+            overlap_suspected: false,
+            hard_hint_attributed: false,
+        };
+        // A whole-recording turn plus a sliver that lives entirely in the
+        // rounded-off tail; the clamp must trim the first and drop the second.
+        let mut turns = vec![turn(0, end_ms), turn(6_119, 6_120)];
+        clamp_diarization_turns_to_duration_ms(&mut turns, audio_duration_ms);
+        assert_eq!(turns, vec![turn(0, 6_119)]);
+
+        // The clamped turn set now validates against the same authoritative
+        // duration, mirroring the report `run_native_sortformer_diarization`
+        // assembles.
+        let voiced_duration_ms = turns[0].end_ms - turns[0].start_ms;
+        let (dominant_speaker_share, unknown_voiced_share) =
+            sortformer_activity_shares(&turns, audio_duration_ms).expect("shares");
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Sortformer,
+            ..DiarizationRequest::default()
+        };
+        let report = DiarizationReport {
+            implementation: "native-sortformer-v1".to_owned(),
+            contract_version: "sortformer-diarization-v1".to_owned(),
+            feature_schema: "sortformer-activity-80ms-v1".to_owned(),
+            speaker_evidence_mode: DiarizationSpeakerEvidenceMode::SortformerActivity,
+            normalized_input_sha256:
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+            hint_document_sha256: None,
+            turns,
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "SPEAKER_00".to_owned(),
+                frame_count: 76,
+                voiced_duration_ms,
+                reliability: 0.9,
+                voice_profile_count: 1,
+                channel_profile_count: 0,
+                training_accepted_count: 1,
+                training_downweighted_count: 0,
+                training_quarantined_count: 0,
+                anchored: false,
+                soft_hint_contradiction: None,
+            }],
+            hint_evidence: Vec::new(),
+            speaker_queries: Vec::new(),
+            speaker_count: SpeakerCountOutcome {
+                request: request.speaker_count.clone(),
+                estimate: None,
+                status: SpeakerCountOutcomeStatus::Unresolved,
+                supported_speaker_count: 1,
+                active_speaker_refs: vec!["SPEAKER_00".to_owned()],
+                dominant_speaker_share,
+                unknown_voiced_share,
+                reasons: vec![SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved],
+                speaker_evidence: vec![SpeakerEvidenceSummary {
+                    speaker_ref: "SPEAKER_00".to_owned(),
+                    assigned_tracklet_count: 1,
+                    independent_tracklet_count: 1,
+                    recurrence_episode_count: 1,
+                    voiced_frame_count: 76,
+                    independent_voiced_frame_count: 76,
+                    voiced_duration_ms,
+                    mean_assignment_confidence: 0.9,
+                    profile_reliability: 0.9,
+                    hard_anchored: false,
+                    separated_from_supported_speakers: true,
+                    reasons: vec![SpeakerEvidenceReason::SupportedByLearnedModelActivity],
+                    supported: true,
+                }],
+            },
+            fallback_status: DiarizationFallbackStatus::SpeakerCountUnresolved,
+            operational_partition: None,
+            neural_representation: None,
+            speaker_segments: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        report
+            .validate_against_request(&request, Some(audio_duration_ms))
+            .expect("clamped boundary turn must validate against the floored duration");
     }
 
     #[test]
