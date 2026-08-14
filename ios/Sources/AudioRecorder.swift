@@ -75,7 +75,9 @@ private final class CaptureSink: @unchecked Sendable {
 @MainActor
 @Observable
 final class AudioRecorder {
-    static let targetRate: Double = 16_000
+    /// nonisolated: the capture sink reads this off the main actor (it is an
+    /// immutable constant, so isolation buys nothing but a Swift 6 error).
+    nonisolated static let targetRate: Double = 16_000
 
     var isRecording = false
     var seconds: Double = 0

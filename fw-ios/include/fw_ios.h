@@ -6,8 +6,8 @@
  * ── Contract ──────────────────────────────────────────────────────────────
  *
  * Return codes (int32_t): 0 = success. Non-zero values are stable:
- *   1 generic failure          2 usage (NULL/invalid argument)
- *   3 model file I/O           4 input decode / invalid audio or options
+ *   1 generic failure          2 usage (NULL/malformed argument, bad options)
+ *   3 model file I/O           4 input decode / invalid audio or request
  *   5 unsupported on target    6 cancelled via fw_request_cancel
  * Pointer-returning entry points return NULL on failure. In every failure
  * case a human-readable reason is available from fw_last_error_message().
