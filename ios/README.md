@@ -24,7 +24,22 @@ Requirements: Xcode with the iOS platform installed, `xcodegen` (brew), and the
 `aarch64-apple-ios` / `aarch64-apple-ios-sim` Rust targets (the script adds
 them). Simulator builds are arm64-only (Apple Silicon hosts); an Intel host
 would need the `x86_64-apple-ios` Rust target added to `build-rust.sh`.
-Regenerate the app icon with `python3 ios/make-icon.py` (needs PIL).
+
+## App Store archive
+
+```bash
+xcodebuild -project ios/FrankenWhisper.xcodeproj -scheme FrankenWhisper \
+  -configuration Release -destination "generic/platform=iOS" \
+  -archivePath "$PWD/ios/build/FrankenWhisper.xcarchive" archive
+
+xcodebuild -exportArchive \
+  -archivePath "$PWD/ios/build/FrankenWhisper.xcarchive" \
+  -exportPath "$PWD/ios/build/export" \
+  -exportOptionsPlist ios/AppStoreExportOptions.plist
+```
+
+The export configuration preserves the checked-in marketing version and build
+number instead of letting App Store Connect renumber the binary.
 
 ## How it hangs together
 
@@ -56,8 +71,9 @@ Regenerate the app icon with `python3 ios/make-icon.py` (needs PIL).
 
 ## Notes
 
-- `FwCore.xcframework` and `FrankenWhisper.xcodeproj` are generated; only
-  `project.yml`, `build-rust.sh`, `make-icon.py`, and `Sources/` are source.
+- `FwCore.xcframework` and `FrankenWhisper.xcodeproj` are generated. The
+  `project.yml`, Swift sources, privacy manifest, app-icon catalog, entitlement,
+  and App Store export options are the reviewable release sources.
 - On-device speed on A17/A18-class hardware is unmeasured; the app shows the
   measured wall time and RTF after each run and claims nothing else.
 - The Sortformer diarizer is development-uncertified upstream and capped at

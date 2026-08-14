@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 struct LabView: View {
     @State private var model = LabModel()
     @State private var showDownloadConsent = false
+    @State private var showClearConfirmation = false
     @State private var showFileImporter = false
     @State private var exportFormat: TranscriptFormat = .text
     @Environment(\.scenePhase) private var scenePhase
@@ -27,6 +28,7 @@ struct LabView: View {
                 .frame(maxWidth: 700)
                 .frame(maxWidth: .infinity)
             }
+            .scrollIndicators(.hidden)
         }
         .tint(Lab.emerald)
         .alert(
@@ -51,13 +53,30 @@ struct LabView: View {
                     + "FastEnhancer denoiser — downloaded once over your connection, verified "
                     + "by SHA-256, and stored on this device. Everything afterwards runs offline.")
         }
+        .confirmationDialog(
+            "Clear downloaded models?", isPresented: $showClearConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Clear \(Self.gigabytes(ModelManifest.totalBytes))", role: .destructive) {
+                model.store.clear()
+            }
+            Button("Keep models", role: .cancel) {}
+        } message: {
+            Text(
+                "This removes the verified Whisper, speaker, and denoiser models. "
+                    + "You will need to download them again before transcribing.")
+        }
         .fileImporter(
             isPresented: $showFileImporter,
             allowedContentTypes: [.audio, .mpeg4Audio, .mp3, .wav],
             allowsMultipleSelection: false
         ) { result in
-            if case .success(let urls) = result, let url = urls.first {
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
                 model.acceptFile(url: url)
+            case .failure(let error):
+                model.reportFileImportError(error)
             }
         }
         .onReceive(
@@ -71,6 +90,7 @@ struct LabView: View {
                 model.unloadEngineForMemoryPressure()
             }
         }
+        .sensoryFeedback(.success, trigger: model.result?.transcript)
     }
 
     // ── Header ─────────────────────────────────────────────────────────────
@@ -91,6 +111,7 @@ struct LabView: View {
                 .foregroundStyle(Lab.textSecondary)
         }
         .padding(.top, 8)
+        .accessibilityElement(children: .combine)
     }
 
     // ── 01 The Specimen ────────────────────────────────────────────────────
@@ -145,7 +166,13 @@ struct LabView: View {
                 text: "weights cached · \(Self.gigabytes(model.store.cachedBytes)) on device")
             Button("Assemble the machine") { model.assembleEngine() }
                 .buttonStyle(PrimaryButtonStyle())
-            Button("Clear downloaded models") { model.store.clear() }
+            if Self.lowMemoryDevice {
+                StatusLine(
+                    kind: .warn,
+                    text: "This device reports under 6 GB of memory. The on-device engine may be unloaded under pressure."
+                )
+            }
+            Button("Clear downloaded models") { showClearConfirmation = true }
                 .buttonStyle(GhostButtonStyle(tint: Lab.danger))
 
         case .loading(let stage):
@@ -187,21 +214,17 @@ struct LabView: View {
                     LevelMeter(level: model.recorder.level)
                     StatusLine(
                         kind: .warn,
-                        text: String(format: "recording · %.0f s", model.recorder.seconds))
+                        text: "recording · \(Self.clock(model.recorder.seconds)) · tap Stop when finished")
+                    Text(
+                        "Speak naturally and keep the level meter moving. Audio stays in memory on this phone."
+                    )
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Lab.textSecondary)
                 }
 
-                HStack(spacing: 10) {
-                    Button(model.recorder.isRecording ? "Stop" : "Record") {
-                        model.toggleRecording()
-                    }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(
-                        model.engineState != .ready
-                            || (model.isBusy && !model.recorder.isRecording))
-
-                    Button("Import audio") { showFileImporter = true }
-                        .buttonStyle(GhostButtonStyle())
-                        .disabled(model.recorder.isRecording || model.isBusy)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) { inputButtons }
+                    VStack(alignment: .leading, spacing: 10) { inputButtons }
                 }
 
                 if model.input != .none {
@@ -212,15 +235,32 @@ struct LabView: View {
                         } ?? model.inputName)
                 }
 
+                if model.isImporting {
+                    HStack(spacing: 8) {
+                        ProgressView().tint(Lab.emerald)
+                        StatusLine(kind: .neutral, text: "reading audio file…")
+                    }
+                }
+
                 optionsRows
 
                 if case .running(let done, let total, let stage) = model.runState {
                     LabProgressBar(fraction: Double(done) / Double(max(1, total)))
-                    StatusLine(kind: .neutral, text: "\(stage) · window \(done)/\(total)")
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        StatusLine(
+                            kind: .neutral,
+                            text: "\(stage) · window \(done)/\(total) · \(Self.clock(model.elapsed(at: context.date))) elapsed"
+                        )
+                    }
                     Button("Abort") { model.cancelRun() }
                         .buttonStyle(GhostButtonStyle(tint: Lab.danger))
                 } else if case .staging = model.runState {
-                    StatusLine(kind: .neutral, text: "preparing audio…")
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        StatusLine(
+                            kind: .neutral,
+                            text: "preparing audio · \(Self.clock(model.elapsed(at: context.date))) elapsed"
+                        )
+                    }
                 } else {
                     Button("Transcribe") { model.transcribe() }
                         .buttonStyle(PrimaryButtonStyle())
@@ -258,6 +298,13 @@ struct LabView: View {
                     }
                 }
                 .pickerStyle(.menu)
+            }
+            if model.diarize && model.diarizerLoaded {
+                Text(
+                    "Speaker labels separate voices into anonymous lanes; they do not identify people by name."
+                )
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(Lab.textSecondary.opacity(0.8))
             }
         }
         .toggleStyle(SwitchToggleStyle(tint: Lab.emerald))
@@ -310,7 +357,12 @@ struct LabView: View {
 
     private func resultView(_ result: Transcription) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            if !result.speakerSegments.isEmpty {
+            if result.segments.isEmpty {
+                StatusLine(
+                    kind: .warn,
+                    text: "No speech was detected. Try a louder recording or import a clearer clip."
+                )
+            } else if !result.speakerSegments.isEmpty {
                 ForEach(Array(result.speakerSegments.enumerated()), id: \.offset) { _, run in
                     speakerRow(run)
                 }
@@ -335,27 +387,33 @@ struct LabView: View {
 
             resultMeta(result)
 
-            HStack(spacing: 10) {
-                Picker("Format", selection: $exportFormat) {
-                    ForEach(TranscriptFormat.allCases) { format in
-                        Text(format.rawValue).tag(format)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 200)
-
-                ShareLink(
-                    item: TranscriptFile(
-                        content: TranscriptExport.content(exportFormat, from: result),
-                        baseName: "frankenwhisper-transcript",
-                        format: exportFormat),
-                    preview: SharePreview("Transcript")
-                ) {
-                    Text("Share")
-                }
-                .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { exportControls(result) }
+                VStack(alignment: .leading, spacing: 10) { exportControls(result) }
             }
         }
+    }
+
+    @ViewBuilder private func exportControls(_ result: Transcription) -> some View {
+        Picker("Format", selection: $exportFormat) {
+            ForEach(TranscriptFormat.allCases) { format in
+                Text(format.rawValue).tag(format)
+            }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 200)
+
+        ShareLink(
+            item: TranscriptFile(
+                content: TranscriptExport.content(exportFormat, from: result),
+                baseName: "frankenwhisper-transcript",
+                format: exportFormat),
+            preview: SharePreview("Transcript")
+        ) {
+            Text("Share")
+        }
+        .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+        .disabled(result.segments.isEmpty)
     }
 
     private func speakerRow(_ run: SpeakerRun) -> some View {
@@ -408,8 +466,7 @@ struct LabView: View {
                     ? Set(result.speakerSegments.compactMap(\.speaker)) : lanes
                 StatusLine(
                     kind: .neutral,
-                    text: "\(speakers.count) speaker lane(s) active "
-                        + "· 4-lane capacity, true count unknown")
+                    text: "\(speakers.count) speaker lane(s) active · labels separate voices, not identities")
             }
         }
     }
@@ -426,6 +483,20 @@ struct LabView: View {
         .padding(.bottom, 24)
     }
 
+    @ViewBuilder private var inputButtons: some View {
+        Button(model.recorder.isRecording ? "Stop" : "Record") {
+            model.toggleRecording()
+        }
+        .buttonStyle(PrimaryButtonStyle())
+        .disabled(
+            model.engineState != .ready
+                || (model.isBusy && !model.recorder.isRecording))
+
+        Button("Import audio") { showFileImporter = true }
+            .buttonStyle(GhostButtonStyle())
+            .disabled(model.recorder.isRecording || model.isBusy)
+    }
+
     // ── Formatting ─────────────────────────────────────────────────────────
 
     private static func gigabytes(_ bytes: Int64) -> String {
@@ -435,5 +506,9 @@ struct LabView: View {
     private static func clock(_ seconds: Double) -> String {
         let clamped = max(0, Int(seconds.rounded()))
         return String(format: "%d:%02d", clamped / 60, clamped % 60)
+    }
+
+    private static var lowMemoryDevice: Bool {
+        ProcessInfo.processInfo.physicalMemory < 6 * 1024 * 1024 * 1024
     }
 }

@@ -56,6 +56,7 @@ struct Bolt: View {
         .frame(width: 13, height: 13)
         .overlay(Circle().stroke(Color.white.opacity(0.15), lineWidth: 0.8))
         .shadow(color: Lab.emerald.opacity(0.35), radius: 4)
+        .accessibilityHidden(true)
     }
 }
 
@@ -74,6 +75,8 @@ struct LabPanel<Content: View>: View {
 }
 
 struct PrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .black, design: .monospaced))
@@ -82,17 +85,22 @@ struct PrimaryButtonStyle: ButtonStyle {
             .foregroundStyle(.white)
             .padding(.horizontal, 18)
             .padding(.vertical, 11)
+            .frame(minHeight: 44)
             .background(
                 LinearGradient(
                     colors: [Lab.emeraldDeep, Lab.emerald.opacity(0.8)],
                     startPoint: .topLeading, endPoint: .bottomTrailing),
                 in: Capsule())
-            .opacity(configuration.isPressed ? 0.75 : 1)
+            .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.35)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
     }
 }
 
 struct GhostButtonStyle: ButtonStyle {
     var tint: Color = Lab.textSecondary
+    @Environment(\.isEnabled) private var isEnabled
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 12, weight: .black, design: .monospaced))
@@ -101,9 +109,10 @@ struct GhostButtonStyle: ButtonStyle {
             .foregroundStyle(tint)
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
-            .background(Color.white.opacity(0.02), in: Capsule())
-            .overlay(Capsule().stroke(Color.white.opacity(0.1), lineWidth: 1))
-            .opacity(configuration.isPressed ? 0.7 : 1)
+            .frame(minHeight: 44)
+            .background(tint.opacity(configuration.isPressed ? 0.14 : 0.04), in: Capsule())
+            .overlay(Capsule().stroke(tint.opacity(0.35), lineWidth: 1))
+            .opacity(isEnabled ? 1 : 0.35)
     }
 }
 
@@ -125,6 +134,9 @@ struct LabProgressBar: View {
         }
         .frame(height: 6)
         .animation(.easeOut(duration: 0.25), value: fraction)
+        .accessibilityElement()
+        .accessibilityLabel("Progress")
+        .accessibilityValue("\(Int(min(1, max(0, fraction)) * 100)) percent")
     }
 }
 
@@ -166,5 +178,8 @@ struct LevelMeter: View {
         }
         .frame(height: 4)
         .animation(.linear(duration: 0.1), value: level)
+        .accessibilityElement()
+        .accessibilityLabel("Microphone level")
+        .accessibilityValue("\(Int(min(1, max(0, level)) * 100)) percent")
     }
 }

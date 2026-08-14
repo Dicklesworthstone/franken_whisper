@@ -114,6 +114,7 @@ final class AudioRecorder {
             // on the same bus raises an ObjC exception (a crash, not a throw).
             input.removeTap(onBus: 0)
             self.sink = nil
+            try? session.setActive(false, options: [.notifyOthersOnDeactivation])
             throw error
         }
         isRecording = true

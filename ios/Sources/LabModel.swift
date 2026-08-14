@@ -43,6 +43,7 @@ final class LabModel {
         }
     }
     var input: Input = .none
+    var isImporting = false
     var inputName: String {
         switch input {
         case .none: ""
@@ -82,12 +83,13 @@ final class LabModel {
 
     private var generation = 0
     private var runTask: Task<Void, Never>?
-    private var runStarted: Date?
+    private(set) var runStarted: Date?
     /// Guards the async permission → start window: a second Record tap while
     /// the system prompt is up must not install a second tap (ObjC crash).
     private var micRequestInFlight = false
 
     var isBusy: Bool {
+        if isImporting { return true }
         if case .running = runState { return true }
         if case .staging = runState { return true }
         if case .loading = engineState { return true }
@@ -152,6 +154,13 @@ final class LabModel {
         if recorder.isRecording {
             let pcm = recorder.stop()
             if pcm.count >= 8_000 {  // half a second minimum
+                let peak = pcm.reduce(Float(0)) { max($0, abs($1)) }
+                guard peak > 0.005 else {
+                    lastError = String(
+                        format: "We could barely hear that recording (peak %.3f). Check the microphone level and try again.",
+                        peak)
+                    return
+                }
                 input = .recording(pcm: pcm)
                 result = nil
                 runState = .idle
@@ -181,17 +190,30 @@ final class LabModel {
     }
 
     func acceptFile(url: URL) {
+        guard !isImporting else { return }
         let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        do {
-            let data = try Data(contentsOf: url)
-            input = .file(
-                data: data, ext: url.pathExtension.lowercased(), name: url.lastPathComponent)
-            result = nil
-            runState = .idle
-        } catch {
-            lastError = "Could not read \(url.lastPathComponent): \(error.localizedDescription)"
+        isImporting = true
+        Task {
+            defer {
+                if scoped { url.stopAccessingSecurityScopedResource() }
+                self.isImporting = false
+            }
+            do {
+                let data = try await Task.detached(priority: .userInitiated) {
+                    try Data(contentsOf: url, options: .mappedIfSafe)
+                }.value
+                input = .file(
+                    data: data, ext: url.pathExtension.lowercased(), name: url.lastPathComponent)
+                result = nil
+                runState = .idle
+            } catch {
+                lastError = "Could not read \(url.lastPathComponent): \(error.localizedDescription)"
+            }
         }
+    }
+
+    func reportFileImportError(_ error: Error) {
+        lastError = "Could not import that audio file: \(error.localizedDescription)"
     }
 
     // ── The run ────────────────────────────────────────────────────────────
@@ -261,6 +283,10 @@ final class LabModel {
 
     func cancelRun() {
         engine.requestCancel()
+    }
+
+    func elapsed(at date: Date) -> TimeInterval {
+        max(0, date.timeIntervalSince(runStarted ?? date))
     }
 
     // ── Hook plumbing ──────────────────────────────────────────────────────
