@@ -9,12 +9,14 @@ import UniformTypeIdentifiers
 enum TranscriptFormat: String, CaseIterable, Identifiable {
     case text = "TXT"
     case srt = "SRT"
+    case json = "JSON"
     var id: String { rawValue }
 
     var fileExtension: String {
         switch self {
         case .text: "txt"
         case .srt: "srt"
+        case .json: "json"
         }
     }
 }
@@ -45,6 +47,26 @@ enum TranscriptExport {
             index += 1
         }
         return out
+    }
+
+    /// The full structured result — segments, speaker runs, turns, and the
+    /// DTW word timings when they were requested — in the engine's own
+    /// snake_case key style. This is the only export that carries `words`,
+    /// which is what makes the word-timestamps toggle worth its compute.
+    static func json(from result: Transcription) -> String {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(result) else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    static func content(_ format: TranscriptFormat, from result: Transcription) -> String {
+        switch format {
+        case .text: text(from: result)
+        case .srt: srt(from: result)
+        case .json: json(from: result)
+        }
     }
 
     private static func timestamp(_ seconds: Double) -> String {

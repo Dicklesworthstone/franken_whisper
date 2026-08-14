@@ -324,11 +324,15 @@ pub use ios_hooks::{emit_partial_segments, emit_span, set_segment_hook, set_span
 /// byte-identical.
 #[cfg(all(not(target_arch = "wasm32"), target_os = "ios"))]
 mod ios_hooks {
-    static SPAN_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str, f64) + Send + Sync>>> =
-        std::sync::Mutex::new(None);
+    /// Host span callback: (span name, milliseconds-or-count value).
+    pub type SpanHook = Box<dyn Fn(&str, f64) + Send + Sync>;
+    /// Host partial-transcript callback: one window's segments as JSON.
+    pub type SegmentHook = Box<dyn Fn(&str) + Send + Sync>;
+
+    static SPAN_HOOK: std::sync::Mutex<Option<SpanHook>> = std::sync::Mutex::new(None);
 
     /// Register the host span hook (replaces any previous hook).
-    pub fn set_span_hook(hook: Box<dyn Fn(&str, f64) + Send + Sync>) {
+    pub fn set_span_hook(hook: SpanHook) {
         *SPAN_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
@@ -345,11 +349,10 @@ mod ios_hooks {
         }
     }
 
-    static SEGMENT_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>> =
-        std::sync::Mutex::new(None);
+    static SEGMENT_HOOK: std::sync::Mutex<Option<SegmentHook>> = std::sync::Mutex::new(None);
 
     /// Register the host partial-transcript hook (replaces any previous).
-    pub fn set_segment_hook(hook: Box<dyn Fn(&str) + Send + Sync>) {
+    pub fn set_segment_hook(hook: SegmentHook) {
         *SEGMENT_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);

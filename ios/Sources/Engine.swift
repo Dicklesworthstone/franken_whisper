@@ -83,7 +83,7 @@ final class EngineHooks: @unchecked Sendable {
 
 // ── Result models (the fw_run_prepared JSON, fw_ios.h §The run) ────────────
 
-struct TranscriptSegment: Decodable, Identifiable, Hashable {
+struct TranscriptSegment: Codable, Identifiable, Hashable {
     var startSec: Double?
     var endSec: Double?
     var text: String
@@ -92,7 +92,7 @@ struct TranscriptSegment: Decodable, Identifiable, Hashable {
     var id: String { "\(startSec ?? -1)-\(endSec ?? -1)-\(text)" }
 }
 
-struct SpeakerRun: Decodable, Identifiable, Hashable {
+struct SpeakerRun: Codable, Identifiable, Hashable {
     var startSec: Double?
     var endSec: Double?
     var speaker: String?
@@ -102,13 +102,13 @@ struct SpeakerRun: Decodable, Identifiable, Hashable {
     var id: String { "\(startSec ?? -1)-\(speaker ?? "?")-\(segmentCount)" }
 }
 
-struct WordTiming: Decodable, Hashable {
+struct WordTiming: Codable, Hashable {
     var text: String
     var startSec: Double
     var endSec: Double
 }
 
-struct Transcription: Decodable {
+struct Transcription: Codable {
     var language: String?
     var segments: [TranscriptSegment]
     var turns: [Turn]
@@ -122,7 +122,7 @@ struct Transcription: Decodable {
     /// reason here).
     var diarizationError: String?
 
-    struct Turn: Decodable, Hashable {
+    struct Turn: Codable, Hashable {
         var startMs: UInt64
         var endMs: UInt64
         var speakerRef: String?

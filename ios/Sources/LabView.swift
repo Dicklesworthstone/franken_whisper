@@ -342,13 +342,11 @@ struct LabView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 140)
+                .frame(width: 200)
 
                 ShareLink(
                     item: TranscriptFile(
-                        content: exportFormat == .text
-                            ? TranscriptExport.text(from: result)
-                            : TranscriptExport.srt(from: result),
+                        content: TranscriptExport.content(exportFormat, from: result),
                         baseName: "frankenwhisper-transcript",
                         format: exportFormat),
                     preview: SharePreview("Transcript")

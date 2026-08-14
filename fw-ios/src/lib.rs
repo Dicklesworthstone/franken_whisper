@@ -899,7 +899,7 @@ fn run_fused(engine: &mut FwEngine, opts: &RunOptions) -> FwResult<String> {
             let ticks = std::sync::atomic::AtomicU64::new(0);
             let diar_checkpoint = move || {
                 let n = ticks.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % 256 == 0 {
+                if n.is_multiple_of(256) {
                     emit_stage("sortformer_tick", n as f64);
                 }
                 checkpoint()
