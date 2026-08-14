@@ -12,7 +12,7 @@ PROFILE="${FW_IOS_PROFILE:-release}"
 
 for target in aarch64-apple-ios aarch64-apple-ios-sim; do
   rustup target list --installed | grep -q "$target" || rustup target add "$target"
-  (cd fw-ios && nice -n 19 cargo build --"$PROFILE" -j 4 --target "$target")
+  (cd fw-ios && nice -n 19 cargo build --"$PROFILE" --locked -j 4 --target "$target")
 done
 
 HEADERS=$(mktemp -d /tmp/fw-ios-headers.XXXXXX)

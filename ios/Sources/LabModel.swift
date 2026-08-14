@@ -73,6 +73,9 @@ final class LabModel {
     }
     var runState: RunState = .idle
     var liveSegments: [TranscriptSegment] = []
+    /// Live segments arrive in the trimmed timebase (fw_ios.h); add this to
+    /// their times for display. The final result already has it added back.
+    var liveOffsetSec: Double = 0
     var result: Transcription?
     var wallSeconds: Double = 0
     var lastError: String?
@@ -106,6 +109,9 @@ final class LabModel {
         let denoiser = store.url(for: ModelManifest.denoiser)
         Task { [engine] in
             do {
+                // Cancellation is process-wide and sticky; a run cancelled
+                // earlier must not fail the Sortformer load's checkpoints.
+                engine.resetCancel()
                 try await engine.load(modelPath: whisper)
                 // The diarizer and denoiser are enhancements: a failure there
                 // degrades (no speakers / no clean-up) instead of blocking
@@ -179,6 +185,7 @@ final class LabModel {
         let gen = generation
         runState = .staging
         liveSegments = []
+        liveOffsetSec = 0
         result = nil
         lastError = nil
         runStarted = Date()
@@ -210,9 +217,13 @@ final class LabModel {
                 case .file(let data, let ext, _):
                     stage = try await engine.stage(fileData: data, ext: ext, denoise: denoise)
                 case .none:
+                    // Unreachable (guarded at entry), but never strand the
+                    // UI in .staging if it somehow happens.
+                    self.runState = .idle
                     return
                 }
                 guard self.generation == gen else { return }
+                self.liveOffsetSec = stage.skippedLeadingSec
                 let windows = max(1, Int((stage.audioSec / 30.0).rounded(.up)))
                 self.runState = .running(windowsDone: 0, windowsTotal: windows, stage: "decoding")
                 let result = try await engine.run(options: options)

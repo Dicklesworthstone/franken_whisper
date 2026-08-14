@@ -117,6 +117,10 @@ struct Transcription: Decodable {
     var droppedWindows: Int
     var audioSec: Double
     var skippedLeadingSec: Double
+    /// Set when diarization was requested but failed after a successful
+    /// decode (fw_ios.h: the transcript survives, speakerless, with the
+    /// reason here).
+    var diarizationError: String?
 
     struct Turn: Decodable, Hashable {
         var startMs: UInt64

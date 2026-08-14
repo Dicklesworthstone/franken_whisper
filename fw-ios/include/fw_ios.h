@@ -150,8 +150,21 @@ int32_t fw_stage_pcm(FwEngine *engine,
  *     "words": [[{text, start_sec, end_sec}, …], …] | null,       // per segment
  *     "dropped_windows": 0,
  *     "audio_sec": 12.3,
- *     "skipped_leading_sec": 0.0
+ *     "skipped_leading_sec": 0.0,
+ *     "diarization_error": "…" | null
  *   }
+ *
+ * Diarization degrades, transcription does not: requesting diarize without a
+ * loaded diarizer fails fast (code 4) BEFORE the decode starts, but a
+ * diarize-stage failure AFTER a successful decode (e.g. audio beyond
+ * Sortformer's two-hour capacity) returns the finished speakerless
+ * transcript with the reason in "diarization_error" instead of discarding
+ * minutes of work. Cancellation always aborts the whole call (code 6).
+ *
+ * Live-transcript timebase: segments streamed through the segments callback
+ * are in the TRIMMED timebase; only the final result adds
+ * skipped_leading_sec back. Hosts displaying live times should add the
+ * staging response's skipped_leading_sec themselves.
  *
  * Long-running: minutes for long audio. Run off the main thread; watch the
  * progress callback ("encoder_window" spans count decode windows) and the

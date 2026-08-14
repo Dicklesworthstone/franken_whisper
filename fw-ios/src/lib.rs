@@ -842,6 +842,15 @@ struct RunOptions {
 }
 
 fn run_fused(engine: &mut FwEngine, opts: &RunOptions) -> FwResult<String> {
+    // Fail-fast BEFORE the expensive decode (and before consuming the staged
+    // PCM): a missing diarizer is a caller bug, and discovering it after
+    // minutes of transcription would throw the whole transcript away.
+    if opts.diarize && engine.diarizer.is_none() {
+        return Err(FwError::InvalidRequest(
+            "diarize requested but no diarizer loaded: call fw_engine_load_sortformer first"
+                .to_string(),
+        ));
+    }
     let (samples, offset_sec) = engine.staged.take().ok_or_else(|| {
         FwError::InvalidRequest("no audio prepared: call fw_stage_* first".to_string())
     })?;
@@ -871,49 +880,63 @@ fn run_fused(engine: &mut FwEngine, opts: &RunOptions) -> FwResult<String> {
     let mut speaker_segments = Vec::new();
     let mut mixed_indices = Vec::new();
     let mut overlap_indices = Vec::new();
+    // Populated when the diarize stage fails for a non-cancellation reason
+    // (e.g. Sortformer's two-hour capacity): the finished transcript is worth
+    // minutes of battery, so it degrades to speakerless output with a named
+    // reason instead of being discarded.
+    let mut diarization_error: Option<String> = None;
 
     if opts.diarize {
-        let session = engine.diarizer.as_ref().ok_or_else(|| {
-            FwError::InvalidRequest(
-                "diarize requested but no diarizer loaded: call fw_engine_load_sortformer first"
-                    .to_string(),
-            )
-        })?;
-        emit_stage("sortformer:diarize", 0.0);
-        // The diarizer has no window structure to count, so its heartbeat is
-        // the cancellation checkpoint: one throttled span per 256 calls tells
-        // the app the stage is alive and moving.
-        let ticks = std::sync::atomic::AtomicU64::new(0);
-        let diar_checkpoint = move || {
-            let n = ticks.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 256 == 0 {
-                emit_stage("sortformer_tick", n as f64);
-            }
-            checkpoint()
-        };
-        let diarization = session
-            .diarize_with_checkpoint(SortformerPcm::mono_16khz(&samples), &diar_checkpoint)?;
+        let session = engine
+            .diarizer
+            .as_ref()
+            .expect("checked before the decode started");
+        let attempt = || -> FwResult<_> {
+            emit_stage("sortformer:diarize", 0.0);
+            // The diarizer has no window structure to count, so its heartbeat
+            // is the cancellation checkpoint: one throttled span per 256
+            // calls tells the app the stage is alive and moving.
+            let ticks = std::sync::atomic::AtomicU64::new(0);
+            let diar_checkpoint = move || {
+                let n = ticks.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 256 == 0 {
+                    emit_stage("sortformer_tick", n as f64);
+                }
+                checkpoint()
+            };
+            let diarization = session
+                .diarize_with_checkpoint(SortformerPcm::mono_16khz(&samples), &diar_checkpoint)?;
 
-        emit_stage("fuse:project", 0.0);
-        let (mapped_turns, _labels) =
-            crate::diarization_projection::sortformer_output_to_diarization_turns(
-                &diarization,
-                &checkpoint,
+            emit_stage("fuse:project", 0.0);
+            let (mapped_turns, _labels) =
+                crate::diarization_projection::sortformer_output_to_diarization_turns(
+                    &diarization,
+                    &checkpoint,
+                )?;
+            // Projection runs at segment granularity (`word_aligned = false`),
+            // matching the browser lane; word timestamps, when requested, ride
+            // alongside in `words` without changing speaker attribution.
+            let projection = crate::diarization_projection::project_diarization_onto_segments(
+                &segments,
+                &mapped_turns,
+                false,
             )?;
-        // Projection runs at segment granularity (`word_aligned = false`),
-        // matching the browser lane; word timestamps, when requested, ride
-        // alongside in `words` without changing speaker attribution.
-        let projection = crate::diarization_projection::project_diarization_onto_segments(
-            &segments,
-            &mapped_turns,
-            false,
-        )?;
-        segments = projection.segments;
-        mixed_indices = projection.mixed_speaker_segment_indices;
-        overlap_indices = projection.overlap_suspected_segment_indices;
-        turns = mapped_turns;
-        speaker_segments =
-            crate::diarization_projection::build_speaker_attributed_segments(&segments, &turns);
+            Ok((mapped_turns, projection))
+        };
+        match attempt() {
+            Ok((mapped_turns, projection)) => {
+                segments = projection.segments;
+                mixed_indices = projection.mixed_speaker_segment_indices;
+                overlap_indices = projection.overlap_suspected_segment_indices;
+                turns = mapped_turns;
+                speaker_segments = crate::diarization_projection::build_speaker_attributed_segments(
+                    &segments, &turns,
+                );
+            }
+            // A host cancel must still abort the whole call.
+            Err(err @ FwError::Cancelled(_)) => return Err(err),
+            Err(err) => diarization_error = Some(err.to_string()),
+        }
     }
 
     // Add the trimmed leading-silence offset back to every emitted time, so
@@ -973,6 +996,7 @@ fn run_fused(engine: &mut FwEngine, opts: &RunOptions) -> FwResult<String> {
         "dropped_windows": out.dropped_windows.len(),
         "audio_sec": audio_sec,
         "skipped_leading_sec": offset_sec,
+        "diarization_error": diarization_error,
     })
     .to_string())
 }

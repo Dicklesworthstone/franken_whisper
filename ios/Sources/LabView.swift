@@ -195,7 +195,9 @@ struct LabView: View {
                         model.toggleRecording()
                     }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(model.engineState != .ready || model.isBusy && !model.recorder.isRecording)
+                    .disabled(
+                        model.engineState != .ready
+                            || (model.isBusy && !model.recorder.isRecording))
 
                     Button("Import audio") { showFileImporter = true }
                         .buttonStyle(GhostButtonStyle())
@@ -288,11 +290,14 @@ struct LabView: View {
         }
     }
 
-    /// Segments streamed live while the decode is still running.
+    /// Segments streamed live while the decode is still running. Indexed IDs:
+    /// repeated identical phrases can produce identical (time, text) tuples,
+    /// and live times need the trimmed-leading-silence offset added back
+    /// (the final result already has it; fw_ios.h documents the split).
     private var liveView: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(model.liveSegments) { segment in
-                segmentRow(segment)
+            ForEach(Array(model.liveSegments.enumerated()), id: \.offset) { _, segment in
+                segmentRow(segment, timeOffset: model.liveOffsetSec)
             }
             HStack(spacing: 6) {
                 ProgressView().tint(Lab.emerald).scaleEffect(0.7)
@@ -306,13 +311,19 @@ struct LabView: View {
     private func resultView(_ result: Transcription) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             if !result.speakerSegments.isEmpty {
-                ForEach(result.speakerSegments) { run in
+                ForEach(Array(result.speakerSegments.enumerated()), id: \.offset) { _, run in
                     speakerRow(run)
                 }
             } else {
-                ForEach(result.segments) { segment in
+                ForEach(Array(result.segments.enumerated()), id: \.offset) { _, segment in
                     segmentRow(segment)
                 }
+            }
+
+            if let reason = result.diarizationError {
+                StatusLine(
+                    kind: .warn,
+                    text: "speakers unavailable for this run — \(reason)")
             }
 
             if result.droppedWindows > 0 {
@@ -369,9 +380,9 @@ struct LabView: View {
         }
     }
 
-    private func segmentRow(_ segment: TranscriptSegment) -> some View {
+    private func segmentRow(_ segment: TranscriptSegment, timeOffset: Double = 0) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(segment.startSec.map(Self.clock) ?? "—")
+            Text(segment.startSec.map { Self.clock($0 + timeOffset) } ?? "—")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(Lab.textSecondary)
                 .frame(width: 44, alignment: .trailing)
@@ -391,9 +402,15 @@ struct LabView: View {
                     format: "%.1f s of audio · %.1f s on device · RTF %.2f · language %@",
                     result.audioSec, model.wallSeconds, rtf, result.language ?? "?"))
             if !result.turns.isEmpty {
+                // Turns' speaker_ref can be absent (anonymous lanes); the
+                // projected speaker runs always carry the display labels.
+                let lanes = Set(result.turns.compactMap(\.speakerRef))
+                let speakers =
+                    lanes.isEmpty
+                    ? Set(result.speakerSegments.compactMap(\.speaker)) : lanes
                 StatusLine(
                     kind: .neutral,
-                    text: "\(Set(result.turns.compactMap(\.speakerRef)).count) speaker lane(s) active "
+                    text: "\(speakers.count) speaker lane(s) active "
                         + "· 4-lane capacity, true count unknown")
             }
         }
