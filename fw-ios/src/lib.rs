@@ -302,9 +302,7 @@ pub extern "C" fn fw_last_error_message() -> *const c_char {
 pub extern "C" fn fw_version() -> *const c_char {
     static VERSION: OnceLock<CString> = OnceLock::new();
     VERSION
-        .get_or_init(|| {
-            CString::new(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| c"0".to_owned())
-        })
+        .get_or_init(|| CString::new(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| c"0".to_owned()))
         .as_ptr()
 }
 
@@ -581,10 +579,11 @@ pub unsafe extern "C" fn fw_engine_load_sortformer(
             return EXIT_USAGE;
         };
         // SAFETY: documented as NULL or valid NUL-terminated strings.
-        let (Some(receipt_path), Some(package_path)) = (
-            unsafe { ptr_island::opt_str(receipt_path) },
-            unsafe { ptr_island::opt_str(package_path) },
-        ) else {
+        let (Some(receipt_path), Some(package_path)) =
+            (unsafe { ptr_island::opt_str(receipt_path) }, unsafe {
+                ptr_island::opt_str(package_path)
+            })
+        else {
             set_error("fw_engine_load_sortformer: a path was NULL or not valid UTF-8");
             return EXIT_USAGE;
         };
@@ -598,14 +597,15 @@ pub unsafe extern "C" fn fw_engine_load_sortformer(
             Ok(bytes) => bytes,
             Err(err) => return fail("fw_engine_load_sortformer(package)", &err),
         };
-        let package = match crate::sortformer_conformance::load_verified_sortformer_package_from_bytes(
-            receipt,
-            package,
-            &checkpoint,
-        ) {
-            Ok(package) => package,
-            Err(err) => return fail("fw_engine_load_sortformer(verify)", &err),
-        };
+        let package =
+            match crate::sortformer_conformance::load_verified_sortformer_package_from_bytes(
+                receipt,
+                package,
+                &checkpoint,
+            ) {
+                Ok(package) => package,
+                Err(err) => return fail("fw_engine_load_sortformer(verify)", &err),
+            };
         emit_stage("sortformer:weights", 0.0);
         match SortformerSession::from_verified_package(&package) {
             Ok(session) => {
@@ -855,10 +855,7 @@ fn run_fused(engine: &mut FwEngine, opts: &RunOptions) -> FwResult<String> {
         translate: opts.translate,
         word_timestamps: opts.word_timestamps,
         beam_size: opts.beam_size,
-        initial_prompt: opts
-            .initial_prompt
-            .clone()
-            .filter(|p| !p.trim().is_empty()),
+        initial_prompt: opts.initial_prompt.clone().filter(|p| !p.trim().is_empty()),
         language: opts
             .language
             .clone()
@@ -894,8 +891,8 @@ fn run_fused(engine: &mut FwEngine, opts: &RunOptions) -> FwResult<String> {
             }
             checkpoint()
         };
-        let diarization =
-            session.diarize_with_checkpoint(SortformerPcm::mono_16khz(&samples), &diar_checkpoint)?;
+        let diarization = session
+            .diarize_with_checkpoint(SortformerPcm::mono_16khz(&samples), &diar_checkpoint)?;
 
         emit_stage("fuse:project", 0.0);
         let (mapped_turns, _labels) =
@@ -915,9 +912,8 @@ fn run_fused(engine: &mut FwEngine, opts: &RunOptions) -> FwResult<String> {
         mixed_indices = projection.mixed_speaker_segment_indices;
         overlap_indices = projection.overlap_suspected_segment_indices;
         turns = mapped_turns;
-        speaker_segments = crate::diarization_projection::build_speaker_attributed_segments(
-            &segments, &turns,
-        );
+        speaker_segments =
+            crate::diarization_projection::build_speaker_attributed_segments(&segments, &turns);
     }
 
     // Add the trimmed leading-silence offset back to every emitted time, so
