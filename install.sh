@@ -877,6 +877,26 @@ install_binary_pair() {
     install_binary_atomic "$long_src" "$DEST/$BINARY_NAME"
 }
 
+# macOS filesystem sidecars are inert packaging noise, not payload: Finder
+# ".DS_Store" entries and AppleDouble "._<member>" resource-fork shadows of an
+# allowlisted member (as produced by macOS tar without COPYFILE_DISABLE=1).
+# They are admitted as no-op members so such an archive still installs, but
+# they are excluded from extraction and never installed.
+is_macos_sidecar_member() {
+    local name="$1" shadowed
+    case "$name" in
+        ".DS_Store") return 0 ;;
+        ._?*) ;;
+        *) return 1 ;;
+    esac
+    shadowed="${name#._}"
+    case "$shadowed" in
+        "$BINARY_NAME"|"$ALIAS_NAME"|"README.md"|"LICENSE"|"NOTICE.sortformer.txt"|"THIRD_PARTY_NOTICES.md"|"AGENTS.md"|".DS_Store")
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Admit only flat release archives with the exact supported member names. Tar
 # entry types are checked before extraction; both formats are checked again for
 # regular, non-symlink binaries before installation.
@@ -903,6 +923,9 @@ validate_archive_members() {
             "THIRD_PARTY_NOTICES.md") third_party_count=$((third_party_count + 1)) ;;
             "AGENTS.md") agents_count=$((agents_count + 1)) ;;
             *)
+                if is_macos_sidecar_member "$normalized"; then
+                    continue
+                fi
                 log_error "Archive contains an unexpected member"
                 return 1
                 ;;
@@ -928,11 +951,15 @@ extract_and_install() {
         command -v tar &>/dev/null || die "tar required for .tar.gz archives"
     fi
     validate_archive_members "$archive" "$archive_ext" || return 1
+    # macOS sidecar members pass validation as no-ops but are excluded here so
+    # nothing beyond the allowlisted payload lands in the extract directory
+    # (and so bsdtar never replays an AppleDouble "._fw" as extended
+    # attributes onto the real binary).
     if [[ "$archive_ext" == "zip" ]]; then
-        unzip -o "$archive" -d "$TMP/extract" >/dev/null 2>&1 || return 1
+        unzip -o "$archive" -x '._*' '.DS_Store' -d "$TMP/extract" >/dev/null 2>&1 || return 1
     else
         mkdir -p "$TMP/extract"
-        tar -xzf "$archive" -C "$TMP/extract" 2>/dev/null || return 1
+        tar --exclude '._*' --exclude '.DS_Store' -xzf "$archive" -C "$TMP/extract" 2>/dev/null || return 1
     fi
 
     local bin="$TMP/extract/$BINARY_NAME"

@@ -129,7 +129,12 @@ jobs:
           mkdir -p dist
           VERSION_NO_V="${RELEASE_VERSION#v}"
           ARCHIVE="franken_whisper-${VERSION_NO_V}-${{ matrix.os_arch }}.${{ matrix.archive_ext }}"
-          tar -czf "dist/$ARCHIVE" \
+          # COPYFILE_DISABLE stops macOS bsdtar from shadowing members with
+          # AppleDouble "._*" resource-fork entries, and the explicit
+          # exclusions belt-and-suspenders both tar flavors: install.sh
+          # rejects archives whose members stray from its allowlist.
+          COPYFILE_DISABLE=1 tar --exclude '._*' --exclude '.DS_Store' \
+            -czf "dist/$ARCHIVE" \
             -C "target/${{ matrix.target }}/release" franken_whisper fw \
             -C "$GITHUB_WORKSPACE" README.md LICENSE THIRD_PARTY_NOTICES.md AGENTS.md
           cd dist
