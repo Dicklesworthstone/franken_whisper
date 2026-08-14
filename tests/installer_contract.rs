@@ -149,6 +149,129 @@ fn installer_accepts_the_exact_dsr_release_archive_members() {
     );
 }
 
+/// Issue #1 regression: the v0.7.2 linux_amd64 tarball was packaged on macOS
+/// without `COPYFILE_DISABLE` and carried AppleDouble `._*` shadows of every
+/// member, which the member allowlist rejected and fresh installs failed.
+/// Sidecars of allowlisted members (plus `.DS_Store`) must now validate as
+/// ignorable no-ops, while genuinely unexpected members stay rejected.
+#[test]
+fn installer_ignores_macos_appledouble_sidecar_members() {
+    let root = tempfile::tempdir().expect("temporary archive harness");
+    let stage = root.path().join("stage");
+    fs::create_dir(&stage).expect("create archive stage");
+    let members = [
+        "franken_whisper",
+        "fw",
+        "README.md",
+        "LICENSE",
+        "NOTICE.sortformer.txt",
+        "THIRD_PARTY_NOTICES.md",
+        "AGENTS.md",
+        "._franken_whisper",
+        "._fw",
+        "._README.md",
+        "._LICENSE",
+        "._NOTICE.sortformer.txt",
+        "._THIRD_PARTY_NOTICES.md",
+        "._AGENTS.md",
+        ".DS_Store",
+        "._.DS_Store",
+    ];
+    for member in members {
+        fs::write(stage.join(member), member).expect("write archive member");
+    }
+    let archive = root
+        .path()
+        .join("franken_whisper-0.7.2-linux_amd64.tar.gz");
+    let status = Command::new("tar")
+        .args(["-czf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(&stage)
+        .args(members)
+        .status()
+        .expect("create release archive");
+    assert!(status.success());
+
+    let output = source_and_run(
+        root.path(),
+        &format!("validate_archive_members \"{}\" tar.gz", archive.display()),
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Extraction must drop the sidecars: only allowlisted payload may land
+    // in the extract directory (bsdtar would otherwise replay `._fw` as
+    // extended attributes onto the real binary).
+    let extract_root = root.path().join("tmp-extract");
+    fs::create_dir(&extract_root).expect("create extract TMP");
+    let extract = source_and_run(
+        root.path(),
+        &format!(
+            r#"
+TMP="{}"
+install_binary_pair() {{ :; }}
+extract_and_install "{}" tar.gz
+ls -A "$TMP/extract"
+"#,
+            extract_root.display(),
+            archive.display()
+        ),
+    );
+    assert!(
+        extract.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&extract.stderr)
+    );
+    let listed = String::from_utf8_lossy(&extract.stdout);
+    assert!(
+        !listed.contains("._") && !listed.contains(".DS_Store"),
+        "sidecars must not be extracted, got: {listed}"
+    );
+}
+
+/// A `._` member that does not shadow an allowlisted name is still an
+/// unexpected member, as is any other stray file.
+#[test]
+fn installer_still_rejects_unexpected_members() {
+    for stray in ["._payload", "extra.txt"] {
+        let root = tempfile::tempdir().expect("temporary archive harness");
+        let stage = root.path().join("stage");
+        fs::create_dir(&stage).expect("create archive stage");
+        let members = ["franken_whisper", "fw", stray];
+        for member in members {
+            fs::write(stage.join(member), member).expect("write archive member");
+        }
+        let archive = root.path().join("franken_whisper-0.7.2-linux_amd64.tar.gz");
+        let status = Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&stage)
+            .args(members)
+            .status()
+            .expect("create release archive");
+        assert!(status.success());
+
+        let output = source_and_run(
+            root.path(),
+            &format!("validate_archive_members \"{}\" tar.gz", archive.display()),
+        );
+        assert!(
+            !output.status.success(),
+            "stray member {stray} must be rejected"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unexpected member"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn release_checksum_resolution_prefers_dsr_sidecar_and_binds_the_archive_name() {
     let root = tempfile::tempdir().expect("temporary checksum harness");
