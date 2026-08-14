@@ -343,24 +343,33 @@ final class LabModel {
 
     func displaySpeaker(_ lane: String?) -> String {
         guard let lane else { return "UNKNOWN" }
-        return speakerNameMap[lane] ?? lane
+        let name = speakerNameMap[lane]?.trimmingCharacters(in: .whitespaces) ?? ""
+        return name.isEmpty ? lane : name
     }
 
+    /// Stores the RAW text: trimming here would fight the keyboard (the
+    /// binding round-trips per keystroke, so a trailing space typed
+    /// mid-"John Smith" would vanish instantly). Display and export trim.
     func setSpeakerName(_ name: String, for lane: String) {
-        let trimmed = name.trimmingCharacters(in: .whitespaces)
-        if trimmed.isEmpty {
+        if name.isEmpty {
             speakerNameMap.removeValue(forKey: lane)
         } else {
-            speakerNameMap[lane] = trimmed
+            speakerNameMap[lane] = name
         }
     }
 
-    /// Everything an export needs beyond the result itself.
+    /// Everything an export needs beyond the result itself. Names are
+    /// trimmed here so in-progress whitespace never reaches a document.
     var exportContext: ExportContext {
-        ExportContext(
+        var trimmed: [String: String] = [:]
+        for (lane, name) in speakerNameMap {
+            let clean = name.trimmingCharacters(in: .whitespaces)
+            if !clean.isEmpty { trimmed[lane] = clean }
+        }
+        return ExportContext(
             sourceName: inputName.isEmpty ? "recording" : inputName,
             wallSeconds: wallSeconds,
-            names: speakerNameMap)
+            names: trimmed)
     }
 
     // ── Hook plumbing ──────────────────────────────────────────────────────

@@ -248,19 +248,27 @@ enum TranscriptExport {
     }
 }
 
-/// A shareable transcript file for ShareLink.
+/// A shareable transcript file for ShareLink. Each format exports under its
+/// real UTType (HTML as public.html, JSON as public.json) so receiving apps
+/// treat the file correctly instead of as generic plain text.
 struct TranscriptFile: Transferable {
     let content: String
     let baseName: String
     let format: TranscriptFormat
 
     static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(exportedContentType: .plainText) { file in
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent("\(file.baseName)-\(UUID().uuidString.prefix(6))")
-                .appendingPathExtension(file.format.fileExtension)
-            try file.content.data(using: .utf8)?.write(to: url)
-            return SentTransferredFile(url)
-        }
+        FileRepresentation(exportedContentType: .html) { try write($0) }
+            .exportingCondition { $0.format == .html }
+        FileRepresentation(exportedContentType: .json) { try write($0) }
+            .exportingCondition { $0.format == .json }
+        FileRepresentation(exportedContentType: .plainText) { try write($0) }
+    }
+
+    private static func write(_ file: TranscriptFile) throws -> SentTransferredFile {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(file.baseName)-\(UUID().uuidString.prefix(6))")
+            .appendingPathExtension(file.format.fileExtension)
+        try Data(file.content.utf8).write(to: url)
+        return SentTransferredFile(url)
     }
 }
