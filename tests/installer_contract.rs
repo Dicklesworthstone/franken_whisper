@@ -149,6 +149,42 @@ fn installer_accepts_the_exact_dsr_release_archive_members() {
     );
 }
 
+/// Build a flat ustar tar.gz containing exactly `members`, each a regular
+/// file. Hand-rolled instead of shelling out to `tar` because macOS bsdtar
+/// special-cases AppleDouble `._*` names at archive-creation time (it folds
+/// them into metadata or drops them), which would make these fixtures
+/// platform-dependent; GNU tar on the Linux release path stores them
+/// literally, and that is the case the installer must survive.
+fn write_flat_targz(path: &Path, members: &[&str]) {
+    use std::io::Write as _;
+    let file = fs::File::create(path).expect("create archive file");
+    let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    for member in members {
+        let data = member.as_bytes();
+        let mut header = [0u8; 512];
+        header[..member.len()].copy_from_slice(member.as_bytes());
+        header[100..107].copy_from_slice(b"0000644");
+        header[108..115].copy_from_slice(b"0000000");
+        header[116..123].copy_from_slice(b"0000000");
+        header[124..135].copy_from_slice(format!("{:011o}", data.len()).as_bytes());
+        header[136..147].copy_from_slice(b"00000000000");
+        header[156] = b'0';
+        header[257..262].copy_from_slice(b"ustar");
+        header[263..265].copy_from_slice(b"00");
+        for byte in &mut header[148..156] {
+            *byte = b' ';
+        }
+        let checksum: u32 = header.iter().map(|&byte| u32::from(byte)).sum();
+        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        gz.write_all(&header).expect("write member header");
+        gz.write_all(data).expect("write member data");
+        gz.write_all(&vec![0u8; (512 - data.len() % 512) % 512])
+            .expect("write member padding");
+    }
+    gz.write_all(&[0u8; 1024]).expect("write archive trailer");
+    gz.finish().expect("finish gzip stream");
+}
+
 /// Issue #1 regression: the v0.7.2 linux_amd64 tarball was packaged on macOS
 /// without `COPYFILE_DISABLE` and carried AppleDouble `._*` shadows of every
 /// member, which the member allowlist rejected and fresh installs failed.
@@ -157,41 +193,30 @@ fn installer_accepts_the_exact_dsr_release_archive_members() {
 #[test]
 fn installer_ignores_macos_appledouble_sidecar_members() {
     let root = tempfile::tempdir().expect("temporary archive harness");
-    let stage = root.path().join("stage");
-    fs::create_dir(&stage).expect("create archive stage");
-    let members = [
-        "franken_whisper",
-        "fw",
-        "README.md",
-        "LICENSE",
-        "NOTICE.sortformer.txt",
-        "THIRD_PARTY_NOTICES.md",
-        "AGENTS.md",
-        "._franken_whisper",
-        "._fw",
-        "._README.md",
-        "._LICENSE",
-        "._NOTICE.sortformer.txt",
-        "._THIRD_PARTY_NOTICES.md",
-        "._AGENTS.md",
-        ".DS_Store",
-        "._.DS_Store",
-    ];
-    for member in members {
-        fs::write(stage.join(member), member).expect("write archive member");
-    }
     let archive = root
         .path()
         .join("franken_whisper-0.7.2-linux_amd64.tar.gz");
-    let status = Command::new("tar")
-        .args(["-czf"])
-        .arg(&archive)
-        .arg("-C")
-        .arg(&stage)
-        .args(members)
-        .status()
-        .expect("create release archive");
-    assert!(status.success());
+    write_flat_targz(
+        &archive,
+        &[
+            "franken_whisper",
+            "fw",
+            "README.md",
+            "LICENSE",
+            "NOTICE.sortformer.txt",
+            "THIRD_PARTY_NOTICES.md",
+            "AGENTS.md",
+            "._franken_whisper",
+            "._fw",
+            "._README.md",
+            "._LICENSE",
+            "._NOTICE.sortformer.txt",
+            "._THIRD_PARTY_NOTICES.md",
+            "._AGENTS.md",
+            ".DS_Store",
+            "._.DS_Store",
+        ],
+    );
 
     let output = source_and_run(
         root.path(),
@@ -234,27 +259,29 @@ ls -A "$TMP/extract"
 }
 
 /// A `._` member that does not shadow an allowlisted name is still an
-/// unexpected member, as is any other stray file.
+/// unexpected member, as is any other stray file. macOS bsdtar hides some
+/// unpaired `._*` names from `tar -tzf` before the validator ever sees them,
+/// so the AppleDouble stray is only asserted where the system tar lists it
+/// (GNU tar does; that is the platform the linux_amd64 archive targets).
 #[test]
 fn installer_still_rejects_unexpected_members() {
     for stray in ["._payload", "extra.txt"] {
         let root = tempfile::tempdir().expect("temporary archive harness");
-        let stage = root.path().join("stage");
-        fs::create_dir(&stage).expect("create archive stage");
-        let members = ["franken_whisper", "fw", stray];
-        for member in members {
-            fs::write(stage.join(member), member).expect("write archive member");
-        }
         let archive = root.path().join("franken_whisper-0.7.2-linux_amd64.tar.gz");
-        let status = Command::new("tar")
-            .args(["-czf"])
+        write_flat_targz(&archive, &["franken_whisper", "fw", stray]);
+
+        let listing = Command::new("tar")
+            .arg("-tzf")
             .arg(&archive)
-            .arg("-C")
-            .arg(&stage)
-            .args(members)
-            .status()
-            .expect("create release archive");
-        assert!(status.success());
+            .output()
+            .expect("list archive with system tar");
+        assert!(listing.status.success());
+        if !String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .any(|line| line == stray)
+        {
+            continue;
+        }
 
         let output = source_and_run(
             root.path(),
