@@ -193,28 +193,30 @@ fn write_flat_targz(path: &Path, members: &[&str]) {
 #[test]
 fn installer_ignores_macos_appledouble_sidecar_members() {
     let root = tempfile::tempdir().expect("temporary archive harness");
-    let archive = root
-        .path()
-        .join("franken_whisper-0.7.2-linux_amd64.tar.gz");
+    let archive = root.path().join("franken_whisper-0.7.2-linux_amd64.tar.gz");
+    // Each AppleDouble sidecar immediately precedes its base member — the
+    // order macOS tar actually emits (and the pairing bsdtar folds silently
+    // when it reads the archive back; a trailing unpaired `._*` entry makes
+    // bsdtar error out, which is not the shape under test).
     write_flat_targz(
         &archive,
         &[
-            "franken_whisper",
-            "fw",
-            "README.md",
-            "LICENSE",
-            "NOTICE.sortformer.txt",
-            "THIRD_PARTY_NOTICES.md",
-            "AGENTS.md",
             "._franken_whisper",
+            "franken_whisper",
             "._fw",
+            "fw",
             "._README.md",
+            "README.md",
             "._LICENSE",
+            "LICENSE",
             "._NOTICE.sortformer.txt",
+            "NOTICE.sortformer.txt",
             "._THIRD_PARTY_NOTICES.md",
+            "THIRD_PARTY_NOTICES.md",
             "._AGENTS.md",
-            ".DS_Store",
+            "AGENTS.md",
             "._.DS_Store",
+            ".DS_Store",
         ],
     );
 
@@ -267,8 +269,11 @@ ls -A "$TMP/extract"
 fn installer_still_rejects_unexpected_members() {
     for stray in ["._payload", "extra.txt"] {
         let root = tempfile::tempdir().expect("temporary archive harness");
+        // The stray leads so bsdtar (which pairs a `._*` entry with the
+        // member that follows it and errors on a trailing unpaired one) can
+        // still list the archive; GNU tar lists every member either way.
         let archive = root.path().join("franken_whisper-0.7.2-linux_amd64.tar.gz");
-        write_flat_targz(&archive, &["franken_whisper", "fw", stray]);
+        write_flat_targz(&archive, &[stray, "franken_whisper", "fw"]);
 
         let listing = Command::new("tar")
             .arg("-tzf")

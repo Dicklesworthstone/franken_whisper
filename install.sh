@@ -954,12 +954,20 @@ extract_and_install() {
     # macOS sidecar members pass validation as no-ops but are excluded here so
     # nothing beyond the allowlisted payload lands in the extract directory
     # (and so bsdtar never replays an AppleDouble "._fw" as extended
-    # attributes onto the real binary).
+    # attributes onto the real binary). bsdtar additionally needs
+    # --no-mac-metadata, or it consumes "._<name>" entries as metadata for the
+    # following member before the exclusion applies and fails the whole
+    # extraction when that restore cannot be replayed; GNU tar has no such
+    # pass and rejects the flag.
     if [[ "$archive_ext" == "zip" ]]; then
         unzip -o "$archive" -x '._*' '.DS_Store' -d "$TMP/extract" >/dev/null 2>&1 || return 1
     else
         mkdir -p "$TMP/extract"
-        tar --exclude '._*' --exclude '.DS_Store' -xzf "$archive" -C "$TMP/extract" 2>/dev/null || return 1
+        local tar_extract_flags=(--exclude '._*' --exclude '.DS_Store')
+        if tar --version 2>/dev/null | grep -q bsdtar; then
+            tar_extract_flags+=(--no-mac-metadata)
+        fi
+        tar "${tar_extract_flags[@]}" -xzf "$archive" -C "$TMP/extract" 2>/dev/null || return 1
     fi
 
     local bin="$TMP/extract/$BINARY_NAME"
