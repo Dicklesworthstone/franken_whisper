@@ -27,6 +27,7 @@ final class LabModel {
     var engineState: EngineState = .notLoaded
     var diarizerLoaded = false
     var denoiserLoaded = false
+    private(set) var enginePausedForMemoryPressure = false
 
     // ── Input ──────────────────────────────────────────────────────────────
     enum Input: Equatable {
@@ -113,6 +114,7 @@ final class LabModel {
         guard store.phase == .ready, engineState == .notLoaded || isFailed(engineState) else {
             return
         }
+        enginePausedForMemoryPressure = false
         generation += 1
         let gen = generation
         engineState = .loading(stage: "waking the machine")
@@ -155,6 +157,26 @@ final class LabModel {
         engineState = .notLoaded
         diarizerLoaded = false
         denoiserLoaded = false
+        enginePausedForMemoryPressure = true
+    }
+
+    /// Unload the resident engine before removing its verified model files.
+    /// This keeps the Clear action available even though normal assembly is
+    /// automatic now.
+    func clearModels() {
+        guard !isBusy else { return }
+        generation += 1
+        let gen = generation
+        engineState = .loading(stage: "clearing the machine")
+        Task { [engine] in
+            await engine.unload()
+            guard self.generation == gen else { return }
+            self.store.clear()
+            self.diarizerLoaded = false
+            self.denoiserLoaded = false
+            self.enginePausedForMemoryPressure = false
+            self.engineState = .notLoaded
+        }
     }
 
     // ── Input handling ─────────────────────────────────────────────────────

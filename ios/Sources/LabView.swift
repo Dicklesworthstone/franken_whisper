@@ -59,7 +59,7 @@ struct LabView: View {
             titleVisibility: .visible
         ) {
             Button("Clear \(Self.gigabytes(ModelManifest.totalBytes))", role: .destructive) {
-                model.store.clear()
+                model.clearModels()
             }
             Button("Keep models", role: .cancel) {}
         } message: {
@@ -86,9 +86,19 @@ struct LabView: View {
         ) { _ in
             model.unloadEngineForMemoryPressure()
         }
+        .onAppear {
+            model.assembleEngine()
+        }
+        .onChange(of: model.store.phase) { _, phase in
+            if phase == .ready, scenePhase == .active {
+                model.assembleEngine()
+            }
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background {
                 model.unloadEngineForMemoryPressure()
+            } else if phase == .active {
+                model.assembleEngine()
             }
         }
         .sensoryFeedback(.success, trigger: model.result?.transcript)
@@ -166,16 +176,23 @@ struct LabView: View {
             StatusLine(
                 kind: .ok,
                 text: "weights cached · \(Self.gigabytes(model.store.cachedBytes)) on device")
-            Button("Assemble the machine") { model.assembleEngine() }
-                .buttonStyle(PrimaryButtonStyle())
+            if model.enginePausedForMemoryPressure {
+                StatusLine(
+                    kind: .warn,
+                    text: "engine paused after memory pressure to protect this app")
+                Button("Reload engine") { model.assembleEngine() }
+                    .buttonStyle(PrimaryButtonStyle())
+            } else {
+                ProgressView()
+                    .tint(Lab.emerald)
+                StatusLine(kind: .neutral, text: "starting the engine automatically…")
+            }
             if Self.lowMemoryDevice {
                 StatusLine(
                     kind: .warn,
                     text: "This device reports under 6 GB of memory. The on-device engine may be unloaded under pressure."
                 )
             }
-            Button("Clear downloaded models") { showClearConfirmation = true }
-                .buttonStyle(GhostButtonStyle(tint: Lab.danger))
 
         case .loading(let stage):
             ProgressView()
@@ -202,6 +219,11 @@ struct LabView: View {
             StatusLine(kind: .err, text: reason)
             Button("Try again") { model.assembleEngine() }
                 .buttonStyle(PrimaryButtonStyle())
+        }
+
+        if !model.isBusy {
+            Button("Clear downloaded models") { showClearConfirmation = true }
+                .buttonStyle(GhostButtonStyle(tint: Lab.danger))
         }
     }
 
@@ -552,12 +574,22 @@ struct LabView: View {
     // ── Footer ─────────────────────────────────────────────────────────────
 
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(spacing: 8) {
             Text("Nothing leaves this device. No accounts, no telemetry, no cloud.")
             Text("franken_whisper — the same pure-Rust engine as the CLI and the browser demo.")
+            Text(
+                "If you like this free app, please show your appreciation by trying out my paid skills site at [JeffreysSkills.md](https://jeffreys-skills.md)."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(Lab.textSecondary.opacity(0.72))
+            .tint(Lab.emerald.opacity(0.8))
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 320)
         }
         .font(.system(size: 10, design: .monospaced))
         .foregroundStyle(Lab.textSecondary.opacity(0.7))
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity)
         .padding(.bottom, 24)
     }
 
