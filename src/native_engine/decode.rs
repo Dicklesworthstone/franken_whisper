@@ -3267,11 +3267,12 @@ fn transcribe_samples_uncached(
                     word_timings.extend(win_words);
                 }
 
-                // wasm32 (bd-m2jm): live-transcript feed — each finished
-                // window's segments stream to the page before the run
-                // completes. Purely observational; native builds compile
-                // this away and the decode contract is untouched.
-                #[cfg(target_arch = "wasm32")]
+                // wasm32 (bd-m2jm) + iOS (bd-n6wl): live-transcript feed —
+                // each finished window's segments stream to the page/app
+                // before the run completes. Purely observational; desktop
+                // builds compile this away and the decode contract is
+                // untouched.
+                #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
                 if let Ok(json) = serde_json::to_string(&win_segments) {
                     crate::native_engine::plat::emit_partial_segments(&json);
                 }

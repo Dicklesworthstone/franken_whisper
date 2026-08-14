@@ -608,14 +608,15 @@ fn load_linear(
             .tensor(weight_name)
             .is_some_and(|t| t.dtype == crate::native_engine::GgmlDType::F16);
 
-    // wasm32 q8_0 lane (bd-3be3): quantized decoder linears stay
-    // block-resident; the general forward match dequantizes rows in-kernel.
-    #[cfg(target_arch = "wasm32")]
+    // wasm32 q8_0 lane (bd-3be3) + iOS (bd-n6wl): quantized decoder linears
+    // stay block-resident; the general forward match dequantizes rows
+    // in-kernel.
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
     let want_q8 = in_dim.is_multiple_of(32)
         && model
             .tensor(weight_name)
             .is_some_and(|t| t.dtype == crate::native_engine::GgmlDType::Q8_0);
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
     let want_q8 = false;
 
     let w = if want_f16 {
@@ -691,12 +692,13 @@ fn load_embedding(
             inp: n_state,
         });
     }
-    // wasm32 q8_0 lane (bd-3be3): the tied embedding dequantizes to f16 AT
-    // LOAD (one spot) so every existing lookup/logits path — including the
-    // int8 head — runs unchanged. A full-f32 dequant would cost 265 MB
-    // against the 4 GB ceiling; f16 halves that. The q8→f16 double rounding
-    // is a numerics change owned by the lane's transcript gate.
-    #[cfg(target_arch = "wasm32")]
+    // wasm32 q8_0 lane (bd-3be3) + iOS (bd-n6wl): the tied embedding
+    // dequantizes to f16 AT LOAD (one spot) so every existing lookup/logits
+    // path — including the int8 head — runs unchanged. A full-f32 dequant
+    // would cost 265 MB against the 4 GB ceiling; f16 halves that. The
+    // q8→f16 double rounding is a numerics change owned by the lane's
+    // transcript gate.
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
     if crate::native_engine::f16_compute_enabled()
         && n_state.is_multiple_of(32)
         && model

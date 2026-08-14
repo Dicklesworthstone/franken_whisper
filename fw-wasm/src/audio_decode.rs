@@ -19,7 +19,9 @@
 //! The parent's `src/audio.rs` covers file-based decode for the CLI; the
 //! downmix here mirrors its reference semantics (mean over channels).
 
-#![cfg(target_arch = "wasm32")]
+// Also mounted by fw-ios (the phone app's FFI crate), which needs the same
+// streaming bytes→PCM decode for imported audio files.
+#![cfg(any(target_arch = "wasm32", target_os = "ios"))]
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};

@@ -356,12 +356,13 @@ fn load_linear_maybe_i7(
             Some(nn::quantize_mat_to_i7(&w)),
         ));
     }
-    // wasm32 (bd-m2jm): keep f16-stored linears f16-RESIDENT, natural
-    // `[out, in]`, multiplied by the same [`nn::gemv_f16_batch`] the decoder's
-    // shipped-default f16 path uses. Halves resident encoder bytes so
-    // large-v3-turbo fits the 4 GB wasm address space; the F16 arm exists
-    // only here, so every native path below is byte-identical to before.
-    #[cfg(target_arch = "wasm32")]
+    // wasm32 (bd-m2jm) + iOS (bd-n6wl): keep f16-stored linears f16-RESIDENT,
+    // natural `[out, in]`, multiplied by the same [`nn::gemv_f16_batch`] the
+    // decoder's shipped-default f16 path uses. Halves resident encoder bytes
+    // so large-v3-turbo fits the 4 GB wasm address space and the phone's
+    // jetsam budget; the F16 arm exists only here, so every desktop path
+    // below is byte-identical to before.
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
     if !to_i7 && let Ok((shape, halves)) = model.tensor_f16_halves(name) {
         if shape != [out_dim, in_dim] {
             return Err(FwError::InvalidRequest(format!(
@@ -378,10 +379,11 @@ fn load_linear_maybe_i7(
             None,
         ));
     }
-    // wasm32 q8_0 lane (bd-3be3): quantized tensors stay block-RESIDENT and
-    // dequantize per row inside the batched GEMV — the smallest-download
-    // lane's whole point.
-    #[cfg(target_arch = "wasm32")]
+    // wasm32 q8_0 lane (bd-3be3) + iOS (bd-n6wl): quantized tensors stay
+    // block-RESIDENT and dequantize per row inside the batched GEMV — the
+    // smallest-download lane's whole point, and on the phone the difference
+    // between ~0.9 GB and ~3.2 GB resident.
+    #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
     if !to_i7
         && in_dim.is_multiple_of(32)
         && let Ok((shape, raw)) = model.tensor_q8_0_raw(name)

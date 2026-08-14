@@ -310,6 +310,63 @@ mod wasm_impl {
     }
 }
 
+#[cfg(all(not(target_arch = "wasm32"), target_os = "ios"))]
+pub use ios_hooks::{emit_partial_segments, emit_span, set_segment_hook, set_span_hook};
+
+/// iOS twin of the wasm host hooks (fw-ios, the phone app's FFI crate): the
+/// engine's progress heartbeat (`emit_span`) and live-transcript feed
+/// (`emit_partial_segments`) forward to callbacks the Swift side installs
+/// through the C ABI. Same shape as the wasm hooks above; a separate module
+/// (rather than widening `wasm_impl`) so the wasm lane's clock/scope shims
+/// never leak into a native build. Unregistered hooks cost one lock + None
+/// check, and desktop builds compile none of this — every call site is gated
+/// `any(target_arch = "wasm32", target_os = "ios")`, keeping Linux/macOS
+/// byte-identical.
+#[cfg(all(not(target_arch = "wasm32"), target_os = "ios"))]
+mod ios_hooks {
+    static SPAN_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str, f64) + Send + Sync>>> =
+        std::sync::Mutex::new(None);
+
+    /// Register the host span hook (replaces any previous hook).
+    pub fn set_span_hook(hook: Box<dyn Fn(&str, f64) + Send + Sync>) {
+        *SPAN_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Forward one span to the registered hook, if any.
+    pub fn emit_span(span: &str, ms: f64) {
+        if let Some(hook) = SPAN_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(span, ms);
+        }
+    }
+
+    static SEGMENT_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>> =
+        std::sync::Mutex::new(None);
+
+    /// Register the host partial-transcript hook (replaces any previous).
+    pub fn set_segment_hook(hook: Box<dyn Fn(&str) + Send + Sync>) {
+        *SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Forward one window's segments (JSON array) to the registered hook.
+    pub fn emit_partial_segments(json: &str) {
+        if let Some(hook) = SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(json);
+        }
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     /// The seam must be a pure re-export on native: `plat::Instant` and
