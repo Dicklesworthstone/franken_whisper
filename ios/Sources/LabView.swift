@@ -5,12 +5,43 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum LabTextEntry: Hashable {
+    case speakerNames
+    case speakerLane(String)
+}
+
+private struct LabTextEntryFramePreferenceKey: PreferenceKey {
+    static let defaultValue: [LabTextEntry: CGRect] = [:]
+
+    static func reduce(
+        value: inout [LabTextEntry: CGRect],
+        nextValue: () -> [LabTextEntry: CGRect]
+    ) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private extension View {
+    func reportLabTextEntryFrame(_ entry: LabTextEntry) -> some View {
+        background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: LabTextEntryFramePreferenceKey.self,
+                    value: [entry: proxy.frame(in: .named("lab-text-entry-space"))]
+                )
+            }
+        }
+    }
+}
+
 struct LabView: View {
     @State private var model = LabModel()
     @State private var showDownloadConsent = false
     @State private var showClearConfirmation = false
     @State private var showFileImporter = false
     @State private var exportFormat: TranscriptFormat = .html
+    @State private var textEntryFrames: [LabTextEntry: CGRect] = [:]
+    @FocusState private var focusedTextEntry: LabTextEntry?
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -31,7 +62,30 @@ struct LabView: View {
             .scrollIndicators(.hidden)
             .scrollDismissesKeyboard(.interactively)
         }
+        .coordinateSpace(name: "lab-text-entry-space")
+        .onPreferenceChange(LabTextEntryFramePreferenceKey.self) { frames in
+            textEntryFrames = frames
+        }
+        .simultaneousGesture(
+            SpatialTapGesture(coordinateSpace: .named("lab-text-entry-space"))
+                .onEnded { tap in
+                    guard focusedTextEntry != nil else { return }
+                    let tappedAField = textEntryFrames.values.contains { frame in
+                        frame.contains(tap.location)
+                    }
+                    if !tappedAField { focusedTextEntry = nil }
+                }
+        )
         .tint(Lab.emerald)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") {
+                    focusedTextEntry = nil
+                }
+                .font(.system(size: 13, weight: .semibold))
+            }
+        }
         .alert(
             "Something snapped", isPresented: .init(
                 get: { model.lastError != nil },
@@ -334,10 +388,12 @@ struct LabView: View {
                 text: $model.speakerNamesRaw,
                 axis: .vertical
             )
+            .focused($focusedTextEntry, equals: .speakerNames)
             .labTextField()
             .textInputAutocapitalization(.words)
             .autocorrectionDisabled()
             .submitLabel(.done)
+            .reportLabTextEntryFrame(.speakerNames)
             Text(
                 model.diarize && model.diarizerLoaded
                     ? "Names help spelling and label the detected voices in speaking order — they assign labels, they don't identify anyone."
@@ -506,10 +562,12 @@ struct LabView: View {
                             get: { model.speakerNameMap[lane] ?? "" },
                             set: { model.setSpeakerName($0, for: lane) })
                     )
+                    .focused($focusedTextEntry, equals: .speakerLane(lane))
                     .labTextField()
                     .textInputAutocapitalization(.words)
                     .autocorrectionDisabled()
                     .submitLabel(.done)
+                    .reportLabTextEntryFrame(.speakerLane(lane))
                 }
             }
         }
