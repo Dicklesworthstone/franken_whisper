@@ -1,0 +1,62 @@
+# iOS bindings for the franken_whisper native engine (bd-n6wl).
+#
+# Standalone crate (NOT a workspace member of the parent package, which ships
+# to crates.io with a whitelisted include set) — the same arrangement as
+# fw-wasm/. It mounts the parent's `src/native_engine` sources via `#[path]`
+# so there is exactly ONE code path: the phone runs the same bytes the native
+# binary and the browser demo ship. The only iOS-specific code is the thin
+# C-ABI surface in src/lib.rs and the `plat` hook seam the app's progress UI
+# listens to (src/native_engine/plat.rs, `ios_hooks`).
+#
+# Build for the phone with ios/build-rust.sh (device + simulator slices +
+# FwCore.xcframework); `cargo check` on the host validates everything except
+# the `target_os = "ios"`-gated arms.
+[package]
+name = "fw-ios"
+version = "0.1.0"
+edition = "2024"
+license-file = "../LICENSE"
+description = "franken_whisper iOS bindings: the native Whisper engine as a C-ABI static library"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+ft-kernel-cpu = { version = "0.1.0", path = "../../frankentorch/crates/ft-kernel-cpu" }
+ft-core = { version = "0.1.0", path = "../../frankentorch/crates/ft-core" }
+ftts-kernels = { version = "0.1", path = "../../frankentts/crates/ftts-kernels", default-features = false }
+half = { version = "2.7", features = ["std"] }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tracing = "0.1"
+# In-crate mp3/m4a/wav decode for imported files (pure Rust; the same feature
+# set the browser lane pins — no ogg/flac/vorbis, which iOS files never are).
+symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "aac", "isomp4", "wav", "pcm"] }
+
+# Same target-gated dep the parent declares: the mounted Sortformer
+# conformance sources use rustix's no-follow open on unix-family targets
+# (iOS included via target_vendor = "apple").
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+
+# Host-check convenience only: the mounted encoder/nn sources gate their
+# Metal offload on `target_os = "macos"`, so a `cargo check` on the Mac host
+# needs the same dep the parent declares. iOS builds never see it (the gates
+# exclude iOS; the phone runs the CPU/NEON path).
+[target.'cfg(target_os = "macos")'.dependencies]
+ft-kernel-metal = { version = "0.1.0", path = "../../frankentorch/crates/ft-kernel-metal" }
+
+# The C ABI is definitionally unsafe; islands carry SAFETY notes (`deny`, not
+# the parent's `forbid`, exactly like focr-ios and ftts-ffi).
+[lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
