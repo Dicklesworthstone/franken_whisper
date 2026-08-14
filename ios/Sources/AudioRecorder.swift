@@ -107,7 +107,15 @@ final class AudioRecorder {
             sink.consume(buffer)
         }
         audioEngine.prepare()
-        try audioEngine.start()
+        do {
+            try audioEngine.start()
+        } catch {
+            // Never leave the tap installed on failure: a second installTap
+            // on the same bus raises an ObjC exception (a crash, not a throw).
+            input.removeTap(onBus: 0)
+            self.sink = nil
+            throw error
+        }
         isRecording = true
         seconds = 0
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in

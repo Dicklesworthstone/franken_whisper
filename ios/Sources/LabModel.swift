@@ -83,6 +83,9 @@ final class LabModel {
     private var generation = 0
     private var runTask: Task<Void, Never>?
     private var runStarted: Date?
+    /// Guards the async permission → start window: a second Record tap while
+    /// the system prompt is up must not install a second tap (ObjC crash).
+    private var micRequestInFlight = false
 
     var isBusy: Bool {
         if case .running = runState { return true }
@@ -156,9 +159,23 @@ final class LabModel {
                 lastError = "Recording too short — hold the button and speak."
             }
         } else {
+            guard !micRequestInFlight else { return }
+            micRequestInFlight = true
             result = nil
-            do { try recorder.start() } catch {
-                lastError = "Microphone unavailable: \(error.localizedDescription)"
+            // Ask for the microphone explicitly: a denied permission would
+            // otherwise record silence and "transcribe" nothing, with no clue
+            // why. The prompt only appears the first time.
+            Task {
+                defer { self.micRequestInFlight = false }
+                guard await AVAudioApplication.requestRecordPermission() else {
+                    self.lastError =
+                        "Microphone access is off. Enable it in Settings › FrankenWhisper."
+                    return
+                }
+                guard !self.recorder.isRecording else { return }
+                do { try self.recorder.start() } catch {
+                    self.lastError = "Microphone unavailable: \(error.localizedDescription)"
+                }
             }
         }
     }
