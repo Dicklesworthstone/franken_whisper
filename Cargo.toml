@@ -1,6 +1,6 @@
 [package]
 name = "franken_whisper"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2024"
 license-file = "LICENSE"
 description = "Native Rust Whisper ASR and speaker diarization with agent-first NDJSON and durable local workflows"
@@ -84,8 +84,8 @@ fsqlite-types = { version = "0.3.0", path = "../frankensqlite/crates/fsqlite-typ
 # FrankenTorch compute kernels for the in-process native whisper engine
 # (rayon-parallel GEMM, softmax, gelu; f16 storage types). These are
 # first-party FrankenSuite crates — see the bd-frp7 epic.
-ft-kernel-cpu = { version = "0.1.0", path = "../frankentorch/crates/ft-kernel-cpu" }
-ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core" }
+ft-kernel-cpu = { version = "0.1.0", path = "../frankentorch/crates/ft-kernel-cpu", package = "frankentorch-kernel-cpu" }
+ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core", package = "frankentorch-core" }
 # FastEnhancer-S speech denoiser (default pipeline stage when its pinned
 # artifact is present; see src/denoise.rs). Zero required deps of its own.
 ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false }
@@ -133,7 +133,7 @@ ft-kernel-metal = { version = "0.1.0", path = "../frankentorch/crates/ft-kernel-
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 # For the f16_gemv_dequant bench to construct `Float16` weights directly.
-ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core" }
+ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core", package = "frankentorch-core" }
 # FastEnhancer-S speech denoiser (default pipeline stage when its pinned
 # artifact is present; see src/denoise.rs). Zero required deps of its own.
 ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false }

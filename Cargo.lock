@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "franken_whisper"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "asupersync 0.3.10",
  "base64 0.22.1",
@@ -1253,10 +1253,10 @@ dependencies = [
  "franken-decision 0.3.10",
  "franken-evidence 0.3.10",
  "franken-kernel 0.3.10",
+ "frankentorch-core",
+ "frankentorch-kernel-cpu",
  "fsqlite",
  "fsqlite-types",
- "ft-core",
- "ft-kernel-cpu",
  "ft-kernel-metal",
  "ftts-kernels",
  "ftui",
@@ -1279,8 +1279,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankentorch-core"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "num-complex",
+]
+
+[[package]]
+name = "frankentorch-kernel-cpu"
+version = "0.1.0"
+dependencies = [
+ "frankentorch-core",
+ "libm",
+ "matrixmultiply",
+ "rayon",
+ "wide",
+]
+
+[[package]]
 name = "fsqlite"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync 0.4.3",
  "fsqlite-core",
@@ -1296,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-types",
  "smallvec",
@@ -1304,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "foldhash",
  "fsqlite-error",
@@ -1320,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync 0.4.3",
  "blake3",
@@ -1350,20 +1369,21 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "tempfile",
  "tracing",
  "xxhash-rust",
 ]
 
 [[package]]
 name = "fsqlite-error"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1374,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1384,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1395,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1407,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1416,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -1426,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync 0.4.3",
  "blake3",
@@ -1450,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -1460,7 +1480,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "argon2",
  "asupersync 0.4.3",
@@ -1483,7 +1503,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -1495,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -1511,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync 0.4.3",
  "bitflags 2.13.1",
@@ -1529,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync 0.4.3",
  "crossbeam-deque",
@@ -1550,7 +1570,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "advisory-lock",
  "asupersync 0.4.3",
@@ -1567,7 +1587,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync 0.4.3",
  "blake3",
@@ -1580,25 +1600,6 @@ dependencies = [
  "serde",
  "tracing",
  "xxhash-rust",
-]
-
-[[package]]
-name = "ft-core"
-version = "0.1.0"
-dependencies = [
- "half",
- "num-complex",
-]
-
-[[package]]
-name = "ft-kernel-cpu"
-version = "0.1.0"
-dependencies = [
- "ft-core",
- "libm",
- "matrixmultiply",
- "rayon",
- "wide",
 ]
 
 [[package]]

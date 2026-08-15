@@ -23,8 +23,8 @@ publish = false
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-ft-kernel-cpu = { version = "0.1.0", path = "../../frankentorch/crates/ft-kernel-cpu" }
-ft-core = { version = "0.1.0", path = "../../frankentorch/crates/ft-core" }
+ft-kernel-cpu = { version = "0.1.0", path = "../../frankentorch/crates/ft-kernel-cpu", package = "frankentorch-kernel-cpu" }
+ft-core = { version = "0.1.0", path = "../../frankentorch/crates/ft-core", package = "frankentorch-core" }
 ftts-kernels = { version = "0.1", path = "../../frankentts/crates/ftts-kernels", default-features = false }
 half = { version = "2.7", features = ["std"] }
 rayon = "1.10"
