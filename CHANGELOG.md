@@ -2,6 +2,16 @@
 
 All notable changes to [franken_whisper](https://github.com/Dicklesworthstone/franken_whisper) are documented in this file.
 
+Scope window: project inception through HEAD on 2026-08-19.
+
+## Version Timeline
+
+| Version | Kind | Date | Summary |
+|---------|------|------|---------|
+| Unreleased | commits on `main` | 2026-08-15 → 2026-08-19 | Janitor docs-reorg (`docs/planning/`, `docs/operations/`) |
+| [`v0.9.3`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.3) | Release | 2026-08-15 | fw-ios C ABI + SwiftUI; installer/diarization follow-through |
+| [`v0.9.2`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.2) | Release | 2026-08-13 | Prior tagged line |
+
 franken_whisper is an agent-first Rust ASR orchestration stack with adaptive Bayesian backend routing, real-time NDJSON streaming, speculative cancel-correct transcription, and SQLite-backed persistence. It wraps `whisper.cpp`, `insanely-fast-whisper`, and `whisper-diarization` behind a unified 10-stage composable pipeline, then adds in-process Rust native engines under a staged conformance-gated rollout.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit links point to the canonical GitHub repository.
@@ -9,6 +19,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 ---
 
 ## [Unreleased]
+
+### Delivered capability
+
+- Remaining root planning and operator docs now live under `docs/planning/` and `docs/operations/`.
+- Skill-loop scratch, beads recovery snapshots, and the root `AGENT_NAME` leak are gone from the index.
+
+### Closed workstreams
+
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/franken_whisper/blob/main/.beads/issues.jsonl).
 
 ### Changed
 
