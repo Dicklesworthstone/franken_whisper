@@ -3885,12 +3885,12 @@ cleanup provide the operational safety boundary around inference.
 | [`docs/operational-playbook.md`](docs/operational-playbook.md) | Deployment and monitoring guide |
 | [`docs/benchmark_regression_policy.md`](docs/benchmark_regression_policy.md) | Performance regression thresholds |
 | [`tests/COVERAGE.md`](tests/COVERAGE.md) | Spec clause → test traceability |
-| [`RECOVERY_RUNBOOK.md`](RECOVERY_RUNBOOK.md) | Disaster recovery procedures |
-| [`SYNC_STRATEGY.md`](SYNC_STRATEGY.md) | One-way sync semantics |
+| [`RECOVERY_RUNBOOK.md`](docs/operations/RECOVERY_RUNBOOK.md) | Disaster recovery procedures |
+| [`SYNC_STRATEGY.md`](docs/operations/SYNC_STRATEGY.md) | One-way sync semantics |
 | [`docs/planning/PROPOSED_ARCHITECTURE.md`](docs/planning/PROPOSED_ARCHITECTURE.md) | System architecture design document |
-| [`FEATURE_PARITY.md`](FEATURE_PARITY.md) | Legacy feature parity matrix |
+| [`FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md) | Legacy feature parity matrix |
 | [`CHANGELOG.md`](CHANGELOG.md) | Capability-wave changelog with live commit links |
-| [`DISCREPANCIES.md`](DISCREPANCIES.md) | Known native-vs-bridge divergences under investigation |
+| [`DISCREPANCIES.md`](docs/planning/DISCREPANCIES.md) | Known native-vs-bridge divergences under investigation |
 
 ---
 

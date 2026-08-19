@@ -104,7 +104,7 @@ that checkout is absent). Behavior levers are env-gated `OnceLock` flags
 flip; grep `const DEFAULT_ON`/`get_or_init` before trusting any claim about
 what is on. Perf/behavior changes here require the evidence-ledger discipline
 (`docs/NEGATIVE_EVIDENCE.md` / `docs/PERF_LEDGER.md`) and byte-exactness or an
-explicit `DISCREPANCIES.md` entry.
+explicit `docs/planning/DISCREPANCIES.md` entry.
 
 ---
 
@@ -112,9 +112,9 @@ explicit `DISCREPANCIES.md` entry.
 
 Use this workflow order:
 1. `docs/planning/PLAN_TO_PORT_WHISPER_STACK_TO_RUST.md`
-2. `EXISTING_LEGACY_WHISPER_STRUCTURE.md`
+2. `docs/planning/EXISTING_LEGACY_WHISPER_STRUCTURE.md`
 3. `docs/planning/PROPOSED_ARCHITECTURE.md`
-4. `FEATURE_PARITY.md`
+4. `docs/planning/FEATURE_PARITY.md`
 
 Implementation should follow spec documents, not ad-hoc copying from legacy code.
 
@@ -131,8 +131,8 @@ Hard rules:
 - No two-way magic merge.
 - Maintain explicit version markers.
 - Keep recovery procedures documented in:
-  - `SYNC_STRATEGY.md`
-  - `RECOVERY_RUNBOOK.md`
+  - `docs/operations/SYNC_STRATEGY.md`
+  - `docs/operations/RECOVERY_RUNBOOK.md`
 
 ---
 
