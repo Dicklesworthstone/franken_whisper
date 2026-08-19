@@ -10,7 +10,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Changed
+
+- **Janitor docs-reorg wave (2026-08-19).** Remaining root planning and operator docs moved under `docs/planning/` and `docs/operations/`. The five historical files that README still names by short title (`FEATURE_PARITY.md`, `DISCREPANCIES.md`, `RECOVERY_RUNBOOK.md`, `SYNC_STRATEGY.md`, `PROPOSED_ARCHITECTURE.md`) now live at those paths.
+
+### Removed
+
+- Skill-loop scratch, beads recovery snapshots already covered by `.gitignore`, and the root `AGENT_NAME` identity leak.
+
+### Representative commits
+
+- [`5e485ac`](https://github.com/Dicklesworthstone/franken_whisper/commit/5e485ac6d99a305c560527601f9039408366d7d7) — untrack skill-loop scratch; move the Whisper port plan and `PROPOSED_ARCHITECTURE.md` into `docs/planning/`.
+- [`2028aed`](https://github.com/Dicklesworthstone/franken_whisper/commit/2028aed0213120a5d0ff28c678fed4b7ecb1ded8) — untrack beads recovery snapshots already gitignored.
+- [`c1c7ef9`](https://github.com/Dicklesworthstone/franken_whisper/commit/c1c7ef9c9856140b74afde570da4b69851744931) — drop agent-identity leaks and root scratch artifacts.
+- [`b71b436`](https://github.com/Dicklesworthstone/franken_whisper/commit/b71b4363ee9e9d251624d8976cd6e85e90ef6af6) — relocate `FEATURE_PARITY.md`, `DISCREPANCIES.md`, `ALIEN_RECOMMENDATIONS.md`, `EXISTING_LEGACY_WHISPER_STRUCTURE.md`, and `TODO_IMPLEMENTATION_TRACKER.md` into [`docs/planning/`](https://github.com/Dicklesworthstone/franken_whisper/tree/main/docs/planning); move [`RECOVERY_RUNBOOK.md`](https://github.com/Dicklesworthstone/franken_whisper/blob/main/docs/operations/RECOVERY_RUNBOOK.md) and [`SYNC_STRATEGY.md`](https://github.com/Dicklesworthstone/franken_whisper/blob/main/docs/operations/SYNC_STRATEGY.md) into `docs/operations/`.
+
+## [0.9.3] - 2026-08-15
+
+GitHub Release: [`v0.9.3`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.3) (2026-08-15). First on-device iOS surface over the native engine, plus installer/diarization correctness and the frankentorch crate-rename follow-through.
+
+### Added
+
+- **fw-ios C ABI + SwiftUI app (bd-n6wl).** A staticlib C ABI mounts the parent engine by path ([`9d3d0f4`](https://github.com/Dicklesworthstone/franken_whisper/commit/9d3d0f4c4)); xcodegen app shell, xcframework build, increased-memory entitlement ([`e256f7b`](https://github.com/Dicklesworthstone/franken_whisper/commit/e256f7b)); `LabModel`/`LabView` on-device transcribe UI ([`b6d5450`](https://github.com/Dicklesworthstone/franken_whisper/commit/b6d5450)); app icon and `ios/` build doc; JSON export carries DTW words; speaker naming, HTML/Markdown exports, and App Store polish ([`8694ee5`](https://github.com/Dicklesworthstone/franken_whisper/commit/8694ee55e), [`8d3b842`](https://github.com/Dicklesworthstone/franken_whisper/commit/8d3b842)). Shared wasm progress heartbeat and compact tensors land on the phone ([`7417b47`](https://github.com/Dicklesworthstone/franken_whisper/commit/7417b47)). App Store privacy policy is published.
+
+### Fixed
+
+- Sortformer turns clamp to the floored millisecond duration so turn ends cannot run past the audio tail ([`07fd138`](https://github.com/Dicklesworthstone/franken_whisper/commit/07fd138a1)).
+- macOS AppleDouble sidecars (`._<member>`, `.DS_Store`) in release archives validate as no-ops and are never extracted; bsdtar extraction adds `--no-mac-metadata` ([`65357e8`](https://github.com/Dicklesworthstone/franken_whisper/commit/65357e857), [`9b667e0`](https://github.com/Dicklesworthstone/franken_whisper/commit/9b667e0)).
+- iOS: assemble the engine automatically and unload through a real Clear; spaces are typeable in rename fields; exports carry real UTTypes; dismiss keyboard outside text fields; keep a speakerless transcript when post-decode diarization fails; no orphaned tap on start failure.
+
+### Changed
+
+- Follow the frankentorch crate renames (`ft-core` → `frankentorch-core`, `ft-kernel-cpu` → `frankentorch-kernel-cpu`) via `package =` dependency renames ([`3e9c4e0`](https://github.com/Dicklesworthstone/franken_whisper/commit/3e9c4e040)). Release sibling pins updated to frankensqlite `d57d6898` and frankentorch `db0d11d7` ([`35f7d37`](https://github.com/Dicklesworthstone/franken_whisper/commit/35f7d37f8)).
+
+Compare: [`v0.9.2...v0.9.3`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.9.2...v0.9.3)
 
 ## [0.9.2] - 2026-08-13
 
@@ -127,7 +160,7 @@ transcript, inert audio-window flags, and lossy per-segment text.
 - The long-form drop log no longer tells operators to set
   `FW_RETRY_FAILED_WINDOW=1`; that retry has been default-on since 2026-07-24.
   The message now points at `FW_TEMP_FALLBACK=1` for sampling-ladder recovery,
-  and `DISCREPANCIES.md` records the corrected default.
+  and [`docs/planning/DISCREPANCIES.md`](https://github.com/Dicklesworthstone/franken_whisper/blob/main/docs/planning/DISCREPANCIES.md) records the corrected default.
 
 ### Contracts
 
@@ -377,7 +410,7 @@ Default-on decisions for these knobs are deliberately reserved (they change gold
   - [`0361bb2`](https://github.com/Dicklesworthstone/franken_whisper/commit/0361bb2) — parallel f16→f32 dequant + tiled parallel weight transpose at load (`model_weights` span 2.4 s → 0.47 s).
   - [`bdbdd21`](https://github.com/Dicklesworthstone/franken_whisper/commit/bdbdd21) — language auto-detect reuses window-0's encode instead of a hidden duplicate encoder pass (−8.8 s on large).
   - [`ee36fd4`](https://github.com/Dicklesworthstone/franken_whisper/commit/ee36fd4) — parallelized the serial glue ops between fork-join matmuls (layer_norm / softmax / gelu / im2col / attention-head loops / logits GEMV / cross-K-V): encoder 8.3 → 5.8 s, tiny wall 0.92 → 0.56 s.
-  - [`0989a5a`](https://github.com/Dicklesworthstone/franken_whisper/commit/0989a5a) — tail-window encoder-context truncation (whisper.cpp `audio_ctx`-style; default-on, kill switch `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE=0`): tail-window encode 4.2 s → 0.24 s (~94%). Main transcript byte-identical; divergence confined to spurious trailing-silence hallucinations on tail windows. See `DISCREPANCIES.md` **DISC-004**.
+  - [`0989a5a`](https://github.com/Dicklesworthstone/franken_whisper/commit/0989a5a) — tail-window encoder-context truncation (whisper.cpp `audio_ctx`-style; default-on, kill switch `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE=0`): tail-window encode 4.2 s → 0.24 s (~94%). Main transcript byte-identical; divergence confined to spurious trailing-silence hallucinations on tail windows. See [`docs/planning/DISCREPANCIES.md`](https://github.com/Dicklesworthstone/franken_whisper/blob/main/docs/planning/DISCREPANCIES.md) **DISC-004**.
   - [`5bb778b`](https://github.com/Dicklesworthstone/franken_whisper/commit/5bb778b) — decoder per-token path: KV buffer reuse, in-place logits band reads, hoisted window-constant cross K^T/V transforms, threaded QKV, head-parallel cross-attention (large 62.6 → 39.9 ms/tok, tiny 11.9 → 6.99 ms/tok; bit-identical, 4 new bitwise tests; ~490 MB cross-buffers dropped on large).
   - **Evidence-backed abandons** — fused QKV (bit-identical but ~16% slower), bmm-batched heads (~4% slower), parallel residual adds (slower), encoder scratch arena (wall/RSS-neutral; sgemm-compute-bound, ft calloc pages are lazy), and an ft-side matmul arena (~9% theoretical/large-window, a frankentorch change, below bar). Full arc + interleaved numbers: `tests/artifacts/perf/20260605T0218Z-native-engine-baseline/RESULTS.md`.
   - **Follow-up (not applied):** the `release` profile's `opt-level = "z"` costs ~26% on large vs `release-perf`; evaluate a `dist` profile change separately.
@@ -389,7 +422,7 @@ Default-on decisions for these knobs are deliberately reserved (they change gold
   - **DTW word-level timestamps** (bd-rjsx) — cross-attention weights of the model's alignment heads are recorded during decode and aligned via dynamic time warping to produce real per-word timings (`DecodeOutput::word_timings`), paid for only when `word_timestamps` is set.
   - **Honest diarizer tagging** (bd-cidv) — the native whisper-diarization path runs real ASR then the orchestrator's text/temporal heuristic diarizer, labeling segments `SPEAKER_NN`. Its `raw_output` declares `"diarizer": "text-temporal-heuristic"` (plus a `diarizer_note`) so no consumer mistakes it for neural diarization; the ECAPA upgrade remains tracked separately.
   - **Rollout-machinery e2e proof** (bd-4slu) — `tests/native_engine_e2e.rs` drives the full library dispatch (ingest → normalize → backend) through the CLI with `FRANKEN_WHISPER_NATIVE_EXECUTION=1` and `FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE=sole|primary`, pointing every bridge binary at `/nonexistent` so a produced transcript can only have come from the native engine. Covers whisper-cpp, insanely-fast, and diarization native paths, plus the honest bridge-only-unavailable error path. All gated on the real `tiny.en` model (skip-not-fail when absent).
-  - **Bridge-vs-native conformance gate** (bd-4slu) — a doubly-gated comparison (`tiny.en` model AND `whisper-cli` present) runs the reference bridge and the native engine on `jfk.wav`, asserting WER ≤ 0.10 and per-segment timestamps within a documented **native-rollout tolerance profile** (0.3 s, not the canonical 50 ms) to absorb greedy-vs-beam divergence. See `DISCREPANCIES.md` DISC-003.
+  - **Bridge-vs-native conformance gate** (bd-4slu) — a doubly-gated comparison (`tiny.en` model AND `whisper-cli` present) runs the reference bridge and the native engine on `jfk.wav`, asserting WER ≤ 0.10 and per-segment timestamps within a documented **native-rollout tolerance profile** (0.3 s, not the canonical 50 ms) to absorb greedy-vs-beam divergence. See [`docs/planning/DISCREPANCIES.md`](https://github.com/Dicklesworthstone/franken_whisper/blob/main/docs/planning/DISCREPANCIES.md) DISC-003.
   - **Gated model fetch** — `scripts/fetch_test_models.sh` provisions `ggml-tiny.en.bin` (sha256-pinned, idempotent, `--force`) into `${FRANKEN_WHISPER_TEST_MODEL_DIR:-~/.cache/franken_whisper/test-models}` and verifies the in-repo `jfk.wav` fixture, turning the otherwise-skipped native conformance/e2e suites into real runs.
 
 ### Speculative Streaming: CLI Integration (post-2026-03-21)
@@ -569,7 +602,7 @@ Default-on decisions for these knobs are deliberately reserved (they change gold
 - Major README refresh with updated architecture and feature documentation (+1,867 lines across three commits) ([`2a2bb9f`](https://github.com/Dicklesworthstone/franken_whisper/commit/2a2bb9fd333df71e1e0069d3086d2e8a49315c7c), [`7d207b8`](https://github.com/Dicklesworthstone/franken_whisper/commit/7d207b8ba23ee18573b12a9a8d9dbeadf16258be), [`ba227a6`](https://github.com/Dicklesworthstone/franken_whisper/commit/ba227a60fab5558e0d09c06171c4e37e5babd49e))
 - Robot event catalog updated with `routing_decision`, `backends.discovery`, and streaming events ([`ecf702b`](https://github.com/Dicklesworthstone/franken_whisper/commit/ecf702bea3219c697871788f4976d48b0f9dbb40))
 - `CHANGELOG.md` rebuilt from git history with live commit links ([`d678a9e`](https://github.com/Dicklesworthstone/franken_whisper/commit/d678a9ee57822cbdee44f14e477a21018f4628a3), [`0059e01`](https://github.com/Dicklesworthstone/franken_whisper/commit/0059e019eeae376dc5bb4298bd74f3ca26d01dd6))
-- `DISCREPANCIES.md` tracking known native-vs-bridge divergences (introduced alongside conformance work in `c72eed3`)
+- [`docs/planning/DISCREPANCIES.md`](https://github.com/Dicklesworthstone/franken_whisper/blob/main/docs/planning/DISCREPANCIES.md) tracking known native-vs-bridge divergences (introduced alongside conformance work in `c72eed3`)
 - Implementation tracker and execution packet documentation updated ([`b34893e`](https://github.com/Dicklesworthstone/franken_whisper/commit/b34893e0e637ece3023c75572036e054b635ebf9))
 
 ---
@@ -690,7 +723,8 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.9.2...main
+[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.9.3...main
+[0.9.3]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.3
 [0.9.2]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.2
 [0.9.1]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.1
 [0.9.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.0
