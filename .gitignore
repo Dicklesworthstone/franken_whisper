@@ -160,6 +160,7 @@ tests/artifacts/perf/20260606T2341Z-scale-baseline/
 # Agent mail
 .agent-mail-project-id
 .agent-mail.yaml
+/AGENT_NAME
 
 # macOS
 .DS_Store
