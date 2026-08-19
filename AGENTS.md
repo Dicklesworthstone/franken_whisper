@@ -111,9 +111,9 @@ explicit `DISCREPANCIES.md` entry.
 ## Porting Workflow (Spec-First)
 
 Use this workflow order:
-1. `PLAN_TO_PORT_WHISPER_STACK_TO_RUST.md`
+1. `docs/planning/PLAN_TO_PORT_WHISPER_STACK_TO_RUST.md`
 2. `EXISTING_LEGACY_WHISPER_STRUCTURE.md`
-3. `PROPOSED_ARCHITECTURE.md`
+3. `docs/planning/PROPOSED_ARCHITECTURE.md`
 4. `FEATURE_PARITY.md`
 
 Implementation should follow spec documents, not ad-hoc copying from legacy code.

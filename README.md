@@ -3887,7 +3887,7 @@ cleanup provide the operational safety boundary around inference.
 | [`tests/COVERAGE.md`](tests/COVERAGE.md) | Spec clause → test traceability |
 | [`RECOVERY_RUNBOOK.md`](RECOVERY_RUNBOOK.md) | Disaster recovery procedures |
 | [`SYNC_STRATEGY.md`](SYNC_STRATEGY.md) | One-way sync semantics |
-| [`PROPOSED_ARCHITECTURE.md`](PROPOSED_ARCHITECTURE.md) | System architecture design document |
+| [`docs/planning/PROPOSED_ARCHITECTURE.md`](docs/planning/PROPOSED_ARCHITECTURE.md) | System architecture design document |
 | [`FEATURE_PARITY.md`](FEATURE_PARITY.md) | Legacy feature parity matrix |
 | [`CHANGELOG.md`](CHANGELOG.md) | Capability-wave changelog with live commit links |
 | [`DISCREPANCIES.md`](DISCREPANCIES.md) | Known native-vs-bridge divergences under investigation |
