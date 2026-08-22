@@ -328,8 +328,303 @@ fn front_truncate_at_word(text: &str, cap: usize) -> &str {
     word_boundary_tail(text, cap)
 }
 
+// ---------------------------------------------------------------------------
+// bd-rt-vad-stream-ulp5: StreamingVad — causal VAD for the live driver
+//
+// The batch VAD derives its activity threshold from GLOBAL whole-file RMS
+// statistics (orchestrator vad_energy_detect_with_analysis) — impossible for
+// a stream. This is the causal replacement: a per-frame adaptive energy
+// pre-gate (running noise floor + relative dB gate) feeding a
+// min-speech / endpoint-silence state machine, with a seam for an optional
+// neural second tier ([`VoiceClassifier`]; the earshot evaluation is the
+// bead's remaining item — energy-only is the v1 default until that
+// evaluation passes, exactly as the bead's decision rule specifies).
+//
+// TIME BASES (bd-rt-vad-stream polish item 2): 20 ms frames = 320 samples
+// @16 kHz = one encoder frame (2 mel hops). This module is the single
+// authority for VAD frame math; AlignAtt frames and mel frames land on the
+// same 20 ms grid.
+// ---------------------------------------------------------------------------
+
+/// VAD frame length: 20 ms at 16 kHz — aligned with encoder frames (2 mel
+/// hops of 160 samples). Single authority for the 20 ms grid.
+pub const VAD_FRAME_SAMPLES: usize = SAMPLE_RATE / 50;
+
+/// Convert a VAD frame index to seconds on the session clock.
+#[must_use]
+pub fn vad_frame_to_sec(frame: u64) -> f64 {
+    frame as f64 * VAD_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64
+}
+
+/// Optional second-tier voice classifier (the earshot seam). Runs only on
+/// frames that pass the energy pre-gate; returning `false` vetoes them.
+pub trait VoiceClassifier: Send {
+    fn is_voice(&mut self, frame: &[f32]) -> bool;
+}
+
+/// Configuration for [`StreamingVad`]. Defaults match the driver CLI
+/// defaults (`--vad-min-speech-ms 250`, `--vad-endpoint-ms 600`,
+/// `--vad-gate-db 9` — renamed from --vad-threshold to avoid the semantic
+/// collision with transcribe's flag).
+#[derive(Debug, Clone)]
+pub struct StreamingVadConfig {
+    /// Sustained voice required before an utterance opens.
+    pub min_speech_ms: u64,
+    /// Sustained silence that closes an utterance.
+    pub endpoint_ms: u64,
+    /// Energy gate: frame must exceed the running noise floor by this many
+    /// dB to count as voiced.
+    pub gate_db: f64,
+    /// Pre-onset audio attributed to the utterance (ring lookback).
+    pub pre_pad_ms: u64,
+    /// Absolute floor: frames below this dBFS never count as voiced
+    /// (guards digital silence from gate-relative false positives).
+    pub min_voice_dbfs: f64,
+    /// Noise-floor upward drift while NOT in speech (fast re-adaptation to
+    /// louder environments), dB per second.
+    pub floor_rise_db_per_sec_silence: f64,
+    /// Noise-floor upward drift while IN speech, dB per second. Default
+    /// equals the silence rate: real speech is protected by the INSTANT
+    /// downward floor reset on inter-word dips (which re-anchor the floor
+    /// every few hundred ms), while steady tones (fans, hums) that opened a
+    /// false utterance get reclassified as floor within ~2-3 s and the
+    /// endpoint machinery closes it — the desired discriminator. Lower this
+    /// only for sustained-tone speech (singing), at the cost of slower
+    /// hum recovery.
+    pub floor_rise_db_per_sec_speech: f64,
+    /// Consecutive unvoiced frames tolerated inside a voiced run before the
+    /// run resets (grace for glottal gaps).
+    pub voiced_run_grace_frames: u32,
+}
+
+impl Default for StreamingVadConfig {
+    fn default() -> Self {
+        Self {
+            min_speech_ms: 250,
+            endpoint_ms: 600,
+            gate_db: 9.0,
+            pre_pad_ms: 200,
+            min_voice_dbfs: -55.0,
+            floor_rise_db_per_sec_silence: 10.0,
+            floor_rise_db_per_sec_speech: 10.0,
+            voiced_run_grace_frames: 2,
+        }
+    }
+}
+
+/// An edge event from the VAD state machine, on the session clock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VadEdge {
+    /// Sustained speech confirmed. `t_sec` is the utterance start: first
+    /// voiced frame minus pre-pad (clamped to the previous endpoint).
+    SpeechStarted { t_sec: f64 },
+    /// Sustained silence after speech. `t_sec` is the end of the last
+    /// voiced frame.
+    Endpoint { t_sec: f64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VadState {
+    Silence,
+    Speech,
+}
+
+/// Causal streaming VAD: push 16 kHz mono samples, receive edge events.
+/// Costs a handful of arithmetic ops per sample (<< 1 ms per driver step).
+pub struct StreamingVad {
+    cfg: StreamingVadConfig,
+    classifier: Option<Box<dyn VoiceClassifier>>,
+    /// Partial frame carried across pushes.
+    partial: Vec<f32>,
+    /// Frames consumed since session start.
+    frames: u64,
+    state: VadState,
+    /// Running noise floor estimate, dBFS.
+    noise_floor_db: f64,
+    /// Current voiced run: (start_frame, voiced_frames, grace_left).
+    voiced_run: Option<(u64, u32, u32)>,
+    /// Unvoiced frames since the last voiced frame (in Speech state).
+    unvoiced_run: u32,
+    /// Frame AFTER the last voiced frame (end of voiced audio).
+    last_voiced_end: u64,
+    /// Session time before which a new utterance's pre-pad may not reach
+    /// (the previous endpoint).
+    floor_time_sec: f64,
+    /// Frames rejected by the second-tier classifier (for stats/eval).
+    classifier_vetoes: u64,
+}
+
+impl std::fmt::Debug for StreamingVad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingVad")
+            .field("state", &self.state)
+            .field("frames", &self.frames)
+            .field("noise_floor_db", &self.noise_floor_db)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamingVad {
+    #[must_use]
+    pub fn new(cfg: StreamingVadConfig) -> Self {
+        Self {
+            cfg,
+            classifier: None,
+            partial: Vec::with_capacity(VAD_FRAME_SAMPLES),
+            frames: 0,
+            state: VadState::Silence,
+            noise_floor_db: -70.0,
+            voiced_run: None,
+            unvoiced_run: 0,
+            last_voiced_end: 0,
+            floor_time_sec: 0.0,
+            classifier_vetoes: 0,
+        }
+    }
+
+    /// Attach the optional second-tier classifier (earshot seam).
+    pub fn with_classifier(mut self, classifier: Box<dyn VoiceClassifier>) -> Self {
+        self.classifier = Some(classifier);
+        self
+    }
+
+    /// Whether the machine currently considers speech open.
+    #[must_use]
+    pub fn in_speech(&self) -> bool {
+        self.state == VadState::Speech
+    }
+
+    /// Current noise-floor estimate (dBFS), for logging/diagnostics.
+    #[must_use]
+    pub fn noise_floor_db(&self) -> f64 {
+        self.noise_floor_db
+    }
+
+    /// Frames vetoed by the second-tier classifier (for stats).
+    #[must_use]
+    pub fn classifier_vetoes(&self) -> u64 {
+        self.classifier_vetoes
+    }
+
+    /// Push new session audio (16 kHz mono, any chunk size); returns edge
+    /// events in order. Chunk-size invariant: identical audio in different
+    /// split points yields identical edges.
+    pub fn push(&mut self, samples: &[f32]) -> Vec<VadEdge> {
+        let mut edges = Vec::new();
+        let mut rest = samples;
+        // Complete a carried partial frame first.
+        if !self.partial.is_empty() {
+            let need = VAD_FRAME_SAMPLES - self.partial.len();
+            let take = need.min(rest.len());
+            self.partial.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.partial.len() == VAD_FRAME_SAMPLES {
+                let frame = std::mem::take(&mut self.partial);
+                self.step_frame(&frame, &mut edges);
+            }
+        }
+        let whole = rest.len() - rest.len() % VAD_FRAME_SAMPLES;
+        for frame in rest[..whole].as_chunks::<VAD_FRAME_SAMPLES>().0 {
+            self.step_frame(frame, &mut edges);
+        }
+        self.partial.extend_from_slice(&rest[whole..]);
+        edges
+    }
+
+    fn step_frame(&mut self, frame: &[f32], edges: &mut Vec<VadEdge>) {
+        let frame_index = self.frames;
+        self.frames += 1;
+
+        let rms_db = frame_dbfs(frame);
+        // Noise floor: instant drop to quieter frames; bounded upward drift
+        // whose rate depends on state (fast in silence, slow in speech).
+        if rms_db < self.noise_floor_db {
+            self.noise_floor_db = rms_db.max(-90.0);
+        } else {
+            let rate = if self.state == VadState::Speech {
+                self.cfg.floor_rise_db_per_sec_speech
+            } else {
+                self.cfg.floor_rise_db_per_sec_silence
+            };
+            self.noise_floor_db += rate * (VAD_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+        }
+
+        let mut voiced =
+            rms_db > self.noise_floor_db + self.cfg.gate_db && rms_db > self.cfg.min_voice_dbfs;
+        if voiced
+            && let Some(classifier) = self.classifier.as_mut()
+            && !classifier.is_voice(frame)
+        {
+            voiced = false;
+            self.classifier_vetoes += 1;
+        }
+
+        if voiced {
+            self.last_voiced_end = frame_index + 1;
+        }
+
+        match self.state {
+            VadState::Silence => {
+                if voiced {
+                    let (start, count, _grace) = self.voiced_run.unwrap_or((
+                        frame_index,
+                        0,
+                        self.cfg.voiced_run_grace_frames,
+                    ));
+                    let count = count + 1;
+                    self.voiced_run = Some((start, count, self.cfg.voiced_run_grace_frames));
+                    if u64::from(count) * 20 >= self.cfg.min_speech_ms {
+                        self.state = VadState::Speech;
+                        self.unvoiced_run = 0;
+                        let pre_pad_sec = self.cfg.pre_pad_ms as f64 / 1000.0;
+                        let t = (vad_frame_to_sec(start) - pre_pad_sec).max(self.floor_time_sec);
+                        edges.push(VadEdge::SpeechStarted { t_sec: t });
+                        self.voiced_run = None;
+                    }
+                } else if let Some((start, count, grace)) = self.voiced_run {
+                    if grace > 0 {
+                        self.voiced_run = Some((start, count, grace - 1));
+                    } else {
+                        self.voiced_run = None;
+                    }
+                }
+            }
+            VadState::Speech => {
+                if voiced {
+                    self.unvoiced_run = 0;
+                } else {
+                    self.unvoiced_run += 1;
+                    if u64::from(self.unvoiced_run) * 20 >= self.cfg.endpoint_ms {
+                        self.state = VadState::Silence;
+                        let t = vad_frame_to_sec(self.last_voiced_end);
+                        self.floor_time_sec = t;
+                        edges.push(VadEdge::Endpoint { t_sec: t });
+                        self.voiced_run = None;
+                        self.unvoiced_run = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Frame RMS level in dBFS (f32 full scale = 0 dBFS).
+fn frame_dbfs(frame: &[f32]) -> f64 {
+    let mean_sq = frame
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        / frame.len() as f64;
+    if mean_sq <= 1e-12 {
+        return -120.0;
+    }
+    10.0 * mean_sq.log10()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     fn cfg() -> SessionBufferConfig {
@@ -579,5 +874,218 @@ mod tests {
         if let Some(p) = b.prompt() {
             assert!(p.chars().count() <= 5, "cap exceeded: {p:?}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-rt-vad-stream-ulp5: StreamingVad
+    // -----------------------------------------------------------------------
+
+    /// Frames of loudness `db` dBFS as raw samples (constant amplitude).
+    fn frames_at_db(db: f64, frames: usize) -> Vec<f32> {
+        let amp = 10f64.powf(db / 20.0) as f32;
+        vec![amp; frames * VAD_FRAME_SAMPLES]
+    }
+
+    fn edges_of(vad: &mut StreamingVad, audio: &[f32]) -> Vec<VadEdge> {
+        vad.push(audio)
+    }
+
+    #[test]
+    fn vad_opens_after_min_speech_and_closes_after_endpoint_silence() {
+        let mut vad = StreamingVad::new(StreamingVadConfig::default());
+        // 1 s of quiet establishes the floor (~-60 dB).
+        assert!(edges_of(&mut vad, &frames_at_db(-60.0, 50)).is_empty());
+        // 300 ms of speech-level audio (well above floor + 9 dB gate).
+        let edges = edges_of(&mut vad, &frames_at_db(-20.0, 15));
+        assert_eq!(edges.len(), 1, "expected SpeechStarted, got {edges:?}");
+        let VadEdge::SpeechStarted { t_sec } = edges[0] else {
+            panic!("expected SpeechStarted, got {edges:?}");
+        };
+        // Onset = first voiced frame (t=1.0s) minus 200 ms pre-pad.
+        assert!((t_sec - 0.8).abs() < 0.021, "onset {t_sec}");
+        assert!(vad.in_speech());
+        // 700 ms of silence closes it (endpoint at 600 ms).
+        let edges = edges_of(&mut vad, &frames_at_db(-60.0, 35));
+        assert_eq!(edges.len(), 1, "expected Endpoint, got {edges:?}");
+        let VadEdge::Endpoint { t_sec } = edges[0] else {
+            panic!("expected Endpoint, got {edges:?}");
+        };
+        // Last voiced frame ended at 1.0 + 0.3 = 1.3 s.
+        assert!((t_sec - 1.3).abs() < 0.021, "endpoint {t_sec}");
+        assert!(!vad.in_speech());
+    }
+
+    #[test]
+    fn vad_short_blip_below_min_speech_never_opens() {
+        let mut vad = StreamingVad::new(StreamingVadConfig::default());
+        let _ = edges_of(&mut vad, &frames_at_db(-60.0, 50));
+        // 100 ms blip (5 frames) < 250 ms min-speech.
+        let mut edges = edges_of(&mut vad, &frames_at_db(-20.0, 5));
+        edges.extend(edges_of(&mut vad, &frames_at_db(-60.0, 50)));
+        assert!(
+            edges.is_empty(),
+            "blip must not open an utterance: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn vad_grace_frames_bridge_glottal_gaps() {
+        let mut vad = StreamingVad::new(StreamingVadConfig::default());
+        let _ = edges_of(&mut vad, &frames_at_db(-60.0, 50));
+        // Voiced run with single-frame dips every 4 frames: grace (2) must
+        // bridge them so the run still accumulates to min-speech.
+        let mut audio = Vec::new();
+        for _ in 0..5 {
+            audio.extend(frames_at_db(-20.0, 4));
+            audio.extend(frames_at_db(-60.0, 1));
+        }
+        let edges = edges_of(&mut vad, &audio);
+        assert!(
+            edges
+                .iter()
+                .any(|e| matches!(e, VadEdge::SpeechStarted { .. })),
+            "gapped speech must still open: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn vad_noise_floor_readapts_to_louder_environment_within_2s() {
+        let mut vad = StreamingVad::new(StreamingVadConfig::default());
+        // Quiet room.
+        let _ = edges_of(&mut vad, &frames_at_db(-60.0, 50));
+        // Environment jumps to a steady -35 dB hum. Initially this reads as
+        // voiced (it clears -60+9), but the floor rises at 10 dB/s in
+        // silence-adjacent states; after ~3 s of sustained hum with no
+        // dynamics the machine must NOT be reporting speech anymore.
+        let mut edges = Vec::new();
+        for _ in 0..150 {
+            edges.extend(vad.push(&frames_at_db(-35.0, 1)));
+        }
+        // The hum may have transiently opened an utterance; it must have
+        // closed again (floor caught up, frames stopped being voiced).
+        // Wait out an endpoint window at the hum level.
+        for _ in 0..40 {
+            edges.extend(vad.push(&frames_at_db(-35.0, 1)));
+        }
+        assert!(
+            !vad.in_speech(),
+            "floor must adapt to steady hum: {edges:?}"
+        );
+        assert!(
+            vad.noise_floor_db() > -45.0,
+            "floor {} too low",
+            vad.noise_floor_db()
+        );
+    }
+
+    #[test]
+    fn vad_digital_silence_never_voiced_despite_low_floor() {
+        let mut vad = StreamingVad::new(StreamingVadConfig::default());
+        // Pure zeros push the floor to the -90 clamp; a -58 dB whisper-of-a
+        // -signal clears floor+gate but sits under min_voice_dbfs (-55):
+        // must NOT count as voice.
+        let _ = edges_of(&mut vad, &vec![0.0f32; VAD_FRAME_SAMPLES * 50]);
+        let edges = edges_of(&mut vad, &frames_at_db(-58.0, 20));
+        assert!(edges.is_empty(), "sub-threshold audio opened: {edges:?}");
+    }
+
+    #[test]
+    fn vad_chunk_size_invariance_metamorphic() {
+        let mut audio = frames_at_db(-60.0, 50);
+        audio.extend(frames_at_db(-20.0, 20));
+        audio.extend(frames_at_db(-60.0, 40));
+        audio.extend(frames_at_db(-18.0, 25));
+        audio.extend(frames_at_db(-60.0, 40));
+
+        let run = |chunk: usize| {
+            let mut vad = StreamingVad::new(StreamingVadConfig::default());
+            let mut edges = Vec::new();
+            for c in audio.chunks(chunk) {
+                edges.extend(vad.push(c));
+            }
+            edges
+        };
+        let a = run(VAD_FRAME_SAMPLES); // exact frames
+        let b = run(7); // pathological tiny
+        let c = run(4096); // large
+        assert_eq!(a, b, "chunk-size variance (320 vs 7)");
+        assert_eq!(a, c, "chunk-size variance (320 vs 4096)");
+        assert_eq!(
+            a.iter()
+                .filter(|e| matches!(e, VadEdge::SpeechStarted { .. }))
+                .count(),
+            2,
+            "expected two utterances: {a:?}"
+        );
+    }
+
+    #[test]
+    fn vad_pre_pad_clamps_to_previous_endpoint() {
+        let cfg = StreamingVadConfig {
+            endpoint_ms: 200,
+            pre_pad_ms: 400,
+            ..StreamingVadConfig::default()
+        };
+        let mut vad = StreamingVad::new(cfg);
+        let mut edges = Vec::new();
+        edges.extend(vad.push(&frames_at_db(-60.0, 25)));
+        edges.extend(vad.push(&frames_at_db(-20.0, 15)));
+        edges.extend(vad.push(&frames_at_db(-60.0, 12))); // 240ms silence -> endpoint
+        edges.extend(vad.push(&frames_at_db(-20.0, 15)));
+        let starts: Vec<f64> = edges
+            .iter()
+            .filter_map(|e| match e {
+                VadEdge::SpeechStarted { t_sec } => Some(*t_sec),
+                VadEdge::Endpoint { .. } => None,
+            })
+            .collect();
+        let ends: Vec<f64> = edges
+            .iter()
+            .filter_map(|e| match e {
+                VadEdge::Endpoint { t_sec } => Some(*t_sec),
+                VadEdge::SpeechStarted { .. } => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2, "{edges:?}");
+        assert_eq!(ends.len(), 1, "{edges:?}");
+        // Second utterance's 400 ms pre-pad would reach into the first
+        // utterance; it must clamp at the endpoint time.
+        assert!(
+            starts[1] >= ends[0] - 1e-9,
+            "pre-pad crossed the previous endpoint: start {} < end {}",
+            starts[1],
+            ends[0]
+        );
+    }
+
+    #[test]
+    fn vad_classifier_veto_blocks_energy_passing_frames() {
+        struct RejectAll;
+        impl VoiceClassifier for RejectAll {
+            fn is_voice(&mut self, _frame: &[f32]) -> bool {
+                false
+            }
+        }
+        let mut vad =
+            StreamingVad::new(StreamingVadConfig::default()).with_classifier(Box::new(RejectAll));
+        let _ = vad.push(&frames_at_db(-60.0, 50));
+        let edges = vad.push(&frames_at_db(-20.0, 30));
+        assert!(edges.is_empty(), "vetoed frames opened an utterance");
+        assert!(vad.classifier_vetoes() > 0);
+    }
+
+    #[test]
+    fn vad_cost_is_trivial_per_step() {
+        // Not a ledger claim — an order-of-magnitude guard: 30 s of audio
+        // through the VAD must be far under a driver step budget.
+        let audio = frames_at_db(-30.0, 1500); // 30 s
+        let mut vad = StreamingVad::new(StreamingVadConfig::default());
+        let started = Instant::now();
+        let _ = vad.push(&audio);
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "VAD too slow: {:?}",
+            started.elapsed()
+        );
     }
 }
