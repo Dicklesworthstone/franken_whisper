@@ -622,6 +622,840 @@ fn frame_dbfs(frame: &[f32]) -> f64 {
     10.0 * mean_sq.log10()
 }
 
+// ---------------------------------------------------------------------------
+// bd-rt-listen-cmd-i48i: the live driver — `fw robot listen`
+//
+// A deliberately boring, single-threaded loop composing the tested pieces:
+// capture -> resample -> SessionBuffer -> StreamingVad -> step decode ->
+// EmissionPolicy -> NDJSON events. It bypasses the 10-stage orchestrator on
+// purpose (path-typed stages + fixed wall-clock budgets are structurally
+// wrong for an unbounded session; decided in the epic, do not relitigate).
+// Every piece of intelligence lives behind a trait (capture source, policy,
+// VAD) so it is unit-testable and swappable.
+//
+// v1 scope notes (staged landing, each with its owning bead):
+// - Emission policy: built-in `endpoint-commit` bootstrap (partials each
+//   step, one committed delta at utterance close). AlignAtt
+//   (bd-rt-alignatt-fry9) and LocalAgreement (bd-rt-local-agreement-l5x8)
+//   plug into `EmissionPolicy` and flip the default when they land.
+// - Confirm lane (bd-rt-confirm-lane-3okr) and persistence
+//   (bd-rt-persist-a66y) attach at the utterance_end seam below; the
+//   `--quality-model` / `--db` flags land WITH those beads.
+// ---------------------------------------------------------------------------
+
+use crate::error::{FwError, FwResult};
+use crate::robot::{self, ListenSessionInfo, ListenSessionStats, UtteranceEndReason};
+
+/// Where the session's audio comes from.
+#[derive(Debug, Clone)]
+pub enum ListenSource {
+    /// Live microphone: cpal primary, ffmpeg fallback (with a warning).
+    Mic {
+        device: Option<String>,
+        backend: CaptureBackend,
+    },
+    /// Raw PCM on stdin (`--source stdin-pcm`) — the composable path.
+    StdinPcm {
+        format: crate::capture::PcmFormat,
+        sample_rate: u32,
+        channels: u16,
+    },
+    /// Replay an audio file (WAV via hound in v1), paced or as-fast-as-possible.
+    FileReplay {
+        path: std::path::PathBuf,
+        realtime_pace: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureBackend {
+    Auto,
+    Cpal,
+    Ffmpeg,
+}
+
+/// Full session configuration (CLI flags marshal into this).
+#[derive(Debug, Clone)]
+pub struct ListenConfig {
+    pub source: ListenSource,
+    /// Fast model spec; `None` = language-keyed default (en => tiny.en,
+    /// otherwise multilingual tiny; bd-rt-model-provision contract).
+    pub fast_model: Option<String>,
+    pub language: Option<String>,
+    pub step_ms: u64,
+    pub buffer: SessionBufferConfig,
+    pub vad: StreamingVadConfig,
+    pub vad_enabled: bool,
+    pub max_seconds: f64,
+    pub max_utterance_sec: f64,
+    pub emit_partials: bool,
+    pub stats_interval_sec: f64,
+    pub capture_buffer_sec: f64,
+}
+
+impl Default for ListenConfig {
+    fn default() -> Self {
+        Self {
+            source: ListenSource::StdinPcm {
+                format: crate::capture::PcmFormat::S16le,
+                sample_rate: 16_000,
+                channels: 1,
+            },
+            fast_model: None,
+            language: None,
+            step_ms: 300,
+            buffer: SessionBufferConfig::default(),
+            vad: StreamingVadConfig::default(),
+            vad_enabled: true,
+            max_seconds: 0.0,
+            max_utterance_sec: 90.0,
+            emit_partials: true,
+            stats_interval_sec: 30.0,
+            capture_buffer_sec: 30.0,
+        }
+    }
+}
+
+/// What a policy decided for one step decode.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyDecision {
+    /// Newly committed text (append-only; empty when nothing commits).
+    pub commit_text: String,
+    /// Committed-through time on the session clock (policy's word boundary).
+    pub commit_through_sec: Option<f64>,
+    /// Mutable tail preview (emitted as transcript.partial when enabled).
+    pub partial_tail: Option<String>,
+    /// Token count backing `commit_text` (for the delta event).
+    pub commit_tokens: u64,
+    /// Mean confidence proxy for the committed text.
+    pub commit_confidence: Option<f64>,
+}
+
+/// The emission-policy seam (bd-rt-listen-cmd + policy beads): decides,
+/// per step decode over the rolling buffer, what becomes committed
+/// (append-only `transcript.delta`) versus mutable preview.
+pub trait EmissionPolicy: Send {
+    /// A mid-utterance step decode (buffer edge is LIVE — audio continues).
+    fn step(
+        &mut self,
+        out: &crate::native_engine::decode::DecodeOutput,
+        buffer: &SessionBuffer,
+    ) -> PolicyDecision;
+    /// The endpoint decode (audio for this utterance is COMPLETE — no
+    /// holdback; commit everything not yet committed).
+    fn finalize(
+        &mut self,
+        out: &crate::native_engine::decode::DecodeOutput,
+        buffer: &SessionBuffer,
+    ) -> PolicyDecision;
+    /// Reset per-utterance state.
+    fn reset(&mut self);
+    /// Stable policy name for listen.session_start.
+    fn name(&self) -> &'static str;
+}
+
+/// Bootstrap policy: zero intelligence, maximum honesty. Every step's full
+/// decode is the mutable preview; nothing commits until the endpoint decode
+/// commits the entire utterance as one delta. This is the baseline arm the
+/// latency harness keeps forever.
+#[derive(Debug, Default)]
+pub struct EndpointCommitPolicy;
+
+impl EmissionPolicy for EndpointCommitPolicy {
+    fn step(
+        &mut self,
+        out: &crate::native_engine::decode::DecodeOutput,
+        _buffer: &SessionBuffer,
+    ) -> PolicyDecision {
+        let tail = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        PolicyDecision {
+            partial_tail: if tail.is_empty() { None } else { Some(tail) },
+            ..PolicyDecision::default()
+        }
+    }
+
+    fn finalize(
+        &mut self,
+        out: &crate::native_engine::decode::DecodeOutput,
+        buffer: &SessionBuffer,
+    ) -> PolicyDecision {
+        let text = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let confidences: Vec<f64> = out.segments.iter().filter_map(|s| s.confidence).collect();
+        let commit_confidence = if confidences.is_empty() {
+            None
+        } else {
+            Some(confidences.iter().sum::<f64>() / confidences.len() as f64)
+        };
+        let end = out
+            .segments
+            .iter()
+            .filter_map(|s| s.end_sec)
+            .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a| a.max(t))));
+        PolicyDecision {
+            commit_through_sec: end.map(|t| buffer.session_time_of(t)),
+            commit_tokens: out.windows.iter().map(|w| w.tokens as u64).sum(),
+            commit_confidence,
+            commit_text: text,
+            partial_tail: None,
+        }
+    }
+
+    fn reset(&mut self) {}
+
+    fn name(&self) -> &'static str {
+        "endpoint-commit"
+    }
+}
+
+/// Resolve the fast-lane model per the bd-rt-model-provision contract.
+/// Returns (loaded model, model label, fallback_warning).
+fn resolve_fast_model(
+    config: &ListenConfig,
+) -> FwResult<(
+    std::sync::Arc<crate::native_engine::NativeWhisperModel>,
+    String,
+    Option<String>,
+)> {
+    let default_spec = match config.language.as_deref() {
+        Some("en") => "tiny.en",
+        _ => "tiny",
+    };
+    let spec = config.fast_model.as_deref().unwrap_or(default_spec);
+    match crate::native_engine::resolve_model(spec) {
+        Ok(path) => {
+            let model = crate::native_engine::NativeWhisperModel::load(&path)?;
+            Ok((model, spec.to_owned(), None))
+        }
+        Err(missing) => {
+            // Fallback contract: session MUST start when the default
+            // release package is present; degraded latency beats refusal.
+            let fallback = crate::native_engine::resolve_model("default").map_err(|_| missing)?;
+            let model = crate::native_engine::NativeWhisperModel::load(&fallback)?;
+            let hint = if spec == "tiny" {
+                "fw pull tiny"
+            } else {
+                "fw pull tiny-en"
+            };
+            Ok((
+                model,
+                "large-v3-turbo".to_owned(),
+                Some(format!(
+                    "fast model `{spec}` is not cached; using the turbo package as the fast lane \
+                     (higher latency). Install the fast-lane package with: {hint}"
+                )),
+            ))
+        }
+    }
+}
+
+/// Load a WAV file for `--source file-replay` (any rate/channels; the
+/// resampler chain normalizes). v1 accepts WAV via hound; other containers
+/// go through `fw transcribe`'s batch path or stdin-pcm piping.
+fn load_replay_wav(path: &std::path::Path) -> FwResult<(Vec<f32>, u32, u16)> {
+    let mut reader = hound::WavReader::open(path).map_err(|error| {
+        FwError::InvalidRequest(format!(
+            "file-replay could not open `{}`: {error} (v1 accepts WAV; for other formats pipe \
+             PCM: ffmpeg -i INPUT -f s16le - | fw robot listen --source stdin-pcm)",
+            path.display()
+        ))
+    })?;
+    let spec = reader.spec();
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<_, _>>()
+            .map_err(|error| FwError::InvalidRequest(format!("bad WAV samples: {error}")))?,
+        hound::SampleFormat::Int => {
+            let denom = f32::from(i16::MAX) + 1.0;
+            reader
+                .samples::<i16>()
+                .map(|s| s.map(|v| f32::from(v) / denom))
+                .collect::<Result<_, _>>()
+                .map_err(|error| FwError::InvalidRequest(format!("bad WAV samples: {error}")))?
+        }
+    };
+    Ok((samples, spec.sample_rate, spec.channels))
+}
+
+fn open_capture_source(
+    config: &ListenConfig,
+) -> FwResult<(
+    Box<dyn crate::capture::CaptureSource>,
+    &'static str,
+    String,
+    Option<String>,
+)> {
+    match &config.source {
+        ListenSource::FileReplay {
+            path,
+            realtime_pace,
+        } => {
+            let (samples, rate, channels) = load_replay_wav(path)?;
+            let source = if *realtime_pace {
+                crate::capture::FixtureCaptureSource::new_paced(samples, rate, channels)?
+            } else {
+                crate::capture::FixtureCaptureSource::new_unpaced(
+                    samples,
+                    rate,
+                    channels,
+                    (u64::from(rate) * config.step_ms / 1000).max(1) as usize,
+                )?
+            };
+            Ok((Box::new(source), "none", path.display().to_string(), None))
+        }
+        ListenSource::StdinPcm {
+            format,
+            sample_rate,
+            channels,
+        } => {
+            use std::io::IsTerminal as _;
+            let source = crate::capture::StdinPcmSource::open(
+                *format,
+                *sample_rate,
+                *channels,
+                config.capture_buffer_sec,
+                std::io::stdin().is_terminal(),
+            )?;
+            Ok((Box::new(source), "none", "<stdin>".to_owned(), None))
+        }
+        ListenSource::Mic { device, backend } => {
+            let device_label = device.clone().unwrap_or_else(|| "<default>".to_owned());
+            match backend {
+                CaptureBackend::Ffmpeg => {
+                    let source = crate::capture::FfmpegCaptureSource::open(
+                        device.as_deref(),
+                        None,
+                        None,
+                        config.capture_buffer_sec,
+                    )?;
+                    Ok((Box::new(source), "ffmpeg", device_label, None))
+                }
+                CaptureBackend::Cpal => {
+                    let source = crate::capture::CpalCaptureSource::open(
+                        device.as_deref(),
+                        config.capture_buffer_sec,
+                    )?;
+                    Ok((Box::new(source), "cpal", device_label, None))
+                }
+                CaptureBackend::Auto => {
+                    match crate::capture::CpalCaptureSource::open(
+                        device.as_deref(),
+                        config.capture_buffer_sec,
+                    ) {
+                        Ok(source) => Ok((Box::new(source), "cpal", device_label, None)),
+                        Err(cpal_error) => {
+                            let source = crate::capture::FfmpegCaptureSource::open(
+                                device.as_deref(),
+                                None,
+                                None,
+                                config.capture_buffer_sec,
+                            )
+                            .map_err(|ffmpeg_error| {
+                                FwError::BackendUnavailable(format!(
+                                    "no capture backend available: cpal failed ({cpal_error}); \
+                                     ffmpeg failed ({ffmpeg_error})"
+                                ))
+                            })?;
+                            Ok((
+                                Box::new(source),
+                                "ffmpeg",
+                                device_label,
+                                Some(format!(
+                                    "cpal capture unavailable ({cpal_error}); fell back to ffmpeg \
+                                     device capture"
+                                )),
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Run one live session, emitting NDJSON event values through `emit`.
+/// Returns `Ok(cancelled)` — `true` when the session ended on Ctrl-C (the
+/// caller maps that to exit code 130). Fatal errors propagate; the CLI
+/// wrapper converts them to the terminal `run_error` event.
+pub fn run_listen_session(
+    config: &ListenConfig,
+    emit: &mut dyn FnMut(serde_json::Value) -> FwResult<()>,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> FwResult<bool> {
+    use crate::native_engine::decode::{AudioCtxPolicy, DecodeParams};
+
+    let session_started = std::time::Instant::now();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let mut seq: u64 = 0;
+    let now_ts = || chrono::Utc::now().to_rfc3339();
+
+    // Model first: session_start marks "ready" (agents key on it).
+    let (model, fast_model_label, fallback_warning) = resolve_fast_model(config)?;
+    let (mut capture, capture_backend, device_label, capture_warning) =
+        open_capture_source(config)?;
+
+    let source_label = match &config.source {
+        ListenSource::Mic { .. } => "mic",
+        ListenSource::StdinPcm { .. } => "stdin-pcm",
+        ListenSource::FileReplay { .. } => "file-replay",
+    };
+    let mut policy = EndpointCommitPolicy;
+    let confirm_disabled_by_fallback = fallback_warning.is_some();
+
+    let info = ListenSessionInfo {
+        source: source_label.to_owned(),
+        capture_backend: capture_backend.to_owned(),
+        device: device_label,
+        sample_rate_hz: capture.sample_rate(),
+        fast_model: fast_model_label.clone(),
+        quality_model: None, // confirm lane lands with bd-rt-confirm-lane-3okr
+        policy: EmissionPolicy::name(&policy).to_owned(),
+        step_ms: config.step_ms,
+        partials: config.emit_partials,
+        vad: serde_json::json!({
+            "enabled": config.vad_enabled,
+            "min_speech_ms": config.vad.min_speech_ms,
+            "endpoint_ms": config.vad.endpoint_ms,
+            "gate_db": config.vad.gate_db,
+        }),
+    };
+    emit(robot::listen_session_start_value(
+        &run_id,
+        seq,
+        &now_ts(),
+        &info,
+    ))?;
+    seq += 1;
+    if let Some(message) = &fallback_warning {
+        emit(robot::listen_warning_value(
+            &run_id,
+            seq,
+            &now_ts(),
+            "fast_model_fallback",
+            serde_json::json!({"detail": message, "confirm_lane_disabled": confirm_disabled_by_fallback}),
+        ))?;
+        seq += 1;
+    }
+    if let Some(message) = capture_warning {
+        emit(robot::listen_warning_value(
+            &run_id,
+            seq,
+            &now_ts(),
+            "fallback_capture_backend",
+            serde_json::json!({"detail": message}),
+        ))?;
+        seq += 1;
+    }
+
+    // Resampler chain: only when the source is not already 16 kHz mono.
+    let mut resampler = if capture.sample_rate() != crate::native_engine::mel::SAMPLE_RATE as u32
+        || capture.channels() != 1
+    {
+        Some(crate::capture::StreamingResampler::new(
+            capture.sample_rate(),
+            capture.channels(),
+            crate::native_engine::mel::SAMPLE_RATE as u32,
+        )?)
+    } else {
+        None
+    };
+
+    let mut buffer = SessionBuffer::new(config.buffer.clone());
+    let mut vad = StreamingVad::new(config.vad.clone());
+    let mut watchdog = crate::capture::SilentInputWatchdog::new(
+        3.0,
+        crate::native_engine::mel::SAMPLE_RATE as u32,
+    );
+    let mut pinned_language = config.language.clone();
+
+    // Session state.
+    let mut utterance_id: u32 = 0;
+    let mut in_speech = false;
+    let mut utterance_started_at: f64 = 0.0;
+    let mut utterance_t0: f64 = 0.0;
+    let mut committed_text = String::new();
+    let mut delta_count: u64 = 0;
+    let mut partial_generation: u64 = 0;
+    let mut stats = ListenSessionStats::default();
+    let mut step_latencies_ms: Vec<f64> = Vec::new();
+    let mut last_stats_emit = std::time::Instant::now();
+    let mut next_step = std::time::Instant::now();
+    let mut raw = vec![0f32; 48_000];
+    let mut resampled: Vec<f32> = Vec::new();
+    let mut source_ended = false;
+    let mut cancelled = false;
+
+    let checkpoint = || -> FwResult<()> {
+        if is_cancelled() {
+            Err(FwError::Cancelled("listen session interrupted".to_owned()))
+        } else {
+            Ok(())
+        }
+    };
+
+    macro_rules! emit_seq {
+        ($value:expr) => {{
+            emit($value)?;
+            seq += 1;
+        }};
+    }
+
+    // One decode over the current buffer.
+    let mut decode_buffer = |buffer: &SessionBuffer,
+                             pinned_language: &Option<String>|
+     -> FwResult<crate::native_engine::decode::DecodeOutput> {
+        let params = DecodeParams {
+            language: pinned_language.clone(),
+            timestamps: true,
+            audio_ctx: AudioCtxPolicy::Auto,
+            bypass_transcript_cache: true,
+            initial_prompt: buffer.prompt(),
+            n_threads: 4,
+            ..DecodeParams::default()
+        };
+        model.transcribe(buffer.window(), &params, &checkpoint)
+    };
+
+    'session: loop {
+        // -- termination checks ------------------------------------------
+        if is_cancelled() {
+            cancelled = true;
+        }
+        let out_of_time = config.max_seconds > 0.0
+            && session_started.elapsed().as_secs_f64() >= config.max_seconds;
+        if cancelled || out_of_time || source_ended {
+            // Final flush when speech is open.
+            if in_speech {
+                let out = decode_buffer(&buffer, &pinned_language)?;
+                let decision = EmissionPolicy::finalize(&mut policy, &out, &buffer);
+                let t1 = buffer.session_duration_sec();
+                if !decision.commit_text.is_empty() {
+                    committed_text.push_str(&decision.commit_text);
+                    delta_count += 1;
+                    stats.deltas += 1;
+                    emit_seq!(robot::transcript_delta_value(
+                        &run_id,
+                        seq,
+                        &now_ts(),
+                        utterance_id,
+                        &decision.commit_text,
+                        utterance_t0,
+                        t1,
+                        decision.commit_tokens,
+                        decision.commit_confidence,
+                    ));
+                }
+                stats.utterances += 1;
+                emit_seq!(robot::utterance_end_value(
+                    &run_id,
+                    seq,
+                    &now_ts(),
+                    utterance_id,
+                    UtteranceEndReason::SessionEnd,
+                    utterance_t0,
+                    t1,
+                    &committed_text,
+                    delta_count,
+                ));
+            }
+            break 'session;
+        }
+
+        // -- pull audio up to the next step deadline ----------------------
+        let wait = next_step.saturating_duration_since(std::time::Instant::now());
+        let read = capture.read(&mut raw, wait.min(std::time::Duration::from_millis(100)))?;
+        if read.ended {
+            source_ended = true;
+        }
+        stats.capture_overruns = read.overrun_frames_dropped;
+        let fresh: &[f32] = &raw[..read.frames * usize::from(capture.channels())];
+        let fresh_16k: &[f32] = if let Some(rs) = resampler.as_mut() {
+            resampled.clear();
+            rs.process(fresh, &mut resampled)?;
+            if source_ended {
+                rs.flush(&mut resampled);
+            }
+            &resampled
+        } else {
+            fresh
+        };
+        if !fresh_16k.is_empty() {
+            if watchdog.observe(fresh_16k) {
+                emit_seq!(robot::listen_warning_value(
+                    &run_id,
+                    seq,
+                    &now_ts(),
+                    "silent_input",
+                    serde_json::json!({
+                        "detail": crate::capture::MIC_PERMISSION_REMEDIATION,
+                        "leading_silent_sec": 3.0,
+                    }),
+                ));
+            }
+            buffer.push(fresh_16k);
+            stats.audio_sec = buffer.session_duration_sec();
+
+            // -- VAD edges -------------------------------------------------
+            let edges = if config.vad_enabled {
+                vad.push(fresh_16k)
+            } else if !in_speech {
+                vec![VadEdge::SpeechStarted {
+                    t_sec: buffer.session_offset_sec(),
+                }]
+            } else {
+                Vec::new()
+            };
+            for edge in edges {
+                match edge {
+                    VadEdge::SpeechStarted { t_sec } => {
+                        if !in_speech {
+                            in_speech = true;
+                            utterance_id += 1;
+                            utterance_started_at = session_started.elapsed().as_secs_f64();
+                            utterance_t0 = t_sec;
+                            committed_text.clear();
+                            delta_count = 0;
+                            partial_generation = 0;
+                            EmissionPolicy::reset(&mut policy);
+                            emit_seq!(robot::speech_started_value(
+                                &run_id,
+                                seq,
+                                &now_ts(),
+                                utterance_id,
+                                t_sec,
+                            ));
+                        }
+                    }
+                    VadEdge::Endpoint { t_sec } => {
+                        if in_speech {
+                            let flush_started = std::time::Instant::now();
+                            let out = decode_buffer(&buffer, &pinned_language)?;
+                            if pinned_language.is_none() {
+                                pinned_language.clone_from(&out.language);
+                            }
+                            let decision = EmissionPolicy::finalize(&mut policy, &out, &buffer);
+                            if !decision.commit_text.is_empty() {
+                                committed_text.push_str(&decision.commit_text);
+                                delta_count += 1;
+                                stats.deltas += 1;
+                                if stats.ttft_ms.is_none() {
+                                    stats.ttft_ms =
+                                        Some(session_started.elapsed().as_secs_f64() * 1000.0);
+                                }
+                                emit_seq!(robot::transcript_delta_value(
+                                    &run_id,
+                                    seq,
+                                    &now_ts(),
+                                    utterance_id,
+                                    &decision.commit_text,
+                                    utterance_t0,
+                                    t_sec,
+                                    decision.commit_tokens,
+                                    decision.commit_confidence,
+                                ));
+                            }
+                            stats.utterances += 1;
+                            emit_seq!(robot::utterance_end_value(
+                                &run_id,
+                                seq,
+                                &now_ts(),
+                                utterance_id,
+                                UtteranceEndReason::Endpoint,
+                                utterance_t0,
+                                t_sec,
+                                &committed_text,
+                                delta_count,
+                            ));
+                            tracing::info!(
+                                utterance_id,
+                                speech_sec = t_sec - utterance_t0,
+                                deltas = delta_count,
+                                chars = committed_text.len(),
+                                endpoint_flush_ms = flush_started.elapsed().as_millis() as u64,
+                                reason = "endpoint",
+                                "utterance closed"
+                            );
+                            // Trim + prompt carry.
+                            buffer.append_committed_text(&committed_text);
+                            buffer.set_committed_through(t_sec);
+                            buffer.trim_to_committed();
+                            buffer.end_utterance();
+                            in_speech = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // -- utterance timeout --------------------------------------------
+        if in_speech
+            && session_started.elapsed().as_secs_f64() - utterance_started_at
+                >= config.max_utterance_sec
+        {
+            let out = decode_buffer(&buffer, &pinned_language)?;
+            let decision = EmissionPolicy::finalize(&mut policy, &out, &buffer);
+            let t1 = buffer.session_duration_sec();
+            if !decision.commit_text.is_empty() {
+                committed_text.push_str(&decision.commit_text);
+                delta_count += 1;
+                stats.deltas += 1;
+                emit_seq!(robot::transcript_delta_value(
+                    &run_id,
+                    seq,
+                    &now_ts(),
+                    utterance_id,
+                    &decision.commit_text,
+                    utterance_t0,
+                    t1,
+                    decision.commit_tokens,
+                    decision.commit_confidence,
+                ));
+            }
+            stats.utterances += 1;
+            emit_seq!(robot::utterance_end_value(
+                &run_id,
+                seq,
+                &now_ts(),
+                utterance_id,
+                UtteranceEndReason::Timeout,
+                utterance_t0,
+                t1,
+                &committed_text,
+                delta_count,
+            ));
+            buffer.append_committed_text(&committed_text);
+            buffer.set_committed_through(t1);
+            buffer.trim_to_committed();
+            buffer.end_utterance();
+            // Forced end mid-speech: next utterance opens immediately.
+            utterance_id += 1;
+            utterance_started_at = session_started.elapsed().as_secs_f64();
+            utterance_t0 = t1;
+            committed_text.clear();
+            delta_count = 0;
+            partial_generation = 0;
+            EmissionPolicy::reset(&mut policy);
+            emit_seq!(robot::speech_started_value(
+                &run_id,
+                seq,
+                &now_ts(),
+                utterance_id,
+                t1
+            ));
+        }
+
+        // -- buffer cap ----------------------------------------------------
+        if let Some(forced) = buffer.enforce_cap() {
+            emit_seq!(robot::listen_warning_value(
+                &run_id,
+                seq,
+                &now_ts(),
+                "forced_trim",
+                serde_json::json!({"dropped_sec": forced.dropped_sec}),
+            ));
+        }
+
+        // -- step decode (mid-utterance partials) ---------------------------
+        if in_speech && std::time::Instant::now() >= next_step {
+            let step_started = std::time::Instant::now();
+            let out = decode_buffer(&buffer, &pinned_language)?;
+            if pinned_language.is_none() {
+                pinned_language.clone_from(&out.language);
+            }
+            let decision = EmissionPolicy::step(&mut policy, &out, &buffer);
+            let elapsed_ms = step_started.elapsed().as_secs_f64() * 1000.0;
+            step_latencies_ms.push(elapsed_ms);
+            tracing::debug!(
+                step = step_latencies_ms.len(),
+                buffer_sec = buffer.buffer_sec(),
+                decoded_ms = elapsed_ms as u64,
+                partial_chars = decision.partial_tail.as_deref().map_or(0, str::len),
+                "listen step"
+            );
+            if config.emit_partials
+                && let Some(tail) = decision.partial_tail
+            {
+                partial_generation += 1;
+                let segment = crate::model::TranscriptionSegment {
+                    start_sec: Some(utterance_t0),
+                    end_sec: Some(buffer.session_duration_sec()),
+                    text: tail,
+                    speaker: None,
+                    confidence: None,
+                };
+                let mut value = robot::transcript_partial_value(&run_id, seq, &now_ts(), &segment);
+                value["utterance_id"] = serde_json::json!(utterance_id);
+                value["generation"] = serde_json::json!(partial_generation);
+                emit_seq!(value);
+            }
+            // Skip logic: schedule from completion (an overrunning decode
+            // skips ticks instead of queueing them).
+            next_step =
+                std::time::Instant::now() + std::time::Duration::from_millis(config.step_ms);
+        } else if !in_speech {
+            next_step =
+                std::time::Instant::now() + std::time::Duration::from_millis(config.step_ms);
+        }
+
+        // -- periodic stats heartbeat ---------------------------------------
+        if config.stats_interval_sec > 0.0
+            && last_stats_emit.elapsed().as_secs_f64() >= config.stats_interval_sec
+        {
+            fill_step_stats(&mut stats, &step_latencies_ms, session_started, &buffer);
+            emit_seq!(robot::listen_session_stats_value(
+                &run_id,
+                seq,
+                &now_ts(),
+                &stats,
+                false
+            ));
+            last_stats_emit = std::time::Instant::now();
+        }
+    }
+
+    // Terminal: final stats (success path; run_error is the fatal terminal
+    // and is emitted by the CLI wrapper when this function errors).
+    fill_step_stats(&mut stats, &step_latencies_ms, session_started, &buffer);
+    emit(robot::listen_session_stats_value(
+        &run_id,
+        seq,
+        &now_ts(),
+        &stats,
+        true,
+    ))?;
+    capture.stop();
+    Ok(cancelled)
+}
+
+fn fill_step_stats(
+    stats: &mut ListenSessionStats,
+    step_latencies_ms: &[f64],
+    session_started: std::time::Instant,
+    buffer: &SessionBuffer,
+) {
+    stats.wall_sec = session_started.elapsed().as_secs_f64();
+    stats.audio_sec = buffer.session_duration_sec();
+    if !step_latencies_ms.is_empty() {
+        stats.mean_step_latency_ms =
+            step_latencies_ms.iter().sum::<f64>() / step_latencies_ms.len() as f64;
+        let mut sorted = step_latencies_ms.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        stats.p95_step_latency_ms = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};

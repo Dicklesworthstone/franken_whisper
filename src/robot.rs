@@ -2352,6 +2352,12 @@ pub fn robot_schema_value() -> serde_json::Value {
     })
 }
 
+/// Emit one arbitrary NDJSON event value (the live listen driver's sink;
+/// same locked-stdout + explicit-flush path every robot event uses).
+pub fn emit_event_value(value: &serde_json::Value) -> FwResult<()> {
+    emit_line(value)
+}
+
 fn emit_line<T: Serialize>(value: &T) -> FwResult<()> {
     // Stream the JSON straight to a locked stdout instead of allocating an
     // intermediate `String` (+ UTF-8 validation) via `to_string`. The emitted

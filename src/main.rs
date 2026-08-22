@@ -2,10 +2,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::Parser;
+use franken_whisper::cli;
 use franken_whisper::cli::{
     Cli, Command, ControlFrameKind, DifferentialOracleCommand, PublicCorpusCommand, PullModelArg,
     RobotCommand, RobotDocsCommand, RunsOutputFormat, ShutdownController, SyncCommand,
-    TtyAudioCommand, TtyAudioControlCommand,
+    TtyAudioCommand, TtyAudioControlCommand, YoutubeCommand,
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
@@ -178,6 +179,106 @@ fn sortformer_audio_duration_ms(sample_count: usize) -> FwResult<u64> {
             FwError::InvalidRequest("native Sortformer audio duration overflows u64".to_owned())
         })
         .map(|milliseconds| milliseconds.div_ceil(sample_rate))
+}
+
+fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
+    use franken_whisper::capture::PcmFormat;
+    use franken_whisper::cli::{
+        CaptureBackendArg, ListenPolicyArg, ListenSourceArg, StdinFormatArg,
+    };
+    use franken_whisper::listen::{CaptureBackend, ListenConfig, ListenSource};
+
+    if args.list_devices {
+        for device in franken_whisper::capture::enumerate_input_devices()? {
+            franken_whisper::robot::emit_event_value(&serde_json::json!({
+                "event": "listen.device",
+                "schema_version": franken_whisper::robot::ROBOT_SCHEMA_VERSION,
+                "name": device.name,
+                "default": device.is_default,
+                "default_sample_rate_hz": device.default_sample_rate_hz,
+                "default_channels": device.default_channels,
+                "backend": "cpal",
+            }))?;
+        }
+        return Ok(());
+    }
+
+    let source = match args.source {
+        ListenSourceArg::Mic => ListenSource::Mic {
+            device: args.mic_device.clone(),
+            backend: match args.capture_backend {
+                CaptureBackendArg::Auto => CaptureBackend::Auto,
+                CaptureBackendArg::Cpal => CaptureBackend::Cpal,
+                CaptureBackendArg::Ffmpeg => CaptureBackend::Ffmpeg,
+            },
+        },
+        ListenSourceArg::StdinPcm => ListenSource::StdinPcm {
+            format: match args.stdin_format {
+                StdinFormatArg::S16le => PcmFormat::S16le,
+                StdinFormatArg::F32le => PcmFormat::F32le,
+            },
+            sample_rate: args.stdin_rate,
+            channels: args.stdin_channels,
+        },
+        ListenSourceArg::FileReplay => {
+            let Some(path) = args.input.clone() else {
+                return Err(FwError::InvalidRequest(
+                    "--source file-replay requires --input PATH".to_owned(),
+                ));
+            };
+            ListenSource::FileReplay {
+                path,
+                realtime_pace: args.realtime_pace,
+            }
+        }
+    };
+    let ListenPolicyArg::EndpointCommit = args.policy; // single variant today
+
+    let mut buffer_config = franken_whisper::listen::SessionBufferConfig {
+        max_buffer_sec: args.max_buffer_sec,
+        ..franken_whisper::listen::SessionBufferConfig::default()
+    };
+    buffer_config.prompt_carry = !args.no_context;
+    let vad_config = franken_whisper::listen::StreamingVadConfig {
+        gate_db: args.vad_gate_db,
+        min_speech_ms: args.vad_min_speech_ms,
+        endpoint_ms: args.vad_endpoint_ms,
+        ..franken_whisper::listen::StreamingVadConfig::default()
+    };
+    let config = ListenConfig {
+        source,
+        fast_model: args.fast_model.clone(),
+        language: args.language.clone(),
+        step_ms: args.step_ms,
+        buffer: buffer_config,
+        vad: vad_config,
+        vad_enabled: !args.no_vad,
+        max_seconds: args.max_seconds,
+        max_utterance_sec: args.max_utterance_sec,
+        emit_partials: !args.no_partials,
+        stats_interval_sec: args.stats_interval_sec,
+        capture_buffer_sec: args.capture_buffer_sec,
+    };
+
+    ShutdownController::install(None)?;
+    let mut emit = |value: serde_json::Value| franken_whisper::robot::emit_event_value(&value);
+    match franken_whisper::listen::run_listen_session(
+        &config,
+        &mut emit,
+        &ShutdownController::is_shutting_down,
+    ) {
+        Ok(cancelled) => {
+            if cancelled {
+                std::process::exit(130);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // Fatal terminal: run_error is ALWAYS the last event.
+            let _ = franken_whisper::robot::emit_robot_error_from_fw(&error);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
@@ -400,6 +501,9 @@ fn run(cli: Cli) -> FwResult<()> {
                         Err(error)
                     }
                 }
+            }
+            RobotCommand::Listen(args) => {
+                return run_robot_listen(*args);
             }
             RobotCommand::Schema => {
                 println!("{}", serde_json::to_string(&robot_schema_value())?);
@@ -1065,37 +1169,45 @@ fn run(cli: Cli) -> FwResult<()> {
             }
         },
         Command::Tui => franken_whisper::tui::run_tui(),
-        Command::Youtube(args) => {
-            let opts = args.to_options()?;
-            let summary = franken_whisper::youtube::pipeline::run(&opts)?;
-            if args.json_summary {
-                println!("{}", serde_json::to_string_pretty(&summary)?);
-            } else {
-                println!(
-                    "YouTube ingestion: {} done, {} skipped, {} failed{}",
-                    summary.done.len(),
-                    summary.skipped.len(),
-                    summary.failed.len(),
-                    if summary.cancelled {
-                        " (cancelled)"
-                    } else {
-                        ""
-                    },
-                );
-                for f in &summary.failed {
-                    eprintln!("  failed {}: {} — {}", f.id, f.title, f.error);
+        Command::Youtube(command) => match command {
+            cli::YoutubeCommand::Run(args) => {
+                let opts = args.to_options()?;
+                let summary = franken_whisper::youtube::pipeline::run(&opts)?;
+                if args.json_summary {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    println!(
+                        "YouTube ingestion: {} done, {} skipped, {} failed{}",
+                        summary.done.len(),
+                        summary.skipped.len(),
+                        summary.failed.len(),
+                        if summary.cancelled {
+                            " (cancelled)"
+                        } else {
+                            ""
+                        },
+                    );
+                    for f in &summary.failed {
+                        eprintln!("  failed {}: {} — {}", f.id, f.title, f.error);
+                    }
                 }
+                // Any failed video is a non-zero outcome; cancellation is
+                // surfaced through the global shutdown exit code in main().
+                if !summary.failed.is_empty() && !summary.cancelled {
+                    return Err(FwError::Unsupported(format!(
+                        "{} youtube video(s) failed",
+                        summary.failed.len()
+                    )));
+                }
+                Ok(())
             }
-            // Any failed video is a non-zero outcome; cancellation is surfaced
-            // through the global shutdown exit code in main().
-            if !summary.failed.is_empty() && !summary.cancelled {
-                return Err(FwError::Unsupported(format!(
-                    "{} youtube video(s) failed",
-                    summary.failed.len()
-                )));
+            cli::YoutubeCommand::Search(search_args) => {
+                franken_whisper::cli::run_youtube_search(&search_args)
             }
-            Ok(())
-        }
+            cli::YoutubeCommand::Enrich(enrich_args) => {
+                franken_whisper::cli::run_youtube_enrich(&enrich_args)
+            }
+        },
     }
 }
 

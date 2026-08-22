@@ -366,8 +366,10 @@ pub enum Command {
     /// Launch the optional human-oriented terminal interface.
     Tui,
     /// Download YouTube audio (videos / playlists / a URL file) and
-    /// transcribe each into a markdown + JSON pair.
-    Youtube(Box<YoutubeArgs>),
+    /// transcribe each into a markdown + JSON pair; or search / enrich the
+    /// YouTube catalog as deduped agent-curated JSON.
+    #[command(subcommand)]
+    Youtube(YoutubeCommand),
     /// Describe stable commands, schemas, features, and error recovery as JSON.
     Capabilities(CapabilitiesArgs),
     /// Report built-in and cached model readiness without downloading.
@@ -870,6 +872,97 @@ impl fmt::Debug for ConfidentialEvaluationArgs {
     }
 }
 
+/// `fw youtube` modes: the ingestion pipeline, or catalog search / enrich.
+#[derive(Debug, Subcommand)]
+pub enum YoutubeCommand {
+    /// Download YouTube audio (videos / playlists / a URL file) and
+    /// transcribe each into a markdown + JSON pair.
+    Run(Box<YoutubeArgs>),
+    /// Search YouTube via yt-dlp and emit deduplicated JSON hits on stdout
+    /// (bd-m7fv). Enriched per-video metadata by default; `--flat` keeps the
+    /// flat-playlist subset for cheap large sweeps.
+    Search(YoutubeSearchArgs),
+    /// Enrich specific video URLs or ids into deduplicated JSON hits
+    /// (bd-m7fv). Playlist inputs are rejected — ingest those through
+    /// `youtube run`.
+    Enrich(YoutubeEnrichArgs),
+}
+
+/// Arguments for `fw youtube search`.
+#[derive(Debug, Args)]
+pub struct YoutubeSearchArgs {
+    /// Free-text search query.
+    #[arg(value_name = "QUERY")]
+    pub query: String,
+
+    /// Maximum number of results to return.
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+
+    /// Keep only the flat-playlist field subset (cheaper large sweeps).
+    #[arg(long)]
+    pub flat: bool,
+
+    /// Explicit yt-dlp binary override (same resolution as ingestion).
+    #[arg(long)]
+    pub ytdlp: Option<PathBuf>,
+}
+
+/// Arguments for `fw youtube enrich`.
+#[derive(Debug, Args)]
+pub struct YoutubeEnrichArgs {
+    /// Video URLs or ids to enrich (positional; duplicates are dropped).
+    #[arg(value_name = "URL_OR_ID")]
+    pub targets: Vec<String>,
+
+    /// Explicit yt-dlp binary override (same resolution as ingestion).
+    #[arg(long)]
+    pub ytdlp: Option<PathBuf>,
+}
+
+/// Run `fw youtube search`: probe yt-dlp, run the query, print deduped hits
+/// as a JSON array on stdout. Deterministic: first-seen order, no decoration.
+///
+/// # Errors
+///
+/// Propagates the yt-dlp probe and search errors.
+pub fn run_youtube_search(args: &YoutubeSearchArgs) -> FwResult<()> {
+    let info = match args.ytdlp.as_deref() {
+        Some(path) => {
+            crate::youtube::ytdlp::probe_with_path(path, chrono::Utc::now().date_naive())?
+        }
+        None => crate::youtube::ytdlp::probe()?,
+    };
+    let token = crate::orchestrator::CancellationToken::unbounded();
+    let hits = crate::youtube::ytdlp::search(&info, &args.query, args.limit, args.flat, &token)?;
+    println!("{}", serde_json::to_string_pretty(&hits)?);
+    Ok(())
+}
+
+/// Run `fw youtube enrich`: probe yt-dlp, fetch each target's metadata, and
+/// print the deduplicated hits as a JSON array on stdout.
+///
+/// # Errors
+///
+/// Propagates the yt-dlp probe, classification, and fetch errors.
+pub fn run_youtube_enrich(args: &YoutubeEnrichArgs) -> FwResult<()> {
+    if args.targets.is_empty() {
+        return Err(FwError::InvalidRequest(
+            "no targets: pass one or more video URLs or ids".to_owned(),
+        ));
+    }
+    let info = match args.ytdlp.as_deref() {
+        Some(path) => {
+            crate::youtube::ytdlp::probe_with_path(path, chrono::Utc::now().date_naive())?
+        }
+        None => crate::youtube::ytdlp::probe()?,
+    };
+    let token = crate::orchestrator::CancellationToken::unbounded();
+    let hits = crate::youtube::ytdlp::enrich(&info, &args.targets, &token)?;
+    println!("{}", serde_json::to_string_pretty(&hits)?);
+    Ok(())
+}
+
 /// Arguments for the `youtube` subcommand.
 #[derive(Debug, Args)]
 pub struct YoutubeArgs {
@@ -976,6 +1069,9 @@ pub enum RobotCommand {
     Triage(HealthArgs),
     /// Query persisted adaptive-routing decisions as NDJSON.
     RoutingHistory(RoutingHistoryArgs),
+    /// Live microphone/pipe transcription: continuous NDJSON session events
+    /// (schema 1.1.0 listen family). See docs/realtime-streaming.md.
+    Listen(Box<ListenArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -1002,6 +1098,143 @@ pub struct RoutingHistoryArgs {
     /// Maximum number of recent runs to scan.
     #[arg(long, default_value_t = 20)]
     pub limit: usize,
+}
+
+/// Audio source for `fw robot listen`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ListenSourceArg {
+    /// Live microphone (cpal primary, ffmpeg fallback).
+    Mic,
+    /// Raw PCM piped on stdin (`ffmpeg -i X -f s16le - | fw robot listen --source stdin-pcm`).
+    StdinPcm,
+    /// Replay an audio file (WAV in v1), optionally paced to real time.
+    FileReplay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CaptureBackendArg {
+    Auto,
+    Cpal,
+    Ffmpeg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ListenPolicyArg {
+    /// Bootstrap baseline: partials every step, one committed delta at
+    /// utterance close. (alignatt becomes the default when it lands.)
+    EndpointCommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum StdinFormatArg {
+    S16le,
+    F32le,
+}
+
+/// Live listen session controls (bd-rt-listen-cmd-i48i). The consolidated
+/// flag list lives on the driver bead; `--quality-model`/`--db` land with
+/// the confirm-lane and persistence beads.
+#[derive(Debug, Args)]
+pub struct ListenArgs {
+    /// Audio source.
+    #[arg(long, value_enum, default_value_t = ListenSourceArg::Mic)]
+    pub source: ListenSourceArg,
+
+    /// Input file for `--source file-replay`.
+    #[arg(long)]
+    pub input: Option<PathBuf>,
+
+    /// Pace file-replay at real time (default: as fast as possible).
+    #[arg(long)]
+    pub realtime_pace: bool,
+
+    /// Capture backend for `--source mic`.
+    #[arg(long, value_enum, default_value_t = CaptureBackendArg::Auto)]
+    pub capture_backend: CaptureBackendArg,
+
+    /// Input device name (default: system default input).
+    #[arg(long)]
+    pub mic_device: Option<String>,
+
+    /// Fast-lane model override (default: tiny.en for --language en,
+    /// multilingual tiny otherwise; missing packages fall back to turbo
+    /// with a warning).
+    #[arg(long)]
+    pub fast_model: Option<String>,
+
+    /// Emission policy.
+    #[arg(long, value_enum, default_value_t = ListenPolicyArg::EndpointCommit)]
+    pub policy: ListenPolicyArg,
+
+    /// Step decode cadence in milliseconds.
+    #[arg(long, default_value_t = 300)]
+    pub step_ms: u64,
+
+    /// Rolling session buffer cap in seconds.
+    #[arg(long, default_value_t = 12.0)]
+    pub max_buffer_sec: f64,
+
+    /// Language hint (ISO 639-1); unset = detect on first speech and pin.
+    #[arg(long)]
+    pub language: Option<String>,
+
+    /// End the session after this many seconds (0 = unbounded).
+    #[arg(long, default_value_t = 0.0)]
+    pub max_seconds: f64,
+
+    /// Force-close an utterance after this many seconds of open speech.
+    #[arg(long, default_value_t = 90.0)]
+    pub max_utterance_sec: f64,
+
+    /// Suppress mutable transcript.partial previews (committed deltas and
+    /// lifecycle events are unaffected; the first remedy for slow consumers).
+    #[arg(long)]
+    pub no_partials: bool,
+
+    /// Periodic session_stats heartbeat interval (0 = final only).
+    #[arg(long, default_value_t = 30.0)]
+    pub stats_interval_sec: f64,
+
+    /// Disable cross-trim/cross-utterance prompt carry.
+    #[arg(long)]
+    pub no_context: bool,
+
+    /// Capture ring capacity in seconds (absorbs slow-consumer stalls).
+    #[arg(long, default_value_t = 30.0)]
+    pub capture_buffer_sec: f64,
+
+    /// stdin-pcm sample rate in Hz.
+    #[arg(long, default_value_t = 16_000)]
+    pub stdin_rate: u32,
+
+    /// stdin-pcm channel count.
+    #[arg(long, default_value_t = 1)]
+    pub stdin_channels: u16,
+
+    /// stdin-pcm sample format.
+    #[arg(long, value_enum, default_value_t = StdinFormatArg::S16le)]
+    pub stdin_format: StdinFormatArg,
+
+    /// Disable VAD gating: one continuous utterance split only by
+    /// --max-utterance-sec (harness baselines, known-continuous feeds).
+    #[arg(long)]
+    pub no_vad: bool,
+
+    /// Energy gate above the running noise floor, in dB.
+    #[arg(long, default_value_t = 9.0)]
+    pub vad_gate_db: f64,
+
+    /// Sustained voice required before an utterance opens (ms).
+    #[arg(long, default_value_t = 250)]
+    pub vad_min_speech_ms: u64,
+
+    /// Sustained silence that closes an utterance (ms).
+    #[arg(long, default_value_t = 600)]
+    pub vad_endpoint_ms: u64,
+
+    /// List input devices as NDJSON and exit (no session).
+    #[arg(long)]
+    pub list_devices: bool,
 }
 
 #[derive(Debug, Subcommand)]
