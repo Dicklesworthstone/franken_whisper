@@ -5289,13 +5289,9 @@ mod tests {
             ..DecodeParams::default()
         };
         assert_eq!(resolve_window_enc_ctx(&fixed, 600, true, false), 300);
-        // no_timestamps prohibition: ANY policy degrades to full windows there
-        // (truncation removes the greedy decoder's only end-of-speech cue).
-        for policy in [
-            AudioCtxPolicy::Full,
-            AudioCtxPolicy::Auto,
-            AudioCtxPolicy::fixed(512),
-        ] {
+        // Reduced policies honor the no-timestamps prohibition (full windows —
+        // truncation there removes the greedy decoder's only end-of-speech cue).
+        for policy in [AudioCtxPolicy::Auto, AudioCtxPolicy::fixed(512)] {
             let p = DecodeParams {
                 audio_ctx: policy,
                 timestamps: false,
@@ -5304,6 +5300,21 @@ mod tests {
             assert_eq!(resolve_window_enc_ctx(&p, 24, false, true), FULL_ENC_CTX);
             assert_eq!(resolve_window_enc_ctx(&p, 24, true, true), FULL_ENC_CTX);
         }
+        // Full delegates to the HISTORICAL tail math unchanged — including its
+        // env-gated non-first tail truncation in no-timestamps mode
+        // (byte-exactness contract; the prohibition is a reduced-policy rule).
+        let full_no_ts = DecodeParams {
+            timestamps: false,
+            ..DecodeParams::default()
+        };
+        assert_eq!(
+            resolve_window_enc_ctx(&full_no_ts, 24, false, true),
+            MIN_ENC_CTX
+        );
+        assert_eq!(
+            resolve_window_enc_ctx(&full_no_ts, 24, true, true),
+            FULL_ENC_CTX
+        );
     }
 
     #[test]
@@ -5414,6 +5425,14 @@ mod tests {
     #[test]
     fn wav_reader_rejects_zero_channels() {
         let wav = synthetic_pcm_wav(0, &[]);
+        eprintln!(
+            "default windows: {:?}",
+            default_out
+                .windows
+                .iter()
+                .map(|w| (w.window_offset_sec, w.tokens))
+                .collect::<Vec<_>>()
+        );
         assert!(
             read_wav_16k_mono(&wav)
                 .expect_err("zero-channel PCM is invalid")

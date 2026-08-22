@@ -215,6 +215,14 @@ fn model_search_dirs() -> Vec<PathBuf> {
             root.join("whisper")
                 .join(crate::model_distribution::WHISPER_ARTIFACT_VERSION),
         );
+        dirs.push(
+            root.join("whisper")
+                .join(crate::model_distribution::TINY_EN_ARTIFACT_VERSION),
+        );
+        dirs.push(
+            root.join("whisper")
+                .join(crate::model_distribution::TINY_ARTIFACT_VERSION),
+        );
         dirs.push(root);
     }
     if let Ok(dir) = std::env::var("FRANKEN_WHISPER_TEST_MODEL_DIR")
@@ -229,6 +237,16 @@ fn model_search_dirs() -> Vec<PathBuf> {
             cache_root
                 .join("whisper")
                 .join(crate::model_distribution::WHISPER_ARTIFACT_VERSION),
+        );
+        dirs.push(
+            cache_root
+                .join("whisper")
+                .join(crate::model_distribution::TINY_EN_ARTIFACT_VERSION),
+        );
+        dirs.push(
+            cache_root
+                .join("whisper")
+                .join(crate::model_distribution::TINY_ARTIFACT_VERSION),
         );
         dirs.push(cache_root);
         dirs.push(
