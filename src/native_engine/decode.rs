@@ -398,6 +398,13 @@ pub struct DecodeWorkStats {
     pub accepted_result_tokens: usize,
     pub prompt_reset_retries: usize,
     pub temperature_fallback_retries: usize,
+    /// Total mel frames physically fed to the encoder across all windows
+    /// (bd-rt-audio-ctx-n4dj observability). Full-context windows contribute
+    /// `FRAMES_PER_CHUNK` (3000) each; a reduced [`AudioCtxPolicy`] window
+    /// contributes its truncated `2*effective_enc_ctx`, so this is the
+    /// deterministic, timing-free proof that context reduction engaged
+    /// end-to-end (and the number the live driver surfaces in session stats).
+    pub encoder_mel_frames: usize,
 }
 
 /// A long-form window the decoder discarded without emitting any transcript
@@ -2177,6 +2184,7 @@ fn decode_independent_no_timestamp_window(
         checkpoint,
     )?;
     work.encoder_calls = 1;
+    work.encoder_mel_frames = FRAMES_PER_CHUNK;
     super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
 
     let t_xkv = crate::native_engine::plat::Instant::now();
@@ -2381,6 +2389,7 @@ fn add_decode_work(total: &mut DecodeWorkStats, part: &DecodeWorkStats) {
     total.accepted_result_tokens += part.accepted_result_tokens;
     total.prompt_reset_retries += part.prompt_reset_retries;
     total.temperature_fallback_retries += part.temperature_fallback_retries;
+    total.encoder_mel_frames += part.encoder_mel_frames;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2890,6 +2899,7 @@ fn transcribe_samples_uncached(
             };
             if !reuses_cached_encode {
                 work.encoder_calls += 1;
+                work.encoder_mel_frames += mel_frames;
             }
             // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
             // no_timestamps advance is always CHUNK_CS, so the next offset is known and

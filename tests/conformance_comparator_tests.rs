@@ -1514,3 +1514,103 @@ fn gated_bridge_vs_native_conformance_jfk_tiny_en() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// bd-rt-audio-ctx-n4dj — DecodeParams::audio_ctx streaming encoder-context knob
+// ---------------------------------------------------------------------------
+
+/// Deterministic same-invocation A/B of the streaming encoder-context knob on
+/// jfk/tiny.en: `Full` (the byte-exact incumbent default) vs `Auto` vs
+/// `Fixed(512)`.
+///
+/// Gates ONLY on mechanism facts via the timing-free
+/// [`native_engine::decode::DecodeWorkStats::encoder_mel_frames`] counter:
+/// `Full` must feed the full padded 3000-frame window; `Auto`/`Fixed` must feed
+/// exactly the truncated counts derived from the clip's real length (first
+/// window included — a live stream is all first-window). Wall-clock and
+/// cross-policy WER numbers are PRINTED for the perf-ledger row and
+/// deliberately never asserted: a contended host must not flake this gate,
+/// and the expected WER delta is published honestly in `docs/PERF_LEDGER.md`
+/// rather than frozen into a pass/fail line here.
+#[test]
+fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
+    let Some(model_path) = native_engine::find_model_file("tiny.en") else {
+        eprintln!("SKIP gated_audio_ctx_policy_mechanism_ab: tiny.en model missing");
+        return;
+    };
+    let bytes = std::fs::read(jfk_wav_path()).expect("read jfk.wav");
+    let samples = read_wav_16k_mono(&bytes).expect("decode jfk.wav to 16k mono");
+    let model = NativeWhisperModel::load(&model_path).expect("load tiny.en");
+    let noop = || Ok(());
+
+    let run = |audio_ctx: native_engine::decode::AudioCtxPolicy| -> (_, std::time::Duration) {
+        let params = native_engine::decode::DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads: 4,
+            max_text_ctx: None,
+            audio_ctx,
+            ..Default::default()
+        };
+        let t = std::time::Instant::now();
+        let out = model
+            .transcribe(&samples, &params, &noop)
+            .expect("transcribe");
+        (out, t.elapsed())
+    };
+
+    // Mirror of the engine's real-frame derivation (decode.rs seek_end_cs):
+    // n_len_org = 1 + (n_samples - 200) / 160, saturated at 0 numerator.
+    let n = samples.len() as i64;
+    let real_frames = usize::try_from(n.saturating_sub(200) / 160 + 1).unwrap_or(0);
+    let auto_ctx = real_frames.div_ceil(2).clamp(64, 1500);
+
+    let (full, full_wall) = run(native_engine::decode::AudioCtxPolicy::Full);
+    let (auto, auto_wall) = run(native_engine::decode::AudioCtxPolicy::Auto);
+    let (fixed, fixed_wall) = run(native_engine::decode::AudioCtxPolicy::fixed(512));
+
+    // ── Mechanism gates (deterministic, timing-free) ──
+    assert_eq!(
+        full.work.encoder_mel_frames, 3000,
+        "Full must encode the full padded single window"
+    );
+    assert_eq!(
+        auto.work.encoder_mel_frames,
+        auto_ctx * 2,
+        "Auto must truncate to ceil(real/2) clamped, FIRST WINDOW INCLUDED"
+    );
+    assert_eq!(
+        fixed.work.encoder_mel_frames,
+        512_usize.min(auto_ctx) * 2,
+        "Fixed(512) feeds min(explicit cap, real-derived ctx) mel frames"
+    );
+    assert_eq!(
+        full.windows.len(),
+        auto.windows.len(),
+        "context policy must not change window segmentation"
+    );
+
+    // ── Published (not asserted) quality/cost numbers for the ledger row ──
+    let full_text = joined_text(&full.segments);
+    let auto_text = joined_text(&auto.segments);
+    let fixed_text = joined_text(&fixed.segments);
+    let wer_auto = word_error_rate_edit(&full_text, &auto_text);
+    let wer_fixed = word_error_rate_edit(&full_text, &fixed_text);
+    eprintln!(
+        "audio_ctx A/B (jfk, tiny.en, greedy, timestamps on): real_frames={real_frames} auto_ctx={auto_ctx}"
+    );
+    eprintln!("  walls: full={full_wall:?} auto={auto_wall:?} fixed={fixed_wall:?}");
+    eprintln!(
+        "  encoder_mel_frames: full={} auto={} fixed={}",
+        full.work.encoder_mel_frames, auto.work.encoder_mel_frames, fixed.work.encoder_mel_frames
+    );
+    eprintln!("  WER vs Full: auto={wer_auto:.4} fixed={wer_fixed:.4}");
+    eprintln!("  FULL : {full_text}");
+    eprintln!("  AUTO : {auto_text}");
+    eprintln!("  FIXED: {fixed_text}");
+    assert!(
+        !full_text.is_empty() && !auto_text.is_empty(),
+        "both policies must produce a transcript on the jfk fixture"
+    );
+}
