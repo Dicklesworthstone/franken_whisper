@@ -90,7 +90,7 @@ MAX_RETRIES=3
 DOWNLOAD_TIMEOUT=120
 # The two compiled model packages occupy 2,117,087,997 bytes. Reserve modest
 # filesystem/metadata headroom before beginning a fresh default pull.
-MIN_MODEL_CACHE_KB=2250000
+MIN_MODEL_CACHE_KB=2400000
 # shellcheck disable=SC2034  # informational metadata, not read by the script
 INSTALLER_VERSION="2.0.0"
 
@@ -1314,7 +1314,7 @@ provision_default_models() {
             log_success "Verified existing native Whisper and Sortformer models under $cache_root"
             return 0
         fi
-        die "Insufficient free space for both native model packages under $cache_root (need at least 2.25 GB available)"
+        die "Insufficient free space for the native model packages under $cache_root (need at least 2.4 GB available)"
     elif [ -z "$available_model_kb" ]; then
         log_warn "Could not measure free space for the model cache; the verified pull will fail closed on an I/O error"
     fi

@@ -1624,6 +1624,14 @@ where
     .is_ok();
     let sortformer_available =
         crate::model_distribution::cached_sortformer_readiness_with_cancel(&is_cancelled)?;
+    let tiny_en_available = crate::model_distribution::cached_fast_lane_readiness_with_cancel(
+        crate::model_distribution::FastLaneModel::TinyEn,
+        &is_cancelled,
+    )?;
+    let tiny_available = crate::model_distribution::cached_fast_lane_readiness_with_cancel(
+        crate::model_distribution::FastLaneModel::Tiny,
+        &is_cancelled,
+    )?;
 
     Ok(json!({
         "schema_version": "franken-whisper-model-registry-v2",
@@ -1665,6 +1673,60 @@ where
                     "fw robot run --input AUDIO"
                 } else {
                     "fw pull whisper --json"
+                },
+            },
+            {
+                "id": "native-whisper-tiny-en-fast-lane",
+                "kind": "whisper_asr",
+                "role": "fast_lane_streaming",
+                "tasks": ["streaming_transcription"],
+                "runtime_status": if tiny_en_available { "ready" } else { "missing_artifact" },
+                "installed": tiny_en_available,
+                "artifact": {
+                    "format": "ggml",
+                    "filename": crate::model_distribution::TINY_EN_WEIGHTS_FILENAME,
+                    "bytes": crate::model_distribution::TINY_EN_WEIGHTS_BYTES,
+                    "sha256": crate::model_distribution::TINY_EN_WEIGHTS_SHA256,
+                    "artifact_version": crate::model_distribution::TINY_EN_ARTIFACT_VERSION,
+                    "precision": "f16",
+                    "preparation_recipe": crate::model_distribution::WHISPER_PREPARATION_RECIPE,
+                    "weight_bytes_identity_preserved": true,
+                    "validation": "compiled_size_and_sha256_then_header_and_tensor_contract_at_load",
+                    "redistribution": crate::model_distribution::WHISPER_DISTRIBUTION_POLICY,
+                    "license": "MIT",
+                    "license_url": crate::model_distribution::WHISPER_LICENSE_URL,
+                },
+                "next_command": if tiny_en_available {
+                    "fw robot listen --language en"
+                } else {
+                    "fw pull tiny-en --json"
+                },
+            },
+            {
+                "id": "native-whisper-tiny-fast-lane",
+                "kind": "whisper_asr",
+                "role": "fast_lane_streaming",
+                "tasks": ["streaming_transcription", "language_detection"],
+                "runtime_status": if tiny_available { "ready" } else { "missing_artifact" },
+                "installed": tiny_available,
+                "artifact": {
+                    "format": "ggml",
+                    "filename": crate::model_distribution::TINY_WEIGHTS_FILENAME,
+                    "bytes": crate::model_distribution::TINY_WEIGHTS_BYTES,
+                    "sha256": crate::model_distribution::TINY_WEIGHTS_SHA256,
+                    "artifact_version": crate::model_distribution::TINY_ARTIFACT_VERSION,
+                    "precision": "f16",
+                    "preparation_recipe": crate::model_distribution::WHISPER_PREPARATION_RECIPE,
+                    "weight_bytes_identity_preserved": true,
+                    "validation": "compiled_size_and_sha256_then_header_and_tensor_contract_at_load",
+                    "redistribution": crate::model_distribution::WHISPER_DISTRIBUTION_POLICY,
+                    "license": "MIT",
+                    "license_url": crate::model_distribution::WHISPER_LICENSE_URL,
+                },
+                "next_command": if tiny_available {
+                    "fw robot listen"
+                } else {
+                    "fw pull tiny --json"
                 },
             },
             {
@@ -1754,6 +1816,17 @@ where
         .and_then(|entry| entry["installed"].as_bool())
         .unwrap_or(false);
     let default_pipeline_ready = whisper_ready && sortformer_ready;
+    let fast_lane_installed = |id: &str| -> bool {
+        models["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["id"] == id)
+            .and_then(|entry| entry["installed"].as_bool())
+            .unwrap_or(false)
+    };
+    let tiny_en_ready = fast_lane_installed("native-whisper-tiny-en-fast-lane");
+    let tiny_ready = fast_lane_installed("native-whisper-tiny-fast-lane");
 
     let mut recommendations = Vec::new();
     if default_pipeline_ready {
@@ -1785,6 +1858,12 @@ where
             "command": "fw pull sortformer --json",
         }));
     }
+    if !tiny_ready {
+        recommendations.push(json!({
+            "reason": "the multilingual fast-lane package for `fw robot listen` is not cached (sessions fall back to the turbo model with the confirm lane disabled)",
+            "command": "fw pull tiny --json",
+        }));
+    }
 
     Ok(json!({
         "schema_version": "franken-whisper-doctor-v1",
@@ -1803,6 +1882,18 @@ where
                 "native_default_ready_accuracy_certification_pending"
             } else {
                 "not_cached_run_fw_pull_sortformer"
+            },
+        },
+        "listen_ready": {
+            "fast_lane_tiny_en": tiny_en_ready,
+            "fast_lane_tiny": tiny_ready,
+            "quality_model": whisper_ready,
+            "status": if tiny_en_ready && tiny_ready && whisper_ready {
+                "preflight_ready_unverified"
+            } else if whisper_ready {
+                "degraded_fast_model_fallback_available"
+            } else {
+                "action_required"
             },
         },
         "health": health_value,

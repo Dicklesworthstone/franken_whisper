@@ -418,6 +418,11 @@ pub enum PullModelArg {
     All,
     Whisper,
     Sortformer,
+    /// Fast-lane streaming package for `fw robot listen` (English-only).
+    TinyEn,
+    /// Fast-lane streaming package for `fw robot listen` (multilingual;
+    /// the default fast model when `--language` is unset or non-English).
+    Tiny,
 }
 
 /// Explicit model-download controls. No other command performs network access.

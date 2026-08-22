@@ -183,10 +183,14 @@ fn sortformer_audio_duration_ms(sample_count: usize) -> FwResult<u64> {
 fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
     let pull_whisper = matches!(model, PullModelArg::All | PullModelArg::Whisper);
     let pull_sortformer = matches!(model, PullModelArg::All | PullModelArg::Sortformer);
+    let pull_tiny_en = matches!(model, PullModelArg::All | PullModelArg::TinyEn);
+    let pull_tiny = matches!(model, PullModelArg::All | PullModelArg::Tiny);
     let requested_model = match model {
         PullModelArg::All => "all",
         PullModelArg::Whisper => "whisper",
         PullModelArg::Sortformer => "sortformer",
+        PullModelArg::TinyEn => "tiny-en",
+        PullModelArg::Tiny => "tiny",
     };
     let result = (|| {
         let mut pulled = Vec::new();
@@ -248,6 +252,52 @@ fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
                 "package_sha256": outcome.package.package_sha256,
                 "distribution_policy": franken_whisper::model_distribution::SORTFORMER_DISTRIBUTION_POLICY,
                 "model_license_notice": franken_whisper::model_distribution::SORTFORMER_REQUIRED_NOTICE,
+            }));
+        }
+        for (enabled, fast_lane) in [
+            (
+                pull_tiny_en,
+                franken_whisper::model_distribution::FastLaneModel::TinyEn,
+            ),
+            (
+                pull_tiny,
+                franken_whisper::model_distribution::FastLaneModel::Tiny,
+            ),
+        ] {
+            if !enabled {
+                continue;
+            }
+            let name = fast_lane.pull_name();
+            let outcome = franken_whisper::model_distribution::pull_fast_lane(
+                fast_lane,
+                ShutdownController::is_shutting_down,
+                |line| {
+                    if !json_output {
+                        eprintln!("fw pull {name}: {line}");
+                    }
+                },
+            )?;
+            if !json_output {
+                eprintln!(
+                    "fw pull {name}: ready ({})",
+                    if outcome.from_cache {
+                        "already cached"
+                    } else {
+                        "downloaded and verified"
+                    }
+                );
+            }
+            pulled.push(serde_json::json!({
+                "model": name,
+                "role": "fast_lane_streaming",
+                "status": "ready",
+                "from_cache": outcome.from_cache,
+                "artifact_version": outcome.package.artifact_version,
+                "package_sha256": outcome.package.weights_sha256,
+                "distribution_policy": franken_whisper::model_distribution::WHISPER_DISTRIBUTION_POLICY,
+                "license": "MIT",
+                "weight_bytes_identity_preserved": true,
+                "preparation_recipe": franken_whisper::model_distribution::WHISPER_PREPARATION_RECIPE,
             }));
         }
         Ok::<_, FwError>(pulled)
