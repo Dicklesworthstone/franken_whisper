@@ -4140,6 +4140,20 @@ mod tests {
             })
         ));
 
+        for (arg, expected) in [
+            ("tiny-en", PullModelArg::TinyEn),
+            ("tiny", PullModelArg::Tiny),
+        ] {
+            let parsed = Cli::try_parse_from(["fw", "pull", arg, "--json"])
+                .unwrap_or_else(|e| panic!("pull {arg} must parse: {e}"));
+            match parsed.command {
+                Command::Pull(args) => {
+                    assert_eq!(args.model, expected, "pull {arg} target");
+                    assert!(args.json);
+                }
+                other => panic!("pull {arg} parsed to {other:?}"),
+            }
+        }
         let pull_default = Cli::try_parse_from(["fw", "pull"]).expect("default pull command");
         assert!(matches!(
             pull_default.command,
