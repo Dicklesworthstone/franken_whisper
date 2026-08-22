@@ -517,8 +517,10 @@ mod tests {
 
     #[test]
     fn prompt_front_truncates_at_word_boundary() {
-        let mut small = SessionBufferConfig::default();
-        small.prompt_cap_chars = 12;
+        let small = SessionBufferConfig {
+            prompt_cap_chars: 12,
+            ..SessionBufferConfig::default()
+        };
         let mut b = SessionBuffer::new(small);
         b.append_committed_text("alpha beta gamma delta");
         let p = b.prompt().expect("prompt");
@@ -533,8 +535,10 @@ mod tests {
 
     #[test]
     fn cross_utterance_tail_respects_its_own_cap() {
-        let mut c = SessionBufferConfig::default();
-        c.cross_utterance_tail_chars = 10;
+        let c = SessionBufferConfig {
+            cross_utterance_tail_chars: 10,
+            ..SessionBufferConfig::default()
+        };
         let mut b = SessionBuffer::new(c);
         b.append_committed_text("one two three four five six");
         b.end_utterance();
@@ -544,8 +548,10 @@ mod tests {
 
     #[test]
     fn no_context_disables_all_carry() {
-        let mut c = SessionBufferConfig::default();
-        c.prompt_carry = false;
+        let c = SessionBufferConfig {
+            prompt_carry: false,
+            ..SessionBufferConfig::default()
+        };
         let mut b = SessionBuffer::new(c);
         b.append_committed_text("ignored");
         b.end_utterance();
@@ -561,9 +567,11 @@ mod tests {
 
     #[test]
     fn multibyte_text_never_splits_in_prompt_paths() {
-        let mut c = SessionBufferConfig::default();
-        c.prompt_cap_chars = 5;
-        c.cross_utterance_tail_chars = 5;
+        let c = SessionBufferConfig {
+            prompt_cap_chars: 5,
+            cross_utterance_tail_chars: 5,
+            ..SessionBufferConfig::default()
+        };
         let mut b = SessionBuffer::new(c);
         b.append_committed_text("héllo wörld émoji");
         b.end_utterance();
