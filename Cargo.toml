@@ -149,8 +149,9 @@ ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", de
 # For the hugepage_gemv_probe (madvise(MADV_HUGEPAGE) A/B on weight streaming).
 # Already a transitive dependency; dev-only, does not affect the shipped binary.
 libc = "0.2"
-# bd-rt-vad-stream-ulp5: second-tier voice-activity classifier under
-# evaluation for the StreamingVad seam (pure Rust, zero deps, MIT/Apache-2.0).
+# bd-rt-vad-stream-ulp5 VERDICT: rejected for the VAD tier-2 default (passes
+# loud music at every usable threshold); kept only for the ignored
+# re-evaluation battery in src/listen.rs.
 earshot = "1.2.2"
 
 [[bench]]

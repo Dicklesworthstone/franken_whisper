@@ -1095,14 +1095,18 @@ mod tests {
     //
     // Decision rule (locked in the bead): ship energy pre-gate + earshot
     // only if the classifier measurably vetoes loud non-speech without
-    // hurting speech recall. Measured result (2026-08-22): harmonic music
-    // at -14 dBFS scores ~0.89 mean / 0.96 max — earshot PASSES loud music
-    // at every usable threshold, so a tier-2 veto adds nothing where the
-    // energy gate actually needs help. Energy-only v1 stands. These tests
-    // are #[ignore]d: they document the negative result and stay runnable
-    // (`cargo test --lib earshot_eval -- --ignored --nocapture`) for
-    // re-evaluation against future earshot versions. Full numbers live in
-    // the bead close comment.
+    // hurting speech recall. Measured result (2026-08-22, release build):
+    // harmonic music at -14 dBFS scores mean 0.886 / max 0.958 — 99.5% of
+    // frames PASS the 0.5 voice threshold and still 80% pass at 0.85;
+    // raising the cutoff to 0.95 finally vetoes the music but kills half
+    // the real speech (jfk.wav mask-recall 0.50). No separating threshold
+    // exists. Hum/noise rejection IS excellent (0.00 / 0.04) and cost is
+    // trivial (4.2 us per 16 ms frame, ~RTF 0.00026) — but loud music is
+    // exactly the case the relative-energy gate cannot veto.
+    // Energy-only v1 ships; the tests below document the negative result
+    // and stay runnable (`cargo test --lib earshot_eval -- --ignored
+    // --nocapture`) for re-evaluation against future earshot versions;
+    // full numbers live in the bead close comment.
     // -----------------------------------------------------------------------
 
     /// earshot's native input frame: 256 samples @ 16 kHz = 16 ms.
@@ -1191,22 +1195,20 @@ mod tests {
             .collect()
     }
 
-    #[ignore = "bd-rt-vad-stream-ulp5 verdict: earshot REJECTED — passes loud music at every usable threshold; kept as a re-evaluation harness"]
+    #[ignore = "bd-rt-vad-stream-ulp5 verdict: earshot REJECTED — music -14 dB passes at every usable threshold (0.995@0.5, 0.80@0.85); kept as a re-evaluation harness"]
     #[test]
     fn earshot_eval_raw_scores_on_labeled_fixtures() {
-        // Exact labels by construction for synthetics; for the real speech
         // clip the reference mask is a BATCH energy mask (p75 of frame RMS)
         // — eval-only ground truth approximation, never runtime logic.
         // Every fixture is scored and printed BEFORE any assertion so one
         // manual run records the complete matrix.
         let dur = |v: &[f32]| v.len() as f64 / SAMPLE_RATE as f64;
 
-        let music = music_signal(SAMPLE_RATE as usize * 6, -14.0);
-        let noise = lcg_noise(SAMPLE_RATE as usize * 4, 0xC0FFEE, -20.0);
+        let music = music_signal(SAMPLE_RATE * 6, -14.0);
+        let noise = lcg_noise(SAMPLE_RATE * 4, 0xC0FFEE, -20.0);
         let hum = hum_signal(SAMPLE_RATE as usize * 4, -18.0);
         let mut violations: Vec<String> = Vec::new();
-        let mut row = |name: &str, samples: &[f32], scores: &[f32],
-                       violations: &mut Vec<String>| {
+        let row = |name: &str, samples: &[f32], scores: &[f32], violations: &mut Vec<String>| {
             let voiced = scores.iter().filter(|&&s| s >= 0.5).count();
             let frac = f64::from(voiced as u32) / scores.len() as f64;
             println!(
@@ -1229,7 +1231,12 @@ mod tests {
             &earshot_scores(&noise),
             &mut violations,
         );
-        row("mains hum -18 dB", &hum, &earshot_scores(&hum), &mut violations);
+        row(
+            "mains hum -18 dB",
+            &hum,
+            &earshot_scores(&hum),
+            &mut violations,
+        );
 
         let jfk = jfk_samples();
         let speech_scores = earshot_scores(&jfk);
@@ -1259,8 +1266,8 @@ mod tests {
         // music while still catching speech?
         println!("threshold sweep [t]: music-pass-rate | jfk-mask-recall");
         for t in [0.30_f32, 0.50, 0.70, 0.85, 0.95] {
-            let mp = music_scores.iter().filter(|&&s| s >= t).count() as f64
-                / music_scores.len() as f64;
+            let mp =
+                music_scores.iter().filter(|&&s| s >= t).count() as f64 / music_scores.len() as f64;
             let rec = rms
                 .iter()
                 .zip(&speech_scores)
@@ -1276,10 +1283,9 @@ mod tests {
         );
     }
 
-    #[ignore = "accuracy verdict is already negative; debug-profile timing on shared rch workers is not decision-grade"]
+    #[ignore = "accuracy verdict is negative (see raw-scores harness); cost itself is fine — 4.2 us/16ms frame release; debug timing on shared rch workers is not decision-grade"]
     #[test]
     fn earshot_eval_cost_per_frame_is_far_under_step_budget() {
-        // Budget shape: a 100 ms driver step carries 5 VAD frames; tier-2
         // may cost at most ~1 ms per step => <=200 us per 16 ms predict.
         let audio = music_signal(SAMPLE_RATE as usize * 10, -14.0);
         let mut det = earshot::Detector::default_boxed();
