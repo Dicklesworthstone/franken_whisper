@@ -2399,7 +2399,7 @@ mod tests {
     use super::{
         LISTEN_SESSION_START_REQUIRED_FIELDS, LISTEN_SESSION_STATS_REQUIRED_FIELDS,
         LISTEN_WARNING_REQUIRED_FIELDS, ListenSessionInfo, ListenSessionStats,
-        NdjsonStreamValidator, SPEECH_STARTED_REQUIRED_FIELDS, StreamOutcome,
+        NdjsonStreamValidator, ROBOT_SCHEMA_VERSION, SPEECH_STARTED_REQUIRED_FIELDS, StreamOutcome,
         TRANSCRIPT_DELTA_REQUIRED_FIELDS, UTTERANCE_END_REQUIRED_FIELDS,
         UTTERANCE_END_TEXT_CAP_BYTES, UtteranceEndReason, listen_session_start_value,
         listen_session_stats_value, listen_warning_value, speech_started_value,
