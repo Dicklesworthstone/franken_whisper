@@ -7354,4 +7354,38 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
         });
     }
+
+    /// bd-4ep1: cross-platform STAGE fingerprints on the real jfk.wav with
+    /// the real tiny.en model. Our own kernels must be platform-consistent:
+    /// identical bits on aarch64 macOS and x86_64 Linux. The first stage
+    /// whose fingerprints DIFFER localizes where the tie-flip epsilon enters
+    /// (tiled jfk flips one token at step 60 between platforms).
+    #[test]
+    fn bd_4ep1_stage_fingerprints_cross_platform() {
+        let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP bd_4ep1_stage_fingerprints: tiny.en model or jfk.wav missing");
+            return;
+        };
+        let fp = |label: &str, slice: &[f32]| {
+            let h = slice.iter().fold(0xC0FFEEu64, |acc, f| {
+                acc.rotate_left(7) ^ (f.to_bits() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            });
+            eprintln!("FP-{label} len={} {:016x}", slice.len(), h);
+        };
+
+        // STAGE 1: log-mel frontend over the full clip.
+        let full = mel::log_mel(&samples, &model.filters, 4).expect("mel");
+        eprintln!(
+            "FP-MELDIM frames={} bins={}",
+            full.n_frames,
+            full.data.len() / full.n_frames.max(1)
+        );
+        fp("MEL", &full.data);
+
+        // STAGE 2: encoder over the first 30 s chunk.
+        let frames = FRAMES_PER_CHUNK.min(full.n_frames);
+        let enc = encoder::forward_from_full_mel_window(&model.encoder, &full, 0, frames, 4, &noop)
+            .expect("encoder");
+        fp("ENC", &enc.data);
+    }
 }
