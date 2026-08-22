@@ -535,7 +535,7 @@ fn golden_corpus_cross_engine_parity_harness() {
     };
 
     let bundle = ConformanceArtifactBundle {
-        schema_version: "1.0.0".to_owned(),
+        schema_version: franken_whisper::robot::ROBOT_SCHEMA_VERSION.to_owned(),
         generated_at_rfc3339: chrono::Utc::now().to_rfc3339(),
         gate_summary,
         fixture_reports,

@@ -9,7 +9,12 @@ use crate::model::{
     RunEvent, RunReport, TranscriptionResult, TranscriptionSegment,
 };
 
-pub const ROBOT_SCHEMA_VERSION: &str = "1.0.0";
+// 1.0.0 -> 1.1.0 (bd-rt-events-ghdx): additive minor bump introducing the
+// real-time listen session event family (listen.session_start,
+// speech_started, transcript.delta, utterance_end, listen.warning,
+// listen.session_stats). No existing field was renamed or removed; 1.0.0
+// consumers that ignore unknown fields/events are unaffected.
+pub const ROBOT_SCHEMA_VERSION: &str = "1.1.0";
 
 pub const STAGE_REQUIRED_FIELDS: &[&str] = &[
     "event",
@@ -597,6 +602,650 @@ pub fn emit_speculation_stats(
     stats: &crate::speculation::SpeculationStats,
 ) -> FwResult<()> {
     emit_line(&speculation_stats_value(run_id, stats))
+}
+
+// ---------------------------------------------------------------------------
+// bd-rt-events-ghdx: Real-time listen session robot events (schema 1.1.0)
+//
+// Contract summary (docs/realtime-streaming.md will carry the prose):
+// - One id: `run_id` — a live session IS a run; `utterance_id` (monotonic u32
+//   from 1) is the sub-grouping key. There is no separate session id.
+// - Listen streams NEVER emit run_start or run_complete. `listen.session_start`
+//   is the acceptance signal; a SUCCESS stream terminates with a final
+//   `listen.session_stats` (`final: true`) and exit 0; a FATAL stream
+//   terminates with `run_error` (final stats best-effort before it).
+// - `transcript.delta` is append-only committed text: concatenating an
+//   utterance's deltas yields its committed transcript, never rewritten by
+//   later deltas. `transcript.partial` remains the mutable tail preview.
+// - `transcript.confirm` / `transcript.correct` may arrive AFTER their
+//   utterance's `utterance_end` (async quality lane) and carry `utterance_id`.
+// ---------------------------------------------------------------------------
+
+pub const LISTEN_SESSION_START_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "source",
+    "capture_backend",
+    "device",
+    "sample_rate_hz",
+    "fast_model",
+    "quality_model",
+    "policy",
+    "step_ms",
+    "partials",
+    "vad",
+];
+
+pub const SPEECH_STARTED_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "t_session_sec",
+];
+
+pub const TRANSCRIPT_DELTA_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "text",
+    "t0_sec",
+    "t1_sec",
+    "tokens",
+    "confidence",
+    "stability",
+];
+
+pub const UTTERANCE_END_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "reason",
+    "t0_sec",
+    "t1_sec",
+    "text",
+    "text_truncated",
+    "delta_count",
+];
+
+pub const LISTEN_WARNING_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "reason",
+    "detail",
+];
+
+pub const LISTEN_SESSION_STATS_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "final",
+    "audio_sec",
+    "wall_sec",
+    "deltas",
+    "utterances",
+    "capture_overruns",
+    "mean_step_latency_ms",
+    "p95_step_latency_ms",
+    "ttft_ms",
+    "policy_holdbacks",
+];
+
+/// `utterance_end.text` cap: beyond this the field is truncated (on a UTF-8
+/// boundary) with `text_truncated: true`; the full text remains
+/// reconstructable from the utterance's deltas, which are never truncated.
+pub const UTTERANCE_END_TEXT_CAP_BYTES: usize = 32 * 1024;
+
+/// Why an utterance closed (`utterance_end.reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtteranceEndReason {
+    /// VAD detected end of speech (the normal, actionable case).
+    Endpoint,
+    /// `--max-utterance-sec` exceeded mid-speech; the next utterance opens
+    /// immediately in the Speech state.
+    Timeout,
+    /// Session buffer forced-trim cascade under pathological continuous
+    /// speech (degraded; see SessionBuffer cap notes).
+    MaxLen,
+    /// Source EOF / Ctrl-C / `--max-seconds` while speech was open.
+    SessionEnd,
+}
+
+impl UtteranceEndReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Endpoint => "endpoint",
+            Self::Timeout => "timeout",
+            Self::MaxLen => "max_len",
+            Self::SessionEnd => "session_end",
+        }
+    }
+}
+
+/// Self-describing header for a live session (`listen.session_start`
+/// payload). The event marks "model loaded, capture running, ready" —
+/// agents key on it before feeding audio expectations.
+#[derive(Debug, Clone)]
+pub struct ListenSessionInfo {
+    /// `mic` | `stdin-pcm` | `file-replay`.
+    pub source: String,
+    /// `cpal` | `ffmpeg` (or `none` for non-device sources).
+    pub capture_backend: String,
+    pub device: String,
+    pub sample_rate_hz: u32,
+    pub fast_model: String,
+    /// `None` when the confirm lane is disabled.
+    pub quality_model: Option<String>,
+    /// `alignatt` | `local-agreement` | `endpoint-commit`.
+    pub policy: String,
+    pub step_ms: u64,
+    /// Whether mutable `transcript.partial` previews are emitted
+    /// (`--no-partials` sets this false).
+    pub partials: bool,
+    /// VAD parameter snapshot (opaque object; agents display, not parse).
+    pub vad: serde_json::Value,
+}
+
+/// Session counters for `listen.session_stats` (periodic heartbeat and the
+/// success-terminal final event).
+#[derive(Debug, Clone, Default)]
+pub struct ListenSessionStats {
+    pub audio_sec: f64,
+    pub wall_sec: f64,
+    pub deltas: u64,
+    pub utterances: u64,
+    pub capture_overruns: u64,
+    pub mean_step_latency_ms: f64,
+    pub p95_step_latency_ms: f64,
+    /// Wall time from session start to the first `transcript.delta`;
+    /// `None` until one is emitted.
+    pub ttft_ms: Option<f64>,
+    pub policy_holdbacks: u64,
+}
+
+/// Construct a `listen.session_start` NDJSON event value.
+#[must_use]
+pub fn listen_session_start_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    info: &ListenSessionInfo,
+) -> serde_json::Value {
+    json!({
+        "event": "listen.session_start",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "source": info.source,
+        "capture_backend": info.capture_backend,
+        "device": info.device,
+        "sample_rate_hz": info.sample_rate_hz,
+        "fast_model": info.fast_model,
+        "quality_model": info.quality_model,
+        "policy": info.policy,
+        "step_ms": info.step_ms,
+        "partials": info.partials,
+        "vad": info.vad,
+    })
+}
+
+/// Construct a `speech_started` NDJSON event value (VAD onset; barge-in
+/// trigger for downstream voice loops).
+#[must_use]
+pub fn speech_started_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    utterance_id: u32,
+    t_session_sec: f64,
+) -> serde_json::Value {
+    json!({
+        "event": "speech_started",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "utterance_id": utterance_id,
+        "t_session_sec": t_session_sec,
+    })
+}
+
+/// Construct a `transcript.delta` NDJSON event value — the append-only
+/// committed-text stream agents act on.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn transcript_delta_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    utterance_id: u32,
+    text: &str,
+    t0_sec: f64,
+    t1_sec: f64,
+    tokens: u64,
+    confidence: Option<f64>,
+) -> serde_json::Value {
+    json!({
+        "event": "transcript.delta",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "utterance_id": utterance_id,
+        "text": text,
+        "t0_sec": t0_sec,
+        "t1_sec": t1_sec,
+        "tokens": tokens,
+        "confidence": confidence,
+        "stability": "committed",
+    })
+}
+
+/// Truncate to at most `cap` bytes on a UTF-8 character boundary.
+fn truncate_utf8(text: &str, cap: usize) -> (&str, bool) {
+    if text.len() <= cap {
+        return (text, false);
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+/// Construct an `utterance_end` NDJSON event value — the "act now" signal.
+///
+/// `text` is the full committed utterance (concatenated deltas); beyond
+/// [`UTTERANCE_END_TEXT_CAP_BYTES`] it is truncated with
+/// `text_truncated: true` (deltas are never truncated, so the full text
+/// remains reconstructable).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn utterance_end_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    utterance_id: u32,
+    reason: UtteranceEndReason,
+    t0_sec: f64,
+    t1_sec: f64,
+    text: &str,
+    delta_count: u64,
+) -> serde_json::Value {
+    let (emitted, truncated) = truncate_utf8(text, UTTERANCE_END_TEXT_CAP_BYTES);
+    json!({
+        "event": "utterance_end",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "utterance_id": utterance_id,
+        "reason": reason.as_str(),
+        "t0_sec": t0_sec,
+        "t1_sec": t1_sec,
+        "text": emitted,
+        "text_truncated": truncated,
+        "delta_count": delta_count,
+    })
+}
+
+/// Construct a `listen.warning` NDJSON event value (structured non-fatal
+/// degradation: silent_input, capture_overrun, fallback_capture_backend,
+/// fast_model_fallback, quality_model_unavailable, confirm_lag, forced_trim,
+/// decode_behind, persist_degraded, endpoint_flush_timeout, ...).
+#[must_use]
+pub fn listen_warning_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    reason: &str,
+    detail: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "event": "listen.warning",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "reason": reason,
+        "detail": detail,
+    })
+}
+
+/// Construct a `listen.session_stats` NDJSON event value. Periodic emissions
+/// (`final: false`) double as a liveness heartbeat during long silence; the
+/// success terminal is the final emission (`final: true`).
+#[must_use]
+pub fn listen_session_stats_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    stats: &ListenSessionStats,
+    is_final: bool,
+) -> serde_json::Value {
+    json!({
+        "event": "listen.session_stats",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "final": is_final,
+        "audio_sec": stats.audio_sec,
+        "wall_sec": stats.wall_sec,
+        "deltas": stats.deltas,
+        "utterances": stats.utterances,
+        "capture_overruns": stats.capture_overruns,
+        "mean_step_latency_ms": stats.mean_step_latency_ms,
+        "p95_step_latency_ms": stats.p95_step_latency_ms,
+        "ttft_ms": stats.ttft_ms,
+        "policy_holdbacks": stats.policy_holdbacks,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// bd-rt-events-ghdx: shared listen-stream invariant validator
+// ---------------------------------------------------------------------------
+
+/// Expected terminal shape of a listen stream (derived from the process exit
+/// code by callers: 0 => Success, nonzero => Fatal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// Terminates with a final `listen.session_stats` (`final: true`).
+    Success,
+    /// Terminates with `run_error` (final stats best-effort before it).
+    Fatal,
+}
+
+/// The single shared invariant engine for listen NDJSON streams
+/// (bd-rt-events-ghdx polish item 5). Reused by the e2e suite, the TTY
+/// relay round-trip test, and the TUI sink-ordering test — one set of teeth.
+///
+/// On violation, the error message names the invariant, the offending event
+/// index and JSON, and up to three events of context on either side.
+pub struct NdjsonStreamValidator {
+    pub outcome: StreamOutcome,
+}
+
+impl NdjsonStreamValidator {
+    #[must_use]
+    pub fn new(outcome: StreamOutcome) -> Self {
+        Self { outcome }
+    }
+
+    /// Validate a parsed listen event stream against the full 1.1.0 listen
+    /// contract. Returns the first violation as a detailed message.
+    pub fn validate(&self, events: &[serde_json::Value]) -> Result<(), String> {
+        if events.is_empty() {
+            return Err("empty stream: expected at least listen.session_start".into());
+        }
+        let name = |e: &serde_json::Value| -> String {
+            e.get("event")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<missing>")
+                .to_owned()
+        };
+
+        // Per-event structural checks.
+        let mut last_seq: Option<u64> = None;
+        for (idx, event) in events.iter().enumerate() {
+            let kind = name(event);
+            if kind == "<missing>" {
+                return Err(violation(
+                    events,
+                    idx,
+                    "every event carries a string `event` field",
+                ));
+            }
+            match event.get("schema_version").and_then(|v| v.as_str()) {
+                Some(ROBOT_SCHEMA_VERSION) => {}
+                _ => {
+                    return Err(violation(
+                        events,
+                        idx,
+                        "every event carries schema_version == ROBOT_SCHEMA_VERSION",
+                    ));
+                }
+            }
+            if kind == "run_start" || kind == "run_complete" {
+                return Err(violation(
+                    events,
+                    idx,
+                    "listen streams never emit run_start/run_complete",
+                ));
+            }
+            if let Some(required) = listen_required_fields(&kind) {
+                for field in required {
+                    if event.get(*field).is_none() {
+                        return Err(violation(
+                            events,
+                            idx,
+                            &format!("`{kind}` is missing required field `{field}`"),
+                        ));
+                    }
+                }
+            }
+            if let Some(seq) = event.get("seq").and_then(serde_json::Value::as_u64) {
+                if let Some(prev) = last_seq {
+                    if seq <= prev {
+                        return Err(violation(
+                            events,
+                            idx,
+                            &format!("seq must be strictly increasing (prev {prev}, got {seq})"),
+                        ));
+                    }
+                }
+                last_seq = Some(seq);
+            }
+        }
+
+        // Stream shape: first and terminal events.
+        if name(&events[0]) != "listen.session_start" {
+            return Err(violation(
+                events,
+                0,
+                "first event must be listen.session_start",
+            ));
+        }
+        let last_idx = events.len() - 1;
+        match self.outcome {
+            StreamOutcome::Success => {
+                let last = &events[last_idx];
+                let is_final_stats = name(last) == "listen.session_stats"
+                    && last.get("final").and_then(serde_json::Value::as_bool) == Some(true);
+                if !is_final_stats {
+                    return Err(violation(
+                        events,
+                        last_idx,
+                        "success streams terminate with listen.session_stats {final: true}",
+                    ));
+                }
+            }
+            StreamOutcome::Fatal => {
+                if name(&events[last_idx]) != "run_error" {
+                    return Err(violation(
+                        events,
+                        last_idx,
+                        "fatal streams terminate with run_error as the last event",
+                    ));
+                }
+            }
+        }
+
+        // Utterance lifecycle + append-only reconstruction.
+        let mut open: Option<(u32, String, u64)> = None; // (id, committed_text, delta_count)
+        let mut next_expected_id: u32 = 1;
+        let mut closed_ids: Vec<u32> = Vec::new();
+        for (idx, event) in events.iter().enumerate() {
+            let uid = event
+                .get("utterance_id")
+                .and_then(serde_json::Value::as_u64);
+            match name(event).as_str() {
+                "speech_started" => {
+                    if open.is_some() {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "speech_started while an utterance is already open (at most one open utterance)",
+                        ));
+                    }
+                    let id = uid.unwrap_or(0) as u32;
+                    if id != next_expected_id {
+                        return Err(violation(
+                            events,
+                            idx,
+                            &format!(
+                                "utterance ids are monotonic from 1 (expected {next_expected_id}, got {id})"
+                            ),
+                        ));
+                    }
+                    open = Some((id, String::new(), 0));
+                }
+                "transcript.delta" => {
+                    let Some((open_id, committed, count)) = open.as_mut() else {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "transcript.delta outside an open utterance",
+                        ));
+                    };
+                    if uid != Some(u64::from(*open_id)) {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "transcript.delta utterance_id must match the open utterance",
+                        ));
+                    }
+                    committed.push_str(event.get("text").and_then(|v| v.as_str()).unwrap_or(""));
+                    *count += 1;
+                }
+                "transcript.partial" => {
+                    if let (Some(partial_uid), Some((open_id, _, _))) = (uid, open.as_ref()) {
+                        if partial_uid != u64::from(*open_id) {
+                            return Err(violation(
+                                events,
+                                idx,
+                                "transcript.partial utterance_id must match the open utterance",
+                            ));
+                        }
+                    } else if uid.is_some() && open.is_none() {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "transcript.partial with utterance_id outside an open utterance",
+                        ));
+                    }
+                }
+                "utterance_end" => {
+                    let Some((open_id, committed, count)) = open.take() else {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "utterance_end without a matching speech_started",
+                        ));
+                    };
+                    if uid != Some(u64::from(open_id)) {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "utterance_end utterance_id must match the open utterance",
+                        ));
+                    }
+                    let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let truncated = event
+                        .get("text_truncated")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let append_only_ok = if truncated {
+                        committed.starts_with(text)
+                    } else {
+                        committed == text
+                    };
+                    if !append_only_ok {
+                        return Err(violation(
+                            events,
+                            idx,
+                            "append-only violation: utterance_end.text must equal the concatenated deltas",
+                        ));
+                    }
+                    if event.get("delta_count").and_then(serde_json::Value::as_u64) != Some(count) {
+                        return Err(violation(
+                            events,
+                            idx,
+                            &format!("delta_count must equal the observed delta events ({count})"),
+                        ));
+                    }
+                    closed_ids.push(open_id);
+                    next_expected_id += 1;
+                }
+                "transcript.confirm" | "transcript.correct" => {
+                    if let Some(confirm_uid) = uid {
+                        let confirm_id = confirm_uid as u32;
+                        if !closed_ids.contains(&confirm_id) {
+                            return Err(violation(
+                                events,
+                                idx,
+                                "confirm/correct must reference an already-closed utterance",
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some((open_id, _, _)) = open {
+            return Err(format!(
+                "utterance {open_id} was opened by speech_started but never closed by utterance_end \
+                 (every speech_started pairs 1:1 with an utterance_end)"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Required-field table for the listen event family (validator lookup).
+fn listen_required_fields(event: &str) -> Option<&'static [&'static str]> {
+    match event {
+        "listen.session_start" => Some(LISTEN_SESSION_START_REQUIRED_FIELDS),
+        "speech_started" => Some(SPEECH_STARTED_REQUIRED_FIELDS),
+        "transcript.delta" => Some(TRANSCRIPT_DELTA_REQUIRED_FIELDS),
+        "utterance_end" => Some(UTTERANCE_END_REQUIRED_FIELDS),
+        "listen.warning" => Some(LISTEN_WARNING_REQUIRED_FIELDS),
+        "listen.session_stats" => Some(LISTEN_SESSION_STATS_REQUIRED_FIELDS),
+        "run_error" => Some(RUN_ERROR_REQUIRED_FIELDS),
+        _ => None,
+    }
+}
+
+/// Format a validator violation with the offending event and ±3 events of
+/// context so streaming-contract failures are debuggable from the message.
+fn violation(events: &[serde_json::Value], idx: usize, invariant: &str) -> String {
+    use std::fmt::Write as _;
+    let mut msg = format!("listen stream invariant violated at event #{idx}: {invariant}\n");
+    let start = idx.saturating_sub(3);
+    let end = (idx + 4).min(events.len());
+    for (i, event) in events.iter().enumerate().take(end).skip(start) {
+        let marker = if i == idx { ">>>" } else { "   " };
+        let _ = writeln!(msg, "{marker} [{i}] {event}");
+    }
+    msg
 }
 
 // ---------------------------------------------------------------------------
@@ -1462,6 +2111,60 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "ts": "2026-02-22T00:00:02Z",
                 }),
             },
+            "listen.session_start": {
+                "required": LISTEN_SESSION_START_REQUIRED_FIELDS,
+                "lifecycle_contract": {
+                    "identifier": "run_id is the only id; a live session IS a run; utterance_id (u32 from 1) is the sub-grouping key",
+                    "terminals": "success streams end with listen.session_stats {final:true}; fatal streams end with run_error (final stats best-effort before it)",
+                    "never_emitted": ["run_start", "run_complete"],
+                },
+                "example": listen_session_start_value("run-123", 0, "2026-02-22T00:00:00Z", &ListenSessionInfo {
+                    source: "mic".into(),
+                    capture_backend: "cpal".into(),
+                    device: "<default>".into(),
+                    sample_rate_hz: 48_000,
+                    fast_model: "tiny.en".into(),
+                    quality_model: Some("large-v3-turbo".into()),
+                    policy: "alignatt".into(),
+                    step_ms: 300,
+                    partials: true,
+                    vad: json!({"min_speech_ms": 250, "endpoint_ms": 600, "gate_db": 9}),
+                }),
+            },
+            "speech_started": {
+                "required": SPEECH_STARTED_REQUIRED_FIELDS,
+                "example": speech_started_value("run-123", 3, "2026-02-22T00:00:01Z", 1, 1.24),
+            },
+            "transcript.delta": {
+                "required": TRANSCRIPT_DELTA_REQUIRED_FIELDS,
+                "append_only_contract": "concatenating an utterance's deltas yields its committed transcript; committed text is never rewritten by later deltas (mutable previews live in transcript.partial)",
+                "example": transcript_delta_value("run-123", 4, "2026-02-22T00:00:02Z", 1, "hello world", 1.24, 2.06, 3, Some(0.91)),
+            },
+            "utterance_end": {
+                "required": UTTERANCE_END_REQUIRED_FIELDS,
+                "reasons": ["endpoint", "timeout", "max_len", "session_end"],
+                "text_cap_bytes": UTTERANCE_END_TEXT_CAP_BYTES,
+                "example": utterance_end_value("run-123", 6, "2026-02-22T00:00:03Z", 1, UtteranceEndReason::Endpoint, 1.24, 2.80, "hello world again", 2),
+            },
+            "listen.warning": {
+                "required": LISTEN_WARNING_REQUIRED_FIELDS,
+                "example": listen_warning_value("run-123", 7, "2026-02-22T00:00:04Z", "capture_overrun", json!({"cumulative_frames_dropped": 4800})),
+            },
+            "listen.session_stats": {
+                "required": LISTEN_SESSION_STATS_REQUIRED_FIELDS,
+                "heartbeat_contract": "periodic emissions (final:false) double as a liveness heartbeat during silence; the success terminal is the final:true emission",
+                "example": listen_session_stats_value("run-123", 9, "2026-02-22T00:00:30Z", &ListenSessionStats {
+                    audio_sec: 28.7,
+                    wall_sec: 30.0,
+                    deltas: 14,
+                    utterances: 3,
+                    capture_overruns: 0,
+                    mean_step_latency_ms: 62.0,
+                    p95_step_latency_ms: 118.0,
+                    ttft_ms: Some(410.0),
+                    policy_holdbacks: 9,
+                }, false),
+            },
             "health.report": {
                 "required": HEALTH_REPORT_REQUIRED_FIELDS,
                 "example": json!({
@@ -1514,6 +2217,11 @@ fn emit_line<T: Serialize>(value: &T) -> FwResult<()> {
     let mut out = std::io::stdout().lock();
     serde_json::to_writer(&mut out, value)?;
     out.write_all(b"\n")?;
+    // Explicit flush: real-time consumers (fw robot listen pipes into agents)
+    // must never sit behind a buffer regardless of how stdout is wrapped.
+    // LineWriter already flushes on '\n' today; this makes the guarantee
+    // independent of that implementation detail (bd-rt-events-ghdx).
+    out.flush()?;
     Ok(())
 }
 
@@ -1685,7 +2393,18 @@ fn run_complete_value(report: &RunReport) -> serde_json::Value {
 mod tests {
     use serde_json::json;
 
-    use crate::model::RunEvent;
+    use crate::model::{RunEvent, TranscriptionSegment};
+
+    #[allow(clippy::wildcard_imports)]
+    use super::{
+        LISTEN_SESSION_START_REQUIRED_FIELDS, LISTEN_SESSION_STATS_REQUIRED_FIELDS,
+        LISTEN_WARNING_REQUIRED_FIELDS, ListenSessionInfo, ListenSessionStats,
+        NdjsonStreamValidator, SPEECH_STARTED_REQUIRED_FIELDS, StreamOutcome,
+        TRANSCRIPT_DELTA_REQUIRED_FIELDS, UTTERANCE_END_REQUIRED_FIELDS,
+        UTTERANCE_END_TEXT_CAP_BYTES, UtteranceEndReason, listen_session_start_value,
+        listen_session_stats_value, listen_warning_value, speech_started_value,
+        transcript_delta_value, utterance_end_value,
+    };
 
     use super::{
         BorrowedComplete, BorrowedRoutingDecision, BorrowedStage, HEALTH_REPORT_REQUIRED_FIELDS,
@@ -2721,7 +3440,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&BorrowedStage::new(cases[0].0, &cases[0].1))
                 .expect("golden stage"),
-            r#"{"event":"stage","schema_version":"1.0.0","run_id":"run","seq":7,"ts":"ts","stage":"stage","code":"code","message":"message","payload":null}"#,
+            r#"{"event":"stage","schema_version":"1.1.0","run_id":"run","seq":7,"ts":"ts","stage":"stage","code":"code","message":"message","payload":null}"#,
         );
     }
 
@@ -2891,7 +3610,7 @@ mod tests {
         let empty_bytes = assert_byte_parity(&empty);
         assert_eq!(
             String::from_utf8(empty_bytes).expect("empty complete is UTF-8"),
-            r#"{"event":"run_complete","schema_version":"1.0.0","run_id":"ndjson-test","trace_id":"00000000000000000000000000000000","started_at":"2026-02-22T00:00:00Z","finished_at":"2026-02-22T00:00:01Z","backend":"whisper_cpp","language":null,"transcript":"","segments":[],"acceleration":null,"diarization":null,"warnings":[],"evidence":[]}"#,
+            r#"{"event":"run_complete","schema_version":"1.1.0","run_id":"ndjson-test","trace_id":"00000000000000000000000000000000","started_at":"2026-02-22T00:00:00Z","finished_at":"2026-02-22T00:00:01Z","backend":"whisper_cpp","language":null,"transcript":"","segments":[],"acceleration":null,"diarization":null,"warnings":[],"evidence":[]}"#,
         );
 
         let mut rich = test_report(vec![], vec![]);
@@ -4408,7 +5127,7 @@ mod tests {
                 &cases[0],
             )
             .expect("golden routing decision"),
-            r#"{"event":"routing_decision","schema_version":"1.0.0","run_id":"run-123","ts":"2026-02-22T00:00:00Z","code":"backend.routing.decision_contract","decision_id":"dec-1","chosen_action":"try_whisper_cpp","calibration_score":0.91,"e_process":1.23,"fallback_active":false,"recommended_order":["whisper_cpp","insanely_fast"],"mode":"adaptive"}"#,
+            r#"{"event":"routing_decision","schema_version":"1.1.0","run_id":"run-123","ts":"2026-02-22T00:00:00Z","code":"backend.routing.decision_contract","decision_id":"dec-1","chosen_action":"try_whisper_cpp","calibration_score":0.91,"e_process":1.23,"fallback_active":false,"recommended_order":["whisper_cpp","insanely_fast"],"mode":"adaptive"}"#,
         );
     }
 
@@ -6195,5 +6914,347 @@ mod tests {
         assert!(guide.contains("fw pull all --json"));
         assert!(guide.contains("installer does this automatically"));
         assert!(guide.contains("inference itself never accesses the network"));
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-rt-events-ghdx: listen session event family + validator
+    // -----------------------------------------------------------------------
+
+    fn sample_session_info() -> ListenSessionInfo {
+        ListenSessionInfo {
+            source: "file-replay".into(),
+            capture_backend: "none".into(),
+            device: "<fixture>".into(),
+            sample_rate_hz: 16_000,
+            fast_model: "tiny.en".into(),
+            quality_model: None,
+            policy: "endpoint-commit".into(),
+            step_ms: 300,
+            partials: true,
+            vad: json!({"min_speech_ms": 250, "endpoint_ms": 600, "gate_db": 9}),
+        }
+    }
+
+    fn sample_stats() -> ListenSessionStats {
+        ListenSessionStats {
+            audio_sec: 2.5,
+            wall_sec: 2.6,
+            deltas: 2,
+            utterances: 1,
+            capture_overruns: 0,
+            mean_step_latency_ms: 40.0,
+            p95_step_latency_ms: 55.0,
+            ttft_ms: Some(390.0),
+            policy_holdbacks: 1,
+        }
+    }
+
+    /// A minimal well-formed success stream: one utterance, two deltas.
+    fn sample_success_stream() -> Vec<serde_json::Value> {
+        vec![
+            listen_session_start_value("run-l", 0, "t0", &sample_session_info()),
+            speech_started_value("run-l", 1, "t1", 1, 0.42),
+            transcript_delta_value("run-l", 2, "t2", 1, "hello ", 0.42, 0.90, 2, Some(0.9)),
+            transcript_partial_value(
+                "run-l",
+                3,
+                "t3",
+                &TranscriptionSegment {
+                    start_sec: Some(0.9),
+                    end_sec: Some(1.3),
+                    text: "wor".into(),
+                    speaker: None,
+                    confidence: Some(0.5),
+                },
+            ),
+            transcript_delta_value("run-l", 4, "t4", 1, "world", 0.90, 1.40, 1, Some(0.88)),
+            utterance_end_value(
+                "run-l",
+                5,
+                "t5",
+                1,
+                UtteranceEndReason::Endpoint,
+                0.42,
+                1.40,
+                "hello world",
+                2,
+            ),
+            listen_session_stats_value("run-l", 6, "t6", &sample_stats(), true),
+        ]
+    }
+
+    #[test]
+    fn listen_event_values_contain_all_required_fields() {
+        let cases: Vec<(&str, &[&str], serde_json::Value)> = vec![
+            (
+                "listen.session_start",
+                LISTEN_SESSION_START_REQUIRED_FIELDS,
+                listen_session_start_value("r", 0, "t", &sample_session_info()),
+            ),
+            (
+                "speech_started",
+                SPEECH_STARTED_REQUIRED_FIELDS,
+                speech_started_value("r", 1, "t", 1, 0.5),
+            ),
+            (
+                "transcript.delta",
+                TRANSCRIPT_DELTA_REQUIRED_FIELDS,
+                transcript_delta_value("r", 2, "t", 1, "x", 0.0, 0.5, 1, None),
+            ),
+            (
+                "utterance_end",
+                UTTERANCE_END_REQUIRED_FIELDS,
+                utterance_end_value(
+                    "r",
+                    3,
+                    "t",
+                    1,
+                    UtteranceEndReason::Endpoint,
+                    0.0,
+                    0.5,
+                    "x",
+                    1,
+                ),
+            ),
+            (
+                "listen.warning",
+                LISTEN_WARNING_REQUIRED_FIELDS,
+                listen_warning_value("r", 4, "t", "silent_input", json!({})),
+            ),
+            (
+                "listen.session_stats",
+                LISTEN_SESSION_STATS_REQUIRED_FIELDS,
+                listen_session_stats_value("r", 5, "t", &sample_stats(), false),
+            ),
+        ];
+        for (event_name, required, value) in &cases {
+            assert_eq!(value["event"], *event_name);
+            assert_eq!(value["schema_version"], ROBOT_SCHEMA_VERSION);
+            for field in *required {
+                assert!(
+                    value.get(*field).is_some(),
+                    "`{event_name}` missing required field `{field}`: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn utterance_end_reason_strings_cover_all_variants() {
+        assert_eq!(UtteranceEndReason::Endpoint.as_str(), "endpoint");
+        assert_eq!(UtteranceEndReason::Timeout.as_str(), "timeout");
+        assert_eq!(UtteranceEndReason::MaxLen.as_str(), "max_len");
+        assert_eq!(UtteranceEndReason::SessionEnd.as_str(), "session_end");
+    }
+
+    #[test]
+    fn utterance_end_text_truncates_at_cap_on_char_boundary() {
+        // Multibyte char straddling the cap must not split.
+        let unit = "é"; // 2 bytes
+        let text = unit.repeat(UTTERANCE_END_TEXT_CAP_BYTES); // 2x the cap in bytes
+        let value = utterance_end_value(
+            "r",
+            1,
+            "t",
+            1,
+            UtteranceEndReason::Timeout,
+            0.0,
+            1.0,
+            &text,
+            1,
+        );
+        assert_eq!(value["text_truncated"], true);
+        let emitted = value["text"].as_str().unwrap();
+        assert!(emitted.len() <= UTTERANCE_END_TEXT_CAP_BYTES);
+        assert!(emitted.len() >= UTTERANCE_END_TEXT_CAP_BYTES - 4);
+        assert!(text.starts_with(emitted));
+
+        // Under the cap: untouched, flag false.
+        let short = utterance_end_value(
+            "r",
+            2,
+            "t",
+            1,
+            UtteranceEndReason::Endpoint,
+            0.0,
+            1.0,
+            "short",
+            1,
+        );
+        assert_eq!(short["text_truncated"], false);
+        assert_eq!(short["text"], "short");
+    }
+
+    #[test]
+    fn validator_accepts_well_formed_success_stream() {
+        let events = sample_success_stream();
+        NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .expect("well-formed stream must validate");
+    }
+
+    #[test]
+    fn validator_accepts_fatal_stream_ending_in_run_error() {
+        let mut events = sample_success_stream();
+        events.pop(); // drop final stats
+        events.push(run_error_value("device unplugged", "FW-IO"));
+        NdjsonStreamValidator::new(StreamOutcome::Fatal)
+            .validate(&events)
+            .expect("fatal stream ending in run_error must validate");
+    }
+
+    #[test]
+    fn validator_rejects_seq_regression() {
+        let mut events = sample_success_stream();
+        events[4]["seq"] = json!(2); // duplicate of an earlier seq
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(
+            err.contains("strictly increasing"),
+            "wrong invariant: {err}"
+        );
+        assert!(err.contains(">>>"), "violation context missing: {err}");
+    }
+
+    #[test]
+    fn validator_rejects_rewritten_committed_text() {
+        let mut events = sample_success_stream();
+        // utterance_end.text disagrees with concatenated deltas.
+        events[5]["text"] = json!("hello there");
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(err.contains("append-only"), "wrong invariant: {err}");
+    }
+
+    #[test]
+    fn validator_rejects_unpaired_speech_started() {
+        let mut events = sample_success_stream();
+        events.remove(5); // drop utterance_end
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(err.contains("never closed"), "wrong invariant: {err}");
+    }
+
+    #[test]
+    fn validator_rejects_run_complete_in_listen_stream() {
+        let mut events = sample_success_stream();
+        events.insert(
+            6,
+            json!({"event": "run_complete", "schema_version": ROBOT_SCHEMA_VERSION}),
+        );
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(
+            err.contains("never emit run_start/run_complete"),
+            "wrong invariant: {err}"
+        );
+    }
+
+    #[test]
+    fn validator_rejects_confirm_for_open_or_unknown_utterance() {
+        let mut events = sample_success_stream();
+        // A confirm referencing utterance 9 (never existed).
+        events.insert(
+            6,
+            json!({
+                "event": "transcript.confirm",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "run-l",
+                "seq": 90,
+                "window_id": 0,
+                "quality_model_id": "turbo",
+                "drift": {},
+                "latency_ms": 100,
+                "ts": "t",
+                "utterance_id": 9,
+            }),
+        );
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(err.contains("already-closed"), "wrong invariant: {err}");
+    }
+
+    #[test]
+    fn validator_rejects_missing_success_terminal() {
+        let mut events = sample_success_stream();
+        events.pop(); // no final stats
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(err.contains("final: true"), "wrong invariant: {err}");
+    }
+
+    #[test]
+    fn validator_rejects_delta_outside_open_utterance() {
+        let mut events = sample_success_stream();
+        events.insert(
+            6,
+            transcript_delta_value("run-l", 50, "t", 1, "late", 2.0, 2.5, 1, None),
+        );
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(
+            err.contains("outside an open utterance"),
+            "wrong invariant: {err}"
+        );
+    }
+
+    #[test]
+    fn listen_golden_synthetic_session_is_byte_stable() {
+        // Two independent constructions serialize byte-identically, and the
+        // committed-delta shape matches the frozen literal (insertion-order
+        // serialization is part of the contract surface).
+        let a: Vec<String> = sample_success_stream()
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        let b: Vec<String> = sample_success_stream()
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        assert_eq!(
+            a, b,
+            "synthetic session serialization must be deterministic"
+        );
+        assert_eq!(
+            a[2],
+            r#"{"event":"transcript.delta","schema_version":"1.1.0","run_id":"run-l","seq":2,"ts":"t2","utterance_id":1,"text":"hello ","t0_sec":0.42,"t1_sec":0.9,"tokens":2,"confidence":0.9,"stability":"committed"}"#,
+        );
+        assert_eq!(
+            a[5],
+            r#"{"event":"utterance_end","schema_version":"1.1.0","run_id":"run-l","seq":5,"ts":"t5","utterance_id":1,"reason":"endpoint","t0_sec":0.42,"t1_sec":1.4,"text":"hello world","text_truncated":false,"delta_count":2}"#,
+        );
+    }
+
+    #[test]
+    fn listen_events_registered_in_robot_schema() {
+        let schema = robot_schema_value();
+        let events = schema["events"].as_object().expect("events map");
+        for name in [
+            "listen.session_start",
+            "speech_started",
+            "transcript.delta",
+            "utterance_end",
+            "listen.warning",
+            "listen.session_stats",
+        ] {
+            let entry = events
+                .get(name)
+                .unwrap_or_else(|| panic!("`{name}` not registered"));
+            assert!(
+                entry.get("required").is_some(),
+                "`{name}` lacks required list"
+            );
+            assert_eq!(
+                entry["example"]["schema_version"], ROBOT_SCHEMA_VERSION,
+                "`{name}` example version mismatch"
+            );
+        }
     }
 }

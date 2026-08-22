@@ -270,6 +270,96 @@ pub struct DecodeParams {
     /// alignment-head presets that share `(n_text_layer, n_text_state)` (the
     /// large-v1/v2/v3 family). Ignored unless `word_timestamps` is set.
     pub model_hint: Option<String>,
+    /// Per-request encoder-context policy for the audio encoder
+    /// ([`AudioCtxPolicy`], bd-rt-audio-ctx-n4dj). The default ([`AudioCtxPolicy::Full`])
+    /// is byte-exact with all prior behavior; the reduced policies are the
+    /// streaming knob (a live session is ALL first-window, where truncation was
+    /// previously impossible without process-lifetime env flags).
+    pub audio_ctx: AudioCtxPolicy,
+}
+
+/// Per-request encoder-context policy for the audio encoder
+/// (bd-rt-audio-ctx-n4dj).
+///
+/// whisper.cpp answers a live stream's "why pay the full padded 30 s encode
+/// every tick" with `-ac` (reduced `audio_ctx`). Our equivalent math already
+/// existed in `tail_enc_ctx`, but it was gated to NON-first windows behind
+/// process-lifetime env flags — useless for streaming, where every window is a
+/// first window and one process must host both batch (Full) and streaming
+/// (truncated) requests. This enum is the per-request, env-free knob.
+///
+/// - [`AudioCtxPolicy::Full`] (default): today's behavior, byte-exact. The
+///   env gates (`FW_FIRST_WINDOW_MARGIN`,
+///   `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE`) keep governing exactly as before.
+/// - [`AudioCtxPolicy::Auto`]: derive the effective ctx from the window's REAL
+///   mel frames with the proven tail math (`ceil(real/2)` clamped to
+///   `[MIN_ENC_CTX, FULL_ENC_CTX]`), FIRST WINDOW INCLUDED. Truncation engages
+///   only in timestamp mode (the no-timestamps repetition-loop failure mode
+///   documented at the loop is honored regardless of policy).
+/// - [`AudioCtxPolicy::Fixed(n)`]: an explicit per-window ctx cap, clamped to
+///   `[MIN_ENC_CTX, FULL_ENC_CTX]` and rounded UP to a multiple of 64
+///   (whisper.cpp discussion ggml-org/whisper.cpp#297), then shrunk to the
+///   window's real audio so short windows never encode pure padding.
+///
+/// # AUTHORITATIVE over env
+///
+/// When the policy is not [`AudioCtxPolicy::Full`] it requires NO env flag and
+/// IGNORES the truncation env gates for this request: params win over env for
+/// per-request behavior; env gates continue to govern Full requests exactly as
+/// today.
+///
+/// # NOT whisper.cpp's `-ac` positional rescaling
+///
+/// whisper.cpp's `-ac` interpolates the positional embedding to the reduced
+/// context and correspondingly rescales timestamp-token precision. We do NOT:
+/// the encoder slices the file positional tensor verbatim (`add_pos_emb`,
+/// "sliced to the first n_ctx rows"), so a truncated window keeps absolute
+/// 20 ms-per-index timestamp semantics. Consequently `max_initial_tid`
+/// precision stays tied to the FULL model `n_audio_ctx` under every policy
+/// (the in-loop comment cites whisper.cpp 6322). Deliberate deviation from the
+/// bead's initial "recompute from effective ctx" wording, recorded on
+/// bd-rt-audio-ctx-n4dj with the encoder evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AudioCtxPolicy {
+    /// Full 1500-frame context on every window (historical behavior).
+    #[default]
+    Full,
+    /// Effective ctx derived from real buffer frames, first window included.
+    Auto,
+    /// Explicit ctx cap: clamped to [64, 1500], rounded up to a multiple of 64.
+    Fixed(usize),
+}
+
+impl AudioCtxPolicy {
+    /// Construct an [`AudioCtxPolicy::Fixed`] policy, clamping `n` into
+    /// `[MIN_ENC_CTX, FULL_ENC_CTX]` and rounding UP to a multiple of 64.
+    /// Clamping is documented behavior; nothing is rejected.
+    #[must_use]
+    pub fn fixed(n: usize) -> Self {
+        Self::Fixed(fixed_enc_ctx_clamped(n))
+    }
+
+    /// Effective encoder frames for a window holding `real_frames` real mel
+    /// frames (1 mel frame = 1 cs). Always within
+    /// `[MIN_ENC_CTX, FULL_ENC_CTX]`; `Fixed` additionally shrinks to the real
+    /// audio so a short window never encodes padding.
+    #[must_use]
+    pub fn effective_enc_ctx(self, real_frames: usize) -> usize {
+        let auto = real_frames.div_ceil(2).clamp(MIN_ENC_CTX, FULL_ENC_CTX);
+        match self {
+            Self::Full => FULL_ENC_CTX,
+            Self::Auto => auto,
+            Self::Fixed(n) => fixed_enc_ctx_clamped(n).min(auto),
+        }
+    }
+}
+
+/// Clamp an explicit `Fixed` request to the valid band, rounded UP to a
+/// multiple of 64. Saturating so an extreme request cannot overflow.
+fn fixed_enc_ctx_clamped(n: usize) -> usize {
+    n.div_ceil(64)
+        .saturating_mul(64)
+        .clamp(MIN_ENC_CTX, FULL_ENC_CTX)
 }
 
 /// Per-window quality-control statistics, surfaced for the evidence ledger.
@@ -1993,6 +2083,34 @@ fn tail_enc_ctx(real_frames: usize, is_first: bool, enabled: bool) -> usize {
     base.clamp(MIN_ENC_CTX, FULL_ENC_CTX)
 }
 
+/// Resolve one window's effective encoder context under the request's
+/// [`AudioCtxPolicy`] (bd-rt-audio-ctx-n4dj).
+///
+/// Single decision point shared by the inline encode AND the pipeline
+/// prefetch dispatch, so the two can never disagree on `mel_frames`. A
+/// non-Full policy is AUTHORITATIVE: neither env gate (`first_window_margin`
+/// nor the `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE` flag folded into
+/// `tail_truncate`) can override it, and `is_first` is irrelevant because a
+/// streaming session is all first-window. The no-timestamps prohibition still
+/// wins for reduced policies: truncating a no_ts window removes the greedy
+/// decoder's only end-of-speech cue (content-loss failure documented at the
+/// call site), so any non-Full policy degrades to full windows there.
+fn resolve_window_enc_ctx(
+    params: &DecodeParams,
+    real_frames: usize,
+    is_first: bool,
+    tail_truncate: bool,
+) -> usize {
+    match params.audio_ctx {
+        AudioCtxPolicy::Full => tail_enc_ctx(real_frames, is_first, tail_truncate),
+        // Reduced policy + no-timestamps mode: honor the documented failure
+        // mode instead of applying the policy (bead constraint: "do not fix
+        // that comment's gate").
+        _ if !params.timestamps => FULL_ENC_CTX,
+        policy => policy.effective_enc_ctx(real_frames),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level transcription (port of whisper_full_with_state greedy path)
 // ---------------------------------------------------------------------------
@@ -2708,16 +2826,19 @@ fn transcribe_samples_uncached(
             // is truncated to `2*enc_ctx` mel frames (`enc_ctx` encoder rows),
             // mirroring whisper.cpp's audio_ctx (-ac) feature — a near-empty final
             // window otherwise pays a full encode for a fraction of a second of
-            // audio (perf hotspot #1). Timestamp/precision semantics are unaffected
-            // (`max_initial_tid` is tied to the full model `n_audio_ctx`, not this
-            // window's ctx — whisper.cpp 6322).
+            // audio (perf hotspot #1). Timestamp/precision semantics are unaffected:
+            // `max_initial_tid` stays tied to the FULL model `n_audio_ctx` under
+            // EVERY policy (whisper.cpp 6322) — unlike whisper.cpp `-ac`, we slice
+            // the file positional embedding verbatim instead of interpolating it,
+            // so timestamp tokens keep absolute 20 ms/index meaning even when this
+            // window's ctx is truncated (see `AudioCtxPolicy`).
             let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
             // Real (unpadded) audio remaining in this window, in mel frames
             // (1 mel frame = 1 cs); capped at the full window, as whisper.cpp does.
             let real_frames = usize::try_from((seek_end_cs - seek_cs).max(0))
                 .unwrap_or(0)
                 .min(FRAMES_PER_CHUNK);
-            let enc_ctx = tail_enc_ctx(real_frames, seek_cs == 0, tail_truncate);
+            let enc_ctx = resolve_window_enc_ctx(params, real_frames, seek_cs == 0, tail_truncate);
             let mel_frames = enc_ctx * 2;
             if mel_frames < FRAMES_PER_CHUNK {
                 tracing::debug!(
@@ -2726,6 +2847,7 @@ fn transcribe_samples_uncached(
                     real_frames,
                     enc_ctx,
                     mel_frames,
+                    policy=?params.audio_ctx,
                     "tail-window encoder-context truncation engaged"
                 );
             }
@@ -2788,7 +2910,8 @@ fn transcribe_samples_uncached(
                         let next_real = usize::try_from((seek_end_cs - next_seek).max(0))
                             .unwrap_or(0)
                             .min(FRAMES_PER_CHUNK);
-                        let next_ctx = tail_enc_ctx(next_real, false, tail_truncate);
+                        let next_ctx =
+                            resolve_window_enc_ctx(params, next_real, false, tail_truncate);
                         if req_tx.send((next_off, next_ctx * 2)).is_ok() {
                             prefetched = Some(next_off);
                         }
@@ -5053,6 +5176,152 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // AudioCtxPolicy (bd-rt-audio-ctx-n4dj)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn audio_ctx_fixed_clamps_and_rounds_up_to_64() {
+        // Round UP to the multiple-of-64 band, clamped to [64, 1500].
+        assert_eq!(AudioCtxPolicy::fixed(0), AudioCtxPolicy::Fixed(MIN_ENC_CTX));
+        assert_eq!(AudioCtxPolicy::fixed(63), AudioCtxPolicy::Fixed(64));
+        assert_eq!(AudioCtxPolicy::fixed(64), AudioCtxPolicy::Fixed(64));
+        assert_eq!(AudioCtxPolicy::fixed(65), AudioCtxPolicy::Fixed(128));
+        assert_eq!(AudioCtxPolicy::fixed(512), AudioCtxPolicy::Fixed(512));
+        assert_eq!(
+            AudioCtxPolicy::fixed(FULL_ENC_CTX),
+            AudioCtxPolicy::Fixed(FULL_ENC_CTX)
+        );
+        // 1499 rounds up to 1536, which clamps back down to the 1500 ceiling.
+        assert_eq!(
+            AudioCtxPolicy::fixed(FULL_ENC_CTX - 1),
+            AudioCtxPolicy::Fixed(FULL_ENC_CTX)
+        );
+        // An extreme request saturates instead of overflowing.
+        assert_eq!(
+            AudioCtxPolicy::fixed(usize::MAX),
+            AudioCtxPolicy::Fixed(FULL_ENC_CTX)
+        );
+    }
+
+    #[test]
+    fn audio_ctx_effective_enc_ctx_bands() {
+        // Auto = ceil(real/2) clamped: the proven tail math, FIRST WINDOW
+        // INCLUDED (a live session is all first window).
+        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(24), MIN_ENC_CTX);
+        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(128), MIN_ENC_CTX);
+        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(129), MIN_ENC_CTX + 1);
+        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(600), 300);
+        assert_eq!(
+            AudioCtxPolicy::Auto.effective_enc_ctx(FRAMES_PER_CHUNK),
+            FULL_ENC_CTX
+        );
+        // Fixed = clamped cap shrunk by the window's real audio.
+        assert_eq!(AudioCtxPolicy::Fixed(512).effective_enc_ctx(2000), 512);
+        assert_eq!(AudioCtxPolicy::Fixed(512).effective_enc_ctx(400), 200);
+        // Full always full regardless of real frames.
+        for rf in [0, 1, 240, 2999] {
+            assert_eq!(AudioCtxPolicy::Full.effective_enc_ctx(rf), FULL_ENC_CTX);
+        }
+    }
+
+    #[test]
+    fn audio_ctx_auto_property_band_across_buffer_lengths() {
+        // Property: for every buffer length 0.5-29.5 s (50..2950 mel frames),
+        // Auto's effective ctx == ceil(real/2) clamped to [64, 1500]; the
+        // exact floor/ceiling boundary lengths hold without panicking.
+        for rf in 50..=2950 {
+            let ctx = AudioCtxPolicy::Auto.effective_enc_ctx(rf);
+            let expected = rf.div_ceil(2).clamp(MIN_ENC_CTX, FULL_ENC_CTX);
+            assert_eq!(ctx, expected, "real_frames={rf}");
+            assert!((MIN_ENC_CTX..=FULL_ENC_CTX).contains(&ctx));
+        }
+        assert_eq!(
+            AudioCtxPolicy::Auto.effective_enc_ctx(2 * MIN_ENC_CTX),
+            MIN_ENC_CTX
+        );
+        assert_eq!(
+            AudioCtxPolicy::Auto.effective_enc_ctx(FRAMES_PER_CHUNK),
+            FULL_ENC_CTX
+        );
+    }
+
+    #[test]
+    fn resolve_window_enc_ctx_policy_overrides_env_gates() {
+        // The env-on/off x param Full/Auto interplay: a non-Full policy is
+        // AUTHORITATIVE — `tail_truncate` (the env-gated flag) and `is_first`
+        // cannot force a full window when Auto/Fixed is requested in timestamp
+        // mode; Full delegates to the historical tail math unchanged.
+        let auto = DecodeParams {
+            audio_ctx: AudioCtxPolicy::Auto,
+            timestamps: true,
+            ..DecodeParams::default()
+        };
+        let full = DecodeParams::default();
+        // Env truncation OFF (tail_truncate=false): Auto still truncates the
+        // FIRST window (env gates ignored); Full stays byte-exact full.
+        assert_eq!(resolve_window_enc_ctx(&auto, 600, true, false), 300);
+        assert_eq!(
+            resolve_window_enc_ctx(&full, 600, true, false),
+            FULL_ENC_CTX
+        );
+        // Env truncation ON: Auto identical (env irrelevant); Full truncates a
+        // non-first short window exactly as today, never the first.
+        assert_eq!(resolve_window_enc_ctx(&auto, 600, false, true), 300);
+        assert_eq!(resolve_window_enc_ctx(&full, 600, false, true), 300);
+        assert_eq!(resolve_window_enc_ctx(&full, 600, true, true), FULL_ENC_CTX);
+        // Fixed caps regardless of gates.
+        let fixed = DecodeParams {
+            audio_ctx: AudioCtxPolicy::fixed(512),
+            timestamps: true,
+            ..DecodeParams::default()
+        };
+        assert_eq!(resolve_window_enc_ctx(&fixed, 600, true, false), 300);
+        // no_timestamps prohibition: ANY policy degrades to full windows there
+        // (truncation removes the greedy decoder's only end-of-speech cue).
+        for policy in [
+            AudioCtxPolicy::Full,
+            AudioCtxPolicy::Auto,
+            AudioCtxPolicy::fixed(512),
+        ] {
+            let p = DecodeParams {
+                audio_ctx: policy,
+                timestamps: false,
+                ..DecodeParams::default()
+            };
+            assert_eq!(resolve_window_enc_ctx(&p, 24, false, true), FULL_ENC_CTX);
+            assert_eq!(resolve_window_enc_ctx(&p, 24, true, true), FULL_ENC_CTX);
+        }
+    }
+
+    #[test]
+    fn audio_ctx_participates_in_cache_fingerprint() {
+        // TranscriptionCache keys on batch_job_fingerprint(samples, params);
+        // params hash via the derived Hash, so distinct policies must never
+        // alias onto each other's cached outputs.
+        let samples = vec![0.5f32; 160];
+        let full = DecodeParams::default();
+        let auto = DecodeParams {
+            audio_ctx: AudioCtxPolicy::Auto,
+            ..DecodeParams::default()
+        };
+        assert_ne!(
+            batch_job_fingerprint(&samples, &full),
+            batch_job_fingerprint(&samples, &auto)
+        );
+        // Equal params (same policy) still fingerprint identically.
+        assert_eq!(
+            batch_job_fingerprint(&samples, &auto),
+            batch_job_fingerprint(
+                &samples,
+                &DecodeParams {
+                    audio_ctx: AudioCtxPolicy::Auto,
+                    ..DecodeParams::default()
+                }
+            )
+        );
     }
 
     #[test]

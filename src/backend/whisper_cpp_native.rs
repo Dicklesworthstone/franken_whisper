@@ -533,6 +533,10 @@ fn decode_params(
         } else {
             None
         },
+        // Streaming encoder-context policy stays at the byte-exact default for
+        // bridge backends (the knob is per-request on the engine; the live
+        // driver opts in, not the batch bridges).
+        audio_ctx: decode::AudioCtxPolicy::Full,
     }
 }
 
