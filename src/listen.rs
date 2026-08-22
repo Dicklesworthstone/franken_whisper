@@ -335,10 +335,11 @@ fn front_truncate_at_word(text: &str, cap: usize) -> &str {
 // statistics (orchestrator vad_energy_detect_with_analysis) — impossible for
 // a stream. This is the causal replacement: a per-frame adaptive energy
 // pre-gate (running noise floor + relative dB gate) feeding a
-// min-speech / endpoint-silence state machine, with a seam for an optional
-// neural second tier ([`VoiceClassifier`]; the earshot evaluation is the
-// bead's remaining item — energy-only is the v1 default until that
-// evaluation passes, exactly as the bead's decision rule specifies).
+// neural second tier ([`VoiceClassifier`]; the earshot tier was EVALUATED
+// and REJECTED — see the ignored `earshot_eval_*` tests and the bead close
+// comment: it passes loud harmonic music at every usable threshold).
+// Energy-only is the shipped v1; the trait seam stays for future
+// classifiers.
 //
 // TIME BASES (bd-rt-vad-stream polish item 2): 20 ms frames = 320 samples
 // @16 kHz = one encoder frame (2 mel hops). This module is the single
@@ -1090,15 +1091,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // bd-rt-vad-stream-ulp5: earshot second-tier EVALUATION
+    // bd-rt-vad-stream-ulp5: earshot second-tier EVALUATION (VERDICT: NO)
     //
     // Decision rule (locked in the bead): ship energy pre-gate + earshot
-    // only if the classifier measurably vetoes loud non-speech (music /
-    // noise / hum trivially pass the relative-energy gate) without hurting
-    // speech recall, at a per-frame cost far under the driver step budget
-    // and a sane binary-size footprint. Otherwise record the negative
-    // result and ship energy-only v1. These tests ARE the evaluation; the
-    // printed numbers go into the bead close comment.
+    // only if the classifier measurably vetoes loud non-speech without
+    // hurting speech recall. Measured result (2026-08-22): harmonic music
+    // at -14 dBFS scores ~0.89 mean / 0.96 max — earshot PASSES loud music
+    // at every usable threshold, so a tier-2 veto adds nothing where the
+    // energy gate actually needs help. Energy-only v1 stands. These tests
+    // are #[ignore]d: they document the negative result and stay runnable
+    // (`cargo test --lib earshot_eval -- --ignored --nocapture`) for
+    // re-evaluation against future earshot versions. Full numbers live in
+    // the bead close comment.
     // -----------------------------------------------------------------------
 
     /// earshot's native input frame: 256 samples @ 16 kHz = 16 ms.
@@ -1176,7 +1180,10 @@ mod tests {
     fn jfk_samples() -> Vec<f32> {
         let mut reader =
             hound::WavReader::open("tests/fixtures/native/jfk.wav").expect("open jfk.wav");
-        assert_eq!(reader.spec().sample_rate, u32::try_from(SAMPLE_RATE).unwrap());
+        assert_eq!(
+            reader.spec().sample_rate,
+            u32::try_from(SAMPLE_RATE).unwrap()
+        );
         assert_eq!(reader.spec().channels, 1);
         reader
             .samples::<i16>()
@@ -1184,22 +1191,22 @@ mod tests {
             .collect()
     }
 
+    #[ignore = "bd-rt-vad-stream-ulp5 verdict: earshot REJECTED — passes loud music at every usable threshold; kept as a re-evaluation harness"]
     #[test]
     fn earshot_eval_raw_scores_on_labeled_fixtures() {
         // Exact labels by construction for synthetics; for the real speech
         // clip the reference mask is a BATCH energy mask (p75 of frame RMS)
         // — eval-only ground truth approximation, never runtime logic.
+        // Every fixture is scored and printed BEFORE any assertion so one
+        // manual run records the complete matrix.
         let dur = |v: &[f32]| v.len() as f64 / SAMPLE_RATE as f64;
 
         let music = music_signal(SAMPLE_RATE as usize * 6, -14.0);
         let noise = lcg_noise(SAMPLE_RATE as usize * 4, 0xC0FFEE, -20.0);
         let hum = hum_signal(SAMPLE_RATE as usize * 4, -18.0);
-        for (name, samples, expect_voice) in [
-            ("music -14 dB", &music, false),
-            ("white noise -20 dB", &noise, false),
-            ("mains hum -18 dB", &hum, false),
-        ] {
-            let scores = earshot_scores(samples);
+        let mut violations: Vec<String> = Vec::new();
+        let mut row = |name: &str, samples: &[f32], scores: &[f32],
+                       violations: &mut Vec<String>| {
             let voiced = scores.iter().filter(|&&s| s >= 0.5).count();
             let frac = f64::from(voiced as u32) / scores.len() as f64;
             println!(
@@ -1209,14 +1216,23 @@ mod tests {
                 scores.iter().cloned().fold(f32::MIN, f32::max),
                 dur(samples)
             );
-            assert!(
-                frac <= 0.05,
-                "{name}: earshot passed {frac:.3} of loud non-speech"
-            );
-        }
+            if frac > 0.05 {
+                violations.push(format!("{name}: {frac:.3} of loud non-speech passed"));
+            }
+        };
+
+        let music_scores = earshot_scores(&music);
+        row("music -14 dB", &music, &music_scores, &mut violations);
+        row(
+            "white noise -20 dB",
+            &noise,
+            &earshot_scores(&noise),
+            &mut violations,
+        );
+        row("mains hum -18 dB", &hum, &earshot_scores(&hum), &mut violations);
 
         let jfk = jfk_samples();
-        let scores = earshot_scores(&jfk);
+        let speech_scores = earshot_scores(&jfk);
         let rms: Vec<f32> = jfk
             .as_chunks::<EARSHOT_FRAME_SAMPLES>()
             .0
@@ -1230,37 +1246,49 @@ mod tests {
         sorted.sort_by(f32::total_cmp);
         let p75 = sorted[sorted.len() * 3 / 4];
         let speech_frames = rms.iter().filter(|&&r| r > p75).count();
-        let hits = rms
-            .iter()
-            .zip(&scores)
-            .filter(|(&r, &s)| *r > p75 && *s >= 0.5)
-            .count();
-        let voiced_total = scores.iter().filter(|&&s| s >= 0.5).count();
-        let recall = hits as f64 / speech_frames.max(1) as f64;
+        let voiced_total = speech_scores.iter().filter(|&&s| s >= 0.5).count();
         println!(
             "eval jfk.wav {:.2}s: {} frames, speech-mask {speech_frames}, earshot voiced \
-             {voiced_total} ({:.3} of all), recall-on-mask {recall:.4}",
+             {voiced_total} ({:.3} of all)",
             dur(&jfk),
-            scores.len(),
-            voiced_total as f64 / scores.len() as f64,
+            speech_scores.len(),
+            voiced_total as f64 / speech_scores.len() as f64,
         );
+
+        // Threshold separation sweep: is there ANY cutoff that vetoes the
+        // music while still catching speech?
+        println!("threshold sweep [t]: music-pass-rate | jfk-mask-recall");
+        for t in [0.30_f32, 0.50, 0.70, 0.85, 0.95] {
+            let mp = music_scores.iter().filter(|&&s| s >= t).count() as f64
+                / music_scores.len() as f64;
+            let rec = rms
+                .iter()
+                .zip(&speech_scores)
+                .filter(|&(&r, &s)| r > p75 && s >= t)
+                .count() as f64
+                / speech_frames.max(1) as f64;
+            println!("  [{t:.2}] {mp:.4} | {rec:.4}");
+        }
+
         assert!(
-            recall >= 0.85,
-            "earshot missed real speech: recall {recall:.3}"
-        );
-        assert!(
-            voiced_total as f64 / scores.len() as f64 >= 0.5,
-            "clean speech clip scored mostly unvoiced"
+            violations.is_empty(),
+            "earshot failed the labeled-fixture evaluation: {violations:?}"
         );
     }
 
+    #[ignore = "accuracy verdict is already negative; debug-profile timing on shared rch workers is not decision-grade"]
     #[test]
     fn earshot_eval_cost_per_frame_is_far_under_step_budget() {
         // Budget shape: a 100 ms driver step carries 5 VAD frames; tier-2
         // may cost at most ~1 ms per step => <=200 us per 16 ms predict.
         let audio = music_signal(SAMPLE_RATE as usize * 10, -14.0);
         let mut det = earshot::Detector::default_boxed();
-        let frames: Vec<&[f32]> = audio.as_chunks::<EARSHOT_FRAME_SAMPLES>().0.iter().collect();
+        let frames: Vec<&[f32]> = audio
+            .as_chunks::<EARSHOT_FRAME_SAMPLES>()
+            .0
+            .iter()
+            .map(|chunk| chunk.as_slice())
+            .collect();
         for f in &frames[..32] {
             let _ = det.predict_f32(f); // warmup
         }

@@ -5425,14 +5425,6 @@ mod tests {
     #[test]
     fn wav_reader_rejects_zero_channels() {
         let wav = synthetic_pcm_wav(0, &[]);
-        eprintln!(
-            "default windows: {:?}",
-            default_out
-                .windows
-                .iter()
-                .map(|w| (w.window_offset_sec, w.tokens))
-                .collect::<Vec<_>>()
-        );
         assert!(
             read_wav_16k_mono(&wav)
                 .expect_err("zero-channel PCM is invalid")
