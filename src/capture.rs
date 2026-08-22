@@ -215,9 +215,11 @@ impl CpalCaptureSource {
                 };
                 let Some(device) = device else {
                     let requested = device_name_owned.as_deref().unwrap_or("<default>");
-                    let _ = setup_tx.send(CpalSetup::Failed(format!(
-                        "input device not found: {requested}"
-                    )));
+                    // Actionable taxonomy (bd-rt-device-probe-wh02): name the
+                    // request AND what exists.
+                    let _ = setup_tx.send(CpalSetup::Failed(
+                        device_not_found_error(requested).to_string(),
+                    ));
                     return;
                 };
                 let supported = match device.default_input_config() {
@@ -584,6 +586,131 @@ impl CaptureSource for FixtureCaptureSource {
 
     fn stop(&mut self) {
         self.stopped = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bd-rt-device-probe-wh02: input-device discovery + failure taxonomy
+//
+// Agents diagnosing "why is the mic silent" need structured answers, not
+// stderr archaeology. Three pieces live here: enumeration (metadata only —
+// NEVER opens a stream, because opening triggers the macOS TCC microphone
+// prompt as a side effect, which is unacceptable for a health probe),
+// the not-found error that lists what IS available, and a silent-input
+// watchdog the driver arms at session start.
+// ---------------------------------------------------------------------------
+
+/// Metadata for one input device (enumeration only; no stream is opened).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputDeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+    /// Default-config sample rate (Hz) when the device reports one.
+    pub default_sample_rate_hz: Option<u32>,
+    /// Default-config channel count when the device reports one.
+    pub default_channels: Option<u16>,
+}
+
+/// Enumerate input devices, deterministically ordered (default device
+/// first, then by name). Metadata queries only — no TCC prompt.
+pub fn enumerate_input_devices() -> FwResult<Vec<InputDeviceInfo>> {
+    use cpal::traits::{DeviceTrait as _, HostTrait as _};
+    let host = cpal::default_host();
+    let default_name = host
+        .default_input_device()
+        .and_then(|device| device.name().ok());
+    let mut devices: Vec<InputDeviceInfo> = Vec::new();
+    let iter = host.input_devices().map_err(|error| {
+        FwError::BackendUnavailable(format!("cannot enumerate audio input devices: {error}"))
+    })?;
+    for device in iter {
+        let Ok(name) = device.name() else { continue };
+        let default_config = device.default_input_config().ok();
+        devices.push(InputDeviceInfo {
+            is_default: default_name.as_deref() == Some(name.as_str()),
+            default_sample_rate_hz: default_config.as_ref().map(|c| c.sample_rate().0),
+            default_channels: default_config
+                .as_ref()
+                .map(cpal::SupportedStreamConfig::channels),
+            name,
+        });
+    }
+    devices.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(devices)
+}
+
+/// macOS TCC remediation text (surfaced whenever capture opens but delivers
+/// nothing, or the platform denies the stream).
+pub const MIC_PERMISSION_REMEDIATION: &str = "if no audio arrives: System Settings > Privacy & \
+     Security > Microphone (macOS; terminal apps prompt on first use — over SSH there is no \
+     prompt, pre-authorize or use --source stdin-pcm)";
+
+/// The device-not-found error, naming the requested device AND what exists
+/// (the actionable form the bead's taxonomy requires).
+pub fn device_not_found_error(requested: &str) -> FwError {
+    let known = enumerate_input_devices()
+        .map(|devices| {
+            devices
+                .iter()
+                .map(|d| d.name.as_str().to_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|_| "<enumeration unavailable>".to_owned());
+    FwError::InvalidRequest(format!(
+        "input device not found: `{requested}`; available input devices: [{known}]"
+    ))
+}
+
+/// Silent-input watchdog (driver arms it at session start): triggers ONCE
+/// when the first `threshold_sec` seconds of a session are PURE digital
+/// zeros — the signature of an unauthorized mic on macOS (TCC denial
+/// delivers zeros, not errors). Any nonzero sample disarms it permanently;
+/// genuine low-level room noise (even -90 dBFS dither) never triggers it.
+/// The driver surfaces the trigger as `listen.warning {reason:
+/// "silent_input"}` and keeps the session alive (some devices legitimately
+/// start silent).
+#[derive(Debug)]
+pub struct SilentInputWatchdog {
+    threshold_samples: u64,
+    zero_samples: u64,
+    disarmed: bool,
+    fired: bool,
+}
+
+impl SilentInputWatchdog {
+    #[must_use]
+    pub fn new(threshold_sec: f64, sample_rate: u32) -> Self {
+        Self {
+            threshold_samples: (threshold_sec * f64::from(sample_rate)).round() as u64,
+            zero_samples: 0,
+            disarmed: false,
+            fired: false,
+        }
+    }
+
+    /// Feed session audio; returns `true` exactly once, at the moment the
+    /// leading-zeros threshold is crossed.
+    pub fn observe(&mut self, samples: &[f32]) -> bool {
+        if self.disarmed || self.fired {
+            return false;
+        }
+        for &sample in samples {
+            if sample != 0.0 {
+                self.disarmed = true;
+                return false;
+            }
+            self.zero_samples += 1;
+            if self.zero_samples >= self.threshold_samples {
+                self.fired = true;
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1879,6 +2006,75 @@ mod tests {
         let err = crate::process::spawn_streaming_stdout("definitely-not-a-real-binary-fw", &[])
             .unwrap_err();
         assert_eq!(err.error_code(), "FW-CMD-MISSING");
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-rt-device-probe-wh02: watchdog + taxonomy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn silent_watchdog_fires_exactly_once_at_threshold() {
+        let mut watchdog = SilentInputWatchdog::new(1.0, 16_000);
+        // 0.9 s of zeros: below threshold.
+        assert!(!watchdog.observe(&vec![0.0; 14_400]));
+        // Crossing 1.0 s: fires exactly once.
+        assert!(watchdog.observe(&vec![0.0; 1_600]));
+        // Never again.
+        assert!(!watchdog.observe(&vec![0.0; 32_000]));
+    }
+
+    #[test]
+    fn silent_watchdog_disarmed_by_any_nonzero_sample() {
+        let mut watchdog = SilentInputWatchdog::new(1.0, 16_000);
+        let mut quiet = vec![0.0f32; 8_000];
+        quiet.push(1e-9); // even sub-audible dither disarms
+        assert!(!watchdog.observe(&quiet));
+        assert!(
+            !watchdog.observe(&vec![0.0; 160_000]),
+            "disarm is permanent"
+        );
+    }
+
+    #[test]
+    fn silent_watchdog_low_level_noise_never_triggers() {
+        let mut watchdog = SilentInputWatchdog::new(0.5, 16_000);
+        // -60 dBFS constant tone: nonzero from the first sample.
+        let noise = vec![0.001f32; 16_000];
+        assert!(!watchdog.observe(&noise));
+    }
+
+    #[test]
+    fn device_not_found_error_names_request_and_inventory() {
+        let err = device_not_found_error("Imaginary USB Mic 9000");
+        assert_eq!(err.error_code(), "FW-INVALID-REQUEST");
+        let message = err.to_string();
+        assert!(message.contains("Imaginary USB Mic 9000"));
+        assert!(message.contains("available input devices"), "{message}");
+    }
+
+    #[test]
+    fn enumerate_input_devices_is_deterministic_and_promptless() {
+        // Runs on any host (zero devices is a valid outcome, e.g. CI).
+        // Asserts the ordering contract and that two enumerations agree —
+        // and by running in CI at all, that enumeration never blocks on a
+        // permission prompt.
+        let Ok(a) = enumerate_input_devices() else {
+            eprintln!("SKIP enumerate: host audio backend unavailable");
+            return;
+        };
+        let b = enumerate_input_devices().expect("second enumeration");
+        assert_eq!(a, b, "enumeration must be stable");
+        if a.len() > 1 {
+            assert!(
+                a[0].is_default || a.iter().all(|d| !d.is_default),
+                "default device must sort first when present"
+            );
+            for pair in a.windows(2) {
+                if !pair[0].is_default && !pair[1].is_default {
+                    assert!(pair[0].name <= pair[1].name, "name ordering");
+                }
+            }
+        }
     }
 
     // ---- live hardware smoke (needs a real input device; run manually) ----

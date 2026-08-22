@@ -1298,7 +1298,26 @@ pub struct HealthReport {
     pub ffmpeg: DependencyCheck,
     pub database: DependencyCheck,
     pub resources: ResourceSnapshot,
+    /// Audio input availability (bd-rt-device-probe-wh02): enumeration-only
+    /// metadata — the probe NEVER opens a stream, because opening triggers
+    /// the macOS TCC microphone prompt as a health-check side effect. An
+    /// explicit live open/read test is a separate, deliberate driver action.
+    /// Additive to the 1.x schema (never in the required-field constants);
+    /// does not participate in `overall_status` (a headless box without a
+    /// mic is healthy for every batch workload).
+    pub audio_input: AudioInputCheck,
     pub overall_status: CheckStatus,
+}
+
+/// Enumeration-only audio input snapshot for `health.report.audio_input`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioInputCheck {
+    pub available: bool,
+    pub default_device: Option<String>,
+    pub device_count: usize,
+    /// Capture backend the driver would try first.
+    pub backend: &'static str,
+    pub issues: Vec<String>,
 }
 
 /// Check if ffmpeg is available via env override, PATH, or provisioned bundle.
@@ -1477,12 +1496,40 @@ pub fn build_health_report(db_path: &Path) -> HealthReport {
         CheckStatus::Unavailable
     };
 
+    let audio_input = match crate::capture::enumerate_input_devices() {
+        Ok(devices) => AudioInputCheck {
+            available: !devices.is_empty(),
+            default_device: devices
+                .iter()
+                .find(|d| d.is_default)
+                .map(|d| d.name.clone()),
+            device_count: devices.len(),
+            backend: "cpal",
+            issues: if devices.is_empty() {
+                vec![
+                    "no audio input devices enumerated; live capture unavailable (batch                      transcription unaffected)"
+                        .to_owned(),
+                ]
+            } else {
+                vec![]
+            },
+        },
+        Err(error) => AudioInputCheck {
+            available: false,
+            default_device: None,
+            device_count: 0,
+            backend: "cpal",
+            issues: vec![error.to_string()],
+        },
+    };
+
     HealthReport {
         ts,
         backends,
         ffmpeg,
         database,
         resources,
+        audio_input,
         overall_status,
     }
 }
@@ -1505,6 +1552,13 @@ pub fn health_report_value(report: &HealthReport) -> serde_json::Value {
             "disk_total_bytes": report.resources.disk_total_bytes,
             "memory_available_bytes": report.resources.memory_available_bytes,
             "memory_total_bytes": report.resources.memory_total_bytes,
+        },
+        "audio_input": {
+            "available": report.audio_input.available,
+            "default_device": report.audio_input.default_device,
+            "device_count": report.audio_input.device_count,
+            "backend": report.audio_input.backend,
+            "issues": report.audio_input.issues,
         },
         "overall_status": report.overall_status.as_str(),
     })
@@ -5752,6 +5806,13 @@ mod tests {
                 disk_total_bytes: None,
                 memory_available_bytes: Some(8_000_000_000),
                 memory_total_bytes: Some(16_000_000_000),
+            },
+            audio_input: super::AudioInputCheck {
+                available: true,
+                default_device: Some("MacBook Pro Microphone".to_owned()),
+                device_count: 1,
+                backend: "cpal",
+                issues: vec![],
             },
             overall_status: super::CheckStatus::Ok,
         }
