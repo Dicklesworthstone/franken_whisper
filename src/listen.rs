@@ -1206,7 +1206,7 @@ mod tests {
 
         let music = music_signal(SAMPLE_RATE * 6, -14.0);
         let noise = lcg_noise(SAMPLE_RATE * 4, 0xC0FFEE, -20.0);
-        let hum = hum_signal(SAMPLE_RATE as usize * 4, -18.0);
+        let hum = hum_signal(SAMPLE_RATE * 4, -18.0);
         let mut violations: Vec<String> = Vec::new();
         let row = |name: &str, samples: &[f32], scores: &[f32], violations: &mut Vec<String>| {
             let voiced = scores.iter().filter(|&&s| s >= 0.5).count();
@@ -1287,7 +1287,7 @@ mod tests {
     #[test]
     fn earshot_eval_cost_per_frame_is_far_under_step_budget() {
         // may cost at most ~1 ms per step => <=200 us per 16 ms predict.
-        let audio = music_signal(SAMPLE_RATE as usize * 10, -14.0);
+        let audio = music_signal(SAMPLE_RATE * 10, -14.0);
         let mut det = earshot::Detector::default_boxed();
         let frames: Vec<&[f32]> = audio
             .as_chunks::<EARSHOT_FRAME_SAMPLES>()

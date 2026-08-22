@@ -276,6 +276,18 @@ pub struct DecodeParams {
     /// streaming knob (a live session is ALL first-window, where truncation was
     /// previously impossible without process-lifetime env flags).
     pub audio_ctx: AudioCtxPolicy,
+    /// Skip the per-model transcription result LRU for this request
+    /// (bd-rt-cache-bypass-xqz1). Default `false` (cache active). The live
+    /// listen driver sets `true` on every step decode: a rolling buffer
+    /// differs every tick, so the cache can never hit, yet each miss COPIES
+    /// the whole sample buffer (up to 16 MiB) into the cache and evicts
+    /// genuinely useful batch entries. The `FW_TRANSCRIPT_CACHE=0` env flag
+    /// remains the process-wide operator kill-switch (OnceLock, set once for
+    /// the process lifetime); this field is the per-request policy so one
+    /// process can serve batch requests (cache useful) and live sessions
+    /// (cache harmful) at the same time. Effective caching =
+    /// env_enabled && !bypass.
+    pub bypass_transcript_cache: bool,
 }
 
 /// Per-request encoder-context policy for the audio encoder
@@ -468,6 +480,12 @@ struct TranscriptionCache {
 }
 
 impl TranscriptionCache {
+    /// Entry count (bypass-path assertions in tests).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     fn lookup(
         &mut self,
         fingerprint: u64,
@@ -2525,7 +2543,11 @@ pub fn transcribe_samples(
     params: &DecodeParams,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<DecodeOutput> {
-    let cacheable = transcription_cache_enabled()
+    if params.bypass_transcript_cache {
+        tracing::debug!("transcript cache bypassed (per-request)");
+    }
+    let cacheable = !params.bypass_transcript_cache
+        && transcription_cache_enabled()
         && samples_16k_mono
             .len()
             .saturating_mul(std::mem::size_of::<f32>())
@@ -5516,6 +5538,74 @@ mod tests {
             max_text_ctx: None,
             ..DecodeParams::default()
         }
+    }
+
+    #[test]
+    fn bypass_transcript_cache_defaults_off_and_is_cache_key_safe() {
+        // Default: caching stays active (bypass=false).
+        assert!(!DecodeParams::default().bypass_transcript_cache);
+        // The field participates in Hash/Eq (derives), so a bypass job can
+        // never coalesce with a cached job of identical audio in
+        // transcribe_samples_batch — assert the inequality that guarantees it.
+        let cached = DecodeParams::default();
+        let bypass = DecodeParams {
+            bypass_transcript_cache: true,
+            ..DecodeParams::default()
+        };
+        assert_ne!(cached, bypass);
+    }
+
+    #[test]
+    fn gated_bypass_transcript_cache_skips_lookup_and_insert() {
+        // Model-gated end-to-end proof: with bypass=true the LRU stays empty
+        // across repeated identical transcriptions (no lookup, no insert, no
+        // sample copy), and physical decode work happens every time; with
+        // bypass=false the second run is a cache hit doing zero decode work.
+        let Some(loaded) = load_tiny_en() else {
+            eprintln!("SKIP gated_bypass_transcript_cache: tiny.en not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_bypass_transcript_cache: jfk.wav missing");
+            return;
+        };
+        let noop = noop;
+        let bypass_params = DecodeParams {
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+        loaded.clear_transcription_cache();
+        let first =
+            transcribe_samples(&loaded, &samples, &bypass_params, &noop).expect("bypass run 1");
+        let second =
+            transcribe_samples(&loaded, &samples, &bypass_params, &noop).expect("bypass run 2");
+        assert!(first.work.sampled_tokens > 0);
+        assert!(
+            second.work.sampled_tokens > 0,
+            "bypass second run must do real work (no cache hit)"
+        );
+        assert_eq!(
+            loaded
+                .transcription_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            0,
+            "bypass runs must not insert into the cache"
+        );
+
+        // Control: same audio without bypass populates and then hits.
+        let cached_params = e2e_params();
+        let third =
+            transcribe_samples(&loaded, &samples, &cached_params, &noop).expect("cached run 1");
+        let fourth =
+            transcribe_samples(&loaded, &samples, &cached_params, &noop).expect("cached run 2");
+        assert!(third.work.sampled_tokens > 0);
+        assert_eq!(
+            fourth.work.sampled_tokens, 0,
+            "second cached run must be a pure cache hit"
+        );
+        assert_eq!(fourth.segments.len(), third.segments.len());
     }
 
     #[test]

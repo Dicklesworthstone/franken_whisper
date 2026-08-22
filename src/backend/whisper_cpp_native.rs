@@ -537,6 +537,7 @@ fn decode_params(
         // bridge backends (the knob is per-request on the engine; the live
         // driver opts in, not the batch bridges).
         audio_ctx: decode::AudioCtxPolicy::Full,
+        bypass_transcript_cache: false,
     }
 }
 
