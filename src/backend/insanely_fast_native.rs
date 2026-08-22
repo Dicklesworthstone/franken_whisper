@@ -585,6 +585,7 @@ fn merge_ranges(results: &[RangeResult]) -> MergedOutput {
                 no_speech_prob: win.no_speech_prob,
                 tokens: win.tokens,
                 window_offset_sec: win.window_offset_sec + offset,
+                token_attn: win.token_attn.clone(),
             });
         }
     }
@@ -963,6 +964,7 @@ mod tests {
                 no_speech_prob: 0.01,
                 tokens: 3,
                 window_offset_sec: offset_sec,
+                token_attn: Vec::new(),
             }],
             dropped_windows: Vec::new(),
             work: decode::DecodeWorkStats::default(),

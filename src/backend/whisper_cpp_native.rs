@@ -538,6 +538,7 @@ fn decode_params(
         // driver opts in, not the batch bridges).
         audio_ctx: decode::AudioCtxPolicy::Full,
         bypass_transcript_cache: false,
+        record_token_attn: false,
     }
 }
 
@@ -1676,6 +1677,7 @@ mod tests {
                 no_speech_prob: 0.01,
                 tokens: 3,
                 window_offset_sec: 0.0,
+                token_attn: Vec::new(),
             }],
             dropped_windows: vec![decode::DroppedWindow {
                 start_sec: 30.0,

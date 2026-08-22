@@ -531,6 +531,7 @@ mod tests {
             no_speech_prob: 0.01,
             tokens: 5,
             window_offset_sec: offset,
+            token_attn: Vec::new(),
         }
     }
 

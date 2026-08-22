@@ -288,6 +288,18 @@ pub struct DecodeParams {
     /// (cache harmful) at the same time. Effective caching =
     /// env_enabled && !bypass.
     pub bypass_transcript_cache: bool,
+    /// Record each greedy token's alignment-head cross-attention argmax
+    /// frame into [`WindowStats::token_attn`] (bd-rt-attn-tap-dfti; feeds
+    /// the AlignAtt streaming emission policy). Greedy-only: combined with
+    /// an effective beam width > 1 the request fails with FW-UNSUPPORTED
+    /// (SimulStreaming shows beam variants exist; future work). Off by
+    /// default and zero-cost when off (attention scores are not
+    /// materialized). Deviation from the bead's "TranscribeOptions, not
+    /// DecodeParams" note, recorded deliberately: a hashable bool with
+    /// output-affecting semantics is transcription-cache-CORRECT (different
+    /// key => different cached output), and a separate options struct would
+    /// churn every public transcribe call site for no safety gain.
+    pub record_token_attn: bool,
 }
 
 /// Per-request encoder-context policy for the audio encoder
@@ -374,6 +386,26 @@ fn fixed_enc_ctx_clamped(n: usize) -> usize {
         .clamp(MIN_ENC_CTX, FULL_ENC_CTX)
 }
 
+/// Per-token alignment-head cross-attention focus (bd-rt-attn-tap-dfti).
+///
+/// `attn_frame` is the argmax encoder frame (20 ms grid, window-relative) of
+/// the alignment heads' mean attention for the token at `token_index` in the
+/// window's decoded stream. Produced by the greedy loop when the
+/// [`DecodeParams::record_token_attn`] flag is set; the AlignAtt streaming
+/// policy commits only tokens whose focus sits safely before the buffer edge.
+///
+/// The window's FINAL accepted token is never forwarded (the loop breaks at
+/// eot/budget/window-end before its forward), so it has no entry here —
+/// consumers must treat a missing tail entry as "at the edge", which is
+/// exactly the conservative reading a holdback policy wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenAttn {
+    /// Index into the window's decoded token stream.
+    pub token_index: u32,
+    /// Argmax encoder frame (1 frame = 20 ms, window-relative).
+    pub attn_frame: u32,
+}
+
 /// Per-window quality-control statistics, surfaced for the evidence ledger.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowStats {
@@ -385,6 +417,9 @@ pub struct WindowStats {
     pub tokens: usize,
     /// Window start offset in seconds.
     pub window_offset_sec: f64,
+    /// Per-token alignment-head attention focus (empty unless
+    /// [`DecodeParams::record_token_attn`] was set on a greedy decode).
+    pub token_attn: Vec<TokenAttn>,
 }
 
 /// Aggregate decoder work performed by one [`transcribe_samples`] call.
@@ -2322,6 +2357,9 @@ fn decode_independent_no_timestamp_window(
             no_speech_prob,
             tokens: result_len,
             window_offset_sec: seek_cs as f64 / 100.0,
+            // Parallel no-context windows are a no-timestamps batch path;
+            // the attention tap is greedy/timestamps streaming machinery.
+            token_attn: Vec::new(),
         },
         work,
     })
@@ -2519,6 +2557,54 @@ fn decode_independent_no_timestamp_windows(
     })
 }
 
+/// Reduce one token's recorded cross-attention to its alignment-head mean
+/// argmax frame (bd-rt-attn-tap-dfti).
+///
+/// `recorded` holds one `[tokens, enc_frames]` matrix per `(layer, head)` in
+/// `layer * n_head + head` order, from the decoder state's
+/// recorded cross-attention weights; during the greedy loop the
+/// token dimension is 1. Returns `None` when nothing usable was recorded
+/// (empty head set, empty mats) — callers treat that as "no tap for this
+/// token", never as frame 0.
+fn reduce_attn_frame(
+    recorded: &[super::Mat],
+    align_heads: &[(usize, usize)],
+    n_head: usize,
+    enc_frames: usize,
+) -> Option<u32> {
+    if recorded.is_empty() || align_heads.is_empty() || enc_frames == 0 || n_head == 0 {
+        return None;
+    }
+    let mut mean = vec![0.0f32; enc_frames];
+    let mut used = 0usize;
+    for &(layer, head) in align_heads {
+        let Some(mat) = recorded.get(layer * n_head + head) else {
+            continue;
+        };
+        if mat.rows == 0 || mat.cols < enc_frames {
+            continue;
+        }
+        // Last row = the most recent token (rows==1 in the greedy loop).
+        let row = mat.row(mat.rows - 1);
+        for (accumulator, &weight) in mean.iter_mut().zip(&row[..enc_frames]) {
+            *accumulator += weight;
+        }
+        used += 1;
+    }
+    if used == 0 {
+        return None;
+    }
+    let mut best = 0usize;
+    let mut best_weight = f32::MIN;
+    for (frame, &weight) in mean.iter().enumerate() {
+        if weight > best_weight {
+            best_weight = weight;
+            best = frame;
+        }
+    }
+    Some(best as u32)
+}
+
 /// Transcribe 16 kHz mono PCM `samples` with the greedy / temperature-0 path of
 /// whisper, returning timed segments + per-window QC statistics.
 ///
@@ -2708,6 +2794,16 @@ fn transcribe_samples_uncached(
     // Beam width (whisper `--beam-size`): field or FW_BEAM_SIZE override, resolved
     // once. 1 = greedy (byte-identical default).
     let effective_beam_size = resolve_beam_size(params);
+    if params.record_token_attn && effective_beam_size > 1 {
+        return Err(FwError::Unsupported(format!(
+            "record_token_attn requires greedy decoding (effective beam width {effective_beam_size});              AlignAtt-over-beams is future work"
+        )));
+    }
+    let attn_align_heads = if params.record_token_attn {
+        dtw::alignment_heads(&m.hparams, params.model_hint.as_deref())
+    } else {
+        Vec::new()
+    };
 
     // Long no-context jobs have no cross-window dependency: timestamp tokens
     // are masked (fixed 30 s seek), the language is already known, prompt carry
@@ -3023,6 +3119,7 @@ fn transcribe_samples_uncached(
             // stay on the greedy sampling path. `beam_size() == 1` (default) ⇒ the
             // greedy branch always runs ⇒ byte-identical to the pre-beam engine.
             let t_loop = crate::native_engine::plat::Instant::now();
+            let mut window_token_attn: Vec<TokenAttn> = Vec::new();
             let (decoded, plogs, _has_ts, seek_delta_cs, result_len) = if effective_beam_size > 1
                 && window_temp == 0.0
             {
@@ -3043,6 +3140,10 @@ fn transcribe_samples_uncached(
                     checkpoint,
                 )?
             } else {
+                // bd-rt-attn-tap-dfti: record cross-attention only during the
+                // sampling loop (the prompt prefill above must not pay the
+                // score-materialization cost for prompt tokens).
+                st.record_cross_attn = params.record_token_attn;
                 let mut decoded: Vec<i32> = Vec::new();
                 let mut plogs: Vec<f32> = Vec::new();
                 let mut has_ts = false;
@@ -3123,7 +3224,28 @@ fn transcribe_samples_uncached(
                     // Forward the just-chosen token to get the next logits.
                     step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
                     work.greedy_single_token_forwards += 1;
+                    if params.record_token_attn
+                        && let Some(frame) = reduce_attn_frame(
+                            st.cross_attn_weights(),
+                            &attn_align_heads,
+                            m.hparams.n_text_head.max(0) as usize,
+                            st.enc_frames(),
+                        )
+                    {
+                        tracing::trace!(
+                            token_index = i,
+                            token_id = tok,
+                            attn_frame = frame,
+                            enc_frames = st.enc_frames(),
+                            "token attention tap"
+                        );
+                        window_token_attn.push(TokenAttn {
+                            token_index: i as u32,
+                            attn_frame: frame,
+                        });
+                    }
                 }
+                st.record_cross_attn = false;
                 (decoded, plogs, has_ts, seek_delta_cs, result_len)
             };
             work.sampled_tokens += decoded.len();
@@ -3354,6 +3476,7 @@ fn transcribe_samples_uncached(
                 no_speech_prob,
                 tokens: result_len,
                 window_offset_sec: seek_cs as f64 / 100.0,
+                token_attn: window_token_attn,
             });
             work.accepted_windows += 1;
             work.accepted_result_tokens += result_len;
@@ -5538,6 +5661,147 @@ mod tests {
             max_text_ctx: None,
             ..DecodeParams::default()
         }
+    }
+
+    #[test]
+    fn reduce_attn_frame_synthetic_argmax_and_head_selection() {
+        use super::super::Mat;
+        let enc = 8usize;
+        let n_head = 2usize; // 2 layers x 2 heads => 4 mats
+        let mk = |peak: usize| {
+            let mut row = vec![0.0f32; enc];
+            row[peak] = 1.0;
+            Mat::from_vec(1, enc, row)
+        };
+        // layer0: heads peak at 2 and 4; layer1: heads peak at 6 and 7.
+        let recorded = vec![mk(2), mk(4), mk(6), mk(7)];
+
+        // Align heads = layer0 only: mean peaks flat between 2 and 4 -> argmax
+        // takes the FIRST max (2) deterministically.
+        assert_eq!(
+            reduce_attn_frame(&recorded, &[(0, 0), (0, 1)], n_head, enc),
+            Some(2)
+        );
+        // Single head (1,1) -> its own peak.
+        assert_eq!(
+            reduce_attn_frame(&recorded, &[(1, 1)], n_head, enc),
+            Some(7)
+        );
+        // Weighted dominance: double weight on head (1,0) via duplication.
+        assert_eq!(
+            reduce_attn_frame(&recorded, &[(1, 0), (1, 0), (0, 0)], n_head, enc),
+            Some(6)
+        );
+        // Degenerate inputs -> None, never frame 0.
+        assert_eq!(reduce_attn_frame(&[], &[(0, 0)], n_head, enc), None);
+        assert_eq!(reduce_attn_frame(&recorded, &[], n_head, enc), None);
+        assert_eq!(reduce_attn_frame(&recorded, &[(9, 9)], n_head, enc), None);
+        assert_eq!(reduce_attn_frame(&recorded, &[(0, 0)], n_head, 0), None);
+    }
+
+    #[test]
+    fn record_token_attn_defaults_off_and_rejects_beam() {
+        assert!(!DecodeParams::default().record_token_attn);
+        let Some(loaded) = load_tiny_en() else {
+            eprintln!("SKIP record_token_attn beam guard: tiny.en not found");
+            return;
+        };
+        let params = DecodeParams {
+            record_token_attn: true,
+            beam_size: Some(4),
+            ..e2e_params()
+        };
+        let err = transcribe_samples(&loaded, &vec![0.0f32; 16_000], &params, &noop)
+            .expect_err("beam + attention tap must be rejected");
+        assert_eq!(err.error_code(), "FW-UNSUPPORTED");
+    }
+
+    #[test]
+    fn gated_token_attn_tap_tracks_speech_signal() {
+        // Model-gated live-signal check (bd-rt-attn-tap-dfti acceptance,
+        // adapted): tap frames must be in-range, cover nearly every forwarded
+        // token, and land near DTW-timed words for the same audio. WordTiming
+        // carries no token span, so parity is measured as the median distance
+        // from each tapped time to the nearest DTW word INTERVAL — same
+        // signal, loose bound (<= 0.30 s), actual value printed for the bead
+        // close note.
+        let Some(loaded) = load_tiny_en() else {
+            eprintln!("SKIP gated_token_attn_tap: tiny.en not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_token_attn_tap: jfk.wav missing");
+            return;
+        };
+        let params = DecodeParams {
+            record_token_attn: true,
+            word_timestamps: true,
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+        let out = transcribe_samples(&loaded, &samples, &params, &noop).expect("transcribe");
+        assert!(!out.windows.is_empty());
+        let mut tap_times: Vec<f64> = Vec::new();
+        for window in &out.windows {
+            assert!(
+                window.token_attn.len() + 1 >= window.tokens.min(window.token_attn.len() + 1),
+                "tap must cover forwarded tokens (missing only the unforwarded tail)"
+            );
+            for tap in &window.token_attn {
+                // 1 encoder frame = 20 ms.
+                tap_times.push(window.window_offset_sec + f64::from(tap.attn_frame) * 0.02);
+            }
+        }
+        assert!(
+            tap_times.len() >= 20,
+            "expected a rich tap stream on jfk, got {}",
+            tap_times.len()
+        );
+        let words: Vec<(f64, f64)> = out
+            .word_timings
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|w| (w.start_sec, w.end_sec))
+            .collect();
+        assert!(
+            !words.is_empty(),
+            "word timings required for the parity check"
+        );
+        let mut distances: Vec<f64> = tap_times
+            .iter()
+            .map(|&t| {
+                words
+                    .iter()
+                    .map(|&(a, b)| {
+                        if t < a {
+                            a - t
+                        } else if t > b {
+                            t - b
+                        } else {
+                            0.0
+                        }
+                    })
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .collect();
+        distances.sort_by(f64::total_cmp);
+        let median = distances[distances.len() / 2];
+        eprintln!(
+            "token-attn parity: {} taps, median distance to nearest DTW word {:.3}s, p90 {:.3}s",
+            distances.len(),
+            median,
+            distances[distances.len() * 9 / 10]
+        );
+        assert!(
+            median <= 0.30,
+            "tap frames drifted from DTW word intervals: median {median:.3}s"
+        );
+
+        // Off path stays empty.
+        let out_off =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe off");
+        assert!(out_off.windows.iter().all(|w| w.token_attn.is_empty()));
     }
 
     #[test]
