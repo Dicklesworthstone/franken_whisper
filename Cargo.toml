@@ -74,6 +74,15 @@ symphonia = { version = "0.5.5", features = ["mp3", "aac", "isomp4", "ogg", "fla
 # ft-kernel-cpu; pinned to the same minor.
 rayon = "1.10"
 
+# Continuous microphone capture for the real-time listen driver
+# (bd-rt-capture-trait-lckq). cpal is the Rust ecosystem standard for input
+# streams (CoreAudio/ALSA/WASAPI); its platform glue carries internal unsafe,
+# which is acceptable under the crate-local #![deny(unsafe_code)] posture
+# (same as symphonia / ft-kernel deps). ringbuf provides the lock-free SPSC
+# ring the audio callback writes into (callback never blocks or allocates).
+cpal = "0.15"
+ringbuf = "0.4"
+
 asupersync = { version = "0.3.4", default-features = false, features = ["tls-webpki-roots"] }
 franken-kernel = "0.3.4"
 franken-evidence = "0.3.4"

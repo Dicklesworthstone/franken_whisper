@@ -10,6 +10,7 @@ pub mod accelerate;
 pub mod adversarial_corpus;
 pub mod audio;
 pub mod backend;
+pub mod capture;
 pub mod cli;
 pub mod confidential_evaluation;
 pub mod conformance;
