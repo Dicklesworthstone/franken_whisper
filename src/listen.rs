@@ -1088,4 +1088,197 @@ mod tests {
             started.elapsed()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // bd-rt-vad-stream-ulp5: earshot second-tier EVALUATION
+    //
+    // Decision rule (locked in the bead): ship energy pre-gate + earshot
+    // only if the classifier measurably vetoes loud non-speech (music /
+    // noise / hum trivially pass the relative-energy gate) without hurting
+    // speech recall, at a per-frame cost far under the driver step budget
+    // and a sane binary-size footprint. Otherwise record the negative
+    // result and ship energy-only v1. These tests ARE the evaluation; the
+    // printed numbers go into the bead close comment.
+    // -----------------------------------------------------------------------
+
+    /// earshot's native input frame: 256 samples @ 16 kHz = 16 ms.
+    const EARSHOT_FRAME_SAMPLES: usize = 256;
+
+    /// Contiguous [-1, 1] stream -> per-16 ms-frame voice scores.
+    fn earshot_scores(samples: &[f32]) -> Vec<f32> {
+        let mut det = earshot::Detector::default_boxed();
+        samples
+            .as_chunks::<EARSHOT_FRAME_SAMPLES>()
+            .0
+            .iter()
+            .map(|f| det.predict_f32(f))
+            .collect()
+    }
+
+    /// Deterministic LCG white noise at `db` dBFS (reproducible across runs).
+    fn lcg_noise(len: usize, seed: u64, db: f64) -> Vec<f32> {
+        let amp = 10f64.powf(db / 20.0);
+        let mut s = seed | 1;
+        (0..len)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let u = (s >> 33) as f64 / ((u64::MAX >> 33) as f64) * 2.0 - 1.0;
+                (u * amp) as f32
+            })
+            .collect()
+    }
+
+    /// Deterministic music-like signal: C-major arpeggio, harmonic-rich
+    /// plucked notes with vibrato and note envelopes, at `db` dBFS. Loud
+    /// music passes any relative-energy gate — the exact case tier-2
+    /// exists for.
+    fn music_signal(len: usize, db: f64) -> Vec<f32> {
+        const PI: f64 = std::f64::consts::PI;
+        let amp = 10f64.powf(db / 20.0);
+        let notes = [261.63_f64, 329.63, 392.0, 523.25];
+        let note_len = 0.15_f64;
+        (0..len)
+            .map(|i| {
+                let t = i as f64 / SAMPLE_RATE as f64;
+                let idx = (t / note_len) as usize % notes.len();
+                let tt = t % note_len;
+                let env =
+                    ((tt / 0.01).min(1.0) * ((note_len - tt) / 0.03).min(1.0)).clamp(0.0, 1.0);
+                let vib = 1.0 + 0.004 * (2.0 * PI * 5.5 * t).sin();
+                let f = notes[idx] * vib;
+                let s = (2.0 * PI * f * t).sin()
+                    + 0.35 * (2.0 * PI * 2.0 * f * t).sin()
+                    + 0.12 * (2.0 * PI * 3.0 * f * t).sin();
+                (amp * env * s * 0.5) as f32
+            })
+            .collect()
+    }
+
+    /// Deterministic mains hum: 60 Hz + harmonics, slow AM, at `db` dBFS.
+    fn hum_signal(len: usize, db: f64) -> Vec<f32> {
+        const PI: f64 = std::f64::consts::PI;
+        let amp = 10f64.powf(db / 20.0);
+        (0..len)
+            .map(|i| {
+                let t = i as f64 / SAMPLE_RATE as f64;
+                let am = 0.85 + 0.15 * (2.0 * PI * 0.7 * t).sin();
+                let s = (2.0 * PI * 60.0 * t).sin()
+                    + 0.5 * (2.0 * PI * 120.0 * t).sin()
+                    + 0.25 * (2.0 * PI * 180.0 * t).sin()
+                    + 0.12 * (2.0 * PI * 240.0 * t).sin();
+                (amp * am * s * 0.53) as f32
+            })
+            .collect()
+    }
+
+    fn jfk_samples() -> Vec<f32> {
+        let mut reader =
+            hound::WavReader::open("tests/fixtures/native/jfk.wav").expect("open jfk.wav");
+        assert_eq!(reader.spec().sample_rate, u32::try_from(SAMPLE_RATE).unwrap());
+        assert_eq!(reader.spec().channels, 1);
+        reader
+            .samples::<i16>()
+            .map(|s| f32::from(s.expect("pcm")) / 32_768.0)
+            .collect()
+    }
+
+    #[test]
+    fn earshot_eval_raw_scores_on_labeled_fixtures() {
+        // Exact labels by construction for synthetics; for the real speech
+        // clip the reference mask is a BATCH energy mask (p75 of frame RMS)
+        // — eval-only ground truth approximation, never runtime logic.
+        let dur = |v: &[f32]| v.len() as f64 / SAMPLE_RATE as f64;
+
+        let music = music_signal(SAMPLE_RATE as usize * 6, -14.0);
+        let noise = lcg_noise(SAMPLE_RATE as usize * 4, 0xC0FFEE, -20.0);
+        let hum = hum_signal(SAMPLE_RATE as usize * 4, -18.0);
+        for (name, samples, expect_voice) in [
+            ("music -14 dB", &music, false),
+            ("white noise -20 dB", &noise, false),
+            ("mains hum -18 dB", &hum, false),
+        ] {
+            let scores = earshot_scores(samples);
+            let voiced = scores.iter().filter(|&&s| s >= 0.5).count();
+            let frac = f64::from(voiced as u32) / scores.len() as f64;
+            println!(
+                "eval {name}: {voiced}/{} frames voiced ({frac:.4}), mean {:.3}, max {:.3} [{:.2}s]",
+                scores.len(),
+                scores.iter().sum::<f32>() / scores.len() as f32,
+                scores.iter().cloned().fold(f32::MIN, f32::max),
+                dur(samples)
+            );
+            assert!(
+                frac <= 0.05,
+                "{name}: earshot passed {frac:.3} of loud non-speech"
+            );
+        }
+
+        let jfk = jfk_samples();
+        let scores = earshot_scores(&jfk);
+        let rms: Vec<f32> = jfk
+            .as_chunks::<EARSHOT_FRAME_SAMPLES>()
+            .0
+            .iter()
+            .map(|f| {
+                let sq: f32 = f.iter().map(|v| v * v).sum();
+                (sq / EARSHOT_FRAME_SAMPLES as f32).sqrt()
+            })
+            .collect();
+        let mut sorted = rms.clone();
+        sorted.sort_by(f32::total_cmp);
+        let p75 = sorted[sorted.len() * 3 / 4];
+        let speech_frames = rms.iter().filter(|&&r| r > p75).count();
+        let hits = rms
+            .iter()
+            .zip(&scores)
+            .filter(|(&r, &s)| *r > p75 && *s >= 0.5)
+            .count();
+        let voiced_total = scores.iter().filter(|&&s| s >= 0.5).count();
+        let recall = hits as f64 / speech_frames.max(1) as f64;
+        println!(
+            "eval jfk.wav {:.2}s: {} frames, speech-mask {speech_frames}, earshot voiced \
+             {voiced_total} ({:.3} of all), recall-on-mask {recall:.4}",
+            dur(&jfk),
+            scores.len(),
+            voiced_total as f64 / scores.len() as f64,
+        );
+        assert!(
+            recall >= 0.85,
+            "earshot missed real speech: recall {recall:.3}"
+        );
+        assert!(
+            voiced_total as f64 / scores.len() as f64 >= 0.5,
+            "clean speech clip scored mostly unvoiced"
+        );
+    }
+
+    #[test]
+    fn earshot_eval_cost_per_frame_is_far_under_step_budget() {
+        // Budget shape: a 100 ms driver step carries 5 VAD frames; tier-2
+        // may cost at most ~1 ms per step => <=200 us per 16 ms predict.
+        let audio = music_signal(SAMPLE_RATE as usize * 10, -14.0);
+        let mut det = earshot::Detector::default_boxed();
+        let frames: Vec<&[f32]> = audio.as_chunks::<EARSHOT_FRAME_SAMPLES>().0.iter().collect();
+        for f in &frames[..32] {
+            let _ = det.predict_f32(f); // warmup
+        }
+        let started = Instant::now();
+        let mut sink = 0.0_f32;
+        for f in &frames {
+            sink += det.predict_f32(f);
+        }
+        let elapsed = started.elapsed();
+        let per_frame_us = elapsed.as_nanos() as f64 / 1_000.0 / frames.len() as f64;
+        println!(
+            "eval earshot cost: {:.1} us per 16 ms frame over {} frames ({sink:.0} sink)",
+            per_frame_us,
+            frames.len()
+        );
+        assert!(
+            per_frame_us < 200.0,
+            "tier-2 too slow: {per_frame_us:.1} us/frame"
+        );
+    }
 }
