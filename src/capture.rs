@@ -588,6 +588,233 @@ impl CaptureSource for FixtureCaptureSource {
 }
 
 // ---------------------------------------------------------------------------
+// bd-rt-resampler-pbk9: streaming resampler to 16 kHz mono
+//
+// Dependency decision (the bead's required evaluation, 2026-08-22): rubato
+// v5 drags in an FFT stack (num-complex/realfft path), the audioadapter
+// family, windowfunctions, and a proc-macro chain — ~10 transitive crates
+// for a task that needs one polyphase FIR. The bead's own caveat ("NO FFT
+// requirement at this rate") decides it: hand-rolled kaiser windowed-sinc
+// polyphase (upfirdn structure), zero new dependencies. Design strength is
+// rubato-class: 70 dB stopband kaiser (beta ~6.76), passband to
+// 0.45*out_rate, stopband at the output Nyquist; tap count derived from the
+// kaiser formula per ratio (48k->16k: ~260 taps; 44.1k->16k: ~239
+// taps/phase across 160 phases). Per-output cost is taps_per_phase MACs —
+// single-digit MMAC/s, immaterial.
+//
+// The batch pipeline's linear-interpolation resampler is deliberately NOT
+// touched (byte-exactness-protected, own ledger history); this is new
+// surface for the live path only.
+// ---------------------------------------------------------------------------
+
+/// Streaming sample-rate converter: device-native interleaved audio in,
+/// 16 kHz (or any target) MONO f32 out. Filter state carries across chunks
+/// (no per-chunk edge clicks); [`StreamingResampler::flush`] drains the
+/// tail at session end.
+///
+/// Group delay is (taps_per_phase-1)/2 input samples (sub-millisecond at
+/// device rates) and is deliberately ignored by the session clock
+/// (bd-rt-buffer note: far under the 20 ms mel frame).
+pub struct StreamingResampler {
+    in_rate: u32,
+    out_rate: u32,
+    channels: usize,
+    /// Upsample / downsample factors, reduced (out/in = l/m).
+    l: u64,
+    m: u64,
+    /// Taps per polyphase branch (K). Filter length is K*L.
+    taps_per_phase: usize,
+    /// Prototype filter, upsampled-domain, length K*L, gain-compensated.
+    filter: Vec<f32>,
+    /// Downmixed mono input not yet fully consumed. Prepadded with K-1
+    /// zeros at construction so the first outputs have history.
+    buf: Vec<f32>,
+    /// Absolute input-sample index of `buf[0]` (including the zero prepad,
+    /// which occupies indices 0..K-1; real audio starts at K-1).
+    buf_start: u64,
+    /// Upsampled-domain position of the next output sample (advances by M).
+    t: u64,
+    /// Carry for a partial interleaved frame split across chunk boundaries.
+    pending_frame: Vec<f32>,
+    flushed: bool,
+}
+
+impl StreamingResampler {
+    /// Create a resampler from `in_rate` Hz interleaved `channels` audio to
+    /// `out_rate` Hz mono.
+    pub fn new(in_rate: u32, channels: u16, out_rate: u32) -> FwResult<Self> {
+        if in_rate == 0 || out_rate == 0 || channels == 0 {
+            return Err(FwError::InvalidRequest(
+                "resampler requires nonzero rates and channel count".into(),
+            ));
+        }
+        let g = gcd(u64::from(in_rate), u64::from(out_rate));
+        let l = u64::from(out_rate) / g;
+        let m = u64::from(in_rate) / g;
+
+        // Kaiser design, A = 70 dB stopband, transition from 0.45*out to
+        // 0.5*out (all in Hz), normalized to the upsampled rate in*L.
+        let fs_up = f64::from(in_rate) * l as f64;
+        let attenuation_db = 70.0;
+        let beta = 0.1102 * (attenuation_db - 8.7);
+        let transition = 0.05 * f64::from(out_rate) / fs_up;
+        let mut n = ((attenuation_db - 7.95) / (14.36 * transition)).ceil() as usize;
+        // Round up to a whole number of phases, keep odd-ish symmetry via
+        // exact center handling below.
+        let taps_per_phase = n.div_ceil(l as usize).max(4);
+        n = taps_per_phase * l as usize;
+
+        let cutoff = 0.475 * f64::from(out_rate) / fs_up; // cycles/sample, mid-transition
+        let center = (n - 1) as f64 / 2.0;
+        let i0_beta = bessel_i0(beta);
+        let gain = l as f64;
+        let mut filter = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = i as f64 - center;
+            let sinc = if x == 0.0 {
+                2.0 * cutoff
+            } else {
+                (2.0 * std::f64::consts::PI * cutoff * x).sin() / (std::f64::consts::PI * x)
+            };
+            let w = {
+                let r = 2.0 * i as f64 / (n - 1) as f64 - 1.0;
+                bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) / i0_beta
+            };
+            filter.push((gain * sinc * w) as f32);
+        }
+
+        let taps = taps_per_phase;
+        Ok(Self {
+            in_rate,
+            out_rate,
+            channels: usize::from(channels),
+            l,
+            m,
+            taps_per_phase: taps,
+            filter,
+            buf: vec![0.0; taps - 1], // history prepad
+            buf_start: 0,
+            // Absolute index space includes the prepad: real input sample j
+            // lives at absolute index (K-1)+j, and output n is centered at
+            // real position n*M/L, i.e. absolute base (K-1) + n*M/L. Start t
+            // so that base(t=start) = K-1.
+            t: (taps as u64 - 1) * l,
+            pending_frame: Vec::with_capacity(usize::from(channels)),
+            flushed: false,
+        })
+    }
+
+    #[must_use]
+    pub fn in_rate(&self) -> u32 {
+        self.in_rate
+    }
+
+    #[must_use]
+    pub fn out_rate(&self) -> u32 {
+        self.out_rate
+    }
+
+    /// Feed interleaved input samples; append produced mono output samples
+    /// to `out`. Chunk boundaries may split frames — a partial frame is
+    /// carried to the next call.
+    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) -> FwResult<()> {
+        if self.flushed {
+            return Err(FwError::InvalidRequest(
+                "resampler already flushed; create a new one per session".into(),
+            ));
+        }
+        // Reassemble whole frames across chunk boundaries, then downmix by
+        // averaging channels (same rule as the batch mixer).
+        let mut samples = input;
+        while !self.pending_frame.is_empty() && !samples.is_empty() {
+            self.pending_frame.push(samples[0]);
+            samples = &samples[1..];
+            if self.pending_frame.len() == self.channels {
+                let mono = self.pending_frame.iter().sum::<f32>() / self.channels as f32;
+                self.buf.push(mono);
+                self.pending_frame.clear();
+            }
+        }
+        let whole = samples.len() - samples.len() % self.channels;
+        for frame in samples[..whole].chunks_exact(self.channels) {
+            self.buf
+                .push(frame.iter().sum::<f32>() / self.channels as f32);
+        }
+        self.pending_frame.extend_from_slice(&samples[whole..]);
+
+        self.emit_ready(out);
+        Ok(())
+    }
+
+    /// Drain the filter tail at end of session (pads history-length zeros).
+    /// The resampler is unusable afterwards.
+    pub fn flush(&mut self, out: &mut Vec<f32>) {
+        if self.flushed {
+            return;
+        }
+        // An incomplete trailing frame is dropped (cannot be downmixed).
+        self.pending_frame.clear();
+        self.buf
+            .extend(std::iter::repeat_n(0.0f32, self.taps_per_phase - 1));
+        self.emit_ready(out);
+        self.flushed = true;
+    }
+
+    /// Emit every output sample whose full tap window is buffered.
+    fn emit_ready(&mut self, out: &mut Vec<f32>) {
+        let k = self.taps_per_phase;
+        let buf_end = self.buf_start + self.buf.len() as u64;
+        loop {
+            let base = self.t / self.l; // newest input index the window touches
+            if base >= buf_end {
+                break;
+            }
+            let phase = (self.t % self.l) as usize;
+            // Window spans input indices [base-k+1 ..= base]; the prepad
+            // guarantees base-k+1 >= buf_start for all reachable t.
+            let start = (base + 1 - k as u64 - self.buf_start) as usize;
+            let window = &self.buf[start..start + k];
+            let mut acc = 0.0f32;
+            // filter index for x[base - j] is phase + j*L, j = 0..K;
+            // window[k-1-j] = x[base-j].
+            for (j, &coeff) in (0..k).map(|j| (j, &self.filter[phase + j * self.l as usize])) {
+                acc += coeff * window[k - 1 - j];
+            }
+            out.push(acc);
+            self.t += self.m;
+        }
+        // Drop input no future output can touch: the oldest sample the next
+        // window needs is (t/L) - (K-1).
+        let needed_from = (self.t / self.l).saturating_sub(k as u64 - 1);
+        if needed_from > self.buf_start {
+            let drop = (needed_from - self.buf_start) as usize;
+            let drop = drop.min(self.buf.len());
+            self.buf.drain(..drop);
+            self.buf_start += drop as u64;
+        }
+    }
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Modified Bessel function of the first kind, order zero (kaiser window).
+fn bessel_i0(x: f64) -> f64 {
+    let half = x / 2.0;
+    let mut sum = 1.0f64;
+    let mut term = 1.0f64;
+    for k in 1..64 {
+        term *= (half / k as f64) * (half / k as f64);
+        sum += term;
+        if term < sum * 1e-14 {
+            break;
+        }
+    }
+    sum
+}
+
+// ---------------------------------------------------------------------------
 // Scriptable mock (test instrument shared by driver/endpoint unit tests)
 // ---------------------------------------------------------------------------
 
@@ -918,6 +1145,200 @@ mod tests {
         // ...10x growth does.
         maybe_log_overruns(30, &last, "test");
         assert_eq!(last.load(Ordering::Relaxed), 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-rt-resampler-pbk9: streaming resampler
+    // -----------------------------------------------------------------------
+
+    fn tone(freq: f64, rate: u32, secs: f64) -> Vec<f32> {
+        let n = (f64::from(rate) * secs) as usize;
+        (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * freq * i as f64 / f64::from(rate)).sin() as f32)
+            .collect()
+    }
+
+    fn rms(x: &[f32]) -> f64 {
+        if x.is_empty() {
+            return 0.0;
+        }
+        (x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / x.len() as f64).sqrt()
+    }
+
+    /// Goertzel power of `freq` in `x` at `rate` (steady-state region only:
+    /// skips the first/last 10% to avoid filter edge transients).
+    fn goertzel(x: &[f32], rate: u32, freq: f64) -> f64 {
+        let skip = x.len() / 10;
+        let x = &x[skip..x.len() - skip];
+        let w = 2.0 * std::f64::consts::PI * freq / f64::from(rate);
+        let coeff = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &v in x {
+            let s0 = f64::from(v) + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        ((s1 * s1 + s2 * s2 - coeff * s1 * s2) / (x.len() as f64 * x.len() as f64 / 4.0)).sqrt()
+    }
+
+    fn resample_all(rs: &mut StreamingResampler, input: &[f32]) -> Vec<f32> {
+        let mut out = Vec::new();
+        rs.process(input, &mut out).unwrap();
+        rs.flush(&mut out);
+        out
+    }
+
+    #[test]
+    fn resampler_48k_preserves_in_band_tone() {
+        let mut rs = StreamingResampler::new(48_000, 1, 16_000).unwrap();
+        let out = resample_all(&mut rs, &tone(1_000.0, 48_000, 1.0));
+        // Length ~ in/3 (+ small flush tail).
+        assert!(
+            out.len() >= 16_000 && out.len() < 16_400,
+            "len {}",
+            out.len()
+        );
+        // 1 kHz survives at close to unit amplitude.
+        let level = goertzel(&out, 16_000, 1_000.0);
+        assert!(level > 0.85, "1 kHz level after resample: {level}");
+        // Overall energy is tone-like (sine RMS ~ 0.707), not inflated.
+        let r = rms(&out);
+        assert!((r - 0.707).abs() < 0.05, "rms {r}");
+    }
+
+    #[test]
+    fn resampler_48k_suppresses_above_nyquist_alias() {
+        // 10 kHz is above the 8 kHz output Nyquist: virtually nothing may
+        // reach the output (this is THE anti-alias requirement; linear
+        // interpolation fails it, which is why this resampler exists).
+        let mut rs = StreamingResampler::new(48_000, 1, 16_000).unwrap();
+        let out = resample_all(&mut rs, &tone(10_000.0, 48_000, 1.0));
+        let steady = &out[out.len() / 10..out.len() * 9 / 10];
+        let level = rms(steady);
+        // -60 dB relative to the 0.707 input RMS.
+        assert!(
+            level < 0.707 * 1e-3,
+            "alias leakage {level} (-{:.1} dB)",
+            -20.0 * (level / 0.707).log10()
+        );
+    }
+
+    #[test]
+    fn resampler_44k1_rational_ratio_preserves_tone() {
+        let mut rs = StreamingResampler::new(44_100, 1, 16_000).unwrap();
+        let out = resample_all(&mut rs, &tone(1_000.0, 44_100, 1.0));
+        let expected = 44_100 / 441 * 160; // in * 160/441
+        assert!(
+            (out.len() as i64 - i64::from(expected)).unsigned_abs() < 400,
+            "len {} vs ~{expected}",
+            out.len()
+        );
+        let level = goertzel(&out, 16_000, 1_000.0);
+        assert!(level > 0.85, "1 kHz level after 44.1k resample: {level}");
+    }
+
+    #[test]
+    fn resampler_stereo_downmix_averages_channels() {
+        // L = tone, R = -tone: average is silence.
+        let mono = tone(440.0, 48_000, 0.5);
+        let interleaved: Vec<f32> = mono.iter().flat_map(|&v| [v, -v]).collect();
+        let mut rs = StreamingResampler::new(48_000, 2, 16_000).unwrap();
+        let out = resample_all(&mut rs, &interleaved);
+        assert!(
+            rms(&out) < 1e-6,
+            "L/-R downmix must cancel, rms {}",
+            rms(&out)
+        );
+
+        // L = R = tone: average preserves it.
+        let interleaved: Vec<f32> = mono.iter().flat_map(|&v| [v, v]).collect();
+        let mut rs = StreamingResampler::new(48_000, 2, 16_000).unwrap();
+        let out = resample_all(&mut rs, &interleaved);
+        assert!(goertzel(&out, 16_000, 440.0) > 0.85);
+    }
+
+    #[test]
+    fn resampler_chunked_equals_whole_bitwise() {
+        let input = tone(1_234.0, 48_000, 0.7);
+        let mut whole = StreamingResampler::new(48_000, 1, 16_000).unwrap();
+        let expected = resample_all(&mut whole, &input);
+
+        // Deterministic ragged chunking (incl. odd sizes).
+        let mut chunked = StreamingResampler::new(48_000, 1, 16_000).unwrap();
+        let mut out = Vec::new();
+        let mut pos = 0;
+        let mut step = 1;
+        while pos < input.len() {
+            let end = (pos + step).min(input.len());
+            chunked.process(&input[pos..end], &mut out).unwrap();
+            pos = end;
+            step = step % 977 + 13; // varied chunk sizes
+        }
+        chunked.flush(&mut out);
+        assert_eq!(expected, out, "chunked processing must be bit-identical");
+    }
+
+    #[test]
+    fn resampler_stereo_chunk_split_mid_frame_is_safe() {
+        let mono = tone(500.0, 48_000, 0.2);
+        let interleaved: Vec<f32> = mono.iter().flat_map(|&v| [v, v]).collect();
+        let mut whole = StreamingResampler::new(48_000, 2, 16_000).unwrap();
+        let expected = resample_all(&mut whole, &interleaved);
+
+        let mut split = StreamingResampler::new(48_000, 2, 16_000).unwrap();
+        let mut out = Vec::new();
+        // Push in chunks of 3 samples: every other chunk splits a frame.
+        for chunk in interleaved.chunks(3) {
+            split.process(chunk, &mut out).unwrap();
+        }
+        split.flush(&mut out);
+        assert_eq!(expected, out);
+    }
+
+    #[test]
+    fn resampler_silence_in_silence_out() {
+        let mut rs = StreamingResampler::new(48_000, 2, 16_000).unwrap();
+        let out = resample_all(&mut rs, &vec![0.0f32; 48_000]);
+        assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn resampler_rejects_zero_config_and_double_flush_use() {
+        assert!(StreamingResampler::new(0, 1, 16_000).is_err());
+        assert!(StreamingResampler::new(48_000, 0, 16_000).is_err());
+        assert!(StreamingResampler::new(48_000, 1, 0).is_err());
+        let mut rs = StreamingResampler::new(48_000, 1, 16_000).unwrap();
+        let mut out = Vec::new();
+        rs.flush(&mut out);
+        rs.flush(&mut out); // idempotent
+        let err = rs.process(&[0.0], &mut out).unwrap_err();
+        assert_eq!(err.error_code(), "FW-INVALID-REQUEST");
+    }
+
+    #[test]
+    fn resampler_equal_rates_mono_is_near_identity() {
+        // 16k -> 16k still runs the (allpass-band) filter; a mid-band tone
+        // must survive essentially unchanged.
+        let mut rs = StreamingResampler::new(16_000, 1, 16_000).unwrap();
+        let out = resample_all(&mut rs, &tone(1_000.0, 16_000, 0.5));
+        let level = goertzel(&out, 16_000, 1_000.0);
+        assert!(level > 0.9, "identity-ratio level {level}");
+    }
+
+    #[test]
+    #[ignore = "throughput sanity, host-dependent; run manually"]
+    fn resampler_throughput_sanity() {
+        let input = tone(1_000.0, 48_000, 1.0);
+        let interleaved: Vec<f32> = input.iter().flat_map(|&v| [v, v]).collect();
+        let mut rs = StreamingResampler::new(48_000, 2, 16_000).unwrap();
+        let started = Instant::now();
+        let mut out = Vec::new();
+        rs.process(&interleaved, &mut out).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(5),
+            "1 s of 48 kHz stereo took {elapsed:?} (expected << 5 ms)"
+        );
     }
 
     // ---- live hardware smoke (needs a real input device; run manually) ----
