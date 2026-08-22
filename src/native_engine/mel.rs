@@ -1681,6 +1681,41 @@ pub fn chunk_frames(mel: &Mel, frame_offset: usize, n_frames: usize) -> Mel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// bd-4ep1: the Hann window and FFT twiddle tables are built at runtime
+    /// from f64 `cos`/`sin`. If the platform libm differs anywhere by 1 ulp,
+    /// these constants differ, and the epsilon enters at the very head of
+    /// the mel pipeline. Fingerprints must be IDENTICAL on every target.
+    #[test]
+    fn transcendental_tables_are_cross_platform_identical() {
+        let fp32 = |slice: &[f32]| {
+            slice.iter().fold(0xC0FFEEu64, |h, v| {
+                h.rotate_left(7) ^ (v.to_bits() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            })
+        };
+        let hann = cached_hann_window();
+        eprintln!("FP-HANN {:016x}", fp32(hann));
+
+        let tw = cached_fft_twiddles();
+        // Fingerprint every level's cos/sin tables plus the odd base table.
+        for (li, lvl) in tw.levels.iter().enumerate() {
+            eprintln!(
+                "FP-TWIDDLE level={li} half={} cos={:016x} neg_sin={:016x}",
+                lvl.half,
+                fp32(&lvl.cos),
+                fp32(&lvl.neg_sin)
+            );
+        }
+        eprintln!(
+            "FP-DFT-BASE n={} cos={:016x} sin={:016x} r5_c5={:016x} r5_s5={:016x} r5_c25={:016x} r5_s25={:016x}",
+            tw.base.n,
+            fp32(&tw.base.cos),
+            fp32(&tw.base.sin),
+            fp32(&tw.base.r5_c5),
+            fp32(&tw.base.r5_s5),
+            fp32(&tw.base.r5_c25),
+            fp32(&tw.base.r5_s25)
+        );
+    }
 
     /// Deterministic LCG (no `rand` dependency). glibc constants.
     struct Lcg(u64);

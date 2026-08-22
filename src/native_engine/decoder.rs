@@ -2959,4 +2959,145 @@ mod tests {
             .unwrap();
         assert!(argmax < 51864, "argmax {argmax} must be a valid id");
     }
+
+    /// bd-4ep1 probe: `project_qkv`'s fused path documents itself as
+    /// bit-identical to the three separate projections ("concat-then-quantize
+    /// is byte-identical … same per-row dot + bias"), yet `FW_NO_QKV_FUSE=1`
+    /// flips the tiled-jfk pin on Linux x86_64. This settles the claim at
+    /// unit level on the production int8 path (default-on) and the f16
+    /// prefill path, at tq=1 (decode) and tq>1 (prefill).
+    fn qkv_probe_linear(tag: u64) -> Linear {
+        const N: usize = 64;
+        let mut s = 0xDEAD_BEEF_CAFE_BABE_u64 ^ tag;
+        let mut next = |s: &mut u64| {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            ((*s >> 40) as f32 / 8_388_608.0 - 1.0) * 0.05_f32
+        };
+        let mut data = Vec::with_capacity(N * N);
+        for _ in 0..N * N {
+            data.push(ft_core::Float16::from_f32(next(&mut s)));
+        }
+        let bias = (0..N).map(|_| next(&mut s)).collect();
+        Linear {
+            w: WeightMat::F16 {
+                data,
+                out: N,
+                inp: N,
+            },
+            bias: Some(bias),
+            w_i8: None,
+            w_i8_block: None,
+            w_i4_pack: None,
+        }
+    }
+
+    #[test]
+    fn qkv_fusion_bit_identity_int8_decode_and_f16_prefill() {
+        let q = qkv_probe_linear(1);
+        let k = qkv_probe_linear(2);
+        let v = qkv_probe_linear(3);
+        let gate = crate::native_engine::int8_attn_enabled();
+        let fused = fuse_qkv(&q, &k, &v).map(|l| l.quantize_if(gate));
+        let qs = q.clone().quantize_if(gate);
+        let ks = k.clone().quantize_if(gate);
+        let vs = v.clone().quantize_if(gate);
+        assert!(fused.as_ref().is_some_and(|l| l.w_i8.is_some()) || !gate);
+
+        let bits = |m: &Mat| m.data.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        for tq in [1_usize, 3] {
+            let mut s = 0xF00Du64 ^ tq as u64;
+            let mut hd = Vec::with_capacity(tq * 64);
+            for _ in 0..tq * 64 {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                hd.push(((s >> 40) as f32 / 8_388_608.0 - 1.0) * 0.5);
+            }
+            let h = Mat::from_vec(tq, 64, hd);
+            let (fq, fk, fv) = project_qkv(fused.as_ref(), &qs, &ks, &vs, 64, &h, false).unwrap();
+            let (sq, sk, sv) = project_qkv(None, &qs, &ks, &vs, 64, &h, false).unwrap();
+            assert_eq!(bits(&fq), bits(&sq), "q diverged at tq={tq}");
+            assert_eq!(bits(&fk), bits(&sk), "k diverged at tq={tq}");
+            assert_eq!(bits(&fv), bits(&sv), "v diverged at tq={tq}");
+            eprintln!("qkv fusion bit-identity holds at tq={tq} (int8 gate on: {gate})");
+        }
+
+        const NS: usize = 384;
+        let mut mk = |tag: u64| -> Linear {
+            let mut s = 0xABCDEF_u64 ^ tag;
+            let mut data = Vec::with_capacity(NS * NS);
+            for _ in 0..NS * NS {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                data.push(Float16::from_f32(
+                    ((s >> 40) as f32 / 8_388_608.0 - 1.0) * 0.05,
+                ));
+            }
+            let bias = (0..NS)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    ((s >> 40) as f32 / 8_388_608.0 - 1.0) * 0.05
+                })
+                .collect();
+            Linear {
+                w: WeightMat::F16 {
+                    data,
+                    out: NS,
+                    inp: NS,
+                },
+                bias: Some(bias),
+                w_i8: None,
+                w_i8_block: None,
+                w_i4_pack: None,
+            }
+        };
+        let q2 = mk(11);
+        let k2 = mk(12);
+        let v2 = mk(13);
+        let fused2 = fuse_qkv(&q2, &k2, &v2).map(|l| l.quantize_if(gate));
+        let qs2 = q2.clone().quantize_if(gate);
+        let ks2 = k2.clone().quantize_if(gate);
+        let vs2 = v2.clone().quantize_if(gate);
+        let mut s = 0xBEEFu64;
+        let mut hd = Vec::with_capacity(2 * NS);
+        for _ in 0..2 * NS {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            hd.push(((s >> 40) as f32 / 8_388_608.0 - 1.0) * 0.5);
+        }
+        let h2 = Mat::from_vec(2, NS, hd);
+        for cohort in [false, true] {
+            let (fq, fk, fv) =
+                project_qkv(fused2.as_ref(), &qs2, &ks2, &vs2, NS, &h2, cohort).unwrap();
+            let (sq, sk, sv) = project_qkv(None, &qs2, &ks2, &vs2, NS, &h2, cohort).unwrap();
+            assert_eq!(bits(&fq), bits(&sq), "q diverged n=384 cohort={cohort}");
+            assert_eq!(bits(&fk), bits(&sk), "k diverged n=384 cohort={cohort}");
+            assert_eq!(bits(&fv), bits(&sv), "v diverged n=384 cohort={cohort}");
+            eprintln!("qkv fusion bit-identity holds at n=384 cohort={cohort}");
+        }
+
+        // bd-4ep1 cross-platform fingerprints: identical inputs through the
+        // production paths must produce identical BITS on every target if
+        // our own kernels are platform-consistent. Any aarch64/x86_64
+        // difference below localizes the divergence to a specific stage.
+        let fp = |m: &Mat| {
+            m.data.iter().fold(0xC0FFEEu64, |h, f| {
+                h.rotate_left(7) ^ (f.to_bits() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            })
+        };
+        let (fq1, fk1, fv1) =
+            project_qkv(fused2.as_ref(), &qs2, &ks2, &vs2, NS, &h2, false).unwrap();
+        eprintln!(
+            "FP384-prefill q={:016x} k={:016x} v={:016x}",
+            fp(&fq1),
+            fp(&fk1),
+            fp(&fv1)
+        );
+    }
 }
