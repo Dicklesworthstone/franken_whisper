@@ -10,11 +10,14 @@ mod helpers;
 use std::collections::HashSet;
 
 use franken_whisper::robot::{
-    BACKENDS_DISCOVERY_REQUIRED_FIELDS, HEALTH_REPORT_REQUIRED_FIELDS, ROBOT_SCHEMA_VERSION,
-    RUN_COMPLETE_REQUIRED_FIELDS, RUN_ERROR_REQUIRED_FIELDS, RUN_START_REQUIRED_FIELDS,
-    SPECULATION_STATS_REQUIRED_FIELDS, STAGE_REQUIRED_FIELDS, TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
-    TRANSCRIPT_CORRECT_REQUIRED_FIELDS, TRANSCRIPT_PARTIAL_REQUIRED_FIELDS,
-    TRANSCRIPT_RETRACT_REQUIRED_FIELDS, robot_schema_value,
+    BACKENDS_DISCOVERY_REQUIRED_FIELDS, HEALTH_REPORT_REQUIRED_FIELDS,
+    LISTEN_SESSION_START_REQUIRED_FIELDS, LISTEN_SESSION_STATS_REQUIRED_FIELDS,
+    LISTEN_WARNING_REQUIRED_FIELDS, ROBOT_SCHEMA_VERSION, RUN_COMPLETE_REQUIRED_FIELDS,
+    RUN_ERROR_REQUIRED_FIELDS, RUN_START_REQUIRED_FIELDS, SPECULATION_STATS_REQUIRED_FIELDS,
+    SPEECH_STARTED_REQUIRED_FIELDS, STAGE_REQUIRED_FIELDS, TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
+    TRANSCRIPT_CORRECT_REQUIRED_FIELDS, TRANSCRIPT_DELTA_REQUIRED_FIELDS,
+    TRANSCRIPT_PARTIAL_REQUIRED_FIELDS, TRANSCRIPT_RETRACT_REQUIRED_FIELDS,
+    UTTERANCE_END_REQUIRED_FIELDS, robot_schema_value,
 };
 use serde_json::Value;
 
@@ -295,8 +298,8 @@ fn schema_has_expected_event_types() {
 
     assert_eq!(
         events.len(),
-        12,
-        "schema must define exactly 12 event types, found {}",
+        18,
+        "schema must define exactly 18 event types (12 batch + 6 listen), found {}",
         events.len()
     );
 
@@ -308,6 +311,12 @@ fn schema_has_expected_event_types() {
         "run_error",
         "backends.discovery",
         "routing_decision",
+        "listen.session_start",
+        "speech_started",
+        "transcript.delta",
+        "utterance_end",
+        "listen.warning",
+        "listen.session_stats",
         "transcript.partial",
         "transcript.confirm",
         "transcript.retract",
@@ -1008,4 +1017,55 @@ fn run_start_required_fields_include_request() {
         RUN_START_REQUIRED_FIELDS.contains(&"request"),
         "RUN_START_REQUIRED_FIELDS must include `request`"
     );
+}
+
+// -----------------------------------------------------------------------
+// bd-rt-events-ghdx: listen session event family (schema 1.1.0)
+// -----------------------------------------------------------------------
+
+#[test]
+fn listen_event_schema_entries_match_required_field_constants() {
+    let schema = robot_schema_value();
+    let events = schema["events"].as_object().expect("events map");
+    let cases: &[(&str, &[&str])] = &[
+        ("listen.session_start", LISTEN_SESSION_START_REQUIRED_FIELDS),
+        ("speech_started", SPEECH_STARTED_REQUIRED_FIELDS),
+        ("transcript.delta", TRANSCRIPT_DELTA_REQUIRED_FIELDS),
+        ("utterance_end", UTTERANCE_END_REQUIRED_FIELDS),
+        ("listen.warning", LISTEN_WARNING_REQUIRED_FIELDS),
+        ("listen.session_stats", LISTEN_SESSION_STATS_REQUIRED_FIELDS),
+    ];
+    for (name, constant) in cases {
+        let entry = events
+            .get(*name)
+            .unwrap_or_else(|| panic!("`{name}` missing from robot schema"));
+        let registered: Vec<String> = entry["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("`{name}` required list missing"))
+            .iter()
+            .map(|v| v.as_str().expect("field name").to_owned())
+            .collect();
+        let expected: Vec<String> = constant.iter().map(|f| (*f).to_owned()).collect();
+        assert_eq!(registered, expected, "`{name}` schema/constant drift");
+        // Every required field must be present in the registered example.
+        for field in *constant {
+            assert!(
+                entry["example"].get(*field).is_some(),
+                "`{name}` example missing required field `{field}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn listen_events_never_include_run_complete_semantics() {
+    // The lifecycle contract: listen streams have no run_complete. Guard the
+    // schema documentation of that divergence.
+    let schema = robot_schema_value();
+    let start = &schema["events"]["listen.session_start"];
+    let never = start["lifecycle_contract"]["never_emitted"]
+        .as_array()
+        .expect("never_emitted documented");
+    let names: Vec<&str> = never.iter().filter_map(|v| v.as_str()).collect();
+    assert!(names.contains(&"run_start") && names.contains(&"run_complete"));
 }

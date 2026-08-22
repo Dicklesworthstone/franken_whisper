@@ -1043,14 +1043,14 @@ impl NdjsonStreamValidator {
                 }
             }
             if let Some(seq) = event.get("seq").and_then(serde_json::Value::as_u64) {
-                if let Some(prev) = last_seq {
-                    if seq <= prev {
-                        return Err(violation(
-                            events,
-                            idx,
-                            &format!("seq must be strictly increasing (prev {prev}, got {seq})"),
-                        ));
-                    }
+                if let Some(prev) = last_seq
+                    && seq <= prev
+                {
+                    return Err(violation(
+                        events,
+                        idx,
+                        &format!("seq must be strictly increasing (prev {prev}, got {seq})"),
+                    ));
                 }
                 last_seq = Some(seq);
             }
@@ -4004,8 +4004,8 @@ mod tests {
             .expect("events should be object");
         assert_eq!(
             events.len(),
-            12,
-            "expected 12 event types including routing history and speculation events, got {}",
+            18,
+            "expected 18 event types including routing history, speculation, and listen session events, got {}",
             events.len()
         );
         for expected in [
@@ -7164,7 +7164,7 @@ mod tests {
                 "event": "transcript.confirm",
                 "schema_version": ROBOT_SCHEMA_VERSION,
                 "run_id": "run-l",
-                "seq": 90,
+                "seq": 6,
                 "window_id": 0,
                 "quality_model_id": "turbo",
                 "drift": {},
@@ -7173,6 +7173,7 @@ mod tests {
                 "utterance_id": 9,
             }),
         );
+        events[7]["seq"] = json!(7); // keep seq strictly increasing past the insert
         let err = NdjsonStreamValidator::new(StreamOutcome::Success)
             .validate(&events)
             .unwrap_err();
@@ -7194,8 +7195,9 @@ mod tests {
         let mut events = sample_success_stream();
         events.insert(
             6,
-            transcript_delta_value("run-l", 50, "t", 1, "late", 2.0, 2.5, 1, None),
+            transcript_delta_value("run-l", 6, "t", 1, "late", 2.0, 2.5, 1, None),
         );
+        events[7]["seq"] = json!(7); // keep seq strictly increasing past the insert
         let err = NdjsonStreamValidator::new(StreamOutcome::Success)
             .validate(&events)
             .unwrap_err();
