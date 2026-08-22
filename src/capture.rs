@@ -112,17 +112,16 @@ fn maybe_log_overruns(total: u64, last_logged: &AtomicU64, context: &str) {
         return;
     }
     let prev = last_logged.load(Ordering::Relaxed);
-    if prev == 0 || total >= prev.saturating_mul(10) {
-        if last_logged
+    if (prev == 0 || total >= prev.saturating_mul(10))
+        && last_logged
             .compare_exchange(prev, total, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
-        {
-            tracing::warn!(
-                cumulative_frames_dropped = total,
-                context,
-                "capture ring overrun: audio frames dropped (consumer too slow)"
-            );
-        }
+    {
+        tracing::warn!(
+            cumulative_frames_dropped = total,
+            context,
+            "capture ring overrun: audio frames dropped (consumer too slow)"
+        );
     }
 }
 
@@ -504,7 +503,7 @@ impl FixtureCaptureSource {
                 "fixture capture requires nonzero sample rate and channels".into(),
             ));
         }
-        if data.len() % usize::from(channels) != 0 {
+        if !data.len().is_multiple_of(usize::from(channels)) {
             return Err(FwError::InvalidRequest(format!(
                 "fixture PCM length {} is not a whole number of {}-channel frames",
                 data.len(),
