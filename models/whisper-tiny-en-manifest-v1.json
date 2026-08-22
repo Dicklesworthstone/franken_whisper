@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "model_id": "openai/whisper-tiny.en",
+  "upstream_repository": "ggerganov/whisper.cpp",
+  "upstream_revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+  "artifact_version": "whisper-tiny-en-f16-v1",
+  "preparation_recipe": "franken-whisper-native-ggml-selection-v1-identity",
+  "distribution_policy": "github_release_with_compiled_sha256",
+  "license_id": "MIT",
+  "license_url": "https://github.com/openai/whisper/blob/main/LICENSE",
+  "weight_precision": "f16",
+  "files": [
+    {
+      "role": "weights",
+      "filename": "ggml-tiny.en.bin",
+      "size": 77704715,
+      "sha256": "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+      "url": "https://github.com/Dicklesworthstone/franken_whisper/releases/download/whisper-tiny-en-f16-v1/ggml-tiny.en.bin"
+    }
+  ]
+}

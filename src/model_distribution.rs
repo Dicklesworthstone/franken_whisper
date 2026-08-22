@@ -50,6 +50,26 @@ pub const WHISPER_DISTRIBUTION_POLICY: &str = "github_release_with_compiled_sha2
 pub const WHISPER_PREPARATION_RECIPE: &str = "franken-whisper-native-ggml-selection-v1-identity";
 pub const WHISPER_LICENSE_URL: &str = "https://github.com/openai/whisper/blob/main/LICENSE";
 
+// Fast-lane streaming packages (bd-rt-model-provision-ffki): the small
+// models `fw robot listen` uses for low-latency partial transcripts.
+// Identity-preserved GGML f16 bytes from the SAME pinned upstream
+// whisper.cpp revision as the turbo package; verified bit-perfect against
+// the upstream LFS pointers at publication (2026-08-22).
+pub const BUILTIN_TINY_EN_MANIFEST_JSON: &str =
+    include_str!("../models/whisper-tiny-en-manifest-v1.json");
+pub const BUILTIN_TINY_MANIFEST_JSON: &str =
+    include_str!("../models/whisper-tiny-manifest-v1.json");
+pub const TINY_EN_ARTIFACT_VERSION: &str = "whisper-tiny-en-f16-v1";
+pub const TINY_EN_WEIGHTS_FILENAME: &str = "ggml-tiny.en.bin";
+pub const TINY_EN_WEIGHTS_BYTES: u64 = 77_704_715;
+pub const TINY_EN_WEIGHTS_SHA256: &str =
+    "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
+pub const TINY_ARTIFACT_VERSION: &str = "whisper-tiny-f16-v1";
+pub const TINY_WEIGHTS_FILENAME: &str = "ggml-tiny.bin";
+pub const TINY_WEIGHTS_BYTES: u64 = 77_691_713;
+pub const TINY_WEIGHTS_SHA256: &str =
+    "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21";
+
 const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_URL_BYTES: usize = 4096;
@@ -584,6 +604,220 @@ where
     )?;
     cancellation_checkpoint(&is_cancelled)?;
     let package = resolve_cached_whisper_with_cancel(&is_cancelled)?;
+    Ok(WhisperPullOutcome {
+        package,
+        from_cache: false,
+    })
+}
+
+/// The two fast-lane streaming model packages (bd-rt-model-provision-ffki).
+/// `fw robot listen` resolution rule: explicit `--language en` => TinyEn;
+/// any other or unset language => Tiny (multilingual, detect-and-pin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastLaneModel {
+    TinyEn,
+    Tiny,
+}
+
+impl FastLaneModel {
+    #[must_use]
+    pub fn artifact_version(self) -> &'static str {
+        match self {
+            Self::TinyEn => TINY_EN_ARTIFACT_VERSION,
+            Self::Tiny => TINY_ARTIFACT_VERSION,
+        }
+    }
+
+    #[must_use]
+    pub fn pull_name(self) -> &'static str {
+        match self {
+            Self::TinyEn => "tiny-en",
+            Self::Tiny => "tiny",
+        }
+    }
+
+    #[must_use]
+    pub fn weights_sha256(self) -> &'static str {
+        match self {
+            Self::TinyEn => TINY_EN_WEIGHTS_SHA256,
+            Self::Tiny => TINY_WEIGHTS_SHA256,
+        }
+    }
+
+    fn manifest_json(self) -> &'static str {
+        match self {
+            Self::TinyEn => BUILTIN_TINY_EN_MANIFEST_JSON,
+            Self::Tiny => BUILTIN_TINY_MANIFEST_JSON,
+        }
+    }
+}
+
+pub fn builtin_fast_lane_manifest(model: FastLaneModel) -> FwResult<WhisperManifest> {
+    let manifest: WhisperManifest = serde_json::from_slice(model.manifest_json().as_bytes())?;
+    validate_fast_lane_manifest(model, &manifest)?;
+    Ok(manifest)
+}
+
+/// Fast-lane analog of [`validate_whisper_manifest`]: every embedded field
+/// must match the compiled trust roots for that model.
+fn validate_fast_lane_manifest(model: FastLaneModel, manifest: &WhisperManifest) -> FwResult<()> {
+    let (model_id, filename, bytes, sha256) = match model {
+        FastLaneModel::TinyEn => (
+            "openai/whisper-tiny.en",
+            TINY_EN_WEIGHTS_FILENAME,
+            TINY_EN_WEIGHTS_BYTES,
+            TINY_EN_WEIGHTS_SHA256,
+        ),
+        FastLaneModel::Tiny => (
+            "openai/whisper-tiny",
+            TINY_WEIGHTS_FILENAME,
+            TINY_WEIGHTS_BYTES,
+            TINY_WEIGHTS_SHA256,
+        ),
+    };
+    if manifest.schema_version != MANIFEST_SCHEMA_VERSION
+        || manifest.model_id != model_id
+        || manifest.upstream_repository != WHISPER_UPSTREAM_REPOSITORY
+        || manifest.upstream_revision != WHISPER_UPSTREAM_REVISION
+        || manifest.artifact_version != model.artifact_version()
+        || manifest.preparation_recipe != WHISPER_PREPARATION_RECIPE
+        || manifest.distribution_policy != WHISPER_DISTRIBUTION_POLICY
+        || manifest.license_id != "MIT"
+        || manifest.license_url != WHISPER_LICENSE_URL
+        || manifest.weight_precision != "f16"
+        || manifest.files.len() != 1
+    {
+        return Err(whisper_manifest_error(
+            "embedded fast-lane manifest disagrees with the compiled runtime contract",
+        ));
+    }
+    let file = &manifest.files[0];
+    validate_filename(&file.filename)?;
+    validate_hash(&file.sha256)?;
+    validate_https_url(&file.url)?;
+    let expected_url = format!(
+        "https://github.com/Dicklesworthstone/franken_whisper/releases/download/{}/{}",
+        model.artifact_version(),
+        filename
+    );
+    if file.role != "weights"
+        || file.filename != filename
+        || file.size != bytes
+        || file.sha256 != sha256
+        || file.url != expected_url
+        || file.size == 0
+        || file.size > MAX_ARTIFACT_BYTES
+    {
+        return Err(whisper_manifest_error(
+            "fast-lane manifest file entry disagrees with its compiled trust root",
+        ));
+    }
+    Ok(())
+}
+
+/// Cache directory for a fast-lane package: `<root>/whisper/<artifact_version>`
+/// (same layout family as the turbo package).
+pub fn fast_lane_cache_dir(model: FastLaneModel) -> FwResult<PathBuf> {
+    let root = cache_root().ok_or_else(|| {
+        FwError::InvalidRequest(format!(
+            "cannot resolve model cache; set {SORTFORMER_MODEL_DIR_ENV}"
+        ))
+    })?;
+    if !root.is_absolute() {
+        return Err(FwError::InvalidRequest(format!(
+            "{SORTFORMER_MODEL_DIR_ENV} must be an absolute path"
+        )));
+    }
+    Ok(root.join("whisper").join(model.artifact_version()))
+}
+
+pub fn resolve_cached_fast_lane_with_cancel<F>(
+    model: FastLaneModel,
+    is_cancelled: F,
+) -> FwResult<CachedWhisperPackage>
+where
+    F: Fn() -> bool + Sync,
+{
+    let manifest = builtin_fast_lane_manifest(model)?;
+    let directory = fast_lane_cache_dir(model)?;
+    let remote = manifest
+        .files
+        .first()
+        .ok_or_else(|| whisper_manifest_error("weights role is missing"))?;
+    let weights_path = directory.join(&remote.filename);
+    if !file_matches_with_cancel(&weights_path, remote, &is_cancelled)? {
+        return Err(FwError::MissingArtifact(weights_path));
+    }
+    Ok(CachedWhisperPackage {
+        weights_path,
+        artifact_version: manifest.artifact_version,
+        weights_sha256: model.weights_sha256().to_owned(),
+    })
+}
+
+/// Non-fatal readiness probe for a fast-lane package (hashes ~78 MB).
+pub fn cached_fast_lane_readiness_with_cancel<F>(
+    model: FastLaneModel,
+    is_cancelled: F,
+) -> FwResult<bool>
+where
+    F: Fn() -> bool + Sync,
+{
+    match resolve_cached_fast_lane_with_cancel(model, is_cancelled) {
+        Ok(_) => Ok(true),
+        Err(FwError::Cancelled(message)) => Err(FwError::Cancelled(message)),
+        Err(_) => Ok(false),
+    }
+}
+
+#[must_use]
+pub fn cached_fast_lane_is_ready(model: FastLaneModel) -> bool {
+    cached_fast_lane_readiness_with_cancel(model, || false).unwrap_or(false)
+}
+
+/// Download and verify a fast-lane package (restartable across verified
+/// cache hits, cooperative under Ctrl+C — same contract as `pull_whisper`).
+pub fn pull_fast_lane<F, P>(
+    model: FastLaneModel,
+    is_cancelled: F,
+    mut progress: P,
+) -> FwResult<WhisperPullOutcome>
+where
+    F: Fn() -> bool + Sync,
+    P: FnMut(&str),
+{
+    cancellation_checkpoint(&is_cancelled)?;
+    let manifest = builtin_fast_lane_manifest(model)?;
+    let directory = fast_lane_cache_dir(model)?;
+    ensure_real_directory(&directory)?;
+    match resolve_cached_fast_lane_with_cancel(model, &is_cancelled) {
+        Ok(package) => {
+            progress("fast-lane weights are already cached and verified");
+            return Ok(WhisperPullOutcome {
+                package,
+                from_cache: true,
+            });
+        }
+        Err(FwError::Cancelled(message)) => return Err(FwError::Cancelled(message)),
+        Err(_) => {}
+    }
+
+    let runtime = RuntimeBuilder::new().build().map_err(|error| {
+        FwError::BackendUnavailable(format!("cannot build model-download runtime: {error}"))
+    })?;
+    let remote = manifest
+        .files
+        .first()
+        .ok_or_else(|| whisper_manifest_error("weights role is missing"))?;
+    install_file(
+        &runtime,
+        remote,
+        &directory.join(&remote.filename),
+        &is_cancelled,
+        &mut progress,
+    )?;
+    cancellation_checkpoint(&is_cancelled)?;
+    let package = resolve_cached_fast_lane_with_cancel(model, &is_cancelled)?;
     Ok(WhisperPullOutcome {
         package,
         from_cache: false,
@@ -1299,6 +1533,84 @@ mod tests {
         assert_eq!(weights.size, WHISPER_WEIGHTS_BYTES);
         assert_eq!(weights.sha256, WHISPER_WEIGHTS_SHA256);
         assert!(weights.url.starts_with(EXPECTED_WHISPER_RELEASE_PREFIX));
+    }
+
+    #[test]
+    fn embedded_fast_lane_manifests_are_exact_and_release_bound() {
+        for (model, model_id, filename, bytes, sha256, version) in [
+            (
+                FastLaneModel::TinyEn,
+                "openai/whisper-tiny.en",
+                TINY_EN_WEIGHTS_FILENAME,
+                TINY_EN_WEIGHTS_BYTES,
+                TINY_EN_WEIGHTS_SHA256,
+                TINY_EN_ARTIFACT_VERSION,
+            ),
+            (
+                FastLaneModel::Tiny,
+                "openai/whisper-tiny",
+                TINY_WEIGHTS_FILENAME,
+                TINY_WEIGHTS_BYTES,
+                TINY_WEIGHTS_SHA256,
+                TINY_ARTIFACT_VERSION,
+            ),
+        ] {
+            let manifest = builtin_fast_lane_manifest(model).expect("embedded manifest");
+            assert_eq!(manifest.model_id, model_id);
+            assert_eq!(manifest.upstream_revision, WHISPER_UPSTREAM_REVISION);
+            assert_eq!(manifest.artifact_version, version);
+            assert_eq!(manifest.files.len(), 1);
+            let weights = &manifest.files[0];
+            assert_eq!(weights.role, "weights");
+            assert_eq!(weights.filename, filename);
+            assert_eq!(weights.size, bytes);
+            assert_eq!(weights.sha256, sha256);
+            assert_eq!(
+                weights.url,
+                format!(
+                    "https://github.com/Dicklesworthstone/franken_whisper/releases/download/{version}/{filename}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn fast_lane_cache_rejects_corrupt_truncated_and_missing_files() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        // Redirect the cache root through the env override used by
+        // cache_root(); serialize env access via the same guard other tests
+        // in this module use if present — here we rely on unique var reads.
+        let manifest = builtin_fast_lane_manifest(FastLaneModel::TinyEn).expect("manifest");
+        let remote = &manifest.files[0];
+        let dir = scratch
+            .path()
+            .join("whisper")
+            .join(TINY_EN_ARTIFACT_VERSION);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(&remote.filename);
+
+        // Missing file: does not match.
+        assert!(!file_matches_with_cancel(&path, remote, &|| false).expect("probe"));
+        // Wrong size: does not match.
+        std::fs::write(&path, b"not the weights").expect("write");
+        assert!(!file_matches_with_cancel(&path, remote, &|| false).expect("probe"));
+        // Right size, corrupt bytes: does not match (hash check).
+        std::fs::write(&path, vec![0u8; remote.size as usize]).expect("write");
+        assert!(!file_matches_with_cancel(&path, remote, &|| false).expect("probe"));
+    }
+
+    #[test]
+    fn fast_lane_pull_names_and_versions_are_stable() {
+        assert_eq!(FastLaneModel::TinyEn.pull_name(), "tiny-en");
+        assert_eq!(FastLaneModel::Tiny.pull_name(), "tiny");
+        assert_eq!(
+            FastLaneModel::TinyEn.artifact_version(),
+            "whisper-tiny-en-f16-v1"
+        );
+        assert_eq!(
+            FastLaneModel::Tiny.artifact_version(),
+            "whisper-tiny-f16-v1"
+        );
     }
 
     #[test]
