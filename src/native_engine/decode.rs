@@ -2629,6 +2629,31 @@ pub fn transcribe_samples(
     params: &DecodeParams,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<DecodeOutput> {
+    transcribe_samples_with_window_hook(m, samples_16k_mono, params, checkpoint, None)
+}
+
+/// Per-window segment callback: fires on the decode thread with each
+/// finished window's segments (window-relative times).
+pub type WindowHook<'a> = &'a (dyn Fn(&[TranscriptionSegment]) + Sync);
+
+/// Scoped-hook variant of [`transcribe_samples`]
+/// (bd-rt-segment-hook-vo6p): `on_window` receives each finished long-form
+/// window's segments (window-relative times, after timestamp rules, on the
+/// decode thread) while the transcription is still running — the confirm
+/// lane streams long-utterance output through this, and it avoids the
+/// process-global [`crate::native_engine::plat::set_segment_hook`] registry
+/// so concurrent sessions cannot observe each other's windows. The hook is
+/// deliberately NOT part of [`DecodeParams`], which must stay
+/// `Clone + Hash + Eq` as the transcription-cache key. A cache hit returns the full
+/// cached output WITHOUT window-by-window hook calls (hits are instant;
+/// progressive delivery is meaningless there); a panicking hook propagates.
+pub fn transcribe_samples_with_window_hook(
+    m: &LoadedModel,
+    samples_16k_mono: &[f32],
+    params: &DecodeParams,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    on_window: Option<WindowHook<'_>>,
+) -> FwResult<DecodeOutput> {
     if params.bypass_transcript_cache {
         tracing::debug!("transcript cache bypassed (per-request)");
     }
@@ -2659,7 +2684,7 @@ pub fn transcribe_samples(
         None
     };
 
-    let output = transcribe_samples_uncached(m, samples_16k_mono, params, checkpoint)?;
+    let output = transcribe_samples_uncached(m, samples_16k_mono, params, checkpoint, on_window)?;
     if let Some(fingerprint) = fingerprint {
         m.transcription_cache
             .lock()
@@ -2674,6 +2699,7 @@ fn transcribe_samples_uncached(
     samples_16k_mono: &[f32],
     params: &DecodeParams,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    on_window: Option<WindowHook<'_>>,
 ) -> FwResult<DecodeOutput> {
     if samples_16k_mono.is_empty() {
         return Err(FwError::InvalidRequest(
@@ -3545,14 +3571,22 @@ fn transcribe_samples_uncached(
                     word_timings.extend(win_words);
                 }
 
-                // wasm32 (bd-m2jm) + iOS (bd-n6wl): live-transcript feed —
-                // each finished window's segments stream to the page/app
-                // before the run completes. Purely observational; desktop
-                // builds compile this away and the decode contract is
-                // untouched.
-                #[cfg(any(target_arch = "wasm32", target_os = "ios"))]
-                if let Ok(json) = serde_json::to_string(&win_segments) {
+                // Live-transcript feed (wasm bd-m2jm, iOS bd-n6wl, desktop
+                // bd-rt-segment-hook-vo6p): each finished window's segments
+                // stream to the host before the run completes. Purely
+                // observational; serialization is skipped entirely when no
+                // global hook is registered, and the scoped per-call hook
+                // (transcribe_samples_with_window_hook) receives the typed
+                // segments without any JSON round-trip. Ordering contract:
+                // fires on the decode thread, after timestamp rules, before
+                // the next window's encode; times are window-relative.
+                if crate::native_engine::plat::segment_hook_active()
+                    && let Ok(json) = serde_json::to_string(&win_segments)
+                {
                     crate::native_engine::plat::emit_partial_segments(&json);
+                }
+                if let Some(hook) = on_window {
+                    hook(&win_segments);
                 }
                 segments.extend(win_segments);
 
@@ -5664,6 +5698,77 @@ mod tests {
     }
 
     #[test]
+    fn gated_window_hook_streams_each_window_in_order() {
+        // bd-rt-segment-hook-vo6p acceptance: a 2-window decode fires the
+        // scoped hook once per window, in order, with exactly the segments
+        // the final DecodeOutput contains for those windows; the GLOBAL
+        // desktop hook receives the same windows as JSON; the no-hook path
+        // is byte-identical (covered by the existing goldens).
+        let Some(loaded) = load_tiny_en() else {
+            eprintln!("SKIP gated_window_hook: tiny.en not found");
+            return;
+        };
+        let Some(jfk) = load_jfk_samples() else {
+            eprintln!("SKIP gated_window_hook: jfk.wav missing");
+            return;
+        };
+        // Tile jfk (~11 s) x3 => ~33 s => 2 long-form windows.
+        let mut tiled = Vec::with_capacity(jfk.len() * 3);
+        for _ in 0..3 {
+            tiled.extend_from_slice(&jfk);
+        }
+
+        let scoped: std::sync::Mutex<Vec<Vec<TranscriptionSegment>>> =
+            std::sync::Mutex::new(Vec::new());
+        let global_windows = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let global_sink = std::sync::Arc::clone(&global_windows);
+        crate::native_engine::plat::set_segment_hook(Box::new(move |json| {
+            global_sink
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(json.to_owned());
+        }));
+
+        let params = DecodeParams {
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+        let hook = |windows: &[TranscriptionSegment]| {
+            scoped
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(windows.to_vec());
+        };
+        let out = transcribe_samples_with_window_hook(&loaded, &tiled, &params, &noop, Some(&hook))
+            .expect("tiled transcribe");
+
+        let scoped = scoped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(
+            scoped.len() >= 2,
+            "expected >=2 window callbacks on ~33s audio, got {}",
+            scoped.len()
+        );
+        // Concatenated hook segments == final output segments, in order.
+        let streamed: Vec<&TranscriptionSegment> = scoped.iter().flatten().collect();
+        assert_eq!(streamed.len(), out.segments.len());
+        for (streamed_segment, final_segment) in streamed.iter().zip(&out.segments) {
+            assert_eq!(streamed_segment.text, final_segment.text);
+        }
+        // Global hook saw the same number of windows (as JSON arrays).
+        let global = global_windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(global.len(), scoped.len(), "global hook window count");
+        for json in &global {
+            assert!(json.starts_with('['), "hook payload must be a JSON array");
+        }
+    }
+
+    #[test]
     fn reduce_attn_frame_synthetic_argmax_and_head_selection() {
         use super::super::Mat;
         let enc = 8usize;
@@ -6845,8 +6950,8 @@ mod tests {
         // Exercise two physical decodes. Calling `transcribe_samples` twice on
         // one model would make the second result an exact-cache hit and prove
         // only that the cache can clone its first answer.
-        let a = transcribe_samples_uncached(&model, &samples, &params, &noop).expect("run a");
-        let b = transcribe_samples_uncached(&model, &samples, &params, &noop).expect("run b");
+        let a = transcribe_samples_uncached(&model, &samples, &params, &noop, None).expect("run a");
+        let b = transcribe_samples_uncached(&model, &samples, &params, &noop, None).expect("run b");
         assert_eq!(a.segments.len(), b.segments.len(), "segment count");
         for (index, (left, right)) in a.segments.iter().zip(&b.segments).enumerate() {
             assert_eq!(left.start_sec, right.start_sec, "segment {index} start");

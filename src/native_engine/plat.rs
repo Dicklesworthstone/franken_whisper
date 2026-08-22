@@ -26,7 +26,7 @@ pub use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 pub use wasm_impl::{
     Instant, Scope, ScopedJoinHandle, available_parallelism, emit_partial_segments, emit_span,
-    scope, set_now_micros, set_segment_hook, set_span_hook,
+    scope, segment_hook_active, set_now_micros, set_segment_hook, set_span_hook,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -298,6 +298,22 @@ mod wasm_impl {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
+    /// Whether a hook is registered (decode-loop serialization guard).
+    pub fn segment_hook_active() -> bool {
+        SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Whether a hook is registered (decode-loop serialization guard).
+    pub fn segment_hook_active() -> bool {
+        SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
     /// Forward one window's segments (JSON array) to the registered hook.
     pub fn emit_partial_segments(json: &str) {
         if let Some(hook) = SEGMENT_HOOK
@@ -311,7 +327,62 @@ mod wasm_impl {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), target_os = "ios"))]
-pub use ios_hooks::{emit_partial_segments, emit_span, set_segment_hook, set_span_hook};
+pub use ios_hooks::{
+    emit_partial_segments, emit_span, segment_hook_active, set_segment_hook, set_span_hook,
+};
+
+/// Desktop twin of the wasm/iOS live-transcript hook registry
+/// (bd-rt-segment-hook-vo6p): the per-window partial-segment feed was
+/// compiled away on macOS/Linux, which is why a long batch transcription
+/// emitted nothing until the very end. Same shape and semantics as the
+/// wasm/iOS modules above; the confirm lane and batch progressive output
+/// are the desktop consumers. The hook fires on the decode thread, after
+/// timestamp rules, before the next window's encode; segment times are
+/// window-relative and the caller re-bases them. A panicking hook
+/// propagates (it runs on the caller's own decode call stack — a hook
+/// panic is a caller bug, not engine state corruption; the transcription
+/// cache is only written after a fully successful decode).
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+mod desktop_hooks {
+    type SegmentHook = Box<dyn Fn(&str) + Send + Sync>;
+
+    static SEGMENT_HOOK: std::sync::Mutex<Option<SegmentHook>> = std::sync::Mutex::new(None);
+
+    /// Register the process-wide partial-transcript hook (replaces any
+    /// previous). Prefer the scoped per-call hook on
+    /// `transcribe_samples_with_window_hook` for new desktop callers —
+    /// this global exists for wasm/iOS surface parity and single-consumer
+    /// processes.
+    pub fn set_segment_hook(hook: SegmentHook) {
+        *SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Whether a hook is registered (lets the decode loop skip JSON
+    /// serialization entirely when nobody is listening — the
+    /// zero-cost-when-off contract).
+    pub fn segment_hook_active() -> bool {
+        SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Forward one window's segments (JSON array) to the registered hook.
+    pub fn emit_partial_segments(json: &str) {
+        if let Some(hook) = SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(json);
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+pub use desktop_hooks::{emit_partial_segments, segment_hook_active, set_segment_hook};
 
 /// iOS twin of the wasm host hooks (fw-ios, the phone app's FFI crate): the
 /// engine's progress heartbeat (`emit_span`) and live-transcript feed

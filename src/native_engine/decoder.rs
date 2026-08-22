@@ -2969,7 +2969,7 @@ mod tests {
     fn qkv_probe_linear(tag: u64) -> Linear {
         const N: usize = 64;
         let mut s = 0xDEAD_BEEF_CAFE_BABE_u64 ^ tag;
-        let mut next = |s: &mut u64| {
+        let next = |s: &mut u64| {
             *s ^= *s << 13;
             *s ^= *s >> 7;
             *s ^= *s << 17;
@@ -3025,7 +3025,7 @@ mod tests {
         }
 
         const NS: usize = 384;
-        let mut mk = |tag: u64| -> Linear {
+        let mk = |tag: u64| -> Linear {
             let mut s = 0xABCDEF_u64 ^ tag;
             let mut data = Vec::with_capacity(NS * NS);
             for _ in 0..NS * NS {
