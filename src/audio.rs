@@ -1354,7 +1354,7 @@ fn capture_microphone(
     Ok(output)
 }
 
-fn microphone_defaults(
+pub(crate) fn microphone_defaults(
     device: Option<&str>,
     ffmpeg_format: Option<&str>,
     ffmpeg_source: Option<&str>,

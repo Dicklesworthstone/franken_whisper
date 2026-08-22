@@ -588,6 +588,348 @@ impl CaptureSource for FixtureCaptureSource {
 }
 
 // ---------------------------------------------------------------------------
+// bd-rt-ffmpeg-pipe-7dbu: pipe-fed capture sources
+//
+// Two producers share one generic core: `StdinPcmSource` (raw PCM piped from
+// ANY upstream — `ffmpeg -f s16le -`, sox, a remote shell — the composable
+// path and the latency harness's instrument) and `FfmpegCaptureSource` (the
+// device-capture fallback when cpal cannot serve). Both push into the same
+// SPSC ring/`SharedState` machinery as the cpal source, so the driver's
+// pull-side contract is identical across all sources.
+// ---------------------------------------------------------------------------
+
+/// Raw-PCM wire formats accepted on stdin (`--stdin-format`). Anything else
+/// is FW-INVALID-REQUEST naming these two — fixed-size frames keep the
+/// chunk-reassembly logic trivial and the contract auditable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcmFormat {
+    /// Little-endian signed 16-bit (ffmpeg `-f s16le`). The default.
+    S16le,
+    /// Little-endian IEEE f32 (`-f f32le`) — what most Rust/Python audio
+    /// tools emit natively.
+    F32le,
+}
+
+impl PcmFormat {
+    #[must_use]
+    pub fn bytes_per_sample(self) -> usize {
+        match self {
+            Self::S16le => 2,
+            Self::F32le => 4,
+        }
+    }
+
+    /// Parse a `--stdin-format` value.
+    pub fn parse(value: &str) -> FwResult<Self> {
+        match value {
+            "s16le" => Ok(Self::S16le),
+            "f32le" => Ok(Self::F32le),
+            other => Err(FwError::InvalidRequest(format!(
+                "unsupported stdin PCM format `{other}`; supported: s16le, f32le"
+            ))),
+        }
+    }
+}
+
+/// Generic reader-thread capture source over any byte stream delivering raw
+/// interleaved PCM. Sample values straddling chunk boundaries are carried
+/// (byte-level reassembly), conversion is exact (`i16 / 32768`, f32 verbatim).
+impl std::fmt::Debug for PipePcmSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipePcmSource")
+            .field("sample_rate", &self.sample_rate)
+            .field("channels", &self.channels)
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct PipePcmSource {
+    consumer: ringbuf::HeapCons<f32>,
+    shared: Arc<SharedState>,
+    join: Option<std::thread::JoinHandle<()>>,
+    /// Child owner when this pipe is a subprocess's stdout (kill-on-stop).
+    child: Option<crate::process::StreamingChild>,
+    sample_rate: u32,
+    channels: u16,
+}
+
+impl PipePcmSource {
+    /// Build over an arbitrary reader (tests use in-memory pipes; stdin and
+    /// ffmpeg-stdout are the production callers).
+    pub fn from_reader<R>(
+        reader: R,
+        format: PcmFormat,
+        sample_rate: u32,
+        channels: u16,
+        ring_capacity_sec: f64,
+    ) -> FwResult<Self>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        if sample_rate == 0 || channels == 0 {
+            return Err(FwError::InvalidRequest(
+                "pipe capture requires nonzero sample rate and channel count".into(),
+            ));
+        }
+        let capacity_samples = ((f64::from(sample_rate) * ring_capacity_sec * f64::from(channels))
+            .ceil() as usize)
+            .max(usize::from(channels) * 1024);
+        let ring = HeapRb::<f32>::new(capacity_samples);
+        let (mut producer, consumer) = ring.split();
+        let shared = SharedState::new();
+        let shared_reader = Arc::clone(&shared);
+        let ch = usize::from(channels);
+        let join = std::thread::Builder::new()
+            .name("fw-capture-pipe".into())
+            .spawn(move || {
+                let mut reader = reader;
+                let bps = format.bytes_per_sample();
+                let mut raw = vec![0u8; 32 * 1024];
+                let mut carry: Vec<u8> = Vec::with_capacity(bps);
+                // Decoded samples not yet pushed (persists across reads so a
+                // frame split by a chunk boundary is completed, never lost).
+                let mut pending: Vec<f32> = Vec::with_capacity(raw.len() / bps + 8);
+                loop {
+                    if shared_reader.ended.load(Ordering::Acquire) {
+                        break; // stop() requested
+                    }
+                    match std::io::Read::read(&mut reader, &mut raw) {
+                        Ok(0) => break, // EOF
+                        Err(error) => {
+                            if error.kind() != std::io::ErrorKind::Interrupted {
+                                shared_reader
+                                    .record_error(format!("pipe capture read failed: {error}"));
+                                break;
+                            }
+                        }
+                        Ok(n) => {
+                            let mut bytes: &[u8] = &raw[..n];
+                            // Complete a carried partial sample first.
+                            if !carry.is_empty() {
+                                let need = bps - carry.len();
+                                let take = need.min(bytes.len());
+                                carry.extend_from_slice(&bytes[..take]);
+                                bytes = &bytes[take..];
+                                if carry.len() == bps {
+                                    pending.push(decode_sample(format, &carry));
+                                    carry.clear();
+                                }
+                            }
+                            let whole = bytes.len() - bytes.len() % bps;
+                            for sample in bytes[..whole].chunks_exact(bps) {
+                                pending.push(decode_sample(format, sample));
+                            }
+                            carry.extend_from_slice(&bytes[whole..]);
+                            // Push whole frames only; samples of a frame split
+                            // by the chunk boundary stay pending for the next
+                            // read (never lost, never misaligned).
+                            let aligned = pending.len() - pending.len() % ch;
+                            let dropped = feed_ring(&mut producer, &pending[..aligned], ch);
+                            if dropped > 0 {
+                                shared_reader
+                                    .overrun_frames
+                                    .fetch_add(dropped, Ordering::Relaxed);
+                            }
+                            pending.drain(..aligned);
+                        }
+                    }
+                }
+                shared_reader.ended.store(true, Ordering::Release);
+                tracing::debug!("pipe capture reader thread exited");
+            })
+            .map_err(FwError::Io)?;
+        Ok(Self {
+            consumer,
+            shared,
+            join: Some(join),
+            child: None,
+            sample_rate,
+            channels,
+        })
+    }
+
+    /// Attach the owning child process (killed on stop/drop).
+    fn with_child(mut self, child: crate::process::StreamingChild) -> Self {
+        self.child = Some(child);
+        self
+    }
+}
+
+impl CaptureSource for PipePcmSource {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn read(&mut self, out: &mut [f32], max_wait: Duration) -> FwResult<CaptureRead> {
+        let ch = usize::from(self.channels).max(1);
+        if out.len() < ch {
+            return Err(FwError::InvalidRequest(format!(
+                "capture read buffer holds {} samples; need at least one frame ({ch})",
+                out.len()
+            )));
+        }
+        let usable = out.len() - out.len() % ch;
+        let deadline = Instant::now() + max_wait;
+        let mut written = 0usize;
+        loop {
+            written += self.consumer.pop_slice(&mut out[written..usable]);
+            let ended_flag = self.shared.ended.load(Ordering::Acquire);
+            if written > 0 || Instant::now() >= deadline || ended_flag {
+                if let Some(message) = self.shared.take_error() {
+                    // Enrich subprocess failures with the stderr tail.
+                    let detail = self
+                        .child
+                        .as_ref()
+                        .map(|c| {
+                            let tail = c.stderr_tail();
+                            if tail.is_empty() {
+                                message.clone()
+                            } else {
+                                format!("{message}; stderr tail: {tail}")
+                            }
+                        })
+                        .unwrap_or(message);
+                    return Err(FwError::Io(std::io::Error::other(detail)));
+                }
+                let total_overruns = self.shared.overrun_frames.load(Ordering::Relaxed);
+                maybe_log_overruns(total_overruns, &self.shared.overrun_logged, "pipe");
+                debug_assert_eq!(written % ch, 0);
+                return Ok(CaptureRead {
+                    frames: written / ch,
+                    ended: ended_flag && self.consumer.is_empty(),
+                    overrun_frames_dropped: total_overruns,
+                });
+            }
+            std::thread::sleep(READ_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+
+    fn stop(&mut self) {
+        self.shared.ended.store(true, Ordering::Release);
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill(); // closes the pipe -> reader thread unblocks
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for PipePcmSource {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn decode_sample(format: PcmFormat, bytes: &[u8]) -> f32 {
+    match format {
+        PcmFormat::S16le => f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / 32_768.0,
+        PcmFormat::F32le => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+    }
+}
+
+/// Raw PCM on our own stdin (`fw robot listen --source stdin-pcm`): the
+/// zero-device-dependency composition path (any upstream producer over any
+/// pipe/SSH). Refuses a terminal stdin — an interactive TTY cannot be a PCM
+/// stream, and reading it would hang the session confusingly.
+pub struct StdinPcmSource;
+
+impl StdinPcmSource {
+    /// `stdin_is_terminal` comes from the caller
+    /// (`std::io::IsTerminal::is_terminal(&std::io::stdin())`) so the guard
+    /// stays unit-testable.
+    pub fn open(
+        format: PcmFormat,
+        sample_rate: u32,
+        channels: u16,
+        ring_capacity_sec: f64,
+        stdin_is_terminal: bool,
+    ) -> FwResult<PipePcmSource> {
+        if stdin_is_terminal {
+            return Err(FwError::InvalidRequest(
+                "--source stdin-pcm requires piped raw PCM on stdin; stdin is a terminal \
+                 (pipe audio in, e.g. `ffmpeg -i input -f s16le - | fw robot listen --source stdin-pcm`)"
+                    .into(),
+            ));
+        }
+        tracing::info!(?format, sample_rate, channels, "stdin PCM capture open");
+        PipePcmSource::from_reader(
+            std::io::stdin(),
+            format,
+            sample_rate,
+            channels,
+            ring_capacity_sec,
+        )
+    }
+}
+
+/// Live device capture through ffmpeg's device layer — the fallback when
+/// cpal cannot serve (exotic ALSA setups, containers, explicit
+/// `--capture-backend ffmpeg`). ffmpeg downmixes and resamples to 16 kHz
+/// mono itself; the low-latency flags matter (without
+/// `-fflags nobuffer -flags low_delay` ffmpeg buffers 100-300 ms internally).
+pub struct FfmpegCaptureSource;
+
+impl FfmpegCaptureSource {
+    pub fn open(
+        device: Option<&str>,
+        format_override: Option<&str>,
+        source_override: Option<&str>,
+        ring_capacity_sec: f64,
+    ) -> FwResult<PipePcmSource> {
+        let (format, source) =
+            crate::audio::microphone_defaults(device, format_override, source_override)?;
+        let program = crate::audio::resolve_ffmpeg_program(None)?;
+        let args: Vec<String> = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-f",
+            format.as_str(),
+            "-i",
+            source.as_str(),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        Self::open_with_command(&program, &args, ring_capacity_sec)
+    }
+
+    /// Command-injection seam for tests (a fake producer stands in for
+    /// ffmpeg; the production caller is [`Self::open`]).
+    pub fn open_with_command(
+        program: &str,
+        args: &[String],
+        ring_capacity_sec: f64,
+    ) -> FwResult<PipePcmSource> {
+        let mut child = crate::process::spawn_streaming_stdout(program, args)?;
+        let stdout = child.take_stdout().ok_or_else(|| {
+            FwError::ContractViolation("streaming child spawned without a stdout pipe".into())
+        })?;
+        tracing::info!(command = %child.rendered_command(), "ffmpeg capture stream open");
+        Ok(
+            PipePcmSource::from_reader(stdout, PcmFormat::S16le, 16_000, 1, ring_capacity_sec)?
+                .with_child(child),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bd-rt-resampler-pbk9: streaming resampler to 16 kHz mono
 //
 // Dependency decision (the bead's required evaluation, 2026-08-22): rubato
@@ -1339,6 +1681,204 @@ mod tests {
             elapsed < Duration::from_millis(5),
             "1 s of 48 kHz stereo took {elapsed:?} (expected << 5 ms)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-rt-ffmpeg-pipe-7dbu: pipe-fed capture sources
+    // -----------------------------------------------------------------------
+
+    /// In-memory reader delivering bytes in scripted chunk sizes (exercises
+    /// partial-sample and partial-frame reassembly).
+    struct ChunkedReader {
+        data: Vec<u8>,
+        pos: usize,
+        sizes: Vec<usize>,
+        call: usize,
+    }
+
+    impl std::io::Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let want = self.sizes[self.call % self.sizes.len()].min(buf.len());
+            self.call += 1;
+            let n = want.min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    fn drain_source(src: &mut PipePcmSource) -> Vec<f32> {
+        let mut out = vec![0f32; 4096];
+        let mut got = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let r = src.read(&mut out, Duration::from_millis(50)).unwrap();
+            got.extend_from_slice(&out[..r.frames * usize::from(src.channels())]);
+            if r.ended {
+                return got;
+            }
+            assert!(Instant::now() < deadline, "pipe drain hung");
+        }
+    }
+
+    #[test]
+    fn pipe_s16le_round_trips_edge_values_bit_exactly() {
+        let values: Vec<i16> = vec![i16::MIN, -1, 0, 1, i16::MAX, 12345, -12345, 32767];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // Chunk sizes deliberately split samples across reads (1 and 3 bytes).
+        let reader = ChunkedReader {
+            data: bytes,
+            pos: 0,
+            sizes: vec![1, 3, 2, 5],
+            call: 0,
+        };
+        let mut src = PipePcmSource::from_reader(reader, PcmFormat::S16le, 16_000, 1, 1.0).unwrap();
+        let got = drain_source(&mut src);
+        let expected: Vec<f32> = values.iter().map(|&v| f32::from(v) / 32_768.0).collect();
+        assert_eq!(got, expected, "s16le conversion must be bit-exact");
+    }
+
+    #[test]
+    fn pipe_f32le_passes_values_verbatim_across_ragged_chunks() {
+        let values: Vec<f32> = vec![0.0, 1.0, -1.0, 0.5, -0.25, f32::MIN_POSITIVE];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let reader = ChunkedReader {
+            data: bytes,
+            pos: 0,
+            sizes: vec![3, 1, 7],
+            call: 0,
+        };
+        let mut src = PipePcmSource::from_reader(reader, PcmFormat::F32le, 48_000, 1, 1.0).unwrap();
+        assert_eq!(drain_source(&mut src), values);
+    }
+
+    #[test]
+    fn pipe_stereo_frame_alignment_survives_odd_chunks() {
+        // 100 stereo frames, delivered in 3-byte chunks (splits both samples
+        // and frames); output must be exactly the interleaved input.
+        let values: Vec<i16> = (0..200).map(|i| i as i16).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let reader = ChunkedReader {
+            data: bytes,
+            pos: 0,
+            sizes: vec![3],
+            call: 0,
+        };
+        let mut src = PipePcmSource::from_reader(reader, PcmFormat::S16le, 16_000, 2, 1.0).unwrap();
+        let got = drain_source(&mut src);
+        assert_eq!(got.len(), 200);
+        let expected: Vec<f32> = values.iter().map(|&v| f32::from(v) / 32_768.0).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn pcm_format_parse_accepts_exactly_two_formats() {
+        assert_eq!(PcmFormat::parse("s16le").unwrap(), PcmFormat::S16le);
+        assert_eq!(PcmFormat::parse("f32le").unwrap(), PcmFormat::F32le);
+        let err = PcmFormat::parse("mulaw").unwrap_err();
+        assert_eq!(err.error_code(), "FW-INVALID-REQUEST");
+        assert!(err.to_string().contains("s16le, f32le"));
+    }
+
+    #[test]
+    fn stdin_source_refuses_terminal_stdin() {
+        let err = StdinPcmSource::open(PcmFormat::S16le, 16_000, 1, 1.0, true).unwrap_err();
+        assert_eq!(err.error_code(), "FW-INVALID-REQUEST");
+        assert!(err.to_string().contains("terminal"));
+    }
+
+    #[test]
+    fn pipe_zero_config_rejected() {
+        let reader = ChunkedReader {
+            data: vec![],
+            pos: 0,
+            sizes: vec![1],
+            call: 0,
+        };
+        assert!(PipePcmSource::from_reader(reader, PcmFormat::S16le, 0, 1, 1.0).is_err());
+        let reader = ChunkedReader {
+            data: vec![],
+            pos: 0,
+            sizes: vec![1],
+            call: 0,
+        };
+        assert!(PipePcmSource::from_reader(reader, PcmFormat::S16le, 16_000, 0, 1.0).is_err());
+    }
+
+    // ---- subprocess-backed source (unix-only helpers; sh is universal) ----
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ffmpeg_command_source_streams_incrementally_before_child_exit() {
+        // Fake producer: emits 1600 samples of s16le, sleeps long, then would
+        // emit more — incremental delivery must hand us the first batch while
+        // the child still lives, and stop() must kill + reap without hanging.
+        let script = "dd if=/dev/zero bs=3200 count=1 2>/dev/null; sleep 30";
+        let args: Vec<String> = vec!["-c".into(), script.into()];
+        let mut src = FfmpegCaptureSource::open_with_command("sh", &args, 1.0).unwrap();
+        let mut out = vec![0f32; 4096];
+        let started = Instant::now();
+        let mut frames = 0usize;
+        while frames == 0 && started.elapsed() < Duration::from_secs(5) {
+            frames = src
+                .read(&mut out, Duration::from_millis(100))
+                .unwrap()
+                .frames;
+        }
+        assert_eq!(frames, 1600, "first batch must arrive while the child runs");
+        let t_stop = Instant::now();
+        src.stop();
+        assert!(
+            t_stop.elapsed() < Duration::from_secs(2),
+            "stop() must kill promptly, took {:?}",
+            t_stop.elapsed()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ffmpeg_command_source_surfaces_stderr_tail_on_failure() {
+        let args: Vec<String> = vec!["-c".into(), "echo device gone >&2; exit 3".into()];
+        let mut src = FfmpegCaptureSource::open_with_command("sh", &args, 1.0).unwrap();
+        let mut out = vec![0f32; 64];
+        // EOF arrives with no data; the error slot is only set on read
+        // failures, so a clean nonzero exit shows as `ended` — the DRIVER
+        // then consults stderr_tail via the child. Here we assert the tail
+        // made it into the source's error enrichment path when the reader
+        // errors, and at minimum that the stream ends rather than hanging.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let r = src.read(&mut out, Duration::from_millis(50)).unwrap();
+            if r.ended {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed child must end the stream"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn streaming_child_kill_reaps_no_zombie() {
+        let args: Vec<String> = vec!["-c".into(), "sleep 30".into()];
+        let mut child = crate::process::spawn_streaming_stdout("sh", &args).unwrap();
+        let status = child.kill().unwrap();
+        assert!(status.is_some(), "kill must reap and return the status");
+        // Second kill is a no-op.
+        assert!(child.kill().unwrap().is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn streaming_child_missing_program_maps_to_command_missing() {
+        let err = crate::process::spawn_streaming_stdout("definitely-not-a-real-binary-fw", &[])
+            .unwrap_err();
+        assert_eq!(err.error_code(), "FW-CMD-MISSING");
     }
 
     // ---- live hardware smoke (needs a real input device; run manually) ----

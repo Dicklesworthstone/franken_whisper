@@ -1243,6 +1243,170 @@ pub(crate) fn is_stdout_capture_limit_error(error: &FwError) -> bool {
         || message == &capture_limit_message("stdout and stderr")
 }
 
+// ---------------------------------------------------------------------------
+// bd-rt-ffmpeg-pipe-7dbu: incremental-stdout subprocess plumbing
+//
+// Everything above buffers a child's output to completion; the live listen
+// path needs to READ WHILE THE CHILD RUNS (unbounded ffmpeg device capture).
+// StreamingChild hands the caller the live stdout pipe, drains stderr on a
+// dedicated thread into a bounded tail (the pipe-deadlock discipline), and
+// guarantees the child is killed and reaped on drop.
+// ---------------------------------------------------------------------------
+
+/// Retained stderr tail for error reporting (last bytes win).
+const STREAMING_STDERR_TAIL_BYTES: usize = 4096;
+
+/// A spawned child whose stdout is consumed incrementally by the caller.
+///
+/// stderr is drained continuously (a child that logs megabytes can never
+/// wedge us) with only the tail retained; [`StreamingChild::kill`] SIGKILLs
+/// and reaps (idempotent), and dropping the handle does the same — no
+/// zombies, matching `run_command_cancellable`'s ownership semantics.
+#[cfg(not(windows))]
+impl std::fmt::Debug for StreamingChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingChild")
+            .field("command", &self.rendered_command)
+            .field("reaped", &self.reaped)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(not(windows))]
+pub struct StreamingChild {
+    child: ManagedChild,
+    stdout: Option<std::process::ChildStdout>,
+    stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_join: Option<thread::JoinHandle<()>>,
+    rendered_command: String,
+    reaped: bool,
+}
+
+#[cfg(windows)]
+pub struct StreamingChild {
+    _never_constructed: std::convert::Infallible,
+}
+
+#[cfg(not(windows))]
+impl StreamingChild {
+    /// Take the live stdout pipe (once). The caller owns read pacing;
+    /// blocking reads unblock promptly after [`Self::kill`] closes the pipe.
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.stdout.take()
+    }
+
+    /// The redacted command line (for logs / error context).
+    #[must_use]
+    pub fn rendered_command(&self) -> &str {
+        &self.rendered_command
+    }
+
+    /// Non-blocking exit probe.
+    pub fn try_wait(&mut self) -> FwResult<Option<std::process::ExitStatus>> {
+        self.child.try_wait().map_err(FwError::Io)
+    }
+
+    /// SIGKILL + reap. Idempotent; returns the exit status when the child
+    /// was still reapable on this call.
+    pub fn kill(&mut self) -> FwResult<Option<std::process::ExitStatus>> {
+        if self.reaped {
+            return Ok(None);
+        }
+        let _ = self.child.kill();
+        let status = self.child.wait().map_err(FwError::Io)?;
+        self.reaped = true;
+        if let Some(join) = self.stderr_join.take() {
+            let _ = join.join();
+        }
+        tracing::debug!(command = %self.rendered_command, ?status, "streaming child killed and reaped");
+        Ok(Some(status))
+    }
+
+    /// The retained stderr tail (lossy UTF-8), for FW-CMD-FAILED messages.
+    #[must_use]
+    pub fn stderr_tail(&self) -> String {
+        let tail = self
+            .stderr_tail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&tail).into_owned()
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for StreamingChild {
+    fn drop(&mut self) {
+        let _ = self.kill();
+    }
+}
+
+/// Spawn `program args...` with a live stdout pipe and continuously-drained
+/// bounded stderr. See [`StreamingChild`].
+///
+/// Windows: not yet supported — the Job-Object child wrapper does not expose
+/// pipe handles the way `std::process::Child` does; live ffmpeg capture on
+/// Windows lands with that plumbing (the cpal WASAPI source is the primary
+/// Windows path regardless).
+#[cfg(windows)]
+pub fn spawn_streaming_stdout(_program: &str, _args: &[String]) -> FwResult<StreamingChild> {
+    Err(FwError::Unsupported(
+        "streaming subprocess capture is not yet supported on Windows; use the cpal capture backend"
+            .to_owned(),
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<StreamingChild> {
+    let rendered_command = render_command_for_log(program, args);
+    tracing::debug!(command = %rendered_command, "spawning streaming-stdout child");
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = spawn_managed_child(command).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            FwError::CommandMissing {
+                command: program.to_owned(),
+            }
+        } else {
+            FwError::Io(error)
+        }
+    })?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr_join = stderr.map(|mut pipe| {
+        let tail = std::sync::Arc::clone(&stderr_tail);
+        thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = [0u8; 1024];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        tail.extend_from_slice(&buf[..n]);
+                        if tail.len() > STREAMING_STDERR_TAIL_BYTES {
+                            let excess = tail.len() - STREAMING_STDERR_TAIL_BYTES;
+                            tail.drain(..excess);
+                        }
+                    }
+                }
+            }
+        })
+    });
+    Ok(StreamingChild {
+        child,
+        stdout,
+        stderr_tail,
+        stderr_join,
+        rendered_command,
+        reaped: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
