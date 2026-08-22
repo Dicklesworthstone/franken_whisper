@@ -77,6 +77,7 @@ WANT_VERSION=0
 WANT_FLAT=0
 WANT_J=0
 WANT_DOWNLOAD=0
+WANT_SEARCH=0
 DEST_TEMPLATE=""
 NEXT_IS_OUTPUT=0
 
@@ -91,6 +92,7 @@ for arg in "$@"; do
     --version)        WANT_VERSION=1 ;;
     --flat-playlist)  WANT_FLAT=1 ;;
     -j)               WANT_J=1 ;;
+    ytsearch*)        WANT_SEARCH=1 ;;
     -f)               WANT_DOWNLOAD=1 ;;  # `-f ba` only appears on the download path
     -o)               NEXT_IS_OUTPUT=1 ;;
     http*)            LAST_URL="$arg" ;;  # remember the URL for id derivation
@@ -113,6 +115,22 @@ url_to_id() {
 # ---- --version ------------------------------------------------------------
 if [ "$WANT_VERSION" -eq 1 ]; then
   echo "${STUB_VERSION:-2025.01.01}"
+  exit 0
+fi
+
+# ---- catalog search (bd-m7fv) ---------------------------------------------
+if [ "$WANT_SEARCH" -eq 1 ]; then
+  if [ "$WANT_FLAT" -eq 1 ]; then
+    echo '{"id":"srchflat0001","title":"Flat Search Hit One","url":"https://www.youtube.com/watch?v=srchflat0001","duration":95.0}'
+    echo '{"id":"srchflat0002","title":"Flat Search Hit Two","webpage_url":"https://www.youtube.com/watch?v=srchflat0002","duration":150}'
+  else
+    # Third line repeats the first id: exercises the caller's dedup-by-id.
+    cat <<'EOF'
+{"id":"srchenr0001","title":"Enriched Search Hit One","channel":"Search Channel","view_count":4242,"upload_date":"20250301","duration":187.5,"url":"https://www.youtube.com/watch?v=srchenr0001"}
+{"id":"srchenr0002","title":"Enriched Search Hit Two","channel":"Other Channel","duration":99.0,"webpage_url":"https://www.youtube.com/watch?v=srchenr0002"}
+{"id":"srchenr0001","title":"Enriched Search Hit One (repeat)","url":"https://www.youtube.com/watch?v=srchenr0001"}
+EOF
+  fi
   exit 0
 fi
 

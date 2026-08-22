@@ -96,6 +96,208 @@ pub struct VideoRef {
     pub duration_sec: Option<f64>,
 }
 
+/// One curated result from `fw youtube search` / `fw youtube enrich`
+/// (bd-j2lh / bd-m7fv): the retained subset of yt-dlp's object that an agent
+/// needs to triage a video without a second fetch. Serialized as JSON on
+/// stdout; `None`-valued optional fields are omitted so agents never parse
+/// null placeholders.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SearchHit {
+    /// Stable YouTube video id.
+    pub id: String,
+    /// Video title (may be empty for restricted entries).
+    pub title: String,
+    /// Canonical watch URL.
+    pub url: String,
+    /// Duration in seconds, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_sec: Option<f64>,
+    /// Channel name, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// View count, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_count: Option<u64>,
+    /// Upload date in `YYYYMMDD` form, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_date: Option<String>,
+}
+
+/// Projected subset parsed from one yt-dlp search line. Works for BOTH the
+/// enriched per-video dump and the flat-playlist dump — every field except
+/// the id is optional.
+#[derive(serde::Deserialize)]
+struct ProjectedSearchEntry {
+    #[serde(default)]
+    id: serde_json::Value,
+    #[serde(default)]
+    title: serde_json::Value,
+    #[serde(default)]
+    url: serde_json::Value,
+    #[serde(default)]
+    webpage_url: serde_json::Value,
+    #[serde(default)]
+    duration: serde_json::Value,
+    #[serde(default)]
+    channel: serde_json::Value,
+    #[serde(default)]
+    view_count: serde_json::Value,
+    #[serde(default)]
+    upload_date: serde_json::Value,
+}
+
+fn search_hit_from_entry(entry: &ProjectedSearchEntry) -> Option<SearchHit> {
+    let id = non_empty_json_string(entry.id.clone())?;
+    let url = non_empty_json_string(entry.webpage_url.clone())
+        .or_else(|| non_empty_json_string(entry.url.clone()))
+        .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
+    Some(SearchHit {
+        title: non_empty_json_string(entry.title.clone()).unwrap_or_default(),
+        url,
+        duration_sec: entry.duration.as_f64(),
+        channel: non_empty_json_string(entry.channel.clone()),
+        view_count: entry.view_count.as_u64(),
+        upload_date: non_empty_json_string(entry.upload_date.clone()),
+        id,
+    })
+}
+
+/// Search YouTube through the probed yt-dlp binary: `ytsearch{limit}:query`
+/// dumped as per-result JSON lines. Enriched mode (default) retains the
+/// curated [`SearchHit`] field set; `--flat` keeps the flat-playlist subset.
+/// Hits are deduplicated by id preserving first-seen order, capped at
+/// `limit`.
+///
+/// # Errors
+///
+/// Propagates [`run_ytdlp`] errors (including the capture-cap too-large
+/// mapping shared with [`expand_playlist`]); per-line parse failures are
+/// skipped with a warning, never fatal.
+pub fn search(
+    info: &YtdlpInfo,
+    query: &str,
+    limit: usize,
+    flat: bool,
+    token: &CancellationToken,
+) -> FwResult<Vec<SearchHit>> {
+    if query.trim().is_empty() {
+        return Err(FwError::InvalidRequest("empty search query".to_owned()));
+    }
+    if limit == 0 {
+        return Err(FwError::InvalidRequest(
+            "--limit must be at least 1".to_owned(),
+        ));
+    }
+    let target = format!("ytsearch{limit}:{query}");
+    let mut args = vec!["--no-warnings".to_owned(), "--".to_owned(), target];
+    if flat {
+        args.insert(0, "--dump-json".to_owned());
+        args.insert(0, "--flat-playlist".to_owned());
+    } else {
+        args.insert(0, "--dump-json".to_owned());
+    }
+    let output = run_ytdlp(info, &args, token, EXPAND_TIMEOUT)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut hits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match serde_json::from_str::<ProjectedSearchEntry>(line) {
+            Ok(entry) => {
+                if let Some(hit) = search_hit_from_entry(&entry)
+                    && seen.insert(hit.id.clone())
+                {
+                    hits.push(hit);
+                    if hits.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "skipping unparseable search line ({err}): {}",
+                    truncate_for_log(line)
+                );
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// Enrich specific video URLs or ids with full metadata via repeated
+/// [`fetch_metadata`] calls, returning deduplicated [`SearchHit`]s in
+/// first-seen order. Playlist URLs are rejected with an actionable error —
+/// ingest playlists through `fw youtube run` instead.
+///
+/// # Errors
+///
+/// Propagates the first [`fetch_metadata`] error; playlist inputs yield
+/// [`FwError::InvalidRequest`].
+pub fn enrich(
+    info: &YtdlpInfo,
+    targets: &[String],
+    token: &CancellationToken,
+) -> FwResult<Vec<SearchHit>> {
+    let mut hits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for target in targets {
+        let trimmed = target.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // A bare 11-char video id is accepted and canonicalized into a watch
+        // URL (yt-dlp itself only understands URLs). 11 chars of
+        // [A-Za-z0-9_-] is exactly YouTube's id alphabet; anything else is
+        // left for classify_url to accept or reject as a URL.
+        let target_owned;
+        let target_ref: &str = {
+            let is_bare_id = trimmed.len() == 11
+                && trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                && classify_url(&format!("https://www.youtube.com/watch?v={trimmed}")).is_ok();
+            if is_bare_id {
+                target_owned = format!("https://www.youtube.com/watch?v={trimmed}");
+                target_owned.as_str()
+            } else {
+                trimmed
+            }
+        };
+        match classify_url(target_ref)? {
+            UrlKind::Video | UrlKind::Ambiguous => {
+                let meta = fetch_metadata(info, target_ref, token)?;
+                if seen.insert(meta.id.clone()) {
+                    hits.push(SearchHit {
+                        id: meta.id.clone(),
+                        title: meta.title.clone(),
+                        url: meta.webpage_url.clone(),
+                        duration_sec: meta.duration_sec,
+                        channel: meta.channel.clone(),
+                        view_count: None,
+                        upload_date: meta.upload_date.clone(),
+                    });
+                }
+            }
+            UrlKind::Playlist => {
+                return Err(FwError::InvalidRequest(format!(
+                    "`{target_ref}` classified as Playlist; enrich takes individual video \
+                     URLs or ids — ingest playlists through `fw youtube run` instead"
+                )));
+            }
+        }
+    }
+    Ok(hits)
+}
+
+/// Deduplicate hits by id preserving first-seen order (shared by CLI merge
+/// paths that combine search + enrich streams).
+#[must_use]
+pub fn dedup_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    let mut seen = std::collections::HashSet::new();
+    hits.into_iter()
+        .filter(|hit| seen.insert(hit.id.clone()))
+        .collect()
+}
+
 /// Full per-video metadata fetched via `yt-dlp -j`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VideoMeta {
@@ -1641,6 +1843,108 @@ mod tests {
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
+    }
+
+    // ---- search / enrich (via stub, bd-m7fv) -----------------------------
+
+    #[test]
+    fn search_enriched_dedupes_and_retains_curated_fields() {
+        let token = CancellationToken::unbounded();
+        let hits = search(&stub_info(), "rust livestream", 10, false, &token)
+            .expect("enriched search should succeed");
+        assert_eq!(
+            hits.len(),
+            2,
+            "duplicate third line must be deduped: {hits:?}"
+        );
+        assert_eq!(hits[0].id, "srchenr0001");
+        assert_eq!(hits[0].title, "Enriched Search Hit One");
+        assert_eq!(hits[0].url, "https://www.youtube.com/watch?v=srchenr0001");
+        assert_eq!(hits[0].channel.as_deref(), Some("Search Channel"));
+        assert_eq!(hits[0].view_count, Some(4242));
+        assert_eq!(hits[0].upload_date.as_deref(), Some("20250301"));
+        assert_eq!(hits[0].duration_sec, Some(187.5));
+        // Second hit exercises the webpage_url fallback for the canonical URL
+        // and omits fields the fixture does not carry.
+        assert_eq!(hits[1].id, "srchenr0002");
+        assert_eq!(hits[1].channel.as_deref(), Some("Other Channel"));
+        assert_eq!(hits[1].view_count, None);
+        assert_eq!(hits[1].upload_date, None);
+    }
+
+    #[test]
+    fn search_flat_keeps_flat_subset() {
+        let token = CancellationToken::unbounded();
+        let hits = search(&stub_info(), "cheap sweep", 10, true, &token)
+            .expect("flat search should succeed");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "srchflat0001");
+        assert_eq!(hits[0].duration_sec, Some(95.0));
+        assert_eq!(hits[1].id, "srchflat0002");
+        // webpage_url fallback supplies the canonical URL in the flat dump.
+        assert_eq!(hits[1].url, "https://www.youtube.com/watch?v=srchflat0002");
+    }
+
+    #[test]
+    fn search_respects_limit_cap() {
+        let token = CancellationToken::unbounded();
+        let hits = search(&stub_info(), "anything", 1, false, &token)
+            .expect("limited search should succeed");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "srchenr0001");
+    }
+
+    #[test]
+    fn search_rejects_empty_query_and_zero_limit() {
+        let token = CancellationToken::unbounded();
+        let err = search(&stub_info(), "   ", 10, false, &token).unwrap_err();
+        assert!(matches!(err, FwError::InvalidRequest(_)));
+        let err = search(&stub_info(), "query", 0, false, &token).unwrap_err();
+        assert!(matches!(err, FwError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn enrich_dedupes_targets_and_maps_metadata() {
+        let token = CancellationToken::unbounded();
+        let targets = vec![
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+            "dQw4w9WgXcQ".to_owned(),
+        ];
+        let hits = enrich(&stub_info(), &targets, &token).expect("enrich should succeed");
+        assert_eq!(hits.len(), 1, "same id twice must collapse to one hit");
+        assert_eq!(hits[0].id, "dQw4w9WgXcQ");
+        assert_eq!(hits[0].channel.as_deref(), Some("Stub Channel"));
+        assert_eq!(hits[0].upload_date.as_deref(), Some("20240115"));
+        assert_eq!(hits[0].duration_sec, Some(212.0));
+    }
+
+    #[test]
+    fn enrich_rejects_playlist_urls_actionably() {
+        let token = CancellationToken::unbounded();
+        let targets = vec!["https://www.youtube.com/playlist?list=PL123".to_owned()];
+        let err = enrich(&stub_info(), &targets, &token).unwrap_err();
+        match err {
+            FwError::InvalidRequest(msg) => {
+                assert!(msg.contains("Playlist") && msg.contains("individual video"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dedup_hits_preserves_first_seen_order() {
+        let hit = |id: &str| SearchHit {
+            id: id.to_owned(),
+            title: String::new(),
+            url: format!("https://www.youtube.com/watch?v={id}"),
+            duration_sec: None,
+            channel: None,
+            view_count: None,
+            upload_date: None,
+        };
+        let merged = dedup_hits(vec![hit("a"), hit("b"), hit("a"), hit("c"), hit("b")]);
+        let ids: Vec<&str> = merged.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
     }
 
     // ---- expand_playlist (via stub) --------------------------------------
