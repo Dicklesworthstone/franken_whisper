@@ -260,7 +260,8 @@ fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
         capture_buffer_sec: args.capture_buffer_sec,
     };
 
-    ShutdownController::install(None)?;
+    // NOTE: main() already installed the Ctrl-C handler; installing twice
+    // errors (ctrlc rejects a second handler).
     let mut emit = |value: serde_json::Value| franken_whisper::robot::emit_event_value(&value);
     match franken_whisper::listen::run_listen_session(
         &config,
@@ -503,7 +504,16 @@ fn run(cli: Cli) -> FwResult<()> {
                 }
             }
             RobotCommand::Listen(args) => {
-                return run_robot_listen(*args);
+                return match run_robot_listen(*args) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        // Fatal terminal contract: run_error is ALWAYS the
+                        // last event on a listen stream, including failures
+                        // before the session opened.
+                        let _ = franken_whisper::robot::emit_robot_error_from_fw(&error);
+                        std::process::exit(1);
+                    }
+                };
             }
             RobotCommand::Schema => {
                 println!("{}", serde_json::to_string(&robot_schema_value())?);
