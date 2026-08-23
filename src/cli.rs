@@ -1169,8 +1169,9 @@ pub enum StdinFormatArg {
 }
 
 /// Live listen session controls (bd-rt-listen-cmd-i48i). The consolidated
-/// flag list lives on the driver bead; `--quality-model`/`--db` land with
-/// the confirm-lane and persistence beads.
+/// flag list lives on the driver bead; `--quality-model`/confirm controls
+/// landed with bd-rt-confirm-lane-3okr; `--db` lands with the persistence
+/// bead (bd-rt-persist-a66y).
 #[derive(Debug, Args)]
 pub struct ListenArgs {
     /// Audio source.
@@ -1274,6 +1275,22 @@ pub struct ListenArgs {
     /// Sustained silence that closes an utterance (ms).
     #[arg(long, default_value_t = 600)]
     pub vad_endpoint_ms: u64,
+
+    /// Confirm-lane quality model (bd-rt-confirm-lane-3okr): `auto`
+    /// (default; large-v3-turbo when its package is installed, lane off
+    /// otherwise), `none` (disable), or an explicit model spec.
+    #[arg(long, default_value = "auto")]
+    pub quality_model: String,
+
+    /// Seconds the session end waits for in-flight quality confirms before
+    /// abandoning them with a `confirm_drain_timeout` warning.
+    #[arg(long, default_value_t = 10.0)]
+    pub confirm_drain_sec: f64,
+
+    /// Max unconfirmed utterances in the confirm queue before the oldest is
+    /// dropped (`confirm_lag` warning). The live lane never blocks.
+    #[arg(long, default_value_t = 4)]
+    pub confirm_queue_bound: usize,
 
     /// List input devices as NDJSON and exit (no session).
     #[arg(long)]

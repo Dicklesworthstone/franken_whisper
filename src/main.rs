@@ -263,6 +263,15 @@ fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
         capture_buffer_sec: args.capture_buffer_sec,
         policy,
         alignatt_holdback_ms: args.alignatt_holdback_ms,
+        quality_model: match args.quality_model.as_str() {
+            "auto" => franken_whisper::listen::QualityModelSetting::Auto,
+            "none" => franken_whisper::listen::QualityModelSetting::Disabled,
+            spec => franken_whisper::listen::QualityModelSetting::Explicit(
+                spec.to_owned(),
+            ),
+        },
+        confirm_queue_bound: args.confirm_queue_bound,
+        confirm_drain_sec: args.confirm_drain_sec,
     };
 
     // NOTE: main() already installed the Ctrl-C handler; installing twice

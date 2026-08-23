@@ -574,6 +574,88 @@ pub fn emit_transcript_correct(
     emit_line(&transcript_correct_value(run_id, correction))
 }
 
+/// Construct an utterance-keyed `transcript.confirm` NDJSON event value for
+/// the live confirm lane (bd-rt-confirm-lane-3okr): the background quality
+/// model re-transcribed a CLOSED utterance and agreed with the fast lane
+/// within tolerance. The append-only contract is untouched — committed
+/// deltas are never rewritten; this verdict is advisory metadata for agents
+/// that want to know the fast text was verified (and how closely a second
+/// engine agreed). Distinct from the speculative-window `transcript.confirm`
+/// (which carries `window_id`/`seq` bookkeeping): the listen variant keys on
+/// `utterance_id` and always follows its `utterance_end`.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn listen_transcript_confirm_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    utterance_id: u32,
+    quality_model_id: &str,
+    drift_wer: f64,
+    drift_confidence_delta: f64,
+    drift_edit_distance: usize,
+    latency_ms: u64,
+) -> serde_json::Value {
+    json!({
+        "event": "transcript.confirm",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "utterance_id": utterance_id,
+        "quality_model_id": quality_model_id,
+        "drift": {
+            "wer_approx": drift_wer,
+            "confidence_delta": drift_confidence_delta,
+            "text_edit_distance": drift_edit_distance,
+        },
+        "latency_ms": latency_ms,
+    })
+}
+
+/// Construct an utterance-keyed `transcript.correct` NDJSON event value for
+/// the live confirm lane (bd-rt-confirm-lane-3okr): the quality model's
+/// re-transcription drifted beyond tolerance, so `segments` carries the
+/// batch-grade version of the utterance. There is deliberately NO
+/// `replaces_seq`/retraction here: the fast lane's committed deltas are
+/// already published history under the append-only contract, and agents
+/// choose whether the corrected text supersedes what they acted on.
+/// Persistence note (bd-rt-persist-a66y interplay): stored segments prefer
+/// the corrected version when one arrives before the run finalizes.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn listen_transcript_correct_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    utterance_id: u32,
+    correction_id: u64,
+    segments: &[crate::model::TranscriptionSegment],
+    quality_model_id: &str,
+    drift_wer: f64,
+    drift_confidence_delta: f64,
+    drift_edit_distance: usize,
+    latency_ms: u64,
+) -> serde_json::Value {
+    json!({
+        "event": "transcript.correct",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+        "utterance_id": utterance_id,
+        "correction_id": correction_id,
+        "segments": segments,
+        "quality_model_id": quality_model_id,
+        "drift": {
+            "wer_approx": drift_wer,
+            "confidence_delta": drift_confidence_delta,
+            "text_edit_distance": drift_edit_distance,
+        },
+        "latency_ms": latency_ms,
+    })
+}
+
 /// Construct a `transcript.speculation_stats` NDJSON event value.
 #[must_use]
 pub fn speculation_stats_value(
@@ -778,6 +860,18 @@ pub struct ListenSessionStats {
     /// `None` until one is emitted.
     pub ttft_ms: Option<f64>,
     pub policy_holdbacks: u64,
+    /// Confirm-lane verdicts that agreed with the fast lane
+    /// (bd-rt-confirm-lane-3okr). Zero when the lane is disabled.
+    pub confirmations_emitted: u64,
+    /// Confirm-lane verdicts that corrected the fast lane. Zero when the
+    /// lane is disabled.
+    pub corrections_emitted: u64,
+    /// Utterance_end -> verdict lag summary in ms (`None` mean = no verdicts
+    /// observed yet). Additive optional contract surface: agents must treat
+    /// absence/null as "lane disabled or nothing confirmed yet".
+    pub confirm_lag_p50_ms: Option<f64>,
+    pub confirm_lag_p95_ms: Option<f64>,
+    pub confirm_lag_max_ms: Option<f64>,
 }
 
 /// Construct a `listen.session_start` NDJSON event value.
@@ -957,6 +1051,11 @@ pub fn listen_session_stats_value(
         "p95_step_latency_ms": stats.p95_step_latency_ms,
         "ttft_ms": stats.ttft_ms,
         "policy_holdbacks": stats.policy_holdbacks,
+        "confirmations_emitted": stats.confirmations_emitted,
+        "corrections_emitted": stats.corrections_emitted,
+        "confirm_lag_p50_ms": stats.confirm_lag_p50_ms,
+        "confirm_lag_p95_ms": stats.confirm_lag_p95_ms,
+        "confirm_lag_max_ms": stats.confirm_lag_max_ms,
     })
 }
 
@@ -2321,6 +2420,11 @@ pub fn robot_schema_value() -> serde_json::Value {
                     p95_step_latency_ms: 118.0,
                     ttft_ms: Some(410.0),
                     policy_holdbacks: 9,
+                    confirmations_emitted: 2,
+                    corrections_emitted: 1,
+                    confirm_lag_p50_ms: Some(812.0),
+                    confirm_lag_p95_ms: Some(1930.0),
+                    confirm_lag_max_ms: Some(2100.0),
                 }, false),
             },
             "health.report": {
@@ -7139,6 +7243,11 @@ mod tests {
             p95_step_latency_ms: 55.0,
             ttft_ms: Some(390.0),
             policy_holdbacks: 1,
+            confirmations_emitted: 0,
+            corrections_emitted: 0,
+            confirm_lag_p50_ms: None,
+            confirm_lag_p95_ms: None,
+            confirm_lag_max_ms: None,
         }
     }
 

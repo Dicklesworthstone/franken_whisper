@@ -711,6 +711,26 @@ pub struct ListenConfig {
     pub capture_buffer_sec: f64,
     pub policy: ListenPolicy,
     pub alignatt_holdback_ms: u64,
+    /// Confirm-lane quality model (bd-rt-confirm-lane-3okr).
+    pub quality_model: QualityModelSetting,
+    /// Max unconfirmed jobs before the oldest is dropped (`confirm_lag`
+    /// warning). Live output never blocks on the quality lane.
+    pub confirm_queue_bound: usize,
+    /// Seconds the session-end path waits for in-flight confirms before
+    /// abandoning them with a `confirm_drain_timeout` warning.
+    pub confirm_drain_sec: f64,
+}
+
+/// `--quality-model` setting for the confirm lane (bd-rt-confirm-lane-3okr).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualityModelSetting {
+    /// Default product behavior: large-v3-turbo when its package is
+    /// installed; lane disabled otherwise. Never downloads models.
+    Auto,
+    /// Explicit opt-out (`--quality-model none`).
+    Disabled,
+    /// Explicit model spec (`--quality-model <spec>`).
+    Explicit(String),
 }
 
 /// Which emission policy drives commits (bd-rt-alignatt-fry9 owns the
@@ -744,6 +764,9 @@ impl Default for ListenConfig {
             capture_buffer_sec: 30.0,
             policy: ListenPolicy::AlignAtt,
             alignatt_holdback_ms: 200,
+            quality_model: QualityModelSetting::Auto,
+            confirm_queue_bound: CONFIRM_QUEUE_DEFAULT_BOUND,
+            confirm_drain_sec: CONFIRM_DRAIN_DEFAULT_SEC,
         }
     }
 }
@@ -1206,6 +1229,436 @@ fn open_capture_source(config: &ListenConfig) -> FwResult<OpenedCapture> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// bd-rt-confirm-lane-3okr: background per-utterance quality confirmation
+// ---------------------------------------------------------------------------
+
+/// Default bound on unconfirmed confirm-lane jobs. When the queue is full,
+/// the OLDEST unconfirmed utterance is dropped (with a `confirm_lag`
+/// warning): the live fast lane must never block on the quality lane.
+pub const CONFIRM_QUEUE_DEFAULT_BOUND: usize = 4;
+
+/// Default seconds the session-end path waits for in-flight confirms before
+/// abandoning them (`confirm_drain_timeout` warning).
+pub const CONFIRM_DRAIN_DEFAULT_SEC: f64 = 10.0;
+
+const CONFIRM_QUALITY_MODEL_DEFAULT: &str = "large-v3-turbo";
+
+/// One closed utterance awaiting quality-lane re-transcription.
+pub(crate) struct ConfirmJob {
+    pub utterance_id: u32,
+    /// Full-utterance PCM captured at close (batch-grade context: no slice
+    /// truncation compromises).
+    pub pcm: Vec<f32>,
+    /// The fast lane's committed text for this utterance.
+    pub committed_text: String,
+    /// Fast lane's pinned/detected language at close (stability: the quality
+    /// decode must not re-detect and diverge mid-session).
+    pub language: Option<String>,
+}
+
+/// What the worker sends back to the session loop.
+#[derive(Debug)]
+pub(crate) enum ConfirmLaneEvent {
+    Verdict(ConfirmVerdict),
+    Warning {
+        reason: String,
+        detail: serde_json::Value,
+    },
+    /// The oldest queued job was dropped because the queue was full.
+    DroppedOldest {
+        utterance_id: u32,
+        queue_bound: usize,
+    },
+}
+
+/// Mapped outcome of one quality-lane decode + tracker comparison.
+#[derive(Debug)]
+pub(crate) struct ConfirmVerdict {
+    pub utterance_id: u32,
+    pub confirmed: bool,
+    pub correction_id: u64,
+    /// Turbo's batch-grade segments (empty on confirm).
+    pub corrected_segments: Vec<crate::model::TranscriptionSegment>,
+    pub drift_wer: f64,
+    pub drift_confidence_delta: f64,
+    pub drift_edit_distance: usize,
+    pub decode_ms: u64,
+    pub quality_model_id: String,
+}
+
+/// Re-transcription result contract for the injected decoder seam. The
+/// production decoder lazily loads the quality model on first call; tests
+/// inject fakes without touching disk.
+pub(crate) enum DecodeOutcome {
+    Segments(Vec<crate::model::TranscriptionSegment>, String),
+    /// Quality model could not be loaded/used at all (missing package,
+    /// corrupt file, OOM). The lane disables itself; the session continues
+    /// fast-only (graceful degradation is LOCKED policy).
+    Unavailable(String),
+    /// Decode aborted because the session ended (checkpoint fired).
+    Aborted,
+    Failed(String),
+}
+
+pub(crate) type QualityDecoder = Box<
+    dyn FnMut(&ConfirmJob, &str, &(dyn Fn() -> bool + Sync)) -> DecodeOutcome
+        + Send,
+>;
+
+struct ConfirmQueueState {
+    jobs: std::collections::VecDeque<ConfirmJob>,
+    bound: usize,
+    shutdown: bool,
+}
+
+/// Handle owned by the session loop: bounded job queue + results channel.
+pub(crate) struct ConfirmLane {
+    shared: std::sync::Arc<(
+        std::sync::Mutex<ConfirmQueueState>,
+        std::sync::Condvar,
+    )>,
+    abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    results_tx: std::sync::mpsc::Sender<ConfirmLaneEvent>,
+    results_rx: std::sync::mpsc::Receiver<ConfirmLaneEvent>,
+    depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ConfirmLane {
+    /// Spawn the single background worker. `decoder` runs entirely on the
+    /// worker thread; the tracker lives there too.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn spawn(bound: usize, mut decoder: QualityDecoder) -> Self {
+        let shared = std::sync::Arc::new((
+            std::sync::Mutex::new(ConfirmQueueState {
+                jobs: std::collections::VecDeque::new(),
+                bound,
+                shutdown: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (results_tx, results_rx) = std::sync::mpsc::channel::<ConfirmLaneEvent>();
+        let worker_shared = std::sync::Arc::clone(&shared);
+        let worker_abort = std::sync::Arc::clone(&abort);
+        let worker_depth = std::sync::Arc::clone(&depth);
+        let spawned = {
+            let results_tx = results_tx.clone();
+            std::thread::Builder::new()
+                .name("fw-confirm".to_owned())
+                .spawn(move || {
+                let (queue_mtx, queue_cv) = &*worker_shared;
+                let mut tracker = crate::speculation::CorrectionTracker::new(
+                    crate::speculation::CorrectionTolerance::default(),
+                );
+                let mut prev_confirmed_text = String::new();
+                // window_id/seq namespace: the utterance id itself (unique
+                // per session; the tracker instance is per-worker).
+                loop {
+                    let job = {
+                        let mut state = queue_mtx.lock().expect("confirm queue poisoned");
+                        loop {
+                            if let Some(job) = state.jobs.pop_front() {
+                                break Some(job);
+                            }
+                            if state.shutdown {
+                                break None;
+                            }
+                            state = queue_cv.wait(state).expect("confirm queue poisoned");
+                        }
+                    };
+                    let Some(job) = job else { break };
+                    let queue_depth = worker_depth.load(std::sync::atomic::Ordering::Relaxed);
+                    let is_abort = || {
+                        worker_abort.load(std::sync::atomic::Ordering::Relaxed)
+                    };
+                    let decode_started = std::time::Instant::now();
+                    match decoder(&job, &prev_confirmed_text, &is_abort) {
+                        DecodeOutcome::Aborted => break,
+                        DecodeOutcome::Unavailable(detail) => {
+                            // Locked graceful-degradation shape: warn once,
+                            // disable the lane, keep the session alive.
+                            let _ = results_tx.send(ConfirmLaneEvent::Warning {
+                                reason: "quality_model_unavailable".to_owned(),
+                                detail: serde_json::json!({ "detail": detail }),
+                            });
+                            // Poison-pill the queue: everything already
+                            // queued is skipped silently (the fast text is
+                            // already published history). Depth resets to
+                            // zero — nothing remains queued or in flight,
+                            // so session-end drain must not report
+                            // phantom abandons.
+                            {
+                                let mut state = queue_mtx
+                                    .lock()
+                                    .expect("confirm queue poisoned");
+                                state.jobs.clear();
+                                drop(state);
+                                worker_depth.store(
+                                    0,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            break;
+                        }
+                        DecodeOutcome::Failed(detail) => {
+                            tracing::info!(
+                                utterance_id = job.utterance_id,
+                                queue_depth,
+                                verdict = "failed",
+                                wer_drift = -1.0_f64,
+                                "confirm job failed"
+                            );
+                            let _ = results_tx.send(ConfirmLaneEvent::Warning {
+                                reason: "confirm_job_failed".to_owned(),
+                                detail: serde_json::json!({
+                                    "detail": detail,
+                                    "utterance_id": job.utterance_id,
+                                }),
+                            });
+                        }
+                        DecodeOutcome::Segments(segments, quality_model_id) => {
+                            let decode_ms =
+                                decode_started.elapsed().as_millis() as u64;
+                            let window_id = u64::from(job.utterance_id);
+                            let fast_segment = crate::model::TranscriptionSegment {
+                                start_sec: Some(0.0),
+                                end_sec: None,
+                                text: job.committed_text.clone(),
+                                speaker: None,
+                                confidence: None,
+                            };
+                            tracker.register_partial(crate::speculation::PartialTranscript {
+                                seq: window_id,
+                                window_id,
+                                model_id: "fast".to_owned(),
+                                segments: vec![fast_segment],
+                                latency_ms: 0,
+                                confidence_mean: 0.0,
+                                emitted_at_rfc3339: chrono::Utc::now().to_rfc3339(),
+                                status: crate::speculation::PartialStatus::Pending,
+                            });
+                            let mapped = match tracker.submit_quality_result(
+                                window_id,
+                                &quality_model_id,
+                                segments,
+                                decode_ms,
+                            ) {
+                                Ok(crate::speculation::CorrectionDecision::Confirm {
+                                    drift,
+                                    ..
+                                }) => {
+                                    prev_confirmed_text = job.committed_text.clone();
+                                    tracing::info!(
+                                        utterance_id = job.utterance_id,
+                                        queue_depth,
+                                        decode_ms,
+                                        verdict = "confirm",
+                                        wer_drift = drift.wer_approx,
+                                        "confirm verdict"
+                                    );
+                                    ConfirmVerdict {
+                                        utterance_id: job.utterance_id,
+                                        confirmed: true,
+                                        correction_id: 0,
+                                        corrected_segments: Vec::new(),
+                                        drift_wer: drift.wer_approx,
+                                        drift_confidence_delta: drift.confidence_delta,
+                                        drift_edit_distance: drift.text_edit_distance,
+                                        decode_ms,
+                                        quality_model_id,
+                                    }
+                                }
+                                Ok(
+                                    crate::speculation::CorrectionDecision::Correct {
+                                        correction,
+                                    },
+                                ) => {
+                                    prev_confirmed_text = correction
+                                        .corrected_segments
+                                        .iter()
+                                        .map(|s| s.text.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                        .trim()
+                                        .to_owned();
+                                    tracing::info!(
+                                        utterance_id = job.utterance_id,
+                                        queue_depth,
+                                        decode_ms,
+                                        verdict = "correct",
+                                        wer_drift = correction.drift.wer_approx,
+                                        correction_id = correction.correction_id,
+                                        "confirm verdict"
+                                    );
+                                    ConfirmVerdict {
+                                        utterance_id: job.utterance_id,
+                                        confirmed: false,
+                                        correction_id: correction.correction_id,
+                                        corrected_segments: correction.corrected_segments,
+                                        drift_wer: correction.drift.wer_approx,
+                                        drift_confidence_delta: correction
+                                            .drift
+                                            .confidence_delta,
+                                        drift_edit_distance: correction
+                                            .drift
+                                            .text_edit_distance,
+                                        decode_ms,
+                                        quality_model_id: correction.quality_model_id,
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = results_tx.send(ConfirmLaneEvent::Warning {
+                                        reason: "confirm_job_failed".to_owned(),
+                                        detail: serde_json::json!({
+                                            "detail": error.to_string(),
+                                            "utterance_id": job.utterance_id,
+                                        }),
+                                    });
+                                    worker_depth
+                                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                    continue;
+                                }
+                            };
+                            let _ = results_tx
+                                .send(ConfirmLaneEvent::Verdict(mapped));
+                        }
+                    }
+                    worker_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                })
+        };
+        if spawned.is_err() {
+            // Worker threads are best-effort infrastructure; if the OS
+            // refuses the thread the session degrades to fast-only.
+            return Self {
+                shared,
+                abort,
+                results_tx: std::sync::mpsc::channel().0,
+                results_rx: std::sync::mpsc::channel().1,
+                depth,
+            };
+        }
+        Self {
+            shared,
+            abort,
+            results_tx,
+            results_rx,
+            depth,
+        }
+    }
+    /// Enqueue one closed utterance. NEVER blocks: when the queue is at its
+    /// bound, the oldest unconfirmed job is dropped and reported so the
+    /// session loop can emit the `confirm_lag` warning.
+    pub(crate) fn submit(&self, job: ConfirmJob) {
+        let (queue_mtx, queue_cv) = &*self.shared;
+        let mut state = queue_mtx.lock().expect("confirm queue poisoned");
+        if state.shutdown {
+            return;
+        }
+        let mut dropped = None;
+        while state.jobs.len() >= state.bound {
+            if let Some(old) = state.jobs.pop_front() {
+                dropped = Some(old.utterance_id);
+                self.depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                break;
+            }
+        }
+        state.jobs.push_back(job);
+        self.depth.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        drop(state);
+        queue_cv.notify_one();
+        if let Some(utterance_id) = dropped {
+            let _ = self.results_tx.send(ConfirmLaneEvent::DroppedOldest {
+                utterance_id,
+                queue_bound: self.bound(),
+            });
+        }
+    }
+
+    fn bound(&self) -> usize {
+        self.shared.0.lock().expect("confirm queue poisoned").bound
+    }
+
+    pub(crate) fn try_recv(&self) -> Option<ConfirmLaneEvent> {
+        self.results_rx.try_recv().ok()
+    }
+
+    /// Session-end collection: gather worker events for up to `drain_sec`,
+    /// then shut the lane down (queue cleared, abort fired so an in-flight
+    /// decode checkpoints out promptly). Returns the collected events plus
+    /// the number of jobs abandoned unfinished (0 when the lane drained
+    /// cleanly). Never blocks past `drain_sec`.
+    pub(crate) fn drain(&self, drain_sec: f64) -> (Vec<ConfirmLaneEvent>, usize) {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs_f64(drain_sec.max(0.0));
+        let mut events = Vec::new();
+        loop {
+            if self.depth.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                break;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = std::time::Duration::from_millis(50)
+                .min(deadline.saturating_duration_since(now));
+            match self.results_rx.recv_timeout(wait) {
+                Ok(event) => events.push(event),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        {
+            let (queue_mtx, queue_cv) = &*self.shared;
+            let mut state = queue_mtx.lock().expect("confirm queue poisoned");
+            state.shutdown = true;
+            state.jobs.clear();
+            drop(state);
+            queue_cv.notify_all();
+        }
+        self.abort
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let abandoned = self.depth.load(std::sync::atomic::Ordering::Relaxed);
+        (events, abandoned)
+    }
+}
+
+
+/// Decide confirm-lane enablement + quality-model label up front (session
+/// start stays fast: resolution is a cheap path stat, the LOAD stays lazy on
+/// the worker thread). Matrix (polish round 1 item 2):
+/// - `Disabled` => off.
+/// - `Auto` => ON iff the turbo package is installed AND the fast lane did
+///   NOT fall back to turbo (self-confirmation is meaningless).
+/// - `Explicit(spec)` => honored unless `spec` IS the effective fast model.
+pub(crate) fn resolve_confirm_lane(
+    setting: &QualityModelSetting,
+    effective_fast_label: &str,
+) -> Option<String> {
+    match setting {
+        QualityModelSetting::Disabled => None,
+        QualityModelSetting::Auto => {
+            if effective_fast_label == CONFIRM_QUALITY_MODEL_DEFAULT {
+                return None;
+            }
+            crate::native_engine::resolve_model(CONFIRM_QUALITY_MODEL_DEFAULT)
+                .ok()
+                .map(|_| CONFIRM_QUALITY_MODEL_DEFAULT.to_owned())
+        }
+        QualityModelSetting::Explicit(spec) => {
+            if spec == effective_fast_label {
+                return None;
+            }
+            crate::native_engine::resolve_model(spec)
+                .ok()
+                .map(|_| spec.clone())
+        }
+    }
+}
+
 /// Run one live session, emitting NDJSON event values through `emit`.
 /// Returns `Ok(cancelled)` — `true` when the session ended on Ctrl-C (the
 /// caller maps that to exit code 130). Fatal errors propagate; the CLI
@@ -1249,6 +1702,69 @@ pub fn run_listen_session(
     };
     let record_token_attn = policy.needs_token_attn();
     let confirm_disabled_by_fallback = fallback_warning.is_some();
+    // Confirm lane (bd-rt-confirm-lane-3okr): resolve enablement + label
+    // up front (cheap stat), spawn the worker; the model LOAD itself stays
+    // lazy on the worker thread so time-to-session_start is unaffected.
+    let confirm_label =
+        resolve_confirm_lane(&config.quality_model, &fast_model_label);
+    let confirm_lane = confirm_label.as_ref().map(|spec| {
+        let spec_owned = spec.clone();
+        let mut loaded: Option<(
+            std::sync::Arc<crate::native_engine::NativeWhisperModel>,
+            String,
+        )> = None;
+        let decoder: QualityDecoder = Box::new(move |job, prev_confirmed, is_abort| {
+            let (model, label) = match loaded.as_ref() {
+                Some(pair) => pair.clone(),
+                None => {
+                    let resolved = crate::native_engine::resolve_model(&spec_owned)
+                        .map_err(|e| e.to_string())
+                        .and_then(|path| {
+                            crate::native_engine::NativeWhisperModel::load(&path)
+                                .map(|m| (m, spec_owned.clone()))
+                                .map_err(|e| e.to_string())
+                        });
+                    match resolved {
+                        Ok(pair) => {
+                            loaded = Some(pair.clone());
+                            pair
+                        }
+                        Err(detail) => return DecodeOutcome::Unavailable(detail),
+                    }
+                }
+            };
+            if is_abort() {
+                return DecodeOutcome::Aborted;
+            }
+            // Batch-grade decode contract: full 30 s padding semantics
+            // (AudioCtxPolicy::Full), no cache (rolling audio can never
+            // hit), language pinned to the fast lane's choice, and the
+            // previous confirmed utterance as prompt continuity.
+            let params = DecodeParams {
+                language: job.language.clone(),
+                timestamps: true,
+                audio_ctx: AudioCtxPolicy::Full,
+                bypass_transcript_cache: true,
+                initial_prompt: (!prev_confirmed.is_empty())
+                    .then(|| prev_confirmed.to_owned()),
+                n_threads: 4,
+                ..DecodeParams::default()
+            };
+            let checkpoint = || -> FwResult<()> {
+                if is_abort() {
+                    Err(FwError::Cancelled("confirm lane abandoned".to_owned()))
+                } else {
+                    Ok(())
+                }
+            };
+            match model.transcribe(&job.pcm, &params, &checkpoint) {
+                Ok(out) => DecodeOutcome::Segments(out.segments, label),
+                Err(FwError::Cancelled(_)) => DecodeOutcome::Aborted,
+                Err(error) => DecodeOutcome::Failed(error.to_string()),
+            }
+        });
+        ConfirmLane::spawn(config.confirm_queue_bound, decoder)
+    });
 
     let info = ListenSessionInfo {
         source: source_label.to_owned(),
@@ -1256,7 +1772,7 @@ pub fn run_listen_session(
         device: device_label,
         sample_rate_hz: capture.sample_rate(),
         fast_model: fast_model_label.clone(),
-        quality_model: None, // confirm lane lands with bd-rt-confirm-lane-3okr
+        quality_model: confirm_label.clone(),
         policy: policy.name().to_owned(),
         step_ms: config.step_ms,
         partials: config.emit_partials,
@@ -1326,6 +1842,9 @@ pub fn run_listen_session(
     let mut delta_count: u64 = 0;
     let mut partial_generation: u64 = 0;
     let mut stats = ListenSessionStats::default();
+    let mut pending_confirm_since: std::collections::HashMap<u32, std::time::Instant> =
+        std::collections::HashMap::new();
+    let mut confirm_lag_ms: Vec<f64> = Vec::new();
     let mut step_latencies_ms: Vec<f64> = Vec::new();
     let mut last_stats_emit = std::time::Instant::now();
     let mut next_step = std::time::Instant::now();
@@ -1387,8 +1906,23 @@ pub fn run_listen_session(
             model.transcribe(buffer.window_from(from_sec), &params, &noop_checkpoint)
         }
     };
-
     'session: loop {
+        // -- collect finished confirm-lane verdicts (non-blocking) --------
+        while let Some(event) =
+            confirm_lane.as_ref().and_then(|lane| lane.try_recv())
+        {
+            handle_confirm_event(
+                event,
+                &run_id,
+                &mut seq,
+                &now_ts,
+                emit,
+                &mut stats,
+                &mut confirm_lag_ms,
+                &mut pending_confirm_since,
+            )?;
+        }
+
         // -- termination checks ------------------------------------------
         if is_cancelled() {
             cancelled = true;
@@ -1433,6 +1967,16 @@ pub fn run_listen_session(
                     &committed_text,
                     delta_count,
                 ));
+                if let Some(lane) = confirm_lane.as_ref() {
+                    pending_confirm_since
+                        .insert(utterance_id, std::time::Instant::now());
+                    lane.submit(ConfirmJob {
+                        utterance_id,
+                        pcm: buffer.window_from(utterance_t0).to_vec(),
+                        committed_text: committed_text.clone(),
+                        language: pinned_language.clone(),
+                    });
+                }
             }
             break 'session;
         }
@@ -1565,6 +2109,16 @@ pub fn run_listen_session(
                                 reason = "endpoint",
                                 "utterance closed"
                             );
+                            if let Some(lane) = confirm_lane.as_ref() {
+                                pending_confirm_since
+                                    .insert(utterance_id, std::time::Instant::now());
+                                lane.submit(ConfirmJob {
+                                    utterance_id,
+                                    pcm: buffer.window_from(utterance_t0).to_vec(),
+                                    committed_text: committed_text.clone(),
+                                    language: pinned_language.clone(),
+                                });
+                            }
                             // Trim + prompt carry.
                             buffer.append_committed_text(&decision.commit_text);
                             buffer.set_committed_through(t_sec);
@@ -1623,6 +2177,16 @@ pub fn run_listen_session(
                 &committed_text,
                 delta_count,
             ));
+            if let Some(lane) = confirm_lane.as_ref() {
+                pending_confirm_since
+                    .insert(utterance_id, std::time::Instant::now());
+                lane.submit(ConfirmJob {
+                    utterance_id,
+                    pcm: buffer.window_from(utterance_t0).to_vec(),
+                    committed_text: committed_text.clone(),
+                    language: pinned_language.clone(),
+                });
+            }
             buffer.append_committed_text(&decision.commit_text);
             buffer.set_committed_through(t1);
             buffer.trim_to_committed();
@@ -1758,8 +2322,47 @@ pub fn run_listen_session(
         }
     }
 
-    // Terminal: final stats (success path; run_error is the fatal terminal
-    // and is emitted by the CLI wrapper when this function errors).
+    // Terminal: confirm-lane drain (bd-rt-confirm-lane-3okr) — a bounded
+    // wait so in-flight quality decodes land before history freezes; then
+    // the final stats. run_error is the fatal terminal and is emitted by
+    // the CLI wrapper when this function errors.
+    if let Some(lane) = confirm_lane.as_ref() {
+        let (events, abandoned) = lane.drain(config.confirm_drain_sec);
+        for event in events {
+            handle_confirm_event(
+                event,
+                &run_id,
+                &mut seq,
+                &now_ts,
+                emit,
+                &mut stats,
+                &mut confirm_lag_ms,
+                &mut pending_confirm_since,
+            )?;
+        }
+        if abandoned > 0 {
+            emit(robot::listen_warning_value(
+                &run_id,
+                seq,
+                &now_ts(),
+                "confirm_drain_timeout",
+                serde_json::json!({
+                    "detail": "session ended before the quality lane drained",
+                    "abandoned_utterances": abandoned,
+                    "drain_sec": config.confirm_drain_sec,
+                }),
+            ))?;
+            seq += 1;
+        }
+    }
+    if !confirm_lag_ms.is_empty() {
+        let mut sorted = confirm_lag_ms.clone();
+        sorted.sort_by(f64::total_cmp);
+        stats.confirm_lag_p50_ms = Some(sorted[sorted.len() / 2]);
+        stats.confirm_lag_p95_ms =
+            Some(sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)]);
+        stats.confirm_lag_max_ms = sorted.last().copied();
+    }
     fill_step_stats(&mut stats, &step_latencies_ms, session_started, &buffer);
     emit(robot::listen_session_stats_value(
         &run_id,
@@ -1788,6 +2391,90 @@ fn fill_step_stats(
         stats.p95_step_latency_ms = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)];
     }
 }
+/// Map one confirm-lane event to its robot NDJSON emission + session-stat
+/// updates (bd-rt-confirm-lane-3okr). Shared by the in-loop drain and the
+/// terminal drain so ordering/seq discipline is identical on both paths.
+#[allow(clippy::too_many_arguments)]
+fn handle_confirm_event(
+    event: ConfirmLaneEvent,
+    run_id: &str,
+    seq: &mut u64,
+    now_ts: &dyn Fn() -> String,
+    emit: &mut dyn FnMut(serde_json::Value) -> FwResult<()>,
+    stats: &mut ListenSessionStats,
+    lag_samples_ms: &mut Vec<f64>,
+    pending_since: &mut std::collections::HashMap<u32, std::time::Instant>,
+) -> FwResult<()> {
+    match event {
+        ConfirmLaneEvent::Verdict(verdict) => {
+            // Confirm lag = utterance_end -> verdict arrival (observation
+            // for the latency harness; not a ledger claim).
+            if let Some(started) = pending_since.remove(&verdict.utterance_id) {
+                lag_samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            if verdict.confirmed {
+                stats.confirmations_emitted += 1;
+                emit(robot::listen_transcript_confirm_value(
+                    run_id,
+                    *seq,
+                    &now_ts(),
+                    verdict.utterance_id,
+                    &verdict.quality_model_id,
+                    verdict.drift_wer,
+                    verdict.drift_confidence_delta,
+                    verdict.drift_edit_distance,
+                    verdict.decode_ms,
+                ))?;
+            } else {
+                stats.corrections_emitted += 1;
+                emit(robot::listen_transcript_correct_value(
+                    run_id,
+                    *seq,
+                    &now_ts(),
+                    verdict.utterance_id,
+                    verdict.correction_id,
+                    &verdict.corrected_segments,
+                    &verdict.quality_model_id,
+                    verdict.drift_wer,
+                    verdict.drift_confidence_delta,
+                    verdict.drift_edit_distance,
+                    verdict.decode_ms,
+                ))?;
+            }
+            *seq += 1;
+        }
+        ConfirmLaneEvent::Warning { reason, detail } => {
+            emit(robot::listen_warning_value(
+                run_id,
+                *seq,
+                &now_ts(),
+                &reason,
+                detail,
+            ))?;
+            *seq += 1;
+        }
+        ConfirmLaneEvent::DroppedOldest {
+            utterance_id,
+            queue_bound,
+        } => {
+            pending_since.remove(&utterance_id);
+            emit(robot::listen_warning_value(
+                run_id,
+                *seq,
+                &now_ts(),
+                "confirm_lag",
+                serde_json::json!({
+                    "detail": "confirm queue full; dropped oldest unconfirmed utterance",
+                    "dropped_utterance_id": utterance_id,
+                    "queue_bound": queue_bound,
+                }),
+            ))?;
+            *seq += 1;
+        }
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1871,6 +2558,227 @@ mod tests {
         b.trim_to_committed();
         // Buffer must still start 200 ms BEFORE the committed watermark.
         assert!((b.session_offset_sec() - 2.8).abs() < 1e-9);
+    }
+
+    // ------------------------------------------------------------------
+    // bd-rt-confirm-lane-3okr: confirm-lane unit tests (injected decoder,
+    // no models on disk required)
+    // ------------------------------------------------------------------
+
+    fn fake_job(id: u32, text: &str) -> ConfirmJob {
+        ConfirmJob {
+            utterance_id: id,
+            pcm: vec![0.0; 1600],
+            committed_text: text.to_owned(),
+            language: Some("en".to_owned()),
+        }
+    }
+
+    fn segment(text: &str) -> crate::model::TranscriptionSegment {
+        crate::model::TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: None,
+            text: text.to_owned(),
+            speaker: None,
+            confidence: None,
+        }
+    }
+
+    /// Collect lane events until `want` arrived or the deadline expired.
+    fn collect(lane: &ConfirmLane, want: usize, secs: u64) -> Vec<ConfirmLaneEvent> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut events = Vec::new();
+        while events.len() < want && Instant::now() < deadline {
+            match lane.try_recv() {
+                Some(event) => events.push(event),
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn confirm_lane_confirms_match_and_pins_language_and_prompt() {
+        type SeenLog =
+            std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, String, String)>>>;
+        let seen: SeenLog = std::sync::Arc::default();
+        let seen_for_decoder = std::sync::Arc::clone(&seen);
+        let decoder: QualityDecoder = Box::new(move |job, prev_confirmed, _abort| {
+            seen_for_decoder
+                .lock()
+                .expect("seen lock")
+                .push((
+                    job.language.clone(),
+                    prev_confirmed.to_owned(),
+                    job.committed_text.clone(),
+                ));
+            DecodeOutcome::Segments(
+                vec![segment(&job.committed_text)],
+                "fake-qm".to_owned(),
+            )
+        });
+        let lane = ConfirmLane::spawn(4, decoder);
+        lane.submit(fake_job(1, "hello world"));
+        lane.submit(fake_job(2, "second utterance"));
+        let events = collect(&lane, 2, 5);
+        let verdicts: Vec<&ConfirmVerdict> = events
+            .iter()
+            .filter_map(|e| match e {
+                ConfirmLaneEvent::Verdict(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(verdicts.len(), 2, "both utterances confirm: {events:?}");
+        assert!(verdicts.iter().all(|v| v.confirmed));
+        assert_eq!(verdicts[0].quality_model_id, "fake-qm");
+        // Language pinning: the quality decode receives the fast lane's
+        // pinned language, not a re-detection.
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen[0].0.as_deref(), Some("en"));
+        assert_eq!(seen[1].0.as_deref(), Some("en"));
+        // Prompt continuity: first job has no prior confirmed text; the
+        // second carries the first's confirmed text.
+        assert!(seen[0].1.is_empty());
+        assert_eq!(seen[1].1, "hello world");
+        let (_, abandoned) = lane.drain(0.05);
+        assert_eq!(abandoned, 0);
+    }
+
+    #[test]
+    fn confirm_lane_corrects_beyond_wer_tolerance() {
+        let decoder: QualityDecoder = Box::new(move |_job, _prev, _abort| {
+            DecodeOutcome::Segments(
+                vec![segment(
+                    "the quick brown fox jumps over the lazy dog and then \
+                     keeps running far beyond every expectation",
+                )],
+                "fake-qm".to_owned(),
+            )
+        });
+        let lane = ConfirmLane::spawn(4, decoder);
+        lane.submit(fake_job(1, "hello"));
+        let events = collect(&lane, 1, 5);
+        assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
+        match &events[0] {
+            ConfirmLaneEvent::Verdict(v) => {
+                assert!(!v.confirmed, "divergent text must correct");
+                assert!(!v.corrected_segments.is_empty());
+                assert!(v.drift_wer > 0.1, "wer drift {} must exceed tolerance", v.drift_wer);
+            }
+            other => panic!("expected verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_bound_drops_oldest_with_warning_event() {
+        let decoder: QualityDecoder = Box::new(move |job, _prev, _abort| {
+            std::thread::sleep(Duration::from_millis(50));
+            DecodeOutcome::Segments(
+                vec![segment(&job.committed_text)],
+                "fake-qm".to_owned(),
+            )
+        });
+        let lane = ConfirmLane::spawn(4, decoder);
+        for id in 1..=6 {
+            lane.submit(fake_job(id, "text"));
+        }
+        let events = collect(&lane, 8, 10);
+        let dropped: Vec<u32> = events
+            .iter()
+            .filter_map(|e| match e {
+                ConfirmLaneEvent::DroppedOldest { utterance_id, .. } => Some(*utterance_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dropped, vec![1, 2], "oldest unconfirmed jobs drop first");
+        let verdict_ids: Vec<u32> = events
+            .iter()
+            .filter_map(|e| match e {
+                ConfirmLaneEvent::Verdict(v) => Some(v.utterance_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(verdict_ids, vec![3, 4, 5, 6]);
+        let (_, abandoned) = lane.drain(0.05);
+        assert_eq!(abandoned, 0);
+    }
+
+    #[test]
+    fn quality_model_unavailable_disables_lane_without_killing_it() {
+        let decoder: QualityDecoder = Box::new(move |_job, _prev, _abort| {
+            DecodeOutcome::Unavailable("package not installed".to_owned())
+        });
+        let lane = ConfirmLane::spawn(4, decoder);
+        lane.submit(fake_job(1, "one"));
+        lane.submit(fake_job(2, "two"));
+        let events = collect(&lane, 1, 5);
+        let warnings: Vec<(&str, &serde_json::Value)> = events
+            .iter()
+            .filter_map(|e| match e {
+                ConfirmLaneEvent::Warning { reason, detail } => Some((reason.as_str(), detail)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "exactly one unavailable warning");
+        assert_eq!(warnings[0].0, "quality_model_unavailable");
+        // No verdicts may follow a load failure; queued jobs are skipped.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ConfirmLaneEvent::Verdict(_))),
+            "lane disabled: no verdicts"
+        );
+        // The handle still drains cleanly (session keeps running fast-only).
+        let (extra, abandoned) = lane.drain(0.05);
+        assert_eq!(abandoned, 0);
+        assert!(!extra
+            .iter()
+            .any(|e| matches!(e, ConfirmLaneEvent::Verdict(_))));
+    }
+
+    #[test]
+    fn drain_abandons_stuck_decode_within_deadline() {
+        // Decoder honors the abort flag only on its poll loop — mirrors the
+        // real checkpoint behavior inside transcribe.
+        let decoder: QualityDecoder = Box::new(move |_job, _prev, is_abort| loop {
+            if is_abort() {
+                return DecodeOutcome::Aborted;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        });
+        let lane = ConfirmLane::spawn(4, decoder);
+        lane.submit(fake_job(1, "stuck"));
+        let started = Instant::now();
+        let (events, abandoned) = lane.drain(0.2);
+        assert!(started.elapsed() < Duration::from_secs(3), "drain must be bounded");
+        assert!(events.is_empty(), "no verdict from an abandoned decode");
+        assert!(abandoned >= 1, "the in-flight job counts as abandoned");
+    }
+
+    #[test]
+    fn confirm_lane_resolution_matrix_excludes_self_confirmation() {
+        use QualityModelSetting::{Auto, Disabled, Explicit};
+        // Explicit opt-out is always off.
+        assert_eq!(resolve_confirm_lane(&Disabled, "tiny.en"), None);
+        // Fast lane fell back to turbo (label says so): Auto must NOT
+        // self-confirm against itself.
+        assert_eq!(resolve_confirm_lane(&Auto, CONFIRM_QUALITY_MODEL_DEFAULT), None);
+        // Explicit spec identical to the effective fast model: off.
+        assert_eq!(
+            resolve_confirm_lane(&Explicit("tiny.en".to_owned()), "tiny.en"),
+            None
+        );
+        // Explicit spec that cannot resolve anywhere: off (never downloads).
+        assert_eq!(
+            resolve_confirm_lane(
+                &Explicit("no-such-model-anywhere".to_owned()),
+                "tiny.en"
+            ),
+            None
+        );
+        // NOTE: the `Auto` + turbo-installed branch is intentionally NOT
+        // asserted here — it depends on whether the release package is
+        // cached on this machine; the model-gated e2e covers that shape.
     }
 
     #[test]
