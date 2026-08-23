@@ -927,15 +927,19 @@ impl AlignAttPolicy {
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
-            let confidences: Vec<f64> =
-                fresh.iter().filter_map(|segment| segment.confidence).collect();
+            let confidences: Vec<f64> = fresh
+                .iter()
+                .filter_map(|segment| segment.confidence)
+                .collect();
             decision.commit_confidence = if confidences.is_empty() {
                 None
             } else {
                 Some(confidences.iter().sum::<f64>() / confidences.len() as f64)
             };
-            decision.commit_through_sec =
-                fresh.iter().filter_map(|segment| segment.end_sec).next_back();
+            decision.commit_through_sec = fresh
+                .iter()
+                .filter_map(|segment| segment.end_sec)
+                .next_back();
             decision.commit_tokens = fresh.len() as u64;
         }
         let tail = out.segments[committable.min(out.segments.len())..]
@@ -1468,18 +1472,15 @@ pub fn run_listen_session(
                         if in_speech {
                             let flush_started = std::time::Instant::now();
                             let slice_from = utterance_t0 + utterance_committed_through;
-                            let out = match decode_utterance(
-                                &buffer,
-                                slice_from,
-                                &pinned_language,
-                                true,
-                            ) {
-                                Err(FwError::Cancelled(_)) => {
-                                    cancelled = true;
-                                    continue 'session;
-                                }
-                                other => other?,
-                            };
+                            let out =
+                                match decode_utterance(&buffer, slice_from, &pinned_language, true)
+                                {
+                                    Err(FwError::Cancelled(_)) => {
+                                        cancelled = true;
+                                        continue 'session;
+                                    }
+                                    other => other?,
+                                };
                             if pinned_language.is_none() {
                                 pinned_language.clone_from(&out.language);
                             }
@@ -2494,7 +2495,11 @@ mod alignatt_tests {
         // the closure guard regardless of attention.
         let mut p = AlignAttPolicy::new(200);
         let o = out(
-            &[(0.0, 4.0, "alpha"), (4.0, 9.0, "bravo"), (9.0, 9.8, "charlie")],
+            &[
+                (0.0, 4.0, "alpha"),
+                (4.0, 9.0, "bravo"),
+                (9.0, 9.8, "charlie"),
+            ],
             &[100, 200, 480],
         );
         let d = EmissionPolicy::step(&mut p, &o, 10.0);
@@ -2512,7 +2517,10 @@ mod alignatt_tests {
         // resurrect the boundary. Safe frame stays 100 -> 2.0 s -> nothing
         // commits.
         let mut p = AlignAttPolicy::new(200);
-        let o = out(&[(0.0, 4.0, "alpha"), (4.0, 9.0, "bravo")], &[100, 495, 200]);
+        let o = out(
+            &[(0.0, 4.0, "alpha"), (4.0, 9.0, "bravo")],
+            &[100, 495, 200],
+        );
         let d = EmissionPolicy::step(&mut p, &o, 10.0);
         assert_eq!(d.commit_text, "");
         assert_eq!(d.commit_tokens, 0);
