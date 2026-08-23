@@ -4181,6 +4181,56 @@ impl ConcurrentTwoLaneExecutor {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- bd-z20h: whisper.cpp v1.7.5 tiny-diarize (tdrz) artifact shape ----
+    // Captured verbatim from `whisper-cli -tdrz -oj` (v1.7.5, ggml-small.en-tdrz)
+    // on a single-speaker 8 s clip. The tdrz dump carries a per-segment
+    // `speaker_turn_next` flag that the extractor must tolerate, and NO
+    // top-level `text` — the transcript must be rebuilt from segments.
+
+    const TDRZ_V175_JSON: &str = r#"{
+	"systeminfo": "WHISPER : CPU",
+	"model": { "type": "small", "multilingual": false, "vocab": 51864 },
+	"result": { "language": "en" },
+	"transcription": [
+		{
+			"timestamps": { "from": "00:00:00,000", "to": "00:00:07,560" },
+			"offsets": { "from": 0, "to": 7560 },
+			"text": " And so my fellow Americans, ask not what your country can do for you.",
+			"speaker_turn_next": false
+		}
+	]
+}"#;
+
+    #[test]
+    fn extract_segments_handles_tdrz_v175_artifact_with_speaker_turn_flag() {
+        let root: serde_json::Value =
+            serde_json::from_str(TDRZ_V175_JSON).expect("fixture must parse");
+        let segments = extract_segments_from_json(&root);
+        assert_eq!(segments.len(), 1, "one tdrz segment expected");
+        assert!(
+            segments[0]
+                .text
+                .contains("And so my fellow Americans, ask not"),
+            "segment text must preserve the spoken sentence verbatim"
+        );
+        // The speaker-turn bookkeeping flag is metadata, not content: it must
+        // never leak into the transcript text.
+        assert!(!segments[0].text.contains("speaker_turn"));
+    }
+
+    #[test]
+    fn tdrz_transcript_rebuilds_from_segments_without_top_level_text() {
+        let root: serde_json::Value =
+            serde_json::from_str(TDRZ_V175_JSON).expect("fixture must parse");
+        // whisper_cpp::run falls back to transcript_from_segments when the
+        // artifact has no top-level `text` (the tdrz dump's shape).
+        assert!(root.get("text").is_none(), "precondition: no top-level text");
+        let segments = extract_segments_from_json(&root);
+        let rebuilt = transcript_from_segments(&segments);
+        assert!(rebuilt.contains("fellow Americans"));
+    }
+
     use super::{
         ADAPTIVE_FALLBACK_CALIBRATION_THRESHOLD, ADAPTIVE_MIN_SAMPLES, BackendHealthReport,
         BackendImplementation, BackendMetrics, BackendSelectionContract,
