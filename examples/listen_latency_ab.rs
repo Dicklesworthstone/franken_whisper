@@ -248,6 +248,8 @@ struct SessionMetrics {
     endpoint_lag_ms: Vec<f64>,
     deltas: u64,
     utterances: u64,
+    partials: u64,
+    partial_interval_ms_p50: Option<f64>,
     wer: Option<f64>,
     hyp_words: usize,
     mean_step_ms: Option<f64>,
@@ -266,6 +268,7 @@ fn extract(raw: &SessionRaw, reference: &str) -> SessionMetrics {
     let mut texts: Vec<String> = Vec::new();
     let mut deltas = 0u64;
     let mut utterances = 0u64;
+    let mut partial_arrivals: Vec<f64> = Vec::new();
     let mut mean_step_ms = None;
     let mut p95_step_ms = None;
     for (arrival, ev) in &raw.lines {
@@ -288,6 +291,7 @@ fn extract(raw: &SessionRaw, reference: &str) -> SessionMetrics {
                     commit_lag_ms.push((arrival - w) * 1000.0);
                 }
             }
+            "transcript.partial" => partial_arrivals.push(*arrival),
             "utterance_end" => {
                 utterances += 1;
                 if let Some(t1) = ev["t1_sec"].as_f64()
@@ -324,6 +328,12 @@ fn extract(raw: &SessionRaw, reference: &str) -> SessionMetrics {
     } else {
         Some(word_error_rate(reference, &joined_text).wer)
     };
+    // Partial cadence (bd-kdg7 ask): inter-partial arrival intervals.
+    let mut partial_intervals: Vec<f64> = partial_arrivals
+        .windows(2)
+        .map(|w| (w[1] - w[0]) * 1000.0)
+        .collect();
+    partial_intervals.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let pace_error_pct = (raw.feed_wall_sec / raw.audio_sec - 1.0) * 100.0;
     SessionMetrics {
         ttft_ms: percentile(&ttfts, 0.5),
@@ -331,6 +341,8 @@ fn extract(raw: &SessionRaw, reference: &str) -> SessionMetrics {
         endpoint_lag_ms,
         deltas,
         utterances,
+        partials: partial_arrivals.len() as u64,
+        partial_interval_ms_p50: percentile(&partial_intervals, 0.5),
         wer,
         hyp_words: joined_text.split_whitespace().count(),
         mean_step_ms,
@@ -359,6 +371,8 @@ fn session_row(m: &SessionMetrics) -> serde_json::Value {
         "endpoint_lag_ms_p50": percentile(&endpoint, 0.5),
         "deltas": m.deltas,
         "utterances": m.utterances,
+        "partials": m.partials,
+        "partial_interval_ms_p50": m.partial_interval_ms_p50,
         "wer": m.wer,
         "hyp_words": m.hyp_words,
         "mean_step_ms": m.mean_step_ms,

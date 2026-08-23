@@ -5560,3 +5560,8 @@ evidence bead is for):
    (no_speech_prob > 0.6 or avg_logprob < −1.0 holds all commits for the
    step, counted in `policy_holdbacks`). Campaign 3: zero output on the
    negative fixture, both arms, both rounds.
+
+Addendum (same campaign): partial cadence added to the harness report
+(bd-kdg7 ask) — spot session (`pauses`, alignatt, release, load ≈30):
+16 partials, inter-partial p50 489 ms against `--step-ms 300` (cadence =
+step interval + decode time, as expected; the gap is the decode).
