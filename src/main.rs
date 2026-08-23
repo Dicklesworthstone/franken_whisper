@@ -235,6 +235,7 @@ fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
     let policy = match args.policy {
         ListenPolicyArg::Alignatt => franken_whisper::listen::ListenPolicy::AlignAtt,
         ListenPolicyArg::EndpointCommit => franken_whisper::listen::ListenPolicy::EndpointCommit,
+        ListenPolicyArg::LocalAgreement => franken_whisper::listen::ListenPolicy::LocalAgreement,
     };
 
     let mut buffer_config = franken_whisper::listen::SessionBufferConfig {

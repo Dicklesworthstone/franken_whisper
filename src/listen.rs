@@ -748,6 +748,9 @@ pub enum ListenPolicy {
     AlignAtt,
     /// Baseline: one commit per utterance at close.
     EndpointCommit,
+    /// Fallback (bd-rt-local-agreement-l5x8): commit only what two
+    /// consecutive decodes agree on. Model-agnostic; never the default.
+    LocalAgreement,
 }
 
 impl Default for ListenConfig {
@@ -1068,6 +1071,187 @@ impl EmissionPolicy for AlignAttPolicy {
 
     fn needs_token_attn(&self) -> bool {
         true
+    }
+}
+
+/// LocalAgreement-2 emission policy (bd-rt-local-agreement-l5x8), segment
+/// grain — the recorded v1 grain of this codebase (mirrors AlignAtt v1 so
+/// harness WER comparisons stay apples-to-apples).
+///
+/// The published fallback (whisper_streaming, arXiv 2307.14743), adapted to
+/// this driver's contract: every step decode covers exactly the un-committed
+/// audio since the utterance origin, so two consecutive outputs over the
+/// SAME origin are directly comparable. The longest common SEGMENT-text
+/// prefix of previous vs current output is stable enough to commit; the
+/// disagreeing tail stays a mutable `transcript.partial`. Any commit
+/// advances the driver's slice origin, which invalidates the stored
+/// previous output (stale-offset reset) — the comparison restarts from the
+/// next decode. Model-agnostic by construction: needs nothing from decoder
+/// internals (no attention tap; `needs_token_attn` is false).
+#[derive(Debug)]
+pub struct LocalAgreementPolicy {
+    /// Segment texts of the previous step decode over the current origin.
+    prev_segments: Option<Vec<String>>,
+}
+
+impl LocalAgreementPolicy {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            prev_segments: None,
+        }
+    }
+
+    /// Longest common prefix length of two segment-text lists.
+    fn lcp_len(prev: &[String], cur: &[String]) -> usize {
+        prev.iter()
+            .zip(cur.iter())
+            .take_while(|(p, c)| p == c)
+            .count()
+    }
+
+    /// Shared decision builder: commit the first `agreed` segments, tail
+    /// becomes the partial. Identical text/confidence/through derivation
+    /// to AlignAtt's decision() so event shapes are indistinguishable.
+    fn decision(
+        out: &crate::native_engine::decode::DecodeOutput,
+        agreed: usize,
+    ) -> PolicyDecision {
+        let mut decision = PolicyDecision::default();
+        let fresh = &out.segments[..agreed.min(out.segments.len())];
+        if !fresh.is_empty() {
+            decision.commit_text = fresh
+                .iter()
+                .map(|segment| segment.text.trim())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let confidences: Vec<f64> = fresh
+                .iter()
+                .filter_map(|segment| segment.confidence)
+                .collect();
+            decision.commit_confidence = if confidences.is_empty() {
+                None
+            } else {
+                Some(confidences.iter().sum::<f64>() / confidences.len() as f64)
+            };
+            decision.commit_through_sec = fresh
+                .iter()
+                .filter_map(|segment| segment.end_sec)
+                .next_back();
+            decision.commit_tokens = fresh.len() as u64;
+        }
+        let tail = out.segments[agreed.min(out.segments.len())..]
+            .iter()
+            .map(|segment| segment.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        decision.partial_tail = if tail.is_empty() { None } else { Some(tail) };
+        decision
+    }
+}
+
+impl Default for LocalAgreementPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EmissionPolicy for LocalAgreementPolicy {
+    fn step(
+        &mut self,
+        out: &crate::native_engine::decode::DecodeOutput,
+        slice_sec: f64,
+    ) -> PolicyDecision {
+        // Same hallucination gate as AlignAtt: irreversible commits demand
+        // a speech-confidence floor even when two decodes agree — two
+        // hallucinations can agree with each other.
+        let no_speech = out
+            .windows
+            .iter()
+            .map(|w| w.no_speech_prob)
+            .fold(0.0_f64, f64::max);
+        let avg_logprob = out
+            .windows
+            .iter()
+            .map(|w| w.avg_logprob)
+            .fold(0.0_f64, f64::min);
+        if no_speech > 0.6 || avg_logprob < -1.0 {
+            let mut decision = Self::decision(out, 0);
+            decision.holdback = true;
+            self.prev_segments = Some(
+                out.segments
+                    .iter()
+                    .map(|s| s.text.trim().to_owned())
+                    .collect(),
+            );
+            tracing::debug!(
+                slice_sec,
+                no_speech,
+                avg_logprob,
+                agreed_prefix_segments = 0,
+                prev_len = 0,
+                cur_len = out.segments.len(),
+                reset_cause = "none",
+                "localagreement step: low-confidence slice, commits held"
+            );
+            return decision;
+        }
+
+        let cur: Vec<String> = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim().to_owned())
+            .collect();
+        let (agreed, reset_cause) = match &self.prev_segments {
+            Some(prev) => {
+                let lcp = Self::lcp_len(prev, &cur);
+                (lcp, "none")
+            }
+            // First decode after an utterance open / stale invalidation:
+            // nothing to agree with yet (this is LA's +1-step lag).
+            None => (0, "stale_offset"),
+        };
+        tracing::debug!(
+            slice_sec,
+            agreed_prefix_segments = agreed,
+            prev_len = self.prev_segments.as_ref().map_or(0, Vec::len),
+            cur_len = cur.len(),
+            reset_cause,
+            "localagreement step"
+        );
+        // Store BEFORE building the decision flag: committing advances the
+        // origin next slice, so a committing step poisons its own history.
+        self.prev_segments = Some(cur);
+        let mut decision = Self::decision(out, agreed);
+        if agreed > 0 && decision.commit_through_sec.is_some() {
+            // Origin will advance past committed audio: the stored previous
+            // output no longer describes the next decode's window.
+            self.prev_segments = None;
+        }
+        decision
+    }
+
+    fn finalize(
+        &mut self,
+        out: &crate::native_engine::decode::DecodeOutput,
+        _slice_sec: f64,
+    ) -> PolicyDecision {
+        // Audio complete: agreement is moot — commit everything.
+        Self::decision(out, out.segments.len())
+    }
+
+    fn reset(&mut self) {
+        self.prev_segments = None;
+    }
+
+    fn name(&self) -> &'static str {
+        "local-agreement"
+    }
+
+    fn needs_token_attn(&self) -> bool {
+        false
     }
 }
 
@@ -1875,6 +2059,7 @@ pub fn run_listen_session(
     let mut policy: Box<dyn EmissionPolicy> = match config.policy {
         ListenPolicy::AlignAtt => Box::new(AlignAttPolicy::new(config.alignatt_holdback_ms)),
         ListenPolicy::EndpointCommit => Box::new(EndpointCommitPolicy),
+        ListenPolicy::LocalAgreement => Box::new(LocalAgreementPolicy::new()),
     };
     let record_token_attn = policy.needs_token_attn();
     let confirm_disabled_by_fallback = fallback_warning.is_some();
@@ -1965,6 +2150,7 @@ pub fn run_listen_session(
         "policy": match config.policy {
             ListenPolicy::AlignAtt => "alignatt",
             ListenPolicy::EndpointCommit => "endpoint-commit",
+            ListenPolicy::LocalAgreement => "local-agreement",
         },
         "quality_model": match &config.quality_model {
             QualityModelSetting::Auto => "auto".to_owned(),
@@ -3980,5 +4166,119 @@ mod alignatt_tests {
         assert!(EmissionPolicy::needs_token_attn(&p));
         assert!(!EmissionPolicy::needs_token_attn(&EndpointCommitPolicy));
         assert_eq!(EmissionPolicy::name(&p), "alignatt");
+    }
+}
+
+#[cfg(test)]
+mod localagreement_tests {
+    use super::*;
+    use crate::model::TranscriptionSegment;
+    use crate::native_engine::decode::{DecodeOutput, WindowStats};
+
+    /// Build a DecodeOutput from (start, end, text) segments with healthy
+    /// window stats (no hallucination-gate trip).
+    fn out(segments: &[(f64, f64, &str)]) -> DecodeOutput {
+        DecodeOutput {
+            segments: segments
+                .iter()
+                .map(|(start, end, text)| TranscriptionSegment {
+                    start_sec: Some(*start),
+                    end_sec: Some(*end),
+                    text: (*text).to_owned(),
+                    speaker: None,
+                    confidence: Some(0.9),
+                })
+                .collect(),
+            language: Some("en".to_owned()),
+            windows: vec![WindowStats {
+                avg_logprob: -0.1,
+                no_speech_prob: 0.01,
+                tokens: 0,
+                window_offset_sec: 0.0,
+                token_attn: Vec::new(),
+            }],
+            dropped_windows: Vec::new(),
+            work: crate::native_engine::decode::DecodeWorkStats::default(),
+            word_timings: None,
+        }
+    }
+
+    #[test]
+    fn first_step_commits_nothing_and_second_agrees_full_prefix() {
+        let mut policy = LocalAgreementPolicy::new();
+        // Step 1: no history — nothing commits (+1-step lag by design).
+        let d1 = EmissionPolicy::step(&mut policy, &out(&[(0.0, 2.0, "hello")]), 2.0);
+        assert!(d1.commit_text.is_empty());
+        assert_eq!(d1.partial_tail.as_deref(), Some("hello"));
+
+        // Step 2 over the SAME origin repeats the segment: agreement.
+        let d2 = EmissionPolicy::step(&mut policy, &out(&[(0.0, 2.0, "hello")]), 3.0);
+        assert_eq!(d2.commit_text, "hello");
+        assert_eq!(d2.commit_through_sec, Some(2.0));
+        // Origin advanced -> stored history invalidated for next step.
+        let d3 = EmissionPolicy::step(&mut policy, &out(&[(2.0, 4.0, "world")]), 4.0);
+        assert!(d3.commit_text.is_empty(), "post-commit step must restart agreement");
+    }
+
+    #[test]
+    fn partial_agreement_commits_only_the_stable_head() {
+        let mut policy = LocalAgreementPolicy::new();
+        let _ = EmissionPolicy::step(&mut policy, &out(&[(0.0, 1.0, "alpha")]), 1.0);
+        let d = EmissionPolicy::step(
+            &mut policy,
+            &out(&[(0.0, 1.0, "alpha"), (1.0, 2.0, "bravo")]),
+            2.0,
+        );
+        assert_eq!(d.commit_text, "alpha");
+        assert_eq!(d.partial_tail.as_deref(), Some("bravo"));
+    }
+
+    #[test]
+    fn zero_agreement_commits_nothing_but_keeps_partial() {
+        let mut policy = LocalAgreementPolicy::new();
+        let _ = EmissionPolicy::step(&mut policy, &out(&[(0.0, 1.0, "alpha")]), 1.0);
+        let d = EmissionPolicy::step(&mut policy, &out(&[(0.0, 1.0, "totally")]), 1.5);
+        assert!(d.commit_text.is_empty());
+        assert_eq!(d.partial_tail.as_deref(), Some("totally"));
+    }
+
+    #[test]
+    fn utterance_reset_forces_fresh_agreement() {
+        let mut policy = LocalAgreementPolicy::new();
+        let _ = EmissionPolicy::step(&mut policy, &out(&[(0.0, 1.0, "alpha")]), 1.0);
+        EmissionPolicy::reset(&mut policy);
+        let d = EmissionPolicy::step(&mut policy, &out(&[(0.0, 1.0, "alpha")]), 1.0);
+        assert!(d.commit_text.is_empty(), "reset drops history: no agreement yet");
+    }
+
+    #[test]
+    fn finalize_commits_everything_without_agreement() {
+        let mut policy = LocalAgreementPolicy::new();
+        let d = EmissionPolicy::finalize(
+            &mut policy,
+            &out(&[(0.0, 1.0, "alpha"), (1.0, 2.0, "bravo")]),
+            2.0,
+        );
+        assert_eq!(d.commit_text, "alpha bravo");
+        assert_eq!(d.commit_through_sec, Some(2.0));
+        assert!(d.partial_tail.is_none());
+    }
+
+    #[test]
+    fn hallucination_gate_holds_commits_even_under_agreement() {
+        let mut policy = LocalAgreementPolicy::new();
+        let _ = EmissionPolicy::step(&mut policy, &out(&[(0.0, 1.0, "alpha")]), 1.0);
+        let mut gated = out(&[(0.0, 1.0, "alpha")]);
+        gated.windows[0].no_speech_prob = 0.9;
+        let d = EmissionPolicy::step(&mut policy, &gated, 1.5);
+        assert!(d.commit_text.is_empty());
+        assert!(d.holdback);
+    }
+
+    #[test]
+    fn policy_metadata_is_model_agnostic() {
+        let p = LocalAgreementPolicy::new();
+        assert_eq!(EmissionPolicy::name(&p), "local-agreement");
+        assert!(!EmissionPolicy::needs_token_attn(&p));
     }
 }

@@ -1160,6 +1160,10 @@ pub enum ListenPolicyArg {
     /// Bootstrap baseline: partials every step, one committed delta at
     /// utterance close.
     EndpointCommit,
+    /// Fallback (bd-rt-local-agreement-l5x8): commit only what two
+    /// consecutive decodes agree on. Model-agnostic insurance baseline;
+    /// never the default.
+    LocalAgreement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
