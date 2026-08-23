@@ -102,6 +102,87 @@ pub fn sanitize_base(title: &str, upload_date: Option<&str>, id: &str) -> String
 pub fn sanitize_base_ascii(title: &str, upload_date: Option<&str>, id: &str) -> String {
     assemble(fold_title(title, true), upload_date, id)
 }
+/// ASCII slug variant (bd-tchp): the whole base is lowercased; every
+/// non-`a-z0-9` run collapses to a single `_`; the result is assembled as
+/// `{YYYYMMDD}_{slug}_{id}` — no spaces, no dashes, no brackets. Shell- and
+/// URL-path-friendly by construction. Non-ASCII text folds to `_` (a slug is
+/// ASCII by definition); an empty title falls back to [`FALLBACK_TITLE`].
+///
+/// Length budget, id integrity, fallback, and the reserved-stem guard match
+/// [`sanitize_base`].
+#[must_use]
+pub fn sanitize_base_slug(title: &str, upload_date: Option<&str>, id: &str) -> String {
+    let mut slug = String::with_capacity(title.len());
+    let mut pending_sep = false;
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_sep {
+                slug.push('_');
+                pending_sep = false;
+            }
+            slug.push(ch.to_ascii_lowercase());
+        } else {
+            pending_sep = !slug.is_empty();
+        }
+    }
+    let slug = slug.trim_matches('_');
+    let slug = if slug.is_empty() {
+        FALLBACK_TITLE
+    } else {
+        slug
+    };
+
+    // Date prefix in compact `YYYYMMDD` form when present and well-formed.
+    let date = upload_date.filter(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()));
+
+    // Budget: reserve `_` + id + optional date + its separator.
+    let reserved = id.len() + 1 + date.map_or(0, |d| d.len() + 1);
+    let budget = MAX_BASE_BYTES.saturating_sub(reserved);
+    let slug = truncate_on_char_boundary(slug, budget);
+    let slug = slug.trim_end_matches('_');
+    let slug = if slug.is_empty() {
+        FALLBACK_TITLE
+    } else {
+        slug
+    };
+
+    let mut base = String::with_capacity(slug.len() + reserved);
+    if let Some(d) = date {
+        base.push_str(d);
+        base.push('_');
+    }
+    base.push_str(slug);
+    base.push('_');
+    base.push_str(id);
+    guard_reserved_stem(base)
+}
+
+/// Filename style selector for YouTube ingestion artifacts (bd-tchp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NamingStyle {
+    /// Lowercase underscore slug — the default (`20240115_my_video_dQw4…`).
+    #[default]
+    Slug,
+    /// Human-readable `{date} - {title} [{id}]`, non-ASCII kept.
+    Pretty,
+    /// Human-readable with non-ASCII folded to `_`.
+    Ascii,
+}
+
+/// Dispatch [`NamingStyle`] to its sanitizer.
+#[must_use]
+pub fn sanitize_base_with(
+    style: NamingStyle,
+    title: &str,
+    upload_date: Option<&str>,
+    id: &str,
+) -> String {
+    match style {
+        NamingStyle::Slug => sanitize_base_slug(title, upload_date, id),
+        NamingStyle::Pretty => sanitize_base(title, upload_date, id),
+        NamingStyle::Ascii => sanitize_base_ascii(title, upload_date, id),
+    }
+}
 
 /// Shared assembly: `[date prefix] + folded title (budgeted) + " [id]"`,
 /// with the Windows-reserved-stem guard applied last.
@@ -359,6 +440,73 @@ mod tests {
     fn all_dots_and_dashes_title_falls_back() {
         let b = sanitize_base("....----", None, "vid");
         assert_eq!(b, "untitled [vid]");
+    }
+
+    // --- slug style (bd-tchp default) ------------------------------------
+
+    #[test]
+    fn slug_lowercases_and_underscores() {
+        let b = sanitize_base_slug("My Video: A Great Title!", Some("20240115"), "dQw4w9WgXcQ");
+        assert_eq!(b, "20240115_my_video_a_great_title_dQw4w9WgXcQ");
+    }
+
+    #[test]
+    fn slug_folds_non_ascii_to_separators() {
+        let b = sanitize_base_slug("日本語 Title", None, "vid");
+        assert_eq!(b, "title_vid");
+    }
+
+    #[test]
+    fn slug_collapses_punctuation_runs() {
+        let b = sanitize_base_slug("Hello,,,   World!!! -- ok", None, "v1");
+        assert_eq!(b, "hello_world_ok_v1");
+    }
+
+    #[test]
+    fn slug_empty_title_falls_back() {
+        let b = sanitize_base_slug("   ", None, "vid");
+        assert_eq!(b, "untitled_vid");
+    }
+
+    #[test]
+    fn slug_without_date_has_no_leading_separator() {
+        let b = sanitize_base_slug("Title", None, "vid");
+        assert_eq!(b, "title_vid");
+        assert!(!b.starts_with('_'));
+    }
+
+    #[test]
+    fn slug_id_never_truncated_by_budget() {
+        // 180-byte budget: a very long title must truncate while the id and
+        // separators stay intact.
+        let long_title = "word ".repeat(80);
+        let id = "dQw4w9WgXcQ";
+        let b = sanitize_base_slug(long_title.trim(), Some("20240115"), id);
+        assert!(b.ends_with(&format!("_{id}")));
+        assert!(b.len() <= MAX_BASE_BYTES);
+        assert!(b.starts_with("20240115_"));
+    }
+
+    #[test]
+    fn sanitize_base_with_dispatches_all_styles() {
+        let t = "A B";
+        assert_eq!(
+            sanitize_base_with(NamingStyle::Slug, t, None, "id1"),
+            sanitize_base_slug(t, None, "id1")
+        );
+        assert_eq!(
+            sanitize_base_with(NamingStyle::Pretty, t, None, "id1"),
+            sanitize_base(t, None, "id1")
+        );
+        assert_eq!(
+            sanitize_base_with(NamingStyle::Ascii, t, None, "id1"),
+            sanitize_base_ascii(t, None, "id1")
+        );
+    }
+
+    #[test]
+    fn slug_style_is_the_default_naming_style() {
+        assert_eq!(NamingStyle::default(), NamingStyle::Slug);
     }
 
     // --- unicode policy: default keeps, ascii folds ---------------------

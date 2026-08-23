@@ -1021,6 +1021,32 @@ pub struct YoutubeArgs {
     /// Emit the final run summary as JSON on stdout (for scripting).
     #[arg(long)]
     pub json_summary: bool,
+
+    /// Filename style for emitted artifacts (bd-tchp default: slug).
+    #[arg(long, value_enum, default_value_t = YoutubeNamingStyleArg::Slug)]
+    pub naming_style: YoutubeNamingStyleArg,
+}
+
+/// CLI-facing naming style selector (maps onto
+/// [`franken_whisper::youtube::naming::NamingStyle`]; kept separate so the
+/// library module stays clap-free).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum YoutubeNamingStyleArg {
+    /// Lowercase underscore slug (default): `20240115_my_title_dQw4w9WgXcQ`.
+    Slug,
+    /// Human-readable `{date} - {title} [{id}]`, non-ASCII kept.
+    Pretty,
+    /// Human-readable with non-ASCII folded to `_`.
+    Ascii,
+}
+impl From<YoutubeNamingStyleArg> for crate::youtube::naming::NamingStyle {
+    fn from(value: YoutubeNamingStyleArg) -> Self {
+        match value {
+            YoutubeNamingStyleArg::Slug => crate::youtube::naming::NamingStyle::Slug,
+            YoutubeNamingStyleArg::Pretty => crate::youtube::naming::NamingStyle::Pretty,
+            YoutubeNamingStyleArg::Ascii => crate::youtube::naming::NamingStyle::Ascii,
+        }
+    }
 }
 
 impl YoutubeArgs {
@@ -1051,6 +1077,7 @@ impl YoutubeArgs {
             keep_audio: !self.no_keep_audio,
             retry_failed: !self.no_retry,
             abort_on_error: self.abort_on_error,
+            naming_style: self.naming_style.into(),
         })
     }
 }

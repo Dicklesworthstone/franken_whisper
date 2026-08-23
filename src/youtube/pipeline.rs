@@ -169,6 +169,8 @@ pub struct YoutubeRunOptions {
     pub retry_failed: bool,
     /// Abort the whole run on the first per-video failure.
     pub abort_on_error: bool,
+    /// Filename style for emitted artifacts (bd-tchp default: slug).
+    pub naming_style: naming::NamingStyle,
 }
 
 /// Final outcome of a run, for the CLI to report / set an exit code.
@@ -569,7 +571,12 @@ fn transcribe_and_render(
 
     let (engine_label, backend_label) = engine_labels(&report);
 
-    let base = naming::sanitize_base(&meta.title, meta.upload_date.as_deref(), &meta.id);
+    let base = naming::sanitize_base_with(
+        opts.naming_style,
+        &meta.title,
+        meta.upload_date.as_deref(),
+        &meta.id,
+    );
     let paths = naming::output_paths(&opts.output_dir, &base);
 
     let input = RenderInput {
@@ -652,6 +659,7 @@ mod tests {
             keep_audio: false,
             retry_failed: false,
             abort_on_error: false,
+            naming_style: naming::NamingStyle::Slug,
         }
     }
 
