@@ -3416,6 +3416,8 @@ mod tests {
             backend_identity: Some("native:test".to_owned()),
             backend_version: Some("1.2.3".to_owned()),
             output_payload_hash: Some("output-hash".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
 
         let historical = historical_pretty_run_report(&rich);

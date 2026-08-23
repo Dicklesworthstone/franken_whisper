@@ -1727,7 +1727,7 @@ impl ListenPersistSink {
     pub(crate) fn feed_pcm(&mut self, samples: &[f32]) {
         use sha2::Digest as _;
         for sample in samples {
-            self.pcm_hasher.update(&sample.to_le_bytes());
+            self.pcm_hasher.update(sample.to_le_bytes());
         }
     }
 
@@ -1822,15 +1822,15 @@ impl ListenPersistSink {
         })
         .to_string();
         let events = std::mem::take(&mut self.pending_events);
-        self.store.listen_close_run(
-            &self.run_id,
-            &events,
-            &result_json,
+        self.store.listen_close_run(&crate::storage::ListenCloseRow {
+            run_id: &self.run_id,
+            events: &events,
+            result_json: &result_json,
             warnings_json,
-            &replay_json,
-            &self.transcript_so_far,
+            replay_json: &replay_json,
+            transcript: &self.transcript_so_far,
             finished_at_rfc3339,
-        )?;
+        })?;
         Ok(pcm_sha256)
     }
 }
@@ -2720,7 +2720,7 @@ pub fn run_listen_session(
         None => None,
     };
     emit(final_stats_value)?;
-    seq += 1;
+    let _ = seq; // terminal event emitted; counter's job is done.
     if let Some(error) = persist_close_error {
         return Err(FwError::Storage(format!(
             "listen persistence failed on final close: {error}"

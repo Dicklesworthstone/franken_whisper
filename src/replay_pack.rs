@@ -241,6 +241,8 @@ mod tests {
                 backend_identity: Some("whisper-cli".to_owned()),
                 backend_version: Some("whisper 1.7.2".to_owned()),
                 output_payload_hash: Some("output-sha256".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         }
     }
