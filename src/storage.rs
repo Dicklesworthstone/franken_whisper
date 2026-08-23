@@ -2243,7 +2243,7 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
             )
             .map_err(|error| FwError::Storage(error.to_string()))?;
         Ok(rows.first().map(|row| {
-            String::from_utf8_lossy(row.get(0).as_bytes().unwrap_or(b"")).into_owned()
+            value_to_string(row.get(0))
         }))
     }
 
@@ -2259,7 +2259,7 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
             )
             .map_err(|error| FwError::Storage(error.to_string()))?;
         Ok(rows.first().map(|row| {
-            String::from_utf8_lossy(row.get(0).as_bytes().unwrap_or(b"")).into_owned()
+            value_to_string(row.get(0))
         }))
     }
 
@@ -3033,6 +3033,8 @@ mod tests {
                 backend_identity: Some("whisper-cli".to_owned()),
                 backend_version: Some("whisper 1.2.3".to_owned()),
                 output_payload_hash: Some("output-hash".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         };
 
@@ -4751,6 +4753,8 @@ mod tests {
             backend_identity: Some("whisper-cli".to_owned()),
             backend_version: Some("whisper 1.7.2".to_owned()),
             output_payload_hash: Some("sha256_def456".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         store.persist_report(&report).expect("persist");
 
@@ -6999,6 +7003,8 @@ mod tests {
                 backend_identity: Some("insanely-fast-whisper".to_owned()),
                 backend_version: Some("0.0.15".to_owned()),
                 output_payload_hash: Some("sha256_789xyz".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         }
     }

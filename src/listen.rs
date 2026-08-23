@@ -2044,7 +2044,7 @@ pub fn run_listen_session(
             "fallback_capture_backend",
             serde_json::json!({"detail": message}),
         );
-        persist_warnings.push(value.clone());
+        persist_warnings.push("fallback_capture_backend".to_owned());
         if let Some(sink) = persist_sink.as_mut() {
             sink.record_event(seq, &now_ts(), "listen.warning", &value);
         }
@@ -2061,7 +2061,7 @@ pub fn run_listen_session(
                 "detail": format!("persistence disabled for this session: {detail}"),
             }),
         );
-        persist_warnings.push(value.clone());
+        persist_warnings.push("persist_degraded".to_owned());
         emit(value)?;
         seq += 1;
     }
