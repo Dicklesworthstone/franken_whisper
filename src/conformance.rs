@@ -815,6 +815,8 @@ mod tests {
             backend_identity: Some("whisper-cli".to_owned()),
             backend_version: Some("whisper 1.0.0".to_owned()),
             output_payload_hash: Some("output-sha".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         let report = compare_replay_envelopes(&replay, &replay);
         assert!(report.within_tolerance());
@@ -827,12 +829,16 @@ mod tests {
             backend_identity: Some("whisper-cli".to_owned()),
             backend_version: Some("1.0.0".to_owned()),
             output_payload_hash: Some("output-sha".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         let observed = ReplayEnvelope {
             input_content_hash: Some("different-input".to_owned()),
             backend_identity: Some("whisper-cli".to_owned()),
             backend_version: None,
             output_payload_hash: Some("different-output".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         let report = compare_replay_envelopes(&expected, &observed);
         assert!(!report.within_tolerance());
@@ -1303,12 +1309,16 @@ mod tests {
             backend_identity: None,
             backend_version: None,
             output_payload_hash: Some("out_a".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         let observed = ReplayEnvelope {
             input_content_hash: Some("hash_a".to_owned()),
             backend_identity: None,
             backend_version: None,
             output_payload_hash: Some("out_a".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         let report = compare_replay_envelopes(&expected, &observed);
         assert!(report.within_tolerance());
@@ -1398,6 +1408,8 @@ mod tests {
             backend_identity: Some("id1".to_owned()),
             backend_version: Some("v1".to_owned()),
             output_payload_hash: Some("out1".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         let observed = ReplayEnvelope::default(); // all None
         let report = compare_replay_envelopes(&expected, &observed);
@@ -1517,12 +1529,16 @@ mod tests {
             backend_identity: Some("whisper.cpp".to_owned()),
             backend_version: Some("1.0.0".to_owned()),
             output_payload_hash: Some("out456".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         let shadow_replay = ReplayEnvelope {
             input_content_hash: Some("abc123".to_owned()),
             backend_identity: Some("whisper.cpp-native".to_owned()),
             backend_version: Some("0.1.0".to_owned()),
             output_payload_hash: Some("out789".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         let report = compare_shadow_run(
             "whisper.cpp",
@@ -1780,6 +1796,8 @@ mod tests {
             backend_identity: Some("whisper-cpp".to_owned()),
             backend_version: Some("1.0".to_owned()),
             output_payload_hash: Some("bbb".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
 
         // Segments diverge in text → segment_comparison fails.

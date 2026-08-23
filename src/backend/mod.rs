@@ -491,7 +491,8 @@ impl RouterState {
             BackendKind::WhisperCpp => Some(0),
             BackendKind::InsanelyFast => Some(1),
             BackendKind::WhisperDiarization => Some(2),
-            BackendKind::Auto => None,
+            // The live listen lane is not a comparison-slot backend.
+            BackendKind::NativeListen | BackendKind::Auto => None,
         }
     }
 
@@ -1204,7 +1205,8 @@ pub fn engine_for(kind: BackendKind) -> Option<Box<dyn Engine>> {
         BackendKind::WhisperCpp => Some(Box::new(WhisperCppEngine)),
         BackendKind::InsanelyFast => Some(Box::new(InsanelyFastEngine)),
         BackendKind::WhisperDiarization => Some(Box::new(WhisperDiarizationEngine)),
-        BackendKind::Auto => None,
+        // The live listen lane drives the engine directly, not via a bridge.
+        BackendKind::NativeListen | BackendKind::Auto => None,
     }
 }
 
@@ -1218,7 +1220,8 @@ pub fn streaming_engine_for(kind: BackendKind) -> Option<Box<dyn StreamingEngine
         BackendKind::WhisperCpp => Some(Box::new(WhisperCppEngine)),
         BackendKind::InsanelyFast => Some(Box::new(InsanelyFastEngine)),
         BackendKind::WhisperDiarization => Some(Box::new(WhisperDiarizationEngine)),
-        BackendKind::Auto => None,
+        // The live listen lane drives the engine directly, not via a bridge.
+        BackendKind::NativeListen | BackendKind::Auto => None,
     }
 }
 
@@ -1402,6 +1405,9 @@ pub fn is_available(kind: BackendKind) -> bool {
         BackendKind::WhisperCpp => whisper_cpp::is_available(),
         BackendKind::InsanelyFast => insanely_fast::is_available(),
         BackendKind::WhisperDiarization => whisper_diarization::is_available(),
+        // The in-process lane's availability is model-package driven; the
+        // listen driver reports degradation via session warnings instead.
+        BackendKind::NativeListen => true,
     }
 }
 
@@ -1524,7 +1530,8 @@ fn bridge_runtime_metadata(kind: BackendKind) -> BackendRuntimeMetadata {
                 version: probe_command_version(&python),
             }
         }
-        BackendKind::Auto => BackendRuntimeMetadata {
+        // The live lane runs in-process; it carries no bridge runtime.
+        BackendKind::NativeListen | BackendKind::Auto => BackendRuntimeMetadata {
             identity: "auto-policy".to_owned(),
             version: None,
         },
@@ -1552,6 +1559,11 @@ fn native_runtime_metadata(kind: BackendKind) -> BackendRuntimeMetadata {
         BackendKind::Auto => BackendRuntimeMetadata {
             identity: "auto-policy".to_owned(),
             version: None,
+        },
+        // The live lane IS the native engine; no distinct identity needed.
+        BackendKind::NativeListen => BackendRuntimeMetadata {
+            identity: "native-listen".to_owned(),
+            version,
         },
     }
 }
@@ -1615,6 +1627,9 @@ fn bridge_available(kind: BackendKind) -> bool {
         BackendKind::WhisperCpp => whisper_cpp::is_available(),
         BackendKind::InsanelyFast => insanely_fast::is_available(),
         BackendKind::WhisperDiarization => whisper_diarization::is_available(),
+        // The live lane is always "available" (in-process); model presence
+        // is reported by the listen driver itself.
+        BackendKind::NativeListen => true,
     }
 }
 
@@ -1624,6 +1639,8 @@ fn native_available(kind: BackendKind) -> bool {
         BackendKind::WhisperCpp => whisper_cpp_native::is_available(),
         BackendKind::InsanelyFast => insanely_fast_native::is_available(),
         BackendKind::WhisperDiarization => whisper_diarization_native::is_available(),
+        // The live lane IS the native engine.
+        BackendKind::NativeListen => true,
     }
 }
 
@@ -1722,6 +1739,12 @@ fn run_backend(
     match kind {
         BackendKind::Auto => Err(FwError::InvalidRequest(
             "internal error: auto backend cannot be run directly".to_owned(),
+        )),
+        // The live listen lane persists sessions itself (bd-rt-persist-a66y)
+        // and never executes through the bridge/native request runners.
+        BackendKind::NativeListen => Err(FwError::InvalidRequest(
+            "internal error: native listen sessions are not run through the backend pipeline"
+                .to_owned(),
         )),
         BackendKind::WhisperCpp => run_backend_with_mode_and_runners(
             kind,
@@ -2234,7 +2257,9 @@ fn check_binary_for_kind(kind: BackendKind) -> (bool, Option<String>) {
         BackendKind::WhisperDiarization => {
             std::env::var("FRANKEN_WHISPER_PYTHON_BIN").unwrap_or_else(|_| "python3".to_owned())
         }
-        BackendKind::Auto => return (false, None),
+        // The live listen lane has no external binary; availability is owned
+        // by the listen pipeline, not backend discovery.
+        BackendKind::NativeListen | BackendKind::Auto => return (false, None),
     };
     match which::which(&bin_name) {
         Ok(path) => (true, Some(path.display().to_string())),
@@ -2252,6 +2277,8 @@ fn probe_version_for_kind(kind: BackendKind) -> Option<String> {
             std::env::var("FRANKEN_WHISPER_PYTHON_BIN").unwrap_or_else(|_| "python3".to_owned())
         }
         BackendKind::Auto => return None,
+        // No external runtime to version-probe for the live listen lane.
+        BackendKind::NativeListen => return None,
     };
     probe_command_version(&bin)
 }
@@ -3095,7 +3122,9 @@ fn prior_for(kind: BackendKind) -> (f64, f64) {
         BackendKind::WhisperCpp => (7.0, 3.0),
         BackendKind::InsanelyFast => (6.0, 4.0),
         BackendKind::WhisperDiarization => (5.0, 5.0),
-        BackendKind::Auto => (1.0, 1.0),
+        // The live listen lane never enters backend routing; the neutral
+        // Auto prior keeps the contract total without inventing evidence.
+        BackendKind::NativeListen | BackendKind::Auto => (1.0, 1.0),
     }
 }
 
@@ -3122,7 +3151,8 @@ fn quality_proxy(kind: BackendKind, request: &TranscribeRequest) -> f64 {
                 0.63
             }
         }
-        BackendKind::Auto => 0.50,
+        // Never routed; neutral placeholder keeps the match total.
+        BackendKind::NativeListen | BackendKind::Auto => 0.50,
     }
 }
 
@@ -3132,7 +3162,8 @@ fn latency_proxy(kind: BackendKind, duration_seconds: f64, diarize: bool) -> f64
         BackendKind::WhisperCpp => 12.0,
         BackendKind::InsanelyFast => 8.0,
         BackendKind::WhisperDiarization => 18.0,
-        BackendKind::Auto => 20.0,
+        // Never routed; neutral placeholder keeps the match total.
+        BackendKind::NativeListen | BackendKind::Auto => 20.0,
     };
     // Sanitize the duration: a NaN/Inf feeds sqrt() -> NaN -> a NaN base loss
     // -> LossMatrix::new() rejection. Negative durations are also nonsensical.

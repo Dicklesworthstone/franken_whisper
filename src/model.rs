@@ -4108,16 +4108,6 @@ pub struct ReplayEnvelope {
     /// SHA-256 of the raw backend output JSON payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_payload_hash: Option<String>,
-    /// Live-session integrity fingerprint (bd-rt-persist-a66y): streamed
-    /// SHA-256 over the concatenated session PCM (16 kHz mono f32,
-    /// little-endian). The audio itself is NOT retained, so this is an
-    /// integrity marker only — not a replayable reference.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pcm_sha256: Option<String>,
-    /// Honest labeling for live rows: why there is no replayable input
-    /// reference and what the hash does and does not attest.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4793,6 +4783,8 @@ mod tests {
             backend_identity: Some("whisper-cli".to_owned()),
             backend_version: Some("1.7.2".to_owned()),
             output_payload_hash: Some("def456".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let parsed: ReplayEnvelope = serde_json::from_str(&json).unwrap();
@@ -5031,6 +5023,8 @@ mod tests {
                 backend_identity: Some("whisper-diarization".to_owned()),
                 backend_version: Some("0.0.15".to_owned()),
                 output_payload_hash: Some("sha256-def".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         };
         let json = serde_json::to_string(&details).unwrap();
@@ -5147,6 +5141,8 @@ mod tests {
                 backend_identity: Some("whisper-cli".to_owned()),
                 backend_version: Some("1.7.2".to_owned()),
                 output_payload_hash: Some("sha256-output".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         }
     }
@@ -5532,6 +5528,8 @@ mod tests {
             backend_identity: None,
             backend_version: Some("1.0".to_owned()),
             output_payload_hash: None,
+            pcm_sha256: None,
+            live_note: None,
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let parsed: ReplayEnvelope = serde_json::from_str(&json).unwrap();

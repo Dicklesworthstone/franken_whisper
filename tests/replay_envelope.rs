@@ -73,6 +73,8 @@ fn replay_envelope_persists_and_round_trips() {
         backend_identity: Some("whisper-cli".to_owned()),
         backend_version: Some("whisper 1.2.3".to_owned()),
         output_payload_hash: Some("output-sha-256".to_owned()),
+        pcm_sha256: None,
+        live_note: None,
     };
 
     store
@@ -102,12 +104,16 @@ fn replay_comparator_flags_semantic_drift() {
         backend_identity: Some("whisper-cli".to_owned()),
         backend_version: Some("whisper 1.2.3".to_owned()),
         output_payload_hash: Some("output-a".to_owned()),
+        pcm_sha256: None,
+        live_note: None,
     };
     let observed = ReplayEnvelope {
         input_content_hash: Some("input-b".to_owned()),
         backend_identity: Some("whisper-cli".to_owned()),
         backend_version: None,
         output_payload_hash: Some("output-b".to_owned()),
+        pcm_sha256: None,
+        live_note: None,
     };
 
     let comparison = compare_replay_envelopes(&expected, &observed);
