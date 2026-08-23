@@ -232,7 +232,10 @@ fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
             }
         }
     };
-    let ListenPolicyArg::EndpointCommit = args.policy; // single variant today
+    let policy = match args.policy {
+        ListenPolicyArg::Alignatt => franken_whisper::listen::ListenPolicy::AlignAtt,
+        ListenPolicyArg::EndpointCommit => franken_whisper::listen::ListenPolicy::EndpointCommit,
+    };
 
     let mut buffer_config = franken_whisper::listen::SessionBufferConfig {
         max_buffer_sec: args.max_buffer_sec,
@@ -258,6 +261,8 @@ fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
         emit_partials: !args.no_partials,
         stats_interval_sec: args.stats_interval_sec,
         capture_buffer_sec: args.capture_buffer_sec,
+        policy,
+        alignatt_holdback_ms: args.alignatt_holdback_ms,
     };
 
     // NOTE: main() already installed the Ctrl-C handler; installing twice

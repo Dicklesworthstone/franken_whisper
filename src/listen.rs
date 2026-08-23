@@ -704,6 +704,18 @@ pub struct ListenConfig {
     pub emit_partials: bool,
     pub stats_interval_sec: f64,
     pub capture_buffer_sec: f64,
+    pub policy: ListenPolicy,
+    pub alignatt_holdback_ms: u64,
+}
+
+/// Which emission policy drives commits (bd-rt-alignatt-fry9 owns the
+/// default flip to AlignAtt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenPolicy {
+    /// AlignAtt (default): attention-gated incremental commits.
+    AlignAtt,
+    /// Baseline: one commit per utterance at close.
+    EndpointCommit,
 }
 
 impl Default for ListenConfig {
@@ -725,6 +737,8 @@ impl Default for ListenConfig {
             emit_partials: true,
             stats_interval_sec: 30.0,
             capture_buffer_sec: 30.0,
+            policy: ListenPolicy::AlignAtt,
+            alignatt_holdback_ms: 200,
         }
     }
 }
@@ -748,19 +762,25 @@ pub struct PolicyDecision {
 /// per step decode over the rolling buffer, what becomes committed
 /// (append-only `transcript.delta`) versus mutable preview.
 pub trait EmissionPolicy: Send {
-    /// A mid-utterance step decode (buffer edge is LIVE — audio continues).
+    /// A mid-utterance step decode (slice edge is LIVE — audio continues).
+    /// `slice_sec` is the decoded utterance slice's audio duration; all
+    /// [`PolicyDecision`] times are SLICE-relative (driver re-bases).
     fn step(
         &mut self,
         out: &crate::native_engine::decode::DecodeOutput,
-        buffer: &SessionBuffer,
+        slice_sec: f64,
     ) -> PolicyDecision;
     /// The endpoint decode (audio for this utterance is COMPLETE — no
     /// holdback; commit everything not yet committed).
     fn finalize(
         &mut self,
         out: &crate::native_engine::decode::DecodeOutput,
-        buffer: &SessionBuffer,
+        slice_sec: f64,
     ) -> PolicyDecision;
+    /// Whether decodes must record the per-token attention tap.
+    fn needs_token_attn(&self) -> bool {
+        false
+    }
     /// Reset per-utterance state.
     fn reset(&mut self);
     /// Stable policy name for listen.session_start.
@@ -778,7 +798,7 @@ impl EmissionPolicy for EndpointCommitPolicy {
     fn step(
         &mut self,
         out: &crate::native_engine::decode::DecodeOutput,
-        _buffer: &SessionBuffer,
+        _slice_sec: f64,
     ) -> PolicyDecision {
         let tail = out
             .segments
@@ -796,7 +816,7 @@ impl EmissionPolicy for EndpointCommitPolicy {
     fn finalize(
         &mut self,
         out: &crate::native_engine::decode::DecodeOutput,
-        buffer: &SessionBuffer,
+        _slice_sec: f64,
     ) -> PolicyDecision {
         let text = out
             .segments
@@ -817,7 +837,8 @@ impl EmissionPolicy for EndpointCommitPolicy {
             .filter_map(|s| s.end_sec)
             .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a| a.max(t))));
         PolicyDecision {
-            commit_through_sec: end.map(|t| buffer.session_time_of(t)),
+            // SLICE-relative (driver re-bases with the utterance start).
+            commit_through_sec: end,
             commit_tokens: out.windows.iter().map(|w| w.tokens as u64).sum(),
             commit_confidence,
             commit_text: text,
@@ -829,6 +850,152 @@ impl EmissionPolicy for EndpointCommitPolicy {
 
     fn name(&self) -> &'static str {
         "endpoint-commit"
+    }
+}
+
+/// AlignAtt emission policy (bd-rt-alignatt-fry9), segment-grain v1.
+///
+/// The published policy (Simul-Whisper / SimulStreaming): a token whose
+/// alignment-head cross-attention focuses at least `holdback_frames`
+/// (20 ms encoder frames) before the live slice edge is stable; commit it.
+/// This v1 applies the rule at SEGMENT granularity: the attention prefix
+/// rule (walk tokens in order, stop at the first token past the safe
+/// limit — never commit past a hole) yields a safe TIME boundary, and
+/// whole segments ending before that boundary commit. Segment grain keeps
+/// append-only reconstruction trivial (utterance text == joined committed
+/// segments == joined deltas); token/word-grain commits need per-token
+/// text in the tap output and are this bead's recorded refinement.
+///
+/// The boundary guard (Simul-Whisper's drop-the-edge-word) falls out of
+/// the grain: a segment whose END sits inside the holdback zone never
+/// commits.
+#[derive(Debug)]
+pub struct AlignAttPolicy {
+    /// Danger-zone width in 20 ms encoder frames (default 10 = 200 ms).
+    holdback_frames: u32,
+    /// Segments already committed for the current utterance.
+    committed_segments: usize,
+}
+
+impl AlignAttPolicy {
+    #[must_use]
+    pub fn new(holdback_ms: u64) -> Self {
+        Self {
+            holdback_frames: (holdback_ms / 20).max(1) as u32,
+            committed_segments: 0,
+        }
+    }
+
+    /// The attention-safe time boundary (slice-relative seconds): the
+    /// largest attention frame in the contiguous safe prefix of the
+    /// utterance's token stream.
+    fn safe_time_sec(
+        &self,
+        out: &crate::native_engine::decode::DecodeOutput,
+        slice_sec: f64,
+    ) -> f64 {
+        let slice_frames = (slice_sec * 50.0) as u32;
+        let limit = slice_frames.saturating_sub(self.holdback_frames);
+        let mut safe_frame: u32 = 0;
+        for window in &out.windows {
+            for tap in &window.token_attn {
+                if tap.attn_frame > limit {
+                    // First unsafe token: nothing past this commits
+                    // (prefix rule — a later "safe" frame may be an
+                    // attention glitch; never cherry-pick past a hole).
+                    return f64::from(safe_frame) * 0.02;
+                }
+                safe_frame = safe_frame.max(tap.attn_frame);
+            }
+        }
+        f64::from(safe_frame) * 0.02
+    }
+
+    fn decision(
+        &mut self,
+        out: &crate::native_engine::decode::DecodeOutput,
+        up_to_sec: f64,
+    ) -> PolicyDecision {
+        let committable = out
+            .segments
+            .iter()
+            .take_while(|segment| segment.end_sec.is_some_and(|end| end <= up_to_sec))
+            .count();
+        let mut decision = PolicyDecision::default();
+        if committable > self.committed_segments {
+            let fresh = &out.segments[self.committed_segments..committable];
+            let text = fresh
+                .iter()
+                .map(|segment| segment.text.trim())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let confidences: Vec<f64> = fresh
+                .iter()
+                .filter_map(|segment| segment.confidence)
+                .collect();
+            decision.commit_confidence = if confidences.is_empty() {
+                None
+            } else {
+                Some(confidences.iter().sum::<f64>() / confidences.len() as f64)
+            };
+            decision.commit_through_sec = fresh
+                .iter()
+                .filter_map(|segment| segment.end_sec)
+                .next_back();
+            decision.commit_tokens = fresh.len() as u64;
+            decision.commit_text = text;
+            self.committed_segments = committable;
+        }
+        let tail = out.segments[self.committed_segments.min(out.segments.len())..]
+            .iter()
+            .map(|segment| segment.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        decision.partial_tail = if tail.is_empty() { None } else { Some(tail) };
+        decision
+    }
+}
+
+impl EmissionPolicy for AlignAttPolicy {
+    fn step(
+        &mut self,
+        out: &crate::native_engine::decode::DecodeOutput,
+        slice_sec: f64,
+    ) -> PolicyDecision {
+        let safe = self.safe_time_sec(out, slice_sec);
+        let decision = self.decision(out, safe);
+        tracing::debug!(
+            slice_sec,
+            safe_time_sec = safe,
+            committed_segments = self.committed_segments,
+            committed_chars = decision.commit_text.len(),
+            partial_chars = decision.partial_tail.as_deref().map_or(0, str::len),
+            "alignatt step"
+        );
+        decision
+    }
+
+    fn finalize(
+        &mut self,
+        out: &crate::native_engine::decode::DecodeOutput,
+        slice_sec: f64,
+    ) -> PolicyDecision {
+        // Audio is complete: the danger zone collapses; commit everything.
+        self.decision(out, slice_sec + 1.0)
+    }
+
+    fn reset(&mut self) {
+        self.committed_segments = 0;
+    }
+
+    fn name(&self) -> &'static str {
+        "alignatt"
+    }
+
+    fn needs_token_attn(&self) -> bool {
+        true
     }
 }
 
@@ -1025,7 +1192,11 @@ pub fn run_listen_session(
         ListenSource::StdinPcm { .. } => "stdin-pcm",
         ListenSource::FileReplay { .. } => "file-replay",
     };
-    let mut policy = EndpointCommitPolicy;
+    let mut policy: Box<dyn EmissionPolicy> = match config.policy {
+        ListenPolicy::AlignAtt => Box::new(AlignAttPolicy::new(config.alignatt_holdback_ms)),
+        ListenPolicy::EndpointCommit => Box::new(EndpointCommitPolicy),
+    };
+    let record_token_attn = policy.needs_token_attn();
     let confirm_disabled_by_fallback = fallback_warning.is_some();
 
     let info = ListenSessionInfo {
@@ -1035,7 +1206,7 @@ pub fn run_listen_session(
         sample_rate_hz: capture.sample_rate(),
         fast_model: fast_model_label.clone(),
         quality_model: None, // confirm lane lands with bd-rt-confirm-lane-3okr
-        policy: EmissionPolicy::name(&policy).to_owned(),
+        policy: policy.name().to_owned(),
         step_ms: config.step_ms,
         partials: config.emit_partials,
         vad: serde_json::json!({
@@ -1100,6 +1271,7 @@ pub fn run_listen_session(
     let mut utterance_started_at: f64 = 0.0;
     let mut utterance_t0: f64 = 0.0;
     let mut committed_text = String::new();
+    let mut utterance_committed_through: f64 = 0.0;
     let mut delta_count: u64 = 0;
     let mut partial_generation: u64 = 0;
     let mut stats = ListenSessionStats::default();
@@ -1147,6 +1319,7 @@ pub fn run_listen_session(
             // single biggest listen-latency lever (see bd-rt-audio-ctx).
             audio_ctx: AudioCtxPolicy::Full,
             bypass_transcript_cache: true,
+            record_token_attn,
             initial_prompt: buffer.prompt(),
             n_threads: 4,
             ..DecodeParams::default()
@@ -1172,9 +1345,12 @@ pub fn run_listen_session(
             // Final flush when speech is open.
             if in_speech {
                 let out = decode_utterance(&buffer, utterance_t0, &pinned_language, false)?;
-                let decision = EmissionPolicy::finalize(&mut policy, &out, &buffer);
+                let decision = policy.finalize(&out, buffer.session_duration_sec() - utterance_t0);
                 let t1 = buffer.session_duration_sec();
                 if !decision.commit_text.is_empty() {
+                    if !committed_text.is_empty() {
+                        committed_text.push(' ');
+                    }
                     committed_text.push_str(&decision.commit_text);
                     delta_count += 1;
                     stats.deltas += 1;
@@ -1184,7 +1360,7 @@ pub fn run_listen_session(
                         &now_ts(),
                         utterance_id,
                         &decision.commit_text,
-                        utterance_t0,
+                        utterance_t0 + utterance_committed_through,
                         t1,
                         decision.commit_tokens,
                         decision.commit_confidence,
@@ -1259,9 +1435,10 @@ pub fn run_listen_session(
                             utterance_started_at = session_started.elapsed().as_secs_f64();
                             utterance_t0 = t_sec;
                             committed_text.clear();
+                            utterance_committed_through = 0.0;
                             delta_count = 0;
                             partial_generation = 0;
-                            EmissionPolicy::reset(&mut policy);
+                            policy.reset();
                             emit_seq!(robot::speech_started_value(
                                 &run_id,
                                 seq,
@@ -1289,8 +1466,12 @@ pub fn run_listen_session(
                             if pinned_language.is_none() {
                                 pinned_language.clone_from(&out.language);
                             }
-                            let decision = EmissionPolicy::finalize(&mut policy, &out, &buffer);
+                            let decision =
+                                policy.finalize(&out, buffer.session_duration_sec() - utterance_t0);
                             if !decision.commit_text.is_empty() {
+                                if !committed_text.is_empty() {
+                                    committed_text.push(' ');
+                                }
                                 committed_text.push_str(&decision.commit_text);
                                 delta_count += 1;
                                 stats.deltas += 1;
@@ -1304,7 +1485,7 @@ pub fn run_listen_session(
                                     &now_ts(),
                                     utterance_id,
                                     &decision.commit_text,
-                                    utterance_t0,
+                                    utterance_t0 + utterance_committed_through,
                                     t_sec,
                                     decision.commit_tokens,
                                     decision.commit_confidence,
@@ -1355,9 +1536,12 @@ pub fn run_listen_session(
                 }
                 other => other?,
             };
-            let decision = EmissionPolicy::finalize(&mut policy, &out, &buffer);
+            let decision = policy.finalize(&out, buffer.session_duration_sec() - utterance_t0);
             let t1 = buffer.session_duration_sec();
             if !decision.commit_text.is_empty() {
+                if !committed_text.is_empty() {
+                    committed_text.push(' ');
+                }
                 committed_text.push_str(&decision.commit_text);
                 delta_count += 1;
                 stats.deltas += 1;
@@ -1367,7 +1551,7 @@ pub fn run_listen_session(
                     &now_ts(),
                     utterance_id,
                     &decision.commit_text,
-                    utterance_t0,
+                    utterance_t0 + utterance_committed_through,
                     t1,
                     decision.commit_tokens,
                     decision.commit_confidence,
@@ -1394,9 +1578,10 @@ pub fn run_listen_session(
             utterance_started_at = session_started.elapsed().as_secs_f64();
             utterance_t0 = t1;
             committed_text.clear();
+            utterance_committed_through = 0.0;
             delta_count = 0;
             partial_generation = 0;
-            EmissionPolicy::reset(&mut policy);
+            policy.reset();
             emit_seq!(robot::speech_started_value(
                 &run_id,
                 seq,
@@ -1430,7 +1615,36 @@ pub fn run_listen_session(
             if pinned_language.is_none() {
                 pinned_language.clone_from(&out.language);
             }
-            let decision = EmissionPolicy::step(&mut policy, &out, &buffer);
+            let slice_sec = buffer.session_duration_sec() - utterance_t0;
+            let decision = policy.step(&out, slice_sec);
+            // Incremental commits (AlignAtt): append-only deltas mid-utterance.
+            if !decision.commit_text.is_empty() {
+                let delta_t0 = utterance_t0 + utterance_committed_through;
+                utterance_committed_through = decision
+                    .commit_through_sec
+                    .unwrap_or(utterance_committed_through);
+                let delta_t1 = utterance_t0 + utterance_committed_through;
+                if !committed_text.is_empty() {
+                    committed_text.push(' ');
+                }
+                committed_text.push_str(&decision.commit_text);
+                delta_count += 1;
+                stats.deltas += 1;
+                if stats.ttft_ms.is_none() {
+                    stats.ttft_ms = Some(session_started.elapsed().as_secs_f64() * 1000.0);
+                }
+                emit_seq!(robot::transcript_delta_value(
+                    &run_id,
+                    seq,
+                    &now_ts(),
+                    utterance_id,
+                    &decision.commit_text,
+                    delta_t0,
+                    delta_t1,
+                    decision.commit_tokens,
+                    decision.commit_confidence,
+                ));
+            }
             let elapsed_ms = step_started.elapsed().as_secs_f64() * 1000.0;
             step_latencies_ms.push(elapsed_ms);
             tracing::debug!(
@@ -2204,5 +2418,148 @@ mod tests {
             per_frame_us < 200.0,
             "tier-2 too slow: {per_frame_us:.1} us/frame"
         );
+    }
+}
+
+#[cfg(test)]
+mod alignatt_tests {
+    use super::*;
+    use crate::model::TranscriptionSegment;
+    use crate::native_engine::decode::{DecodeOutput, TokenAttn, WindowStats};
+
+    /// Build a DecodeOutput with the given segments and one window whose
+    /// token_attn carries the given attention frames (in decode order).
+    fn out(segments: &[(f64, f64, &str)], attn_frames: &[u32]) -> DecodeOutput {
+        DecodeOutput {
+            segments: segments
+                .iter()
+                .map(|(start, end, text)| TranscriptionSegment {
+                    start_sec: Some(*start),
+                    end_sec: Some(*end),
+                    text: (*text).to_owned(),
+                    speaker: None,
+                    confidence: Some(0.9),
+                })
+                .collect(),
+            language: Some("en".to_owned()),
+            windows: vec![WindowStats {
+                avg_logprob: -0.1,
+                no_speech_prob: 0.01,
+                tokens: attn_frames.len(),
+                window_offset_sec: 0.0,
+                token_attn: attn_frames
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| TokenAttn {
+                        token_index: i as u32,
+                        attn_frame: *f,
+                    })
+                    .collect(),
+            }],
+            dropped_windows: Vec::new(),
+            work: crate::native_engine::decode::DecodeWorkStats::default(),
+            word_timings: None,
+        }
+    }
+
+    #[test]
+    fn commits_segments_wholly_behind_the_attention_boundary() {
+        // 10 s slice, 200 ms holdback -> limit frame 490 (9.8 s edge zone).
+        // Attention prefix reaches frame 480 -> safe boundary 9.6 s.
+        let mut p = AlignAttPolicy::new(200);
+        let o = out(
+            &[
+                (0.0, 4.0, "alpha"),
+                (4.0, 9.0, "bravo"),
+                (9.0, 9.8, "charlie"),
+            ],
+            &[100, 200, 480],
+        );
+        let d = EmissionPolicy::step(&mut p, &o, 10.0);
+        assert_eq!(d.commit_text, "alpha bravo");
+        assert_eq!(d.commit_tokens, 2);
+        assert_eq!(d.commit_through_sec, Some(9.0));
+        assert_eq!(d.partial_tail.as_deref(), Some("charlie"));
+        assert!(d.commit_confidence.is_some());
+    }
+
+    #[test]
+    fn attention_prefix_rule_never_commits_past_an_unsafe_token() {
+        // Middle token attends INSIDE the holdback zone (frame 495 > 490):
+        // the prefix stops there; the trailing "safe" token must not
+        // resurrect the boundary. Safe frame stays 100 -> 2.0 s -> segment
+        // ending at 4.0 s cannot commit.
+        let mut p = AlignAttPolicy::new(200);
+        let o = out(
+            &[(0.0, 4.0, "alpha"), (4.0, 9.0, "bravo")],
+            &[100, 495, 200],
+        );
+        let d = EmissionPolicy::step(&mut p, &o, 10.0);
+        assert_eq!(d.commit_text, "");
+        assert_eq!(d.commit_tokens, 0);
+        assert_eq!(d.partial_tail.as_deref(), Some("alpha bravo"));
+    }
+
+    #[test]
+    fn commits_are_incremental_and_never_reemitted() {
+        let mut p = AlignAttPolicy::new(200);
+        // Step 1: only "alpha" is safe.
+        let d1 = EmissionPolicy::step(
+            &mut p,
+            &out(&[(0.0, 2.0, "alpha"), (2.0, 4.5, "bravo")], &[150]),
+            5.0,
+        );
+        assert_eq!(d1.commit_text, "alpha");
+        // Step 2 (audio grew): "bravo" becomes safe; "alpha" NOT re-emitted.
+        let d2 = EmissionPolicy::step(
+            &mut p,
+            &out(
+                &[
+                    (0.0, 2.0, "alpha"),
+                    (2.0, 4.5, "bravo"),
+                    (4.5, 7.8, "charlie"),
+                ],
+                &[150, 300],
+            ),
+            8.0,
+        );
+        assert_eq!(d2.commit_text, "bravo");
+        assert_eq!(d2.commit_through_sec, Some(4.5));
+        assert_eq!(d2.partial_tail.as_deref(), Some("charlie"));
+    }
+
+    #[test]
+    fn finalize_commits_the_remaining_tail_and_reset_rearms() {
+        let mut p = AlignAttPolicy::new(200);
+        let o = out(&[(0.0, 2.0, "alpha"), (2.0, 3.9, "bravo")], &[90]);
+        let d1 = EmissionPolicy::step(&mut p, &o, 4.0);
+        assert_eq!(d1.commit_text, "alpha");
+        // Endpoint: no holdback; everything uncommitted flushes.
+        let d2 = EmissionPolicy::finalize(&mut p, &o, 4.0);
+        assert_eq!(d2.commit_text, "bravo");
+        assert!(d2.partial_tail.is_none());
+        // A fresh utterance starts from zero.
+        EmissionPolicy::reset(&mut p);
+        let d3 = EmissionPolicy::finalize(&mut p, &o, 4.0);
+        assert_eq!(d3.commit_text, "alpha bravo");
+    }
+
+    #[test]
+    fn empty_decode_yields_an_empty_decision() {
+        let mut p = AlignAttPolicy::new(200);
+        let d = EmissionPolicy::step(&mut p, &out(&[], &[]), 1.0);
+        assert_eq!(d.commit_text, "");
+        assert!(d.partial_tail.is_none());
+        assert!(d.commit_through_sec.is_none());
+    }
+
+    #[test]
+    fn holdback_floors_at_one_frame_and_policies_declare_attn_needs() {
+        // 0 ms holdback still keeps one frame of guard.
+        let p = AlignAttPolicy::new(0);
+        assert_eq!(p.holdback_frames, 1);
+        assert!(EmissionPolicy::needs_token_attn(&p));
+        assert!(!EmissionPolicy::needs_token_attn(&EndpointCommitPolicy));
+        assert_eq!(EmissionPolicy::name(&p), "alignatt");
     }
 }

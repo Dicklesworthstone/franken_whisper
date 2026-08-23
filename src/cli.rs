@@ -1153,8 +1153,12 @@ pub enum CaptureBackendArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ListenPolicyArg {
+    /// AlignAtt (default): attention-gated incremental commits — deltas
+    /// stream mid-utterance as soon as the decoder's alignment heads stop
+    /// attending near the live audio edge (bd-rt-alignatt-fry9).
+    Alignatt,
     /// Bootstrap baseline: partials every step, one committed delta at
-    /// utterance close. (alignatt becomes the default when it lands.)
+    /// utterance close.
     EndpointCommit,
 }
 
@@ -1196,8 +1200,14 @@ pub struct ListenArgs {
     pub fast_model: Option<String>,
 
     /// Emission policy.
-    #[arg(long, value_enum, default_value_t = ListenPolicyArg::EndpointCommit)]
+    #[arg(long, value_enum, default_value_t = ListenPolicyArg::Alignatt)]
     pub policy: ListenPolicyArg,
+
+    /// AlignAtt holdback: how far (ms) the decoder's attention must sit
+    /// behind the live audio edge before text commits. Lower = faster,
+    /// riskier; higher = safer, laggier.
+    #[arg(long, default_value_t = 200)]
+    pub alignatt_holdback_ms: u64,
 
     /// Step decode cadence in milliseconds.
     #[arg(long, default_value_t = 300)]
@@ -4393,7 +4403,8 @@ mod tests {
         };
         assert!(matches!(args.source, ListenSourceArg::Mic));
         assert!(matches!(args.capture_backend, CaptureBackendArg::Auto));
-        assert!(matches!(args.policy, ListenPolicyArg::EndpointCommit));
+        assert!(matches!(args.policy, ListenPolicyArg::Alignatt));
+        assert_eq!(args.alignatt_holdback_ms, 200);
         assert_eq!(args.step_ms, 300);
         assert_eq!(args.max_buffer_sec, 12.0);
         assert_eq!(args.max_utterance_sec, 90.0);
