@@ -751,6 +751,8 @@ pub fn finite_seconds_interval_to_ms(start_sec: f64, end_sec: f64) -> Option<(u6
 
 #[cfg(test)]
 mod tests {
+    use crate::model::{DiarizationTurn, TranscriptionSegment};
+
     /// The module-local epsilon must stay equal to the conformance-canonical
     /// one (duplicated here so this module carries no conformance dep).
     #[test]
@@ -761,5 +763,57 @@ mod tests {
                 .abs()
                 == 0.0
         );
+    }
+    /// bd-6xsk regression: whisper.cpp `--split-on-word --max-segment-length`
+    /// runs can emit a zero-duration middle segment (`start_ms == end_ms`).
+    /// The projection must canonicalize it — text preserved, timestamps
+    /// released into the explicitly-unknown-speaker lane (mixed-marked when
+    /// several known speakers exist) — instead of rejecting the entire run.
+    #[test]
+    fn zero_duration_middle_segment_survives_projection() {
+        let turn = |start_ms: u64, end_ms: u64, speaker: &str| DiarizationTurn {
+            start_ms,
+            end_ms,
+            speaker_ref: Some(speaker.to_owned()),
+            speaker_confidence: Some(0.9),
+            change_confidence: None,
+            overlap_suspected: false,
+            hard_hint_attributed: false,
+        };
+        let segment = |start_sec: Option<f64>, end_sec: Option<f64>, text: &str| {
+            TranscriptionSegment {
+                start_sec,
+                end_sec,
+                text: text.to_owned(),
+                speaker: None,
+                confidence: Some(0.8),
+            }
+        };
+        let segments = vec![
+            segment(Some(0.0), Some(1.0), "And so my fellow"),
+            // The degenerate observation: a word-aligned slice whose decoder
+            // timestamps collapsed onto the same instant.
+            segment(Some(1.0), Some(1.0), "Americans"),
+            segment(Some(1.5), Some(3.0), "ask not"),
+        ];
+        let turns = vec![turn(0, 2_000, "A"), turn(2_000, 4_000, "B")];
+
+        let projection =
+            super::project_diarization_onto_segments(&segments, &turns, true)
+                .expect("a zero-duration middle segment must not reject the run");
+
+        assert_eq!(projection.segments.len(), 3);
+        // Text and order are never modified.
+        assert_eq!(projection.segments[1].text, "Americans");
+        // The degenerate middle segment is canonicalized into the explicitly
+        // unknown-speaker lane, not dropped and not fail-closed.
+        assert_eq!(projection.segments[1].start_sec, None);
+        assert_eq!(projection.segments[1].end_sec, None);
+        assert!(projection.mixed_speaker_segment_indices.contains(&1));
+        // Neighboring timed segments keep their timestamps and get labels.
+        assert_eq!(projection.segments[0].start_sec, Some(0.0));
+        assert_eq!(projection.segments[0].speaker.as_deref(), Some("A"));
+        assert_eq!(projection.segments[2].end_sec, Some(3.0));
+        assert_eq!(projection.segments[2].speaker.as_deref(), Some("B"));
     }
 }
