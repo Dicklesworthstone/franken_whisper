@@ -1170,6 +1170,17 @@ fn open_capture_source(config: &ListenConfig) -> FwResult<OpenedCapture> {
 /// Returns `Ok(cancelled)` — `true` when the session ended on Ctrl-C (the
 /// caller maps that to exit code 130). Fatal errors propagate; the CLI
 /// wrapper converts them to the terminal `run_error` event.
+///
+/// # Utterance lifecycle contract (bd-rt-endpoint-i3k2)
+///
+/// Every `speech_started` is matched by exactly one later `utterance_end`
+/// carrying the same `utterance_id`; ids allocate monotonically from 1 and
+/// utterances never nest. `speech_started` fires eagerly at VAD onset, so an
+/// utterance whose decode commits nothing still closes with
+/// `utterance_end{text:"", delta_count:0}` — empty-text utterance ends are
+/// normal (breath/cough triggers), never an error. Deltas for an utterance
+/// always precede its `utterance_end`, and the session's `seq` strictly
+/// increases across every event.
 pub fn run_listen_session(
     config: &ListenConfig,
     emit: &mut dyn FnMut(serde_json::Value) -> FwResult<()>,
@@ -2531,7 +2542,7 @@ mod alignatt_tests {
     #[test]
     fn finalize_commits_the_remaining_tail_and_reset_rearms() {
         let mut p = AlignAttPolicy::new(200);
-        let o = out(&[(0.0, 2.0, "alpha"), (2.0, 3.9, "bravo")], &[90]);
+        let o = out(&[(0.0, 2.0, "alpha"), (2.0, 3.9, "bravo")], &[120]);
         let d1 = EmissionPolicy::step(&mut p, &o, 4.0);
         assert_eq!(d1.commit_text, "alpha");
         // Endpoint: no holdback; everything uncommitted flushes.
@@ -2551,6 +2562,136 @@ mod alignatt_tests {
         assert_eq!(d.commit_text, "");
         assert!(d.partial_tail.is_none());
         assert!(d.commit_through_sec.is_none());
+    }
+
+    // -- bd-rt-endpoint-i3k2: utterance-lifecycle invariants ---------------
+
+    /// Write a 16 kHz mono s16 WAV from (seconds, is-speech) segments.
+    /// Speech segments are a 220 Hz tone at 0.4 full scale — far above the
+    /// VAD gate; silence segments are exact zeros.
+    fn write_lifecycle_wav(path: &std::path::Path, segments: &[(f64, bool)]) {
+        use std::f32::consts::TAU;
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for &(sec, speech) in segments {
+            let n = (sec * 16_000.0) as usize;
+            for i in 0..n {
+                let s = if speech {
+                    (TAU * 220.0 * (i as f32 / 16_000.0)).sin() * 0.4
+                } else {
+                    0.0
+                };
+                writer
+                    .write_sample((s * f32::from(i16::MAX)) as i16)
+                    .unwrap();
+            }
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn gated_listen_lifecycle_pairs_every_speech_started_with_one_end() {
+        if crate::native_engine::resolve_model("tiny.en").is_err() {
+            eprintln!("SKIP lifecycle invariants: tiny.en not cached (`fw pull tiny-en`)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("lifecycle.wav");
+        // Quiet lead | speech | gap | short burst (frequently commits nothing
+        // -> exercises the empty-text end contract) | quiet tail.
+        write_lifecycle_wav(
+            &wav,
+            &[
+                (0.8, false),
+                (1.2, true),
+                (0.7, false),
+                (0.35, true),
+                (1.2, false),
+            ],
+        );
+
+        let events = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
+        let config = ListenConfig {
+            source: ListenSource::FileReplay {
+                path: wav,
+                realtime_pace: false,
+            },
+            fast_model: Some("tiny.en".to_owned()),
+            language: Some("en".to_owned()),
+            step_ms: 250,
+            max_seconds: 60.0,
+            ..ListenConfig::default()
+        };
+        run_listen_session(
+            &config,
+            &mut |value| {
+                events.borrow_mut().push(value);
+                Ok(())
+            },
+            &|| false,
+        )
+        .unwrap();
+        let events = events.into_inner();
+        assert!(events.len() >= 4, "expected session_start/…/stats stream");
+
+        let kind = |v: &serde_json::Value| v["event"].as_str().unwrap_or_default().to_owned();
+
+        // seq strictly increases across every event.
+        let seqs: Vec<u64> = events.iter().filter_map(|v| v["seq"].as_u64()).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "seq must increase");
+        assert_eq!(kind(&events[0]), "listen.session_start");
+        assert_eq!(kind(events.last().unwrap()), "listen.session_stats");
+        assert_eq!(events.last().unwrap()["final"], serde_json::json!(true));
+
+        // Pairing: LIFO open/close with unique monotonic ids from 1; deltas
+        // only inside their still-open utterance and before its end.
+        let mut open: Vec<u32> = Vec::new();
+        let mut closed: Vec<(u32, String)> = Vec::new();
+        for value in &events {
+            let id = || value["utterance_id"].as_u64().unwrap() as u32;
+            match kind(value).as_str() {
+                "speech_started" => {
+                    let id = id();
+                    assert!(!open.contains(&id), "duplicate open for {id}");
+                    open.push(id);
+                }
+                "transcript.delta" => {
+                    let id = id();
+                    assert!(
+                        open.last() == Some(&id),
+                        "delta {id} outside its open utterance"
+                    );
+                }
+                "utterance_end" => {
+                    let id = id();
+                    assert_eq!(open.last(), Some(&id), "end must close open {id}");
+                    open.pop();
+                    assert!(matches!(
+                        value["reason"].as_str(),
+                        Some("endpoint") | Some("timeout") | Some("max_len") | Some("session_end")
+                    ));
+                    if value["delta_count"].as_u64() == Some(0) {
+                        assert_eq!(value["text"], "", "zero-delta ends carry empty text");
+                    }
+                    closed.push((id, kind(value)));
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_empty(), "session ended with an open utterance");
+        assert!(
+            !closed.is_empty(),
+            "fixture must close at least one utterance"
+        );
+        let mut ids: Vec<u32> = closed.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids, (1..=ids.len() as u32).collect::<Vec<_>>());
     }
 
     #[test]
