@@ -4225,7 +4225,10 @@ mod tests {
             serde_json::from_str(TDRZ_V175_JSON).expect("fixture must parse");
         // whisper_cpp::run falls back to transcript_from_segments when the
         // artifact has no top-level `text` (the tdrz dump's shape).
-        assert!(root.get("text").is_none(), "precondition: no top-level text");
+        assert!(
+            root.get("text").is_none(),
+            "precondition: no top-level text"
+        );
         let segments = extract_segments_from_json(&root);
         let rebuilt = transcript_from_segments(&segments);
         assert!(rebuilt.contains("fellow Americans"));
