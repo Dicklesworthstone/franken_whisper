@@ -20,7 +20,7 @@ fn main() {
     let mut acc: i64 = 0;
     for s in &samples {
         let s = if s.is_finite() { *s } else { 0.0 };
-        let q = (s.max(-1.0).min(1.0) * f32::from(i16::MAX)).round() as i16;
+        let q = (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
         acc += i64::from(q);
     }
     let quant_only = t.elapsed();
@@ -56,7 +56,7 @@ fn prequantized(samples: &[f32]) -> Vec<i16> {
         .iter()
         .map(|s| {
             let s = if s.is_finite() { *s } else { 0.0 };
-            (s.max(-1.0).min(1.0) * f32::from(i16::MAX)).round() as i16
+            (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16
         })
         .collect()
 }
@@ -74,7 +74,7 @@ fn write_wav(path: &std::path::Path, samples: &[f32]) {
         let mut buffered = writer.get_i16_writer(chunk.len() as u32);
         for s in chunk {
             let s = if s.is_finite() { *s } else { 0.0 };
-            buffered.write_sample((s.max(-1.0).min(1.0) * f32::from(i16::MAX)).round() as i16);
+            buffered.write_sample((s.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16);
         }
         buffered.flush().unwrap();
     }

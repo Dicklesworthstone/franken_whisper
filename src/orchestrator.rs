@@ -1388,7 +1388,7 @@ where
         .spawn(move || {
             let _ = tx.send(operation());
         })
-        .map_err(|error| FwError::Io(error))?;
+        .map_err(FwError::Io)?;
 
     match rx.recv_timeout(budget_duration(budget_ms)) {
         Ok(result) => result,
