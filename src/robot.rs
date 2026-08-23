@@ -1596,6 +1596,13 @@ pub fn capabilities_value() -> serde_json::Value {
             "metal_target_compiled": cfg!(target_os = "macos"),
             "metal_runtime_policy": "automatic_for_eligible_large_operations",
         },
+        "ios_surface": {
+            "artifact": "fw-ios staticlib (C ABI) + SwiftUI app",
+            "header": "fw-ios/include/fw_ios.h",
+            "contract_doc": "docs/fw_ios_contract.md",
+            "abi_parity_guard": "tests/fw_ios_header_parity.rs",
+            "note": "separate build product; not part of this CLI binary",
+        },
         "agent_orientation": {
             "command": "fw robot triage",
             "model_status": "fw models --json",

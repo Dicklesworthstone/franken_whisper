@@ -4505,6 +4505,30 @@ cargo install cross
 cross build --release --target aarch64-unknown-linux-gnu
 ```
 
+### iOS (fw-ios C ABI + SwiftUI)
+
+Shipped since v0.9.3: the native engine runs on-device through **`fw-ios`**, a
+static library exposing a C ABI (`fw-ios/include/fw_ios.h`, 17 exported
+functions: engine open/close/info, Sortformer + denoiser loading, staged
+audio/PCM, full run, progress + live-transcript callbacks, cooperative
+cancellation, string release). The staticlib mounts this repo's own
+`src/native_engine/` sources by path — one inference implementation, no FFI
+into third parties, `#![forbid(unsafe_code)]` discipline carried to the
+audited pointer island in `fw-ios/src/lib.rs`.
+
+A SwiftUI application under `ios/Sources/` (xcodegen project in
+`ios/project.yml`) wraps the handle in an actor and provides on-device
+transcription, speaker naming, and JSON/Markdown export.
+
+- Contract details (return codes 0–6, ownership, threading, staging→run flow):
+  [`docs/fw_ios_contract.md`](docs/fw_ios_contract.md)
+- Header ↔ ABI lockstep is enforced by
+  `tests/fw_ios_header_parity.rs`; a symbol added on one side without the
+  other fails the suite.
+- The iOS surface is a separate build product — it is not part of the CLI
+  binaries or the Homebrew/curl installs above. Agents can discover it via
+  the `ios_surface` key of `fw capabilities --json`.
+
 ### Build Reproducibility
 
 The release profile fixes optimization, LTO, codegen-unit, panic, and stripping
