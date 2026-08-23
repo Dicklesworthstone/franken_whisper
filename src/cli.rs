@@ -1022,6 +1022,11 @@ pub struct YoutubeArgs {
     #[arg(long)]
     pub json_summary: bool,
 
+    /// bd-lun9 batch-wave size: download in waves of this many videos so
+    /// untranscribed audio cannot pile up on disk. 0 = all at once.
+    #[arg(long, default_value_t = 0)]
+    pub batch_size: usize,
+
     /// Filename style for emitted artifacts (bd-tchp default: slug).
     #[arg(long, value_enum, default_value_t = YoutubeNamingStyleArg::Slug)]
     pub naming_style: YoutubeNamingStyleArg,
@@ -1078,6 +1083,7 @@ impl YoutubeArgs {
             retry_failed: !self.no_retry,
             abort_on_error: self.abort_on_error,
             naming_style: self.naming_style.into(),
+            batch_size: self.batch_size,
         })
     }
 }

@@ -153,6 +153,12 @@ pub struct YoutubeRunOptions {
     pub batch_file: Option<PathBuf>,
     /// Output directory (created if absent).
     pub output_dir: PathBuf,
+    /// bd-lun9 batch-wave size: process downloads in waves of this many
+    /// videos so untranscribed audio cannot pile up on disk while the
+    /// sequential transcription consumer lags behind parallel download
+    /// workers. 0 = single wave (all videos at once — historical behavior).
+    pub batch_size: usize,
+
     /// Model spec forwarded to the engine.
     pub model: Option<String>,
     /// Language hint.
@@ -335,173 +341,304 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
 
     let engine = FrankenWhisperEngine::new()?;
 
-    // ── Download stage: bounded worker pool feeding a bounded channel. ──
-    // Capacity == concurrency keeps disk bounded (~concurrency in-flight +
-    // queued). Each worker kills its yt-dlp child if the token fires.
-    let concurrency = opts.concurrency.max(1);
-    let (tx, rx) = sync_channel::<DownloadResult>(concurrency);
-    let work = std::sync::Arc::new(std::sync::Mutex::new(to_process.into_iter()));
-    let audio_dir_arc = std::sync::Arc::new(audio_dir.clone());
-    let info_arc = std::sync::Arc::new(info.clone());
+    // ── bd-lun9 batch waves ─────────────────────────────────────────────
+    // batch_size > 0 partitions work into waves so downloaded-but-untranscribed
+    // audio cannot accumulate unbounded while the sequential transcription
+    // consumer lags behind parallel download workers. 0 = single wave (history).
+    let batches = partition_batches(to_process, opts.batch_size);
+    'waves: for batch in batches {
+        // ── Download stage: bounded worker pool feeding a bounded channel. ──
+        // Capacity == concurrency keeps disk bounded (~concurrency in-flight +
+        // queued). Each worker kills its yt-dlp child if the token fires.
+        let concurrency = opts.concurrency.max(1);
+        let (tx, rx) = sync_channel::<DownloadResult>(concurrency);
+        let work = std::sync::Arc::new(std::sync::Mutex::new(batch.into_iter()));
+        let audio_dir_arc = std::sync::Arc::new(audio_dir.clone());
+        let info_arc = std::sync::Arc::new(info.clone());
 
-    std::thread::scope(|scope| -> FwResult<()> {
-        for _ in 0..concurrency {
-            let tx = tx.clone();
-            let work = std::sync::Arc::clone(&work);
-            let audio_dir = std::sync::Arc::clone(&audio_dir_arc);
-            let info = std::sync::Arc::clone(&info_arc);
-            scope.spawn(move || {
-                let dl_token = CancellationToken::unbounded();
-                loop {
-                    if ShutdownController::is_shutting_down() {
-                        break;
+        std::thread::scope(|scope| -> FwResult<()> {
+            for _ in 0..concurrency {
+                let tx = tx.clone();
+                let work = std::sync::Arc::clone(&work);
+                let audio_dir = std::sync::Arc::clone(&audio_dir_arc);
+                let info = std::sync::Arc::clone(&info_arc);
+                scope.spawn(move || {
+                    let dl_token = CancellationToken::unbounded();
+                    loop {
+                        if ShutdownController::is_shutting_down() {
+                            break;
+                        }
+                        let next = {
+                            let mut guard = work.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.next()
+                        };
+                        let Some(video) = next else { break };
+                        let outcome = download_one(&info, &video, &audio_dir, &dl_token);
+                        if tx.send(DownloadResult { video, outcome }).is_err() {
+                            break; // consumer gone (cancel/abort)
+                        }
                     }
-                    let next = {
-                        let mut guard = work.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.next()
-                    };
-                    let Some(video) = next else { break };
-                    let outcome = download_one(&info, &video, &audio_dir, &dl_token);
-                    if tx.send(DownloadResult { video, outcome }).is_err() {
-                        break; // consumer gone (cancel/abort)
-                    }
-                }
-            });
-        }
-        drop(tx); // close the channel once all workers finish
+                });
+            }
+            drop(tx); // close the channel once all workers finish
 
-        // ── Transcription consumer: sequential, on this thread. ──
-        for result in rx {
-            let DownloadResult { video, outcome } = result;
-            if token.checkpoint().is_err() {
-                // Cancelled while this download sat in the channel: persist its
-                // state so a resume reuses the audio rather than orphaning it.
-                if let Ok((audio_path, _meta)) = &outcome {
-                    manifest.set_state(
-                        &video.id,
-                        VideoState::Downloaded {
-                            audio_path: audio_path.display().to_string(),
-                        },
-                    );
-                    manifest.save(&manifest_path)?;
-                }
-                summary.cancelled = true;
-                break;
-            }
-            let (audio_path, meta) = match outcome {
-                Ok(pair) => pair,
-                Err(error) => {
-                    record_failure(&mut manifest, &manifest_path, &video, &error)?;
-                    summary.failed.push(FailedVideo {
-                        id: video.id.clone(),
-                        title: video.title.clone(),
-                        error,
-                    });
-                    if opts.abort_on_error {
-                        summary.cancelled = true;
-                        break;
+            // ── Transcription consumer: sequential, on this thread. ──
+            for result in rx {
+                let DownloadResult { video, outcome } = result;
+                if token.checkpoint().is_err() {
+                    // Cancelled while this download sat in the channel: persist its
+                    // state so a resume reuses the audio rather than orphaning it.
+                    if let Ok((audio_path, _meta)) = &outcome {
+                        manifest.set_state(
+                            &video.id,
+                            VideoState::Downloaded {
+                                audio_path: audio_path.display().to_string(),
+                            },
+                        );
+                        manifest.save(&manifest_path)?;
                     }
-                    continue;
-                }
-            };
-            // ID-DIVERGENCE GUARD (manifest-key consistency, see the module
-            // invariant): the manifest is keyed — on discovery AND on every
-            // `set_state` — by `video.id`, which is derived **deterministically
-            // from the input URL** (`extract_video_id`, or the rare fallback
-            // fetch's id). Naming/output, by contrast, uses the authoritative
-            // `meta.id` from yt-dlp. For valid YouTube URLs these are equal (the
-            // `v=` param IS the video id and yt-dlp echoes it). They must stay
-            // equal for resume to be correct: a re-run re-derives the SAME key
-            // from the same URL and finds the `Done` entry, so a downloaded
-            // video is never reprocessed. If yt-dlp ever canonicalizes the id to
-            // something the URL parse can't reproduce, the output file (named
-            // from `meta.id`) and the manifest key (the URL-derived id) would
-            // disagree — resume still works (the key is URL-deterministic), but
-            // the on-disk filename id would differ from the manifest key. Surface
-            // that rare divergence rather than letting it pass silently.
-            if meta.id != video.id {
-                tracing::warn!(
-                    manifest_key = %video.id,
-                    resolved_id = %meta.id,
-                    url = %video.url,
-                    "yt-dlp resolved a video id that differs from the URL-derived id; \
-                     the output filename will use the resolved id while the manifest is \
-                     keyed by the URL-derived id (resume stays correct)"
-                );
-            }
-            // NB: we intentionally do NOT persist a `Downloaded` state here.
-            // Write-amplification fix: the manifest is a full-rewrite-on-save
-            // BTreeMap, so each save is O(N) bytes; saving here once per video
-            // makes per-video work O(N²) total writes for an N-video playlist.
-            // This intermediate save bought no resume benefit anyway — the
-            // partition logic above re-enters `download_one` for any non-Done /
-            // non-Failed entry (a `Downloaded` entry is re-downloaded on
-            // resume, which the contract permits), so the only durable states
-            // that matter are the terminal `Done`/`Failed` (and the rare
-            // cancel-persist below). The single per-video save now happens at
-            // the terminal transition.
-            match transcribe_and_render(&engine, opts, &video, &meta, &audio_path) {
-                Ok(paths) => {
-                    let audio_kept = if opts.keep_audio {
-                        Some(audio_path.display().to_string())
-                    } else {
-                        let _ = std::fs::remove_file(&audio_path);
-                        None
-                    };
-                    manifest.set_state(
-                        &video.id,
-                        VideoState::Done {
-                            audio_path: audio_kept,
-                            markdown_path: paths.md.display().to_string(),
-                            json_path: paths.json.display().to_string(),
-                        },
-                    );
-                    manifest.save(&manifest_path)?;
-                    summary.done.push(video.id.clone());
-                }
-                Err(FwError::Cancelled(_)) => {
-                    // No terminal state to persist (the entry is still
-                    // `Pending`); a resume re-downloads + re-transcribes, which
-                    // the contract permits. Dropping this save avoids a full
-                    // O(N)-byte manifest rewrite on the cancel path.
                     summary.cancelled = true;
                     break;
                 }
-                Err(e) => {
-                    let error = e.to_string();
-                    record_failure(&mut manifest, &manifest_path, &video, &error)?;
-                    summary.failed.push(FailedVideo {
-                        id: video.id.clone(),
-                        title: video.title.clone(),
-                        error,
-                    });
-                    if opts.abort_on_error {
+                let (audio_path, meta) = match outcome {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        record_failure(&mut manifest, &manifest_path, &video, &error)?;
+                        summary.failed.push(FailedVideo {
+                            id: video.id.clone(),
+                            title: video.title.clone(),
+                            error,
+                        });
+                        if opts.abort_on_error {
+                            summary.cancelled = true;
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                // ID-DIVERGENCE GUARD (manifest-key consistency, see the module
+                // invariant): the manifest is keyed — on discovery AND on every
+                // `set_state` — by `video.id`, which is derived **deterministically
+                // from the input URL** (`extract_video_id`, or the rare fallback
+                // fetch's id). Naming/output, by contrast, uses the authoritative
+                // `meta.id` from yt-dlp. For valid YouTube URLs these are equal (the
+                // `v=` param IS the video id and yt-dlp echoes it). They must stay
+                // equal for resume to be correct: a re-run re-derives the SAME key
+                // from the same URL and finds the `Done` entry, so a downloaded
+                // video is never reprocessed. If yt-dlp ever canonicalizes the id to
+                // something the URL parse can't reproduce, the output file (named
+                // from `meta.id`) and the manifest key (the URL-derived id) would
+                // disagree — resume still works (the key is URL-deterministic), but
+                // the on-disk filename id would differ from the manifest key. Surface
+                // that rare divergence rather than letting it pass silently.
+                if meta.id != video.id {
+                    tracing::warn!(
+                        manifest_key = %video.id,
+                        resolved_id = %meta.id,
+                        url = %video.url,
+                        "yt-dlp resolved a video id that differs from the URL-derived id; \
+                         the output filename will use the resolved id while the manifest is \
+                         keyed by the URL-derived id (resume stays correct)"
+                    );
+                }
+                // NB: we intentionally do NOT persist a `Downloaded` state here.
+                // Write-amplification fix: the manifest is a full-rewrite-on-save
+                // BTreeMap, so each save is O(N) bytes; saving here once per video
+                // makes per-video work O(N²) total writes for an N-video playlist.
+                // This intermediate save bought no resume benefit anyway — the
+                // partition logic above re-enters `download_one` for any non-Done /
+                // non-Failed entry (a `Downloaded` entry is re-downloaded on
+                // resume, which the contract permits), so the only durable states
+                // that matter are the terminal `Done`/`Failed` (and the rare
+                // cancel-persist below). The single per-video save now happens at
+                // the terminal transition.
+                match transcribe_and_render(&engine, opts, &video, &meta, &audio_path) {
+                    Ok(paths) => {
+                        let audio_kept = if opts.keep_audio {
+                            Some(audio_path.display().to_string())
+                        } else {
+                            let _ = std::fs::remove_file(&audio_path);
+                            None
+                        };
+                        manifest.set_state(
+                            &video.id,
+                            VideoState::Done {
+                                audio_path: audio_kept,
+                                markdown_path: paths.md.display().to_string(),
+                                json_path: paths.json.display().to_string(),
+                            },
+                        );
+                        manifest.save(&manifest_path)?;
+                        summary.done.push(video.id.clone());
+                    }
+                    Err(FwError::Cancelled(_)) => {
+                        // No terminal state to persist (the entry is still
+                        // `Pending`); a resume re-downloads + re-transcribes, which
+                        // the contract permits. Dropping this save avoids a full
+                        // O(N)-byte manifest rewrite on the cancel path.
                         summary.cancelled = true;
                         break;
                     }
+                    Err(e) => {
+                        let error = e.to_string();
+                        record_failure(&mut manifest, &manifest_path, &video, &error)?;
+                        summary.failed.push(FailedVideo {
+                            id: video.id.clone(),
+                            title: video.title.clone(),
+                            error,
+                        });
+                        if opts.abort_on_error {
+                            summary.cancelled = true;
+                            break;
+                        }
+                    }
                 }
             }
+            Ok(())
+        })?;
+        // Any exit condition that abandoned the consumer early (cancel or
+        // --abort-on-error) also abandons the remaining waves.
+        if summary.cancelled {
+            break 'waves;
         }
-        Ok(())
-    })?;
+    }
 
     Ok(summary)
 }
 
-/// Download a single video's audio. This performs the **single** authoritative
-/// `yt-dlp -j` metadata fetch for the video and returns the fetched
-/// [`VideoMeta`] alongside the audio path, so the renderer never re-fetches it.
+/// In-run retry budget for a single video's download (bd-lun9): attempts
+/// beyond the first are spaced by full-jitter exponential backoff. The
+/// cross-run budget lives in the manifest (`MAX_ATTEMPTS`); this one only
+// bounds work inside a single run.
+const DOWNLOAD_IN_RUN_RETRIES: u32 = 3;
+
+/// Backoff base (`2^attempt * base`, capped) before full jitter.
+const DOWNLOAD_BACKOFF_BASE_MS: u64 = 2_000;
+
+/// Upper bound on any single backoff delay.
+const DOWNLOAD_BACKOFF_CAP_MS: u64 = 30_000;
+
+/// Transient-failure classification (bd-lun9): timeouts and I/O errors are
+/// retryable by nature; a non-zero yt-dlp exit is retryable only when its
+/// stderr smells like a transient upstream/network condition (rate limiting,
+/// resolution blips, reset connections). Everything else — private videos,
+/// geo blocks, bad URLs — is deterministic and must fail fast.
+fn is_retryable_download_error(error: &FwError) -> bool {
+    match error {
+        FwError::CommandTimedOut { .. } | FwError::Io(_) => true,
+        FwError::CommandFailed { stderr_suffix, .. } => {
+            let s = stderr_suffix.to_ascii_lowercase();
+            [
+                "429",
+                "503",
+                "temporary failure",
+                "connection reset",
+                "connection timed out",
+            ]
+            .iter()
+            .any(|needle| s.contains(needle))
+        }
+        _ => false,
+    }
+}
+
+/// Pure full-jitter exponential delay computation (bd-lun9): base 2 s,
+/// doubling per attempt, capped; SplitMix64 over nanos ^ attempt-hash for
+/// the jitter — no rand dependency, the decoder's temperature-ladder idiom.
+#[must_use]
+fn backoff_delay_ms(attempt: u32) -> u64 {
+    let exp_ms = DOWNLOAD_BACKOFF_BASE_MS
+        .saturating_mul(1_u64 << attempt.min(4))
+        .min(DOWNLOAD_BACKOFF_CAP_MS);
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        ^ (u64::from(attempt) << 32);
+    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    state ^= state >> 30;
+    state = state.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    state ^= state >> 27;
+    (state >> 33) % (exp_ms + 1)
+}
+
+/// Cancellation-aware sleep in 100 ms slices, each followed by a token
+/// checkpoint so Ctrl+C interrupts promptly mid-backoff. Returns `Err` if
+/// cancelled while waiting.
+fn sleep_cancellable(delay: std::time::Duration, token: &CancellationToken) -> FwResult<()> {
+    let mut waited = std::time::Duration::from_millis(0);
+    while waited < delay {
+        token.checkpoint()?;
+        let slice = std::time::Duration::from_millis(100);
+        std::thread::sleep(slice);
+        waited += slice;
+    }
+    Ok(())
+}
+
+/// Backoff then wait, cancellation-aware (bd-lun9).
+fn jittered_backoff_sleep(attempt: u32, token: &CancellationToken) -> FwResult<()> {
+    sleep_cancellable(
+        std::time::Duration::from_millis(backoff_delay_ms(attempt)),
+        token,
+    )
+}
+
+/// Split the work list into bd-lun9 batch waves. `size == 0` yields a single
+/// wave containing everything (historical behavior); otherwise consecutive
+/// chunks of exactly `size` (the last may be short).
+#[must_use]
+fn partition_batches(items: Vec<VideoRef>, size: usize) -> Vec<Vec<VideoRef>> {
+    if size == 0 || items.len() <= size {
+        return vec![items];
+    }
+    items.chunks(size).map(<[VideoRef]>::to_vec).collect()
+}
+
+/// Download a single video's audio, retrying transient failures with
+/// full-jitter exponential backoff (bd-lun9). This performs the **single**
+/// authoritative `yt-dlp -j` metadata fetch for the video and returns the
+/// fetched [`VideoMeta`] alongside the audio path, so the renderer never
+/// re-fetches it.
 fn download_one(
     info: &YtdlpInfo,
     video: &VideoRef,
     audio_dir: &Path,
     token: &CancellationToken,
 ) -> Result<(PathBuf, VideoMeta), String> {
+    let mut attempt = 0_u32;
+    loop {
+        match download_one_attempt(info, video, audio_dir, token) {
+            Ok(ok) => return Ok(ok),
+            Err(fw_err)
+                if attempt < DOWNLOAD_IN_RUN_RETRIES && is_retryable_download_error(&fw_err) =>
+            {
+                tracing::warn!(
+                    id = %video.id,
+                    attempt = attempt + 1,
+                    retries_left = DOWNLOAD_IN_RUN_RETRIES - attempt,
+                    error = %fw_err,
+                    "transient download failure; backing off before retry"
+                );
+                jittered_backoff_sleep(attempt, token).map_err(|e| e.to_string())?;
+                attempt += 1;
+            }
+            Err(fw_err) => return Err(fw_err.to_string()),
+        }
+    }
+}
+/// One physical metadata+download pass (no retries).
+fn download_one_attempt(
+    info: &YtdlpInfo,
+    video: &VideoRef,
+    audio_dir: &Path,
+    token: &CancellationToken,
+) -> FwResult<(PathBuf, VideoMeta)> {
     let t_meta = std::time::Instant::now();
-    let meta = ytdlp::fetch_metadata(info, &video.url, token).map_err(|e| e.to_string())?;
+    let meta = ytdlp::fetch_metadata(info, &video.url, token)?;
     crate::native_engine::perf_span("yt.dl_metadata", t_meta.elapsed().as_secs_f64() * 1e3, "");
     let t_dl = std::time::Instant::now();
-    let path = ytdlp::download_audio(info, &meta, audio_dir, token).map_err(|e| e.to_string())?;
+    let path = ytdlp::download_audio(info, &meta, audio_dir, token)?;
     crate::native_engine::perf_span("yt.download", t_dl.elapsed().as_secs_f64() * 1e3, "");
     Ok((path, meta))
 }
@@ -659,8 +796,93 @@ mod tests {
             keep_audio: false,
             retry_failed: false,
             abort_on_error: false,
+            batch_size: 0,
             naming_style: naming::NamingStyle::Slug,
         }
+    }
+
+    fn vr(id: &str) -> VideoRef {
+        VideoRef {
+            id: id.to_owned(),
+            title: format!("Title {id}"),
+            url: format!("https://www.youtube.com/watch?v={id}"),
+            duration_sec: None,
+        }
+    }
+
+    // ---- bd-lun9: batch waves + transient retry classification ------------
+
+    #[test]
+    fn partition_batches_zero_size_is_single_wave() {
+        let items = vec![vr("a"), vr("b"), vr("c")];
+        let waves = partition_batches(items, 0);
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].len(), 3);
+    }
+
+    #[test]
+    fn partition_batches_chunks_and_keeps_order() {
+        let items = vec![vr("a"), vr("b"), vr("c"), vr("d"), vr("e")];
+        let waves = partition_batches(items, 2);
+        let ids: Vec<Vec<&str>> = waves
+            .iter()
+            .map(|w| w.iter().map(|v| v.id.as_str()).collect())
+            .collect();
+        assert_eq!(ids, [vec!["a", "b"], vec!["c", "d"], vec!["e"]]);
+    }
+
+    #[test]
+    fn partition_batches_size_larger_than_work_is_one_wave() {
+        let items = vec![vr("a"), vr("b")];
+        let waves = partition_batches(items, 100);
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].len(), 2);
+    }
+
+    #[test]
+    fn transient_timeouts_are_retryable_but_private_videos_are_not() {
+        assert!(is_retryable_download_error(&FwError::CommandTimedOut {
+            command: "yt-dlp".to_owned(),
+            timeout_ms: 300_000,
+            stderr_suffix: String::new(),
+        }));
+        assert!(is_retryable_download_error(&FwError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset")
+        )));
+        // Rate limiting is the canonical transient CommandFailed.
+        assert!(is_retryable_download_error(&FwError::from_command_failure(
+            "yt-dlp".to_owned(),
+            1,
+            "ERROR: HTTP Error 429: Too Many Requests".to_owned(),
+        )));
+        // Deterministic content errors must fail fast.
+        assert!(!is_retryable_download_error(
+            &FwError::from_command_failure(
+                "yt-dlp".to_owned(),
+                1,
+                "ERROR: Private video. Sign in".to_owned(),
+            )
+        ));
+        assert!(!is_retryable_download_error(&FwError::InvalidRequest(
+            "bad url".to_owned()
+        )));
+    }
+
+    #[test]
+    fn backoff_delay_never_exceeds_cap_even_at_huge_attempt() {
+        for attempt in [0_u32, 1, 5, 30, 1000] {
+            let d = backoff_delay_ms(attempt);
+            assert!(d <= DOWNLOAD_BACKOFF_CAP_MS, "attempt {attempt} -> {d}ms");
+        }
+    }
+
+    #[test]
+    fn cancellable_sleep_surfaces_expired_deadline_as_cancelled() {
+        use crate::orchestrator::CancellationToken as Tok;
+        let token = Tok::with_deadline_from_now(std::time::Duration::from_millis(0));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let err = sleep_cancellable(std::time::Duration::from_secs(60), &token).unwrap_err();
+        assert!(matches!(err, FwError::Cancelled(_)));
     }
 
     // ---- resolve_videos: bug-hunt edge cases (no network for Video forms) --
