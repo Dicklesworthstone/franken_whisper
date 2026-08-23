@@ -1949,6 +1949,8 @@ async fn run_pipeline_body(
                 .as_ref()
                 .and_then(|r| r.version.clone()),
             output_payload_hash: inter.backend_output_sha256,
+            pcm_sha256: None,
+            live_note: None,
         },
     };
 

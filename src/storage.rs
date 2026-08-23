@@ -2046,7 +2046,7 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
         let replay_placeholder = serde_json::json!({
             "kind": "live-session",
             "pcm_sha256": serde_json::Value::Null,
-            "note": "audio not retained; hash is an integrity fingerprint, not a replayable reference",
+            "live_note": "audio not retained; hash is an integrity fingerprint, not a replayable reference",
         })
         .to_string();
         self.retry_busy(|store| {
@@ -2199,6 +2199,7 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                         )
                         .map_err(|error| FwError::Storage(error.to_string()))?;
                 }
+
                 store
                     .connection
                     .execute_with_params(
@@ -2228,6 +2229,38 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                 }
             }
         })
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): the persisted listen-config
+    /// snapshot (`runs.request_json`) so downstream tooling can verify the
+    /// config round-trip without raw SQL access.
+    pub fn stored_request_json(&self, run_id: &str) -> FwResult<Option<String>> {
+        let rows = self
+            .connection
+            .query_with_params(
+                "SELECT request_json FROM runs WHERE id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(rows.first().map(|row| {
+            String::from_utf8_lossy(row.get(0).as_bytes().unwrap_or(b"")).into_owned()
+        }))
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): the raw replay envelope JSON so
+    /// downstream tooling can inspect live-session integrity metadata
+    /// (`pcm_sha256` / `live_note`) without raw SQL access.
+    pub fn stored_replay_json(&self, run_id: &str) -> FwResult<Option<String>> {
+        let rows = self
+            .connection
+            .query_with_params(
+                "SELECT replay_json FROM runs WHERE id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(rows.first().map(|row| {
+            String::from_utf8_lossy(row.get(0).as_bytes().unwrap_or(b"")).into_owned()
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -2749,13 +2782,10 @@ fn value_to_i64(value: Option<&SqliteValue>) -> i64 {
     }
 }
 
-fn parse_backend(value: &str) -> BackendKind {
-    match value {
-        "whisper_cpp" => BackendKind::WhisperCpp,
-        "insanely_fast" => BackendKind::InsanelyFast,
-        "whisper_diarization" => BackendKind::WhisperDiarization,
-        _ => BackendKind::Auto,
-    }
+fn storage_u64(value: u64, field: &str) -> FwResult<SqliteValue> {
+    i64::try_from(value)
+        .map(SqliteValue::Integer)
+        .map_err(|_| FwError::Storage(format!("{field} exceeds SQLite INTEGER range")))
 }
 
 fn is_busy_storage_error(error: &FwError) -> bool {
@@ -2786,10 +2816,14 @@ fn optional_float(value: Option<f64>) -> SqliteValue {
     }
 }
 
-fn storage_u64(value: u64, field: &str) -> FwResult<SqliteValue> {
-    i64::try_from(value)
-        .map(SqliteValue::Integer)
-        .map_err(|_| FwError::Storage(format!("{field} exceeds SQLite INTEGER range")))
+fn parse_backend(value: &str) -> BackendKind {
+    match value {
+        "whisper_cpp" => BackendKind::WhisperCpp,
+        "insanely_fast" => BackendKind::InsanelyFast,
+        "whisper_diarization" => BackendKind::WhisperDiarization,
+        "native-listen" => BackendKind::NativeListen,
+        _ => BackendKind::Auto,
+    }
 }
 
 fn storage_index(value: usize, field: &str) -> FwResult<SqliteValue> {

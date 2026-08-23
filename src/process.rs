@@ -1409,7 +1409,6 @@ pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<Stream
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::time::Duration;
 
     use crate::orchestrator::CancellationToken;
@@ -1421,16 +1420,6 @@ mod tests {
         run_command_cancellable_with_input_and_probe, run_command_cancellable_with_probe,
     };
 
-    fn assert_reported_cwd(stdout: &[u8], expected: &Path) {
-        let reported_text = String::from_utf8_lossy(stdout);
-        let reported = Path::new(reported_text.trim())
-            .canonicalize()
-            .expect("reported cwd should resolve");
-        let expected = expected
-            .canonicalize()
-            .expect("expected cwd should resolve");
-        assert_eq!(reported, expected, "reported cwd: {reported_text}");
-    }
 
     #[test]
     fn cancellable_poll_schedule_rejoins_fixed_cadence() {
@@ -2019,9 +2008,19 @@ mod tests {
 
     #[test]
     fn run_command_with_cwd() {
+        // Behavior contract, not path identity: RCH workers expose the same
+        // checkout/temp trees under different path spellings (/data vs /Users
+        // aliases), so comparing reported cwd strings is environment-sensitive.
+        // A child that creates a file relative to its cwd proves the requested
+        // directory took effect under every spelling, including root.
         let dir = tempfile::tempdir().expect("tempdir");
-        let output = run_command("pwd", &[], Some(dir.path())).expect("pwd should succeed");
-        assert_reported_cwd(&output.stdout, dir.path());
+        let marker = "fw-cwd-marker.txt";
+        run_command("touch", &[marker.to_owned()], Some(dir.path()))
+            .expect("touch should succeed");
+        assert!(
+            dir.path().join(marker).is_file(),
+            "child must resolve relative paths against the requested cwd"
+        );
     }
 
     #[test]
@@ -2234,11 +2233,25 @@ mod tests {
 
     #[test]
     fn cancellable_with_cwd_succeeds() {
+        // Same behavior contract as run_command_with_cwd: prove the requested
+        // cwd took effect via a relative-path side effect instead of comparing
+        // reported path strings, which differ across RCH /data vs /Users
+        // aliases.
         let dir = tempfile::tempdir().expect("tempdir");
+        let marker = "fw-cwd-cancellable-marker.txt";
         let cancel = CancellationToken::no_deadline();
-        let output = run_command_cancellable("pwd", &[], Some(dir.path()), &cancel, None)
-            .expect("pwd should succeed");
-        assert_reported_cwd(&output.stdout, dir.path());
+        run_command_cancellable(
+            "touch",
+            &[marker.to_owned()],
+            Some(dir.path()),
+            &cancel,
+            None,
+        )
+        .expect("touch should succeed");
+        assert!(
+            dir.path().join(marker).is_file(),
+            "cancelled-capable child must resolve relative paths against the requested cwd"
+        );
     }
 
     #[test]

@@ -1292,6 +1292,15 @@ pub struct ListenArgs {
     #[arg(long, default_value_t = 4)]
     pub confirm_queue_bound: usize,
 
+    /// Persist the session to SQLite at utterance granularity
+    /// (bd-rt-persist-a66y, crash-durable). Disabled by `--no-persist`.
+    #[arg(long)]
+    pub no_persist: bool,
+
+    /// Database file for run history (same store as batch runs).
+    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    pub db: PathBuf,
+
     /// List input devices as NDJSON and exit (no session).
     #[arg(long)]
     pub list_devices: bool,

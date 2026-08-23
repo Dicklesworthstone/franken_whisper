@@ -272,6 +272,8 @@ fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
         },
         confirm_queue_bound: args.confirm_queue_bound,
         confirm_drain_sec: args.confirm_drain_sec,
+        persist: !args.no_persist,
+        db_path: args.db.clone(),
     };
 
     // NOTE: main() already installed the Ctrl-C handler; installing twice

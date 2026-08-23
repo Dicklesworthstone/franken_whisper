@@ -847,7 +847,7 @@ pub struct ListenSessionInfo {
 
 /// Session counters for `listen.session_stats` (periodic heartbeat and the
 /// success-terminal final event).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ListenSessionStats {
     pub audio_sec: f64,
     pub wall_sec: f64,

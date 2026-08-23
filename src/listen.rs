@@ -1796,23 +1796,36 @@ impl ListenPersistSink {
     /// stats/warnings + finalized replay envelope with the PCM hash.
     pub(crate) fn close(
         mut self,
-        result_json: &str,
         warnings_json: &str,
         finished_at_rfc3339: &str,
+        language: Option<&str>,
     ) -> FwResult<String> {
         use sha2::Digest as _;
         let pcm_sha256 = format!("{:x}", std::mem::take(&mut self.pcm_hasher).finalize());
         let replay_json = serde_json::json!({
             "kind": "live-session",
             "pcm_sha256": pcm_sha256,
-            "note": "audio not retained; hash is an integrity fingerprint, not a replayable reference",
+            "live_note": "audio not retained; hash is an integrity fingerprint, not a replayable reference",
+        })
+        .to_string();
+        // Batch-shaped summary so the EXISTING loaders (`fw runs show`,
+        // load_run_details) consume listen rows unchanged. Segments stay
+        // empty here: the segments table is the authoritative store.
+        let result_json = serde_json::json!({
+            "backend": "native_listen",
+            "transcript": self.transcript_so_far,
+            "language": language,
+            "segments": [],
+            "acceleration": null,
+            "raw_output": {},
+            "artifact_paths": [],
         })
         .to_string();
         let events = std::mem::take(&mut self.pending_events);
         self.store.listen_close_run(
             &self.run_id,
             &events,
-            result_json,
+            &result_json,
             warnings_json,
             &replay_json,
             &self.transcript_so_far,
@@ -1949,8 +1962,15 @@ pub fn run_listen_session(
         "fast_model": config.fast_model,
         "language": config.language,
         "step_ms": config.step_ms,
-        "policy": config.policy,
-        "quality_model": config.quality_model,
+        "policy": match config.policy {
+            ListenPolicy::AlignAtt => "alignatt",
+            ListenPolicy::EndpointCommit => "endpoint-commit",
+        },
+        "quality_model": match &config.quality_model {
+            QualityModelSetting::Auto => "auto".to_owned(),
+            QualityModelSetting::Disabled => "none".to_owned(),
+            QualityModelSetting::Explicit(spec) => spec.clone(),
+        },
         "vad_enabled": config.vad_enabled,
         "emit_partials": config.emit_partials,
         "max_seconds": config.max_seconds,
@@ -1975,7 +1995,7 @@ pub fn run_listen_session(
     };
     // Warning payloads collected for warnings_json at close (the persisted
     // degradation trail, independent of stdout).
-    let mut persist_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut persist_warnings: Vec<String> = Vec::new();
 
     let info = ListenSessionInfo {
         source: source_label.to_owned(),
@@ -2009,7 +2029,7 @@ pub fn run_listen_session(
             "fast_model_fallback",
             serde_json::json!({"detail": message, "confirm_lane_disabled": confirm_disabled_by_fallback}),
         );
-        persist_warnings.push(value.clone());
+        persist_warnings.push("fast_model_fallback".to_owned());
         if let Some(sink) = persist_sink.as_mut() {
             sink.record_event(seq, &now_ts(), "listen.warning", &value);
         }
@@ -2058,6 +2078,13 @@ pub fn run_listen_session(
     } else {
         None
     };
+    let mut buffer = SessionBuffer::new(config.buffer.clone());
+    let mut vad = StreamingVad::new(config.vad.clone());
+    let mut watchdog = crate::capture::SilentInputWatchdog::new(
+        3.0,
+        crate::native_engine::mel::SAMPLE_RATE as u32,
+    );
+    let mut pinned_language = config.language.clone();
 
     // Session state.
     let mut utterance_id: u32 = 0;
@@ -2098,12 +2125,15 @@ pub fn run_listen_session(
                 let event_name = $value
                     .get("event")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                    .unwrap_or_default()
+                    .to_owned();
                 if event_name == "listen.warning" {
-                    persist_warnings.push($value.clone());
+                    if let Some(reason) = $value.get("reason").and_then(|v| v.as_str()) {
+                        persist_warnings.push(reason.to_owned());
+                    }
                 }
                 if let Some(sink) = persist_sink.as_mut() {
-                    sink.record_event(seq, &now_ts(), event_name, &$value);
+                    sink.record_event(seq, &now_ts(), &event_name, &$value);
                 }
             }
             emit($value)?;
@@ -2183,8 +2213,9 @@ pub fn run_listen_session(
                 &now_ts,
                 emit,
                 &mut stats,
+                &mut confirm_lag_ms,
                 &mut pending_confirm_since,
-                persist_sink.as_mut(),
+                &mut persist_sink,
             )?;
         }
 
@@ -2635,7 +2666,7 @@ pub fn run_listen_session(
                 &mut stats,
                 &mut confirm_lag_ms,
                 &mut pending_confirm_since,
-                persist_sink.as_mut(),
+                &mut persist_sink,
             )?;
         }
         if abandoned > 0 {
@@ -2675,9 +2706,15 @@ pub fn run_listen_session(
     let persist_close_error = match persist_sink.take() {
         Some(sink) => sink
             .close(
-                &serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_owned()),
-                &persist_warnings_to_json(&persist_warnings),
+                &serde_json::Value::Array(
+                    persist_warnings
+                        .iter()
+                        .map(|reason| serde_json::json!(reason))
+                        .collect::<Vec<_>>(),
+                )
+                .to_string(),
                 &now_ts(),
+                pinned_language.as_deref(),
             )
             .err(),
         None => None,
@@ -2689,14 +2726,6 @@ pub fn run_listen_session(
             "listen persistence failed on final close: {error}"
         )));
     }
-    capture.stop();
-    Ok(cancelled)
-}
-
-/// Serialize the collected warning payloads for `runs.warnings_json`.
-fn persist_warnings_to_json(warnings: &[serde_json::Value]) -> String {
-    serde_json::Value::Array(warnings.to_vec()).to_string()
-}
     capture.stop();
     Ok(cancelled)
 }
