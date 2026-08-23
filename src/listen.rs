@@ -719,6 +719,13 @@ pub struct ListenConfig {
     /// Seconds the session-end path waits for in-flight confirms before
     /// abandoning them with a `confirm_drain_timeout` warning.
     pub confirm_drain_sec: f64,
+    /// Persist the session to SQLite at utterance granularity
+    /// (bd-rt-persist-a66y). Library default OFF; the CLI turns it on
+    /// unless `--no-persist` (mirrors the batch transcribe flag).
+    pub persist: bool,
+    /// Database file for the persistence sink (canonical default:
+    /// `.franken_whisper/storage.sqlite3`, same as batch/sync tooling).
+    pub db_path: std::path::PathBuf,
 }
 
 /// `--quality-model` setting for the confirm lane (bd-rt-confirm-lane-3okr).
@@ -767,6 +774,8 @@ impl Default for ListenConfig {
             quality_model: QualityModelSetting::Auto,
             confirm_queue_bound: CONFIRM_QUEUE_DEFAULT_BOUND,
             confirm_drain_sec: CONFIRM_DRAIN_DEFAULT_SEC,
+            persist: false,
+            db_path: std::path::PathBuf::from(".franken_whisper/storage.sqlite3"),
         }
     }
 }
@@ -1659,6 +1668,160 @@ pub(crate) fn resolve_confirm_lane(
     }
 }
 
+// ---------------------------------------------------------------------------
+// bd-rt-persist-a66y: utterance-granular SQLite persistence for live runs
+// ---------------------------------------------------------------------------
+
+/// Crash-durable sink for one live session. One session = ONE run row
+/// (`backend = "native-listen"`); durability advances at UTTERANCE
+/// granularity — each closed utterance appends its delta segments plus all
+/// buffered stream events inside one savepoint transaction and bumps
+/// `finished_at` to a "last known alive" wall time (runs.finished_at is NOT
+/// NULL; a crashed session is recognizable as a listen run whose events lack
+/// the session-end marker). `transcript.partial` events are deliberately NOT
+/// persisted — ephemeral preview garnish, unlike batch where every event is
+/// kept; the divergence is documented in the storage row-type docs.
+pub(crate) struct ListenPersistSink {
+    store: crate::storage::RunStore,
+    run_id: String,
+    pending_segments: Vec<crate::storage::ListenSegmentRow>,
+    pending_events: Vec<crate::storage::ListenEventRow>,
+    transcript_so_far: String,
+    /// Streamed SHA-256 over the concatenated session PCM (16 kHz mono f32,
+    /// little-endian), fed as audio arrives. Schema-coherent integrity
+    /// metadata ONLY: the audio itself is not retained, so nothing can
+    /// verify it today (round-2 anti-ceremony correction). It becomes a
+    /// verifiable reference only if `--keep-session-audio` ever lands.
+    pcm_hasher: sha2::Sha256,
+    next_segment_idx: usize,
+}
+
+impl ListenPersistSink {
+    /// Open the store, insert the run row, and start the envelope.
+    pub(crate) fn open(
+        db_path: &std::path::Path,
+        run_id: &str,
+        started_at_rfc3339: &str,
+        input_path_label: &str,
+        request_json: &str,
+    ) -> FwResult<Self> {
+        let store = crate::storage::RunStore::open(db_path)?;
+        store.listen_open_run(&crate::storage::ListenRunOpen {
+            run_id,
+            started_at_rfc3339,
+            input_path: input_path_label,
+            request_json,
+        })?;
+        Ok(Self {
+            store,
+            run_id: run_id.to_owned(),
+            pending_segments: Vec::new(),
+            pending_events: Vec::new(),
+            transcript_so_far: String::new(),
+            pcm_hasher: sha2::Digest::new(),
+            next_segment_idx: 0,
+        })
+    }
+
+    /// Feed resampled 16 kHz mono session PCM into the streamed hash.
+    pub(crate) fn feed_pcm(&mut self, samples: &[f32]) {
+        use sha2::Digest as _;
+        for sample in samples {
+            self.pcm_hasher.update(&sample.to_le_bytes());
+        }
+    }
+
+    /// Buffer one stream event for the next flush (partials skipped).
+    pub(crate) fn record_event(
+        &mut self,
+        seq: u64,
+        ts_rfc3339: &str,
+        event_name: &str,
+        value: &serde_json::Value,
+    ) {
+        if event_name == "transcript.partial" {
+            return;
+        }
+        self.pending_events
+            .push(crate::storage::ListenEventRow {
+                seq,
+                ts_rfc3339: ts_rfc3339.to_owned(),
+                code: event_name.to_owned(),
+                payload_json: value.to_string(),
+            });
+    }
+
+    /// Buffer one committed delta slice of the open utterance.
+    pub(crate) fn record_delta(&mut self, start_sec: f64, end_sec: f64, text: &str) {
+        let idx = self.next_segment_idx;
+        self.next_segment_idx += 1;
+        self.pending_segments
+            .push(crate::storage::ListenSegmentRow {
+                idx,
+                start_sec,
+                end_sec,
+                text: text.to_owned(),
+            });
+    }
+
+    /// Append closed-utterance text to the running persisted transcript.
+    pub(crate) fn append_transcript(&mut self, utterance_text: &str) {
+        if utterance_text.is_empty() {
+            return;
+        }
+        if !self.transcript_so_far.is_empty() {
+            self.transcript_so_far.push(' ');
+        }
+        self.transcript_so_far.push_str(utterance_text);
+    }
+
+    /// Durability point: append the closed utterance's segments + buffered
+    /// events atomically and advance the last-known-alive timestamp.
+    pub(crate) fn flush_utterance(&mut self, now_rfc3339: &str) -> FwResult<()> {
+        if self.pending_segments.is_empty() && self.pending_events.is_empty() {
+            return Ok(());
+        }
+        let segments = std::mem::take(&mut self.pending_segments);
+        let events = std::mem::take(&mut self.pending_events);
+        self.store.listen_flush_utterance(
+            &self.run_id,
+            &segments,
+            &events,
+            &self.transcript_so_far.clone(),
+            now_rfc3339,
+        )
+    }
+
+    /// Close the run: drain remaining events, write true end time + final
+    /// stats/warnings + finalized replay envelope with the PCM hash.
+    pub(crate) fn close(
+        mut self,
+        result_json: &str,
+        warnings_json: &str,
+        finished_at_rfc3339: &str,
+    ) -> FwResult<String> {
+        use sha2::Digest as _;
+        let pcm_sha256 = format!("{:x}", std::mem::take(&mut self.pcm_hasher).finalize());
+        let replay_json = serde_json::json!({
+            "kind": "live-session",
+            "pcm_sha256": pcm_sha256,
+            "note": "audio not retained; hash is an integrity fingerprint, not a replayable reference",
+        })
+        .to_string();
+        let events = std::mem::take(&mut self.pending_events);
+        self.store.listen_close_run(
+            &self.run_id,
+            &events,
+            result_json,
+            warnings_json,
+            &replay_json,
+            &self.transcript_so_far,
+            finished_at_rfc3339,
+        )?;
+        Ok(pcm_sha256)
+    }
+}
+
 /// Run one live session, emitting NDJSON event values through `emit`.
 /// Returns `Ok(cancelled)` — `true` when the session ended on Ctrl-C (the
 /// caller maps that to exit code 130). Fatal errors propagate; the CLI
@@ -1766,6 +1929,54 @@ pub fn run_listen_session(
         ConfirmLane::spawn(config.confirm_queue_bound, decoder)
     });
 
+    // Persistence sink (bd-rt-persist-a66y): one run row per session,
+    // utterance-granular flushes. Open failure degrades the session to
+    // fast-only; the warning is EMITTED after session_start (streams start
+    // with session_start, always) and recorded like every other event.
+    let mut persist_open_error: Option<String> = None;
+    let input_label = match &config.source {
+        ListenSource::FileReplay { path, .. } => path.display().to_string(),
+        ListenSource::Mic { .. } => "mic".to_owned(),
+        ListenSource::StdinPcm {
+            format,
+            sample_rate,
+            channels,
+        } => format!("stdin-pcm:{format:?}/{sample_rate}Hz/{channels}ch"),
+    };
+    let request_json = serde_json::json!({
+        "kind": "listen",
+        "source": source_label,
+        "fast_model": config.fast_model,
+        "language": config.language,
+        "step_ms": config.step_ms,
+        "policy": config.policy,
+        "quality_model": config.quality_model,
+        "vad_enabled": config.vad_enabled,
+        "emit_partials": config.emit_partials,
+        "max_seconds": config.max_seconds,
+    })
+    .to_string();
+    let mut persist_sink: Option<ListenPersistSink> = if config.persist {
+        match ListenPersistSink::open(
+            &config.db_path,
+            &run_id,
+            &now_ts(),
+            &input_label,
+            &request_json,
+        ) {
+            Ok(sink) => Some(sink),
+            Err(error) => {
+                persist_open_error = Some(error.to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Warning payloads collected for warnings_json at close (the persisted
+    // degradation trail, independent of stdout).
+    let mut persist_warnings: Vec<serde_json::Value> = Vec::new();
+
     let info = ListenSessionInfo {
         source: source_label.to_owned(),
         capture_backend: capture_backend.to_owned(),
@@ -1783,31 +1994,55 @@ pub fn run_listen_session(
             "gate_db": config.vad.gate_db,
         }),
     };
-    emit(robot::listen_session_start_value(
-        &run_id,
-        seq,
-        &now_ts(),
-        &info,
-    ))?;
+    let session_start_value =
+        robot::listen_session_start_value(&run_id, seq, &now_ts(), &info);
+    if let Some(sink) = persist_sink.as_mut() {
+        sink.record_event(seq, &now_ts(), "listen.session_start", &session_start_value);
+    }
+    emit(session_start_value)?;
     seq += 1;
     if let Some(message) = &fallback_warning {
-        emit(robot::listen_warning_value(
+        let value = robot::listen_warning_value(
             &run_id,
             seq,
             &now_ts(),
             "fast_model_fallback",
             serde_json::json!({"detail": message, "confirm_lane_disabled": confirm_disabled_by_fallback}),
-        ))?;
+        );
+        persist_warnings.push(value.clone());
+        if let Some(sink) = persist_sink.as_mut() {
+            sink.record_event(seq, &now_ts(), "listen.warning", &value);
+        }
+        emit(value)?;
         seq += 1;
     }
     if let Some(message) = capture_warning {
-        emit(robot::listen_warning_value(
+        let value = robot::listen_warning_value(
             &run_id,
             seq,
             &now_ts(),
             "fallback_capture_backend",
             serde_json::json!({"detail": message}),
-        ))?;
+        );
+        persist_warnings.push(value.clone());
+        if let Some(sink) = persist_sink.as_mut() {
+            sink.record_event(seq, &now_ts(), "listen.warning", &value);
+        }
+        emit(value)?;
+        seq += 1;
+    }
+    if let Some(detail) = persist_open_error {
+        let value = robot::listen_warning_value(
+            &run_id,
+            seq,
+            &now_ts(),
+            "persist_degraded",
+            serde_json::json!({
+                "detail": format!("persistence disabled for this session: {detail}"),
+            }),
+        );
+        persist_warnings.push(value.clone());
+        emit(value)?;
         seq += 1;
     }
 
@@ -1823,14 +2058,6 @@ pub fn run_listen_session(
     } else {
         None
     };
-
-    let mut buffer = SessionBuffer::new(config.buffer.clone());
-    let mut vad = StreamingVad::new(config.vad.clone());
-    let mut watchdog = crate::capture::SilentInputWatchdog::new(
-        3.0,
-        crate::native_engine::mel::SAMPLE_RATE as u32,
-    );
-    let mut pinned_language = config.language.clone();
 
     // Session state.
     let mut utterance_id: u32 = 0;
@@ -1861,10 +2088,48 @@ pub fn run_listen_session(
         }
     };
 
+    // Emit + record: every stream event funnels through here so the
+    // persistence sink sees exactly what stdout sees (minus partials,
+    // which are deliberately not persisted). Warnings additionally
+    // collect into warnings_json for the final close.
     macro_rules! emit_seq {
         ($value:expr) => {{
+            {
+                let event_name = $value
+                    .get("event")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if event_name == "listen.warning" {
+                    persist_warnings.push($value.clone());
+                }
+                if let Some(sink) = persist_sink.as_mut() {
+                    sink.record_event(seq, &now_ts(), event_name, &$value);
+                }
+            }
             emit($value)?;
             seq += 1;
+        }};
+    }
+
+    // Utterance-granular durability point (bd-rt-persist-a66y): called at
+    // every utterance close. Flush failure emits `persist_degraded` and the
+    // session continues — live output is the product.
+    macro_rules! persist_flush {
+        () => {{
+            if let Some(sink) = persist_sink.as_mut() {
+                sink.append_transcript(&committed_text);
+            }
+            let flush_result =
+                persist_sink.as_mut().map(|sink| sink.flush_utterance(&now_ts()));
+            if let Some(Err(error)) = flush_result {
+                emit_seq!(robot::listen_warning_value(
+                    &run_id,
+                    seq,
+                    &now_ts(),
+                    "persist_degraded",
+                    serde_json::json!({"detail": error.to_string()}),
+                ));
+            }
         }};
     }
 
@@ -1918,8 +2183,8 @@ pub fn run_listen_session(
                 &now_ts,
                 emit,
                 &mut stats,
-                &mut confirm_lag_ms,
                 &mut pending_confirm_since,
+                persist_sink.as_mut(),
             )?;
         }
 
@@ -1943,6 +2208,13 @@ pub fn run_listen_session(
                     committed_text.push_str(&decision.commit_text);
                     delta_count += 1;
                     stats.deltas += 1;
+                    if let Some(sink) = persist_sink.as_mut() {
+                        sink.record_delta(
+                            utterance_t0 + utterance_committed_through,
+                            t1,
+                            &decision.commit_text,
+                        );
+                    }
                     emit_seq!(robot::transcript_delta_value(
                         &run_id,
                         seq,
@@ -1977,6 +2249,7 @@ pub fn run_listen_session(
                         language: pinned_language.clone(),
                     });
                 }
+                persist_flush!();
             }
             break 'session;
         }
@@ -2011,6 +2284,11 @@ pub fn run_listen_session(
                         "leading_silent_sec": 3.0,
                     }),
                 ));
+            }
+            // Streamed session-PCM integrity hash (bd-rt-persist-a66y):
+            // fed with the resampled 16 kHz mono stream exactly as heard.
+            if let Some(sink) = persist_sink.as_mut() {
+                sink.feed_pcm(fresh_16k);
             }
             buffer.push(fresh_16k);
             stats.audio_sec = buffer.session_duration_sec();
@@ -2076,6 +2354,13 @@ pub fn run_listen_session(
                                     stats.ttft_ms =
                                         Some(session_started.elapsed().as_secs_f64() * 1000.0);
                                 }
+                                if let Some(sink) = persist_sink.as_mut() {
+                                    sink.record_delta(
+                                        utterance_t0 + utterance_committed_through,
+                                        t_sec,
+                                        &decision.commit_text,
+                                    );
+                                }
                                 emit_seq!(robot::transcript_delta_value(
                                     &run_id,
                                     seq,
@@ -2119,6 +2404,7 @@ pub fn run_listen_session(
                                     language: pinned_language.clone(),
                                 });
                             }
+                            persist_flush!();
                             // Trim + prompt carry.
                             buffer.append_committed_text(&decision.commit_text);
                             buffer.set_committed_through(t_sec);
@@ -2153,6 +2439,13 @@ pub fn run_listen_session(
                 committed_text.push_str(&decision.commit_text);
                 delta_count += 1;
                 stats.deltas += 1;
+                if let Some(sink) = persist_sink.as_mut() {
+                    sink.record_delta(
+                        utterance_t0 + utterance_committed_through,
+                        t1,
+                        &decision.commit_text,
+                    );
+                }
                 emit_seq!(robot::transcript_delta_value(
                     &run_id,
                     seq,
@@ -2187,6 +2480,7 @@ pub fn run_listen_session(
                     language: pinned_language.clone(),
                 });
             }
+            persist_flush!();
             buffer.append_committed_text(&decision.commit_text);
             buffer.set_committed_through(t1);
             buffer.trim_to_committed();
@@ -2259,6 +2553,9 @@ pub fn run_listen_session(
                 stats.deltas += 1;
                 if stats.ttft_ms.is_none() {
                     stats.ttft_ms = Some(session_started.elapsed().as_secs_f64() * 1000.0);
+                }
+                if let Some(sink) = persist_sink.as_mut() {
+                    sink.record_delta(delta_t0, delta_t1, &decision.commit_text);
                 }
                 emit_seq!(robot::transcript_delta_value(
                     &run_id,
@@ -2338,6 +2635,7 @@ pub fn run_listen_session(
                 &mut stats,
                 &mut confirm_lag_ms,
                 &mut pending_confirm_since,
+                persist_sink.as_mut(),
             )?;
         }
         if abandoned > 0 {
@@ -2364,13 +2662,41 @@ pub fn run_listen_session(
         stats.confirm_lag_max_ms = sorted.last().copied();
     }
     fill_step_stats(&mut stats, &step_latencies_ms, session_started, &buffer);
-    emit(robot::listen_session_stats_value(
-        &run_id,
-        seq,
-        &now_ts(),
-        &stats,
-        true,
-    ))?;
+    // Final stats event is recorded into the sink BEFORE close so the
+    // persisted event trail ends exactly like the stdout stream.
+    let final_stats_value =
+        robot::listen_session_stats_value(&run_id, seq, &now_ts(), &stats, true);
+    if let Some(sink) = persist_sink.as_mut() {
+        sink.record_event(seq, &now_ts(), "listen.session_stats", &final_stats_value);
+    }
+    // Close the run: true end time + final stats/warnings + finalized
+    // replay envelope. Failure here surfaces as run_error AFTER the session
+    // events were emitted (never silently lost).
+    let persist_close_error = match persist_sink.take() {
+        Some(sink) => sink
+            .close(
+                &serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_owned()),
+                &persist_warnings_to_json(&persist_warnings),
+                &now_ts(),
+            )
+            .err(),
+        None => None,
+    };
+    emit(final_stats_value)?;
+    seq += 1;
+    if let Some(error) = persist_close_error {
+        return Err(FwError::Storage(format!(
+            "listen persistence failed on final close: {error}"
+        )));
+    }
+    capture.stop();
+    Ok(cancelled)
+}
+
+/// Serialize the collected warning payloads for `runs.warnings_json`.
+fn persist_warnings_to_json(warnings: &[serde_json::Value]) -> String {
+    serde_json::Value::Array(warnings.to_vec()).to_string()
+}
     capture.stop();
     Ok(cancelled)
 }
@@ -2404,7 +2730,65 @@ fn handle_confirm_event(
     stats: &mut ListenSessionStats,
     lag_samples_ms: &mut Vec<f64>,
     pending_since: &mut std::collections::HashMap<u32, std::time::Instant>,
+    sink: &mut Option<ListenPersistSink>,
 ) -> FwResult<()> {
+    // Record-then-emit so the persisted trail matches stdout exactly.
+    match &event {
+        ConfirmLaneEvent::Verdict(verdict) => {
+            if let Some(s) = sink.as_mut() {
+                let value = if verdict.confirmed {
+                    robot::listen_transcript_confirm_value(
+                        run_id,
+                        *seq,
+                        &now_ts(),
+                        verdict.utterance_id,
+                        &verdict.quality_model_id,
+                        verdict.drift_wer,
+                        verdict.drift_confidence_delta,
+                        verdict.drift_edit_distance,
+                        verdict.decode_ms,
+                    )
+                } else {
+                    robot::listen_transcript_correct_value(
+                        run_id,
+                        *seq,
+                        &now_ts(),
+                        verdict.utterance_id,
+                        verdict.correction_id,
+                        &verdict.corrected_segments,
+                        &verdict.quality_model_id,
+                        verdict.drift_wer,
+                        verdict.drift_confidence_delta,
+                        verdict.drift_edit_distance,
+                        verdict.decode_ms,
+                    )
+                };
+                s.record_event(*seq, &now_ts(), value["event"].as_str().unwrap_or(""), &value);
+            }
+        }
+        ConfirmLaneEvent::Warning { reason, detail } => {
+            if let Some(s) = sink.as_mut() {
+                let value = robot::listen_warning_value(run_id, *seq, &now_ts(), reason, detail.clone());
+                s.record_event(*seq, &now_ts(), "listen.warning", &value);
+            }
+        }
+        ConfirmLaneEvent::DroppedOldest { utterance_id, queue_bound } => {
+            if let Some(s) = sink.as_mut() {
+                let value = robot::listen_warning_value(
+                    run_id,
+                    *seq,
+                    &now_ts(),
+                    "confirm_lag",
+                    serde_json::json!({
+                        "detail": "confirm queue full; dropped oldest unconfirmed utterance",
+                        "dropped_utterance_id": utterance_id,
+                        "queue_bound": queue_bound,
+                    }),
+                );
+                s.record_event(*seq, &now_ts(), "listen.warning", &value);
+            }
+        }
+    }
     match event {
         ConfirmLaneEvent::Verdict(verdict) => {
             // Confirm lag = utterance_end -> verdict arrival (observation
