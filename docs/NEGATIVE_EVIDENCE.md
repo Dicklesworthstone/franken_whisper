@@ -4,6 +4,27 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-08-23 - CoralCoast (M4 Pro dev host / ovh-a worker): **REJECTED — bd-3nw3 f32→i16 quantize/write lever is sub-0.1% of e2e; do not optimize.**
+
+Probe: `examples/bd3nw3_write_probe.rs` (release, ovh-a Zen worker), 30 M samples
+(≈11.3 min of 44.1 kHz mono). Results:
+
+| Path | Time |
+|---|---|
+| quantize math alone (scalar, sanitize+clamp+scale+round) | 25.6 ms |
+| full `write_mono_wav_i16` (chunked hound writer) | **57.2 ms** |
+| pre-quantized Vec\<i16\> then hound-write | 86.9 ms (WORSE — extra pass + allocation) |
+
+The entire artifact-write stage is ~0.57 ms per minute of audio — noise against
+multi-second decode/transcribe stages. Pre-quantizing (the obvious "fix") makes
+it slower. The hound per-sample `write_sample` overhead is real (~31 ms) but
+bypassing hound's data-chunk writer would mean hand-building WAV chunks for a
+sub-millisecond win. Resample lever was already landed as the L16 SIMD probe;
+the remaining unexplored bd-3nw3 surface is DECODE-side (symphonia compressed
+decode dominates batch ingest), which is upstream-crate territory.
+
+AGENT_NAME=CoralCoast. Probe committed at examples/bd3nw3_write_probe.rs.
+
 ## 2026-08-11 - M4 Pro dev host: **OBSERVED LOSS / NO ADMISSIBLE VERDICT — two-row-block simdgroup GEMM (128 threads / 4 simdgroups) trailed the 256-thread / 8-simdgroup layout.**
 
 No numerical same-invocation A/A null control was recorded, so the observation
