@@ -140,6 +140,19 @@ impl SessionBuffer {
         &self.samples
     }
 
+    /// The decode window starting at an absolute session time (clamped to
+    /// the buffered range). The driver slices each utterance's decodes to
+    /// the utterance span so the keep-back / min-tail audio retained from
+    /// the PREVIOUS utterance is never re-transcribed — the first live
+    /// session showed exactly that seam duplication (text from utterance
+    /// N-1 reappearing in N's transcript) when decoding the whole buffer.
+    #[must_use]
+    pub fn window_from(&self, session_sec: f64) -> &[f32] {
+        let absolute = seconds_to_samples(session_sec.max(0.0)) as u64;
+        let start = absolute.saturating_sub(self.trimmed) as usize;
+        &self.samples[start.min(self.samples.len())..]
+    }
+
     /// Buffered audio duration in seconds.
     #[must_use]
     pub fn buffer_sec(&self) -> f64 {
@@ -1112,9 +1125,13 @@ pub fn run_listen_session(
         }};
     }
 
-    // One decode over the current buffer.
-    let mut decode_buffer = |buffer: &SessionBuffer,
-                             pinned_language: &Option<String>|
+    // One decode over the CURRENT UTTERANCE's audio (sliced from the
+    // rolling buffer at the utterance start so previous-utterance
+    // keep-back audio is never re-transcribed; linguistic continuity
+    // comes from the prompt carry instead).
+    let mut decode_utterance = |buffer: &SessionBuffer,
+                                from_sec: f64,
+                                pinned_language: &Option<String>|
      -> FwResult<crate::native_engine::decode::DecodeOutput> {
         let params = DecodeParams {
             language: pinned_language.clone(),
@@ -1125,7 +1142,7 @@ pub fn run_listen_session(
             n_threads: 4,
             ..DecodeParams::default()
         };
-        model.transcribe(buffer.window(), &params, &checkpoint)
+        model.transcribe(buffer.window_from(from_sec), &params, &checkpoint)
     };
 
     'session: loop {
@@ -1138,7 +1155,7 @@ pub fn run_listen_session(
         if cancelled || out_of_time || source_ended {
             // Final flush when speech is open.
             if in_speech {
-                let out = decode_buffer(&buffer, &pinned_language)?;
+                let out = decode_utterance(&buffer, utterance_t0, &pinned_language)?;
                 let decision = EmissionPolicy::finalize(&mut policy, &out, &buffer);
                 let t1 = buffer.session_duration_sec();
                 if !decision.commit_text.is_empty() {
@@ -1241,7 +1258,7 @@ pub fn run_listen_session(
                     VadEdge::Endpoint { t_sec } => {
                         if in_speech {
                             let flush_started = std::time::Instant::now();
-                            let out = decode_buffer(&buffer, &pinned_language)?;
+                            let out = decode_utterance(&buffer, utterance_t0, &pinned_language)?;
                             if pinned_language.is_none() {
                                 pinned_language.clone_from(&out.language);
                             }
@@ -1304,7 +1321,7 @@ pub fn run_listen_session(
             && session_started.elapsed().as_secs_f64() - utterance_started_at
                 >= config.max_utterance_sec
         {
-            let out = decode_buffer(&buffer, &pinned_language)?;
+            let out = decode_utterance(&buffer, utterance_t0, &pinned_language)?;
             let decision = EmissionPolicy::finalize(&mut policy, &out, &buffer);
             let t1 = buffer.session_duration_sec();
             if !decision.commit_text.is_empty() {
@@ -1370,7 +1387,7 @@ pub fn run_listen_session(
         // -- step decode (mid-utterance partials) ---------------------------
         if in_speech && std::time::Instant::now() >= next_step {
             let step_started = std::time::Instant::now();
-            let out = decode_buffer(&buffer, &pinned_language)?;
+            let out = decode_utterance(&buffer, utterance_t0, &pinned_language)?;
             if pinned_language.is_none() {
                 pinned_language.clone_from(&out.language);
             }
