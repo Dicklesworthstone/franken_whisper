@@ -1362,13 +1362,16 @@ pub fn run_listen_session(
         let params = DecodeParams {
             language: pinned_language.clone(),
             timestamps: true,
-            // bd-hlxb evidence (2026-08-23): AudioCtxPolicy::Auto currently
-            // yields ZERO tokens on real speech slices (driver A/B on jfk:
-            // Auto = empty transcripts + 3-25x decode time from window
-            // retries; Full = correct per-utterance text). Full is the safe
-            // default until the Auto path is fixed; flipping back is the
-            // single biggest listen-latency lever (see bd-rt-audio-ctx).
-            audio_ctx: AudioCtxPolicy::Full,
+            // Auto re-enabled (bd-rt-audio-ctx-auto-empty-4c2i fixed): the
+            // empty-transcript failure was the last-window rescue requiring
+            // has_ts (whisper.cpp keys it on seek coverage alone), and the
+            // repetition loops were an under-conditioned encoder below the
+            // new AUTO_MIN_ENC_CTX floor. Probe (audio_ctx_auto_probe):
+            // Auto tracks Full's text on jfk slices at 2-4x less decode.
+            audio_ctx: AudioCtxPolicy::Auto,
+            // Live caption stream: bracket-noise markers ([BLANK_AUDIO],
+            // [MUSIC]) on trailing-silence windows are chatter, not text.
+            suppress_nst: true,
             bypass_transcript_cache: true,
             record_token_attn,
             initial_prompt: buffer.prompt(),

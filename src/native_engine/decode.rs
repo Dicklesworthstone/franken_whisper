@@ -95,6 +95,12 @@ const MAX_INITIAL_TS_SEC: f32 = 1.0;
 /// `n_audio_ctx`, never this truncated ctx — whisper.cpp 6322) is unaffected.
 const MIN_ENC_CTX: usize = 64;
 
+/// Quality floor for [`AudioCtxPolicy::Auto`]'s derived context. Below this
+/// the encoder is too under-conditioned for reliable decoding (repetition
+/// loops, dropped clauses — probe evidence on the policy's doc). `Fixed`
+/// deliberately bypasses it: an explicit cap is the caller's decision.
+const AUTO_MIN_ENC_CTX: usize = 512;
+
 /// Full-model encoder context for a 30 s window (`FRAMES_PER_CHUNK / 2`). The
 /// tail-truncation derivation never exceeds this.
 const FULL_ENC_CTX: usize = FRAMES_PER_CHUNK / 2;
@@ -372,7 +378,14 @@ impl AudioCtxPolicy {
         let auto = real_frames.div_ceil(2).clamp(MIN_ENC_CTX, FULL_ENC_CTX);
         match self {
             Self::Full => FULL_ENC_CTX,
-            Self::Auto => auto,
+            // Auto floors at AUTO_MIN_ENC_CTX for QUALITY, not shape
+            // validity: tiny.en on jfk slices at ctx 110/150/221 loops and
+            // degrades ("And so my fellow American," x4 inside one window;
+            // sentence doubling) — the under-conditioned encoder starves the
+            // decoder — while ctx >= ~512 tracks Full-ctx text (probe:
+            // examples/audio_ctx_auto_probe.rs, bd-rt-audio-ctx-auto-empty).
+            // A 512 floor still cuts the per-step encode ~3x vs Full.
+            Self::Auto => auto.max(AUTO_MIN_ENC_CTX.min(FULL_ENC_CTX)),
             Self::Fixed(n) => fixed_enc_ctx_clamped(n).min(auto),
         }
     }
@@ -1253,12 +1266,15 @@ fn beam_decode_window(
             }
 
             let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
-            let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+            let covers_audio_end = seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+            let reached_end = has_ts && covers_audio_end;
             let terminate = bail || tok == tk.eot || budget_reached || reached_end;
 
             if terminate {
                 if !bail {
-                    if result_len == 0 && params.timestamps && reached_end {
+                    // Coverage-keyed rescue, has_ts-free (whisper.cpp
+                    // 7391-7396 parity; see the greedy path's comment).
+                    if result_len == 0 && params.timestamps && covers_audio_end {
                         result_len = i + 1;
                     }
                     if !params.timestamps {
@@ -3227,10 +3243,22 @@ fn transcribe_samples_uncached(
                     // onward, so the token at index `i == mt` is the forced closer and
                     // the window completes here with `decoded.len() == mt + 1`.
                     let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
-                    let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+                    let covers_audio_end = seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+                    let reached_end = has_ts && covers_audio_end;
                     if tok == tk.eot || budget_reached || reached_end {
                         if result_len == 0 && params.timestamps {
-                            if reached_end {
+                            // whisper.cpp 7391-7396: the rescue keys on seek
+                            // COVERAGE alone, never on has_ts. A window that
+                            // closes at eot having emitted only <|0.00|>
+                            // (== timestamp_begin, so has_ts stays false) plus
+                            // text still yields its tokens when it covers the
+                            // remaining audio (seek_delta_cs is still CHUNK_CS
+                            // then, so any final window qualifies — exactly
+                            // whisper.cpp's arithmetic). Requiring has_ts here
+                            // discarded real speech as an empty window on
+                            // truncated-ctx slices (bd-rt-audio-ctx-auto-empty:
+                            // 4.42 s jfk slice under AudioCtxPolicy::Auto).
+                            if covers_audio_end {
                                 result_len = i + 1;
                             } else {
                                 // Decoder failed with no timestamps closed.
@@ -5397,12 +5425,19 @@ mod tests {
 
     #[test]
     fn audio_ctx_effective_enc_ctx_bands() {
-        // Auto = ceil(real/2) clamped: the proven tail math, FIRST WINDOW
-        // INCLUDED (a live session is all first window).
-        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(24), MIN_ENC_CTX);
-        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(128), MIN_ENC_CTX);
-        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(129), MIN_ENC_CTX + 1);
-        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(600), 300);
+        // Auto = ceil(real/2) clamped, then floored at AUTO_MIN_ENC_CTX for
+        // decode QUALITY (bd-rt-audio-ctx-auto-empty: repetition loops below
+        // it), FIRST WINDOW INCLUDED (a live session is all first window).
+        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(24), AUTO_MIN_ENC_CTX);
+        assert_eq!(
+            AudioCtxPolicy::Auto.effective_enc_ctx(128),
+            AUTO_MIN_ENC_CTX
+        );
+        assert_eq!(
+            AudioCtxPolicy::Auto.effective_enc_ctx(600),
+            AUTO_MIN_ENC_CTX
+        );
+        assert_eq!(AudioCtxPolicy::Auto.effective_enc_ctx(1200), 600);
         assert_eq!(
             AudioCtxPolicy::Auto.effective_enc_ctx(FRAMES_PER_CHUNK),
             FULL_ENC_CTX
@@ -5423,13 +5458,18 @@ mod tests {
         // exact floor/ceiling boundary lengths hold without panicking.
         for rf in 50..=2950 {
             let ctx = AudioCtxPolicy::Auto.effective_enc_ctx(rf);
-            let expected = rf.div_ceil(2).clamp(MIN_ENC_CTX, FULL_ENC_CTX);
+            let expected = rf
+                .div_ceil(2)
+                .clamp(MIN_ENC_CTX, FULL_ENC_CTX)
+                .max(AUTO_MIN_ENC_CTX);
             assert_eq!(ctx, expected, "real_frames={rf}");
-            assert!((MIN_ENC_CTX..=FULL_ENC_CTX).contains(&ctx));
+            assert!((AUTO_MIN_ENC_CTX..=FULL_ENC_CTX).contains(&ctx));
         }
+        // Short audio floors at the QUALITY floor (bd-rt-audio-ctx-auto-empty:
+        // under-conditioned encoders loop below it), not the shape minimum.
         assert_eq!(
             AudioCtxPolicy::Auto.effective_enc_ctx(2 * MIN_ENC_CTX),
-            MIN_ENC_CTX
+            AUTO_MIN_ENC_CTX
         );
         assert_eq!(
             AudioCtxPolicy::Auto.effective_enc_ctx(FRAMES_PER_CHUNK),
@@ -5451,14 +5491,14 @@ mod tests {
         let full = DecodeParams::default();
         // Env truncation OFF (tail_truncate=false): Auto still truncates the
         // FIRST window (env gates ignored); Full stays byte-exact full.
-        assert_eq!(resolve_window_enc_ctx(&auto, 600, true, false), 300);
+        assert_eq!(resolve_window_enc_ctx(&auto, 600, true, false), 512);
         assert_eq!(
             resolve_window_enc_ctx(&full, 600, true, false),
             FULL_ENC_CTX
         );
         // Env truncation ON: Auto identical (env irrelevant); Full truncates a
         // non-first short window exactly as today, never the first.
-        assert_eq!(resolve_window_enc_ctx(&auto, 600, false, true), 300);
+        assert_eq!(resolve_window_enc_ctx(&auto, 600, false, true), 512);
         assert_eq!(resolve_window_enc_ctx(&full, 600, false, true), 300);
         assert_eq!(resolve_window_enc_ctx(&full, 600, true, true), FULL_ENC_CTX);
         // Fixed caps regardless of gates.
