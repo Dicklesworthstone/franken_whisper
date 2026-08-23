@@ -216,3 +216,14 @@ is 0.89× on this AVX2-no-VNNI box). No autonomously-landable byte-exact perf le
 swept, fresh shipped-tiny.en encoder profile = exp `__expf_fma` ~9% [poly-exp owns it: turbo-on,
 tiny.en regressed-off] + rayon `__sched_yield` [contention-inflated] + int8-GEMM bulk — no new
 hot spot).
+
+**Update 2026-08-23 (post-dates the verdicts above):** the blanket
+"encoder FLOP-reduction is measured dead on CPU" conclusion predates the
+2026-07-31 flagship row. Structural token merging landed as a WER-certified
+lever (`FW_TOME_R`, `src/native_engine/encoder.rs`) and now carries the
+live-incumbent whole-job record — large-v3-turbo **2.992045×** vs
+`whisper-cli`, same-invocation, dual A/A nulls in `[0.98, 1.02]`
+(`docs/PERF_LEDGER.md`). Treat per-axis closures above as historical
+evidence scoped to the configurations they tested, and re-read the newest
+ledger rows before writing off any axis. The owner/infra lever list
+(GPU stack, real draft model, AVX-512-VNNI) is unaffected.

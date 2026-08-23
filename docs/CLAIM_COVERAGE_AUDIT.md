@@ -3,6 +3,16 @@
 **Date:** 2026-07-30, re-verified after the flagship row on 2026-07-31 ·
 **Auditor:** MagentaMeadow (cc lane), re-run by BlackThrush · **Bead:** bd-b4hp
 
+> **Addendum 2026-08-23.** The 45 / 4 / 41 count below is a snapshot as of
+> 2026-07-31 and predates the newest admissible row it helped force: the
+> large-v3-turbo whole-job ratio improved to **2.992045×** (ToMe R=500,
+> same-invocation incumbent, dual A/A nulls in `[0.98, 1.02]`, CI95 excluding
+> 1.0 — `docs/PERF_LEDGER.md`). The README headline now quotes that newer
+> row; note its WER figure is the **control arm's** cross-engine WER
+> (0.010753), while the shipped R=500 arm's own cross-engine WER on the same
+> clip was higher (0.025090). Re-run `scripts/claim_coverage_audit.py` at
+> read time rather than trusting either snapshot.
+
 **Reproduce with `python3 scripts/claim_coverage_audit.py [--detail]`.** The
 first publication of this audit stated its method in prose but shipped no
 script, so the headline could not be re-derived by a reader. It now can be.
@@ -136,3 +146,12 @@ that self-labels `NON-CAMPAIGN` is excluded from the supported set even though
 it does quote a live incumbent run. Without the date rule the population reads
 46, which is why the two published totals must be quoted together with the
 rule that produced them.
+
+---
+
+**Addendum 2026-08-23.** Item 3 of the conversion queue (publishing the beam
+path's negative result) remains open: the ledger records native
+`retry+beam5` at roughly 3–4.6× slower than `whisper-cli -bs 5` on long-form,
+and no engine-level conversion has landed since this audit. The greedy-only
+public claim is unchanged and still matches the shipped default
+(`FW_BEAM_SIZE` unset ⇒ greedy).

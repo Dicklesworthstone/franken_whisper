@@ -54,7 +54,7 @@
 - [x] optional frankentui human interface.
 
 ### Phase 5 (native-engine convergence)
-- [~] Replace bridge adapters with native Rust engine implementations under one engine contract (formal `Engine` trait defined with `name()`, `kind()`, `capabilities()`, `is_available()`, `run()`; `EngineCapabilities` struct; native pilots now exist for whisper.cpp / insanely-fast / diarization with runtime dispatch control via `FRANKEN_WHISPER_NATIVE_EXECUTION` + rollout stage; bridge adapters remain default/safety fallback while pilots converge).
+- [x] Replace bridge adapters with native Rust engine implementations under one engine contract (formal `Engine` trait defined with `name()`, `kind()`, `capabilities()`, `is_available()`, `run()`; `EngineCapabilities` struct). SHIPPED: the pure-Rust Whisper engine in `src/native_engine/` is the product default at rollout stage `sole` (`FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE=sole`, native execution on by default); bridge adapters remain available only as explicit operator opt-in compatibility paths. Live-incumbent matched-greedy benchmark rows live in `docs/PERF_LEDGER.md`.
 - [x] Land conformance harness with explicit compatibility tolerances (text/timestamp/speaker/calibration envelopes; `SegmentCompatibilityTolerance` with configurable timestamp/text/speaker tolerance; `SegmentComparisonReport` with per-axis drift counts; fixture-driven cross-engine tests in `tests/conformance_harness.rs`).
 - [x] Seed fixture-driven conformance harness (`tests/conformance_harness.rs`) with golden-corpus comparison fixtures and expand to corpus-scale replay checks (`compare_segments_with_tolerance`, `compare_replay_envelopes`).
 - [x] Add bridge-vs-native corpus pair gating and machine-readable conformance artifact bundle emission (`target/conformance/bridge_native_conformance_bundle.json` from `tests/conformance_harness.rs`).
@@ -72,21 +72,31 @@
   segmentation, robust hard/soft known-interval enrollment, deterministic
   constrained clustering, temporal smoothing, and word-safe transcript
   projection.
-- [x] Integrate explicit `auto|acoustic|external|neural` selection, typed
-  fallback, stable robot provenance events, cancellation, and DTW/VAD boundary
-  hints into the canonical `Diarize` stage.
+- [x] Integrate explicit `auto|sortformer|acoustic|external|ecapa|ecapa_fused`
+  engine selection, typed fallback policies, stable robot provenance events
+  (`diarize.rollout`), cancellation, and DTW/VAD boundary hints into the
+  canonical `Diarize` stage. The obsolete `neural` spelling is retired.
 - [x] Persist normalized reports/turns/hint audits/privacy-safe profile
-  summaries in schema v4 and deterministically rebuild them after JSONL import.
+  summaries in schema v4/v5 and deterministically rebuild them after JSONL
+  import.
 - [x] Quarantine the historical six-dimensional text/temporal clusterer from
   acoustic and verified-external evidence gates.
-- [~] Promote `auto` through
-  Shadow -> Validated -> Fallback -> Primary -> Sole. Default remains `shadow`;
-  explicit `--diarization-engine acoustic` is available for focused use.
-- [ ] Certify public-corpus DER/JER/calibration and same-host performance.
-  Hermetic synthetic tests prove invariants and determinism, not real-corpus
-  accuracy.
-- [ ] Add the optional ECAPA-style neural implementation tracked by `bd-ohex`
-  behind the same output, supervision, privacy, and rollback contract.
+- [x] Ship native Streaming Sortformer as the `auto` default (pinned
+  `sortformer-v2.1-f32-v1` package, four anonymous lanes, recommended
+  340/40/40/300/188 cache profile, byte-exact L8 turns vs the NeMo adapter on
+  the parity row per DISC-007); capacity-ineligible or missing-package
+  requests fall back to the Rust acoustic engine. Legacy acoustic-only
+  admission control (`FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT`) remains
+  `shadow` by default, and both engines stay development-uncertified until
+  the public-corpus gates close.
+- [ ] Certify public-corpus DER/JER/calibration and same-host performance
+  (open under `bd-odj7.13*`). Hermetic synthetic tests prove invariants and
+  determinism, not real-corpus accuracy.
+- [x] Add the optional ECAPA-style neural implementation behind the same
+  output, supervision, privacy, and rollback contract (`--diarization-engine
+  ecapa` / `ecapa-fused`, pinned user-provided safetensors,
+  `src/ecapa_inference.rs`); its public-corpus accuracy/calibration
+  certification remains open under `bd-ohex.4`.
 
 ## Non-Negotiable Contracts
 

@@ -148,7 +148,7 @@ Required tags (per `REQUIRED_CORPUS_TAGS`):
 
 ## Known Divergences
 
-See [DISCREPANCIES.md](/DISCREPANCIES.md) for intentional deviations:
+See [DISCREPANCIES.md](../docs/planning/DISCREPANCIES.md) for intentional deviations:
 
 | ID | Description | Resolution |
 |----|-------------|:----------:|

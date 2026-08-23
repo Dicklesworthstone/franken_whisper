@@ -86,7 +86,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 - **A real in-process Whisper engine, in pure Rust.** ggml model parsing, log-mel frontend, encoder/decoder transformer inference on FrankenTorch CPU kernels, greedy decoding with whisper.cpp's full timestamp-rule suite, and cross-attention DTW word timestamps. No FFI, no Python, no subprocess — drop a ggml model file in place and transcribe.
 - **Rust-native Sortformer speaker diarization by default.** The in-process fused model emits anonymous activity lanes and overlapping turns for up to four speakers, then projects that independent timeline onto Whisper segments. It remains development-uncertified: four lanes are a hard capacity boundary, not proof that a recording has no additional speakers. Known intervals and requests beyond that capacity use the bounded acoustic path, which is an available but uncertified fallback. Explicit ECAPA modes remain available for experiments with pinned speaker embeddings. None of these modes claims gender or biometric identity.
 - **Adaptive Bayesian backend routing.** Each `auto` request runs a formal decision contract with an explicit loss matrix, per-backend Beta posteriors, Brier-scored calibration, and deterministic fallback when the model is mis-calibrated.
-- **Real-time NDJSON streaming.** Every pipeline stage emits sequenced, timestamped events on stable schema `v1.0.0`. No fragile regex; agents parse JSON.
+- **Real-time NDJSON streaming.** Every pipeline stage emits sequenced, timestamped events on stable schema `v1.1.0` (the 1.0.0 contract plus the additive listen-event family). No fragile regex; agents parse JSON.
 - **Durable run history.** Every transcription persists to SQLite with full event logs, replay envelopes, and JSONL export/import, even when the process crashes mid-run.
 - **Cooperative cancellation.** Ctrl+C propagates through the pipeline via
   cancellation tokens. Owned subprocess trees are terminated and verified,
@@ -173,7 +173,7 @@ cat frames.ndjson | franken_whisper tty-audio decode --output restored.wav
 
 ### Agent-First, Human-Optional
 
-The primary interface is `robot`. Every command in robot mode emits sequenced, timestamped NDJSON on stdout with schema version `1.0.0`. Human-friendly output (`transcribe` without `--json`) is the exception. Robot mode never mixes decorative stderr into the data stream; structured `run_error` envelopes replace human prose even for argument-parsing failures.
+The primary interface is `robot`. Every command in robot mode emits sequenced, timestamped NDJSON on stdout with schema version `1.1.0` (bumped additively from `1.0.0` when the listen event family landed; batch events are unchanged). Human-friendly output (`transcribe` without `--json`) is the exception. Robot mode never mixes decorative stderr into the data stream; structured `run_error` envelopes replace human prose even for argument-parsing failures.
 
 ### Deterministic by Default
 
@@ -277,7 +277,7 @@ Most tools occupy one level. `franken_whisper` is the orchestration layer: it wr
 | ffmpeg required? | for non-WAV | always | always | **fallback only (video + exotic codecs + mic)** |
 | Video audio extraction | — | — | — | **automatic via `-vn`** |
 | TTY audio transport | — | — | — | **mulaw + zlib + base64 NDJSON** |
-| Microphone capture | — | — | — | **ALSA / AVFoundation / DirectShow via ffmpeg** |
+| Microphone capture | — | — | — | **cpal (CoreAudio/ALSA/WASAPI) with ffmpeg fallback** |
 | Auto-provisioned ffmpeg | — | — | — | **downloads static binary if missing (Linux x86_64)** |
 
 ### Commercial API Comparison
@@ -314,7 +314,7 @@ opt-out. An offline install accepts a preseeded verified cache or requires
 provisioning drops back to the validated invoking user so the packages do not
 land in root's private cache. A release download failure never silently falls
 back to a source build; use `--from-source` explicitly. Before a fresh model
-pull, the installer requires at least 2.25 GB free on the cache filesystem; an
+pull, the installer requires at least 2.4 GB free on the cache filesystem; an
 already-complete cache is admitted after both compiled trust roots are verified.
 
 Options:
@@ -433,14 +433,14 @@ franken_whisper transcribe --input audio.mp3 --language ja --json
 franken_whisper robot run --input audio.mp3 --backend auto
 ```
 
-Output (one JSON object per line, schema `1.0.0`):
+Output (one JSON object per line, schema `1.1.0`):
 
 ```json
-{"event":"run_start","schema_version":"1.0.0","request":{"input":"audio.mp3","backend":"auto"}}
-{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":1,"ts":"2026-07-28T00:00:00Z","stage":"ingest","code":"ingest.start","message":"materializing input","payload":{}}
-{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":2,"ts":"2026-07-28T00:00:01Z","stage":"normalize","code":"normalize.ok","message":"audio normalized","payload":{}}
-{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":3,"ts":"2026-07-28T00:00:02Z","stage":"backend","code":"backend.routing.decision_contract","message":"routing decision","payload":{"chosen_action":"try_whisper_cpp"}}
-{"event":"run_complete","schema_version":"1.0.0","run_id":"...","trace_id":"...","started_at":"2026-07-28T00:00:00Z","finished_at":"2026-07-28T00:00:03Z","backend":"whisper_cpp","language":"en","transcript":"Hello world...","segments":[],"acceleration":null,"diarization":null,"warnings":[],"evidence":[]}
+{"event":"run_start","schema_version":"1.1.0","request":{"input":"audio.mp3","backend":"auto"}}
+{"event":"stage","schema_version":"1.1.0","run_id":"...","seq":1,"ts":"2026-07-28T00:00:00Z","stage":"ingest","code":"ingest.start","message":"materializing input","payload":{}}
+{"event":"stage","schema_version":"1.1.0","run_id":"...","seq":2,"ts":"2026-07-28T00:00:01Z","stage":"normalize","code":"normalize.ok","message":"audio normalized","payload":{}}
+{"event":"stage","schema_version":"1.1.0","run_id":"...","seq":3,"ts":"2026-07-28T00:00:02Z","stage":"backend","code":"backend.routing.decision_contract","message":"routing decision","payload":{"chosen_action":"try_whisper_cpp"}}
+{"event":"run_complete","schema_version":"1.1.0","run_id":"...","trace_id":"...","started_at":"2026-07-28T00:00:00Z","finished_at":"2026-07-28T00:00:03Z","backend":"whisper_cpp","language":"en","transcript":"Hello world...","segments":[],"acceleration":null,"diarization":null,"warnings":[],"evidence":[]}
 ```
 
 ### 3. Speaker Diarization
@@ -1307,7 +1307,7 @@ franken_whisper robot health
 franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 ```
 
-**Robot Event Catalog (schema `1.0.0`):**
+**Robot Event Catalog (schema `1.1.0`; the six `listen.*` / speech-lifecycle events of the realtime driver are additive members of the same contract):**
 
 | Event | Description |
 |-------|-------------|
@@ -1338,7 +1338,7 @@ gap is never stderr-only.
 ```json
 {
   "event": "health.report",
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "ts": "2026-04-25T00:00:00Z",
   "backends": [
     {"name": "whisper.cpp", "available": true, "path": "/usr/local/bin/whisper-cli", "version": "1.7.2", "issues": []}
@@ -1844,12 +1844,12 @@ For severely corrupted databases the recovery path is JSONL-based: export from a
 **Cancellation-Safe Writes.** The token-checkpoint pattern ensures no partial data reaches the database:
 
 ```
-SAVEPOINT sp_persist_N
+SAVEPOINT fw_persist_N
   INSERT INTO runs ...
   INSERT INTO segments ... (N rows)
   INSERT INTO events ... (M rows)
   token.checkpoint()?       -- rolls back if cancelled
-RELEASE SAVEPOINT sp_persist_N
+RELEASE SAVEPOINT fw_persist_N
 ```
 
 If the token fires between inserts, the savepoint rolls back cleanly. If the process is killed during `RELEASE`, SQLite's journal recovery handles it on next open. Savepoints (not top-level transactions) let concurrent sessions nest persist calls without deadlocking.
@@ -2536,7 +2536,7 @@ these warnings to hard errors.
 Multi-armed bandits (UCB, Thompson sampling) optimize for a single reward signal. Backend selection involves multiple conflicting objectives (latency, quality, failure risk) that vary per request (diarization changes the optimal backend). The Bayesian decision contract with an explicit loss matrix handles this naturally: each (state, action) pair has a multi-factor cost, and the posterior captures per-backend reliability independent of the cost model. Bandits would have to collapse the multi-factor cost into a single scalar reward, losing the ability to reason about tradeoffs.
 
 **Why savepoints instead of top-level transactions?**
-Top-level `BEGIN/COMMIT` transactions don't nest in SQLite. If a caller is already inside a transaction (for example, a concurrent session), a nested `BEGIN` either fails or starts an implicit savepoint depending on the driver. Explicit `SAVEPOINT` / `RELEASE` always nest correctly and make the isolation boundaries visible in the code. The naming convention (`sp_persist_N`, `fw_session_name`) provides debuggability when inspecting WAL state.
+Top-level `BEGIN/COMMIT` transactions don't nest in SQLite. If a caller is already inside a transaction (for example, a concurrent session), a nested `BEGIN` either fails or starts an implicit savepoint depending on the driver. Explicit `SAVEPOINT` / `RELEASE` always nest correctly and make the isolation boundaries visible in the code. The naming convention (`fw_persist_N` for persistence, `fw_session_<name>` for concurrent sessions) provides debuggability when inspecting WAL state.
 
 **Why mu-law over Opus for TTY audio?**
 Opus would require either an FFI binding to `libopus` with a new unsafe boundary
@@ -2817,7 +2817,7 @@ The interactive TUI (`--features tui`) provides a three-pane interface:
 
 ### Microphone Capture
 
-Live microphone capture is the only path that requires ffmpeg (file transcription uses the built-in decoder). The capture path adapts to the host OS:
+`transcribe --mic` (batch capture) shells out to ffmpeg using the host's input framework; the realtime `fw robot listen` driver prefers **cpal** (CoreAudio / ALSA / WASAPI) and falls back to ffmpeg when cpal cannot open a device:
 
 | OS | ffmpeg Format | Default Device | Notes |
 |----|--------------|----------------|-------|
@@ -2825,7 +2825,7 @@ Live microphone capture is the only path that requires ffmpeg (file transcriptio
 | macOS | `avfoundation` | `:0` | First audio input device |
 | Windows | `dshow` | `audio=default` | DirectShow |
 
-The microphone flow:
+The batch microphone flow:
 
 1. Spawn ffmpeg with `-f <format> -i <device> -t <seconds> -ar 16000 -ac 1 -c:a pcm_s16le <output>`
 2. Wait for capture to complete (bounded by `--mic-seconds`)
@@ -3675,12 +3675,12 @@ Step by step, when you run `franken_whisper transcribe --input meeting.mp3 --jso
 
 10. PERSIST STAGE (budget: 20s)
    emit: stage { code: "persist.start" }
-   SAVEPOINT sp_persist_1
+   SAVEPOINT fw_persist_1
      INSERT INTO runs (run_id, started_at, ...)
      INSERT INTO segments (42 rows)
      INSERT INTO events (8 rows)
      token.checkpoint() -> Ok (not cancelled)
-   RELEASE SAVEPOINT sp_persist_1
+   RELEASE SAVEPOINT fw_persist_1
    emit: stage { code: "persist.ok" }
 
 11. LATENCY PROFILING
@@ -3861,7 +3861,7 @@ The built-in Rust decoder handles MP3, AAC, FLAC, WAV, OGG, Vorbis, and ALAC nat
 
 ### Agent consumption is the primary interface
 
-The `robot` subcommand is the *primary* interface: sequenced NDJSON events with stable schema versioning (v1.0.0), 13 exact terminal error codes, health diagnostics, routing history, speculation events, and structured error envelopes even for argument-parsing failures.
+The `robot` subcommand is the *primary* interface: sequenced NDJSON events with stable schema versioning (v1.1.0), 13 exact terminal error codes, health diagnostics, routing history, speculation events, and structured error envelopes even for argument-parsing failures.
 
 ### Audited Rust safety boundaries
 
@@ -4379,14 +4379,17 @@ VACUUM;
 **Backup procedure (recommended):**
 
 ```bash
-# 1. Export the database state to portable JSONL (incremental or full)
-franken_whisper sync export-jsonl --output backup/$(date +%F)/ --gzip
+# 1. Export the database state to portable JSONL
+franken_whisper sync export-jsonl --output backup/$(date +%F)/
 
-# 2. Verify the export integrity
+# 2. Gzip out-of-band (import reads .jsonl.gz transparently)
+gzip backup/$(date +%F)/*.jsonl
+
+# 3. Verify the export integrity against the live database
 franken_whisper sync import-jsonl --input backup/$(date +%F)/ \
-  --conflict-policy skip --dry-run
+  --conflict-policy skip
 
-# 3. Copy the snapshot off-host
+# 4. Copy the snapshot off-host
 rsync -a backup/$(date +%F)/ user@host:/srv/franken_whisper/backups/
 ```
 
@@ -4764,7 +4767,7 @@ idx,start_sec,end_sec,speaker,text,confidence
 ```jsonc
 {
   "event": "health.report",
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "ts": "2026-05-17T12:34:56Z",
   "backends": [                       // one entry per known backend
     {
@@ -4809,7 +4812,7 @@ idx,start_sec,end_sec,speaker,text,confidence
 - `degraded`: one or more backends missing but at least one usable; or ffmpeg missing but the built-in decoder covers the formats actually being used.
 - `error`: no backends available, OR database integrity check failed, OR critical dependency missing.
 
-**Field stability.** The schema is part of the `1.0.0` contract. New fields may be added but no existing fields will be renamed or removed at this schema version. Agents should ignore unknown fields rather than fail on them.
+**Field stability.** The schema is part of the `1.x` contract (currently `1.1.0`; the listen event family was an additive minor bump). New fields may be added but no existing fields will be renamed or removed within the 1.x line. Agents should ignore unknown fields rather than fail on them.
 
 ---
 
@@ -5152,7 +5155,7 @@ franken_whisper robot schema | jq '.events["routing_decision"].payload'
 # fallback_active flag, evidence ledger entry, etc.
 ```
 
-The schema document is part of the `1.0.0` contract: adding new event types requires a minor-version bump, and renaming or removing required fields requires a major-version bump. Schema version is reported on every event so agents can detect mismatch instantly.
+The schema document is part of the `1.x` contract (currently `1.1.0`): adding new event types requires a minor-version bump, and renaming or removing required fields requires a major-version bump. Schema version is reported on every event so agents can detect mismatch instantly.
 
 ---
 

@@ -2,13 +2,13 @@
 
 All notable changes to [franken_whisper](https://github.com/Dicklesworthstone/franken_whisper) are documented in this file.
 
-Scope window: project inception through HEAD on 2026-08-19.
+Scope window: project inception through HEAD on 2026-08-23.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased | commits on `main` | 2026-08-15 → 2026-08-19 | Janitor docs-reorg (`docs/planning/`, `docs/operations/`) |
+| Unreleased | commits on `main` | 2026-08-15 → 2026-08-23 | Realtime `fw robot listen` driver; attention tap; docs-reorg follow-through |
 | [`v0.9.3`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.3) | Release | 2026-08-15 | fw-ios C ABI + SwiftUI; installer/diarization follow-through |
 | [`v0.9.2`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.2) | Release | 2026-08-13 | Prior tagged line |
 
@@ -24,6 +24,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 - Remaining root planning and operator docs now live under `docs/planning/` and `docs/operations/`.
 - Skill-loop scratch, beads recovery snapshots, and the root `AGENT_NAME` leak are gone from the index.
+- **Realtime mic streaming driver `fw robot listen`.** Capture→VAD→decode→policy→NDJSON loop over the native engine: cpal capture with ffmpeg fallback (`src/capture.rs`), causal 20 ms energy VAD with endpoint lifecycle events (`speech_started` / `transcript.delta` / `utterance_end`), bounded session buffer with prompt carry, `endpoint-commit` emission policy, and the six-event listen family added to the robot schema additively (`ROBOT_SCHEMA_VERSION` now `1.1.0`).
+- **Greedy-decoder per-token alignment-head attention tap.** `DecodeParams::record_token_attn` records each token's argmax encoder frame into `WindowStats::token_attn` (greedy-only; bd-rt-attn-tap-dfti), the data source for the AlignAtt emission policy (bd-rt-alignatt-fry9, in flight).
 
 ### Closed workstreams
 
@@ -32,6 +34,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 ### Changed
 
 - **Janitor docs-reorg wave (2026-08-19).** Remaining root planning and operator docs moved under `docs/planning/` and `docs/operations/`. The five historical files that README still names by short title (`FEATURE_PARITY.md`, `DISCREPANCIES.md`, `RECOVERY_RUNBOOK.md`, `SYNC_STRATEGY.md`, `PROPOSED_ARCHITECTURE.md`) now live at those paths.
+- **Documentation truth pass (2026-08-23).** README corrected against HEAD code: robot schema is `v1.1.0`; the backup recipe no longer cites nonexistent `--gzip` / `--dry-run` sync flags; installer free-space gate matches the enforced 2.4 GB; microphone capture documents cpal-primary capture; persist savepoints named `fw_persist_N`. `FEATURE_PARITY.md` Phase 5/6 rewritten to shipped reality (native engine at `sole`, Sortformer as the `auto` default, ECAPA implemented); `PERF_FRONTIER.md` and `CLAIM_COVERAGE_AUDIT.md` carry dated addenda reconciling them with the 2.99× flagship row.
+- **Fixed:** whisper-cpp bridge stage-thread stack overflow at HEAD (oversized fsqlite async frames; stage threads now get 64 MiB debug stacks — bd-4gtx).
 
 ### Removed
 
