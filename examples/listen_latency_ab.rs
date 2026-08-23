@@ -422,21 +422,34 @@ fn main() {
                 per_arm.entry(arm.clone()).or_default().push(m);
             }
         }
-        // A/A nulls on the `pauses` fixture only (wall-cost control): each
-        // arm twice back-to-back; ratio of median commit lags gates verdicts.
-        if fixture.name == "pauses" {
+        // A/A nulls on the `long` fixture (the most deltas per session, so
+        // the pooled medians rest on a workable sample): two session PAIRS
+        // per arm, commit lags pooled across each side before the median —
+        // a median-of-3 ratio (first campaign) is load noise, not a null.
+        if fixture.name == "long" {
             for arm in &arm_names {
-                eprintln!("   A/A null: {arm}");
-                let a = extract(&run_session(&fw, arm, &fixture.samples), &fixture.reference);
-                let b = extract(&run_session(&fw, arm, &fixture.samples), &fixture.reference);
-                let ratio = match (
-                    median(&mut a.commit_lag_ms.clone()),
-                    median(&mut b.commit_lag_ms.clone()),
-                ) {
+                eprintln!("   A/A null: {arm} (2 pairs, pooled)");
+                let mut side_a: Vec<f64> = Vec::new();
+                let mut side_b: Vec<f64> = Vec::new();
+                for _ in 0..2 {
+                    side_a.extend(
+                        extract(&run_session(&fw, arm, &fixture.samples), &fixture.reference)
+                            .commit_lag_ms,
+                    );
+                    side_b.extend(
+                        extract(&run_session(&fw, arm, &fixture.samples), &fixture.reference)
+                            .commit_lag_ms,
+                    );
+                }
+                let ratio = match (median(&mut side_a), median(&mut side_b)) {
                     (Some(x), Some(y)) if y > 0.0 => Some(x / y),
                     _ => None,
                 };
-                eprintln!("     null ratio {ratio:?}");
+                eprintln!(
+                    "     null ratio {ratio:?} (n={}/{})",
+                    side_a.len(),
+                    side_b.len()
+                );
                 null_ratios.insert(arm.clone(), serde_json::json!(ratio));
             }
         }

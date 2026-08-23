@@ -4,6 +4,26 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-08-23 - CoralCoast (ovh-a Zen worker): **VERIFIED WIN — bd-3nw3 core premise holds: builtin symphonia normalization beats the ffmpeg subprocess 1.4–1.7× on a realistic batch-ingest input; remaining micro-levers measured marginal, bead closed.**
+
+Head-to-head on a 600 s stereo 44.1 kHz MP3 (`sine+pink-noise mix, 192 kbps`,
+14.4 MB) → 16 kHz mono s16 WAV, release build, warm cache, 4 runs each
+(`examples/bd3nw3_normalize_probe.rs`, committed):
+
+| Variant | elapsed_ms per run |
+|---|---|
+| builtin symphonia decode+resample | 611 / 673 / 689 / 692 |
+| ffmpeg subprocess (forced via FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE=1) | 905 / 954 / 1050 / 1207 |
+
+Builtin wins every run (~1.4–1.7×), confirming the design bet that avoiding
+the subprocess dominates for common formats. Combined with today's earlier
+REJECTED entry (quantize/write lever < 0.1% of e2e) and the previously landed
+L16 SIMD resample probe, all named bd-3nw3 levers are now dispositioned:
+buffer-reuse/arena remainders are marginal against a ~0.7 s/file normalize
+that is itself dwarfed by transcription. Bead closed with this record.
+
+AGENT_NAME=CoralCoast.
+
 ## 2026-08-23 - CoralCoast (M4 Pro dev host / ovh-a worker): **REJECTED — bd-3nw3 f32→i16 quantize/write lever is sub-0.1% of e2e; do not optimize.**
 
 Probe: `examples/bd3nw3_write_probe.rs` (release, ovh-a Zen worker), 30 M samples
