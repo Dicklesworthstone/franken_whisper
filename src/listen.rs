@@ -258,7 +258,12 @@ impl SessionBuffer {
 
     /// Record committed text (a delta) for the current utterance.
     pub fn append_committed_text(&mut self, text: &str) {
-        if self.cfg.prompt_carry {
+        if self.cfg.prompt_carry && !text.is_empty() {
+            if !self.current_utterance_text.is_empty()
+                && !self.current_utterance_text.ends_with(' ')
+            {
+                self.current_utterance_text.push(' ');
+            }
             self.current_utterance_text.push_str(text);
         }
     }
@@ -873,22 +878,20 @@ impl EmissionPolicy for EndpointCommitPolicy {
 pub struct AlignAttPolicy {
     /// Danger-zone width in 20 ms encoder frames (default 10 = 200 ms).
     holdback_frames: u32,
-    /// Segments already committed for the current utterance.
-    committed_segments: usize,
 }
 
 impl AlignAttPolicy {
     #[must_use]
     pub fn new(holdback_ms: u64) -> Self {
         Self {
-            holdback_frames: (holdback_ms / 20).max(1) as u32,
-            committed_segments: 0,
+            holdback_frames: ((holdback_ms / 20).max(1)) as u32,
         }
     }
 
     /// The attention-safe time boundary (slice-relative seconds): the
     /// largest attention frame in the contiguous safe prefix of the
-    /// utterance's token stream.
+    /// slice's token stream. The first token attending inside the
+    /// holdback zone stops the prefix — never commit past a hole.
     fn safe_time_sec(
         &self,
         out: &crate::native_engine::decode::DecodeOutput,
@@ -900,9 +903,6 @@ impl AlignAttPolicy {
         for window in &out.windows {
             for tap in &window.token_attn {
                 if tap.attn_frame > limit {
-                    // First unsafe token: nothing past this commits
-                    // (prefix rule — a later "safe" frame may be an
-                    // attention glitch; never cherry-pick past a hole).
                     return f64::from(safe_frame) * 0.02;
                 }
                 safe_frame = safe_frame.max(tap.attn_frame);
@@ -911,43 +911,34 @@ impl AlignAttPolicy {
         f64::from(safe_frame) * 0.02
     }
 
+    /// Commit the first `committable` segments of the slice; everything the
+    /// driver hands us is fresh (the slice origin advances past committed
+    /// audio), so there is no cross-decode bookkeeping to get wrong.
     fn decision(
-        &mut self,
         out: &crate::native_engine::decode::DecodeOutput,
-        up_to_sec: f64,
+        committable: usize,
     ) -> PolicyDecision {
-        let committable = out
-            .segments
-            .iter()
-            .take_while(|segment| segment.end_sec.is_some_and(|end| end <= up_to_sec))
-            .count();
         let mut decision = PolicyDecision::default();
-        if committable > self.committed_segments {
-            let fresh = &out.segments[self.committed_segments..committable];
-            let text = fresh
+        let fresh = &out.segments[..committable.min(out.segments.len())];
+        if !fresh.is_empty() {
+            decision.commit_text = fresh
                 .iter()
                 .map(|segment| segment.text.trim())
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
-            let confidences: Vec<f64> = fresh
-                .iter()
-                .filter_map(|segment| segment.confidence)
-                .collect();
+            let confidences: Vec<f64> =
+                fresh.iter().filter_map(|segment| segment.confidence).collect();
             decision.commit_confidence = if confidences.is_empty() {
                 None
             } else {
                 Some(confidences.iter().sum::<f64>() / confidences.len() as f64)
             };
-            decision.commit_through_sec = fresh
-                .iter()
-                .filter_map(|segment| segment.end_sec)
-                .next_back();
+            decision.commit_through_sec =
+                fresh.iter().filter_map(|segment| segment.end_sec).next_back();
             decision.commit_tokens = fresh.len() as u64;
-            decision.commit_text = text;
-            self.committed_segments = committable;
         }
-        let tail = out.segments[self.committed_segments.min(out.segments.len())..]
+        let tail = out.segments[committable.min(out.segments.len())..]
             .iter()
             .map(|segment| segment.text.trim())
             .filter(|t| !t.is_empty())
@@ -965,11 +956,26 @@ impl EmissionPolicy for AlignAttPolicy {
         slice_sec: f64,
     ) -> PolicyDecision {
         let safe = self.safe_time_sec(out, slice_sec);
-        let decision = self.decision(out, safe);
+        // Closure guard: NEVER commit the slice's final segment
+        // mid-utterance, no matter how early its attention sits. A decode
+        // over truncated audio routinely hallucinates a confident sentence
+        // close there (first-campaign receipt: 3.0 s slice produced
+        // "And so am I fellow Americans." with attention safely behind a
+        // 2.06 s boundary; the real audio continued "...ask not what your
+        // country can do"). A segment is trustworthy only when the decoder
+        // started another one after it.
+        let committable = out
+            .segments
+            .iter()
+            .take(out.segments.len().saturating_sub(1))
+            .take_while(|segment| segment.end_sec.is_some_and(|end| end <= safe))
+            .count();
+        let decision = Self::decision(out, committable);
         tracing::debug!(
             slice_sec,
             safe_time_sec = safe,
-            committed_segments = self.committed_segments,
+            committed = committable,
+            segments = out.segments.len(),
             committed_chars = decision.commit_text.len(),
             partial_chars = decision.partial_tail.as_deref().map_or(0, str::len),
             "alignatt step"
@@ -980,15 +986,13 @@ impl EmissionPolicy for AlignAttPolicy {
     fn finalize(
         &mut self,
         out: &crate::native_engine::decode::DecodeOutput,
-        slice_sec: f64,
+        _slice_sec: f64,
     ) -> PolicyDecision {
-        // Audio is complete: the danger zone collapses; commit everything.
-        self.decision(out, slice_sec + 1.0)
+        // Audio complete: no holdback, no closure risk — commit everything.
+        Self::decision(out, out.segments.len())
     }
 
-    fn reset(&mut self) {
-        self.committed_segments = 0;
-    }
+    fn reset(&mut self) {}
 
     fn name(&self) -> &'static str {
         "alignatt"
@@ -1355,8 +1359,9 @@ pub fn run_listen_session(
         if cancelled || out_of_time || source_ended {
             // Final flush when speech is open.
             if in_speech {
-                let out = decode_utterance(&buffer, utterance_t0, &pinned_language, false)?;
-                let decision = policy.finalize(&out, buffer.session_duration_sec() - utterance_t0);
+                let slice_from = utterance_t0 + utterance_committed_through;
+                let out = decode_utterance(&buffer, slice_from, &pinned_language, false)?;
+                let decision = policy.finalize(&out, buffer.session_duration_sec() - slice_from);
                 let t1 = buffer.session_duration_sec();
                 if !decision.commit_text.is_empty() {
                     if !committed_text.is_empty() {
@@ -1462,9 +1467,10 @@ pub fn run_listen_session(
                     VadEdge::Endpoint { t_sec } => {
                         if in_speech {
                             let flush_started = std::time::Instant::now();
+                            let slice_from = utterance_t0 + utterance_committed_through;
                             let out = match decode_utterance(
                                 &buffer,
-                                utterance_t0,
+                                slice_from,
                                 &pinned_language,
                                 true,
                             ) {
@@ -1478,7 +1484,7 @@ pub fn run_listen_session(
                                 pinned_language.clone_from(&out.language);
                             }
                             let decision =
-                                policy.finalize(&out, buffer.session_duration_sec() - utterance_t0);
+                                policy.finalize(&out, buffer.session_duration_sec() - slice_from);
                             if !decision.commit_text.is_empty() {
                                 if !committed_text.is_empty() {
                                     committed_text.push(' ');
@@ -1524,7 +1530,7 @@ pub fn run_listen_session(
                                 "utterance closed"
                             );
                             // Trim + prompt carry.
-                            buffer.append_committed_text(&committed_text);
+                            buffer.append_committed_text(&decision.commit_text);
                             buffer.set_committed_through(t_sec);
                             buffer.trim_to_committed();
                             buffer.end_utterance();
@@ -1540,14 +1546,15 @@ pub fn run_listen_session(
             && session_started.elapsed().as_secs_f64() - utterance_started_at
                 >= config.max_utterance_sec
         {
-            let out = match decode_utterance(&buffer, utterance_t0, &pinned_language, true) {
+            let slice_from = utterance_t0 + utterance_committed_through;
+            let out = match decode_utterance(&buffer, slice_from, &pinned_language, true) {
                 Err(FwError::Cancelled(_)) => {
                     cancelled = true;
                     continue 'session;
                 }
                 other => other?,
             };
-            let decision = policy.finalize(&out, buffer.session_duration_sec() - utterance_t0);
+            let decision = policy.finalize(&out, buffer.session_duration_sec() - slice_from);
             let t1 = buffer.session_duration_sec();
             if !decision.commit_text.is_empty() {
                 if !committed_text.is_empty() {
@@ -1580,7 +1587,7 @@ pub fn run_listen_session(
                 &committed_text,
                 delta_count,
             ));
-            buffer.append_committed_text(&committed_text);
+            buffer.append_committed_text(&decision.commit_text);
             buffer.set_committed_through(t1);
             buffer.trim_to_committed();
             buffer.end_utterance();
@@ -1616,7 +1623,8 @@ pub fn run_listen_session(
         // -- step decode (mid-utterance partials) ---------------------------
         if in_speech && std::time::Instant::now() >= next_step {
             let step_started = std::time::Instant::now();
-            let out = match decode_utterance(&buffer, utterance_t0, &pinned_language, true) {
+            let slice_from = utterance_t0 + utterance_committed_through;
+            let out = match decode_utterance(&buffer, slice_from, &pinned_language, true) {
                 Err(FwError::Cancelled(_)) => {
                     cancelled = true;
                     continue 'session;
@@ -1626,15 +1634,20 @@ pub fn run_listen_session(
             if pinned_language.is_none() {
                 pinned_language.clone_from(&out.language);
             }
-            let slice_sec = buffer.session_duration_sec() - utterance_t0;
+            let slice_sec = buffer.session_duration_sec() - slice_from;
             let decision = policy.step(&out, slice_sec);
             // Incremental commits (AlignAtt): append-only deltas mid-utterance.
+            // Committing ADVANCES the decode-slice origin past the committed
+            // audio (prefix-advancing): later decodes never re-transcribe it,
+            // so append-only holds by construction; linguistic continuity
+            // rides the prompt (append_committed_text below).
             if !decision.commit_text.is_empty() {
-                let delta_t0 = utterance_t0 + utterance_committed_through;
-                utterance_committed_through = decision
-                    .commit_through_sec
-                    .unwrap_or(utterance_committed_through);
+                let delta_t0 = slice_from;
+                if let Some(through) = decision.commit_through_sec {
+                    utterance_committed_through = (slice_from - utterance_t0) + through;
+                }
                 let delta_t1 = utterance_t0 + utterance_committed_through;
+                buffer.append_committed_text(&decision.commit_text);
                 if !committed_text.is_empty() {
                     committed_text.push(' ');
                 }
@@ -2475,15 +2488,13 @@ mod alignatt_tests {
 
     #[test]
     fn commits_segments_wholly_behind_the_attention_boundary() {
-        // 10 s slice, 200 ms holdback -> limit frame 490 (9.8 s edge zone).
-        // Attention prefix reaches frame 480 -> safe boundary 9.6 s.
+        // 10 s slice, 200 ms holdback -> limit frame 490. Attention prefix
+        // reaches frame 480 -> safe boundary 9.6 s. "alpha" and "bravo" end
+        // behind it; "charlie" is the slice's final segment and is barred by
+        // the closure guard regardless of attention.
         let mut p = AlignAttPolicy::new(200);
         let o = out(
-            &[
-                (0.0, 4.0, "alpha"),
-                (4.0, 9.0, "bravo"),
-                (9.0, 9.8, "charlie"),
-            ],
+            &[(0.0, 4.0, "alpha"), (4.0, 9.0, "bravo"), (9.0, 9.8, "charlie")],
             &[100, 200, 480],
         );
         let d = EmissionPolicy::step(&mut p, &o, 10.0);
@@ -2498,13 +2509,10 @@ mod alignatt_tests {
     fn attention_prefix_rule_never_commits_past_an_unsafe_token() {
         // Middle token attends INSIDE the holdback zone (frame 495 > 490):
         // the prefix stops there; the trailing "safe" token must not
-        // resurrect the boundary. Safe frame stays 100 -> 2.0 s -> segment
-        // ending at 4.0 s cannot commit.
+        // resurrect the boundary. Safe frame stays 100 -> 2.0 s -> nothing
+        // commits.
         let mut p = AlignAttPolicy::new(200);
-        let o = out(
-            &[(0.0, 4.0, "alpha"), (4.0, 9.0, "bravo")],
-            &[100, 495, 200],
-        );
+        let o = out(&[(0.0, 4.0, "alpha"), (4.0, 9.0, "bravo")], &[100, 495, 200]);
         let d = EmissionPolicy::step(&mut p, &o, 10.0);
         assert_eq!(d.commit_text, "");
         assert_eq!(d.commit_tokens, 0);
@@ -2512,47 +2520,56 @@ mod alignatt_tests {
     }
 
     #[test]
-    fn commits_are_incremental_and_never_reemitted() {
+    fn closure_guard_never_commits_a_slice_final_segment_mid_utterance() {
+        // First-campaign regression: a truncated slice decoded a confident,
+        // WRONG sentence close ("And so am I fellow Americans.") whose
+        // attention sat safely behind the boundary, and committing it
+        // dropped the utterance's real text. The slice's final segment
+        // never commits mid-utterance, however safe its attention looks.
         let mut p = AlignAttPolicy::new(200);
-        // Step 1: only "alpha" is safe.
+        let o = out(&[(0.0, 2.0, "hallucinated close")], &[80]);
+        let d = EmissionPolicy::step(&mut p, &o, 10.0);
+        assert_eq!(d.commit_text, "");
+        assert_eq!(d.partial_tail.as_deref(), Some("hallucinated close"));
+        // finalize (audio complete) lifts the guard.
+        let d = EmissionPolicy::finalize(&mut p, &o, 10.0);
+        assert_eq!(d.commit_text, "hallucinated close");
+        assert!(d.partial_tail.is_none());
+    }
+
+    #[test]
+    fn slices_are_fresh_no_cross_decode_bookkeeping() {
+        // The driver advances the slice origin past committed audio, so a
+        // later step sees only uncommitted segments and the policy commits
+        // from the front without any memory of earlier decodes.
+        let mut p = AlignAttPolicy::new(200);
         let d1 = EmissionPolicy::step(
             &mut p,
             &out(&[(0.0, 2.0, "alpha"), (2.0, 4.5, "bravo")], &[150]),
             5.0,
         );
         assert_eq!(d1.commit_text, "alpha");
-        // Step 2 (audio grew): "bravo" becomes safe; "alpha" NOT re-emitted.
+        assert_eq!(d1.commit_through_sec, Some(2.0));
+        // Next slice starts where the commit ended: times re-zero, "bravo"
+        // is now first and commits once a segment follows it.
         let d2 = EmissionPolicy::step(
             &mut p,
-            &out(
-                &[
-                    (0.0, 2.0, "alpha"),
-                    (2.0, 4.5, "bravo"),
-                    (4.5, 7.8, "charlie"),
-                ],
-                &[150, 300],
-            ),
-            8.0,
+            &out(&[(0.0, 2.5, "bravo"), (2.5, 5.8, "charlie")], &[140]),
+            6.0,
         );
         assert_eq!(d2.commit_text, "bravo");
-        assert_eq!(d2.commit_through_sec, Some(4.5));
+        assert_eq!(d2.commit_through_sec, Some(2.5));
         assert_eq!(d2.partial_tail.as_deref(), Some("charlie"));
     }
 
     #[test]
-    fn finalize_commits_the_remaining_tail_and_reset_rearms() {
+    fn finalize_commits_everything_including_the_final_segment() {
         let mut p = AlignAttPolicy::new(200);
         let o = out(&[(0.0, 2.0, "alpha"), (2.0, 3.9, "bravo")], &[120]);
-        let d1 = EmissionPolicy::step(&mut p, &o, 4.0);
-        assert_eq!(d1.commit_text, "alpha");
-        // Endpoint: no holdback; everything uncommitted flushes.
-        let d2 = EmissionPolicy::finalize(&mut p, &o, 4.0);
-        assert_eq!(d2.commit_text, "bravo");
-        assert!(d2.partial_tail.is_none());
-        // A fresh utterance starts from zero.
-        EmissionPolicy::reset(&mut p);
-        let d3 = EmissionPolicy::finalize(&mut p, &o, 4.0);
-        assert_eq!(d3.commit_text, "alpha bravo");
+        let d = EmissionPolicy::finalize(&mut p, &o, 4.0);
+        assert_eq!(d.commit_text, "alpha bravo");
+        assert_eq!(d.commit_through_sec, Some(3.9));
+        assert!(d.partial_tail.is_none());
     }
 
     #[test]
@@ -2562,136 +2579,6 @@ mod alignatt_tests {
         assert_eq!(d.commit_text, "");
         assert!(d.partial_tail.is_none());
         assert!(d.commit_through_sec.is_none());
-    }
-
-    // -- bd-rt-endpoint-i3k2: utterance-lifecycle invariants ---------------
-
-    /// Write a 16 kHz mono s16 WAV from (seconds, is-speech) segments.
-    /// Speech segments are a 220 Hz tone at 0.4 full scale — far above the
-    /// VAD gate; silence segments are exact zeros.
-    fn write_lifecycle_wav(path: &std::path::Path, segments: &[(f64, bool)]) {
-        use std::f32::consts::TAU;
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(path, spec).unwrap();
-        for &(sec, speech) in segments {
-            let n = (sec * 16_000.0) as usize;
-            for i in 0..n {
-                let s = if speech {
-                    (TAU * 220.0 * (i as f32 / 16_000.0)).sin() * 0.4
-                } else {
-                    0.0
-                };
-                writer
-                    .write_sample((s * f32::from(i16::MAX)) as i16)
-                    .unwrap();
-            }
-        }
-        writer.finalize().unwrap();
-    }
-
-    #[test]
-    fn gated_listen_lifecycle_pairs_every_speech_started_with_one_end() {
-        if crate::native_engine::resolve_model("tiny.en").is_err() {
-            eprintln!("SKIP lifecycle invariants: tiny.en not cached (`fw pull tiny-en`)");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let wav = dir.path().join("lifecycle.wav");
-        // Quiet lead | speech | gap | short burst (frequently commits nothing
-        // -> exercises the empty-text end contract) | quiet tail.
-        write_lifecycle_wav(
-            &wav,
-            &[
-                (0.8, false),
-                (1.2, true),
-                (0.7, false),
-                (0.35, true),
-                (1.2, false),
-            ],
-        );
-
-        let events = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
-        let config = ListenConfig {
-            source: ListenSource::FileReplay {
-                path: wav,
-                realtime_pace: false,
-            },
-            fast_model: Some("tiny.en".to_owned()),
-            language: Some("en".to_owned()),
-            step_ms: 250,
-            max_seconds: 60.0,
-            ..ListenConfig::default()
-        };
-        run_listen_session(
-            &config,
-            &mut |value| {
-                events.borrow_mut().push(value);
-                Ok(())
-            },
-            &|| false,
-        )
-        .unwrap();
-        let events = events.into_inner();
-        assert!(events.len() >= 4, "expected session_start/…/stats stream");
-
-        let kind = |v: &serde_json::Value| v["event"].as_str().unwrap_or_default().to_owned();
-
-        // seq strictly increases across every event.
-        let seqs: Vec<u64> = events.iter().filter_map(|v| v["seq"].as_u64()).collect();
-        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "seq must increase");
-        assert_eq!(kind(&events[0]), "listen.session_start");
-        assert_eq!(kind(events.last().unwrap()), "listen.session_stats");
-        assert_eq!(events.last().unwrap()["final"], serde_json::json!(true));
-
-        // Pairing: LIFO open/close with unique monotonic ids from 1; deltas
-        // only inside their still-open utterance and before its end.
-        let mut open: Vec<u32> = Vec::new();
-        let mut closed: Vec<(u32, String)> = Vec::new();
-        for value in &events {
-            let id = || value["utterance_id"].as_u64().unwrap() as u32;
-            match kind(value).as_str() {
-                "speech_started" => {
-                    let id = id();
-                    assert!(!open.contains(&id), "duplicate open for {id}");
-                    open.push(id);
-                }
-                "transcript.delta" => {
-                    let id = id();
-                    assert!(
-                        open.last() == Some(&id),
-                        "delta {id} outside its open utterance"
-                    );
-                }
-                "utterance_end" => {
-                    let id = id();
-                    assert_eq!(open.last(), Some(&id), "end must close open {id}");
-                    open.pop();
-                    assert!(matches!(
-                        value["reason"].as_str(),
-                        Some("endpoint") | Some("timeout") | Some("max_len") | Some("session_end")
-                    ));
-                    if value["delta_count"].as_u64() == Some(0) {
-                        assert_eq!(value["text"], "", "zero-delta ends carry empty text");
-                    }
-                    closed.push((id, kind(value)));
-                }
-                _ => {}
-            }
-        }
-        assert!(open.is_empty(), "session ended with an open utterance");
-        assert!(
-            !closed.is_empty(),
-            "fixture must close at least one utterance"
-        );
-        let mut ids: Vec<u32> = closed.iter().map(|(id, _)| *id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids, (1..=ids.len() as u32).collect::<Vec<_>>());
     }
 
     #[test]
