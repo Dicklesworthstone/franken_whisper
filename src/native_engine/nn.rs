@@ -529,6 +529,14 @@ fn kernel_err(e: ft_kernel_cpu::KernelError) -> FwError {
     FwError::InvalidRequest(format!("ft-kernel-cpu: {e}"))
 }
 
+/// bd-4ep1: force the ISA-order-independent reference sgemm for every
+/// `[m,k]x[k,n]` matmul (m > 1). `FT_SGEMM_STRICT_PARITY=1`, default OFF.
+fn strict_parity_sgemm() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FT_SGEMM_STRICT_PARITY").is_some());
+    *ON
+}
+
 /// `[m,k] x [k,n] -> [m,n]`, delegating to FrankenTorch's parallel sgemm.
 ///
 /// # Errors
@@ -564,6 +572,30 @@ pub fn matmul(a: &Mat, b: &Mat) -> FwResult<Mat> {
             }
         }
         return Ok(Mat::from_vec(1, n, out));
+    }
+
+    // bd-4ep1 strict-parity reference path (`FT_SGEMM_STRICT_PARITY=1`,
+    // default OFF): the ft sgemm micro-kernels accumulate in ISA-specific
+    // orders (AVX2 vs NEON), so encoder outputs differ in low bits across
+    // platforms — invisible short-window, but it compounds through long
+    // self-conditioned decodes and flips near-ties (tiled-jfk step 60).
+    // This path accumulates each output in FIXED ascending-k order with
+    // sequential f32 adds (same proven-stable pattern as the m==1 saxpy
+    // above; no FMA contraction), making results bit-identical across
+    // x86_64 and arm64 at a measured throughput cost.
+    if strict_parity_sgemm() {
+        let mut out = vec![0.0f32; m * n];
+        for i in 0..m {
+            let orow = &mut out[i * n..(i + 1) * n];
+            for kk in 0..k {
+                let av = a.data[i * k + kk];
+                let brow = &b.data[kk * n..(kk + 1) * n];
+                for (o, &bv) in orow.iter_mut().zip(brow) {
+                    *o += av * bv;
+                }
+            }
+        }
+        return Ok(Mat::from_vec(m, n, out));
     }
 
     let lhs_meta = meta_2d(m, k);
