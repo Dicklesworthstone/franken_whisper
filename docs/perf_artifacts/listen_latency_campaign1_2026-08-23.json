@@ -1,0 +1,409 @@
+{
+  "harness": "listen_latency_ab",
+  "bead": "bd-rt-latency-harness-3dkh",
+  "scope": "self_relative",
+  "binary": "/private/tmp/claude-501/-Users-jemanuel-projects-franken-whisper/34a32d9e-3bb4-4a12-b4da-7ad1fbc2ff18/scratchpad/fw-private-target/release/franken_whisper",
+  "rounds": 2,
+  "arms": [
+    "alignatt",
+    "endpoint-commit"
+  ],
+  "aa_null_commit_lag_ratio": {
+    "alignatt": 0.9629438163308005,
+    "endpoint-commit": 0.9358231856199779
+  },
+  "aa_nulls_within_band": false,
+  "comparative_verdicts_allowed": false,
+  "fixtures": {
+    "short": {
+      "alignatt": {
+        "sessions": [
+          {
+            "ttft_ms": 5193.291792,
+            "commit_lag_ms_p50": 789.1532500000001,
+            "commit_lag_ms_p95": 789.1532500000001,
+            "endpoint_lag_ms_p50": 789.1941659999997,
+            "deltas": 1,
+            "utterances": 1,
+            "wer": 0.4166666666666667,
+            "hyp_words": 7,
+            "mean_step_ms": 199.4286205555555,
+            "p95_step_ms": 343.59975,
+            "pace_error_pct": -0.20261111594204184,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not"
+          },
+          {
+            "ttft_ms": 5175.116042,
+            "commit_lag_ms_p50": 769.671292,
+            "commit_lag_ms_p95": 769.671292,
+            "endpoint_lag_ms_p50": 769.7072919999996,
+            "deltas": 1,
+            "utterances": 1,
+            "wer": 0.4166666666666667,
+            "hyp_words": 7,
+            "mean_step_ms": 171.2865085,
+            "p95_step_ms": 234.240125,
+            "pace_error_pct": -0.18978863768116527,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not"
+          }
+        ],
+        "ttft_ms_median": 5193.291792,
+        "commit_lag_ms_median": 789.1532500000001
+      },
+      "endpoint-commit": {
+        "sessions": [
+          {
+            "ttft_ms": 5186.423624999999,
+            "commit_lag_ms_p50": 783.8298749999994,
+            "commit_lag_ms_p95": 783.8298749999994,
+            "endpoint_lag_ms_p50": 783.894417,
+            "deltas": 1,
+            "utterances": 1,
+            "wer": 0.4166666666666667,
+            "hyp_words": 7,
+            "mean_step_ms": 166.1344916,
+            "p95_step_ms": 184.657084,
+            "pace_error_pct": -0.172651579710148,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not"
+          },
+          {
+            "ttft_ms": 5204.527040999999,
+            "commit_lag_ms_p50": 797.1734159999996,
+            "commit_lag_ms_p95": 797.1734159999996,
+            "endpoint_lag_ms_p50": 797.2085409999999,
+            "deltas": 1,
+            "utterances": 1,
+            "wer": 0.4166666666666667,
+            "hyp_words": 7,
+            "mean_step_ms": 171.28407930000003,
+            "p95_step_ms": 192.27329200000003,
+            "pace_error_pct": -0.20728260869565807,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not"
+          }
+        ],
+        "ttft_ms_median": 5204.527040999999,
+        "commit_lag_ms_median": 797.1734159999996
+      }
+    },
+    "pauses": {
+      "alignatt": {
+        "sessions": [
+          {
+            "ttft_ms": 2999.5590409999995,
+            "commit_lag_ms_p50": 793.7541659999994,
+            "commit_lag_ms_p95": 814.7085000000001,
+            "endpoint_lag_ms_p50": 793.7914159999995,
+            "deltas": 3,
+            "utterances": 3,
+            "wer": 0.22727272727272727,
+            "hyp_words": 17,
+            "mean_step_ms": 176.39802343750003,
+            "p95_step_ms": 213.052292,
+            "pace_error_pct": -0.11974582727273253,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not for you! Ask what you can do for your country!"
+          },
+          {
+            "ttft_ms": 3135.724334000001,
+            "commit_lag_ms_p50": 822.7136249999995,
+            "commit_lag_ms_p95": 933.608834000001,
+            "endpoint_lag_ms_p50": 822.7936659999999,
+            "deltas": 3,
+            "utterances": 3,
+            "wer": 0.22727272727272727,
+            "hyp_words": 17,
+            "mean_step_ms": 212.288614,
+            "p95_step_ms": 286.244625,
+            "pace_error_pct": -0.1031617363636439,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not for you! Ask what you can do for your country!"
+          }
+        ],
+        "ttft_ms_median": 3135.724334000001,
+        "commit_lag_ms_median": 814.7085000000001
+      },
+      "endpoint-commit": {
+        "sessions": [
+          {
+            "ttft_ms": 3120.4489999999996,
+            "commit_lag_ms_p50": 799.4908340000002,
+            "commit_lag_ms_p95": 922.7926669999995,
+            "endpoint_lag_ms_p50": 799.5246250000001,
+            "deltas": 3,
+            "utterances": 3,
+            "wer": 0.22727272727272727,
+            "hyp_words": 17,
+            "mean_step_ms": 193.35016386666663,
+            "p95_step_ms": 353.016458,
+            "pace_error_pct": -0.16109886363636639,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not for you! Ask what you can do for your country!"
+          },
+          {
+            "ttft_ms": 2998.3755830000005,
+            "commit_lag_ms_p50": 953.0768750000007,
+            "commit_lag_ms_p95": 1003.1842910000001,
+            "endpoint_lag_ms_p50": 953.1121250000006,
+            "deltas": 3,
+            "utterances": 3,
+            "wer": 0.22727272727272727,
+            "hyp_words": 17,
+            "mean_step_ms": 286.17341353846155,
+            "p95_step_ms": 473.458917,
+            "pace_error_pct": -0.13726667272727644,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not for you! Ask what you can do for your country!"
+          }
+        ],
+        "ttft_ms_median": 3120.4489999999996,
+        "commit_lag_ms_median": 922.7926669999995
+      }
+    },
+    "long": {
+      "alignatt": {
+        "sessions": [
+          {
+            "ttft_ms": 3098.048583,
+            "commit_lag_ms_p50": 897.9249159999991,
+            "commit_lag_ms_p95": 1032.6602500000001,
+            "endpoint_lag_ms_p50": 897.959083,
+            "deltas": 6,
+            "utterances": 6,
+            "wer": 0.22727272727272727,
+            "hyp_words": 34,
+            "mean_step_ms": 213.82502486666667,
+            "p95_step_ms": 342.841875,
+            "pace_error_pct": -0.055453790909087974,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not for you! Ask what you can do for your country! And so my fellow Americans ask not! for you. Ask what you can do for your country."
+          },
+          {
+            "ttft_ms": 2988.765542000003,
+            "commit_lag_ms_p50": 787.8490420000013,
+            "commit_lag_ms_p95": 793.0825830000003,
+            "endpoint_lag_ms_p50": 787.8802500000006,
+            "deltas": 6,
+            "utterances": 6,
+            "wer": 0.22727272727272727,
+            "hyp_words": 34,
+            "mean_step_ms": 181.89350125806448,
+            "p95_step_ms": 235.882708,
+            "pace_error_pct": -0.07872178181819178,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not for you! Ask what you can do for your country! And so my fellow Americans ask not! for you. Ask what you can do for your country."
+          }
+        ],
+        "ttft_ms_median": 3098.048583,
+        "commit_lag_ms_median": 793.0825830000003
+      },
+      "endpoint-commit": {
+        "sessions": [
+          {
+            "ttft_ms": 3119.415375000001,
+            "commit_lag_ms_p50": 850.6865420000019,
+            "commit_lag_ms_p95": 918.2336670000009,
+            "endpoint_lag_ms_p50": 850.7282079999995,
+            "deltas": 6,
+            "utterances": 6,
+            "wer": 0.22727272727272727,
+            "hyp_words": 34,
+            "mean_step_ms": 216.67930751724143,
+            "p95_step_ms": 352.74212500000004,
+            "pace_error_pct": -0.08389829545454308,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not for you! Ask what you can do for your country! And so my fellow Americans ask not! for you. Ask what you can do for your country."
+          },
+          {
+            "ttft_ms": 3033.951166999998,
+            "commit_lag_ms_p50": 826.7847499999981,
+            "commit_lag_ms_p95": 975.1657499999995,
+            "endpoint_lag_ms_p50": 826.8190000000004,
+            "deltas": 6,
+            "utterances": 6,
+            "wer": 0.22727272727272727,
+            "hyp_words": 34,
+            "mean_step_ms": 198.60684554838707,
+            "p95_step_ms": 338.16083299999997,
+            "pace_error_pct": -0.05379848636363205,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "And so my fellow Americans ask not for you! Ask what you can do for your country! And so my fellow Americans ask not! for you. Ask what you can do for your country."
+          }
+        ],
+        "ttft_ms_median": 3119.415375000001,
+        "commit_lag_ms_median": 826.7847499999981
+      }
+    },
+    "noisy": {
+      "alignatt": {
+        "sessions": [
+          {
+            "ttft_ms": 5092.185167,
+            "commit_lag_ms_p50": 1212.1922089999994,
+            "commit_lag_ms_p95": 1212.1922089999994,
+            "endpoint_lag_ms_p50": 1212.2707500000001,
+            "deltas": 2,
+            "utterances": 2,
+            "wer": 0.4090909090909091,
+            "hyp_words": 15,
+            "mean_step_ms": 305.9963369166666,
+            "p95_step_ms": 404.11225,
+            "pace_error_pct": -0.15534242727273107,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "and so my fellow American and not ask what you can do for your country."
+          },
+          {
+            "ttft_ms": 5549.838167,
+            "commit_lag_ms_p50": 1280.7868749999996,
+            "commit_lag_ms_p95": 1280.7868749999996,
+            "endpoint_lag_ms_p50": 1280.8856669999998,
+            "deltas": 2,
+            "utterances": 2,
+            "wer": 0.4090909090909091,
+            "hyp_words": 15,
+            "mean_step_ms": 413.6072083,
+            "p95_step_ms": 787.375458,
+            "pace_error_pct": -0.16605606363636616,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "and so my fellow American and not ask what you can do for your country."
+          }
+        ],
+        "ttft_ms_median": 5549.838167,
+        "commit_lag_ms_median": 1212.1922089999994
+      },
+      "endpoint-commit": {
+        "sessions": [
+          {
+            "ttft_ms": 5146.505209,
+            "commit_lag_ms_p50": 1165.7707080000002,
+            "commit_lag_ms_p95": 1165.7707080000002,
+            "endpoint_lag_ms_p50": 1165.807333,
+            "deltas": 2,
+            "utterances": 2,
+            "wer": 0.4090909090909091,
+            "hyp_words": 15,
+            "mean_step_ms": 296.8861173636364,
+            "p95_step_ms": 427.951583,
+            "pace_error_pct": -0.11447235454545845,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "and so my fellow American and not ask what you can do for your country."
+          },
+          {
+            "ttft_ms": 5572.817791,
+            "commit_lag_ms_p50": 1292.4883330000005,
+            "commit_lag_ms_p95": 1292.4883330000005,
+            "endpoint_lag_ms_p50": 1292.5316670000004,
+            "deltas": 2,
+            "utterances": 2,
+            "wer": 0.4090909090909091,
+            "hyp_words": 15,
+            "mean_step_ms": 468.6951065555556,
+            "p95_step_ms": 881.518083,
+            "pace_error_pct": -0.1431060636363668,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": "and so my fellow American and not ask what you can do for your country."
+          }
+        ],
+        "ttft_ms_median": 5572.817791,
+        "commit_lag_ms_median": 1165.7707080000002
+      }
+    },
+    "negative": {
+      "alignatt": {
+        "sessions": [
+          {
+            "ttft_ms": null,
+            "commit_lag_ms_p50": null,
+            "commit_lag_ms_p95": null,
+            "endpoint_lag_ms_p50": 1484.8814170000005,
+            "deltas": 0,
+            "utterances": 1,
+            "wer": null,
+            "hyp_words": 0,
+            "mean_step_ms": 629.9388252,
+            "p95_step_ms": 826.380667,
+            "pace_error_pct": -0.14871302500000239,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": ""
+          },
+          {
+            "ttft_ms": null,
+            "commit_lag_ms_p50": null,
+            "commit_lag_ms_p95": null,
+            "endpoint_lag_ms_p50": 886.3125410000006,
+            "deltas": 0,
+            "utterances": 1,
+            "wer": null,
+            "hyp_words": 0,
+            "mean_step_ms": 266.89749512500003,
+            "p95_step_ms": 388.156667,
+            "pace_error_pct": -0.16609218749999988,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": ""
+          }
+        ],
+        "ttft_ms_median": null,
+        "commit_lag_ms_median": null
+      },
+      "endpoint-commit": {
+        "sessions": [
+          {
+            "ttft_ms": null,
+            "commit_lag_ms_p50": null,
+            "commit_lag_ms_p95": null,
+            "endpoint_lag_ms_p50": 1086.2721670000005,
+            "deltas": 0,
+            "utterances": 1,
+            "wer": null,
+            "hyp_words": 0,
+            "mean_step_ms": 305.35762512499997,
+            "p95_step_ms": 527.257542,
+            "pace_error_pct": -0.22141562499999878,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": ""
+          },
+          {
+            "ttft_ms": null,
+            "commit_lag_ms_p50": null,
+            "commit_lag_ms_p95": null,
+            "endpoint_lag_ms_p50": 2771.878,
+            "deltas": 0,
+            "utterances": 1,
+            "wer": null,
+            "hyp_words": 0,
+            "mean_step_ms": 389.880677,
+            "p95_step_ms": 1262.5175829999998,
+            "pace_error_pct": -0.19120729999999586,
+            "pace_violation": false,
+            "exit_ok": true,
+            "text": ""
+          }
+        ],
+        "ttft_ms_median": null,
+        "commit_lag_ms_median": null
+      }
+    }
+  }
+}

@@ -37,6 +37,7 @@
 //! - `long`:     the clip tiled 2x (22 s monologue shape).
 //! - `noisy`:    full clip + seeded LCG noise at ~15 dB SNR.
 //! - `negative`: 8 s of 440 Hz tone (music-only; expect zero output).
+//!
 //! The 2-minute timeout-path fixture is deferred to a campaign extension
 //! (wall-cost; the timeout arm is covered by unit tests).
 //!
@@ -122,8 +123,8 @@ fn build_fixtures(names: &[String]) -> Vec<Fixture> {
                 name: "negative",
                 samples: (0..SAMPLE_RATE * 8)
                     .map(|i| {
-                        (0.2 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32)
-                            .sin())
+                        0.2 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32)
+                            .sin()
                     })
                     .collect(),
                 reference: String::new(),
@@ -341,7 +342,7 @@ fn extract(raw: &SessionRaw, reference: &str) -> SessionMetrics {
     }
 }
 
-fn median(values: &mut Vec<f64>) -> Option<f64> {
+fn median(values: &mut [f64]) -> Option<f64> {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     percentile(values, 0.5)
 }

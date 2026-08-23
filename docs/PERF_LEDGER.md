@@ -5496,3 +5496,67 @@ sensitive, not a lever. Sortformer int8 aims at the fastconformer body
 `pos_enc.pe` is a standalone 4.2% candidate (f16 or synthesized). No
 frankentts-style cold-tensor monster exists in either model (their census
 found 47% in one tensor; our largest is 8.2%).
+
+---
+## 2026-08-23 — OBSERVATIONS (A/A nulls failed the band; no comparative verdicts) — **First `robot listen` streaming latency/quality campaign** (bd-rt-latency-harness-3dkh)
+
+Result class: SELF-RELATIVE OBSERVATIONS. First campaign of
+`examples/listen_latency_ab.rs`: the harness drives the real
+`franken_whisper robot listen` binary (release build, rev at this commit)
+over `--source stdin-pcm`, feeding paced s16le PCM on a 20 ms grid with
+per-write wall logging; NDJSON arrivals stamped per line. Metrics per the
+bead: TTFT = wall(first delta) − wall(injection of speech-onset audio);
+commit lag = delta arrival − wall(injection of its `t1_sec` audio);
+WER = joined `utterance_end` texts vs reference.
+
+**Method**: fixtures derived deterministically in-memory from the pinned
+public-domain `tests/fixtures/native/jfk.wav` (16 kHz mono 11 s): `short`
+(first 6.9 s), `pauses` (full clip), `long` (2× tile), `noisy` (+seeded
+LCG noise ≈15 dB SNR), `negative` (440 Hz tone). Arms `alignatt` (default)
+vs `endpoint-commit`, greedy beam 1, tiny.en fast lane, `--step-ms 300`,
+2 rounds, order-alternated, one invocation. A/A nulls: 2 session pairs
+per arm on `long`, commit lags pooled per side, ratio of medians must land
+in [0.98, 1.02]. Pace gate: every session within ±1 % of real time
+(worst observed 0.23 %). Host: shared mac, load avg ≈28–43 during runs —
+**both null ratios missed the band (alignatt 0.963, endpoint 0.936), so
+this campaign banks NO cross-arm comparison**; a quiet-host rerun can.
+
+**Rows (medians across rounds; artifact:
+`docs/perf_artifacts/listen_latency_campaign1_2026-08-23.json`)**
+
+| fixture | arm | TTFT ms | commit-lag p50 ms | WER | deltas |
+|---|---|---|---|---|---|
+| short | alignatt | 5193 | 789 | 0.417 | 1 |
+| short | endpoint-commit | 5205 | 797 | 0.417 | 1 |
+| pauses | alignatt | 3136 | 815 | 0.227 | 3 |
+| pauses | endpoint-commit | 3120 | 923 | 0.227 | 3 |
+| long | alignatt | 3098 | 793 | 0.227 | 6 |
+| long | endpoint-commit | 3119 | 827 | 0.227 | 6 |
+| noisy | alignatt | 5550 | 1212 | 0.409 | 2 |
+| noisy | endpoint-commit | 5573 | 1166 | 0.409 | 2 |
+| negative | both | — | — | 0 words emitted | 0 |
+
+Retraction count: 0 by construction (append-only deltas), both arms, all
+sessions. Text equivalence: joined delta text identical across arms on
+every fixture. jfk's single-sentence utterances close before a second
+segment exists, so alignatt's mid-utterance commits rarely fire here; a
+continuous-monologue (>12 s single-utterance) fixture is the recorded
+extension where the policies actually separate.
+
+**The campaign's real yield was two shipped bug fixes** (this is what the
+evidence bead is for):
+1. Campaign 1 exposed that AlignAttPolicy's committed-segment INDEX was
+   unsound across re-decodes (segment boundaries shift between slice
+   decodes): a 3.0 s slice hallucinated a confident close
+   ("And so am I fellow Americans."), committed it, and the endpoint
+   flush then dropped the utterance's real text. Fixed by
+   prefix-advancing slices (the decode origin moves past committed audio;
+   committed text rides the prompt) plus a closure guard (a slice's final
+   segment never commits mid-utterance). Isolation probe
+   `examples/attn_tap_purity_probe.rs` cleared the attention tap itself:
+   `record_token_attn` on/off transcripts are identical.
+2. Campaign 2's tone fixture caught alignatt committing hallucinated text
+   on non-speech (deltas=[0,1]); fixed with the classic quality gate
+   (no_speech_prob > 0.6 or avg_logprob < −1.0 holds all commits for the
+   step, counted in `policy_holdbacks`). Campaign 3: zero output on the
+   negative fixture, both arms, both rounds.

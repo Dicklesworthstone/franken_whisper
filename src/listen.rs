@@ -761,6 +761,9 @@ pub struct PolicyDecision {
     pub commit_tokens: u64,
     /// Mean confidence proxy for the committed text.
     pub commit_confidence: Option<f64>,
+    /// True when the policy withheld an otherwise-eligible commit this step
+    /// (quality gate / holdback zone) — counted into session stats.
+    pub holdback: bool,
 }
 
 /// The emission-policy seam (bd-rt-listen-cmd + policy beads): decides,
@@ -848,6 +851,7 @@ impl EmissionPolicy for EndpointCommitPolicy {
             commit_confidence,
             commit_text: text,
             partial_tail: None,
+            holdback: false,
         }
     }
 
@@ -959,6 +963,34 @@ impl EmissionPolicy for AlignAttPolicy {
         out: &crate::native_engine::decode::DecodeOutput,
         slice_sec: f64,
     ) -> PolicyDecision {
+        // Hallucination gate: a commit is irreversible, so a slice that
+        // smells like non-speech commits nothing (classic Whisper gate:
+        // high no-speech probability or very low mean log-prob — first
+        // campaign receipt: alignatt committed invented text on the
+        // music-only negative fixture; endpoint-commit did not, because it
+        // only ever emits VAD-closed utterance text). The tail still flows
+        // as a mutable partial; finalize/utterance close is unaffected.
+        let no_speech = out
+            .windows
+            .iter()
+            .map(|w| w.no_speech_prob)
+            .fold(0.0_f64, f64::max);
+        let avg_logprob = out
+            .windows
+            .iter()
+            .map(|w| w.avg_logprob)
+            .fold(0.0_f64, f64::min);
+        if no_speech > 0.6 || avg_logprob < -1.0 {
+            let mut decision = Self::decision(out, 0);
+            decision.holdback = true;
+            tracing::debug!(
+                slice_sec,
+                no_speech,
+                avg_logprob,
+                "alignatt step: low-confidence slice, commits held"
+            );
+            return decision;
+        }
         let safe = self.safe_time_sec(out, slice_sec);
         // Closure guard: NEVER commit the slice's final segment
         // mid-utterance, no matter how early its attention sits. A decode
@@ -1637,6 +1669,9 @@ pub fn run_listen_session(
             }
             let slice_sec = buffer.session_duration_sec() - slice_from;
             let decision = policy.step(&out, slice_sec);
+            if decision.holdback {
+                stats.policy_holdbacks += 1;
+            }
             // Incremental commits (AlignAtt): append-only deltas mid-utterance.
             // Committing ADVANCES the decode-slice origin past the committed
             // audio (prefix-advancing): later decodes never re-transcribe it,
@@ -2587,6 +2622,30 @@ mod alignatt_tests {
         assert_eq!(d.commit_text, "");
         assert!(d.partial_tail.is_none());
         assert!(d.commit_through_sec.is_none());
+    }
+
+    #[test]
+    fn hallucination_gate_holds_commits_on_low_confidence_slices() {
+        // Campaign receipt: a step decode over pure tone produced
+        // confident-looking segments; committing them puts invented text
+        // in the append-only stream. High no-speech probability (or very
+        // low avg logprob) must hold ALL commits for that step.
+        let mut p = AlignAttPolicy::new(200);
+        let mut o = out(&[(0.0, 2.0, "ghost"), (2.0, 4.0, "words")], &[80, 150]);
+        o.windows[0].no_speech_prob = 0.9;
+        let d = EmissionPolicy::step(&mut p, &o, 10.0);
+        assert_eq!(d.commit_text, "");
+        assert!(d.holdback);
+        assert_eq!(d.partial_tail.as_deref(), Some("ghost words"));
+        // Same segments with healthy stats commit normally.
+        let o2 = out(&[(0.0, 2.0, "real"), (2.0, 4.0, "words")], &[80, 150]);
+        let d2 = EmissionPolicy::step(&mut p, &o2, 10.0);
+        assert_eq!(d2.commit_text, "real");
+        assert!(!d2.holdback);
+        // Very low avg_logprob trips the gate too.
+        let mut o3 = out(&[(0.0, 2.0, "mush"), (2.0, 4.0, "tail")], &[80, 150]);
+        o3.windows[0].avg_logprob = -1.5;
+        assert!(EmissionPolicy::step(&mut p, &o3, 10.0).holdback);
     }
 
     #[test]
