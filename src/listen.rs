@@ -902,14 +902,15 @@ fn load_replay_wav(path: &std::path::Path) -> FwResult<(Vec<f32>, u32, u16)> {
     Ok((samples, spec.sample_rate, spec.channels))
 }
 
-fn open_capture_source(
-    config: &ListenConfig,
-) -> FwResult<(
+/// (source, capture-backend label, device label, optional fallback warning).
+type OpenedCapture = (
     Box<dyn crate::capture::CaptureSource>,
     &'static str,
     String,
     Option<String>,
-)> {
+);
+
+fn open_capture_source(config: &ListenConfig) -> FwResult<OpenedCapture> {
     match &config.source {
         ListenSource::FileReplay {
             path,
@@ -1130,10 +1131,10 @@ pub fn run_listen_session(
     // keep-back audio is never re-transcribed; linguistic continuity
     // comes from the prompt carry instead).
     let noop_checkpoint = || -> FwResult<()> { Ok(()) };
-    let mut decode_utterance = |buffer: &SessionBuffer,
-                                from_sec: f64,
-                                pinned_language: &Option<String>,
-                                allow_cancel: bool|
+    let decode_utterance = |buffer: &SessionBuffer,
+                            from_sec: f64,
+                            pinned_language: &Option<String>,
+                            allow_cancel: bool|
      -> FwResult<crate::native_engine::decode::DecodeOutput> {
         let params = DecodeParams {
             language: pinned_language.clone(),

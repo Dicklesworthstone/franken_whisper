@@ -1356,15 +1356,39 @@ fn checkpoint_or_emit(
     }
 }
 
+/// Stack budget for pipeline stage threads (bd-4gtx).
+///
+/// Storage stages drive fsqlite statement futures through
+/// [`crate::storage::block_on`]. Those futures nest deeply (statement dispatch
+/// → DML → triggers → nested execution — see `storage::block_on` docs) and in
+/// DEBUG builds their state machines overflow the 2 MiB default thread stack,
+/// aborting the whole process mid-run. `.cargo/config.toml` raises
+/// `RUST_MIN_STACK` for cargo-driven test runs, but a directly executed debug
+/// binary spawns stage threads without that env. 64 MiB matches the config
+/// value; the reservation is virtual and only committed lazily. Release builds
+/// measured comfortable headroom at the default size.
+#[must_use]
+const fn stage_thread_stack_bytes() -> usize {
+    if cfg!(debug_assertions) {
+        64 * 1024 * 1024
+    } else {
+        2 * 1024 * 1024
+    }
+}
+
 fn run_stage_with_budget<T, F>(stage: &'static str, budget_ms: u64, operation: F) -> FwResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> FwResult<T> + Send + 'static,
 {
     let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = tx.send(operation());
-    });
+    std::thread::Builder::new()
+        .name(format!("stage-{stage}"))
+        .stack_size(stage_thread_stack_bytes())
+        .spawn(move || {
+            let _ = tx.send(operation());
+        })
+        .map_err(|error| FwError::Io(error))?;
 
     match rx.recv_timeout(budget_duration(budget_ms)) {
         Ok(result) => result,

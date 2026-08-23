@@ -6,7 +6,7 @@ use franken_whisper::cli;
 use franken_whisper::cli::{
     Cli, Command, ControlFrameKind, DifferentialOracleCommand, PublicCorpusCommand, PullModelArg,
     RobotCommand, RobotDocsCommand, RunsOutputFormat, ShutdownController, SyncCommand,
-    TtyAudioCommand, TtyAudioControlCommand, YoutubeCommand,
+    TtyAudioCommand, TtyAudioControlCommand,
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
@@ -503,18 +503,16 @@ fn run(cli: Cli) -> FwResult<()> {
                     }
                 }
             }
-            RobotCommand::Listen(args) => {
-                return match run_robot_listen(*args) {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        // Fatal terminal contract: run_error is ALWAYS the
-                        // last event on a listen stream, including failures
-                        // before the session opened.
-                        let _ = franken_whisper::robot::emit_robot_error_from_fw(&error);
-                        std::process::exit(1);
-                    }
-                };
-            }
+            RobotCommand::Listen(args) => match run_robot_listen(*args) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // Fatal terminal contract: run_error is ALWAYS the
+                    // last event on a listen stream, including failures
+                    // before the session opened.
+                    let _ = franken_whisper::robot::emit_robot_error_from_fw(&error);
+                    std::process::exit(1);
+                }
+            },
             RobotCommand::Schema => {
                 println!("{}", serde_json::to_string(&robot_schema_value())?);
                 Ok(())
