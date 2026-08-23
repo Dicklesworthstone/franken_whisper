@@ -4382,6 +4382,116 @@ mod tests {
     }
 
     #[test]
+    fn robot_listen_parses_defaults_and_full_flag_set() {
+        // Defaults (bd-rt-listen-cmd-i48i consolidated flag list).
+        let cli = Cli::try_parse_from(["fw", "robot", "listen"]).expect("bare listen");
+        let Command::Robot {
+            command: RobotCommand::Listen(args),
+        } = cli.command
+        else {
+            panic!("expected robot listen");
+        };
+        assert!(matches!(args.source, ListenSourceArg::Mic));
+        assert!(matches!(args.capture_backend, CaptureBackendArg::Auto));
+        assert!(matches!(args.policy, ListenPolicyArg::EndpointCommit));
+        assert_eq!(args.step_ms, 300);
+        assert_eq!(args.max_buffer_sec, 12.0);
+        assert_eq!(args.max_utterance_sec, 90.0);
+        assert_eq!(args.stats_interval_sec, 30.0);
+        assert_eq!(args.capture_buffer_sec, 30.0);
+        assert_eq!(args.stdin_rate, 16_000);
+        assert_eq!(args.stdin_channels, 1);
+        assert!(matches!(args.stdin_format, StdinFormatArg::S16le));
+        assert_eq!(args.vad_gate_db, 9.0);
+        assert_eq!(args.vad_min_speech_ms, 250);
+        assert_eq!(args.vad_endpoint_ms, 600);
+        assert!(!args.no_partials && !args.no_vad && !args.no_context);
+        assert!(!args.list_devices && !args.realtime_pace);
+        assert!(args.language.is_none() && args.fast_model.is_none());
+
+        // Full flag exercise.
+        let cli = Cli::try_parse_from([
+            "fw",
+            "robot",
+            "listen",
+            "--source",
+            "file-replay",
+            "--input",
+            "/tmp/a.wav",
+            "--realtime-pace",
+            "--fast-model",
+            "tiny",
+            "--language",
+            "de",
+            "--step-ms",
+            "500",
+            "--max-buffer-sec",
+            "8",
+            "--max-seconds",
+            "60",
+            "--max-utterance-sec",
+            "30",
+            "--no-partials",
+            "--stats-interval-sec",
+            "5",
+            "--no-context",
+            "--capture-buffer-sec",
+            "10",
+            "--vad-gate-db",
+            "6",
+            "--vad-min-speech-ms",
+            "200",
+            "--vad-endpoint-ms",
+            "800",
+        ])
+        .expect("full listen flags");
+        let Command::Robot {
+            command: RobotCommand::Listen(args),
+        } = cli.command
+        else {
+            panic!("expected robot listen");
+        };
+        assert!(matches!(args.source, ListenSourceArg::FileReplay));
+        assert_eq!(
+            args.input.as_deref(),
+            Some(std::path::Path::new("/tmp/a.wav"))
+        );
+        assert!(args.realtime_pace && args.no_partials && args.no_context);
+        assert_eq!(args.language.as_deref(), Some("de"));
+        assert_eq!(args.step_ms, 500);
+        assert_eq!(args.vad_endpoint_ms, 800);
+
+        // stdin-pcm variants.
+        let cli = Cli::try_parse_from([
+            "fw",
+            "robot",
+            "listen",
+            "--source",
+            "stdin-pcm",
+            "--stdin-rate",
+            "48000",
+            "--stdin-channels",
+            "2",
+            "--stdin-format",
+            "f32le",
+        ])
+        .expect("stdin listen");
+        let Command::Robot {
+            command: RobotCommand::Listen(args),
+        } = cli.command
+        else {
+            panic!("expected robot listen");
+        };
+        assert!(matches!(args.source, ListenSourceArg::StdinPcm));
+        assert_eq!((args.stdin_rate, args.stdin_channels), (48_000, 2));
+        assert!(matches!(args.stdin_format, StdinFormatArg::F32le));
+
+        // Unknown policy value is a parse error (robot syntax contract:
+        // the binary wrapper turns this into one JSON envelope + exit 2).
+        assert!(Cli::try_parse_from(["fw", "robot", "listen", "--policy", "nonsense"]).is_err());
+    }
+
+    #[test]
     fn agent_discovery_commands_parse_with_stable_shapes() {
         let capabilities =
             Cli::try_parse_from(["fw", "capabilities", "--json"]).expect("capabilities command");

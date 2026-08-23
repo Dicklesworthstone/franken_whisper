@@ -1129,20 +1129,35 @@ pub fn run_listen_session(
     // rolling buffer at the utterance start so previous-utterance
     // keep-back audio is never re-transcribed; linguistic continuity
     // comes from the prompt carry instead).
+    let noop_checkpoint = || -> FwResult<()> { Ok(()) };
     let mut decode_utterance = |buffer: &SessionBuffer,
                                 from_sec: f64,
-                                pinned_language: &Option<String>|
+                                pinned_language: &Option<String>,
+                                allow_cancel: bool|
      -> FwResult<crate::native_engine::decode::DecodeOutput> {
         let params = DecodeParams {
             language: pinned_language.clone(),
             timestamps: true,
-            audio_ctx: AudioCtxPolicy::Auto,
+            // bd-hlxb evidence (2026-08-23): AudioCtxPolicy::Auto currently
+            // yields ZERO tokens on real speech slices (driver A/B on jfk:
+            // Auto = empty transcripts + 3-25x decode time from window
+            // retries; Full = correct per-utterance text). Full is the safe
+            // default until the Auto path is fixed; flipping back is the
+            // single biggest listen-latency lever (see bd-rt-audio-ctx).
+            audio_ctx: AudioCtxPolicy::Full,
             bypass_transcript_cache: true,
             initial_prompt: buffer.prompt(),
             n_threads: 4,
             ..DecodeParams::default()
         };
-        model.transcribe(buffer.window_from(from_sec), &params, &checkpoint)
+        if allow_cancel {
+            model.transcribe(buffer.window_from(from_sec), &params, &checkpoint)
+        } else {
+            // Session-end flush: Ctrl-C already fired; this one bounded
+            // decode (buffer is capped) delivers the final words rather
+            // than dropping the open utterance.
+            model.transcribe(buffer.window_from(from_sec), &params, &noop_checkpoint)
+        }
     };
 
     'session: loop {
@@ -1155,7 +1170,7 @@ pub fn run_listen_session(
         if cancelled || out_of_time || source_ended {
             // Final flush when speech is open.
             if in_speech {
-                let out = decode_utterance(&buffer, utterance_t0, &pinned_language)?;
+                let out = decode_utterance(&buffer, utterance_t0, &pinned_language, false)?;
                 let decision = EmissionPolicy::finalize(&mut policy, &out, &buffer);
                 let t1 = buffer.session_duration_sec();
                 if !decision.commit_text.is_empty() {
@@ -1258,7 +1273,18 @@ pub fn run_listen_session(
                     VadEdge::Endpoint { t_sec } => {
                         if in_speech {
                             let flush_started = std::time::Instant::now();
-                            let out = decode_utterance(&buffer, utterance_t0, &pinned_language)?;
+                            let out = match decode_utterance(
+                                &buffer,
+                                utterance_t0,
+                                &pinned_language,
+                                true,
+                            ) {
+                                Err(FwError::Cancelled(_)) => {
+                                    cancelled = true;
+                                    continue 'session;
+                                }
+                                other => other?,
+                            };
                             if pinned_language.is_none() {
                                 pinned_language.clone_from(&out.language);
                             }
@@ -1321,7 +1347,13 @@ pub fn run_listen_session(
             && session_started.elapsed().as_secs_f64() - utterance_started_at
                 >= config.max_utterance_sec
         {
-            let out = decode_utterance(&buffer, utterance_t0, &pinned_language)?;
+            let out = match decode_utterance(&buffer, utterance_t0, &pinned_language, true) {
+                Err(FwError::Cancelled(_)) => {
+                    cancelled = true;
+                    continue 'session;
+                }
+                other => other?,
+            };
             let decision = EmissionPolicy::finalize(&mut policy, &out, &buffer);
             let t1 = buffer.session_duration_sec();
             if !decision.commit_text.is_empty() {
@@ -1387,7 +1419,13 @@ pub fn run_listen_session(
         // -- step decode (mid-utterance partials) ---------------------------
         if in_speech && std::time::Instant::now() >= next_step {
             let step_started = std::time::Instant::now();
-            let out = decode_utterance(&buffer, utterance_t0, &pinned_language)?;
+            let out = match decode_utterance(&buffer, utterance_t0, &pinned_language, true) {
+                Err(FwError::Cancelled(_)) => {
+                    cancelled = true;
+                    continue 'session;
+                }
+                other => other?,
+            };
             if pinned_language.is_none() {
                 pinned_language.clone_from(&out.language);
             }
