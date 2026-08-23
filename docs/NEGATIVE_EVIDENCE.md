@@ -4,6 +4,28 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-08-23 - CoralCoast (hz2 Zen worker): **MEASURED / CPU LEVERS MOOT — bd-cy9u TTY codec runs 147×(encode)/6022×(decode) realtime; wire bandwidth is the binding constraint, and an adaptive controller already exists.**
+
+Probe: `examples/bdcy9u_tty_throughput.rs` — full public paths over a 60 s
+8 kHz mono fixture with INCOMPRESSIBLE pseudo-noise payload (worst case for
+the zlib stage):
+
+| Metric | Measured |
+|---|---|
+| encode (ffmpeg mulaw head + zlib + b64 + crc32/sha256 + JSON framing) | 408 ms = **147× realtime** |
+| decode (parse + verify + decompress + reassemble) | 9 ms = **6022× realtime** |
+| wire bandwidth required | **98.6 kbit/s** worst case (speech compresses lower) |
+| roundtrip | mulaw payload intact |
+
+The bead's candidate levers (cache-friendly layout, branchless CRC/FEC,
+table-driven codec) target numbers already two orders of magnitude beyond
+what any TTY/PTY link consumes (~1× realtime at 10–100 kbit/s). The binding
+constraint on slow links is WIRE BANDWIDTH, which is the domain of the
+existing tested `AdaptiveBitrateController` (bd-2xe.3), plus the retransmit
+plan/policy machinery for loss. No codec change justified.
+
+AGENT_NAME=CoralCoast. Probe committed at examples/bdcy9u_tty_throughput.rs.
+
 ## 2026-08-23 - CoralCoast (ovh-a Zen worker): **VERIFIED WIN — bd-3nw3 core premise holds: builtin symphonia normalization beats the ffmpeg subprocess 1.4–1.7× on a realistic batch-ingest input; remaining micro-levers measured marginal, bead closed.**
 
 Head-to-head on a 600 s stereo 44.1 kHz MP3 (`sine+pink-noise mix, 192 kbps`,
