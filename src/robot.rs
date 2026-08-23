@@ -1614,6 +1614,9 @@ pub fn capabilities_value() -> serde_json::Value {
             {"command": "fw robot schema", "output": "json"},
             {"command": "fw robot backends", "output": "json"},
             {"command": "fw robot run --input AUDIO", "output": "ndjson"},
+            {"command": "fw youtube run --url URL --json-summary", "output": "json"},
+            {"command": "fw youtube search QUERY [--limit N] [--flat]", "output": "json"},
+            {"command": "fw youtube enrich URL_OR_ID...", "output": "json"},
         ],
         "privacy": {
             "agent_discovery_network_access": false,
@@ -2010,7 +2013,10 @@ pub const fn robot_docs_guide() -> &'static str {
 4. Parse stdout only as JSON/NDJSON; diagnostics and tracing belong on stderr.\n\
 5. On failure, branch on the stable `FW-*` code from `fw capabilities --json`.\n\
 6. Run `fw pull all --json` to provision both hash-pinned native default packages.\n\
-7. The installer does this automatically; inference itself never accesses the network.\n"
+7. The installer does this automatically; inference itself never accesses the network.\n\
+8. Curate the YouTube catalog with `fw youtube search QUERY` (deduped JSON hits;\n\
+   `--flat` for cheap sweeps) and `fw youtube enrich URL_OR_ID...`; ingestion is\n\
+   `fw youtube run --url URL` (`--json-summary` for scripting).\n"
 }
 
 /// Emit a single `health.report` NDJSON line to stdout.
@@ -7003,6 +7009,28 @@ mod tests {
                 .is_some_and(|commands| commands.iter().any(|entry| {
                     entry["command"] == "fw robot run --input AUDIO" && entry["output"] == "ndjson"
                 }))
+        );
+        // bd-m7fv: the youtube curation subcommands must stay discoverable.
+        let commands_text: Vec<String> = value["structured_commands"]
+            .as_array()
+            .expect("structured commands")
+            .iter()
+            .filter_map(|entry| entry["command"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            commands_text
+                .iter()
+                .any(|c| c.starts_with("fw youtube run "))
+        );
+        assert!(
+            commands_text
+                .iter()
+                .any(|c| c.starts_with("fw youtube search "))
+        );
+        assert!(
+            commands_text
+                .iter()
+                .any(|c| c.starts_with("fw youtube enrich "))
         );
     }
 
