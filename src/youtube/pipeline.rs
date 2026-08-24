@@ -174,7 +174,7 @@ pub enum YoutubeRobotEvents {
 pub struct YoutubeEventEmitter {
     output: YoutubeRobotEvents,
     run_id: String,
-    seq: std::sync::atomic::AtomicU64,
+    seq: std::sync::Mutex<u64>,
 }
 
 impl YoutubeEventEmitter {
@@ -184,7 +184,7 @@ impl YoutubeEventEmitter {
         Self {
             output,
             run_id: format!("yt-{}", uuid::Uuid::new_v4()),
-            seq: std::sync::atomic::AtomicU64::new(0),
+            seq: std::sync::Mutex::new(0),
         }
     }
 
@@ -200,11 +200,19 @@ impl YoutubeEventEmitter {
         if matches!(self.output, YoutubeRobotEvents::Off) {
             return Ok(());
         }
+        // Allocate the sequence number while holding the same emitter-local
+        // critical section through the physical write. An atomic fetch before
+        // a separate stdout/capture lock could publish seq=2 before seq=1.
+        let mut seq = self
+            .seq
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *seq += 1;
         let mut envelope = serde_json::json!({
             "event": format!("youtube.{event}"),
             "schema_version": crate::robot::ROBOT_SCHEMA_VERSION,
             "run_id": self.run_id,
-            "seq": self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            "seq": *seq,
             "ts": chrono::Utc::now().to_rfc3339(),
         });
         if let (Some(envelope), Some(payload)) = (envelope.as_object_mut(), payload.as_object()) {
@@ -2038,13 +2046,15 @@ https://youtu.be/ccccccccccc
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len();
         assert_eq!(lines_len, (workers * per_worker) as usize);
-        let mut seqs: Vec<u64> = parse_events(&buffer)
+        let seqs: Vec<u64> = parse_events(&buffer)
             .into_iter()
             .map(|v| v["seq"].as_u64().expect("seq"))
             .collect();
-        seqs.sort_unstable();
         let expected: Vec<u64> = (1..=workers * per_worker).collect();
-        assert_eq!(seqs, expected, "seq must partition 1..=N exactly once");
+        assert_eq!(
+            seqs, expected,
+            "physical event order must be monotonically sequenced"
+        );
     }
 
     #[test]
