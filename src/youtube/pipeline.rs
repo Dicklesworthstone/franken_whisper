@@ -170,7 +170,7 @@ pub enum YoutubeRobotEvents {
 /// workers emit `downloading` / `downloaded` concurrently while the
 /// transcription consumer emits the rest, so `seq` is an atomic counter and
 /// stdout writes go through the shared robot lock.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct YoutubeEventEmitter {
     output: YoutubeRobotEvents,
     run_id: String,
@@ -1656,6 +1656,7 @@ https://youtu.be/ccccccccccc
         assert!(!summary.cancelled);
 
         let parsed = parse_events(&buffer);
+        eprintln!("captured youtube events: {parsed:?}");
         let names: Vec<&str> = parsed
             .iter()
             .map(|v| v["event"].as_str().expect("event"))
@@ -1672,11 +1673,14 @@ https://youtu.be/ccccccccccc
             "failure stream, got {names:?}"
         );
         assert_eq!(parsed[3]["id"], "PRIVATE_ID");
+        // classify_stderr maps the stub's "Private video" stderr to
+        // FwError::InvalidRequest("video is private; ...") before the event
+        // ever carries it, so match the mapped message, not the raw stderr.
         assert!(
             parsed[3]["error"]
                 .as_str()
                 .expect("error")
-                .contains("Private")
+                .contains("private")
         );
         assert_eq!(parsed[3]["attempts"], serde_json::json!(1));
         let complete = &parsed[4];
