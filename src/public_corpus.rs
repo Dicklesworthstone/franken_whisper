@@ -27162,6 +27162,23 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_public_lane_fingerprints_have_literal_oracles() {
+        let evidence = valid_unavailable_sidecar_evidence();
+        let actual = evidence
+            .variants
+            .iter()
+            .map(|variant| variant.lane_configuration_sha256.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                "0000000000000000000000000000000000000000000000000000000000000000";
+                super::PublicCorpusSidecarLane::ALL.len()
+            ]
+        );
+    }
+
+    #[test]
     fn sidecar_pair_bottom_k_matches_full_sort_and_samples_late_audio() {
         let audio_sha256 = [0x5a; 32];
         let mut sampler =

@@ -434,9 +434,10 @@ the valid modulus response at each support. Second order filters a first-order
 modulus path only at a larger support and averages the resulting valid modulus.
 One output requires at least eight valid positions. Non-wrapping
 support prevents a smooth trend or single regime boundary from acquiring an
-artificial reverse transition at the window seam. Focused analytic ramp and
-scalar differential tests use `2e-6`; the promotion tolerance remains to be
-frozen by `.15.3`. A constant or near-constant input trajectory is rejected
+artificial reverse transition at the window seam. Focused analytic ramp,
+scalar differential, and metamorphic tests use the frozen
+`ACOUSTIC_SIDECAR_DIFFERENTIAL_TOLERANCE` of `2e-6`. A constant or near-constant
+input trajectory is rejected
 before normalization rather than reported as a bank of zeros. `FirstOrder`,
 `SecondOrder`, and `FirstAndSecondOrder` are distinct
 hashed selections. `SecondOrder` computes
