@@ -204,7 +204,7 @@ fn youtube_private_video_fails_gracefully_without_model() {
     let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
     cmd.arg("youtube")
         .arg("run")
-        .arg("https://www.youtube.com/watch?v=PRIVATE00001")
+        .arg("https://www.youtube.com/watch?v=PRIVATE00001&fw_stub_fail=private")
         .arg("--output-dir")
         .arg(out.to_str().unwrap())
         .arg("--model")
@@ -212,7 +212,6 @@ fn youtube_private_video_fails_gracefully_without_model() {
         .arg("--robot")
         .env("FRANKEN_WHISPER_STATE_DIR", dir.path())
         .env("FRANKEN_WHISPER_YTDLP_BIN", stub_path())
-        .env("STUB_FAIL_MODE", "private")
         .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "1")
         .env("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole")
         .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", "/nonexistent-bridge")

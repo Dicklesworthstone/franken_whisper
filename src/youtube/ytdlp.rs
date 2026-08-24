@@ -1119,7 +1119,7 @@ pub fn download_audio(
         .filter(|line| !line.is_empty())
         .rev()
         .map(PathBuf::from)
-        .find(|candidate| is_reusable_download_path(candidate, dest_dir, &meta.id));
+        .find(|candidate| is_completed_owned_download_path(candidate, dest_dir, &meta.id));
 
     if let Some(path) = printed {
         return Ok(path);
@@ -1158,9 +1158,7 @@ pub(crate) fn is_reusable_download_path(path: &Path, dest_dir: &Path, id: &str) 
         "oga", "ogg", "opus", "wav", "weba", "webm", "wv",
     ];
 
-    if path.parent() != Some(dest_dir)
-        || path.file_stem().and_then(|value| value.to_str()) != Some(id)
-    {
+    if !is_completed_owned_download_path(path, dest_dir, id) {
         return false;
     }
     let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
@@ -1169,6 +1167,20 @@ pub(crate) fn is_reusable_download_path(path: &Path, dest_dir: &Path, id: &str) 
     if !REUSABLE_MEDIA_EXTENSIONS
         .iter()
         .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    {
+        return false;
+    }
+    true
+}
+
+/// Validate yt-dlp's authoritative `after_move:filepath` without guessing its
+/// output container. `bestaudio/best` may legitimately select legacy video
+/// containers that are absent from the narrower resume scan allowlist; the
+/// normalizer handles those through ffmpeg.
+fn is_completed_owned_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
+    if path.parent() != Some(dest_dir)
+        || path.file_stem().and_then(|value| value.to_str()) != Some(id)
+        || path.extension().is_none()
     {
         return false;
     }
@@ -2195,6 +2207,39 @@ mod tests {
             "/tests/fixtures/native/jfk_cut8.bin"
         ));
         assert_eq!(downloaded.as_slice(), tracked_fixture);
+    }
+
+    #[test]
+    fn download_audio_rejects_existing_printed_path_for_a_different_video_id() {
+        let token = CancellationToken::unbounded();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut meta = meta_for_download();
+        meta.id = "EXPECTED001".to_owned();
+        meta.webpage_url = "https://www.youtube.com/watch?v=WRONGPATH01".to_owned();
+
+        let error = download_audio(&stub_info(), &meta, dir.path(), &token)
+            .expect_err("yt-dlp's existing wrong-id printed path must be rejected");
+        assert!(matches!(
+            error,
+            FwError::MissingArtifact(path)
+                if path == dir.path().join("EXPECTED001.<ext>")
+        ));
+        assert!(
+            dir.path().join("WRONGPATH01.wav").is_file(),
+            "the rejected printed path must exist so a bare is_file check would false-green"
+        );
+    }
+
+    #[test]
+    fn authoritative_printed_path_accepts_owned_legacy_media_container() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = dir.path().join("legacy001.flv");
+        std::fs::write(&legacy, b"legacy media container").expect("legacy artifact");
+        assert!(is_completed_owned_download_path(
+            &legacy,
+            dir.path(),
+            "legacy001"
+        ));
     }
 
     #[test]
