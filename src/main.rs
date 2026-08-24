@@ -1197,24 +1197,29 @@ fn run(cli: Cli) -> FwResult<()> {
             cli::YoutubeCommand::Run(args) => {
                 let opts = args.to_options()?;
                 let summary = franken_whisper::youtube::pipeline::run(&opts)?;
-                if args.json_summary {
-                    println!("{}", serde_json::to_string_pretty(&summary)?);
-                } else {
-                    println!(
-                        "YouTube ingestion: {} done, {} skipped, {} failed{}",
-                        summary.done.len(),
-                        summary.skipped.len(),
-                        summary.failed.len(),
-                        if summary.cancelled {
-                            " (cancelled)"
-                        } else {
-                            ""
-                        },
-                    );
-                    for f in &summary.failed {
-                        eprintln!("  failed {}: {} — {}", f.id, f.title, f.error);
+                if !args.robot {
+                    if args.json_summary {
+                        println!("{}", serde_json::to_string_pretty(&summary)?);
+                    } else {
+                        println!(
+                            "YouTube ingestion: {} done, {} skipped, {} failed{}",
+                            summary.done.len(),
+                            summary.skipped.len(),
+                            summary.failed.len(),
+                            if summary.cancelled {
+                                " (cancelled)"
+                            } else {
+                                ""
+                            },
+                        );
+                        for f in &summary.failed {
+                            eprintln!("  failed {}: {} — {}", f.id, f.title, f.error);
+                        }
                     }
                 }
+                // Robot mode (bd-27v1.1): the streamed NDJSON events ending in
+                // youtube.run_complete are the entire stdout contract; no
+                // trailing human/summary output is appended.
                 // Any failed video is a non-zero outcome; cancellation is
                 // surfaced through the global shutdown exit code in main().
                 if !summary.failed.is_empty() && !summary.cancelled {

@@ -1171,6 +1171,10 @@ pub enum ListenPolicyArg {
     /// Bootstrap baseline: partials every step, one committed delta at
     /// utterance close.
     EndpointCommit,
+    /// Fallback (bd-rt-local-agreement-l5x8): commit only what two
+    /// consecutive decodes agree on. Model-agnostic insurance baseline;
+    /// never the default.
+    LocalAgreement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1224,6 +1228,13 @@ pub struct ListenArgs {
     /// Step decode cadence in milliseconds.
     #[arg(long, default_value_t = 300)]
     pub step_ms: u64,
+
+    /// bd-rt-adaptive-contract-yw68: enable the two adaptive controllers
+    /// (step cadence + AlignAtt holdback) under the alien-artifact
+    /// contract. Default OFF; each adapts only its one knob, Brier-gated,
+    /// with deterministic fallback to these configured values.
+    #[arg(long)]
+    pub adaptive: bool,
 
     /// Rolling session buffer cap in seconds.
     #[arg(long, default_value_t = 12.0)]
@@ -1302,6 +1313,15 @@ pub struct ListenArgs {
     /// dropped (`confirm_lag` warning). The live lane never blocks.
     #[arg(long, default_value_t = 4)]
     pub confirm_queue_bound: usize,
+
+    /// Persist the session to SQLite at utterance granularity
+    /// (bd-rt-persist-a66y, crash-durable). Disabled by `--no-persist`.
+    #[arg(long)]
+    pub no_persist: bool,
+
+    /// Database file for run history (same store as batch runs).
+    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    pub db: PathBuf,
 
     /// List input devices as NDJSON and exit (no session).
     #[arg(long)]
