@@ -866,6 +866,11 @@ franken_whisper youtube run --batch-file urls.txt --output-dir ./talks
 
 URLs may be passed positionally or with repeated `--url` flags, and mixed freely with `--batch-file`. A `watch?v=X&list=Y` URL is treated as the **single video** `X`, not the surrounding playlist.
 
+The same command group provides agent-oriented catalog helpers:
+`franken_whisper youtube search <QUERY>` emits deduplicated JSON hits, and
+`franken_whisper youtube enrich <TARGET>...` resolves full metadata for chosen
+URLs or ids. Run each subcommand with `--help` for its focused flags.
+
 ### Output
 
 Each video produces a markdown transcript and a JSON sidecar. The default slug style is `{upload_date}_{title}_{id}` with lowercase ASCII title text and an intact, case-preserved YouTube id; `--naming-style pretty` selects the historical `{upload_date} - {title} [{id}]` layout. The downloaded audio is kept under `audio/<id>.<ext>` (delete it automatically with `--no-keep-audio`), and a `.fw_youtube_manifest.json` state file tracks per-video progress.
@@ -1479,6 +1484,11 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 | `listen.warning` | Structured non-fatal degradation (`confirm_lag`, `forced_trim`, `capture_overrun`, …) |
 | `listen.session_stats` | Heartbeat + terminal session stats (`ttft_ms`, step latencies, confirm-lag percentiles; `final:true` ends a success stream) |
 | `listen.controller` | Default-off adaptive cadence/holdback decision with state transition, Brier calibration, observation count, and deterministic-fallback status |
+| `youtube.run_start` / `youtube.run_complete` | YouTube ingestion request envelope and exactly-one terminal aggregate summary |
+| `youtube.discovered` | Resolved video identity, title, and URL |
+| `youtube.downloading` / `youtube.downloaded` | Per-video download lifecycle and resulting local audio artifact metadata |
+| `youtube.transcribing` / `youtube.done` | Per-video native transcription start and written Markdown/JSON artifact summary |
+| `youtube.skipped` / `youtube.failed` | Explicit terminal disposition for an unprocessed or failed video |
 
 **Stage Codes.** Each pipeline stage emits paired `*.start` / `*.ok` codes (or `*.error` on failure, `*.skip` when not needed, `*.cancelled` on token fire, `*.timeout` on budget overrun):
 

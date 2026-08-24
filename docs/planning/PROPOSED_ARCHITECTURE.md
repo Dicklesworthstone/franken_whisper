@@ -464,6 +464,14 @@ Robot mode output is versioned via `ROBOT_SCHEMA_VERSION` (currently `"1.1.0"`, 
 | `listen.warning` | `event`, `schema_version`, `run_id`, `seq`, `ts`, `reason`, `detail` |
 | `listen.session_stats` | `event`, `schema_version`, `run_id`, `seq`, `ts`, `final`, bounded session counters and latency summaries |
 | `listen.controller` | shared listen envelope plus `controller`, `from`, `to`, `reason`, `brier`, `observations`, `fallback_active` (only with default-off `--adaptive`) |
+| `youtube.run_start` | shared YouTube envelope plus resolved request/output settings |
+| `youtube.discovered` | shared YouTube envelope plus `id`, `title`, `url` |
+| `youtube.downloading` / `youtube.transcribing` | shared YouTube envelope plus `id` |
+| `youtube.downloaded` | shared YouTube envelope plus `id`, `audio_path`, `bytes` |
+| `youtube.done` | shared YouTube envelope plus `id`, output paths, `wall_ms`, `rtf` |
+| `youtube.skipped` | shared YouTube envelope plus `id`, `reason` |
+| `youtube.failed` | shared YouTube envelope plus `id`, `title`, `error`, `attempts` |
+| `youtube.run_complete` | shared YouTube envelope plus aggregate `done`, `skipped`, `failed`, `cancelled` |
 
 ### Streaming Delivery
 

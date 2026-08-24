@@ -12,8 +12,10 @@ use crate::model::{
 // 1.0.0 -> 1.1.0 (bd-rt-events-ghdx): additive minor bump introducing the
 // real-time listen session event family (listen.session_start,
 // speech_started, transcript.delta, utterance_end, listen.warning,
-// listen.session_stats). No existing field was renamed or removed; 1.0.0
-// consumers that ignore unknown fields/events are unaffected.
+// listen.session_stats). Later 1.1.0 additions include the default-off
+// listen.controller evidence event and the youtube.* ingestion family. No
+// existing field was renamed or removed; 1.0.0 consumers that ignore unknown
+// fields/events are unaffected.
 pub const ROBOT_SCHEMA_VERSION: &str = "1.1.0";
 
 pub const STAGE_REQUIRED_FIELDS: &[&str] = &[
@@ -48,6 +50,93 @@ pub const RUN_COMPLETE_REQUIRED_FIELDS: &[&str] = &[
 pub const BACKENDS_DISCOVERY_REQUIRED_FIELDS: &[&str] = &["event", "schema_version", "backends"];
 pub const ROUTING_DECISION_REQUIRED_FIELDS: &[&str] =
     &["event", "schema_version", "run_id", "ts", "code"];
+
+pub const YOUTUBE_RUN_START_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "output_dir",
+    "n_urls",
+    "batch_file",
+    "concurrency",
+    "batch_size",
+    "backend",
+    "model",
+    "language",
+    "diarize",
+    "keep_audio",
+    "retry_failed",
+    "abort_on_error",
+];
+pub const YOUTUBE_DISCOVERED_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "id",
+    "title",
+    "url",
+];
+pub const YOUTUBE_DOWNLOADING_REQUIRED_FIELDS: &[&str] =
+    &["event", "schema_version", "run_id", "seq", "ts", "id"];
+pub const YOUTUBE_DOWNLOADED_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "id",
+    "audio_path",
+    "bytes",
+];
+pub const YOUTUBE_TRANSCRIBING_REQUIRED_FIELDS: &[&str] =
+    &["event", "schema_version", "run_id", "seq", "ts", "id"];
+pub const YOUTUBE_DONE_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "id",
+    "md_path",
+    "json_path",
+    "wall_ms",
+    "rtf",
+];
+pub const YOUTUBE_SKIPPED_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "id",
+    "reason",
+];
+pub const YOUTUBE_FAILED_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "id",
+    "title",
+    "error",
+    "attempts",
+];
+pub const YOUTUBE_RUN_COMPLETE_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "done",
+    "skipped",
+    "failed",
+    "cancelled",
+];
 
 pub const TRANSCRIPT_PARTIAL_REQUIRED_FIELDS: &[&str] = &[
     "event",
@@ -2493,6 +2582,132 @@ pub fn robot_schema_value() -> serde_json::Value {
                     brier: 0.12,
                     observations: 12,
                     fallback_active: false,
+                }),
+            },
+            "youtube.run_start": {
+                "required": YOUTUBE_RUN_START_REQUIRED_FIELDS,
+                "example": json!({
+                    "event": "youtube.run_start",
+                    "schema_version": ROBOT_SCHEMA_VERSION,
+                    "run_id": "yt-run-123",
+                    "seq": 1,
+                    "ts": "2026-06-07T00:00:00Z",
+                    "output_dir": "youtube_transcripts",
+                    "n_urls": 1,
+                    "batch_file": null,
+                    "concurrency": 3,
+                    "batch_size": 0,
+                    "backend": "auto",
+                    "model": "tiny.en",
+                    "language": null,
+                    "diarize": true,
+                    "keep_audio": true,
+                    "retry_failed": true,
+                    "abort_on_error": false,
+                }),
+            },
+            "youtube.discovered": {
+                "required": YOUTUBE_DISCOVERED_REQUIRED_FIELDS,
+                "example": json!({
+                    "event": "youtube.discovered",
+                    "schema_version": ROBOT_SCHEMA_VERSION,
+                    "run_id": "yt-run-123",
+                    "seq": 2,
+                    "ts": "2026-06-07T00:00:01Z",
+                    "id": "jNQXAC9IVRw",
+                    "title": "Me at the zoo",
+                    "url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+                }),
+            },
+            "youtube.downloading": {
+                "required": YOUTUBE_DOWNLOADING_REQUIRED_FIELDS,
+                "example": json!({
+                    "event": "youtube.downloading",
+                    "schema_version": ROBOT_SCHEMA_VERSION,
+                    "run_id": "yt-run-123",
+                    "seq": 3,
+                    "ts": "2026-06-07T00:00:02Z",
+                    "id": "jNQXAC9IVRw",
+                }),
+            },
+            "youtube.downloaded": {
+                "required": YOUTUBE_DOWNLOADED_REQUIRED_FIELDS,
+                "example": json!({
+                    "event": "youtube.downloaded",
+                    "schema_version": ROBOT_SCHEMA_VERSION,
+                    "run_id": "yt-run-123",
+                    "seq": 4,
+                    "ts": "2026-06-07T00:00:03Z",
+                    "id": "jNQXAC9IVRw",
+                    "audio_path": "youtube_transcripts/audio/jNQXAC9IVRw.webm",
+                    "bytes": 123456,
+                }),
+            },
+            "youtube.transcribing": {
+                "required": YOUTUBE_TRANSCRIBING_REQUIRED_FIELDS,
+                "example": json!({
+                    "event": "youtube.transcribing",
+                    "schema_version": ROBOT_SCHEMA_VERSION,
+                    "run_id": "yt-run-123",
+                    "seq": 5,
+                    "ts": "2026-06-07T00:00:04Z",
+                    "id": "jNQXAC9IVRw",
+                }),
+            },
+            "youtube.done": {
+                "required": YOUTUBE_DONE_REQUIRED_FIELDS,
+                "example": json!({
+                    "event": "youtube.done",
+                    "schema_version": ROBOT_SCHEMA_VERSION,
+                    "run_id": "yt-run-123",
+                    "seq": 6,
+                    "ts": "2026-06-07T00:00:05Z",
+                    "id": "jNQXAC9IVRw",
+                    "md_path": "youtube_transcripts/20050424_me_at_the_zoo_jNQXAC9IVRw.md",
+                    "json_path": "youtube_transcripts/20050424_me_at_the_zoo_jNQXAC9IVRw.json",
+                    "wall_ms": 480,
+                    "rtf": 0.025,
+                }),
+            },
+            "youtube.skipped": {
+                "required": YOUTUBE_SKIPPED_REQUIRED_FIELDS,
+                "example": json!({
+                    "event": "youtube.skipped",
+                    "schema_version": ROBOT_SCHEMA_VERSION,
+                    "run_id": "yt-run-123",
+                    "seq": 7,
+                    "ts": "2026-06-07T00:00:06Z",
+                    "id": "jNQXAC9IVRw",
+                    "reason": "already_done",
+                }),
+            },
+            "youtube.failed": {
+                "required": YOUTUBE_FAILED_REQUIRED_FIELDS,
+                "example": json!({
+                    "event": "youtube.failed",
+                    "schema_version": ROBOT_SCHEMA_VERSION,
+                    "run_id": "yt-run-123",
+                    "seq": 8,
+                    "ts": "2026-06-07T00:00:07Z",
+                    "id": "jNQXAC9IVRw",
+                    "title": "Me at the zoo",
+                    "error": "download failed",
+                    "attempts": 1,
+                }),
+            },
+            "youtube.run_complete": {
+                "required": YOUTUBE_RUN_COMPLETE_REQUIRED_FIELDS,
+                "terminal": true,
+                "example": json!({
+                    "event": "youtube.run_complete",
+                    "schema_version": ROBOT_SCHEMA_VERSION,
+                    "run_id": "yt-run-123",
+                    "seq": 9,
+                    "ts": "2026-06-07T00:00:08Z",
+                    "done": ["jNQXAC9IVRw"],
+                    "skipped": [],
+                    "failed": [],
+                    "cancelled": false,
                 }),
             },
             "health.report": {
@@ -7682,6 +7897,44 @@ mod tests {
                 entry.get("required").is_some(),
                 "`{name}` lacks required list"
             );
+            assert_eq!(
+                entry["example"]["schema_version"], ROBOT_SCHEMA_VERSION,
+                "`{name}` example version mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn youtube_events_registered_in_robot_schema_with_complete_examples() {
+        let schema = robot_schema_value();
+        let events = schema["events"].as_object().expect("events map");
+        for name in [
+            "youtube.run_start",
+            "youtube.discovered",
+            "youtube.downloading",
+            "youtube.downloaded",
+            "youtube.transcribing",
+            "youtube.done",
+            "youtube.skipped",
+            "youtube.failed",
+            "youtube.run_complete",
+        ] {
+            let entry = events
+                .get(name)
+                .unwrap_or_else(|| panic!("`{name}` not registered"));
+            let required = entry["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("`{name}` lacks required list"));
+            let example = entry["example"]
+                .as_object()
+                .unwrap_or_else(|| panic!("`{name}` lacks example object"));
+            for field in required {
+                let field = field.as_str().expect("required field name");
+                assert!(
+                    example.contains_key(field),
+                    "`{name}` example lacks required field `{field}`"
+                );
+            }
             assert_eq!(
                 entry["example"]["schema_version"], ROBOT_SCHEMA_VERSION,
                 "`{name}` example version mismatch"

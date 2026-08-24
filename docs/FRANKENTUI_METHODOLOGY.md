@@ -68,7 +68,8 @@ This means the TUI adds zero compile-time or runtime cost when the feature is of
   listen family (`listen.session_start`, `speech_started`,
   `transcript.delta`, `utterance_end`, `listen.warning`,
   `listen.session_stats`) and default-off adaptive `listen.controller`
-  decisions emitted by `fw robot listen`.
+  decisions emitted by `fw robot listen`, plus the `youtube.*` ingestion
+  lifecycle emitted by `fw youtube run --robot`.
 - Streaming: pipeline events arrive via `mpsc::channel` from `FrankenWhisperEngine::transcribe_with_stream` and are emitted as they arrive.
 - Contract: deterministic where possible, explicit error codes, no human decoration mixed with machine output.
 - Introspection: `franken_whisper robot schema` emits a self-describing JSON document with required fields and examples for every event type.
