@@ -3858,10 +3858,21 @@ async fn execute_vad(
 // ---------------------------------------------------------------------------
 
 /// Report produced by the source separation stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeparationMode {
+    /// Energy-based analysis ran and produced a coverage verdict.
+    EnergyAnalysis,
+    /// Analysis was impossible; audio passed through with NO isolation claim
+    /// (bd-f2se: the previous `vocal_isolated=true` here was a lie).
+    UnavailablePassthrough,
+}
+
 #[derive(Debug, Clone)]
 struct SeparateReport {
     /// Whether the audio was determined to contain predominantly vocal content.
     vocal_isolated: bool,
+    /// How this report was produced (drives honest stage telemetry).
+    mode: SeparationMode,
     /// Fraction of audio duration covered by active speech regions (0.0 - 1.0).
     speech_coverage: f64,
     /// Average RMS energy of the audio.
@@ -3910,12 +3921,13 @@ fn source_separate_with_analysis(
             Ok(analysis) => analysis,
             Err(reason) => {
                 return Ok(SeparateReport {
-                    vocal_isolated: true,
+                    vocal_isolated: false,
+                    mode: SeparationMode::UnavailablePassthrough,
                     speech_coverage: 0.0,
                     avg_rms: 0.0,
                     active_region_count: 0,
                     notes: vec![format!(
-                        "analysis unavailable ({reason}); assuming vocal content present"
+                        "analysis unavailable ({reason}); passthrough without isolation claim"
                     )],
                 });
             }
@@ -3953,6 +3965,7 @@ fn source_separate_with_analysis(
     Ok(SeparateReport {
         vocal_isolated,
         speech_coverage,
+        mode: SeparationMode::EnergyAnalysis,
         avg_rms: f64::from(analysis.avg_rms),
         active_region_count: analysis.active_regions.len(),
         notes,
@@ -4013,6 +4026,10 @@ async fn execute_separate(
         "source separation pass finished",
         json!({
             "vocal_isolated": report.vocal_isolated,
+            "separation_mode": match report.mode {
+                SeparationMode::EnergyAnalysis => "energy_analysis",
+                SeparationMode::UnavailablePassthrough => "unavailable_passthrough",
+            },
             "speech_coverage": report.speech_coverage,
             "avg_rms": report.avg_rms,
             "active_region_count": report.active_region_count,
@@ -13534,9 +13551,11 @@ mod tests {
         let result =
             source_separate(std::path::Path::new("/nonexistent/audio.wav"), &token).unwrap();
 
-        // Missing file → graceful fallback.
-        assert!(result.vocal_isolated);
-        assert!(result.notes[0].contains("analysis unavailable"));
+        // Missing file → graceful passthrough WITHOUT an isolation claim
+        // (bd-f2se removed the vocal_isolated=true lie here).
+        assert!(!result.vocal_isolated);
+        assert_eq!(result.mode, super::SeparationMode::UnavailablePassthrough);
+        assert!(result.notes[0].contains("passthrough without isolation claim"));
     }
 
     fn assert_vad_reports_equal(actual: &VadReport, expected: &VadReport) {
@@ -13566,7 +13585,7 @@ mod tests {
     }
 
     fn assert_separate_reports_equal(actual: &SeparateReport, expected: &SeparateReport) {
-        assert_eq!(actual.vocal_isolated, expected.vocal_isolated);
+        assert_eq!(actual.mode, expected.mode);
         assert_eq!(
             actual.speech_coverage.to_bits(),
             expected.speech_coverage.to_bits()
@@ -13675,7 +13694,6 @@ mod tests {
             checksum = checksum.wrapping_add(report.active_region_count as u64);
             black_box(&report);
         }
-        black_box(checksum);
         started.elapsed()
     }
 
@@ -13730,17 +13748,15 @@ mod tests {
         let candidate_signature = separate_report_signature(&candidate);
         assert_eq!(candidate_signature, historical_signature);
         let output_sha256 = format!("{:x}", Sha256::digest(candidate_signature.as_bytes()));
-
         let calibration = measure_source_separation::<false>(&path, &analysis, 1);
         let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
         let iterations = iterations.clamp(1, 4_096);
-
-        black_box(paired_source_separation_ratios::<false, false>(
+        let warmup_ratios = paired_source_separation_ratios::<false, true>(
             &path,
             &analysis,
             iterations,
             WARMUP_REPETITIONS,
-        ));
+        );
         let null_ratios = paired_source_separation_ratios::<false, false>(
             &path,
             &analysis,
