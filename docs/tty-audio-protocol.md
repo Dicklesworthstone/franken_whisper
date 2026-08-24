@@ -378,7 +378,7 @@ Critical control frames (handshake, session close) are emitted multiple times ba
 All TTY audio CLI commands produce machine-readable output suitable for agent orchestration:
 
 1. **NDJSON transport**: every output line is a self-contained JSON object. One JSON object per line, newline-delimited.
-2. **Stable schema**: output shapes are versioned (`schema_version: "1.0.0"`). Breaking changes require a version bump.
+2. **Stable schema**: output shapes are versioned (`schema_version` follows the robot contract's `ROBOT_SCHEMA_VERSION`, currently `1.1.0`). Breaking changes require a version bump.
 3. **Deterministic output**: given identical input and parameters, all commands produce byte-identical output. The retransmit loop is fully deterministic with no time-dependent behavior (`timeout_ms` is advisory/reporting only; no sleeps).
 4. **Structured errors**: errors are reported as JSON with explicit error codes, never mixed with human-readable decoration.
 5. **Pipe-friendly**: all data frames and control frames go to stdout. Diagnostic/error information goes to stderr. Output can be safely piped into downstream tools (`jq`, other `tty-audio` subcommands, agent orchestrators).

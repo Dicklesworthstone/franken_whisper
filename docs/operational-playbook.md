@@ -76,6 +76,24 @@ Escalate before merge when any of the following occurs:
 - Stage budget policy causes non-deterministic behavior.
 - Required external backend prerequisites are unclear to operators.
 
+## Live Session Operations (`fw robot listen`)
+
+- **RAM:** the confirm lane keeps a second model resident beside the fast
+  lane (tiny + large-v3-turbo). Size the host for both, or run
+  `--quality-model none`.
+- **Headless capture:** macOS TCC microphone prompts never render over SSH.
+  Pre-authorize the terminal app before deployment, prove enumeration with
+  `fw robot listen --list-devices` (metadata-only; never prompts), and use
+  `--source stdin-pcm` when no mic is trustworthy. `silent_input` warnings
+  are the TCC-denial signature (zeros, not errors).
+- **Thread sizing:** decode throughput follows the global Rayon pool built
+  once at first use (`ensure_default_rayon_pool`); set `RAYON_NUM_THREADS`
+  explicitly for latency-oriented sizing on dedicated boxes.
+- **Durability:** sessions persist at utterance granularity
+  (backend `native-listen`, savepoint per closed utterance); a crashed
+  session is a listen run without its session-end marker. `--no-persist`
+  opts out entirely.
+
 ## Primary References
 
 - `AGENTS.md`
@@ -84,4 +102,5 @@ Escalate before merge when any of the following occurs:
 - `FEATURE_PARITY.md`
 - `SYNC_STRATEGY.md`
 - `RECOVERY_RUNBOOK.md`
+- `docs/realtime-streaming.md`
 - `TODO_IMPLEMENTATION_TRACKER.md`
