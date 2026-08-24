@@ -847,7 +847,7 @@ pub struct ListenSessionInfo {
 
 /// Session counters for `listen.session_stats` (periodic heartbeat and the
 /// success-terminal final event).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ListenSessionStats {
     pub audio_sec: f64,
     pub wall_sec: f64,
@@ -872,6 +872,11 @@ pub struct ListenSessionStats {
     pub confirm_lag_p50_ms: Option<f64>,
     pub confirm_lag_p95_ms: Option<f64>,
     pub confirm_lag_max_ms: Option<f64>,
+    /// bd-rt-adaptive-contract-yw68: live controller state snapshots
+    /// (`step_ms` / `holdback_frames` objects, or `{"enabled": false}`).
+    /// Additive optional contract surface: `None` serializes as null and
+    /// agents must treat that as "controllers off".
+    pub controllers: Option<serde_json::Value>,
 }
 
 /// Construct a `listen.session_start` NDJSON event value.
@@ -1028,6 +1033,7 @@ pub fn listen_warning_value(
 /// (`final: false`) double as a liveness heartbeat during long silence; the
 /// success terminal is the final emission (`final: true`).
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn listen_session_stats_value(
     run_id: &str,
     seq: u64,
@@ -1047,6 +1053,7 @@ pub fn listen_session_stats_value(
         "deltas": stats.deltas,
         "utterances": stats.utterances,
         "capture_overruns": stats.capture_overruns,
+        "controllers": stats.controllers,
         "mean_step_latency_ms": stats.mean_step_latency_ms,
         "p95_step_latency_ms": stats.p95_step_latency_ms,
         "ttft_ms": stats.ttft_ms,
@@ -1057,6 +1064,32 @@ pub fn listen_session_stats_value(
         "confirm_lag_p95_ms": stats.confirm_lag_p95_ms,
         "confirm_lag_max_ms": stats.confirm_lag_max_ms,
     })
+}
+
+/// Construct a `listen.controller` NDJSON event value (bd-rt-adaptive-
+/// contract-yw68): one auditable adaptive-controller decision.
+#[must_use]
+pub fn listen_controller_value(
+    run_id: &str,
+    seq: u64,
+    ts: &str,
+    entry: &crate::listen::AdaptiveControllerEntry,
+) -> serde_json::Value {
+    let mut value = json!({
+        "event": "listen.controller",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "seq": seq,
+        "ts": ts,
+    });
+    if let (Some(obj), Ok(payload)) = (value.as_object_mut(), serde_json::to_value(entry))
+        && let Some(fields) = payload.as_object()
+    {
+        for (key, item) in fields {
+            obj.insert(key.clone(), item.clone());
+        }
+    }
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -2122,7 +2155,8 @@ pub const fn robot_docs_guide() -> &'static str {
 7. The installer does this automatically; inference itself never accesses the network.\n\
 8. Curate the YouTube catalog with `fw youtube search QUERY` (deduped JSON hits;\n\
    `--flat` for cheap sweeps) and `fw youtube enrich URL_OR_ID...`; ingestion is\n\
-   `fw youtube run --url URL` (`--json-summary` for scripting).\n"
+   `fw youtube run --url URL` (`--robot` streams per-video NDJSON events;\n\
+   `--json-summary` prints one final JSON blob).\n"
 }
 
 /// Emit a single `health.report` NDJSON line to stdout.
@@ -2425,6 +2459,10 @@ pub fn robot_schema_value() -> serde_json::Value {
                     confirm_lag_p50_ms: Some(812.0),
                     confirm_lag_p95_ms: Some(1930.0),
                     confirm_lag_max_ms: Some(2100.0),
+                    controllers: Some(serde_json::json!({
+                        "step_ms": { "enabled": true, "current": 300 },
+                        "holdback_frames": { "enabled": true, "current": 10 },
+                    })),
                 }, false),
             },
             "health.report": {
@@ -3416,6 +3454,8 @@ mod tests {
             backend_identity: Some("native:test".to_owned()),
             backend_version: Some("1.2.3".to_owned()),
             output_payload_hash: Some("output-hash".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
 
         let historical = historical_pretty_run_report(&rich);
@@ -7248,6 +7288,7 @@ mod tests {
             confirm_lag_p50_ms: None,
             confirm_lag_p95_ms: None,
             confirm_lag_max_ms: None,
+            controllers: None,
         }
     }
 

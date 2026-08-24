@@ -235,6 +235,7 @@ fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
     let policy = match args.policy {
         ListenPolicyArg::Alignatt => franken_whisper::listen::ListenPolicy::AlignAtt,
         ListenPolicyArg::EndpointCommit => franken_whisper::listen::ListenPolicy::EndpointCommit,
+        ListenPolicyArg::LocalAgreement => franken_whisper::listen::ListenPolicy::LocalAgreement,
     };
 
     let mut buffer_config = franken_whisper::listen::SessionBufferConfig {
@@ -263,15 +264,16 @@ fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
         capture_buffer_sec: args.capture_buffer_sec,
         policy,
         alignatt_holdback_ms: args.alignatt_holdback_ms,
+        adaptive_controllers: args.adaptive,
         quality_model: match args.quality_model.as_str() {
             "auto" => franken_whisper::listen::QualityModelSetting::Auto,
             "none" => franken_whisper::listen::QualityModelSetting::Disabled,
-            spec => franken_whisper::listen::QualityModelSetting::Explicit(
-                spec.to_owned(),
-            ),
+            spec => franken_whisper::listen::QualityModelSetting::Explicit(spec.to_owned()),
         },
         confirm_queue_bound: args.confirm_queue_bound,
         confirm_drain_sec: args.confirm_drain_sec,
+        persist: !args.no_persist,
+        db_path: args.db.clone(),
     };
 
     // NOTE: main() already installed the Ctrl-C handler; installing twice

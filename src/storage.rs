@@ -163,6 +163,49 @@ impl std::fmt::Debug for RunStore {
     }
 }
 
+/// Row payload for opening a live listen run (bd-rt-persist-a66y): one
+/// session = one run row, backend `native-listen`.
+pub(crate) struct ListenRunOpen<'a> {
+    pub run_id: &'a str,
+    pub started_at_rfc3339: &'a str,
+    /// Source label: the replay file path, or `mic` / `stdin-pcm`.
+    pub input_path: &'a str,
+    /// Full listen config snapshot so replay/audit can round-trip it.
+    pub request_json: &'a str,
+}
+
+/// One committed delta persisted as a segment row (speaker/confidence NULL:
+/// the live lane carries no diarization attribution).
+pub(crate) struct ListenSegmentRow {
+    pub idx: usize,
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub text: String,
+}
+
+/// One buffered stream event persisted verbatim at flush time. Note the
+/// deliberate divergence from batch: `transcript.partial` events are NOT
+/// persisted for live runs (ephemeral preview garnish); deltas, utterance
+/// lifecycle, warnings, verdicts, and session lifecycle ARE.
+pub(crate) struct ListenEventRow {
+    pub seq: u64,
+    pub ts_rfc3339: String,
+    pub code: String,
+    pub payload_json: String,
+}
+
+/// Row payload for closing a live listen run (bd-rt-persist-a66y): drains
+/// remaining events, writes the true end time and final summary fields.
+pub(crate) struct ListenCloseRow<'a> {
+    pub run_id: &'a str,
+    pub events: &'a [ListenEventRow],
+    pub result_json: &'a str,
+    pub warnings_json: &'a str,
+    pub replay_json: &'a str,
+    pub transcript: &'a str,
+    pub finished_at_rfc3339: &'a str,
+}
+
 impl RunStore {
     pub fn open(db_path: &Path) -> FwResult<Self> {
         if let Some(parent) = db_path.parent()
@@ -1975,6 +2018,298 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
     }
 
     // -----------------------------------------------------------------------
+    // bd-rt-persist-a66y: utterance-granular persistence for live listen runs
+    // -----------------------------------------------------------------------
+
+    /// Retry wrapper for the listen-flush family: same busy/backoff budget
+    /// as the batch persist path (concurrent batch agents + live sessions
+    /// share one database file).
+    fn retry_busy<T>(&self, mut op: impl FnMut(&Self) -> FwResult<T>) -> FwResult<T> {
+        for attempt in 0..=PERSIST_BUSY_RETRY_ATTEMPTS {
+            match op(self) {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if is_busy_storage_error(&error) && attempt < PERSIST_BUSY_RETRY_ATTEMPTS =>
+                {
+                    std::thread::sleep(Duration::from_millis(
+                        PERSIST_BUSY_BASE_BACKOFF_MS * (attempt as u64 + 1),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(FwError::Storage(
+            "listen persist retry loop exhausted unexpectedly".to_owned(),
+        ))
+    }
+
+    /// Insert the run row opening a live listen session (one session = one
+    /// row, backend `native-listen`). `finished_at` starts at `started_at`
+    /// and is advanced to a "last known alive" wall time on every flush —
+    /// the NOT NULL schema makes a provisional value mandatory; a crashed
+    /// session is recognizable as a listen run whose events lack the
+    /// session-end marker (round 4 convention). `replay_json` opens as an
+    /// honestly-labeled placeholder; the PCM hash lands only on clean close.
+    pub(crate) fn listen_open_run(&self, open: &ListenRunOpen<'_>) -> FwResult<()> {
+        // Crashed sessions must stay readable by the standard loaders, so
+        // the row opens with a schema-valid minimal result (empty
+        // transcript); close() overwrites it with the final summary.
+        let result_placeholder = serde_json::json!({
+            "backend": "native_listen",
+            "transcript": "",
+            "language": null,
+            "segments": [],
+            "acceleration": null,
+            "raw_output": {},
+            "artifact_paths": [],
+        })
+        .to_string();
+        let replay_placeholder = serde_json::json!({
+            "kind": "live-session",
+            "pcm_sha256": serde_json::Value::Null,
+            "live_note": "audio not retained; hash is an integrity fingerprint, not a replayable reference",
+        })
+        .to_string();
+        self.retry_busy(|store| {
+            let savepoint = next_persist_savepoint_name();
+            store
+                .connection
+                .execute(&format!("SAVEPOINT {savepoint};"))
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            let inner = store.connection.execute_with_params(
+                "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
+                 normalized_wav_path, request_json, result_json, warnings_json, transcript, \
+                 replay_json) VALUES (?1, ?2, ?2, 'native-listen', ?3, '', ?4, ?6, '[]', '', ?5)",
+                &[
+                    SqliteValue::Text(open.run_id.to_owned().into()),
+                    SqliteValue::Text(open.started_at_rfc3339.to_owned().into()),
+                    SqliteValue::Text(open.input_path.to_owned().into()),
+                    SqliteValue::Text(open.request_json.to_owned().into()),
+                    SqliteValue::Text(replay_placeholder.clone().into()),
+                    SqliteValue::Text(result_placeholder.clone().into()),
+                ],
+            );
+
+            match inner {
+                Ok(_) => store
+                    .connection
+                    .execute(&format!("RELEASE SAVEPOINT {savepoint};"))
+                    .map(|_| ())
+                    .map_err(|error| FwError::Storage(error.to_string())),
+                Err(error) => {
+                    let _ = rollback_savepoint(&store.connection, &savepoint);
+                    Err(FwError::Storage(error.to_string()))
+                }
+            }
+        })
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): number of durable segment rows
+    /// for a listen run. The segments TABLE is the authoritative utterance
+    /// store for live runs; `result_json.segments` stays an empty summary.
+    pub fn listen_segment_count(&self, run_id: &str) -> FwResult<i64> {
+        let rows = self
+            .connection
+            .query_with_params(
+                "SELECT COUNT(*) FROM segments WHERE run_id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(rows
+            .first()
+            .and_then(|row| row.get(0).and_then(|value| value.as_integer()))
+            .unwrap_or(0))
+    }
+
+    /// Append one closed utterance's delta segments plus every stream event
+    /// buffered since the previous flush, inside ONE savepoint transaction;
+    /// advance `finished_at` to the last-known-alive time and refresh the
+    /// running transcript. Utterances are the atomic durability unit.
+    pub(crate) fn listen_flush_utterance(
+        &self,
+        run_id: &str,
+        segments: &[ListenSegmentRow],
+        events: &[ListenEventRow],
+        transcript_so_far: &str,
+        finished_at_rfc3339: &str,
+    ) -> FwResult<()> {
+        self.retry_busy(|store| {
+            let savepoint = next_persist_savepoint_name();
+            store
+                .connection
+                .execute(&format!("SAVEPOINT {savepoint};"))
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            let inner = (|| -> Result<(), FwError> {
+                for segment in segments {
+                    store
+                        .connection
+                        .execute_with_params(
+                            "INSERT OR REPLACE INTO segments (run_id, idx, start_sec, end_sec, \
+                             speaker, text, confidence) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL)",
+                            &[
+                                SqliteValue::Text(run_id.to_owned().into()),
+                                SqliteValue::Integer(segment.idx as i64),
+                                SqliteValue::Float(segment.start_sec),
+                                SqliteValue::Float(segment.end_sec),
+                                SqliteValue::Text(segment.text.clone().into()),
+                            ],
+                        )
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                }
+                for event in events {
+                    store
+                        .connection
+                        .execute_with_params(
+                            "INSERT OR REPLACE INTO events (run_id, seq, ts_rfc3339, stage, code, \
+                             message, payload_json) VALUES (?1, ?2, ?3, 'listen', ?4, '', ?5)",
+                            &[
+                                SqliteValue::Text(run_id.to_owned().into()),
+                                SqliteValue::Integer(event.seq as i64),
+                                SqliteValue::Text(event.ts_rfc3339.clone().into()),
+                                SqliteValue::Text(event.code.clone().into()),
+                                SqliteValue::Text(event.payload_json.clone().into()),
+                            ],
+                        )
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                }
+                if !segments.is_empty() || !events.is_empty() {
+                    store
+                        .connection
+                        .execute_with_params(
+                            "UPDATE runs SET finished_at = ?2, transcript = ?3 WHERE id = ?1",
+                            &[
+                                SqliteValue::Text(run_id.to_owned().into()),
+                                SqliteValue::Text(finished_at_rfc3339.to_owned().into()),
+                                SqliteValue::Text(transcript_so_far.to_owned().into()),
+                            ],
+                        )
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                }
+                Ok(())
+            })();
+            match inner {
+                Ok(()) => store
+                    .connection
+                    .execute(&format!("RELEASE SAVEPOINT {savepoint};"))
+                    .map(|_| ())
+                    .map_err(|error| FwError::Storage(error.to_string())),
+                Err(error) => {
+                    let _ = rollback_savepoint(&store.connection, &savepoint);
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    /// Close a live session: drain remaining events, write the true end
+    /// time, final stats/result JSON, warnings, running transcript, and the
+    /// finalized replay envelope with the streamed session-PCM hash. A
+    /// failure here is NOT swallowed by the caller (final close failure
+    /// surfaces as run_error after the session events were emitted).
+    pub(crate) fn listen_close_run(&self, close: &ListenCloseRow<'_>) -> FwResult<()> {
+        let run_id = close.run_id;
+        let events = close.events;
+        let result_json = close.result_json;
+        let warnings_json = close.warnings_json;
+        let replay_json = close.replay_json;
+        let transcript = close.transcript;
+        let finished_at_rfc3339 = close.finished_at_rfc3339;
+        self.retry_busy(|store| {
+            let savepoint = next_persist_savepoint_name();
+            store
+                .connection
+                .execute(&format!("SAVEPOINT {savepoint};"))
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            let inner = (|| -> Result<(), FwError> {
+                for event in events {
+                    store
+                        .connection
+                        .execute_with_params(
+                            "INSERT OR REPLACE INTO events (run_id, seq, ts_rfc3339, stage, code, \
+                             message, payload_json) VALUES (?1, ?2, ?3, 'listen', ?4, '', ?5)",
+                            &[
+                                SqliteValue::Text(run_id.to_owned().into()),
+                                SqliteValue::Integer(event.seq as i64),
+                                SqliteValue::Text(event.ts_rfc3339.clone().into()),
+                                SqliteValue::Text(event.code.clone().into()),
+                                SqliteValue::Text(event.payload_json.clone().into()),
+                            ],
+                        )
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                }
+
+                store
+                    .connection
+                    .execute_with_params(
+                        "UPDATE runs SET finished_at = ?2, result_json = ?3, warnings_json = ?4, \
+                         replay_json = ?5, transcript = ?6 WHERE id = ?1",
+                        &[
+                            SqliteValue::Text(run_id.to_owned().into()),
+                            SqliteValue::Text(finished_at_rfc3339.to_owned().into()),
+                            SqliteValue::Text(result_json.to_owned().into()),
+                            SqliteValue::Text(warnings_json.to_owned().into()),
+                            SqliteValue::Text(replay_json.to_owned().into()),
+                            SqliteValue::Text(transcript.to_owned().into()),
+                        ],
+                    )
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                Ok(())
+            })();
+            match inner {
+                Ok(()) => store
+                    .connection
+                    .execute(&format!("RELEASE SAVEPOINT {savepoint};"))
+                    .map(|_| ())
+                    .map_err(|error| FwError::Storage(error.to_string())),
+                Err(error) => {
+                    let _ = rollback_savepoint(&store.connection, &savepoint);
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): the persisted listen-config
+    /// snapshot (`runs.request_json`) so downstream tooling can verify the
+    /// config round-trip without raw SQL access.
+    pub fn stored_request_json(&self, run_id: &str) -> FwResult<Option<String>> {
+        let rows = self
+            .connection
+            .query_with_params(
+                "SELECT request_json FROM runs WHERE id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(rows.first().map(|row| value_to_string(row.get(0))))
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): the raw replay envelope JSON so
+    /// downstream tooling can inspect live-session integrity metadata
+    /// (`pcm_sha256` / `live_note`) without raw SQL access.
+    pub fn stored_replay_json(&self, run_id: &str) -> FwResult<Option<String>> {
+        let rows = self
+            .connection
+            .query_with_params(
+                "SELECT replay_json FROM runs WHERE id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(rows.first().map(|row| value_to_string(row.get(0))))
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): `PRAGMA integrity_check` verdict
+    /// for crash-recovery assertions and operator diagnostics.
+    pub fn query_integrity_check(&self) -> String {
+        let rows = self
+            .connection
+            .query("PRAGMA integrity_check;")
+            .unwrap_or_default();
+        rows.first()
+            .map(|row| value_to_string(row.get(0)))
+            .unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
     // bd-3i1.3: Diagnostic PRAGMAs for storage observability
     // -----------------------------------------------------------------------
 
@@ -2493,13 +2828,10 @@ fn value_to_i64(value: Option<&SqliteValue>) -> i64 {
     }
 }
 
-fn parse_backend(value: &str) -> BackendKind {
-    match value {
-        "whisper_cpp" => BackendKind::WhisperCpp,
-        "insanely_fast" => BackendKind::InsanelyFast,
-        "whisper_diarization" => BackendKind::WhisperDiarization,
-        _ => BackendKind::Auto,
-    }
+fn storage_u64(value: u64, field: &str) -> FwResult<SqliteValue> {
+    i64::try_from(value)
+        .map(SqliteValue::Integer)
+        .map_err(|_| FwError::Storage(format!("{field} exceeds SQLite INTEGER range")))
 }
 
 fn is_busy_storage_error(error: &FwError) -> bool {
@@ -2530,10 +2862,14 @@ fn optional_float(value: Option<f64>) -> SqliteValue {
     }
 }
 
-fn storage_u64(value: u64, field: &str) -> FwResult<SqliteValue> {
-    i64::try_from(value)
-        .map(SqliteValue::Integer)
-        .map_err(|_| FwError::Storage(format!("{field} exceeds SQLite INTEGER range")))
+fn parse_backend(value: &str) -> BackendKind {
+    match value {
+        "whisper_cpp" => BackendKind::WhisperCpp,
+        "insanely_fast" => BackendKind::InsanelyFast,
+        "whisper_diarization" => BackendKind::WhisperDiarization,
+        "native-listen" => BackendKind::NativeListen,
+        _ => BackendKind::Auto,
+    }
 }
 
 fn storage_index(value: usize, field: &str) -> FwResult<SqliteValue> {
@@ -2743,6 +3079,8 @@ mod tests {
                 backend_identity: Some("whisper-cli".to_owned()),
                 backend_version: Some("whisper 1.2.3".to_owned()),
                 output_payload_hash: Some("output-hash".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         };
 
@@ -4461,6 +4799,8 @@ mod tests {
             backend_identity: Some("whisper-cli".to_owned()),
             backend_version: Some("whisper 1.7.2".to_owned()),
             output_payload_hash: Some("sha256_def456".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
         store.persist_report(&report).expect("persist");
 
@@ -6709,6 +7049,8 @@ mod tests {
                 backend_identity: Some("insanely-fast-whisper".to_owned()),
                 backend_version: Some("0.0.15".to_owned()),
                 output_payload_hash: Some("sha256_789xyz".to_owned()),
+                pcm_sha256: None,
+                live_note: None,
             },
         }
     }

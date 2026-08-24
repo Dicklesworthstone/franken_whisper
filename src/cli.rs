@@ -1030,6 +1030,12 @@ pub struct YoutubeArgs {
     /// Filename style for emitted artifacts (bd-tchp default: slug).
     #[arg(long, value_enum, default_value_t = YoutubeNamingStyleArg::Slug)]
     pub naming_style: YoutubeNamingStyleArg,
+
+    /// Stream per-video NDJSON robot events on stdout (schema 1.1.0,
+    /// terminal `youtube.run_complete`). Mutually exclusive with
+    /// `--json-summary`: the stream replaces the single-blob output.
+    #[arg(long, conflicts_with = "json_summary")]
+    pub robot: bool,
 }
 
 /// CLI-facing naming style selector (maps onto
@@ -1084,6 +1090,11 @@ impl YoutubeArgs {
             abort_on_error: self.abort_on_error,
             naming_style: self.naming_style.into(),
             batch_size: self.batch_size,
+            robot_events: if self.robot {
+                crate::youtube::pipeline::YoutubeRobotEvents::Stdout
+            } else {
+                crate::youtube::pipeline::YoutubeRobotEvents::Off
+            },
         })
     }
 }

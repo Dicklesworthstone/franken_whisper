@@ -760,6 +760,8 @@ fn synthesize_replay_envelope(
             "bridge-fixture-v1".to_owned()
         }),
         output_payload_hash: Some(sha256_hex(&artifact_bytes)),
+        pcm_sha256: None,
+        live_note: None,
     }
 }
 

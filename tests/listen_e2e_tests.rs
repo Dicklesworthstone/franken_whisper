@@ -24,7 +24,11 @@ fn manifest_dir() -> PathBuf {
 }
 
 fn jfk_wav() -> PathBuf {
-    manifest_dir().join("tests").join("fixtures").join("native").join("jfk.wav")
+    manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("native")
+        .join("jfk.wav")
 }
 
 /// Model gate: both lanes must resolve exactly the way the binary resolves
@@ -32,8 +36,7 @@ fn jfk_wav() -> PathBuf {
 /// SKIP line when either package is missing.
 fn require_both_models() -> bool {
     let fast_ok = franken_whisper::native_engine::resolve_model("tiny.en").is_ok();
-    let quality_ok =
-        franken_whisper::native_engine::resolve_model("large-v3-turbo").is_ok();
+    let quality_ok = franken_whisper::native_engine::resolve_model("large-v3-turbo").is_ok();
     if !fast_ok || !quality_ok {
         eprintln!(
             "SKIP confirm_lane_e2e: missing model package(s) \
@@ -71,8 +74,7 @@ fn run_listen(extra_args: &[&str]) -> (Vec<serde_json::Value>, i32, String) {
     let stderr = child.stderr.take().expect("piped stderr");
     // Drain stderr on a helper thread so the child never blocks on a full
     // pipe; keep only the tail for failure diagnostics.
-    let stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::default();
+    let stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
     let stderr_handle = std::thread::spawn({
         let stderr_tail = std::sync::Arc::clone(&stderr_tail);
         move || {
@@ -157,11 +159,18 @@ fn confirm_lane_e2e_turbo_verifies_fast_lane_utterances() {
         )
     }) {
         assert!(
-            event.get("quality_model_id").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+            event
+                .get("quality_model_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
             "verdict must name its quality model: {event}"
         );
         assert!(
-            event.get("drift").and_then(|d| d.get("wer_approx")).and_then(|v| v.as_f64()).is_some(),
+            event
+                .get("drift")
+                .and_then(|d| d.get("wer_approx"))
+                .and_then(|v| v.as_f64())
+                .is_some(),
             "verdict must carry drift.wer_approx: {event}"
         );
         assert!(
@@ -170,7 +179,10 @@ fn confirm_lane_e2e_turbo_verifies_fast_lane_utterances() {
         );
         if event.get("event").and_then(|v| v.as_str()) == Some("transcript.correct") {
             assert!(
-                event.get("segments").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty()),
+                event
+                    .get("segments")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| !a.is_empty()),
                 "correct verdict must carry the quality segments: {event}"
             );
             assert!(
@@ -187,9 +199,14 @@ fn confirm_lane_e2e_turbo_verifies_fast_lane_utterances() {
         .rev()
         .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("listen.session_stats"))
         .expect("success stream ends with session_stats");
-    let confirmations =
-        final_stats.get("confirmations_emitted").and_then(|v| v.as_u64()).unwrap_or(0);
-    let corrections = final_stats.get("corrections_emitted").and_then(|v| v.as_u64()).unwrap_or(0);
+    let confirmations = final_stats
+        .get("confirmations_emitted")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let corrections = final_stats
+        .get("corrections_emitted")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     assert_eq!(
         usize::try_from(confirmations + corrections).unwrap_or(0),
         verdicts.len(),
@@ -228,11 +245,48 @@ fn confirm_lane_e2e_quality_model_none_emits_zero_verdicts() {
         .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("listen.session_stats"))
         .expect("success stream ends with session_stats");
     assert_eq!(
-        final_stats.get("confirmations_emitted").and_then(|v| v.as_u64()),
+        final_stats
+            .get("confirmations_emitted")
+            .and_then(|v| v.as_u64()),
         Some(0)
     );
     assert_eq!(
-        final_stats.get("corrections_emitted").and_then(|v| v.as_u64()),
+        final_stats
+            .get("corrections_emitted")
+            .and_then(|v| v.as_u64()),
         Some(0)
+    );
+}
+
+/// LocalAgreement-2 fallback policy (bd-rt-local-agreement-l5x8): the
+/// stream must be contract-valid and append-only, and session_start must
+/// announce the policy so agents can tell lanes apart. Event SHAPES are
+/// identical to AlignAtt — that is the contract.
+#[test]
+fn local_agreement_e2e_stream_is_contract_valid_and_labeled() {
+    if !require_fast_model() {
+        return;
+    }
+    let (events, code, stderr) = run_listen(&[
+        "--fast-model",
+        "tiny.en",
+        "--language",
+        "en",
+        "--quality-model",
+        "none",
+        "--policy",
+        "local-agreement",
+    ]);
+    assert_eq!(code, 0, "listen session must exit 0; stderr:\n{stderr}");
+    NdjsonStreamValidator::new(StreamOutcome::Success)
+        .validate(&events)
+        .expect("local-agreement stream must satisfy the listen contract");
+    let start = events
+        .iter()
+        .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("listen.session_start"))
+        .expect("session_start present");
+    assert_eq!(
+        start.get("policy").and_then(|v| v.as_str()),
+        Some("local-agreement")
     );
 }
