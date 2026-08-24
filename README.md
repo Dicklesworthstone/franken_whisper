@@ -13,7 +13,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native large-v3-turbo engine is 2.99× faster than whisper.cpp on a 124.5-second whole job; tiny.en is 1.52× faster on a 124.5-second transcribe-only workload and 1.51× faster on a 300-second transcribe-only workload.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming (true-live mic/pipe streaming via `fw robot listen`; batch robot mode streams sequenced stage events), DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native large-v3-turbo engine is 2.99× faster than whisper.cpp on a 124.5-second whole job; tiny.en is 1.52× faster on a 124.5-second transcribe-only workload and 1.51× faster on a 300-second transcribe-only workload.**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -40,6 +40,7 @@ fw models --json
 fw pull all --json
 fw doctor --json
 fw robot schema
+fw robot listen --list-devices   # live streaming capture check
 ```
 
 `fw robot run --input AUDIO --backend auto` streams NDJSON. Robot syntax
@@ -926,6 +927,7 @@ The **JSON** sidecar carries the structured form — `video` metadata, `run` met
 | `--no-retry` | `false` | Do not retry videos previously marked failed in the manifest |
 | `--abort-on-error` | `false` | Stop the whole run on the first per-video failure |
 | `--json-summary` | `false` | Emit the final run summary as JSON on stdout (for scripting) |
+| `--robot` | `false` | Stream per-video NDJSON robot events (`youtube.*`, schema 1.1.0) on stdout |
 
 ### Idempotent & Resumable
 
@@ -955,6 +957,141 @@ yt-dlp --update-to nightly      # or track the nightly channel for the freshest 
 franken_whisper deliberately downloads with the forgiving `bestaudio/best` format selector rather than a strict codec filter, so a slightly stale yt-dlp still succeeds in more cases — but when YouTube breakage does occur, updating yt-dlp is the first and usually the only step.
 
 ---
+
+## Real-Time Streaming (`fw robot listen`)
+
+`fw robot listen` is **true live streaming**: speak into a microphone (or pipe raw PCM / replay a WAV) and act on transcript events while the speaker is still talking. It is a separate driver from batch `robot run`, not a flag on it: batch robot mode streams sequenced *stage* events, but those events are buffered per stage and only reach stdout when each stage completes — time-to-first-text equals full-file latency. The live driver calls the native engine directly in a bounded rolling-buffer loop (capture → resample → VAD → step decode → emission policy → NDJSON), bypassing the 10-stage pipeline whose path-typed stages and fixed wall-clock budgets are structurally wrong for an unbounded session.
+
+### Quickstart
+
+```bash
+# Live microphone -> agent-consumable NDJSON (default: tiny.en fast lane, AlignAtt policy)
+fw robot listen | jq -r 'select(.event == "transcript.delta") | .text'
+
+# No device needed: pipe any producer in as raw PCM (16 kHz mono s16le shown; rate/channels configurable)
+ffmpeg -i stream.mp3 -f s16le -ar 16000 -ac 1 - | fw robot listen --source stdin-pcm
+
+# Deterministic replay of a WAV through the identical event contract
+fw robot listen --source file-replay --input meeting.wav --realtime-pace
+```
+
+### The event contract (schema `1.1.0`)
+
+One JSON object per line on stdout, explicitly flushed. Every event carries `schema_version`, a strictly increasing per-session `seq`, an RFC-3339 `ts`, and the session `run_id`. A live session IS a run: it never emits `run_start`/`run_complete`; a success stream ends with `listen.session_stats {final: true}`, a fatal error ends with `run_error`.
+
+| Event | Meaning |
+|-------|---------|
+| `listen.session_start` | Session configuration echo: source, capture backend, device, models, policy, step cadence, VAD parameter snapshot |
+| `speech_started` | VAD opened an utterance (`utterance_id`, monotonically increasing from 1; utterances never nest) |
+| `transcript.delta` | **Append-only committed text** — concatenating an utterance's deltas yields its transcript; committed text is never rewritten by later events |
+| `transcript.partial` | Mutable preview of the uncommitted tail (suppress with `--no-partials`; the first remedy for slow consumers) |
+| `utterance_end` | The "act now" signal: full committed `text` (32 KiB cap with `text_truncated` flag; deltas always carry the full text), `delta_count`, close `reason` = `endpoint` \| `timeout` \| `max_len` \| `session_end` |
+| `transcript.confirm` / `transcript.correct` | Quality-lane verdicts keyed by `utterance_id`; may arrive **after** their `utterance_end` (async confirm lane; never blocks the live lane) |
+| `listen.warning` | Structured non-fatal degradation: `silent_input`, `capture_overrun`, `fallback_capture_backend`, `fast_model_fallback`, `quality_model_unavailable`, `confirm_lag`, `forced_trim`, `decode_behind`, `persist_degraded`, `endpoint_flush_timeout`, … |
+| `listen.session_stats` | Liveness heartbeat (default every 30 s, silence included) and terminal stats: `ttft_ms`, `mean/p95_step_latency_ms`, `deltas`, `utterances`, `capture_overruns`, `policy_holdbacks`, confirm-lag p50/p95/max |
+
+Lifecycle invariants (enforced by contract tests): every `speech_started` is matched by exactly one later `utterance_end` carrying the same `utterance_id`; an utterance whose decode commits nothing still closes with empty text (breath/cough triggers are normal, never errors); an utterance's deltas always precede its `utterance_end`; `seq` strictly increases across every event.
+
+```text
+speech_started ──► transcript.delta* ─────► utterance_end ──► transcript.confirm/correct?
+  (VAD onset)       append-only commits +      (endpoint / timeout /    async quality lane,
+                    mutable partial previews    max_len / session_end)   keyed by utterance_id
+```
+
+### Emission policies
+
+- **`--policy alignatt` (default).** AlignAtt (Simul-Whisper / SimulStreaming): a segment commits once its tokens' alignment-head cross-attention sits at least `--alignatt-holdback-ms` (default 200 ms) behind the live audio edge. Mid-utterance deltas flow as soon as attention stops attending near the buffer edge. A quality gate holds all commits for steps with high no-speech probability or very low mean log-prob (counted in `policy_holdbacks`) so non-speech audio does not hallucinate committed text.
+- **`--policy endpoint-commit`.** Zero-intelligence baseline: mutable partials every step, one committed delta when the utterance closes. Kept forever as the latency harness's control arm.
+- **`--policy local-agreement`.** LocalAgreement-2 fallback (whisper_streaming, arXiv 2307.14743): commit only the segment-text prefix two consecutive decodes agree on. Model-agnostic insurance (needs no attention tap); never the default.
+
+jfk-style single-sentence utterances close before policies can differ; continuous monologues (>12 s single utterance) are where AlignAtt separates from endpoint-commit.
+
+### Flags
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--source` | `mic` | `mic` \| `stdin-pcm` \| `file-replay` |
+| `--input` + `--realtime-pace` | — / off | WAV input for `file-replay`; pace at real time vs. as-fast-as-possible |
+| `--capture-backend` / `--mic-device` | `auto` / system default | capture backend `auto`\|`cpal`\|`ffmpeg`; input device name |
+| `--list-devices` | off | enumerate input devices as NDJSON and exit (metadata only; never triggers a TCC prompt) |
+| `--fast-model` | auto | fast-lane model override (default tiny.en for `en`, multilingual tiny otherwise) |
+| `--policy` / `--alignatt-holdback-ms` | `alignatt` / 200 | emission policy (above); AlignAtt danger-zone width |
+| `--step-ms` / `--max-buffer-sec` | 300 / 12 | decode cadence; rolling buffer cap |
+| `--language` | detect-and-pin | ISO 639-1 hint |
+| `--max-seconds` / `--max-utterance-sec` | 0 / 90 | session length cap (0 = unbounded); force-close long open speech |
+| `--no-partials` | off | suppress mutable partial previews (first remedy for slow consumers) |
+| `--stats-interval-sec` | 30 | `listen.session_stats` heartbeat interval (0 = final only) |
+| `--no-context` / `--capture-buffer-sec` | off / 30 | disable prompt carry; capture ring capacity |
+| `--no-vad`, `--vad-gate-db`, `--vad-min-speech-ms`, `--vad-endpoint-ms` | off, 9, 250, 600 | VAD gating and tuning |
+| `--quality-model`, `--confirm-drain-sec`, `--confirm-queue-bound` | auto, 10, 4 | confirm-lane controls (above) |
+| `--db` / `--no-persist` | `.franken_whisper/storage.sqlite3` / off | persistence store; disable persistence |
+| `--stdin-rate` / `--stdin-channels` / `--stdin-format` | 16000 / 1 / s16le | stdin-pcm format |
+
+Full semantics per flag: [`docs/realtime-streaming.md`](docs/realtime-streaming.md).
+
+### Models and the quality-confirm lane
+
+The fast lane runs a small resident model: `tiny.en` when `--language en`, multilingual `tiny` otherwise (detect-and-pin). Missing fast-lane packages fall back to the turbo model with a `fast_model_fallback` warning; provision them with `fw pull tiny` / `fw pull tiny-en`.
+
+The confirm lane re-transcribes each closed utterance with a quality model in a background thread. `--quality-model auto` (default) enables it iff the large-v3-turbo package is installed AND the fast lane did not fall back to turbo (self-confirmation is meaningless); `none` disables it; an explicit spec is honored unless it names the effective fast model. Verdicts reuse the batch CorrectionTracker and surface as `transcript.confirm`/`transcript.correct`. The live lane never blocks on the quality lane: more than `--confirm-queue-bound` (default 4) unconfirmed utterances drops the oldest with a `confirm_lag` warning, and session end waits at most `--confirm-drain-sec` (default 10) before a `confirm_drain_timeout` warning.
+
+### Persistence
+
+Sessions persist to SQLite by default (`--db`, default `.franken_whisper/storage.sqlite3`; disable with `--no-persist`) as ONE run row with backend `native-listen`, durability advancing at UTTERANCE granularity inside savepoint transactions. Mutable `transcript.partial` previews are deliberately NOT persisted (unlike batch, where every event is kept). A crashed session is recognizable as a listen run lacking its session-end marker; `runs.finished_at` is bumped at each flush as "last known alive".
+
+### Latency expectations (measured, not aspirational)
+
+From the first streaming latency campaign (`examples/listen_latency_ab.rs`, release build, `--source stdin-pcm`, paced 20 ms PCM injection; PERF_LEDGER 2026-08-23, bd-rt-latency-harness-3dkh, artifact `docs/perf_artifacts/listen_latency_campaign1_2026-08-23.json`) on a **loaded shared host** (load average ≈28–43):
+
+- TTFT (first `transcript.delta` minus speech-onset injection): medians 3.1–5.6 s across fixtures — dominated by model load + first decode under contention, not steady-state stepping.
+- Commit lag p50: ~0.79–1.21 s behind the audio being committed.
+- Partial cadence: inter-partial p50 489 ms against `--step-ms 300` (cadence = step interval + decode time).
+- Retraction count: 0 by construction (append-only deltas). Joined delta text was identical across policy arms on every fixture; the tone-only negative fixture produced zero output.
+
+Honesty note: that campaign's A/A nulls missed the pre-declared band (host load), so it banks NO cross-policy comparison — quiet-host reruns can. Do not quote these rows as comparative wins; they are self-relative observations under load.
+
+Live sessions transcribe only: speaker diarization is not part of the live driver (attribution stays a batch/post-hoc feature), and the fast lane decodes greedy-only (AlignAtt requires the attention tap, which fails requests with beam > 1).
+
+### Agent integration
+
+**Python:**
+
+```python
+import json, sys, subprocess
+
+proc = subprocess.Popen(
+    ["fw", "robot", "listen", "--source", "stdin-pcm"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+)
+for line in proc.stdout:
+    event = json.loads(line)
+    if event["event"] == "transcript.delta":
+        print("COMMIT:", event["text"])           # append-only: safe to persist
+    elif event["event"] == "utterance_end":
+        print("ACT ON UTTERANCE:", event["text"]) # complete turn, act now
+    elif event["event"] == "listen.warning":
+        print("DEGRADED:", event["reason"], file=sys.stderr)
+    elif event["event"] == "listen.session_stats" and event.get("final"):
+        break
+```
+
+**Node.js:**
+
+```javascript
+import { spawn } from "node:child_process";
+import readline from "node:readline";
+
+const proc = spawn("fw", ["robot", "listen"]);
+const rl = readline.createInterface({ input: proc.stdout });
+for await (const line of rl) {
+  const event = JSON.parse(line);
+  if (event.event === "transcript.delta") console.log("COMMIT:", event.text);
+  if (event.event === "utterance_end") console.log("ACT ON UTTERANCE:", event.text);
+  if (event.event === "listen.session_stats" && event.final) break;
+}
+```
+
+Key on `transcript.delta` for durable state (it never changes after arrival) and `utterance_end` for turn-taking actions (answering, tool calls). Treat `transcript.partial` as ephemeral display garnish. Full architecture, design rationale, tunables, and failure-mode tables: [`docs/realtime-streaming.md`](docs/realtime-streaming.md).
 
 ## Command Reference
 
@@ -1294,6 +1431,9 @@ Agent-first interface with structured NDJSON output and a stable schema contract
 # streaming transcription with stage events
 franken_whisper robot run [TRANSCRIBE_OPTIONS]
 
+# live microphone / pipe streaming (see "Real-Time Streaming" section)
+franken_whisper robot listen [--source mic|stdin-pcm|file-replay ...]
+
 # emit the full JSON schema for every event type
 franken_whisper robot schema
 
@@ -1323,6 +1463,12 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 | `transcript.retract` | Quality model retracts partial (drift exceeds tolerance) |
 | `transcript.correct` | Quality model correction with corrected segments |
 | `transcript.speculation_stats` | Aggregate speculation pipeline statistics |
+| `listen.session_start` | Live session configuration echo (additive 1.1.0 family; a session never emits `run_start`/`run_complete`) |
+| `speech_started` | VAD opened an utterance (`utterance_id` from 1, never nested) |
+| `transcript.delta` | Append-only committed text for the live driver (concatenating deltas = the utterance transcript) |
+| `utterance_end` | Utterance closed: full committed text (32 KiB cap + `text_truncated`), `delta_count`, close reason |
+| `listen.warning` | Structured non-fatal degradation (`confirm_lag`, `forced_trim`, `capture_overrun`, …) |
+| `listen.session_stats` | Heartbeat + terminal session stats (`ttft_ms`, step latencies, confirm-lag percentiles; `final:true` ends a success stream) |
 
 **Stage Codes.** Each pipeline stage emits paired `*.start` / `*.ok` codes (or `*.error` on failure, `*.skip` when not needed, `*.cancelled` on token fire, `*.timeout` on budget overrun):
 
@@ -4604,7 +4750,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 |----------|----------------------|
 | **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --json` (native Whisper plus native Sortformer by default; explicit count hints remain optional) |
 | **Podcast batch processing** | `for f in podcasts/*.mp3; do franken_whisper transcribe --input "$f" --backend whisper-cpp --model large-v3 --json; done` |
-| **Live transcription dashboard** | `robot run --mic --mic-seconds 300 --speculative --fast-model tiny.en --quality-model large-v3` piped to a Server-Sent Events translator |
+| **Live transcription dashboard** | `fw robot listen --source stdin-pcm` piped to a Server-Sent Events translator — true-live deltas, not batch stage events |
 | **Voicemail archival** | `transcribe --stdin --backend auto --json` invoked from a mail-handler hook |
 | **Live event captioning over SSH** | `tty-audio encode --input mic.wav` ➜ SSH ➜ `tty-audio decode --output a.wav && franken_whisper transcribe --input a.wav --json` |
 | **Multi-language conference transcription** | `transcribe --input session.mp4 --language ja --translate --json` (transcribe Japanese, translate to English) |
@@ -4612,7 +4758,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 | **Voice-note search index** | Persist all runs into a dedicated DB, `sync export-jsonl` nightly, ingest `segments.jsonl` into a full-text search index keyed by `(run_id, idx)` |
 | **Forensic transcription with audit trail** | `--json --output-srt --output-vtt` plus a snapshot of the replay pack for chain-of-custody |
 | **Karaoke / lyrics alignment** | `transcribe --input song.mp3 --output-lrc --json` then post-process with the word-level timestamps via library API |
-| **Real-time accessibility captioning** | `robot run --mic --speculative` with `transcript.partial` driving a low-latency UI and `transcript.confirm` / `transcript.correct` updating the canonical text |
+| **Real-time accessibility captioning** | `fw robot listen` with committed `transcript.delta` text driving captions and the async quality lane's `transcript.confirm` / `transcript.correct` refining them after each utterance closes |
 | **Air-gapped sensitive recordings** | Preseed and verify both release packages, install with `--offline`, and add `--no-persist` if local transcript storage is forbidden |
 
 The common theme: `franken_whisper` is the same binary in every use case. The configuration changes; the integration story (NDJSON events, structured errors, deterministic replay) does not.
@@ -4642,12 +4788,27 @@ transcript.correct: event, schema_version, run_id, correction_id, replaces_seq, 
                     segments, drift, latency_ms, ts
 health.report     : event, schema_version, ts, backends, ffmpeg, database, resources,
                     overall_status
-speculation.stats : event, schema_version, run_id, windows_processed, corrections_emitted,
-                    confirmations_emitted, correction_rate, mean_fast_latency_ms,
-                    mean_quality_latency_ms, current_window_size_ms, mean_drift_wer, ts
+transcript.speculation_stats: event, schema_version, run_id, windows_processed,
+                    corrections_emitted, confirmations_emitted, correction_rate,
+                    mean_fast_latency_ms, mean_quality_latency_ms,
+                    current_window_size_ms, mean_drift_wer, ts
+listen.session_start: event, schema_version, run_id, seq, ts, source, capture_backend,
+                    device, sample_rate_hz, fast_model, quality_model, policy, step_ms,
+                    partials, vad
+speech_started    : event, schema_version, run_id, seq, ts, utterance_id, t_session_sec
+transcript.delta  : event, schema_version, run_id, seq, ts, utterance_id, text, t0_sec,
+                    t1_sec, tokens, confidence, stability
+utterance_end     : event, schema_version, run_id, seq, ts, utterance_id, reason, t0_sec,
+                    t1_sec, text, text_truncated, delta_count
+listen.warning    : event, schema_version, run_id, seq, ts, reason, detail
+listen.session_stats: event, schema_version, run_id, seq, ts, final, audio_sec, wall_sec,
+                    deltas, utterances, capture_overruns, mean_step_latency_ms,
+                    p95_step_latency_ms, ttft_ms, policy_holdbacks
 ```
 
 Agents can `assert` these fields on every parsed event and abort early on contract violations rather than partially handling malformed input.
+
+Live-mode note: in live sessions the shared `transcript.confirm` / `transcript.correct` events are keyed by `utterance_id` instead of `window_id` and follow their `utterance_end`; `transcript.delta` is the append-only committed-text stream (mutable previews ride `transcript.partial`, which carries the same required fields as the batch variant).
 
 ---
 
@@ -5145,6 +5306,7 @@ Before deploying `franken_whisper` to a production workflow, walk through:
 - [ ] **Native rollout stage chosen.** Default `sole` is the all-native product path. Set another stage only when you deliberately want bridge compatibility behavior.
 - [ ] **Error handling integrated.** Your downstream consumer differentiates `run_complete` from `run_error` events in robot mode, and handles each `FW-ROBOT-*` code appropriately.
 - [ ] **Disk monitoring in place.** Alert on `disk_free_bytes / disk_total_bytes < 0.10` and on `wal_checkpoint.log_frames` climbing across consecutive `robot health` probes.
+- [ ] **Live sessions sized** (`fw robot listen`). The confirm lane keeps a second model in memory alongside the resident fast lane — plan RAM for both (tiny fast lane + large-v3-turbo quality lane), or set `--quality-model none` on memory-constrained hosts. Grant microphone access BEFORE headless/SSH deployment (macOS TCC prompts never render over SSH); `fw robot listen --list-devices` proves capture works. Decode throughput follows the global Rayon pool, which is built once at first use (`ensure_default_rayon_pool`, src/backend/mod.rs) — set `RAYON_NUM_THREADS` explicitly when sizing a dedicated live host for latency rather than throughput.
 
 ---
 
@@ -5157,16 +5319,22 @@ franken_whisper robot schema | jq '.events | keys'
 # [
 #   "backends.discovery",
 #   "health.report",
+#   "listen.session_start",
+#   "listen.session_stats",
+#   "listen.warning",
 #   "routing_decision",
 #   "run_complete",
 #   "run_error",
 #   "run_start",
-#   "speculation.stats",
+#   "speech_started",
 #   "stage",
 #   "transcript.confirm",
 #   "transcript.correct",
+#   "transcript.delta",
 #   "transcript.partial",
-#   "transcript.retract"
+#   "transcript.retract",
+#   "transcript.speculation_stats",
+#   "utterance_end"
 # ]
 
 franken_whisper robot schema | jq '.events["run_complete"].required'
