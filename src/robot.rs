@@ -2301,7 +2301,7 @@ fn dependency_check_json(check: &DependencyCheck) -> serde_json::Value {
 
 #[must_use]
 pub fn robot_schema_value() -> serde_json::Value {
-    json!({
+    let mut schema = json!({
         "version": ROBOT_SCHEMA_VERSION,
         "schema_version": ROBOT_SCHEMA_VERSION,
         "line_oriented": "ndjson",
@@ -2585,133 +2585,6 @@ pub fn robot_schema_value() -> serde_json::Value {
                     fallback_active: false,
                 }),
             },
-            "youtube.run_start": {
-                "required": YOUTUBE_RUN_START_REQUIRED_FIELDS,
-                "example": json!({
-                    "event": "youtube.run_start",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "run_id": "yt-run-123",
-                    "seq": 1,
-                    "ts": "2026-06-07T00:00:00Z",
-                    "output_dir": "youtube_transcripts",
-                    "n_urls": 1,
-                    "batch_file": null,
-                    "concurrency": 3,
-                    "batch_size": 0,
-                    "backend": "auto",
-                    "model": "tiny.en",
-                    "language": null,
-                    "diarize": true,
-                    "keep_audio": true,
-                    "retry_failed": true,
-                    "abort_on_error": false,
-                }),
-            },
-            "youtube.discovered": {
-                "required": YOUTUBE_DISCOVERED_REQUIRED_FIELDS,
-                "example": json!({
-                    "event": "youtube.discovered",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "run_id": "yt-run-123",
-                    "seq": 2,
-                    "ts": "2026-06-07T00:00:01Z",
-                    "id": "jNQXAC9IVRw",
-                    "title": "Me at the zoo",
-                    "url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
-                }),
-            },
-            "youtube.downloading": {
-                "required": YOUTUBE_DOWNLOADING_REQUIRED_FIELDS,
-                "example": json!({
-                    "event": "youtube.downloading",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "run_id": "yt-run-123",
-                    "seq": 3,
-                    "ts": "2026-06-07T00:00:02Z",
-                    "id": "jNQXAC9IVRw",
-                }),
-            },
-            "youtube.downloaded": {
-                "required": YOUTUBE_DOWNLOADED_REQUIRED_FIELDS,
-                "example": json!({
-                    "event": "youtube.downloaded",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "run_id": "yt-run-123",
-                    "seq": 4,
-                    "ts": "2026-06-07T00:00:03Z",
-                    "id": "jNQXAC9IVRw",
-                    "audio_path": "youtube_transcripts/audio/jNQXAC9IVRw.webm",
-                    "bytes": 123456,
-                    "reused": false,
-                }),
-            },
-            "youtube.transcribing": {
-                "required": YOUTUBE_TRANSCRIBING_REQUIRED_FIELDS,
-                "example": json!({
-                    "event": "youtube.transcribing",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "run_id": "yt-run-123",
-                    "seq": 5,
-                    "ts": "2026-06-07T00:00:04Z",
-                    "id": "jNQXAC9IVRw",
-                }),
-            },
-            "youtube.done": {
-                "required": YOUTUBE_DONE_REQUIRED_FIELDS,
-                "example": json!({
-                    "event": "youtube.done",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "run_id": "yt-run-123",
-                    "seq": 6,
-                    "ts": "2026-06-07T00:00:05Z",
-                    "id": "jNQXAC9IVRw",
-                    "md_path": "youtube_transcripts/20050424_me_at_the_zoo_jNQXAC9IVRw.md",
-                    "json_path": "youtube_transcripts/20050424_me_at_the_zoo_jNQXAC9IVRw.json",
-                    "wall_ms": 480,
-                    "rtf": 0.025,
-                }),
-            },
-            "youtube.skipped": {
-                "required": YOUTUBE_SKIPPED_REQUIRED_FIELDS,
-                "example": json!({
-                    "event": "youtube.skipped",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "run_id": "yt-run-123",
-                    "seq": 7,
-                    "ts": "2026-06-07T00:00:06Z",
-                    "id": "jNQXAC9IVRw",
-                    "reason": "already_done",
-                }),
-            },
-            "youtube.failed": {
-                "required": YOUTUBE_FAILED_REQUIRED_FIELDS,
-                "example": json!({
-                    "event": "youtube.failed",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "run_id": "yt-run-123",
-                    "seq": 8,
-                    "ts": "2026-06-07T00:00:07Z",
-                    "id": "jNQXAC9IVRw",
-                    "title": "Me at the zoo",
-                    "error": "download failed",
-                    "attempts": 1,
-                }),
-            },
-            "youtube.run_complete": {
-                "required": YOUTUBE_RUN_COMPLETE_REQUIRED_FIELDS,
-                "terminal": true,
-                "example": json!({
-                    "event": "youtube.run_complete",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "run_id": "yt-run-123",
-                    "seq": 9,
-                    "ts": "2026-06-07T00:00:08Z",
-                    "done": ["jNQXAC9IVRw"],
-                    "skipped": [],
-                    "failed": [],
-                    "cancelled": false,
-                }),
-            },
             "health.report": {
                 "required": HEALTH_REPORT_REQUIRED_FIELDS,
                 "example": json!({
@@ -2751,6 +2624,146 @@ pub fn robot_schema_value() -> serde_json::Value {
                 }),
             },
         }
+    });
+    let serde_json::Value::Object(youtube_events) = youtube_event_schema_value() else {
+        unreachable!("youtube schema events are constructed as an object")
+    };
+    schema["events"]
+        .as_object_mut()
+        .expect("robot schema events must be an object")
+        .extend(youtube_events);
+    schema
+}
+
+fn youtube_event_schema_value() -> serde_json::Value {
+    json!({
+        "youtube.run_start": {
+            "required": YOUTUBE_RUN_START_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.run_start",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 1,
+                "ts": "2026-06-07T00:00:00Z",
+                "output_dir": "youtube_transcripts",
+                "n_urls": 1,
+                "batch_file": null,
+                "concurrency": 3,
+                "batch_size": 0,
+                "backend": "auto",
+                "model": "tiny.en",
+                "language": null,
+                "diarize": true,
+                "keep_audio": true,
+                "retry_failed": true,
+                "abort_on_error": false,
+            },
+        },
+        "youtube.discovered": {
+            "required": YOUTUBE_DISCOVERED_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.discovered",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 2,
+                "ts": "2026-06-07T00:00:01Z",
+                "id": "jNQXAC9IVRw",
+                "title": "Me at the zoo",
+                "url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+            },
+        },
+        "youtube.downloading": {
+            "required": YOUTUBE_DOWNLOADING_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.downloading",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 3,
+                "ts": "2026-06-07T00:00:02Z",
+                "id": "jNQXAC9IVRw",
+            },
+        },
+        "youtube.downloaded": {
+            "required": YOUTUBE_DOWNLOADED_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.downloaded",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 4,
+                "ts": "2026-06-07T00:00:03Z",
+                "id": "jNQXAC9IVRw",
+                "audio_path": "youtube_transcripts/audio/jNQXAC9IVRw.webm",
+                "bytes": 123456,
+                "reused": false,
+            },
+        },
+        "youtube.transcribing": {
+            "required": YOUTUBE_TRANSCRIBING_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.transcribing",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 5,
+                "ts": "2026-06-07T00:00:04Z",
+                "id": "jNQXAC9IVRw",
+            },
+        },
+        "youtube.done": {
+            "required": YOUTUBE_DONE_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.done",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 6,
+                "ts": "2026-06-07T00:00:05Z",
+                "id": "jNQXAC9IVRw",
+                "md_path": "youtube_transcripts/20050424_me_at_the_zoo_jNQXAC9IVRw.md",
+                "json_path": "youtube_transcripts/20050424_me_at_the_zoo_jNQXAC9IVRw.json",
+                "wall_ms": 480,
+                "rtf": 0.025,
+            },
+        },
+        "youtube.skipped": {
+            "required": YOUTUBE_SKIPPED_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.skipped",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 7,
+                "ts": "2026-06-07T00:00:06Z",
+                "id": "jNQXAC9IVRw",
+                "reason": "already_done",
+            },
+        },
+        "youtube.failed": {
+            "required": YOUTUBE_FAILED_REQUIRED_FIELDS,
+            "example": {
+                "event": "youtube.failed",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 8,
+                "ts": "2026-06-07T00:00:07Z",
+                "id": "jNQXAC9IVRw",
+                "title": "Me at the zoo",
+                "error": "download failed",
+                "attempts": 1,
+            },
+        },
+        "youtube.run_complete": {
+            "required": YOUTUBE_RUN_COMPLETE_REQUIRED_FIELDS,
+            "terminal": true,
+            "example": {
+                "event": "youtube.run_complete",
+                "schema_version": ROBOT_SCHEMA_VERSION,
+                "run_id": "yt-run-123",
+                "seq": 9,
+                "ts": "2026-06-07T00:00:08Z",
+                "done": ["jNQXAC9IVRw"],
+                "skipped": [],
+                "failed": [],
+                "cancelled": false,
+            },
+        },
     })
 }
 
