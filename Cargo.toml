@@ -105,7 +105,7 @@ ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", de
 # by the f16-compute GEMV kernels (nn::gemv_f16). Pinned to ft-core's version.
 half = { version = "2.7", features = ["std"] }
 
-ftui = { version = "0.5.0", path = "../frankentui/crates/ftui", default-features = false, features = ["crossterm"], optional = true }
+ftui = { version = "0.6.0", path = "../frankentui/crates/ftui", default-features = false, features = ["crossterm"], optional = true }
 
 # frankenjax differential oracle (feature `fj-oracle`, bd-ohra): the fj
 # interpreter family serves as the independent evaluation oracle for
