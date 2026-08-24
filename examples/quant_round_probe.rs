@@ -11,7 +11,7 @@
 //!
 //! Run: cargo run --release --example quant_round_probe
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use core::arch::x86_64::*;
 
 /// Exact replica of `nn::quantize_act_i7`'s inner (scalar `.round()`).
