@@ -6494,7 +6494,7 @@ impl LstmWeights {
         let mut pre = vec![0.0f32; 4 * hidden];
         for t in 0..x.rows {
             let x_row = &x.data[t * x.cols..(t + 1) * x.cols];
-            for j in 0..(4 * hidden) {
+            for (j, pre_j) in pre.iter_mut().enumerate() {
                 let mut acc = self.b_ih[j] + self.b_hh[j];
                 let w_ih_row = &self.w_ih.data[j * x.cols..(j + 1) * x.cols];
                 for (i, &xi) in x_row.iter().enumerate() {
@@ -6504,7 +6504,7 @@ impl LstmWeights {
                 for (k, &hk) in state.h.iter().enumerate() {
                     acc += hk * w_hh_row[k];
                 }
-                pre[j] = acc;
+                *pre_j = acc;
             }
             let out_row = &mut out.data[t * hidden..(t + 1) * hidden];
             for k in 0..hidden {
@@ -6638,8 +6638,8 @@ mod tests {
         let out = weights.lstm_forward(&x, &mut state).expect("forward");
         let (rows_ref, h_ref, c_ref) =
             lstm_naive_reference(&weights.w_ih, &weights.w_hh, &weights.b_ih, &weights.b_hh, &x);
-        for t in 0..x.rows {
-            for (k, (a, b)) in out.row(t).iter().zip(rows_ref[t].iter()).enumerate() {
+        for (t, row_ref) in rows_ref.iter().enumerate() {
+            for (k, (a, b)) in out.row(t).iter().zip(row_ref.iter()).enumerate() {
                 assert!(
                     (a - b).abs() <= 1e-6,
                     "row {t} gate {k}: {a} vs {b}"

@@ -425,7 +425,7 @@ pub(crate) fn run_with_info(
     let manifest_path = opts.output_dir.join(MANIFEST_NAME);
 
     let mut manifest = Manifest::load(&manifest_path)?;
-    let videos = resolve_videos(&info, opts, &token)?;
+    let videos = resolve_videos(info, opts, &token)?;
     for v in &videos {
         manifest.upsert_discovered(v);
     }
