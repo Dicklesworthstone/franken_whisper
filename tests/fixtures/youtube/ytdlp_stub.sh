@@ -13,7 +13,8 @@
 #   -j ... (no --flat-playlist)       -> prints one canned full-metadata JSON object
 #   -f ba ... -o TEMPLATE --print after_move:filepath URL
 #                                     -> copies $STUB_FIXTURE_WAV (default: the
-#                                        repo jfk.wav) to <dest_dir>/<id>.wav and
+#                                        tracked repo jfk_cut8.bin WAV) to
+#                                        <dest_dir>/<id>.wav and
 #                                        prints that path on its own stdout line
 #
 # Error injection via STUB_FAIL_MODE or an `fw_stub_fail=<mode>` URL query:
@@ -24,7 +25,7 @@
 #
 # Override knobs (env):
 #   STUB_VERSION        version string printed for --version   (default 2025.01.01)
-#   STUB_FIXTURE_WAV    source wav copied on download          (default repo jfk.wav)
+#   STUB_FIXTURE_WAV    source wav copied on download   (default tracked jfk_cut8.bin)
 #   STUB_VIDEO_ID       id used for the download output name    (default dQw4w9WgXcQ)
 #   STUB_LIVE_STATUS    live_status field in -j metadata        (default not_live)
 
@@ -167,9 +168,10 @@ if [ "$WANT_DOWNLOAD" -eq 1 ]; then
 
   SRC_WAV="${STUB_FIXTURE_WAV:-}"
   if [ -z "$SRC_WAV" ]; then
-    # Default: jfk.wav relative to this script (tests/fixtures/native/jfk.wav).
+    # The .bin suffix bypasses the fixture-size ignore rule; the bytes are a
+    # valid RIFF/WAVE file tracked in Git and therefore present on RCH workers.
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    SRC_WAV="$SCRIPT_DIR/../native/jfk.wav"
+    SRC_WAV="$SCRIPT_DIR/../native/jfk_cut8.bin"
   fi
   if [ ! -f "$SRC_WAV" ]; then
     echo "ERROR: stub fixture wav not found at $SRC_WAV" >&2

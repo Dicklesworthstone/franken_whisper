@@ -2161,9 +2161,12 @@ mod tests {
             Some("dQw4w9WgXcQ.wav")
         );
         assert!(path.starts_with(dir.path()));
-        // The copied file should be non-empty (the jfk.wav fixture).
-        let len = std::fs::metadata(&path).unwrap().len();
-        assert!(len > 0, "downloaded file should be non-empty");
+        let downloaded = std::fs::read(&path).expect("read stub download");
+        let tracked_fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/native/jfk_cut8.bin"
+        ));
+        assert_eq!(downloaded.as_slice(), tracked_fixture);
     }
 
     // ---- error mapping ---------------------------------------------------
