@@ -407,6 +407,7 @@ checkout.
 | `ft-core` / `ft-kernel-cpu` | crates.io `0.1.0`; source path `../frankentorch` | Required tensor types and native Whisper CPU kernels |
 | `ft-kernel-metal` *(macOS)* | crates.io `0.1.0`; source path `../frankentorch` | Automatic Metal compute for eligible large operations |
 | `ftui` *(feature: `tui`)* | crates.io `0.5.0`; source path `../frankentui` | Optional terminal UI framework |
+| `fj-lax` / `fj-core` *(feature: `fj-oracle`)* | source path `../frankenjax` | Independent differential oracle for native-kernel conformance tests (seeded, 1e-4 tolerance; see [docs/conformance-contract.md](docs/conformance-contract.md)) |
 
 ---
 

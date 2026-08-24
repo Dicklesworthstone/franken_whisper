@@ -57,14 +57,17 @@ This means the TUI adds zero compile-time or runtime cost when the feature is of
 
 - Entry point: `franken_whisper robot run <args>`
 - Output: NDJSON to stdout, one line per event.
-- Schema version: `ROBOT_SCHEMA_VERSION` (currently `"1.0.0"`), included in every line.
+- Schema version: `ROBOT_SCHEMA_VERSION` (currently `"1.1.0"` — the additive listen-family bump), included in every line.
 - Event types:
   `run_start`, `stage`, `run_complete`, `run_error`,
   diagnostic/introspection events such as `backends.discovery` and `health.report`,
   `routing_decision` output from `franken_whisper robot routing-history`,
   and speculative streaming events such as
   `transcript.partial`, `transcript.confirm`, `transcript.retract`,
-  `transcript.correct`, and `transcript.speculation_stats`.
+  `transcript.correct`, and `transcript.speculation_stats`, plus the live
+  listen family (`listen.session_start`, `speech_started`,
+  `transcript.delta`, `utterance_end`, `listen.warning`,
+  `listen.session_stats`) emitted by `fw robot listen`.
 - Streaming: pipeline events arrive via `mpsc::channel` from `FrankenWhisperEngine::transcribe_with_stream` and are emitted as they arrive.
 - Contract: deterministic where possible, explicit error codes, no human decoration mixed with machine output.
 - Introspection: `franken_whisper robot schema` emits a self-describing JSON document with required fields and examples for every event type.
