@@ -144,6 +144,90 @@ impl Manifest {
     }
 }
 
+/// Output destination for youtube robot-mode NDJSON events (bd-27v1.1).
+///
+/// `Off` (the default) preserves the historical human / `--json-summary`
+/// behavior with zero emission cost. `Stdout` streams one JSON object per
+/// line through the shared locked-stdout robot path
+/// ([`crate::robot::emit_event_value`]); `Capture` collects the identical
+/// lines in memory so tests can assert on the full event stream without
+/// touching process stdout.
+#[derive(Clone, Debug, Default)]
+pub enum YoutubeRobotEvents {
+    /// Robot mode off: no event emission (default).
+    #[default]
+    Off,
+    /// Stream NDJSON events to process stdout.
+    Stdout,
+    /// Collect NDJSON lines into a shared buffer (tests).
+    Capture(std::sync::Arc<std::sync::Mutex<Vec<String>>>),
+}
+
+/// Emits sequenced `youtube.*` NDJSON events matching the robot stage-event
+/// envelope: every line carries `event`, `schema_version`
+/// ([`crate::robot::ROBOT_SCHEMA_VERSION`]), a stable per-run `run_id`, a
+/// monotonic `seq`, and an RFC-3339 `ts`. Emission is thread-safe: download
+/// workers emit `downloading` / `downloaded` concurrently while the
+/// transcription consumer emits the rest, so `seq` is an atomic counter and
+/// stdout writes go through the shared robot lock.
+#[derive(Debug, Clone)]
+pub struct YoutubeEventEmitter {
+    output: YoutubeRobotEvents,
+    run_id: String,
+    seq: std::sync::atomic::AtomicU64,
+}
+
+impl YoutubeEventEmitter {
+    /// Build an emitter for the given destination with a fresh `yt-<uuid>`
+    /// run id shared by every event of this run.
+    pub fn new(output: YoutubeRobotEvents) -> Self {
+        Self {
+            output,
+            run_id: format!("yt-{}", uuid::Uuid::new_v4()),
+            seq: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Stable run id shared by every event of this run.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Emit one `youtube.<event>` envelope, flattening `payload` fields into
+    /// the envelope. In `Off` mode this returns immediately without building
+    /// any JSON, so non-robot runs pay nothing.
+    pub fn emit(&self, event: &str, payload: serde_json::Value) -> FwResult<()> {
+        if matches!(self.output, YoutubeRobotEvents::Off) {
+            return Ok(());
+        }
+        let mut envelope = serde_json::json!({
+            "event": format!("youtube.{event}"),
+            "schema_version": crate::robot::ROBOT_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "seq": self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            "ts": chrono::Utc::now().to_rfc3339(),
+        });
+        if let (Some(envelope), Some(payload)) =
+            (envelope.as_object_mut(), payload.as_object())
+        {
+            for (key, value) in payload {
+                envelope.insert(key.clone(), value.clone());
+            }
+        }
+        match &self.output {
+            YoutubeRobotEvents::Off => Ok(()),
+            YoutubeRobotEvents::Stdout => crate::robot::emit_event_value(&envelope),
+            YoutubeRobotEvents::Capture(buffer) => {
+                buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(serde_json::to_string(&envelope).map_err(FwError::Json)?);
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Options controlling a YouTube ingestion run.
 #[derive(Debug, Clone)]
 pub struct YoutubeRunOptions {
@@ -177,6 +261,9 @@ pub struct YoutubeRunOptions {
     pub abort_on_error: bool,
     /// Filename style for emitted artifacts (bd-tchp default: slug).
     pub naming_style: naming::NamingStyle,
+    /// bd-27v1.1: destination for robot-mode NDJSON `youtube.*` events
+    /// (`--robot` selects [`YoutubeRobotEvents::Stdout`]).
+    pub robot_events: YoutubeRobotEvents,
 }
 
 /// Final outcome of a run, for the CLI to report / set an exit code.
@@ -289,8 +376,11 @@ struct DownloadResult {
 }
 
 /// Run the full ingestion pipeline.
+///
+/// Probes `yt-dlp` once (the only environment-dependent step), then hands off
+/// to [`run_with_info`], which is hermetic given a [`YtdlpInfo`] and therefore
+/// unit-testable against the stub fixture without network access.
 pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
-    let token = CancellationToken::unbounded();
     let info = ytdlp::probe()?;
     if info.stale {
         tracing::warn!(
@@ -298,6 +388,38 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
             "yt-dlp build is over 90 days old; YouTube may have changed — consider `yt-dlp -U`"
         );
     }
+    run_with_info(opts, &info)
+}
+
+/// Run the pipeline against an already-probed `yt-dlp`.
+///
+/// Streams bd-27v1.1 robot events per the configured [`YoutubeRobotEvents`]
+/// destination; see [`YoutubeEventEmitter`] for the envelope contract.
+pub(crate) fn run_with_info(
+    opts: &YoutubeRunOptions,
+    info: &YtdlpInfo,
+) -> FwResult<YoutubeRunSummary> {
+    let token = CancellationToken::unbounded();
+    let events = std::sync::Arc::new(YoutubeEventEmitter::new(opts.robot_events.clone()));
+    // First event of every robot run: echoes the fully resolved request so an
+    // agent can audit what the run was actually configured to do.
+    events.emit(
+        "run_start",
+        serde_json::json!({
+            "output_dir": opts.output_dir.display().to_string(),
+            "n_urls": opts.urls.len(),
+            "batch_file": opts.batch_file.as_ref().map(|p| p.display().to_string()),
+            "concurrency": opts.concurrency.max(1),
+            "batch_size": opts.batch_size,
+            "backend": opts.backend.as_str(),
+            "model": opts.model,
+            "language": opts.language,
+            "diarize": opts.diarize,
+            "keep_audio": opts.keep_audio,
+            "retry_failed": opts.retry_failed,
+            "abort_on_error": opts.abort_on_error,
+        }),
+    )?;
 
     std::fs::create_dir_all(&opts.output_dir).map_err(FwError::Io)?;
     let audio_dir = opts.output_dir.join("audio");
@@ -310,6 +432,12 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
         manifest.upsert_discovered(v);
     }
     manifest.save(&manifest_path)?;
+    for v in &videos {
+        events.emit(
+            "discovered",
+            serde_json::json!({ "id": v.id, "title": v.title, "url": v.url }),
+        )?;
+    }
 
     // Partition into work-to-do vs already-satisfied (idempotent resume).
     let mut summary = YoutubeRunSummary::default();
@@ -319,10 +447,18 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
             Some(VideoState::Done { .. }) => {
                 tracing::info!(id = %v.id, "already done; skipping");
                 summary.skipped.push(v.id.clone());
+                events.emit(
+                    "skipped",
+                    serde_json::json!({ "id": v.id, "reason": "already_done" }),
+                )?;
             }
             Some(VideoState::Failed { .. }) if !opts.retry_failed => {
                 tracing::info!(id = %v.id, "previously failed; --no-retry, skipping");
                 summary.skipped.push(v.id.clone());
+                events.emit(
+                    "skipped",
+                    serde_json::json!({ "id": v.id, "reason": "previously_failed_no_retry" }),
+                )?;
             }
             Some(VideoState::Failed { attempts, .. }) if *attempts >= MAX_ATTEMPTS => {
                 tracing::info!(
@@ -330,12 +466,17 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                     "exhausted retry budget; skipping (delete the manifest entry to force a retry)"
                 );
                 summary.skipped.push(v.id.clone());
+                events.emit(
+                    "skipped",
+                    serde_json::json!({ "id": v.id, "reason": "retry_budget_exhausted" }),
+                )?;
             }
             _ => to_process.push(v.clone()),
         }
     }
 
     if to_process.is_empty() {
+        emit_run_complete(&events, &summary)?;
         return Ok(summary);
     }
 
@@ -362,6 +503,7 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                 let work = std::sync::Arc::clone(&work);
                 let audio_dir = std::sync::Arc::clone(&audio_dir_arc);
                 let info = std::sync::Arc::clone(&info_arc);
+                let events = std::sync::Arc::clone(&events);
                 scope.spawn(move || {
                     let dl_token = CancellationToken::unbounded();
                     loop {
@@ -373,7 +515,26 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                             guard.next()
                         };
                         let Some(video) = next else { break };
+                        // Worker-side emission cannot propagate errors (this
+                        // closure returns ()); a broken stdout pipe surfaces on
+                        // the consumer side instead. Capture-mode serialization
+                        // of plain values cannot fail in practice.
+                        let _ = events.emit(
+                            "downloading",
+                            serde_json::json!({ "id": video.id }),
+                        );
                         let outcome = download_one(&info, &video, &audio_dir, &dl_token);
+                        if let Ok((audio_path, _meta)) = &outcome {
+                            let bytes = std::fs::metadata(audio_path).ok().map(|m| m.len());
+                            let _ = events.emit(
+                                "downloaded",
+                                serde_json::json!({
+                                    "id": video.id,
+                                    "audio_path": audio_path.display().to_string(),
+                                    "bytes": bytes,
+                                }),
+                            );
+                        }
                         if tx.send(DownloadResult { video, outcome }).is_err() {
                             break; // consumer gone (cancel/abort)
                         }
@@ -404,11 +565,21 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                     Ok(pair) => pair,
                     Err(error) => {
                         record_failure(&mut manifest, &manifest_path, &video, &error)?;
-                        summary.failed.push(FailedVideo {
+                        let failure = FailedVideo {
                             id: video.id.clone(),
                             title: video.title.clone(),
-                            error,
-                        });
+                            error: error.clone(),
+                        };
+                        events.emit(
+                            "failed",
+                            serde_json::json!({
+                                "id": &failure.id,
+                                "title": &failure.title,
+                                "error": &failure.error,
+                                "attempts": manifest.attempts(&failure.id),
+                            }),
+                        )?;
+                        summary.failed.push(failure);
                         if opts.abort_on_error {
                             summary.cancelled = true;
                             break;
@@ -452,8 +623,12 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                 // that matter are the terminal `Done`/`Failed` (and the rare
                 // cancel-persist below). The single per-video save now happens at
                 // the terminal transition.
+                events.emit(
+                    "transcribing",
+                    serde_json::json!({ "id": video.id }),
+                )?;
                 match transcribe_and_render(&engine, opts, &video, &meta, &audio_path) {
-                    Ok(paths) => {
+                    Ok((paths, wall_ms, rtf)) => {
                         let audio_kept = if opts.keep_audio {
                             Some(audio_path.display().to_string())
                         } else {
@@ -470,6 +645,16 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                         );
                         manifest.save(&manifest_path)?;
                         summary.done.push(video.id.clone());
+                        events.emit(
+                            "done",
+                            serde_json::json!({
+                                "id": video.id,
+                                "md_path": paths.md.display().to_string(),
+                                "json_path": paths.json.display().to_string(),
+                                "wall_ms": wall_ms,
+                                "rtf": rtf,
+                            }),
+                        )?;
                     }
                     Err(FwError::Cancelled(_)) => {
                         // No terminal state to persist (the entry is still
@@ -503,7 +688,26 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
         }
     }
 
+    emit_run_complete(&events, &summary)?;
     Ok(summary)
+}
+
+/// Terminal aggregate event (bd-27v1.1): exactly one per robot run, always
+/// last; `cancelled` distinguishes Ctrl+C and `--abort-on-error` endings from
+/// a fully completed run.
+fn emit_run_complete(
+    events: &YoutubeEventEmitter,
+    summary: &YoutubeRunSummary,
+) -> FwResult<()> {
+    events.emit(
+        "run_complete",
+        serde_json::json!({
+            "done": &summary.done,
+            "skipped": &summary.skipped,
+            "failed": &summary.failed,
+            "cancelled": summary.cancelled,
+        }),
+    )
 }
 
 /// In-run retry budget for a single video's download (bd-lun9): attempts
@@ -674,7 +878,7 @@ fn transcribe_and_render(
     _video: &VideoRef,
     meta: &VideoMeta,
     audio_path: &Path,
-) -> FwResult<OutputPaths> {
+) -> FwResult<(OutputPaths, u64, Option<f64>)> {
     let started = chrono::Utc::now();
     let started_instant = Instant::now();
 
@@ -750,7 +954,7 @@ fn transcribe_and_render(
         &serde_json::to_string_pretty(&json).map_err(FwError::Json)?,
     )?;
     crate::native_engine::perf_span("yt.render", t_render.elapsed().as_secs_f64() * 1e3, "");
-    Ok(paths)
+    Ok((paths, wall_ms, rtf))
 }
 
 /// Pull engine/backend labels out of the run report's raw output (best effort).
@@ -798,6 +1002,7 @@ mod tests {
             abort_on_error: false,
             batch_size: 0,
             naming_style: naming::NamingStyle::Slug,
+            robot_events: YoutubeRobotEvents::Off,
         }
     }
 
@@ -1245,5 +1450,237 @@ https://youtu.be/ccccccccccc
             pct > 45.0,
             "expected >45% byte reduction, got {pct:.1}% (old={old_bytes}, new={new_bytes})"
         );
+    }
+    // ---- bd-27v1.1: robot-mode NDJSON event stream ----------------------
+
+    /// Robot-mode options wired to an in-memory capture buffer; returns the
+    /// options plus the shared buffer the emitted lines land in.
+    fn capturing_opts(
+        urls: Vec<String>,
+        output_dir: &Path,
+    ) -> (
+        YoutubeRunOptions,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut opts = opts_with_urls(urls);
+        opts.output_dir = output_dir.to_path_buf();
+        opts.robot_events = YoutubeRobotEvents::Capture(std::sync::Arc::clone(&buffer));
+        (opts, buffer)
+    }
+
+    /// Parse captured NDJSON lines into JSON values.
+    fn parse_events(buffer: &std::sync::Mutex<Vec<String>>) -> Vec<serde_json::Value> {
+        buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("captured line must be JSON"))
+            .collect()
+    }
+
+    #[test]
+    fn emitter_envelope_carries_schema_seq_ts_and_stable_run_id() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(
+            std::sync::Arc::clone(&buffer),
+        ));
+        events
+            .emit("run_start", serde_json::json!({ "n_urls": 0 }))
+            .expect("emit 1");
+        events
+            .emit("discovered", serde_json::json!({ "id": "x" }))
+            .expect("emit 2");
+        events
+            .emit("run_complete", serde_json::json!({ "cancelled": false }))
+            .expect("emit 3");
+
+        let parsed = parse_events(&buffer);
+        assert_eq!(parsed.len(), 3);
+        let run_ids: Vec<&str> = parsed
+            .iter()
+            .map(|v| v["run_id"].as_str().expect("run_id"))
+            .collect();
+        assert!(run_ids.iter().all(|id| id.starts_with("yt-")));
+        assert_eq!(run_ids[0], run_ids[1]);
+        assert_eq!(run_ids[1], run_ids[2]);
+        for (i, value) in parsed.iter().enumerate() {
+            assert_eq!(
+                value["schema_version"],
+                serde_json::json!(crate::robot::ROBOT_SCHEMA_VERSION),
+                "event {i} schema"
+            );
+            assert_eq!(value["seq"], serde_json::json!((i + 1) as u64));
+            assert!(
+                value["event"]
+                    .as_str()
+                    .expect("event")
+                    .starts_with("youtube."),
+                "event {i} must be namespaced"
+            );
+            let ts = value["ts"].as_str().expect("ts");
+            chrono::DateTime::parse_from_rfc3339(ts)
+                .unwrap_or_else(|e| panic!("ts must be RFC-3339 ({e}): {ts}"));
+        }
+        assert_eq!(parsed[0]["event"], "youtube.run_start");
+        assert_eq!(parsed[2]["event"], "youtube.run_complete");
+    }
+
+    #[test]
+    fn emitter_off_mode_is_a_no_op() {
+        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Off);
+        events
+            .emit("downloading", serde_json::json!({ "id": "x" }))
+            .expect("off-mode emit must succeed without side effects");
+    }
+
+    #[test]
+    fn emitter_seq_is_unique_across_threads() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = std::sync::Arc::new(YoutubeEventEmitter::new(
+            YoutubeRobotEvents::Capture(std::sync::Arc::clone(&buffer)),
+        ));
+        let workers = 8_u64;
+        let per_worker = 25_u64;
+        let mut handles = Vec::new();
+        for worker in 0..workers {
+            let events = std::sync::Arc::clone(&events);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_worker {
+                    events
+                        .emit("tick", serde_json::json!({ "worker": worker, "i": i }))
+                        .expect("emit");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker thread");
+        }
+        let lines_len = buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert_eq!(lines_len, (workers * per_worker) as usize);
+        let mut seqs: Vec<u64> = parse_events(&buffer)
+            .into_iter()
+            .map(|v| v["seq"].as_u64().expect("seq"))
+            .collect();
+        seqs.sort_unstable();
+        let expected: Vec<u64> = (1..=workers * per_worker).collect();
+        assert_eq!(seqs, expected, "seq must partition 1..=N exactly once");
+    }
+
+    #[test]
+    fn robot_run_streams_start_discovered_skipped_and_terminal_complete() {
+        // Both videos pre-Done in the manifest: the run emits the full
+        // bookkeeping stream without ever reaching transcription.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join(MANIFEST_NAME);
+        let mut manifest = Manifest::default();
+        for vid in ["vid000000001", "vid000000002"] {
+            manifest.order.push(vid.to_owned());
+            manifest.entries.insert(
+                vid.to_owned(),
+                ManifestEntry {
+                    id: vid.to_owned(),
+                    title: format!("Title {vid}"),
+                    url: format!("https://www.youtube.com/watch?v={vid}"),
+                    state: Some(VideoState::Done {
+                        audio_path: None,
+                        markdown_path: format!("out/{vid}.md"),
+                        json_path: format!("out/{vid}.json"),
+                    }),
+                },
+            );
+        }
+        manifest.save(&manifest_path).expect("seed manifest");
+
+        let (opts, buffer) = capturing_opts(
+            vec!["https://www.youtube.com/playlist?list=PLstub".to_owned()],
+            dir.path(),
+        );
+        let summary = run_with_info(&opts, &stub_info()).expect("run");
+
+        assert_eq!(summary.skipped.len(), 2);
+        assert!(summary.done.is_empty());
+        assert!(summary.failed.is_empty());
+        assert!(!summary.cancelled);
+
+        let parsed = parse_events(&buffer);
+        let names: Vec<&str> = parsed
+            .iter()
+            .map(|v| v["event"].as_str().expect("event"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "youtube.run_start",
+                "youtube.discovered",
+                "youtube.discovered",
+                "youtube.skipped",
+                "youtube.skipped",
+                "youtube.run_complete",
+            ],
+            "full expected stream, got {names:?}"
+        );
+        assert_eq!(parsed[0]["output_dir"], dir.path().display().to_string());
+        assert_eq!(parsed[0]["concurrency"], serde_json::json!(1));
+        assert_eq!(parsed[3]["reason"], "already_done");
+        assert_eq!(parsed[4]["reason"], "already_done");
+        let complete = &parsed[5];
+        assert_eq!(complete["done"], serde_json::json!([]));
+        assert_eq!(
+            complete["skipped"],
+            serde_json::json!(["vid000000001", "vid000000002"])
+        );
+        assert_eq!(complete["failed"], serde_json::json!([]));
+        assert_eq!(complete["cancelled"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn robot_run_streams_failed_event_on_deterministic_download_failure() {
+        // fw_stub_fail=private is a deterministic failure: fail-fast (no retry
+        // backoff), the engine is constructed but never transcribes, and the
+        // stream still terminates with a run_complete aggregate.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (opts, buffer) = capturing_opts(
+            vec![
+                "https://www.youtube.com/watch?v=PRIVATE_ID&fw_stub_fail=private"
+                    .to_owned(),
+            ],
+            dir.path(),
+        );
+        let summary = run_with_info(&opts, &stub_info()).expect("run");
+        assert_eq!(summary.failed.len(), 1);
+        assert_eq!(summary.failed[0].id, "PRIVATE_ID");
+        assert!(!summary.cancelled);
+
+        let parsed = parse_events(&buffer);
+        let names: Vec<&str> = parsed
+            .iter()
+            .map(|v| v["event"].as_str().expect("event"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "youtube.run_start",
+                "youtube.discovered",
+                "youtube.downloading",
+                "youtube.failed",
+                "youtube.run_complete",
+            ],
+            "failure stream, got {names:?}"
+        );
+        assert_eq!(parsed[3]["id"], "PRIVATE_ID");
+        assert!(
+            parsed[3]["error"]
+                .as_str()
+                .expect("error")
+                .contains("Private")
+        );
+        assert_eq!(parsed[3]["attempts"], serde_json::json!(1));
+        let complete = &parsed[4];
+        assert_eq!(complete["failed"].as_array().expect("failed").len(), 1);
+        assert_eq!(complete["cancelled"], serde_json::json!(false));
     }
 }
