@@ -3542,6 +3542,7 @@ cargo clippy --all-targets -- -D warnings
 | Robot contract | NDJSON schema, field presence, path safety, and panic handling |
 | TTY audio | Handshake, integrity, retransmit, telemetry, and control frames |
 | Conformance | Cross-engine tolerance, replay drift, segment invariants, and model-gated fixtures |
+| Differential oracle (`fj-oracle`) | native_engine kernels (matmul, softmax, layer norm, conv1d) cross-checked against the frankenjax `fj-lax` interpreter on seeded random tensors, 1e-4 tolerance; feature-gated, see [docs/conformance-contract.md](docs/conformance-contract.md) |
 | Storage and sync | SQLite round trips, concurrent writes, JSONL recovery, and lock ownership |
 | Cancellation | Process-tree ownership, stage budgets, cleanup, and interruption |
 | Speculation | Windowing, adaptive thresholds, correction drift, and retractions |
