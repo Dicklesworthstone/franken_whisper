@@ -101,3 +101,31 @@
   short-final-chunk FIFO regression, pinned libc++ top-k tie regression, and
   full-recording session parity.
 - **Review date:** 2026-08-08
+
+## DISC-008: Unclosed timestamp rescue is first-window only
+
+- **Reference:** whisper.cpp's end-of-window rescue retains a timestamp-mode
+  sequence with no closed timestamp when its current seek delta covers the
+  remaining audio.
+- **Our impl:** The native greedy and beam paths apply that has-timestamp-free
+  rescue only at `seek_cs == 0`. Later windows must close a timestamp before
+  their text can be retained; otherwise they follow the existing failed-window
+  path.
+- **Reason:** A short first-window streaming decode can legitimately emit
+  `<|0.00|>` plus text and EOT, so removing the rescue entirely loses real
+  speech. On a later short tail, however, the default `CHUNK_CS` seek delta
+  makes coverage true before the model closes a timestamp. If the preceding
+  window already emitted the overlapping speech, accepting that tail emits it
+  a second time. The first-window boundary preserves the streaming case without
+  adding transcript-deduplication heuristics.
+- **Observed impact:** On canonical tiny.en plus tiled `jfk.wav` (three tiles),
+  the unbounded coverage rescue produced eight occurrences of `country` in
+  both the default and `max_context=0` cells; the exact oracle is six. This is
+  a decoding-boundary defect, not a prompt-carry difference.
+- **Resolution:** **ACCEPTED as a narrow native quality divergence.** The policy
+  is shared by greedy and beam decoding and is pinned by opposite first-window
+  and later-tail unit cells plus the model-level exact tiled-JFK gate.
+- **Tests affected:**
+  `src/native_engine/decode.rs::unclosed_window_rescue_is_first_window_only`
+  and `gated_max_context_zero_disables_prompt_carry`.
+- **Review date:** 2026-08-24
