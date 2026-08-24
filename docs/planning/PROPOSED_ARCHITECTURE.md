@@ -10,7 +10,8 @@
 and integrates with:
 - `asupersync` for cancel-correct orchestration and bounded cleanup,
 - `frankensqlite` (`fsqlite`) for all durable state,
-- `frankentorch` / optional `frankenjax` for accelerated compute paths,
+- `frankentorch` for required native compute kernels and optional `frankenjax`
+  as an independent differential-test oracle,
 - optional `frankentui` for human operator UX.
 
 ## 2. Top-Level Components
@@ -32,7 +33,9 @@ and integrates with:
 - `StreamingEngine` extension trait for real-time incremental segment delivery.
 - current implementation includes bridge adapters for `whisper_cpp`, `insanely_fast`, and `whisper_diarization`.
 - target state is full native Rust engines (`WhisperEngineCpu`, `WhisperEngineGpu`, `DiarizationEngine`) sharing one contract.
-- optional acceleration pass via `frankentorch` / `frankenjax` feature flags.
+- native execution through required FrankenTorch CPU kernels, with target-gated
+  Metal selection on supported macOS operations; the optional `fj-oracle`
+  feature is conformance-only and never a production compute backend.
 - all engine execution paths accept `CancellationToken` for deadline-aware abort.
 
 4. `native acoustic diarization` (`src/diarization.rs`):

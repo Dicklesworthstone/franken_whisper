@@ -49,8 +49,7 @@ cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo check --all-targets --features tui
-cargo check --all-targets --features gpu-frankentorch
-cargo check --all-targets --features gpu-frankenjax
+cargo test --features fj-oracle --test conformance_oracle_tests
 ```
 
 ## 7. Documentation and Handoff

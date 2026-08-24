@@ -1,5 +1,11 @@
 # TODO_IMPLEMENTATION_TRACKER.md
 
+> Historical tracker note: checked `gpu-frankentorch` and `gpu-frankenjax`
+> commands below record the February 2026 tree. Those high-level features were
+> deliberately retired by `d294feed` and `b51b3fb3`; current feature checks are
+> `tui` plus the test-only `fj-oracle` differential suite. Do not rerun the
+> retired command rows as present-day gates.
+
 ## Legend
 - [ ] pending
 - [~] in progress

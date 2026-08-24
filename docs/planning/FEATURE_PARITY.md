@@ -17,7 +17,7 @@
 
 ## Phase-by-Phase Parity Targets
 
-### Phase 1 (current)
+### Phase 1 (completed foundation)
 - [x] Spec documents and extraction map.
 - [x] Architecture contract and stage model.
 - [x] `fsqlite`-only persistence contract.
@@ -47,7 +47,10 @@
 - [x] line-in and stream behavior parity envelope (cross-input-mode validation: file/stdin/mic InputSource variants; serialization round-trip; error consistency across input modes; 20 integration tests covering Phase 3 contracts).
 
 ### Phase 4 (beyond parity)
-- [x] native acceleration stage with feature-gated frankentorch/frankenjax + CPU fallback.
+- [x] deterministic CPU confidence-normalization stage. The retired
+  `gpu-frankentorch` / `gpu-frankenjax` high-level adapters are not current
+  features; native inference uses required FrankenTorch kernels, and the
+  optional `fj-oracle` feature is a differential conformance test only.
 - [x] adaptive backend routing evidence ledger (shadow mode, explicit loss + posterior + fallback trigger, deterministic static execution).
 - [~] asupersync-managed cancel-safe multi-stage execution (explicit per-stage budgets and timeout codes implemented; deeper region/task attribution remains).
 - [x] robust TTY/PTY low-bandwidth audio relay mode (versioned protocol v1; CRC32 + SHA-256 integrity; sequence gap/duplicate detection; fail-closed + skip-missing recovery policies; protocol spec in docs/tty-audio-protocol.md).

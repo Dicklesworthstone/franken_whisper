@@ -20,15 +20,15 @@ Features originating from or inspired by the whisper.cpp (C/C++) project.
 |---|---|---|---|---|
 | Basic transcription (whisper_cpp backend) | legacy_whispercpp | `backend::whisper_cpp` | Done | Subprocess bridge to `whisper-cli` with JSON output parsing, segment extraction, and language detection. Configurable via `FRANKEN_WHISPER_WHISPER_CPP_BIN` env var. |
 | VAD (Voice Activity Detection) | legacy_whispercpp | `backend::whisper_cpp`, `model::VadParams` | Done | Full Silero VAD parameter passthrough: threshold, min speech/silence duration, max speech duration, speech padding, samples overlap, model path. Forwarded as CLI flags to whisper-cli. |
-| GPU acceleration | legacy_whispercpp | `accelerate`, `model::BackendParams` | Done | `--no-gpu` flag, GPU layer offload count. Acceleration module provides confidence normalization via optional frankentorch/frankenjax backends with deterministic CPU fallback. |
+| GPU acceleration | legacy_whispercpp | `backend::whisper_cpp`, `native_engine` | Done | Bridge requests forward `--no-gpu` and GPU layer controls to `whisper-cli`. The native engine uses required FrankenTorch CPU kernels and automatically selects its target-gated Metal kernel for eligible operations on macOS; FrankenJAX is a test-only differential oracle, not a production acceleration backend. |
 | Streaming output (real-time stage events) | legacy_whispercpp | `orchestrator`, `robot` | Done | Real-time NDJSON stage streaming via `transcribe_with_stream()` using mpsc channels. Stage events emitted during pipeline execution. Note: this is pipeline-stage streaming, not audio-chunk streaming like whisper.cpp's `whisper-stream`. |
-| Streaming transcription (live audio chunked inference) | legacy_whispercpp | `listen`, `capture`, `robot` | Done | `fw robot listen` runs native rolling-buffer inference over microphone, stdin PCM, or paced file replay and emits append-only NDJSON transcript deltas while speech is still in progress. This dedicated live driver bypasses the batch backend-capability flag; batch engines may still report `supports_streaming: false`. |
+| Streaming transcription (live audio chunked inference) | legacy_whispercpp | `listen`, `capture`, `robot` | Partial | `fw robot listen` runs native rolling-buffer inference over microphone, stdin PCM, or paced file replay and emits append-only NDJSON transcript deltas while speech is still in progress. This dedicated live driver bypasses the batch backend-capability flag; batch engines may still report `supports_streaming: false`. Source and focused policy tests are present, but the deterministic file-replay/golden lifecycle E2E remains open as `bd-rt-e2e-0zo5`. |
 | Word-level timestamps | legacy_whispercpp | `backend::whisper_cpp` | Done | Parsed from whisper-cli JSON output into `TranscriptionSegment` with `start_sec`/`end_sec`. Split-on-word boundary mode (`-sow`) supported. |
 | Decoding parameters | legacy_whispercpp | `model::DecodingParams`, `backend::whisper_cpp` | Done | Full passthrough: best_of, beam_size, max_context, max_segment_length, temperature, temperature_increment, entropy_threshold, logprob_threshold, no_speech_threshold. |
 | Multiple output formats | legacy_whispercpp | `model::OutputFormat`, `backend::whisper_cpp` | Done | Supports txt, vtt, srt, csv, json, json-full, lrc. Artifact paths collected and returned in result. |
 | ffmpeg normalization | legacy_whispercpp | `audio` | Done | Primary path converts input to 16kHz mono PCM WAV via ffmpeg subprocess (cancellable with timeout). When ffmpeg is unavailable, file-based normalization falls back to built-in Rust decode/resample for common formats. Duration probing remains ffprobe-based when available. |
-| Microphone capture | legacy_whispercpp | `audio`, `model::InputSource::Microphone` | Done | Captures via ffmpeg with platform-specific defaults (ALSA on Linux, AVFoundation on macOS). Configurable device, format, source, and duration. |
-| Confidence scoring | legacy_whispercpp | `model::TranscriptionSegment`, `accelerate` | Done | Per-segment confidence field parsed from backend output. Acceleration module normalizes confidence scores (softmax) with optional GPU path and deterministic CPU fallback. |
+| Microphone capture | legacy_whispercpp | `audio`, `capture`, `listen`, `model::InputSource::Microphone` | Done | Batch `transcribe --mic` captures via ffmpeg with platform-specific defaults. `fw robot listen` instead prefers cpal (CoreAudio/ALSA/WASAPI) and falls back to ffmpeg. Device and source controls remain explicit. |
+| Confidence scoring | legacy_whispercpp | `model::TranscriptionSegment`, `accelerate` | Done | Per-segment confidence is parsed from backend output and normalized by the deterministic CPU-only `accelerate` stage. The retired high-level FrankenTorch/FrankenJAX GPU adapters are not part of this stage. |
 | Quantized model support | legacy_whispercpp | `backend::whisper_cpp` | Done | Model path passthrough via `-m` flag. Quantized ggml models (Q4/Q5/Q8) usable by providing the model file path. |
 | Threading parameters | legacy_whispercpp | `backend::whisper_cpp`, `model::BackendParams` | Done | Thread count (`-t`) and processor count (`-p`) forwarded to whisper-cli. |
 | Audio windowing | legacy_whispercpp | `model::BackendParams`, `backend::whisper_cpp` | Done | Offset (`-ot`) and duration (`-d`) parameters, audio context size (`-ac`), and word threshold (`-wt`) supported. |
@@ -85,12 +85,12 @@ Features that span all legacy projects or are new to franken_whisper.
 | TUI mode | None (novel) | `tui` | Done | frankentui-based terminal UI with runs/timeline/events panes. Focus cycling, keyboard navigation, auto-refresh. Feature-gated behind `--features tui`. |
 | SQLite persistence | None (novel) | `storage` | Done | frankensqlite-backed `RunStore` with runs, segments, and events tables. Schema initialization, run persistence, query by ID, recent runs listing. |
 | JSONL export/import sync | None (novel) | `sync` | Done | One-way atomic sync with file locking (stale lock detection, archive). Manifest with schema version, row counts, SHA-256 checksums. Conflict policies: reject, skip, overwrite. Export format version 1.0. |
-| Confidence scoring / normalization | None (novel) | `accelerate` | Done | Softmax confidence normalization with optional GPU acceleration (frankentorch/frankenjax feature gates). Pre/post probability mass tracking. Deterministic CPU fallback guaranteed. |
+| Confidence scoring / normalization | None (novel) | `accelerate` | Done | Deterministic CPU confidence normalization with pre/post probability-mass tracking. This stage reports `AccelerationBackend::None`; native Whisper compute acceleration belongs to `native_engine`, while `fj-oracle` is conformance-only. |
 | Schema versioning | None (novel) | `robot`, `sync` | Done | Robot schema version 1.1.0 (additive listen-family bump from 1.0.0). Sync schema version 1.1 with export format version 1.0. Schema versions embedded in all NDJSON envelopes and JSONL manifests. |
 | Error codes | None (novel) | `error` | Done | Two-tier error code system: per-variant codes (FW-IO, FW-JSON, FW-CMD-MISSING, FW-CMD-FAILED, FW-CMD-TIMEOUT, FW-BACKEND-UNAVAILABLE, FW-INVALID-REQUEST, FW-STORAGE, FW-UNSUPPORTED, FW-MISSING-ARTIFACT, FW-CANCELLED, FW-STAGE-TIMEOUT) and grouped robot codes (FW-ROBOT-TIMEOUT, FW-ROBOT-BACKEND, FW-ROBOT-REQUEST, FW-ROBOT-STORAGE, FW-ROBOT-CANCELLED, FW-ROBOT-EXEC). |
 | Backend health probing | None (novel) | `backend` | Done | `probe_system_health()` with per-backend reports: binary discovery, version probing, availability status, RFC3339 timestamps. Thread-safe cached health state with TTL. Exposed through robot diagnostics surfaces including `robot backends` (`backends.discovery`) and `robot health` (`health.report`). |
 | TTY audio codec (mu-law + zlib + base64) | None (novel) | `tty_audio` | Done | NDJSON-framed audio transport. Encode/decode with mu-law compression, zlib deflation, base64 encoding. Per-frame CRC32 and SHA-256 integrity. Protocol version negotiation (handshake/ack). Control frames: retransmit_request, ack, backpressure. Recovery modes for missing/corrupt frames. |
-| Real-time streaming driver | None (novel) | `listen`, `capture`, `robot` | Done | `fw robot listen`: cpal/ffmpeg/stdin-pcm capture -> causal VAD -> bounded rolling buffer with prompt carry -> greedy step decode -> emission policy (AlignAtt default, endpoint-commit baseline, LocalAgreement-2 fallback) -> append-only NDJSON deltas + mutable partials, async quality-confirm lane, utterance-granular crash-durable SQLite persistence. Additive schema 1.1.0 family; see `docs/realtime-streaming.md`. |
+| Real-time streaming driver | None (novel) | `listen`, `capture`, `robot` | Partial | `fw robot listen` is source-implemented: cpal/ffmpeg/stdin-pcm capture -> causal VAD -> bounded rolling buffer with prompt carry -> greedy step decode -> emission policy (AlignAtt default, endpoint-commit baseline, LocalAgreement-2 fallback) -> append-only NDJSON deltas + mutable partials, async quality-confirm lane, utterance-granular crash-durable SQLite persistence. Deterministic file-replay/golden lifecycle E2E remains open as `bd-rt-e2e-0zo5`. |
 | Differential kernel oracle | None (novel) | `native_engine`, `tests/conformance_oracle_tests.rs` | Done | Feature-gated (`fj-oracle`) cross-checks of matmul/softmax/layer-norm/conv1d against the frankenjax `fj-lax` interpreter on seeded random tensors, tolerance 1e-4 max-abs; divergences dump full JSON tensor artifacts. |
 | Replay packs | None (novel) | `replay_pack` | Done | Self-contained replay artifact directory: `env.json` (runtime snapshot), `manifest.json` (file inventory with content hashes), `repro.lock` (frozen decision state with routing evidence). |
 | Conformance checking | None (novel) | `conformance` | Done | Segment invariant validation (overlap detection, timestamp epsilon). Segment compatibility comparison with configurable tolerance (timestamp, text, speaker). Replay envelope comparison (input hash, backend identity/version, output hash). |
@@ -123,7 +123,7 @@ Features that span all legacy projects or are new to franken_whisper.
 
 | Legacy Project | Done | Partial | Todo | N/A | Total | Completion % |
 |---|---|---|---|---|---|---|
-| legacy_whispercpp | 15 | 0 | 0 | 1 | 16 | 94% |
+| legacy_whispercpp | 14 | 1 | 0 | 1 | 16 | 88% (94% source-complete) |
 | legacy_insanely_fast_whisper | 9 | 0 | 0 | 0 | 9 | 100% |
 | legacy_whisper_diarization | 4 | 4 | 0 | 1 | 9 | 44% (89% via bridge) |
 
@@ -131,8 +131,8 @@ Features that span all legacy projects or are new to franken_whisper.
 
 | Status | Count |
 |---|---|
-| Done | 30 |
-| Partial | 0 |
+| Done | 29 |
+| Partial | 1 |
 | Todo | 0 |
 | N/A | 0 |
 | **Total** | **30** |
@@ -141,13 +141,18 @@ Features that span all legacy projects or are new to franken_whisper.
 
 | Category | Done | Partial | Todo | N/A | Total Tracked |
 |---|---|---|---|---|---|
-| All features | 58 | 4 | 0 | 2 | 64 |
+| All features | 56 | 6 | 0 | 2 | 64 |
 | **Completion (Done + Partial)** | | | | | **97%** |
-| **Completion (Done only)** | | | | | **91%** |
+| **Completion (Done only)** | | | | | **88%** |
 
 ### Key Gaps Remaining
 
-1. **Remaining native diarization stages**: The classical Rust acoustic
+1. **Live-streaming certification**: the native `fw robot listen` driver is
+   source-implemented and has focused policy/campaign evidence, but the
+   deterministic file-replay/golden NDJSON lifecycle suite remains open as
+   `bd-rt-e2e-0zo5`; no full E2E certification is claimed here.
+
+2. **Remaining native diarization stages**: The classical Rust acoustic
    diarizer and explicit safe-Rust ECAPA execution through the common diarizer
    are operational. Neural accuracy/calibration and automatic rollout remain
    uncertified. Source separation, forced alignment, and punctuation

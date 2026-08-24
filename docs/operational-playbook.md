@@ -64,8 +64,7 @@ Exit criteria:
    - `cargo test`
 5. Run feature checks relevant to this repo:
    - `cargo check --all-targets --features tui`
-   - `cargo check --all-targets --features gpu-frankentorch`
-   - `cargo check --all-targets --features gpu-frankenjax`
+   - `cargo test --features fj-oracle --test conformance_oracle_tests`
 6. Reconcile tracker and document residual risks explicitly.
 
 ## Escalation Rules

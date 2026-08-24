@@ -789,6 +789,21 @@ pub const LISTEN_SESSION_STATS_REQUIRED_FIELDS: &[&str] = &[
     "policy_holdbacks",
 ];
 
+pub const LISTEN_CONTROLLER_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "controller",
+    "from",
+    "to",
+    "reason",
+    "brier",
+    "observations",
+    "fallback_active",
+];
+
 /// `utterance_end.text` cap: beyond this the field is truncated (on a UTF-8
 /// boundary) with `text_truncated: true`; the full text remains
 /// reconstructable from the utterance's deltas, which are never truncated.
@@ -1361,6 +1376,7 @@ fn listen_required_fields(event: &str) -> Option<&'static [&'static str]> {
         "utterance_end" => Some(UTTERANCE_END_REQUIRED_FIELDS),
         "listen.warning" => Some(LISTEN_WARNING_REQUIRED_FIELDS),
         "listen.session_stats" => Some(LISTEN_SESSION_STATS_REQUIRED_FIELDS),
+        "listen.controller" => Some(LISTEN_CONTROLLER_REQUIRED_FIELDS),
         "run_error" => Some(RUN_ERROR_REQUIRED_FIELDS),
         _ => None,
     }
@@ -2465,6 +2481,20 @@ pub fn robot_schema_value() -> serde_json::Value {
                     })),
                 }, false),
             },
+            "listen.controller": {
+                "required": LISTEN_CONTROLLER_REQUIRED_FIELDS,
+                "default_on": false,
+                "contract": "bounded adaptive cadence/holdback decision with Brier-gated deterministic fallback",
+                "example": listen_controller_value("run-123", 8, "2026-02-22T00:00:12Z", &crate::listen::AdaptiveControllerEntry {
+                    controller: "step_ms",
+                    from: 300,
+                    to: 350,
+                    reason: "overrun_pressure".to_owned(),
+                    brier: 0.12,
+                    observations: 12,
+                    fallback_active: false,
+                }),
+            },
             "health.report": {
                 "required": HEALTH_REPORT_REQUIRED_FIELDS,
                 "example": json!({
@@ -2703,13 +2733,13 @@ mod tests {
 
     #[allow(clippy::wildcard_imports)]
     use super::{
-        LISTEN_SESSION_START_REQUIRED_FIELDS, LISTEN_SESSION_STATS_REQUIRED_FIELDS,
-        LISTEN_WARNING_REQUIRED_FIELDS, ListenSessionInfo, ListenSessionStats,
-        NdjsonStreamValidator, ROBOT_SCHEMA_VERSION, SPEECH_STARTED_REQUIRED_FIELDS, StreamOutcome,
-        TRANSCRIPT_DELTA_REQUIRED_FIELDS, UTTERANCE_END_REQUIRED_FIELDS,
-        UTTERANCE_END_TEXT_CAP_BYTES, UtteranceEndReason, listen_session_start_value,
-        listen_session_stats_value, listen_warning_value, speech_started_value,
-        transcript_delta_value, utterance_end_value,
+        LISTEN_CONTROLLER_REQUIRED_FIELDS, LISTEN_SESSION_START_REQUIRED_FIELDS,
+        LISTEN_SESSION_STATS_REQUIRED_FIELDS, LISTEN_WARNING_REQUIRED_FIELDS, ListenSessionInfo,
+        ListenSessionStats, NdjsonStreamValidator, ROBOT_SCHEMA_VERSION,
+        SPEECH_STARTED_REQUIRED_FIELDS, StreamOutcome, TRANSCRIPT_DELTA_REQUIRED_FIELDS,
+        UTTERANCE_END_REQUIRED_FIELDS, UTTERANCE_END_TEXT_CAP_BYTES, UtteranceEndReason,
+        listen_controller_value, listen_session_start_value, listen_session_stats_value,
+        listen_warning_value, speech_started_value, transcript_delta_value, utterance_end_value,
     };
 
     use super::{
@@ -7369,6 +7399,24 @@ mod tests {
                 LISTEN_SESSION_STATS_REQUIRED_FIELDS,
                 listen_session_stats_value("r", 5, "t", &sample_stats(), false),
             ),
+            (
+                "listen.controller",
+                LISTEN_CONTROLLER_REQUIRED_FIELDS,
+                listen_controller_value(
+                    "r",
+                    6,
+                    "t",
+                    &crate::listen::AdaptiveControllerEntry {
+                        controller: "step_ms",
+                        from: 300,
+                        to: 350,
+                        reason: "overrun_pressure".to_owned(),
+                        brier: 0.12,
+                        observations: 12,
+                        fallback_active: false,
+                    },
+                ),
+            ),
         ];
         for (event_name, required, value) in &cases {
             assert_eq!(value["event"], *event_name);
@@ -7434,6 +7482,43 @@ mod tests {
         NdjsonStreamValidator::new(StreamOutcome::Success)
             .validate(&events)
             .expect("well-formed stream must validate");
+    }
+
+    #[test]
+    fn validator_accepts_controller_and_rejects_missing_controller_evidence() {
+        let mut events = sample_success_stream();
+        let mut final_stats = events.pop().expect("final stats");
+        let controller = listen_controller_value(
+            "run-l",
+            6,
+            "t6",
+            &crate::listen::AdaptiveControllerEntry {
+                controller: "step_ms",
+                from: 300,
+                to: 350,
+                reason: "overrun_pressure".to_owned(),
+                brier: 0.12,
+                observations: 12,
+                fallback_active: false,
+            },
+        );
+        final_stats["seq"] = json!(7);
+        events.push(controller.clone());
+        events.push(final_stats.clone());
+        NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .expect("controller evidence must be accepted in a listen stream");
+
+        let mut missing_brier = controller;
+        missing_brier
+            .as_object_mut()
+            .expect("controller object")
+            .remove("brier");
+        events[6] = missing_brier;
+        let err = NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_err();
+        assert!(err.contains("missing required field `brier`"), "{err}");
     }
 
     #[test]
@@ -7588,6 +7673,7 @@ mod tests {
             "utterance_end",
             "listen.warning",
             "listen.session_stats",
+            "listen.controller",
         ] {
             let entry = events
                 .get(name)

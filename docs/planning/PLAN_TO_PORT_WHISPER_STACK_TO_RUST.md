@@ -42,11 +42,13 @@ This is not a line-by-line translation. Legacy repositories are behavioral oracl
   - no orphaned background jobs in long-running modes.
 
 ### `/dp/frankentorch` and optional `/dp/frankenjax`
-- Backend abstraction must allow:
-  - model execution over tensor runtime(s),
-  - fallback hierarchy: accelerated backend -> classical backend.
-- Current implementation: feature-gated acceleration pass (`gpu-frankentorch`, `gpu-frankenjax`)
-  with deterministic CPU fallback.
+- Native model execution uses the required FrankenTorch CPU kernels, with
+  target-gated Metal selection for eligible operations on supported macOS
+  hosts.
+- FrankenJAX is optional under `fj-oracle` and serves only as an independent
+  differential conformance oracle. The former `gpu-frankentorch` and
+  `gpu-frankenjax` high-level acceleration features were retired; confidence
+  normalization is deliberately CPU-only.
 
 ### `/dp/frankensqlite` (mandatory for all SQLite)
 - Do not use `rusqlite`.

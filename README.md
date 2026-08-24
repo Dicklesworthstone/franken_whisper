@@ -373,13 +373,15 @@ cargo build --release --features tui
 The native engine always uses FrankenTorch CPU kernels. On macOS, large eligible
 matrix operations automatically use the target-gated Metal kernel when a Metal
 device is available; `FRANKEN_WHISPER_GPU=0` forces CPU execution. The only
-optional Cargo feature is `tui`. The release profile uses `opt-level = 3`, full
-LTO, one codegen unit, `panic = "abort"`, and stripped symbols.
+production Cargo feature is `tui`; `fj-oracle` enables a test-only FrankenJAX
+differential oracle and is not a runtime acceleration backend. The release
+profile uses `opt-level = 3`, full LTO, one codegen unit, `panic = "abort"`, and
+stripped symbols.
 
 ### Prerequisites
 
 - **Rust nightly** (2024 edition; pinned via `rust-toolchain.toml`)
-- **ffmpeg** (optional): only needed for video files, exotic codecs `symphonia` cannot decode, and live microphone capture. On Linux x86_64 it is auto-provisioned on first use unless `FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0`.
+- **ffmpeg** (optional): needed for video files, exotic codecs `symphonia` cannot decode, batch `transcribe --mic`, and as the fallback live-capture backend when cpal cannot open the device. On Linux x86_64 it is auto-provisioned on first use unless `FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0`.
 - **The two native default model packages.** The installer provisions them, or run `fw pull all`. Native Whisper uses the pinned `whisper-large-v3-turbo-f16-v1` GGML f16 release; native diarization uses the pinned four-lane `sortformer-v2.1-f32-v1` package. Both are hash-checked against compiled trust roots. No external backend binary is required for the default pipeline. The native engine's ggml parser accepts f32 and f16 `.bin` models (`hparams.ftype` 0/1); quantized ggml variants are rejected today and remain on the roadmap (see [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md) for the measured f16 frontier).
 - **The pinned ECAPA package** (only for `ecapa` or `ecapa-fused`): `ecapa_tdnn_voxceleb.safetensors`, SHA-256 `9276a840c52cdd2e9afb73cd87a38e15749e12bf494d3ca47b5bc162f237cbcc`, under `$FRANKEN_WHISPER_MODEL_DIR/aux/` or `~/.cache/franken_whisper/models/aux/`. The converted artifact is not published, so `scripts/fetch_aux_models.sh` prints the pinned conversion instructions and expected digest instead of downloading it.
 - **Bridge backend binaries** (optional explicit alternates):
@@ -393,7 +395,8 @@ LTO, one codegen unit, `panic = "abort"`, and stripped symbols.
 `franken_whisper` integrates several crates from the FrankenSuite ecosystem.
 Published packages resolve them from **crates.io**. A source checkout uses
 versioned path dependencies for the exact local FrankenSQLite, FrankenTorch,
-and optional FrankenTUI sources; `scripts/prepare_release_siblings.sh` stages
+FrankenTTS, optional FrankenTUI, and optional FrankenJAX sources;
+`scripts/prepare_release_siblings.sh` stages
 the release-pinned sibling commits without modifying an existing mismatched
 checkout.
 
@@ -403,10 +406,11 @@ checkout.
 | `franken-kernel` | crates.io `0.3.4` | Budget, TraceId, time utilities |
 | `franken-evidence` | crates.io `0.3.4` | Evidence ledger primitives |
 | `franken-decision` | crates.io `0.3.4` | Decision contract framework |
-| `fsqlite` / `fsqlite-types` | crates.io `0.2.0`; source path `../frankensqlite` | Pure-Rust SQLite persistence and value types |
+| `fsqlite` / `fsqlite-types` | crates.io `0.3.0`; source path `../frankensqlite` | Pure-Rust SQLite persistence and value types |
 | `ft-core` / `ft-kernel-cpu` | crates.io `0.1.0`; source path `../frankentorch` | Required tensor types and native Whisper CPU kernels |
 | `ft-kernel-metal` *(macOS)* | crates.io `0.1.0`; source path `../frankentorch` | Automatic Metal compute for eligible large operations |
-| `ftui` *(feature: `tui`)* | crates.io `0.5.0`; source path `../frankentui` | Optional terminal UI framework |
+| `ftts-kernels` | crates.io `0.1`; source path `../frankentts` | Required FastEnhancer-S denoising kernels |
+| `ftui` *(feature: `tui`)* | crates.io `0.6.0`; source path `../frankentui` | Optional terminal UI framework |
 | `fj-lax` / `fj-core` *(feature: `fj-oracle`)* | source path `../frankenjax` | Independent differential oracle for native-kernel conformance tests (seeded, 1e-4 tolerance; see [docs/conformance-contract.md](docs/conformance-contract.md)) |
 
 ---
@@ -841,35 +845,35 @@ cat audio.mp3 | franken_whisper transcribe --stdin --json
 
 ## YouTube Ingestion
 
-`franken_whisper youtube` downloads YouTube audio and transcribes each video into a clean, deep-linked **markdown + JSON** pair. Hand it individual video URLs, playlist URLs (auto-expanded to their videos), or a file of URLs — it downloads, transcribes, and writes one transcript per video into `youtube_transcripts/` (override with `--output-dir`). Because the transcription runs on the same engine as `transcribe`, this pairs naturally with the in-process native engine: **no cloud, no API keys, your audio never leaves the machine.**
+`franken_whisper youtube run` downloads YouTube audio and transcribes each video into a clean, deep-linked **markdown + JSON** pair. Hand it individual video URLs, playlist URLs (auto-expanded to their videos), or a file of URLs — it downloads, transcribes, and writes one transcript per video into `youtube_transcripts/` (override with `--output-dir`). Because the transcription runs on the same engine as `transcribe`, this pairs naturally with the in-process native engine: **no cloud, no API keys, your audio never leaves the machine.**
 
 ```bash
 # Single video
-franken_whisper youtube "https://www.youtube.com/watch?v=jNQXAC9IVRw" --model tiny.en
+franken_whisper youtube run "https://www.youtube.com/watch?v=jNQXAC9IVRw" --model tiny.en
 
 # Several videos at once
-franken_whisper youtube \
+franken_whisper youtube run \
   "https://youtu.be/VIDEO_A" \
   "https://youtu.be/VIDEO_B" \
   --concurrency 4
 
 # A whole playlist (expanded to its videos automatically)
-franken_whisper youtube "https://www.youtube.com/playlist?list=PLxxxxxxxx"
+franken_whisper youtube run "https://www.youtube.com/playlist?list=PLxxxxxxxx"
 
 # A file with one URL per line (blank lines and #/;/] comments ignored)
-franken_whisper youtube --batch-file urls.txt --output-dir ./talks
+franken_whisper youtube run --batch-file urls.txt --output-dir ./talks
 ```
 
 URLs may be passed positionally or with repeated `--url` flags, and mixed freely with `--batch-file`. A `watch?v=X&list=Y` URL is treated as the **single video** `X`, not the surrounding playlist.
 
 ### Output
 
-Each video produces a markdown transcript and a JSON sidecar, named `{upload_date} - {title} [{id}]` (the YouTube id keeps names collision-proof; non-ASCII titles are preserved, path-hostile characters folded). The downloaded audio is kept under `audio/<id>.<ext>` (delete it automatically with `--no-keep-audio`), and a `.fw_youtube_manifest.json` state file tracks per-video progress.
+Each video produces a markdown transcript and a JSON sidecar. The default slug style is `{upload_date}_{title}_{id}` with lowercase ASCII title text and an intact, case-preserved YouTube id; `--naming-style pretty` selects the historical `{upload_date} - {title} [{id}]` layout. The downloaded audio is kept under `audio/<id>.<ext>` (delete it automatically with `--no-keep-audio`), and a `.fw_youtube_manifest.json` state file tracks per-video progress.
 
 ```
 youtube_transcripts/
-├── 2005-04-24 - Me at the zoo [jNQXAC9IVRw].md
-├── 2005-04-24 - Me at the zoo [jNQXAC9IVRw].json
+├── 20050424_me_at_the_zoo_jNQXAC9IVRw.md
+├── 20050424_me_at_the_zoo_jNQXAC9IVRw.json
 ├── audio/
 │   └── jNQXAC9IVRw.webm
 └── .fw_youtube_manifest.json
@@ -924,6 +928,8 @@ The **JSON** sidecar carries the structured form — `video` metadata, `run` met
 | `--diarize` | `true` | Explicitly retain the default speaker diarization stage |
 | `--no-diarize` | `false` | Disable native speaker diarization |
 | `--concurrency <N>` | `3` | Maximum concurrent downloads |
+| `--batch-size <N>` | `0` | Bound videos per download/transcribe wave (`0` processes all in one wave) |
+| `--naming-style <S>` | `slug` | `slug`, `pretty`, or ASCII-lossy `ascii` artifact names |
 | `--no-keep-audio` | `false` | Delete each audio file after its transcript is written |
 | `--no-retry` | `false` | Do not retry videos previously marked failed in the manifest |
 | `--abort-on-error` | `false` | Stop the whole run on the first per-video failure |
@@ -932,7 +938,7 @@ The **JSON** sidecar carries the structured form — `video` metadata, `run` met
 
 ### Idempotent & Resumable
 
-The `.fw_youtube_manifest.json` makes every run resumable. A re-run **skips videos already `done`**, **retries previously failed videos** (unless `--no-retry`), and picks up exactly where it left off. **Ctrl+C cancels cleanly** — yt-dlp is killed, in-flight transcription aborts, and the manifest stays honest about what completed. By default a partial failure is reported and the run continues; `--abort-on-error` stops on the first failure instead.
+The `.fw_youtube_manifest.json` makes terminal work idempotent: a re-run **skips videos already `done`** and **retries previously failed videos** (unless `--no-retry`). Incomplete intermediate work is re-entered conservatively; until `bd-27v1` closes its remaining resume proof, a download interrupted before a terminal manifest transition may be repeated. **Ctrl+C cancels cleanly** — yt-dlp is killed, in-flight transcription aborts, and the manifest stays honest about what completed. By default a partial failure is reported and the run continues; `--abort-on-error` stops on the first failure instead.
 
 ### Requires `yt-dlp`
 
@@ -1634,6 +1640,7 @@ Built on the [FrankenTUI](https://github.com/Dicklesworthstone/frankentui) frame
 | Feature | Description |
 |---------|-------------|
 | `tui` | Enable the interactive TUI via `ftui` |
+| `fj-oracle` | Enable the FrankenJAX differential conformance oracle tests; not a production acceleration backend |
 
 No features are enabled by default. FrankenTorch CPU kernels and the macOS-only
 Metal dependency are target-selected implementation details, not optional
@@ -2630,13 +2637,15 @@ franken_whisper
   +-- franken-evidence    (crates.io ^0.3.4)  Evidence ledger primitives
   +-- franken-decision    (crates.io ^0.3.4)  Decision contract framework
   |
-  +-- fsqlite             (crates.io 0.2.0)   Pure-Rust SQLite implementation
-  +-- fsqlite-types       (crates.io 0.2.0)   Core SQLite value types
+  +-- fsqlite             (crates.io 0.3.0)   Pure-Rust SQLite implementation
+  +-- fsqlite-types       (crates.io 0.3.0)   Core SQLite value types
   |
   +-- ft-core             (crates.io 0.1.0)   Tensor types
   +-- ft-kernel-cpu       (crates.io 0.1.0)   Native Whisper CPU kernels
   +-- [macOS] ft-kernel-metal (crates.io 0.1.0) Automatic Metal kernels
-  +-- [optional] ftui     (crates.io 0.5.0, feature: tui) Terminal UI
+  +-- ftts-kernels        (crates.io 0.1)     FastEnhancer-S denoising kernels
+  +-- [optional] ftui     (crates.io 0.6.0, feature: tui) Terminal UI
+  +-- [optional] fj-lax/fj-core (0.1.0, feature: fj-oracle) Test-only differential oracle
 ```
 
 **Third-party dependencies (non-optional):**
@@ -3682,12 +3691,12 @@ rm .franken_whisper/locks/sync.lock
 ## Limitations
 
 - **Both default model packages are required for the default pipeline.** The installer provisions them, or run `fw pull all`. `--no-diarize` removes the Sortformer requirement for a transcript-only request. Explicit bridge modes remain available when their external tools are installed.
-- **ffmpeg only needed for video / exotic formats / mic.** The built-in Rust decoder handles common audio formats natively. ffmpeg is used as an automatic fallback for video files and exotic codecs. Microphone capture always depends on ffmpeg.
+- **ffmpeg only needed for video / exotic formats / batch mic / live fallback.** The built-in Rust decoder handles common audio formats natively. Batch `transcribe --mic` uses ffmpeg; `fw robot listen` prefers cpal and falls back to ffmpeg only when cpal cannot open the device.
 - **Source checkouts need pinned siblings.** The Git checkout intentionally uses versioned path dependencies for FrankenSQLite, FrankenTorch, and optional FrankenTUI development. Run `scripts/prepare_release_siblings.sh` before a source build. The crates.io package resolves the same version requirements from the registry and does not require sibling checkouts.
 - **Native execution is the default, not a certification claim.** The `sole` stage prevents silent bridge fallback. Sortformer remains development-uncertified and capped at four anonymous lanes despite being the product default.
 - **One-way sync.** JSONL export / import is one-way. There is no bidirectional merge beyond the explicit `--conflict-policy` flag.
 - **Single-machine.** Designed for single-machine use with local SQLite. No distributed or multi-node support.
-- **ffmpeg auto-provisioning is Linux x86_64 only.** On other platforms (`macOS`, Windows, Linux ARM) you must install ffmpeg manually for the formats `symphonia` cannot decode and for microphone capture.
+- **ffmpeg auto-provisioning is Linux x86_64 only.** On other platforms (`macOS`, Windows, Linux ARM) install ffmpeg manually for formats `symphonia` cannot decode, batch microphone capture, or live-capture fallback.
 
 ---
 

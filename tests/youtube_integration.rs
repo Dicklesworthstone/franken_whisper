@@ -26,11 +26,12 @@ struct CliRun {
     stderr: String,
 }
 
-/// Run `franken_whisper youtube <args>` with the stub wired in and the native
+/// Run `franken_whisper youtube run <args>` with the stub wired in and the native
 /// engine forced (no network, no bridge binaries).
 fn run_youtube(args: &[&str], state_root: &Path) -> CliRun {
     let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
     cmd.arg("youtube");
+    cmd.arg("run");
     cmd.args(args);
     cmd.env("FRANKEN_WHISPER_STATE_DIR", state_root);
     cmd.env("FRANKEN_WHISPER_YTDLP_BIN", stub_path());
@@ -103,17 +104,18 @@ fn gated_youtube_batch_file_produces_md_and_json_then_resumes() {
     assert_eq!(mds.len(), 2, "expected 2 markdown files, got {mds:?}");
     assert_eq!(jsons.len(), 2, "expected 2 json files");
 
-    // The id suffix appears in the names; both transcripts contain real text.
+    // The default slug style preserves each case-sensitive id as the final
+    // filename component; both transcripts contain real text.
     let names: Vec<String> = mds
         .iter()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     assert!(
-        names.iter().any(|n| n.contains("[AAAAAAAAAAA]")),
+        names.iter().any(|n| n.ends_with("_AAAAAAAAAAA.md")),
         "names missing first id: {names:?}"
     );
     assert!(
-        names.iter().any(|n| n.contains("[BBBBBBBBBBB]")),
+        names.iter().any(|n| n.ends_with("_BBBBBBBBBBB.md")),
         "names missing second id: {names:?}"
     );
     for md in &mds {
@@ -179,6 +181,7 @@ fn gated_youtube_private_video_fails_gracefully_and_records_manifest() {
 
     let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
     cmd.arg("youtube")
+        .arg("run")
         .arg("https://www.youtube.com/watch?v=PRIVATE00001")
         .arg("--output-dir")
         .arg(out.to_str().unwrap())
