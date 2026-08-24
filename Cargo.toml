@@ -31,6 +31,7 @@ include = [
 [features]
 default = []
 tui = ["dep:ftui"]
+fj-oracle = ["dep:fj-lax", "dep:fj-core"]
 
 # Two binaries from the same entry point: the full name and the short `fw`
 # alias agents and humans actually type. Listing them explicitly disables the
@@ -105,6 +106,14 @@ ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", de
 half = { version = "2.7", features = ["std"] }
 
 ftui = { version = "0.5.0", path = "../frankentui/crates/ftui", default-features = false, features = ["crossterm"], optional = true }
+
+# frankenjax differential oracle (feature `fj-oracle`, bd-ohra): the fj
+# interpreter family serves as the independent evaluation oracle for
+# conformance cross-checks of native_engine nn.rs primitives. Optional +
+# feature-gated so default builds never compile it; run with
+# `cargo test --features fj-oracle --test conformance_oracle_tests`.
+fj-lax = { version = "0.1.0", path = "../frankenjax/crates/fj-lax", optional = true }
+fj-core = { version = "0.1.0", path = "../frankenjax/crates/fj-core", optional = true }
 
 # Safe handle-relative openat, ownership checks, and no-clobber rename
 # publication are unavailable in std. This narrowly featured target-specific
