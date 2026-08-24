@@ -13759,6 +13759,7 @@ mod tests {
             iterations,
             WARMUP_REPETITIONS,
         );
+        black_box(warmup_ratios);
         let null_ratios = paired_source_separation_ratios::<false, false>(
             &path,
             &analysis,

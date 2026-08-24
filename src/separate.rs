@@ -253,7 +253,7 @@ fn fft_in_place(re: &mut [f32], im: &mut [f32]) {
     debug_assert!(n.is_power_of_two());
     let bits = n.trailing_zeros();
     for i in 0..n {
-        let j = ((i.reverse_bits()) >> (usize::BITS - bits)) as usize;
+        let j = (i.reverse_bits()) >> (usize::BITS - bits);
         if j > i {
             re.swap(i, j);
             im.swap(i, j);
@@ -314,7 +314,7 @@ pub(crate) fn irfft_mag_phase(mag: &[f32], phase: &[f32], out: &mut [f32]) {
     }
     // IDFT via forward FFT on the conjugated spectrum: for a conjugate-
     // symmetric spectrum X, x[n] = Re{FFT(conj(X))[n]}/N exactly.
-    for v in im.iter_mut() {
+    for v in &mut im {
         *v = -*v;
     }
     fft_in_place(&mut re, &mut im);
@@ -387,14 +387,16 @@ fn parse_safetensors_f32(raw: &[u8]) -> FwResult<std::collections::BTreeMap<Stri
             )));
         }
         let bytes = &raw[header_end + start..header_end + end];
-        if bytes.len() % 4 != 0 {
+        if !bytes.len().is_multiple_of(4) {
             return Err(FwError::InvalidRequest(format!(
                 "safetensors: {name} byte length not f32-aligned"
             )));
         }
         let data = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| f32::from_le_bytes(chunk))
             .collect();
         out.insert(name, SafeTensor { shape, data });
     }
@@ -496,7 +498,7 @@ mod tests {
             offset += data.len() * 4;
         }
         let mut hb = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
-        while hb.len() % 8 != 0 {
+        while !hb.len().is_multiple_of(8) {
             hb.push(b' ');
         }
         let mut bytes = (hb.len() as u64).to_le_bytes().to_vec();
