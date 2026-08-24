@@ -1811,12 +1811,14 @@ pub fn prepare_voxconverse_descriptor_with_cancel(
         ));
     }
 
-    let output_parent = validate_new_output_with_policy(
+    let (output_parent, output_existed) = validate_output_with_policy(
         &canonical_project,
         &canonical_input,
         request.output_path,
         OutputLocationPolicy::BeneathInput,
+        ExistingOutputPolicy::Reject,
     )?;
+    debug_assert!(!output_existed);
     let development_audio_root = canonical_subdirectory(
         &canonical_input,
         request.development_audio_root,
@@ -3406,7 +3408,15 @@ pub fn run_public_corpus_ablation_with_cancel(
 /// `public_corpus.output_platform`.
 pub fn run_public_corpus_sidecar_study_with_cancel(
     request: PublicCorpusSidecarStudyRequest<'_>,
+    is_cancelled: impl FnMut() -> bool,
+) -> FwResult<PublicCorpusSidecarStudyEvidence> {
+    run_public_corpus_sidecar_study_with_publication_hook(request, is_cancelled, || Ok(()))
+}
+
+fn run_public_corpus_sidecar_study_with_publication_hook(
+    request: PublicCorpusSidecarStudyRequest<'_>,
     mut is_cancelled: impl FnMut() -> bool,
+    after_bundle_commit: impl FnOnce() -> FwResult<()>,
 ) -> FwResult<PublicCorpusSidecarStudyEvidence> {
     let PublicCorpusSidecarStudyRequest {
         project_root,
@@ -3450,8 +3460,8 @@ pub fn run_public_corpus_sidecar_study_with_cancel(
             "input root must be disjoint from the project checkout",
         ));
     }
-    let bundle_output_parent =
-        validate_new_output(&canonical_project, &canonical_input, bundle_output_path)?;
+    let (bundle_output_parent, bundle_already_published) =
+        validate_resumable_output(&canonical_project, &canonical_input, bundle_output_path)?;
     let evidence_output_parent =
         validate_new_output(&canonical_project, &canonical_input, evidence_output_path)?;
     if bundle_output_parent.same_output_target(
@@ -3927,44 +3937,17 @@ pub fn run_public_corpus_sidecar_study_with_cancel(
     result.result_sha256 = canonical_sha256(&result)?;
     verify_public_corpus_sidecar_study_evidence(&result)?;
     checkpoint_cancelled(&mut is_cancelled)?;
-    let staged_bundle = stage_new_json(
+    publish_resumable_sidecar_pair(
         bundle_output_path,
         &bundle_output_parent,
+        bundle_already_published,
         &bundle,
-        "public-corpus bundle",
-        &mut is_cancelled,
-    )?;
-    let staged_evidence = match stage_new_json(
         evidence_output_path,
         &evidence_output_parent,
         &result,
-        "sidecar study evidence",
         &mut is_cancelled,
-    ) {
-        Ok(staged) => staged,
-        Err(error) => {
-            return Err(staged_scrubbed_error(
-                error,
-                &[(&staged_bundle, "public-corpus bundle")],
-            ));
-        }
-    };
-    if let Err(error) = checkpoint_cancelled(&mut is_cancelled) {
-        return Err(staged_scrubbed_error(
-            error,
-            &[
-                (&staged_bundle, "public-corpus bundle"),
-                (&staged_evidence, "sidecar study evidence"),
-            ],
-        ));
-    }
-    if let Err(error) = publish_staged_json(staged_bundle, "public-corpus bundle") {
-        return Err(staged_scrubbed_error(
-            error,
-            &[(&staged_evidence, "sidecar study evidence")],
-        ));
-    }
-    publish_staged_json(staged_evidence, "sidecar study evidence")?;
+        after_bundle_commit,
+    )?;
     Ok(result)
 }
 
@@ -13735,7 +13718,29 @@ fn validate_new_output(
     input: &Path,
     output: &Path,
 ) -> FwResult<ValidatedOutputParent> {
-    validate_new_output_with_policy(project, input, output, OutputLocationPolicy::External)
+    let (parent, existed) = validate_output_with_policy(
+        project,
+        input,
+        output,
+        OutputLocationPolicy::External,
+        ExistingOutputPolicy::Reject,
+    )?;
+    debug_assert!(!existed);
+    Ok(parent)
+}
+
+fn validate_resumable_output(
+    project: &Path,
+    input: &Path,
+    output: &Path,
+) -> FwResult<(ValidatedOutputParent, bool)> {
+    validate_output_with_policy(
+        project,
+        input,
+        output,
+        OutputLocationPolicy::External,
+        ExistingOutputPolicy::AllowExactName,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -13744,12 +13749,19 @@ enum OutputLocationPolicy {
     BeneathInput,
 }
 
-fn validate_new_output_with_policy(
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ExistingOutputPolicy {
+    Reject,
+    AllowExactName,
+}
+
+fn validate_output_with_policy(
     project: &Path,
     input: &Path,
     output: &Path,
     location_policy: OutputLocationPolicy,
-) -> FwResult<ValidatedOutputParent> {
+    existing_output_policy: ExistingOutputPolicy,
+) -> FwResult<(ValidatedOutputParent, bool)> {
     if !output.is_absolute() || output.extension().and_then(|value| value.to_str()) != Some("json")
     {
         return Err(public_corpus_error(
@@ -13827,6 +13839,7 @@ fn validate_new_output_with_policy(
                 "output parent entries could not be checked for case-fold collisions",
             )
         })?;
+        let mut exact_output_exists = false;
         for entry in entries {
             let entry = entry.map_err(|_| {
                 public_corpus_error(
@@ -13834,11 +13847,14 @@ fn validate_new_output_with_policy(
                     "output parent entries could not be checked for case-fold collisions",
                 )
             })?;
-            if entry
-                .file_name()
-                .to_bytes()
-                .eq_ignore_ascii_case(output_name_text.as_bytes())
-            {
+            let entry_name = entry.file_name().to_bytes();
+            if entry_name.eq_ignore_ascii_case(output_name_text.as_bytes()) {
+                if existing_output_policy == ExistingOutputPolicy::AllowExactName
+                    && entry_name == output_name_text.as_bytes()
+                {
+                    exact_output_exists = true;
+                    continue;
+                }
                 return Err(public_corpus_error(
                     "output_exists",
                     "output or an ASCII-case-fold sibling already exists",
@@ -13846,21 +13862,29 @@ fn validate_new_output_with_policy(
             }
         }
 
-        match statat(&validated.directory, output_name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(_) => {
-                return Err(public_corpus_error(
-                    "output_exists",
-                    "output must not already exist",
-                ));
-            }
-            Err(error) if error == rustix::io::Errno::NOENT => {}
-            Err(_) => {
-                return Err(public_corpus_error(
-                    "output_target",
-                    "output target could not be checked relative to its validated parent",
-                ));
-            }
-        }
+        let output_exists =
+            match statat(&validated.directory, output_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(_) if existing_output_policy == ExistingOutputPolicy::AllowExactName => true,
+                Ok(_) => {
+                    return Err(public_corpus_error(
+                        "output_exists",
+                        "output must not already exist",
+                    ));
+                }
+                Err(error) if error == rustix::io::Errno::NOENT && !exact_output_exists => false,
+                Err(error) if error == rustix::io::Errno::NOENT => {
+                    return Err(public_corpus_error(
+                        "output_target_changed",
+                        "output changed during resumable publication preflight",
+                    ));
+                }
+                Err(_) => {
+                    return Err(public_corpus_error(
+                        "output_target",
+                        "output target could not be checked relative to its validated parent",
+                    ));
+                }
+            };
         match location_policy {
             OutputLocationPolicy::External => {
                 if paths_overlap(project, &validated.canonical_path)
@@ -13883,11 +13907,17 @@ fn validate_new_output_with_policy(
                 }
             }
         }
-        Ok(validated)
+        Ok((validated, output_exists))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
-        let _ = (project, input, parent, location_policy);
+        let _ = (
+            project,
+            input,
+            parent,
+            location_policy,
+            existing_output_policy,
+        );
         Err(FwError::Unsupported(
             "public_corpus.output_platform: race-safe public artifact publication requires Linux, Android, or an Apple platform"
                 .to_owned(),
@@ -14464,6 +14494,232 @@ fn publish_staged_json(staged: StagedJsonOutput<'_>, artifact: &str) -> FwResult
                 .to_owned(),
         ))
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+struct VerifiedExistingJsonOutput<'a> {
+    output_parent: &'a ValidatedOutputParent,
+    output_name: OsString,
+    file: File,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+struct VerifiedExistingJsonOutput<'a>(std::marker::PhantomData<&'a ()>);
+
+impl VerifiedExistingJsonOutput<'_> {
+    fn verify_identity(&self, artifact: &str) -> FwResult<()> {
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            verify_output_parent_identity(self.output_parent).map_err(|_| {
+                public_corpus_error(
+                    "output_resume_changed",
+                    &format!("existing {artifact} parent changed during recovery"),
+                )
+            })?;
+            verify_output_leaf_identity(self.output_parent, &self.output_name, &self.file)
+                .map_err(|_| {
+                    public_corpus_error(
+                        "output_resume_changed",
+                        &format!("existing {artifact} changed during recovery"),
+                    )
+                })?;
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        {
+            let _ = artifact;
+            Err(FwError::Unsupported(
+                "public_corpus.output_platform: resumable public artifact verification requires Linux, Android, or an Apple platform"
+                    .to_owned(),
+            ))
+        }
+    }
+}
+
+fn pretty_json_bytes<T: Serialize>(value: &T, artifact: &str) -> FwResult<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|_| {
+        public_corpus_error(
+            "output_write",
+            &format!("{artifact} output could not be serialized"),
+        )
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn verify_existing_json_output<'a, T: Serialize>(
+    output_path: &Path,
+    output_parent: &'a ValidatedOutputParent,
+    expected: &T,
+    artifact: &str,
+) -> FwResult<VerifiedExistingJsonOutput<'a>> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        use rustix::fs::{Mode, OFlags, openat};
+
+        verify_output_parent_identity(output_parent)?;
+        let output_name = output_path
+            .file_name()
+            .ok_or_else(|| public_corpus_error("output_path", "output must include a file name"))?
+            .to_owned();
+        let descriptor = openat(
+            &output_parent.directory,
+            &output_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| {
+            public_corpus_error(
+                "output_resume_mismatch",
+                &format!("existing {artifact} could not be opened for exact recovery"),
+            )
+        })?;
+        let mut file = File::from(descriptor);
+        let metadata = file.metadata().map_err(|_| {
+            public_corpus_error(
+                "output_resume_mismatch",
+                &format!("existing {artifact} metadata could not be verified"),
+            )
+        })?;
+        if !metadata.is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o777 != 0o600
+        {
+            return Err(public_corpus_error(
+                "output_resume_mismatch",
+                &format!(
+                    "existing {artifact} must be an owner-only regular file for exact recovery"
+                ),
+            ));
+        }
+        verify_output_leaf_identity(output_parent, &output_name, &file)?;
+        let expected_bytes = pretty_json_bytes(expected, artifact)?;
+        if metadata.len() != u64::try_from(expected_bytes.len()).unwrap_or(u64::MAX) {
+            return Err(public_corpus_error(
+                "output_resume_mismatch",
+                &format!("existing {artifact} does not match the recomputed canonical output"),
+            ));
+        }
+        let mut actual = Vec::with_capacity(expected_bytes.len());
+        file.read_to_end(&mut actual).map_err(|_| {
+            public_corpus_error(
+                "output_resume_mismatch",
+                &format!("existing {artifact} could not be read for exact recovery"),
+            )
+        })?;
+        if actual != expected_bytes {
+            return Err(public_corpus_error(
+                "output_resume_mismatch",
+                &format!("existing {artifact} does not match the recomputed canonical output"),
+            ));
+        }
+        let verified = VerifiedExistingJsonOutput {
+            output_parent,
+            output_name,
+            file,
+        };
+        verified.verify_identity(artifact)?;
+        Ok(verified)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = (output_path, output_parent, expected, artifact);
+        Err(FwError::Unsupported(
+            "public_corpus.output_platform: resumable public artifact verification requires Linux, Android, or an Apple platform"
+                .to_owned(),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_resumable_sidecar_pair<B: Serialize, E: Serialize>(
+    bundle_output_path: &Path,
+    bundle_output_parent: &ValidatedOutputParent,
+    bundle_already_published: bool,
+    bundle: &B,
+    evidence_output_path: &Path,
+    evidence_output_parent: &ValidatedOutputParent,
+    evidence: &E,
+    is_cancelled: &mut impl FnMut() -> bool,
+    after_bundle_commit: impl FnOnce() -> FwResult<()>,
+) -> FwResult<()> {
+    if bundle_already_published {
+        let existing_bundle = verify_existing_json_output(
+            bundle_output_path,
+            bundle_output_parent,
+            bundle,
+            "public-corpus bundle",
+        )?;
+        let staged_evidence = stage_new_json(
+            evidence_output_path,
+            evidence_output_parent,
+            evidence,
+            "sidecar study evidence",
+            is_cancelled,
+        )?;
+        if let Err(error) = checkpoint_cancelled(is_cancelled) {
+            return Err(staged_scrubbed_error(
+                error,
+                &[(&staged_evidence, "sidecar study evidence")],
+            ));
+        }
+        if let Err(error) = existing_bundle.verify_identity("public-corpus bundle") {
+            return Err(staged_scrubbed_error(
+                error,
+                &[(&staged_evidence, "sidecar study evidence")],
+            ));
+        }
+        publish_staged_json(staged_evidence, "sidecar study evidence")?;
+        existing_bundle.verify_identity("public-corpus bundle")?;
+        return Ok(());
+    }
+
+    let staged_bundle = stage_new_json(
+        bundle_output_path,
+        bundle_output_parent,
+        bundle,
+        "public-corpus bundle",
+        is_cancelled,
+    )?;
+    let staged_evidence = match stage_new_json(
+        evidence_output_path,
+        evidence_output_parent,
+        evidence,
+        "sidecar study evidence",
+        is_cancelled,
+    ) {
+        Ok(staged) => staged,
+        Err(error) => {
+            return Err(staged_scrubbed_error(
+                error,
+                &[(&staged_bundle, "public-corpus bundle")],
+            ));
+        }
+    };
+    if let Err(error) = checkpoint_cancelled(is_cancelled) {
+        return Err(staged_scrubbed_error(
+            error,
+            &[
+                (&staged_bundle, "public-corpus bundle"),
+                (&staged_evidence, "sidecar study evidence"),
+            ],
+        ));
+    }
+    if let Err(error) = publish_staged_json(staged_bundle, "public-corpus bundle") {
+        return Err(staged_scrubbed_error(
+            error,
+            &[(&staged_evidence, "sidecar study evidence")],
+        ));
+    }
+    if let Err(error) = after_bundle_commit() {
+        return Err(staged_scrubbed_error(
+            error,
+            &[(&staged_evidence, "sidecar study evidence")],
+        ));
+    }
+    publish_staged_json(staged_evidence, "sidecar study evidence")
 }
 
 fn write_new_json<T: Serialize>(
@@ -29797,6 +30053,122 @@ mod tests {
             std::fs::read(staging[0].path())
                 .expect("empty marker")
                 .is_empty()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn sidecar_pair_recovers_exact_bundle_after_injected_between_commit_failure() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let project = project.canonicalize().expect("canonical project");
+        let input = input.canonicalize().expect("canonical input");
+        let bundle_path = output_parent.join("bundle.json");
+        let evidence_path = output_parent.join("evidence.json");
+        let bundle = json!({"bundle_sha256": "canonical-bundle-v1", "rows": [1, 2, 3]});
+        let evidence = json!({"completion": true, "bundle_sha256": "canonical-bundle-v1"});
+
+        let (bundle_parent, bundle_existed) =
+            super::validate_resumable_output(&project, &input, &bundle_path)
+                .expect("new resumable bundle output");
+        assert!(!bundle_existed);
+        let evidence_parent =
+            validate_new_output(&project, &input, &evidence_path).expect("new evidence output");
+        let injected = super::publish_resumable_sidecar_pair(
+            &bundle_path,
+            &bundle_parent,
+            bundle_existed,
+            &bundle,
+            &evidence_path,
+            &evidence_parent,
+            &evidence,
+            &mut || false,
+            || {
+                Err(super::public_corpus_error(
+                    "test_between_commits",
+                    "deterministic failure after bundle commit",
+                ))
+            },
+        )
+        .expect_err("injected between-commit failure");
+        assert!(injected.to_string().contains("test_between_commits"));
+        assert!(bundle_path.is_file());
+        assert!(!evidence_path.exists());
+
+        let committed_bundle_bytes = std::fs::read(&bundle_path).expect("committed bundle");
+        assert_eq!(
+            committed_bundle_bytes,
+            super::pretty_json_bytes(&bundle, "fixture bundle").expect("expected bundle bytes")
+        );
+        let committed_bundle_metadata = bundle_path.metadata().expect("committed bundle metadata");
+
+        let (bundle_parent, bundle_existed) =
+            super::validate_resumable_output(&project, &input, &bundle_path)
+                .expect("existing resumable bundle output");
+        assert!(bundle_existed);
+        let evidence_parent = validate_new_output(&project, &input, &evidence_path)
+            .expect("still-absent evidence output");
+        let mismatch = super::publish_resumable_sidecar_pair(
+            &bundle_path,
+            &bundle_parent,
+            bundle_existed,
+            &json!({"bundle_sha256": "different-bundle"}),
+            &evidence_path,
+            &evidence_parent,
+            &evidence,
+            &mut || false,
+            || Ok(()),
+        )
+        .expect_err("mismatched recovery bundle");
+        assert!(mismatch.to_string().contains("output_resume_mismatch"));
+        assert!(!evidence_path.exists());
+        assert_eq!(
+            std::fs::read(&bundle_path).expect("unchanged bundle after mismatch"),
+            committed_bundle_bytes
+        );
+
+        let (bundle_parent, bundle_existed) =
+            super::validate_resumable_output(&project, &input, &bundle_path)
+                .expect("exact resumable bundle output");
+        let evidence_parent = validate_new_output(&project, &input, &evidence_path)
+            .expect("evidence output before recovery");
+        super::publish_resumable_sidecar_pair(
+            &bundle_path,
+            &bundle_parent,
+            bundle_existed,
+            &bundle,
+            &evidence_path,
+            &evidence_parent,
+            &evidence,
+            &mut || false,
+            || Ok(()),
+        )
+        .expect("exact-content recovery");
+
+        assert_eq!(
+            std::fs::read(&bundle_path).expect("bundle after recovery"),
+            committed_bundle_bytes
+        );
+        let recovered_bundle_metadata = bundle_path.metadata().expect("recovered bundle metadata");
+        assert_eq!(
+            committed_bundle_metadata.dev(),
+            recovered_bundle_metadata.dev()
+        );
+        assert_eq!(
+            committed_bundle_metadata.ino(),
+            recovered_bundle_metadata.ino()
+        );
+        assert_eq!(
+            std::fs::read(&evidence_path).expect("completion evidence"),
+            super::pretty_json_bytes(&evidence, "fixture evidence")
+                .expect("expected evidence bytes")
         );
     }
 

@@ -1384,9 +1384,16 @@ artifact may already exist and is never truncated. An ambiguous rename result
 is also commit-uncertain and conservatively preserves the held inode; only an
 authoritative no-clobber conflict permits pre-commit scrubbing. A
 bundle/evidence pair is staged before either publication, but the two
-independent final-name renames
-are not a cross-file transaction, so callers must treat successful evidence
-publication as the completed pair.
+independent final-name renames are not a cross-file transaction. Successful
+evidence publication is therefore the explicit completion signal. If the
+bundle commit succeeds and evidence publication does not, a retry may resume
+only when the existing bundle remains an owner-only regular file whose inode
+identity and complete pretty-JSON bytes exactly match the newly recomputed,
+canonically verified bundle. The retry opens that bundle read-only and creates
+only the still-absent evidence destination through the same no-clobber commit.
+A byte mismatch, identity change, permission change, non-regular destination,
+or existing evidence file fails closed; recovery never deletes, truncates, or
+overwrites either final destination.
 The path-bearing descriptor type is deserialization-only and has no `Debug` or
 serialization implementation.
 
