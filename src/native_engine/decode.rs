@@ -1272,9 +1272,12 @@ fn beam_decode_window(
 
             if terminate {
                 if !bail {
-                    // Coverage-keyed rescue, has_ts-free (whisper.cpp
-                    // 7391-7396 parity; see the greedy path's comment).
-                    if result_len == 0 && params.timestamps && covers_audio_end {
+                    // The has-timestamp-free rescue is deliberately limited to
+                    // the first window; see `should_rescue_unclosed_first_window`.
+                    if result_len == 0
+                        && params.timestamps
+                        && should_rescue_unclosed_first_window(seek_cs, covers_audio_end)
+                    {
                         result_len = i + 1;
                     }
                     if !params.timestamps {
@@ -2212,6 +2215,18 @@ fn single_timestamp_ending(
         && !budget_forced
         && decoded[decoded.len() - 2] < timestamp_begin
         && decoded[decoded.len() - 1] > timestamp_begin
+}
+
+/// Whether a timestamp-mode decode with no closed timestamp may retain its text.
+///
+/// A short first window can legitimately reach EOT after `<|0.00|>` plus text;
+/// retaining it is required by reduced audio-context streaming. On a later
+/// window, however, the default full-chunk `seek_delta_cs` makes coverage true
+/// for every short final tail, including a tail that overlaps audio already
+/// emitted by the preceding timestamp. Accepting that unclosed tail duplicates
+/// the boundary transcript, so only the first window receives this rescue.
+fn should_rescue_unclosed_first_window(seek_cs: i64, covers_audio_end: bool) -> bool {
+    seek_cs == 0 && covers_audio_end
 }
 
 struct IndependentWindowResult {
@@ -3247,18 +3262,14 @@ fn transcribe_samples_uncached(
                     let reached_end = has_ts && covers_audio_end;
                     if tok == tk.eot || budget_reached || reached_end {
                         if result_len == 0 && params.timestamps {
-                            // whisper.cpp 7391-7396: the rescue keys on seek
-                            // COVERAGE alone, never on has_ts. A window that
-                            // closes at eot having emitted only <|0.00|>
-                            // (== timestamp_begin, so has_ts stays false) plus
-                            // text still yields its tokens when it covers the
-                            // remaining audio (seek_delta_cs is still CHUNK_CS
-                            // then, so any final window qualifies — exactly
-                            // whisper.cpp's arithmetic). Requiring has_ts here
-                            // discarded real speech as an empty window on
-                            // truncated-ctx slices (bd-rt-audio-ctx-auto-empty:
-                            // 4.42 s jfk slice under AudioCtxPolicy::Auto).
-                            if covers_audio_end {
+                            // Retain an unclosed first-window transcript when it
+                            // covers the input (required by reduced audio-context
+                            // streaming), but reject later overlapping tails that
+                            // would duplicate already-emitted boundary text.
+                            if should_rescue_unclosed_first_window(
+                                seek_cs,
+                                covers_audio_end,
+                            ) {
                                 result_len = i + 1;
                             } else {
                                 // Decoder failed with no timestamps closed.
@@ -4969,6 +4980,21 @@ mod tests {
         // Degenerate lengths.
         assert!(!single_timestamp_ending(&[beg + 10], beg, true, None));
         assert!(!single_timestamp_ending(&[], beg, true, None));
+    }
+
+    #[test]
+    fn unclosed_window_rescue_is_first_window_only() {
+        // Positive cell: a short first-window streaming slice reaches EOT after
+        // `<|0.00|>` plus text and must retain that transcript.
+        assert!(should_rescue_unclosed_first_window(0, true));
+
+        // Negative cell: a later short tail also satisfies the default
+        // full-chunk coverage arithmetic, but may overlap the preceding closed
+        // timestamp and must not be emitted a second time.
+        assert!(!should_rescue_unclosed_first_window(2_800, true));
+
+        // Coverage remains mandatory even on the first window.
+        assert!(!should_rescue_unclosed_first_window(0, false));
     }
 
     #[test]
