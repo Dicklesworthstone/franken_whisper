@@ -1568,6 +1568,41 @@ runtime evidence. This licensing boundary does not prevent local parity and
 comparison work, but it does prevent artifact publication or a distributable
 product claim.
 
+**License-scope investigation (bd-y4ip.15, 2026-08-23, read-only evidence
+pass).** Facts, each retrieved from the upstream repository
+(`github.com/PalabraAI/redimnet2`) on this date:
+
+- The `v1.0.0` tag tree (`README.md`, `assets/`, `hubconf.py`, `redimnet2/`,
+  `requirements.txt`) contains no license file. Its release body reads only
+  "pre-trained redimnet2 weights vox2-dev (ptn and lm)" (published
+  2026-03-04T14:25:10Z; it remains the repository's ONLY release).
+- Release asset `b2-vox2-lm.pt` — the pinned checkpoint (15,897,450 bytes,
+  SHA-256 `0545a29679a87fe1c662d2bbd05e3b3fe0d1b392832729abaa135e4079a2f77a`)
+  — was uploaded 2026-03-04T14:25:03Z and never re-published afterward;
+  no asset postdates the license addition.
+- Upstream added `## License / MIT` to the README on 2026-07-06
+  ("Update public ReDimNet2 release docs and hub loading", commit
+  `608196213116`) while that same README links the v1.0.0 checkpoint assets
+  as its official download path, then added the top-level MIT LICENSE file on
+  2026-07-09 (commit `2a8d15f65b1d`, "Add MIT License to the project").
+- The repository description states it contains "the official implementation
+  and pretrained weights". No issue or discussion mentions licensing.
+  There is no official HuggingFace mirror (third-party mirrors already label
+  conversions MIT; noted, not authoritative).
+
+Assessment: this demonstrates clear maintainer INTENT that the project —
+including its published checkpoints — is MIT, but it is not an authoritative
+statement that the MIT grant extends retroactively to the March 2026 release
+assets, which were distributed before any license declaration existed.
+Circumstantial intent does not meet the bead's bar of "authoritative upstream
+clarification or another legally sufficient artifact."
+
+Disposition: distribution status stays `operator_local_no_release`. A
+maintainer inquiry has been drafted (retained in the tracker comment on
+bd-y4ip.15) for the operator to send from an operator identity; upon a
+sufficient reply or equivalent artifact, update THIS section first, then the
+receipt status, then bd-y4ip.3.
+
 The AMI adapter enforces the corpus site's scenario-only training,
 development, and unseen-test meeting-family split. Other corpora use an
 external descriptor whose exact bytes are frozen by SHA-256, followed by the
