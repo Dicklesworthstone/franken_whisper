@@ -186,7 +186,6 @@ impl DtlnSeparator {
         } else {
             0
         };
-        let mut stage1_out = vec![0.0f32; output_len];
         let mut output = vec![0.0f32; output_len];
         let mut mag = vec![0.0f32; BINS];
         let mut phase = vec![0.0f32; BINS];
@@ -198,27 +197,22 @@ impl DtlnSeparator {
             // Stage 1: mask in the STFT-magnitude domain.
             let log_mag: Vec<f32> = mag.iter().map(|&m| (m + STFT_NORM_EPS).ln()).collect();
             let mask1 = self.s1.forward(&log_mag, &mut state1)?;
-            let masked_mag: Vec<f32> = mag.iter().zip(&mask1).map(|(&m, &k)| m * k).collect();
+            let masked_mag: Vec<f32> =
+                mag.iter().zip(&mask1).map(|(&m, &k)| m * k).collect();
             let mut denoised = vec![0.0f32; BLOCK_LEN];
             irfft_mag_phase(&masked_mag, &phase, &mut denoised);
-            for (j, slot) in denoised.iter().enumerate() {
-                stage1_out[start + j] += slot;
-            }
 
-            // Stage 2: mask in the learned domain over the RAW stage-1 frame
-            // (the frame as it exists in the overlap-add buffer at its own
-            // origin — matching per-frame processing of the training graph's
-            // second stage input built via tf.signal.frame of stage-1 output).
-            let raw_frame_start = start;
-            let raw_frame = &stage1_out[raw_frame_start..raw_frame_start + BLOCK_LEN];
-            let encoded = matvec(raw_frame, &self.s2_encoder, ENCODER_FEATURES);
+            // Stage 2 consumes the PRE-OLA frame directly — upstream trains
+            // Conv1D on the ifftLayer output and overlap-adds only AFTER the
+            // decoder (build_DTLN_model, lines ~346-355). Feeding it the
+            // accumulated buffer instead double-counts overlapping frames.
+            let encoded = matvec(&denoised, &self.s2_encoder, ENCODER_FEATURES);
             let mask2 = self.s2.forward(&encoded, &mut state2)?;
-            let masked_enc: Vec<f32> = encoded.iter().zip(&mask2).map(|(&e, &k)| e * k).collect();
+            let masked_enc: Vec<f32> =
+                encoded.iter().zip(&mask2).map(|(&e, &k)| e * k).collect();
             let decoded = matvec(&masked_enc, &self.s2_decoder, BLOCK_LEN);
             for (j, slot) in decoded.iter().enumerate() {
-                if start + j < output.len() {
-                    output[start + j] += slot;
-                }
+                output[start + j] += slot;
             }
         }
         Ok(output)
