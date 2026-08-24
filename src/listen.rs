@@ -1224,7 +1224,7 @@ impl EmissionPolicy for LocalAgreementPolicy {
         // Store BEFORE building the decision flag: committing advances the
         // origin next slice, so a committing step poisons its own history.
         self.prev_segments = Some(cur);
-        let mut decision = Self::decision(out, agreed);
+        let decision = Self::decision(out, agreed);
         if agreed > 0 && decision.commit_through_sec.is_some() {
             // Origin will advance past committed audio: the stored previous
             // output no longer describes the next decode's window.
