@@ -32,6 +32,7 @@ pub mod process;
 pub mod public_corpus;
 pub mod replay_pack;
 pub mod robot;
+pub mod separate;
 pub mod sortformer_conformance;
 pub mod sortformer_identity;
 pub mod sortformer_inference;

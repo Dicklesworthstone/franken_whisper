@@ -6393,6 +6393,149 @@ pub(crate) fn transpose_parallel(data: &[f32], rows: usize, cols: usize) -> Vec<
     out
 }
 
+// ---------------------------------------------------------------------------
+// LSTM forward kernel (bd-uuml): the reusable recurrent primitive for
+// sequence models. First consumer: DTLN-style source separation (bd-mmx3).
+//
+// GATE LAYOUT: rows of `w_ih` / `w_hh` and of both bias vectors are grouped
+// as [i, f, g, o] (PyTorch order) per hidden block. Weight converters
+// importing ONNX (i, o, f, g) or Keras/TF checkpoints MUST permute rows to
+// this layout; the kernel never reorders.
+//
+// NUMERICS: f32 accumulation in a fixed order — per timestep, pre[j] =
+// b_ih[j] + b_hh[j] + dot(x_t, w_ih row j) + dot(h_{t-1}, w_hh row j), with
+// every output row computed independently from its input row. Splitting a
+// sequence across calls with a carried [`LstmState`] therefore reproduces
+// the single-call result BIT-EXACTLY (asserted by test), which is what makes
+// stateful streaming safe.
+
+/// Weights for one LSTM layer. Shapes follow the ONNX/PyTorch projection
+/// convention: `w_ih: [4H, input]`, `w_hh: [4H, H]`, biases `[4H]`.
+#[derive(Debug, Clone)]
+pub struct LstmWeights {
+    pub w_ih: Mat,
+    pub w_hh: Mat,
+    pub b_ih: Vec<f32>,
+    pub b_hh: Vec<f32>,
+}
+
+/// Carried recurrent state (length = hidden size). Empty vectors mean a
+/// fresh session and are zero-initialized by [`LstmWeights::lstm_forward`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LstmState {
+    pub h: Vec<f32>,
+    pub c: Vec<f32>,
+}
+
+impl LstmState {
+    /// Fresh zero state for a hidden size.
+    #[must_use]
+    pub fn zeros(hidden: usize) -> Self {
+        Self {
+            h: vec![0.0; hidden],
+            c: vec![0.0; hidden],
+        }
+    }
+}
+
+impl LstmWeights {
+    /// Validate shape contracts once at construction.
+    pub fn new(w_ih: Mat, w_hh: Mat, b_ih: Vec<f32>, b_hh: Vec<f32>) -> FwResult<Self> {
+        let hidden = w_hh.cols;
+        if w_ih.rows != 4 * hidden || w_hh.rows != 4 * hidden {
+            return Err(FwError::InvalidRequest(format!(
+                "lstm: weight rows must be 4*hidden ({hidden}); got w_ih {} x {}, w_hh {} x {}",
+                w_ih.rows, w_ih.cols, w_hh.rows, w_hh.cols
+            )));
+        }
+        if b_ih.len() != 4 * hidden || b_hh.len() != 4 * hidden {
+            return Err(FwError::InvalidRequest(format!(
+                "lstm: bias lengths must be 4*hidden ({hidden}); got {} and {}",
+                b_ih.len(),
+                b_hh.len()
+            )));
+        }
+        Ok(Self {
+            w_ih,
+            w_hh,
+            b_ih,
+            b_hh,
+        })
+    }
+
+    /// Hidden size H.
+    #[must_use]
+    pub fn hidden_size(&self) -> usize {
+        self.w_hh.cols
+    }
+
+    /// Run the recurrence over `x: [T, input]`, writing one output row per
+    /// timestep, updating `state` in place. An empty `state` starts fresh;
+    /// otherwise its length must equal the hidden size.
+    pub fn lstm_forward(&self, x: &Mat, state: &mut LstmState) -> FwResult<Mat> {
+        let hidden = self.hidden_size();
+        if x.cols != self.w_ih.cols {
+            return Err(FwError::InvalidRequest(format!(
+                "lstm: input width {} != weight input width {}",
+                x.cols, self.w_ih.cols
+            )));
+        }
+        match (state.h.is_empty(), state.c.is_empty()) {
+            (true, true) => *state = LstmState::zeros(hidden),
+            (false, false) => {
+                if state.h.len() != hidden || state.c.len() != hidden {
+                    return Err(FwError::InvalidRequest(format!(
+                        "lstm: carried state length ({}, {}) != hidden size {hidden}",
+                        state.h.len(),
+                        state.c.len()
+                    )));
+                }
+            }
+            _ => {
+                return Err(FwError::InvalidRequest(
+                    "lstm: h and c states must be jointly empty or jointly sized".into(),
+                ));
+            }
+        }
+        let mut out = Mat::zeros(x.rows, hidden);
+        // Gate scratch reused across timesteps: allocation-stable after warmup.
+        let mut pre = vec![0.0f32; 4 * hidden];
+        for t in 0..x.rows {
+            let x_row = &x.data[t * x.cols..(t + 1) * x.cols];
+            for (j, pre_j) in pre.iter_mut().enumerate() {
+                let mut acc = self.b_ih[j] + self.b_hh[j];
+                let w_ih_row = &self.w_ih.data[j * x.cols..(j + 1) * x.cols];
+                for (i, &xi) in x_row.iter().enumerate() {
+                    acc += xi * w_ih_row[i];
+                }
+                let w_hh_row = &self.w_hh.data[j * hidden..(j + 1) * hidden];
+                for (k, &hk) in state.h.iter().enumerate() {
+                    acc += hk * w_hh_row[k];
+                }
+                *pre_j = acc;
+            }
+            let out_row = &mut out.data[t * hidden..(t + 1) * hidden];
+            for k in 0..hidden {
+                let i_gate = sigmoid_scalar(pre[k]);
+                let f_gate = sigmoid_scalar(pre[hidden + k]);
+                let g_gate = (pre[2 * hidden + k]).tanh();
+                let o_gate = sigmoid_scalar(pre[3 * hidden + k]);
+                let c_new = f_gate * state.c[k] + i_gate * g_gate;
+                state.c[k] = c_new;
+                let h_new = o_gate * c_new.tanh();
+                state.h[k] = h_new;
+                out_row[k] = h_new;
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[inline]
+fn sigmoid_scalar(v: f32) -> f32 {
+    1.0 / (1.0 + (-v).exp())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6417,6 +6560,182 @@ mod tests {
             let data = (0..rows * cols).map(|_| self.next_f32()).collect();
             Mat::from_vec(rows, cols, data)
         }
+    }
+
+    // -- bd-uuml: LSTM forward kernel ---------------------------------------
+
+    /// Independent naive LSTM reference (mirrors the documented [i, f, g, o]
+    /// gate layout and the kernel's accumulation order so parity is tight).
+    fn lstm_naive_reference(
+        w_ih: &Mat,
+        w_hh: &Mat,
+        b_ih: &[f32],
+        b_hh: &[f32],
+        x: &Mat,
+    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+        let hidden = w_hh.cols;
+        let mut h = vec![0.0f32; hidden];
+        let mut c = vec![0.0f32; hidden];
+        let mut rows_out = Vec::with_capacity(x.rows);
+        for t in 0..x.rows {
+            let mut next_h = vec![0.0f32; hidden];
+            let mut next_c = vec![0.0f32; hidden];
+            for k in 0..hidden {
+                let mut i_pre = b_ih[k] + b_hh[k];
+                for (i, &xi) in x.row(t).iter().enumerate() {
+                    i_pre += xi * w_ih.data[k * w_ih.cols + i];
+                }
+                for (s, &hv) in h.iter().enumerate() {
+                    i_pre += hv * w_hh.data[k * hidden + s];
+                }
+                let mut f_pre = b_ih[hidden + k] + b_hh[hidden + k];
+                for (i, &xi) in x.row(t).iter().enumerate() {
+                    f_pre += xi * w_ih.data[(hidden + k) * w_ih.cols + i];
+                }
+                for (s, &hv) in h.iter().enumerate() {
+                    f_pre += hv * w_hh.data[(hidden + k) * hidden + s];
+                }
+                let mut g_pre = b_ih[2 * hidden + k] + b_hh[2 * hidden + k];
+                for (i, &xi) in x.row(t).iter().enumerate() {
+                    g_pre += xi * w_ih.data[(2 * hidden + k) * w_ih.cols + i];
+                }
+                for (s, &hv) in h.iter().enumerate() {
+                    g_pre += hv * w_hh.data[(2 * hidden + k) * hidden + s];
+                }
+                let mut o_pre = b_ih[3 * hidden + k] + b_hh[3 * hidden + k];
+                for (i, &xi) in x.row(t).iter().enumerate() {
+                    o_pre += xi * w_ih.data[(3 * hidden + k) * w_ih.cols + i];
+                }
+                for (s, &hv) in h.iter().enumerate() {
+                    o_pre += hv * w_hh.data[(3 * hidden + k) * hidden + s];
+                }
+                let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
+                let c_new = sig(f_pre) * c[k] + sig(i_pre) * g_pre.tanh();
+                next_c[k] = c_new;
+                next_h[k] = sig(o_pre) * c_new.tanh();
+            }
+            rows_out.push(next_h.clone());
+            h = next_h;
+            c = next_c;
+        }
+        (rows_out, h, c)
+    }
+
+    fn lstm_fixture(hidden: usize, input: usize, seed: u64) -> (LstmWeights, Mat) {
+        let mut rng = Lcg::new(seed);
+        let mut w_ih = rng.mat(4 * hidden, input);
+        // Keep activations bounded: scale weights so gates live in a sane range.
+        for v in &mut w_ih.data {
+            *v *= 0.4;
+        }
+        let mut w_hh = rng.mat(4 * hidden, hidden);
+        for v in &mut w_hh.data {
+            *v *= 0.4;
+        }
+        let b_ih = (0..4 * hidden)
+            .map(|i| (i % 5) as f32 * 0.05 - 0.1)
+            .collect();
+        let b_hh = (0..4 * hidden)
+            .map(|i| (i % 3) as f32 * 0.02 - 0.02)
+            .collect();
+        let weights = LstmWeights::new(w_ih, w_hh, b_ih, b_hh).expect("fixture weights");
+        let x = rng.mat(7, input);
+        (weights, x)
+    }
+
+    #[test]
+    fn lstm_forward_matches_naive_reference_on_seeded_inputs() {
+        let (weights, x) = lstm_fixture(8, 5, 0x00_0B_D5);
+        let mut state = LstmState::default();
+        let out = weights.lstm_forward(&x, &mut state).expect("forward");
+        let (rows_ref, h_ref, c_ref) = lstm_naive_reference(
+            &weights.w_ih,
+            &weights.w_hh,
+            &weights.b_ih,
+            &weights.b_hh,
+            &x,
+        );
+        for (t, row_ref) in rows_ref.iter().enumerate() {
+            for (k, (a, b)) in out.row(t).iter().zip(row_ref.iter()).enumerate() {
+                assert!((a - b).abs() <= 1e-6, "row {t} gate {k}: {a} vs {b}");
+            }
+        }
+        for k in 0..state.h.len() {
+            assert!((state.h[k] - h_ref[k]).abs() <= 1e-6);
+            assert!((state.c[k] - c_ref[k]).abs() <= 1e-6);
+        }
+    }
+
+    #[test]
+    fn lstm_split_with_carried_state_is_bit_exact_vs_single_call() {
+        let (weights, x) = lstm_fixture(6, 9, 0xBEEF_CAFE);
+        let mut whole_state = LstmState::default();
+        let whole = weights.lstm_forward(&x, &mut whole_state).expect("whole");
+        let mut split_state = LstmState::default();
+        let head = weights
+            .lstm_forward(
+                &Mat::from_vec(3, x.cols, x.data[..3 * x.cols].to_vec()),
+                &mut split_state,
+            )
+            .expect("head");
+        let tail = weights
+            .lstm_forward(
+                &Mat::from_vec(x.rows - 3, x.cols, x.data[3 * x.cols..].to_vec()),
+                &mut split_state,
+            )
+            .expect("tail");
+        for t in 0..3 {
+            assert_eq!(whole.row(t), head.row(t));
+        }
+        for t in 3..x.rows {
+            assert_eq!(whole.row(t), tail.row(t - 3));
+        }
+        assert_eq!(whole_state.h, split_state.h);
+        assert_eq!(whole_state.c, split_state.c);
+    }
+
+    #[test]
+    fn lstm_rejects_mismatched_dims_and_partial_state() {
+        let (weights, x) = lstm_fixture(4, 6, 0xD1_0001);
+        let wrong_width = Mat::from_vec(2, 5, vec![0.0; 10]);
+        let mut state = LstmState::default();
+        assert!(matches!(
+            weights.lstm_forward(&wrong_width, &mut state),
+            Err(FwError::InvalidRequest(_))
+        ));
+        let mut bad_len = LstmState {
+            h: vec![0.0; 3],
+            c: vec![0.0; 4],
+        };
+        assert!(matches!(
+            weights.lstm_forward(&x, &mut bad_len),
+            Err(FwError::InvalidRequest(_))
+        ));
+        let mut half = LstmState {
+            h: vec![0.0; 4],
+            c: Vec::new(),
+        };
+        assert!(matches!(
+            weights.lstm_forward(&x, &mut half),
+            Err(FwError::InvalidRequest(_))
+        ));
+        let bad_weights = LstmWeights::new(
+            Mat::from_vec(15, 6, vec![0.0; 90]),
+            Mat::from_vec(16, 4, vec![0.0; 64]),
+            vec![0.0; 16],
+            vec![0.0; 16],
+        );
+        assert!(matches!(bad_weights, Err(FwError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn lstm_default_state_matches_explicit_zero_state() {
+        let (weights, x) = lstm_fixture(5, 7, 0x5EED_0002);
+        let mut implicit = LstmState::default();
+        let a = weights.lstm_forward(&x, &mut implicit).expect("implicit");
+        let mut explicit = LstmState::zeros(weights.hidden_size());
+        let b = weights.lstm_forward(&x, &mut explicit).expect("explicit");
+        assert_eq!(a.data, b.data);
     }
 
     /// The f16-direct encoder quant (`quantize_f16_bytes_to_i7`, `c701b45`) MUST
