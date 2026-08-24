@@ -207,9 +207,7 @@ impl YoutubeEventEmitter {
             "seq": self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             "ts": chrono::Utc::now().to_rfc3339(),
         });
-        if let (Some(envelope), Some(payload)) =
-            (envelope.as_object_mut(), payload.as_object())
-        {
+        if let (Some(envelope), Some(payload)) = (envelope.as_object_mut(), payload.as_object()) {
             for (key, value) in payload {
                 envelope.insert(key.clone(), value.clone());
             }
@@ -519,10 +517,7 @@ pub(crate) fn run_with_info(
                         // closure returns ()); a broken stdout pipe surfaces on
                         // the consumer side instead. Capture-mode serialization
                         // of plain values cannot fail in practice.
-                        let _ = events.emit(
-                            "downloading",
-                            serde_json::json!({ "id": video.id }),
-                        );
+                        let _ = events.emit("downloading", serde_json::json!({ "id": video.id }));
                         let outcome = download_one(&info, &video, &audio_dir, &dl_token);
                         if let Ok((audio_path, _meta)) = &outcome {
                             let bytes = std::fs::metadata(audio_path).ok().map(|m| m.len());
@@ -623,10 +618,7 @@ pub(crate) fn run_with_info(
                 // that matter are the terminal `Done`/`Failed` (and the rare
                 // cancel-persist below). The single per-video save now happens at
                 // the terminal transition.
-                events.emit(
-                    "transcribing",
-                    serde_json::json!({ "id": video.id }),
-                )?;
+                events.emit("transcribing", serde_json::json!({ "id": video.id }))?;
                 match transcribe_and_render(&engine, opts, &video, &meta, &audio_path) {
                     Ok((paths, wall_ms, rtf)) => {
                         let audio_kept = if opts.keep_audio {
@@ -695,10 +687,7 @@ pub(crate) fn run_with_info(
 /// Terminal aggregate event (bd-27v1.1): exactly one per robot run, always
 /// last; `cancelled` distinguishes Ctrl+C and `--abort-on-error` endings from
 /// a fully completed run.
-fn emit_run_complete(
-    events: &YoutubeEventEmitter,
-    summary: &YoutubeRunSummary,
-) -> FwResult<()> {
+fn emit_run_complete(events: &YoutubeEventEmitter, summary: &YoutubeRunSummary) -> FwResult<()> {
     events.emit(
         "run_complete",
         serde_json::json!({
@@ -1482,9 +1471,8 @@ https://youtu.be/ccccccccccc
     #[test]
     fn emitter_envelope_carries_schema_seq_ts_and_stable_run_id() {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(
-            std::sync::Arc::clone(&buffer),
-        ));
+        let events =
+            YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(std::sync::Arc::clone(&buffer)));
         events
             .emit("run_start", serde_json::json!({ "n_urls": 0 }))
             .expect("emit 1");
@@ -1537,9 +1525,9 @@ https://youtu.be/ccccccccccc
     #[test]
     fn emitter_seq_is_unique_across_threads() {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events = std::sync::Arc::new(YoutubeEventEmitter::new(
-            YoutubeRobotEvents::Capture(std::sync::Arc::clone(&buffer)),
-        ));
+        let events = std::sync::Arc::new(YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(
+            std::sync::Arc::clone(&buffer),
+        )));
         let workers = 8_u64;
         let per_worker = 25_u64;
         let mut handles = Vec::new();
@@ -1644,10 +1632,7 @@ https://youtu.be/ccccccccccc
         // stream still terminates with a run_complete aggregate.
         let dir = tempfile::tempdir().expect("tempdir");
         let (opts, buffer) = capturing_opts(
-            vec![
-                "https://www.youtube.com/watch?v=PRIVATE_ID&fw_stub_fail=private"
-                    .to_owned(),
-            ],
+            vec!["https://www.youtube.com/watch?v=PRIVATE_ID&fw_stub_fail=private".to_owned()],
             dir.path(),
         );
         let summary = run_with_info(&opts, &stub_info()).expect("run");
