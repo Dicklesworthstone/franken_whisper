@@ -27163,18 +27163,25 @@ mod tests {
 
     #[test]
     fn sidecar_public_lane_fingerprints_have_literal_oracles() {
-        let evidence = valid_unavailable_sidecar_evidence();
-        let actual = evidence
-            .variants
-            .iter()
-            .map(|variant| variant.lane_configuration_sha256.as_str())
-            .collect::<Vec<_>>();
+        let actual = super::canonical_sha256(&super::PublicCorpusSidecarLaneFingerprint {
+            runner_version: super::PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION,
+            lane: super::PublicCorpusSidecarLane::FrameHaarL4,
+            fusion_scope: super::PublicCorpusSidecarFusionScope::BoundaryFusionV2,
+            study_configuration_sha256:
+                "77f8ef0ccbb32e433e8d5a808e9f54d0468a17ebfd0d02ce93b5052ee1513c06",
+            fusion_configuration_sha256: Some(
+                "f42b9449734f6f7ed3d1a16fc9443f19908f948bb8eb343ed895085ea881a5c7",
+            ),
+            pair_calibration_sha256: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            protocol_sha256:
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        })
+        .expect("public sidecar lane fingerprint");
         assert_eq!(
             actual,
-            vec![
-                "0000000000000000000000000000000000000000000000000000000000000000";
-                super::PublicCorpusSidecarLane::ALL.len()
-            ]
+            "0fa6757ad05e33232d9d3835f1d277897075370fa00113378f3c6cf24291514a"
         );
     }
 

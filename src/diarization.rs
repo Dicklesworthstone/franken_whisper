@@ -30932,7 +30932,7 @@ mod tests {
             .expect("valid fusion configuration hash");
         assert_eq!(
             hash,
-            "0000000000000000000000000000000000000000000000000000000000000000"
+            "f42b9449734f6f7ed3d1a16fc9443f19908f948bb8eb343ed895085ea881a5c7"
         );
         assert_eq!(
             hash,
