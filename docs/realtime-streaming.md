@@ -200,6 +200,7 @@ with `fw pull tiny` / `fw pull tiny-en`.
 | `--policy` | `alignatt` | `alignatt` \| `endpoint-commit` \| `local-agreement` |
 | `--alignatt-holdback-ms` | 200 | danger-zone width behind the live edge before tokens commit |
 | `--step-ms` | 300 | step decode cadence |
+| `--adaptive` | off | bd-rt-adaptive-contract-yw68: adapt step cadence (±50 ms within [200, 1000]) and AlignAtt holdback (±2 frames within [5, 25]) under the alien-artifact contract; Brier-gated deterministic fallback to these configured values; every decision emits a `listen.controller` event and live state rides `listen.session_stats.controllers` |
 | `--max-buffer-sec` | 12 | rolling buffer cap |
 | `--language` | detect-and-pin | ISO 639-1 hint |
 | `--max-seconds` | 0 (unbounded) | end the session after N seconds |
@@ -268,15 +269,18 @@ re-decodes; non-speech holdback gate) plus the attention-tap purity probe
 Deterministic correctness testing of the live path (file-replay e2e, golden
 NDJSON streams, lifecycle invariants) is wave 6 bead `bd-rt-e2e-0zo5`.
 
-## 7. Adaptive controllers: planned, not shipped
+## 7. Adaptive controllers: shipped, default-off (`--adaptive`)
 
-The deterministic policies above ship today. Adaptive cadence/holdback
-controllers (state space, action space, loss matrix, posterior, calibration
-metric, deterministic fallback trigger, evidence ledger — the project's
-alien-artifact contract) are SPECIFIED in open bead
-`bd-rt-adaptive-contract-yw68` and are NOT implemented; nothing in the listen
-path adapts at runtime yet. When they land they will be default-off with a
-deterministic fallback trigger, per repo law.
+The deterministic policies above are the default product. The two sanctioned
+adaptive controllers (bd-rt-adaptive-contract-yw68) now EXIST behind
+`--adaptive`, copying the `SpeculationWindowController` shape: state space
+(overrun posterior / correction posterior), action space (step ±50 ms within
+[200, 1000]; holdback ±2 frames within [5, 25]), loss asymmetry (missed ticks;
+corrections cost ~10x staleness), Beta posteriors with Brier-scored rolling
+calibration, deterministic fallback to the configured values when Brier > 0.25
+with >= 10 samples, bounded evidence ledger, `listen.controller` events, and a
+controller snapshot in every `listen.session_stats`. Default OFF: flipping the
+default requires harness evidence per ledger discipline.
 
 ## 8. Scope boundaries
 

@@ -711,6 +711,10 @@ pub struct ListenConfig {
     pub capture_buffer_sec: f64,
     pub policy: ListenPolicy,
     pub alignatt_holdback_ms: u64,
+    /// bd-rt-adaptive-contract-yw68: enable the two adaptive controllers
+    /// (`--adaptive`). Default OFF; flipping the default later requires
+    /// harness evidence per ledger discipline.
+    pub adaptive_controllers: bool,
     /// Confirm-lane quality model (bd-rt-confirm-lane-3okr).
     pub quality_model: QualityModelSetting,
     /// Max unconfirmed jobs before the oldest is dropped (`confirm_lag`
@@ -753,6 +757,354 @@ pub enum ListenPolicy {
     LocalAgreement,
 }
 
+// ── bd-rt-adaptive-contract-yw68: adaptive controllers ──────────────────────
+//
+// Two knobs adapt, nothing else; both ship the full alien-artifact contract
+// (state space, action space, loss, Beta posterior, Brier-scored calibration,
+// deterministic fallback) by copying the shape of
+// [`crate::speculation::SpeculationWindowController`]. Default OFF via
+// [`ListenConfig::adaptive_controllers`].
+
+pub(crate) const ADAPTIVE_STEP_MIN_MS: u64 = 200;
+pub(crate) const ADAPTIVE_STEP_MAX_MS: u64 = 1000;
+pub(crate) const ADAPTIVE_STEP_DELTA_MS: u64 = 50;
+pub(crate) const ADAPTIVE_HOLDBACK_MIN_FRAMES: u32 = 5;
+pub(crate) const ADAPTIVE_HOLDBACK_MAX_FRAMES: u32 = 25;
+pub(crate) const ADAPTIVE_HOLDBACK_DELTA_FRAMES: u32 = 2;
+
+/// One auditable controller decision (surfaced as a `listen.controller`
+/// event and mirrored into the session-stats snapshot).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdaptiveControllerEntry {
+    pub controller: &'static str,
+    pub from: u64,
+    pub to: u64,
+    pub reason: String,
+    pub brier: f64,
+    pub observations: u64,
+    pub fallback_active: bool,
+}
+
+/// Shared contract machinery: Brier-gated deterministic fallback.
+const ADAPTIVE_BRIER_FALLBACK_THRESHOLD: f64 = 0.25;
+const ADAPTIVE_MIN_CALIBRATION_SAMPLES: usize = 10;
+
+/// Adaptive step-cadence controller.
+///
+/// State space: overrun posterior (decode latency exceeding the current
+/// step budget) + Brier calibration. Action space: {keep, +50 ms, −50 ms}
+/// within [200, 1000] ms. Loss: missed-tick rate (overruns) dominates;
+/// staleness shrinks only when overruns are rare. Fallback: revert to the
+/// configured `--step-ms` while calibration degrades.
+pub struct AdaptiveStepController {
+    configured_step_ms: u64,
+    current_step_ms: u64,
+    posterior: crate::speculation::BetaPosterior,
+    calibration: crate::speculation::CalibrationTracker,
+    observations: u64,
+    pending_prediction: Option<f64>,
+    fallback_active: bool,
+    ledger: Vec<AdaptiveControllerEntry>,
+}
+
+const ADAPTIVE_MIN_OBS_BEFORE_ADAPT: u64 = 5;
+const ADAPTIVE_GROW_OVERRUN_RATE: f64 = 0.5;
+const ADAPTIVE_SHRINK_OVERRUN_RATE: f64 = 0.125;
+
+impl AdaptiveStepController {
+    #[must_use]
+    pub fn new(configured_step_ms: u64) -> Self {
+        Self {
+            configured_step_ms,
+            current_step_ms: configured_step_ms.clamp(ADAPTIVE_STEP_MIN_MS, ADAPTIVE_STEP_MAX_MS),
+            posterior: crate::speculation::BetaPosterior::weakly_informative(),
+            calibration: crate::speculation::CalibrationTracker::new(20),
+            observations: 0,
+            pending_prediction: None,
+            fallback_active: false,
+            ledger: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn current_step_ms(&self) -> u64 {
+        self.current_step_ms
+    }
+
+    #[must_use]
+    pub fn fallback_active(&self) -> bool {
+        self.fallback_active
+    }
+
+    #[must_use]
+    pub fn ledger(&self) -> &[AdaptiveControllerEntry] {
+        &self.ledger
+    }
+
+    /// Snapshot for `listen.session_stats`.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "current": self.current_step_ms,
+            "configured": self.configured_step_ms,
+            "observations": self.observations,
+            "brier": self.calibration.brier_score(),
+            "overrun_rate": Self::event_rate(self.posterior.alpha, self.posterior.beta),
+            "fallback_active": self.fallback_active,
+        })
+    }
+
+    fn event_rate(alpha: f64, beta: f64) -> f64 {
+        let total = alpha + beta - 4.0;
+        if total > 0.0 {
+            (alpha - 2.0) / total
+        } else {
+            0.0
+        }
+    }
+
+    /// Called before each step decode: records the overrun prediction that
+    /// [`Self::resolve_step`] scores against the measured latency.
+    pub fn begin_step(&mut self) {
+        self.pending_prediction = Some(self.posterior.mean());
+    }
+
+    /// Resolve the pending prediction with the step's decode latency and
+    /// return a decision entry when the cadence changed.
+    pub fn resolve_step(&mut self, elapsed_ms: f64) -> Option<AdaptiveControllerEntry> {
+        let prediction = self.pending_prediction.take()?;
+        let overran = elapsed_ms > self.current_step_ms as f64;
+        self.calibration.record(prediction, overran);
+        if overran {
+            self.posterior.observe_correction();
+        } else {
+            self.posterior.observe_confirmation();
+        }
+        self.observations += 1;
+
+        let brier = self.calibration.brier_score();
+        let degraded = brier > ADAPTIVE_BRIER_FALLBACK_THRESHOLD
+            && self.calibration.sample_count() >= ADAPTIVE_MIN_CALIBRATION_SAMPLES;
+        if degraded {
+            if !self.fallback_active || self.current_step_ms != self.configured_step_ms {
+                self.fallback_active = true;
+                return Some(self.entry(
+                    self.current_step_ms,
+                    self.configured_step_ms,
+                    format!("brier={brier:.3}"),
+                    brier,
+                ));
+            }
+            return None;
+        }
+        // Calibration healthy again: release the fallback pin deterministically.
+        if self.fallback_active {
+            self.fallback_active = false;
+        }
+
+        if self.observations < ADAPTIVE_MIN_OBS_BEFORE_ADAPT {
+            return None;
+        }
+        let rate = Self::event_rate(self.posterior.alpha, self.posterior.beta);
+        if rate > ADAPTIVE_GROW_OVERRUN_RATE && self.current_step_ms < ADAPTIVE_STEP_MAX_MS {
+            let to = (self.current_step_ms + ADAPTIVE_STEP_DELTA_MS).min(ADAPTIVE_STEP_MAX_MS);
+            return Some(self.entry(
+                self.current_step_ms,
+                to,
+                format!("overrun_rate={rate:.3}"),
+                brier,
+            ));
+        }
+        if rate < ADAPTIVE_SHRINK_OVERRUN_RATE && self.current_step_ms > ADAPTIVE_STEP_MIN_MS {
+            let to = (self.current_step_ms - ADAPTIVE_STEP_DELTA_MS).max(ADAPTIVE_STEP_MIN_MS);
+            return Some(self.entry(
+                self.current_step_ms,
+                to,
+                format!("overrun_rate={rate:.3}"),
+                brier,
+            ));
+        }
+        None
+    }
+
+    fn entry(&mut self, from: u64, to: u64, reason: String, brier: f64) -> AdaptiveControllerEntry {
+        self.current_step_ms = to;
+        let entry = AdaptiveControllerEntry {
+            controller: "step_ms",
+            from,
+            to,
+            reason,
+            brier,
+            observations: self.observations,
+            fallback_active: self.fallback_active,
+        };
+        // Ledger is audit state, not unbounded memory: keep the most recent
+        // decisions only.
+        if self.ledger.len() >= 512 {
+            self.ledger.remove(0);
+        }
+        self.ledger.push(entry.clone());
+        entry
+    }
+}
+
+/// Adaptive AlignAtt holdback controller.
+///
+/// State space: correction posterior over confirm-lane verdicts + Brier
+/// calibration. Action space: {keep, +2, −2 frames} within [5, 25]
+/// (20 ms encoder frames). Loss asymmetry: committed-text stability is
+/// sacred, corrections cost 10x staleness, so growth triggers earlier than
+/// shrink. Fallback: configured holdback (default 10 frames).
+pub struct AdaptiveHoldbackController {
+    configured_frames: u32,
+    current_frames: u32,
+    posterior: crate::speculation::BetaPosterior,
+    calibration: crate::speculation::CalibrationTracker,
+    verdicts: u64,
+    fallback_active: bool,
+    ledger: Vec<AdaptiveControllerEntry>,
+}
+
+const ADAPTIVE_SHRINK_MIN_VERDICTS: u64 = 10;
+const ADAPTIVE_GROW_CORRECTION_RATE: f64 = 0.25;
+const ADAPTIVE_SHRINK_CORRECTION_RATE: f64 = 0.0625;
+
+impl AdaptiveHoldbackController {
+    #[must_use]
+    pub fn new(holdback_ms: u64) -> Self {
+        let configured = (((holdback_ms / 20).max(1)) as u32)
+            .clamp(ADAPTIVE_HOLDBACK_MIN_FRAMES, ADAPTIVE_HOLDBACK_MAX_FRAMES);
+        Self {
+            configured_frames: configured,
+            current_frames: configured,
+            posterior: crate::speculation::BetaPosterior::weakly_informative(),
+            calibration: crate::speculation::CalibrationTracker::new(20),
+            verdicts: 0,
+            fallback_active: false,
+            ledger: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn current_frames(&self) -> u32 {
+        self.current_frames
+    }
+
+    #[must_use]
+    pub fn fallback_active(&self) -> bool {
+        self.fallback_active
+    }
+
+    #[must_use]
+    pub fn ledger(&self) -> &[AdaptiveControllerEntry] {
+        &self.ledger
+    }
+
+    /// Prediction recorded before the next batch of verdicts resolves.
+    pub fn begin_batch(&mut self) -> f64 {
+        self.posterior.mean()
+    }
+
+    /// Resolve a batch of confirm-lane verdicts; returns a decision entry
+    /// when the applied frame count changed (driver re-applies it to the
+    /// emission policy).
+    pub fn resolve_verdicts(
+        &mut self,
+        predicted: f64,
+        confirmations: u64,
+        corrections: u64,
+    ) -> Option<AdaptiveControllerEntry> {
+        if confirmations + corrections == 0 {
+            return None;
+        }
+        for _ in 0..corrections {
+            self.posterior.observe_correction();
+            self.calibration.record(predicted, true);
+        }
+        for _ in 0..confirmations {
+            self.posterior.observe_confirmation();
+            self.calibration.record(predicted, false);
+        }
+        self.verdicts += confirmations + corrections;
+
+        let brier = self.calibration.brier_score();
+        let degraded = brier > ADAPTIVE_BRIER_FALLBACK_THRESHOLD
+            && self.calibration.sample_count() >= ADAPTIVE_MIN_CALIBRATION_SAMPLES;
+        if degraded {
+            if !self.fallback_active || self.current_frames != self.configured_frames {
+                self.fallback_active = true;
+                return Some(self.entry(
+                    u64::from(self.current_frames),
+                    u64::from(self.configured_frames),
+                    format!("brier={brier:.3}"),
+                    brier,
+                ));
+            }
+            return None;
+        }
+        self.fallback_active = false;
+
+        let rate = AdaptiveStepController::event_rate(self.posterior.alpha, self.posterior.beta);
+        if rate > ADAPTIVE_GROW_CORRECTION_RATE
+            && self.current_frames < ADAPTIVE_HOLDBACK_MAX_FRAMES
+        {
+            let to = (self.current_frames + ADAPTIVE_HOLDBACK_DELTA_FRAMES)
+                .min(ADAPTIVE_HOLDBACK_MAX_FRAMES);
+            return Some(self.entry(
+                u64::from(self.current_frames),
+                u64::from(to),
+                format!("correction_rate={rate:.3}"),
+                brier,
+            ));
+        }
+        if rate < ADAPTIVE_SHRINK_CORRECTION_RATE
+            && self.verdicts >= ADAPTIVE_SHRINK_MIN_VERDICTS
+            && self.current_frames > ADAPTIVE_HOLDBACK_MIN_FRAMES
+        {
+            let to = (self.current_frames - ADAPTIVE_HOLDBACK_DELTA_FRAMES)
+                .max(ADAPTIVE_HOLDBACK_MIN_FRAMES);
+            return Some(self.entry(
+                u64::from(self.current_frames),
+                u64::from(to),
+                format!("correction_rate={rate:.3}"),
+                brier,
+            ));
+        }
+        None
+    }
+
+    fn entry(&mut self, from: u64, to: u64, reason: String, brier: f64) -> AdaptiveControllerEntry {
+        self.current_frames = u32::try_from(to).unwrap_or(self.current_frames);
+        let entry = AdaptiveControllerEntry {
+            controller: "holdback_frames",
+            from,
+            to,
+            reason,
+            brier,
+            observations: self.verdicts,
+            fallback_active: self.fallback_active,
+        };
+        if self.ledger.len() >= 512 {
+            self.ledger.remove(0);
+        }
+        self.ledger.push(entry.clone());
+        entry
+    }
+
+    /// Snapshot for `listen.session_stats`.
+    #[must_use]
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "current": self.current_frames,
+            "configured": self.configured_frames,
+            "verdicts": self.verdicts,
+            "brier": self.calibration.brier_score(),
+            "correction_rate": AdaptiveStepController::event_rate(self.posterior.alpha, self.posterior.beta),
+            "fallback_active": self.fallback_active,
+        })
+    }
+}
+
 impl Default for ListenConfig {
     fn default() -> Self {
         Self {
@@ -774,6 +1126,7 @@ impl Default for ListenConfig {
             capture_buffer_sec: 30.0,
             policy: ListenPolicy::AlignAtt,
             alignatt_holdback_ms: 200,
+            adaptive_controllers: false,
             quality_model: QualityModelSetting::Auto,
             confirm_queue_bound: CONFIRM_QUEUE_DEFAULT_BOUND,
             confirm_drain_sec: CONFIRM_DRAIN_DEFAULT_SEC,
@@ -828,6 +1181,10 @@ pub trait EmissionPolicy: Send {
     fn reset(&mut self);
     /// Stable policy name for listen.session_start.
     fn name(&self) -> &'static str;
+    /// bd-rt-adaptive-contract-yw68: adapt the AlignAtt holdback width.
+    /// Default no-op so policies without a holdback knob ignore adaptation;
+    /// `frames` is clamped to the contract bounds [5, 25].
+    fn set_holdback_frames(&mut self, _frames: u32) {}
 }
 
 /// Bootstrap policy: zero intelligence, maximum honesty. Every step's full
@@ -1064,6 +1421,10 @@ impl EmissionPolicy for AlignAttPolicy {
     }
 
     fn reset(&mut self) {}
+    fn set_holdback_frames(&mut self, frames: u32) {
+        self.holdback_frames =
+            frames.clamp(ADAPTIVE_HOLDBACK_MIN_FRAMES, ADAPTIVE_HOLDBACK_MAX_FRAMES);
+    }
 
     fn name(&self) -> &'static str {
         "alignatt"
@@ -1113,10 +1474,7 @@ impl LocalAgreementPolicy {
     /// Shared decision builder: commit the first `agreed` segments, tail
     /// becomes the partial. Identical text/confidence/through derivation
     /// to AlignAtt's decision() so event shapes are indistinguishable.
-    fn decision(
-        out: &crate::native_engine::decode::DecodeOutput,
-        agreed: usize,
-    ) -> PolicyDecision {
+    fn decision(out: &crate::native_engine::decode::DecodeOutput, agreed: usize) -> PolicyDecision {
         let mut decision = PolicyDecision::default();
         let fresh = &out.segments[..agreed.min(out.segments.len())];
         if !fresh.is_empty() {
@@ -1494,10 +1852,8 @@ pub(crate) enum DecodeOutcome {
     Failed(String),
 }
 
-pub(crate) type QualityDecoder = Box<
-    dyn FnMut(&ConfirmJob, &str, &(dyn Fn() -> bool + Sync)) -> DecodeOutcome
-        + Send,
->;
+pub(crate) type QualityDecoder =
+    Box<dyn FnMut(&ConfirmJob, &str, &(dyn Fn() -> bool + Sync)) -> DecodeOutcome + Send>;
 
 struct ConfirmQueueState {
     jobs: std::collections::VecDeque<ConfirmJob>,
@@ -1507,10 +1863,7 @@ struct ConfirmQueueState {
 
 /// Handle owned by the session loop: bounded job queue + results channel.
 pub(crate) struct ConfirmLane {
-    shared: std::sync::Arc<(
-        std::sync::Mutex<ConfirmQueueState>,
-        std::sync::Condvar,
-    )>,
+    shared: std::sync::Arc<(std::sync::Mutex<ConfirmQueueState>, std::sync::Condvar)>,
     abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     results_tx: std::sync::mpsc::Sender<ConfirmLaneEvent>,
     results_rx: std::sync::mpsc::Receiver<ConfirmLaneEvent>,
@@ -1541,185 +1894,175 @@ impl ConfirmLane {
             std::thread::Builder::new()
                 .name("fw-confirm".to_owned())
                 .spawn(move || {
-                let (queue_mtx, queue_cv) = &*worker_shared;
-                let mut tracker = crate::speculation::CorrectionTracker::new(
-                    crate::speculation::CorrectionTolerance::default(),
-                );
-                let mut prev_confirmed_text = String::new();
-                // window_id/seq namespace: the utterance id itself (unique
-                // per session; the tracker instance is per-worker).
-                loop {
-                    let job = {
-                        let mut state = queue_mtx.lock().expect("confirm queue poisoned");
-                        loop {
-                            if let Some(job) = state.jobs.pop_front() {
-                                break Some(job);
+                    let (queue_mtx, queue_cv) = &*worker_shared;
+                    let mut tracker = crate::speculation::CorrectionTracker::new(
+                        crate::speculation::CorrectionTolerance::default(),
+                    );
+                    let mut prev_confirmed_text = String::new();
+                    // window_id/seq namespace: the utterance id itself (unique
+                    // per session; the tracker instance is per-worker).
+                    loop {
+                        let job = {
+                            let mut state = queue_mtx.lock().expect("confirm queue poisoned");
+                            loop {
+                                if let Some(job) = state.jobs.pop_front() {
+                                    break Some(job);
+                                }
+                                if state.shutdown {
+                                    break None;
+                                }
+                                state = queue_cv.wait(state).expect("confirm queue poisoned");
                             }
-                            if state.shutdown {
-                                break None;
+                        };
+                        let Some(job) = job else { break };
+                        let queue_depth = worker_depth.load(std::sync::atomic::Ordering::Relaxed);
+                        let is_abort = || worker_abort.load(std::sync::atomic::Ordering::Relaxed);
+                        let decode_started = std::time::Instant::now();
+                        match decoder(&job, &prev_confirmed_text, &is_abort) {
+                            DecodeOutcome::Aborted => break,
+                            DecodeOutcome::Unavailable(detail) => {
+                                // Locked graceful-degradation shape: warn once,
+                                // disable the lane, keep the session alive.
+                                let _ = results_tx.send(ConfirmLaneEvent::Warning {
+                                    reason: "quality_model_unavailable".to_owned(),
+                                    detail: serde_json::json!({ "detail": detail }),
+                                });
+                                // Poison-pill the queue: everything already
+                                // queued is skipped silently (the fast text is
+                                // already published history). Depth resets to
+                                // zero — nothing remains queued or in flight,
+                                // so session-end drain must not report
+                                // phantom abandons.
+                                {
+                                    let mut state =
+                                        queue_mtx.lock().expect("confirm queue poisoned");
+                                    state.jobs.clear();
+                                    drop(state);
+                                    worker_depth.store(0, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                break;
                             }
-                            state = queue_cv.wait(state).expect("confirm queue poisoned");
-                        }
-                    };
-                    let Some(job) = job else { break };
-                    let queue_depth = worker_depth.load(std::sync::atomic::Ordering::Relaxed);
-                    let is_abort = || {
-                        worker_abort.load(std::sync::atomic::Ordering::Relaxed)
-                    };
-                    let decode_started = std::time::Instant::now();
-                    match decoder(&job, &prev_confirmed_text, &is_abort) {
-                        DecodeOutcome::Aborted => break,
-                        DecodeOutcome::Unavailable(detail) => {
-                            // Locked graceful-degradation shape: warn once,
-                            // disable the lane, keep the session alive.
-                            let _ = results_tx.send(ConfirmLaneEvent::Warning {
-                                reason: "quality_model_unavailable".to_owned(),
-                                detail: serde_json::json!({ "detail": detail }),
-                            });
-                            // Poison-pill the queue: everything already
-                            // queued is skipped silently (the fast text is
-                            // already published history). Depth resets to
-                            // zero — nothing remains queued or in flight,
-                            // so session-end drain must not report
-                            // phantom abandons.
-                            {
-                                let mut state = queue_mtx
-                                    .lock()
-                                    .expect("confirm queue poisoned");
-                                state.jobs.clear();
-                                drop(state);
-                                worker_depth.store(
-                                    0,
-                                    std::sync::atomic::Ordering::Relaxed,
+                            DecodeOutcome::Failed(detail) => {
+                                tracing::info!(
+                                    utterance_id = job.utterance_id,
+                                    queue_depth,
+                                    verdict = "failed",
+                                    wer_drift = -1.0_f64,
+                                    "confirm job failed"
                                 );
+                                let _ = results_tx.send(ConfirmLaneEvent::Warning {
+                                    reason: "confirm_job_failed".to_owned(),
+                                    detail: serde_json::json!({
+                                        "detail": detail,
+                                        "utterance_id": job.utterance_id,
+                                    }),
+                                });
                             }
-                            break;
-                        }
-                        DecodeOutcome::Failed(detail) => {
-                            tracing::info!(
-                                utterance_id = job.utterance_id,
-                                queue_depth,
-                                verdict = "failed",
-                                wer_drift = -1.0_f64,
-                                "confirm job failed"
-                            );
-                            let _ = results_tx.send(ConfirmLaneEvent::Warning {
-                                reason: "confirm_job_failed".to_owned(),
-                                detail: serde_json::json!({
-                                    "detail": detail,
-                                    "utterance_id": job.utterance_id,
-                                }),
-                            });
-                        }
-                        DecodeOutcome::Segments(segments, quality_model_id) => {
-                            let decode_ms =
-                                decode_started.elapsed().as_millis() as u64;
-                            let window_id = u64::from(job.utterance_id);
-                            let fast_segment = crate::model::TranscriptionSegment {
-                                start_sec: Some(0.0),
-                                end_sec: None,
-                                text: job.committed_text.clone(),
-                                speaker: None,
-                                confidence: None,
-                            };
-                            tracker.register_partial(crate::speculation::PartialTranscript {
-                                seq: window_id,
-                                window_id,
-                                model_id: "fast".to_owned(),
-                                segments: vec![fast_segment],
-                                latency_ms: 0,
-                                confidence_mean: 0.0,
-                                emitted_at_rfc3339: chrono::Utc::now().to_rfc3339(),
-                                status: crate::speculation::PartialStatus::Pending,
-                            });
-                            let mapped = match tracker.submit_quality_result(
-                                window_id,
-                                &quality_model_id,
-                                segments,
-                                decode_ms,
-                            ) {
-                                Ok(crate::speculation::CorrectionDecision::Confirm {
-                                    drift,
-                                    ..
-                                }) => {
-                                    prev_confirmed_text = job.committed_text.clone();
-                                    tracing::info!(
-                                        utterance_id = job.utterance_id,
-                                        queue_depth,
-                                        decode_ms,
-                                        verdict = "confirm",
-                                        wer_drift = drift.wer_approx,
-                                        "confirm verdict"
-                                    );
-                                    ConfirmVerdict {
-                                        utterance_id: job.utterance_id,
-                                        confirmed: true,
-                                        correction_id: 0,
-                                        corrected_segments: Vec::new(),
-                                        drift_wer: drift.wer_approx,
-                                        drift_confidence_delta: drift.confidence_delta,
-                                        drift_edit_distance: drift.text_edit_distance,
-                                        decode_ms,
-                                        quality_model_id,
+                            DecodeOutcome::Segments(segments, quality_model_id) => {
+                                let decode_ms = decode_started.elapsed().as_millis() as u64;
+                                let window_id = u64::from(job.utterance_id);
+                                let fast_segment = crate::model::TranscriptionSegment {
+                                    start_sec: Some(0.0),
+                                    end_sec: None,
+                                    text: job.committed_text.clone(),
+                                    speaker: None,
+                                    confidence: None,
+                                };
+                                tracker.register_partial(crate::speculation::PartialTranscript {
+                                    seq: window_id,
+                                    window_id,
+                                    model_id: "fast".to_owned(),
+                                    segments: vec![fast_segment],
+                                    latency_ms: 0,
+                                    confidence_mean: 0.0,
+                                    emitted_at_rfc3339: chrono::Utc::now().to_rfc3339(),
+                                    status: crate::speculation::PartialStatus::Pending,
+                                });
+                                let mapped = match tracker.submit_quality_result(
+                                    window_id,
+                                    &quality_model_id,
+                                    segments,
+                                    decode_ms,
+                                ) {
+                                    Ok(crate::speculation::CorrectionDecision::Confirm {
+                                        drift,
+                                        ..
+                                    }) => {
+                                        prev_confirmed_text = job.committed_text.clone();
+                                        tracing::info!(
+                                            utterance_id = job.utterance_id,
+                                            queue_depth,
+                                            decode_ms,
+                                            verdict = "confirm",
+                                            wer_drift = drift.wer_approx,
+                                            "confirm verdict"
+                                        );
+                                        ConfirmVerdict {
+                                            utterance_id: job.utterance_id,
+                                            confirmed: true,
+                                            correction_id: 0,
+                                            corrected_segments: Vec::new(),
+                                            drift_wer: drift.wer_approx,
+                                            drift_confidence_delta: drift.confidence_delta,
+                                            drift_edit_distance: drift.text_edit_distance,
+                                            decode_ms,
+                                            quality_model_id,
+                                        }
                                     }
-                                }
-                                Ok(
-                                    crate::speculation::CorrectionDecision::Correct {
+                                    Ok(crate::speculation::CorrectionDecision::Correct {
                                         correction,
-                                    },
-                                ) => {
-                                    prev_confirmed_text = correction
-                                        .corrected_segments
-                                        .iter()
-                                        .map(|s| s.text.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(" ")
-                                        .trim()
-                                        .to_owned();
-                                    tracing::info!(
-                                        utterance_id = job.utterance_id,
-                                        queue_depth,
-                                        decode_ms,
-                                        verdict = "correct",
-                                        wer_drift = correction.drift.wer_approx,
-                                        correction_id = correction.correction_id,
-                                        "confirm verdict"
-                                    );
-                                    ConfirmVerdict {
-                                        utterance_id: job.utterance_id,
-                                        confirmed: false,
-                                        correction_id: correction.correction_id,
-                                        corrected_segments: correction.corrected_segments,
-                                        drift_wer: correction.drift.wer_approx,
-                                        drift_confidence_delta: correction
-                                            .drift
-                                            .confidence_delta,
-                                        drift_edit_distance: correction
-                                            .drift
-                                            .text_edit_distance,
-                                        decode_ms,
-                                        quality_model_id: correction.quality_model_id,
+                                    }) => {
+                                        prev_confirmed_text = correction
+                                            .corrected_segments
+                                            .iter()
+                                            .map(|s| s.text.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(" ")
+                                            .trim()
+                                            .to_owned();
+                                        tracing::info!(
+                                            utterance_id = job.utterance_id,
+                                            queue_depth,
+                                            decode_ms,
+                                            verdict = "correct",
+                                            wer_drift = correction.drift.wer_approx,
+                                            correction_id = correction.correction_id,
+                                            "confirm verdict"
+                                        );
+                                        ConfirmVerdict {
+                                            utterance_id: job.utterance_id,
+                                            confirmed: false,
+                                            correction_id: correction.correction_id,
+                                            corrected_segments: correction.corrected_segments,
+                                            drift_wer: correction.drift.wer_approx,
+                                            drift_confidence_delta: correction
+                                                .drift
+                                                .confidence_delta,
+                                            drift_edit_distance: correction
+                                                .drift
+                                                .text_edit_distance,
+                                            decode_ms,
+                                            quality_model_id: correction.quality_model_id,
+                                        }
                                     }
-                                }
-                                Err(error) => {
-                                    let _ = results_tx.send(ConfirmLaneEvent::Warning {
-                                        reason: "confirm_job_failed".to_owned(),
-                                        detail: serde_json::json!({
-                                            "detail": error.to_string(),
-                                            "utterance_id": job.utterance_id,
-                                        }),
-                                    });
-                                    worker_depth
-                                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                                    continue;
-                                }
-                            };
-                            let _ = results_tx
-                                .send(ConfirmLaneEvent::Verdict(mapped));
+                                    Err(error) => {
+                                        let _ = results_tx.send(ConfirmLaneEvent::Warning {
+                                            reason: "confirm_job_failed".to_owned(),
+                                            detail: serde_json::json!({
+                                                "detail": error.to_string(),
+                                                "utterance_id": job.utterance_id,
+                                            }),
+                                        });
+                                        worker_depth
+                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                        continue;
+                                    }
+                                };
+                                let _ = results_tx.send(ConfirmLaneEvent::Verdict(mapped));
+                            }
                         }
+                        worker_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    worker_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                }
                 })
         };
         if spawned.is_err() {
@@ -1754,13 +2097,15 @@ impl ConfirmLane {
         while state.jobs.len() >= state.bound {
             if let Some(old) = state.jobs.pop_front() {
                 dropped = Some(old.utterance_id);
-                self.depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                self.depth
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 break;
             }
         }
         state.jobs.push_back(job);
-        self.depth.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drop(state);
         queue_cv.notify_one();
         if let Some(utterance_id) = dropped {
@@ -1785,8 +2130,8 @@ impl ConfirmLane {
     /// the number of jobs abandoned unfinished (0 when the lane drained
     /// cleanly). Never blocks past `drain_sec`.
     pub(crate) fn drain(&self, drain_sec: f64) -> (Vec<ConfirmLaneEvent>, usize) {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs_f64(drain_sec.max(0.0));
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs_f64(drain_sec.max(0.0));
         let mut events = Vec::new();
         loop {
             if self.depth.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -1796,8 +2141,8 @@ impl ConfirmLane {
             if now >= deadline {
                 break;
             }
-            let wait = std::time::Duration::from_millis(50)
-                .min(deadline.saturating_duration_since(now));
+            let wait =
+                std::time::Duration::from_millis(50).min(deadline.saturating_duration_since(now));
             match self.results_rx.recv_timeout(wait) {
                 Ok(event) => events.push(event),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -1812,13 +2157,11 @@ impl ConfirmLane {
             drop(state);
             queue_cv.notify_all();
         }
-        self.abort
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
         let abandoned = self.depth.load(std::sync::atomic::Ordering::Relaxed);
         (events, abandoned)
     }
 }
-
 
 /// Decide confirm-lane enablement + quality-model label up front (session
 /// start stays fast: resolution is a cheap path stat, the LOAD stays lazy on
@@ -1926,13 +2269,12 @@ impl ListenPersistSink {
         if event_name == "transcript.partial" {
             return;
         }
-        self.pending_events
-            .push(crate::storage::ListenEventRow {
-                seq,
-                ts_rfc3339: ts_rfc3339.to_owned(),
-                code: event_name.to_owned(),
-                payload_json: value.to_string(),
-            });
+        self.pending_events.push(crate::storage::ListenEventRow {
+            seq,
+            ts_rfc3339: ts_rfc3339.to_owned(),
+            code: event_name.to_owned(),
+            payload_json: value.to_string(),
+        });
     }
 
     /// Buffer one committed delta slice of the open utterance.
@@ -2006,15 +2348,16 @@ impl ListenPersistSink {
         })
         .to_string();
         let events = std::mem::take(&mut self.pending_events);
-        self.store.listen_close_run(&crate::storage::ListenCloseRow {
-            run_id: &self.run_id,
-            events: &events,
-            result_json: &result_json,
-            warnings_json,
-            replay_json: &replay_json,
-            transcript: &self.transcript_so_far,
-            finished_at_rfc3339,
-        })?;
+        self.store
+            .listen_close_run(&crate::storage::ListenCloseRow {
+                run_id: &self.run_id,
+                events: &events,
+                result_json: &result_json,
+                warnings_json,
+                replay_json: &replay_json,
+                transcript: &self.transcript_so_far,
+                finished_at_rfc3339,
+            })?;
         Ok(pcm_sha256)
     }
 }
@@ -2040,6 +2383,12 @@ pub fn run_listen_session(
     is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> FwResult<bool> {
     use crate::native_engine::decode::{AudioCtxPolicy, DecodeParams};
+    let mut step_ctrl = config
+        .adaptive_controllers
+        .then(|| AdaptiveStepController::new(config.step_ms));
+    let mut hold_ctrl = config
+        .adaptive_controllers
+        .then(|| AdaptiveHoldbackController::new(config.alignatt_holdback_ms));
 
     let session_started = std::time::Instant::now();
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -2066,8 +2415,7 @@ pub fn run_listen_session(
     // Confirm lane (bd-rt-confirm-lane-3okr): resolve enablement + label
     // up front (cheap stat), spawn the worker; the model LOAD itself stays
     // lazy on the worker thread so time-to-session_start is unaffected.
-    let confirm_label =
-        resolve_confirm_lane(&config.quality_model, &fast_model_label);
+    let confirm_label = resolve_confirm_lane(&config.quality_model, &fast_model_label);
     let confirm_lane = confirm_label.as_ref().map(|spec| {
         let spec_owned = spec.clone();
         let mut loaded: Option<(
@@ -2106,8 +2454,7 @@ pub fn run_listen_session(
                 timestamps: true,
                 audio_ctx: AudioCtxPolicy::Full,
                 bypass_transcript_cache: true,
-                initial_prompt: (!prev_confirmed.is_empty())
-                    .then(|| prev_confirmed.to_owned()),
+                initial_prompt: (!prev_confirmed.is_empty()).then(|| prev_confirmed.to_owned()),
                 n_threads: 4,
                 ..DecodeParams::default()
             };
@@ -2200,8 +2547,7 @@ pub fn run_listen_session(
             "gate_db": config.vad.gate_db,
         }),
     };
-    let session_start_value =
-        robot::listen_session_start_value(&run_id, seq, &now_ts(), &info);
+    let session_start_value = robot::listen_session_start_value(&run_id, seq, &now_ts(), &info);
     if let Some(sink) = persist_sink.as_mut() {
         sink.record_event(seq, &now_ts(), "listen.session_start", &session_start_value);
     }
@@ -2389,9 +2735,13 @@ pub fn run_listen_session(
     };
     'session: loop {
         // -- collect finished confirm-lane verdicts (non-blocking) --------
-        while let Some(event) =
-            confirm_lane.as_ref().and_then(|lane| lane.try_recv())
-        {
+        // bd-rt-adaptive-contract-yw68: the holdback controller scores the
+        // verdict batch (corrections drive holdback growth — committed-text
+        // stability is sacred) and re-applies the frame width to the
+        // emission policy when it changes.
+        let confirm_before = stats.confirmations_emitted;
+        let correct_before = stats.corrections_emitted;
+        while let Some(event) = confirm_lane.as_ref().and_then(|lane| lane.try_recv()) {
             handle_confirm_event(
                 event,
                 &run_id,
@@ -2403,6 +2753,23 @@ pub fn run_listen_session(
                 &mut pending_confirm_since,
                 &mut persist_sink,
             )?;
+        }
+        if let Some(controller) = hold_ctrl.as_mut() {
+            let predicted = controller.begin_batch();
+            let entry = controller.resolve_verdicts(
+                predicted,
+                stats.confirmations_emitted - confirm_before,
+                stats.corrections_emitted - correct_before,
+            );
+            if let Some(entry) = entry {
+                policy.set_holdback_frames(u32::try_from(entry.to).unwrap_or(10));
+                emit_seq!(robot::listen_controller_value(
+                    &run_id,
+                    seq,
+                    &now_ts(),
+                    &entry,
+                ));
+            }
         }
 
         // -- termination checks ------------------------------------------
@@ -2457,8 +2824,7 @@ pub fn run_listen_session(
                     delta_count,
                 ));
                 if let Some(lane) = confirm_lane.as_ref() {
-                    pending_confirm_since
-                        .insert(utterance_id, std::time::Instant::now());
+                    pending_confirm_since.insert(utterance_id, std::time::Instant::now());
                     lane.submit(ConfirmJob {
                         utterance_id,
                         pcm: buffer.window_from(utterance_t0).to_vec(),
@@ -2688,8 +3054,7 @@ pub fn run_listen_session(
                 delta_count,
             ));
             if let Some(lane) = confirm_lane.as_ref() {
-                pending_confirm_since
-                    .insert(utterance_id, std::time::Instant::now());
+                pending_confirm_since.insert(utterance_id, std::time::Instant::now());
                 lane.submit(ConfirmJob {
                     utterance_id,
                     pcm: buffer.window_from(utterance_t0).to_vec(),
@@ -2734,6 +3099,9 @@ pub fn run_listen_session(
         // -- step decode (mid-utterance partials) ---------------------------
         if in_speech && std::time::Instant::now() >= next_step {
             let step_started = std::time::Instant::now();
+            if let Some(controller) = step_ctrl.as_mut() {
+                controller.begin_step();
+            }
             let slice_from = utterance_t0 + utterance_committed_through;
             let out = match decode_utterance(&buffer, slice_from, &pinned_language, true) {
                 Err(FwError::Cancelled(_)) => {
@@ -2788,6 +3156,17 @@ pub fn run_listen_session(
             }
             let elapsed_ms = step_started.elapsed().as_secs_f64() * 1000.0;
             step_latencies_ms.push(elapsed_ms);
+            if let Some(entry) = step_ctrl
+                .as_mut()
+                .and_then(|controller| controller.resolve_step(elapsed_ms))
+            {
+                emit_seq!(robot::listen_controller_value(
+                    &run_id,
+                    seq,
+                    &now_ts(),
+                    &entry
+                ));
+            }
             tracing::debug!(
                 step = step_latencies_ms.len(),
                 buffer_sec = buffer.buffer_sec(),
@@ -2812,9 +3191,13 @@ pub fn run_listen_session(
                 emit_seq!(value);
             }
             // Skip logic: schedule from completion (an overrunning decode
-            // skips ticks instead of queueing them).
+            // skips ticks instead of queueing them). bd-yw68: the adaptive
+            // controller's cadence replaces the configured one mid-session.
+            let effective_step_ms = step_ctrl
+                .as_ref()
+                .map_or(config.step_ms, |c| c.current_step_ms());
             next_step =
-                std::time::Instant::now() + std::time::Duration::from_millis(config.step_ms);
+                std::time::Instant::now() + std::time::Duration::from_millis(effective_step_ms);
         } else if !in_speech {
             next_step =
                 std::time::Instant::now() + std::time::Duration::from_millis(config.step_ms);
@@ -2824,6 +3207,26 @@ pub fn run_listen_session(
         if config.stats_interval_sec > 0.0
             && last_stats_emit.elapsed().as_secs_f64() >= config.stats_interval_sec
         {
+            // bd-yw68: surface live controller state in every heartbeat so
+            // post-hoc audit never depends on process-internal state.
+            stats.controllers = Some(serde_json::json!({
+                "step_ms": step_ctrl.as_ref().map_or(
+                    serde_json::json!({ "enabled": false }),
+                    |c| {
+                        let mut snap = c.snapshot();
+                        snap["enabled"] = serde_json::json!(true);
+                        snap
+                    },
+                ),
+                "holdback_frames": hold_ctrl.as_ref().map_or(
+                    serde_json::json!({ "enabled": false }),
+                    |c| {
+                        let mut snap = c.snapshot();
+                        snap["enabled"] = serde_json::json!(true);
+                        snap
+                    },
+                ),
+            }));
             fill_step_stats(&mut stats, &step_latencies_ms, session_started, &buffer);
             emit_seq!(robot::listen_session_stats_value(
                 &run_id,
@@ -2874,8 +3277,7 @@ pub fn run_listen_session(
         let mut sorted = confirm_lag_ms.clone();
         sorted.sort_by(f64::total_cmp);
         stats.confirm_lag_p50_ms = Some(sorted[sorted.len() / 2]);
-        stats.confirm_lag_p95_ms =
-            Some(sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)]);
+        stats.confirm_lag_p95_ms = Some(sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)]);
         stats.confirm_lag_max_ms = sorted.last().copied();
     }
     fill_step_stats(&mut stats, &step_latencies_ms, session_started, &buffer);
@@ -2978,16 +3380,25 @@ fn handle_confirm_event(
                         verdict.decode_ms,
                     )
                 };
-                s.record_event(*seq, &now_ts(), value["event"].as_str().unwrap_or(""), &value);
+                s.record_event(
+                    *seq,
+                    &now_ts(),
+                    value["event"].as_str().unwrap_or(""),
+                    &value,
+                );
             }
         }
         ConfirmLaneEvent::Warning { reason, detail } => {
             if let Some(s) = sink.as_mut() {
-                let value = robot::listen_warning_value(run_id, *seq, &now_ts(), reason, detail.clone());
+                let value =
+                    robot::listen_warning_value(run_id, *seq, &now_ts(), reason, detail.clone());
                 s.record_event(*seq, &now_ts(), "listen.warning", &value);
             }
         }
-        ConfirmLaneEvent::DroppedOldest { utterance_id, queue_bound } => {
+        ConfirmLaneEvent::DroppedOldest {
+            utterance_id,
+            queue_bound,
+        } => {
             if let Some(s) = sink.as_mut() {
                 let value = robot::listen_warning_value(
                     run_id,
@@ -3073,7 +3484,6 @@ fn handle_confirm_event(
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -3198,23 +3608,16 @@ mod tests {
 
     #[test]
     fn confirm_lane_confirms_match_and_pins_language_and_prompt() {
-        type SeenLog =
-            std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, String, String)>>>;
+        type SeenLog = std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, String, String)>>>;
         let seen: SeenLog = std::sync::Arc::default();
         let seen_for_decoder = std::sync::Arc::clone(&seen);
         let decoder: QualityDecoder = Box::new(move |job, prev_confirmed, _abort| {
-            seen_for_decoder
-                .lock()
-                .expect("seen lock")
-                .push((
-                    job.language.clone(),
-                    prev_confirmed.to_owned(),
-                    job.committed_text.clone(),
-                ));
-            DecodeOutcome::Segments(
-                vec![segment(&job.committed_text)],
-                "fake-qm".to_owned(),
-            )
+            seen_for_decoder.lock().expect("seen lock").push((
+                job.language.clone(),
+                prev_confirmed.to_owned(),
+                job.committed_text.clone(),
+            ));
+            DecodeOutcome::Segments(vec![segment(&job.committed_text)], "fake-qm".to_owned())
         });
         let lane = ConfirmLane::spawn(4, decoder);
         lane.submit(fake_job(1, "hello world"));
@@ -3262,7 +3665,11 @@ mod tests {
             ConfirmLaneEvent::Verdict(v) => {
                 assert!(!v.confirmed, "divergent text must correct");
                 assert!(!v.corrected_segments.is_empty());
-                assert!(v.drift_wer > 0.1, "wer drift {} must exceed tolerance", v.drift_wer);
+                assert!(
+                    v.drift_wer > 0.1,
+                    "wer drift {} must exceed tolerance",
+                    v.drift_wer
+                );
             }
             other => panic!("expected verdict, got {other:?}"),
         }
@@ -3272,10 +3679,7 @@ mod tests {
     fn queue_bound_drops_oldest_with_warning_event() {
         let decoder: QualityDecoder = Box::new(move |job, _prev, _abort| {
             std::thread::sleep(Duration::from_millis(50));
-            DecodeOutcome::Segments(
-                vec![segment(&job.committed_text)],
-                "fake-qm".to_owned(),
-            )
+            DecodeOutcome::Segments(vec![segment(&job.committed_text)], "fake-qm".to_owned())
         });
         let lane = ConfirmLane::spawn(4, decoder);
         for id in 1..=6 {
@@ -3330,26 +3734,33 @@ mod tests {
         // The handle still drains cleanly (session keeps running fast-only).
         let (extra, abandoned) = lane.drain(0.05);
         assert_eq!(abandoned, 0);
-        assert!(!extra
-            .iter()
-            .any(|e| matches!(e, ConfirmLaneEvent::Verdict(_))));
+        assert!(
+            !extra
+                .iter()
+                .any(|e| matches!(e, ConfirmLaneEvent::Verdict(_)))
+        );
     }
 
     #[test]
     fn drain_abandons_stuck_decode_within_deadline() {
         // Decoder honors the abort flag only on its poll loop — mirrors the
         // real checkpoint behavior inside transcribe.
-        let decoder: QualityDecoder = Box::new(move |_job, _prev, is_abort| loop {
-            if is_abort() {
-                return DecodeOutcome::Aborted;
+        let decoder: QualityDecoder = Box::new(move |_job, _prev, is_abort| {
+            loop {
+                if is_abort() {
+                    return DecodeOutcome::Aborted;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_millis(20));
         });
         let lane = ConfirmLane::spawn(4, decoder);
         lane.submit(fake_job(1, "stuck"));
         let started = Instant::now();
         let (events, abandoned) = lane.drain(0.2);
-        assert!(started.elapsed() < Duration::from_secs(3), "drain must be bounded");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "drain must be bounded"
+        );
         assert!(events.is_empty(), "no verdict from an abandoned decode");
         assert!(abandoned >= 1, "the in-flight job counts as abandoned");
     }
@@ -3361,7 +3772,10 @@ mod tests {
         assert_eq!(resolve_confirm_lane(&Disabled, "tiny.en"), None);
         // Fast lane fell back to turbo (label says so): Auto must NOT
         // self-confirm against itself.
-        assert_eq!(resolve_confirm_lane(&Auto, CONFIRM_QUALITY_MODEL_DEFAULT), None);
+        assert_eq!(
+            resolve_confirm_lane(&Auto, CONFIRM_QUALITY_MODEL_DEFAULT),
+            None
+        );
         // Explicit spec identical to the effective fast model: off.
         assert_eq!(
             resolve_confirm_lane(&Explicit("tiny.en".to_owned()), "tiny.en"),
@@ -3369,10 +3783,7 @@ mod tests {
         );
         // Explicit spec that cannot resolve anywhere: off (never downloads).
         assert_eq!(
-            resolve_confirm_lane(
-                &Explicit("no-such-model-anywhere".to_owned()),
-                "tiny.en"
-            ),
+            resolve_confirm_lane(&Explicit("no-such-model-anywhere".to_owned()), "tiny.en"),
             None
         );
         // NOTE: the `Auto` + turbo-installed branch is intentionally NOT
@@ -4217,7 +4628,10 @@ mod localagreement_tests {
         assert_eq!(d2.commit_through_sec, Some(2.0));
         // Origin advanced -> stored history invalidated for next step.
         let d3 = EmissionPolicy::step(&mut policy, &out(&[(2.0, 4.0, "world")]), 4.0);
-        assert!(d3.commit_text.is_empty(), "post-commit step must restart agreement");
+        assert!(
+            d3.commit_text.is_empty(),
+            "post-commit step must restart agreement"
+        );
     }
 
     #[test]
@@ -4248,7 +4662,10 @@ mod localagreement_tests {
         let _ = EmissionPolicy::step(&mut policy, &out(&[(0.0, 1.0, "alpha")]), 1.0);
         EmissionPolicy::reset(&mut policy);
         let d = EmissionPolicy::step(&mut policy, &out(&[(0.0, 1.0, "alpha")]), 1.0);
-        assert!(d.commit_text.is_empty(), "reset drops history: no agreement yet");
+        assert!(
+            d.commit_text.is_empty(),
+            "reset drops history: no agreement yet"
+        );
     }
 
     #[test]
@@ -4280,5 +4697,171 @@ mod localagreement_tests {
         let p = LocalAgreementPolicy::new();
         assert_eq!(EmissionPolicy::name(&p), "local-agreement");
         assert!(!EmissionPolicy::needs_token_attn(&p));
+    }
+}
+
+#[cfg(test)]
+mod adaptive_contract_tests {
+    use super::*;
+    use crate::model::TranscriptionSegment;
+
+    /// Drive one begin/resolve cycle; returns the decision target.
+    fn step_once(controller: &mut AdaptiveStepController, overran: bool) -> u64 {
+        let elapsed = controller.current_step_ms() as f64 + if overran { 10.0 } else { -50.0 };
+        controller.begin_step();
+        let entry = controller.resolve_step(elapsed);
+        entry.map_or(controller.current_step_ms(), |e| e.to)
+    }
+
+    #[test]
+    fn step_controller_grows_under_sustained_overruns_and_respects_cap() {
+        let mut c = AdaptiveStepController::new(300);
+        let mut last = 300_u64;
+        for _ in 0..40 {
+            let to = step_once(&mut c, true);
+            assert!(
+                to >= last,
+                "sustained overruns must never shrink: {to} < {last}"
+            );
+            last = to;
+        }
+        assert_eq!(last, ADAPTIVE_STEP_MAX_MS, "must grow to the contract cap");
+    }
+
+    #[test]
+    fn step_controller_shrinks_only_when_overruns_are_rare() {
+        let mut c = AdaptiveStepController::new(600);
+        // Warm-up observations (>= 5) with accurate "no overrun" predictions.
+        for _ in 0..8 {
+            step_once(&mut c, false);
+        }
+        let before = c.current_step_ms();
+        let to = step_once(&mut c, false);
+        assert!(
+            to < before,
+            "rare overruns with healthy calibration must shrink: {before} -> {to}"
+        );
+        assert!(to >= ADAPTIVE_STEP_MIN_MS);
+    }
+
+    #[test]
+    fn brier_degradation_pins_configured_fallback_then_recovers() {
+        let mut c = AdaptiveStepController::new(400);
+        // Poison calibration: drive the posterior to predict overrun ~1.0,
+        // then resolve repeatedly with NO overrun (every Brier term ~1.0).
+        for _ in 0..20 {
+            c.posterior.observe_correction();
+        }
+        let mut saw_fallback = false;
+        for _ in 0..15 {
+            c.begin_step();
+            let _entry = c.resolve_step(1.0);
+            if c.fallback_active() {
+                saw_fallback = true;
+                assert_eq!(c.current_step_ms(), 400, "fallback pins configured value");
+            }
+        }
+        assert!(
+            saw_fallback,
+            "Brier > threshold with >= 10 samples must fire fallback"
+        );
+        // Recovery: reset the poisoned state, then feed calm accurate steps.
+        c.posterior = crate::speculation::BetaPosterior::weakly_informative();
+        c.calibration = crate::speculation::CalibrationTracker::new(20);
+        for _ in 0..12 {
+            step_once(&mut c, false);
+        }
+        assert!(
+            !c.fallback_active(),
+            "healthy calibration must release the pin"
+        );
+        assert!(
+            c.ledger().iter().any(|e| e.fallback_active),
+            "fallback must be auditable via the ledger"
+        );
+    }
+
+    #[test]
+    fn holdback_grows_on_corrections_caps_at_contract_max() {
+        let mut c = AdaptiveHoldbackController::new(200); // 10 frames
+        let mut last = c.current_frames();
+        for _ in 0..30 {
+            let predicted = c.begin_batch();
+            let _entry = c.resolve_verdicts(predicted, 0, 4);
+            let cur = c.current_frames();
+            assert!(cur >= last, "corrections must never shrink holdback");
+            assert!(cur <= ADAPTIVE_HOLDBACK_MAX_FRAMES);
+            last = cur;
+        }
+        assert_eq!(last, ADAPTIVE_HOLDBACK_MAX_FRAMES);
+    }
+
+    #[test]
+    fn holdback_shrinks_late_and_never_below_floor() {
+        let mut c = AdaptiveHoldbackController::new(500); // 25 frames
+        for _ in 0..40 {
+            let predicted = c.begin_batch();
+            let _entry = c.resolve_verdicts(predicted, 9, 0);
+            assert!(c.current_frames() >= ADAPTIVE_HOLDBACK_MIN_FRAMES);
+        }
+        assert!(
+            c.current_frames() < 25,
+            "sustained confirmations must eventually relax holdback"
+        );
+    }
+
+    #[test]
+    fn alignatt_policy_applies_adapted_holdback_width() {
+        use crate::native_engine::decode::{DecodeOutput, TokenAttn, WindowStats};
+        let mk = |attn: &[u32]| DecodeOutput {
+            segments: vec![
+                TranscriptionSegment {
+                    start_sec: Some(0.0),
+                    end_sec: Some(9.0),
+                    text: "alpha".to_owned(),
+                    speaker: None,
+                    confidence: Some(0.9),
+                },
+                TranscriptionSegment {
+                    start_sec: Some(9.0),
+                    end_sec: Some(9.8),
+                    text: "tail".to_owned(),
+                    speaker: None,
+                    confidence: Some(0.9),
+                },
+            ],
+            language: Some("en".to_owned()),
+            windows: vec![WindowStats {
+                avg_logprob: -0.1,
+                no_speech_prob: 0.01,
+                tokens: attn.len(),
+                window_offset_sec: 0.0,
+                token_attn: attn
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| TokenAttn {
+                        token_index: i as u32,
+                        attn_frame: *f,
+                    })
+                    .collect(),
+            }],
+            dropped_windows: Vec::new(),
+            work: crate::native_engine::decode::DecodeWorkStats::default(),
+            word_timings: None,
+        };
+        // Attention at frame 492 of a 500-frame slice: the default 200 ms
+        // (10 frames) holdback bars it (limit 490 < 492); relaxing to 5
+        // frames (limit 495) lets the segment commit.
+        let mut p = AlignAttPolicy::new(200);
+        let tight = EmissionPolicy::step(&mut p, &mk(&[492]), 10.0);
+        assert!(tight.commit_text.is_empty());
+        p.set_holdback_frames(5);
+        let relaxed = EmissionPolicy::step(&mut p, &mk(&[492]), 10.0);
+        assert_eq!(relaxed.commit_text, "alpha");
+    }
+
+    #[test]
+    fn listen_config_default_has_controllers_off() {
+        assert!(!ListenConfig::default().adaptive_controllers);
     }
 }

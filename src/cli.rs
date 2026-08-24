@@ -1229,6 +1229,13 @@ pub struct ListenArgs {
     #[arg(long, default_value_t = 300)]
     pub step_ms: u64,
 
+    /// bd-rt-adaptive-contract-yw68: enable the two adaptive controllers
+    /// (step cadence + AlignAtt holdback) under the alien-artifact
+    /// contract. Default OFF; each adapts only its one knob, Brier-gated,
+    /// with deterministic fallback to these configured values.
+    #[arg(long)]
+    pub adaptive: bool,
+
     /// Rolling session buffer cap in seconds.
     #[arg(long, default_value_t = 12.0)]
     pub max_buffer_sec: f64,
