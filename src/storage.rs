@@ -2024,16 +2024,12 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
     /// Retry wrapper for the listen-flush family: same busy/backoff budget
     /// as the batch persist path (concurrent batch agents + live sessions
     /// share one database file).
-    fn retry_busy<T>(
-        &self,
-        mut op: impl FnMut(&Self) -> FwResult<T>,
-    ) -> FwResult<T> {
+    fn retry_busy<T>(&self, mut op: impl FnMut(&Self) -> FwResult<T>) -> FwResult<T> {
         for attempt in 0..=PERSIST_BUSY_RETRY_ATTEMPTS {
             match op(self) {
                 Ok(value) => return Ok(value),
                 Err(error)
-                    if is_busy_storage_error(&error)
-                        && attempt < PERSIST_BUSY_RETRY_ATTEMPTS =>
+                    if is_busy_storage_error(&error) && attempt < PERSIST_BUSY_RETRY_ATTEMPTS =>
                 {
                     std::thread::sleep(Duration::from_millis(
                         PERSIST_BUSY_BASE_BACKOFF_MS * (attempt as u64 + 1),
@@ -2284,9 +2280,7 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                 &[SqliteValue::Text(run_id.to_owned().into())],
             )
             .map_err(|error| FwError::Storage(error.to_string()))?;
-        Ok(rows.first().map(|row| {
-            value_to_string(row.get(0))
-        }))
+        Ok(rows.first().map(|row| value_to_string(row.get(0))))
     }
 
     /// Audit reader (bd-rt-persist-a66y): the raw replay envelope JSON so
@@ -2300,9 +2294,7 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                 &[SqliteValue::Text(run_id.to_owned().into())],
             )
             .map_err(|error| FwError::Storage(error.to_string()))?;
-        Ok(rows.first().map(|row| {
-            value_to_string(row.get(0))
-        }))
+        Ok(rows.first().map(|row| value_to_string(row.get(0))))
     }
 
     /// Audit reader (bd-rt-persist-a66y): `PRAGMA integrity_check` verdict

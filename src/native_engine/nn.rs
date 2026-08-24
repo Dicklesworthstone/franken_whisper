@@ -6431,7 +6431,10 @@ impl LstmState {
     /// Fresh zero state for a hidden size.
     #[must_use]
     pub fn zeros(hidden: usize) -> Self {
-        Self { h: vec![0.0; hidden], c: vec![0.0; hidden] }
+        Self {
+            h: vec![0.0; hidden],
+            c: vec![0.0; hidden],
+        }
     }
 }
 
@@ -6452,7 +6455,12 @@ impl LstmWeights {
                 b_hh.len()
             )));
         }
-        Ok(Self { w_ih, w_hh, b_ih, b_hh })
+        Ok(Self {
+            w_ih,
+            w_hh,
+            b_ih,
+            b_hh,
+        })
     }
 
     /// Hidden size H.
@@ -6486,7 +6494,7 @@ impl LstmWeights {
             _ => {
                 return Err(FwError::InvalidRequest(
                     "lstm: h and c states must be jointly empty or jointly sized".into(),
-                ))
+                ));
             }
         }
         let mut out = Mat::zeros(x.rows, hidden);
@@ -6624,8 +6632,12 @@ mod tests {
         for v in &mut w_hh.data {
             *v *= 0.4;
         }
-        let b_ih = (0..4 * hidden).map(|i| (i % 5) as f32 * 0.05 - 0.1).collect();
-        let b_hh = (0..4 * hidden).map(|i| (i % 3) as f32 * 0.02 - 0.02).collect();
+        let b_ih = (0..4 * hidden)
+            .map(|i| (i % 5) as f32 * 0.05 - 0.1)
+            .collect();
+        let b_hh = (0..4 * hidden)
+            .map(|i| (i % 3) as f32 * 0.02 - 0.02)
+            .collect();
         let weights = LstmWeights::new(w_ih, w_hh, b_ih, b_hh).expect("fixture weights");
         let x = rng.mat(7, input);
         (weights, x)
@@ -6636,14 +6648,16 @@ mod tests {
         let (weights, x) = lstm_fixture(8, 5, 0x00_0B_D5);
         let mut state = LstmState::default();
         let out = weights.lstm_forward(&x, &mut state).expect("forward");
-        let (rows_ref, h_ref, c_ref) =
-            lstm_naive_reference(&weights.w_ih, &weights.w_hh, &weights.b_ih, &weights.b_hh, &x);
+        let (rows_ref, h_ref, c_ref) = lstm_naive_reference(
+            &weights.w_ih,
+            &weights.w_hh,
+            &weights.b_ih,
+            &weights.b_hh,
+            &x,
+        );
         for (t, row_ref) in rows_ref.iter().enumerate() {
             for (k, (a, b)) in out.row(t).iter().zip(row_ref.iter()).enumerate() {
-                assert!(
-                    (a - b).abs() <= 1e-6,
-                    "row {t} gate {k}: {a} vs {b}"
-                );
+                assert!((a - b).abs() <= 1e-6, "row {t} gate {k}: {a} vs {b}");
             }
         }
         for k in 0..state.h.len() {
@@ -6658,10 +6672,17 @@ mod tests {
         let mut whole_state = LstmState::default();
         let whole = weights.lstm_forward(&x, &mut whole_state).expect("whole");
         let mut split_state = LstmState::default();
-        let head = weights.lstm_forward(&Mat::from_vec(3, x.cols, x.data[..3 * x.cols].to_vec()), &mut split_state)
+        let head = weights
+            .lstm_forward(
+                &Mat::from_vec(3, x.cols, x.data[..3 * x.cols].to_vec()),
+                &mut split_state,
+            )
             .expect("head");
         let tail = weights
-            .lstm_forward(&Mat::from_vec(x.rows - 3, x.cols, x.data[3 * x.cols..].to_vec()), &mut split_state)
+            .lstm_forward(
+                &Mat::from_vec(x.rows - 3, x.cols, x.data[3 * x.cols..].to_vec()),
+                &mut split_state,
+            )
             .expect("tail");
         for t in 0..3 {
             assert_eq!(whole.row(t), head.row(t));
@@ -6682,12 +6703,18 @@ mod tests {
             weights.lstm_forward(&wrong_width, &mut state),
             Err(FwError::InvalidRequest(_))
         ));
-        let mut bad_len = LstmState { h: vec![0.0; 3], c: vec![0.0; 4] };
+        let mut bad_len = LstmState {
+            h: vec![0.0; 3],
+            c: vec![0.0; 4],
+        };
         assert!(matches!(
             weights.lstm_forward(&x, &mut bad_len),
             Err(FwError::InvalidRequest(_))
         ));
-        let mut half = LstmState { h: vec![0.0; 4], c: Vec::new() };
+        let mut half = LstmState {
+            h: vec![0.0; 4],
+            c: Vec::new(),
+        };
         assert!(matches!(
             weights.lstm_forward(&x, &mut half),
             Err(FwError::InvalidRequest(_))

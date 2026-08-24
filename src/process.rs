@@ -1420,7 +1420,6 @@ mod tests {
         run_command_cancellable_with_input_and_probe, run_command_cancellable_with_probe,
     };
 
-
     #[test]
     fn cancellable_poll_schedule_rejoins_fixed_cadence() {
         let delays: [u128; 8] =
@@ -2015,8 +2014,7 @@ mod tests {
         // directory took effect under every spelling, including root.
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = "fw-cwd-marker.txt";
-        run_command("touch", &[marker.to_owned()], Some(dir.path()))
-            .expect("touch should succeed");
+        run_command("touch", &[marker.to_owned()], Some(dir.path())).expect("touch should succeed");
         assert!(
             dir.path().join(marker).is_file(),
             "child must resolve relative paths against the requested cwd"

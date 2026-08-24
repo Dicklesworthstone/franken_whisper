@@ -54,9 +54,10 @@ fn decode_jfk_f32() -> Vec<f32> {
     let mut reader = hound::WavReader::open(jfk_wav()).expect("open jfk.wav");
     let spec = reader.spec();
     match spec.sample_format {
-        SampleFormat::Float => {
-            reader.samples::<f32>().map(|s| s.expect("float sample")).collect()
-        }
+        SampleFormat::Float => reader
+            .samples::<f32>()
+            .map(|s| s.expect("float sample"))
+            .collect(),
         SampleFormat::Int => {
             let denom = f32::from(i16::MAX) + 1.0;
             reader
@@ -187,7 +188,10 @@ fn persist_file_replay_rows_request_json_and_envelope() {
 
     // Event trail + segment granularity via the details loader (the same
     // path `fw runs show` uses). Deltas persisted 1:1; partials NOT.
-    let details = store.load_run_details(&run_id).expect("details").expect("row");
+    let details = store
+        .load_run_details(&run_id)
+        .expect("details")
+        .expect("row");
     // The segments TABLE is the authoritative utterance store for live
     // runs; result_json.segments is an empty summary by design.
     let persisted_segments = store.listen_segment_count(&run_id).expect("count");
@@ -199,7 +203,10 @@ fn persist_file_replay_rows_request_json_and_envelope() {
     let codes: Vec<&str> = details.events.iter().map(|e| e.code.as_str()).collect();
     assert!(codes.contains(&"listen.session_start"));
     assert!(codes.contains(&"listen.session_stats"));
-    assert!(!codes.contains(&"transcript.partial"), "partials are not durable (spec decision)");
+    assert!(
+        !codes.contains(&"transcript.partial"),
+        "partials are not durable (spec decision)"
+    );
 }
 
 #[test]
@@ -240,7 +247,10 @@ fn kill_nine_mid_session_keeps_flushed_utterances_and_db_intact() {
             }
         }
     }
-    assert!(utterance_ends_seen >= 2, "need two closed utterances before the kill");
+    assert!(
+        utterance_ends_seen >= 2,
+        "need two closed utterances before the kill"
+    );
     // The durability flush commits just AFTER the utterance_end hits
     // stdout; give it a beat so the kill lands past the second flush.
     std::thread::sleep(Duration::from_millis(1000));
@@ -250,7 +260,6 @@ fn kill_nine_mid_session_keeps_flushed_utterances_and_db_intact() {
     // Give the OS a beat; WAL recovery happens on reopen.
     std::thread::sleep(Duration::from_millis(300));
 
-
     let store = RunStore::open(&db).expect("reopen after SIGKILL");
     let integrity = store.query_integrity_check();
     assert_eq!(integrity, "ok", "database must survive SIGKILL uncorrupted");
@@ -259,8 +268,15 @@ fn kill_nine_mid_session_keeps_flushed_utterances_and_db_intact() {
         persisted_segments >= 2,
         "flushed deltas must be durable after SIGKILL (segments={persisted_segments})"
     );
-    let details = store.load_run_details(&run_id).expect("details").expect("row");
-    let ends = details.events.iter().filter(|e| e.code == "utterance_end").count();
+    let details = store
+        .load_run_details(&run_id)
+        .expect("details")
+        .expect("row");
+    let ends = details
+        .events
+        .iter()
+        .filter(|e| e.code == "utterance_end")
+        .count();
     assert!(ends >= 2, "two utterance_end events durable (ends={ends})");
 }
 
@@ -302,13 +318,24 @@ fn concurrent_batch_and_live_share_one_database() {
         .expect("batch status")
         .code()
         .unwrap_or(-1);
-    assert_eq!(batch_code, 0, "batch run against the shared db must succeed");
-    assert_eq!(live.join().expect("join live"), 0, "live session must succeed concurrently");
+    assert_eq!(
+        batch_code, 0,
+        "batch run against the shared db must succeed"
+    );
+    assert_eq!(
+        live.join().expect("join live"),
+        0,
+        "live session must succeed concurrently"
+    );
 
     let store = RunStore::open(&db).expect("open shared db");
     let summaries = store.list_recent_runs(20).expect("list runs");
-    let has_listen = summaries.iter().any(|s| s.backend == BackendKind::NativeListen);
-    let has_batch = summaries.iter().any(|s| s.backend != BackendKind::NativeListen);
+    let has_listen = summaries
+        .iter()
+        .any(|s| s.backend == BackendKind::NativeListen);
+    let has_batch = summaries
+        .iter()
+        .any(|s| s.backend != BackendKind::NativeListen);
     assert!(has_listen, "live run persisted alongside batch");
     assert!(has_batch, "batch run persisted alongside live");
 }

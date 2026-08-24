@@ -20,7 +20,7 @@
 
 use fj_core::{Primitive, Shape, TensorValue, Value};
 use fj_lax::eval_primitive;
-use franken_whisper::native_engine::{nn, Mat};
+use franken_whisper::native_engine::{Mat, nn};
 use std::collections::BTreeMap;
 
 /// Maximum absolute element difference accepted between the native kernel and
@@ -61,13 +61,21 @@ impl XorShift {
 
 fn tensor(shape: &[u32], data: &[f32]) -> Value {
     Value::Tensor(
-        TensorValue::new_f32_values(Shape { dims: shape.to_vec() }, data.to_vec())
-            .expect("oracle input tensor"),
+        TensorValue::new_f32_values(
+            Shape {
+                dims: shape.to_vec(),
+            },
+            data.to_vec(),
+        )
+        .expect("oracle input tensor"),
     )
 }
 
 fn params(pairs: &[(&str, String)]) -> BTreeMap<String, String> {
-    pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), v.clone()))
+        .collect()
 }
 
 /// Evaluate one primitive and return its F32 tensor payload flattened.
@@ -77,13 +85,23 @@ fn eval_f32(primitive: Primitive, inputs: &[Value], p: &BTreeMap<String, String>
             .elements
             .as_f32_slice()
             .map(<[f32]>::to_vec)
-            .unwrap_or_else(|| t.to_f64_vec().expect("numeric tensor").iter().map(|&v| v as f32).collect()),
+            .unwrap_or_else(|| {
+                t.to_f64_vec()
+                    .expect("numeric tensor")
+                    .iter()
+                    .map(|&v| v as f32)
+                    .collect()
+            }),
         other => panic!("expected tensor from {primitive:?}, got {other:?}"),
     }
 }
 
 fn broadcast(src: &Value, target_shape: &[u32], broadcast_dims: &str) -> Value {
-    let shape_str = target_shape.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let shape_str = target_shape
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let mut p = BTreeMap::new();
     p.insert("shape".to_owned(), shape_str);
     p.insert("broadcast_dimensions".to_owned(), broadcast_dims.to_owned());
@@ -92,7 +110,11 @@ fn broadcast(src: &Value, target_shape: &[u32], broadcast_dims: &str) -> Value {
 }
 
 fn reduce_axes(op: Primitive, src: &Value, axes: &str) -> Vec<f32> {
-    eval_f32(op, std::slice::from_ref(src), &params(&[("axes", axes.to_owned())]))
+    eval_f32(
+        op,
+        std::slice::from_ref(src),
+        &params(&[("axes", axes.to_owned())]),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -134,10 +156,18 @@ fn oracle_layer_norm(x: &[f32], r: u32, k: u32, gamma: &[f32], beta: &[f32], eps
         eval_f32(Primitive::Div, &[s, kk], &BTreeMap::new())
     };
     let mean_b = broadcast(&tensor(&[r, 1], &mean), &[r, k], "0,1");
-    let centered_v = eval_f32(Primitive::Sub, &[xt.clone(), mean_b.clone()], &BTreeMap::new());
+    let centered_v = eval_f32(
+        Primitive::Sub,
+        &[xt.clone(), mean_b.clone()],
+        &BTreeMap::new(),
+    );
     let centered = tensor(&[r, k], &centered_v);
     // var = sum(centered^2)/K per row.
-    let sq_v = eval_f32(Primitive::Mul, &[centered.clone(), centered.clone()], &BTreeMap::new());
+    let sq_v = eval_f32(
+        Primitive::Mul,
+        &[centered.clone(), centered.clone()],
+        &BTreeMap::new(),
+    );
     let sq = tensor(&[r, k], &sq_v);
     let sq_sum = reduce_axes(Primitive::ReduceSum, &sq, "1");
     let var = {
@@ -185,12 +215,19 @@ fn oracle_conv1d(
     let mut out = eval_f32(
         Primitive::Conv,
         &[lhs, rhs],
-        &params(&[("strides", stride.to_string()), ("padding", "VALID".to_owned())]),
+        &params(&[
+            ("strides", stride.to_string()),
+            ("padding", "VALID".to_owned()),
+        ]),
     );
     // fj output is [1,T_out,Cout]; add bias via explicit broadcast add.
     let t_out = out.len() / cout;
     let out_t = tensor(&[1, t_out as u32, cout as u32], &out);
-    let bias_b = broadcast(&tensor(&[cout as u32], bias), &[1, t_out as u32, cout as u32], "2");
+    let bias_b = broadcast(
+        &tensor(&[cout as u32], bias),
+        &[1, t_out as u32, cout as u32],
+        "2",
+    );
     out = eval_f32(Primitive::Add, &[out_t, bias_b], &BTreeMap::new());
     out
 }
@@ -235,17 +272,29 @@ fn compare(op: &'static str, seed: u64, expected: &[f32], actual: &[f32]) -> Res
     if bad_count == 0 {
         return Ok(());
     }
-    Err(Diff { op, seed, max_abs, first_bad, bad_count, expected: expected.to_vec(), actual: actual.to_vec() })
+    Err(Diff {
+        op,
+        seed,
+        max_abs,
+        first_bad,
+        bad_count,
+        expected: expected.to_vec(),
+        actual: actual.to_vec(),
+    })
 }
 
 impl Diff {
     /// Write the full debugging artifact and panic with its path.
     fn fail(self) -> ! {
-        let dir = std::path::PathBuf::from(std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/target").to_owned()
-        }));
+        let dir = std::path::PathBuf::from(
+            std::env::var("CARGO_TARGET_DIR")
+                .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/target").to_owned()),
+        );
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(format!("fj_oracle_divergence_{}_seed{}.json", self.op, self.seed));
+        let path = dir.join(format!(
+            "fj_oracle_divergence_{}_seed{}.json",
+            self.op, self.seed
+        ));
         let artifact = serde_json::json!({
             "op": self.op,
             "seed": self.seed,
@@ -256,10 +305,16 @@ impl Diff {
             "expected": self.expected,
             "actual": self.actual,
         });
-        let wrote = std::fs::write(&path, serde_json::to_string_pretty(&artifact).expect("artifact json"));
+        let wrote = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&artifact).expect("artifact json"),
+        );
         let note = match wrote {
             Ok(()) => format!("divergence artifact written to {}", path.display()),
-            Err(e) => format!("FAILED to write divergence artifact {}: {e}", path.display()),
+            Err(e) => format!(
+                "FAILED to write divergence artifact {}: {e}",
+                path.display()
+            ),
         };
         panic!(
             "{}: {} elements exceed tolerance {TOLERANCE} (max |diff| = {}, first at {:?}); {note}",
@@ -280,8 +335,11 @@ fn oracle_matmul_matches_native_matmul_seed_20260823() {
     let mut rng = XorShift(0x2026_0823_DEAD_BEEF);
     let a = rng.vec(M * K);
     let b = rng.vec(K * N);
-    let native = nn::matmul(&Mat::from_vec(M, K, a.clone()), &Mat::from_vec(K, N, b.clone()))
-        .expect("native matmul");
+    let native = nn::matmul(
+        &Mat::from_vec(M, K, a.clone()),
+        &Mat::from_vec(K, N, b.clone()),
+    )
+    .expect("native matmul");
     let oracle = oracle_matmul(&a, &b, M, K, N as u32);
     if let Err(d) = compare("matmul", 0x2026_0823_DEAD_BEEF, &oracle, &native.data) {
         d.fail();
@@ -314,7 +372,12 @@ fn oracle_layer_norm_matches_native_seed_20260823() {
     let mut native_mat = Mat::from_vec(R, K, x.clone());
     nn::layer_norm(&mut native_mat, &gamma, &beta, eps);
     let oracle = oracle_layer_norm(&x, R as u32, K as u32, &gamma, &beta, eps);
-    if let Err(d) = compare("layer_norm", 0x2026_0823_FEED_C0DE, &oracle, &native_mat.data) {
+    if let Err(d) = compare(
+        "layer_norm",
+        0x2026_0823_FEED_C0DE,
+        &oracle,
+        &native_mat.data,
+    ) {
         d.fail();
     }
 }

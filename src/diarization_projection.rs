@@ -780,15 +780,14 @@ mod tests {
             overlap_suspected: false,
             hard_hint_attributed: false,
         };
-        let segment = |start_sec: Option<f64>, end_sec: Option<f64>, text: &str| {
-            TranscriptionSegment {
+        let segment =
+            |start_sec: Option<f64>, end_sec: Option<f64>, text: &str| TranscriptionSegment {
                 start_sec,
                 end_sec,
                 text: text.to_owned(),
                 speaker: None,
                 confidence: Some(0.8),
-            }
-        };
+            };
         let segments = vec![
             segment(Some(0.0), Some(1.0), "And so my fellow"),
             // The degenerate observation: a word-aligned slice whose decoder
@@ -798,9 +797,8 @@ mod tests {
         ];
         let turns = vec![turn(0, 2_000, "A"), turn(2_000, 4_000, "B")];
 
-        let projection =
-            super::project_diarization_onto_segments(&segments, &turns, true)
-                .expect("a zero-duration middle segment must not reject the run");
+        let projection = super::project_diarization_onto_segments(&segments, &turns, true)
+            .expect("a zero-duration middle segment must not reject the run");
 
         assert_eq!(projection.segments.len(), 3);
         // Text and order are never modified.

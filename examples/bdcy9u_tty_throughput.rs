@@ -37,8 +37,12 @@ fn main() {
     // ---- ENCODE (full public path; includes the ffmpeg transcode head) ----
     let encoded_path = dir.join("encoded.ndjson");
     let t = Instant::now();
-    franken_whisper::tty_audio::encode_to_writer(&wav, 100, &mut std::fs::File::create(&encoded_path).expect("enc"))
-        .expect("encode");
+    franken_whisper::tty_audio::encode_to_writer(
+        &wav,
+        100,
+        &mut std::fs::File::create(&encoded_path).expect("enc"),
+    )
+    .expect("encode");
     let enc = t.elapsed();
     let wire_bytes = std::fs::metadata(&encoded_path).expect("wire").len();
 
@@ -69,9 +73,6 @@ fn main() {
         wire_bytes as f64 / audio_seconds,
         wire_bytes as f64 * 8.0 / audio_seconds / 1000.0
     );
-    println!(
-        "BD3NW3CY9U>>> decoded_bytes={} (mulaw payload)",
-        raw.len()
-    );
+    println!("BD3NW3CY9U>>> decoded_bytes={} (mulaw payload)", raw.len());
     let _ = std::fs::remove_dir_all(&dir);
 }
