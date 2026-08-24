@@ -4108,6 +4108,15 @@ pub struct ReplayEnvelope {
     /// SHA-256 of the raw backend output JSON payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_payload_hash: Option<String>,
+    /// Live-session integrity fingerprint (bd-rt-persist-a66y): streamed
+    /// SHA-256 over the concatenated session PCM (16 kHz mono f32,
+    /// little-endian). Audio is NOT retained, so this marks integrity only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcm_sha256: Option<String>,
+    /// Honest labeling for live rows: why there is no replayable reference
+    /// and what the hash does and does not attest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

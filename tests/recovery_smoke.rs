@@ -64,6 +64,8 @@ fn fixture_report(id: &str, db_path: &std::path::Path) -> RunReport {
             backend_identity: Some("whisper-cli".to_owned()),
             backend_version: Some("whisper 1.2.3".to_owned()),
             output_payload_hash: Some("recovery-output-hash".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         },
     }
 }

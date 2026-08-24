@@ -7,7 +7,7 @@
 //! (repo rule: no deletions without explicit operator approval).
 
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -188,7 +188,14 @@ fn persist_file_replay_rows_request_json_and_envelope() {
     // Event trail + segment granularity via the details loader (the same
     // path `fw runs show` uses). Deltas persisted 1:1; partials NOT.
     let details = store.load_run_details(&run_id).expect("details").expect("row");
-    assert_eq!(details.segments.len(), delta_count_stdout as usize);
+    // The segments TABLE is the authoritative utterance store for live
+    // runs; result_json.segments is an empty summary by design.
+    let persisted_segments = store.listen_segment_count(&run_id).expect("count");
+    assert_eq!(
+        usize::try_from(persisted_segments).unwrap_or(0),
+        delta_count_stdout as usize,
+        "every committed delta must be a durable segment row"
+    );
     let codes: Vec<&str> = details.events.iter().map(|e| e.code.as_str()).collect();
     assert!(codes.contains(&"listen.session_start"));
     assert!(codes.contains(&"listen.session_stats"));
@@ -217,14 +224,14 @@ fn kill_nine_mid_session_keeps_flushed_utterances_and_db_intact() {
     let mut utterance_ends_seen = 0u32;
     let mut run_id = String::new();
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-        if line.contains("\"listen.session_start\"") {
-            if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-                run_id = event
-                    .get("run_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_owned();
-            }
+        if line.contains("\"listen.session_start\"")
+            && let Ok(event) = serde_json::from_str::<serde_json::Value>(&line)
+        {
+            run_id = event
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
         }
         if line.contains("\"utterance_end\"") {
             utterance_ends_seen += 1;
@@ -234,22 +241,25 @@ fn kill_nine_mid_session_keeps_flushed_utterances_and_db_intact() {
         }
     }
     assert!(utterance_ends_seen >= 2, "need two closed utterances before the kill");
+    // The durability flush commits just AFTER the utterance_end hits
+    // stdout; give it a beat so the kill lands past the second flush.
+    std::thread::sleep(Duration::from_millis(1000));
     child.kill().expect("SIGKILL mid-session");
     let _ = child.wait();
 
     // Give the OS a beat; WAL recovery happens on reopen.
     std::thread::sleep(Duration::from_millis(300));
 
+
     let store = RunStore::open(&db).expect("reopen after SIGKILL");
     let integrity = store.query_integrity_check();
     assert_eq!(integrity, "ok", "database must survive SIGKILL uncorrupted");
-
-    let details = store.load_run_details(&run_id).expect("details").expect("row");
+    let persisted_segments = store.listen_segment_count(&run_id).expect("count");
     assert!(
-        details.segments.len() >= 2,
-        "flushed deltas must be durable after SIGKILL (segments={})",
-        details.segments.len()
+        persisted_segments >= 2,
+        "flushed deltas must be durable after SIGKILL (segments={persisted_segments})"
     );
+    let details = store.load_run_details(&run_id).expect("details").expect("row");
     let ends = details.events.iter().filter(|e| e.code == "utterance_end").count();
     assert!(ends >= 2, "two utterance_end events durable (ends={ends})");
 }

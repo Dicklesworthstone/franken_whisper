@@ -2122,7 +2122,8 @@ pub const fn robot_docs_guide() -> &'static str {
 7. The installer does this automatically; inference itself never accesses the network.\n\
 8. Curate the YouTube catalog with `fw youtube search QUERY` (deduped JSON hits;\n\
    `--flat` for cheap sweeps) and `fw youtube enrich URL_OR_ID...`; ingestion is\n\
-   `fw youtube run --url URL` (`--json-summary` for scripting).\n"
+   `fw youtube run --url URL` (`--robot` streams per-video NDJSON events;\n\
+   `--json-summary` prints one final JSON blob).\n"
 }
 
 /// Emit a single `health.report` NDJSON line to stdout.
@@ -3416,6 +3417,8 @@ mod tests {
             backend_identity: Some("native:test".to_owned()),
             backend_version: Some("1.2.3".to_owned()),
             output_payload_hash: Some("output-hash".to_owned()),
+            pcm_sha256: None,
+            live_note: None,
         };
 
         let historical = historical_pretty_run_report(&rich);

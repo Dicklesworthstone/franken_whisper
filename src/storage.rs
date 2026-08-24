@@ -194,6 +194,18 @@ pub(crate) struct ListenEventRow {
     pub payload_json: String,
 }
 
+/// Row payload for closing a live listen run (bd-rt-persist-a66y): drains
+/// remaining events, writes the true end time and final summary fields.
+pub(crate) struct ListenCloseRow<'a> {
+    pub run_id: &'a str,
+    pub events: &'a [ListenEventRow],
+    pub result_json: &'a str,
+    pub warnings_json: &'a str,
+    pub replay_json: &'a str,
+    pub transcript: &'a str,
+    pub finished_at_rfc3339: &'a str,
+}
+
 impl RunStore {
     pub fn open(db_path: &Path) -> FwResult<Self> {
         if let Some(parent) = db_path.parent()
@@ -2043,6 +2055,19 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
     /// session-end marker (round 4 convention). `replay_json` opens as an
     /// honestly-labeled placeholder; the PCM hash lands only on clean close.
     pub(crate) fn listen_open_run(&self, open: &ListenRunOpen<'_>) -> FwResult<()> {
+        // Crashed sessions must stay readable by the standard loaders, so
+        // the row opens with a schema-valid minimal result (empty
+        // transcript); close() overwrites it with the final summary.
+        let result_placeholder = serde_json::json!({
+            "backend": "native_listen",
+            "transcript": "",
+            "language": null,
+            "segments": [],
+            "acceleration": null,
+            "raw_output": {},
+            "artifact_paths": [],
+        })
+        .to_string();
         let replay_placeholder = serde_json::json!({
             "kind": "live-session",
             "pcm_sha256": serde_json::Value::Null,
@@ -2058,15 +2083,17 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
             let inner = store.connection.execute_with_params(
                 "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
                  normalized_wav_path, request_json, result_json, warnings_json, transcript, \
-                 replay_json) VALUES (?1, ?2, ?2, 'native-listen', ?3, '', ?4, '{}', '[]', '', ?5)",
+                 replay_json) VALUES (?1, ?2, ?2, 'native-listen', ?3, '', ?4, ?6, '[]', '', ?5)",
                 &[
                     SqliteValue::Text(open.run_id.to_owned().into()),
                     SqliteValue::Text(open.started_at_rfc3339.to_owned().into()),
                     SqliteValue::Text(open.input_path.to_owned().into()),
                     SqliteValue::Text(open.request_json.to_owned().into()),
                     SqliteValue::Text(replay_placeholder.clone().into()),
+                    SqliteValue::Text(result_placeholder.clone().into()),
                 ],
             );
+
             match inner {
                 Ok(_) => store
                     .connection
@@ -2079,6 +2106,23 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                 }
             }
         })
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): number of durable segment rows
+    /// for a listen run. The segments TABLE is the authoritative utterance
+    /// store for live runs; `result_json.segments` stays an empty summary.
+    pub fn listen_segment_count(&self, run_id: &str) -> FwResult<i64> {
+        let rows = self
+            .connection
+            .query_with_params(
+                "SELECT COUNT(*) FROM segments WHERE run_id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(rows
+            .first()
+            .and_then(|row| row.get(0).and_then(|value| value.as_integer()))
+            .unwrap_or(0))
     }
 
     /// Append one closed utterance's delta segments plus every stream event
@@ -2166,16 +2210,14 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
     /// finalized replay envelope with the streamed session-PCM hash. A
     /// failure here is NOT swallowed by the caller (final close failure
     /// surfaces as run_error after the session events were emitted).
-    pub(crate) fn listen_close_run(
-        &self,
-        run_id: &str,
-        events: &[ListenEventRow],
-        result_json: &str,
-        warnings_json: &str,
-        replay_json: &str,
-        transcript: &str,
-        finished_at_rfc3339: &str,
-    ) -> FwResult<()> {
+    pub(crate) fn listen_close_run(&self, close: &ListenCloseRow<'_>) -> FwResult<()> {
+        let run_id = close.run_id;
+        let events = close.events;
+        let result_json = close.result_json;
+        let warnings_json = close.warnings_json;
+        let replay_json = close.replay_json;
+        let transcript = close.transcript;
+        let finished_at_rfc3339 = close.finished_at_rfc3339;
         self.retry_busy(|store| {
             let savepoint = next_persist_savepoint_name();
             store
@@ -2261,6 +2303,18 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
         Ok(rows.first().map(|row| {
             value_to_string(row.get(0))
         }))
+    }
+
+    /// Audit reader (bd-rt-persist-a66y): `PRAGMA integrity_check` verdict
+    /// for crash-recovery assertions and operator diagnostics.
+    pub fn query_integrity_check(&self) -> String {
+        let rows = self
+            .connection
+            .query("PRAGMA integrity_check;")
+            .unwrap_or_default();
+        rows.first()
+            .map(|row| value_to_string(row.get(0)))
+            .unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
