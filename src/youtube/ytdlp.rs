@@ -1119,7 +1119,7 @@ pub fn download_audio(
         .filter(|line| !line.is_empty())
         .rev()
         .map(PathBuf::from)
-        .find(|candidate| candidate.is_file());
+        .find(|candidate| is_reusable_download_path(candidate, dest_dir, &meta.id));
 
     if let Some(path) = printed {
         return Ok(path);
@@ -2198,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn downloaded_scan_rejects_partial_and_sidecar_artifacts() {
+    fn downloaded_scan_accepts_only_nonempty_owned_media_for_exact_id() {
         let dir = tempfile::tempdir().expect("tempdir");
         for extension in ["part", "tmp", "ytdl", "json"] {
             std::fs::write(
@@ -2208,6 +2208,15 @@ mod tests {
             .expect("non-media artifact");
         }
         std::fs::write(dir.path().join("video123.webm"), b"").expect("empty media artifact");
+        std::fs::write(dir.path().join("different.wav"), b"wrong id")
+            .expect("wrong-id media artifact");
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("symlink-target.wav");
+            std::fs::write(&target, b"symlink target").expect("symlink target");
+            std::os::unix::fs::symlink(&target, dir.path().join("video123.mp3"))
+                .expect("symlink media artifact");
+        }
         assert_eq!(find_downloaded_by_id(dir.path(), "video123"), None);
 
         let completed = dir.path().join("video123.wav");

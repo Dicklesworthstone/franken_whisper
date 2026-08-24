@@ -209,6 +209,7 @@ fn youtube_private_video_fails_gracefully_without_model() {
         .arg(out.to_str().unwrap())
         .arg("--model")
         .arg("tiny.en")
+        .arg("--robot")
         .env("FRANKEN_WHISPER_STATE_DIR", dir.path())
         .env("FRANKEN_WHISPER_YTDLP_BIN", stub_path())
         .env("STUB_FAIL_MODE", "private")
@@ -218,12 +219,37 @@ fn youtube_private_video_fails_gracefully_without_model() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = cmd.output().expect("spawn");
-    // A run where every video failed exits non-zero (private => resolve fails
-    // at metadata before any work).
     assert!(
         !output.status.success(),
         "private-video run should exit non-zero"
     );
+    let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .expect("robot stdout utf8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("robot NDJSON line"))
+        .collect();
+    let failed: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "youtube.failed")
+        .collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["id"], "PRIVATE00001");
+    assert!(
+        failed[0]["error"]
+            .as_str()
+            .expect("private error")
+            .contains("private"),
+        "the failure must come from the private-video contract"
+    );
+    assert_eq!(events.last().expect("terminal")["event"], "youtube.run_complete");
+    assert_eq!(events.last().expect("terminal")["cancelled"], false);
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(out.join(".fw_youtube_manifest.json")).expect("manifest"),
+    )
+    .expect("parse manifest");
+    assert_eq!(manifest["entries"]["PRIVATE00001"]["state"]["state"], "failed");
+    assert_eq!(manifest["entries"]["PRIVATE00001"]["state"]["attempts"], 1);
 }
 
 #[test]
@@ -234,12 +260,15 @@ fn youtube_robot_abort_on_transcription_failure_exits_nonzero_and_persists_failu
     let run = run_youtube(
         &[
             "https://www.youtube.com/watch?v=MISSING0001",
+            "https://www.youtube.com/watch?v=AFTERFAIL01",
             "--output-dir",
             out.to_str().expect("output path"),
             "--model",
             missing_model.to_str().expect("model path"),
             "--no-diarize",
             "--abort-on-error",
+            "--batch-size",
+            "1",
             "--robot",
         ],
         dir.path(),
@@ -275,6 +304,15 @@ fn youtube_robot_abort_on_transcription_failure_exits_nonzero_and_persists_failu
     assert_eq!(
         events
             .iter()
+            .filter(|event| event["id"] == "AFTERFAIL01")
+            .filter(|event| event["event"] != "youtube.discovered")
+            .count(),
+        0,
+        "the later wave must remain undispatched after transcription fails"
+    );
+    assert_eq!(
+        events
+            .iter()
             .filter(|event| event["event"] == "youtube.run_complete")
             .count(),
         1
@@ -295,4 +333,5 @@ fn youtube_robot_abort_on_transcription_failure_exits_nonzero_and_persists_failu
     .expect("parse manifest");
     assert_eq!(manifest["entries"]["MISSING0001"]["state"]["state"], "failed");
     assert_eq!(manifest["entries"]["MISSING0001"]["state"]["attempts"], 1);
+    assert_eq!(manifest["entries"]["AFTERFAIL01"]["state"]["state"], "pending");
 }

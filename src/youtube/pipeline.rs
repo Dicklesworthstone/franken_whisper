@@ -275,7 +275,8 @@ pub struct YoutubeRunOptions {
     pub keep_audio: bool,
     /// Retry videos previously marked failed.
     pub retry_failed: bool,
-    /// Abort the whole run on the first per-video failure.
+    /// Stop scheduling later waves after the first observed per-video failure.
+    /// Downloads already in flight in the current wave may still finish.
     pub abort_on_error: bool,
     /// Filename style for emitted artifacts (bd-tchp default: slug).
     pub naming_style: naming::NamingStyle,
@@ -790,8 +791,8 @@ fn finalize_run(
 }
 
 /// Terminal aggregate event (bd-27v1.1): exactly one per robot run, always
-/// last; `cancelled` distinguishes Ctrl+C and `--abort-on-error` endings from
-/// a fully completed run.
+/// last; `cancelled` distinguishes actual shutdown/cancellation from a fully
+/// completed or fail-fast run.
 fn emit_run_complete(events: &YoutubeEventEmitter, summary: &YoutubeRunSummary) -> FwResult<()> {
     events.emit(
         "run_complete",
@@ -835,6 +836,13 @@ fn is_retryable_download_error(error: &FwError) -> bool {
             ]
             .iter()
             .any(|needle| s.contains(needle))
+        }
+        // yt-dlp's signature mapper intentionally turns HTTP 429 into an
+        // actionable InvalidRequest message. Preserve its transient nature
+        // here instead of requiring the raw CommandFailed representation.
+        FwError::InvalidRequest(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("429") || message.contains("rate-limit")
         }
         _ => false,
     }
@@ -1485,10 +1493,9 @@ mod tests {
             |info, url, token| {
                 metadata_calls += 1;
                 if metadata_calls == 1 {
-                    Err(FwError::from_command_failure(
-                        "yt-dlp".to_owned(),
-                        1,
-                        "ERROR: HTTP Error 429: Too Many Requests".to_owned(),
+                    Err(FwError::InvalidRequest(
+                        "YouTube rate-limited the downloader (HTTP 429). Wait and retry."
+                            .to_owned(),
                     ))
                 } else {
                     ytdlp::fetch_metadata(info, url, token)
@@ -1532,6 +1539,9 @@ mod tests {
             "yt-dlp".to_owned(),
             1,
             "ERROR: HTTP Error 429: Too Many Requests".to_owned(),
+        )));
+        assert!(is_retryable_download_error(&FwError::InvalidRequest(
+            "YouTube rate-limited the downloader (HTTP 429). Wait and retry.".to_owned(),
         )));
         // Deterministic content errors must fail fast.
         assert!(!is_retryable_download_error(
@@ -2066,7 +2076,16 @@ https://youtu.be/ccccccccccc
         let parsed = parse_events(&buffer);
         let terminal = parsed.last().expect("terminal event");
         assert_eq!(terminal["event"], "youtube.run_complete");
-        assert_eq!(terminal["failed"], serde_json::json!(["ABORTFAIL01"]));
+        let failed = terminal["failed"].as_array().expect("failed summaries");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["id"], "ABORTFAIL01");
+        assert_eq!(failed[0]["title"], "");
+        assert!(
+            failed[0]["error"]
+                .as_str()
+                .expect("failure error")
+                .contains("private")
+        );
         assert_eq!(terminal["cancelled"], false);
         let later_work_events = parsed
             .iter()
