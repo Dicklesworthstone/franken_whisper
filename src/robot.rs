@@ -2628,10 +2628,14 @@ pub fn robot_schema_value() -> serde_json::Value {
     let serde_json::Value::Object(youtube_events) = youtube_event_schema_value() else {
         unreachable!("youtube schema events are constructed as an object")
     };
-    schema["events"]
+    let events = schema["events"]
         .as_object_mut()
-        .expect("robot schema events must be an object")
-        .extend(youtube_events);
+        .expect("robot schema events must be an object");
+    let health_report = events
+        .remove("health.report")
+        .expect("robot schema includes the health report event");
+    events.extend(youtube_events);
+    events.insert("health.report".to_owned(), health_report);
     schema
 }
 

@@ -227,7 +227,7 @@ fn youtube_private_video_fails_gracefully_without_model() {
 }
 
 #[test]
-fn youtube_robot_transcription_failure_emits_and_persists_terminal_failure() {
+fn youtube_robot_abort_on_transcription_failure_exits_nonzero_and_persists_failure() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("out");
     let missing_model = dir.path().join("definitely-missing-model.bin");
@@ -239,6 +239,7 @@ fn youtube_robot_transcription_failure_emits_and_persists_terminal_failure() {
             "--model",
             missing_model.to_str().expect("model path"),
             "--no-diarize",
+            "--abort-on-error",
             "--robot",
         ],
         dir.path(),
@@ -281,6 +282,11 @@ fn youtube_robot_transcription_failure_emits_and_persists_terminal_failure() {
     assert_eq!(
         events.last().expect("terminal event")["event"],
         "youtube.run_complete"
+    );
+    assert_eq!(
+        events.last().expect("terminal event")["cancelled"],
+        false,
+        "--abort-on-error must not be misclassified as Ctrl+C cancellation"
     );
 
     let manifest: serde_json::Value = serde_json::from_slice(

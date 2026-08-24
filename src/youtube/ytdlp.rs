@@ -1153,12 +1153,28 @@ pub(crate) fn find_downloaded_by_id(dest_dir: &Path, id: &str) -> Option<PathBuf
 /// this exact video id. Partial yt-dlp artifacts and symlinks are never resume
 /// inputs.
 pub(crate) fn is_reusable_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
-    let extension = path.extension().and_then(|value| value.to_str());
-    path.parent() == Some(dest_dir)
-        && path.file_stem().and_then(|value| value.to_str()) == Some(id)
-        && extension.is_some_and(|value| !matches!(value, "part" | "tmp" | "ytdl"))
-        && std::fs::symlink_metadata(path)
-            .is_ok_and(|metadata| metadata.file_type().is_file())
+    const REUSABLE_MEDIA_EXTENSIONS: &[&str] = &[
+        "aac", "aif", "aiff", "alac", "flac", "m4a", "mka", "mkv", "mov", "mp3", "mp4",
+        "oga", "ogg", "opus", "wav", "weba", "webm", "wv",
+    ];
+
+    if path.parent() != Some(dest_dir)
+        || path.file_stem().and_then(|value| value.to_str()) != Some(id)
+    {
+        return false;
+    }
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    if !REUSABLE_MEDIA_EXTENSIONS
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    {
+        return false;
+    }
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_file() && metadata.len() > 0
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2184,13 +2200,17 @@ mod tests {
     #[test]
     fn downloaded_scan_rejects_partial_and_sidecar_artifacts() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for extension in ["part", "tmp", "ytdl"] {
-            std::fs::write(dir.path().join(format!("video123.{extension}")), b"partial")
-                .expect("partial artifact");
+        for extension in ["part", "tmp", "ytdl", "json"] {
+            std::fs::write(
+                dir.path().join(format!("video123.{extension}")),
+                b"not reusable media",
+            )
+            .expect("non-media artifact");
         }
+        std::fs::write(dir.path().join("video123.webm"), b"").expect("empty media artifact");
         assert_eq!(find_downloaded_by_id(dir.path(), "video123"), None);
 
-        let completed = dir.path().join("video123.webm");
+        let completed = dir.path().join("video123.wav");
         std::fs::write(&completed, b"complete").expect("completed artifact");
         assert_eq!(find_downloaded_by_id(dir.path(), "video123"), Some(completed));
     }

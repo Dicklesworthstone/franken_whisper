@@ -168,8 +168,8 @@ pub enum YoutubeRobotEvents {
 /// ([`crate::robot::ROBOT_SCHEMA_VERSION`]), a stable per-run `run_id`, a
 /// monotonic `seq`, and an RFC-3339 `ts`. Emission is thread-safe: download
 /// workers emit `downloading` / `downloaded` concurrently while the
-/// transcription consumer emits the rest, so `seq` is an atomic counter and
-/// stdout writes go through the shared robot lock.
+/// transcription consumer emits the rest, so sequence allocation and the
+/// physical stdout/capture write share one emitter-local critical section.
 #[derive(Debug)]
 pub struct YoutubeEventEmitter {
     output: YoutubeRobotEvents,
@@ -208,18 +208,30 @@ impl YoutubeEventEmitter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *seq += 1;
-        let mut envelope = serde_json::json!({
-            "event": format!("youtube.{event}"),
-            "schema_version": crate::robot::ROBOT_SCHEMA_VERSION,
-            "run_id": self.run_id,
-            "seq": *seq,
-            "ts": chrono::Utc::now().to_rfc3339(),
-        });
-        if let (Some(envelope), Some(payload)) = (envelope.as_object_mut(), payload.as_object()) {
-            for (key, value) in payload {
-                envelope.insert(key.clone(), value.clone());
-            }
-        }
+        let mut fields = match payload {
+            serde_json::Value::Object(fields) => fields,
+            _ => serde_json::Map::new(),
+        };
+        // Payload fields are flattened first; the authoritative envelope is
+        // inserted last so callers cannot forge routing or ordering metadata.
+        fields.insert(
+            "event".to_owned(),
+            serde_json::Value::String(format!("youtube.{event}")),
+        );
+        fields.insert(
+            "schema_version".to_owned(),
+            serde_json::Value::String(crate::robot::ROBOT_SCHEMA_VERSION.to_owned()),
+        );
+        fields.insert(
+            "run_id".to_owned(),
+            serde_json::Value::String(self.run_id.clone()),
+        );
+        fields.insert("seq".to_owned(), serde_json::Value::from(*seq));
+        fields.insert(
+            "ts".to_owned(),
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        let envelope = serde_json::Value::Object(fields);
         match &self.output {
             YoutubeRobotEvents::Off => Ok(()),
             YoutubeRobotEvents::Stdout => crate::robot::emit_event_value(&envelope),
@@ -550,6 +562,7 @@ fn run_with_info_body(
     // consumer lags behind parallel download workers. 0 = single wave (history).
     let batches = partition_batches(to_process, opts.batch_size);
     'waves: for batch in batches {
+        let mut abort_remaining = false;
         // ── Download stage: bounded worker pool feeding a bounded channel. ──
         // Capacity == concurrency keeps disk bounded (~concurrency in-flight +
         // queued). Each worker kills its yt-dlp child if the token fires.
@@ -644,7 +657,7 @@ fn run_with_info_body(
                             &mut summary,
                         )?;
                         if opts.abort_on_error {
-                            summary.cancelled = true;
+                            abort_remaining = true;
                             break;
                         }
                         continue;
@@ -732,7 +745,7 @@ fn run_with_info_body(
                             &mut summary,
                         )?;
                         if opts.abort_on_error {
-                            summary.cancelled = true;
+                            abort_remaining = true;
                             break;
                         }
                     }
@@ -740,9 +753,9 @@ fn run_with_info_body(
             }
             Ok(())
         })?;
-        // Any exit condition that abandoned the consumer early (cancel or
-        // --abort-on-error) also abandons the remaining waves.
-        if summary.cancelled {
+        // Cancellation and fail-fast abort both abandon later waves, but only
+        // a real shutdown/cancellation marks the public summary cancelled.
+        if summary.cancelled || abort_remaining {
             break 'waves;
         }
     }
@@ -886,38 +899,55 @@ fn execute_download_work(
     audio_dir: &Path,
     token: &CancellationToken,
 ) -> Result<(PathBuf, VideoMeta), String> {
+    execute_download_work_with_metadata(info, work, audio_dir, token, ytdlp::fetch_metadata)
+}
+
+fn execute_download_work_with_metadata<F>(
+    info: &YtdlpInfo,
+    work: &DownloadWork,
+    audio_dir: &Path,
+    token: &CancellationToken,
+    mut fetch_metadata: F,
+) -> Result<(PathBuf, VideoMeta), String>
+where
+    F: FnMut(&YtdlpInfo, &str, &CancellationToken) -> FwResult<VideoMeta>,
+{
     match work {
-        DownloadWork::Fetch(video) => download_one(info, video, audio_dir, token),
-        DownloadWork::Reuse { video, audio_path } => ytdlp::fetch_metadata(info, &video.url, token)
-            .map(|meta| (audio_path.clone(), meta))
-            .map_err(|error| error.to_string()),
+        DownloadWork::Fetch(video) => retry_download_stage(&video.id, token, || {
+            download_one_attempt(info, video, audio_dir, token)
+        }),
+        DownloadWork::Reuse { video, audio_path } => {
+            retry_download_stage(&video.id, token, || {
+                fetch_metadata(info, &video.url, token)
+                    .map(|meta| (audio_path.clone(), meta))
+            })
+        }
     }
 }
 
-/// Download a single video's audio, retrying transient failures with
-/// full-jitter exponential backoff (bd-lun9). This performs the **single**
-/// authoritative `yt-dlp -j` metadata fetch for the video and returns the
-/// fetched [`VideoMeta`] alongside the audio path, so the renderer never
-/// re-fetches it.
-fn download_one(
-    info: &YtdlpInfo,
-    video: &VideoRef,
-    audio_dir: &Path,
+/// Execute one download-stage operation with the same bounded transient retry
+/// policy for both fresh downloads and metadata-only audio reuse.
+fn retry_download_stage<T, F>(
+    video_id: &str,
     token: &CancellationToken,
-) -> Result<(PathBuf, VideoMeta), String> {
+    mut operation: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> FwResult<T>,
+{
     let mut attempt = 0_u32;
     loop {
-        match download_one_attempt(info, video, audio_dir, token) {
+        match operation() {
             Ok(ok) => return Ok(ok),
             Err(fw_err)
                 if attempt < DOWNLOAD_IN_RUN_RETRIES && is_retryable_download_error(&fw_err) =>
             {
                 tracing::warn!(
-                    id = %video.id,
+                    id = %video_id,
                     attempt = attempt + 1,
                     retries_left = DOWNLOAD_IN_RUN_RETRIES - attempt,
                     error = %fw_err,
-                    "transient download failure; backing off before retry"
+                    "transient download-stage failure; backing off before retry"
                 );
                 jittered_backoff_sleep(attempt, token).map_err(|e| e.to_string())?;
                 attempt += 1;
@@ -926,7 +956,8 @@ fn download_one(
         }
     }
 }
-/// One physical metadata+download pass (no retries).
+
+/// One physical metadata+download pass (the caller owns retries).
 fn download_one_attempt(
     info: &YtdlpInfo,
     video: &VideoRef,
@@ -1428,6 +1459,53 @@ mod tests {
                 .as_slice(),
             sentinel,
             "the download path must not run for reusable audio"
+        );
+    }
+
+    #[test]
+    fn reuse_work_retries_transient_metadata_without_overwriting_audio() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).expect("audio dir");
+        let video = vr("retryreuse1");
+        let audio_path = audio_dir.join("retryreuse1.wav");
+        let sentinel: &[u8] = b"retry metadata without downloading again";
+        std::fs::write(&audio_path, sentinel).expect("seed audio");
+        let work = DownloadWork::Reuse {
+            video,
+            audio_path: audio_path.clone(),
+        };
+        let mut metadata_calls = 0_u32;
+
+        let (returned_path, meta) = execute_download_work_with_metadata(
+            &stub_info(),
+            &work,
+            &audio_dir,
+            &CancellationToken::unbounded(),
+            |info, url, token| {
+                metadata_calls += 1;
+                if metadata_calls == 1 {
+                    Err(FwError::from_command_failure(
+                        "yt-dlp".to_owned(),
+                        1,
+                        "ERROR: HTTP Error 429: Too Many Requests".to_owned(),
+                    ))
+                } else {
+                    ytdlp::fetch_metadata(info, url, token)
+                }
+            },
+        )
+        .expect("transient metadata fetch should recover");
+
+        assert_eq!(metadata_calls, 2, "one transient attempt plus one success");
+        assert_eq!(returned_path, audio_path);
+        assert_eq!(meta.id, "retryreuse1");
+        assert_eq!(
+            std::fs::read(&returned_path)
+                .expect("read reused audio")
+                .as_slice(),
+            sentinel,
+            "metadata retry must never invoke the audio download path"
         );
     }
 
@@ -1966,6 +2044,49 @@ https://youtu.be/ccccccccccc
     }
 
     #[test]
+    fn abort_on_error_stops_later_waves_without_claiming_cancellation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut opts, buffer) = capturing_opts(
+            vec![
+                "https://www.youtube.com/watch?v=ABORTFAIL01&fw_stub_fail=private".to_owned(),
+                "https://www.youtube.com/watch?v=AFTERABORT1".to_owned(),
+            ],
+            dir.path(),
+        );
+        opts.abort_on_error = true;
+        opts.concurrency = 1;
+        opts.batch_size = 1;
+
+        let summary = run_with_info(&opts, &stub_info()).expect("per-video failure summary");
+        assert_eq!(summary.failed.len(), 1);
+        assert_eq!(summary.failed[0].id, "ABORTFAIL01");
+        assert!(summary.done.is_empty());
+        assert!(!summary.cancelled, "fail-fast is not Ctrl+C cancellation");
+
+        let parsed = parse_events(&buffer);
+        let terminal = parsed.last().expect("terminal event");
+        assert_eq!(terminal["event"], "youtube.run_complete");
+        assert_eq!(terminal["failed"], serde_json::json!(["ABORTFAIL01"]));
+        assert_eq!(terminal["cancelled"], false);
+        let later_work_events = parsed
+            .iter()
+            .filter(|event| event["id"] == "AFTERABORT1")
+            .filter(|event| event["event"] != "youtube.discovered")
+            .count();
+        assert_eq!(later_work_events, 0, "later waves must not start after abort");
+
+        let manifest = Manifest::load(&dir.path().join(MANIFEST_NAME)).expect("manifest");
+        assert!(matches!(
+            manifest.entries["ABORTFAIL01"].state.as_ref(),
+            Some(VideoState::Failed { attempts: 1, .. })
+        ));
+        assert!(matches!(
+            manifest.entries["AFTERABORT1"].state.as_ref(),
+            Some(VideoState::Pending)
+        ));
+    }
+
+    #[test]
     fn emitter_envelope_carries_schema_seq_ts_and_stable_run_id() {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let events =
@@ -2009,6 +2130,40 @@ https://youtu.be/ccccccccccc
         }
         assert_eq!(parsed[0]["event"], "youtube.run_start");
         assert_eq!(parsed[2]["event"], "youtube.run_complete");
+    }
+
+    #[test]
+    fn emitter_payload_cannot_forge_authoritative_envelope_fields() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events =
+            YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(std::sync::Arc::clone(&buffer)));
+        let expected_run_id = events.run_id().to_owned();
+        events
+            .emit(
+                "discovered",
+                serde_json::json!({
+                    "event": "forged.event",
+                    "schema_version": "forged-schema",
+                    "run_id": "forged-run",
+                    "seq": 99,
+                    "ts": "not-a-timestamp",
+                    "id": "safe-id",
+                }),
+            )
+            .expect("emit protected envelope");
+
+        let parsed = parse_events(&buffer);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["event"], "youtube.discovered");
+        assert_eq!(
+            parsed[0]["schema_version"],
+            crate::robot::ROBOT_SCHEMA_VERSION
+        );
+        assert_eq!(parsed[0]["run_id"], expected_run_id);
+        assert_eq!(parsed[0]["seq"], 1);
+        assert_eq!(parsed[0]["id"], "safe-id");
+        chrono::DateTime::parse_from_rfc3339(parsed[0]["ts"].as_str().expect("ts"))
+            .expect("authoritative RFC-3339 timestamp");
     }
 
     #[test]
