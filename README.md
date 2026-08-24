@@ -990,6 +990,7 @@ One JSON object per line on stdout, explicitly flushed. Every event carries `sch
 | `transcript.confirm` / `transcript.correct` | Quality-lane verdicts keyed by `utterance_id`; may arrive **after** their `utterance_end` (async confirm lane; never blocks the live lane) |
 | `listen.warning` | Structured non-fatal degradation: `silent_input`, `capture_overrun`, `fallback_capture_backend`, `fast_model_fallback`, `quality_model_unavailable`, `confirm_lag`, `forced_trim`, `decode_behind`, `persist_degraded`, `endpoint_flush_timeout`, … |
 | `listen.session_stats` | Liveness heartbeat (default every 30 s, silence included) and terminal stats: `ttft_ms`, `mean/p95_step_latency_ms`, `deltas`, `utterances`, `capture_overruns`, `policy_holdbacks`, confirm-lag p50/p95/max |
+| `listen.controller` | Default-off `--adaptive` decision evidence: bounded cadence/holdback transition, Brier calibration, observation count, and deterministic-fallback status |
 
 Lifecycle invariants (enforced by contract tests): every `speech_started` is matched by exactly one later `utterance_end` carrying the same `utterance_id`; an utterance whose decode commits nothing still closes with empty text (breath/cough triggers are normal, never errors); an utterance's deltas always precede its `utterance_end`; `seq` strictly increases across every event.
 
@@ -1018,6 +1019,7 @@ jfk-style single-sentence utterances close before policies can differ; continuou
 | `--fast-model` | auto | fast-lane model override (default tiny.en for `en`, multilingual tiny otherwise) |
 | `--policy` / `--alignatt-holdback-ms` | `alignatt` / 200 | emission policy (above); AlignAtt danger-zone width |
 | `--step-ms` / `--max-buffer-sec` | 300 / 12 | decode cadence; rolling buffer cap |
+| `--adaptive` | off | adapt cadence and AlignAtt holdback within fixed bounds; Brier calibration failures deterministically restore configured values and emit `listen.controller` evidence |
 | `--language` | detect-and-pin | ISO 639-1 hint |
 | `--max-seconds` / `--max-utterance-sec` | 0 / 90 | session length cap (0 = unbounded); force-close long open speech |
 | `--no-partials` | off | suppress mutable partial previews (first remedy for slow consumers) |
@@ -1448,7 +1450,7 @@ franken_whisper robot health
 franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 ```
 
-**Robot Event Catalog (schema `1.1.0`; the six `listen.*` / speech-lifecycle events of the realtime driver are additive members of the same contract):**
+**Robot Event Catalog (schema `1.1.0`; the six core `listen.*` / speech-lifecycle events and the optional adaptive-controller event are additive members of the same contract):**
 
 | Event | Description |
 |-------|-------------|
@@ -1470,6 +1472,7 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 | `utterance_end` | Utterance closed: full committed text (32 KiB cap + `text_truncated`), `delta_count`, close reason |
 | `listen.warning` | Structured non-fatal degradation (`confirm_lag`, `forced_trim`, `capture_overrun`, …) |
 | `listen.session_stats` | Heartbeat + terminal session stats (`ttft_ms`, step latencies, confirm-lag percentiles; `final:true` ends a success stream) |
+| `listen.controller` | Default-off adaptive cadence/holdback decision with state transition, Brier calibration, observation count, and deterministic-fallback status |
 
 **Stage Codes.** Each pipeline stage emits paired `*.start` / `*.ok` codes (or `*.error` on failure, `*.skip` when not needed, `*.cancelled` on token fire, `*.timeout` on budget overrun):
 
@@ -3744,7 +3747,7 @@ SQLite fits a single-machine CLI tool: zero configuration, no daemon, ACID trans
 Yes. Any video file ffmpeg can decode (MP4, MKV, AVI, MOV, WebM, …) is handled automatically. The ffmpeg fallback extracts the audio track using `-vn`.
 
 **Q: What's the "alien-artifact engineering contract"?**
-A design discipline for adaptive controllers. Every adaptive system in `franken_whisper` (the router, the bitrate controller, the budget tuner, the speculation window controller, the correction tracker) must declare an explicit state space, action space, loss matrix, calibration metric, deterministic fallback trigger, and evidence ledger. This prevents adaptive systems from making unbounded bad decisions when their models are wrong.
+A design discipline for adaptive controllers. Every adaptive system in `franken_whisper` (the router, the bitrate controller, the budget tuner, the speculation window controller, the correction tracker, and the default-off live cadence/holdback controllers) must declare an explicit state space, action space, loss matrix, calibration metric, deterministic fallback trigger, and evidence ledger. This prevents adaptive systems from making unbounded bad decisions when their models are wrong.
 
 **Q: Will my HuggingFace token end up in log files?**
 No. Every command line is rendered through `render_command_for_log()` which redacts `--hf-token` values. The redaction applies to tracing output, error messages, and snapshot tests alike.

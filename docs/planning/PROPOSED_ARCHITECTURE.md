@@ -436,7 +436,7 @@ audit/recovery representation; SQLite is authoritative.
 
 ### Schema Version Tracking
 
-Robot mode output is versioned via `ROBOT_SCHEMA_VERSION` (currently `"1.0.0"`). Every emitted NDJSON line includes a `schema_version` field so consumers can detect contract changes.
+Robot mode output is versioned via `ROBOT_SCHEMA_VERSION` (currently `"1.1.0"`, the additive live-listen family bump from `1.0.0`). Every emitted NDJSON line includes a `schema_version` field so consumers can detect contract changes.
 
 ### Event Types
 
@@ -454,6 +454,13 @@ Robot mode output is versioned via `ROBOT_SCHEMA_VERSION` (currently `"1.0.0"`).
 | `transcript.correct` | `event`, `schema_version`, `run_id`, `correction_id`, `replaces_seq`, `window_id`, `segments`, `drift`, `latency_ms`, `ts` |
 | `transcript.speculation_stats` | `event`, `schema_version`, `run_id`, `windows_processed`, `corrections_emitted`, `confirmations_emitted`, `correction_rate`, `mean_fast_latency_ms`, `mean_quality_latency_ms`, `current_window_size_ms`, `mean_drift_wer`, `ts` |
 | `health.report`| `event`, `schema_version`, `ts`, `backends`, `ffmpeg`, `database`, `resources`, `overall_status`            |
+| `listen.session_start` | `event`, `schema_version`, `run_id`, `seq`, `ts`, `source`, `capture_backend`, `device`, `sample_rate_hz`, `fast_model`, `quality_model`, `policy`, `step_ms`, `partials`, `vad` |
+| `speech_started` | `event`, `schema_version`, `run_id`, `seq`, `ts`, `utterance_id`, `t_session_sec` |
+| `transcript.delta` | `event`, `schema_version`, `run_id`, `seq`, `ts`, `utterance_id`, `text`, `t0_sec`, `t1_sec`, `tokens`, `confidence`, `stability` |
+| `utterance_end` | `event`, `schema_version`, `run_id`, `seq`, `ts`, `utterance_id`, `reason`, `t0_sec`, `t1_sec`, `text`, `text_truncated`, `delta_count` |
+| `listen.warning` | `event`, `schema_version`, `run_id`, `seq`, `ts`, `reason`, `detail` |
+| `listen.session_stats` | `event`, `schema_version`, `run_id`, `seq`, `ts`, `final`, bounded session counters and latency summaries |
+| `listen.controller` | shared listen envelope plus `controller`, `from`, `to`, `reason`, `brier`, `observations`, `fallback_active` (only with default-off `--adaptive`) |
 
 ### Streaming Delivery
 
@@ -499,16 +506,18 @@ Goal:
 - `LiveTranscriptionView` TUI component for real-time segment display,
 - health report infrastructure (`HealthReport`, dependency checks, resource snapshots),
 - stage latency profiling with tuning recommendations,
-- graceful Ctrl+C shutdown controller.
+- graceful Ctrl+C shutdown controller,
+- the native `fw robot listen` rolling-buffer live driver with microphone,
+  stdin-PCM, and paced file-replay capture, and
+- default-off, Brier-gated live cadence/holdback controllers with deterministic
+  fallback and `listen.controller` evidence.
 
 **Remaining future packets**:
 - deeper native compute kernels beyond current acceleration pass (Vad, Separate,
   Align, and Punctuate still have placeholder or transitional portions),
 - corpus-calibrated acoustic confidence and optional ECAPA-style neural
   embeddings behind the same diarization contract,
-- online streaming transcript update protocol (live audio chunked inference),
 - native `StreamingEngine` implementations for `InsanelyFastEngine` and `WhisperDiarizationEngine`,
-- wiring `HealthReport` into a `robot health` CLI subcommand,
 - advanced frankentui dashboard modes: waveform visualization, speaker color-coding, search/filter (while preserving robot mode contract).
 
 ## 13. Operational Methodology Artifacts

@@ -22,7 +22,7 @@ Features originating from or inspired by the whisper.cpp (C/C++) project.
 | VAD (Voice Activity Detection) | legacy_whispercpp | `backend::whisper_cpp`, `model::VadParams` | Done | Full Silero VAD parameter passthrough: threshold, min speech/silence duration, max speech duration, speech padding, samples overlap, model path. Forwarded as CLI flags to whisper-cli. |
 | GPU acceleration | legacy_whispercpp | `accelerate`, `model::BackendParams` | Done | `--no-gpu` flag, GPU layer offload count. Acceleration module provides confidence normalization via optional frankentorch/frankenjax backends with deterministic CPU fallback. |
 | Streaming output (real-time stage events) | legacy_whispercpp | `orchestrator`, `robot` | Done | Real-time NDJSON stage streaming via `transcribe_with_stream()` using mpsc channels. Stage events emitted during pipeline execution. Note: this is pipeline-stage streaming, not audio-chunk streaming like whisper.cpp's `whisper-stream`. |
-| Streaming transcription (live audio chunked inference) | legacy_whispercpp | -- | Todo | whisper.cpp offers sliding-window real-time transcription of live audio. franken_whisper does not yet implement native chunked audio streaming inference. All backends declare `supports_streaming: false`. |
+| Streaming transcription (live audio chunked inference) | legacy_whispercpp | `listen`, `capture`, `robot` | Done | `fw robot listen` runs native rolling-buffer inference over microphone, stdin PCM, or paced file replay and emits append-only NDJSON transcript deltas while speech is still in progress. This dedicated live driver bypasses the batch backend-capability flag; batch engines may still report `supports_streaming: false`. |
 | Word-level timestamps | legacy_whispercpp | `backend::whisper_cpp` | Done | Parsed from whisper-cli JSON output into `TranscriptionSegment` with `start_sec`/`end_sec`. Split-on-word boundary mode (`-sow`) supported. |
 | Decoding parameters | legacy_whispercpp | `model::DecodingParams`, `backend::whisper_cpp` | Done | Full passthrough: best_of, beam_size, max_context, max_segment_length, temperature, temperature_increment, entropy_threshold, logprob_threshold, no_speech_threshold. |
 | Multiple output formats | legacy_whispercpp | `model::OutputFormat`, `backend::whisper_cpp` | Done | Supports txt, vtt, srt, csv, json, json-full, lrc. Artifact paths collected and returned in result. |
@@ -81,7 +81,7 @@ Features that span all legacy projects or are new to franken_whisper.
 | Feature | Legacy Source | Rust Module | Status | Notes |
 |---|---|---|---|---|
 | CLI interface | All three | `cli`, `main` | Done | clap-based CLI with subcommands: `transcribe`, `robot run/schema/backends/health/triage/routing-history/listen`, `youtube`, `runs`, `sync export-jsonl/import-jsonl`, `tty-audio encode/decode/retransmit-plan`, `tui`. |
-| Robot mode (NDJSON output) | None (novel) | `robot` | Done | Structured NDJSON line-oriented output with schema version 1.1.0. Coverage includes lifecycle events (`run_start`, `stage`, `run_complete`, `run_error`), discovery/diagnostics (`backends.discovery`, `health.report`), routing-history output (`routing_decision` via `robot routing-history`), speculative streaming events (`transcript.partial`, `transcript.confirm`, `transcript.retract`, `transcript.correct`, `transcript.speculation_stats`), and the additive live-session family (`listen.session_start`, `speech_started`, `transcript.delta`, `utterance_end`, `listen.warning`, `listen.session_stats`). Required fields are enforced per event type. |
+| Robot mode (NDJSON output) | None (novel) | `robot` | Done | Structured NDJSON line-oriented output with schema version 1.1.0. Coverage includes lifecycle events (`run_start`, `stage`, `run_complete`, `run_error`), discovery/diagnostics (`backends.discovery`, `health.report`), routing-history output (`routing_decision` via `robot routing-history`), speculative streaming events (`transcript.partial`, `transcript.confirm`, `transcript.retract`, `transcript.correct`, `transcript.speculation_stats`), and the additive live-session family (`listen.session_start`, `speech_started`, `transcript.delta`, `utterance_end`, `listen.warning`, `listen.session_stats`) plus default-off adaptive `listen.controller` decisions. Required fields are enforced for the core live family; controller decisions carry the shared envelope plus controller state, action, calibration, and fallback evidence. |
 | TUI mode | None (novel) | `tui` | Done | frankentui-based terminal UI with runs/timeline/events panes. Focus cycling, keyboard navigation, auto-refresh. Feature-gated behind `--features tui`. |
 | SQLite persistence | None (novel) | `storage` | Done | frankensqlite-backed `RunStore` with runs, segments, and events tables. Schema initialization, run persistence, query by ID, recent runs listing. |
 | JSONL export/import sync | None (novel) | `sync` | Done | One-way atomic sync with file locking (stale lock detection, archive). Manifest with schema version, row counts, SHA-256 checksums. Conflict policies: reject, skip, overwrite. Export format version 1.0. |
@@ -123,7 +123,7 @@ Features that span all legacy projects or are new to franken_whisper.
 
 | Legacy Project | Done | Partial | Todo | N/A | Total | Completion % |
 |---|---|---|---|---|---|---|
-| legacy_whispercpp | 14 | 0 | 1 | 1 | 16 | 88% |
+| legacy_whispercpp | 15 | 0 | 0 | 1 | 16 | 94% |
 | legacy_insanely_fast_whisper | 9 | 0 | 0 | 0 | 9 | 100% |
 | legacy_whisper_diarization | 4 | 4 | 0 | 1 | 9 | 44% (89% via bridge) |
 
@@ -141,15 +141,13 @@ Features that span all legacy projects or are new to franken_whisper.
 
 | Category | Done | Partial | Todo | N/A | Total Tracked |
 |---|---|---|---|---|---|
-| All features | 57 | 4 | 1 | 2 | 64 |
-| **Completion (Done + Partial)** | | | | | **95%** |
-| **Completion (Done only)** | | | | | **89%** |
+| All features | 58 | 4 | 0 | 2 | 64 |
+| **Completion (Done + Partial)** | | | | | **97%** |
+| **Completion (Done only)** | | | | | **91%** |
 
 ### Key Gaps Remaining
 
-1. **Streaming transcription (live audio chunked inference)**: whisper.cpp's real-time sliding-window transcription is not yet replicated natively. The `StreamingEngine` trait is implemented and `WhisperCppEngine` has a streaming adapter, but native chunked audio streaming inference (sliding-window on live audio) is not yet available. The `LiveTranscriptionView` TUI component is ready to consume streaming segments.
-
-2. **Remaining native diarization stages**: The classical Rust acoustic
+1. **Remaining native diarization stages**: The classical Rust acoustic
    diarizer and explicit safe-Rust ECAPA execution through the common diarizer
    are operational. Neural accuracy/calibration and automatic rollout remain
    uncertified. Source separation, forced alignment, and punctuation
