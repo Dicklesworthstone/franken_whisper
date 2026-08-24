@@ -91,6 +91,7 @@ pub const YOUTUBE_DOWNLOADED_REQUIRED_FIELDS: &[&str] = &[
     "id",
     "audio_path",
     "bytes",
+    "reused",
 ];
 pub const YOUTUBE_TRANSCRIBING_REQUIRED_FIELDS: &[&str] =
     &["event", "schema_version", "run_id", "seq", "ts", "id"];
@@ -2641,6 +2642,7 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "id": "jNQXAC9IVRw",
                     "audio_path": "youtube_transcripts/audio/jNQXAC9IVRw.webm",
                     "bytes": 123456,
+                    "reused": false,
                 }),
             },
             "youtube.transcribing": {

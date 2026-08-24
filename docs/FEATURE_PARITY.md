@@ -80,7 +80,7 @@ Features that span all legacy projects or are new to franken_whisper.
 
 | Feature | Legacy Source | Rust Module | Status | Notes |
 |---|---|---|---|---|
-| CLI interface | All three | `cli`, `main` | Done | clap-based CLI with subcommands: `transcribe`, `robot run/schema/backends/health/triage/routing-history/listen`, `youtube`, `runs`, `sync export-jsonl/import-jsonl`, `tty-audio encode/decode/retransmit-plan`, `tui`. |
+| CLI interface | All three | `cli`, `main` | Done | clap-based CLI with subcommands: `transcribe`, `robot run/schema/backends/health/triage/routing-history/listen`, `youtube run/search/enrich`, `runs`, `sync export-jsonl/import-jsonl`, `tty-audio encode/decode/retransmit-plan`, `tui`. |
 | Robot mode (NDJSON output) | None (novel) | `robot` | Done | Structured NDJSON line-oriented output with schema version 1.1.0. Coverage includes lifecycle events (`run_start`, `stage`, `run_complete`, `run_error`), discovery/diagnostics (`backends.discovery`, `health.report`), routing-history output (`routing_decision` via `robot routing-history`), speculative streaming events, the additive live-session family plus default-off `listen.controller` decisions, and the `youtube.*` ingestion lifecycle. `robot schema` registers required fields and examples for these emitted families. |
 | TUI mode | None (novel) | `tui` | Done | frankentui-based terminal UI with runs/timeline/events panes. Focus cycling, keyboard navigation, auto-refresh. Feature-gated behind `--features tui`. |
 | SQLite persistence | None (novel) | `storage` | Done | frankensqlite-backed `RunStore` with runs, segments, and events tables. Schema initialization, run persistence, query by ID, recent runs listing. |

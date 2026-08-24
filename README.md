@@ -902,7 +902,7 @@ The **markdown** leads with the title, a metadata line, a source link, and an ho
 _Transcribed by franken_whisper 0.2.0 (native, tiny.en, auto) in 0.48s — RTF 0.025_
 ```
 
-The **JSON** sidecar carries the structured form — `video` metadata, `run` metadata, and a flat `utterances` array (one record per segment with `start_sec` / `end_sec` / `text` / `confidence`, plus `speaker` when diarized):
+The **JSON** sidecar carries the structured form — `video` metadata, `run` metadata, native `windows` decode evidence, and a flat `utterances` array (one record per segment with `start_sec` / `end_sec` / `text` / `confidence`, plus `speaker` when diarized). External subprocess backends emit an empty `windows` array; an in-process `native-v2` result must provide the complete typed window contract or rendering fails closed:
 
 ```json
 {
@@ -912,6 +912,10 @@ The **JSON** sidecar carries the structured form — `video` metadata, `run` met
   "run":   { "model": "tiny.en", "engine": "native", "backend": "auto",
              "version_tag": "0.2.0", "started": "2026-06-07T00:00:00Z",
              "wall_ms": 480, "rtf": 0.025 },
+  "windows": [
+    { "window_offset_sec": 0.0, "tokens": 23,
+      "avg_logprob": -0.31, "no_speech_prob": 0.02 }
+  ],
   "utterances": [
     { "i": 0, "start_sec": 0.0, "end_sec": 4.2,
       "text": "All right, so here we are in front of the elephants…",
@@ -943,7 +947,7 @@ The **JSON** sidecar carries the structured form — `video` metadata, `run` met
 
 ### Idempotent & Resumable
 
-The `.fw_youtube_manifest.json` makes terminal work idempotent: a re-run **skips videos already `done`** and **retries previously failed videos** (unless `--no-retry`). Incomplete intermediate work is re-entered conservatively; until `bd-27v1` closes its remaining resume proof, a download interrupted before a terminal manifest transition may be repeated. **Ctrl+C cancels cleanly** — yt-dlp is killed, in-flight transcription aborts, and the manifest stays honest about what completed. By default a partial failure is reported and the run continues; `--abort-on-error` stops on the first failure instead.
+The `.fw_youtube_manifest.json` makes terminal work idempotent: a re-run **skips videos already `done`** and **retries previously failed videos** (unless `--no-retry`). Incomplete intermediate work is recovered from either an explicit `downloaded` manifest state or a completed `audio/<id>.<ext>` artifact left between download and the terminal transition; partial files, symlinks, wrong ids, and paths outside the owned audio directory are rejected. **Ctrl+C cancels cleanly** — yt-dlp is killed, in-flight transcription aborts, and the manifest stays honest about what completed. By default a partial failure is recorded, emitted as `youtube.failed`, and the run continues; `--abort-on-error` stops on the first failure. Every robot run that gets past `youtube.run_start` funnels through exactly one terminal `youtube.run_complete` emission attempt.
 
 ### Requires `yt-dlp`
 

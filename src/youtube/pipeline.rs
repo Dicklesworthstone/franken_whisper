@@ -466,7 +466,7 @@ pub(crate) fn run_with_info(
     )?;
 
     let outcome = run_with_info_body(opts, info, &token, &events);
-    finalize_run(&events, outcome)
+    finalize_run(events.as_ref(), outcome)
 }
 
 fn run_with_info_body(
@@ -475,7 +475,6 @@ fn run_with_info_body(
     token: &CancellationToken,
     events: &std::sync::Arc<YoutubeEventEmitter>,
 ) -> FwResult<YoutubeRunSummary> {
-
     std::fs::create_dir_all(&opts.output_dir).map_err(FwError::Io)?;
     let audio_dir = opts.output_dir.join("audio");
     std::fs::create_dir_all(&audio_dir).map_err(FwError::Io)?;
@@ -558,7 +557,7 @@ fn run_with_info_body(
                 let work = std::sync::Arc::clone(&work);
                 let audio_dir = std::sync::Arc::clone(&audio_dir_arc);
                 let info = std::sync::Arc::clone(&info_arc);
-                let events = std::sync::Arc::clone(&events);
+                let events = std::sync::Arc::clone(events);
                 scope.spawn(move || {
                     let dl_token = CancellationToken::unbounded();
                     loop {
@@ -633,7 +632,7 @@ fn run_with_info_body(
                             &video,
                             &video.title,
                             &error,
-                            &events,
+                            events.as_ref(),
                             &mut summary,
                         )?;
                         if opts.abort_on_error {
@@ -721,7 +720,7 @@ fn run_with_info_body(
                             &video,
                             &meta.title,
                             &error,
-                            &events,
+                            events.as_ref(),
                             &mut summary,
                         )?;
                         if opts.abort_on_error {
@@ -754,7 +753,7 @@ fn finalize_run(
         }
         Err(error) => {
             let summary = YoutubeRunSummary {
-                cancelled: matches!(error, FwError::Cancelled(_)),
+                cancelled: matches!(&error, FwError::Cancelled(_)),
                 ..YoutubeRunSummary::default()
             };
             if let Err(emit_error) = emit_run_complete(events, &summary) {
@@ -1399,7 +1398,7 @@ mod tests {
         std::fs::create_dir_all(&audio_dir).expect("audio dir");
         let video = vr("reuse000001");
         let audio_path = audio_dir.join("reuse000001.wav");
-        let sentinel = b"existing audio must remain byte exact";
+        let sentinel: &[u8] = b"existing audio must remain byte exact";
         std::fs::write(&audio_path, sentinel).expect("seed audio");
         let work = DownloadWork::Reuse {
             video,
@@ -1416,7 +1415,9 @@ mod tests {
         assert_eq!(returned_path, audio_path);
         assert_eq!(meta.id, "reuse000001");
         assert_eq!(
-            std::fs::read(&returned_path).expect("read reused audio"),
+            std::fs::read(&returned_path)
+                .expect("read reused audio")
+                .as_slice(),
             sentinel,
             "the download path must not run for reusable audio"
         );

@@ -467,7 +467,7 @@ Robot mode output is versioned via `ROBOT_SCHEMA_VERSION` (currently `"1.1.0"`, 
 | `youtube.run_start` | shared YouTube envelope plus resolved request/output settings |
 | `youtube.discovered` | shared YouTube envelope plus `id`, `title`, `url` |
 | `youtube.downloading` / `youtube.transcribing` | shared YouTube envelope plus `id` |
-| `youtube.downloaded` | shared YouTube envelope plus `id`, `audio_path`, `bytes` |
+| `youtube.downloaded` | shared YouTube envelope plus `id`, `audio_path`, `bytes`, `reused` |
 | `youtube.done` | shared YouTube envelope plus `id`, output paths, `wall_ms`, `rtf` |
 | `youtube.skipped` | shared YouTube envelope plus `id`, `reason` |
 | `youtube.failed` | shared YouTube envelope plus `id`, `title`, `error`, `attempts` |
