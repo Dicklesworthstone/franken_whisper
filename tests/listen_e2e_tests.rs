@@ -236,3 +236,33 @@ fn confirm_lane_e2e_quality_model_none_emits_zero_verdicts() {
         Some(0)
     );
 }
+
+/// LocalAgreement-2 fallback policy (bd-rt-local-agreement-l5x8): the
+/// stream must be contract-valid and append-only, and session_start must
+/// announce the policy so agents can tell lanes apart. Event SHAPES are
+/// identical to AlignAtt — that is the contract.
+#[test]
+fn local_agreement_e2e_stream_is_contract_valid_and_labeled() {
+    if !require_fast_model() {
+        return;
+    }
+    let (events, code, stderr) = run_listen(&[
+        "--fast-model",
+        "tiny.en",
+        "--language",
+        "en",
+        "--quality-model",
+        "none",
+        "--policy",
+        "local-agreement",
+    ]);
+    assert_eq!(code, 0, "listen session must exit 0; stderr:\n{stderr}");
+    NdjsonStreamValidator::new(StreamOutcome::Success)
+        .validate(&events)
+        .expect("local-agreement stream must satisfy the listen contract");
+    let start = events
+        .iter()
+        .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("listen.session_start"))
+        .expect("session_start present");
+    assert_eq!(start.get("policy").and_then(|v| v.as_str()), Some("local-agreement"));
+}
