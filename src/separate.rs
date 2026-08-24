@@ -178,8 +178,16 @@ impl DtlnSeparator {
         } else {
             0
         };
-        let mut stage1_out = vec![0.0f32; frames_total * BLOCK_LEN + BLOCK_LEN];
-        let mut output = vec![0.0f32; frames_total * BLOCK_LEN];
+        // Overlap-add spans exactly (frames-1)*shift + block_len samples;
+        // tail samples that never fill a frame are dropped, matching
+        // tf.signal.frame's convention on the stage-2 input side.
+        let output_len = if frames_total > 0 {
+            (frames_total - 1) * BLOCK_SHIFT + BLOCK_LEN
+        } else {
+            0
+        };
+        let mut stage1_out = vec![0.0f32; output_len];
+        let mut output = vec![0.0f32; output_len];
         let mut mag = vec![0.0f32; BINS];
         let mut phase = vec![0.0f32; BINS];
         for frame_index in 0..frames_total {
@@ -306,21 +314,23 @@ pub(crate) fn irfft_mag_phase(mag: &[f32], phase: &[f32], out: &mut [f32]) {
         re[k] = mag[k] * c;
         im[k] = mag[k] * s;
     }
+    // Conjugate-symmetric rebuild: X[N-k] = conj(X[k]); the Nyquist bin is
+    // real by construction.
     for k in 1..BINS - 1 {
         re[BLOCK_LEN - k] = re[k];
         im[BLOCK_LEN - k] = -im[k];
     }
+    // IDFT via forward FFT on the conjugated spectrum: for a conjugate-
+    // symmetric spectrum X, x[n] = Re{FFT(conj(X))[n]}/N exactly.
+    for v in im.iter_mut() {
+        *v = -*v;
+    }
     fft_in_place(&mut re, &mut im);
     let n_inv = 1.0f32 / BLOCK_LEN as f32;
-    for (dst, (&r, &i)) in out.iter_mut().zip(re.iter().zip(&im)) {
-        *dst = r * n_inv; // symmetric component: imag ~ 0
+    for (dst, &r) in out.iter_mut().zip(&re) {
+        *dst = r * n_inv;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Minimal safetensors reader: F32 little-endian only, no trust in metadata.
-// ---------------------------------------------------------------------------
-
 struct SafeTensor {
     shape: Vec<usize>,
     data: Vec<f32>,
@@ -523,9 +533,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dtln_bad_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmpdir");
         let path = dir.join("bad_shape.safetensors");
-        std::fs::write(&path, &good).expect("write");
-        // Corrupt one shape inside the header JSON.
+        // Corrupt one tensor's shape inside the header JSON (first match =
+        // s1.lstm0.kernel's "[257,512]"), then persist BEFORE loading.
         let mutated = String::from_utf8_lossy(&good).replacen("[257,", "[256,", 1);
+        std::fs::write(&path, mutated.as_bytes()).expect("write mutated");
         assert!(
             DtlnSeparator::from_safetensors(&path).is_err(),
             "shape contract must fail closed"

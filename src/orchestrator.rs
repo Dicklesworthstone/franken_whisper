@@ -13458,7 +13458,7 @@ mod tests {
     }
 
     #[test]
-    fn source_separate_returns_vocal_isolated_on_invalid_wav() {
+    fn source_separate_passthrough_without_claim_on_invalid_wav() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.wav");
         std::fs::write(&path, b"fake audio").unwrap();
@@ -13466,12 +13466,17 @@ mod tests {
         let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
         let report = source_separate(&path, &token).unwrap();
 
-        // Invalid WAV → fallback path: assumes vocal content present.
-        assert!(report.vocal_isolated);
+        // Invalid WAV → passthrough with NO isolation claim (bd-f2se removed
+        // the vocal_isolated=true lie on this path).
+        assert!(!report.vocal_isolated);
+        assert_eq!(
+            report.mode,
+            super::SeparationMode::UnavailablePassthrough
+        );
         assert!(!report.notes.is_empty());
         assert!(
-            report.notes[0].contains("analysis unavailable"),
-            "expected fallback note, got: {}",
+            report.notes[0].contains("passthrough without isolation claim"),
+            "expected honest passthrough note, got: {}",
             report.notes[0]
         );
     }
