@@ -7,13 +7,28 @@
 //! still needs a real model, so these tests are GATED on `tiny.en` being
 //! resolvable and force the native engine (`FRANKEN_WHISPER_NATIVE_EXECUTION=1`,
 //! rollout `sole`, all bridge bins missing) — exactly like the other gated
-//! e2e tests. When the model is absent they print a `SKIP` line and pass.
+//! e2e tests. When the model is absent they print a `SKIP` line and pass unless
+//! `FW_REQUIRE_YOUTUBE_E2E=1` selects the strict closure lane, where absence is
+//! a hard failure rather than vacuous credit.
 
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 
 fn model_present() -> bool {
     franken_whisper::native_engine::find_model_file("tiny.en").is_some()
+}
+
+fn model_present_or_skip() -> bool {
+    if model_present() {
+        return true;
+    }
+    assert_ne!(
+        std::env::var("FW_REQUIRE_YOUTUBE_E2E").as_deref(),
+        Ok("1"),
+        "FW_REQUIRE_YOUTUBE_E2E=1 but ggml-tiny.en.bin is not resolvable; run scripts/fetch_test_models.sh"
+    );
+    eprintln!("SKIP: ggml-tiny.en.bin not resolvable (see scripts/fetch_test_models.sh)");
+    false
 }
 
 fn stub_path() -> std::path::PathBuf {
@@ -52,8 +67,7 @@ fn run_youtube(args: &[&str], state_root: &Path) -> CliRun {
 
 #[test]
 fn gated_youtube_batch_file_produces_md_and_json_then_resumes() {
-    if !model_present() {
-        eprintln!("SKIP: ggml-tiny.en.bin not resolvable (see scripts/fetch_test_models.sh)");
+    if !model_present_or_skip() {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
@@ -127,12 +141,24 @@ fn gated_youtube_batch_file_produces_md_and_json_then_resumes() {
             md.path()
         );
     }
-    // The JSON carries per-utterance records.
+    // The JSON carries per-utterance records and the exact native-v2 decoder
+    // window evidence; JFK speech must not produce a vacuous empty array.
     for j in &jsons {
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(j.path()).expect("read json")).expect("parse");
         assert!(v["video"]["id"].is_string());
         assert!(v["utterances"].is_array());
+        let windows = v["windows"].as_array().expect("native windows array");
+        assert!(!windows.is_empty(), "speech sidecar must carry native windows");
+        for window in windows {
+            assert!(window["window_offset_sec"].as_f64().is_some());
+            assert!(window["tokens"].as_u64().is_some());
+            assert!(window["avg_logprob"].as_f64().is_some());
+            let no_speech = window["no_speech_prob"]
+                .as_f64()
+                .expect("numeric no_speech_prob");
+            assert!((0.0..=1.0).contains(&no_speech));
+        }
     }
 
     // The summary reports 2 done, 0 failed.
@@ -171,11 +197,7 @@ fn gated_youtube_batch_file_produces_md_and_json_then_resumes() {
 }
 
 #[test]
-fn gated_youtube_private_video_fails_gracefully_and_records_manifest() {
-    if !model_present() {
-        eprintln!("SKIP: ggml-tiny.en.bin not resolvable");
-        return;
-    }
+fn youtube_private_video_fails_gracefully_without_model() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("out");
 
@@ -202,4 +224,69 @@ fn gated_youtube_private_video_fails_gracefully_and_records_manifest() {
         !output.status.success(),
         "private-video run should exit non-zero"
     );
+}
+
+#[test]
+fn youtube_robot_transcription_failure_emits_and_persists_terminal_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out");
+    let missing_model = dir.path().join("definitely-missing-model.bin");
+    let run = run_youtube(
+        &[
+            "https://www.youtube.com/watch?v=MISSING0001",
+            "--output-dir",
+            out.to_str().expect("output path"),
+            "--model",
+            missing_model.to_str().expect("model path"),
+            "--no-diarize",
+            "--robot",
+        ],
+        dir.path(),
+    );
+    assert!(!run.status.success(), "missing model must fail the run");
+
+    let events: Vec<serde_json::Value> = run
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("robot NDJSON line"))
+        .collect();
+    let failed: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "youtube.failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "exactly one per-video failure event");
+    assert_eq!(failed[0]["id"], "MISSING0001");
+    assert_eq!(failed[0]["title"], "Stub Title MISSING0001");
+    assert_eq!(failed[0]["attempts"], 1);
+    assert!(
+        failed[0]["error"]
+            .as_str()
+            .expect("failure message")
+            .contains("model")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "youtube.done")
+            .count(),
+        0
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "youtube.run_complete")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events.last().expect("terminal event")["event"],
+        "youtube.run_complete"
+    );
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(out.join(".fw_youtube_manifest.json")).expect("manifest"),
+    )
+    .expect("parse manifest");
+    assert_eq!(manifest["entries"]["MISSING0001"]["state"]["state"], "failed");
+    assert_eq!(manifest["entries"]["MISSING0001"]["state"]["attempts"], 1);
 }

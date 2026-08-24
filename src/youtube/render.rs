@@ -102,6 +102,23 @@ pub struct RenderRun {
     pub rtf: Option<f64>,
 }
 
+/// Decode-window evidence projected from an in-process native backend.
+///
+/// These fields intentionally mirror the stable `native-v2` raw-output
+/// contract emitted by every native backend. Keeping them typed prevents the
+/// YouTube JSON artifact from silently dropping or reshaping decoder evidence.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RenderWindowStats {
+    /// Start offset of the decode window in seconds.
+    pub window_offset_sec: f64,
+    /// Number of decoded tokens in the window.
+    pub tokens: u64,
+    /// Mean token log probability for the window.
+    pub avg_logprob: f64,
+    /// Model probability that the window contains no speech.
+    pub no_speech_prob: f64,
+}
+
 /// The complete, self-contained input to the renderers.
 ///
 /// This is the integration contract with `youtube/pipeline.rs`: the pipeline
@@ -118,6 +135,8 @@ pub struct RenderInput<'a> {
     /// segments; the Markdown groups them into paragraphs, but the JSON
     /// `utterances` array is one entry per segment (count is preserved).
     pub segments: &'a [TranscriptionSegment],
+    /// Native decode-window evidence. External backends supply an empty slice.
+    pub windows: &'a [RenderWindowStats],
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +625,8 @@ fn description_intro(description: Option<&str>) -> Option<String> {
 ///              "duration"?, "webpage_url", "description"? },
 ///   "run":   { "model", "engine", "backend", "version_tag"?, "started",
 ///              "wall_ms", "rtf"? },
+///   "windows": [ { "window_offset_sec", "tokens", "avg_logprob",
+///                  "no_speech_prob" }, ... ],
 ///   "utterances": [ { "i", "start_sec", "end_sec", "text",
 ///                     "confidence", "speaker"? }, ... ]
 /// }
@@ -666,6 +687,7 @@ pub fn render_json(input: &RenderInput<'_>) -> Value {
     json!({
         "video": Value::Object(video),
         "run": Value::Object(run),
+        "windows": input.windows,
         "utterances": utterances,
     })
 }
@@ -1879,6 +1901,7 @@ mod tests {
             video: sample_video(),
             run: sample_run(),
             segments: &segs,
+            windows: &[],
         };
         let md = render_markdown(&input);
         // Sanity: exactly three body paragraphs (lead-in markers).
@@ -1898,6 +1921,7 @@ mod tests {
             video: sample_video(),
             run: sample_run(),
             segments: &segs,
+            windows: &[],
         };
         let md = render_markdown(&input);
         assert!(md.contains("SPEAKER_00:"));
@@ -1916,6 +1940,7 @@ mod tests {
             video: sample_video(),
             run: sample_run(),
             segments: &segs,
+            windows: &[],
         };
         let md = render_markdown(&input);
         assert!(md.contains("**[1:01:01]"));
@@ -1930,6 +1955,7 @@ mod tests {
             video: sample_video(),
             run: sample_run(),
             segments: &segs,
+            windows: &[],
         };
         let md = render_markdown(&input);
         assert!(md.contains("No speech detected"));
@@ -1954,6 +1980,7 @@ mod tests {
             video: sample_video(),
             run: sample_run(),
             segments: &segs,
+            windows: &[],
         };
         let md = render_markdown(&input);
         // No gaps and one speaker, so any split is purely the word cap.
@@ -1980,6 +2007,7 @@ mod tests {
             video,
             run: sample_run(),
             segments: &segs,
+            windows: &[],
         };
         let md = render_markdown(&input);
         assert!(md.contains('…'), "long description should be ellipsized");
@@ -2106,6 +2134,7 @@ mod tests {
             video: sample_video(),
             run: sample_run(),
             segments: &segs,
+            windows: &[],
         };
         let val = render_json(&input);
         let pretty = serde_json::to_string_pretty(&val).unwrap();
@@ -2128,6 +2157,7 @@ mod tests {
             video,
             run,
             segments: &segs,
+            windows: &[],
         };
         let val = render_json(&input);
         let v = val.get("video").unwrap().as_object().unwrap();
@@ -2159,6 +2189,7 @@ mod tests {
             video: sample_video(),
             run: sample_run(),
             segments: &segs,
+            windows: &[],
         };
         let val = render_json(&input);
         let utts = val.get("utterances").unwrap().as_array().unwrap();
@@ -2171,6 +2202,34 @@ mod tests {
         for (i, u) in utts.iter().enumerate() {
             assert_eq!(u.get("i").unwrap().as_u64().unwrap() as usize, i);
         }
+    }
+
+    #[test]
+    fn json_preserves_native_window_stats() {
+        let segs = vec![seg(0.0, 1.0, "hello")];
+        let windows = vec![RenderWindowStats {
+            window_offset_sec: 30.0,
+            tokens: 17,
+            avg_logprob: -0.42,
+            no_speech_prob: 0.125,
+        }];
+        let input = RenderInput {
+            video: sample_video(),
+            run: sample_run(),
+            segments: &segs,
+            windows: &windows,
+        };
+
+        let val = render_json(&input);
+        assert_eq!(
+            val["windows"],
+            serde_json::json!([{
+                "window_offset_sec": 30.0,
+                "tokens": 17,
+                "avg_logprob": -0.42,
+                "no_speech_prob": 0.125,
+            }])
+        );
     }
 
     #[test]
@@ -2195,6 +2254,7 @@ mod tests {
             video: sample_video(),
             run: sample_run(),
             segments: &segs,
+            windows: &[],
         };
         let val = render_json(&input);
         let utts = val.get("utterances").unwrap().as_array().unwrap();
@@ -2231,6 +2291,7 @@ mod tests {
             video: sample_video(),
             run: sample_run(),
             segments: &segs,
+            windows: &[],
         };
         let val = render_json(&input);
         let utts = val.get("utterances").unwrap().as_array().unwrap();

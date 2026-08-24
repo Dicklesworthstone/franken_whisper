@@ -1138,15 +1138,27 @@ pub fn download_audio(
 
 /// Scan `dest_dir` for a file whose stem equals `id` (the template names
 /// downloads `<id>.<ext>`).
-fn find_downloaded_by_id(dest_dir: &Path, id: &str) -> Option<PathBuf> {
+pub(crate) fn find_downloaded_by_id(dest_dir: &Path, id: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dest_dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() && path.file_stem().and_then(|s| s.to_str()) == Some(id) {
+        if is_reusable_download_path(&path, dest_dir, id) {
             return Some(path);
         }
     }
     None
+}
+
+/// Whether `path` is a completed, regular download owned by `dest_dir` for
+/// this exact video id. Partial yt-dlp artifacts and symlinks are never resume
+/// inputs.
+pub(crate) fn is_reusable_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
+    let extension = path.extension().and_then(|value| value.to_str());
+    path.parent() == Some(dest_dir)
+        && path.file_stem().and_then(|value| value.to_str()) == Some(id)
+        && extension.is_some_and(|value| !matches!(value, "part" | "tmp" | "ytdl"))
+        && std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
 // ---------------------------------------------------------------------------
@@ -2167,6 +2179,20 @@ mod tests {
             "/tests/fixtures/native/jfk_cut8.bin"
         ));
         assert_eq!(downloaded.as_slice(), tracked_fixture);
+    }
+
+    #[test]
+    fn downloaded_scan_rejects_partial_and_sidecar_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for extension in ["part", "tmp", "ytdl"] {
+            std::fs::write(dir.path().join(format!("video123.{extension}")), b"partial")
+                .expect("partial artifact");
+        }
+        assert_eq!(find_downloaded_by_id(dir.path(), "video123"), None);
+
+        let completed = dir.path().join("video123.webm");
+        std::fs::write(&completed, b"complete").expect("completed artifact");
+        assert_eq!(find_downloaded_by_id(dir.path(), "video123"), Some(completed));
     }
 
     // ---- error mapping ---------------------------------------------------

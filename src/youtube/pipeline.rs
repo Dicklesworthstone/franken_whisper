@@ -42,7 +42,7 @@ use crate::model::{
 use crate::orchestrator::{CancellationToken, FrankenWhisperEngine};
 
 use super::naming::{self, OutputPaths};
-use super::render::{self, RenderInput, RenderRun, RenderVideo};
+use super::render::{self, RenderInput, RenderRun, RenderVideo, RenderWindowStats};
 use super::ytdlp::{self, UrlKind, VideoMeta, VideoRef, YtdlpInfo};
 
 /// Manifest file name written into the output directory.
@@ -373,6 +373,52 @@ struct DownloadResult {
     outcome: Result<(PathBuf, VideoMeta), String>,
 }
 
+/// Download-stage work selected from manifest state plus on-disk evidence.
+/// A reusable audio artifact still needs one metadata fetch for rendering, but
+/// it must not invoke yt-dlp's download path again.
+#[derive(Debug, Clone)]
+enum DownloadWork {
+    Fetch(VideoRef),
+    Reuse {
+        video: VideoRef,
+        audio_path: PathBuf,
+    },
+}
+
+impl DownloadWork {
+    fn video(&self) -> &VideoRef {
+        match self {
+            Self::Fetch(video) | Self::Reuse { video, .. } => video,
+        }
+    }
+
+    fn reuses_audio(&self) -> bool {
+        matches!(self, Self::Reuse { .. })
+    }
+}
+
+fn select_download_work(
+    video: &VideoRef,
+    state: Option<&VideoState>,
+    audio_dir: &Path,
+) -> DownloadWork {
+    let recorded = match state {
+        Some(VideoState::Downloaded { audio_path }) => Some(PathBuf::from(audio_path)),
+        _ => None,
+    };
+    let reusable = recorded
+        .filter(|path| ytdlp::is_reusable_download_path(path, audio_dir, &video.id))
+        .or_else(|| ytdlp::find_downloaded_by_id(audio_dir, &video.id));
+
+    match reusable {
+        Some(audio_path) => DownloadWork::Reuse {
+            video: video.clone(),
+            audio_path,
+        },
+        None => DownloadWork::Fetch(video.clone()),
+    }
+}
+
 /// Run the full ingestion pipeline.
 ///
 /// Probes `yt-dlp` once (the only environment-dependent step), then hands off
@@ -419,13 +465,24 @@ pub(crate) fn run_with_info(
         }),
     )?;
 
+    let outcome = run_with_info_body(opts, info, &token, &events);
+    finalize_run(&events, outcome)
+}
+
+fn run_with_info_body(
+    opts: &YoutubeRunOptions,
+    info: &YtdlpInfo,
+    token: &CancellationToken,
+    events: &std::sync::Arc<YoutubeEventEmitter>,
+) -> FwResult<YoutubeRunSummary> {
+
     std::fs::create_dir_all(&opts.output_dir).map_err(FwError::Io)?;
     let audio_dir = opts.output_dir.join("audio");
     std::fs::create_dir_all(&audio_dir).map_err(FwError::Io)?;
     let manifest_path = opts.output_dir.join(MANIFEST_NAME);
 
     let mut manifest = Manifest::load(&manifest_path)?;
-    let videos = resolve_videos(info, opts, &token)?;
+    let videos = resolve_videos(info, opts, token)?;
     for v in &videos {
         manifest.upsert_discovered(v);
     }
@@ -439,9 +496,10 @@ pub(crate) fn run_with_info(
 
     // Partition into work-to-do vs already-satisfied (idempotent resume).
     let mut summary = YoutubeRunSummary::default();
-    let mut to_process: Vec<VideoRef> = Vec::new();
+    let mut to_process: Vec<DownloadWork> = Vec::new();
     for v in &videos {
-        match manifest.entries.get(&v.id).and_then(|e| e.state.as_ref()) {
+        let state = manifest.entries.get(&v.id).and_then(|e| e.state.as_ref());
+        match state {
             Some(VideoState::Done { .. }) => {
                 tracing::info!(id = %v.id, "already done; skipping");
                 summary.skipped.push(v.id.clone());
@@ -469,12 +527,11 @@ pub(crate) fn run_with_info(
                     serde_json::json!({ "id": v.id, "reason": "retry_budget_exhausted" }),
                 )?;
             }
-            _ => to_process.push(v.clone()),
+            _ => to_process.push(select_download_work(v, state, &audio_dir)),
         }
     }
 
     if to_process.is_empty() {
-        emit_run_complete(&events, &summary)?;
         return Ok(summary);
     }
 
@@ -512,13 +569,23 @@ pub(crate) fn run_with_info(
                             let mut guard = work.lock().unwrap_or_else(|e| e.into_inner());
                             guard.next()
                         };
-                        let Some(video) = next else { break };
+                        let Some(work_item) = next else { break };
+                        let video = work_item.video().clone();
                         // Worker-side emission cannot propagate errors (this
                         // closure returns ()); a broken stdout pipe surfaces on
                         // the consumer side instead. Capture-mode serialization
                         // of plain values cannot fail in practice.
-                        let _ = events.emit("downloading", serde_json::json!({ "id": video.id }));
-                        let outcome = download_one(&info, &video, &audio_dir, &dl_token);
+                        if !work_item.reuses_audio() {
+                            let _ = events
+                                .emit("downloading", serde_json::json!({ "id": video.id }));
+                        }
+                        let reused = work_item.reuses_audio();
+                        let outcome = execute_download_work(
+                            &info,
+                            &work_item,
+                            &audio_dir,
+                            &dl_token,
+                        );
                         if let Ok((audio_path, _meta)) = &outcome {
                             let bytes = std::fs::metadata(audio_path).ok().map(|m| m.len());
                             let _ = events.emit(
@@ -527,6 +594,7 @@ pub(crate) fn run_with_info(
                                     "id": video.id,
                                     "audio_path": audio_path.display().to_string(),
                                     "bytes": bytes,
+                                    "reused": reused,
                                 }),
                             );
                         }
@@ -559,22 +627,15 @@ pub(crate) fn run_with_info(
                 let (audio_path, meta) = match outcome {
                     Ok(pair) => pair,
                     Err(error) => {
-                        record_failure(&mut manifest, &manifest_path, &video, &error)?;
-                        let failure = FailedVideo {
-                            id: video.id.clone(),
-                            title: video.title.clone(),
-                            error: error.clone(),
-                        };
-                        events.emit(
-                            "failed",
-                            serde_json::json!({
-                                "id": &failure.id,
-                                "title": &failure.title,
-                                "error": &failure.error,
-                                "attempts": manifest.attempts(&failure.id),
-                            }),
+                        record_and_emit_failure(
+                            &mut manifest,
+                            &manifest_path,
+                            &video,
+                            &video.title,
+                            &error,
+                            &events,
+                            &mut summary,
                         )?;
-                        summary.failed.push(failure);
                         if opts.abort_on_error {
                             summary.cancelled = true;
                             break;
@@ -607,17 +668,12 @@ pub(crate) fn run_with_info(
                          keyed by the URL-derived id (resume stays correct)"
                     );
                 }
-                // NB: we intentionally do NOT persist a `Downloaded` state here.
-                // Write-amplification fix: the manifest is a full-rewrite-on-save
-                // BTreeMap, so each save is O(N) bytes; saving here once per video
-                // makes per-video work O(N²) total writes for an N-video playlist.
-                // This intermediate save bought no resume benefit anyway — the
-                // partition logic above re-enters `download_one` for any non-Done /
-                // non-Failed entry (a `Downloaded` entry is re-downloaded on
-                // resume, which the contract permits), so the only durable states
-                // that matter are the terminal `Done`/`Failed` (and the rare
-                // cancel-persist below). The single per-video save now happens at
-                // the terminal transition.
+                // We intentionally avoid a full-manifest `Downloaded` save on the
+                // hot path. A crash after download is recovered by scanning the
+                // controlled `<id>.*` audio directory on the next run; explicit
+                // `Downloaded` state written by the cancellation path is also
+                // honored. This keeps one terminal manifest rewrite per video
+                // without sacrificing artifact reuse.
                 events.emit("transcribing", serde_json::json!({ "id": video.id }))?;
                 match transcribe_and_render(&engine, opts, &video, &meta, &audio_path) {
                     Ok((paths, wall_ms, rtf)) => {
@@ -650,20 +706,24 @@ pub(crate) fn run_with_info(
                     }
                     Err(FwError::Cancelled(_)) => {
                         // No terminal state to persist (the entry is still
-                        // `Pending`); a resume re-downloads + re-transcribes, which
-                        // the contract permits. Dropping this save avoids a full
-                        // O(N)-byte manifest rewrite on the cancel path.
+                        // `Pending`); a resume finds the completed `<id>.*` audio
+                        // artifact and reuses it before retrying transcription.
+                        // Dropping this save avoids a full O(N)-byte manifest
+                        // rewrite on the cancel path.
                         summary.cancelled = true;
                         break;
                     }
                     Err(e) => {
                         let error = e.to_string();
-                        record_failure(&mut manifest, &manifest_path, &video, &error)?;
-                        summary.failed.push(FailedVideo {
-                            id: video.id.clone(),
-                            title: video.title.clone(),
-                            error,
-                        });
+                        record_and_emit_failure(
+                            &mut manifest,
+                            &manifest_path,
+                            &video,
+                            &meta.title,
+                            &error,
+                            &events,
+                            &mut summary,
+                        )?;
                         if opts.abort_on_error {
                             summary.cancelled = true;
                             break;
@@ -680,8 +740,33 @@ pub(crate) fn run_with_info(
         }
     }
 
-    emit_run_complete(&events, &summary)?;
     Ok(summary)
+}
+
+fn finalize_run(
+    events: &YoutubeEventEmitter,
+    outcome: FwResult<YoutubeRunSummary>,
+) -> FwResult<YoutubeRunSummary> {
+    match outcome {
+        Ok(summary) => {
+            emit_run_complete(events, &summary)?;
+            Ok(summary)
+        }
+        Err(error) => {
+            let summary = YoutubeRunSummary {
+                cancelled: matches!(error, FwError::Cancelled(_)),
+                ..YoutubeRunSummary::default()
+            };
+            if let Err(emit_error) = emit_run_complete(events, &summary) {
+                tracing::warn!(
+                    error = %emit_error,
+                    original_error = %error,
+                    "failed to emit terminal youtube.run_complete after pipeline error"
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Terminal aggregate event (bd-27v1.1): exactly one per robot run, always
@@ -781,11 +866,25 @@ fn jittered_backoff_sleep(attempt: u32, token: &CancellationToken) -> FwResult<(
 /// wave containing everything (historical behavior); otherwise consecutive
 /// chunks of exactly `size` (the last may be short).
 #[must_use]
-fn partition_batches(items: Vec<VideoRef>, size: usize) -> Vec<Vec<VideoRef>> {
+fn partition_batches<T: Clone>(items: Vec<T>, size: usize) -> Vec<Vec<T>> {
     if size == 0 || items.len() <= size {
         return vec![items];
     }
-    items.chunks(size).map(<[VideoRef]>::to_vec).collect()
+    items.chunks(size).map(<[T]>::to_vec).collect()
+}
+
+fn execute_download_work(
+    info: &YtdlpInfo,
+    work: &DownloadWork,
+    audio_dir: &Path,
+    token: &CancellationToken,
+) -> Result<(PathBuf, VideoMeta), String> {
+    match work {
+        DownloadWork::Fetch(video) => download_one(info, video, audio_dir, token),
+        DownloadWork::Reuse { video, audio_path } => ytdlp::fetch_metadata(info, &video.url, token)
+            .map(|meta| (audio_path.clone(), meta))
+            .map_err(|error| error.to_string()),
+    }
 }
 
 /// Download a single video's audio, retrying transient failures with
@@ -855,6 +954,34 @@ fn record_failure(
     Ok(())
 }
 
+fn record_and_emit_failure(
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+    video: &VideoRef,
+    title: &str,
+    error: &str,
+    events: &YoutubeEventEmitter,
+    summary: &mut YoutubeRunSummary,
+) -> FwResult<()> {
+    record_failure(manifest, manifest_path, video, error)?;
+    let failure = FailedVideo {
+        id: video.id.clone(),
+        title: title.to_owned(),
+        error: error.to_owned(),
+    };
+    events.emit(
+        "failed",
+        serde_json::json!({
+            "id": &failure.id,
+            "title": &failure.title,
+            "error": &failure.error,
+            "attempts": manifest.attempts(&failure.id),
+        }),
+    )?;
+    summary.failed.push(failure);
+    Ok(())
+}
+
 /// Transcribe a downloaded audio file and render markdown + JSON.
 ///
 /// `meta` is the [`VideoMeta`] the download worker already fetched (the single
@@ -893,6 +1020,7 @@ fn transcribe_and_render(
     let wall_ms = started_instant.elapsed().as_millis() as u64;
     crate::native_engine::perf_span("yt.transcribe", wall_ms as f64, "");
     let segments: &[TranscriptionSegment] = &report.result.segments;
+    let windows = project_native_windows(&report.result.raw_output)?;
 
     let rtf = meta
         .duration_sec
@@ -933,6 +1061,7 @@ fn transcribe_and_render(
             rtf,
         },
         segments,
+        windows: &windows,
     };
 
     let t_render = std::time::Instant::now();
@@ -944,6 +1073,93 @@ fn transcribe_and_render(
     )?;
     crate::native_engine::perf_span("yt.render", t_render.elapsed().as_secs_f64() * 1e3, "");
     Ok((paths, wall_ms, rtf))
+}
+
+/// Project the stable `native-v2` decode-window contract into the YouTube JSON
+/// renderer. Subprocess backends do not expose this native evidence and yield
+/// an empty list. Once an in-process producer declares `native-v2`, every
+/// required field is checked so malformed producer output cannot be published
+/// as an apparently complete sidecar.
+fn project_native_windows(raw: &serde_json::Value) -> FwResult<Vec<RenderWindowStats>> {
+    let schema_version = raw
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str);
+    let in_process = raw
+        .get("in_process")
+        .and_then(serde_json::Value::as_bool);
+    match (schema_version, in_process) {
+        (Some("native-v2"), Some(true)) => {}
+        (Some("native-v2"), _) | (_, Some(true)) => {
+            return Err(FwError::ContractViolation(
+                "partial native raw-output declaration: native-v2 requires in_process=true and vice versa"
+                    .to_owned(),
+            ));
+        }
+        _ => return Ok(Vec::new()),
+    }
+
+    let windows = raw
+        .get("windows")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            FwError::ContractViolation(
+                "native-v2 raw output is missing the required windows array".to_owned(),
+            )
+        })?;
+
+    windows
+        .iter()
+        .enumerate()
+        .map(|(index, window)| {
+            let field = |name: &str| {
+                window.get(name).ok_or_else(|| {
+                    FwError::ContractViolation(format!(
+                        "native-v2 window {index} is missing required field {name}"
+                    ))
+                })
+            };
+            let finite = |name: &str| {
+                let value = field(name)?.as_f64().ok_or_else(|| {
+                    FwError::ContractViolation(format!(
+                        "native-v2 window {index} field {name} is not numeric"
+                    ))
+                })?;
+                if value.is_finite() {
+                    Ok(value)
+                } else {
+                    Err(FwError::ContractViolation(format!(
+                        "native-v2 window {index} field {name} is not finite"
+                    )))
+                }
+            };
+
+            let window_offset_sec = finite("window_offset_sec")?;
+            if window_offset_sec < 0.0 {
+                return Err(FwError::ContractViolation(format!(
+                    "native-v2 window {index} field window_offset_sec is negative"
+                )));
+            }
+            let tokens = field("tokens")?.as_u64().ok_or_else(|| {
+                FwError::ContractViolation(format!(
+                    "native-v2 window {index} field tokens is not an unsigned integer"
+                ))
+            })?;
+            let avg_logprob = finite("avg_logprob")?;
+            let no_speech_prob = finite("no_speech_prob")?;
+            if !(0.0..=1.0).contains(&no_speech_prob) {
+                return Err(FwError::ContractViolation(format!(
+                    "native-v2 window {index} field no_speech_prob is outside [0, 1]"
+                )));
+            }
+
+            Ok(RenderWindowStats {
+                window_offset_sec,
+                tokens,
+                avg_logprob,
+                no_speech_prob,
+            })
+        })
+        .collect()
 }
 
 /// Pull engine/backend labels out of the run report's raw output (best effort).
@@ -1004,6 +1220,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_window_projection_preserves_exact_decoder_evidence() {
+        let raw = serde_json::json!({
+            "schema_version": "native-v2",
+            "in_process": true,
+            "windows": [{
+                "window_offset_sec": 30.0,
+                "tokens": 17,
+                "avg_logprob": -0.42,
+                "no_speech_prob": 0.125,
+                "additive_future_field": "ignored"
+            }]
+        });
+
+        let projected = project_native_windows(&raw).expect("valid native-v2 windows");
+        assert_eq!(
+            projected,
+            vec![RenderWindowStats {
+                window_offset_sec: 30.0,
+                tokens: 17,
+                avg_logprob: -0.42,
+                no_speech_prob: 0.125,
+            }]
+        );
+    }
+
+    #[test]
+    fn native_window_projection_is_empty_for_external_backends() {
+        let raw = serde_json::json!({
+            "engine": "whisper-cli",
+            "segments": [],
+        });
+        assert!(
+            project_native_windows(&raw)
+                .expect("external output is not a native-v2 contract")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_window_projection_rejects_partial_native_declarations() {
+        for raw in [
+            serde_json::json!({
+                "schema_version": "native-v2",
+                "windows": [],
+            }),
+            serde_json::json!({
+                "in_process": true,
+                "windows": [],
+            }),
+            serde_json::json!({
+                "schema_version": "native-v2",
+                "in_process": false,
+                "windows": [],
+            }),
+        ] {
+            let error = project_native_windows(&raw)
+                .expect_err("partial native declaration must fail closed");
+            assert!(matches!(error, FwError::ContractViolation(_)));
+        }
+    }
+
+    #[test]
+    fn native_window_projection_rejects_missing_required_evidence() {
+        let missing = serde_json::json!({
+            "schema_version": "native-v2",
+            "in_process": true,
+            "windows": [{
+                "window_offset_sec": 0.0,
+                "tokens": 3,
+                "avg_logprob": -0.5
+            }]
+        });
+        let error = project_native_windows(&missing).expect_err("missing probability must fail");
+        assert!(matches!(error, FwError::ContractViolation(_)));
+
+        let out_of_range = serde_json::json!({
+            "schema_version": "native-v2",
+            "in_process": true,
+            "windows": [{
+                "window_offset_sec": 0.0,
+                "tokens": 3,
+                "avg_logprob": -0.5,
+                "no_speech_prob": 1.5
+            }]
+        });
+        let error = project_native_windows(&out_of_range)
+            .expect_err("out-of-range probability must fail");
+        assert!(matches!(error, FwError::ContractViolation(_)));
+    }
+
     // ---- bd-lun9: batch waves + transient retry classification ------------
 
     #[test]
@@ -1023,6 +1330,96 @@ mod tests {
             .map(|w| w.iter().map(|v| v.id.as_str()).collect())
             .collect();
         assert_eq!(ids, [vec!["a", "b"], vec!["c", "d"], vec!["e"]]);
+    }
+
+    #[test]
+    fn resume_selects_existing_recorded_or_orphaned_audio_without_fetch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).expect("audio dir");
+
+        let recorded_video = vr("recorded001");
+        let recorded_path = audio_dir.join("recorded001.opus");
+        std::fs::write(&recorded_path, b"recorded sentinel").expect("recorded audio");
+        let recorded_state = VideoState::Downloaded {
+            audio_path: recorded_path.display().to_string(),
+        };
+        let selected = select_download_work(
+            &recorded_video,
+            Some(&recorded_state),
+            &audio_dir,
+        );
+        assert!(matches!(
+            selected,
+            DownloadWork::Reuse { ref audio_path, .. } if audio_path == &recorded_path
+        ));
+
+        let orphaned_video = vr("orphaned001");
+        let orphaned_path = audio_dir.join("orphaned001.wav");
+        std::fs::write(&orphaned_path, b"orphaned sentinel").expect("orphaned audio");
+        let selected = select_download_work(
+            &orphaned_video,
+            Some(&VideoState::Pending),
+            &audio_dir,
+        );
+        assert!(matches!(
+            selected,
+            DownloadWork::Reuse { ref audio_path, .. } if audio_path == &orphaned_path
+        ));
+
+        let missing_video = vr("missing00001");
+        assert!(matches!(
+            select_download_work(&missing_video, Some(&VideoState::Pending), &audio_dir),
+            DownloadWork::Fetch(_)
+        ));
+    }
+
+    #[test]
+    fn resume_rejects_recorded_paths_outside_the_owned_audio_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).expect("audio dir");
+        let outside_path = dir.path().join("outside001.wav");
+        std::fs::write(&outside_path, b"outside sentinel").expect("outside file");
+        let video = vr("outside001");
+        let state = VideoState::Downloaded {
+            audio_path: outside_path.display().to_string(),
+        };
+
+        assert!(matches!(
+            select_download_work(&video, Some(&state), &audio_dir),
+            DownloadWork::Fetch(_)
+        ));
+    }
+
+    #[test]
+    fn reuse_work_fetches_metadata_without_overwriting_audio() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).expect("audio dir");
+        let video = vr("reuse000001");
+        let audio_path = audio_dir.join("reuse000001.wav");
+        let sentinel = b"existing audio must remain byte exact";
+        std::fs::write(&audio_path, sentinel).expect("seed audio");
+        let work = DownloadWork::Reuse {
+            video,
+            audio_path: audio_path.clone(),
+        };
+
+        let (returned_path, meta) = execute_download_work(
+            &stub_info(),
+            &work,
+            &audio_dir,
+            &CancellationToken::unbounded(),
+        )
+        .expect("metadata-only reuse");
+        assert_eq!(returned_path, audio_path);
+        assert_eq!(meta.id, "reuse000001");
+        assert_eq!(
+            std::fs::read(&returned_path).expect("read reused audio"),
+            sentinel,
+            "the download path must not run for reusable audio"
+        );
     }
 
     #[test]
@@ -1466,6 +1863,97 @@ https://youtu.be/ccccccccccc
             .iter()
             .map(|line| serde_json::from_str(line).expect("captured line must be JSON"))
             .collect()
+    }
+
+    #[test]
+    fn downstream_failure_is_persisted_summarized_and_emitted_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join(MANIFEST_NAME);
+        let video = vr("failure0001");
+        let mut manifest = Manifest::default();
+        manifest.upsert_discovered(&video);
+        manifest.save(&manifest_path).expect("seed manifest");
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(
+            std::sync::Arc::clone(&buffer),
+        ));
+        let mut summary = YoutubeRunSummary::default();
+
+        record_and_emit_failure(
+            &mut manifest,
+            &manifest_path,
+            &video,
+            "Authoritative metadata title",
+            "render fault",
+            &events,
+            &mut summary,
+        )
+        .expect("record downstream failure");
+
+        assert_eq!(summary.failed.len(), 1);
+        assert_eq!(summary.failed[0].title, "Authoritative metadata title");
+        assert!(matches!(
+            manifest.entries["failure0001"].state.as_ref(),
+            Some(VideoState::Failed {
+                error,
+                attempts: 1,
+            }) if error == "render fault"
+        ));
+        let persisted = Manifest::load(&manifest_path).expect("reload manifest");
+        assert!(matches!(
+            persisted.entries["failure0001"].state.as_ref(),
+            Some(VideoState::Failed { attempts: 1, .. })
+        ));
+
+        let parsed = parse_events(&buffer);
+        assert_eq!(parsed.len(), 1, "exactly one failure event");
+        assert_eq!(parsed[0]["event"], "youtube.failed");
+        assert_eq!(parsed[0]["title"], "Authoritative metadata title");
+        assert_eq!(parsed[0]["error"], "render fault");
+        assert_eq!(parsed[0]["attempts"], 1);
+    }
+
+    #[test]
+    fn finalize_run_emits_exactly_one_cancelled_terminal_event() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(
+            std::sync::Arc::clone(&buffer),
+        ));
+        events
+            .emit("run_start", serde_json::json!({ "n_urls": 1 }))
+            .expect("start event");
+
+        let error = finalize_run(
+            &events,
+            Err(FwError::Cancelled("test cancellation".to_owned())),
+        )
+        .expect_err("original cancellation must propagate");
+        assert!(matches!(error, FwError::Cancelled(_)));
+
+        let parsed = parse_events(&buffer);
+        let terminals: Vec<_> = parsed
+            .iter()
+            .filter(|event| event["event"] == "youtube.run_complete")
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(parsed.last().expect("last event")["event"], "youtube.run_complete");
+        assert_eq!(terminals[0]["cancelled"], true);
+    }
+
+    #[test]
+    fn run_emits_terminal_event_when_input_resolution_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (opts, buffer) = capturing_opts(vec!["not-a-youtube-url".to_owned()], dir.path());
+
+        let error = run_with_info(&opts, &stub_info()).expect_err("invalid URL must fail");
+        assert!(matches!(error, FwError::InvalidRequest(_)));
+        let parsed = parse_events(&buffer);
+        let names: Vec<_> = parsed
+            .iter()
+            .map(|event| event["event"].as_str().expect("event"))
+            .collect();
+        assert_eq!(names, ["youtube.run_start", "youtube.run_complete"]);
+        assert_eq!(parsed[1]["cancelled"], false);
     }
 
     #[test]
