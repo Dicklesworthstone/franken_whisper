@@ -197,8 +197,7 @@ impl DtlnSeparator {
             // Stage 1: mask in the STFT-magnitude domain.
             let log_mag: Vec<f32> = mag.iter().map(|&m| (m + STFT_NORM_EPS).ln()).collect();
             let mask1 = self.s1.forward(&log_mag, &mut state1)?;
-            let masked_mag: Vec<f32> =
-                mag.iter().zip(&mask1).map(|(&m, &k)| m * k).collect();
+            let masked_mag: Vec<f32> = mag.iter().zip(&mask1).map(|(&m, &k)| m * k).collect();
             let mut denoised = vec![0.0f32; BLOCK_LEN];
             irfft_mag_phase(&masked_mag, &phase, &mut denoised);
 
@@ -208,8 +207,7 @@ impl DtlnSeparator {
             // accumulated buffer instead double-counts overlapping frames.
             let encoded = matvec(&denoised, &self.s2_encoder, ENCODER_FEATURES);
             let mask2 = self.s2.forward(&encoded, &mut state2)?;
-            let masked_enc: Vec<f32> =
-                encoded.iter().zip(&mask2).map(|(&e, &k)| e * k).collect();
+            let masked_enc: Vec<f32> = encoded.iter().zip(&mask2).map(|(&e, &k)| e * k).collect();
             let decoded = matvec(&masked_enc, &self.s2_decoder, BLOCK_LEN);
             for (j, slot) in decoded.iter().enumerate() {
                 output[start + j] += slot;

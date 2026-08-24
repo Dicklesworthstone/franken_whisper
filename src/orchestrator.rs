@@ -13469,10 +13469,7 @@ mod tests {
         // Invalid WAV → passthrough with NO isolation claim (bd-f2se removed
         // the vocal_isolated=true lie on this path).
         assert!(!report.vocal_isolated);
-        assert_eq!(
-            report.mode,
-            super::SeparationMode::UnavailablePassthrough
-        );
+        assert_eq!(report.mode, super::SeparationMode::UnavailablePassthrough);
         assert!(!report.notes.is_empty());
         assert!(
             report.notes[0].contains("passthrough without isolation claim"),
