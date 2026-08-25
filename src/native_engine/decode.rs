@@ -322,14 +322,16 @@ pub struct DecodeParams {
 ///   env gates (`FW_FIRST_WINDOW_MARGIN`,
 ///   `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE`) keep governing exactly as before.
 /// - [`AudioCtxPolicy::Auto`]: derive the effective ctx from the window's REAL
-///   mel frames with the proven tail math (`ceil(real/2)` clamped to
-///   `[MIN_ENC_CTX, FULL_ENC_CTX]`), FIRST WINDOW INCLUDED. Truncation engages
+///   mel frames with the proven tail math (`ceil(real/2)` clamped to the model
+///   band), then apply the 512-frame quality floor established by
+///   `bd-rt-audio-ctx-auto-empty`, FIRST WINDOW INCLUDED. Truncation engages
 ///   only in timestamp mode (the no-timestamps repetition-loop failure mode
 ///   documented at the loop is honored regardless of policy).
 /// - [`AudioCtxPolicy::Fixed(n)`]: an explicit per-window ctx cap, clamped to
 ///   `[MIN_ENC_CTX, FULL_ENC_CTX]` and rounded UP to a multiple of 64
-///   (whisper.cpp discussion ggml-org/whisper.cpp#297), then shrunk to the
-///   window's real audio so short windows never encode pure padding.
+///   (whisper.cpp discussion ggml-org/whisper.cpp#297). The effective ctx is
+///   then shrunk to the real-audio-derived ctx so short windows never encode
+///   pure padding; after that shrink it need not remain a multiple of 64.
 ///
 /// # AUTHORITATIVE over env
 ///
@@ -354,9 +356,10 @@ pub enum AudioCtxPolicy {
     /// Full 1500-frame context on every window (historical behavior).
     #[default]
     Full,
-    /// Effective ctx derived from real buffer frames, first window included.
+    /// Effective ctx derived from real buffer frames with a 512-frame quality
+    /// floor, first window included.
     Auto,
-    /// Explicit ctx cap: clamped to [64, 1500], rounded up to a multiple of 64.
+    /// Explicit cap: clamp/round the request, then shrink to real audio.
     Fixed(usize),
 }
 
@@ -371,8 +374,9 @@ impl AudioCtxPolicy {
 
     /// Effective encoder frames for a window holding `real_frames` real mel
     /// frames (1 mel frame = 1 cs). Always within
-    /// `[MIN_ENC_CTX, FULL_ENC_CTX]`; `Fixed` additionally shrinks to the real
-    /// audio so a short window never encodes padding.
+    /// `[MIN_ENC_CTX, FULL_ENC_CTX]`; `Auto` additionally applies its quality
+    /// floor, while `Fixed` shrinks to the real audio so a short window never
+    /// encodes padding.
     #[must_use]
     pub fn effective_enc_ctx(self, real_frames: usize) -> usize {
         let auto = real_frames.div_ceil(2).clamp(MIN_ENC_CTX, FULL_ENC_CTX);
@@ -3029,7 +3033,7 @@ fn transcribe_samples_uncached(
                     target: "franken_whisper::native_engine::decode",
                     seek_cs,
                     real_frames,
-                    enc_ctx,
+                    effective_enc_ctx = enc_ctx,
                     mel_frames,
                     policy=?params.audio_ctx,
                     "tail-window encoder-context truncation engaged"
@@ -5480,8 +5484,9 @@ mod tests {
     #[test]
     fn audio_ctx_auto_property_band_across_buffer_lengths() {
         // Property: for every buffer length 0.5-29.5 s (50..2950 mel frames),
-        // Auto's effective ctx == ceil(real/2) clamped to [64, 1500]; the
-        // exact floor/ceiling boundary lengths hold without panicking.
+        // Auto's effective ctx == ceil(real/2) clamped to the model band and
+        // then floored at 512 for decode quality; the exact floor/ceiling
+        // boundary lengths hold without panicking.
         for rf in 50..=2950 {
             let ctx = AudioCtxPolicy::Auto.effective_enc_ctx(rf);
             let expected = rf

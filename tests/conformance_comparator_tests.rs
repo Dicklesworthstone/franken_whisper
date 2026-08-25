@@ -1526,12 +1526,10 @@ fn gated_bridge_vs_native_conformance_jfk_tiny_en() {
 /// Gates ONLY on mechanism facts via the timing-free
 /// [`native_engine::decode::DecodeWorkStats::encoder_mel_frames`] counter:
 /// `Full` must feed the full padded 3000-frame window; `Auto`/`Fixed` must feed
-/// exactly the truncated counts derived from the clip's real length (first
-/// window included — a live stream is all first-window). Wall-clock and
-/// cross-policy WER numbers are PRINTED for the perf-ledger row and
-/// deliberately never asserted: a contended host must not flake this gate,
-/// and the expected WER delta is published honestly in `docs/PERF_LEDGER.md`
-/// rather than frozen into a pass/fail line here.
+/// counts bounded by their effective post-safety-floor policy (first window
+/// included — a live stream is all first-window). Wall-clock and cross-policy
+/// WER numbers are PRINTED as candidate evidence for a future perf-ledger row
+/// and deliberately never asserted: a contended host must not flake this gate.
 #[test]
 fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
     let Some(model_path) = native_engine::find_model_file("tiny.en") else {
@@ -1564,7 +1562,9 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
     // n_len_org = 1 + (n_samples - 200) / 160, saturated at 0 numerator.
     let n = samples.len() as i64;
     let real_frames = usize::try_from(n.saturating_sub(200) / 160 + 1).unwrap_or(0);
-    let auto_ctx = real_frames.div_ceil(2).clamp(64, 1500);
+    let auto_ctx = native_engine::decode::AudioCtxPolicy::Auto.effective_enc_ctx(real_frames);
+    let fixed_ctx =
+        native_engine::decode::AudioCtxPolicy::fixed(512).effective_enc_ctx(real_frames);
 
     let (full, full_wall) = run(native_engine::decode::AudioCtxPolicy::Full);
     let (auto, auto_wall) = run(native_engine::decode::AudioCtxPolicy::Auto);
@@ -1575,17 +1575,17 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
     // Full pads EVERY window to the full 3000 frames — exact invariant. A
     // reduced policy's total depends on segmentation (a slightly different
     // transcript legitimately moves the final timestamp and can spawn an extra
-    // floor-sized tail window), so those are bounded rather than exact: every
-    // window is capped by its real-derived ctx (first window = auto_ctx; tails
-    // ≤ the MIN_ENC_CTX floor of 128 mel frames when their real audio runs
-    // out), and the reduction must be large on this single-utterance fixture.
+    // tail window), so those are bounded rather than exact. The policy's
+    // effective ctx is monotone in remaining real audio, making the first
+    // window's ctx a valid cap for every later window. Auto's 512-frame quality
+    // floor and Fixed's shrink-to-real semantics therefore stay part of the
+    // bound instead of being replaced by the obsolete 64-frame tail floor.
     assert_eq!(
         full.work.encoder_mel_frames,
         3000 * full.windows.len(),
         "Full must pad every window to FRAMES_PER_CHUNK"
     );
-    let tail_floor_mel = 2 * 64; // MIN_ENC_CTX floor, in mel frames
-    let auto_upper = auto_ctx * 2 + auto.windows.len().saturating_sub(1) * tail_floor_mel;
+    let auto_upper = auto_ctx * 2 * auto.windows.len();
     assert!(
         auto.work.encoder_mel_frames <= auto_upper,
         "Auto total {} exceeds per-window real-derived cap sum {auto_upper}",
@@ -1597,8 +1597,7 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         auto.work.encoder_mel_frames,
         full.work.encoder_mel_frames
     );
-    let fixed_cap = 512_usize.min(auto_ctx) * 2;
-    let fixed_upper = fixed_cap + fixed.windows.len().saturating_sub(1) * tail_floor_mel;
+    let fixed_upper = fixed_ctx * 2 * fixed.windows.len();
     assert!(
         fixed.work.encoder_mel_frames <= fixed_upper,
         "Fixed(512) total {} exceeds cap-bounded sum {fixed_upper}",
