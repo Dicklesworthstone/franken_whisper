@@ -4030,7 +4030,7 @@ pub struct TranscribeRequest {
     pub backend_params: BackendParams,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptionSegment {
     pub start_sec: Option<f64>,
     pub end_sec: Option<f64>,
