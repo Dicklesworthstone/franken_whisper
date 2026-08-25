@@ -1541,7 +1541,7 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
     let model = NativeWhisperModel::load(&model_path).expect("load tiny.en");
     let noop = || Ok(());
 
-    let run = |audio_ctx: native_engine::decode::AudioCtxPolicy| -> (_, std::time::Duration) {
+    let run = |input: &[f32], audio_ctx| {
         let params = native_engine::decode::DecodeParams {
             language: None,
             translate: false,
@@ -1553,7 +1553,7 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         };
         let t = std::time::Instant::now();
         let out = model
-            .transcribe(&samples, &params, &noop)
+            .transcribe(input, &params, &noop)
             .expect("transcribe");
         (out, t.elapsed())
     };
@@ -1566,9 +1566,12 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
     let fixed_ctx =
         native_engine::decode::AudioCtxPolicy::fixed(512).effective_enc_ctx(real_frames);
 
-    let (full, full_wall) = run(native_engine::decode::AudioCtxPolicy::Full);
-    let (auto, auto_wall) = run(native_engine::decode::AudioCtxPolicy::Auto);
-    let (fixed, fixed_wall) = run(native_engine::decode::AudioCtxPolicy::fixed(512));
+    let (full, full_wall) = run(&samples, native_engine::decode::AudioCtxPolicy::Full);
+    let (auto, auto_wall) = run(&samples, native_engine::decode::AudioCtxPolicy::Auto);
+    let (fixed, fixed_wall) = run(
+        &samples,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+    );
 
     // ── Mechanism gates (deterministic, timing-free) ──
     //
@@ -1602,6 +1605,92 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         fixed.work.encoder_mel_frames <= fixed_upper,
         "Fixed(512) total {} exceeds cap-bounded sum {fixed_upper}",
         fixed.work.encoder_mel_frames
+    );
+
+    // ── Exact quality-floor boundary through the real model path ──
+    //
+    // The engine derives real mel frames as
+    // `1 + max(n_samples - 200, 0) / 160`. Choose an actual sub-500 ms decode
+    // plus exact sample counts on the two sides of Auto's 512-ctx floor
+    // transition and at the 1500-ctx ceiling. At 1024 real frames Auto and
+    // Fixed(512) must be byte-equivalent because both encode 1024 mel frames.
+    // At 1025,
+    // ceil(real/2) makes Auto encode 1026 while Fixed remains capped at 1024.
+    // These model-backed cells fail if first-window reduction is bypassed,
+    // ceil regresses to floor, the Auto quality floor sticks one frame too
+    // long, or Fixed stops enforcing its cap.
+    let samples_for_real_frames = |real_frames: usize| {
+        let sample_count = 200 + 160 * real_frames.saturating_sub(1);
+        assert!(
+            sample_count <= samples.len(),
+            "jfk fixture is too short for {real_frames} exact real mel frames"
+        );
+        &samples[..sample_count]
+    };
+    let sub_500ms_input = samples_for_real_frames(49);
+    let floor_input = samples_for_real_frames(1024);
+    let above_floor_input = samples_for_real_frames(1025);
+    // Exact 3000-real-frame silence reaches Auto's full-context ceiling while
+    // keeping transcript quality outside this mechanism-only assertion.
+    let ceiling_input = vec![0.0; 200 + 160 * 2999];
+    let (auto_sub_500ms, _) = run(
+        sub_500ms_input,
+        native_engine::decode::AudioCtxPolicy::Auto,
+    );
+    assert_eq!(auto_sub_500ms.work.encoder_calls, 1);
+    assert_eq!(auto_sub_500ms.work.encoder_mel_frames, 1024);
+    assert!(auto_sub_500ms.dropped_windows.is_empty());
+
+    let (auto_ceiling, _) = run(
+        &ceiling_input,
+        native_engine::decode::AudioCtxPolicy::Auto,
+    );
+    assert_eq!(auto_ceiling.work.encoder_calls, 1);
+    assert_eq!(auto_ceiling.work.encoder_mel_frames, 3000);
+    assert!(auto_ceiling.dropped_windows.is_empty());
+
+    let (auto_floor, _) = run(
+        floor_input,
+        native_engine::decode::AudioCtxPolicy::Auto,
+    );
+    let (fixed_floor, _) = run(
+        floor_input,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+    );
+    assert_eq!(auto_floor.work.encoder_calls, 1);
+    assert_eq!(fixed_floor.work.encoder_calls, 1);
+    assert_eq!(auto_floor.work.encoder_mel_frames, 1024);
+    assert_eq!(fixed_floor.work.encoder_mel_frames, 1024);
+    assert_eq!(auto_floor.segments, fixed_floor.segments);
+    assert!(auto_floor.dropped_windows.is_empty());
+    assert!(fixed_floor.dropped_windows.is_empty());
+    assert!(
+        !joined_text(&auto_floor.segments).is_empty(),
+        "both 512-context policies must decode the speech-bearing floor slice"
+    );
+
+    let (auto_above_floor, _) = run(
+        above_floor_input,
+        native_engine::decode::AudioCtxPolicy::Auto,
+    );
+    let (fixed_above_floor, _) = run(
+        above_floor_input,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+    );
+    assert_eq!(auto_above_floor.work.encoder_calls, 1);
+    assert_eq!(fixed_above_floor.work.encoder_calls, 1);
+    assert_eq!(auto_above_floor.work.encoder_mel_frames, 1026);
+    assert_eq!(fixed_above_floor.work.encoder_mel_frames, 1024);
+    assert_eq!(
+        auto_above_floor.work.encoder_mel_frames,
+        fixed_above_floor.work.encoder_mel_frames + 2
+    );
+    assert!(auto_above_floor.dropped_windows.is_empty());
+    assert!(fixed_above_floor.dropped_windows.is_empty());
+    assert!(
+        !joined_text(&auto_above_floor.segments).is_empty()
+            && !joined_text(&fixed_above_floor.segments).is_empty(),
+        "both policies must decode the speech-bearing above-floor slice"
     );
 
     // ── Published (not asserted) quality/cost numbers for the ledger row ──
