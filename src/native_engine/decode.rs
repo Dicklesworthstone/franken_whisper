@@ -462,10 +462,11 @@ pub struct DecodeWorkStats {
     pub accepted_result_tokens: usize,
     pub prompt_reset_retries: usize,
     pub temperature_fallback_retries: usize,
-    /// Decode attempts whose selected timestamp-mode result had text but no
-    /// closed timestamp and was retained by [`should_rescue_unclosed_window`].
-    /// This is a work counter (temperature fallback may retry afterward), not
-    /// a count of final emitted segments.
+    /// Selected timestamp-mode decode attempts whose `result_len` was populated
+    /// by [`should_rescue_unclosed_window`] without a closed timestamp. This is
+    /// a work/decision counter (temperature fallback may retry and no-speech
+    /// classification may suppress emission afterward), not a count of text or
+    /// final emitted segments.
     pub unclosed_window_rescue_attempts: usize,
     /// Total mel frames physically fed to the encoder across all windows
     /// (bd-rt-audio-ctx-n4dj observability). Full-context windows contribute
