@@ -23,6 +23,9 @@
 #   429     -> stderr "ERROR: HTTP Error 429: Too Many Requests"                exit 1
 #   exit1   -> generic stderr + exit 1
 #
+# Download-shape injection via URL query:
+#   fw_stub_ext=flv -> materialize and print the exact-id artifact with a .flv suffix
+#
 # Override knobs (env):
 #   STUB_VERSION        version string printed for --version   (default 2025.01.01)
 #   STUB_FIXTURE_WAV    source wav copied on download   (default tracked jfk_cut8.bin)
@@ -43,16 +46,16 @@ fi
 # filesystems can reject that pattern transiently with ETXTBSY even after the
 # writer has closed the file.
 FAIL_MODE="${STUB_FAIL_MODE:-}"
-if [ -z "$FAIL_MODE" ]; then
-  for arg in "$@"; do
-    case "$arg" in
-      *fw_stub_fail=private*) FAIL_MODE="private" ;;
-      *fw_stub_fail=geo*)     FAIL_MODE="geo" ;;
-      *fw_stub_fail=429*)     FAIL_MODE="429" ;;
-      *fw_stub_fail=exit1*)   FAIL_MODE="exit1" ;;
-    esac
-  done
-fi
+OUTPUT_EXT="wav"
+for arg in "$@"; do
+  case "$arg" in
+    *fw_stub_fail=private*) [ -n "$FAIL_MODE" ] || FAIL_MODE="private" ;;
+    *fw_stub_fail=geo*)     [ -n "$FAIL_MODE" ] || FAIL_MODE="geo" ;;
+    *fw_stub_fail=429*)     [ -n "$FAIL_MODE" ] || FAIL_MODE="429" ;;
+    *fw_stub_fail=exit1*)   [ -n "$FAIL_MODE" ] || FAIL_MODE="exit1" ;;
+    *fw_stub_ext=flv*)      OUTPUT_EXT="flv" ;;
+  esac
+done
 
 case "$FAIL_MODE" in
   private)
@@ -178,7 +181,7 @@ if [ "$WANT_DOWNLOAD" -eq 1 ]; then
     exit 1
   fi
 
-  OUT_PATH="$DEST_DIR/$VIDEO_ID.wav"
+  OUT_PATH="$DEST_DIR/$VIDEO_ID.$OUTPUT_EXT"
   cp "$SRC_WAV" "$OUT_PATH"
 
   # Emulate yt-dlp's `--print after_move:filepath`: print the final path on

@@ -1154,8 +1154,8 @@ pub(crate) fn find_downloaded_by_id(dest_dir: &Path, id: &str) -> Option<PathBuf
 /// inputs.
 pub(crate) fn is_reusable_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
     const REUSABLE_MEDIA_EXTENSIONS: &[&str] = &[
-        "aac", "aif", "aiff", "alac", "flac", "m4a", "mka", "mkv", "mov", "mp3", "mp4",
-        "oga", "ogg", "opus", "wav", "weba", "webm", "wv",
+        "aac", "aif", "aiff", "alac", "flac", "m4a", "mka", "mkv", "mov", "mp3", "mp4", "oga",
+        "ogg", "opus", "wav", "weba", "webm", "wv",
     ];
 
     if !is_completed_owned_download_path(path, dest_dir, id) {
@@ -1184,9 +1184,8 @@ fn is_completed_owned_download_path(path: &Path, dest_dir: &Path, id: &str) -> b
     {
         return false;
     }
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-        metadata.file_type().is_file() && metadata.len() > 0
-    })
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -2231,15 +2230,20 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_printed_path_accepts_owned_legacy_media_container() {
+    fn download_audio_accepts_authoritative_owned_legacy_container() {
+        let token = CancellationToken::unbounded();
         let dir = tempfile::tempdir().expect("tempdir");
-        let legacy = dir.path().join("legacy001.flv");
-        std::fs::write(&legacy, b"legacy media container").expect("legacy artifact");
-        assert!(is_completed_owned_download_path(
-            &legacy,
-            dir.path(),
-            "legacy001"
-        ));
+        let mut meta = meta_for_download();
+        meta.webpage_url.push_str("&fw_stub_ext=flv");
+
+        let path = download_audio(&stub_info(), &meta, dir.path(), &token)
+            .expect("yt-dlp's authoritative legacy-container path should succeed");
+        assert_eq!(path, dir.path().join("dQw4w9WgXcQ.flv"));
+        assert!(path.is_file(), "returned legacy container must exist");
+        assert!(
+            !is_reusable_download_path(&path, dir.path(), &meta.id),
+            "the legacy extension must stay outside the narrower resume allowlist so this test fails if download_audio regresses to that predicate"
+        );
     }
 
     #[test]
@@ -2266,7 +2270,10 @@ mod tests {
 
         let completed = dir.path().join("video123.wav");
         std::fs::write(&completed, b"complete").expect("completed artifact");
-        assert_eq!(find_downloaded_by_id(dir.path(), "video123"), Some(completed));
+        assert_eq!(
+            find_downloaded_by_id(dir.path(), "video123"),
+            Some(completed)
+        );
     }
 
     // ---- error mapping ---------------------------------------------------
