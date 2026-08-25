@@ -35,12 +35,37 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import torch as torch_types
 
-EXPORTER_SCHEMA = "franken-whisper-redimnet2-export-v2"
-RECEIPT_SCHEMA = "franken-whisper-redimnet2-conversion-receipt-v2"
+EXPORTER_SCHEMA = "franken-whisper-redimnet2-export-v3"
+RECEIPT_SCHEMA = "franken-whisper-redimnet2-conversion-receipt-v3"
 TRUTH_SCHEMA = "franken-whisper-redimnet2-synthetic-truth-v1"
 MODEL_ID = "PalabraAI/redimnet2:b2-vox2-lm"
 MODEL_RELEASE = "v1.0.0"
 MODEL_SOURCE_REVISION = "5294667e806ac3b0f27abc301a114ef132b64b42"
+MODEL_SOURCE_COMMIT_AT = "2026-03-04T13:25:10Z"
+MODEL_RELEASE_RECORD_CREATED_AT = "2026-03-04T13:25:24Z"
+MODEL_CHECKPOINT_ASSET_CREATED_AT = "2026-03-04T14:25:02Z"
+MODEL_RELEASE_PUBLISHED_AT = "2026-03-04T14:25:10Z"
+MODEL_DISTRIBUTION_ARTIFACT_STATUS = "operator_local_pending_release_manifest"
+MODEL_DISTRIBUTION_POLICY_AFTER_VERIFIED_PUBLICATION = (
+    "github_release_with_license_and_notice"
+)
+MODEL_LICENSE_SCOPE_STATUS = "resolved"
+MODEL_LICENSE_SPDX = "MIT"
+MODEL_LICENSE_DECLARATION_PATH = "README.md"
+MODEL_LICENSE_DECLARATION_SHA256 = (
+    "27d500b510a1cdc054a8ccbad484cf6062639fcb9d6b661714214fe766ed4e76"
+)
+MODEL_LICENSE_TERMS_REVISION = "2a8d15f65b1dfb5d73fede2f11ee42bcccca3035"
+MODEL_LICENSE_TERMS_URL = (
+    "https://raw.githubusercontent.com/PalabraAI/redimnet2/"
+    "2a8d15f65b1dfb5d73fede2f11ee42bcccca3035/LICENSE"
+)
+MODEL_LICENSE_TERMS_BYTES = 1_067
+MODEL_LICENSE_TERMS_SHA256 = (
+    "3d5a4bf9936a7d09dd770588c0d7cb116fc16916a0310d71fb1fff5d64562101"
+)
+MODEL_LICENSE_REQUIRED_FILENAME = "LICENSE.redimnet2.txt"
+MODEL_LICENSE_REQUIRED_NOTICE = "Copyright (c) 2026 Palabra.ai"
 CHECKPOINT_BYTES = 15_897_450
 CHECKPOINT_SHA256 = "0545a29679a87fe1c662d2bbd05e3b3fe0d1b392832729abaa135e4079a2f77a"
 CONFIG_SHA256 = "63939097377bff85dc1553a54f6aa2dcacfea106881addde475fb4f64505dd1a"
@@ -897,8 +922,46 @@ def main() -> int:
             "trainable_parameters": TRAINABLE_PARAMETERS,
         },
         "distribution": {
-            "reason": "pinned_v1.0.0_tag_has_no_repository_license_file_and_model_weight_scope_is_not_explicit",
-            "status": "operator_local_no_release",
+            "artifact_status": MODEL_DISTRIBUTION_ARTIFACT_STATUS,
+            "license_scope": {
+                "full_terms": {
+                    "bytes": MODEL_LICENSE_TERMS_BYTES,
+                    "sha256": MODEL_LICENSE_TERMS_SHA256,
+                    "source_revision": MODEL_LICENSE_TERMS_REVISION,
+                    "url": MODEL_LICENSE_TERMS_URL,
+                },
+                "scope_evidence": {
+                    "checkpoint_asset_created_at": (
+                        MODEL_CHECKPOINT_ASSET_CREATED_AT
+                    ),
+                    "declared_license": MODEL_LICENSE_SPDX,
+                    "declares_official_pretrained_weights": True,
+                    "kind": "contemporaneous_tagged_readme",
+                    "links_exact_v1_release_assets": True,
+                    "relative_path": MODEL_LICENSE_DECLARATION_PATH,
+                    "release_published_at": MODEL_RELEASE_PUBLISHED_AT,
+                    "release_record_created_at": (
+                        MODEL_RELEASE_RECORD_CREATED_AT
+                    ),
+                    "sha256": MODEL_LICENSE_DECLARATION_SHA256,
+                    "source_commit_at": MODEL_SOURCE_COMMIT_AT,
+                    "source_revision": MODEL_SOURCE_REVISION,
+                },
+                "spdx": MODEL_LICENSE_SPDX,
+                "status": MODEL_LICENSE_SCOPE_STATUS,
+            },
+            "release_requirements": {
+                "notice_is_contained_in_license_payload": True,
+                "policy_after_verified_publication": (
+                    MODEL_DISTRIBUTION_POLICY_AFTER_VERIFIED_PUBLICATION
+                ),
+                "release_ready": False,
+                "required_license_bytes": MODEL_LICENSE_TERMS_BYTES,
+                "required_license_filename": MODEL_LICENSE_REQUIRED_FILENAME,
+                "required_license_sha256": MODEL_LICENSE_TERMS_SHA256,
+                "required_notice": MODEL_LICENSE_REQUIRED_NOTICE,
+                "separate_identity_bound_release_manifest_required": True,
+            },
         },
         "exporter": {
             "schema": EXPORTER_SCHEMA,

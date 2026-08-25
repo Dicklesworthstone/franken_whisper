@@ -1014,7 +1014,7 @@ pub struct YoutubeArgs {
     #[arg(long)]
     pub no_retry: bool,
 
-    /// Stop the whole run on the first per-video failure.
+    /// Stop scheduling later waves after a per-video failure.
     #[arg(long)]
     pub abort_on_error: bool,
 

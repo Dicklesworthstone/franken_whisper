@@ -738,7 +738,7 @@ python3 scripts/export_redimnet2.py INPUT.pt SOURCE_ROOT OUTPUT_DIR
 All three arguments must resolve outside this checkout, `OUTPUT_DIR` must not
 exist, and the command performs no download. The exporter installs a Python
 audit hook that denies socket and child-process events for the full conversion.
-Its exporter and conversion-receipt schemas are v2; the synthetic truth tensor
+Its exporter and conversion-receipt schemas are v3; the synthetic truth tensor
 contract remains v1. It requires Python 3.12.12 with
 torch/torchaudio 2.7.1, NumPy 2.2.6, SciPy 1.15.3, and safetensors 0.5.3. It
 hash-binds the 15,897,450-byte upstream checkpoint and 14 source files, rejects
@@ -753,8 +753,8 @@ f32 package (SHA-256
 `d41a729f5ef008d70c6d6bf4ab7ca27e299a478ff665665a4e31afff7f46ddeb`),
 an 8,828,392-byte non-human synthetic seam pack (SHA-256
 `21042537873c3dacafafd134d7c9e296318458f55f1a429c00bc9542f95f3238`),
-and a canonical path-free receipt. Two final hardened fresh exports were
-byte-identical; their receipt SHA-256 is
+and a canonical path-free receipt. Two final hardened v2 exports were
+byte-identical; their immutable v2 receipt SHA-256 is
 `e4e5aab1838dd386895425acc11e3405191e30ce2111c313c2734bfc2bccd77e`. The
 model has 3,677,760 total parameters, of which 3,676,320 are trainable and 1,440
 are frozen; its raw 192-vector is retained separately from consumer-side L2
@@ -764,11 +764,23 @@ pinned initialization message are captured and retained only as path-free
 code/count/byte/digest records; any unknown warning or console output fails.
 Publication uses a stable destination directory handle with no-follow,
 create-exclusive files, inode checks, and
-fsync. The v1.0.0 tag predates the repository's current MIT file, so the
-receipt deliberately marks this package `operator_local_no_release` until the
-model-weight license scope is explicitly established. No ReDimNet weights,
-truth tensors, feature values, local paths, audio, transcripts, or biometric
-vectors belong in Git or public runtime reports.
+fsync. Those historical v2 receipts remain `operator_local_no_release`; they
+are not relabeled by the v3 schema. The immutable v1.0.0 README identifies the
+repository's official pretrained weights, links the exact release assets, and
+declares MIT. Its source commit and GitHub release record predate the checkpoint
+upload, so this is contemporaneous scope evidence rather than a later
+retroactive inference. The exporter pins that README at SHA-256
+`27d500b510a1cdc054a8ccbad484cf6062639fcb9d6b661714214fe766ed4e76` and
+pins the later canonical 1,067-byte MIT payload at commit `2a8d15f65b1d`,
+SHA-256 `3d5a4bf9936a7d09dd770588c0d7cb116fc16916a0310d71fb1fff5d64562101`.
+Fresh v3 receipts therefore mark license scope resolved while keeping artifacts
+`operator_local_pending_release_manifest`. A public raw or converted package
+must still carry that exact license payload and notice and be bound by a
+separate identity-checked release manifest before it may claim
+`github_release_with_license_and_notice`. No ReDimNet weights, truth tensors,
+feature values, local paths, audio, transcripts, or biometric vectors belong in
+Git or public runtime reports. The historical package, truth, and v2 receipt
+hashes above are not evidence that a fresh v3 receipt has been reproduced.
 
 The two explicit Rust-native ECAPA modes run the pinned ECAPA-TDNN speaker
 representation in process through the common segmentation, known-speaker
@@ -941,13 +953,13 @@ The **JSON** sidecar carries the structured form — `video` metadata, `run` met
 | `--naming-style <S>` | `slug` | `slug`, `pretty`, or ASCII-lossy `ascii` artifact names |
 | `--no-keep-audio` | `false` | Delete each audio file after its transcript is written |
 | `--no-retry` | `false` | Do not retry videos previously marked failed in the manifest |
-| `--abort-on-error` | `false` | Stop the whole run on the first per-video failure |
+| `--abort-on-error` | `false` | Stop scheduling later waves after a per-video failure |
 | `--json-summary` | `false` | Emit the final run summary as JSON on stdout (for scripting) |
 | `--robot` | `false` | Stream per-video NDJSON robot events (`youtube.*`, schema 1.1.0) on stdout |
 
 ### Idempotent & Resumable
 
-The `.fw_youtube_manifest.json` makes terminal work idempotent: a re-run **skips videos already `done`** and **retries previously failed videos** (unless `--no-retry`). Incomplete intermediate work is recovered from either an explicit `downloaded` manifest state or a completed `audio/<id>.<ext>` artifact left between download and the terminal transition; partial files, symlinks, wrong ids, and paths outside the owned audio directory are rejected. **Ctrl+C cancels cleanly** — yt-dlp is killed, in-flight transcription aborts, and the manifest stays honest about what completed. By default a partial failure is recorded, emitted as `youtube.failed`, and the run continues; `--abort-on-error` stops on the first failure. Every robot run that gets past `youtube.run_start` funnels through exactly one terminal `youtube.run_complete` emission attempt.
+The `.fw_youtube_manifest.json` makes terminal work idempotent: a re-run **skips videos already `done`** and **retries previously failed videos** (unless `--no-retry`). Incomplete intermediate work is recovered from either an explicit `downloaded` manifest state or a completed `audio/<id>.<ext>` artifact left between download and the terminal transition; partial files, symlinks, wrong ids, and paths outside the owned audio directory are rejected. **Ctrl+C cancels cleanly** — yt-dlp is killed, in-flight transcription aborts, and the manifest stays honest about what completed. By default a partial failure is recorded, emitted as `youtube.failed`, and the run continues; `--abort-on-error` stops scheduling later waves after a failure, while videos already running in the current wave may finish. Every robot run that gets past `youtube.run_start` funnels through exactly one terminal `youtube.run_complete` emission attempt.
 
 ### Requires `yt-dlp`
 

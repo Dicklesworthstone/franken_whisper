@@ -1523,7 +1523,7 @@ model contains 3,677,760 parameters: 3,676,320 trainable plus the frozen
 1,440-element first-stage weighting tensor.
 
 `scripts/export_redimnet2.py` is the only accepted raw-checkpoint boundary. Its
-current exporter and conversion-receipt schemas are v2; the synthetic truth
+current exporter and conversion-receipt schemas are v3; the synthetic truth
 tensor contract remains v1. It requires the exact Python/package tuple and
 14-file source manifest. Before
 import, it requires the executable `redimnet2` package-file census to equal the
@@ -1563,53 +1563,39 @@ are captured and retained only as path-free code, count, byte, and message
 digests; unknown warnings or console output fail. The
 initial frontend ceiling of `2e-5`/`2e-6` was rejected before native work and
 is preserved in the receipt rather than erased. Two independent final hardened
-exports were byte-identical, including the path-free receipt at SHA-256
+v2 exports were byte-identical, including the immutable path-free v2 receipt at
+SHA-256
 `e4e5aab1838dd386895425acc11e3405191e30ce2111c313c2734bfc2bccd77e`.
 
-The v1.0.0 tag contains no top-level repository license file even though a
-later main revision has an MIT file and individual pinned sources carry MIT or
-Apache notices. Model-weight redistribution scope is therefore unresolved.
-The receipt fixes distribution status to `operator_local_no_release`; no
-converted package, checkpoint, truth tensors, feature values, local paths,
-audio, transcripts, or biometric vectors may enter Git, a public release, or
-runtime evidence. This licensing boundary does not prevent local parity and
-comparison work, but it does prevent artifact publication or a distributable
-product claim.
+The two historical v2 receipts remain `operator_local_no_release`; changing the
+future schema does not reinterpret those immutable bytes. The license-scope
+premise behind that conservative status was nevertheless wrong. Although the
+v1.0.0 tree has no top-level `LICENSE`, its immutable README says that the
+repository contains the official implementation and pretrained weights, links
+the exact v1.0.0 model assets including `b2-vox2-lm.pt`, and declares `MIT`.
+The exporter already pins that README at SHA-256
+`27d500b510a1cdc054a8ccbad484cf6062639fcb9d6b661714214fe766ed4e76`.
+The source commit time (2026-03-04T13:25:10Z) and GitHub release-record creation
+time (2026-03-04T13:25:24Z) both precede the checkpoint asset creation time
+(2026-03-04T14:25:02Z) and release publication time
+(2026-03-04T14:25:10Z). The MIT declaration is therefore contemporaneous scope
+evidence for the published checkpoint, not a retroactive inference from a July
+change. The 2026-07-09 commit `2a8d15f65b1d` later supplied the canonical full
+MIT payload and notice; those 1,067 bytes have SHA-256
+`3d5a4bf9936a7d09dd770588c0d7cb116fc16916a0310d71fb1fff5d64562101`.
 
-**License-scope investigation (bd-y4ip.15, 2026-08-23, read-only evidence
-pass).** Facts, each retrieved from the upstream repository
-(`github.com/PalabraAI/redimnet2`) on this date:
-
-- The `v1.0.0` tag tree (`README.md`, `assets/`, `hubconf.py`, `redimnet2/`,
-  `requirements.txt`) contains no license file. Its release body reads only
-  "pre-trained redimnet2 weights vox2-dev (ptn and lm)" (published
-  2026-03-04T14:25:10Z; it remains the repository's ONLY release).
-- Release asset `b2-vox2-lm.pt` — the pinned checkpoint (15,897,450 bytes,
-  SHA-256 `0545a29679a87fe1c662d2bbd05e3b3fe0d1b392832729abaa135e4079a2f77a`)
-  — was uploaded 2026-03-04T14:25:03Z and never re-published afterward;
-  no asset postdates the license addition.
-- Upstream added `## License / MIT` to the README on 2026-07-06
-  ("Update public ReDimNet2 release docs and hub loading", commit
-  `608196213116`) while that same README links the v1.0.0 checkpoint assets
-  as its official download path, then added the top-level MIT LICENSE file on
-  2026-07-09 (commit `2a8d15f65b1d`, "Add MIT License to the project").
-- The repository description states it contains "the official implementation
-  and pretrained weights". No issue or discussion mentions licensing.
-  There is no official HuggingFace mirror (third-party mirrors already label
-  conversions MIT; noted, not authoritative).
-
-Assessment: this demonstrates clear maintainer INTENT that the project —
-including its published checkpoints — is MIT, but it is not an authoritative
-statement that the MIT grant extends retroactively to the March 2026 release
-assets, which were distributed before any license declaration existed.
-Circumstantial intent does not meet the bead's bar of "authoritative upstream
-clarification or another legally sufficient artifact."
-
-Disposition: distribution status stays `operator_local_no_release`. A
-maintainer inquiry has been drafted (retained in the tracker comment on
-bd-y4ip.15) for the operator to send from an operator identity; upon a
-sufficient reply or equivalent artifact, update THIS section first, then the
-receipt status, then bd-y4ip.3.
+Fresh v3 receipts record `license_scope.status = resolved` but fail closed on
+transport: `artifact_status = operator_local_pending_release_manifest` and
+`release_ready = false`. A raw or converted package may claim
+`github_release_with_license_and_notice` only after a separate identity-bound
+release manifest co-admits the weights, conversion receipt, exact canonical
+license payload as `LICENSE.redimnet2.txt`, and the notice
+`Copyright (c) 2026 Palabra.ai`. The converter does not create that release
+manifest. Model and truth bytes remain outside Git and public runtime evidence.
+A fresh v3 export must recheck package/truth determinism, receipt determinism,
+privacy/path absence, the new schema/status fields, and both license hashes;
+the historical package, truth, and v2 receipt hashes are not a v3 execution
+result.
 
 The AMI adapter enforces the corpus site's scenario-only training,
 development, and unseen-test meeting-family split. Other corpora use an
