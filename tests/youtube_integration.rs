@@ -149,7 +149,10 @@ fn gated_youtube_batch_file_produces_md_and_json_then_resumes() {
         assert!(v["video"]["id"].is_string());
         assert!(v["utterances"].is_array());
         let windows = v["windows"].as_array().expect("native windows array");
-        assert!(!windows.is_empty(), "speech sidecar must carry native windows");
+        assert!(
+            !windows.is_empty(),
+            "speech sidecar must carry native windows"
+        );
         for window in windows {
             assert!(window["window_offset_sec"].as_f64().is_some());
             assert!(window["tokens"].as_u64().is_some());
@@ -240,14 +243,20 @@ fn youtube_private_video_fails_gracefully_without_model() {
             .contains("private"),
         "the failure must come from the private-video contract"
     );
-    assert_eq!(events.last().expect("terminal")["event"], "youtube.run_complete");
+    assert_eq!(
+        events.last().expect("terminal")["event"],
+        "youtube.run_complete"
+    );
     assert_eq!(events.last().expect("terminal")["cancelled"], false);
 
     let manifest: serde_json::Value = serde_json::from_slice(
         &std::fs::read(out.join(".fw_youtube_manifest.json")).expect("manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["entries"]["PRIVATE00001"]["state"]["state"], "failed");
+    assert_eq!(
+        manifest["entries"]["PRIVATE00001"]["state"]["state"],
+        "failed"
+    );
     assert_eq!(manifest["entries"]["PRIVATE00001"]["state"]["attempts"], 1);
 }
 
@@ -330,9 +339,93 @@ fn youtube_robot_abort_on_transcription_failure_exits_nonzero_and_persists_failu
         &std::fs::read(out.join(".fw_youtube_manifest.json")).expect("manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["entries"]["MISSING0001"]["state"]["state"], "failed");
+    assert_eq!(
+        manifest["entries"]["MISSING0001"]["state"]["state"],
+        "failed"
+    );
     assert_eq!(manifest["entries"]["MISSING0001"]["state"]["attempts"], 1);
-    assert_eq!(manifest["entries"]["AFTERFAIL01"]["state"]["state"], "pending");
+    assert_eq!(
+        manifest["entries"]["AFTERFAIL01"]["state"]["state"],
+        "pending"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn youtube_real_sigint_exits_130() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out");
+    let call_log = dir.path().join("ytdlp-calls.log");
+    let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
+    command
+        .arg("youtube")
+        .arg("run")
+        .arg("https://www.youtube.com/watch?v=SIGINT00001&fw_stub_fail=429")
+        .arg("--output-dir")
+        .arg(&out)
+        .arg("--model")
+        .arg(dir.path().join("unused-missing-model.bin"))
+        .arg("--robot")
+        .env("FRANKEN_WHISPER_STATE_DIR", dir.path())
+        .env("FRANKEN_WHISPER_YTDLP_BIN", stub_path())
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "1")
+        .env("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole")
+        .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", "/nonexistent-bridge")
+        .env("FRANKEN_WHISPER_INSANELY_FAST_BIN", "/nonexistent-bridge")
+        .env("FRANKEN_WHISPER_PYTHON_BIN", "/nonexistent-bridge")
+        .env("STUB_CALL_LOG", &call_log)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn franken_whisper youtube");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let worker_is_active = std::fs::read_to_string(&call_log)
+            .is_ok_and(|calls| calls.contains("fw_stub_fail=429"));
+        if worker_is_active {
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("inspect youtube CLI") {
+            let output = child
+                .wait_with_output()
+                .expect("collect early youtube exit");
+            panic!(
+                "youtube CLI exited as {status} before the signal probe became active; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("terminate timed-out youtube CLI");
+            let output = child
+                .wait_with_output()
+                .expect("collect timed-out youtube CLI");
+            panic!(
+                "yt-dlp worker path did not become active before SIGINT deadline; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let signal_status = ProcessCommand::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("invoke kill -INT");
+    assert!(signal_status.success(), "deliver SIGINT to youtube CLI");
+
+    let output = child
+        .wait_with_output()
+        .expect("reap interrupted youtube CLI");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "real SIGINT must retain the stable interrupted exit code; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(unix)]
