@@ -1549,6 +1549,9 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
             n_threads: 4,
             max_text_ctx: None,
             audio_ctx,
+            // This gate asserts physical encoder work. Make that authority
+            // explicit instead of depending on a freshly loaded, cold LRU.
+            bypass_transcript_cache: true,
             ..Default::default()
         };
         let t = std::time::Instant::now();
