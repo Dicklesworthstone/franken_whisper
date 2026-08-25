@@ -1163,6 +1163,22 @@ mod tests {
     }
 
     #[test]
+    fn shared_projection_timing_constants_match_conformance() {
+        assert!(
+            (CANONICAL_PROJECTION_EPSILON_SEC
+                - crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC)
+                .abs()
+                == 0.0
+        );
+        assert!(
+            (CANONICAL_PROJECTION_MIN_DURATION_SEC
+                - crate::conformance::CANONICAL_PROJECTION_MIN_DURATION_SEC)
+                .abs()
+                == 0.0
+        );
+    }
+
+    #[test]
     fn requested_audio_window_none_without_flags() {
         let request = native_request();
         assert!(requested_audio_window(&request).is_none());
