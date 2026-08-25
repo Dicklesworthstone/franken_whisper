@@ -52,6 +52,10 @@ path = "src/main.rs"
 name = "fw"
 path = "src/bin/fw.rs"
 
+[[bin]]
+name = "sortformer-f16-downcast"
+path = "src/bin/sortformer_f16_downcast.rs"
+
 [dependencies]
 ctrlc = "3.4"
 base64 = "0.22.1"
