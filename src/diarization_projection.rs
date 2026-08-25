@@ -4,10 +4,10 @@
 //!
 //! Relocated VERBATIM from `diarization.rs` (which re-exports everything, so
 //! call sites and type identities are unchanged) into this dependency-light
-//! module: it uses only `crate::model` types, `crate::error`, and the
-//! canonical projection epsilon — no ECAPA/acoustic machinery — so the wasm
-//! build (bd-m2jm) can mount the exact fusion code the CLI ships instead of
-//! mirroring it.
+//! module: it uses only the shared model/error types and the native decoder's
+//! content-free DTW timing observations — no ECAPA/acoustic machinery — so the
+//! wasm build (bd-m2jm) can mount the exact fusion and word-normalization code
+//! the CLI ships instead of mirroring it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
