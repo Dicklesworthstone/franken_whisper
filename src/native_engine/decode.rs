@@ -1193,6 +1193,7 @@ fn beam_decode_window(
     n_max_tokens: usize,
     user_max_tokens: Option<usize>,
     beam: usize,
+    has_prior_segments: bool,
     checkpoint: &dyn Fn() -> FwResult<()>,
 ) -> FwResult<WindowDecode> {
     let mut active: Vec<BeamHyp> = vec![BeamHyp {
@@ -1276,11 +1277,16 @@ fn beam_decode_window(
 
             if terminate {
                 if !bail {
-                    // The has-timestamp-free rescue is deliberately limited to
-                    // the first window; see `should_rescue_unclosed_first_window`.
+                    // Retain an end-covering unclosed transcript only when it
+                    // cannot duplicate prior output; see
+                    // `should_rescue_unclosed_window`.
                     if result_len == 0
                         && params.timestamps
-                        && should_rescue_unclosed_first_window(seek_cs, covers_audio_end)
+                        && should_rescue_unclosed_window(
+                            seek_cs,
+                            covers_audio_end,
+                            has_prior_segments,
+                        )
                     {
                         result_len = i + 1;
                     }
@@ -2224,13 +2230,22 @@ fn single_timestamp_ending(
 /// Whether a timestamp-mode decode with no closed timestamp may retain its text.
 ///
 /// A short first window can legitimately reach EOT after `<|0.00|>` plus text;
-/// retaining it is required by reduced audio-context streaming. On a later
-/// window, however, the default full-chunk `seek_delta_cs` makes coverage true
-/// for every short final tail, including a tail that overlaps audio already
-/// emitted by the preceding timestamp. Accepting that unclosed tail duplicates
-/// the boundary transcript, so only the first window receives this rescue.
-fn should_rescue_unclosed_first_window(seek_cs: i64, covers_audio_end: bool) -> bool {
-    seek_cs == 0 && covers_audio_end
+/// retaining it is required by reduced audio-context streaming. The same shape
+/// can occur after an initial silent window followed by real speech, so window
+/// position alone is not sufficient evidence of duplication. A later unclosed
+/// tail is therefore also safe to retain when the run has emitted no prior
+/// segment: there is literally no earlier transcript for it to duplicate.
+///
+/// Once any segment exists, the conservative first-window repair remains in
+/// force. Distinguishing hallucinated boundary repetition from intentional
+/// repeated speech would require acoustic evidence; text overlap is not a safe
+/// discriminator because verbatim repetition can be real content.
+fn should_rescue_unclosed_window(
+    seek_cs: i64,
+    covers_audio_end: bool,
+    has_prior_segments: bool,
+) -> bool {
+    covers_audio_end && (seek_cs == 0 || !has_prior_segments)
 }
 
 struct IndependentWindowResult {
@@ -2325,6 +2340,7 @@ fn decode_independent_no_timestamp_window(
             n_max_tokens,
             user_max_tokens,
             beam,
+            false,
             &cp,
         )?;
         (decoded, plogs, seek_delta_cs, result_len)
@@ -3198,6 +3214,7 @@ fn transcribe_samples_uncached(
                     n_max_tokens,
                     user_max_tokens,
                     effective_beam_size,
+                    !segments.is_empty(),
                     checkpoint,
                 )?
             } else {
@@ -3266,13 +3283,12 @@ fn transcribe_samples_uncached(
                     let reached_end = has_ts && covers_audio_end;
                     if tok == tk.eot || budget_reached || reached_end {
                         if result_len == 0 && params.timestamps {
-                            // Retain an unclosed first-window transcript when it
-                            // covers the input (required by reduced audio-context
-                            // streaming), but reject later overlapping tails that
-                            // would duplicate already-emitted boundary text.
-                            if should_rescue_unclosed_first_window(
+                            // Retain an end-covering unclosed transcript only when
+                            // it cannot duplicate prior emitted output.
+                            if should_rescue_unclosed_window(
                                 seek_cs,
                                 covers_audio_end,
+                                !segments.is_empty(),
                             ) {
                                 result_len = i + 1;
                             } else {
@@ -4987,18 +5003,22 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_window_rescue_is_first_window_only() {
+    fn unclosed_window_rescue_requires_no_prior_output() {
         // Positive cell: a short first-window streaming slice reaches EOT after
         // `<|0.00|>` plus text and must retain that transcript.
-        assert!(should_rescue_unclosed_first_window(0, true));
+        assert!(should_rescue_unclosed_window(0, true, false));
 
-        // Negative cell: a later short tail also satisfies the default
-        // full-chunk coverage arithmetic, but may overlap the preceding closed
-        // timestamp and must not be emitted a second time.
-        assert!(!should_rescue_unclosed_first_window(2_800, true));
+        // Positive cell: after an initial silent window, a later short tail has
+        // no prior transcript to duplicate and must retain genuine new speech.
+        assert!(should_rescue_unclosed_window(3_000, true, false));
+
+        // Negative cell: once prior output exists, a later short tail also
+        // satisfies the default full-chunk coverage arithmetic but may overlap
+        // the preceding transcript and must not be emitted a second time.
+        assert!(!should_rescue_unclosed_window(2_800, true, true));
 
         // Coverage remains mandatory even on the first window.
-        assert!(!should_rescue_unclosed_first_window(0, false));
+        assert!(!should_rescue_unclosed_window(0, false, false));
     }
 
     #[test]
