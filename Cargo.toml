@@ -22,6 +22,7 @@ include = [
     "/src/**",
     "!/src/.DS_Store",
     "/models/**",
+    "/scripts/convert_generic_to_safetensors.py",
     "/scripts/convert_to_safetensors.py",
     "/scripts/export_sortformer_activations.py",
     "/docs/native_engine_contract.md",

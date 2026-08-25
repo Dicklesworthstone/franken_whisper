@@ -35,9 +35,11 @@
 //! # No network access
 //!
 //! Like the whisper engine, nothing here ever downloads. Fetching / converting
-//! aux models is an explicit, separate, user-invoked step (see
-//! `scripts/fetch_aux_models.sh` and `scripts/convert_to_safetensors.py`); a
-//! missing model is a hard, actionable error from [`resolve_aux_model`].
+//! aux models is an explicit, separate, user-invoked step. Generic checkpoints
+//! use `scripts/convert_generic_to_safetensors.py`; frozen ECAPA and Sortformer
+//! profiles use the byte-pinned `scripts/convert_to_safetensors.py` through
+//! their model-specific workflows. A missing model is a hard, actionable error
+//! from [`resolve_aux_model`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -57,7 +59,7 @@ const MAX_HEADER_LEN: u64 = 100 * 1024 * 1024;
 
 /// The reserved key inside the JSON header that carries free-form, non-tensor
 /// metadata (e.g. provenance / conversion info written by
-/// `convert_to_safetensors.py`).
+/// `convert_generic_to_safetensors.py` or the frozen profile converter).
 const METADATA_KEY: &str = "__metadata__";
 
 /// A safetensors dtype accepted by the parser.
