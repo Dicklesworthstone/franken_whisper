@@ -45,6 +45,10 @@
 # outputs or evaluation corpora from this tree to remote build workers.
 tests/artifacts/perf/**
 
+# Local diagnostic runs can contain symlinks that Windows workers cannot
+# recreate and are never compilation inputs.
+.doctor/**
+
 # Licensed model packages, converted tensors, and path-bearing receipts are
 # operator-local proof inputs, never remote-build inputs.
 **/*.[nN][eE][mM][oO]
