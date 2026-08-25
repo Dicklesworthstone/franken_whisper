@@ -1642,8 +1642,7 @@ mod tests {
         // Token with no deadline at all — should complete normally for fast commands.
         let cancel = CancellationToken::no_deadline();
         let command = platform_command("exit 0", "exit 0");
-        let result =
-            run_command_cancellable(command.program, &command.args, None, &cancel, None);
+        let result = run_command_cancellable(command.program, &command.args, None, &cancel, None);
         assert!(result.is_ok());
     }
 
@@ -2259,9 +2258,8 @@ mod tests {
             "printf '%s' 'test_output'",
             "[Console]::Out.Write('test_output')",
         );
-        let output =
-            run_command_cancellable(command.program, &command.args, None, &cancel, None)
-                .expect("stdout fixture should succeed");
+        let output = run_command_cancellable(command.program, &command.args, None, &cancel, None)
+            .expect("stdout fixture should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("test_output"),
@@ -2343,9 +2341,8 @@ mod tests {
         // Both safety nets disabled — should still work for fast commands.
         let cancel = CancellationToken::no_deadline();
         let command = platform_command("printf '%s' ok", "[Console]::Out.Write('ok')");
-        let output =
-            run_command_cancellable(command.program, &command.args, None, &cancel, None)
-                .expect("should succeed");
+        let output = run_command_cancellable(command.program, &command.args, None, &cancel, None)
+            .expect("should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("ok"));
     }
