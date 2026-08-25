@@ -6341,6 +6341,59 @@ mod tests {
     }
 
     #[test]
+    fn gated_later_unclosed_tail_without_prior_output_is_retained() {
+        // Non-tiled positive control for bd-4ep1: the first 30 s window is
+        // silence, while the later final window contains genuinely new speech
+        // (the last 3 s of JFK). This exercises the reduced-audio-context path
+        // where short tails have produced `<|0.00|> text <eot>` without any
+        // preceding text that could be duplicated. A window-position-only
+        // rescue rejects that transcript and records DroppedWindow; the
+        // evidence-aware rule retains it because no prior segment exists.
+        let (Some(model), Some(jfk)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP gated_later_unclosed_tail: tiny.en model or jfk.wav missing");
+            return;
+        };
+        let tail_samples = 3 * SAMPLE_RATE;
+        assert!(
+            jfk.len() >= tail_samples,
+            "jfk fixture must contain a 3 s tail"
+        );
+        let mut silence_then_tail = vec![0.0; 30 * SAMPLE_RATE];
+        silence_then_tail.extend_from_slice(&jfk[jfk.len() - tail_samples..]);
+
+        let params = DecodeParams {
+            audio_ctx: AudioCtxPolicy::Auto,
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+        let out = transcribe_samples_uncached(
+            &model,
+            &silence_then_tail,
+            &params,
+            &noop,
+            None,
+        )
+        .expect("decode silence followed by genuine final-tail speech");
+        let text = out
+            .segments
+            .iter()
+            .map(|segment| segment.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(out.windows.len() >= 2, "fixture must exercise a later window");
+        assert!(
+            text.to_lowercase().contains("country"),
+            "genuine later-tail speech must be retained: {text:?}"
+        );
+        assert!(
+            out.dropped_windows.is_empty(),
+            "genuine later-tail speech must not be reported as dropped: {:?}",
+            out.dropped_windows
+        );
+    }
+
+    #[test]
     fn gated_suppress_nst_field_is_neutral_on_clean_speech() {
         // suppress_nst (whisper --suppress-nst) masks non-speech/symbol tokens.
         // jfk is clean speech that never decodes a non-speech token, so masking
