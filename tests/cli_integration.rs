@@ -530,6 +530,49 @@ printf '%s\n' '{"text":"stub transcript","language":"en","segments":[{"start":0.
 }
 
 #[cfg(unix)]
+fn write_whisper_cpp_zero_duration_word_stub_binary(dir: &std::path::Path) -> PathBuf {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let stub_path = dir.join("whisper_cpp_zero_duration_word_stub.sh");
+    let script = r#"#!/bin/bash
+set -euo pipefail
+out_prefix=""
+split_on_word=0
+max_segment_length=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -of)
+      out_prefix="$2"
+      shift 2
+      ;;
+    -sow)
+      split_on_word=1
+      shift
+      ;;
+    -ml)
+      max_segment_length="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [[ -z "${out_prefix}" || "${split_on_word}" != "1" || "${max_segment_length}" != "100" ]]; then
+  echo "missing split-on-word zero-duration regression contract" >&2
+  exit 42
+fi
+printf '%s\n' '{"result":{"language":"en"},"transcription":[{"offsets":{"from":0,"to":1000},"text":" first","confidence":0.91},{"offsets":{"from":1000,"to":1000},"text":" zero-width","confidence":0.72},{"offsets":{"from":1500,"to":2000},"text":" third","confidence":0.83}]}' > "${out_prefix}.json"
+"#;
+    fs::write(&stub_path, script).expect("write zero-duration word stub");
+    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&stub_path, perms).expect("chmod");
+    stub_path
+}
+
+#[cfg(unix)]
 fn write_whisper_cpp_tiny_diarize_stub_binary(dir: &std::path::Path) -> PathBuf {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -3391,6 +3434,54 @@ fn tiny_diarize_emits_native_json_artifact_and_preserves_speaker_turn_signal() {
             .filter_map(serde_json::Value::as_str)
             .any(|path| path.ends_with("/whispercpp_output.json")),
         "expected artifact path basename whispercpp_output.json"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn split_on_word_bridge_preserves_zero_duration_observation_in_final_json() {
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_zero_duration_word_stub_binary(dir.path());
+    let input_wav = dir.path().join("zero_duration_word_input.wav");
+    generate_voiced_wav_without_ffmpeg(&input_wav, 250);
+
+    let report = run_transcribe_json_with_stub(
+        &[
+            "--input",
+            input_wav.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--split-on-word",
+            "--max-segment-length",
+            "100",
+            "--no-persist",
+            "--json",
+        ],
+        None,
+        &stub_bin,
+        &state_root,
+    );
+
+    let segments = report["result"]["segments"]
+        .as_array()
+        .expect("final result segments");
+    assert_eq!(segments.len(), 3);
+    assert_eq!(segments[0]["text"], "first");
+    assert_eq!(segments[0]["start_sec"], 0.0);
+    assert_eq!(segments[0]["end_sec"], 1.0);
+    assert_eq!(segments[1]["text"], "zero-width");
+    assert_eq!(segments[1]["confidence"], 0.72);
+    assert!(segments[1]["start_sec"].is_null());
+    assert!(segments[1]["end_sec"].is_null());
+    assert_eq!(segments[2]["text"], "third");
+    assert_eq!(segments[2]["start_sec"], 1.5);
+    assert_eq!(segments[2]["end_sec"], 2.0);
+
+    assert_eq!(
+        report["result"]["raw_output"]["transcription"][1]["offsets"],
+        serde_json::json!({"from": 1000, "to": 1000}),
+        "the adapter must preserve the decoder's raw evidence"
     );
 }
 
