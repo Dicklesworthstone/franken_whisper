@@ -320,10 +320,12 @@ mod wasm_api {
     // mirror), then merged speaker-attributed runs. The result JSON is
     // `{language, segments, turns, speaker_segments, dropped_windows,
     // audio_sec}`; `initial_prompt` is the CLI's `--prompt` (None/empty is
-    // byte-identical to no prompt). Projection runs at segment granularity
-    // (`word_aligned = false`) because word timestamps stay off in the
-    // browser build. Exposed as two stages so the page can build a progress
-    // model between them, plus a single-shot compatibility wrapper.
+    // byte-identical to no prompt). The fixed large-v3-turbo route records
+    // decoder attention and uses the same canonical DTW word normalizer as the
+    // native backend. Any incomplete timing set falls back to the prior
+    // segment-granularity projection. Exposed as two stages so the page can
+    // build a progress model between them, plus a single-shot compatibility
+    // wrapper.
 
     /// Hydrate the FastEnhancer denoiser from its pinned artifact bytes
     /// (838 KB; the page verifies the sha256 pin before the bytes get here,
@@ -440,6 +442,8 @@ mod wasm_api {
             // selector so the user can pin it.
             let params = DecodeParams {
                 timestamps: true,
+                word_timestamps: true,
+                model_hint: Some("large-v3-turbo".to_owned()),
                 n_threads: 1,
                 initial_prompt: initial_prompt.filter(|p| !p.trim().is_empty()),
                 language: language.filter(|l| !l.trim().is_empty() && l != "auto"),
@@ -478,10 +482,31 @@ mod wasm_api {
                 &|| Ok(()),
             )
             .map_err(js_err)?;
+        let (projection_segments, word_aligned) = match out
+            .word_timings
+            .as_ref()
+            .filter(|timings| timings.iter().any(|segment| !segment.is_empty()))
+        {
+            Some(word_timings) => {
+                let normalized =
+                    crate::diarization_projection::normalize_dtw_projection_units(
+                        &out.segments,
+                        word_timings,
+                        || Ok(()),
+                    )
+                    .map_err(js_err)?;
+                if normalized.word_aligned_safe {
+                    (normalized.segments, true)
+                } else {
+                    (out.segments.clone(), false)
+                }
+            }
+            None => (out.segments.clone(), false),
+        };
         let mut projection = crate::diarization_projection::project_diarization_onto_segments(
-            &out.segments,
+            &projection_segments,
             &turns,
-            false,
+            word_aligned,
         )
         .map_err(js_err)?;
         let mut turns = turns;
