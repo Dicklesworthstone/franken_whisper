@@ -1536,6 +1536,20 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         eprintln!("SKIP gated_audio_ctx_policy_mechanism_ab: tiny.en model missing");
         return;
     };
+    // This is specifically the default-policy, greedy incumbent comparison.
+    // Process-global overrides would silently change that experiment while the
+    // printed row still called it greedy/Full, so reject them explicitly.
+    for key in [
+        "FW_BEAM_SIZE",
+        "FW_TEMP_FALLBACK",
+        "FW_FIRST_WINDOW_MARGIN",
+        "FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE",
+    ] {
+        assert!(
+            std::env::var_os(key).is_none(),
+            "{key} must be unset for the default greedy audio_ctx gate"
+        );
+    }
     let bytes = std::fs::read(jfk_wav_path()).expect("read jfk.wav");
     let samples = read_wav_16k_mono(&bytes).expect("decode jfk.wav to 16k mono");
     let model = NativeWhisperModel::load(&model_path).expect("load tiny.en");
@@ -1566,8 +1580,6 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
     let n = samples.len() as i64;
     let real_frames = usize::try_from(n.saturating_sub(200) / 160 + 1).unwrap_or(0);
     let auto_ctx = native_engine::decode::AudioCtxPolicy::Auto.effective_enc_ctx(real_frames);
-    let fixed_ctx =
-        native_engine::decode::AudioCtxPolicy::fixed(512).effective_enc_ctx(real_frames);
 
     let (full, full_wall) = run(&samples, native_engine::decode::AudioCtxPolicy::Full);
     let (auto, auto_wall) = run(&samples, native_engine::decode::AudioCtxPolicy::Auto);
@@ -1576,26 +1588,65 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         native_engine::decode::AudioCtxPolicy::fixed(512),
     );
 
+    // Timestamp decoding may legitimately split even a short input into more
+    // than one seek. Check the exact physical work for every seek the model
+    // actually chose instead of assuming a single accepted window. Window
+    // offsets are emitted from integer centiseconds, so round-trip them back to
+    // that timebase before deriving the remaining real audio.
+    let assert_reduced_policy_work =
+        |label: &str,
+         input_real_frames: usize,
+         policy: native_engine::decode::AudioCtxPolicy,
+         out: &native_engine::decode::DecodeOutput| {
+            assert!(out.work.encoder_calls >= 1, "{label}: no physical encode");
+            assert_eq!(
+                out.work.encoder_calls,
+                out.windows.len(),
+                "{label}: retries must reuse their seek's physical encode"
+            );
+            let expected_mel_frames = out
+                .windows
+                .iter()
+                .map(|window| {
+                    let seek_cs_f64 = window.window_offset_sec * 100.0;
+                    let seek_cs_rounded = seek_cs_f64.round();
+                    assert!(
+                        (seek_cs_f64 - seek_cs_rounded).abs() < 1e-6,
+                        "{label}: non-centisecond window offset {}",
+                        window.window_offset_sec
+                    );
+                    let seek_cs = seek_cs_rounded as usize;
+                    let remaining_real_frames = input_real_frames
+                        .saturating_sub(seek_cs)
+                        .min(3000);
+                    policy.effective_enc_ctx(remaining_real_frames) * 2
+                })
+                .sum::<usize>();
+            assert_eq!(
+                out.work.encoder_mel_frames, expected_mel_frames,
+                "{label}: aggregate encoder work disagrees with observed seek offsets"
+            );
+        };
+
     // ── Mechanism gates (deterministic, timing-free) ──
     //
     // Full pads EVERY window to the full 3000 frames — exact invariant. A
     // reduced policy's total depends on segmentation (a slightly different
     // transcript legitimately moves the final timestamp and can spawn an extra
-    // tail window), so those are bounded rather than exact. The policy's
-    // effective ctx is monotone in remaining real audio, making the first
-    // window's ctx a valid cap for every later window. Auto's 512-frame quality
-    // floor and Fixed's shrink-to-real semantics therefore stay part of the
-    // bound instead of being replaced by the obsolete 64-frame tail floor.
+    // tail window), so derive its exact aggregate from the observed seeks.
+    // Auto's 512-frame quality floor and Fixed's shrink-to-real semantics stay
+    // part of that expectation instead of being replaced by the obsolete
+    // 64-frame tail floor.
     assert_eq!(
         full.work.encoder_mel_frames,
         3000 * full.windows.len(),
         "Full must pad every window to FRAMES_PER_CHUNK"
     );
-    let auto_upper = auto_ctx * 2 * auto.windows.len();
-    assert!(
-        auto.work.encoder_mel_frames <= auto_upper,
-        "Auto total {} exceeds per-window real-derived cap sum {auto_upper}",
-        auto.work.encoder_mel_frames
+    assert_reduced_policy_work(
+        "whole-jfk Auto",
+        real_frames,
+        native_engine::decode::AudioCtxPolicy::Auto,
+        &auto,
     );
     assert!(
         auto.work.encoder_mel_frames * 2 < full.work.encoder_mel_frames,
@@ -1603,11 +1654,11 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         auto.work.encoder_mel_frames,
         full.work.encoder_mel_frames
     );
-    let fixed_upper = fixed_ctx * 2 * fixed.windows.len();
-    assert!(
-        fixed.work.encoder_mel_frames <= fixed_upper,
-        "Fixed(512) total {} exceeds cap-bounded sum {fixed_upper}",
-        fixed.work.encoder_mel_frames
+    assert_reduced_policy_work(
+        "whole-jfk Fixed(512)",
+        real_frames,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+        &fixed,
     );
 
     // ── Exact quality-floor boundary through the real model path ──
@@ -1616,9 +1667,10 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
     // `1 + max(n_samples - 200, 0) / 160`. Choose an actual sub-500 ms decode
     // plus exact sample counts on the two sides of Auto's 512-ctx floor
     // transition and at the 1500-ctx ceiling. At 1024 real frames Auto and
-    // Fixed(512) must be byte-equivalent because both encode 1024 mel frames.
-    // At 1025,
-    // ceil(real/2) makes Auto encode 1026 while Fixed remains capped at 1024.
+    // Fixed(512) both feed 1024 mel frames on the first seek. At 1025,
+    // ceil(real/2) makes Auto's first seek feed 1026 while Fixed remains capped
+    // at 1024. Later model-directed tail seeks are checked individually through
+    // their observed offsets rather than prohibited by the test.
     // These model-backed cells fail if first-window reduction is bypassed,
     // ceil regresses to floor, the Auto quality floor sticks one frame too
     // long, or Fixed stops enforcing its cap.
@@ -1643,15 +1695,23 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         sub_500ms_input,
         native_engine::decode::AudioCtxPolicy::Auto,
     );
-    assert_eq!(auto_sub_500ms.work.encoder_calls, 1);
-    assert_eq!(auto_sub_500ms.work.encoder_mel_frames, 1024);
+    assert_reduced_policy_work(
+        "sub-500ms Auto",
+        49,
+        native_engine::decode::AudioCtxPolicy::Auto,
+        &auto_sub_500ms,
+    );
 
     let (auto_ceiling, _) = run(
         &ceiling_input,
         native_engine::decode::AudioCtxPolicy::Auto,
     );
-    assert!(auto_ceiling.work.encoder_calls >= 1);
-    assert!(auto_ceiling.work.encoder_mel_frames >= 3000);
+    assert_reduced_policy_work(
+        "ceiling Auto",
+        3000,
+        native_engine::decode::AudioCtxPolicy::Auto,
+        &auto_ceiling,
+    );
 
     let (auto_floor, _) = run(
         floor_input,
@@ -1661,13 +1721,21 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         floor_input,
         native_engine::decode::AudioCtxPolicy::fixed(512),
     );
-    assert_eq!(auto_floor.work.encoder_calls, 1);
-    assert_eq!(fixed_floor.work.encoder_calls, 1);
-    assert_eq!(auto_floor.work.encoder_mel_frames, 1024);
-    assert_eq!(fixed_floor.work.encoder_mel_frames, 1024);
-    assert_eq!(auto_floor.segments, fixed_floor.segments);
+    assert_reduced_policy_work(
+        "floor Auto",
+        1024,
+        native_engine::decode::AudioCtxPolicy::Auto,
+        &auto_floor,
+    );
+    assert_reduced_policy_work(
+        "floor Fixed(512)",
+        1024,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+        &fixed_floor,
+    );
     assert!(
-        !joined_text(&auto_floor.segments).is_empty(),
+        !joined_text(&auto_floor.segments).is_empty()
+            && !joined_text(&fixed_floor.segments).is_empty(),
         "both 512-context policies must decode the speech-bearing floor slice"
     );
 
@@ -1679,13 +1747,22 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         above_floor_input,
         native_engine::decode::AudioCtxPolicy::fixed(512),
     );
-    assert_eq!(auto_above_floor.work.encoder_calls, 1);
-    assert_eq!(fixed_above_floor.work.encoder_calls, 1);
-    assert_eq!(auto_above_floor.work.encoder_mel_frames, 1026);
-    assert_eq!(fixed_above_floor.work.encoder_mel_frames, 1024);
+    assert_reduced_policy_work(
+        "above-floor Auto",
+        1025,
+        native_engine::decode::AudioCtxPolicy::Auto,
+        &auto_above_floor,
+    );
+    assert_reduced_policy_work(
+        "above-floor Fixed(512)",
+        1025,
+        native_engine::decode::AudioCtxPolicy::fixed(512),
+        &fixed_above_floor,
+    );
     assert_eq!(
-        auto_above_floor.work.encoder_mel_frames,
-        fixed_above_floor.work.encoder_mel_frames + 2
+        native_engine::decode::AudioCtxPolicy::Auto.effective_enc_ctx(1025) * 2,
+        native_engine::decode::AudioCtxPolicy::fixed(512).effective_enc_ctx(1025) * 2 + 2,
+        "the planted boundary negative must distinguish Auto from Fixed(512)"
     );
     assert!(
         !joined_text(&auto_above_floor.segments).is_empty()
