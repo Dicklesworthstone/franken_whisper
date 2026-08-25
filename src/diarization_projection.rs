@@ -811,7 +811,7 @@ fn snap_speaker_changes_to_punctuation(projected: &mut [TranscriptionSegment]) {
 /// well-formed, monotonic zero-width pair to absent timing; projection will
 /// then retain it as an explicitly unknown speaker observation.  Other bad
 /// timestamp shapes remain fail-closed in [`validate_projection_segments`].
-fn canonicalize_zero_duration_projection_segments(
+pub(crate) fn canonicalize_zero_duration_projection_segments(
     segments: &[TranscriptionSegment],
     word_aligned: bool,
 ) -> FwResult<Vec<TranscriptionSegment>> {

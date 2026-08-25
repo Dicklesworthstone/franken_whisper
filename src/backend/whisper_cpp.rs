@@ -3,6 +3,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::backend::{extract_segments_from_json, transcript_from_segments};
+use crate::diarization_projection::{
+    canonicalize_zero_duration_projection_segments, validate_projection_segments,
+};
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, OutputFormat, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
@@ -42,7 +45,7 @@ pub fn run(
     }
 
     let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(&json_path)?)?;
-    let segments = extract_segments_from_json(&raw);
+    let segments = adapt_projection_segments(request, &extract_segments_from_json(&raw))?;
 
     let transcript = raw
         .get("text")
@@ -78,6 +81,28 @@ pub fn run(
         raw_output: raw,
         artifact_paths,
     })
+}
+
+/// Canonicalize the one degenerate timestamp shape that `whisper-cli` can
+/// emit for an explicitly word-split request.
+///
+/// `-sow` is the adapter's evidence that these are decoder word-boundary
+/// observations. A quantized `[t, t]` observation keeps its text, confidence,
+/// order, and slot but relinquishes timing because it carries no interval from
+/// which speaker ownership can be inferred. The full adapted timeline is then
+/// validated with strict word-aligned geometry so this exception cannot hide a
+/// reversed, overlapping, non-finite, or unpaired neighbor.
+fn adapt_projection_segments(
+    request: &TranscribeRequest,
+    segments: &[TranscriptionSegment],
+) -> FwResult<Vec<TranscriptionSegment>> {
+    if !request.backend_params.split_on_word || request.backend_params.no_timestamps {
+        return Ok(segments.to_vec());
+    }
+
+    let adapted = canonicalize_zero_duration_projection_segments(segments, true)?;
+    validate_projection_segments(&adapted, true)?;
+    Ok(adapted)
 }
 
 pub(crate) fn build_args(
@@ -353,7 +378,7 @@ mod tests {
         VadParams, WordTimestampParams,
     };
 
-    use super::build_args;
+    use super::{adapt_projection_segments, build_args};
 
     fn minimal_request() -> TranscribeRequest {
         TranscribeRequest {
@@ -370,6 +395,91 @@ mod tests {
             timeout_ms: None,
             backend_params: BackendParams::default(),
         }
+    }
+
+    fn segment(
+        start_sec: Option<f64>,
+        end_sec: Option<f64>,
+        text: &str,
+        confidence: Option<f64>,
+    ) -> crate::model::TranscriptionSegment {
+        crate::model::TranscriptionSegment {
+            start_sec,
+            end_sec,
+            text: text.to_owned(),
+            speaker: None,
+            confidence,
+        }
+    }
+
+    #[test]
+    fn split_on_word_adapter_preserves_zero_duration_observation_as_untimed() {
+        let mut request = minimal_request();
+        request.backend_params.split_on_word = true;
+        request.backend_params.decoding = Some(DecodingParams {
+            max_segment_length: Some(100),
+            ..DecodingParams::default()
+        });
+        let input = vec![
+            segment(Some(0.0), Some(1.0), "first", Some(0.91)),
+            segment(Some(1.0), Some(1.0), "zero-width", Some(0.72)),
+            segment(Some(1.5), Some(2.0), "third", Some(0.83)),
+        ];
+
+        let adapted = adapt_projection_segments(&request, &input)
+            .expect("word-split zero-width observation must canonicalize");
+
+        assert_eq!(adapted.len(), input.len());
+        assert_eq!(adapted[0], input[0]);
+        assert_eq!(adapted[1].text, "zero-width");
+        assert_eq!(adapted[1].confidence, Some(0.72));
+        assert_eq!(adapted[1].start_sec, None);
+        assert_eq!(adapted[1].end_sec, None);
+        assert_eq!(adapted[2], input[2]);
+    }
+
+    #[test]
+    fn split_on_word_adapter_does_not_hide_malformed_neighbors() {
+        let mut request = minimal_request();
+        request.backend_params.split_on_word = true;
+
+        let overlapping_previous = vec![
+            segment(Some(0.0), Some(1.1), "first", None),
+            segment(Some(1.0), Some(1.0), "zero-width", None),
+            segment(Some(1.0), Some(2.0), "third", None),
+        ];
+        assert!(adapt_projection_segments(&request, &overlapping_previous).is_err());
+
+        let reversed_next = vec![
+            segment(Some(0.0), Some(1.0), "first", None),
+            segment(Some(1.0), Some(1.0), "zero-width", None),
+            segment(Some(0.9), Some(2.0), "third", None),
+        ];
+        assert!(adapt_projection_segments(&request, &reversed_next).is_err());
+
+        let unpaired = vec![segment(Some(1.0), None, "missing end", None)];
+        assert!(adapt_projection_segments(&request, &unpaired).is_err());
+    }
+
+    #[test]
+    fn non_word_or_no_timestamp_requests_do_not_gain_canonicalization_authority() {
+        let zero_width = vec![segment(Some(1.0), Some(1.0), "external", Some(0.4))];
+
+        let request = minimal_request();
+        let unchanged = adapt_projection_segments(&request, &zero_width)
+            .expect("non-word adapter must leave the observation untouched");
+        assert_eq!(unchanged, zero_width);
+        assert!(
+            crate::diarization_projection::validate_projection_segments(&unchanged, false)
+                .is_err()
+        );
+
+        let mut no_timestamps = minimal_request();
+        no_timestamps.backend_params.split_on_word = true;
+        no_timestamps.backend_params.no_timestamps = true;
+        let unchanged = adapt_projection_segments(&no_timestamps, &zero_width)
+            .expect("timestamps-suppressed request has no timing authority");
+        assert_eq!(unchanged, zero_width);
     }
 
     #[test]
