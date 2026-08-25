@@ -43,7 +43,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::conformance::DTW_PROJECTION_SCHEMA_VERSION;
-use crate::conformance::{CANONICAL_PROJECTION_EPSILON_SEC, CANONICAL_PROJECTION_MIN_DURATION_SEC};
+use crate::diarization_projection::{
+    CANONICAL_PROJECTION_EPSILON_SEC, CANONICAL_PROJECTION_MIN_DURATION_SEC,
+    CanonicalProjectionUnit, ProjectionUnitProvenance, normalize_dtw_projection_units,
+};
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, DiarizationEngine, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
@@ -69,62 +72,6 @@ pub(crate) enum WordTimestampMode {
     Word,
     /// Split into words, then regroup runs of words up to `max_len` characters.
     MaxLen(u32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionUnitProvenance {
-    DecoderWordTimestamp,
-    SegmentInterpolationFallback,
-    SegmentGeometryFallback,
-}
-
-impl ProjectionUnitProvenance {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::DecoderWordTimestamp => "decoder_word_timestamp",
-            Self::SegmentInterpolationFallback => "segment_interpolation_fallback",
-            Self::SegmentGeometryFallback => "segment_geometry_fallback",
-        }
-    }
-
-    const fn supported_labels() -> [&'static str; 3] {
-        [
-            Self::DecoderWordTimestamp.as_str(),
-            Self::SegmentInterpolationFallback.as_str(),
-            Self::SegmentGeometryFallback.as_str(),
-        ]
-    }
-}
-
-/// One unambiguous transcript unit accepted by acoustic projection.
-///
-/// Times are finite seconds and describe a positive half-open interval
-/// `[start_sec, end_sec)`. Units are ordered and non-overlapping. Provenance is
-/// retained independently of the text-bearing public segment representation.
-#[derive(Debug, Clone, PartialEq)]
-struct CanonicalProjectionUnit {
-    start_sec: f64,
-    end_sec: f64,
-    text: String,
-    confidence: Option<f64>,
-    source_segment_index: usize,
-    source_word_start_index: usize,
-    source_word_end_index: usize,
-    provenance: ProjectionUnitProvenance,
-    was_clamped: bool,
-    was_expanded: bool,
-}
-
-impl CanonicalProjectionUnit {
-    fn as_segment(&self) -> TranscriptionSegment {
-        TranscriptionSegment {
-            start_sec: Some(self.start_sec),
-            end_sec: Some(self.end_sec),
-            text: self.text.clone(),
-            speaker: None,
-            confidence: self.confidence,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,54 +137,6 @@ struct DtwSegmentsOutcome {
     #[cfg(test)]
     canonical_units: Vec<CanonicalProjectionUnit>,
     report: DtwProjectionReport,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionNormalizationErrorReason {
-    ExtraTimingSegments,
-    ParentTimestampPair,
-    ParentTimestampNonFinite,
-    ParentTimestampNegative,
-    ParentDuration,
-    ParentOverlap,
-    WordTimestampNonFinite,
-    WordTimestampNegative,
-    WordTimestampReversed,
-    WordOrderReversed,
-    WordOverlap,
-    CanonicalInvariant,
-}
-
-impl ProjectionNormalizationErrorReason {
-    const fn code(self) -> &'static str {
-        match self {
-            Self::ExtraTimingSegments => "FW-DTW-PROJECTION-EXTRA-SEGMENTS",
-            Self::ParentTimestampPair => "FW-DTW-PROJECTION-PARENT-PAIR",
-            Self::ParentTimestampNonFinite => "FW-DTW-PROJECTION-PARENT-NONFINITE",
-            Self::ParentTimestampNegative => "FW-DTW-PROJECTION-PARENT-NEGATIVE",
-            Self::ParentDuration => "FW-DTW-PROJECTION-PARENT-DURATION",
-            Self::ParentOverlap => "FW-DTW-PROJECTION-PARENT-OVERLAP",
-            Self::WordTimestampNonFinite => "FW-DTW-PROJECTION-WORD-NONFINITE",
-            Self::WordTimestampNegative => "FW-DTW-PROJECTION-WORD-NEGATIVE",
-            Self::WordTimestampReversed => "FW-DTW-PROJECTION-WORD-REVERSED",
-            Self::WordOrderReversed => "FW-DTW-PROJECTION-WORD-ORDER",
-            Self::WordOverlap => "FW-DTW-PROJECTION-WORD-OVERLAP",
-            Self::CanonicalInvariant => "FW-DTW-PROJECTION-CANONICAL-INVARIANT",
-        }
-    }
-}
-
-fn projection_normalization_error(
-    reason: ProjectionNormalizationErrorReason,
-    segment_index: usize,
-    word_index: Option<usize>,
-    detail: impl std::fmt::Display,
-) -> FwError {
-    let word = word_index.map_or_else(String::new, |index| format!(" word={index}"));
-    FwError::InvalidRequest(format!(
-        "dtw projection normalization [{}]: segment={segment_index}{word} {detail}",
-        reason.code()
-    ))
 }
 
 /// Map the request's [`WordTimestampParams`] to a [`WordTimestampMode`].
