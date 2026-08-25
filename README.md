@@ -528,7 +528,7 @@ for the versioned schemas and fail-closed policy.
 
 The multiscale acoustic sidecar is exposed only through the separate public
 evaluation command `diarization-corpus sidecar-study`, using
-`public-diarization-acoustic-sidecar-study-v3` and its v3 runner. It is not a
+`public-diarization-acoustic-sidecar-study-v6` and its v8 runner. It is not a
 `transcribe` option: normal segmentation, clustering, robot output,
 persistence, and the normal transcription route are not mutated by the
 sidecar study. This is a routing guarantee, not a claim that current reports

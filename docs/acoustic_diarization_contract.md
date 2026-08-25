@@ -507,8 +507,8 @@ Nothing in this section establishes that any new candidate improves
 diarization. `bd-odj7.13.15` therefore remains in progress.
 
 The evaluator uses the separate
-`public-diarization-acoustic-sidecar-study-v3` schema and
-`public-diarization-acoustic-sidecar-study-runner-v3`; it does not modify public
+`public-diarization-acoustic-sidecar-study-v6` schema and
+`public-diarization-acoustic-sidecar-study-runner-v8`; it does not modify public
 acoustic ablation v8. The protocol fixes oracle VAD (`oracle_vad=true`) and
 leaves speaker count inferred (`oracle_speaker_count=false` with an `Infer`
 request). Its DER/JER and speaker-count evidence therefore evaluates
@@ -530,7 +530,7 @@ exact lane order:
 12. `all_haar_l4`
 13. `all_d4_l4`
 
-The baseline is explicitly unfused. For each candidate, the v3 artifact retains
+The baseline is explicitly unfused. For each candidate, the v6 artifact retains
 aggregate boundary metrics; conditional same/different-speaker metrics;
 comparable-frame and retained-pair score coverage; Channel and MixedAuxiliary
 dominance opportunities, counts, and rates split by same/different-speaker
