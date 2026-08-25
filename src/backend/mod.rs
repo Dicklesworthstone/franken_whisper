@@ -1965,18 +1965,37 @@ struct BackendReadiness {
     reason: Option<String>,
 }
 
+fn unavailable_reason(mode: NativeExecutionMode, request: &TranscribeRequest) -> String {
+    if matches!(
+        mode,
+        NativeExecutionMode::NativePreferred | NativeExecutionMode::NativeOnly
+    ) && let Some(spec) = request.model.as_deref().filter(|spec| !spec.is_empty())
+        && !native_engine::native_model_available(spec)
+    {
+        return match native_engine::resolve_model(spec) {
+            Ok(path) => format!(
+                "requested native model is unavailable after validation: `{}`",
+                path.display()
+            ),
+            Err(error) => format!("requested native model is unavailable: {error}"),
+        };
+    }
+
+    match mode {
+        NativeExecutionMode::BridgeOnly => "binary/script unavailable".to_owned(),
+        NativeExecutionMode::NativePreferred => {
+            "native and bridge engines both unavailable".to_owned()
+        }
+        NativeExecutionMode::NativeOnly => "native engine unavailable".to_owned(),
+    }
+}
+
 fn readiness_for(kind: BackendKind, request: &TranscribeRequest) -> BackendReadiness {
     let mode = native_execution_mode(native_rollout_stage());
     if !available_for_request(kind, mode, request) {
         return BackendReadiness {
             available: false,
-            reason: Some(match mode {
-                NativeExecutionMode::BridgeOnly => "binary/script unavailable".to_owned(),
-                NativeExecutionMode::NativePreferred => {
-                    "native and bridge engines both unavailable".to_owned()
-                }
-                NativeExecutionMode::NativeOnly => "native engine unavailable".to_owned(),
-            }),
+            reason: Some(unavailable_reason(mode, request)),
         };
     }
 
@@ -4281,7 +4300,8 @@ mod tests {
         posterior_success_probability, prior_for, probe_system_health,
         probe_system_health_uncached, quality_proxy, runtime_metadata,
         runtime_metadata_with_implementation, sanitize_timestamp, segment_end, segment_start,
-        static_fallback_selection_outcome, transcript_from_segments, update_router_state,
+        static_fallback_selection_outcome, transcript_from_segments, unavailable_reason,
+        update_router_state,
     };
     use crate::conformance::NativeEngineRolloutStage;
     use crate::model::{
@@ -4313,6 +4333,22 @@ mod tests {
             timeout_ms: None,
             backend_params: crate::model::BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn native_only_unavailability_preserves_explicit_model_cause() {
+        let mut request = test_request(false);
+        request.model = Some("definitely-missing-native-model.bin".to_owned());
+
+        let reason = unavailable_reason(super::NativeExecutionMode::NativeOnly, &request);
+        assert!(reason.contains("requested native model is unavailable"));
+        assert!(reason.contains("definitely-missing-native-model.bin"));
+
+        request.model = None;
+        assert_eq!(
+            unavailable_reason(super::NativeExecutionMode::NativeOnly, &request),
+            "native engine unavailable"
+        );
     }
 
     #[test]
