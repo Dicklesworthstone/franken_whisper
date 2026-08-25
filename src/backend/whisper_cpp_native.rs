@@ -45,8 +45,10 @@ use serde_json::{Value, json};
 use crate::conformance::DTW_PROJECTION_SCHEMA_VERSION;
 use crate::diarization_projection::{
     CANONICAL_PROJECTION_EPSILON_SEC, CANONICAL_PROJECTION_MIN_DURATION_SEC,
-    CanonicalProjectionUnit, ProjectionUnitProvenance, normalize_dtw_projection_units,
+    ProjectionUnitProvenance, normalize_dtw_projection_units,
 };
+#[cfg(test)]
+use crate::diarization_projection::CanonicalProjectionUnit;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, DiarizationEngine, TranscribeRequest, TranscriptionResult, TranscriptionSegment,

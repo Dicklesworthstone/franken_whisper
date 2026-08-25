@@ -1266,13 +1266,20 @@ pub fn finite_seconds_interval_to_ms(start_sec: f64, end_sec: f64) -> Option<(u6
 mod tests {
     use crate::model::{DiarizationTurn, TranscriptionSegment};
 
-    /// The module-local epsilon must stay equal to the conformance-canonical
-    /// one (duplicated here so this module carries no conformance dep).
+    /// The module-local timing constants must stay equal to the
+    /// conformance-canonical values (duplicated here so this module carries no
+    /// conformance dependency in browser builds).
     #[test]
-    fn projection_epsilon_matches_conformance() {
+    fn projection_timing_constants_match_conformance() {
         assert!(
             (super::CANONICAL_PROJECTION_EPSILON_SEC
                 - crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC)
+                .abs()
+                == 0.0
+        );
+        assert!(
+            (super::CANONICAL_PROJECTION_MIN_DURATION_SEC
+                - crate::conformance::CANONICAL_PROJECTION_MIN_DURATION_SEC)
                 .abs()
                 == 0.0
         );

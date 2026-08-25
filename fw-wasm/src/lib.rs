@@ -443,7 +443,6 @@ mod wasm_api {
             let params = DecodeParams {
                 timestamps: true,
                 word_timestamps: true,
-                model_hint: Some("large-v3-turbo".to_owned()),
                 n_threads: 1,
                 initial_prompt: initial_prompt.filter(|p| !p.trim().is_empty()),
                 language: language.filter(|l| !l.trim().is_empty() && l != "auto"),
