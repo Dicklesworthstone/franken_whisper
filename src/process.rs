@@ -1420,6 +1420,33 @@ mod tests {
         run_command_cancellable_with_input_and_probe, run_command_cancellable_with_probe,
     };
 
+    struct PlatformCommand {
+        program: &'static str,
+        args: Vec<String>,
+    }
+
+    #[cfg(unix)]
+    fn platform_command(unix_script: &str, _windows_script: &str) -> PlatformCommand {
+        PlatformCommand {
+            program: "sh",
+            args: vec!["-c".to_owned(), unix_script.to_owned()],
+        }
+    }
+
+    #[cfg(windows)]
+    fn platform_command(_unix_script: &str, windows_script: &str) -> PlatformCommand {
+        PlatformCommand {
+            program: "powershell.exe",
+            args: vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                windows_script.to_owned(),
+            ],
+        }
+    }
+
     #[test]
     fn cancellable_poll_schedule_rejoins_fixed_cadence() {
         let delays: [u128; 8] =
@@ -1433,25 +1460,35 @@ mod tests {
     fn cancellable_completes_fast_command() {
         // A command that exits immediately should succeed with a far-future deadline.
         let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
-        let result =
-            run_command_cancellable("true", &[], None, &cancel, Some(Duration::from_secs(10)));
-        assert!(result.is_ok(), "true should succeed: {result:?}");
+        let command = platform_command("exit 0", "exit 0");
+        let result = run_command_cancellable(
+            command.program,
+            &command.args,
+            None,
+            &cancel,
+            Some(Duration::from_secs(10)),
+        );
+        assert!(result.is_ok(), "success fixture should succeed: {result:?}");
     }
 
     #[test]
     fn cancellable_stdin_payload_reaches_the_child_exactly() {
         let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
         let payload = b"strict worker request\n";
-        let output = run_command_cancellable_with_input_and_probe(
+        let command = platform_command(
             "cat",
-            &[],
+            "[Console]::OpenStandardInput().CopyTo([Console]::OpenStandardOutput())",
+        );
+        let output = run_command_cancellable_with_input_and_probe(
+            command.program,
+            &command.args,
             None,
             &cancel,
             Some(Duration::from_secs(10)),
             None,
             payload,
         )
-        .expect("cat must receive the bounded stdin payload");
+        .expect("stdin fixture must receive the bounded payload");
         assert_eq!(output.stdout, payload);
     }
 
@@ -1541,9 +1578,10 @@ mod tests {
         // Tiny sleep to ensure we're past the deadline.
         std::thread::sleep(Duration::from_millis(10));
 
+        let command = platform_command("sleep 60", "Start-Sleep -Seconds 60");
         let result = run_command_cancellable(
-            "sleep",
-            &["60".to_owned()],
+            command.program,
+            &command.args,
             None,
             &cancel,
             Some(Duration::from_secs(120)),
@@ -1562,9 +1600,10 @@ mod tests {
         let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(60));
         let polls = std::sync::atomic::AtomicUsize::new(0);
         let caller_cancelled = || polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2;
+        let command = platform_command("sleep 60", "Start-Sleep -Seconds 60");
         let result = run_command_cancellable_with_probe(
-            "sleep",
-            &["60".to_owned()],
+            command.program,
+            &command.args,
             None,
             &cancel,
             Some(Duration::from_secs(120)),
@@ -1580,9 +1619,10 @@ mod tests {
     fn cancellable_hard_timeout_takes_effect() {
         // Token with no deadline (far future), but hard timeout is tiny.
         let cancel = CancellationToken::with_deadline_from_now(Duration::from_secs(600));
+        let command = platform_command("sleep 60", "Start-Sleep -Seconds 60");
         let result = run_command_cancellable(
-            "sleep",
-            &["60".to_owned()],
+            command.program,
+            &command.args,
             None,
             &cancel,
             Some(Duration::from_millis(100)),
@@ -1601,7 +1641,9 @@ mod tests {
     fn cancellable_no_deadline_still_works() {
         // Token with no deadline at all — should complete normally for fast commands.
         let cancel = CancellationToken::no_deadline();
-        let result = run_command_cancellable("true", &[], None, &cancel, None);
+        let command = platform_command("exit 0", "exit 0");
+        let result =
+            run_command_cancellable(command.program, &command.args, None, &cancel, None);
         assert!(result.is_ok());
     }
 
@@ -1612,8 +1654,10 @@ mod tests {
     use super::{run_command, run_command_with_timeout, saturating_duration_ms};
 
     #[test]
-    fn run_command_succeeds_for_true() {
-        let output = run_command("true", &[], None).expect("true should succeed");
+    fn run_command_succeeds_for_platform_fixture() {
+        let command = platform_command("exit 0", "exit 0");
+        let output = run_command(command.program, &command.args, None)
+            .expect("platform success fixture should succeed");
         assert!(output.status.success());
     }
 
@@ -1730,7 +1774,9 @@ mod tests {
 
     #[test]
     fn run_command_nonzero_exit_returns_command_failed() {
-        let err = run_command("false", &[], None).expect_err("false should fail");
+        let command = platform_command("exit 7", "exit 7");
+        let err = run_command(command.program, &command.args, None)
+            .expect_err("nonzero fixture should fail");
         let text = err.to_string();
         assert!(
             text.contains("command failed") || text.contains("status"),
@@ -1740,16 +1786,23 @@ mod tests {
 
     #[test]
     fn run_command_with_timeout_succeeds_when_fast() {
-        let output = run_command_with_timeout("true", &[], None, Some(Duration::from_secs(5)))
-            .expect("true should succeed within timeout");
+        let command = platform_command("exit 0", "exit 0");
+        let output = run_command_with_timeout(
+            command.program,
+            &command.args,
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .expect("success fixture should complete within timeout");
         assert!(output.status.success());
     }
 
     #[test]
     fn run_command_with_timeout_kills_slow_command() {
+        let command = platform_command("sleep 60", "Start-Sleep -Seconds 60");
         let err = run_command_with_timeout(
-            "sleep",
-            &["60".to_owned()],
+            command.program,
+            &command.args,
             None,
             Some(Duration::from_millis(100)),
         )
@@ -1995,12 +2048,15 @@ mod tests {
 
     #[test]
     fn run_command_captures_stderr() {
-        // `ls` on a nonexistent path writes to stderr and exits non-zero.
-        let err = run_command("ls", &["/nonexistent_path_xyz_99999".to_owned()], None)
-            .expect_err("ls on nonexistent should fail");
+        let command = platform_command(
+            "printf '%s' 'nonexistent_path_xyz_99999' >&2; exit 7",
+            "[Console]::Error.Write('nonexistent_path_xyz_99999'); exit 7",
+        );
+        let err = run_command(command.program, &command.args, None)
+            .expect_err("stderr fixture should fail");
         let text = err.to_string();
         assert!(
-            text.contains("nonexistent_path") || text.contains("No such file"),
+            text.contains("nonexistent_path_xyz_99999"),
             "expected stderr content, got: {text}"
         );
     }
@@ -2014,7 +2070,12 @@ mod tests {
         // directory took effect under every spelling, including root.
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = "fw-cwd-marker.txt";
-        run_command("touch", &[marker.to_owned()], Some(dir.path())).expect("touch should succeed");
+        let command = platform_command(
+            "printf '' > fw-cwd-marker.txt",
+            "[IO.File]::WriteAllBytes('fw-cwd-marker.txt', [byte[]]@())",
+        );
+        run_command(command.program, &command.args, Some(dir.path()))
+            .expect("cwd fixture should succeed");
         assert!(
             dir.path().join(marker).is_file(),
             "child must resolve relative paths against the requested cwd"
@@ -2070,10 +2131,12 @@ mod tests {
     use super::command_exists;
 
     #[test]
-    fn command_exists_true_for_known_binary() {
-        // `ls` and `true` exist on all Unix-like systems.
-        assert!(command_exists("ls"), "ls should exist");
-        assert!(command_exists("true"), "true should exist");
+    fn command_exists_true_for_platform_fixture() {
+        let command = platform_command("exit 0", "exit 0");
+        assert!(
+            command_exists(command.program),
+            "platform test shell should exist"
+        );
     }
 
     #[test]
@@ -2157,14 +2220,20 @@ mod tests {
 
     #[test]
     fn run_command_with_timeout_none_behaves_like_run_command() {
-        let output = run_command_with_timeout("true", &[], None, None).expect("should succeed");
+        let command = platform_command("exit 0", "exit 0");
+        let output = run_command_with_timeout(command.program, &command.args, None, None)
+            .expect("success fixture should succeed");
         assert!(output.status.success());
     }
 
     #[test]
     fn run_command_with_args() {
-        let output = run_command("echo", &["hello".to_owned(), "world".to_owned()], None)
-            .expect("echo should succeed");
+        let command = platform_command(
+            "printf '%s' 'hello world'",
+            "[Console]::Out.Write('hello world')",
+        );
+        let output = run_command(command.program, &command.args, None)
+            .expect("stdout fixture should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("hello world"),
@@ -2186,9 +2255,13 @@ mod tests {
     #[test]
     fn cancellable_captures_output_from_successful_command() {
         let cancel = CancellationToken::no_deadline();
+        let command = platform_command(
+            "printf '%s' 'test_output'",
+            "[Console]::Out.Write('test_output')",
+        );
         let output =
-            run_command_cancellable("echo", &["test_output".to_owned()], None, &cancel, None)
-                .expect("echo should succeed");
+            run_command_cancellable(command.program, &command.args, None, &cancel, None)
+                .expect("stdout fixture should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("test_output"),
@@ -2199,8 +2272,9 @@ mod tests {
     #[test]
     fn cancellable_nonzero_exit_returns_error() {
         let cancel = CancellationToken::no_deadline();
-        let err = run_command_cancellable("false", &[], None, &cancel, None)
-            .expect_err("false should fail");
+        let command = platform_command("exit 7", "exit 7");
+        let err = run_command_cancellable(command.program, &command.args, None, &cancel, None)
+            .expect_err("nonzero fixture should fail");
         assert!(
             !matches!(err, crate::error::FwError::Cancelled(_)),
             "should not be cancelled, should be command failure: {err:?}"
@@ -2238,14 +2312,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = "fw-cwd-cancellable-marker.txt";
         let cancel = CancellationToken::no_deadline();
+        let command = platform_command(
+            "printf '' > fw-cwd-cancellable-marker.txt",
+            "[IO.File]::WriteAllBytes('fw-cwd-cancellable-marker.txt', [byte[]]@())",
+        );
         run_command_cancellable(
-            "touch",
-            &[marker.to_owned()],
+            command.program,
+            &command.args,
             Some(dir.path()),
             &cancel,
             None,
         )
-        .expect("touch should succeed");
+        .expect("cancellable cwd fixture should succeed");
         assert!(
             dir.path().join(marker).is_file(),
             "cancelled-capable child must resolve relative paths against the requested cwd"
@@ -2253,8 +2331,10 @@ mod tests {
     }
 
     #[test]
-    fn run_command_empty_args_succeeds() {
-        let output = run_command("true", &[], None).expect("true with no args");
+    fn run_command_success_fixture_succeeds() {
+        let command = platform_command("exit 0", "exit 0");
+        let output = run_command(command.program, &command.args, None)
+            .expect("platform success fixture should succeed");
         assert!(output.status.success());
     }
 
@@ -2262,20 +2342,22 @@ mod tests {
     fn cancellable_with_hard_timeout_none_and_no_deadline() {
         // Both safety nets disabled — should still work for fast commands.
         let cancel = CancellationToken::no_deadline();
-        let output = run_command_cancellable("echo", &["ok".to_owned()], None, &cancel, None)
-            .expect("should succeed");
+        let command = platform_command("printf '%s' ok", "[Console]::Out.Write('ok')");
+        let output =
+            run_command_cancellable(command.program, &command.args, None, &cancel, None)
+                .expect("should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("ok"));
     }
 
     #[test]
     fn run_command_preserves_large_stdout_payload() {
-        let output = run_command(
-            "sh",
-            &["-c".to_owned(), "yes x | head -c 200000".to_owned()],
-            None,
-        )
-        .expect("large stdout command should succeed");
+        let command = platform_command(
+            "yes x | head -c 200000",
+            "[Console]::Out.Write('x' * 200000)",
+        );
+        let output = run_command(command.program, &command.args, None)
+            .expect("large stdout command should succeed");
         assert_eq!(
             output.stdout.len(),
             200_000,
@@ -2285,15 +2367,12 @@ mod tests {
 
     #[test]
     fn run_command_preserves_large_stderr_payload_on_failure() {
-        let err = run_command(
-            "sh",
-            &[
-                "-c".to_owned(),
-                "yes e | head -c 200000 >&2; exit 7".to_owned(),
-            ],
-            None,
-        )
-        .expect_err("command should fail with large stderr output");
+        let command = platform_command(
+            "yes e | head -c 200000 >&2; exit 7",
+            "[Console]::Error.Write('e' * 200000); exit 7",
+        );
+        let err = run_command(command.program, &command.args, None)
+            .expect_err("command should fail with large stderr output");
         let text = err.to_string();
         assert!(
             text.len() > 100_000,
