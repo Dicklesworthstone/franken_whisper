@@ -462,6 +462,11 @@ pub struct DecodeWorkStats {
     pub accepted_result_tokens: usize,
     pub prompt_reset_retries: usize,
     pub temperature_fallback_retries: usize,
+    /// Decode attempts whose selected timestamp-mode result had text but no
+    /// closed timestamp and was retained by [`should_rescue_unclosed_window`].
+    /// This is a work counter (temperature fallback may retry afterward), not
+    /// a count of final emitted segments.
+    pub unclosed_window_rescue_attempts: usize,
     /// Total mel frames physically fed to the encoder across all windows
     /// (bd-rt-audio-ctx-n4dj observability). Full-context windows contribute
     /// `FRAMES_PER_CHUNK` (3000) each; a reduced [`AudioCtxPolicy`] window
@@ -2496,6 +2501,7 @@ fn add_decode_work(total: &mut DecodeWorkStats, part: &DecodeWorkStats) {
     total.accepted_result_tokens += part.accepted_result_tokens;
     total.prompt_reset_retries += part.prompt_reset_retries;
     total.temperature_fallback_retries += part.temperature_fallback_retries;
+    total.unclosed_window_rescue_attempts += part.unclosed_window_rescue_attempts;
     total.encoder_mel_frames += part.encoder_mel_frames;
 }
 
@@ -3197,7 +3203,7 @@ fn transcribe_samples_uncached(
             // greedy branch always runs ⇒ byte-identical to the pre-beam engine.
             let t_loop = crate::native_engine::plat::Instant::now();
             let mut window_token_attn: Vec<TokenAttn> = Vec::new();
-            let (decoded, plogs, _has_ts, seek_delta_cs, result_len) = if effective_beam_size > 1
+            let (decoded, plogs, has_ts, seek_delta_cs, result_len) = if effective_beam_size > 1
                 && window_temp == 0.0
             {
                 // `st` is left intact (beam clones per hypothesis) for the DTW
@@ -3334,6 +3340,9 @@ fn transcribe_samples_uncached(
                 (decoded, plogs, has_ts, seek_delta_cs, result_len)
             };
             work.sampled_tokens += decoded.len();
+            if params.timestamps && result_len > 0 && !has_ts {
+                work.unclosed_window_rescue_attempts += 1;
+            }
 
             // avg_logprob over result tokens (whisper.cpp 6602-6617).
             let result_plogs: &[f32] = if result_len > 0 && result_len <= plogs.len() {
@@ -6338,6 +6347,14 @@ mod tests {
             "max_context=0 must decode each tile exactly once: {}",
             joined(&nocarry_out)
         );
+        assert_eq!(
+            default_out.work.unclosed_window_rescue_attempts, 0,
+            "the tiled duplicate tail must not be rescued"
+        );
+        assert_eq!(
+            nocarry_out.work.unclosed_window_rescue_attempts, 0,
+            "the tiled no-carry duplicate tail must not be rescued"
+        );
     }
 
     #[test]
@@ -6390,6 +6407,10 @@ mod tests {
             out.dropped_windows.is_empty(),
             "genuine later-tail speech must not be reported as dropped: {:?}",
             out.dropped_windows
+        );
+        assert_eq!(
+            out.work.unclosed_window_rescue_attempts, 1,
+            "fixture must exercise exactly one later unclosed-window rescue"
         );
     }
 
