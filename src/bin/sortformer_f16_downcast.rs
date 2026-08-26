@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use franken_whisper::sortformer_conformance::SORTFORMER_PACKAGE_BYTES;
 use franken_whisper::sortformer_f16_downcast::derive_sortformer_f16_artifact;
-use tempfile::NamedTempFile;
+use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
 const MAX_PARENT_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -111,7 +111,7 @@ fn read_bounded(
     expected_bytes: Option<u64>,
     label: &str,
 ) -> Result<Vec<u8>, String> {
-    let file = File::open(path).map_err(|_| format!("{label} could not be read"))?;
+    let file = open_readonly_nonblocking(path, label)?;
     let metadata = file
         .metadata()
         .map_err(|_| format!("{label} could not be inspected"))?;
@@ -142,6 +142,26 @@ fn read_bounded(
     Ok(bytes)
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn open_readonly_nonblocking(path: &Path, label: &str) -> Result<File, String> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| format!("{label} could not be opened as a regular file"))?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn open_readonly_nonblocking(_path: &Path, label: &str) -> Result<File, String> {
+    Err(format!(
+        "{label} cannot be opened safely on this platform"
+    ))
+}
+
 fn publish_exact(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
     if path
         .try_exists()
@@ -162,21 +182,27 @@ fn publish_exact(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut staged = NamedTempFile::new_in(parent)
+    let mut staged = TempFileBuilder::new()
+        .prefix(".sortformer-f16-stage-")
+        .tempfile_in(parent)
         .map_err(|_| format!("{label} staging file could not be created"))?;
     if staged
         .write_all(bytes)
         .and_then(|()| staged.as_file().sync_all())
         .is_err()
     {
-        let _retained = staged.keep();
-        return Err(format!("{label} staging bytes could not be persisted"));
+        return Err(format!(
+            "{label} staging bytes could not be persisted{}",
+            retain_staging(staged)
+        ));
     }
     match staged.persist_noclobber(path) {
         Ok(_) => {}
         Err(error) => {
-            let _retained = error.file.keep();
-            return Err(format!("{label} could not be published without overwriting"));
+            return Err(format!(
+                "{label} could not be published without overwriting{}",
+                retain_staging(error.file)
+            ));
         }
     }
     sync_parent_directory(parent, label)?;
@@ -190,6 +216,21 @@ fn publish_exact(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn retain_staging(staged: NamedTempFile) -> String {
+    match staged.keep() {
+        Ok((_file, path)) => path.file_name().map_or_else(
+            || "; staging bytes retained in the output directory".to_owned(),
+            |name| {
+                format!(
+                    "; staging bytes retained in the output directory as {}",
+                    name.to_string_lossy()
+                )
+            },
+        ),
+        Err(_) => "; staging-file retention failed".to_owned(),
+    }
+}
+
 #[cfg(unix)]
 fn sync_parent_directory(parent: &Path, label: &str) -> Result<(), String> {
     File::open(parent)
@@ -200,4 +241,42 @@ fn sync_parent_directory(parent: &Path, label: &str) -> Result<(), String> {
 #[cfg(not(unix))]
 fn sync_parent_directory(_parent: &Path, _label: &str) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_is_idempotent_but_never_overwrites_different_bytes() {
+        let directory = tempfile::tempdir().expect("create output directory");
+        let output = directory.path().join("artifact.bin");
+
+        publish_exact(&output, b"first", "test artifact").expect("initial publication");
+        publish_exact(&output, b"first", "test artifact").expect("idempotent recovery");
+        let error = publish_exact(&output, b"second", "test artifact")
+            .expect_err("different bytes must not overwrite");
+
+        assert!(error.contains("refusing to overwrite"));
+        assert_eq!(
+            read_bounded(&output, 5, Some(5), "test artifact").expect("read published bytes"),
+            b"first"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn bounded_reader_rejects_symlink_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("create input directory");
+        let target = directory.path().join("target.bin");
+        let link = directory.path().join("link.bin");
+        std::fs::write(&target, b"bytes").expect("write target");
+        symlink(&target, &link).expect("create symlink");
+
+        let error = read_bounded(&link, 5, Some(5), "test input")
+            .expect_err("symlink input must be rejected");
+        assert!(error.contains("could not be opened as a regular file"));
+    }
 }
