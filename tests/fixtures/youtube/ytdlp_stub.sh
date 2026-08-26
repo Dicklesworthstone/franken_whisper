@@ -9,9 +9,11 @@
 #
 # Modes (selected by inspecting the argument vector):
 #   --version                         -> prints a canned YYYY.MM.DD date line
-#   --flat-playlist --dump-json URL   -> prints 2 canned flat-playlist JSON lines
-#   -j ... (no --flat-playlist)       -> prints one canned full-metadata JSON object
-#   -f ba ... -o TEMPLATE --print after_move:filepath URL
+#   --flat-playlist --dump-json --simulate URL
+#                                     -> prints 2 canned flat-playlist JSON lines
+#   -j --simulate ... (no --flat-playlist)
+#                                     -> prints one canned full-metadata JSON object
+#   -f bestaudio/best ... -o TEMPLATE --print after_move:filepath URL
 #                                     -> copies $STUB_FIXTURE_WAV (default: the
 #                                        tracked repo jfk_cut8.bin WAV) to
 #                                        <dest_dir>/<id>.wav and
@@ -80,10 +82,13 @@ esac
 WANT_VERSION=0
 WANT_FLAT=0
 WANT_J=0
+WANT_SIMULATE=0
+WANT_NO_SIMULATE=0
 WANT_DOWNLOAD=0
 WANT_SEARCH=0
 DEST_TEMPLATE=""
 NEXT_IS_OUTPUT=0
+OPTIONS_DONE=0
 
 LAST_URL=""
 for arg in "$@"; do
@@ -92,21 +97,39 @@ for arg in "$@"; do
     NEXT_IS_OUTPUT=0
     continue
   fi
+  if [ "$OPTIONS_DONE" -eq 1 ]; then
+    case "$arg" in
+      ytsearch*) WANT_SEARCH=1 ;;
+      *)         LAST_URL="$arg" ;;
+    esac
+    continue
+  fi
   case "$arg" in
+    --)               OPTIONS_DONE=1 ;;
     --version)        WANT_VERSION=1 ;;
     --flat-playlist)  WANT_FLAT=1 ;;
     -j)               WANT_J=1 ;;
+    --simulate)       WANT_SIMULATE=1 ;;
+    --no-simulate)    WANT_NO_SIMULATE=1 ;;
     ytsearch*)        WANT_SEARCH=1 ;;
-    -f)               WANT_DOWNLOAD=1 ;;  # `-f ba` only appears on the download path
+    -f)               WANT_DOWNLOAD=1 ;;  # format selection only appears on downloads
     -o)               NEXT_IS_OUTPUT=1 ;;
     http*)            LAST_URL="$arg" ;;  # remember the URL for id derivation
   esac
 done
 
+require_simulation() {
+  if [ "$WANT_SIMULATE" -ne 1 ] || [ "$WANT_NO_SIMULATE" -ne 0 ]; then
+    echo "ERROR: metadata-only operation must use --simulate and must not use --no-simulate" >&2
+    exit 2
+  fi
+}
+
 # Derive a stable video id from a watch URL so multi-URL runs stay distinct
 # and self-consistent. Falls back to STUB_VIDEO_ID for non-watch inputs.
 url_to_id() {
   local u="$1" id=""
+  u="${u%%#*}"
   case "$u" in
     *watch?v=*)   id="${u#*watch?v=}"; id="${id%%&*}" ;;
     *youtu.be/*)  id="${u#*youtu.be/}"; id="${id%%[?&]*}" ;;
@@ -124,6 +147,7 @@ fi
 
 # ---- catalog search (bd-m7fv) ---------------------------------------------
 if [ "$WANT_SEARCH" -eq 1 ]; then
+  require_simulation
   if [ "$WANT_FLAT" -eq 1 ]; then
     echo '{"id":"srchflat0001","title":"Flat Search Hit One","url":"https://www.youtube.com/watch?v=srchflat0001","duration":95.0}'
     echo '{"id":"srchflat0002","title":"Flat Search Hit Two","webpage_url":"https://www.youtube.com/watch?v=srchflat0002","duration":150}'
@@ -140,6 +164,7 @@ fi
 
 # ---- playlist expansion ---------------------------------------------------
 if [ "$WANT_FLAT" -eq 1 ]; then
+  require_simulation
   echo '{"id":"vid000000001","title":"First Playlist Entry","url":"https://www.youtube.com/watch?v=vid000000001","duration":61.0}'
   # Second line intentionally uses webpage_url instead of url (fallback path)
   # and an integer duration to exercise numeric coercion.
@@ -149,6 +174,7 @@ fi
 
 # ---- full metadata --------------------------------------------------------
 if [ "$WANT_J" -eq 1 ] && [ "$WANT_DOWNLOAD" -eq 0 ]; then
+  require_simulation
   MID="$(url_to_id "$LAST_URL")"
   cat <<EOF
 {"id":"$MID","title":"Stub Title $MID","channel":"Stub Channel","uploader":"Stub Uploader","upload_date":"20240115","duration":212.0,"webpage_url":"https://www.youtube.com/watch?v=$MID","description":"A canned description.","availability":"public","live_status":"${STUB_LIVE_STATUS:-not_live}"}

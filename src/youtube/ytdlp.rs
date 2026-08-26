@@ -19,9 +19,9 @@
 //! # yt-dlp CLI contract (agent-verified cheat-sheet, see the bd-27v1 epic)
 //!
 //! - probe:    `--version`                (prints `YYYY.MM.DD`)
-//! - expand:   `--flat-playlist --dump-json --no-warnings URL`
-//! - metadata: `-j --no-simulate --no-playlist --no-warnings URL`
-//! - download: `-f ba --no-playlist --no-warnings --no-progress`
+//! - expand:   `--flat-playlist --dump-json --simulate --no-warnings URL`
+//! - metadata: `-j --simulate --no-playlist --no-warnings URL`
+//! - download: `-f bestaudio/best --no-playlist --no-warnings --no-progress`
 //!   `-o '<dest>/%(id)s.%(ext)s' --print after_move:filepath`
 //!   `--sleep-interval 2 --max-sleep-interval 5 --retries 10 URL`
 //!
@@ -163,10 +163,11 @@ fn search_hit_from_entry(entry: &ProjectedSearchEntry) -> Option<SearchHit> {
 }
 
 /// Search YouTube through the probed yt-dlp binary: `ytsearch{limit}:query`
-/// dumped as per-result JSON lines. Enriched mode (default) retains the
+/// dumped as per-result JSON lines with explicit `--simulate`, so a user
+/// configuration containing `--no-simulate` cannot turn this metadata-only
+/// operation into a media download. Enriched mode (default) retains the
 /// curated [`SearchHit`] field set; `--flat` keeps the flat-playlist subset.
-/// Hits are deduplicated by id preserving first-seen order, capped at
-/// `limit`.
+/// Hits are deduplicated by id preserving first-seen order, capped at `limit`.
 ///
 /// # Errors
 ///
@@ -189,12 +190,15 @@ pub fn search(
         ));
     }
     let target = format!("ytsearch{limit}:{query}");
-    let mut args = vec!["--no-warnings".to_owned(), "--".to_owned(), target];
+    let mut args = vec![
+        "--dump-json".to_owned(),
+        "--simulate".to_owned(),
+        "--no-warnings".to_owned(),
+        "--".to_owned(),
+        target,
+    ];
     if flat {
-        args.insert(0, "--dump-json".to_owned());
         args.insert(0, "--flat-playlist".to_owned());
-    } else {
-        args.insert(0, "--dump-json".to_owned());
     }
     let output = run_ytdlp(info, &args, token, EXPAND_TIMEOUT)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -452,8 +456,12 @@ pub fn classify_url(url: &str) -> FwResult<UrlKind> {
             "empty URL; expected a YouTube video or playlist URL".to_owned(),
         ));
     }
+    // A URL fragment is client-side navigation metadata, never part of a
+    // YouTube video or playlist identifier. Strip it before parsing while
+    // retaining the original input in diagnostics.
+    let parsed = strip_url_fragment(trimmed);
 
-    let (host, rest) = split_host_and_rest(trimmed).ok_or_else(|| {
+    let (host, rest) = split_host_and_rest(parsed).ok_or_else(|| {
         FwError::InvalidRequest(format!(
             "not a recognized URL: `{trimmed}`; expected a YouTube video or playlist URL"
         ))
@@ -569,7 +577,7 @@ pub fn extract_video_id(url: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let (host, rest) = split_host_and_rest(trimmed)?;
+    let (host, rest) = split_host_and_rest(strip_url_fragment(trimmed))?;
     let host = host.to_ascii_lowercase();
 
     // youtu.be/ID short links: the first path segment is the id.
@@ -608,6 +616,12 @@ pub fn extract_video_id(url: &str) -> Option<String> {
     // Any other path: accept a `v=` query if present (mirrors classify_url's
     // permissive tail), otherwise no id.
     query_param_value(query, "v").and_then(non_empty_id)
+}
+
+/// Remove the client-side fragment from a URL before classifying or
+/// extracting server-side YouTube identifiers.
+fn strip_url_fragment(url: &str) -> &str {
+    url.split_once('#').map_or(url, |(base, _)| base)
 }
 
 /// Return `Some(id)` when `id` is non-empty, else `None`.
@@ -673,9 +687,11 @@ fn query_has_nonempty_param(query: &str, name: &str) -> bool {
 
 /// Expand a playlist URL into its constituent [`VideoRef`]s.
 ///
-/// Runs `yt-dlp --flat-playlist --dump-json --no-warnings URL` and parses the
-/// JSON-lines output. Lines that fail to parse (or lack an `id`) are skipped
-/// with a warning rather than failing the whole expansion.
+/// Runs `yt-dlp --flat-playlist --dump-json --simulate --no-warnings URL` and
+/// parses the JSON-lines output. Explicit simulation prevents a user config
+/// from turning playlist discovery into a media download. Lines that fail to
+/// parse (or lack an `id`) are skipped with a warning rather than failing the
+/// whole expansion.
 ///
 /// # Errors
 ///
@@ -689,6 +705,7 @@ pub fn expand_playlist(
     let args = vec![
         "--flat-playlist".to_owned(),
         "--dump-json".to_owned(),
+        "--simulate".to_owned(),
         "--no-warnings".to_owned(),
         // `--` stops yt-dlp option parsing: a hostile URL (e.g. a
         // playlist-entry `url` field starting with `-`) can never be read as a
@@ -946,7 +963,7 @@ impl<'de> serde::Deserialize<'de> for ProjectedVideoMetadata {
 
 /// Fetch full metadata for a single video via `yt-dlp -j`.
 ///
-/// Runs `yt-dlp -j --no-simulate --no-playlist --no-warnings URL`. Live and
+/// Runs `yt-dlp -j --simulate --no-playlist --no-warnings URL`. Live and
 /// upcoming streams are rejected with a clear [`FwError::Unsupported`] because
 /// they cannot be transcribed as a finished recording.
 ///
@@ -961,7 +978,11 @@ pub fn fetch_metadata(
 ) -> FwResult<VideoMeta> {
     let args = vec![
         "-j".to_owned(),
-        "--no-simulate".to_owned(),
+        // Keep this explicit even though `-j` normally implies simulation.
+        // `--no-simulate` reverses that implication and downloads media while
+        // printing metadata, leaking an unowned artifact into the caller's
+        // working directory before the pipeline's owned download step.
+        "--simulate".to_owned(),
         "--no-playlist".to_owned(),
         "--no-warnings".to_owned(),
         // `--` stops yt-dlp option parsing: a hostile URL (e.g. a
@@ -1051,7 +1072,7 @@ fn video_meta_from_json(value: &serde_json::Value) -> FwResult<VideoMeta> {
 /// path to the downloaded file.
 ///
 /// Runs:
-/// `yt-dlp -f ba --no-playlist --no-warnings --no-progress`
+/// `yt-dlp -f bestaudio/best --no-playlist --no-warnings --no-progress`
 /// `-o '<dest_dir>/%(id)s.%(ext)s' --print after_move:filepath`
 /// `--sleep-interval 2 --max-sleep-interval 5 --retries 10 URL`
 ///
@@ -1061,12 +1082,13 @@ fn video_meta_from_json(value: &serde_json::Value) -> FwResult<VideoMeta> {
 /// # Cancellation
 ///
 /// Execution flows through [`run_command_cancellable`], which polls `token` on
-/// every iteration and kills the child process when the token fires. For
-/// best-audio (`-f ba`) downloads yt-dlp does **not** normally spawn an
-/// `ffmpeg` child (no `-x` re-encode is requested). Cancellation currently
-/// guarantees termination and reaping of the direct yt-dlp process only;
-/// process-tree termination for an unexpectedly inherited descendant remains
-/// a separate contract gap. A token firing maps to [`FwError::Cancelled`].
+/// every iteration. Ordinary CLI invocations launch yt-dlp in a fresh
+/// caller-owned process group (or Windows Job Object) and terminate that tree
+/// when the token fires. A Unix worker that already belongs to an externally
+/// owned process tree instead keeps nested descendants in the outer group,
+/// reaps the direct yt-dlp child locally, and leaves recursive termination to
+/// that outer owner. Unsupported bounded-tree platforms fail before launch. A
+/// token firing maps to [`FwError::Cancelled`].
 ///
 /// # Errors
 ///
@@ -1557,6 +1579,10 @@ mod tests {
             classify_url("https://youtu.be/"),
             Err(FwError::InvalidRequest(_))
         ));
+        assert!(matches!(
+            classify_url("https://youtu.be/#t=42"),
+            Err(FwError::InvalidRequest(_))
+        ));
     }
 
     #[test]
@@ -1622,6 +1648,23 @@ mod tests {
     }
 
     #[test]
+    fn extract_id_strips_url_fragments_from_every_video_form() {
+        for (url, expected) in [
+            ("https://www.youtube.com/watch?v=watch123#t=42", "watch123"),
+            ("https://youtu.be/short123#t=42", "short123"),
+            ("https://www.youtube.com/shorts/shorts123#comments", "shorts123"),
+            ("https://www.youtube.com/live/live123#t=1", "live123"),
+            ("https://www.youtube.com/embed/embed123#player", "embed123"),
+        ] {
+            assert_eq!(
+                extract_video_id(url).as_deref(),
+                Some(expected),
+                "fragment must not become part of the id for {url}"
+            );
+        }
+    }
+
+    #[test]
     fn extract_id_mobile_music_nocookie_hosts() {
         assert_eq!(
             extract_video_id("https://m.youtube.com/watch?v=abc").as_deref(),
@@ -1661,6 +1704,7 @@ mod tests {
         assert_eq!(extract_video_id("https://vimeo.com/12345"), None);
         // youtu.be with no id.
         assert_eq!(extract_video_id("https://youtu.be/"), None);
+        assert_eq!(extract_video_id("https://youtu.be/#t=42"), None);
         // Empty / garbage.
         assert_eq!(extract_video_id("   "), None);
         assert_eq!(extract_video_id("not even a url"), None);
@@ -2098,7 +2142,7 @@ mod tests {
     // ---- fetch_metadata (via stub) ---------------------------------------
 
     #[test]
-    fn fetch_metadata_parses_full_object() {
+    fn fetch_metadata_is_explicitly_non_downloading_and_parses_full_object() {
         let token = CancellationToken::unbounded();
         let meta = fetch_metadata(&stub_info(), "https://youtu.be/dQw4w9WgXcQ", &token)
             .expect("metadata should parse");
@@ -2111,6 +2155,14 @@ mod tests {
         assert_eq!(meta.availability.as_deref(), Some("public"));
         assert_eq!(meta.live_status.as_deref(), Some("not_live"));
         assert!(meta.description.is_some());
+
+        let fragmented = fetch_metadata(
+            &stub_info(),
+            "youtube.com/watch?v=fragment123#t=42",
+            &token,
+        )
+        .expect("fragmented metadata URL should parse");
+        assert_eq!(fragmented.id, "fragment123");
     }
 
     #[test]
