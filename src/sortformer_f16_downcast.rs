@@ -291,6 +291,9 @@ fn downcast_package(
             receipt_contract_source_sha256: receipt_contract_source_sha256(),
             downcaster_core_source_sha256: downcaster_core_source_sha256(),
             downcaster_cli_source_sha256: downcaster_cli_source_sha256(),
+            parent_verifier_source_sha256: parent_verifier_source_sha256(),
+            safetensors_parser_source_sha256: safetensors_parser_source_sha256(),
+            cargo_manifest_sha256: cargo_manifest_sha256(),
             cargo_lock_sha256: cargo_lock_sha256(),
             rust_toolchain_sha256: rust_toolchain_sha256(),
         },
@@ -498,6 +501,18 @@ fn receipt_contract_source_sha256() -> String {
 
 fn downcaster_cli_source_sha256() -> String {
     sha256_bytes(include_bytes!("bin/sortformer_f16_downcast.rs"))
+}
+
+fn parent_verifier_source_sha256() -> String {
+    sha256_bytes(include_bytes!("sortformer_conformance.rs"))
+}
+
+fn safetensors_parser_source_sha256() -> String {
+    sha256_bytes(include_bytes!("native_engine/weights.rs"))
+}
+
+fn cargo_manifest_sha256() -> String {
+    sha256_bytes(include_bytes!("../Cargo.toml"))
 }
 
 fn cargo_lock_sha256() -> String {

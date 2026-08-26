@@ -40,6 +40,9 @@ pub struct SortformerF16DerivationIdentity {
     pub receipt_contract_source_sha256: String,
     pub downcaster_core_source_sha256: String,
     pub downcaster_cli_source_sha256: String,
+    pub parent_verifier_source_sha256: String,
+    pub safetensors_parser_source_sha256: String,
+    pub cargo_manifest_sha256: String,
     pub cargo_lock_sha256: String,
     pub rust_toolchain_sha256: String,
 }
