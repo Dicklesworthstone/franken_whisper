@@ -11,6 +11,7 @@ readme = "README.md"
 keywords = ["whisper", "speech-to-text", "diarization", "asr", "audio"]
 categories = ["command-line-utilities", "multimedia::audio"]
 include = [
+    "/.cargo/config.toml",
     "/Cargo.toml",
     "/Cargo.lock",
     "/rust-toolchain.toml",
