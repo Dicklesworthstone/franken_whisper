@@ -933,9 +933,27 @@ pub fn load_verified_sortformer_package_from_bytes(
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<VerifiedSortformerPackage> {
     let expected = pinned_model_expectations();
+    load_verified_sortformer_package_from_bytes_against(
+        receipt_bytes,
+        package_bytes,
+        SORTFORMER_CONVERSION_RECEIPT_SHA256,
+        checkpoint,
+        &|| {},
+        &expected,
+    )
+}
+
+fn load_verified_sortformer_package_from_bytes_against(
+    receipt_bytes: Vec<u8>,
+    package_bytes: Vec<u8>,
+    expected_receipt_sha256: &str,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    before_package_hash: &(dyn Fn() + Sync),
+    expected: &ReceiptExpectations,
+) -> FwResult<VerifiedSortformerPackage> {
     require_sha256(
         "receipt_trust_root",
-        SORTFORMER_CONVERSION_RECEIPT_SHA256,
+        expected_receipt_sha256,
         SortformerArtifactDomain::Conversion,
     )?;
     sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
@@ -947,7 +965,12 @@ pub fn load_verified_sortformer_package_from_bytes(
             "conversion receipt exceeds the bounded receipt size",
         ));
     }
-    if sha256_bytes(&receipt_bytes) != SORTFORMER_CONVERSION_RECEIPT_SHA256 {
+    if sha256_bytes_with_checkpoint(
+        &receipt_bytes,
+        SortformerArtifactDomain::Conversion,
+        checkpoint,
+    )? != expected_receipt_sha256
+    {
         return Err(sortformer_error(
             "receipt_identity",
             "conversion receipt checksum does not match the independent trust root",
@@ -973,7 +996,7 @@ pub fn load_verified_sortformer_package_from_bytes(
             "conversion receipt bytes are not the canonical JSON encoding",
         ));
     }
-    verify_receipt(&receipt, &expected, checkpoint)?;
+    verify_receipt(&receipt, expected, checkpoint)?;
 
     if package_bytes.len() as u64 > MAX_PACKAGE_BYTES
         || u64::try_from(package_bytes.len()).ok() != Some(receipt.package.bytes)
@@ -984,7 +1007,13 @@ pub fn load_verified_sortformer_package_from_bytes(
         ));
     }
     sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
-    if sha256_bytes(&package_bytes) != receipt.package.sha256 {
+    before_package_hash();
+    if sha256_bytes_with_checkpoint(
+        &package_bytes,
+        SortformerArtifactDomain::Conversion,
+        checkpoint,
+    )? != receipt.package.sha256
+    {
         return Err(sortformer_error(
             "package_identity",
             "weight package checksum does not match the receipt pin",
@@ -1003,7 +1032,7 @@ pub fn load_verified_sortformer_package_from_bytes(
             "weight package is not structurally valid safetensors",
         )
     })?;
-    verify_package(&package, &receipt, &expected, checkpoint)?;
+    verify_package(&package, &receipt, expected, checkpoint)?;
     sortformer_checkpoint(checkpoint, SortformerArtifactDomain::Conversion)?;
     Ok(VerifiedSortformerPackage { receipt, package })
 }
@@ -3862,6 +3891,20 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex_digest(hasher.finalize())
 }
 
+fn sha256_bytes_with_checkpoint(
+    bytes: &[u8],
+    domain: SortformerArtifactDomain,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<String> {
+    let mut hasher = Sha256::new();
+    for chunk in bytes.chunks(READ_CHUNK_BYTES) {
+        sortformer_checkpoint(checkpoint, domain)?;
+        hasher.update(chunk);
+    }
+    sortformer_checkpoint(checkpoint, domain)?;
+    Ok(hex_digest(hasher.finalize()))
+}
+
 fn canonical_json_bytes<T: Serialize>(value: &T) -> FwResult<Vec<u8>> {
     let value = serde_json::to_value(value)?;
     let mut output = Vec::new();
@@ -3916,7 +3959,7 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use serde_json::json;
 
@@ -3972,6 +4015,156 @@ mod tests {
         assert_eq!(checkpoints.load(Ordering::SeqCst), 2);
         assert!(matches!(error, FwError::Cancelled(_)));
         assert!(!error.to_string().contains("sensitive test reason"));
+    }
+
+    #[test]
+    fn checkpointed_sha256_is_byte_exact_with_fixed_chunk_counts() {
+        for length in [
+            0,
+            1,
+            READ_CHUNK_BYTES,
+            READ_CHUNK_BYTES + 1,
+            READ_CHUNK_BYTES * 2 + 1,
+        ] {
+            let bytes = (0..length)
+                .map(|index| u8::try_from(index % 251).expect("bounded byte pattern"))
+                .collect::<Vec<_>>();
+            let checkpoints = AtomicUsize::new(0);
+            let observed = sha256_bytes_with_checkpoint(
+                &bytes,
+                SortformerArtifactDomain::Conversion,
+                &|| {
+                    checkpoints.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .expect("checkpointed digest");
+            let chunks = length.div_ceil(READ_CHUNK_BYTES);
+
+            assert_eq!(observed, sha256_bytes(&bytes));
+            assert_eq!(checkpoints.load(Ordering::SeqCst), chunks + 1);
+        }
+
+        let bytes = (0..=READ_CHUNK_BYTES)
+            .map(|index| u8::try_from(index % 251).expect("bounded byte pattern"))
+            .collect::<Vec<_>>();
+        let mut boundary_mutation = bytes.clone();
+        boundary_mutation[READ_CHUNK_BYTES] ^= 1;
+        let original = sha256_bytes_with_checkpoint(
+            &bytes,
+            SortformerArtifactDomain::Conversion,
+            &|| Ok(()),
+        )
+        .expect("checkpointed original boundary digest");
+        let mutated = sha256_bytes_with_checkpoint(
+            &boundary_mutation,
+            SortformerArtifactDomain::Conversion,
+            &|| Ok(()),
+        )
+        .expect("checkpointed mutated boundary digest");
+        assert_ne!(original, mutated);
+    }
+
+    #[test]
+    fn checkpointed_sha256_observes_terminal_cancellation_without_leaking_details() {
+        let bytes = vec![0x5a; READ_CHUNK_BYTES + 1];
+        let checkpoints = AtomicUsize::new(0);
+        let error = sha256_bytes_with_checkpoint(
+            &bytes,
+            SortformerArtifactDomain::Conversion,
+            &|| {
+                if checkpoints.fetch_add(1, Ordering::SeqCst) == 2 {
+                    Err(FwError::Cancelled(
+                        "terminal cancellation detail must not escape".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("terminal checkpoint must remain cancellation-aware");
+
+        assert_eq!(checkpoints.load(Ordering::SeqCst), 3);
+        match error {
+            FwError::Cancelled(message) => assert_eq!(
+                message,
+                "sortformer_conversion.load_cancelled: cooperative checkpoint requested cancellation"
+            ),
+            other => panic!("expected sanitized conversion cancellation, got {other}"),
+        }
+    }
+
+    #[test]
+    fn byte_loader_observes_receipt_hash_cancellation_before_identity_failure() {
+        let checkpoints = AtomicUsize::new(0);
+        let error = load_verified_sortformer_package_from_bytes(
+            vec![0x3c; READ_CHUNK_BYTES + 1],
+            Vec::new(),
+            &|| {
+                if checkpoints.fetch_add(1, Ordering::SeqCst) == 2 {
+                    Err(FwError::Cancelled(
+                        "receipt hash cancellation detail must not escape".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("receipt hashing must observe cancellation before checksum rejection");
+
+        assert_eq!(checkpoints.load(Ordering::SeqCst), 3);
+        match error {
+            FwError::Cancelled(message) => assert_eq!(
+                message,
+                "sortformer_conversion.load_cancelled: cooperative checkpoint requested cancellation"
+            ),
+            other => panic!("expected sanitized conversion cancellation, got {other}"),
+        }
+    }
+
+    #[test]
+    fn byte_loader_tiny_seam_observes_package_hash_cancellation_before_identity_failure() {
+        let bundle = tiny_bundle();
+        let receipt_bytes =
+            canonical_json_bytes(&bundle.receipt).expect("canonical tiny receipt bytes");
+        let receipt_sha256 = sha256_bytes(&receipt_bytes);
+        let mut package_bytes = bundle.package_bytes.clone();
+        *package_bytes
+            .last_mut()
+            .expect("tiny package has payload bytes") ^= 1;
+        let package_hash_phase = AtomicBool::new(false);
+        let package_hash_checkpoints = AtomicUsize::new(0);
+
+        let error = load_verified_sortformer_package_from_bytes_against(
+            receipt_bytes,
+            package_bytes,
+            &receipt_sha256,
+            &|| {
+                if package_hash_phase.load(Ordering::SeqCst) {
+                    if package_hash_checkpoints.fetch_add(1, Ordering::SeqCst) == 1 {
+                        Err(FwError::Cancelled(
+                            "package hash cancellation detail must not escape".to_owned(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                }
+            },
+            &|| package_hash_phase.store(true, Ordering::SeqCst),
+            &bundle.expected,
+        )
+        .expect_err("package hashing must observe cancellation before checksum rejection");
+
+        assert_eq!(package_hash_checkpoints.load(Ordering::SeqCst), 2);
+        match error {
+            FwError::Cancelled(message) => assert_eq!(
+                message,
+                "sortformer_conversion.load_cancelled: cooperative checkpoint requested cancellation"
+            ),
+            other => panic!("expected sanitized conversion cancellation, got {other}"),
+        }
     }
 
     #[test]

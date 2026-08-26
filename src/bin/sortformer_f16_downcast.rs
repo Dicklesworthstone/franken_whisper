@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read as _;
@@ -16,13 +15,26 @@ use franken_whisper::sortformer_f16_downcast::derive_sortformer_f16_artifact;
 use uuid::Uuid;
 
 const MAX_PARENT_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+const COMPILED_CLI_SOURCE: &[u8] = include_bytes!("sortformer_f16_downcast.rs");
 
 struct Args {
+    repository_root: PathBuf,
     parent_receipt: PathBuf,
     parent_package: PathBuf,
     output_package: PathBuf,
     output_receipt: PathBuf,
 }
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+struct RepositoryBoundary {
+    requested_root: PathBuf,
+    canonical_root: PathBuf,
+    directory: File,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+struct RepositoryBoundary;
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 struct OutputTarget {
@@ -47,7 +59,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let (output_package, output_receipt) = validate_outputs(&args)?;
+    let (repository, output_package, output_receipt) = validate_outputs(&args)?;
     let parent_receipt = read_bounded(
         &args.parent_receipt,
         MAX_PARENT_RECEIPT_BYTES,
@@ -68,6 +80,7 @@ fn run() -> Result<(), String> {
     let (derived_package, derived_receipt) = artifact.into_bytes();
 
     publish_artifact_pair(
+        &repository,
         &output_package,
         &output_receipt,
         &derived_package,
@@ -82,57 +95,254 @@ fn run() -> Result<(), String> {
 }
 
 fn publish_artifact_pair(
+    repository: &RepositoryBoundary,
     output_package: &OutputTarget,
     output_receipt: &OutputTarget,
     package_bytes: &[u8],
     receipt_bytes: &[u8],
 ) -> Result<(), String> {
+    publish_artifact_pair_with_after_receipt(
+        repository,
+        output_package,
+        output_receipt,
+        package_bytes,
+        receipt_bytes,
+        &|| Ok(()),
+    )
+}
+
+fn publish_artifact_pair_with_after_receipt(
+    repository: &RepositoryBoundary,
+    output_package: &OutputTarget,
+    output_receipt: &OutputTarget,
+    package_bytes: &[u8],
+    receipt_bytes: &[u8],
+    after_receipt_publish: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    verify_repository_boundary_identity(repository)?;
     publish_exact(output_package, package_bytes, "output package")?;
+    let package_identity = confirm_existing_exact(
+        output_package,
+        None,
+        package_bytes,
+        "output package",
+    )?;
     publish_exact(output_receipt, receipt_bytes, "output receipt").map_err(|error| {
         format!(
             "{error}; artifact-pair completion is not confirmed: the output package was \
-             durably committed, while receipt state is exactly as reported above; retry only \
-             with identical bytes and paths"
+             confirmed before the receipt attempt, but receipt completion/durability is \
+             unconfirmed; inspect both output paths and retry only with identical bytes and paths"
         )
-    })
+    })?;
+    let receipt_identity = confirm_existing_exact(
+        output_receipt,
+        None,
+        receipt_bytes,
+        "output receipt",
+    )
+    .map_err(|error| {
+        format!(
+            "{error}; artifact-pair completion is uncertain: receipt publication returned \
+             success, but its identity/durability could not be confirmed; inspect both output \
+             paths and retry only with identical bytes and paths"
+        )
+    })?;
+    after_receipt_publish().map_err(|error| {
+        format!(
+            "{error}; artifact-pair completion is uncertain after receipt publication; inspect \
+             both output paths and retry only with identical bytes and paths"
+        )
+    })?;
+    confirm_existing_exact(
+        output_package,
+        Some(&package_identity),
+        package_bytes,
+        "output package",
+    )
+    .map_err(|error| {
+        format!(
+            "{error}; artifact-pair completion is uncertain after receipt publication: final \
+             package identity/durability confirmation failed; inspect both output paths and \
+             retry only with identical bytes and paths"
+        )
+    })?;
+    confirm_existing_exact(
+        output_receipt,
+        Some(&receipt_identity),
+        receipt_bytes,
+        "output receipt",
+    )
+    .map_err(|error| {
+        format!(
+            "{error}; artifact-pair completion is uncertain: final receipt identity/durability \
+             confirmation failed; inspect both output paths and retry only with identical bytes \
+             and paths"
+        )
+    })?;
+    verify_repository_boundary_identity(repository).map_err(|error| {
+        format!(
+            "{error}; artifact-pair output policy is uncertain because the trusted repository \
+             boundary changed during publication; inspect both output paths"
+        )
+    })?;
+    Ok(())
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut args = env::args_os();
     let _program = args.next();
-    let values = args.collect::<Vec<_>>();
-    if values.len() != 4 {
-        return Err(
-            "usage: sortformer-f16-downcast <parent-receipt> <parent-package> \
-             <new-output-package> <new-output-receipt>"
-                .to_owned(),
-        );
+    parse_args_from(args)
+}
+
+fn parse_args_from(values: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
+    let mut values = values.into_iter();
+    let repository_root = values.next().ok_or_else(usage)?;
+    let parent_receipt = values.next().ok_or_else(usage)?;
+    let parent_package = values.next().ok_or_else(usage)?;
+    let output_package = values.next().ok_or_else(usage)?;
+    let output_receipt = values.next().ok_or_else(usage)?;
+    if values.next().is_some() {
+        return Err(usage());
     }
     Ok(Args {
-        parent_receipt: PathBuf::from(values[0].clone()),
-        parent_package: PathBuf::from(values[1].clone()),
-        output_package: PathBuf::from(values[2].clone()),
-        output_receipt: PathBuf::from(values[3].clone()),
+        repository_root: PathBuf::from(repository_root),
+        parent_receipt: PathBuf::from(parent_receipt),
+        parent_package: PathBuf::from(parent_package),
+        output_package: PathBuf::from(output_package),
+        output_receipt: PathBuf::from(output_receipt),
     })
 }
 
+fn usage() -> String {
+    "usage: sortformer-f16-downcast <trusted-repository-root> <parent-receipt> \
+     <parent-package> <new-output-package> <new-output-receipt>"
+        .to_owned()
+}
+
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn validate_outputs(args: &Args) -> Result<(OutputTarget, OutputTarget), String> {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .canonicalize()
-        .map_err(|_| "repository boundary could not be resolved".to_owned())?;
-    let package = bind_output_target(&args.output_package, &repository)?;
-    let receipt = bind_output_target(&args.output_receipt, &repository)?;
+fn validate_outputs(
+    args: &Args,
+) -> Result<(RepositoryBoundary, OutputTarget, OutputTarget), String> {
+    let repository = bind_repository_boundary(&args.repository_root)?;
+    let package = bind_output_target(&args.output_package, &repository.canonical_root)?;
+    let receipt = bind_output_target(&args.output_receipt, &repository.canonical_root)?;
     if same_output_target(&package, &receipt)? {
         return Err("output package and receipt paths must be distinct".to_owned());
     }
-    Ok((package, receipt))
+    verify_repository_boundary_identity(&repository)?;
+    Ok((repository, package, receipt))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn validate_outputs(args: &Args) -> Result<(OutputTarget, OutputTarget), String> {
-    let _ = (&args.output_package, &args.output_receipt);
+fn validate_outputs(
+    args: &Args,
+) -> Result<(RepositoryBoundary, OutputTarget, OutputTarget), String> {
+    let _ = (
+        &args.repository_root,
+        &args.output_package,
+        &args.output_receipt,
+    );
     Err("derived artifacts cannot be published safely on this platform".to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn bind_repository_boundary(path: &Path) -> Result<RepositoryBoundary, String> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let directory = File::from(
+        open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| "trusted repository root could not be identity-bound".to_owned())?,
+    );
+    let canonical_root = path
+        .canonicalize()
+        .map_err(|_| "trusted repository root could not be resolved".to_owned())?;
+    let boundary = RepositoryBoundary {
+        requested_root: path.to_owned(),
+        canonical_root,
+        directory,
+    };
+    verify_repository_boundary_identity(&boundary)?;
+    verify_repository_cli_source(&boundary)?;
+    verify_repository_boundary_identity(&boundary)?;
+    Ok(boundary)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn verify_repository_boundary_identity(repository: &RepositoryBoundary) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let opened = repository
+        .directory
+        .metadata()
+        .map_err(|_| "trusted repository root identity could not be read".to_owned())?;
+    let canonical = repository
+        .canonical_root
+        .symlink_metadata()
+        .map_err(|_| "trusted repository root changed after validation".to_owned())?;
+    let requested = repository
+        .requested_root
+        .symlink_metadata()
+        .map_err(|_| "trusted repository root changed after validation".to_owned())?;
+    if !opened.is_dir()
+        || !canonical.is_dir()
+        || !requested.is_dir()
+        || opened.dev() != canonical.dev()
+        || opened.ino() != canonical.ino()
+        || opened.dev() != requested.dev()
+        || opened.ino() != requested.ino()
+    {
+        return Err("trusted repository root changed after validation".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn verify_repository_boundary_identity(_repository: &RepositoryBoundary) -> Result<(), String> {
+    Err("trusted repository roots cannot be verified safely on this platform".to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn verify_repository_cli_source(repository: &RepositoryBoundary) -> Result<(), String> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let directory_flags =
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let src = File::from(
+        openat(&repository.directory, "src", directory_flags, Mode::empty())
+            .map_err(|_| "trusted repository src directory could not be opened".to_owned())?,
+    );
+    let bin = File::from(
+        openat(&src, "bin", directory_flags, Mode::empty())
+            .map_err(|_| "trusted repository bin directory could not be opened".to_owned())?,
+    );
+    let source = File::from(
+        openat(
+            &bin,
+            "sortformer_f16_downcast.rs",
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| "trusted repository converter source could not be opened".to_owned())?,
+    );
+    let expected_bytes = u64::try_from(COMPILED_CLI_SOURCE.len())
+        .map_err(|_| "compiled converter source size does not fit u64".to_owned())?;
+    let observed = read_bounded_file(
+        &source,
+        expected_bytes,
+        Some(expected_bytes),
+        "trusted repository converter source",
+    )?;
+    if observed != COMPILED_CLI_SOURCE {
+        return Err(
+            "trusted repository root does not contain this binary's exact converter source"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -354,16 +564,15 @@ fn publish_exact_with_parent_sync(
     label: &str,
     sync_parent: &dyn Fn(&File) -> std::io::Result<()>,
 ) -> Result<(), String> {
-    publish_exact_with_hooks(
-        target,
-        bytes,
-        label,
-        &write_all_staging,
-        &File::sync_all,
-        &File::sync_all,
+    let before_rename = || Ok(());
+    let hooks = PublishHooks {
+        write_staging: &write_all_staging,
+        sync_staging: &File::sync_all,
+        sync_existing: &File::sync_all,
         sync_parent,
-        &|| Ok(()),
-    )
+        before_rename: &before_rename,
+    };
+    publish_exact_with_hooks(target, bytes, label, &hooks)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -372,15 +581,20 @@ fn write_all_staging(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+struct PublishHooks<'a> {
+    write_staging: &'a dyn Fn(&mut File, &[u8]) -> std::io::Result<()>,
+    sync_staging: &'a dyn Fn(&File) -> std::io::Result<()>,
+    sync_existing: &'a dyn Fn(&File) -> std::io::Result<()>,
+    sync_parent: &'a dyn Fn(&File) -> std::io::Result<()>,
+    before_rename: &'a dyn Fn() -> Result<(), String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn publish_exact_with_hooks(
     target: &OutputTarget,
     bytes: &[u8],
     label: &str,
-    write_staging: &dyn Fn(&mut File, &[u8]) -> std::io::Result<()>,
-    sync_staging: &dyn Fn(&File) -> std::io::Result<()>,
-    sync_existing: &dyn Fn(&File) -> std::io::Result<()>,
-    sync_parent: &dyn Fn(&File) -> std::io::Result<()>,
-    before_rename: &dyn Fn() -> Result<(), String>,
+    hooks: &PublishHooks<'_>,
 ) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -397,10 +611,10 @@ fn publish_exact_with_hooks(
                 "refusing to overwrite an existing {label} with different bytes"
             ));
         }
-        sync_existing(&existing)
+        (hooks.sync_existing)(&existing)
             .map_err(|_| format!("existing {label} bytes could not be synchronized"))?;
-        sync_parent(&target.directory)
-            .map_err(|_| format!("{label} directory entry could not be synchronized"))?;
+        (hooks.sync_parent)(&target.directory)
+            .map_err(|_| format!("{label} directory entry synchronization was not confirmed"))?;
         verify_output_parent_identity(target)?;
         verify_output_leaf_identity(target, &existing, label)?;
         return Ok(());
@@ -470,7 +684,7 @@ fn publish_exact_with_hooks(
             )
         ));
     }
-    if write_staging(&mut staging_file, bytes).is_err() {
+    if (hooks.write_staging)(&mut staging_file, bytes).is_err() {
         return Err(format!(
             "{label} staging bytes could not be written{}",
             staging_diagnostic_suffix(
@@ -482,7 +696,7 @@ fn publish_exact_with_hooks(
             )
         ));
     }
-    if sync_staging(&staging_file).is_err() {
+    if (hooks.sync_staging)(&staging_file).is_err() {
         return Err(format!(
             "{label} staging bytes could not be synchronized{}",
             staging_diagnostic_suffix(
@@ -507,7 +721,7 @@ fn publish_exact_with_hooks(
         .map_err(|error| format!("{error}{}", full_synced()))?;
     verify_named_leaf_identity(target, &staging_name, &staging_file, label)
         .map_err(|error| format!("{error}{}", full_synced()))?;
-    before_rename().map_err(|error| format!("{error}{}", full_synced()))?;
+    (hooks.before_rename)().map_err(|error| format!("{error}{}", full_synced()))?;
     if let Err(rename_error) = renameat_with(
         &target.directory,
         &staging_name,
@@ -567,8 +781,9 @@ fn publish_exact_with_hooks(
             "its final bytes changed during confirmation",
         ));
     }
-    sync_parent(&target.directory)
-        .map_err(|_| committed_uncertain(label, "its directory entry was not synchronized"))?;
+    (hooks.sync_parent)(&target.directory).map_err(|_| {
+        committed_uncertain(label, "its directory entry synchronization was not confirmed")
+    })?;
     verify_output_parent_identity(target).map_err(|_| {
         committed_uncertain(label, "its parent identity changed after synchronization")
     })?;
@@ -624,6 +839,105 @@ fn open_output_leaf(
         Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
         Err(_) => Err(format!("{label} path could not be inspected safely")),
     }
+}
+
+/// Confirm an already-published output without creating or replacing it.
+///
+/// When `retained_identity` is present, the current name must still resolve to
+/// that exact inode. Pair publication uses sequential confirmation points;
+/// two independent pathnames cannot be made atomic against an arbitrary
+/// same-EUID process that ignores this publisher's protocol.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn confirm_existing_exact(
+    target: &OutputTarget,
+    retained_identity: Option<&File>,
+    bytes: &[u8],
+    label: &str,
+) -> Result<File, String> {
+    let hooks = ConfirmHooks {
+        sync_file: &File::sync_all,
+        sync_parent: &File::sync_all,
+    };
+    confirm_existing_exact_with_hooks(target, retained_identity, bytes, label, &hooks)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+struct ConfirmHooks<'a> {
+    sync_file: &'a dyn Fn(&File) -> std::io::Result<()>,
+    sync_parent: &'a dyn Fn(&File) -> std::io::Result<()>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn confirm_existing_exact_with_hooks(
+    target: &OutputTarget,
+    retained_identity: Option<&File>,
+    bytes: &[u8],
+    label: &str,
+    hooks: &ConfirmHooks<'_>,
+) -> Result<File, String> {
+    verify_output_parent_identity(target)?;
+    let current = open_output_leaf(target, label, true)?
+        .ok_or_else(|| format!("{label} disappeared before confirmation"))?;
+    if let Some(retained_identity) = retained_identity
+        && !same_open_file_identity(retained_identity, &current, label)?
+    {
+        return Err(format!("{label} inode changed during artifact-pair publication"));
+    }
+    verify_open_output_bytes(target, &current, bytes, label)?;
+    (hooks.sync_file)(&current)
+        .map_err(|_| format!("{label} byte synchronization was not confirmed"))?;
+    (hooks.sync_parent)(&target.directory)
+        .map_err(|_| format!("{label} directory entry synchronization was not confirmed"))?;
+    let confirmed = open_output_leaf(target, label, true)?
+        .ok_or_else(|| format!("{label} disappeared after synchronization"))?;
+    if !same_open_file_identity(&current, &confirmed, label)? {
+        return Err(format!("{label} inode changed during artifact-pair publication"));
+    }
+    verify_open_output_bytes(target, &confirmed, bytes, label)?;
+    Ok(confirmed)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn verify_open_output_bytes(
+    target: &OutputTarget,
+    current: &File,
+    bytes: &[u8],
+    label: &str,
+) -> Result<(), String> {
+    let expected = u64::try_from(bytes.len())
+        .map_err(|_| format!("{label} size does not fit u64"))?;
+    let observed = read_bounded_file(current, expected, Some(expected), label)?;
+    verify_output_parent_identity(target)?;
+    verify_output_leaf_identity(target, current, label)?;
+    if observed != bytes {
+        return Err(format!("{label} bytes changed during artifact-pair publication"));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn confirm_existing_exact(
+    _target: &OutputTarget,
+    _retained_identity: Option<&File>,
+    _bytes: &[u8],
+    label: &str,
+) -> Result<File, String> {
+    Err(format!(
+        "{label} cannot be confirmed safely on this platform"
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn same_open_file_identity(left: &File, right: &File, label: &str) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let left = left
+        .metadata()
+        .map_err(|_| format!("retained {label} identity could not be read"))?;
+    let right = right
+        .metadata()
+        .map_err(|_| format!("current {label} identity could not be read"))?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -811,11 +1125,14 @@ mod tests {
             .expect("set fixture permissions");
     }
 
+    fn test_repository_boundary() -> RepositoryBoundary {
+        bind_repository_boundary(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("bind exact test repository")
+    }
+
     fn test_output_target(path: &Path) -> OutputTarget {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .expect("canonical repository");
-        bind_output_target(path, &repository).expect("bind test output target")
+        let repository = test_repository_boundary();
+        bind_output_target(path, &repository.canonical_root).expect("bind test output target")
     }
 
     fn single_staging_path(directory: &Path) -> PathBuf {
@@ -832,6 +1149,64 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(stages.len(), 1);
         stages.into_iter().next().expect("one staging path")
+    }
+
+    #[test]
+    fn argument_parser_maps_the_exact_five_position_contract() {
+        let args = parse_args_from(
+            [
+                "trusted-repository",
+                "parent-receipt.json",
+                "parent-package.safetensors",
+                "output-package.safetensors",
+                "output-receipt.json",
+            ]
+            .map(OsString::from),
+        )
+        .expect("parse the documented positional contract");
+
+        assert_eq!(args.repository_root, PathBuf::from("trusted-repository"));
+        assert_eq!(args.parent_receipt, PathBuf::from("parent-receipt.json"));
+        assert_eq!(
+            args.parent_package,
+            PathBuf::from("parent-package.safetensors")
+        );
+        assert_eq!(
+            args.output_package,
+            PathBuf::from("output-package.safetensors")
+        );
+        assert_eq!(args.output_receipt, PathBuf::from("output-receipt.json"));
+    }
+
+    #[test]
+    fn argument_parser_rejects_too_few_and_too_many_positions() {
+        let too_few = parse_args_from(
+            [
+                "trusted-repository",
+                "parent-receipt.json",
+                "parent-package.safetensors",
+                "output-package.safetensors",
+            ]
+            .map(OsString::from),
+        )
+        .err()
+        .expect("four positions must be rejected");
+        let too_many = parse_args_from(
+            [
+                "trusted-repository",
+                "parent-receipt.json",
+                "parent-package.safetensors",
+                "output-package.safetensors",
+                "output-receipt.json",
+                "unexpected-extra",
+            ]
+            .map(OsString::from),
+        )
+        .err()
+        .expect("six positions must be rejected");
+
+        assert_eq!(too_few, usage());
+        assert_eq!(too_many, usage());
     }
 
     #[test]
@@ -910,7 +1285,11 @@ mod tests {
             &sync_parent,
         )
         .expect_err("first directory sync must fail after publication");
-        assert!(error.contains("was published but its directory entry was not synchronized"));
+        assert!(
+            error.contains(
+                "was published but its directory entry synchronization was not confirmed"
+            )
+        );
         assert_eq!(
             read_bounded(&output, 19, Some(19), "test artifact")
                 .expect("committed bytes remain visible"),
@@ -939,24 +1318,26 @@ mod tests {
         let target = test_output_target(&output);
         let file_sync_calls = AtomicUsize::new(0);
         let parent_sync_calls = AtomicUsize::new(0);
+        let sync_existing = |_: &File| {
+            file_sync_calls.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("synthetic existing-file sync failure"))
+        };
+        let sync_parent = |_: &File| {
+            parent_sync_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let before_rename = || Ok(());
+        let hooks = PublishHooks {
+            write_staging: &write_all_staging,
+            sync_staging: &File::sync_all,
+            sync_existing: &sync_existing,
+            sync_parent: &sync_parent,
+            before_rename: &before_rename,
+        };
 
-        let error = publish_exact_with_hooks(
-            &target,
-            b"identical",
-            "test artifact",
-            &write_all_staging,
-            &File::sync_all,
-            &|_| {
-                file_sync_calls.fetch_add(1, Ordering::SeqCst);
-                Err(io::Error::other("synthetic existing-file sync failure"))
-            },
-            &|_| {
-                parent_sync_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-            &|| Ok(()),
-        )
-        .expect_err("existing identical bytes must not bypass file synchronization");
+        let error =
+            publish_exact_with_hooks(&target, b"identical", "test artifact", &hooks)
+                .expect_err("existing identical bytes must not bypass file synchronization");
 
         assert!(error.contains("existing test artifact bytes could not be synchronized"));
         assert_eq!(file_sync_calls.load(Ordering::SeqCst), 1);
@@ -970,17 +1351,19 @@ mod tests {
         let directory = tempfile::tempdir().expect("create output directory");
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
-        let error = publish_exact_with_hooks(
-            &target,
-            b"payload",
-            "test artifact",
-            &|_, _| Err(io::Error::other("synthetic write failure")),
-            &File::sync_all,
-            &File::sync_all,
-            &File::sync_all,
-            &|| Ok(()),
-        )
-        .expect_err("failed write must report the created staging state");
+        let write_staging = |_: &mut File, _: &[u8]| {
+            Err(io::Error::other("synthetic write failure"))
+        };
+        let before_rename = || Ok(());
+        let hooks = PublishHooks {
+            write_staging: &write_staging,
+            sync_staging: &File::sync_all,
+            sync_existing: &File::sync_all,
+            sync_parent: &File::sync_all,
+            before_rename: &before_rename,
+        };
+        let error = publish_exact_with_hooks(&target, b"payload", "test artifact", &hooks)
+            .expect_err("failed write must report the created staging state");
 
         assert!(error.contains("zero payload bytes were intentionally written"));
         assert!(error.contains("resolved to the held inode at diagnosis time"));
@@ -1000,20 +1383,20 @@ mod tests {
         let directory = tempfile::tempdir().expect("create output directory");
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
-        let error = publish_exact_with_hooks(
-            &target,
-            b"payload",
-            "test artifact",
-            &|file, bytes| {
-                file.write_all(&bytes[..3])?;
-                Err(io::Error::other("synthetic partial write failure"))
-            },
-            &File::sync_all,
-            &File::sync_all,
-            &File::sync_all,
-            &|| Ok(()),
-        )
-        .expect_err("partial write must not overclaim retained bytes");
+        let write_staging = |file: &mut File, bytes: &[u8]| {
+            file.write_all(&bytes[..3])?;
+            Err(io::Error::other("synthetic partial write failure"))
+        };
+        let before_rename = || Ok(());
+        let hooks = PublishHooks {
+            write_staging: &write_staging,
+            sync_staging: &File::sync_all,
+            sync_existing: &File::sync_all,
+            sync_parent: &File::sync_all,
+            before_rename: &before_rename,
+        };
+        let error = publish_exact_with_hooks(&target, b"payload", "test artifact", &hooks)
+            .expect_err("partial write must not overclaim retained bytes");
 
         assert!(error.contains("only 3 of 7 payload bytes were observed"));
         assert!(error.contains("durability is unconfirmed"));
@@ -1031,17 +1414,17 @@ mod tests {
         let directory = tempfile::tempdir().expect("create output directory");
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
-        let error = publish_exact_with_hooks(
-            &target,
-            b"payload",
-            "test artifact",
-            &write_all_staging,
-            &|_| Err(io::Error::other("synthetic staging sync failure")),
-            &File::sync_all,
-            &File::sync_all,
-            &|| Ok(()),
-        )
-        .expect_err("failed sync must distinguish written from durable bytes");
+        let sync_staging = |_: &File| Err(io::Error::other("synthetic staging sync failure"));
+        let before_rename = || Ok(());
+        let hooks = PublishHooks {
+            write_staging: &write_all_staging,
+            sync_staging: &sync_staging,
+            sync_existing: &File::sync_all,
+            sync_parent: &File::sync_all,
+            before_rename: &before_rename,
+        };
+        let error = publish_exact_with_hooks(&target, b"payload", "test artifact", &hooks)
+            .expect_err("failed sync must distinguish written from durable bytes");
 
         assert!(error.contains("all 7 payload bytes were written"));
         assert!(error.contains("synchronization was not confirmed"));
@@ -1057,17 +1440,16 @@ mod tests {
         let directory = tempfile::tempdir().expect("create output directory");
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
-        let error = publish_exact_with_hooks(
-            &target,
-            b"payload",
-            "test artifact",
-            &write_all_staging,
-            &File::sync_all,
-            &File::sync_all,
-            &File::sync_all,
-            &|| Err("synthetic pre-rename stop".to_owned()),
-        )
-        .expect_err("pre-rename failure must name the synchronized stage");
+        let before_rename = || Err("synthetic pre-rename stop".to_owned());
+        let hooks = PublishHooks {
+            write_staging: &write_all_staging,
+            sync_staging: &File::sync_all,
+            sync_existing: &File::sync_all,
+            sync_parent: &File::sync_all,
+            before_rename: &before_rename,
+        };
+        let error = publish_exact_with_hooks(&target, b"payload", "test artifact", &hooks)
+            .expect_err("pre-rename failure must name the synchronized stage");
 
         assert!(error.contains("all 7 payload bytes were synchronized"));
         assert!(error.contains("resolved to the held inode at diagnosis time"));
@@ -1121,18 +1503,17 @@ mod tests {
             std::fs::write(&output, b"competitor")
                 .map_err(|error| format!("create synthetic collision: {error}"))
         };
+        let hooks = PublishHooks {
+            write_staging: &write_all_staging,
+            sync_staging: &File::sync_all,
+            sync_existing: &File::sync_all,
+            sync_parent: &File::sync_all,
+            before_rename: &create_collision,
+        };
 
-        let error = publish_exact_with_hooks(
-            &target,
-            b"derived artifact",
-            "test artifact",
-            &write_all_staging,
-            &File::sync_all,
-            &File::sync_all,
-            &File::sync_all,
-            &create_collision,
-        )
-        .expect_err("no-clobber rename must reject a last-moment collision");
+        let error =
+            publish_exact_with_hooks(&target, b"derived artifact", "test artifact", &hooks)
+                .expect_err("no-clobber rename must reject a last-moment collision");
 
         assert!(error.contains("could not be published without overwriting"));
         assert_eq!(std::fs::read(&output).expect("read collision"), b"competitor");
@@ -1154,20 +1535,23 @@ mod tests {
     }
 
     #[test]
-    fn receipt_failure_reports_the_durably_committed_partial_pair() {
+    fn receipt_failure_reports_the_confirmed_partial_pair_without_overclaiming_receipt_state() {
         let directory = tempfile::tempdir().expect("create output directory");
         let package_path = directory.path().join("package.bin");
         let receipt_path = directory.path().join("receipt.json");
         std::fs::write(&receipt_path, b"incumbent").expect("write incumbent receipt");
         set_mode(&receipt_path, 0o600);
+        let repository = test_repository_boundary();
         let package = test_output_target(&package_path);
         let receipt = test_output_target(&receipt_path);
 
-        let error = publish_artifact_pair(&package, &receipt, b"package", b"receipt")
-            .expect_err("receipt collision must leave an explicit partial pair");
+        let error =
+            publish_artifact_pair(&repository, &package, &receipt, b"package", b"receipt")
+                .expect_err("receipt collision must leave an explicit partial pair");
 
         assert!(error.contains("artifact-pair completion is not confirmed"));
-        assert!(error.contains("output package was durably committed"));
+        assert!(error.contains("output package was confirmed before the receipt attempt"));
+        assert!(error.contains("receipt completion/durability is unconfirmed"));
         assert_eq!(
             std::fs::read(&package_path).expect("read committed package"),
             b"package"
@@ -1176,6 +1560,389 @@ mod tests {
             std::fs::read(&receipt_path).expect("read incumbent receipt"),
             b"incumbent"
         );
+    }
+
+    #[test]
+    fn pair_publication_succeeds_and_identical_retry_is_idempotent() {
+        let directory = tempfile::tempdir().expect("create output directory");
+        let package_path = directory.path().join("package.bin");
+        let receipt_path = directory.path().join("receipt.json");
+        let repository = test_repository_boundary();
+        let package = test_output_target(&package_path);
+        let receipt = test_output_target(&receipt_path);
+
+        publish_artifact_pair(&repository, &package, &receipt, b"package", b"receipt")
+            .expect("publish an exact artifact pair");
+        publish_artifact_pair(&repository, &package, &receipt, b"package", b"receipt")
+            .expect("retry an identical artifact pair");
+
+        assert_eq!(
+            std::fs::read(&package_path).expect("read published package"),
+            b"package"
+        );
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("read published receipt"),
+            b"receipt"
+        );
+    }
+
+    #[test]
+    fn pair_confirmation_rejects_a_package_name_that_disappears_after_receipt_publication() {
+        let directory = tempfile::tempdir().expect("create output directory");
+        let package_path = directory.path().join("package.bin");
+        let moved_package_path = directory.path().join("moved-package.bin");
+        let receipt_path = directory.path().join("receipt.json");
+        let repository = test_repository_boundary();
+        let package = test_output_target(&package_path);
+        let receipt = test_output_target(&receipt_path);
+        let move_package = || {
+            std::fs::rename(&package_path, &moved_package_path)
+                .map_err(|error| format!("move package after receipt publication: {error}"))
+        };
+
+        let error = publish_artifact_pair_with_after_receipt(
+            &repository,
+            &package,
+            &receipt,
+            b"package",
+            b"receipt",
+            &move_package,
+        )
+        .expect_err("a missing package name must make pair completion uncertain");
+
+        assert!(error.contains("output package disappeared before confirmation"));
+        assert!(error.contains("final package identity/durability confirmation failed"));
+        assert_eq!(
+            std::fs::read(&moved_package_path).expect("read preserved moved package"),
+            b"package"
+        );
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("read published receipt"),
+            b"receipt"
+        );
+    }
+
+    #[test]
+    fn pair_confirmation_rejects_an_identical_different_inode_after_receipt_publication() {
+        let directory = tempfile::tempdir().expect("create output directory");
+        let package_path = directory.path().join("package.bin");
+        let retained_package_path = directory.path().join("retained-package.bin");
+        let receipt_path = directory.path().join("receipt.json");
+        let repository = test_repository_boundary();
+        let package = test_output_target(&package_path);
+        let receipt = test_output_target(&receipt_path);
+        let replace_package = || {
+            std::fs::rename(&package_path, &retained_package_path)
+                .map_err(|error| format!("retain original package inode: {error}"))?;
+            std::fs::write(&package_path, b"package")
+                .map_err(|error| format!("write identical replacement package: {error}"))?;
+            set_mode(&package_path, 0o600);
+            Ok(())
+        };
+
+        let error = publish_artifact_pair_with_after_receipt(
+            &repository,
+            &package,
+            &receipt,
+            b"package",
+            b"receipt",
+            &replace_package,
+        )
+        .expect_err("a different inode must fail even when its bytes match");
+
+        assert!(error.contains("output package inode changed"));
+        assert!(error.contains("final package identity/durability confirmation failed"));
+        assert_eq!(
+            std::fs::read(&retained_package_path).expect("read retained original package"),
+            b"package"
+        );
+        assert_eq!(
+            std::fs::read(&package_path).expect("read identical replacement package"),
+            b"package"
+        );
+    }
+
+    #[test]
+    fn pair_confirmation_rejects_same_inode_byte_mutation_after_receipt_publication() {
+        let directory = tempfile::tempdir().expect("create output directory");
+        let package_path = directory.path().join("package.bin");
+        let receipt_path = directory.path().join("receipt.json");
+        let repository = test_repository_boundary();
+        let package = test_output_target(&package_path);
+        let receipt = test_output_target(&receipt_path);
+        let mutate_package = || {
+            std::fs::write(&package_path, b"tamper!")
+                .map_err(|error| format!("mutate package after receipt publication: {error}"))
+        };
+
+        let error = publish_artifact_pair_with_after_receipt(
+            &repository,
+            &package,
+            &receipt,
+            b"package",
+            b"receipt",
+            &mutate_package,
+        )
+        .expect_err("same-inode byte mutation must make pair completion uncertain");
+
+        assert!(error.contains("output package bytes changed"));
+        assert!(error.contains("final package identity/durability confirmation failed"));
+        assert_eq!(
+            std::fs::read(&package_path).expect("read mutated package"),
+            b"tamper!"
+        );
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("read published receipt"),
+            b"receipt"
+        );
+    }
+
+    #[test]
+    fn confirmation_rejects_wrong_bytes_before_any_synchronization() {
+        use std::io;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().expect("create output directory");
+        let output = directory.path().join("package.bin");
+        std::fs::write(&output, b"tamper!").expect("write mismatched package bytes");
+        set_mode(&output, 0o600);
+        let target = test_output_target(&output);
+        let file_sync_calls = AtomicUsize::new(0);
+        let parent_sync_calls = AtomicUsize::new(0);
+        let sync_file = |_: &File| {
+            file_sync_calls.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("unexpected file synchronization"))
+        };
+        let sync_parent = |_: &File| {
+            parent_sync_calls.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("unexpected parent synchronization"))
+        };
+        let hooks = ConfirmHooks {
+            sync_file: &sync_file,
+            sync_parent: &sync_parent,
+        };
+
+        let error = confirm_existing_exact_with_hooks(
+            &target,
+            None,
+            b"package",
+            "output package",
+            &hooks,
+        )
+        .expect_err("mismatched bytes must be rejected before synchronization");
+
+        assert!(error.contains("output package bytes changed"));
+        assert_eq!(file_sync_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(parent_sync_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn confirmation_rechecks_bytes_after_synchronization() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().expect("create output directory");
+        let output = directory.path().join("package.bin");
+        std::fs::write(&output, b"package").expect("write expected package bytes");
+        set_mode(&output, 0o600);
+        let target = test_output_target(&output);
+        let file_sync_calls = AtomicUsize::new(0);
+        let parent_sync_calls = AtomicUsize::new(0);
+        let sync_file = |file: &File| {
+            file_sync_calls.fetch_add(1, Ordering::SeqCst);
+            file.sync_all()?;
+            std::fs::write(&output, b"tamper!")
+        };
+        let sync_parent = |directory: &File| {
+            parent_sync_calls.fetch_add(1, Ordering::SeqCst);
+            directory.sync_all()
+        };
+        let hooks = ConfirmHooks {
+            sync_file: &sync_file,
+            sync_parent: &sync_parent,
+        };
+
+        let error = confirm_existing_exact_with_hooks(
+            &target,
+            None,
+            b"package",
+            "output package",
+            &hooks,
+        )
+        .expect_err("post-sync byte mutation must invalidate confirmation");
+
+        assert!(error.contains("output package bytes changed"));
+        assert_eq!(file_sync_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(parent_sync_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(&output).expect("read post-sync mutation"),
+            b"tamper!"
+        );
+    }
+
+    #[test]
+    fn pair_confirmation_rejects_a_receipt_name_that_disappears_after_publication() {
+        let directory = tempfile::tempdir().expect("create output directory");
+        let package_path = directory.path().join("package.bin");
+        let receipt_path = directory.path().join("receipt.json");
+        let moved_receipt_path = directory.path().join("moved-receipt.json");
+        let repository = test_repository_boundary();
+        let package = test_output_target(&package_path);
+        let receipt = test_output_target(&receipt_path);
+        let move_receipt = || {
+            std::fs::rename(&receipt_path, &moved_receipt_path)
+                .map_err(|error| format!("move receipt after publication: {error}"))
+        };
+
+        let error = publish_artifact_pair_with_after_receipt(
+            &repository,
+            &package,
+            &receipt,
+            b"package",
+            b"receipt",
+            &move_receipt,
+        )
+        .expect_err("a missing receipt name must make pair completion uncertain");
+
+        assert!(error.contains("output receipt disappeared before confirmation"));
+        assert!(error.contains("final receipt identity/durability confirmation failed"));
+        assert_eq!(
+            std::fs::read(&package_path).expect("read published package"),
+            b"package"
+        );
+        assert_eq!(
+            std::fs::read(&moved_receipt_path).expect("read preserved moved receipt"),
+            b"receipt"
+        );
+    }
+
+    #[test]
+    fn pair_confirmation_rejects_an_identical_replacement_receipt_inode() {
+        let directory = tempfile::tempdir().expect("create output directory");
+        let package_path = directory.path().join("package.bin");
+        let receipt_path = directory.path().join("receipt.json");
+        let retained_receipt_path = directory.path().join("retained-receipt.json");
+        let repository = test_repository_boundary();
+        let package = test_output_target(&package_path);
+        let receipt = test_output_target(&receipt_path);
+        let replace_receipt = || {
+            std::fs::rename(&receipt_path, &retained_receipt_path)
+                .map_err(|error| format!("retain original receipt inode: {error}"))?;
+            std::fs::write(&receipt_path, b"receipt")
+                .map_err(|error| format!("write identical replacement receipt: {error}"))?;
+            set_mode(&receipt_path, 0o600);
+            Ok(())
+        };
+
+        let error = publish_artifact_pair_with_after_receipt(
+            &repository,
+            &package,
+            &receipt,
+            b"package",
+            b"receipt",
+            &replace_receipt,
+        )
+        .expect_err("an identical replacement receipt inode must invalidate the pair");
+
+        assert!(error.contains("output receipt inode changed"));
+        assert!(error.contains("final receipt identity/durability confirmation failed"));
+        assert_eq!(
+            std::fs::read(&retained_receipt_path).expect("read retained original receipt"),
+            b"receipt"
+        );
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("read identical replacement receipt"),
+            b"receipt"
+        );
+    }
+
+    #[test]
+    fn trusted_repository_boundary_is_source_and_inode_bound() {
+        let repository = test_repository_boundary();
+        verify_repository_boundary_identity(&repository).expect("current repository stays bound");
+
+        let outer = tempfile::tempdir().expect("create repository test root");
+        let requested = outer.path().join("repository");
+        let moved = outer.path().join("moved-repository");
+        let bin = requested.join("src/bin");
+        std::fs::create_dir_all(&bin).expect("create synthetic repository tree");
+        std::fs::write(bin.join("sortformer_f16_downcast.rs"), COMPILED_CLI_SOURCE)
+            .expect("write exact converter source");
+        let repository = bind_repository_boundary(&requested)
+            .expect("an explicitly trusted exact-source root can be bound");
+
+        std::fs::rename(&requested, &moved).expect("move bound repository root");
+        std::fs::create_dir(&requested).expect("create replacement repository root");
+        let error = verify_repository_boundary_identity(&repository)
+            .expect_err("repository path replacement must invalidate authority");
+        assert!(error.contains("trusted repository root changed after validation"));
+    }
+
+    #[test]
+    fn pair_confirmation_rejects_repository_path_replacement_during_publication() {
+        let outer = tempfile::tempdir().expect("create repository test root");
+        let requested = outer.path().join("repository");
+        let moved = outer.path().join("moved-repository");
+        let bin = requested.join("src/bin");
+        let output_directory = outer.path().join("output");
+        std::fs::create_dir_all(&bin).expect("create synthetic repository tree");
+        std::fs::create_dir(&output_directory).expect("create output directory");
+        set_mode(&output_directory, 0o700);
+        std::fs::write(bin.join("sortformer_f16_downcast.rs"), COMPILED_CLI_SOURCE)
+            .expect("write exact converter source");
+        let repository = bind_repository_boundary(&requested)
+            .expect("an explicitly trusted exact-source root can be bound");
+        let package_path = output_directory.join("package.bin");
+        let receipt_path = output_directory.join("receipt.json");
+        let package = bind_output_target(&package_path, &repository.canonical_root)
+            .expect("bind package output outside synthetic repository");
+        let receipt = bind_output_target(&receipt_path, &repository.canonical_root)
+            .expect("bind receipt output outside synthetic repository");
+        let replace_repository = || {
+            std::fs::rename(&requested, &moved)
+                .map_err(|error| format!("move trusted repository root: {error}"))?;
+            std::fs::create_dir(&requested)
+                .map_err(|error| format!("replace trusted repository root: {error}"))
+        };
+
+        let error = publish_artifact_pair_with_after_receipt(
+            &repository,
+            &package,
+            &receipt,
+            b"package",
+            b"receipt",
+            &replace_repository,
+        )
+        .expect_err("repository path replacement must invalidate pair completion");
+
+        assert!(error.contains("trusted repository root changed after validation"));
+        assert!(error.contains("artifact-pair output policy is uncertain"));
+        assert_eq!(
+            std::fs::read(&package_path).expect("read published package"),
+            b"package"
+        );
+        assert_eq!(
+            std::fs::read(&receipt_path).expect("read published receipt"),
+            b"receipt"
+        );
+    }
+
+    #[test]
+    fn trusted_repository_boundary_rejects_same_length_different_converter_source() {
+        let outer = tempfile::tempdir().expect("create repository test root");
+        let bin = outer.path().join("src/bin");
+        std::fs::create_dir_all(&bin).expect("create synthetic repository tree");
+        let mut different_source = COMPILED_CLI_SOURCE.to_vec();
+        different_source[0] ^= 1;
+        std::fs::write(
+            bin.join("sortformer_f16_downcast.rs"),
+            &different_source,
+        )
+        .expect("write same-length different converter source");
+
+        let error = bind_repository_boundary(outer.path())
+            .err()
+            .expect("different converter source must not define the trusted boundary");
+        assert!(error.contains("does not contain this binary's exact converter source"));
     }
 
     #[test]
