@@ -1087,8 +1087,10 @@ fn video_meta_from_json(value: &serde_json::Value) -> FwResult<VideoMeta> {
 /// when the token fires. A Unix worker that already belongs to an externally
 /// owned process tree instead keeps nested descendants in the outer group,
 /// reaps the direct yt-dlp child locally, and leaves recursive termination to
-/// that outer owner. Unsupported bounded-tree platforms fail before launch. A
-/// token firing maps to [`FwError::Cancelled`].
+/// that outer owner. Unsupported bounded-tree platforms fail before launch.
+/// After successful cleanup, a token firing maps to [`FwError::Cancelled`]; a
+/// cleanup-certification failure instead surfaces as
+/// [`FwError::ContractViolation`].
 ///
 /// # Errors
 ///
