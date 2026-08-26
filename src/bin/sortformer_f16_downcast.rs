@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use std::process::ExitCode;
 
 use franken_whisper::sortformer_conformance::SORTFORMER_PACKAGE_BYTES;
 use franken_whisper::sortformer_f16_downcast::derive_sortformer_f16_artifact;
-use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use uuid::Uuid;
 
 const MAX_PARENT_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -17,6 +18,13 @@ struct Args {
     parent_package: PathBuf,
     output_package: PathBuf,
     output_receipt: PathBuf,
+}
+
+struct OutputTarget {
+    requested_parent: PathBuf,
+    canonical_parent: PathBuf,
+    directory: File,
+    name: OsString,
 }
 
 fn main() -> ExitCode {
@@ -31,7 +39,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    validate_outputs(&args)?;
+    let (output_package, output_receipt) = validate_outputs(&args)?;
     let parent_receipt = read_bounded(
         &args.parent_receipt,
         MAX_PARENT_RECEIPT_BYTES,
@@ -51,8 +59,8 @@ fn run() -> Result<(), String> {
     let receipt_sha256 = artifact.receipt_sha256();
     let (derived_package, derived_receipt) = artifact.into_bytes();
 
-    publish_exact(&args.output_package, &derived_package, "output package")?;
-    publish_exact(&args.output_receipt, &derived_receipt, "output receipt")?;
+    publish_exact(&output_package, &derived_package, "output package")?;
+    publish_exact(&output_receipt, &derived_receipt, "output receipt")?;
 
     println!("wrote derived Sortformer f16 artifact");
     println!("package bytes: {package_bytes}");
@@ -80,27 +88,116 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-fn validate_outputs(args: &Args) -> Result<(), String> {
-    if args.output_package == args.output_receipt {
-        return Err("output package and receipt paths must be distinct".to_owned());
-    }
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn validate_outputs(args: &Args) -> Result<(OutputTarget, OutputTarget), String> {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .canonicalize()
         .map_err(|_| "repository boundary could not be resolved".to_owned())?;
-    for path in [&args.output_package, &args.output_receipt] {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        if !parent.is_dir() {
-            return Err("output parent directory does not exist".to_owned());
-        }
-        let parent = parent
-            .canonicalize()
-            .map_err(|_| "output parent directory could not be resolved".to_owned())?;
-        if parent.starts_with(&repository) {
-            return Err("derived model artifacts must be written outside the repository".to_owned());
-        }
+    let package = bind_output_target(&args.output_package, &repository)?;
+    let receipt = bind_output_target(&args.output_receipt, &repository)?;
+    if same_output_target(&package, &receipt)? {
+        return Err("output package and receipt paths must be distinct".to_owned());
+    }
+    Ok((package, receipt))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn validate_outputs(_args: &Args) -> Result<(OutputTarget, OutputTarget), String> {
+    Err("derived artifacts cannot be published safely on this platform".to_owned())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn bind_output_target(path: &Path, repository: &Path) -> Result<OutputTarget, String> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "output path must include a file name".to_owned())?;
+    if matches!(name.to_str(), Some("." | "..")) {
+        return Err("output file name must not traverse directories".to_owned());
+    }
+    let requested_parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_owned();
+    let directory = File::from(
+        open(
+            &requested_parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| "output parent directory could not be identity-bound".to_owned())?,
+    );
+    let canonical_parent = requested_parent
+        .canonicalize()
+        .map_err(|_| "output parent directory could not be resolved".to_owned())?;
+    if canonical_parent.starts_with(repository) {
+        return Err("derived model artifacts must be written outside the repository".to_owned());
+    }
+    let target = OutputTarget {
+        requested_parent,
+        canonical_parent,
+        directory,
+        name: name.to_owned(),
+    };
+    verify_output_parent_identity(&target)?;
+    Ok(target)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn same_output_target(left: &OutputTarget, right: &OutputTarget) -> Result<bool, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let left_parent = left
+        .directory
+        .metadata()
+        .map_err(|_| "output package parent identity could not be read".to_owned())?;
+    let right_parent = right
+        .directory
+        .metadata()
+        .map_err(|_| "output receipt parent identity could not be read".to_owned())?;
+    Ok(left_parent.dev() == right_parent.dev()
+        && left_parent.ino() == right_parent.ino()
+        && left
+            .name
+            .as_bytes()
+            .eq_ignore_ascii_case(right.name.as_bytes()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn verify_output_parent_identity(target: &OutputTarget) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let opened = target
+        .directory
+        .metadata()
+        .map_err(|_| "validated output parent identity could not be read".to_owned())?;
+    let canonical = target
+        .canonical_parent
+        .symlink_metadata()
+        .map_err(|_| "output parent changed after validation".to_owned())?;
+    let requested = target
+        .requested_parent
+        .symlink_metadata()
+        .map_err(|_| "output parent changed after validation".to_owned())?;
+    if !opened.is_dir()
+        || !canonical.is_dir()
+        || !requested.is_dir()
+        || opened.dev() != canonical.dev()
+        || opened.ino() != canonical.ino()
+        || opened.dev() != requested.dev()
+        || opened.ino() != requested.ino()
+    {
+        return Err("output parent changed after validation".to_owned());
+    }
+    if opened.uid() != rustix::process::geteuid().as_raw() || opened.mode() & 0o022 != 0 {
+        return Err(
+            "output parent must be owned by the effective user and not group/world writable"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -112,6 +209,15 @@ fn read_bounded(
     label: &str,
 ) -> Result<Vec<u8>, String> {
     let file = open_readonly_nonblocking(path, label)?;
+    read_bounded_file(&file, max_bytes, expected_bytes, label)
+}
+
+fn read_bounded_file(
+    file: &File,
+    max_bytes: u64,
+    expected_bytes: Option<u64>,
+    label: &str,
+) -> Result<Vec<u8>, String> {
     let metadata = file
         .metadata()
         .map_err(|_| format!("{label} could not be inspected"))?;
@@ -131,7 +237,9 @@ fn read_bounded(
                 .map_err(|_| format!("{label} size does not fit this platform"))?,
         )
         .map_err(|_| format!("{label} allocation failed"))?;
-    file.take(read_limit)
+    let mut reader = file;
+    reader
+        .take(read_limit)
         .read_to_end(&mut bytes)
         .map_err(|_| format!("{label} could not be read"))?;
     let observed = u64::try_from(bytes.len())
@@ -162,85 +270,191 @@ fn open_readonly_nonblocking(_path: &Path, label: &str) -> Result<File, String> 
     ))
 }
 
-fn publish_exact(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
-    if path
-        .try_exists()
-        .map_err(|_| format!("{label} path could not be inspected"))?
-    {
-        let expected = u64::try_from(bytes.len())
-            .map_err(|_| format!("{label} size does not fit u64"))?;
-        let existing = read_bounded(path, expected, Some(expected), label)?;
-        if existing == bytes {
-            return Ok(());
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn publish_exact(target: &OutputTarget, bytes: &[u8], label: &str) -> Result<(), String> {
+    publish_exact_with_parent_sync(target, bytes, label, &|directory| directory.sync_all())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn publish_exact_with_parent_sync(
+    target: &OutputTarget,
+    bytes: &[u8],
+    label: &str,
+    sync_parent: &dyn Fn(&File) -> std::io::Result<()>,
+) -> Result<(), String> {
+    use rustix::fs::{Mode, OFlags, RenameFlags, openat, renameat_with};
+
+    verify_output_parent_identity(target)?;
+    let expected = u64::try_from(bytes.len())
+        .map_err(|_| format!("{label} size does not fit u64"))?;
+    if let Some(existing) = open_output_leaf(target, label)? {
+        existing
+            .sync_all()
+            .map_err(|_| format!("existing {label} could not be synchronized"))?;
+        let existing_bytes = read_bounded_file(&existing, expected, Some(expected), label)?;
+        verify_output_leaf_identity(target, &existing, label)?;
+        if existing_bytes != bytes {
+            return Err(format!(
+                "refusing to overwrite an existing {label} with different bytes"
+            ));
         }
-        return Err(format!(
-            "refusing to overwrite an existing {label} with different bytes"
-        ));
+        sync_parent(&target.directory)
+            .map_err(|_| format!("{label} directory entry could not be synchronized"))?;
+        verify_output_parent_identity(target)?;
+        verify_output_leaf_identity(target, &existing, label)?;
+        return Ok(());
     }
 
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut staged = TempFileBuilder::new()
-        .prefix(".sortformer-f16-stage-")
-        .tempfile_in(parent)
-        .map_err(|_| format!("{label} staging file could not be created"))?;
-    if staged
+    let mut staged = None;
+    for _ in 0..8 {
+        let name = OsString::from(format!(
+            ".sortformer-f16-stage-{}",
+            Uuid::new_v4().simple()
+        ));
+        match openat(
+            &target.directory,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(descriptor) => {
+                staged = Some((name, File::from(descriptor)));
+                break;
+            }
+            Err(error) if error == rustix::io::Errno::EXIST => {}
+            Err(_) => return Err(format!("{label} staging file could not be created")),
+        }
+    }
+    let (staging_name, mut staging_file) = staged
+        .ok_or_else(|| format!("{label} staging file could not be created after bounded retries"))?;
+    if staging_file
         .write_all(bytes)
-        .and_then(|()| staged.as_file().sync_all())
+        .and_then(|()| staging_file.sync_all())
         .is_err()
     {
         return Err(format!(
             "{label} staging bytes could not be persisted{}",
-            retain_staging(staged)
+            retained_staging_suffix(&staging_name)
         ));
     }
-    match staged.persist_noclobber(path) {
-        Ok(_) => {}
-        Err(error) => {
-            return Err(format!(
-                "{label} could not be published without overwriting{}",
-                retain_staging(error.file)
-            ));
-        }
+    verify_output_parent_identity(target)?;
+    verify_named_leaf_identity(target, &staging_name, &staging_file, label)?;
+    if let Err(error) = renameat_with(
+        &target.directory,
+        &staging_name,
+        &target.directory,
+        &target.name,
+        RenameFlags::NOREPLACE,
+    ) {
+        let detail = if error == rustix::io::Errno::EXIST {
+            "could not be published without overwriting"
+        } else {
+            "publication state is uncertain after the no-clobber rename failed"
+        };
+        return Err(format!(
+            "{label} {detail}{}",
+            retained_staging_suffix(&staging_name)
+        ));
     }
-    sync_parent_directory(parent, label)?;
-
-    let expected = u64::try_from(bytes.len())
-        .map_err(|_| format!("{label} size does not fit u64"))?;
-    let published = read_bounded(path, expected, Some(expected), label)?;
-    if published != bytes {
+    verify_output_parent_identity(target)
+        .map_err(|_| format!("{label} was published but its parent identity changed"))?;
+    verify_output_leaf_identity(target, &staging_file, label)?;
+    let published = open_output_leaf(target, label)?
+        .ok_or_else(|| format!("{label} disappeared after publication"))?;
+    let published_bytes = read_bounded_file(&published, expected, Some(expected), label)?;
+    verify_output_leaf_identity(target, &published, label)?;
+    if published_bytes != bytes {
         return Err(format!("{label} changed after publication"));
     }
+    sync_parent(&target.directory)
+        .map_err(|_| format!("{label} directory entry could not be synchronized"))?;
+    verify_output_parent_identity(target)?;
+    verify_output_leaf_identity(target, &published, label)?;
     Ok(())
 }
 
-fn retain_staging(staged: NamedTempFile) -> String {
-    match staged.keep() {
-        Ok((_file, path)) => path.file_name().map_or_else(
-            || "; staging bytes retained in the output directory".to_owned(),
-            |name| {
-                format!(
-                    "; staging bytes retained in the output directory as {}",
-                    name.to_string_lossy()
-                )
-            },
-        ),
-        Err(_) => "; staging-file retention failed".to_owned(),
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn publish_exact(_target: &OutputTarget, _bytes: &[u8], label: &str) -> Result<(), String> {
+    Err(format!("{label} cannot be published safely on this platform"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn open_output_leaf(target: &OutputTarget, label: &str) -> Result<Option<File>, String> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    verify_output_parent_identity(target)?;
+    match openat(
+        &target.directory,
+        &target.name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => {
+            let file = File::from(descriptor);
+            if !file
+                .metadata()
+                .map_err(|_| format!("{label} could not be inspected"))?
+                .is_file()
+            {
+                return Err(format!("{label} is not a regular file"));
+            }
+            Ok(Some(file))
+        }
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
+        Err(_) => Err(format!("{label} path could not be inspected safely")),
     }
 }
 
-#[cfg(unix)]
-fn sync_parent_directory(parent: &Path, label: &str) -> Result<(), String> {
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| format!("{label} directory entry could not be synchronized"))
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn verify_output_leaf_identity(
+    target: &OutputTarget,
+    expected: &File,
+    label: &str,
+) -> Result<(), String> {
+    verify_named_leaf_identity(target, &target.name, expected, label)
 }
 
-#[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path, _label: &str) -> Result<(), String> {
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn verify_named_leaf_identity(
+    target: &OutputTarget,
+    name: &std::ffi::OsStr,
+    expected: &File,
+    label: &str,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let current = File::from(
+        openat(
+            &target.directory,
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| format!("{label} identity could not be verified"))?,
+    );
+    let expected = expected
+        .metadata()
+        .map_err(|_| format!("{label} identity could not be read"))?;
+    let current = current
+        .metadata()
+        .map_err(|_| format!("{label} identity could not be read"))?;
+    if !expected.is_file()
+        || !current.is_file()
+        || expected.dev() != current.dev()
+        || expected.ino() != current.ino()
+    {
+        return Err(format!("{label} identity changed during publication"));
+    }
     Ok(())
+}
+
+fn retained_staging_suffix(name: &std::ffi::OsStr) -> String {
+    format!(
+        "; staging bytes retained in the output directory as {}",
+        name.to_string_lossy()
+    )
 }
 
 #[cfg(test)]
