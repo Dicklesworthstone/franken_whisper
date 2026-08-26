@@ -15,13 +15,15 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{FwError, FwResult};
 use crate::native_engine::weights::SafetensorsFile;
+use crate::sortformer_f16_contract::{
+    SORTFORMER_F16_DERIVATION_METHOD, SORTFORMER_F16_DERIVATION_METHOD_VERSION,
+    SORTFORMER_F16_DERIVATION_RECEIPT_SCHEMA, SortformerF16ArtifactDtype,
+    SortformerF16DerivationIdentity, SortformerF16DerivationReceipt,
+    SortformerF16PackageIdentity, SortformerF16TensorRecord, SortformerF16TensorTransform,
+};
 use crate::sortformer_conformance::{
-    SORTFORMER_CONVERSION_RECEIPT_SHA256, SORTFORMER_F16_DERIVATION_METHOD,
-    SORTFORMER_F16_DERIVATION_METHOD_VERSION, SORTFORMER_F16_DERIVATION_RECEIPT_SCHEMA,
-    SORTFORMER_MODEL_ID, SORTFORMER_MODEL_REVISION, SORTFORMER_PACKAGE_SHA256,
-    SortformerF16ArtifactDtype, SortformerF16DerivationIdentity,
-    SortformerF16DerivationReceipt, SortformerF16PackageIdentity, SortformerF16TensorRecord,
-    SortformerF16TensorTransform, VerifiedSortformerPackage,
+    SORTFORMER_CONVERSION_RECEIPT_SHA256, SORTFORMER_MODEL_ID, SORTFORMER_MODEL_REVISION,
+    SORTFORMER_PACKAGE_SHA256, VerifiedSortformerPackage,
     load_verified_sortformer_package_from_bytes,
 };
 const PACKAGE_FORMAT: &str = "safetensors";
@@ -286,6 +288,7 @@ fn downcast_package(
             method: SORTFORMER_F16_DERIVATION_METHOD.to_owned(),
             method_version: SORTFORMER_F16_DERIVATION_METHOD_VERSION.to_owned(),
             rounding_mode: "round_to_nearest_ties_to_even".to_owned(),
+            receipt_contract_source_sha256: receipt_contract_source_sha256(),
             downcaster_core_source_sha256: downcaster_core_source_sha256(),
             downcaster_cli_source_sha256: downcaster_cli_source_sha256(),
             cargo_lock_sha256: cargo_lock_sha256(),
@@ -487,6 +490,10 @@ fn downcast_checkpoint(checkpoint: &(dyn Fn() -> FwResult<()> + Sync)) -> FwResu
 
 fn downcaster_core_source_sha256() -> String {
     sha256_bytes(include_bytes!("sortformer_f16_downcast.rs"))
+}
+
+fn receipt_contract_source_sha256() -> String {
+    sha256_bytes(include_bytes!("sortformer_f16_contract.rs"))
 }
 
 fn downcaster_cli_source_sha256() -> String {

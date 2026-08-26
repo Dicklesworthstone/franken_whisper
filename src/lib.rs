@@ -34,6 +34,7 @@ pub mod replay_pack;
 pub mod robot;
 pub mod separate;
 pub mod sortformer_conformance;
+pub mod sortformer_f16_contract;
 pub mod sortformer_f16_downcast;
 pub mod sortformer_identity;
 pub mod sortformer_inference;

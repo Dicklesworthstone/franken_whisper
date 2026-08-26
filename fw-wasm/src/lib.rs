@@ -34,6 +34,8 @@ pub mod native_engine;
 pub mod diarization_projection;
 #[path = "../../src/sortformer_conformance.rs"]
 pub mod sortformer_conformance;
+#[path = "../../src/sortformer_f16_contract.rs"]
+pub mod sortformer_f16_contract;
 #[path = "../../src/sortformer_inference.rs"]
 pub mod sortformer_inference;
 
