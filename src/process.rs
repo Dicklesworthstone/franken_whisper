@@ -266,6 +266,17 @@ fn render_command_for_log(program: &str, args: &[String]) -> String {
     let mut redact_next = false;
     for arg in args {
         if redact_next {
+            if let Some((flag, _value)) = arg.split_once('=')
+                && is_sensitive_flag(flag)
+            {
+                capacity = capacity.saturating_add(flag.len().saturating_add(4));
+                redact_next = false;
+                continue;
+            }
+            if is_sensitive_flag(arg) {
+                capacity = capacity.saturating_add(arg.len());
+                continue;
+            }
             capacity = capacity.saturating_add(3);
             redact_next = false;
             continue;
@@ -290,6 +301,18 @@ fn render_command_for_log(program: &str, args: &[String]) -> String {
     for arg in args {
         rendered.push(' ');
         if redact_next {
+            if let Some((flag, _value)) = arg.split_once('=')
+                && is_sensitive_flag(flag)
+            {
+                rendered.push_str(flag);
+                rendered.push_str("=***");
+                redact_next = false;
+                continue;
+            }
+            if is_sensitive_flag(arg) {
+                rendered.push_str(arg);
+                continue;
+            }
             rendered.push_str("***");
             redact_next = false;
             continue;
@@ -331,6 +354,175 @@ fn is_sensitive_flag(flag: &str) -> bool {
     )
 }
 
+fn sensitive_arg_values(args: &[String]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut capture_next = false;
+
+    for arg in args {
+        if capture_next {
+            if let Some((flag, value)) = arg.split_once('=')
+                && is_sensitive_flag(flag)
+            {
+                if !value.is_empty() {
+                    values.push(value.to_owned());
+                }
+                capture_next = false;
+                continue;
+            }
+            if is_sensitive_flag(arg) {
+                continue;
+            }
+            if !arg.is_empty() {
+                values.push(arg.clone());
+            }
+            capture_next = false;
+            continue;
+        }
+
+        if let Some((flag, value)) = arg.split_once('=')
+            && is_sensitive_flag(flag)
+        {
+            if !value.is_empty() {
+                values.push(value.to_owned());
+            }
+            continue;
+        }
+
+        capture_next = is_sensitive_flag(arg);
+    }
+
+    // Replace longer values first so an overlapping short secret cannot leave
+    // the suffix of a longer secret visible. The lexical tie-breaker makes the
+    // order deterministic and groups duplicates for `dedup`.
+    values.sort_unstable_by(|left, right| {
+        right
+            .len()
+            .cmp(&left.len())
+            .then_with(|| left.cmp(right))
+    });
+    values.dedup();
+    values
+}
+
+fn redact_sensitive_text(text: &str, sensitive_values: &[String]) -> String {
+    let replacement: String = std::iter::repeat_n(redaction_marker(sensitive_values), 3).collect();
+    let mut redacted = text.to_owned();
+    for value in sensitive_values {
+        redacted = redacted.replace(value.as_str(), &replacement);
+    }
+    redacted
+}
+
+fn redaction_marker(sensitive_values: &[String]) -> char {
+    const PREFERRED: [char; 5] = ['*', '#', '•', '█', '�'];
+    let used: std::collections::HashSet<char> = sensitive_values
+        .iter()
+        .flat_map(|value| value.chars())
+        .collect();
+    PREFERRED
+        .into_iter()
+        .find(|candidate| !used.contains(candidate))
+        .or_else(|| ('\u{e000}'..='\u{f8ff}').find(|candidate| !used.contains(candidate)))
+        // NUL cannot be passed to a spawned process argument, so even a
+        // pathological value containing every visible fallback cannot equal
+        // this final separator.
+        .unwrap_or('\0')
+}
+
+fn sensitive_byte_mask(bytes: &[u8], sensitive_values: &[String]) -> Vec<bool> {
+    let mut mask = vec![false; bytes.len()];
+    for value in sensitive_values {
+        let needle = value.as_bytes();
+        if needle.is_empty() {
+            continue;
+        }
+        mark_sensitive_matches(bytes, needle, &mut mask);
+    }
+    mask
+}
+
+fn mark_sensitive_matches(bytes: &[u8], needle: &[u8], mask: &mut [bool]) {
+    debug_assert!(!needle.is_empty());
+    debug_assert_eq!(bytes.len(), mask.len());
+
+    let mut prefix = vec![0usize; needle.len()];
+    for index in 1..needle.len() {
+        let mut matched = prefix[index - 1];
+        while matched > 0 && needle[index] != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if needle[index] == needle[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+
+    let mut matched = 0usize;
+    let mut pending_range: Option<(usize, usize)> = None;
+    for (index, byte) in bytes.iter().enumerate() {
+        while matched > 0 && *byte != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if *byte == needle[matched] {
+            matched += 1;
+        }
+        if matched == needle.len() {
+            let end = index + 1;
+            let start = end - needle.len();
+            pending_range = match pending_range.take() {
+                Some((range_start, range_end)) if start <= range_end => {
+                    Some((range_start, range_end.max(end)))
+                }
+                Some((range_start, range_end)) => {
+                    mask[range_start..range_end].fill(true);
+                    Some((start, end))
+                }
+                None => Some((start, end)),
+            };
+            matched = prefix[matched - 1];
+        }
+    }
+    if let Some((start, end)) = pending_range {
+        mask[start..end].fill(true);
+    }
+}
+
+fn render_redacted_bytes(bytes: &[u8], mask: &[bool], start: usize, marker: char) -> String {
+    debug_assert_eq!(bytes.len(), mask.len());
+    let mut rendered = Vec::with_capacity(bytes.len().saturating_sub(start));
+    let mut marker_buf = [0u8; 4];
+    let marker = marker.encode_utf8(&mut marker_buf).as_bytes();
+    let mut index = start.min(bytes.len());
+    while index < bytes.len() {
+        if mask[index] {
+            for _ in 0..3 {
+                rendered.extend_from_slice(marker);
+            }
+            index += 1;
+            while index < bytes.len() && mask[index] {
+                index += 1;
+            }
+        } else {
+            rendered.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&rendered).into_owned()
+}
+
+fn captured_stderr_for_error(stderr: &[u8], sensitive_values: &[String]) -> String {
+    let mask = sensitive_byte_mask(stderr, sensitive_values);
+    let rendered = render_redacted_bytes(stderr, &mask, 0, redaction_marker(sensitive_values));
+    redact_sensitive_text(&rendered, sensitive_values)
+}
+
+fn command_error_diagnostics(program: &str, args: &[String]) -> (String, Vec<String>) {
+    let sensitive_values = sensitive_arg_values(args);
+    let rendered = render_command_for_log(program, args);
+    let rendered = redact_sensitive_text(&rendered, &sensitive_values);
+    (rendered, sensitive_values)
+}
+
 pub fn run_command_with_timeout(
     program: &str,
     args: &[String],
@@ -343,7 +535,7 @@ pub fn run_command_with_timeout(
         });
     }
 
-    let rendered = render_command_for_log(program, args);
+    let (rendered, sensitive_values) = command_error_diagnostics(program, args);
     let mut command = Command::new(program);
     command.args(args);
     if let Some(dir) = cwd {
@@ -381,7 +573,13 @@ pub fn run_command_with_timeout(
                     cleanup?;
                     let stdout = stdout_result?;
                     let stderr = stderr_result?;
-                    return validate_captured_command_output(&rendered, status, stdout, stderr);
+                    return validate_captured_command_output(
+                        &rendered,
+                        status,
+                        stdout,
+                        stderr,
+                        &sensitive_values,
+                    );
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -421,7 +619,7 @@ pub fn run_command_with_timeout(
                     .finish()
                     .map(|capture| capture.bytes)
                     .unwrap_or_default();
-                let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
+                let stderr_str = captured_stderr_for_error(&stderr, &sensitive_values);
                 return Err(merge_process_tree_cleanup_result(
                     FwError::from_command_timeout(
                         rendered,
@@ -439,7 +637,7 @@ pub fn run_command_with_timeout(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let output = command.output()?;
-    validate_command_output(&rendered, output)
+    validate_command_output(&rendered, output, &sensitive_values)
 }
 
 // The early sleeps total 50ms, preserving the original polling phase and
@@ -574,7 +772,7 @@ fn run_command_cancellable_with_optional_input(
         });
     }
 
-    let rendered = render_command_for_log(program, args);
+    let (rendered, sensitive_values) = command_error_diagnostics(program, args);
     let mut command = Command::new(program);
     command.args(args);
     if bounded_process_tree_unsupported() {
@@ -654,7 +852,7 @@ fn run_command_cancellable_with_optional_input(
                 .finish()
                 .map(|capture| capture.bytes)
                 .unwrap_or_default();
-            let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
+            let stderr_str = captured_stderr_for_error(&stderr, &sensitive_values);
             return Err(merge_process_tree_cleanup_result(
                 FwError::from_command_timeout(rendered, saturating_duration_ms(limit), stderr_str),
                 cleanup,
@@ -691,7 +889,13 @@ fn run_command_cancellable_with_optional_input(
                 cleanup?;
                 let stdout = stdout_result?;
                 let stderr = stderr_result?;
-                return validate_captured_command_output(&rendered, status, stdout, stderr);
+                return validate_captured_command_output(
+                    &rendered,
+                    status,
+                    stdout,
+                    stderr,
+                    &sensitive_values,
+                );
             }
             Ok(None) => {}
             Err(error) => {
@@ -873,13 +1077,17 @@ fn terminate_descendant_process_tree(
     wait_for_child_reap(child, Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT)
 }
 
-fn validate_command_output(rendered: &str, output: Output) -> FwResult<Output> {
+fn validate_command_output(
+    rendered: &str,
+    output: Output,
+    sensitive_values: &[String],
+) -> FwResult<Output> {
     if output.status.success() {
         return Ok(output);
     }
 
     let status = output.status.code().unwrap_or(-1);
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stderr = captured_stderr_for_error(&output.stderr, sensitive_values);
     Err(FwError::from_command_failure(
         rendered.to_owned(),
         status,
@@ -1201,6 +1409,7 @@ fn validate_captured_command_output(
     status: std::process::ExitStatus,
     stdout: PipeCapture,
     stderr: PipeCapture,
+    sensitive_values: &[String],
 ) -> FwResult<Output> {
     if stdout.drain_incomplete || stderr.drain_incomplete {
         return Err(FwError::ContractViolation(
@@ -1224,6 +1433,7 @@ fn validate_captured_command_output(
             stdout: stdout.bytes,
             stderr: stderr.bytes,
         },
+        sensitive_values,
     )
 }
 
@@ -1253,8 +1463,54 @@ pub(crate) fn is_stdout_capture_limit_error(error: &FwError) -> bool {
 // guarantees the child is killed and reaped on drop.
 // ---------------------------------------------------------------------------
 
-/// Retained stderr tail for error reporting (last bytes win).
+/// Public stderr-tail bound for error reporting (last bytes win). The drainer
+/// retains up to one maximum-secret-length of private overlap so redaction can
+/// recognize a value that crosses this nominal boundary; callers still receive
+/// at most this many raw-context bytes before replacement markers are rendered.
 const STREAMING_STDERR_TAIL_BYTES: usize = 4096;
+
+fn streaming_stderr_tail_capacity(sensitive_values: &[String]) -> usize {
+    let overlap = sensitive_values
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1);
+    STREAMING_STDERR_TAIL_BYTES.saturating_add(overlap)
+}
+
+fn append_streaming_stderr_tail(tail: &mut Vec<u8>, chunk: &[u8], capacity: usize) {
+    tail.extend_from_slice(chunk);
+    if tail.len() > capacity {
+        let excess = tail.len() - capacity;
+        tail.drain(..excess);
+    }
+}
+
+fn sanitized_streaming_stderr_tail(tail: &[u8], sensitive_values: &[String]) -> String {
+    let mask = sensitive_byte_mask(tail, sensitive_values);
+    let start = tail.len().saturating_sub(STREAMING_STDERR_TAIL_BYTES);
+    let rendered = render_redacted_bytes(
+        tail,
+        &mask,
+        start,
+        redaction_marker(sensitive_values),
+    );
+    let rendered = redact_sensitive_text(&rendered, sensitive_values);
+    bounded_text_tail(&rendered, STREAMING_STDERR_TAIL_BYTES)
+}
+
+fn bounded_text_tail(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
+}
 
 /// A spawned child whose stdout is consumed incrementally by the caller.
 ///
@@ -1279,6 +1535,7 @@ pub struct StreamingChild {
     stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     stderr_join: Option<thread::JoinHandle<()>>,
     rendered_command: String,
+    sensitive_values: Vec<String>,
     reaped: bool,
 }
 
@@ -1322,14 +1579,15 @@ impl StreamingChild {
         Ok(Some(status))
     }
 
-    /// The retained stderr tail (lossy UTF-8), for FW-CMD-FAILED messages.
+    /// The retained, argv-secret-redacted stderr tail (lossy UTF-8), for
+    /// FW-CMD-FAILED messages.
     #[must_use]
     pub fn stderr_tail(&self) -> String {
         let tail = self
             .stderr_tail
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        String::from_utf8_lossy(&tail).into_owned()
+        sanitized_streaming_stderr_tail(&tail, &self.sensitive_values)
     }
 }
 
@@ -1357,7 +1615,8 @@ pub fn spawn_streaming_stdout(_program: &str, _args: &[String]) -> FwResult<Stre
 
 #[cfg(not(windows))]
 pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<StreamingChild> {
-    let rendered_command = render_command_for_log(program, args);
+    let (rendered_command, sensitive_values) = command_error_diagnostics(program, args);
+    let stderr_tail_capacity = streaming_stderr_tail_capacity(&sensitive_values);
     tracing::debug!(command = %rendered_command, "spawning streaming-stdout child");
     let mut command = Command::new(program);
     command
@@ -1387,11 +1646,11 @@ pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<Stream
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        tail.extend_from_slice(&buf[..n]);
-                        if tail.len() > STREAMING_STDERR_TAIL_BYTES {
-                            let excess = tail.len() - STREAMING_STDERR_TAIL_BYTES;
-                            tail.drain(..excess);
-                        }
+                        append_streaming_stderr_tail(
+                            &mut tail,
+                            &buf[..n],
+                            stderr_tail_capacity,
+                        );
                     }
                 }
             }
@@ -1403,6 +1662,7 @@ pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<Stream
         stderr_tail,
         stderr_join,
         rendered_command,
+        sensitive_values,
         reaped: false,
     })
 }
@@ -1416,8 +1676,9 @@ mod tests {
     #[cfg(unix)]
     use super::run_command_cancellable_with_input_probe_and_observer;
     use super::{
-        cancellable_poll_delay, render_command_for_log, run_command_cancellable,
-        run_command_cancellable_with_input_and_probe, run_command_cancellable_with_probe,
+        cancellable_poll_delay, command_error_diagnostics, render_command_for_log,
+        run_command_cancellable, run_command_cancellable_with_input_and_probe,
+        run_command_cancellable_with_probe, sensitive_arg_values,
     };
 
     struct PlatformCommand {
@@ -2112,6 +2373,318 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_arg_values_are_longest_first_unique_and_nonempty() {
+        let args = vec![
+            "--hf-token".to_owned(),
+            "token".to_owned(),
+            "--api-key=token-suffix".to_owned(),
+            "--auth-token=token".to_owned(),
+            "--password=".to_owned(),
+            "--secret".to_owned(),
+        ];
+
+        assert_eq!(
+            sensitive_arg_values(&args),
+            vec!["token-suffix".to_owned(), "token".to_owned()]
+        );
+    }
+
+    #[test]
+    fn adjacent_sensitive_flags_rearm_redaction_for_their_own_values() {
+        let split_secret = "adjacent_secret_123";
+        let equal_secret = "equal_secret_456";
+        let args = vec![
+            "--hf-token".to_owned(),
+            "--api-key".to_owned(),
+            split_secret.to_owned(),
+            "--secret".to_owned(),
+            format!("--auth-token={equal_secret}"),
+        ];
+
+        let (rendered, sensitive_values) = command_error_diagnostics("prog", &args);
+        assert_eq!(
+            sensitive_values,
+            vec![split_secret.to_owned(), equal_secret.to_owned()]
+        );
+        assert_eq!(
+            rendered,
+            "prog --hf-token --api-key *** --secret --auth-token=***"
+        );
+        assert!(!rendered.contains(split_secret));
+        assert!(!rendered.contains(equal_secret));
+    }
+
+    #[test]
+    fn command_diagnostics_redact_repeated_sensitive_value_everywhere() {
+        let secret = "repeated_secret_123";
+        let args = vec![
+            "--hf-token".to_owned(),
+            secret.to_owned(),
+            "--label".to_owned(),
+            secret.to_owned(),
+        ];
+
+        let (rendered, sensitive_values) = command_error_diagnostics("prog", &args);
+        assert_eq!(sensitive_values, vec![secret.to_owned()]);
+        assert!(!rendered.contains(secret), "repeated secret leaked: {rendered}");
+        assert!(
+            rendered.contains("--label ***"),
+            "nonsensitive occurrence was not scrubbed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn command_diagnostics_do_not_reemit_asterisk_only_secret() {
+        let secret = "***";
+        let args = vec!["--secret".to_owned(), secret.to_owned()];
+
+        let (rendered, _) = command_error_diagnostics("prog", &args);
+        assert!(!rendered.contains(secret), "mask re-emitted the secret: {rendered}");
+        assert!(
+            rendered.contains("--secret ###"),
+            "alternate marker was not selected: {rendered}"
+        );
+    }
+
+    #[test]
+    fn captured_stderr_scrubs_secret_reconstructed_by_lossy_utf8() {
+        let secret = "A�B";
+        let sensitive_values = vec![secret.to_owned()];
+
+        let rendered = super::captured_stderr_for_error(b"A\xffB", &sensitive_values);
+        assert_eq!(rendered, "***");
+        assert!(
+            !rendered.contains(secret),
+            "lossy UTF-8 reconstructed the secret: {rendered}"
+        );
+    }
+
+    #[test]
+    fn captured_stderr_redacts_overlapping_repetitive_matches() {
+        let sensitive_values = vec!["aaa".to_owned()];
+
+        let rendered = super::captured_stderr_for_error(b"aaaaab", &sensitive_values);
+        assert_eq!(rendered, "***b");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_child_stderr_redacts_split_and_equal_argv_secrets() {
+        let hf_secret = "hf_secret_echo_123";
+        let api_secret = "api_secret_echo_456";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'benign-context:%s:%s:%s\\n' \"$1\" \"$2\" \"$3\" >&2; exit 9"
+                .to_owned(),
+            "fw-secret-probe".to_owned(),
+            "--hf-token".to_owned(),
+            hf_secret.to_owned(),
+            format!("--api-key={api_secret}"),
+        ];
+
+        let error = run_command("sh", &args, None).expect_err("fixture must fail");
+        let text = error.to_string();
+        assert!(text.contains("benign-context"), "benign stderr was lost: {text}");
+        assert!(
+            text.contains("--hf-token:***:--api-key=***"),
+            "sensitive argv values were not replaced in context: {text}"
+        );
+        assert!(!text.contains(hf_secret), "HF token leaked: {text}");
+        assert!(!text.contains(api_secret), "API key leaked: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_timeout_stderr_redacts_argv_secret() {
+        let secret = "timeout_secret_echo_789";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'timeout-context:%s\\n' \"$2\" >&2; sleep 30".to_owned(),
+            "fw-timeout-probe".to_owned(),
+            "--hf-token".to_owned(),
+            secret.to_owned(),
+        ];
+
+        let error = run_command_with_timeout(
+            "sh",
+            &args,
+            None,
+            Some(Duration::from_secs(1)),
+        )
+        .expect_err("fixture must time out");
+        let text = error.to_string();
+        assert!(text.contains("timeout-context:***"), "context was lost: {text}");
+        assert!(!text.contains(secret), "timeout leaked argv secret: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_nonzero_stderr_redacts_argv_secret() {
+        let secret = "bounded_failure_secret_901";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'bounded-failure:%s\\n' \"$2\" >&2; exit 7".to_owned(),
+            "fw-bounded-failure-probe".to_owned(),
+            "--api-key".to_owned(),
+            secret.to_owned(),
+        ];
+
+        let error = run_command_with_timeout("sh", &args, None, Some(Duration::from_secs(5)))
+            .expect_err("fixture must fail");
+        let text = error.to_string();
+        assert!(text.contains("bounded-failure"), "context was lost: {text}");
+        assert!(!text.contains(secret), "bounded failure leaked secret: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_timeout_stderr_redacts_argv_secret() {
+        let secret = "cancellable_secret_echo_012";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'cancellable-context:%s\\n' \"$2\" >&2; sleep 30".to_owned(),
+            "fw-cancellable-probe".to_owned(),
+            "--auth-token".to_owned(),
+            secret.to_owned(),
+        ];
+        let token = CancellationToken::no_deadline();
+
+        let error = run_command_cancellable(
+            "sh",
+            &args,
+            None,
+            &token,
+            Some(Duration::from_secs(1)),
+        )
+        .expect_err("fixture must time out");
+        let text = error.to_string();
+        assert!(
+            text.contains("cancellable-context:***"),
+            "context was lost: {text}"
+        );
+        assert!(
+            !text.contains(secret),
+            "cancellable timeout leaked argv secret: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_nonzero_stderr_redacts_argv_secret() {
+        let secret = "cancellable_failure_secret_234";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'cancellable-failure:%s\\n' \"$2\" >&2; exit 8".to_owned(),
+            "fw-cancellable-failure-probe".to_owned(),
+            "--auth-token".to_owned(),
+            secret.to_owned(),
+        ];
+        let token = CancellationToken::no_deadline();
+
+        let error = run_command_cancellable(
+            "sh",
+            &args,
+            None,
+            &token,
+            Some(Duration::from_secs(5)),
+        )
+        .expect_err("fixture must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("cancellable-failure"),
+            "context was lost: {text}"
+        );
+        assert!(
+            !text.contains(secret),
+            "cancellable failure leaked secret: {text}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn streaming_stderr_tail_redacts_argv_secret() {
+        let secret = "streaming_secret_echo_345";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'stream-context:%s\\n' \"$2\" >&2".to_owned(),
+            "fw-stream-probe".to_owned(),
+            "--access-token".to_owned(),
+            secret.to_owned(),
+        ];
+        let mut child = super::spawn_streaming_stdout("sh", &args).expect("spawn fixture");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().expect("probe child").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "streaming fixture did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().expect("join stderr drainer");
+
+        let tail = child.stderr_tail();
+        assert!(tail.contains("stream-context:***"), "context was lost: {tail}");
+        assert!(!tail.contains(secret), "streaming tail leaked argv secret: {tail}");
+    }
+
+    #[test]
+    fn streaming_stderr_tail_redacts_secret_across_nominal_boundary() {
+        let secret = "boundary_secret_567";
+        let sensitive_values = vec![secret.to_owned()];
+        let capacity = super::streaming_stderr_tail_capacity(&sensitive_values);
+        let suffix_len = super::STREAMING_STDERR_TAIL_BYTES + 1 - secret.len();
+        let mut raw = vec![b'p'; 100];
+        raw.extend_from_slice(secret.as_bytes());
+        raw.extend(std::iter::repeat_n(b'z', suffix_len));
+
+        let mut retained = Vec::new();
+        for chunk in raw.chunks(257) {
+            super::append_streaming_stderr_tail(&mut retained, chunk, capacity);
+        }
+        let tail = super::sanitized_streaming_stderr_tail(&retained, &sensitive_values);
+
+        assert!(tail.len() <= super::STREAMING_STDERR_TAIL_BYTES);
+        assert!(tail.starts_with('*'), "boundary secret prefix was not masked");
+        assert!(
+            !tail.contains(secret) && !tail.contains(&secret[1..]),
+            "boundary-straddling secret leaked: {tail}"
+        );
+        assert!(tail.ends_with("zzzz"), "benign tail context was lost");
+    }
+
+    #[test]
+    fn streaming_stderr_tail_remains_bounded_when_markers_expand() {
+        let sensitive_values = vec!["*".to_owned(), "#".to_owned()];
+        let capacity = super::streaming_stderr_tail_capacity(&sensitive_values);
+        let raw: Vec<u8> = (0..super::STREAMING_STDERR_TAIL_BYTES + 100)
+            .map(|index| match index % 3 {
+                0 => b'*',
+                1 => b'#',
+                _ => b'a',
+            })
+            .collect();
+        let mut retained = Vec::new();
+        for chunk in raw.chunks(257) {
+            super::append_streaming_stderr_tail(&mut retained, chunk, capacity);
+        }
+
+        let tail = super::sanitized_streaming_stderr_tail(&retained, &sensitive_values);
+        assert!(
+            tail.len() <= super::STREAMING_STDERR_TAIL_BYTES,
+            "expanded marker tail exceeded the public bound: {}",
+            tail.len()
+        );
+        assert!(
+            !tail.contains('*') && !tail.contains('#'),
+            "one-byte secret leaked: {tail}"
+        );
+        assert!(tail.contains('a'), "benign tail context was lost");
+    }
+
+    #[test]
     fn saturating_duration_ms_normal_case() {
         assert_eq!(saturating_duration_ms(Duration::from_secs(5)), 5000);
         assert_eq!(saturating_duration_ms(Duration::from_millis(1234)), 1234);
@@ -2176,16 +2749,48 @@ mod tests {
     }
 
     #[test]
+    fn validate_command_output_redacts_overlapping_argv_secrets() {
+        let args = vec![
+            "--hf-token".to_owned(),
+            "fwsecret".to_owned(),
+            "--api-key=fwsecret-long".to_owned(),
+        ];
+        let sensitive_values = sensitive_arg_values(&args);
+        let output = fake_output(
+            1,
+            "benign failure: --api-key=fwsecret-long and --hf-token fwsecret",
+        );
+
+        let error = validate_command_output(
+            "test-cmd --hf-token *** --api-key=***",
+            output,
+            &sensitive_values,
+        )
+        .expect_err("fixture must fail");
+        let text = error.to_string();
+        assert!(text.contains("benign failure"), "benign context was lost: {text}");
+        assert!(
+            text.contains("--api-key=*** and --hf-token ***"),
+            "redacted context is incomplete: {text}"
+        );
+        assert!(!text.contains("fwsecret"), "secret leaked: {text}");
+        assert!(
+            !text.contains("-long"),
+            "longer overlapping secret was only partially redacted: {text}"
+        );
+    }
+
+    #[test]
     fn validate_command_output_success_returns_ok() {
         let output = fake_output(0, "");
-        let result = validate_command_output("test-cmd", output);
+        let result = validate_command_output("test-cmd", output, &[]);
         assert!(result.is_ok());
     }
 
     #[test]
     fn validate_command_output_nonzero_exit_returns_error() {
         let output = fake_output(1, "something went wrong");
-        let result = validate_command_output("test-cmd", output);
+        let result = validate_command_output("test-cmd", output, &[]);
         assert!(result.is_err());
         let text = result.unwrap_err().to_string();
         assert!(
@@ -2197,7 +2802,7 @@ mod tests {
     #[test]
     fn validate_command_output_preserves_exit_code_in_error() {
         let output = fake_output(42, "exit code 42");
-        let err = validate_command_output("my-tool --flag", output).unwrap_err();
+        let err = validate_command_output("my-tool --flag", output, &[]).unwrap_err();
         let text = err.to_string();
         assert!(
             text.contains("42"),
@@ -2208,7 +2813,7 @@ mod tests {
     #[test]
     fn validate_command_output_empty_stderr_still_fails_on_nonzero() {
         let output = fake_output(2, "");
-        let result = validate_command_output("cmd", output);
+        let result = validate_command_output("cmd", output, &[]);
         assert!(
             result.is_err(),
             "non-zero exit with empty stderr should still fail"
@@ -2293,7 +2898,7 @@ mod tests {
     #[test]
     fn validate_command_output_includes_command_name_in_error() {
         let output = fake_output(1, "boom");
-        let err = validate_command_output("my-special-cmd --flag", output).unwrap_err();
+        let err = validate_command_output("my-special-cmd --flag", output, &[]).unwrap_err();
         let text = err.to_string();
         assert!(
             text.contains("my-special-cmd"),
@@ -2391,7 +2996,7 @@ mod tests {
             stdout: Vec::new(),
             stderr: b"killed".to_vec(),
         };
-        let result = validate_command_output("signaled-cmd", output);
+        let result = validate_command_output("signaled-cmd", output, &[]);
         assert!(result.is_err(), "signal-killed process should fail");
         let text = result.unwrap_err().to_string();
         // The code falls back to -1 when .code() returns None.
