@@ -2307,19 +2307,21 @@ impl ListenPersistSink {
         if self.pending_segments.is_empty() && self.pending_events.is_empty() {
             return Ok(());
         }
-        let segments = std::mem::take(&mut self.pending_segments);
-        let events = std::mem::take(&mut self.pending_events);
         self.store.listen_flush_utterance(
             &self.run_id,
-            &segments,
-            &events,
-            &self.transcript_so_far.clone(),
+            &self.pending_segments,
+            &self.pending_events,
+            &self.transcript_so_far,
             now_rfc3339,
-        )
+        )?;
+        self.pending_segments.clear();
+        self.pending_events.clear();
+        Ok(())
     }
 
-    /// Close the run: drain remaining events, write true end time + final
-    /// stats/warnings + finalized replay envelope with the PCM hash.
+    /// Close the run: drain retained segments and remaining events, write true
+    /// end time + final stats/warnings + finalized replay envelope with the
+    /// PCM hash.
     pub(crate) fn close(
         mut self,
         warnings_json: &str,
@@ -2347,10 +2349,12 @@ impl ListenPersistSink {
             "artifact_paths": [],
         })
         .to_string();
+        let segments = std::mem::take(&mut self.pending_segments);
         let events = std::mem::take(&mut self.pending_events);
         self.store
             .listen_close_run(&crate::storage::ListenCloseRow {
                 run_id: &self.run_id,
+                segments: &segments,
                 events: &events,
                 result_json: &result_json,
                 warnings_json,
@@ -3497,6 +3501,254 @@ mod tests {
 
     fn secs(buffer: &SessionBuffer) -> (f64, f64) {
         (buffer.session_offset_sec(), buffer.buffer_sec())
+    }
+
+    #[test]
+    fn failed_persist_flush_retains_exact_rows_for_retry_and_close() {
+        // Deliberately leave the unique test database in the system temp
+        // directory: repository policy forbids automated file deletion.
+        let dir = std::env::temp_dir().join(format!(
+            "fw_listen_flush_retry_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp directory");
+        let db_path = dir.join("listen-flush-retry.sqlite3");
+        let run_id = "listen-flush-retry";
+        let mut sink = ListenPersistSink::open(
+            &db_path,
+            run_id,
+            "2026-08-26T00:00:00Z",
+            "test-input",
+            r#"{"kind":"listen-test"}"#,
+        )
+        .expect("open listen persistence sink");
+        let inspection = crate::storage::BlockingConnection::open(db_path.display().to_string())
+            .expect("open inspection connection");
+
+        sink.record_delta(0.0, 0.5, "alpha");
+        sink.record_delta(0.5, 1.0, "bravo");
+        sink.record_event(
+            7,
+            "2026-08-26T00:00:01Z",
+            "transcript.delta",
+            &serde_json::json!({"text": "alpha"}),
+        );
+        sink.record_event(
+            8,
+            "2026-08-26T00:00:02Z",
+            "utterance_end",
+            &serde_json::json!({"text": "alpha bravo"}),
+        );
+        sink.append_transcript("alpha bravo");
+
+        // Fail after both segment inserts and the first event insert. The
+        // savepoint must roll back the partial database work, while the sink
+        // retains the complete in-memory batch for a later attempt.
+        sink.store
+            .connection()
+            .execute(
+                "CREATE TRIGGER fail_listen_event_flush \
+                 BEFORE INSERT ON events \
+                 WHEN NEW.run_id = 'listen-flush-retry' AND NEW.seq = 8 \
+                 BEGIN \
+                    SELECT RAISE(ABORT, 'injected listen flush failure'); \
+                 END;",
+            )
+            .expect("create failure trigger");
+        let error = sink
+            .flush_utterance("2026-08-26T00:00:02Z")
+            .expect_err("injected flush must fail");
+        assert!(matches!(&error, FwError::Storage(_)));
+        assert!(
+            error.to_string().contains("injected listen flush failure"),
+            "unexpected failure source: {error}"
+        );
+        assert_eq!(sink.pending_segments.len(), 2);
+        assert_eq!(sink.pending_events.len(), 2);
+        assert_eq!(sink.pending_segments[0].idx, 0);
+        assert_eq!(sink.pending_segments[0].start_sec, 0.0);
+        assert_eq!(sink.pending_segments[0].end_sec, 0.5);
+        assert_eq!(sink.pending_segments[0].text, "alpha");
+        assert_eq!(sink.pending_segments[1].idx, 1);
+        assert_eq!(sink.pending_segments[1].text, "bravo");
+        assert_eq!(sink.pending_events[0].seq, 7);
+        assert_eq!(
+            sink.pending_events[0].ts_rfc3339,
+            "2026-08-26T00:00:01Z"
+        );
+        assert_eq!(sink.pending_events[0].code, "transcript.delta");
+        assert_eq!(sink.pending_events[0].payload_json, r#"{"text":"alpha"}"#);
+        assert_eq!(sink.pending_events[1].seq, 8);
+        assert_eq!(sink.pending_events[1].code, "utterance_end");
+
+        let segment_count = inspection
+            .query("SELECT COUNT(*) FROM segments WHERE run_id = 'listen-flush-retry'")
+            .expect("count rolled-back segments");
+        assert_eq!(
+            segment_count[0].get(0).and_then(|value| value.as_integer()),
+            Some(0)
+        );
+        let event_count = inspection
+            .query("SELECT COUNT(*) FROM events WHERE run_id = 'listen-flush-retry'")
+            .expect("count rolled-back events");
+        assert_eq!(
+            event_count[0].get(0).and_then(|value| value.as_integer()),
+            Some(0)
+        );
+
+        sink.store
+            .connection()
+            .execute("DROP TRIGGER fail_listen_event_flush;")
+            .expect("remove failure trigger");
+        sink.flush_utterance("2026-08-26T00:00:03Z")
+            .expect("retry retained rows");
+        assert!(sink.pending_segments.is_empty());
+        assert!(sink.pending_events.is_empty());
+        sink.flush_utterance("2026-08-26T00:00:03.500Z")
+            .expect("empty retry is idempotent");
+        let after_empty_retry = inspection
+            .query(
+                "SELECT finished_at, transcript FROM runs \
+                 WHERE id = 'listen-flush-retry'",
+            )
+            .expect("query no-op retry timestamp");
+        assert_eq!(
+            after_empty_retry[0]
+                .get(0)
+                .and_then(|value| value.as_text()),
+            Some("2026-08-26T00:00:03Z")
+        );
+        assert_eq!(
+            after_empty_retry[0]
+                .get(1)
+                .and_then(|value| value.as_text()),
+            Some("alpha bravo")
+        );
+
+        // Recreate the same failure on a later batch, then finish the session
+        // without another ordinary flush. Final close must carry the retained
+        // segment into its terminal transaction with the event and envelope.
+        sink.record_delta(1.0, 1.5, "charlie");
+        sink.record_event(
+            9,
+            "2026-08-26T00:00:04Z",
+            "transcript.delta",
+            &serde_json::json!({"text": "charlie"}),
+        );
+        sink.append_transcript("charlie");
+        sink.store
+            .connection()
+            .execute(
+                "CREATE TRIGGER fail_listen_event_flush \
+                 BEFORE INSERT ON events \
+                 WHEN NEW.run_id = 'listen-flush-retry' AND NEW.seq = 9 \
+                 BEGIN \
+                    SELECT RAISE(ABORT, 'injected final listen flush failure'); \
+                 END;",
+            )
+            .expect("create final failure trigger");
+        let error = sink
+            .flush_utterance("2026-08-26T00:00:04Z")
+            .expect_err("injected final flush must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("injected final listen flush failure"),
+            "unexpected final failure source: {error}"
+        );
+        assert_eq!(sink.pending_segments.len(), 1);
+        assert_eq!(sink.pending_events.len(), 1);
+        sink.store
+            .connection()
+            .execute("DROP TRIGGER fail_listen_event_flush;")
+            .expect("remove final failure trigger");
+        sink.close("[]", "2026-08-26T00:00:05Z", Some("en"))
+            .expect("close persists rows retained from the final failed flush");
+
+        let segments = inspection
+            .query(
+                "SELECT idx, start_sec, end_sec, text FROM segments \
+                 WHERE run_id = 'listen-flush-retry' ORDER BY idx",
+            )
+            .expect("query persisted segments");
+        assert_eq!(segments.len(), 3);
+        for (row, (idx, start, end, text)) in segments.iter().zip([
+            (0, 0.0, 0.5, "alpha"),
+            (1, 0.5, 1.0, "bravo"),
+            (2, 1.0, 1.5, "charlie"),
+        ]) {
+            assert_eq!(row.get(0).and_then(|value| value.as_integer()), Some(idx));
+            assert_eq!(row.get(1).and_then(|value| value.as_float()), Some(start));
+            assert_eq!(row.get(2).and_then(|value| value.as_float()), Some(end));
+            assert_eq!(row.get(3).and_then(|value| value.as_text()), Some(text));
+        }
+
+        let events = inspection
+            .query(
+                "SELECT seq, ts_rfc3339, code, payload_json FROM events \
+                 WHERE run_id = 'listen-flush-retry' ORDER BY seq",
+            )
+            .expect("query persisted events");
+        assert_eq!(events.len(), 3);
+        for (row, (seq, timestamp, code, payload)) in events.iter().zip([
+            (
+                7,
+                "2026-08-26T00:00:01Z",
+                "transcript.delta",
+                r#"{"text":"alpha"}"#,
+            ),
+            (
+                8,
+                "2026-08-26T00:00:02Z",
+                "utterance_end",
+                r#"{"text":"alpha bravo"}"#,
+            ),
+            (
+                9,
+                "2026-08-26T00:00:04Z",
+                "transcript.delta",
+                r#"{"text":"charlie"}"#,
+            ),
+        ]) {
+            assert_eq!(row.get(0).and_then(|value| value.as_integer()), Some(seq));
+            assert_eq!(
+                row.get(1).and_then(|value| value.as_text()),
+                Some(timestamp)
+            );
+            assert_eq!(row.get(2).and_then(|value| value.as_text()), Some(code));
+            assert_eq!(
+                row.get(3).and_then(|value| value.as_text()),
+                Some(payload)
+            );
+        }
+
+        let run = inspection
+            .query(
+                "SELECT finished_at, transcript, result_json FROM runs \
+                 WHERE id = 'listen-flush-retry'",
+            )
+            .expect("query finalized run");
+        assert_eq!(run.len(), 1);
+        assert_eq!(
+            run[0].get(0).and_then(|value| value.as_text()),
+            Some("2026-08-26T00:00:05Z")
+        );
+        assert_eq!(
+            run[0].get(1).and_then(|value| value.as_text()),
+            Some("alpha bravo charlie")
+        );
+        let result: serde_json::Value = serde_json::from_str(
+            run[0]
+                .get(2)
+                .and_then(|value| value.as_text())
+                .expect("result_json text"),
+        )
+        .expect("valid result_json");
+        assert_eq!(result["transcript"], "alpha bravo charlie");
     }
 
     #[test]

@@ -195,9 +195,13 @@ pub(crate) struct ListenEventRow {
 }
 
 /// Row payload for closing a live listen run (bd-rt-persist-a66y): drains
-/// remaining events, writes the true end time and final summary fields.
+/// retained segments and remaining events, then writes the true end time and
+/// final summary fields in the same transaction.
 pub(crate) struct ListenCloseRow<'a> {
     pub run_id: &'a str,
+    /// Any delta rows retained after the last utterance flush failed. They
+    /// land in the same terminal transaction as the final run envelope.
+    pub segments: &'a [ListenSegmentRow],
     pub events: &'a [ListenEventRow],
     pub result_json: &'a str,
     pub warnings_json: &'a str,
@@ -2201,13 +2205,15 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
         })
     }
 
-    /// Close a live session: drain remaining events, write the true end
-    /// time, final stats/result JSON, warnings, running transcript, and the
-    /// finalized replay envelope with the streamed session-PCM hash. A
-    /// failure here is NOT swallowed by the caller (final close failure
-    /// surfaces as run_error after the session events were emitted).
+    /// Close a live session: drain retained segments and remaining events,
+    /// write the true end time, final stats/result JSON, warnings, running
+    /// transcript, and the finalized replay envelope with the streamed
+    /// session-PCM hash. A failure here is NOT swallowed by the caller (final
+    /// close failure surfaces as run_error after the session events were
+    /// emitted).
     pub(crate) fn listen_close_run(&self, close: &ListenCloseRow<'_>) -> FwResult<()> {
         let run_id = close.run_id;
+        let segments = close.segments;
         let events = close.events;
         let result_json = close.result_json;
         let warnings_json = close.warnings_json;
@@ -2221,6 +2227,22 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                 .execute(&format!("SAVEPOINT {savepoint};"))
                 .map_err(|error| FwError::Storage(error.to_string()))?;
             let inner = (|| -> Result<(), FwError> {
+                for segment in segments {
+                    store
+                        .connection
+                        .execute_with_params(
+                            "INSERT OR REPLACE INTO segments (run_id, idx, start_sec, end_sec, \
+                             speaker, text, confidence) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL)",
+                            &[
+                                SqliteValue::Text(run_id.to_owned().into()),
+                                SqliteValue::Integer(segment.idx as i64),
+                                SqliteValue::Float(segment.start_sec),
+                                SqliteValue::Float(segment.end_sec),
+                                SqliteValue::Text(segment.text.clone().into()),
+                            ],
+                        )
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                }
                 for event in events {
                     store
                         .connection
