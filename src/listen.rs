@@ -3599,6 +3599,25 @@ mod tests {
             event_count[0].get(0).and_then(|value| value.as_integer()),
             Some(0)
         );
+        let run_after_failed_flush = inspection
+            .query(
+                "SELECT finished_at, transcript FROM runs \
+                 WHERE id = 'listen-flush-retry'",
+            )
+            .expect("query run state after failed flush");
+        assert_eq!(run_after_failed_flush.len(), 1);
+        assert_eq!(
+            run_after_failed_flush[0]
+                .get(0)
+                .and_then(|value| value.as_text()),
+            Some("2026-08-26T00:00:00Z")
+        );
+        assert_eq!(
+            run_after_failed_flush[0]
+                .get(1)
+                .and_then(|value| value.as_text()),
+            Some("")
+        );
 
         sink.store
             .connection()
