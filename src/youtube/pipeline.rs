@@ -1058,9 +1058,8 @@ fn settle_rendered_video<R>(
 where
     R: FnOnce(&Path) -> std::io::Result<()>,
 {
-    let audio_path_text = rendered.audio_path.display().to_string();
     let audio_kept = if rendered.keep_audio {
-        Some(audio_path_text)
+        Some(rendered.audio_path.display().to_string())
     } else {
         match remove_file(rendered.audio_path) {
             Ok(()) => None,
