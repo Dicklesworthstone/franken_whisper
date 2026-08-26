@@ -30,6 +30,7 @@ const BYTE_ORDER: &str = "little_endian";
 const TENSOR_ORDER: &str = "lexicographic_name_order";
 const METADATA_POLICY: &str = "absent";
 const CONVERSION_CHUNK_ELEMENTS: usize = 16 * 1024;
+const MAX_DERIVED_HEADER_BYTES: usize = 8 * 1024 * 1024;
 
 /// Strict receipt for one deterministic f32-to-f16 derivation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,7 +52,10 @@ pub struct SortformerF16DerivationIdentity {
     pub method: String,
     pub method_version: String,
     pub rounding_mode: String,
-    pub downcaster_source_sha256: String,
+    pub downcaster_core_source_sha256: String,
+    pub downcaster_cli_source_sha256: String,
+    pub cargo_lock_sha256: String,
+    pub rust_toolchain_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,7 +199,7 @@ pub fn derive_sortformer_f16_artifact_with_checkpoint(
     parent_package_bytes: Vec<u8>,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<DerivedSortformerF16Artifact> {
-    checkpoint()?;
+    downcast_checkpoint(checkpoint)?;
     let verified = load_verified_sortformer_package_from_bytes(
         parent_receipt_bytes,
         parent_package_bytes,
@@ -223,7 +227,7 @@ fn downcast_package(
     parent: &ParentArtifactIdentity,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<DerivedSortformerF16Artifact> {
-    checkpoint()?;
+    downcast_checkpoint(checkpoint)?;
     if source.metadata().is_some() {
         return Err(downcast_error(
             "source_metadata",
@@ -231,16 +235,20 @@ fn downcast_package(
         ));
     }
 
+    let payload_bytes = source_payload_upper_bound(source)?;
+    let package_capacity = payload_bytes
+        .checked_add(MAX_DERIVED_HEADER_BYTES + 8)
+        .ok_or_else(|| downcast_error("package_bounds", "output package size overflows usize"))?;
     let mut payload = Vec::new();
     payload
-        .try_reserve(source_payload_upper_bound(source)?)
+        .try_reserve_exact(package_capacity)
         .map_err(|_| downcast_error("package_allocation", "output payload allocation failed"))?;
     let mut records = Vec::with_capacity(source.len());
     let mut header_records = Vec::with_capacity(source.len());
     let mut census = DerivedCensus::default();
 
     for name in source.names() {
-        checkpoint()?;
+        downcast_checkpoint(checkpoint)?;
         let shape = source
             .shape(name)?
             .iter()
@@ -357,7 +365,10 @@ fn downcast_package(
             method: SORTFORMER_F16_DERIVATION_METHOD.to_owned(),
             method_version: SORTFORMER_F16_DERIVATION_METHOD_VERSION.to_owned(),
             rounding_mode: "round_to_nearest_ties_to_even".to_owned(),
-            downcaster_source_sha256: downcaster_source_sha256(),
+            downcaster_core_source_sha256: downcaster_core_source_sha256(),
+            downcaster_cli_source_sha256: downcaster_cli_source_sha256(),
+            cargo_lock_sha256: cargo_lock_sha256(),
+            rust_toolchain_sha256: rust_toolchain_sha256(),
         },
         package: SortformerF16PackageIdentity {
             format: PACKAGE_FORMAT.to_owned(),
@@ -384,278 +395,6 @@ fn downcast_package(
         receipt_bytes,
         receipt,
     })
-}
-
-/// Validate derivation consistency against the current downcaster source.
-///
-/// This is deliberately not runtime artifact admission. A published f16 lane
-/// must additionally pin the independently reviewed receipt digest.
-pub fn validate_derived_sortformer_f16_artifact(
-    receipt_bytes: &[u8],
-    package_bytes: &[u8],
-) -> FwResult<SortformerF16DerivationReceipt> {
-    let receipt: SortformerF16DerivationReceipt = serde_json::from_slice(receipt_bytes)
-        .map_err(|_| downcast_error("receipt_schema", "receipt is not strict v2 JSON"))?;
-    if canonical_json_bytes(&receipt)? != receipt_bytes {
-        return Err(downcast_error(
-            "receipt_canonical",
-            "receipt bytes are not canonical JSON",
-        ));
-    }
-    if receipt.schema_version != SORTFORMER_F16_DERIVATION_RECEIPT_SCHEMA
-        || receipt.model_id != SORTFORMER_MODEL_ID
-        || receipt.model_revision != SORTFORMER_MODEL_REVISION
-        || receipt.derivation.parent_receipt_sha256 != SORTFORMER_CONVERSION_RECEIPT_SHA256
-        || receipt.derivation.parent_package_sha256 != SORTFORMER_PACKAGE_SHA256
-        || receipt.derivation.method != SORTFORMER_F16_DERIVATION_METHOD
-        || receipt.derivation.method_version != SORTFORMER_F16_DERIVATION_METHOD_VERSION
-        || receipt.derivation.rounding_mode != "round_to_nearest_ties_to_even"
-        || receipt.derivation.downcaster_source_sha256 != downcaster_source_sha256()
-    {
-        return Err(downcast_error(
-            "derivation_identity",
-            "receipt does not bind the frozen parent and current derivation method",
-        ));
-    }
-    let package_len = u64::try_from(package_bytes.len())
-        .map_err(|_| downcast_error("package_identity", "package size does not fit u64"))?;
-    if receipt.package.format != PACKAGE_FORMAT
-        || receipt.package.byte_order != BYTE_ORDER
-        || receipt.package.tensor_order != TENSOR_ORDER
-        || receipt.package.metadata_policy != METADATA_POLICY
-        || receipt.package.bytes != package_len
-        || receipt.package.sha256 != sha256_bytes(package_bytes)
-    {
-        return Err(downcast_error(
-            "package_identity",
-            "derived package identity does not match the receipt",
-        ));
-    }
-    verify_compact_package_layout(package_bytes, receipt.package.payload_bytes)?;
-    let package = SafetensorsFile::from_bytes(package_bytes)
-        .map_err(|_| downcast_error("package_structure", "derived package is not safetensors"))?;
-    if package.metadata().is_some() || package.len() != receipt.records.len() {
-        return Err(downcast_error(
-            "package_census",
-            "derived package metadata or tensor count changed",
-        ));
-    }
-    verify_derived_records(&receipt, &package)?;
-    Ok(receipt)
-}
-
-fn verify_derived_records(
-    receipt: &SortformerF16DerivationReceipt,
-    package: &SafetensorsFile,
-) -> FwResult<()> {
-    let mut f16_tensors = 0u64;
-    let mut f16_elements = 0u64;
-    let mut f16_bytes = 0u64;
-    let mut i64_tensors = 0u64;
-    let mut i64_elements = 0u64;
-    let mut i64_bytes = 0u64;
-    for (record, name) in receipt.records.iter().zip(package.names()) {
-        let expected_shape = record
-            .shape
-            .iter()
-            .map(|&dimension| {
-                usize::try_from(dimension).map_err(|_| {
-                    downcast_error("tensor_identity", "tensor dimension does not fit usize")
-                })
-            })
-            .collect::<FwResult<Vec<_>>>()?;
-        if record.name != name
-            || package.shape(name)? != expected_shape.as_slice()
-            || record.destination_value_sha256 != sha256_bytes(package.tensor_raw_bytes(name)?)
-        {
-            return Err(downcast_error(
-                "tensor_identity",
-                "derived tensor name, shape, or payload digest changed",
-            ));
-        }
-        let raw_bytes = u64::try_from(package.tensor_raw_bytes(name)?.len()).map_err(|_| {
-            downcast_error("package_census", "tensor byte count does not fit u64")
-        })?;
-        if record.destination_bytes != raw_bytes {
-            return Err(downcast_error(
-                "tensor_census",
-                "derived tensor byte count changed",
-            ));
-        }
-        match (
-            record.source_dtype,
-            record.destination_dtype,
-            record.transform,
-            package.dtype_name(name)?,
-        ) {
-            (
-                SortformerF16ArtifactDtype::F32,
-                SortformerF16ArtifactDtype::F16,
-                SortformerF16TensorTransform::RoundToNearestTiesToEvenF32ToF16,
-                "F16",
-            ) => {
-                let expected_source_bytes = record.elements.checked_mul(4).ok_or_else(|| {
-                    downcast_error("tensor_census", "F32 source byte count overflows u64")
-                })?;
-                let expected_destination_bytes = record.elements.checked_mul(2).ok_or_else(|| {
-                    downcast_error("tensor_census", "F16 destination byte count overflows u64")
-                })?;
-                if record.source_bytes != expected_source_bytes
-                    || record.destination_bytes != expected_destination_bytes
-                {
-                    return Err(downcast_error(
-                        "tensor_census",
-                        "F32-to-F16 tensor byte census changed",
-                    ));
-                }
-                f16_tensors = checked_add(f16_tensors, 1, "f16 tensor count")?;
-                f16_elements = checked_add(f16_elements, record.elements, "f16 elements")?;
-                f16_bytes = checked_add(f16_bytes, raw_bytes, "f16 bytes")?;
-            }
-            (
-                SortformerF16ArtifactDtype::I64,
-                SortformerF16ArtifactDtype::I64,
-                SortformerF16TensorTransform::IdentityI64,
-                "I64",
-            ) => {
-                let expected_bytes = record.elements.checked_mul(8).ok_or_else(|| {
-                    downcast_error("tensor_census", "I64 tensor byte count overflows u64")
-                })?;
-                if record.source_bytes != expected_bytes
-                    || record.destination_bytes != expected_bytes
-                    || record.source_value_sha256 != record.destination_value_sha256
-                {
-                    return Err(downcast_error(
-                        "control_identity",
-                        "I64 control tensor was not copied byte-for-byte",
-                    ));
-                }
-                i64_tensors = checked_add(i64_tensors, 1, "i64 tensor count")?;
-                i64_elements = checked_add(i64_elements, record.elements, "i64 elements")?;
-                i64_bytes = checked_add(i64_bytes, raw_bytes, "i64 bytes")?;
-            }
-            _ => {
-                return Err(downcast_error(
-                    "tensor_dtype",
-                    "derived tensor dtype or transform changed",
-                ));
-            }
-        }
-    }
-    let expected_dtype_set = [
-        (f16_tensors != 0).then_some(SortformerF16ArtifactDtype::F16),
-        (i64_tensors != 0).then_some(SortformerF16ArtifactDtype::I64),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    let record_count = u64::try_from(receipt.records.len())
-        .map_err(|_| downcast_error("package_census", "record count does not fit u64"))?;
-    let payload_bytes = f16_bytes
-        .checked_add(i64_bytes)
-        .ok_or_else(|| downcast_error("package_census", "payload byte count overflows u64"))?;
-    if receipt.package.tensor_count != record_count
-        || receipt.package.f16_tensors != f16_tensors
-        || receipt.package.f16_elements != f16_elements
-        || receipt.package.f16_bytes != f16_bytes
-        || receipt.package.i64_tensors != i64_tensors
-        || receipt.package.i64_elements != i64_elements
-        || receipt.package.i64_bytes != i64_bytes
-        || receipt.package.payload_bytes != payload_bytes
-        || receipt.package.dtype_set != expected_dtype_set
-    {
-        return Err(downcast_error(
-            "package_census",
-            "derived package dtype census changed",
-        ));
-    }
-    Ok(())
-}
-
-fn verify_compact_package_layout(bytes: &[u8], expected_payload_bytes: u64) -> FwResult<()> {
-    let prefix: [u8; 8] = bytes
-        .get(..8)
-        .and_then(|value| value.try_into().ok())
-        .ok_or_else(|| {
-            downcast_error(
-                "package_structure",
-                "derived package lacks a complete header-length prefix",
-            )
-        })?;
-    let header_len = usize::try_from(u64::from_le_bytes(prefix)).map_err(|_| {
-        downcast_error(
-            "package_structure",
-            "derived package header length does not fit usize",
-        )
-    })?;
-    let data_start = 8usize.checked_add(header_len).ok_or_else(|| {
-        downcast_error(
-            "package_structure",
-            "derived package header offset overflows usize",
-        )
-    })?;
-    let data_len = bytes.len().checked_sub(data_start).ok_or_else(|| {
-        downcast_error(
-            "package_structure",
-            "derived package header extends past the package",
-        )
-    })?;
-    if u64::try_from(data_len).ok() != Some(expected_payload_bytes) {
-        return Err(downcast_error(
-            "package_layout",
-            "derived package payload size changed",
-        ));
-    }
-    let header: serde_json::Value = serde_json::from_slice(
-        bytes
-            .get(8..data_start)
-            .ok_or_else(|| downcast_error("package_structure", "header span is unavailable"))?,
-    )
-    .map_err(|_| downcast_error("package_structure", "header is not valid JSON"))?;
-    let entries = header.as_object().ok_or_else(|| {
-        downcast_error("package_structure", "safetensors header is not an object")
-    })?;
-    let mut spans = Vec::with_capacity(entries.len());
-    for (name, entry) in entries {
-        if name == "__metadata__" {
-            return Err(downcast_error(
-                "package_layout",
-                "derived package must not contain metadata",
-            ));
-        }
-        let offsets = entry
-            .get("data_offsets")
-            .and_then(serde_json::Value::as_array)
-            .filter(|values| values.len() == 2)
-            .ok_or_else(|| {
-                downcast_error("package_structure", "tensor offsets are not a pair")
-            })?;
-        let begin = offsets[0]
-            .as_u64()
-            .ok_or_else(|| downcast_error("package_structure", "tensor start is not u64"))?;
-        let end = offsets[1]
-            .as_u64()
-            .ok_or_else(|| downcast_error("package_structure", "tensor end is not u64"))?;
-        spans.push((name.as_str(), begin, end));
-    }
-    spans.sort_unstable_by_key(|(name, _, _)| *name);
-    let mut cursor = 0u64;
-    for (_, begin, end) in spans {
-        if begin != cursor || end < begin || end > expected_payload_bytes {
-            return Err(downcast_error(
-                "package_layout",
-                "derived tensor spans are not compact and non-overlapping",
-            ));
-        }
-        cursor = end;
-    }
-    if cursor != expected_payload_bytes {
-        return Err(downcast_error(
-            "package_layout",
-            "derived tensor spans do not cover the complete payload",
-        ));
-    }
-    Ok(())
 }
 
 fn source_payload_upper_bound(source: &SafetensorsFile) -> FwResult<usize> {
@@ -690,7 +429,7 @@ fn downcast_f32_payload(
         ));
     }
     for chunk in source.chunks(CONVERSION_CHUNK_ELEMENTS * 4) {
-        checkpoint()?;
+        downcast_checkpoint(checkpoint)?;
         for bytes in chunk.as_chunks::<4>().0 {
             let bits = f32_to_f16_rne_bits(f32::from_le_bytes(*bytes)).map_err(|_| {
                 downcast_error(
@@ -706,7 +445,7 @@ fn downcast_f32_payload(
 
 fn serialize_safetensors(
     records: &[(String, SortformerF16ArtifactDtype, Vec<u64>, [u64; 2])],
-    payload: Vec<u8>,
+    mut payload: Vec<u8>,
 ) -> FwResult<Vec<u8>> {
     let mut header = BTreeMap::new();
     for (name, dtype, shape, offsets) in records {
@@ -733,18 +472,26 @@ fn serialize_safetensors(
     header_bytes.resize(header_bytes.len().next_multiple_of(8), b' ');
     let header_len = u64::try_from(header_bytes.len())
         .map_err(|_| downcast_error("package_bounds", "header size does not fit u64"))?;
-    let total_len = 8usize
+    if header_bytes.len() > MAX_DERIVED_HEADER_BYTES {
+        return Err(downcast_error(
+            "package_bounds",
+            "derived safetensors header exceeds its bounded envelope",
+        ));
+    }
+    let prefix_len = 8usize
         .checked_add(header_bytes.len())
-        .and_then(|length| length.checked_add(payload.len()))
-        .ok_or_else(|| downcast_error("package_bounds", "package size overflows usize"))?;
-    let mut package = Vec::new();
-    package
-        .try_reserve_exact(total_len)
-        .map_err(|_| downcast_error("package_allocation", "output package allocation failed"))?;
-    package.extend_from_slice(&header_len.to_le_bytes());
-    package.extend_from_slice(&header_bytes);
-    package.extend_from_slice(&payload);
-    Ok(package)
+        .ok_or_else(|| downcast_error("package_bounds", "package prefix overflows usize"))?;
+    let payload_len = payload.len();
+    payload.resize(
+        payload_len
+            .checked_add(prefix_len)
+            .ok_or_else(|| downcast_error("package_bounds", "package size overflows usize"))?,
+        0,
+    );
+    payload.copy_within(0..payload_len, prefix_len);
+    payload[..8].copy_from_slice(&header_len.to_le_bytes());
+    payload[8..prefix_len].copy_from_slice(&header_bytes);
+    Ok(payload)
 }
 
 fn f32_to_f16_rne_bits(value: f32) -> Result<u16, ()> {
@@ -803,8 +550,34 @@ fn checked_add(left: u64, right: u64, label: &str) -> FwResult<u64> {
     })
 }
 
-fn downcaster_source_sha256() -> String {
+fn downcast_checkpoint(checkpoint: &(dyn Fn() -> FwResult<()> + Sync)) -> FwResult<()> {
+    match checkpoint() {
+        Ok(()) => Ok(()),
+        Err(FwError::Cancelled(_)) => Err(FwError::Cancelled(
+            "sortformer_f16_downcast.cancelled: cooperative checkpoint requested cancellation"
+                .to_owned(),
+        )),
+        Err(_) => Err(FwError::ContractViolation(
+            "sortformer_f16_downcast.checkpoint_failure: checkpoint returned a non-cancellation failure"
+                .to_owned(),
+        )),
+    }
+}
+
+fn downcaster_core_source_sha256() -> String {
     sha256_bytes(include_bytes!("sortformer_f16_downcast.rs"))
+}
+
+fn downcaster_cli_source_sha256() -> String {
+    sha256_bytes(include_bytes!("bin/sortformer_f16_downcast.rs"))
+}
+
+fn cargo_lock_sha256() -> String {
+    sha256_bytes(include_bytes!("../Cargo.lock"))
+}
+
+fn rust_toolchain_sha256() -> String {
+    sha256_bytes(include_bytes!("../rust-toolchain.toml"))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -1001,24 +774,52 @@ mod tests {
     }
 
     #[test]
-    fn consistency_validator_rejects_receipt_and_package_mutations() {
-        let source = synthetic_package(&[("weight", "F32", &[1], f32_bytes(&[1.0]))]);
-        let artifact = downcast_package(&source, &synthetic_parent(), &|| Ok(()))
-            .expect("derive fixture");
+    fn source_mutation_changes_package_and_bound_record_digests() {
+        let first_source = synthetic_package(&[("weight", "F32", &[1], f32_bytes(&[1.0]))]);
+        let second_source = synthetic_package(&[(
+            "weight",
+            "F32",
+            &[1],
+            f32_bytes(&[f32::from_bits(1.0f32.to_bits() + 8_192)]),
+        )]);
+        let first = downcast_package(&first_source, &synthetic_parent(), &|| Ok(()))
+            .expect("first derivation");
+        let second = downcast_package(&second_source, &synthetic_parent(), &|| Ok(()))
+            .expect("mutated derivation");
+        assert_ne!(first.package_bytes(), second.package_bytes());
+        assert_ne!(first.receipt_bytes(), second.receipt_bytes());
+        assert_ne!(
+            first.receipt().records[0].source_value_sha256,
+            second.receipt().records[0].source_value_sha256
+        );
+        assert_ne!(
+            first.receipt().records[0].destination_value_sha256,
+            second.receipt().records[0].destination_value_sha256
+        );
+    }
 
-        let mut package = artifact.package_bytes().to_vec();
-        *package.last_mut().expect("payload byte") ^= 1;
-        let error = validate_derived_sortformer_f16_artifact(artifact.receipt_bytes(), &package)
-            .expect_err("package mutation must fail");
-        assert!(error.to_string().contains("package_identity"));
+    #[test]
+    fn cancellation_between_payload_chunks_returns_no_artifact() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let mut receipt: serde_json::Value =
-            serde_json::from_slice(artifact.receipt_bytes()).expect("receipt JSON");
-        receipt["derivation"]["method"] = serde_json::json!("toward-zero");
-        let receipt = canonical_json_bytes(&receipt).expect("mutated canonical receipt");
-        let error = validate_derived_sortformer_f16_artifact(&receipt, artifact.package_bytes())
-            .expect_err("method mutation must fail");
-        assert!(error.to_string().contains("derivation_identity"));
+        let values = vec![1.0; CONVERSION_CHUNK_ELEMENTS + 1];
+        let source = synthetic_package(&[(
+            "weight",
+            "F32",
+            &[u64::try_from(values.len()).expect("fixture length fits u64")],
+            f32_bytes(&values),
+        )]);
+        let calls = AtomicUsize::new(0);
+        let error = downcast_package(&source, &synthetic_parent(), &|| {
+            if calls.fetch_add(1, Ordering::SeqCst) >= 3 {
+                Err(FwError::Cancelled("synthetic stop".to_owned()))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("second payload chunk must observe cancellation");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]
