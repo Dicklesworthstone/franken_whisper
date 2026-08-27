@@ -719,31 +719,11 @@ fn run_with_info_body(
                         continue;
                     }
                 };
-                // ID-DIVERGENCE GUARD (manifest-key consistency, see the module
-                // invariant): the manifest is keyed — on discovery AND on every
-                // `set_state` — by `video.id`, which is derived **deterministically
-                // from the input URL** (`extract_video_id`, or the rare fallback
-                // fetch's id). Naming/output, by contrast, uses the authoritative
-                // `meta.id` from yt-dlp. For valid YouTube URLs these are equal (the
-                // `v=` param IS the video id and yt-dlp echoes it). They must stay
-                // equal for resume to be correct: a re-run re-derives the SAME key
-                // from the same URL and finds the `Done` entry, so a downloaded
-                // video is never reprocessed. If yt-dlp ever canonicalizes the id to
-                // something the URL parse can't reproduce, the output file (named
-                // from `meta.id`) and the manifest key (the URL-derived id) would
-                // disagree — resume still works (the key is URL-deterministic), but
-                // the on-disk filename id would differ from the manifest key. Surface
-                // that rare divergence rather than letting it pass silently.
-                if meta.id != video.id {
-                    tracing::warn!(
-                        manifest_key = %video.id,
-                        resolved_id = %meta.id,
-                        url = %video.url,
-                        "yt-dlp resolved a video id that differs from the URL-derived id; \
-                         the output filename will use the resolved id while the manifest is \
-                         keyed by the URL-derived id (resume stays correct)"
-                    );
-                }
+                // Both fresh-download and reusable-audio workers validate this
+                // before returning. Keep the assertion beside the manifest /
+                // output transition so a future work-path bypass cannot silently
+                // reintroduce split identities.
+                debug_assert_eq!(meta.id, video.id);
                 // We intentionally avoid a full-manifest `Downloaded` save on the
                 // hot path. A crash after download is recovered by scanning the
                 // controlled `<id>.*` audio directory on the next run; explicit
@@ -978,8 +958,9 @@ where
         }),
         DownloadWork::Reuse { video, audio_path } => {
             retry_download_stage(&video.id, token, || {
-                fetch_metadata(info, &video.url, token)
-                    .map(|meta| (audio_path.clone(), meta))
+                let meta = fetch_metadata(info, &video.url, token)?;
+                validate_metadata_identity(video, &meta)?;
+                Ok((audio_path.clone(), meta))
             })
         }
     }
@@ -1027,10 +1008,26 @@ fn download_one_attempt(
     let t_meta = std::time::Instant::now();
     let meta = ytdlp::fetch_metadata(info, &video.url, token)?;
     crate::native_engine::perf_span("yt.dl_metadata", t_meta.elapsed().as_secs_f64() * 1e3, "");
+    validate_metadata_identity(video, &meta)?;
     let t_dl = std::time::Instant::now();
     let path = ytdlp::download_audio(info, &meta, audio_dir, token)?;
     crate::native_engine::perf_span("yt.download", t_dl.elapsed().as_secs_f64() * 1e3, "");
     Ok((path, meta))
+}
+
+/// The URL-derived id is the durable deduplication and manifest authority,
+/// while yt-dlp's metadata id controls the physical download/output names.
+/// Continuing when they differ would create two identities for one work item:
+/// crash reuse would miss the downloaded filename, concurrent equivalents
+/// could target one artifact, and no-keep-audio cleanup would reject the path.
+fn validate_metadata_identity(video: &VideoRef, meta: &VideoMeta) -> FwResult<()> {
+    if meta.id == video.id {
+        return Ok(());
+    }
+    Err(FwError::ContractViolation(format!(
+        "yt-dlp resolved video id `{}` but the canonical input identity is `{}` for `{}`",
+        meta.id, video.id, video.url
+    )))
 }
 
 fn record_failure(
@@ -1814,6 +1811,50 @@ mod tests {
     }
 
     #[test]
+    fn reuse_work_rejects_metadata_identity_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).expect("audio dir");
+        let video = vr("manifest001");
+        let audio_path = audio_dir.join("manifest001.wav");
+        std::fs::write(&audio_path, b"owned reusable audio").expect("seed audio");
+        let work = DownloadWork::Reuse {
+            video,
+            audio_path: audio_path.clone(),
+        };
+
+        let error = execute_download_work_with_metadata(
+            &stub_info(),
+            &work,
+            &audio_dir,
+            &CancellationToken::unbounded(),
+            |_info, _url, _token| {
+                Ok(VideoMeta {
+                    id: "resolved999".to_owned(),
+                    title: "Resolved to another identity".to_owned(),
+                    channel: None,
+                    uploader: None,
+                    upload_date: None,
+                    duration_sec: None,
+                    webpage_url: "https://www.youtube.com/watch?v=resolved999".to_owned(),
+                    description: None,
+                    availability: None,
+                    live_status: None,
+                })
+            },
+        )
+        .expect_err("metadata identity divergence must fail closed");
+
+        assert!(error.contains("resolved999"), "resolved id diagnostic: {error}");
+        assert!(error.contains("manifest001"), "manifest id diagnostic: {error}");
+        assert_eq!(
+            std::fs::read(&audio_path).expect("reused audio remains present"),
+            b"owned reusable audio",
+            "identity rejection must not mutate the retained artifact"
+        );
+    }
+
+    #[test]
     fn reuse_work_retries_transient_metadata_without_overwriting_audio() {
         let dir = tempfile::tempdir().expect("tempdir");
         let audio_dir = dir.path().join("audio");
@@ -1933,6 +1974,20 @@ mod tests {
         let videos = resolve_videos(&stub_info(), &opts, &token).expect("resolve");
         let ids: Vec<&str> = videos.iter().map(|v| v.id.as_str()).collect();
         assert_eq!(ids, vec!["dQw4w9WgXcQ", "SECOND00001"], "deduped by id");
+    }
+
+    #[test]
+    fn resolve_dedupes_percent_encoded_and_raw_video_ids() {
+        let token = CancellationToken::unbounded();
+        let opts = opts_with_urls(vec![
+            "https://www.youtube.com/watch?v=abc-123_XYZ".to_owned(),
+            "https://www.youtube.com/watch?v=abc%2D123%5fXYZ".to_owned(),
+            "https://youtu.be/%61bc-123_XYZ".to_owned(),
+        ]);
+        let videos = resolve_videos(&stub_info(), &opts, &token).expect("resolve");
+
+        assert_eq!(videos.len(), 1, "equivalent URL encodings are one work item");
+        assert_eq!(videos[0].id, "abc-123_XYZ");
     }
 
     #[test]

@@ -568,10 +568,12 @@ pub fn classify_url(url: &str) -> FwResult<UrlKind> {
 /// - `youtu.be/ID` (with an optional `?t=`/`&`/trailing-path tail)
 /// - `shorts/ID`, `live/ID`, `embed/ID`
 ///
-/// Returns `None` for playlist URLs, non-YouTube hosts, or any shape without a
-/// recoverable id. Callers that already classified a URL as `Video`/`Ambiguous`
-/// can treat `None` as a (should-not-happen) signal to fall back to a single
-/// metadata fetch for correctness.
+/// Percent-encoded ASCII id characters are decoded before the id is returned,
+/// so equivalent raw and encoded URLs share one deduplication / manifest key.
+/// Returns `None` for playlist URLs, non-YouTube hosts, or any shape whose id
+/// cannot be recovered as YouTube's ASCII `[A-Za-z0-9_-]+` alphabet. Callers
+/// that already classified a URL as `Video`/`Ambiguous` must fall back to a
+/// single metadata fetch when this returns `None`.
 #[must_use]
 pub fn extract_video_id(url: &str) -> Option<String> {
     let trimmed = url.trim();
@@ -585,7 +587,7 @@ pub fn extract_video_id(url: &str) -> Option<String> {
     if host == "youtu.be" {
         let id = rest.trim_start_matches('/');
         let id = id.split(['?', '&', '/']).next().unwrap_or_default();
-        return non_empty_id(id);
+        return canonical_video_id_component(id);
     }
 
     if !is_youtube_host(&host) {
@@ -605,18 +607,18 @@ pub fn extract_video_id(url: &str) -> Option<String> {
         .or_else(|| path.strip_prefix("embed/"))
     {
         let id = id.split('/').next().unwrap_or_default();
-        return non_empty_id(id);
+        return canonical_video_id_component(id);
     }
 
     // /watch?v=ID (&list=Y): the `v=` param is the single video, per
     // --no-playlist. A bare /watch?list= with no v= is a playlist -> None.
     if path == "watch" {
-        return query_param_value(query, "v").and_then(non_empty_id);
+        return query_param_value(query, "v").and_then(canonical_video_id_component);
     }
 
     // Any other path: accept a `v=` query if present (mirrors classify_url's
     // permissive tail), otherwise no id.
-    query_param_value(query, "v").and_then(non_empty_id)
+    query_param_value(query, "v").and_then(canonical_video_id_component)
 }
 
 /// Remove the client-side fragment from a URL before classifying or
@@ -625,12 +627,44 @@ fn strip_url_fragment(url: &str) -> &str {
     url.split_once('#').map_or(url, |(base, _)| base)
 }
 
-/// Return `Some(id)` when `id` is non-empty, else `None`.
-fn non_empty_id(id: &str) -> Option<String> {
+/// Decode a syntactically recoverable YouTube id component into the canonical
+/// ASCII alphabet used by metadata and download filenames. Restricting percent
+/// escapes to that alphabet prevents encoded path/query delimiters from being
+/// mistaken for part of an id; those inputs take the authoritative metadata
+/// fallback instead.
+fn canonical_video_id_component(id: &str) -> Option<String> {
     if id.is_empty() {
-        None
-    } else {
-        Some(id.to_owned())
+        return None;
+    }
+
+    let bytes = id.as_bytes();
+    let mut canonical = String::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let value = if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            index += 3;
+            (hex_nibble(high)? << 4) | hex_nibble(low)?
+        } else {
+            let value = bytes[index];
+            index += 1;
+            value
+        };
+        if !(value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-')) {
+            return None;
+        }
+        canonical.push(char::from(value));
+    }
+    Some(canonical)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1691,6 +1725,45 @@ mod tests {
                 extract_video_id(url).as_deref(),
                 Some(expected),
                 "fragment must not become part of the id for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_id_canonicalizes_percent_encoded_ascii_id_bytes() {
+        for url in [
+            "https://www.youtube.com/watch?v=abc%2D123%5fXYZ",
+            "https://youtu.be/abc%2d123%5FXYZ",
+            "https://www.youtube.com/shorts/%61bc-123_XYZ",
+            "https://www.youtube.com/live/abc-123_%58YZ",
+            "https://www.youtube.com/embed/abc-123_XY%5a",
+        ] {
+            assert_eq!(
+                extract_video_id(url).as_deref(),
+                Some("abc-123_XYZ"),
+                "encoded and raw forms must share one canonical id: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_id_defers_noncanonical_components_to_metadata() {
+        for url in [
+            "https://www.youtube.com/watch?v=abc%2",
+            "https://www.youtube.com/watch?v=abc%GG",
+            "https://www.youtube.com/watch?v=abc%2Fdef",
+            "https://www.youtube.com/watch?v=abc+def",
+            "https://youtu.be/abc%3Fdef",
+            "https://www.youtube.com/shorts/abc.def",
+        ] {
+            assert!(
+                matches!(classify_url(url), Ok(UrlKind::Video)),
+                "the URL shape remains a video and can take the metadata fallback: {url}"
+            );
+            assert_eq!(
+                extract_video_id(url),
+                None,
+                "unsafe local identity must defer to authoritative metadata: {url}"
             );
         }
     }
