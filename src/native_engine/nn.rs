@@ -6404,19 +6404,43 @@ pub(crate) fn transpose_parallel(data: &[f32], rows: usize, cols: usize) -> Vec<
 //
 // NUMERICS: f32 accumulation in a fixed order — per timestep, pre[j] =
 // b_ih[j] + b_hh[j] + dot(x_t, w_ih row j) + dot(h_{t-1}, w_hh row j), with
-// every output row computed independently from its input row. Splitting a
-// sequence across calls with a carried [`LstmState`] therefore reproduces
-// the single-call result BIT-EXACTLY (asserted by test), which is what makes
-// stateful streaming safe.
+// every output row computed independently from its input row. The recurrent
+// gate activation is an explicit weight contract; the candidate gate remains
+// tanh. Splitting a sequence across calls with a carried [`LstmState`]
+// therefore reproduces the single-call result BIT-EXACTLY (asserted by test),
+// which is what makes stateful streaming safe.
+
+/// Activation applied to the input, forget, and output gates of an LSTM.
+/// The candidate gate always uses tanh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LstmRecurrentActivation {
+    /// Standard PyTorch/ONNX logistic sigmoid: `1 / (1 + exp(-x))`.
+    LogisticSigmoid,
+    /// Keras v2 hard sigmoid: `clip(0.2 * x + 0.5, 0, 1)`.
+    HardSigmoid,
+}
+
+impl LstmRecurrentActivation {
+    #[inline]
+    fn apply(self, value: f32) -> f32 {
+        match self {
+            Self::LogisticSigmoid => 1.0 / (1.0 + (-value).exp()),
+            Self::HardSigmoid => (0.2 * value + 0.5).clamp(0.0, 1.0),
+        }
+    }
+}
 
 /// Weights for one LSTM layer. Shapes follow the ONNX/PyTorch projection
-/// convention: `w_ih: [4H, input]`, `w_hh: [4H, H]`, biases `[4H]`.
+/// convention: `w_ih: [4H, input]`, `w_hh: [4H, H]`, biases `[4H]`. The
+/// recurrent-gate activation is required at construction so imported model
+/// semantics cannot silently inherit the wrong framework default.
 #[derive(Debug, Clone)]
 pub struct LstmWeights {
     pub w_ih: Mat,
     pub w_hh: Mat,
     pub b_ih: Vec<f32>,
     pub b_hh: Vec<f32>,
+    recurrent_activation: LstmRecurrentActivation,
 }
 
 /// Carried recurrent state (length = hidden size). Empty vectors mean a
@@ -6440,7 +6464,13 @@ impl LstmState {
 
 impl LstmWeights {
     /// Validate shape contracts once at construction.
-    pub fn new(w_ih: Mat, w_hh: Mat, b_ih: Vec<f32>, b_hh: Vec<f32>) -> FwResult<Self> {
+    pub fn new(
+        w_ih: Mat,
+        w_hh: Mat,
+        b_ih: Vec<f32>,
+        b_hh: Vec<f32>,
+        recurrent_activation: LstmRecurrentActivation,
+    ) -> FwResult<Self> {
         let hidden = w_hh.cols;
         if w_ih.rows != 4 * hidden || w_hh.rows != 4 * hidden {
             return Err(FwError::InvalidRequest(format!(
@@ -6460,6 +6490,7 @@ impl LstmWeights {
             w_hh,
             b_ih,
             b_hh,
+            recurrent_activation,
         })
     }
 
@@ -6467,6 +6498,12 @@ impl LstmWeights {
     #[must_use]
     pub fn hidden_size(&self) -> usize {
         self.w_hh.cols
+    }
+
+    /// Activation bound to the input, forget, and output gates.
+    #[must_use]
+    pub fn recurrent_activation(&self) -> LstmRecurrentActivation {
+        self.recurrent_activation
     }
 
     /// Run the recurrence over `x: [T, input]`, writing one output row per
@@ -6516,10 +6553,10 @@ impl LstmWeights {
             }
             let out_row = &mut out.data[t * hidden..(t + 1) * hidden];
             for k in 0..hidden {
-                let i_gate = sigmoid_scalar(pre[k]);
-                let f_gate = sigmoid_scalar(pre[hidden + k]);
+                let i_gate = self.recurrent_activation.apply(pre[k]);
+                let f_gate = self.recurrent_activation.apply(pre[hidden + k]);
                 let g_gate = (pre[2 * hidden + k]).tanh();
-                let o_gate = sigmoid_scalar(pre[3 * hidden + k]);
+                let o_gate = self.recurrent_activation.apply(pre[3 * hidden + k]);
                 let c_new = f_gate * state.c[k] + i_gate * g_gate;
                 state.c[k] = c_new;
                 let h_new = o_gate * c_new.tanh();
@@ -6529,11 +6566,6 @@ impl LstmWeights {
         }
         Ok(out)
     }
-}
-
-#[inline]
-fn sigmoid_scalar(v: f32) -> f32 {
-    1.0 / (1.0 + (-v).exp())
 }
 
 #[cfg(test)]
@@ -6638,7 +6670,14 @@ mod tests {
         let b_hh = (0..4 * hidden)
             .map(|i| (i % 3) as f32 * 0.02 - 0.02)
             .collect();
-        let weights = LstmWeights::new(w_ih, w_hh, b_ih, b_hh).expect("fixture weights");
+        let weights = LstmWeights::new(
+            w_ih,
+            w_hh,
+            b_ih,
+            b_hh,
+            LstmRecurrentActivation::LogisticSigmoid,
+        )
+        .expect("fixture weights");
         let x = rng.mat(7, input);
         (weights, x)
     }
@@ -6646,6 +6685,10 @@ mod tests {
     #[test]
     fn lstm_forward_matches_naive_reference_on_seeded_inputs() {
         let (weights, x) = lstm_fixture(8, 5, 0x00_0B_D5);
+        assert_eq!(
+            weights.recurrent_activation(),
+            LstmRecurrentActivation::LogisticSigmoid
+        );
         let mut state = LstmState::default();
         let out = weights.lstm_forward(&x, &mut state).expect("forward");
         let (rows_ref, h_ref, c_ref) = lstm_naive_reference(
@@ -6664,6 +6707,76 @@ mod tests {
             assert!((state.h[k] - h_ref[k]).abs() <= 1e-6);
             assert!((state.c[k] - c_ref[k]).abs() <= 1e-6);
         }
+    }
+
+    #[test]
+    fn lstm_hard_sigmoid_matches_asymmetric_multiframe_reference() {
+        let w_ih = Mat::from_vec(4, 1, vec![1.2, -0.8, 0.7, 1.5]);
+        let w_hh = Mat::from_vec(4, 1, vec![0.4, -0.3, 0.2, 0.6]);
+        let b_ih = vec![-2.7, 1.4, -0.5, 2.8];
+        let b_hh = vec![0.0; 4];
+        let x = Mat::from_vec(3, 1, vec![1.0, -0.6, 1.8]);
+
+        let hard_weights = LstmWeights::new(
+            w_ih.clone(),
+            w_hh.clone(),
+            b_ih.clone(),
+            b_hh.clone(),
+            LstmRecurrentActivation::HardSigmoid,
+        )
+        .expect("hard-sigmoid weights");
+        let logistic_weights = LstmWeights::new(
+            w_ih,
+            w_hh,
+            b_ih,
+            b_hh,
+            LstmRecurrentActivation::LogisticSigmoid,
+        )
+        .expect("logistic weights");
+
+        let hard_sigmoid = |value: f32| (0.2 * value + 0.5).clamp(0.0, 1.0);
+        let mut expected_h = 0.0f32;
+        let mut expected_c = 0.0f32;
+        let mut expected_rows = Vec::with_capacity(x.rows);
+        for &input in &x.data {
+            let i_pre = -2.7 + input * 1.2 + expected_h * 0.4;
+            let f_pre = 1.4 + input * -0.8 + expected_h * -0.3;
+            let g_pre = -0.5 + input * 0.7 + expected_h * 0.2;
+            let o_pre = 2.8 + input * 1.5 + expected_h * 0.6;
+            expected_c =
+                hard_sigmoid(f_pre) * expected_c + hard_sigmoid(i_pre) * g_pre.tanh();
+            expected_h = hard_sigmoid(o_pre) * expected_c.tanh();
+            expected_rows.push(expected_h);
+        }
+
+        let mut hard_state = LstmState::default();
+        let hard = hard_weights
+            .lstm_forward(&x, &mut hard_state)
+            .expect("hard-sigmoid forward");
+        for (t, (&observed, &expected)) in
+            hard.data.iter().zip(expected_rows.iter()).enumerate()
+        {
+            assert!(
+                (observed - expected).abs() <= 1e-6,
+                "hard-sigmoid row {t}: {observed} vs {expected}"
+            );
+        }
+        assert!((hard_state.h[0] - expected_h).abs() <= 1e-6);
+        assert!((hard_state.c[0] - expected_c).abs() <= 1e-6);
+
+        let mut logistic_state = LstmState::default();
+        let logistic = logistic_weights
+            .lstm_forward(&x, &mut logistic_state)
+            .expect("logistic forward");
+        assert!(
+            hard.data
+                .iter()
+                .zip(&logistic.data)
+                .any(|(hard_value, logistic_value)| {
+                    (hard_value - logistic_value).abs() > 1e-3
+                }),
+            "the fixture must distinguish hard sigmoid from logistic sigmoid"
+        );
     }
 
     #[test]
@@ -6724,6 +6837,7 @@ mod tests {
             Mat::from_vec(16, 4, vec![0.0; 64]),
             vec![0.0; 16],
             vec![0.0; 16],
+            LstmRecurrentActivation::LogisticSigmoid,
         );
         assert!(matches!(bad_weights, Err(FwError::InvalidRequest(_))));
     }

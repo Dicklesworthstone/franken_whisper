@@ -31,7 +31,7 @@
 const NUM_UNITS: usize = 128;
 
 use crate::error::{FwError, FwResult};
-use crate::native_engine::nn::{LstmState, LstmWeights};
+use crate::native_engine::nn::{LstmRecurrentActivation, LstmState, LstmWeights};
 use crate::native_engine::weights::SafetensorsFile;
 use crate::native_engine::{Mat, nn};
 
@@ -148,7 +148,13 @@ impl DtlnSeparator {
         };
         let zeros4 = || vec![0.0f32; 4 * NUM_UNITS];
         let lstm = |k: &str, r: &str, b: &str| -> FwResult<LstmWeights> {
-            LstmWeights::new(transpose(k)?, transpose(r)?, get(b)?.data.clone(), zeros4())
+            LstmWeights::new(
+                transpose(k)?,
+                transpose(r)?,
+                get(b)?.data.clone(),
+                zeros4(),
+                LstmRecurrentActivation::HardSigmoid,
+            )
         };
         let as_mat = |name: &str| -> FwResult<Mat> {
             let t = get(name)?;
@@ -381,8 +387,26 @@ mod tests {
             Mat::from_vec(4, 1, recurrent_weights.to_vec()),
             input_bias.to_vec(),
             vec![0.0; 4],
+            LstmRecurrentActivation::HardSigmoid,
         )
         .expect("one-unit LSTM fixture")
+    }
+
+    #[test]
+    fn dtln_loader_selects_hard_sigmoid_for_every_lstm_layer() {
+        let separator = write_and_load(&contract_fixture_bytes(0.0, false), "gate_activation");
+        for (name, weights) in [
+            ("s1.lstm0", &separator.s1.lstm0),
+            ("s1.lstm1", &separator.s1.lstm1),
+            ("s2.lstm0", &separator.s2.lstm0),
+            ("s2.lstm1", &separator.s2.lstm1),
+        ] {
+            assert_eq!(
+                weights.recurrent_activation(),
+                LstmRecurrentActivation::HardSigmoid,
+                "{name} must follow the Keras v2 checkpoint contract"
+            );
+        }
     }
 
     #[test]
