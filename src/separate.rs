@@ -78,12 +78,18 @@ struct MaskKernel {
     mask_bias: Vec<f32>,
 }
 
+#[derive(Default)]
+struct MaskState {
+    lstm0: LstmState,
+    lstm1: LstmState,
+}
+
 impl MaskKernel {
-    fn forward(&self, features: &[f32], state: &mut LstmState) -> FwResult<Vec<f32>> {
+    fn forward(&self, features: &[f32], state: &mut MaskState) -> FwResult<Vec<f32>> {
         let normalized = instant_layer_norm(features, &self.norm_gamma, &self.norm_beta);
         let input_mat = Mat::from_vec(1, normalized.len(), normalized);
-        let hidden = self.lstm0.lstm_forward(&input_mat, state)?;
-        let hidden = self.lstm1.lstm_forward(&hidden, state)?;
+        let hidden = self.lstm0.lstm_forward(&input_mat, &mut state.lstm0)?;
+        let hidden = self.lstm1.lstm_forward(&hidden, &mut state.lstm1)?;
         nn::matmul_bias(&hidden, &self.mask_kernel, Some(&self.mask_bias))
             .map(|row| row.data.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect())
     }
@@ -172,8 +178,8 @@ impl DtlnSeparator {
 
     /// Separate one utterance. Deterministic; resets recurrent state.
     pub fn separate(&mut self, samples: &[f32]) -> FwResult<Vec<f32>> {
-        let mut state1 = LstmState::default();
-        let mut state2 = LstmState::default();
+        let mut state1 = MaskState::default();
+        let mut state2 = MaskState::default();
         let frames_total = if samples.len() >= BLOCK_LEN {
             1 + (samples.len() - BLOCK_LEN) / BLOCK_SHIFT
         } else {
@@ -363,6 +369,106 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             ((self.0 >> 33) as f32 / (u32::MAX >> 1) as f32) * 2.0 - 1.0
         }
+    }
+
+    fn one_unit_lstm(
+        input_weights: [f32; 4],
+        recurrent_weights: [f32; 4],
+        input_bias: [f32; 4],
+    ) -> LstmWeights {
+        LstmWeights::new(
+            Mat::from_vec(4, 1, input_weights.to_vec()),
+            Mat::from_vec(4, 1, recurrent_weights.to_vec()),
+            input_bias.to_vec(),
+            vec![0.0; 4],
+        )
+        .expect("one-unit LSTM fixture")
+    }
+
+    #[test]
+    fn stacked_mask_lstm_layers_match_independent_state_reference() {
+        let kernel = MaskKernel {
+            norm_gamma: vec![0.0],
+            norm_beta: vec![0.75],
+            lstm0: one_unit_lstm(
+                [0.3, -0.2, 0.4, 0.1],
+                [0.15, 0.05, -0.1, 0.2],
+                [0.2, 0.1, -0.05, 0.3],
+            ),
+            lstm1: one_unit_lstm(
+                [-0.25, 0.35, 0.2, -0.15],
+                [0.05, -0.2, 0.3, 0.1],
+                [-0.1, 0.25, 0.15, 0.05],
+            ),
+            mask_kernel: Mat::from_vec(1, 1, vec![1.2]),
+            mask_bias: vec![0.1],
+        };
+        let mut observed_state = MaskState::default();
+        let mut expected_lstm0 = LstmState::default();
+        let mut expected_lstm1 = LstmState::default();
+        let frames = [[0.2_f32], [-0.6], [1.1]];
+        let mut observed_sequence = Vec::new();
+
+        for features in &frames {
+            let observed = kernel
+                .forward(features, &mut observed_state)
+                .expect("stacked forward");
+
+            let normalized = instant_layer_norm(features, &kernel.norm_gamma, &kernel.norm_beta);
+            let input = Mat::from_vec(1, normalized.len(), normalized);
+            let hidden0 = kernel
+                .lstm0
+                .lstm_forward(&input, &mut expected_lstm0)
+                .expect("layer zero reference");
+            let hidden1 = kernel
+                .lstm1
+                .lstm_forward(&hidden0, &mut expected_lstm1)
+                .expect("layer one reference");
+            let expected = nn::matmul_bias(&hidden1, &kernel.mask_kernel, Some(&kernel.mask_bias))
+                .expect("reference mask projection")
+                .data
+                .iter()
+                .map(|&value| 1.0 / (1.0 + (-value).exp()))
+                .collect::<Vec<_>>();
+
+            assert_eq!(observed, expected);
+            observed_sequence.push(observed);
+        }
+
+        assert_eq!(observed_state.lstm0, expected_lstm0);
+        assert_eq!(observed_state.lstm1, expected_lstm1);
+        assert_ne!(
+            observed_state.lstm0, observed_state.lstm1,
+            "the two layer states must remain distinct for this asymmetric fixture"
+        );
+
+        let mut regressed_shared_state = LstmState::default();
+        let regressed_sequence = frames
+            .iter()
+            .map(|features| {
+                let normalized =
+                    instant_layer_norm(features, &kernel.norm_gamma, &kernel.norm_beta);
+                let input = Mat::from_vec(1, normalized.len(), normalized);
+                let hidden0 = kernel
+                    .lstm0
+                    .lstm_forward(&input, &mut regressed_shared_state)
+                    .expect("regressed layer zero");
+                let hidden1 = kernel
+                    .lstm1
+                    .lstm_forward(&hidden0, &mut regressed_shared_state)
+                    .expect("regressed layer one");
+                nn::matmul_bias(&hidden1, &kernel.mask_kernel, Some(&kernel.mask_bias))
+                    .expect("regressed mask projection")
+                    .data
+                    .iter()
+                    .map(|&value| 1.0 / (1.0 + (-value).exp()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(
+            observed_sequence, regressed_sequence,
+            "the fixture must distinguish independent layer state from the prior shared-state recurrence"
+        );
     }
 
     fn naive_dft_mag(frame: &[f32]) -> Vec<f64> {
