@@ -60,8 +60,14 @@ const MAX_ATTEMPTS: u32 = 3;
 pub enum VideoState {
     /// Discovered, not yet started.
     Pending,
-    /// Audio downloaded to `audio_path`, not yet transcribed.
-    Downloaded { audio_path: String },
+    /// Audio downloaded to `audio_path`, not yet transcribed. `attempts`
+    /// preserves the cross-run failure budget when cancellation retains a
+    /// reusable download after a prior failed run.
+    Downloaded {
+        audio_path: String,
+        #[serde(default)]
+        attempts: u32,
+    },
     /// Fully processed; markdown + JSON written.
     Done {
         audio_path: Option<String>,
@@ -138,7 +144,9 @@ impl Manifest {
 
     fn attempts(&self, id: &str) -> u32 {
         match self.entries.get(id).and_then(|e| e.state.as_ref()) {
-            Some(VideoState::Failed { attempts, .. }) => *attempts,
+            Some(VideoState::Downloaded { attempts, .. } | VideoState::Failed { attempts, .. }) => {
+                *attempts
+            }
             _ => 0,
         }
     }
@@ -424,7 +432,7 @@ fn select_download_work(
     audio_dir: &Path,
 ) -> DownloadWork {
     let recorded = match state {
-        Some(VideoState::Downloaded { audio_path }) => Some(PathBuf::from(audio_path)),
+        Some(VideoState::Downloaded { audio_path, .. }) => Some(PathBuf::from(audio_path)),
         _ => None,
     };
     let reusable = recorded
@@ -519,6 +527,7 @@ fn run_with_info_body(
     let mut to_process: Vec<DownloadWork> = Vec::new();
     for v in &videos {
         let state = manifest.entries.get(&v.id).and_then(|e| e.state.as_ref());
+        let attempts = manifest.attempts(&v.id);
         match state {
             Some(VideoState::Done { .. }) => {
                 tracing::info!(id = %v.id, "already done; skipping");
@@ -528,7 +537,7 @@ fn run_with_info_body(
                     serde_json::json!({ "id": v.id, "reason": "already_done" }),
                 )?;
             }
-            Some(VideoState::Failed { .. }) if !opts.retry_failed => {
+            Some(_) if attempts > 0 && !opts.retry_failed => {
                 tracing::info!(id = %v.id, "previously failed; --no-retry, skipping");
                 summary.skipped.push(v.id.clone());
                 events.emit(
@@ -536,7 +545,7 @@ fn run_with_info_body(
                     serde_json::json!({ "id": v.id, "reason": "previously_failed_no_retry" }),
                 )?;
             }
-            Some(VideoState::Failed { attempts, .. }) if *attempts >= MAX_ATTEMPTS => {
+            Some(_) if attempts >= MAX_ATTEMPTS => {
                 tracing::info!(
                     id = %v.id, attempts,
                     "exhausted retry budget; skipping (delete the manifest entry to force a retry)"
@@ -634,13 +643,12 @@ fn run_with_info_body(
                     // Cancelled while this download sat in the channel: persist its
                     // state so a resume reuses the audio rather than orphaning it.
                     if let Ok((audio_path, _meta)) = &outcome {
-                        manifest.set_state(
+                        persist_cancelled_download(
+                            &mut manifest,
+                            &manifest_path,
                             &video.id,
-                            VideoState::Downloaded {
-                                audio_path: audio_path.display().to_string(),
-                            },
-                        );
-                        manifest.save(&manifest_path)?;
+                            audio_path,
+                        )?;
                     }
                     summary.cancelled = true;
                     break;
@@ -722,11 +730,12 @@ fn run_with_info_body(
                         }
                     }
                     Err(FwError::Cancelled(_)) => {
-                        // No terminal state to persist (the entry is still
-                        // `Pending`); a resume finds the completed `<id>.*` audio
-                        // artifact and reuses it before retrying transcription.
-                        // Dropping this save avoids a full O(N)-byte manifest
-                        // rewrite on the cancel path.
+                        // Keep the current manifest state unchanged: it may be
+                        // `Pending` or a prior `Failed` state whose attempt budget
+                        // must survive cancellation. A resume finds the completed
+                        // `<id>.*` audio artifact and reuses it before retrying
+                        // transcription. Dropping this save also avoids a full
+                        // O(N)-byte manifest rewrite on the cancel path.
                         summary.cancelled = true;
                         break;
                     }
@@ -994,6 +1003,23 @@ fn record_failure(
     manifest.save(manifest_path)?;
     tracing::warn!(id = %video.id, attempts, error, "video failed");
     Ok(())
+}
+
+fn persist_cancelled_download(
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+    video_id: &str,
+    audio_path: &Path,
+) -> FwResult<()> {
+    let attempts = manifest.attempts(video_id);
+    manifest.set_state(
+        video_id,
+        VideoState::Downloaded {
+            audio_path: audio_path.display().to_string(),
+            attempts,
+        },
+    );
+    manifest.save(manifest_path)
 }
 
 fn record_and_emit_failure(
@@ -1467,6 +1493,7 @@ mod tests {
         std::fs::write(&recorded_path, b"recorded sentinel").expect("recorded audio");
         let recorded_state = VideoState::Downloaded {
             audio_path: recorded_path.display().to_string(),
+            attempts: 0,
         };
         let selected = select_download_work(
             &recorded_video,
@@ -1508,6 +1535,7 @@ mod tests {
         let video = vr("outside001");
         let state = VideoState::Downloaded {
             audio_path: outside_path.display().to_string(),
+            attempts: 0,
         };
 
         assert!(matches!(
@@ -1900,6 +1928,84 @@ https://youtu.be/ccccccccccc
     }
 
     #[test]
+    fn cancelled_reusable_download_preserves_retry_budget_until_terminal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join(MANIFEST_NAME);
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).expect("audio dir");
+        let audio_path = audio_dir.join("canceltry01.wav");
+        std::fs::write(&audio_path, b"reusable cancelled download").expect("seed audio");
+
+        let video = vr("canceltry01");
+        let mut manifest = Manifest::default();
+        manifest.upsert_discovered(&video);
+        manifest.set_state(
+            &video.id,
+            VideoState::Failed {
+                error: "second failure".to_owned(),
+                attempts: MAX_ATTEMPTS - 1,
+            },
+        );
+        manifest.save(&manifest_path).expect("seed failed manifest");
+
+        persist_cancelled_download(&mut manifest, &manifest_path, &video.id, &audio_path)
+            .expect("persist cancelled download");
+
+        let mut retained = Manifest::load(&manifest_path).expect("reload retained download");
+        assert_eq!(retained.attempts(&video.id), MAX_ATTEMPTS - 1);
+        assert!(matches!(
+            retained.entries[&video.id].state.as_ref(),
+            Some(VideoState::Downloaded {
+                audio_path: saved_path,
+                attempts,
+            }) if saved_path == &audio_path.display().to_string()
+                && *attempts == MAX_ATTEMPTS - 1
+        ));
+        assert!(matches!(
+            select_download_work(
+                &video,
+                retained.entries[&video.id].state.as_ref(),
+                &audio_dir,
+            ),
+            DownloadWork::Reuse { audio_path: reused, .. } if reused == audio_path
+        ));
+
+        record_failure(&mut retained, &manifest_path, &video, "third failure")
+            .expect("record next failure");
+        assert_eq!(retained.attempts(&video.id), MAX_ATTEMPTS);
+        persist_cancelled_download(&mut retained, &manifest_path, &video.id, &audio_path)
+            .expect("retain terminal cancelled download");
+        assert_eq!(retained.attempts(&video.id), MAX_ATTEMPTS);
+
+        let (mut opts, buffer) = capturing_opts(vec![video.url.clone()], dir.path());
+        opts.retry_failed = true;
+        let summary = run_with_info(&opts, &stub_info()).expect("terminal budget run");
+        assert_eq!(summary.skipped, vec![video.id.clone()]);
+        assert!(summary.done.is_empty());
+        assert!(summary.failed.is_empty());
+
+        let persisted = Manifest::load(&manifest_path).expect("reload terminal manifest");
+        assert!(matches!(
+            persisted.entries[&video.id].state.as_ref(),
+            Some(VideoState::Downloaded { attempts, .. }) if *attempts == MAX_ATTEMPTS
+        ));
+        let events = parse_events(&buffer);
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(serde_json::Value::as_str) == Some("youtube.skipped")
+                && event.get("id").and_then(serde_json::Value::as_str) == Some(video.id.as_str())
+                && event.get("reason").and_then(serde_json::Value::as_str)
+                    == Some("retry_budget_exhausted")
+        }));
+        assert!(
+            events.iter().all(
+                |event| event.get("event").and_then(serde_json::Value::as_str)
+                    != Some("youtube.downloading")
+            ),
+            "MAX_ATTEMPTS video must remain terminal"
+        );
+    }
+
+    #[test]
     fn manifest_load_missing_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         let m = Manifest::load(&dir.path().join("nope.json")).expect("load");
@@ -1963,6 +2069,7 @@ https://youtu.be/ccccccccccc
                 &id,
                 VideoState::Downloaded {
                     audio_path: format!("audio/{id}.m4a"),
+                    attempts: 0,
                 },
             );
             old_bytes += save_bytes(&old_clone); // intermediate save (dropped now)
