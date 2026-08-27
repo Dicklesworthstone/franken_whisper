@@ -635,6 +635,12 @@ fn parse_audio_frames_for_decode<R: Read>(reader: &mut R) -> FwResult<Vec<TtyAud
     for entry in entries {
         match entry {
             FrameLine::Audio(frame) => {
+                if session_close_reason.is_some() {
+                    return Err(FwError::InvalidRequest(format!(
+                        "tty-audio frame received after session_close at seq {}",
+                        frame.seq
+                    )));
+                }
                 if handshake_seen {
                     if frame.protocol_version != negotiated_version {
                         return Err(FwError::InvalidRequest(format!(
@@ -2631,6 +2637,36 @@ mod tests {
         let (report, raw) = decode_frames_to_raw(&mut reader).expect("decode");
         assert_eq!(report.frames_decoded, 2);
         assert_eq!(raw, b"chunk-zerochunk-one");
+    }
+
+    #[test]
+    fn decode_rejects_audio_after_session_close_even_when_last_seq_matches() {
+        let handshake = serde_json::to_string(&TtyControlFrame::Handshake {
+            min_version: MIN_PROTOCOL_VERSION,
+            max_version: SUPPORTED_PROTOCOL_VERSION,
+            supported_codecs: vec![CODEC_MULAW_ZLIB_B64.to_owned()],
+        })
+        .expect("serialize handshake");
+        let frames = [make_frame(0, b"chunk-zero"), make_frame(1, b"chunk-one")];
+        let close = serde_json::to_string(&TtyControlFrame::SessionClose {
+            reason: SessionCloseReason::Normal,
+            last_data_seq: Some(1),
+        })
+        .expect("serialize close");
+        let ndjson = format!(
+            "{handshake}\n{}\n{close}\n{}\n",
+            serde_json::to_string(&frames[0]).expect("serialize first frame"),
+            serde_json::to_string(&frames[1]).expect("serialize post-close frame")
+        );
+        let mut reader = ndjson.as_bytes();
+
+        let error = decode_frames_to_raw(&mut reader)
+            .expect_err("audio after session_close must fail despite a matching final maximum");
+        assert!(
+            error
+                .to_string()
+                .contains("frame received after session_close at seq 1")
+        );
     }
 
     #[test]
