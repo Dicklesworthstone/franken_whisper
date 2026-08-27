@@ -495,10 +495,15 @@ pub fn run(
     let is_cancelled = || token.is_some_and(|token| token.checkpoint().is_err());
     let model_source = native_engine::resolve_model_source_with_cancel(&spec, &is_cancelled)
         .map_err(|error| match error {
-            error @ (FwError::Cancelled(_) | FwError::StageTimeout { .. }) => error,
+            error @ FwError::Cancelled(_) => token
+                .and_then(|token| token.checkpoint().err())
+                .unwrap_or(error),
+            error @ FwError::StageTimeout { .. } => error,
             other => FwError::BackendUnavailable(other.to_string()),
         })?;
-    let model = model_source.load()?;
+    let model_path = model_source.path().to_path_buf();
+    let checkpoint = checkpoint_for(token);
+    let model = model_source.load_with_checkpoint(&checkpoint)?;
 
     // Read the normalized WAV to f32 mono samples, then apply the requested
     // window. Timestamps are shifted back into the source timebase after
@@ -547,7 +552,6 @@ pub fn run(
     let want_dtw = want_words && !request.backend_params.no_timestamps;
 
     let params = decode_params(request, want_dtw, &spec);
-    let checkpoint = checkpoint_for(token);
     let mut output = model.transcribe(&samples, &params, &checkpoint)?;
 
     // Shift every emitted timestamp back into the source-file timebase so a
@@ -588,7 +592,7 @@ pub fn run(
     let language = output.language.clone().or_else(|| request.language.clone());
 
     let t_tag = std::time::Instant::now();
-    let version_tag = model.version_tag();
+    let version_tag = model.version_tag_with_checkpoint(&checkpoint)?;
     crate::native_engine::perf_span("version_tag", t_tag.elapsed().as_secs_f64() * 1e3, "");
     crate::native_engine::perf_span("backend_run", t_backend.elapsed().as_secs_f64() * 1e3, "");
     let mut raw_output = raw_output_json(

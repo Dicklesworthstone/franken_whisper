@@ -246,10 +246,15 @@ pub fn run(
     let is_cancelled = || token.is_some_and(|token| token.checkpoint().is_err());
     let model_source = native_engine::resolve_model_source_with_cancel(&spec, &is_cancelled)
         .map_err(|error| match error {
-            error @ (FwError::Cancelled(_) | FwError::StageTimeout { .. }) => error,
+            error @ FwError::Cancelled(_) => token
+                .and_then(|token| token.checkpoint().err())
+                .unwrap_or(error),
+            error @ FwError::StageTimeout { .. } => error,
             other => FwError::BackendUnavailable(other.to_string()),
         })?;
-    let model = model_source.load()?;
+    let model_path = model_source.path().to_path_buf();
+    let checkpoint = checkpoint_for(token);
+    let model = model_source.load_with_checkpoint(&checkpoint)?;
 
     let samples = read_normalized_wav(normalized_wav)?;
 
@@ -259,7 +264,6 @@ pub fn run(
 
     // Real ASR: the engine decides what (and when) words were spoken.
     let params = decode_params(request);
-    let checkpoint = checkpoint_for(token);
     let output = model.transcribe(&samples, &params, &checkpoint)?;
 
     if let Some(tok) = token {
@@ -289,10 +293,11 @@ pub fn run(
     let audio_provenance = analysis
         .as_ref()
         .map(super::native_audio::NativeAudioAnalysis::as_json);
+    let version_tag = model.version_tag_with_checkpoint(&checkpoint)?;
     let raw_output = raw_output_json(
         &spec,
         &model_path,
-        model.version_tag(),
+        version_tag,
         &output.windows,
         &report,
         audio_provenance,

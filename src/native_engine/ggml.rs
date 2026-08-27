@@ -731,7 +731,16 @@ impl GgmlModel {
     ///   structure, or trailing bytes after the tensor directory.
     /// - [`FwError::Unsupported`] for a quantized `ftype`.
     pub fn load(path: &Path) -> FwResult<Self> {
-        Self::load_from_file(std::fs::File::open(path)?)
+        Self::load_with_checkpoint(path, &|| Ok(()))
+    }
+
+    /// Load from `path` while checking cancellation between cold-load phases.
+    pub fn load_with_checkpoint(
+        path: &Path,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Self> {
+        checkpoint()?;
+        Self::load_from_file_with_checkpoint(std::fs::File::open(path)?, checkpoint)
     }
 
     /// Parse a ggml model from an already-open descriptor.
@@ -741,14 +750,27 @@ impl GgmlModel {
     /// authentication; the cache pathname is never reopened after the trust
     /// decision.
     pub fn load_from_file(file: std::fs::File) -> FwResult<Self> {
+        Self::load_from_file_with_checkpoint(file, &|| Ok(()))
+    }
+
+    /// Parse an open descriptor while checking cancellation before and after
+    /// each bounded I/O/parse phase.
+    pub fn load_from_file_with_checkpoint(
+        file: std::fs::File,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Self> {
+        checkpoint()?;
         // bd-A14: opt-in streaming loader preads each tensor on demand instead
         // of holding the whole ~1.6 GB file resident (peak-RSS win, default-off).
         #[cfg(unix)]
         if stream_load_enabled() {
-            return Self::load_streamed(file);
+            return Self::load_streamed(file, checkpoint);
         }
         let blob = read_blob_parallel_file(file)?;
-        Self::parse(blob)
+        checkpoint()?;
+        let model = Self::parse(blob)?;
+        checkpoint()?;
+        Ok(model)
     }
 
     /// Parse a ggml model already in memory (bd-m2jm: the wasm/browser entry,
@@ -978,7 +1000,11 @@ impl GgmlModel {
     /// Errors mirror [`Self::parse`] (bad magic, malformed/truncated structure,
     /// unsupported dtype, trailing bytes).
     #[cfg(unix)]
-    fn load_streamed(file: std::fs::File) -> FwResult<Self> {
+    fn load_streamed(
+        file: std::fs::File,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Self> {
+        checkpoint()?;
         let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
         // The directory scan uses a SEPARATE buffered handle (dropped when the
         // scan ends); `file` is kept only for the on-demand payload preads.
@@ -986,13 +1012,16 @@ impl GgmlModel {
         std::io::Seek::rewind(&mut scan)?;
         let cur = StreamCursor::new(std::io::BufReader::with_capacity(1 << 20, scan), len);
         let scanned = Self::scan_streamed_inner(cur)?;
-        Ok(Self {
+        checkpoint()?;
+        let model = Self {
             hparams: scanned.hparams,
             filters: scanned.filters,
             vocab_tokens: scanned.vocab_tokens,
             tensors: scanned.tensors,
             source: TensorSource::Streamed(file),
-        })
+        };
+        checkpoint()?;
+        Ok(model)
     }
 
     /// Parse a ggml model through a caller-supplied positioned reader,
@@ -2938,7 +2967,11 @@ mod tests {
         };
         let resident = GgmlModel::parse(read_blob_parallel(&path).expect("read blob"))
             .expect("resident parse");
-        let streamed = GgmlModel::load_streamed(&path).expect("streamed parse");
+        let streamed = GgmlModel::load_streamed(
+            std::fs::File::open(&path).expect("open streamed model"),
+            &|| Ok(()),
+        )
+        .expect("streamed parse");
 
         // Header / filterbank / vocab identical.
         assert_eq!(resident.hparams, streamed.hparams, "hparams differ");

@@ -1081,6 +1081,20 @@ impl ResolvedWhisperModel {
             Self::Authenticated(package) => NativeWhisperModel::load_authenticated(package),
         }
     }
+
+    /// Load this exact source while polling the caller's cancellation fence
+    /// between cold-load phases.
+    pub fn load_with_checkpoint(
+        &self,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Arc<NativeWhisperModel>> {
+        match self {
+            Self::Path(path) => NativeWhisperModel::load_with_checkpoint(path, checkpoint),
+            Self::Authenticated(package) => {
+                NativeWhisperModel::load_authenticated_with_checkpoint(package, checkpoint)
+            }
+        }
+    }
 }
 
 /// Whether `spec` is a bare sentinel for the authenticated release package.
@@ -1537,7 +1551,17 @@ impl NativeWhisperModel {
     /// - Whatever [`ggml::GgmlModel::load`] / [`decode::LoadedModel::from_ggml`]
     ///   return for a malformed or unsupported model.
     pub fn load(path: &Path) -> FwResult<Arc<Self>> {
-        Self::load_inner(path, false)
+        Self::load_inner(path, false, &|| Ok(()), true)
+    }
+
+    /// Load a path while polling cancellation between cold-load phases. Unlike
+    /// [`Self::load`], this stage-owned path does not spawn detached version
+    /// hashing; the tag remains lazy if the stage succeeds.
+    pub fn load_with_checkpoint(
+        path: &Path,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Arc<Self>> {
+        Self::load_inner(path, false, checkpoint, false)
     }
 
     /// Load a release package from the exact descriptor that passed its
@@ -1546,12 +1570,36 @@ impl NativeWhisperModel {
     pub fn load_authenticated(
         package: &crate::model_distribution::CachedWhisperPackage,
     ) -> FwResult<Arc<Self>> {
+        Self::load_authenticated_inner(package, &|| Ok(()), true)
+    }
+
+    /// Load an authenticated package while polling cancellation between
+    /// descriptor I/O, parse, and inference-weight construction phases.
+    pub fn load_authenticated_with_checkpoint(
+        package: &crate::model_distribution::CachedWhisperPackage,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Arc<Self>> {
+        Self::load_authenticated_inner(package, checkpoint, false)
+    }
+
+    fn load_authenticated_inner(
+        package: &crate::model_distribution::CachedWhisperPackage,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
+    ) -> FwResult<Arc<Self>> {
+        checkpoint()?;
         let key = ModelCacheKey::authenticated(
             package.weights_path.clone(),
             package.weights_sha256.clone(),
         );
         let file = package.try_clone_weights_file()?;
-        Self::load_key(key, false, Some(file))
+        Self::load_key(
+            key,
+            false,
+            Some(file),
+            checkpoint,
+            warm_version_tag,
+        )
     }
 
     /// Load a model and keep one process-wide strong resident slot alive.
@@ -1562,7 +1610,7 @@ impl NativeWhisperModel {
     /// replaces the resident slot, so memory retention is capped to one model.
     /// Plain [`load`](Self::load) keeps the original Weak-only semantics.
     pub fn load_resident(path: &Path) -> FwResult<Arc<Self>> {
-        Self::load_inner(path, true)
+        Self::load_inner(path, true, &|| Ok(()), true)
     }
 
     /// Load a resident model from an already-canonicalized absolute path.
@@ -1586,19 +1634,33 @@ impl NativeWhisperModel {
                 "resident canonical model path must be absolute".to_owned(),
             ));
         }
-        Self::load_canonical(canonical_path.to_path_buf(), true)
+        Self::load_canonical(canonical_path.to_path_buf(), true, &|| Ok(()), true)
     }
 
-    fn load_inner(path: &Path, keep_resident: bool) -> FwResult<Arc<Self>> {
+    fn load_inner(
+        path: &Path,
+        keep_resident: bool,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
+    ) -> FwResult<Arc<Self>> {
+        checkpoint()?;
         let canonical = path.canonicalize()?;
-        Self::load_canonical(canonical, keep_resident)
+        checkpoint()?;
+        Self::load_canonical(canonical, keep_resident, checkpoint, warm_version_tag)
     }
 
-    fn load_canonical(canonical: PathBuf, keep_resident: bool) -> FwResult<Arc<Self>> {
+    fn load_canonical(
+        canonical: PathBuf,
+        keep_resident: bool,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
+    ) -> FwResult<Arc<Self>> {
         Self::load_key(
             ModelCacheKey::unverified(canonical),
             keep_resident,
             None,
+            checkpoint,
+            warm_version_tag,
         )
     }
 
@@ -1606,7 +1668,10 @@ impl NativeWhisperModel {
         key: ModelCacheKey,
         keep_resident: bool,
         authenticated_file: Option<File>,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
     ) -> FwResult<Arc<Self>> {
+        checkpoint()?;
         // Fast path: a live cached instance.
         {
             let mut guard = lock_cache();
@@ -1644,9 +1709,17 @@ impl NativeWhisperModel {
             // Held across the parse below — `plock` and `_held` are both locals of
             // this block (no self-referential borrow); dropped on return. Lock order
             // is always per-path THEN cache (cache is only taken briefly), no deadlock.
-            let _held = plock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _held = loop {
+                checkpoint()?;
+                match plock.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        break poisoned.into_inner();
+                    }
+                }
+            };
+            checkpoint()?;
             // A peer may have published while we waited on the per-path lock.
             {
                 let mut guard = lock_cache();
@@ -1665,18 +1738,26 @@ impl NativeWhisperModel {
                     return Ok(existing);
                 }
             }
-            let model = Self::do_parse_and_publish(
+            let result = Self::do_parse_and_publish(
                 key.clone(),
                 keep_resident,
                 authenticated_file,
-            )?;
+                checkpoint,
+                warm_version_tag,
+            );
             // Drop our in-flight marker (waiting peers hold their own `Arc` clone).
             if let Some(cache) = lock_cache().as_mut() {
                 cache.loading.remove(&key);
             }
-            return Ok(model);
+            return result;
         }
-        Self::do_parse_and_publish(key, keep_resident, authenticated_file)
+        Self::do_parse_and_publish(
+            key,
+            keep_resident,
+            authenticated_file,
+            checkpoint,
+            warm_version_tag,
+        )
     }
 
     /// Parse the ggml model, quantize weights, publish to the cache, and warm the
@@ -1687,16 +1768,19 @@ impl NativeWhisperModel {
         key: ModelCacheKey,
         keep_resident: bool,
         authenticated_file: Option<File>,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
     ) -> FwResult<Arc<Self>> {
+        checkpoint()?;
         // Parse outside the lock so a slow load doesn't block other paths.
         let t_parse = crate::native_engine::plat::Instant::now();
         let ggml = match authenticated_file {
-            Some(file) => ggml::GgmlModel::load_from_file(file)?,
-            None => ggml::GgmlModel::load(&key.path)?,
+            Some(file) => ggml::GgmlModel::load_from_file_with_checkpoint(file, checkpoint)?,
+            None => ggml::GgmlModel::load_with_checkpoint(&key.path, checkpoint)?,
         };
         perf_span("model_parse", t_parse.elapsed().as_secs_f64() * 1e3, "");
         let t_weights = crate::native_engine::plat::Instant::now();
-        let inner = decode::LoadedModel::from_ggml(ggml)?;
+        let inner = decode::LoadedModel::from_ggml_with_checkpoint(ggml, checkpoint)?;
         perf_span("model_weights", t_weights.elapsed().as_secs_f64() * 1e3, "");
         let version_tag = OnceLock::new();
         if let Some(digest) = &key.authenticated_sha256 {
@@ -1708,6 +1792,7 @@ impl NativeWhisperModel {
             model_path: key.path.clone(),
             version_tag,
         });
+        checkpoint()?;
 
         // Re-check under the lock: a racing thread may have populated the slot
         // while we were parsing. If so, prefer the already-published instance.
@@ -1744,12 +1829,15 @@ impl NativeWhisperModel {
         // ready, so observable behavior (the tag itself) is unchanged. The
         // clone keeps the model alive until the hash finishes (bounded by
         // hash time; documented tradeoff).
-        let warm = Arc::clone(&model);
-        let _ = std::thread::Builder::new()
-            .name("fw-model-hash".into())
-            .spawn(move || {
-                let _ = warm.version_tag();
-            });
+        if warm_version_tag {
+            let warm = Arc::clone(&model);
+            let _ = std::thread::Builder::new()
+                .name("fw-model-hash".into())
+                .spawn(move || {
+                    let _ = warm.version_tag();
+                });
+        }
+        checkpoint()?;
         Ok(model)
     }
 
@@ -1791,6 +1879,34 @@ impl NativeWhisperModel {
             .clone()
     }
 
+    /// Return this model's stable identity while honoring stage cancellation.
+    ///
+    /// A custom model path may require streaming the whole file on the first
+    /// call. Checking between reads prevents a timed-out native stage from
+    /// remaining live solely to finish that diagnostic hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first cancellation or deadline error reported by
+    /// `checkpoint`.
+    pub fn version_tag_with_checkpoint(
+        &self,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<String> {
+        checkpoint()?;
+        if let Some(version_tag) = self.version_tag.get() {
+            checkpoint()?;
+            return Ok(version_tag.clone());
+        }
+
+        let prefix = file_sha256_prefix_with_checkpoint(&self.model_path, checkpoint)?
+            .unwrap_or_else(|| "unavailable".to_owned());
+        let candidate = format!("fw-native-v1+sha256:{prefix}");
+        let _ = self.version_tag.set(candidate.clone());
+        checkpoint()?;
+        Ok(self.version_tag.get().cloned().unwrap_or(candidate))
+    }
+
     /// Borrow the underlying loaded model (parsed weights / tokenizer / etc.).
     #[must_use]
     pub fn loaded(&self) -> &decode::LoadedModel {
@@ -1809,24 +1925,41 @@ fn lock_cache() -> std::sync::MutexGuard<'static, Option<ModelCache>> {
 /// digest, or `None` on I/O failure.
 #[must_use]
 fn file_sha256_prefix(path: &Path) -> Option<String> {
+    file_sha256_prefix_with_checkpoint(path, &|| Ok(()))
+        .ok()
+        .flatten()
+}
+
+/// Cancellation-aware implementation of [`file_sha256_prefix`].
+fn file_sha256_prefix_with_checkpoint(
+    path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<Option<String>> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open(path).ok()?;
+    checkpoint()?;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf).ok()?;
+        checkpoint()?;
+        let Ok(n) = file.read(&mut buf) else {
+            return Ok(None);
+        };
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
     }
+    checkpoint()?;
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(12);
     for byte in digest.iter().take(6) {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
     }
-    Some(hex)
+    Ok(Some(hex))
 }
 
 #[cfg(test)]
@@ -2496,7 +2629,8 @@ mod tests {
         let dir = TempDir::new("resident_cache");
         let path = write_file(dir.path(), "ggml-resident.bin", synthetic_model_bytes());
 
-        let a = NativeWhisperModel::load_inner(&path, true).expect("resident load a");
+        let a = NativeWhisperModel::load_inner(&path, true, &|| Ok(()), true)
+            .expect("resident load a");
         let _ = a.version_tag();
         let weak = Arc::downgrade(&a);
         drop(a);
@@ -2504,7 +2638,8 @@ mod tests {
         let retained = weak
             .upgrade()
             .expect("resident cache must keep the model alive after caller drop");
-        let b = NativeWhisperModel::load_inner(&path, true).expect("resident load b");
+        let b = NativeWhisperModel::load_inner(&path, true, &|| Ok(()), true)
+            .expect("resident load b");
         assert!(
             Arc::ptr_eq(&retained, &b),
             "resident reload must return the retained Arc"
@@ -2585,6 +2720,35 @@ mod tests {
             m1.version_tag(),
             m2.version_tag(),
             "distinct file contents must hash differently"
+        );
+    }
+
+    #[test]
+    fn version_hash_honors_checkpoint_between_file_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TempDir::new("vtag_cancel");
+        let bytes = vec![0u8; 3 * 64 * 1024];
+        let path = write_file(dir.path(), "ggml-vtag-cancel.bin", &bytes);
+        let checks = AtomicUsize::new(0);
+
+        let result = file_sha256_prefix_with_checkpoint(&path, &|| {
+            let check = checks.fetch_add(1, Ordering::SeqCst);
+            if check >= 2 {
+                Err(FwError::StageTimeout {
+                    stage: "backend".to_owned(),
+                    budget_ms: 20,
+                })
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(matches!(result, Err(FwError::StageTimeout { .. })));
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            3,
+            "hashing must poll again after its first 64 KiB read"
         );
     }
 

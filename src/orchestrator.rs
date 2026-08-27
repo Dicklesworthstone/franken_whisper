@@ -1518,7 +1518,7 @@ where
     E: FnOnce() -> FwError,
 {
     let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name(format!("stage-{stage}"))
         .stack_size(stage_thread_stack_bytes())
         .spawn(move || {
@@ -1527,11 +1527,27 @@ where
         .map_err(FwError::Io)?;
 
     match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(RecvTimeoutError::Timeout) => Err(timeout_error()),
-        Err(RecvTimeoutError::Disconnected) => Err(FwError::BackendUnavailable(format!(
-            "stage `{stage}` worker exited before returning a result"
-        ))),
+        Ok(result) => match worker.join() {
+            Ok(()) => result,
+            Err(_) => Err(FwError::BackendUnavailable(format!(
+                "stage `{stage}` worker panicked after returning a result"
+            ))),
+        },
+        Err(RecvTimeoutError::Timeout) => {
+            let error = timeout_error();
+            // Stage operations receive a token with the same deadline as this
+            // receiver. Join after expiry so their cooperative checkpoint can
+            // unwind native work before a later stage starts; dropping this
+            // handle would detach CPU, memory, and file I/O past the timeout.
+            let _ = worker.join();
+            Err(error)
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            Err(FwError::BackendUnavailable(format!(
+                "stage `{stage}` worker exited before returning a result"
+            )))
+        }
     }
 }
 
@@ -2394,28 +2410,34 @@ async fn execute_backend(
     let backend_wav = normalized_wav.clone();
     let backend_dir = run_tmp_dir.path().to_path_buf();
     let backend_budget_ms = stage_budgets.backend_ms;
-    let cancel_token = pcx.stage_token(backend_budget_ms); // ubs:ignore — cancellation token is not a secret
-    let execution_result = run_stage_with_budget("backend", backend_budget_ms, move || {
-        let tok = Some(&cancel_token);
-        if let Some(order) = backend_order {
-            backend::execute_with_order(
-                &backend_request,
-                &backend_wav,
-                &backend_dir,
-                budget_duration(backend_budget_ms),
-                &order,
-                tok,
-            )
-        } else {
-            backend::execute(
-                &backend_request,
-                &backend_wav,
-                &backend_dir,
-                budget_duration(backend_budget_ms),
-                tok,
-            )
-        }
-    });
+    let cancel_token =
+        pcx.named_stage_token("backend", backend_budget_ms); // ubs:ignore — token is not a secret
+    let execution_result = run_stage_with_token_budget(
+        "backend",
+        backend_budget_ms,
+        cancel_token,
+        move || {
+            let tok = Some(&cancel_token);
+            if let Some(order) = backend_order {
+                backend::execute_with_order(
+                    &backend_request,
+                    &backend_wav,
+                    &backend_dir,
+                    budget_duration(backend_budget_ms),
+                    &order,
+                    tok,
+                )
+            } else {
+                backend::execute(
+                    &backend_request,
+                    &backend_wav,
+                    &backend_dir,
+                    budget_duration(backend_budget_ms),
+                    tok,
+                )
+            }
+        },
+    );
 
     if let Some((top_backend, predicted_success)) = adaptive_prediction {
         let top_succeeded = match &execution_result {
@@ -2701,7 +2723,8 @@ async fn execute_backend_speculative(
     );
 
     let backend_budget_ms = stage_budgets.backend_ms;
-    let cancel_token = pcx.stage_token(backend_budget_ms); // ubs:ignore — token, not a secret
+    let cancel_token =
+        pcx.named_stage_token("backend", backend_budget_ms); // ubs:ignore — token, not a secret
     let normalized_wav = normalized_wav.clone();
     let backend_dir = run_tmp_dir.path().to_path_buf();
     let base_request = backend_request_for_waveform(request, inter.vocal_isolated);
@@ -2709,7 +2732,7 @@ async fn execute_backend_speculative(
     let per_invocation_timeout = budget_duration(backend_budget_ms);
 
     /// Internal carry value: the speculation pipeline's inner result is
-    /// reified as a `Result` so the wrapping `run_stage_with_budget` closure
+    /// reified as a `Result` so the wrapping stage-supervisor closure
     /// can always succeed with the partial events / stats / merged segments,
     /// regardless of whether the pipeline itself errored mid-run.
     type SpecOutcome = (
@@ -2719,8 +2742,11 @@ async fn execute_backend_speculative(
         Vec<crate::model::TranscriptionSegment>,
     );
 
-    let outcome: FwResult<SpecOutcome> =
-        run_stage_with_budget("backend", backend_budget_ms, move || {
+    let outcome: FwResult<SpecOutcome> = run_stage_with_token_budget(
+        "backend",
+        backend_budget_ms,
+        cancel_token,
+        move || {
             let tok = cancel_token;
             let mut pipeline =
                 crate::streaming::SpeculativeStreamingPipeline::new(spec_config.clone(), run_id);
@@ -2792,12 +2818,13 @@ async fn execute_backend_speculative(
             // instead of cloning it via `events().to_vec()`.
             let emitted = pipeline.into_events();
             Ok((inner_result, emitted, stats, merged))
-        });
+        },
+    );
 
     let (inner_result, emitted_events, stats, merged) = match outcome {
         Ok(value) => value,
         Err(error) => {
-            // `run_stage_with_budget` itself failed (stage-budget timeout, panic,
+            // The stage supervisor itself failed (stage-budget timeout, panic,
             // …). No events to forward; just emit the terminal backend.* event.
             let code = stage_failure_code("backend", &error);
             log.push(
@@ -8336,6 +8363,52 @@ mod tests {
             stage_failure_message(&error, "fallback"),
             "stage budget exceeded"
         );
+    }
+
+    #[test]
+    fn timed_out_stage_is_quiescent_before_followup_starts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let active = Arc::new(AtomicBool::new(false));
+        let quiesced = Arc::new(AtomicBool::new(false));
+        let worker_active = Arc::clone(&active);
+        let worker_quiesced = Arc::clone(&quiesced);
+        let budget_ms = 20;
+        let deadline = Utc::now() + chrono::Duration::milliseconds(budget_ms as i64);
+        let token = named_stage_token_for_deadlines(None, deadline, "backend", budget_ms as u64);
+        let worker_token = token;
+
+        let result: FwResult<()> = run_stage_with_token_budget(
+            "backend",
+            budget_ms as u64,
+            token,
+            move || {
+                worker_active.store(true, Ordering::SeqCst);
+                loop {
+                    match worker_token.checkpoint() {
+                        Ok(()) => std::thread::yield_now(),
+                        Err(error) => {
+                            worker_active.store(false, Ordering::SeqCst);
+                            worker_quiesced.store(true, Ordering::SeqCst);
+                            return Err(error);
+                        }
+                    }
+                }
+            },
+        );
+
+        assert!(matches!(result, Err(FwError::StageTimeout { .. })));
+        assert!(quiesced.load(Ordering::SeqCst));
+        assert!(!active.load(Ordering::SeqCst));
+
+        run_stage_with_budget("followup", 5_000, move || {
+            assert!(
+                !active.load(Ordering::SeqCst),
+                "later stage overlapped timed-out native work"
+            );
+            Ok(())
+        })
+        .expect("follow-up stage");
     }
 
     #[test]

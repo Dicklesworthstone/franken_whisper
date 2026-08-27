@@ -139,6 +139,16 @@ impl LoadedModel {
     /// Propagates [`EncoderWeights::from_ggml`] / [`DecoderWeights::from_ggml`]
     /// shape-validation errors.
     pub fn from_ggml(model: GgmlModel) -> FwResult<Self> {
+        Self::from_ggml_with_checkpoint(model, &|| Ok(()))
+    }
+
+    /// Build inference weights while checking cancellation at every bounded
+    /// cold-load phase boundary.
+    pub fn from_ggml_with_checkpoint(
+        model: GgmlModel,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Self> {
+        checkpoint()?;
         let hparams = model.hparams; // `Copy`, so `model` stays whole for the borrows below.
         // The encoder (~180 ms) and decoder (~102 ms) weight builds are independent
         // and neither saturates RAM bandwidth (~14 GB/s vs ~100+ aggregate), so run
@@ -186,8 +196,10 @@ impl LoadedModel {
                 .install(build_weights),
             None => build_weights(),
         };
+        checkpoint()?;
         let encoder = encoder?;
         let decoder = decoder?;
+        checkpoint()?;
         // Build the tokenizer and take the filterbank AFTER the borrowing weight
         // builds, so both are MOVED out of the now-finished-with `model` (dropped at
         // return) instead of cloned. The vocab move alone drops ~`n_vocab` (~51 865 on
@@ -196,14 +208,17 @@ impl LoadedModel {
         // Byte-identical (same vocab/filters bytes, only the ownership changes).
         let filters = model.filters;
         let tokenizer = Tokenizer::from_vocab(&hparams, model.vocab_tokens);
-        Ok(Self {
+        checkpoint()?;
+        let loaded = Self {
             hparams,
             filters,
             tokenizer,
             encoder,
             decoder,
             transcription_cache: std::sync::Mutex::new(TranscriptionCache::default()),
-        })
+        };
+        checkpoint()?;
+        Ok(loaded)
     }
 
     /// Drop all exact transcription results retained by this model.

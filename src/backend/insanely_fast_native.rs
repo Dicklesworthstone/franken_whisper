@@ -368,10 +368,17 @@ pub fn run(
     let is_cancelled = || token.is_some_and(|token| token.checkpoint().is_err());
     let model_source = native_engine::resolve_model_source_with_cancel(&spec, &is_cancelled)
         .map_err(|error| match error {
-            error @ (FwError::Cancelled(_) | FwError::StageTimeout { .. }) => error,
+            error @ FwError::Cancelled(_) => token
+                .and_then(|token| token.checkpoint().err())
+                .unwrap_or(error),
+            error @ FwError::StageTimeout { .. } => error,
             other => FwError::BackendUnavailable(other.to_string()),
         })?;
-    let model = model_source.load()?;
+    let model_path = model_source.path().to_path_buf();
+    let checkpoint = || {
+        token.map_or(Ok(()), crate::orchestrator::CancellationToken::checkpoint)
+    };
+    let model = model_source.load_with_checkpoint(&checkpoint)?;
 
     let samples = read_normalized_wav(normalized_wav)?;
 
@@ -412,11 +419,12 @@ pub fn run(
     )?;
     let transcript = super::transcript_from_segments(&segments);
     let language = merged.language.or_else(|| request.language.clone());
+    let version_tag = model.version_tag_with_checkpoint(&checkpoint)?;
 
     let raw_output = raw_output_json(
         &spec,
         &model_path,
-        model.version_tag(),
+        version_tag,
         win_count,
         n_workers,
         threads_per_worker,

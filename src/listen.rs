@@ -1920,7 +1920,14 @@ fn resolve_fast_model(
     Option<String>,
 )> {
     let (source, label, warning) = resolve_fast_model_path(config, is_cancelled)?;
-    let model = source.load()?;
+    let checkpoint = || {
+        if is_cancelled() {
+            Err(FwError::Cancelled("listen model load cancelled".to_owned()))
+        } else {
+            Ok(())
+        }
+    };
+    let model = source.load_with_checkpoint(&checkpoint)?;
     Ok((model, label, warning))
 }
 
@@ -2841,8 +2848,17 @@ pub fn run_listen_session(
                     )
                         .map_err(|e| e.to_string())
                         .and_then(|source| {
+                            let checkpoint = || {
+                                if is_abort() {
+                                    Err(FwError::Cancelled(
+                                        "confirm lane model load abandoned".to_owned(),
+                                    ))
+                                } else {
+                                    Ok(())
+                                }
+                            };
                             source
-                                .load()
+                                .load_with_checkpoint(&checkpoint)
                                 .map(|m| (m, spec_owned.clone()))
                                 .map_err(|e| e.to_string())
                         });
