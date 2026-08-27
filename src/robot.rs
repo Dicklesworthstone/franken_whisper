@@ -13,9 +13,9 @@ use crate::model::{
 // real-time listen session event family (listen.session_start,
 // speech_started, transcript.delta, utterance_end, listen.warning,
 // listen.session_stats). Later 1.1.0 additions include the default-off
-// listen.controller evidence event and the youtube.* ingestion family. No
-// existing field was renamed or removed; 1.0.0 consumers that ignore unknown
-// fields/events are unaffected.
+// listen.controller evidence event, the youtube.* ingestion family, device
+// discovery, and the routing-history terminal. No existing field was renamed
+// or removed; 1.0.0 consumers that ignore unknown fields/events are unaffected.
 pub const ROBOT_SCHEMA_VERSION: &str = "1.1.0";
 
 pub const STAGE_REQUIRED_FIELDS: &[&str] = &[
@@ -50,6 +50,17 @@ pub const RUN_COMPLETE_REQUIRED_FIELDS: &[&str] = &[
 pub const BACKENDS_DISCOVERY_REQUIRED_FIELDS: &[&str] = &["event", "schema_version", "backends"];
 pub const ROUTING_DECISION_REQUIRED_FIELDS: &[&str] =
     &["event", "schema_version", "run_id", "ts", "code"];
+pub const ROUTING_HISTORY_COMPLETE_REQUIRED_FIELDS: &[&str] =
+    &["event", "schema_version", "records"];
+pub const LISTEN_DEVICE_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "name",
+    "default",
+    "default_sample_rate_hz",
+    "default_channels",
+    "backend",
+];
 
 pub const YOUTUBE_RUN_START_REQUIRED_FIELDS: &[&str] = &[
     "event",
@@ -221,6 +232,30 @@ pub fn emit_robot_start(request_summary: serde_json::Value) -> FwResult<()> {
 
 pub fn emit_robot_error(message: &str, code: &str) -> FwResult<()> {
     emit_line(&run_error_value(message, code))
+}
+
+/// Build the stable robot envelope for one enumerated input device.
+#[must_use]
+pub fn listen_device_value(device: &crate::capture::InputDeviceInfo) -> serde_json::Value {
+    json!({
+        "event": "listen.device",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "name": device.name,
+        "default": device.is_default,
+        "default_sample_rate_hz": device.default_sample_rate_hz,
+        "default_channels": device.default_channels,
+        "backend": "cpal",
+    })
+}
+
+/// Build the terminal summary for `fw robot routing-history`.
+#[must_use]
+pub fn routing_history_complete_value(records: usize) -> serde_json::Value {
+    json!({
+        "event": "routing_history.complete",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "records": records,
+    })
 }
 
 /// Emit a `run_error` event directly from an [`FwError`], using its
@@ -2418,6 +2453,11 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "mode": "adaptive",
                 }),
             },
+            "routing_history.complete": {
+                "required": ROUTING_HISTORY_COMPLETE_REQUIRED_FIELDS,
+                "terminal": true,
+                "example": routing_history_complete_value(12),
+            },
             "transcript.partial": {
                 "required": TRANSCRIPT_PARTIAL_REQUIRED_FIELDS,
                 "example": json!({
@@ -2507,6 +2547,15 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "current_window_size_ms": 3000,
                     "mean_drift_wer": 0.11,
                     "ts": "2026-02-22T00:00:02Z",
+                }),
+            },
+            "listen.device": {
+                "required": LISTEN_DEVICE_REQUIRED_FIELDS,
+                "example": listen_device_value(&crate::capture::InputDeviceInfo {
+                    name: "Built-in Microphone".to_owned(),
+                    is_default: true,
+                    default_sample_rate_hz: Some(48_000),
+                    default_channels: Some(2),
                 }),
             },
             "listen.session_start": {
@@ -2977,13 +3026,15 @@ mod tests {
 
     #[allow(clippy::wildcard_imports)]
     use super::{
-        LISTEN_CONTROLLER_REQUIRED_FIELDS, LISTEN_SESSION_START_REQUIRED_FIELDS,
-        LISTEN_SESSION_STATS_REQUIRED_FIELDS, LISTEN_WARNING_REQUIRED_FIELDS, ListenSessionInfo,
-        ListenSessionStats, NdjsonStreamValidator, ROBOT_SCHEMA_VERSION,
+        LISTEN_CONTROLLER_REQUIRED_FIELDS, LISTEN_DEVICE_REQUIRED_FIELDS,
+        LISTEN_SESSION_START_REQUIRED_FIELDS, LISTEN_SESSION_STATS_REQUIRED_FIELDS,
+        LISTEN_WARNING_REQUIRED_FIELDS, ListenSessionInfo, ListenSessionStats,
+        NdjsonStreamValidator, ROBOT_SCHEMA_VERSION, ROUTING_HISTORY_COMPLETE_REQUIRED_FIELDS,
         SPEECH_STARTED_REQUIRED_FIELDS, StreamOutcome, TRANSCRIPT_DELTA_REQUIRED_FIELDS,
         UTTERANCE_END_REQUIRED_FIELDS, UTTERANCE_END_TEXT_CAP_BYTES, UtteranceEndReason,
-        listen_controller_value, listen_session_start_value, listen_session_stats_value,
-        listen_warning_value, speech_started_value, transcript_delta_value, utterance_end_value,
+        listen_controller_value, listen_device_value, listen_session_start_value,
+        listen_session_stats_value, listen_warning_value, routing_history_complete_value,
+        speech_started_value, transcript_delta_value, utterance_end_value,
     };
 
     use super::{
@@ -2997,18 +3048,20 @@ mod tests {
         transcript_partial_value,
     };
 
-    const ROBOT_SCHEMA_EVENT_TYPES: [&str; 28] = [
+    const ROBOT_SCHEMA_EVENT_TYPES: [&str; 30] = [
         "run_start",
         "stage",
         "run_complete",
         "run_error",
         "backends.discovery",
         "routing_decision",
+        "routing_history.complete",
         "transcript.partial",
         "transcript.confirm",
         "transcript.retract",
         "transcript.correct",
         "transcript.speculation_stats",
+        "listen.device",
         "listen.session_start",
         "speech_started",
         "transcript.delta",
@@ -3255,6 +3308,52 @@ mod tests {
                 .len(),
             RUN_ERROR_REQUIRED_FIELDS.len()
         );
+    }
+
+    #[test]
+    fn auxiliary_command_events_use_the_catalogued_contract() {
+        let device = crate::capture::InputDeviceInfo {
+            name: "Test Microphone".to_owned(),
+            is_default: true,
+            default_sample_rate_hz: Some(48_000),
+            default_channels: Some(2),
+        };
+        let device_event = listen_device_value(&device);
+        assert_eq!(device_event["event"], "listen.device");
+        assert_eq!(device_event["name"], "Test Microphone");
+        assert_eq!(device_event["default"], true);
+        assert_eq!(device_event["backend"], "cpal");
+
+        let routing_event = routing_history_complete_value(7);
+        assert_eq!(routing_event["event"], "routing_history.complete");
+        assert_eq!(routing_event["records"], 7);
+
+        let schema = robot_schema_value();
+        for (event_name, value, required) in [
+            (
+                "listen.device",
+                device_event,
+                LISTEN_DEVICE_REQUIRED_FIELDS,
+            ),
+            (
+                "routing_history.complete",
+                routing_event,
+                ROUTING_HISTORY_COMPLETE_REQUIRED_FIELDS,
+            ),
+        ] {
+            assert_eq!(schema["events"][event_name]["example"]["event"], event_name);
+            assert_eq!(
+                schema["events"][event_name]["required"],
+                json!(required),
+                "{event_name} schema/constant drift"
+            );
+            for field in required {
+                assert!(
+                    value.get(field).is_some(),
+                    "{event_name} constructor is missing required field `{field}`"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4619,7 +4718,7 @@ mod tests {
         let expected: HashSet<&str> = ROBOT_SCHEMA_EVENT_TYPES.into_iter().collect();
         assert_eq!(
             actual, expected,
-            "schema must define the exact 28-event robot contract"
+            "schema must define the exact 30-event robot contract"
         );
     }
 

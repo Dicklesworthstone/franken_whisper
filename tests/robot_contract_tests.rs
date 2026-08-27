@@ -11,8 +11,9 @@ use std::collections::HashSet;
 
 use franken_whisper::robot::{
     BACKENDS_DISCOVERY_REQUIRED_FIELDS, HEALTH_REPORT_REQUIRED_FIELDS,
-    LISTEN_SESSION_START_REQUIRED_FIELDS, LISTEN_SESSION_STATS_REQUIRED_FIELDS,
-    LISTEN_WARNING_REQUIRED_FIELDS, ROBOT_SCHEMA_VERSION, RUN_COMPLETE_REQUIRED_FIELDS,
+    LISTEN_DEVICE_REQUIRED_FIELDS, LISTEN_SESSION_START_REQUIRED_FIELDS,
+    LISTEN_SESSION_STATS_REQUIRED_FIELDS, LISTEN_WARNING_REQUIRED_FIELDS, ROBOT_SCHEMA_VERSION,
+    ROUTING_HISTORY_COMPLETE_REQUIRED_FIELDS, RUN_COMPLETE_REQUIRED_FIELDS,
     RUN_ERROR_REQUIRED_FIELDS, RUN_START_REQUIRED_FIELDS, SPECULATION_STATS_REQUIRED_FIELDS,
     SPEECH_STARTED_REQUIRED_FIELDS, STAGE_REQUIRED_FIELDS, TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
     TRANSCRIPT_CORRECT_REQUIRED_FIELDS, TRANSCRIPT_DELTA_REQUIRED_FIELDS,
@@ -21,18 +22,20 @@ use franken_whisper::robot::{
 };
 use serde_json::Value;
 
-const ROBOT_SCHEMA_EVENT_TYPES: [&str; 28] = [
+const ROBOT_SCHEMA_EVENT_TYPES: [&str; 30] = [
     "run_start",
     "stage",
     "run_complete",
     "run_error",
     "backends.discovery",
     "routing_decision",
+    "routing_history.complete",
     "transcript.partial",
     "transcript.confirm",
     "transcript.retract",
     "transcript.correct",
     "transcript.speculation_stats",
+    "listen.device",
     "listen.session_start",
     "speech_started",
     "transcript.delta",
@@ -290,11 +293,14 @@ fn event_type_strings_are_correct_in_examples() {
         "run_complete",
         "run_error",
         "backends.discovery",
+        "routing_decision",
+        "routing_history.complete",
         "transcript.partial",
         "transcript.confirm",
         "transcript.retract",
         "transcript.correct",
         "transcript.speculation_stats",
+        "listen.device",
         "health.report",
     ];
 
@@ -331,8 +337,26 @@ fn schema_has_expected_event_types() {
     let expected: HashSet<&str> = ROBOT_SCHEMA_EVENT_TYPES.into_iter().collect();
     assert_eq!(
         actual, expected,
-        "schema must define the exact 28-event robot contract"
+        "schema must define the exact 30-event robot contract"
     );
+}
+
+#[test]
+fn auxiliary_command_schema_entries_match_required_field_constants() {
+    let schema = robot_schema_value();
+    for (event_name, required) in [
+        ("listen.device", LISTEN_DEVICE_REQUIRED_FIELDS),
+        (
+            "routing_history.complete",
+            ROUTING_HISTORY_COMPLETE_REQUIRED_FIELDS,
+        ),
+    ] {
+        assert_eq!(
+            schema["events"][event_name]["required"],
+            serde_json::json!(required),
+            "{event_name} schema/constant drift"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

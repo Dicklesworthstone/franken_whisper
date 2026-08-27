@@ -11,8 +11,9 @@ use franken_whisper::cli::{
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
     backends_discovery_value, build_backends_report, build_health_report, emit_health_report,
-    emit_pretty_run_report, emit_robot_complete, emit_robot_error_from_fw, emit_robot_stage,
-    emit_robot_start, robot_schema_value, routing_decision_line,
+    emit_event_value, emit_pretty_run_report, emit_robot_complete, emit_robot_error_from_fw,
+    emit_robot_stage, emit_robot_start, listen_device_value, robot_schema_value,
+    routing_decision_line, routing_history_complete_value,
 };
 use franken_whisper::storage::RunStore;
 use franken_whisper::tty_audio;
@@ -190,15 +191,7 @@ fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
 
     if args.list_devices {
         for device in franken_whisper::capture::enumerate_input_devices()? {
-            franken_whisper::robot::emit_event_value(&serde_json::json!({
-                "event": "listen.device",
-                "schema_version": franken_whisper::robot::ROBOT_SCHEMA_VERSION,
-                "name": device.name,
-                "default": device.is_default,
-                "default_sample_rate_hz": device.default_sample_rate_hz,
-                "default_channels": device.default_channels,
-                "backend": "cpal",
-            }))?;
+            emit_event_value(&listen_device_value(&device))?;
         }
         return Ok(());
     }
@@ -558,14 +551,7 @@ fn run(cli: Cli) -> FwResult<()> {
                         }
                     }
                 }
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "event": "routing_history.complete",
-                        "schema_version": franken_whisper::robot::ROBOT_SCHEMA_VERSION,
-                        "records": records,
-                    }))?
-                );
+                emit_event_value(&routing_history_complete_value(records))?;
                 Ok(())
             }
             RobotCommand::Health(args) => {
