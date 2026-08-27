@@ -4230,7 +4230,10 @@ fn source_separate_stage(
     }
 
     checkpoint()?;
-    let mut separator = crate::separate::DtlnSeparator::from_safetensors(weights_path)?;
+    let mut separator = crate::separate::DtlnSeparator::from_safetensors_with_checkpoint(
+        weights_path,
+        &checkpoint,
+    )?;
     checkpoint()?;
     let separated = separator.separate_with_checkpoint(&samples, &checkpoint)?;
     let input_rms = waveform_rms(&samples);

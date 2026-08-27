@@ -30,6 +30,8 @@
 //! must report an explicit passthrough instead of claiming isolation.
 const NUM_UNITS: usize = 128;
 
+use std::io::Read as _;
+
 use crate::error::{FwError, FwResult};
 use crate::native_engine::nn::{LstmRecurrentActivation, LstmState, LstmWeights};
 use crate::native_engine::weights::SafetensorsFile;
@@ -40,6 +42,11 @@ pub const BLOCK_SHIFT: usize = 128;
 pub const BINS: usize = BLOCK_LEN / 2 + 1;
 const STFT_NORM_EPS: f32 = 1e-7;
 const ENCODER_FEATURES: usize = 256;
+// The exact tensor payload is 3_949_068 bytes. The remaining space permits
+// the canonical safetensors header while rejecting padded or unrelated model
+// artifacts before allocating from an operator-controlled file size.
+const MAX_DTLN_SAFETENSORS_BYTES: u64 = 4 * 1024 * 1024;
+const DTLN_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Tensor names/shapes the pinned receipt guarantees, mirrored as compile-
 /// time contract so loader drift fails closed here rather than at inference.
@@ -116,7 +123,16 @@ impl DtlnSeparator {
     /// `scripts/export_dtln.py`). Every name/shape is checked against the
     /// compile-time contract; finiteness is checked per tensor.
     pub fn from_safetensors(path: &std::path::Path) -> FwResult<Self> {
-        let raw = std::fs::read(path)?;
+        Self::from_safetensors_with_checkpoint(path, &|| Ok(()))
+    }
+
+    /// Load the converted artifact while honoring an enclosing stage's
+    /// cancellation contract during filesystem admission and bounded reads.
+    pub(crate) fn from_safetensors_with_checkpoint(
+        path: &std::path::Path,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Self> {
+        let raw = read_dtln_weights(path, checkpoint)?;
         let tensors = parse_safetensors_f32(raw)?;
         let get = |name: &str| -> FwResult<&SafeTensor> {
             tensors
@@ -244,6 +260,130 @@ impl DtlnSeparator {
         checkpoint()?;
         Ok(output)
     }
+}
+
+fn read_dtln_weights(
+    path: &std::path::Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<Vec<u8>> {
+    checkpoint()?;
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if metadata_is_indirection(&path_metadata) || !path_metadata.is_file() {
+        return Err(FwError::InvalidRequest(
+            "dtln: weights must be a regular non-symlink file".to_owned(),
+        ));
+    }
+
+    let mut file = open_dtln_weights_nonblocking(path)?;
+    let descriptor_metadata = file.metadata()?;
+    if !descriptor_metadata.is_file() || metadata_is_indirection(&descriptor_metadata) {
+        return Err(FwError::InvalidRequest(
+            "dtln: weights must remain a regular non-symlink file while being opened".to_owned(),
+        ));
+    }
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if path_metadata.dev() != descriptor_metadata.dev()
+            || path_metadata.ino() != descriptor_metadata.ino()
+        {
+            return Err(FwError::InvalidRequest(
+                "dtln: weights changed while being opened".to_owned(),
+            ));
+        }
+    }
+    if descriptor_metadata.len() > MAX_DTLN_SAFETENSORS_BYTES {
+        return Err(FwError::InvalidRequest(
+            "dtln: weights exceed the 4 MiB safety limit".to_owned(),
+        ));
+    }
+
+    let expected_len = usize::try_from(descriptor_metadata.len()).map_err(|_| {
+        FwError::InvalidRequest("dtln: weight size does not fit this platform".to_owned())
+    })?;
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(expected_len)
+        .map_err(|_| FwError::InvalidRequest("dtln: weight allocation failed".to_owned()))?;
+    let mut chunk = [0_u8; DTLN_READ_CHUNK_BYTES];
+    loop {
+        checkpoint()?;
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        let next_len = raw.len().checked_add(count).ok_or_else(|| {
+            FwError::InvalidRequest("dtln: weight size overflowed".to_owned())
+        })?;
+        if next_len as u64 > MAX_DTLN_SAFETENSORS_BYTES {
+            return Err(FwError::InvalidRequest(
+                "dtln: weights exceed the 4 MiB safety limit".to_owned(),
+            ));
+        }
+        raw.try_reserve(count)
+            .map_err(|_| FwError::InvalidRequest("dtln: weight allocation failed".to_owned()))?;
+        raw.extend_from_slice(&chunk[..count]);
+    }
+    checkpoint()?;
+
+    let final_metadata = file.metadata()?;
+    if raw.len() != expected_len || final_metadata.len() != descriptor_metadata.len() {
+        return Err(FwError::InvalidRequest(
+            "dtln: weight size changed while being read".to_owned(),
+        ));
+    }
+    Ok(raw)
+}
+
+#[cfg(target_family = "unix")]
+fn open_dtln_weights_nonblocking(path: &std::path::Path) -> FwResult<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|_| {
+        FwError::InvalidRequest("dtln: weights could not be opened safely".to_owned())
+    })?;
+    Ok(std::fs::File::from(descriptor))
+}
+
+#[cfg(windows)]
+fn open_dtln_weights_nonblocking(path: &std::path::Path) -> FwResult<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| {
+            FwError::InvalidRequest("dtln: weights could not be opened safely".to_owned())
+        })
+}
+
+#[cfg(not(any(target_family = "unix", windows)))]
+fn open_dtln_weights_nonblocking(_path: &std::path::Path) -> FwResult<std::fs::File> {
+    Err(FwError::Unsupported(
+        "DTLN weights cannot be opened safely on this platform".to_owned(),
+    ))
+}
+
+fn metadata_is_indirection(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 /// row-major [len, cols] times vector: out[j] = sum_i v[i] * w[i*cols + j].
@@ -650,6 +790,84 @@ mod tests {
         let path = dir.join(format!("{tag}.safetensors"));
         std::fs::write(&path, bytes).expect("write");
         DtlnSeparator::from_safetensors(&path).expect("load")
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn loader_rejects_weight_symlink_instead_of_following_it() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!("dtln_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let target = dir.join("symlink-target.safetensors");
+        std::fs::write(&target, contract_fixture_bytes(0.0, false)).expect("write target");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let link = dir.join(format!("weights-link-{nonce}.safetensors"));
+        symlink(&target, &link).expect("create weights symlink");
+
+        let error = match DtlnSeparator::from_safetensors(&link) {
+            Ok(_) => panic!("symlinked DTLN weights were followed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FwError::InvalidRequest(_)));
+        assert!(error.to_string().contains("regular non-symlink file"));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn loader_rejects_special_file_before_attempting_payload_read() {
+        let error = match DtlnSeparator::from_safetensors(std::path::Path::new("/dev/null")) {
+            Ok(_) => panic!("special file was admitted as DTLN weights"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FwError::InvalidRequest(_)));
+        assert!(error.to_string().contains("regular non-symlink file"));
+    }
+
+    #[test]
+    fn loader_rejects_oversized_weight_artifact_before_allocating_payload() {
+        let dir = std::env::temp_dir().join(format!("dtln_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("oversized.safetensors");
+        let file = std::fs::File::create(&path).expect("create sparse oversized artifact");
+        file.set_len(MAX_DTLN_SAFETENSORS_BYTES + 1)
+            .expect("size sparse oversized artifact");
+
+        let error = match DtlnSeparator::from_safetensors(&path) {
+            Ok(_) => panic!("oversized DTLN weights were admitted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FwError::InvalidRequest(_)));
+        assert!(error.to_string().contains("4 MiB safety limit"));
+    }
+
+    #[test]
+    fn loader_cancellation_interrupts_between_weight_payload_chunks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("dtln_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("cancel-load.safetensors");
+        std::fs::write(&path, contract_fixture_bytes(0.0, false)).expect("write weights");
+        let checkpoints = AtomicUsize::new(0);
+        let error = match DtlnSeparator::from_safetensors_with_checkpoint(&path, &|| {
+            if checkpoints.fetch_add(1, Ordering::SeqCst) >= 2 {
+                Err(FwError::Cancelled(
+                    "test cancellation between DTLN payload chunks".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        }) {
+            Ok(_) => panic!("cancelled DTLN weight load completed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert_eq!(checkpoints.load(Ordering::SeqCst), 3);
     }
 
     #[test]
