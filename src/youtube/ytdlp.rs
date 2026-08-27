@@ -1209,14 +1209,21 @@ pub(crate) fn is_reusable_download_path(path: &Path, dest_dir: &Path, id: &str) 
 /// containers that are absent from the narrower resume scan allowlist; the
 /// normalizer handles those through ffmpeg.
 fn is_completed_owned_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
-    if path.parent() != Some(dest_dir)
-        || path.file_stem().and_then(|value| value.to_str()) != Some(id)
-        || path.extension().is_none()
-    {
+    if !is_owned_download_path(path, dest_dir, id) {
         return false;
     }
     std::fs::symlink_metadata(path)
         .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() > 0)
+}
+
+/// Whether `path` is lexically owned by this downloader invocation. Unlike
+/// [`is_reusable_download_path`], this does not require the file to exist: a
+/// durable cleanup intent must validate an already-deleted target before
+/// treating `NotFound` as success.
+pub(crate) fn is_owned_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
+    path.parent() == Some(dest_dir)
+        && path.file_stem().and_then(|value| value.to_str()) == Some(id)
+        && path.extension().is_some()
 }
 
 // ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@
 //! and the engine aborts its own work at the next checkpoint.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 use std::time::Instant;
@@ -55,7 +56,7 @@ const MAX_ATTEMPTS: u32 = 3;
 
 /// Per-video processing state. Persisted in the manifest so a re-run resumes
 /// exactly where a crash or cancellation left off.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum VideoState {
     /// Discovered, not yet started.
@@ -67,6 +68,22 @@ pub enum VideoState {
         audio_path: String,
         #[serde(default)]
         attempts: u32,
+    },
+    /// Rendering completed and `--no-keep-audio` cleanup must settle before
+    /// the terminal `Done` state is durable. A restart can retry deletion when
+    /// `audio_path` still exists or treat `NotFound` as an already-settled
+    /// cleanup without downloading or transcribing again.
+    CleanupPending {
+        title: String,
+        audio_path: String,
+        markdown_path: String,
+        json_path: String,
+        wall_ms: u64,
+        rtf: Option<f64>,
+        #[serde(default)]
+        attempts: u32,
+        #[serde(default)]
+        last_error: Option<String>,
     },
     /// Fully processed; markdown + JSON written.
     Done {
@@ -116,8 +133,17 @@ impl Manifest {
     fn save(&self, path: &Path) -> FwResult<()> {
         let body = serde_json::to_string_pretty(self).map_err(FwError::Json)?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body).map_err(FwError::Io)?;
+        let mut file = std::fs::File::create(&tmp).map_err(FwError::Io)?;
+        file.write_all(body.as_bytes()).map_err(FwError::Io)?;
+        file.sync_all().map_err(FwError::Io)?;
+        drop(file);
         std::fs::rename(&tmp, path).map_err(FwError::Io)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(FwError::Io)?;
+        }
         Ok(())
     }
 
@@ -144,9 +170,11 @@ impl Manifest {
 
     fn attempts(&self, id: &str) -> u32 {
         match self.entries.get(id).and_then(|e| e.state.as_ref()) {
-            Some(VideoState::Downloaded { attempts, .. } | VideoState::Failed { attempts, .. }) => {
-                *attempts
-            }
+            Some(
+                VideoState::Downloaded { attempts, .. }
+                | VideoState::CleanupPending { attempts, .. }
+                | VideoState::Failed { attempts, .. },
+            ) => *attempts,
             _ => 0,
         }
     }
@@ -525,10 +553,14 @@ fn run_with_info_body(
     // Partition into work-to-do vs already-satisfied (idempotent resume).
     let mut summary = YoutubeRunSummary::default();
     let mut to_process: Vec<DownloadWork> = Vec::new();
+    let mut abort_before_work = false;
     for v in &videos {
-        let state = manifest.entries.get(&v.id).and_then(|e| e.state.as_ref());
+        let state = manifest
+            .entries
+            .get(&v.id)
+            .and_then(|entry| entry.state.clone());
         let attempts = manifest.attempts(&v.id);
-        match state {
+        match state.as_ref() {
             Some(VideoState::Done { .. }) => {
                 tracing::info!(id = %v.id, "already done; skipping");
                 summary.skipped.push(v.id.clone());
@@ -536,6 +568,21 @@ fn run_with_info_body(
                     "skipped",
                     serde_json::json!({ "id": v.id, "reason": "already_done" }),
                 )?;
+            }
+            Some(VideoState::CleanupPending { .. }) => {
+                tracing::info!(id = %v.id, "resuming pending post-render audio cleanup");
+                let disposition = finish_pending_cleanup(
+                    &mut manifest,
+                    &manifest_path,
+                    v,
+                    events.as_ref(),
+                    &mut summary,
+                    std::fs::remove_file,
+                )?;
+                if disposition == RenderedVideoDisposition::CleanupFailed && opts.abort_on_error {
+                    abort_before_work = true;
+                    break;
+                }
             }
             Some(_) if attempts > 0 && !opts.retry_failed => {
                 tracing::info!(id = %v.id, "previously failed; --no-retry, skipping");
@@ -556,11 +603,11 @@ fn run_with_info_body(
                     serde_json::json!({ "id": v.id, "reason": "retry_budget_exhausted" }),
                 )?;
             }
-            _ => to_process.push(select_download_work(v, state, &audio_dir)),
+            _ => to_process.push(select_download_work(v, state.as_ref(), &audio_dir)),
         }
     }
 
-    if to_process.is_empty() {
+    if abort_before_work || to_process.is_empty() {
         return Ok(summary);
     }
 
@@ -1070,9 +1117,11 @@ struct CompletedRender<'a> {
 ///
 /// Audio removal is part of the `--no-keep-audio` contract, so an I/O failure
 /// other than `NotFound` is a per-video failure rather than a successful
-/// `Done` transition. The removal callback keeps this production transition
-/// deterministically testable on platforms where permission failures cannot
-/// be induced reliably.
+/// `Done` transition. Before removal, the manifest durably records
+/// [`VideoState::CleanupPending`], so a crash after deletion but before the
+/// final save can settle from `NotFound` without redownloading. The removal
+/// callback keeps this production transition deterministically testable on
+/// platforms where permission failures cannot be induced reliably.
 fn settle_rendered_video<R>(
     manifest: &mut Manifest,
     manifest_path: &Path,
@@ -1084,49 +1133,237 @@ fn settle_rendered_video<R>(
 where
     R: FnOnce(&Path) -> std::io::Result<()>,
 {
-    let audio_kept = if rendered.keep_audio {
-        Some(rendered.audio_path.display().to_string())
-    } else {
-        match remove_file(rendered.audio_path) {
-            Ok(()) => None,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                let error = format!(
-                    "delete downloaded audio {} after rendering: {error}",
-                    rendered.audio_path.display()
-                );
-                record_and_emit_failure(
-                    manifest,
-                    manifest_path,
-                    rendered.video,
-                    rendered.title,
-                    &error,
-                    events,
-                    summary,
-                )?;
-                return Ok(RenderedVideoDisposition::CleanupFailed);
-            }
+    let mut save_manifest = Manifest::save;
+    if rendered.keep_audio {
+        return persist_rendered_done_with(
+            manifest,
+            manifest_path,
+            rendered.video,
+            Some(rendered.audio_path.display().to_string()),
+            &rendered.paths.md.display().to_string(),
+            &rendered.paths.json.display().to_string(),
+            rendered.wall_ms,
+            rendered.rtf,
+            events,
+            summary,
+            &mut save_manifest,
+        );
+    }
+
+    persist_cleanup_intent_with(manifest, manifest_path, &rendered, &mut save_manifest)?;
+    finish_pending_cleanup_with(
+        manifest,
+        manifest_path,
+        rendered.video,
+        events,
+        summary,
+        &mut save_manifest,
+        remove_file,
+    )
+}
+
+fn persist_cleanup_intent_with<S>(
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+    rendered: &CompletedRender<'_>,
+    save_manifest: &mut S,
+) -> FwResult<()>
+where
+    S: FnMut(&Manifest, &Path) -> FwResult<()>,
+{
+    let attempts = manifest.attempts(&rendered.video.id);
+    manifest.set_state(
+        &rendered.video.id,
+        VideoState::CleanupPending {
+            title: rendered.title.to_owned(),
+            audio_path: rendered.audio_path.display().to_string(),
+            markdown_path: rendered.paths.md.display().to_string(),
+            json_path: rendered.paths.json.display().to_string(),
+            wall_ms: rendered.wall_ms,
+            rtf: rendered.rtf,
+            attempts,
+            last_error: None,
+        },
+    );
+    save_manifest(manifest, manifest_path)
+}
+
+fn finish_pending_cleanup<R>(
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+    video: &VideoRef,
+    events: &YoutubeEventEmitter,
+    summary: &mut YoutubeRunSummary,
+    remove_file: R,
+) -> FwResult<RenderedVideoDisposition>
+where
+    R: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let mut save_manifest = Manifest::save;
+    finish_pending_cleanup_with(
+        manifest,
+        manifest_path,
+        video,
+        events,
+        summary,
+        &mut save_manifest,
+        remove_file,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_pending_cleanup_with<R, S>(
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+    video: &VideoRef,
+    events: &YoutubeEventEmitter,
+    summary: &mut YoutubeRunSummary,
+    save_manifest: &mut S,
+    remove_file: R,
+) -> FwResult<RenderedVideoDisposition>
+where
+    R: FnOnce(&Path) -> std::io::Result<()>,
+    S: FnMut(&Manifest, &Path) -> FwResult<()>,
+{
+    let (title, audio_path, markdown_path, json_path, wall_ms, rtf) = match manifest
+        .entries
+        .get(&video.id)
+        .and_then(|entry| entry.state.as_ref())
+    {
+        Some(VideoState::CleanupPending {
+            title,
+            audio_path,
+            markdown_path,
+            json_path,
+            wall_ms,
+            rtf,
+            ..
+        }) => (
+            title.clone(),
+            PathBuf::from(audio_path),
+            markdown_path.clone(),
+            json_path.clone(),
+            *wall_ms,
+            *rtf,
+        ),
+        _ => {
+            return Err(FwError::ContractViolation(format!(
+                "video {} has no pending cleanup state to settle",
+                video.id
+            )));
         }
     };
 
+    let output_dir = manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let audio_dir = output_dir.join("audio");
+    if !ytdlp::is_owned_download_path(&audio_path, &audio_dir, &video.id) {
+        return Err(FwError::ContractViolation(format!(
+            "pending cleanup path {} is not owned by {} for video {}",
+            audio_path.display(),
+            audio_dir.display(),
+            video.id
+        )));
+    }
+
+    match remove_file(&audio_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let error = format!(
+                "delete downloaded audio {} after rendering: {error}",
+                audio_path.display()
+            );
+            let attempts = manifest.attempts(&video.id).saturating_add(1);
+            let Some(VideoState::CleanupPending {
+                attempts: stored_attempts,
+                last_error,
+                ..
+            }) = manifest
+                .entries
+                .get_mut(&video.id)
+                .and_then(|entry| entry.state.as_mut())
+            else {
+                return Err(FwError::ContractViolation(format!(
+                    "video {} lost its pending cleanup state",
+                    video.id
+                )));
+            };
+            *stored_attempts = attempts;
+            *last_error = Some(error.clone());
+            save_manifest(manifest, manifest_path)?;
+
+            let failure = FailedVideo {
+                id: video.id.clone(),
+                title,
+                error,
+            };
+            events.emit(
+                "failed",
+                serde_json::json!({
+                    "id": &failure.id,
+                    "title": &failure.title,
+                    "error": &failure.error,
+                    "attempts": attempts,
+                }),
+            )?;
+            summary.failed.push(failure);
+            return Ok(RenderedVideoDisposition::CleanupFailed);
+        }
+    }
+
+    persist_rendered_done_with(
+        manifest,
+        manifest_path,
+        video,
+        None,
+        &markdown_path,
+        &json_path,
+        wall_ms,
+        rtf,
+        events,
+        summary,
+        save_manifest,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_rendered_done_with<S>(
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+    video: &VideoRef,
+    audio_path: Option<String>,
+    markdown_path: &str,
+    json_path: &str,
+    wall_ms: u64,
+    rtf: Option<f64>,
+    events: &YoutubeEventEmitter,
+    summary: &mut YoutubeRunSummary,
+    save_manifest: &mut S,
+) -> FwResult<RenderedVideoDisposition>
+where
+    S: FnMut(&Manifest, &Path) -> FwResult<()>,
+{
     manifest.set_state(
-        &rendered.video.id,
+        &video.id,
         VideoState::Done {
-            audio_path: audio_kept,
-            markdown_path: rendered.paths.md.display().to_string(),
-            json_path: rendered.paths.json.display().to_string(),
+            audio_path,
+            markdown_path: markdown_path.to_owned(),
+            json_path: json_path.to_owned(),
         },
     );
-    manifest.save(manifest_path)?;
-    summary.done.push(rendered.video.id.clone());
+    save_manifest(manifest, manifest_path)?;
+    summary.done.push(video.id.clone());
     events.emit(
         "done",
         serde_json::json!({
-            "id": rendered.video.id,
-            "md_path": rendered.paths.md.display().to_string(),
-            "json_path": rendered.paths.json.display().to_string(),
-            "wall_ms": rendered.wall_ms,
-            "rtf": rendered.rtf,
+            "id": video.id,
+            "md_path": markdown_path,
+            "json_path": json_path,
+            "wall_ms": wall_ms,
+            "rtf": rtf,
         }),
     )?;
     Ok(RenderedVideoDisposition::Done)
@@ -2148,7 +2385,7 @@ https://youtu.be/ccccccccccc
     }
 
     #[test]
-    fn cleanup_failure_is_persisted_emitted_and_reusable() {
+    fn cleanup_failure_keeps_durable_intent_and_emits_failure() {
         let dir = tempfile::tempdir().expect("tempdir");
         let audio_dir = dir.path().join("audio");
         std::fs::create_dir_all(&audio_dir).expect("audio dir");
@@ -2206,20 +2443,20 @@ https://youtu.be/ccccccccccc
         let state = persisted.entries["cleanup0001"]
             .state
             .as_ref()
-            .expect("terminal state");
+            .expect("durable cleanup state");
         assert!(matches!(
             state,
-            VideoState::Failed {
-                error,
+            VideoState::CleanupPending {
+                audio_path: persisted_audio,
+                markdown_path,
+                json_path,
                 attempts: 1,
-            } if error.contains("fixture denial")
-        ));
-        assert!(matches!(
-            select_download_work(&video, Some(state), &audio_dir),
-            DownloadWork::Reuse {
-                ref audio_path,
+                last_error: Some(last_error),
                 ..
-            } if audio_path == &audio_dir.join("cleanup0001.wav")
+            } if persisted_audio == &audio_path.display().to_string()
+                && markdown_path == &paths.md.display().to_string()
+                && json_path == &paths.json.display().to_string()
+                && last_error.contains("fixture denial")
         ));
 
         let parsed = parse_events(&buffer);
@@ -2283,7 +2520,7 @@ https://youtu.be/ccccccccccc
     }
 
     #[test]
-    fn successful_cleanup_deletes_audio_before_recording_done() {
+    fn successful_cleanup_persists_intent_before_delete_and_done_after() {
         let dir = tempfile::tempdir().expect("tempdir");
         let audio_dir = dir.path().join("audio");
         std::fs::create_dir_all(&audio_dir).expect("audio dir");
@@ -2312,7 +2549,19 @@ https://youtu.be/ccccccccccc
             },
             &events,
             &mut summary,
-            std::fs::remove_file,
+            |path| {
+                let persisted = Manifest::load(&manifest_path)
+                    .expect("cleanup intent must be durable before deletion");
+                assert!(matches!(
+                    persisted.entries["deleted0001"].state.as_ref(),
+                    Some(VideoState::CleanupPending {
+                        audio_path,
+                        attempts: 0,
+                        ..
+                    }) if audio_path == &path.display().to_string()
+                ));
+                std::fs::remove_file(path)
+            },
         )
         .expect("successful cleanup");
 
@@ -2321,6 +2570,229 @@ https://youtu.be/ccccccccccc
         assert_eq!(summary.done, ["deleted0001"]);
         assert!(matches!(
             manifest.entries["deleted0001"].state.as_ref(),
+            Some(VideoState::Done {
+                audio_path: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cleanup_intent_save_failure_leaves_audio_and_prior_durable_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).expect("audio dir");
+        let video = vr("intentfail01");
+        let audio_path = audio_dir.join("intentfail01.wav");
+        std::fs::write(&audio_path, b"must survive failed intent save").expect("seed audio");
+        let manifest_path = dir.path().join(MANIFEST_NAME);
+        let mut manifest = Manifest::default();
+        manifest.upsert_discovered(&video);
+        manifest.save(&manifest_path).expect("seed manifest");
+        let paths = naming::output_paths(dir.path(), "rendered_intentfail01");
+        let rendered = CompletedRender {
+            video: &video,
+            title: "Intent save failure",
+            audio_path: &audio_path,
+            paths: &paths,
+            wall_ms: 3,
+            rtf: Some(0.25),
+            keep_audio: false,
+        };
+        let mut fail_save = |_: &Manifest, _: &Path| {
+            Err(FwError::Storage("fixture intent save failure".to_owned()))
+        };
+
+        let error =
+            persist_cleanup_intent_with(&mut manifest, &manifest_path, &rendered, &mut fail_save)
+                .expect_err("intent persistence failure must stop before deletion");
+        assert!(error.to_string().contains("fixture intent save failure"));
+        assert_eq!(
+            std::fs::read(&audio_path).expect("audio survives"),
+            b"must survive failed intent save"
+        );
+        let durable = Manifest::load(&manifest_path).expect("reload prior manifest");
+        assert!(matches!(
+            durable.entries["intentfail01"].state.as_ref(),
+            Some(VideoState::Pending)
+        ));
+    }
+
+    #[test]
+    fn pending_cleanup_rejects_unowned_manifest_path_before_removal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside_path = dir.path().join("outside.wav");
+        std::fs::write(&outside_path, b"must not be deleted").expect("seed outside file");
+        let video = vr("unownedclean1");
+        let manifest_path = dir.path().join(MANIFEST_NAME);
+        let mut manifest = Manifest::default();
+        manifest.upsert_discovered(&video);
+        manifest.set_state(
+            &video.id,
+            VideoState::CleanupPending {
+                title: "Unowned cleanup".to_owned(),
+                audio_path: outside_path.display().to_string(),
+                markdown_path: dir.path().join("rendered.md").display().to_string(),
+                json_path: dir.path().join("rendered.json").display().to_string(),
+                wall_ms: 1,
+                rtf: None,
+                attempts: 0,
+                last_error: None,
+            },
+        );
+        manifest.save(&manifest_path).expect("seed cleanup intent");
+        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Off);
+        let mut summary = YoutubeRunSummary::default();
+        let remover_called = std::cell::Cell::new(false);
+
+        let error = finish_pending_cleanup(
+            &mut manifest,
+            &manifest_path,
+            &video,
+            &events,
+            &mut summary,
+            |_| {
+                remover_called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("unowned manifest path must fail closed");
+
+        assert!(matches!(error, FwError::ContractViolation(_)));
+        assert!(!remover_called.get());
+        assert_eq!(
+            std::fs::read(&outside_path).expect("outside file remains"),
+            b"must not be deleted"
+        );
+        assert!(summary.done.is_empty());
+        assert!(summary.failed.is_empty());
+    }
+
+    #[test]
+    fn pending_cleanup_restart_deletes_present_audio_without_retranscribing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).expect("audio dir");
+        let video = vr("pendingclean01");
+        let audio_path = audio_dir.join("pendingclean01.wav");
+        std::fs::write(&audio_path, b"pending cleanup").expect("seed audio");
+        let manifest_path = dir.path().join(MANIFEST_NAME);
+        let mut manifest = Manifest::default();
+        manifest.upsert_discovered(&video);
+        manifest.set_state(
+            &video.id,
+            VideoState::Failed {
+                error: "prior transcription failure".to_owned(),
+                attempts: 2,
+            },
+        );
+        manifest.save(&manifest_path).expect("seed manifest");
+        let paths = naming::output_paths(dir.path(), "rendered_pendingclean01");
+        let rendered = CompletedRender {
+            video: &video,
+            title: "Pending cleanup",
+            audio_path: &audio_path,
+            paths: &paths,
+            wall_ms: 7,
+            rtf: Some(0.75),
+            keep_audio: false,
+        };
+        let mut save_manifest = Manifest::save;
+        persist_cleanup_intent_with(&mut manifest, &manifest_path, &rendered, &mut save_manifest)
+            .expect("persist cleanup intent");
+
+        let (opts, buffer) = capturing_opts(vec![video.url.clone()], dir.path());
+        let summary = run_with_info(&opts, &stub_info())
+            .expect("restart should settle pending deletion without retrying ASR");
+
+        assert!(!audio_path.exists());
+        assert_eq!(summary.done, ["pendingclean01"]);
+        assert!(summary.failed.is_empty());
+        assert!(summary.skipped.is_empty());
+        assert!(matches!(
+            Manifest::load(&manifest_path).expect("reload done").entries["pendingclean01"]
+                .state
+                .as_ref(),
+            Some(VideoState::Done {
+                audio_path: None,
+                markdown_path,
+                json_path,
+            }) if markdown_path == &paths.md.display().to_string()
+                && json_path == &paths.json.display().to_string()
+        ));
+        let parsed = parse_events(&buffer);
+        assert!(parsed.iter().any(|event| event["event"] == "youtube.done"));
+        assert!(parsed.iter().all(|event| {
+            event["event"] != "youtube.downloading" && event["event"] != "youtube.transcribing"
+        }));
+    }
+
+    #[test]
+    fn done_save_failure_recovers_when_deleted_audio_is_already_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audio_dir = dir.path().join("audio");
+        std::fs::create_dir_all(&audio_dir).expect("audio dir");
+        let video = vr("donesavefail1");
+        let audio_path = audio_dir.join("donesavefail1.wav");
+        std::fs::write(&audio_path, b"delete before failed done save").expect("seed audio");
+        let manifest_path = dir.path().join(MANIFEST_NAME);
+        let mut manifest = Manifest::default();
+        manifest.upsert_discovered(&video);
+        manifest.save(&manifest_path).expect("seed manifest");
+        let paths = naming::output_paths(dir.path(), "rendered_donesavefail1");
+        let rendered = CompletedRender {
+            video: &video,
+            title: "Done save failure",
+            audio_path: &audio_path,
+            paths: &paths,
+            wall_ms: 9,
+            rtf: None,
+            keep_audio: false,
+        };
+        let mut save_manifest = Manifest::save;
+        persist_cleanup_intent_with(&mut manifest, &manifest_path, &rendered, &mut save_manifest)
+            .expect("persist cleanup intent");
+
+        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Off);
+        let mut summary = YoutubeRunSummary::default();
+        let mut fail_done_save =
+            |_: &Manifest, _: &Path| Err(FwError::Storage("fixture done save failure".to_owned()));
+        let error = finish_pending_cleanup_with(
+            &mut manifest,
+            &manifest_path,
+            &video,
+            &events,
+            &mut summary,
+            &mut fail_done_save,
+            std::fs::remove_file,
+        )
+        .expect_err("final Done persistence must fail after deletion");
+        assert!(error.to_string().contains("fixture done save failure"));
+        assert!(!audio_path.exists());
+        assert!(summary.done.is_empty());
+
+        let mut restarted = Manifest::load(&manifest_path).expect("restart pending manifest");
+        assert!(matches!(
+            restarted.entries["donesavefail1"].state.as_ref(),
+            Some(VideoState::CleanupPending { .. })
+        ));
+        let recovered = finish_pending_cleanup(
+            &mut restarted,
+            &manifest_path,
+            &video,
+            &events,
+            &mut summary,
+            std::fs::remove_file,
+        )
+        .expect("NotFound must settle the durable cleanup intent");
+        assert_eq!(recovered, RenderedVideoDisposition::Done);
+        assert_eq!(summary.done, ["donesavefail1"]);
+        assert!(matches!(
+            Manifest::load(&manifest_path)
+                .expect("reload recovered Done")
+                .entries["donesavefail1"]
+                .state
+                .as_ref(),
             Some(VideoState::Done {
                 audio_path: None,
                 ..
