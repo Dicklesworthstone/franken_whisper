@@ -1177,9 +1177,16 @@ pub(crate) fn find_downloaded_by_id(dest_dir: &Path, id: &str) -> Option<PathBuf
 /// this exact video id. Partial yt-dlp artifacts and symlinks are never resume
 /// inputs.
 pub(crate) fn is_reusable_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
+    // Keep this aligned with yt-dlp's audio/video `MEDIA_EXTENSIONS`. The
+    // `bestaudio/best` fallback can legitimately return a video container
+    // (including legacy `.flv`) when no audio-only stream exists, and ffmpeg
+    // normalization handles those containers. Manifests, subtitles,
+    // thumbnails, and partial-download suffixes are intentionally absent.
     const REUSABLE_MEDIA_EXTENSIONS: &[&str] = &[
-        "aac", "aif", "aiff", "alac", "flac", "m4a", "mka", "mkv", "mov", "mp3", "mp4", "oga",
-        "ogg", "opus", "wav", "weba", "webm", "wv",
+        "3g2", "3gp", "aac", "aif", "aiff", "alac", "ape", "asf", "avi", "divx", "f4a", "f4b",
+        "f4v", "flac", "flv", "m4a", "m4b", "m4r", "m4v", "mka", "mk3d", "mkv", "mov", "mp3",
+        "mp4", "mpg", "oga", "ogg", "ogv", "ogx", "opus", "spx", "vorbis", "wav", "weba", "webm",
+        "wma", "wmv", "wv",
     ];
 
     if !is_completed_owned_download_path(path, dest_dir, id) {
@@ -2295,15 +2302,20 @@ mod tests {
         assert_eq!(path, dir.path().join("dQw4w9WgXcQ.flv"));
         assert!(path.is_file(), "returned legacy container must exist");
         assert!(
-            !is_reusable_download_path(&path, dir.path(), &meta.id),
-            "the legacy extension must stay outside the narrower resume allowlist so this test fails if download_audio regresses to that predicate"
+            is_reusable_download_path(&path, dir.path(), &meta.id),
+            "an authoritative completed legacy container must be reusable"
+        );
+        assert_eq!(
+            find_downloaded_by_id(dir.path(), &meta.id),
+            Some(path),
+            "resume scanning must find the same completed legacy container"
         );
     }
 
     #[test]
     fn downloaded_scan_accepts_only_nonempty_owned_media_for_exact_id() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for extension in ["part", "tmp", "ytdl", "json"] {
+        for extension in ["part", "tmp", "ytdl", "json", "jpg", "vtt", "description"] {
             std::fs::write(
                 dir.path().join(format!("video123.{extension}")),
                 b"not reusable media",
