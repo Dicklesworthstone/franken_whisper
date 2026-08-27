@@ -439,7 +439,7 @@ pub fn is_stale(version_date: NaiveDate, today: NaiveDate) -> bool {
 /// Recognized YouTube forms:
 /// - `watch?v=ID`                  -> [`UrlKind::Video`]
 /// - `youtu.be/ID`                 -> [`UrlKind::Video`]
-/// - `shorts/ID`, `live/ID`        -> [`UrlKind::Video`]
+/// - `shorts/ID`, `live/ID`, `embed/ID` -> [`UrlKind::Video`]
 /// - `playlist?list=ID`            -> [`UrlKind::Playlist`]
 /// - `watch?v=X&list=Y`            -> [`UrlKind::Ambiguous`] (treated as Video)
 ///
@@ -494,10 +494,11 @@ pub fn classify_url(url: &str) -> FwResult<UrlKind> {
     };
     let path = path.trim_start_matches('/');
 
-    // /shorts/ID and /live/ID are always single videos.
+    // /shorts/ID, /live/ID, and /embed/ID are always single videos.
     if let Some(id) = path
         .strip_prefix("shorts/")
         .or_else(|| path.strip_prefix("live/"))
+        .or_else(|| path.strip_prefix("embed/"))
     {
         let id = id.split('/').next().unwrap_or_default();
         if id.is_empty() {
@@ -550,7 +551,7 @@ pub fn classify_url(url: &str) -> FwResult<UrlKind> {
 
     Err(FwError::InvalidRequest(format!(
         "unrecognized YouTube URL shape: `{trimmed}`; \
-         expected watch?v=, youtu.be/, shorts/, live/, or playlist?list="
+         expected watch?v=, youtu.be/, shorts/, live/, embed/, or playlist?list="
     )))
 }
 
@@ -1505,6 +1506,21 @@ mod tests {
     }
 
     #[test]
+    fn classify_embed_with_or_without_fragment() {
+        for url in [
+            "https://www.youtube.com/embed/abc123XYZ_-",
+            "https://www.youtube.com/embed/abc123XYZ_-#player",
+        ] {
+            assert_eq!(classify_url(url).unwrap(), UrlKind::Video, "{url}");
+            assert_eq!(
+                extract_video_id(url).as_deref(),
+                Some("abc123XYZ_-"),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
     fn classify_playlist() {
         assert_eq!(
             classify_url("https://www.youtube.com/playlist?list=PL1234567890").unwrap(),
@@ -1738,6 +1754,8 @@ mod tests {
             "https://youtu.be/dQw4w9WgXcQ?t=42",
             "https://www.youtube.com/shorts/abc123XYZ_-",
             "https://www.youtube.com/live/abc123XYZ_-",
+            "https://www.youtube.com/embed/embedID0001",
+            "https://www.youtube.com/embed/embedID0001#player",
             "https://www.youtube.com/watch?v=abc&list=PL123",
             "https://www.youtube.com/watch?list=PL123&v=abc",
             "https://m.youtube.com/watch?v=abc",
