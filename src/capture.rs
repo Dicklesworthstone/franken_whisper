@@ -44,6 +44,22 @@ use crate::error::{FwError, FwResult};
 /// signalling machinery inside the audio callback.
 const READ_POLL: Duration = Duration::from_millis(1);
 const PIPE_CHILD_EXIT_WAIT: Duration = Duration::from_secs(1);
+/// Hard memory envelope for any capture ring. This still admits five minutes
+/// of 48 kHz stereo f32 audio (28.8M samples) with headroom, while preventing
+/// caller- or device-supplied rate/channel values from becoming an unbounded
+/// allocation request.
+const MAX_CAPTURE_RING_SAMPLES: usize = 32 * 1024 * 1024;
+/// Multichannel downmix is useful for real audio layouts, but a raw u16 channel
+/// count is not a safe allocation/CPU contract for a streaming resampler.
+const MAX_RESAMPLER_CHANNELS: u16 = 64;
+/// Bound per-output CPU independently of total filter storage. Common rates
+/// through 384 kHz remain below this ceiling; pathological decimation ratios
+/// cannot turn each 16 kHz output sample into millions of MACs.
+const MAX_RESAMPLER_TAPS_PER_PHASE: usize = 4 * 1024;
+/// The polyphase filter is retained for the life of the stream. Sixteen MiB of
+/// f32 coefficients is already far beyond common 44.1/48/96/192 kHz layouts;
+/// larger rational ratios are rejected before allocation.
+const MAX_RESAMPLER_FILTER_TAPS: usize = 4 * 1024 * 1024;
 
 /// Result of one [`CaptureSource::read`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +141,41 @@ fn maybe_log_overruns(total: u64, last_logged: &AtomicU64, context: &str) {
             "capture ring overrun: audio frames dropped (consumer too slow)"
         );
     }
+}
+
+/// Resolve a bounded ring size before allocating or starting a producer.
+/// Shared by hardware and pipe sources so every public capture constructor
+/// enforces the same memory envelope.
+pub(crate) fn capture_ring_capacity_samples(
+    sample_rate: u32,
+    channels: u16,
+    ring_capacity_sec: f64,
+) -> FwResult<usize> {
+    if sample_rate == 0 || channels == 0 {
+        return Err(FwError::InvalidRequest(
+            "capture ring requires nonzero sample rate and channel count".to_owned(),
+        ));
+    }
+    if !ring_capacity_sec.is_finite() || ring_capacity_sec <= 0.0 {
+        return Err(FwError::InvalidRequest(
+            "capture ring capacity must be finite and greater than zero seconds".to_owned(),
+        ));
+    }
+
+    let channel_count = usize::from(channels);
+    let minimum = channel_count.checked_mul(1024).ok_or_else(|| {
+        FwError::InvalidRequest("capture ring minimum size overflows usize".to_owned())
+    })?;
+    let requested = f64::from(sample_rate) * ring_capacity_sec * f64::from(channels);
+    if !requested.is_finite()
+        || requested > MAX_CAPTURE_RING_SAMPLES as f64
+        || minimum > MAX_CAPTURE_RING_SAMPLES
+    {
+        return Err(FwError::InvalidRequest(format!(
+            "capture ring requests {requested:.0} samples for {sample_rate} Hz/{channels}ch/{ring_capacity_sec}s; maximum is {MAX_CAPTURE_RING_SAMPLES}"
+        )));
+    }
+    Ok((requested.ceil() as usize).max(minimum))
 }
 
 // ---------------------------------------------------------------------------
@@ -237,10 +288,17 @@ impl CpalCaptureSource {
                 let sample_format = supported.sample_format();
                 let config: cpal::StreamConfig = supported.into();
 
-                let capacity_samples =
-                    ((f64::from(sample_rate) * ring_capacity_sec * f64::from(channels)).ceil()
-                        as usize)
-                        .max(usize::from(channels) * 1024);
+                let capacity_samples = match capture_ring_capacity_samples(
+                    sample_rate,
+                    channels,
+                    ring_capacity_sec,
+                ) {
+                    Ok(capacity) => capacity,
+                    Err(error) => {
+                        let _ = setup_tx.send(CpalSetup::Failed(error.to_string()));
+                        return;
+                    }
+                };
                 let ring = HeapRb::<f32>::new(capacity_samples);
                 let (mut producer, consumer) = ring.split();
                 if cons_tx.send(consumer).is_err() {
@@ -811,14 +869,8 @@ impl PipePcmSource {
     where
         R: std::io::Read + Send + 'static,
     {
-        if sample_rate == 0 || channels == 0 {
-            return Err(FwError::InvalidRequest(
-                "pipe capture requires nonzero sample rate and channel count".into(),
-            ));
-        }
-        let capacity_samples = ((f64::from(sample_rate) * ring_capacity_sec * f64::from(channels))
-            .ceil() as usize)
-            .max(usize::from(channels) * 1024);
+        let capacity_samples =
+            capture_ring_capacity_samples(sample_rate, channels, ring_capacity_sec)?;
         let ring = HeapRb::<f32>::new(capacity_samples);
         let (mut producer, consumer) = ring.split();
         let shared = SharedState::new();
@@ -1085,6 +1137,9 @@ impl FfmpegCaptureSource {
         args: &[String],
         ring_capacity_sec: f64,
     ) -> FwResult<PipePcmSource> {
+        // Validate before spawning: an invalid public API value must not leave
+        // an avoidable child-process side effect for cleanup to recover.
+        capture_ring_capacity_samples(16_000, 1, ring_capacity_sec)?;
         let mut child = crate::process::spawn_streaming_stdout(program, args)?;
         let stdout = child.take_stdout().ok_or_else(|| {
             FwError::ContractViolation("streaming child spawned without a stdout pipe".into())
@@ -1149,30 +1204,87 @@ pub struct StreamingResampler {
     flushed: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResamplerLayout {
+    l: u64,
+    m: u64,
+    taps_per_phase: usize,
+    filter_len: usize,
+}
+
 impl StreamingResampler {
-    /// Create a resampler from `in_rate` Hz interleaved `channels` audio to
-    /// `out_rate` Hz mono.
-    pub fn new(in_rate: u32, channels: u16, out_rate: u32) -> FwResult<Self> {
+    fn checked_layout(in_rate: u32, channels: u16, out_rate: u32) -> FwResult<ResamplerLayout> {
         if in_rate == 0 || out_rate == 0 || channels == 0 {
             return Err(FwError::InvalidRequest(
                 "resampler requires nonzero rates and channel count".into(),
             ));
         }
+        if channels > MAX_RESAMPLER_CHANNELS {
+            return Err(FwError::InvalidRequest(format!(
+                "resampler channel count {channels} exceeds the {MAX_RESAMPLER_CHANNELS}-channel safety limit"
+            )));
+        }
+
         let g = gcd(u64::from(in_rate), u64::from(out_rate));
         let l = u64::from(out_rate) / g;
         let m = u64::from(in_rate) / g;
+        let l_usize = usize::try_from(l).map_err(|_| {
+            FwError::InvalidRequest("resampler phase count does not fit in usize".to_owned())
+        })?;
+
+        // Kaiser design, A = 70 dB stopband, transition from 0.45*out to
+        // 0.5*out (all in Hz), normalized to the upsampled rate in*L.
+        let fs_up = f64::from(in_rate) * l as f64;
+        let attenuation_db = 70.0;
+        let transition = 0.05 * f64::from(out_rate) / fs_up;
+        let estimated_len = ((attenuation_db - 7.95) / (14.36 * transition)).ceil();
+        if !estimated_len.is_finite() || estimated_len > MAX_RESAMPLER_FILTER_TAPS as f64 {
+            return Err(FwError::InvalidRequest(format!(
+                "resampler filter for {in_rate} Hz -> {out_rate} Hz requires approximately {estimated_len:.0} taps; maximum is {MAX_RESAMPLER_FILTER_TAPS}"
+            )));
+        }
+        let taps_per_phase = (estimated_len as usize).div_ceil(l_usize).max(4);
+        if taps_per_phase > MAX_RESAMPLER_TAPS_PER_PHASE {
+            return Err(FwError::InvalidRequest(format!(
+                "resampler filter for {in_rate} Hz -> {out_rate} Hz requires {taps_per_phase} taps per output phase; maximum is {MAX_RESAMPLER_TAPS_PER_PHASE}"
+            )));
+        }
+        let filter_len = taps_per_phase.checked_mul(l_usize).ok_or_else(|| {
+            FwError::InvalidRequest("resampler filter length overflows usize".to_owned())
+        })?;
+        if filter_len > MAX_RESAMPLER_FILTER_TAPS {
+            return Err(FwError::InvalidRequest(format!(
+                "resampler filter for {in_rate} Hz -> {out_rate} Hz requires {filter_len} taps after phase alignment; maximum is {MAX_RESAMPLER_FILTER_TAPS}"
+            )));
+        }
+        Ok(ResamplerLayout {
+            l,
+            m,
+            taps_per_phase,
+            filter_len,
+        })
+    }
+
+    /// Validate rate/channel-derived allocation bounds without constructing a
+    /// filter. The listen driver uses this before resolving external resources.
+    pub(crate) fn validate_config(in_rate: u32, channels: u16, out_rate: u32) -> FwResult<()> {
+        Self::checked_layout(in_rate, channels, out_rate).map(|_| ())
+    }
+
+    /// Create a resampler from `in_rate` Hz interleaved `channels` audio to
+    /// `out_rate` Hz mono.
+    pub fn new(in_rate: u32, channels: u16, out_rate: u32) -> FwResult<Self> {
+        let layout = Self::checked_layout(in_rate, channels, out_rate)?;
+        let l = layout.l;
+        let m = layout.m;
 
         // Kaiser design, A = 70 dB stopband, transition from 0.45*out to
         // 0.5*out (all in Hz), normalized to the upsampled rate in*L.
         let fs_up = f64::from(in_rate) * l as f64;
         let attenuation_db = 70.0;
         let beta = 0.1102 * (attenuation_db - 8.7);
-        let transition = 0.05 * f64::from(out_rate) / fs_up;
-        let mut n = ((attenuation_db - 7.95) / (14.36 * transition)).ceil() as usize;
-        // Round up to a whole number of phases, keep odd-ish symmetry via
-        // exact center handling below.
-        let taps_per_phase = n.div_ceil(l as usize).max(4);
-        n = taps_per_phase * l as usize;
+        let taps_per_phase = layout.taps_per_phase;
+        let n = layout.filter_len;
 
         let cutoff = 0.475 * f64::from(out_rate) / fs_up; // cycles/sample, mid-transition
         let center = (n - 1) as f64 / 2.0;
@@ -1818,6 +1930,16 @@ mod tests {
         assert!(StreamingResampler::new(0, 1, 16_000).is_err());
         assert!(StreamingResampler::new(48_000, 0, 16_000).is_err());
         assert!(StreamingResampler::new(48_000, 1, 0).is_err());
+        let excessive_channels =
+            StreamingResampler::validate_config(48_000, MAX_RESAMPLER_CHANNELS + 1, 16_000)
+                .expect_err("unsafe channel count must fail before allocation");
+        assert!(excessive_channels.to_string().contains("channel count"));
+        let excessive_filter = StreamingResampler::validate_config(u32::MAX, 1, 16_000)
+            .expect_err("unsafe rational filter must fail before allocation");
+        assert!(excessive_filter.to_string().contains("filter"));
+        let excessive_work = StreamingResampler::validate_config(16_000_000, 1, 16_000)
+            .expect_err("unsafe per-output work must fail before allocation");
+        assert!(excessive_work.to_string().contains("per output phase"));
         let mut rs = StreamingResampler::new(48_000, 1, 16_000).unwrap();
         let mut out = Vec::new();
         rs.flush(&mut out);
@@ -1973,6 +2095,18 @@ mod tests {
     }
 
     #[test]
+    fn command_capture_rejects_unsafe_ring_before_spawning() {
+        let error = FfmpegCaptureSource::open_with_command(
+            "definitely-missing-capture-producer",
+            &[],
+            f64::INFINITY,
+        )
+        .expect_err("invalid ring must win over missing program resolution");
+        assert_eq!(error.error_code(), "FW-INVALID-REQUEST");
+        assert!(error.to_string().contains("capture ring capacity"));
+    }
+
+    #[test]
     fn pipe_zero_config_rejected() {
         let reader = ChunkedReader {
             data: vec![],
@@ -1988,6 +2122,23 @@ mod tests {
             call: 0,
         };
         assert!(PipePcmSource::from_reader(reader, PcmFormat::S16le, 16_000, 0, 1.0).is_err());
+    }
+
+    #[test]
+    fn capture_ring_capacity_is_finite_positive_and_memory_bounded() {
+        assert_eq!(
+            capture_ring_capacity_samples(48_000, 2, 300.0).expect("five-minute stereo ring"),
+            28_800_000
+        );
+        for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = capture_ring_capacity_samples(16_000, 1, seconds)
+                .expect_err("invalid ring duration must fail closed");
+            assert_eq!(error.error_code(), "FW-INVALID-REQUEST");
+        }
+        let error = capture_ring_capacity_samples(u32::MAX, u16::MAX, 300.0)
+            .expect_err("catastrophic ring request must fail before allocation");
+        assert_eq!(error.error_code(), "FW-INVALID-REQUEST");
+        assert!(error.to_string().contains("maximum"));
     }
 
     #[test]

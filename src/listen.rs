@@ -739,6 +739,10 @@ const MAX_LIVE_BUFFER_SEC: f64 = 300.0;
 const MAX_LISTEN_STEP_MS: u64 = 60_000;
 const MAX_LIVE_BUFFER_MS: u64 = MAX_LIVE_BUFFER_SEC as u64 * 1_000;
 const MAX_CONFIRM_QUEUE_BOUND: usize = 64;
+/// VAD dB controls outside this envelope have no physical meaning for f32 PCM
+/// and can make otherwise finite downstream additions overflow to infinity.
+const MAX_ABS_VAD_DB: f64 = 1_000.0;
+const MAX_VAD_FLOOR_RISE_DB_PER_SEC: f64 = 1_000.0;
 /// A quality-lane drain is deliberately bounded. Larger waits turn terminal
 /// cleanup into an operational hang and can exceed platform `Instant` ranges.
 const MAX_CONFIRM_DRAIN_SEC: f64 = 3_600.0;
@@ -828,15 +832,39 @@ impl ListenConfig {
             ));
         }
         require_finite("vad.gate_db", self.vad.gate_db)?;
+        if self.vad.gate_db.abs() > MAX_ABS_VAD_DB {
+            return Err(invalid_listen_config(
+                "vad.gate_db",
+                &format!("must be within +/-{MAX_ABS_VAD_DB} dB"),
+            ));
+        }
         require_finite("vad.min_voice_dbfs", self.vad.min_voice_dbfs)?;
+        if self.vad.min_voice_dbfs.abs() > MAX_ABS_VAD_DB {
+            return Err(invalid_listen_config(
+                "vad.min_voice_dbfs",
+                &format!("must be within +/-{MAX_ABS_VAD_DB} dBFS"),
+            ));
+        }
         require_nonnegative_finite(
             "vad.floor_rise_db_per_sec_silence",
             self.vad.floor_rise_db_per_sec_silence,
         )?;
+        if self.vad.floor_rise_db_per_sec_silence > MAX_VAD_FLOOR_RISE_DB_PER_SEC {
+            return Err(invalid_listen_config(
+                "vad.floor_rise_db_per_sec_silence",
+                &format!("must be at most {MAX_VAD_FLOOR_RISE_DB_PER_SEC} dB per second"),
+            ));
+        }
         require_nonnegative_finite(
             "vad.floor_rise_db_per_sec_speech",
             self.vad.floor_rise_db_per_sec_speech,
         )?;
+        if self.vad.floor_rise_db_per_sec_speech > MAX_VAD_FLOOR_RISE_DB_PER_SEC {
+            return Err(invalid_listen_config(
+                "vad.floor_rise_db_per_sec_speech",
+                &format!("must be at most {MAX_VAD_FLOOR_RISE_DB_PER_SEC} dB per second"),
+            ));
+        }
 
         require_nonnegative_finite("max_seconds", self.max_seconds)?;
         require_finite("max_utterance_sec", self.max_utterance_sec)?;
@@ -890,6 +918,22 @@ impl ListenConfig {
                     "must be greater than zero",
                 ));
             }
+            crate::capture::capture_ring_capacity_samples(
+                *sample_rate,
+                *channels,
+                self.capture_buffer_sec,
+            )
+            .map_err(|error| {
+                invalid_listen_config("source.stdin.capture_ring", &format!("is unsafe: {error}"))
+            })?;
+            crate::capture::StreamingResampler::validate_config(
+                *sample_rate,
+                *channels,
+                SAMPLE_RATE as u32,
+            )
+            .map_err(|error| {
+                invalid_listen_config("source.stdin.resampler", &format!("is unsafe: {error}"))
+            })?;
         }
         Ok(())
     }
@@ -1817,9 +1861,9 @@ fn resolve_fast_model(
     }
 }
 
-/// Load a WAV file for `--source file-replay` (any rate/channels; the
-/// resampler chain normalizes). v1 accepts WAV via hound; other containers
-/// go through `fw transcribe`'s batch path or stdin-pcm piping.
+/// Load a WAV file for `--source file-replay` (bounded rate/channels; the
+/// resampler chain normalizes). v1 accepts WAV via hound; other containers go
+/// through `fw transcribe`'s batch path or stdin-pcm piping.
 fn load_replay_wav(path: &std::path::Path) -> FwResult<(Vec<f32>, u32, u16)> {
     let mut reader = hound::WavReader::open(path).map_err(|error| {
         FwError::InvalidRequest(format!(
@@ -1829,6 +1873,16 @@ fn load_replay_wav(path: &std::path::Path) -> FwResult<(Vec<f32>, u32, u16)> {
         ))
     })?;
     let spec = reader.spec();
+    crate::capture::StreamingResampler::validate_config(
+        spec.sample_rate,
+        spec.channels,
+        SAMPLE_RATE as u32,
+    )
+    .map_err(|error| {
+        FwError::InvalidRequest(format!(
+            "file-replay WAV has an unsafe sample-rate/channel layout: {error}"
+        ))
+    })?;
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
@@ -2677,6 +2731,19 @@ pub fn run_listen_session(
     let (model, fast_model_label, fallback_warning) = resolve_fast_model(config)?;
     let (mut capture, capture_backend, device_label, capture_warning) =
         open_capture_source(config)?;
+    // A source can supply its rate/channel layout only after opening (notably
+    // cpal device discovery and WAV headers). Complete the allocation-safety
+    // check before spawning the confirm lane, opening persistence, or emitting
+    // session_start, whose contract means the session is ready.
+    let mut resampler = if capture.sample_rate() != SAMPLE_RATE as u32 || capture.channels() != 1 {
+        Some(crate::capture::StreamingResampler::new(
+            capture.sample_rate(),
+            capture.channels(),
+            SAMPLE_RATE as u32,
+        )?)
+    } else {
+        None
+    };
 
     let source_label = match &config.source {
         ListenSource::Mic { .. } => "mic",
@@ -2876,18 +2943,6 @@ pub fn run_listen_session(
         ));
     }
 
-    // Resampler chain: only when the source is not already 16 kHz mono.
-    let mut resampler = if capture.sample_rate() != crate::native_engine::mel::SAMPLE_RATE as u32
-        || capture.channels() != 1
-    {
-        Some(crate::capture::StreamingResampler::new(
-            capture.sample_rate(),
-            capture.channels(),
-            crate::native_engine::mel::SAMPLE_RATE as u32,
-        )?)
-    } else {
-        None
-    };
     let mut buffer = SessionBuffer::new(config.buffer.clone());
     let mut vad = StreamingVad::new(config.vad.clone());
     let mut watchdog = crate::capture::SilentInputWatchdog::new(
@@ -5733,6 +5788,26 @@ mod adaptive_contract_tests {
                 config.vad.floor_rise_db_per_sec_speech = -0.1;
             }
         );
+        expect_invalid!("vad.gate_db", |config: &mut ListenConfig| {
+            config.vad.gate_db = MAX_ABS_VAD_DB + 1.0;
+        });
+        expect_invalid!("vad.min_voice_dbfs", |config: &mut ListenConfig| {
+            config.vad.min_voice_dbfs = -(MAX_ABS_VAD_DB + 1.0);
+        });
+        expect_invalid!(
+            "vad.floor_rise_db_per_sec_silence",
+            |config: &mut ListenConfig| {
+                config.vad.floor_rise_db_per_sec_silence =
+                    MAX_VAD_FLOOR_RISE_DB_PER_SEC + 1.0;
+            }
+        );
+        expect_invalid!(
+            "vad.floor_rise_db_per_sec_speech",
+            |config: &mut ListenConfig| {
+                config.vad.floor_rise_db_per_sec_speech =
+                    MAX_VAD_FLOOR_RISE_DB_PER_SEC + 1.0;
+            }
+        );
         expect_invalid!("max_seconds", |config: &mut ListenConfig| {
             config.max_seconds = -0.1;
         });
@@ -5775,6 +5850,29 @@ mod adaptive_contract_tests {
                 format: crate::capture::PcmFormat::S16le,
                 sample_rate: 16_000,
                 channels: 0,
+            };
+        });
+        expect_invalid!("source.stdin.capture_ring", |config: &mut ListenConfig| {
+            config.source = ListenSource::StdinPcm {
+                format: crate::capture::PcmFormat::S16le,
+                sample_rate: u32::MAX,
+                channels: u16::MAX,
+            };
+        });
+        expect_invalid!("source.stdin.resampler", |config: &mut ListenConfig| {
+            config.capture_buffer_sec = 0.000_001;
+            config.source = ListenSource::StdinPcm {
+                format: crate::capture::PcmFormat::S16le,
+                sample_rate: u32::MAX,
+                channels: 1,
+            };
+        });
+        expect_invalid!("source.stdin.resampler", |config: &mut ListenConfig| {
+            config.capture_buffer_sec = 0.001;
+            config.source = ListenSource::StdinPcm {
+                format: crate::capture::PcmFormat::S16le,
+                sample_rate: 16_000,
+                channels: 65,
             };
         });
     }
