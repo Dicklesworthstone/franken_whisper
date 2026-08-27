@@ -3902,6 +3902,8 @@ struct SeparateReport {
     output_samples: Option<usize>,
     /// Replacement waveform consumed by downstream stages.
     output_wav: Option<PathBuf>,
+    /// SHA-256 of the finalized replacement WAV bytes.
+    output_sha256: Option<String>,
     /// Notes about the separation process.
     notes: Vec<String>,
 }
@@ -3952,6 +3954,7 @@ fn source_separate_with_analysis(
                     output_rms: None,
                     output_samples: None,
                     output_wav: None,
+                    output_sha256: None,
                     notes: vec![format!(
                         "analysis unavailable ({reason}); passthrough without isolation claim"
                     )],
@@ -3997,6 +4000,7 @@ fn source_separate_with_analysis(
         output_rms: None,
         output_samples: None,
         output_wav: None,
+        output_sha256: None,
         notes,
     })
 }
@@ -4060,6 +4064,7 @@ fn source_separate_stage(
         &separated,
         &checkpoint,
     )?;
+    let output_sha256 = sha256_file_with_checkpoint(output_wav, &checkpoint)?;
 
     report.vocal_isolated = true;
     report.mode = SeparationMode::Dtln;
@@ -4067,6 +4072,7 @@ fn source_separate_stage(
     report.output_rms = Some(output_rms);
     report.output_samples = Some(separated.len());
     report.output_wav = Some(output_wav.to_path_buf());
+    report.output_sha256 = Some(output_sha256);
     report.notes.push(format!(
         "DTLN transform applied: input_rms={input_rms:.6}, output_rms={output_rms:.6}, output_samples={}",
         separated.len()
@@ -4074,13 +4080,30 @@ fn source_separate_stage(
     Ok(report)
 }
 
-fn apply_separate_report(inter: &mut PipelineIntermediate, report: &SeparateReport) {
-    inter.vocal_isolated = report.vocal_isolated;
-    if let (Some(output_wav), Some(output_samples)) =
-        (report.output_wav.clone(), report.output_samples)
-    {
-        inter.normalized_wav = Some(output_wav);
-        inter.normalized_duration = Some(output_samples as f64 / 16_000.0);
+fn apply_separate_report(
+    inter: &mut PipelineIntermediate,
+    report: &SeparateReport,
+) -> FwResult<()> {
+    match (
+        report.output_wav.as_ref(),
+        report.output_samples,
+        report.output_sha256.as_ref(),
+    ) {
+        (Some(output_wav), Some(output_samples), Some(output_sha256)) => {
+            inter.vocal_isolated = report.vocal_isolated;
+            inter.normalized_wav = Some(output_wav.clone());
+            inter.normalized_duration = Some(output_samples as f64 / 16_000.0);
+            inter.normalized_input_sha256 = Some(output_sha256.clone());
+            Ok(())
+        }
+        (None, None, None) => {
+            inter.vocal_isolated = report.vocal_isolated;
+            Ok(())
+        }
+        _ => Err(FwError::ContractViolation(
+            "source separation replacement path, sample count, and content hash must be present together"
+                .to_owned(),
+        )),
     }
 }
 
@@ -4137,7 +4160,16 @@ async fn execute_separate(
         }
     };
 
-    apply_separate_report(inter, &report);
+    if let Err(error) = apply_separate_report(inter, &report) {
+        let code = stage_failure_code("separate", &error);
+        log.push(
+            "separate",
+            &code,
+            stage_failure_message(&error, "source separation failed"),
+            json!({"error": error.to_string(), "budget_ms": sep_budget_ms}),
+        );
+        return Err(error);
+    }
     inter.warnings.extend(report.notes.iter().cloned());
 
     tracing::debug!(stage = "separate", "Source separation complete");
@@ -13710,19 +13742,74 @@ mod tests {
         assert!(report.output_wav.is_none());
         assert!(report.output_rms.is_none());
         assert!(report.output_samples.is_none());
+        assert!(report.output_sha256.is_none());
         assert!(!output.exists());
         let mut inter = super::PipelineIntermediate::new();
         inter.normalized_wav = Some(input.clone());
         inter.normalized_duration = Some(1.0);
-        super::apply_separate_report(&mut inter, &report);
+        inter.normalized_input_sha256 = Some("original-normalized-hash".to_owned());
+        super::apply_separate_report(&mut inter, &report)
+            .expect("passthrough report must preserve the normalized input binding");
         assert_eq!(inter.normalized_wav.as_deref(), Some(input.as_path()));
         assert_eq!(inter.normalized_duration, Some(1.0));
+        assert_eq!(
+            inter.normalized_input_sha256.as_deref(),
+            Some("original-normalized-hash")
+        );
         assert!(!inter.vocal_isolated);
         assert!(
             report
                 .notes
                 .iter()
                 .any(|note| note.contains("weights are not configured"))
+        );
+    }
+
+    #[test]
+    fn apply_separate_report_rebinds_replay_hash_atomically() {
+        let input = PathBuf::from("original-normalized.wav");
+        let output = PathBuf::from("dtln-vocals.wav");
+        let original_hash = super::sha256_bytes_hex(b"original normalized wav bytes");
+        let replacement_hash = super::sha256_bytes_hex(b"finalized DTLN wav bytes");
+        let report = super::SeparateReport {
+            vocal_isolated: true,
+            mode: super::SeparationMode::Dtln,
+            speech_coverage: 0.75,
+            avg_rms: 0.25,
+            active_region_count: 1,
+            output_rms: Some(0.125),
+            output_samples: Some(8_000),
+            output_wav: Some(output.clone()),
+            output_sha256: Some(replacement_hash.clone()),
+            notes: Vec::new(),
+        };
+        let mut inter = super::PipelineIntermediate::new();
+        inter.vocal_isolated = false;
+        inter.normalized_wav = Some(input.clone());
+        inter.normalized_duration = Some(1.0);
+        inter.normalized_input_sha256 = Some(original_hash.clone());
+
+        let mut malformed = report.clone();
+        malformed.output_sha256 = None;
+        let error = super::apply_separate_report(&mut inter, &malformed)
+            .expect_err("a replacement without its finalized content hash must fail closed");
+        assert!(matches!(error, FwError::ContractViolation(_)));
+        assert!(!inter.vocal_isolated);
+        assert_eq!(inter.normalized_wav.as_deref(), Some(input.as_path()));
+        assert_eq!(inter.normalized_duration, Some(1.0));
+        assert_eq!(
+            inter.normalized_input_sha256.as_deref(),
+            Some(original_hash.as_str())
+        );
+
+        super::apply_separate_report(&mut inter, &report)
+            .expect("complete replacement evidence must apply");
+        assert!(inter.vocal_isolated);
+        assert_eq!(inter.normalized_wav.as_deref(), Some(output.as_path()));
+        assert_eq!(inter.normalized_duration, Some(0.5));
+        assert_eq!(
+            inter.normalized_input_sha256.as_deref(),
+            Some(replacement_hash.as_str())
         );
     }
 
@@ -13781,6 +13868,8 @@ mod tests {
         let mut inter = super::PipelineIntermediate::new();
         inter.normalized_wav = Some(input.clone());
         inter.normalized_duration = Some(99.0);
+        let original_hash = super::sha256_file(&input).expect("hash input WAV");
+        inter.normalized_input_sha256 = Some(original_hash.clone());
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -13799,6 +13888,12 @@ mod tests {
         assert_eq!(
             inter.normalized_duration,
             Some(crate::separate::BLOCK_LEN as f64 / 16_000.0)
+        );
+        let replacement_hash = super::sha256_file(&output).expect("hash replacement WAV");
+        assert_ne!(replacement_hash, original_hash);
+        assert_eq!(
+            inter.normalized_input_sha256.as_deref(),
+            Some(replacement_hash.as_str())
         );
         let event = log
             .events
@@ -13901,6 +13996,7 @@ mod tests {
         assert_eq!(actual.output_rms, expected.output_rms);
         assert_eq!(actual.output_samples, expected.output_samples);
         assert_eq!(actual.output_wav, expected.output_wav);
+        assert_eq!(actual.output_sha256, expected.output_sha256);
         assert_eq!(actual.notes, expected.notes);
     }
 
