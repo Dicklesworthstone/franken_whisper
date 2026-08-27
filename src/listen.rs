@@ -2366,6 +2366,66 @@ impl ListenPersistSink {
     }
 }
 
+fn listen_event_identity(value: &serde_json::Value, expected_seq: u64) -> FwResult<(&str, &str)> {
+    let event_name = value
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            FwError::ContractViolation(
+                "listen event is missing its required string `event` field".to_owned(),
+            )
+        })?;
+    let event_seq = value
+        .get("seq")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            FwError::ContractViolation(format!(
+                "listen event `{event_name}` is missing its required integer `seq` field"
+            ))
+        })?;
+    if event_seq != expected_seq {
+        return Err(FwError::ContractViolation(format!(
+            "listen event `{event_name}` has seq {event_seq}, expected {expected_seq}"
+        )));
+    }
+    let timestamp = value
+        .get("ts")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            FwError::ContractViolation(format!(
+                "listen event `{event_name}` is missing its required string `ts` field"
+            ))
+        })?;
+    Ok((event_name, timestamp))
+}
+
+/// Inspect, persist, and emit one already-owned event value. The constructor
+/// runs before this function exactly once; persistence serializes this same
+/// value, including its timestamp, before ownership moves to the emitter.
+fn record_and_emit_listen_value(
+    value: serde_json::Value,
+    seq: &mut u64,
+    emit: &mut dyn FnMut(serde_json::Value) -> FwResult<()>,
+    sink: &mut Option<ListenPersistSink>,
+    persist_warnings: &mut Vec<String>,
+) -> FwResult<()> {
+    let (event_name, timestamp) = listen_event_identity(&value, *seq)?;
+    let next_seq = (*seq).checked_add(1).ok_or_else(|| {
+        FwError::ContractViolation("listen event sequence overflowed u64".to_owned())
+    })?;
+    if event_name == "listen.warning"
+        && let Some(reason) = value.get("reason").and_then(serde_json::Value::as_str)
+    {
+        persist_warnings.push(reason.to_owned());
+    }
+    if let Some(sink) = sink.as_mut() {
+        sink.record_event(*seq, timestamp, event_name, &value);
+    }
+    emit(value)?;
+    *seq = next_seq;
+    Ok(())
+}
+
 /// Run one live session, emitting NDJSON event values through `emit`.
 /// Returns `Ok(cancelled)` — `true` when the session ended on Ctrl-C (the
 /// caller maps that to exit code 130). Fatal errors propagate; the CLI
@@ -2534,6 +2594,21 @@ pub fn run_listen_session(
     // degradation trail, independent of stdout).
     let mut persist_warnings: Vec<String> = Vec::new();
 
+    // Every constructor expression is bound once before the same owned value
+    // is inspected, persisted, and moved to the emitter.
+    macro_rules! emit_seq {
+        ($value:expr) => {{
+            let value = $value;
+            record_and_emit_listen_value(
+                value,
+                &mut seq,
+                emit,
+                &mut persist_sink,
+                &mut persist_warnings,
+            )?;
+        }};
+    }
+
     let info = ListenSessionInfo {
         source: source_label.to_owned(),
         capture_backend: capture_backend.to_owned(),
@@ -2551,44 +2626,32 @@ pub fn run_listen_session(
             "gate_db": config.vad.gate_db,
         }),
     };
-    let session_start_value = robot::listen_session_start_value(&run_id, seq, &now_ts(), &info);
-    if let Some(sink) = persist_sink.as_mut() {
-        sink.record_event(seq, &now_ts(), "listen.session_start", &session_start_value);
-    }
-    emit(session_start_value)?;
-    seq += 1;
+    emit_seq!(robot::listen_session_start_value(
+        &run_id,
+        seq,
+        &now_ts(),
+        &info
+    ));
     if let Some(message) = &fallback_warning {
-        let value = robot::listen_warning_value(
+        emit_seq!(robot::listen_warning_value(
             &run_id,
             seq,
             &now_ts(),
             "fast_model_fallback",
             serde_json::json!({"detail": message, "confirm_lane_disabled": confirm_disabled_by_fallback}),
-        );
-        persist_warnings.push("fast_model_fallback".to_owned());
-        if let Some(sink) = persist_sink.as_mut() {
-            sink.record_event(seq, &now_ts(), "listen.warning", &value);
-        }
-        emit(value)?;
-        seq += 1;
+        ));
     }
     if let Some(message) = capture_warning {
-        let value = robot::listen_warning_value(
+        emit_seq!(robot::listen_warning_value(
             &run_id,
             seq,
             &now_ts(),
             "fallback_capture_backend",
             serde_json::json!({"detail": message}),
-        );
-        persist_warnings.push("fallback_capture_backend".to_owned());
-        if let Some(sink) = persist_sink.as_mut() {
-            sink.record_event(seq, &now_ts(), "listen.warning", &value);
-        }
-        emit(value)?;
-        seq += 1;
+        ));
     }
     if let Some(detail) = persist_open_error {
-        let value = robot::listen_warning_value(
+        emit_seq!(robot::listen_warning_value(
             &run_id,
             seq,
             &now_ts(),
@@ -2596,10 +2659,7 @@ pub fn run_listen_session(
             serde_json::json!({
                 "detail": format!("persistence disabled for this session: {detail}"),
             }),
-        );
-        persist_warnings.push("persist_degraded".to_owned());
-        emit(value)?;
-        seq += 1;
+        ));
     }
 
     // Resampler chain: only when the source is not already 16 kHz mono.
@@ -2650,32 +2710,6 @@ pub fn run_listen_session(
             Ok(())
         }
     };
-
-    // Emit + record: every stream event funnels through here so the
-    // persistence sink sees exactly what stdout sees (minus partials,
-    // which are deliberately not persisted). Warnings additionally
-    // collect into warnings_json for the final close.
-    macro_rules! emit_seq {
-        ($value:expr) => {{
-            {
-                let event_name = $value
-                    .get("event")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_owned();
-                if event_name == "listen.warning" {
-                    if let Some(reason) = $value.get("reason").and_then(|v| v.as_str()) {
-                        persist_warnings.push(reason.to_owned());
-                    }
-                }
-                if let Some(sink) = persist_sink.as_mut() {
-                    sink.record_event(seq, &now_ts(), &event_name, &$value);
-                }
-            }
-            emit($value)?;
-            seq += 1;
-        }};
-    }
 
     // Utterance-granular durability point (bd-rt-persist-a66y): called at
     // every utterance close. Flush failure emits `persist_degraded` and the
@@ -2756,6 +2790,7 @@ pub fn run_listen_session(
                 &mut confirm_lag_ms,
                 &mut pending_confirm_since,
                 &mut persist_sink,
+                &mut persist_warnings,
             )?;
         }
         if let Some(controller) = hold_ctrl.as_mut() {
@@ -3260,10 +3295,11 @@ pub fn run_listen_session(
                 &mut confirm_lag_ms,
                 &mut pending_confirm_since,
                 &mut persist_sink,
+                &mut persist_warnings,
             )?;
         }
         if abandoned > 0 {
-            emit(robot::listen_warning_value(
+            emit_seq!(robot::listen_warning_value(
                 &run_id,
                 seq,
                 &now_ts(),
@@ -3273,8 +3309,7 @@ pub fn run_listen_session(
                     "abandoned_utterances": abandoned,
                     "drain_sec": config.confirm_drain_sec,
                 }),
-            ))?;
-            seq += 1;
+            ));
         }
     }
     if !confirm_lag_ms.is_empty() {
@@ -3289,8 +3324,9 @@ pub fn run_listen_session(
     // persisted event trail ends exactly like the stdout stream.
     let final_stats_value =
         robot::listen_session_stats_value(&run_id, seq, &now_ts(), &stats, true);
+    let (final_event_name, final_timestamp) = listen_event_identity(&final_stats_value, seq)?;
     if let Some(sink) = persist_sink.as_mut() {
-        sink.record_event(seq, &now_ts(), "listen.session_stats", &final_stats_value);
+        sink.record_event(seq, final_timestamp, final_event_name, &final_stats_value);
     }
     // Close the run: true end time + final stats/warnings + finalized
     // replay envelope. Failure here surfaces as run_error AFTER the session
@@ -3352,74 +3388,9 @@ fn handle_confirm_event(
     lag_samples_ms: &mut Vec<f64>,
     pending_since: &mut std::collections::HashMap<u32, std::time::Instant>,
     sink: &mut Option<ListenPersistSink>,
+    persist_warnings: &mut Vec<String>,
 ) -> FwResult<()> {
-    // Record-then-emit so the persisted trail matches stdout exactly.
-    match &event {
-        ConfirmLaneEvent::Verdict(verdict) => {
-            if let Some(s) = sink.as_mut() {
-                let value = if verdict.confirmed {
-                    robot::listen_transcript_confirm_value(
-                        run_id,
-                        *seq,
-                        &now_ts(),
-                        verdict.utterance_id,
-                        &verdict.quality_model_id,
-                        verdict.drift_wer,
-                        verdict.drift_confidence_delta,
-                        verdict.drift_edit_distance,
-                        verdict.decode_ms,
-                    )
-                } else {
-                    robot::listen_transcript_correct_value(
-                        run_id,
-                        *seq,
-                        &now_ts(),
-                        verdict.utterance_id,
-                        verdict.correction_id,
-                        &verdict.corrected_segments,
-                        &verdict.quality_model_id,
-                        verdict.drift_wer,
-                        verdict.drift_confidence_delta,
-                        verdict.drift_edit_distance,
-                        verdict.decode_ms,
-                    )
-                };
-                s.record_event(
-                    *seq,
-                    &now_ts(),
-                    value["event"].as_str().unwrap_or(""),
-                    &value,
-                );
-            }
-        }
-        ConfirmLaneEvent::Warning { reason, detail } => {
-            if let Some(s) = sink.as_mut() {
-                let value =
-                    robot::listen_warning_value(run_id, *seq, &now_ts(), reason, detail.clone());
-                s.record_event(*seq, &now_ts(), "listen.warning", &value);
-            }
-        }
-        ConfirmLaneEvent::DroppedOldest {
-            utterance_id,
-            queue_bound,
-        } => {
-            if let Some(s) = sink.as_mut() {
-                let value = robot::listen_warning_value(
-                    run_id,
-                    *seq,
-                    &now_ts(),
-                    "confirm_lag",
-                    serde_json::json!({
-                        "detail": "confirm queue full; dropped oldest unconfirmed utterance",
-                        "dropped_utterance_id": utterance_id,
-                        "queue_bound": queue_bound,
-                    }),
-                );
-                s.record_event(*seq, &now_ts(), "listen.warning", &value);
-            }
-        }
-    }
-    match event {
+    let value = match event {
         ConfirmLaneEvent::Verdict(verdict) => {
             // Confirm lag = utterance_end -> verdict arrival (observation
             // for the latency harness; not a ledger claim).
@@ -3428,7 +3399,7 @@ fn handle_confirm_event(
             }
             if verdict.confirmed {
                 stats.confirmations_emitted += 1;
-                emit(robot::listen_transcript_confirm_value(
+                robot::listen_transcript_confirm_value(
                     run_id,
                     *seq,
                     &now_ts(),
@@ -3438,10 +3409,10 @@ fn handle_confirm_event(
                     verdict.drift_confidence_delta,
                     verdict.drift_edit_distance,
                     verdict.decode_ms,
-                ))?;
+                )
             } else {
                 stats.corrections_emitted += 1;
-                emit(robot::listen_transcript_correct_value(
+                robot::listen_transcript_correct_value(
                     run_id,
                     *seq,
                     &now_ts(),
@@ -3453,26 +3424,18 @@ fn handle_confirm_event(
                     verdict.drift_confidence_delta,
                     verdict.drift_edit_distance,
                     verdict.decode_ms,
-                ))?;
+                )
             }
-            *seq += 1;
         }
         ConfirmLaneEvent::Warning { reason, detail } => {
-            emit(robot::listen_warning_value(
-                run_id,
-                *seq,
-                &now_ts(),
-                &reason,
-                detail,
-            ))?;
-            *seq += 1;
+            robot::listen_warning_value(run_id, *seq, &now_ts(), &reason, detail)
         }
         ConfirmLaneEvent::DroppedOldest {
             utterance_id,
             queue_bound,
         } => {
             pending_since.remove(&utterance_id);
-            emit(robot::listen_warning_value(
+            robot::listen_warning_value(
                 run_id,
                 *seq,
                 &now_ts(),
@@ -3482,11 +3445,10 @@ fn handle_confirm_event(
                     "dropped_utterance_id": utterance_id,
                     "queue_bound": queue_bound,
                 }),
-            ))?;
-            *seq += 1;
+            )
         }
-    }
-    Ok(())
+    };
+    record_and_emit_listen_value(value, seq, emit, sink, persist_warnings)
 }
 
 #[cfg(test)]
@@ -3501,6 +3463,156 @@ mod tests {
 
     fn secs(buffer: &SessionBuffer) -> (f64, f64) {
         (buffer.session_offset_sec(), buffer.buffer_sec())
+    }
+
+    #[test]
+    fn listen_event_identity_fails_closed_on_missing_or_wrong_identity() {
+        for (value, expected_error) in [
+            (
+                serde_json::json!({"seq": 0, "ts": "2026-08-27T00:00:00Z"}),
+                "missing its required string `event` field",
+            ),
+            (
+                serde_json::json!({"event": "listen.warning", "ts": "2026-08-27T00:00:00Z"}),
+                "missing its required integer `seq` field",
+            ),
+            (
+                serde_json::json!({"event": "listen.warning", "seq": 9, "ts": "2026-08-27T00:00:00Z"}),
+                "has seq 9, expected 0",
+            ),
+            (
+                serde_json::json!({"event": "listen.warning", "seq": 0}),
+                "missing its required string `ts` field",
+            ),
+        ] {
+            let error = listen_event_identity(&value, 0).expect_err("invalid identity must fail");
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error for {value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_events_use_one_timestamp_and_identical_persisted_payloads() {
+        // Deliberately leave the unique test database in the system temp
+        // directory: repository policy forbids automated file deletion.
+        let dir = std::env::temp_dir().join(format!(
+            "fw_listen_event_exactness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp directory");
+        let mut sink = Some(
+            ListenPersistSink::open(
+                &dir.join("listen-event-exactness.sqlite3"),
+                "listen-event-exactness",
+                "2026-08-27T00:00:00Z",
+                "test-input",
+                r#"{"kind":"listen-test"}"#,
+            )
+            .expect("open listen persistence sink"),
+        );
+        let clock_calls = std::cell::Cell::new(0u32);
+        let now_ts = || {
+            let call = clock_calls.get() + 1;
+            clock_calls.set(call);
+            format!("2026-08-27T00:00:{call:02}Z")
+        };
+        let mut seq = 0;
+        let mut stats = ListenSessionStats::default();
+        let mut lag_samples = Vec::new();
+        let mut pending_since = std::collections::HashMap::from([
+            (1, std::time::Instant::now()),
+            (2, std::time::Instant::now()),
+            (4, std::time::Instant::now()),
+        ]);
+        let mut warnings = Vec::new();
+        let mut emitted = Vec::new();
+        {
+            let mut emit = |value| {
+                let mut bytes = Vec::new();
+                serde_json::to_writer(&mut bytes, &value).expect("serialize emitted event");
+                emitted.push((value, bytes));
+                Ok(())
+            };
+            for event in [
+                ConfirmLaneEvent::Verdict(ConfirmVerdict {
+                    utterance_id: 1,
+                    confirmed: true,
+                    correction_id: 0,
+                    corrected_segments: Vec::new(),
+                    drift_wer: 0.0,
+                    drift_confidence_delta: 0.0,
+                    drift_edit_distance: 0,
+                    decode_ms: 10,
+                    quality_model_id: "quality-model".to_owned(),
+                }),
+                ConfirmLaneEvent::Verdict(ConfirmVerdict {
+                    utterance_id: 2,
+                    confirmed: false,
+                    correction_id: 7,
+                    corrected_segments: vec![segment("corrected text")],
+                    drift_wer: 0.5,
+                    drift_confidence_delta: 0.25,
+                    drift_edit_distance: 2,
+                    decode_ms: 11,
+                    quality_model_id: "quality-model".to_owned(),
+                }),
+                ConfirmLaneEvent::Warning {
+                    reason: "quality_model_unavailable".to_owned(),
+                    detail: serde_json::json!({"detail": "fixture warning"}),
+                },
+                ConfirmLaneEvent::DroppedOldest {
+                    utterance_id: 4,
+                    queue_bound: 2,
+                },
+            ] {
+                handle_confirm_event(
+                    event,
+                    "listen-event-exactness",
+                    &mut seq,
+                    &now_ts,
+                    &mut emit,
+                    &mut stats,
+                    &mut lag_samples,
+                    &mut pending_since,
+                    &mut sink,
+                    &mut warnings,
+                )
+                .expect("record and emit one owned event value");
+            }
+        }
+
+        assert_eq!(clock_calls.get(), 4, "one timestamp call per event");
+        assert_eq!(seq, 4);
+        assert_eq!(stats.confirmations_emitted, 1);
+        assert_eq!(stats.corrections_emitted, 1);
+        assert_eq!(
+            warnings,
+            vec![
+                "quality_model_unavailable".to_owned(),
+                "confirm_lag".to_owned(),
+            ]
+        );
+        let persisted = &sink.as_ref().expect("sink remains open").pending_events;
+        assert_eq!(persisted.len(), emitted.len());
+        for (row, (value, emitted_bytes)) in persisted.iter().zip(&emitted) {
+            assert_eq!(row.seq, value["seq"].as_u64().expect("event seq"));
+            assert_eq!(
+                row.ts_rfc3339,
+                value["ts"].as_str().expect("event timestamp")
+            );
+            assert_eq!(row.code, value["event"].as_str().expect("event name"));
+            assert_eq!(
+                row.payload_json.as_bytes(),
+                emitted_bytes,
+                "persisted and emitted JSON must be byte-identical"
+            );
+        }
     }
 
     #[test]
@@ -3576,10 +3688,7 @@ mod tests {
         assert_eq!(sink.pending_segments[1].idx, 1);
         assert_eq!(sink.pending_segments[1].text, "bravo");
         assert_eq!(sink.pending_events[0].seq, 7);
-        assert_eq!(
-            sink.pending_events[0].ts_rfc3339,
-            "2026-08-26T00:00:01Z"
-        );
+        assert_eq!(sink.pending_events[0].ts_rfc3339, "2026-08-26T00:00:01Z");
         assert_eq!(sink.pending_events[0].code, "transcript.delta");
         assert_eq!(sink.pending_events[0].payload_json, r#"{"text":"alpha"}"#);
         assert_eq!(sink.pending_events[1].seq, 8);
@@ -3739,10 +3848,7 @@ mod tests {
                 Some(timestamp)
             );
             assert_eq!(row.get(2).and_then(|value| value.as_text()), Some(code));
-            assert_eq!(
-                row.get(3).and_then(|value| value.as_text()),
-                Some(payload)
-            );
+            assert_eq!(row.get(3).and_then(|value| value.as_text()), Some(payload));
         }
 
         let run = inspection
