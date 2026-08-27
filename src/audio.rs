@@ -157,6 +157,27 @@ pub fn read_normalized_wav_16k_mono_with_checkpoint(
     path: &Path,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<Vec<f32>> {
+    let samples = read_normalized_wav_16k_mono_raw_with_checkpoint(path, checkpoint)?;
+    // Default neural denoise stage (bd-z6kz): applied whenever the pinned
+    // FastEnhancer artifact is present and `FW_DENOISE` has not disabled it.
+    // Absent artifact = byte-identical passthrough, which is what CI and the
+    // golden fixtures run under. Length-preserving, so every downstream
+    // timestamp is untouched.
+    if let Some(denoiser) = crate::denoise::shared() {
+        let denoised = denoiser.denoise_16k(&samples);
+        checkpoint()?;
+        return Ok(denoised);
+    }
+    Ok(samples)
+}
+
+/// Read the normalized waveform without applying any optional model stage.
+/// Source separation uses this so the explicit pipeline stage, rather than a
+/// process-global denoiser setting, owns the exact transform it reports.
+pub(crate) fn read_normalized_wav_16k_mono_raw_with_checkpoint(
+    path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<Vec<f32>> {
     const MAX_WAV_CONTAINER_OVERHEAD_BYTES: u64 = 1024 * 1024;
     let maximum_bytes = u64::try_from(
         crate::sortformer_inference::SORTFORMER_MAX_AUDIO_SAMPLES
@@ -209,16 +230,6 @@ pub fn read_normalized_wav_16k_mono_with_checkpoint(
     checkpoint()?;
     let samples = crate::native_engine::decode::read_wav_16k_mono(&bytes)?;
     checkpoint()?;
-    // Default neural denoise stage (bd-z6kz): applied whenever the pinned
-    // FastEnhancer artifact is present and `FW_DENOISE` has not disabled it.
-    // Absent artifact = byte-identical passthrough, which is what CI and the
-    // golden fixtures run under. Length-preserving, so every downstream
-    // timestamp is untouched.
-    if let Some(denoiser) = crate::denoise::shared() {
-        let denoised = denoiser.denoise_16k(&samples);
-        checkpoint()?;
-        return Ok(denoised);
-    }
     Ok(samples)
 }
 
@@ -1066,13 +1077,33 @@ pub fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<
     output
 }
 
+/// Persist an in-process 16 kHz mono transform with bounded cancellation
+/// checkpoints. This is the canonical writer for model-produced pipeline WAVs.
+pub(crate) fn write_normalized_wav_16k_mono_with_checkpoint(
+    path: &Path,
+    samples: &[f32],
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<()> {
+    write_mono_wav_i16_with_checkpoint(path, samples, 16_000, checkpoint)
+}
+
+fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResult<()> {
+    write_mono_wav_i16_with_checkpoint(path, samples, sample_rate, &|| Ok(()))
+}
+
 #[allow(
     clippy::manual_clamp,
     reason = "max/min avoids a documented aarch64 nightly clamp miscompile"
 )]
-fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResult<()> {
+fn write_mono_wav_i16_with_checkpoint(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<()> {
     const WRITE_CHUNK_SAMPLES: usize = 8_192;
 
+    checkpoint()?;
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
@@ -1081,6 +1112,7 @@ fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResul
     };
     let mut writer = hound::WavWriter::create(path, spec).map_err(hound_error_to_fw)?;
     for chunk in samples.chunks(WRITE_CHUNK_SAMPLES) {
+        checkpoint()?;
         let mut buffered = writer.get_i16_writer(chunk.len() as u32);
         for sample in chunk {
             // Sanitize non-finite inputs to 0.0 (silence). NOTE: use max().min() rather than
@@ -1094,7 +1126,9 @@ fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResul
         }
         buffered.flush().map_err(hound_error_to_fw)?;
     }
+    checkpoint()?;
     writer.finalize().map_err(hound_error_to_fw)?;
+    checkpoint()?;
     Ok(())
 }
 

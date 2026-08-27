@@ -184,6 +184,19 @@ impl DtlnSeparator {
 
     /// Separate one utterance. Deterministic; resets recurrent state.
     pub fn separate(&mut self, samples: &[f32]) -> FwResult<Vec<f32>> {
+        self.separate_with_checkpoint(samples, &|| Ok(()))
+    }
+
+    /// Separate one utterance with cancellation checks before and between
+    /// every recurrent stage. The callback also fences the final output so a
+    /// cancellation observed after the last decoder frame cannot be reported
+    /// as a completed transform.
+    pub(crate) fn separate_with_checkpoint(
+        &mut self,
+        samples: &[f32],
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Vec<f32>> {
+        checkpoint()?;
         let mut state1 = MaskState::default();
         let mut state2 = MaskState::default();
         let frames_total = if samples.len() >= BLOCK_LEN {
@@ -203,6 +216,7 @@ impl DtlnSeparator {
         let mut mag = vec![0.0f32; BINS];
         let mut phase = vec![0.0f32; BINS];
         for frame_index in 0..frames_total {
+            checkpoint()?;
             let start = frame_index * BLOCK_SHIFT;
             let frame = &samples[start..start + BLOCK_LEN];
             rfft_mag_phase(frame, &mut mag, &mut phase);
@@ -213,6 +227,7 @@ impl DtlnSeparator {
             let masked_mag: Vec<f32> = mag.iter().zip(&mask1).map(|(&m, &k)| m * k).collect();
             let mut denoised = vec![0.0f32; BLOCK_LEN];
             irfft_mag_phase(&masked_mag, &phase, &mut denoised);
+            checkpoint()?;
 
             // Stage 2 consumes the PRE-OLA frame directly — upstream trains
             // Conv1D on the ifftLayer output and overlap-adds only AFTER the
@@ -226,6 +241,7 @@ impl DtlnSeparator {
                 output[start + j] += slot;
             }
         }
+        checkpoint()?;
         Ok(output)
     }
 }
@@ -743,6 +759,54 @@ mod tests {
             |x: &[f32]| (x.iter().map(|&v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt();
         let ratio = rms(&output) / rms(&input[..output.len()]).max(1e-12);
         assert!(ratio < 1e-3, "expected near-silence, rms ratio {ratio}");
+    }
+
+    #[test]
+    fn separation_cancellation_interrupts_between_recurrent_stages() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut separator = write_and_load(&contract_fixture_bytes(0.0, false), "cancel");
+        // Poison stage two so this test is mutation-red for the checkpoint:
+        // without the inter-stage fence, inference reaches the bad width and
+        // returns InvalidRequest instead of the requested cancellation.
+        separator.s2.lstm0.w_ih.cols += 1;
+        let samples = vec![0.25f32; BLOCK_LEN];
+        let checkpoints = AtomicUsize::new(0);
+        let error = separator
+            .separate_with_checkpoint(&samples, &|| {
+                if checkpoints.fetch_add(1, Ordering::SeqCst) >= 2 {
+                    Err(FwError::Cancelled(
+                        "test cancellation between DTLN stages".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("checkpoint cancellation must abort separation");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert_eq!(checkpoints.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn separation_cancellation_fences_completed_output() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut separator = write_and_load(&contract_fixture_bytes(0.0, false), "final-cancel");
+        let samples = vec![0.25f32; BLOCK_LEN];
+        let checkpoints = AtomicUsize::new(0);
+        let error = separator
+            .separate_with_checkpoint(&samples, &|| {
+                if checkpoints.fetch_add(1, Ordering::SeqCst) >= 3 {
+                    Err(FwError::Cancelled(
+                        "test cancellation at completed DTLN output fence".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("final checkpoint cancellation must suppress completed output");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert_eq!(checkpoints.load(Ordering::SeqCst), 4);
     }
 
     /// Model-gated acceptance: speech+tone mixture through the REAL converted

@@ -1815,7 +1815,7 @@ async fn run_pipeline_body(
                 execute_vad(pcx, log, request, stage_budgets, &mut inter).await?;
             }
             PipelineStage::Separate => {
-                execute_separate(pcx, log, stage_budgets, &mut inter).await?;
+                execute_separate(pcx, log, stage_budgets, run_tmp_dir, &mut inter).await?;
             }
             // When `request.backend_params.speculative` is set, the Backend stage
             // is replaced with a `SpeculativeStreamingPipeline`-driven path
@@ -2133,6 +2133,21 @@ async fn execute_normalize(
     Ok(())
 }
 
+fn backend_request_for_waveform(
+    request: &TranscribeRequest,
+    native_separation_applied: bool,
+) -> TranscribeRequest {
+    let mut backend_request = request.clone();
+    if native_separation_applied {
+        backend_request
+            .backend_params
+            .diarization_config
+            .get_or_insert_with(crate::model::DiarizationConfig::default)
+            .no_stem = true;
+    }
+    backend_request
+}
+
 async fn execute_backend(
     pcx: &mut PipelineCx,
     log: &mut EventLog,
@@ -2234,7 +2249,7 @@ async fn execute_backend(
         }),
     );
 
-    let backend_request = request.clone();
+    let backend_request = backend_request_for_waveform(request, inter.vocal_isolated);
     let backend_wav = normalized_wav.clone();
     let backend_dir = run_tmp_dir.path().to_path_buf();
     let backend_budget_ms = stage_budgets.backend_ms;
@@ -2548,7 +2563,7 @@ async fn execute_backend_speculative(
     let cancel_token = pcx.stage_token(backend_budget_ms); // ubs:ignore — token, not a secret
     let normalized_wav = normalized_wav.clone();
     let backend_dir = run_tmp_dir.path().to_path_buf();
-    let base_request = request.clone();
+    let base_request = backend_request_for_waveform(request, inter.vocal_isolated);
     let run_id = log.run_id.clone();
     let per_invocation_timeout = budget_duration(backend_budget_ms);
 
@@ -3860,6 +3875,8 @@ async fn execute_vad(
 /// Report produced by the source separation stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeparationMode {
+    /// The pinned in-process DTLN model produced the downstream waveform.
+    Dtln,
     /// Energy-based analysis ran and produced a coverage verdict.
     EnergyAnalysis,
     /// Analysis was impossible; audio passed through with NO isolation claim
@@ -3879,6 +3896,12 @@ struct SeparateReport {
     avg_rms: f64,
     /// Number of distinct speech regions detected.
     active_region_count: usize,
+    /// RMS of the DTLN output when a transform ran.
+    output_rms: Option<f64>,
+    /// Sample count of the DTLN output when a transform ran.
+    output_samples: Option<usize>,
+    /// Replacement waveform consumed by downstream stages.
+    output_wav: Option<PathBuf>,
     /// Notes about the separation process.
     notes: Vec<String>,
 }
@@ -3926,6 +3949,9 @@ fn source_separate_with_analysis(
                     speech_coverage: 0.0,
                     avg_rms: 0.0,
                     active_region_count: 0,
+                    output_rms: None,
+                    output_samples: None,
+                    output_wav: None,
                     notes: vec![format!(
                         "analysis unavailable ({reason}); passthrough without isolation claim"
                     )],
@@ -3968,14 +3994,91 @@ fn source_separate_with_analysis(
         mode: SeparationMode::EnergyAnalysis,
         avg_rms: f64::from(analysis.avg_rms),
         active_region_count: analysis.active_regions.len(),
+        output_rms: None,
+        output_samples: None,
+        output_wav: None,
         notes,
     })
+}
+
+fn waveform_rms(samples: &[f32]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let square_sum = samples
+        .iter()
+        .map(|&sample| {
+            let sample = f64::from(sample);
+            sample * sample
+        })
+        .sum::<f64>();
+    (square_sum / samples.len() as f64).sqrt()
+}
+
+fn source_separate_stage(
+    normalized_wav: &Path,
+    cached_analysis: Option<&backend::native_audio::NativeAudioAnalysis>,
+    weights_path: Option<&Path>,
+    output_wav: &Path,
+    token: &CancellationToken,
+) -> FwResult<SeparateReport> {
+    let mut report = source_separate_with_analysis(normalized_wav, cached_analysis, token)?;
+    let Some(weights_path) = weights_path else {
+        report.vocal_isolated = false;
+        report.mode = SeparationMode::UnavailablePassthrough;
+        report.notes.push(
+            "DTLN weights are not configured; original normalized waveform passed through without an isolation claim"
+                .to_owned(),
+        );
+        return Ok(report);
+    };
+
+    let checkpoint = || token.checkpoint();
+    let samples = audio::read_normalized_wav_16k_mono_raw_with_checkpoint(
+        normalized_wav,
+        &checkpoint,
+    )?;
+    if samples.len() < crate::separate::BLOCK_LEN {
+        report.vocal_isolated = false;
+        report.mode = SeparationMode::UnavailablePassthrough;
+        report.notes.push(format!(
+            "DTLN requires at least {} samples; {}-sample input passed through without an isolation claim",
+            crate::separate::BLOCK_LEN,
+            samples.len()
+        ));
+        return Ok(report);
+    }
+
+    checkpoint()?;
+    let mut separator = crate::separate::DtlnSeparator::from_safetensors(weights_path)?;
+    checkpoint()?;
+    let separated = separator.separate_with_checkpoint(&samples, &checkpoint)?;
+    let input_rms = waveform_rms(&samples);
+    let output_rms = waveform_rms(&separated);
+    audio::write_normalized_wav_16k_mono_with_checkpoint(
+        output_wav,
+        &separated,
+        &checkpoint,
+    )?;
+
+    report.vocal_isolated = true;
+    report.mode = SeparationMode::Dtln;
+    report.avg_rms = input_rms;
+    report.output_rms = Some(output_rms);
+    report.output_samples = Some(separated.len());
+    report.output_wav = Some(output_wav.to_path_buf());
+    report.notes.push(format!(
+        "DTLN transform applied: input_rms={input_rms:.6}, output_rms={output_rms:.6}, output_samples={}",
+        separated.len()
+    ));
+    Ok(report)
 }
 
 async fn execute_separate(
     pcx: &mut PipelineCx,
     log: &mut EventLog,
     stage_budgets: StageBudgetPolicy,
+    run_tmp_dir: &tempfile::TempDir,
     inter: &mut PipelineIntermediate,
 ) -> FwResult<()> {
     let normalized_wav = inter.normalized_wav.as_ref().ok_or_else(|| {
@@ -3997,11 +4100,19 @@ async fn execute_separate(
 
     let sep_wav = normalized_wav.clone();
     let cached_analysis = inter.native_audio_analysis.clone();
+    let weights_path = crate::separate::weights_path_from_env();
+    let output_wav = run_tmp_dir.path().join("dtln_vocals_16k_mono.wav");
     let sep_budget_ms = stage_budgets.separate_ms;
     let sep_token = pcx.stage_token(sep_budget_ms); // ubs:ignore — cancellation token is not a secret
 
     let report = match run_stage_with_budget("separate", sep_budget_ms, move || {
-        source_separate_with_analysis(&sep_wav, cached_analysis.as_deref(), &sep_token)
+        source_separate_stage(
+            &sep_wav,
+            cached_analysis.as_deref(),
+            weights_path.as_deref(),
+            &output_wav,
+            &sep_token,
+        )
     }) {
         Ok(report) => report,
         Err(error) => {
@@ -4017,6 +4128,12 @@ async fn execute_separate(
     };
 
     inter.vocal_isolated = report.vocal_isolated;
+    if let (Some(output_wav), Some(output_samples)) =
+        (report.output_wav.clone(), report.output_samples)
+    {
+        inter.normalized_wav = Some(output_wav);
+        inter.normalized_duration = Some(output_samples as f64 / 16_000.0);
+    }
     inter.warnings.extend(report.notes.iter().cloned());
 
     tracing::debug!(stage = "separate", "Source separation complete");
@@ -4027,11 +4144,14 @@ async fn execute_separate(
         json!({
             "vocal_isolated": report.vocal_isolated,
             "separation_mode": match report.mode {
+                SeparationMode::Dtln => "dtln",
                 SeparationMode::EnergyAnalysis => "energy_analysis",
                 SeparationMode::UnavailablePassthrough => "unavailable_passthrough",
             },
             "speech_coverage": report.speech_coverage,
             "avg_rms": report.avg_rms,
+            "output_rms": report.output_rms,
+            "output_samples": report.output_samples,
             "active_region_count": report.active_region_count,
             "notes": report.notes,
         }),
@@ -13560,6 +13680,72 @@ mod tests {
         assert!(result.notes[0].contains("passthrough without isolation claim"));
     }
 
+    #[test]
+    fn source_separate_stage_without_weights_is_honest_passthrough() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("speech.wav");
+        let output = dir.path().join("must-not-exist.wav");
+        let samples = (0..16_000)
+            .map(|index| {
+                let phase = index as f64 * 440.0 * std::f64::consts::TAU / 16_000.0;
+                (phase.sin() * 8_000.0) as i16
+            })
+            .collect::<Vec<_>>();
+        write_pcm16_mono_wav_for_vad(&input, 16_000, &samples);
+
+        let report = super::source_separate_stage(
+            &input,
+            None,
+            None,
+            &output,
+            &CancellationToken::no_deadline(),
+        )
+        .expect("missing weights must be an honest passthrough");
+        assert!(!report.vocal_isolated);
+        assert_eq!(report.mode, super::SeparationMode::UnavailablePassthrough);
+        assert!(report.output_wav.is_none());
+        assert!(report.output_rms.is_none());
+        assert!(report.output_samples.is_none());
+        assert!(!output.exists());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("weights are not configured"))
+        );
+    }
+
+    #[test]
+    fn native_separation_disables_external_backend_double_stemming() {
+        let dir = tempdir().unwrap();
+        let request = TranscribeRequest {
+            input: InputSource::File {
+                path: dir.path().join("input.wav"),
+            },
+            backend: BackendKind::WhisperDiarization,
+            model: None,
+            language: None,
+            translate: false,
+            diarize: true,
+            persist: false,
+            db_path: dir.path().join("storage.sqlite3"),
+            timeout_ms: None,
+            backend_params: BackendParams::default(),
+        };
+
+        let passthrough = super::backend_request_for_waveform(&request, false);
+        assert!(passthrough.backend_params.diarization_config.is_none());
+        let separated = super::backend_request_for_waveform(&request, true);
+        assert!(
+            separated
+                .backend_params
+                .diarization_config
+                .as_ref()
+                .is_some_and(|config| config.no_stem)
+        );
+        assert!(request.backend_params.diarization_config.is_none());
+    }
+
     fn assert_vad_reports_equal(actual: &VadReport, expected: &VadReport) {
         assert_eq!(actual.frames_total, expected.frames_total);
         assert_eq!(actual.frames_voiced, expected.frames_voiced);
@@ -13594,6 +13780,9 @@ mod tests {
         );
         assert_eq!(actual.avg_rms.to_bits(), expected.avg_rms.to_bits());
         assert_eq!(actual.active_region_count, expected.active_region_count);
+        assert_eq!(actual.output_rms, expected.output_rms);
+        assert_eq!(actual.output_samples, expected.output_samples);
+        assert_eq!(actual.output_wav, expected.output_wav);
         assert_eq!(actual.notes, expected.notes);
     }
 
@@ -14483,7 +14672,8 @@ mod tests {
         let report =
             source_separate(std::path::Path::new("/nonexistent/audio.wav"), &token).unwrap();
         // Should fallback gracefully.
-        assert!(report.vocal_isolated);
+        assert!(!report.vocal_isolated);
+        assert_eq!(report.mode, super::SeparationMode::UnavailablePassthrough);
         assert!(
             report
                 .notes
