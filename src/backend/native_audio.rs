@@ -306,10 +306,24 @@ fn parse_pcm16_mono_wav_with_checkpoint(
 
     loop {
         checkpoint()?;
+        let chunk_start = reader.stream_position().map_err(FwError::Io)?;
+        if chunk_start == file_len {
+            break;
+        }
+        if chunk_start > file_len || file_len - chunk_start < 8 {
+            return Err(FwError::InvalidRequest(
+                "truncated wav chunk header".to_owned(),
+            ));
+        }
+
         let mut chunk_header = [0u8; 8];
         match reader.read_exact(&mut chunk_header) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(FwError::InvalidRequest(
+                    "truncated wav chunk header".to_owned(),
+                ));
+            }
             Err(error) => {
                 return Err(FwError::Io(error));
             }
@@ -1325,6 +1339,31 @@ mod tests {
             error.contains("truncated wav chunk body"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn parse_wav_rejects_every_partial_chunk_header_length() {
+        let dir = tempdir().expect("tempdir");
+        let wav_path = dir.path().join("partial-chunk-header.wav");
+        write_pcm16_mono_wav(&wav_path, 16_000, &[0_i16; 640]);
+        let valid_bytes = std::fs::read(&wav_path).expect("read valid WAV");
+
+        analyze_wav(&wav_path, None).expect("exact EOF after a complete chunk must parse");
+
+        for trailing_len in 1..8 {
+            let mut torn_bytes = valid_bytes.clone();
+            torn_bytes.extend(std::iter::repeat_n(0_u8, trailing_len));
+            let riff_len = u32::try_from(torn_bytes.len() - 8).expect("small fixture length");
+            torn_bytes[4..8].copy_from_slice(&riff_len.to_le_bytes());
+            std::fs::write(&wav_path, torn_bytes).expect("write torn WAV");
+
+            let error = analyze_wav(&wav_path, None)
+                .expect_err("an incomplete RIFF chunk header must fail closed");
+            assert!(
+                error.contains("truncated wav chunk header"),
+                "unexpected error for {trailing_len} trailing bytes: {error}"
+            );
+        }
     }
 
     #[test]
