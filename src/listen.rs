@@ -2426,11 +2426,16 @@ fn record_and_emit_listen_value(
     Ok(())
 }
 
-/// Record the terminal stats value, close its persistence sink, then emit the
-/// exact same owned value. Persistence closes first; when terminal emission
-/// succeeds, a close failure surfaces afterward, matching the listen error
-/// contract.
-fn close_and_emit_final_listen_value(
+/// Stop the capture owner, record the terminal stats value, close its
+/// persistence sink, then emit the exact same owned value. Capture cleanup
+/// happens first so a surviving process tree cannot coexist with a durably
+/// successful session row or `final: true` event.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the terminal seam keeps capture, persistence, and exact event ownership explicit"
+)]
+fn stop_close_and_emit_final_listen_value(
+    capture: &mut dyn crate::capture::CaptureSource,
     value: serde_json::Value,
     seq: u64,
     emit: &mut dyn FnMut(serde_json::Value) -> FwResult<()>,
@@ -2439,6 +2444,7 @@ fn close_and_emit_final_listen_value(
     finished_at_rfc3339: &dyn Fn() -> String,
     language: Option<&str>,
 ) -> FwResult<()> {
+    capture.stop()?;
     let (event_name, timestamp) = listen_event_identity(&value, seq)?;
     if let Some(sink) = sink.as_mut() {
         sink.record_event(seq, timestamp, event_name, &value);
@@ -3371,7 +3377,8 @@ pub fn run_listen_session(
     // Close the run: true end time + final stats/warnings + finalized
     // replay envelope. Failure here surfaces as run_error AFTER the session
     // events were emitted (never silently lost).
-    close_and_emit_final_listen_value(
+    stop_close_and_emit_final_listen_value(
+        capture.as_mut(),
         final_stats_value,
         seq,
         emit,
@@ -3380,7 +3387,6 @@ pub fn run_listen_session(
         &now_ts,
         pinned_language.as_deref(),
     )?;
-    capture.stop()?;
     Ok(cancelled)
 }
 
@@ -3491,6 +3497,44 @@ mod tests {
         (buffer.session_offset_sec(), buffer.buffer_sec())
     }
 
+    struct TerminalCapture {
+        fail_stop: bool,
+        stop_calls: usize,
+    }
+
+    impl crate::capture::CaptureSource for TerminalCapture {
+        fn sample_rate(&self) -> u32 {
+            16_000
+        }
+
+        fn channels(&self) -> u16 {
+            1
+        }
+
+        fn read(
+            &mut self,
+            _out: &mut [f32],
+            _max_wait: Duration,
+        ) -> FwResult<crate::capture::CaptureRead> {
+            Ok(crate::capture::CaptureRead {
+                frames: 0,
+                ended: true,
+                overrun_frames_dropped: 0,
+            })
+        }
+
+        fn stop(&mut self) -> FwResult<()> {
+            self.stop_calls += 1;
+            if self.fail_stop {
+                Err(FwError::ContractViolation(
+                    "test capture process tree survived cleanup".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[test]
     fn listen_event_identity_fails_closed_on_missing_or_wrong_identity() {
         for (value, expected_error) in [
@@ -3517,6 +3561,68 @@ mod tests {
                 "unexpected error for {value}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn capture_stop_failure_prevents_successful_terminal_event() {
+        // Deliberately leave the unique test database in the system temp
+        // directory: repository policy forbids automated file deletion.
+        let dir = std::env::temp_dir().join(format!(
+            "fw_listen_capture_stop_failure_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp directory");
+        let db_path = dir.join("capture-stop-failure.sqlite3");
+        let mut sink = Some(
+            ListenPersistSink::open(
+                &db_path,
+                "capture-stop-failure",
+                "2026-08-27T00:00:00Z",
+                "test-input",
+                r#"{"kind":"listen-test"}"#,
+            )
+            .expect("open listen persistence sink"),
+        );
+        let mut capture = TerminalCapture {
+            fail_stop: true,
+            stop_calls: 0,
+        };
+        let mut emitted = false;
+        let mut emit = |_value| {
+            emitted = true;
+            Ok(())
+        };
+        let final_stats = robot::listen_session_stats_value(
+            "capture-stop-failure",
+            0,
+            "2026-08-27T00:00:00Z",
+            &robot::ListenSessionStats::default(),
+            true,
+        );
+
+        let error = stop_close_and_emit_final_listen_value(
+            &mut capture,
+            final_stats,
+            0,
+            &mut emit,
+            &mut sink,
+            &[],
+            &|| "2026-08-27T00:00:01Z".to_owned(),
+            None,
+        )
+        .expect_err("capture cleanup failure must prevent successful finalization");
+
+        assert!(matches!(error, FwError::ContractViolation(_)));
+        assert_eq!(capture.stop_calls, 1);
+        assert!(!emitted, "final stats were emitted after cleanup failed");
+        assert!(
+            sink.is_some(),
+            "persistence sink was consumed and durably closed after cleanup failed"
+        );
     }
 
     #[test]
@@ -3636,6 +3742,10 @@ mod tests {
             &stats,
             true,
         );
+        let mut capture = TerminalCapture {
+            fail_stop: false,
+            stop_calls: 0,
+        };
         {
             let mut emit = |value| {
                 let mut bytes = Vec::new();
@@ -3643,7 +3753,8 @@ mod tests {
                 emitted.push((value, bytes));
                 Ok(())
             };
-            close_and_emit_final_listen_value(
+            stop_close_and_emit_final_listen_value(
+                &mut capture,
                 final_stats_value,
                 seq,
                 &mut emit,
@@ -3654,6 +3765,7 @@ mod tests {
             )
             .expect("persist, close, and emit exact terminal event");
         }
+        assert_eq!(capture.stop_calls, 1);
         assert!(sink.is_none(), "terminal event closes the persistence sink");
         assert_eq!(clock_calls.get(), 5, "one timestamp call per event");
         assert_eq!(
