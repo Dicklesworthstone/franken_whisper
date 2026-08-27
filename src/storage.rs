@@ -483,7 +483,24 @@ impl RunStore {
             result.transcript.clone()
         };
 
-        // Checkpoint before loading events (second major query).
+        let segments = if backend == BackendKind::NativeListen {
+            if let Some(tok) = token {
+                tok.checkpoint()?;
+            }
+            let segment_rows = self
+                .connection
+                .query_with_params(
+                    "SELECT idx, start_sec, end_sec, speaker, text, confidence \
+                     FROM segments WHERE run_id = ?1 ORDER BY idx ASC",
+                    &[SqliteValue::Text(run_id.clone().into())],
+                )
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            parse_durable_segment_rows(&run_id, &segment_rows, 0)?
+        } else {
+            result.segments
+        };
+
+        // Checkpoint before loading events (the next major query).
         if let Some(tok) = token {
             tok.checkpoint()?;
         }
@@ -535,7 +552,7 @@ impl RunStore {
             finished_at_rfc3339,
             backend,
             transcript,
-            segments: result.segments,
+            segments,
             diarization: result.diarization,
             projection_timeline,
             events,
@@ -545,9 +562,10 @@ impl RunStore {
         }))
     }
 
-    /// Load full details for many runs with two batched `WHERE id/run_id IN (…)`
-    /// queries instead of the per-run N+1 (`load_run_details` × N, each 2 queries +
-    /// 2 schema scans). Returns details for the run_ids that exist, in input order.
+    /// Load full details for many runs with batched `WHERE id/run_id IN (…)`
+    /// queries instead of the per-run N+1. Ordinary batch-ASR history uses runs +
+    /// events; a third query loads authoritative segment rows only when the batch
+    /// contains native-listen runs. Returns existing run_ids in input order.
     /// Output is byte-identical to per-run `load_run_details` (asserted by
     /// `load_run_details_batch_matches_per_run`). `FW_STORAGE_BATCH_HISTORY=0` falls
     /// back to the per-run path (kill-switch + A/B arm).
@@ -595,8 +613,41 @@ impl RunStore {
             .map_err(|error| FwError::Storage(error.to_string()))?;
         let mut run_by_id: std::collections::HashMap<String, fsqlite::Row> =
             std::collections::HashMap::with_capacity(run_rows.len());
+        let mut native_listen_run_ids = Vec::new();
         for row in run_rows {
-            run_by_id.insert(value_to_string(row.get(0)), row);
+            let run_id = value_to_string(row.get(0));
+            if parse_backend(&value_to_string(row.get(3))) == BackendKind::NativeListen {
+                native_listen_run_ids.push(run_id.clone());
+            }
+            run_by_id.insert(run_id, row);
+        }
+
+        let mut segments_by_run: std::collections::HashMap<String, Vec<fsqlite::Row>> =
+            std::collections::HashMap::new();
+        if !native_listen_run_ids.is_empty() {
+            let segment_placeholders = (1..=native_listen_run_ids.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let segment_params: Vec<SqliteValue> = native_listen_run_ids
+                .iter()
+                .map(|id| SqliteValue::Text(id.clone().into()))
+                .collect();
+            let segment_sql = format!(
+                "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
+                 FROM segments WHERE run_id IN ({segment_placeholders}) \
+                 ORDER BY run_id ASC, idx ASC"
+            );
+            let segment_rows = self
+                .connection
+                .query_with_params(&segment_sql, &segment_params)
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            for row in segment_rows {
+                segments_by_run
+                    .entry(value_to_string(row.get(0)))
+                    .or_default()
+                    .push(row);
+            }
         }
 
         let evt_sql = format!(
@@ -622,7 +673,8 @@ impl RunStore {
                 continue;
             };
             let events = events_by_run.remove(run_id).unwrap_or_default();
-            out.push(assemble_run_details_batched(run_row, &events)?);
+            let segments = segments_by_run.remove(run_id).unwrap_or_default();
+            out.push(assemble_run_details_batched(run_row, &events, &segments)?);
         }
         Ok(out)
     }
@@ -2549,11 +2601,12 @@ fn persist_skip_stmt_sp_enabled() -> bool {
     std::env::var("FW_PERSIST_SKIP_STMT_SP").ok().as_deref() != Some("0")
 }
 
-/// Whether [`RunStore::load_run_details_batch`] loads many runs with two batched
+/// Whether [`RunStore::load_run_details_batch`] loads many runs with batched
 /// `WHERE id/run_id IN (…)` queries (default) instead of one `load_run_details`
-/// (two queries + two schema scans) per run — the app-level N+1 in the routing-
-/// history command. Output is identical either way (asserted by a batch-vs-per-run
-/// test). `FW_STORAGE_BATCH_HISTORY=0` restores the per-run path (kill-switch + A/B).
+/// call per run — the app-level N+1 in the routing-history command. Native-listen
+/// batches add one bounded segment query; ordinary runs retain the runs+events
+/// path. Output is identical either way (asserted by batch-vs-per-run tests).
+/// `FW_STORAGE_BATCH_HISTORY=0` restores the per-run path (kill-switch + A/B).
 fn batch_history_enabled() -> bool {
     std::env::var("FW_STORAGE_BATCH_HISTORY").ok().as_deref() != Some("0")
 }
@@ -2572,15 +2625,110 @@ fn validate_stored_result_contracts(run_id: &str, result: &TranscriptionResult) 
     Ok(())
 }
 
+fn parse_durable_segment_rows(
+    run_id: &str,
+    rows: &[fsqlite::Row],
+    column_offset: usize,
+) -> FwResult<Vec<TranscriptionSegment>> {
+    rows.iter()
+        .map(|row| {
+            let idx = row
+                .get(column_offset)
+                .and_then(SqliteValue::as_integer)
+                .ok_or_else(|| {
+                    FwError::Storage(format!(
+                        "invalid durable segment index for run {run_id}"
+                    ))
+                })?;
+            if idx < 0 {
+                return Err(FwError::Storage(format!(
+                    "invalid durable segment index {idx} for run {run_id}"
+                )));
+            }
+
+            let start_sec = parse_optional_segment_float(
+                row.get(column_offset + 1),
+                run_id,
+                idx,
+                "start_sec",
+            )?;
+            let end_sec = parse_optional_segment_float(
+                row.get(column_offset + 2),
+                run_id,
+                idx,
+                "end_sec",
+            )?;
+            let speaker = match row.get(column_offset + 3) {
+                None | Some(SqliteValue::Null) => None,
+                Some(SqliteValue::Text(value)) => Some(value.to_string()),
+                Some(_) => {
+                    return Err(FwError::Storage(format!(
+                        "invalid durable segment speaker for run {run_id} index {idx}"
+                    )));
+                }
+            };
+            let text = row
+                .get(column_offset + 4)
+                .and_then(SqliteValue::as_text)
+                .ok_or_else(|| {
+                    FwError::Storage(format!(
+                        "invalid durable segment text for run {run_id} index {idx}"
+                    ))
+                })?
+                .to_owned();
+            let confidence = parse_optional_segment_float(
+                row.get(column_offset + 5),
+                run_id,
+                idx,
+                "confidence",
+            )?;
+
+            Ok(TranscriptionSegment {
+                start_sec,
+                end_sec,
+                text,
+                speaker,
+                confidence,
+            })
+        })
+        .collect()
+}
+
+fn parse_optional_segment_float(
+    value: Option<&SqliteValue>,
+    run_id: &str,
+    idx: i64,
+    field: &str,
+) -> FwResult<Option<f64>> {
+    let number = match value {
+        None | Some(SqliteValue::Null) => return Ok(None),
+        Some(SqliteValue::Float(value)) => *value,
+        Some(SqliteValue::Integer(value)) => *value as f64,
+        Some(_) => {
+            return Err(FwError::Storage(format!(
+                "invalid durable segment {field} for run {run_id} index {idx}"
+            )));
+        }
+    };
+    if !number.is_finite() {
+        return Err(FwError::Storage(format!(
+            "non-finite durable segment {field} for run {run_id} index {idx}"
+        )));
+    }
+    Ok(Some(number))
+}
+
 /// Assemble a [`StoredRunDetails`] from a batched `runs` row (9 cols: id,
 /// started_at, finished_at, backend, result_json, warnings_json, transcript,
 /// replay_json, acceleration_json) and its batched `events` rows (7 cols: run_id,
 /// seq, ts_rfc3339, stage, code, message, payload_json). Mirrors the per-run
 /// assembly in `load_run_details_cancellable` exactly — the only difference is the
 /// events carry `run_id` at column 0 (so seq…payload shift +1) to allow grouping.
+/// Native-listen `segment_rows` likewise carry `run_id` before idx…confidence.
 fn assemble_run_details_batched(
     run_row: &fsqlite::Row,
     event_rows: &[fsqlite::Row],
+    segment_rows: &[fsqlite::Row],
 ) -> FwResult<StoredRunDetails> {
     let run_id = value_to_string(run_row.get(0));
     let started_at_rfc3339 = value_to_string(run_row.get(1));
@@ -2604,6 +2752,11 @@ fn assemble_run_details_batched(
         transcript_fallback
     } else {
         result.transcript.clone()
+    };
+    let segments = if backend == BackendKind::NativeListen {
+        parse_durable_segment_rows(&run_id, segment_rows, 1)?
+    } else {
+        result.segments
     };
 
     let events = event_rows
@@ -2643,7 +2796,7 @@ fn assemble_run_details_batched(
         finished_at_rfc3339,
         backend,
         transcript,
-        segments: result.segments,
+        segments,
         diarization: result.diarization,
         projection_timeline,
         events,
@@ -6148,6 +6301,136 @@ mod tests {
     }
 
     #[test]
+    fn native_listen_detail_loaders_return_ordered_durable_segments_before_close() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("listen_history.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_id = "listen-history-1";
+
+        store
+            .listen_open_run(&ListenRunOpen {
+                run_id,
+                started_at_rfc3339: "2026-08-27T07:00:00Z",
+                input_path: "stdin-pcm",
+                request_json: "{}",
+            })
+            .expect("open live run");
+        store
+            .listen_flush_utterance(
+                run_id,
+                &[
+                    ListenSegmentRow {
+                        idx: 2,
+                        start_sec: 2.0,
+                        end_sec: 3.25,
+                        text: "third".to_owned(),
+                    },
+                    ListenSegmentRow {
+                        idx: 0,
+                        start_sec: 0.0,
+                        end_sec: 0.75,
+                        text: "first".to_owned(),
+                    },
+                    ListenSegmentRow {
+                        idx: 1,
+                        start_sec: 0.75,
+                        end_sec: 2.0,
+                        text: "second".to_owned(),
+                    },
+                ],
+                &[],
+                "first second third",
+                "2026-08-27T07:00:03Z",
+            )
+            .expect("flush live utterance");
+
+        let expected = vec![
+            TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(0.75),
+                text: "first".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+            TranscriptionSegment {
+                start_sec: Some(0.75),
+                end_sec: Some(2.0),
+                text: "second".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+            TranscriptionSegment {
+                start_sec: Some(2.0),
+                end_sec: Some(3.25),
+                text: "third".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+        ];
+
+        let single = store
+            .load_run_details(run_id)
+            .expect("load single details")
+            .expect("live run exists before close");
+        assert_eq!(single.backend, BackendKind::NativeListen);
+        assert_eq!(single.transcript, "first second third");
+        assert_eq!(single.segments, expected);
+
+        let batch = store
+            .load_run_details_batch(&[run_id.to_owned()])
+            .expect("load batched details");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].backend, BackendKind::NativeListen);
+        assert_eq!(batch[0].transcript, "first second third");
+        assert_eq!(batch[0].segments, expected);
+    }
+
+    #[test]
+    fn native_listen_detail_loaders_reject_invalid_durable_segment_index() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("listen_history_invalid_segment.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_id = "listen-history-invalid-segment";
+
+        store
+            .listen_open_run(&ListenRunOpen {
+                run_id,
+                started_at_rfc3339: "2026-08-27T07:05:00Z",
+                input_path: "stdin-pcm",
+                request_json: "{}",
+            })
+            .expect("open live run");
+
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
+        conn.execute_with_params(
+            "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) \
+             VALUES (?1, -1, 0.0, 1.0, NULL, 'corrupt', NULL)",
+            &[SqliteValue::Text(run_id.to_owned().into())],
+        )
+        .expect("insert corrupt durable segment");
+
+        let single_error = store
+            .load_run_details(run_id)
+            .expect_err("single loader must reject corrupt durable segment");
+        assert!(
+            single_error
+                .to_string()
+                .contains("invalid durable segment index -1"),
+            "unexpected single-loader error: {single_error}"
+        );
+
+        let batch_error = store
+            .load_run_details_batch(&[run_id.to_owned()])
+            .expect_err("batch loader must reject corrupt durable segment");
+        assert!(
+            batch_error
+                .to_string()
+                .contains("invalid durable segment index -1"),
+            "unexpected batch-loader error: {batch_error}"
+        );
+    }
+
+    #[test]
     fn segments_loaded_from_result_json_not_segments_table() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("seg_source.sqlite3");
@@ -6178,6 +6461,17 @@ mod tests {
             .expect("exists");
         assert_eq!(details.segments.len(), 1, "segments come from result_json");
         assert_eq!(details.segments[0].text, "from json");
+
+        let batch = store
+            .load_run_details_batch(&["run-segsrc".to_owned()])
+            .expect("batch query");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].segments.len(),
+            1,
+            "ordinary batched history must keep using result_json"
+        );
+        assert_eq!(batch[0].segments[0].text, "from json");
     }
 
     #[test]
