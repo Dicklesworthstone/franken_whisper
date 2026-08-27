@@ -330,6 +330,14 @@ pub fn decode_frames_to_raw<R: Read>(reader: &mut R) -> FwResult<(DecodeReport, 
     decode_frames_to_raw_with_policy(reader, DecodeRecoveryPolicy::FailClosed)
 }
 
+fn next_sequence_number(seq: u64) -> FwResult<u64> {
+    seq.checked_add(1).ok_or_else(|| {
+        FwError::InvalidRequest(format!(
+            "tty-audio sequence space exhausted at seq {seq}"
+        ))
+    })
+}
+
 pub fn decode_frames_to_raw_with_policy<R: Read>(
     reader: &mut R,
     policy: DecodeRecoveryPolicy,
@@ -415,7 +423,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
                     return Err(error);
                 }
                 contiguous_prefix_intact = false;
-                expected_seq = frame.seq + 1;
+                expected_seq = next_sequence_number(frame.seq)?;
                 seen.insert(frame.seq);
                 continue;
             }
@@ -429,7 +437,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
                     return Err(error);
                 }
                 contiguous_prefix_intact = false;
-                expected_seq = frame.seq + 1;
+                expected_seq = next_sequence_number(frame.seq)?;
                 seen.insert(frame.seq);
                 continue;
             }
@@ -449,7 +457,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
                 }
                 raw.truncate(decoded_start);
                 contiguous_prefix_intact = false;
-                expected_seq = frame.seq + 1;
+                expected_seq = next_sequence_number(frame.seq)?;
                 seen.insert(frame.seq);
                 continue;
             }
@@ -467,7 +475,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
                 }
                 raw.truncate(decoded_start);
                 contiguous_prefix_intact = false;
-                expected_seq = frame.seq + 1;
+                expected_seq = next_sequence_number(frame.seq)?;
                 seen.insert(frame.seq);
                 continue;
             }
@@ -478,7 +486,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
         if contiguous_prefix_intact {
             highest_contiguous_seq = Some(frame.seq);
         }
-        expected_seq = frame.seq + 1;
+        expected_seq = next_sequence_number(frame.seq)?;
     }
 
     let report = DecodeReport {
@@ -1167,6 +1175,7 @@ pub fn stream_mic_to_ndjson<S: MicAudioSource, W: Write>(
             continue;
         }
 
+        let next_seq = next_sequence_number(seq)?;
         let crc = crc32_of(&chunk);
         let sha = sha256_hex(&chunk);
         let compressed = compress_chunk(&chunk)?;
@@ -1184,7 +1193,7 @@ pub fn stream_mic_to_ndjson<S: MicAudioSource, W: Write>(
 
         write_mic_stream_event_line(writer, &frame, &mut event_line)?;
 
-        seq += 1;
+        seq = next_seq;
     }
 
     Ok(seq)
@@ -1318,6 +1327,8 @@ impl TtyAudioPipelineAdapter {
             }
 
             validate_audio_frame_metadata(frame)?;
+            // Finalization represents the contiguous frame count as highest_seq + 1.
+            next_sequence_number(frame.seq)?;
 
             let compressed = STANDARD_NO_PAD
                 .decode(&frame.payload_b64)
@@ -1376,7 +1387,13 @@ impl TtyAudioPipelineAdapter {
                 "no frames have been ingested".to_owned(),
             ));
         };
-        let expected_frame_count = highest_seq + 1;
+        let expected_frame_count = match next_sequence_number(highest_seq) {
+            Ok(count) => count,
+            Err(error) => {
+                self.finalized = false;
+                return Err(error);
+            }
+        };
         if self.raw_pcm.len() as u64 != expected_frame_count {
             self.finalized = false;
             return Err(FwError::InvalidRequest(format!(
@@ -2272,6 +2289,41 @@ mod tests {
         assert_eq!(report.integrity_failures, vec![1]);
         assert_eq!(report.dropped_frames, vec![1]);
         assert_eq!(raw, b"ok0ok2");
+    }
+
+    #[test]
+    fn decode_skip_missing_rejects_sequence_space_exhaustion_after_valid_frame() {
+        let frame = make_frame(u64::MAX, b"last-representable-sequence");
+        let ndjson = frames_to_ndjson(&[frame]);
+        let mut reader = ndjson.as_bytes();
+
+        let error =
+            decode_frames_to_raw_with_policy(&mut reader, DecodeRecoveryPolicy::SkipMissing)
+                .expect_err("sequence exhaustion must fail instead of wrapping expected_seq");
+        assert!(
+            error
+                .to_string()
+                .contains("sequence space exhausted at seq 18446744073709551615")
+        );
+    }
+
+    #[test]
+    fn decode_skip_missing_rejects_sequence_space_exhaustion_after_corrupt_frame() {
+        let mut frame = make_frame(u64::MAX, b"corrupt-terminal-sequence");
+        frame.payload_b64 = "not-valid-base64".to_owned();
+        frame.crc32 = None;
+        frame.payload_sha256 = None;
+        let ndjson = frames_to_ndjson(&[frame]);
+        let mut reader = ndjson.as_bytes();
+
+        let error =
+            decode_frames_to_raw_with_policy(&mut reader, DecodeRecoveryPolicy::SkipMissing)
+                .expect_err("recovery must fail instead of wrapping expected_seq");
+        assert!(
+            error
+                .to_string()
+                .contains("sequence space exhausted at seq 18446744073709551615")
+        );
     }
 
     #[test]
@@ -4713,6 +4765,27 @@ mod tests {
             !adapter.is_finalized(),
             "failed finalize should leave adapter open for retransmit repair"
         );
+    }
+
+    #[test]
+    fn pipeline_adapter_ingest_rejects_sequence_space_exhaustion_and_stays_usable() {
+        let mut adapter = TtyAudioPipelineAdapter::new().expect("new adapter");
+        let error = adapter
+            .ingest_frames(&[make_frame(u64::MAX, b"terminal")])
+            .expect_err("sequence exhaustion must fail before storing the frame");
+        assert!(
+            error
+                .to_string()
+                .contains("sequence space exhausted at seq 18446744073709551615")
+        );
+        assert_eq!(adapter.frames_ingested(), 0);
+        assert_eq!(adapter.raw_pcm_len(), 0);
+
+        let count = adapter
+            .ingest_frames(&[make_frame(0, b"replacement")])
+            .expect("adapter should remain usable after rejecting sequence exhaustion");
+        assert_eq!(count, 1);
+        assert_eq!(adapter.frames_ingested(), 1);
     }
 
     // ---------------------------------------------------------------
