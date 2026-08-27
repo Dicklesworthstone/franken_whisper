@@ -1203,6 +1203,20 @@ fn import_inner(
     input_dir: &Path,
     conflict_policy: ConflictPolicy,
 ) -> FwResult<ImportResult> {
+    import_inner_with_batch_mode(
+        db_path,
+        input_dir,
+        conflict_policy,
+        sync_batch_import_enabled(),
+    )
+}
+
+fn import_inner_with_batch_mode(
+    db_path: &Path,
+    input_dir: &Path,
+    conflict_policy: ConflictPolicy,
+    batch_import_enabled: bool,
+) -> FwResult<ImportResult> {
     // Validate manifest
     let manifest_path = input_dir.join("manifest.json");
     if !manifest_path.exists() {
@@ -1239,7 +1253,13 @@ fn import_inner(
         .execute("BEGIN;")
         .map_err(|error| FwError::Storage(error.to_string()))?;
 
-    let result = import_tables(connection, &input_paths, &manifest, conflict_policy);
+    let result = import_tables(
+        connection,
+        &input_paths,
+        &manifest,
+        conflict_policy,
+        batch_import_enabled,
+    );
 
     match result {
         Ok(import_result) => {
@@ -1284,6 +1304,7 @@ fn import_tables(
     input_paths: &JsonlInputPaths,
     manifest: &SyncManifest,
     conflict_policy: ConflictPolicy,
+    batch_import_enabled: bool,
 ) -> FwResult<ImportResult> {
     let mut conflicts = Vec::new();
     let mut run_tracking = RunImportTracking::default();
@@ -1295,6 +1316,7 @@ fn import_tables(
         conflict_policy,
         &mut conflicts,
         &mut run_tracking,
+        batch_import_enabled,
     )
     .map_err(|error| FwError::Storage(format!("runs import failed: {error}")))?;
 
@@ -1314,7 +1336,9 @@ fn import_tables(
         &mut conflicts,
         &run_tracking.imported_run_ids,
         &run_tracking.overwritten_run_ids,
+        &run_tracking.inserted_run_ids,
         &run_tracking.overwritten_segment_idxs_before,
+        batch_import_enabled,
     )
     .map_err(|error| FwError::Storage(format!("segments import failed: {error}")))?;
 
@@ -1333,7 +1357,9 @@ fn import_tables(
         &mut conflicts,
         &run_tracking.imported_run_ids,
         &run_tracking.overwritten_run_ids,
+        &run_tracking.inserted_run_ids,
         &run_tracking.overwritten_event_seqs_before,
+        batch_import_enabled,
     )
     .map_err(|error| FwError::Storage(format!("events import failed: {error}")))?;
 
@@ -1355,6 +1381,7 @@ fn import_tables(
 #[derive(Default)]
 struct RunImportTracking {
     imported_run_ids: HashSet<String>,
+    inserted_run_ids: HashSet<String>,
     overwritten_run_ids: HashSet<String>,
     overwritten_segment_idxs_before: HashMap<String, HashSet<i64>>,
     overwritten_event_seqs_before: HashMap<String, HashSet<i64>>,
@@ -1366,11 +1393,12 @@ fn import_runs(
     conflict_policy: ConflictPolicy,
     conflicts: &mut Vec<SyncConflict>,
     tracking: &mut RunImportTracking,
+    batch_import_enabled: bool,
 ) -> FwResult<u64> {
     let reader = open_jsonl_reader(path)?;
     let mut count = 0u64;
 
-    if sync_batch_import_enabled() {
+    if batch_import_enabled {
         // Batched: pre-fetch the existing rows for a chunk of ids with one
         // `WHERE id IN (…)` query, then run the SAME `apply_run_row` conflict logic
         // per line ⇒ byte-identical to the per-line path. Chunked to bound memory.
@@ -1581,6 +1609,7 @@ fn apply_run_row(
             &cols,
         )
         .map_err(|error| FwError::Storage(format!("insert runs `{id}` failed: {error}")))?;
+    tracking.inserted_run_ids.insert(id.to_owned());
 
     Ok(Some(cols))
 }
@@ -1706,6 +1735,25 @@ fn record_segment_pre(
     Ok(())
 }
 
+/// Validate a child row that belongs to a target run which existed before this
+/// import. `Skip` is a whole-aggregate policy: accepted rows still count toward
+/// manifest reconciliation, but none may query, compare, or mutate child state.
+fn skip_preexisting_child_row(
+    run_id: &str,
+    row: &serde_json::Value,
+    conflict_policy: ConflictPolicy,
+    inserted_run_ids: &HashSet<String>,
+    required_fields: &[&str],
+) -> FwResult<bool> {
+    if conflict_policy != ConflictPolicy::Skip || inserted_run_ids.contains(run_id) {
+        return Ok(false);
+    }
+    for field in required_fields {
+        json_str(row, field)?;
+    }
+    Ok(true)
+}
+
 /// Apply one `segments` JSONL row against `existing` (current DB/seen row, or
 /// `None`). **Shared by the per-line and batched paths** ⇒ byte-identical imported
 /// rows. Returns `Some(inserted_cols)` when a row was INSERTed (so the batched
@@ -1805,6 +1853,10 @@ fn apply_segment_row(
 /// intra-chunk seen-map (updated on every INSERT), reproducing the per-line invariant
 /// that a duplicate `(run_id, idx)` later in the file sees the earlier line's insert.
 /// Drains `chunk`. Returns the number of lines processed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "segment batching keeps parent-policy sets explicit and borrowed"
+)]
 fn flush_segment_chunk(
     connection: &Connection,
     chunk: &mut Vec<(String, i64, serde_json::Value)>,
@@ -1813,6 +1865,7 @@ fn flush_segment_chunk(
     state: &mut SegmentImportState,
     imported_run_ids: &HashSet<String>,
     overwritten_run_ids: &HashSet<String>,
+    inserted_run_ids: &HashSet<String>,
 ) -> FwResult<u64> {
     if chunk.is_empty() {
         return Ok(0);
@@ -1822,31 +1875,36 @@ fn flush_segment_chunk(
     let unique_run_ids: Vec<String> = chunk
         .iter()
         .map(|(run_id, _, _)| run_id.clone())
+        .filter(|run_id| {
+            conflict_policy != ConflictPolicy::Skip || inserted_run_ids.contains(run_id)
+        })
         .filter(|run_id| seen.insert(run_id.clone()))
         .collect();
-    let placeholders = (1..=unique_run_ids.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id IN ({placeholders})"
-    );
-    let params: Vec<SqliteValue> = unique_run_ids
-        .iter()
-        .map(|run_id| SqliteValue::Text(run_id.clone().into()))
-        .collect();
-    let rows = connection
-        .query_with_params(&sql, &params)
-        .map_err(|error| {
-            FwError::Storage(format!("batch query segments existing failed: {error}"))
-        })?;
-
     let mut existing_map: HashMap<(String, i64), Vec<SqliteValue>> = HashMap::new();
-    for r in &rows {
-        let cols = segment_row_to_cols(r);
-        let run_id = value_to_string_sqlite(cols.first());
-        if let Some(SqliteValue::Integer(idx)) = cols.get(1) {
-            existing_map.insert((run_id, *idx), cols);
+    if !unique_run_ids.is_empty() {
+        let placeholders = (1..=unique_run_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id IN ({placeholders})"
+        );
+        let params: Vec<SqliteValue> = unique_run_ids
+            .iter()
+            .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+            .collect();
+        let rows = connection
+            .query_with_params(&sql, &params)
+            .map_err(|error| {
+                FwError::Storage(format!("batch query segments existing failed: {error}"))
+            })?;
+
+        for row in &rows {
+            let cols = segment_row_to_cols(row);
+            let run_id = value_to_string_sqlite(cols.first());
+            if let Some(SqliteValue::Integer(idx)) = cols.get(1) {
+                existing_map.insert((run_id, *idx), cols);
+            }
         }
     }
 
@@ -1863,6 +1921,16 @@ fn flush_segment_chunk(
             overwritten_run_ids,
             state,
         )?;
+        if skip_preexisting_child_row(
+            &run_id,
+            &row,
+            conflict_policy,
+            inserted_run_ids,
+            &["text"],
+        )? {
+            count += 1;
+            continue;
+        }
         let existing = existing_map.get(&(run_id.clone(), idx)).cloned();
         if let Some(cols) = apply_segment_row(
             connection,
@@ -1882,6 +1950,10 @@ fn flush_segment_chunk(
     Ok(count)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "segment import keeps parent-policy sets explicit and borrowed"
+)]
 fn import_segments(
     connection: &Connection,
     path: &Path,
@@ -1889,13 +1961,15 @@ fn import_segments(
     conflicts: &mut Vec<SyncConflict>,
     imported_run_ids: &HashSet<String>,
     overwritten_run_ids: &HashSet<String>,
+    inserted_run_ids: &HashSet<String>,
     overwritten_segment_idxs_before: &HashMap<String, HashSet<i64>>,
+    batch_import_enabled: bool,
 ) -> FwResult<u64> {
     let reader = open_jsonl_reader(path)?;
     let mut count = 0u64;
     let mut state = SegmentImportState::default();
 
-    if sync_batch_import_enabled() {
+    if batch_import_enabled {
         let chunk_size = sync_query_batch_size().max(1);
         let mut chunk: Vec<(String, i64, serde_json::Value)> = Vec::with_capacity(chunk_size);
         for line in reader.lines() {
@@ -1920,6 +1994,7 @@ fn import_segments(
                     &mut state,
                     imported_run_ids,
                     overwritten_run_ids,
+                    inserted_run_ids,
                 )?;
             }
         }
@@ -1931,6 +2006,7 @@ fn import_segments(
             &mut state,
             imported_run_ids,
             overwritten_run_ids,
+            inserted_run_ids,
         )?;
     } else {
         for line in reader.lines() {
@@ -1958,6 +2034,16 @@ fn import_segments(
                 overwritten_run_ids,
                 &mut state,
             )?;
+            if skip_preexisting_child_row(
+                &run_id,
+                &row,
+                conflict_policy,
+                inserted_run_ids,
+                &["text"],
+            )? {
+                count += 1;
+                continue;
+            }
 
             let existing_rows = connection
                 .query_with_params(
@@ -2135,6 +2221,10 @@ fn apply_event_row(
 
 /// Batched-import worker for `events` (mirror of [`flush_segment_chunk`]; composite
 /// `(run_id, seq)` key, prefetched by `run_id`, seen-map for intra-chunk dups).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "event batching keeps parent-policy sets explicit and borrowed"
+)]
 fn flush_event_chunk(
     connection: &Connection,
     chunk: &mut Vec<(String, i64, serde_json::Value)>,
@@ -2143,6 +2233,7 @@ fn flush_event_chunk(
     state: &mut EventImportState,
     imported_run_ids: &HashSet<String>,
     overwritten_run_ids: &HashSet<String>,
+    inserted_run_ids: &HashSet<String>,
 ) -> FwResult<u64> {
     if chunk.is_empty() {
         return Ok(0);
@@ -2152,31 +2243,36 @@ fn flush_event_chunk(
     let unique_run_ids: Vec<String> = chunk
         .iter()
         .map(|(run_id, _, _)| run_id.clone())
+        .filter(|run_id| {
+            conflict_policy != ConflictPolicy::Skip || inserted_run_ids.contains(run_id)
+        })
         .filter(|run_id| seen.insert(run_id.clone()))
         .collect();
-    let placeholders = (1..=unique_run_ids.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id IN ({placeholders})"
-    );
-    let params: Vec<SqliteValue> = unique_run_ids
-        .iter()
-        .map(|run_id| SqliteValue::Text(run_id.clone().into()))
-        .collect();
-    let rows = connection
-        .query_with_params(&sql, &params)
-        .map_err(|error| {
-            FwError::Storage(format!("batch query events existing failed: {error}"))
-        })?;
-
     let mut existing_map: HashMap<(String, i64), Vec<SqliteValue>> = HashMap::new();
-    for r in &rows {
-        let cols = event_row_to_cols(r);
-        let run_id = value_to_string_sqlite(cols.first());
-        if let Some(SqliteValue::Integer(seq)) = cols.get(1) {
-            existing_map.insert((run_id, *seq), cols);
+    if !unique_run_ids.is_empty() {
+        let placeholders = (1..=unique_run_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id IN ({placeholders})"
+        );
+        let params: Vec<SqliteValue> = unique_run_ids
+            .iter()
+            .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+            .collect();
+        let rows = connection
+            .query_with_params(&sql, &params)
+            .map_err(|error| {
+                FwError::Storage(format!("batch query events existing failed: {error}"))
+            })?;
+
+        for row in &rows {
+            let cols = event_row_to_cols(row);
+            let run_id = value_to_string_sqlite(cols.first());
+            if let Some(SqliteValue::Integer(seq)) = cols.get(1) {
+                existing_map.insert((run_id, *seq), cols);
+            }
         }
     }
 
@@ -2193,6 +2289,16 @@ fn flush_event_chunk(
             overwritten_run_ids,
             state,
         )?;
+        if skip_preexisting_child_row(
+            &run_id,
+            &row,
+            conflict_policy,
+            inserted_run_ids,
+            &["ts_rfc3339", "stage", "code", "message", "payload_json"],
+        )? {
+            count += 1;
+            continue;
+        }
         let existing = existing_map.get(&(run_id.clone(), seq)).cloned();
         if let Some(cols) = apply_event_row(
             connection,
@@ -2212,6 +2318,10 @@ fn flush_event_chunk(
     Ok(count)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "event import keeps parent-policy sets explicit and borrowed"
+)]
 fn import_events(
     connection: &Connection,
     path: &Path,
@@ -2219,13 +2329,15 @@ fn import_events(
     conflicts: &mut Vec<SyncConflict>,
     imported_run_ids: &HashSet<String>,
     overwritten_run_ids: &HashSet<String>,
+    inserted_run_ids: &HashSet<String>,
     overwritten_event_seqs_before: &HashMap<String, HashSet<i64>>,
+    batch_import_enabled: bool,
 ) -> FwResult<u64> {
     let reader = open_jsonl_reader(path)?;
     let mut count = 0u64;
     let mut state = EventImportState::default();
 
-    if sync_batch_import_enabled() {
+    if batch_import_enabled {
         let chunk_size = sync_query_batch_size().max(1);
         let mut chunk: Vec<(String, i64, serde_json::Value)> = Vec::with_capacity(chunk_size);
         for line in reader.lines() {
@@ -2250,6 +2362,7 @@ fn import_events(
                     &mut state,
                     imported_run_ids,
                     overwritten_run_ids,
+                    inserted_run_ids,
                 )?;
             }
         }
@@ -2261,6 +2374,7 @@ fn import_events(
             &mut state,
             imported_run_ids,
             overwritten_run_ids,
+            inserted_run_ids,
         )?;
     } else {
         for line in reader.lines() {
@@ -2288,6 +2402,16 @@ fn import_events(
                 overwritten_run_ids,
                 &mut state,
             )?;
+            if skip_preexisting_child_row(
+                &run_id,
+                &row,
+                conflict_policy,
+                inserted_run_ids,
+                &["ts_rfc3339", "stage", "code", "message", "payload_json"],
+            )? {
+                count += 1;
+                continue;
+            }
 
             let existing_rows = connection
                 .query_with_params(
@@ -11983,6 +12107,277 @@ mod tests {
     }
 
     #[test]
+    fn import_skip_policy_preserves_preexisting_run_as_a_whole_aggregate() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("skip_aggregate_source.sqlite3");
+        let target_db = dir.path().join("skip_aggregate_target.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+        let run_id = "run-skip-aggregate";
+
+        let store = RunStore::open(&source_db).expect("store");
+        store
+            .persist_report(&fixture_report(run_id, &source_db))
+            .expect("persist");
+        export(&source_db, &export_dir, &state_root).expect("export");
+        import(&target_db, &export_dir, &state_root, ConflictPolicy::Skip)
+            .expect("seed target");
+
+        let dump_target = || {
+            let connection = Connection::open(target_db.display().to_string())
+                .expect("open target connection");
+            let strings = |columns: Vec<SqliteValue>| -> Vec<String> {
+                columns
+                    .iter()
+                    .map(|value| value_to_string_sqlite(Some(value)))
+                    .collect()
+            };
+            (
+                connection
+                    .query("SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs ORDER BY id")
+                    .expect("dump runs")
+                    .iter()
+                    .map(run_row_to_cols)
+                    .map(|columns| strings(columns))
+                    .collect::<Vec<_>>(),
+                connection
+                    .query("SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments ORDER BY run_id, idx")
+                    .expect("dump segments")
+                    .iter()
+                    .map(segment_row_to_cols)
+                    .map(|columns| strings(columns))
+                    .collect::<Vec<_>>(),
+                connection
+                    .query("SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events ORDER BY run_id, seq")
+                    .expect("dump events")
+                    .iter()
+                    .map(event_row_to_cols)
+                    .map(|columns| strings(columns))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let original_aggregate = dump_target();
+
+        let read_rows = |name: &str| -> Vec<serde_json::Value> {
+            fs::read_to_string(export_dir.join(name))
+                .expect("read JSONL")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("parse JSONL row"))
+                .collect()
+        };
+        let runs = read_rows("runs.jsonl");
+        let mut segments = read_rows("segments.jsonl");
+        let mut events = read_rows("events.jsonl");
+
+        // The parent remains byte-identical. Its early no-op must not stop the
+        // child phase from treating it as a target-preexisting aggregate.
+        segments[0]["text"] = json!("archive-only replacement");
+        segments.push(json!({
+            "run_id": run_id,
+            "idx": 99,
+            "start_sec": 5.0,
+            "end_sec": 6.0,
+            "speaker": null,
+            "text": "archive-only child",
+            "confidence": null
+        }));
+        events[0]["message"] = json!("archive-only replacement");
+        events.push(json!({
+            "run_id": run_id,
+            "seq": 99,
+            "ts_rfc3339": "2026-01-01T00:00:04Z",
+            "stage": "archive",
+            "code": "archive.only",
+            "message": "archive-only child",
+            "payload_json": "{}"
+        }));
+        write_jsonl_snapshot(&export_dir, &runs, &segments, &events);
+
+        for batch_import_enabled in [false, true] {
+            let result = import_inner_with_batch_mode(
+                &target_db,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect("skip aggregate import");
+            assert!(result.conflicts.is_empty(), "Skip remains silent");
+            assert_eq!(result.runs_imported, 1, "processed parent row count");
+            assert_eq!(result.segments_imported, 3, "processed segment row count");
+            assert_eq!(result.events_imported, 3, "processed event row count");
+            assert_eq!(
+                dump_target(),
+                original_aggregate,
+                "Skip must preserve every stored parent and child column (batch={batch_import_enabled})"
+            );
+        }
+
+        let mut conflicting_runs = runs.clone();
+        conflicting_runs[0]["transcript"] = json!("archive-only transcript");
+        write_jsonl_snapshot(&export_dir, &conflicting_runs, &segments, &events);
+        for batch_import_enabled in [false, true] {
+            import_inner_with_batch_mode(
+                &target_db,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect("skip conflicting aggregate");
+            assert_eq!(
+                dump_target(),
+                original_aggregate,
+                "a conflicting parent must also preserve its whole aggregate (batch={batch_import_enabled})"
+            );
+        }
+
+        let mut duplicate_run = runs[0].clone();
+        duplicate_run["transcript"] = json!("later duplicate parent");
+        write_jsonl_snapshot(
+            &export_dir,
+            &[runs[0].clone(), duplicate_run],
+            &segments,
+            &events,
+        );
+        for batch_import_enabled in [false, true] {
+            let duplicate_target = dir
+                .path()
+                .join(format!("duplicate_target_{batch_import_enabled}.sqlite3"));
+            let result = import_inner_with_batch_mode(
+                &duplicate_target,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect("import archive-created duplicate parent");
+            assert_eq!(result.runs_imported, 2);
+            assert_eq!(result.segments_imported, 3);
+            assert_eq!(result.events_imported, 3);
+
+            let connection = Connection::open(duplicate_target.display().to_string())
+                .expect("open duplicate target");
+            let run_rows = connection
+                .query("SELECT transcript FROM runs")
+                .expect("query duplicate target run");
+            assert_eq!(run_rows.len(), 1);
+            assert_eq!(
+                value_to_string_sqlite(run_rows[0].get(0)),
+                "hello world from sync test",
+                "first parent row remains authoritative"
+            );
+            let segment_count = connection
+                .query("SELECT COUNT(*) FROM segments")
+                .expect("count segments");
+            assert_eq!(value_to_i64_sqlite(segment_count[0].get(0)), 3);
+            let event_count = connection
+                .query("SELECT COUNT(*) FROM events")
+                .expect("count events");
+            assert_eq!(value_to_i64_sqlite(event_count[0].get(0)), 3);
+        }
+
+        let child_only_segments = vec![json!({
+            "run_id": run_id,
+            "idx": 100,
+            "start_sec": 6.0,
+            "end_sec": 7.0,
+            "speaker": null,
+            "text": "child-only archive segment",
+            "confidence": null
+        })];
+        let child_only_events = vec![json!({
+            "run_id": run_id,
+            "seq": 100,
+            "ts_rfc3339": "2026-01-01T00:00:05Z",
+            "stage": "archive",
+            "code": "archive.child_only",
+            "message": "child-only archive event",
+            "payload_json": "{}"
+        })];
+        write_jsonl_snapshot(
+            &export_dir,
+            &[],
+            &child_only_segments,
+            &child_only_events,
+        );
+
+        for batch_import_enabled in [false, true] {
+            let child_only_result = import_inner_with_batch_mode(
+                &target_db,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect("skip child-only archive");
+            assert_eq!(child_only_result.runs_imported, 0);
+            assert_eq!(child_only_result.segments_imported, 1);
+            assert_eq!(child_only_result.events_imported, 1);
+            assert!(child_only_result.conflicts.is_empty());
+            assert_eq!(
+                dump_target(),
+                original_aggregate,
+                "child-only archives must not graft onto target-resident runs (batch={batch_import_enabled})"
+            );
+        }
+
+        let malformed_segment = json!({
+            "run_id": run_id,
+            "idx": 101,
+            "start_sec": 7.0,
+            "end_sec": 8.0,
+            "speaker": null,
+            "confidence": null
+        });
+        write_jsonl_snapshot(&export_dir, &[], &[malformed_segment], &[]);
+        for batch_import_enabled in [false, true] {
+            let error = import_inner_with_batch_mode(
+                &target_db,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect_err("skipped child rows must still validate required fields");
+            assert!(
+                error.to_string().contains("missing string field `text`"),
+                "unexpected malformed skipped-row error: {error}"
+            );
+            assert_eq!(
+                dump_target(),
+                original_aggregate,
+                "malformed skipped rows must roll the transaction back (batch={batch_import_enabled})"
+            );
+        }
+
+        let malformed_event = json!({
+            "run_id": run_id,
+            "seq": 101,
+            "ts_rfc3339": "2026-01-01T00:00:06Z",
+            "stage": "archive",
+            "code": "archive.malformed",
+            "message": "missing payload"
+        });
+        write_jsonl_snapshot(&export_dir, &[], &[], &[malformed_event]);
+        for batch_import_enabled in [false, true] {
+            let error = import_inner_with_batch_mode(
+                &target_db,
+                &export_dir,
+                ConflictPolicy::Skip,
+                batch_import_enabled,
+            )
+            .expect_err("skipped events must still validate required fields");
+            assert!(
+                error
+                    .to_string()
+                    .contains("missing string field `payload_json`"),
+                "unexpected malformed skipped-event error: {error}"
+            );
+            assert_eq!(
+                dump_target(),
+                original_aggregate,
+                "malformed skipped events must roll the transaction back (batch={batch_import_enabled})"
+            );
+        }
+    }
+
+    #[test]
     fn import_skip_policy_with_conflicting_segment_preserves_original_text() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("skip_seg.sqlite3");
@@ -14201,7 +14596,7 @@ mod tests {
         // Batched.
         {
             let mut st = SegmentImportState::default();
-            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            let (imp, ovr, skipped) = (HashSet::new(), HashSet::new(), HashSet::new());
             let mut chunk = import_rows.clone();
             let n = flush_segment_chunk(
                 &cbat,
@@ -14211,6 +14606,7 @@ mod tests {
                 &mut st,
                 &imp,
                 &ovr,
+                &skipped,
             )
             .expect("flush");
             assert_eq!(n, 3);
@@ -14342,7 +14738,7 @@ mod tests {
 
         {
             let mut st = EventImportState::default();
-            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            let (imp, ovr, skipped) = (HashSet::new(), HashSet::new(), HashSet::new());
             let mut chunk = import_rows.clone();
             let n = flush_event_chunk(
                 &cbat,
@@ -14352,6 +14748,7 @@ mod tests {
                 &mut st,
                 &imp,
                 &ovr,
+                &skipped,
             )
             .expect("flush");
             assert_eq!(n, 3);

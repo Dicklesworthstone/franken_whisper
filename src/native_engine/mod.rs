@@ -1052,14 +1052,27 @@ pub fn find_model_file(short_name: &str) -> Option<PathBuf> {
 // Model resolution
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Whether `spec` is a bare sentinel for the authenticated release package.
+/// Path-bearing spellings are deliberately excluded even when their basename
+/// is `default` or `large-v3-turbo`.
+#[must_use]
+pub(crate) fn is_release_package_spec(spec: &str) -> bool {
+    let spec = spec.trim();
+    spec.is_empty()
+        || spec.eq_ignore_ascii_case("default")
+        || spec.eq_ignore_ascii_case("large-v3-turbo")
+}
+
 /// Resolve a user-supplied model `spec` to a concrete, canonicalized path to a
 /// ggml `.bin` file.
 ///
-/// Two forms are accepted:
-/// 1. **A filesystem path** (absolute or relative) that already exists — it is
+/// Three forms are accepted:
+/// 1. **A release-package sentinel** (`default`, `large-v3-turbo`, or blank) —
+///    resolved only through the authenticated package installed by `fw pull`.
+/// 2. **A filesystem path** (absolute or relative) that already exists — it is
 ///    canonicalized and returned verbatim. This lets callers point at any
 ///    `.bin` anywhere on disk.
-/// 2. **A short model name** such as `"tiny.en"` or `"base"` — searched as
+/// 3. **A short model name** such as `"tiny.en"` or `"base"` — searched as
 ///    `ggml-{name}.bin` across [`model_search_dirs`] in precedence order. The
 ///    canonical `"large-v3-turbo"` name and an unspecified/default request are
 ///    reserved for the authenticated release package installed by `fw pull`.
@@ -1084,7 +1097,15 @@ pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
     // than trying to open a file literally named "" (which fails obscurely).
     let spec = spec.trim();
 
-    // Form 1: an existing path wins, even if it happens to look like a name.
+    // Bare release names are trust-boundary sentinels, never CWD-relative
+    // paths. A custom file with the same basename remains selectable through
+    // an explicit path spelling such as `./default` or `/models/default`.
+    if is_release_package_spec(spec) {
+        let package = crate::model_distribution::resolve_cached_whisper()?;
+        return package.weights_path.canonicalize().map_err(Into::into);
+    }
+
+    // Form 2: an existing explicit path wins over short-name lookup.
     if !spec.is_empty() {
         let as_path = Path::new(spec);
         if as_path.is_file() {
@@ -1097,25 +1118,9 @@ pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
         }
     }
 
-    // This canonical name is the release trust boundary, not an alias for an
-    // arbitrary same-named file in a legacy search directory. Operators can
-    // still request another compatible model by passing its explicit path.
-    if spec.eq_ignore_ascii_case("large-v3-turbo") {
-        let package = crate::model_distribution::resolve_cached_whisper()?;
-        return package.weights_path.canonicalize().map_err(Into::into);
-    }
-
     let dirs = model_search_dirs();
 
-    // The shipped default is the hash-pinned release package. Never substitute
-    // an arbitrary discovered model when that package is missing or corrupt;
-    // doing so would make the default depend on unrelated files on the host.
-    if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
-        let package = crate::model_distribution::resolve_cached_whisper()?;
-        return package.weights_path.canonicalize().map_err(Into::into);
-    }
-
-    // Form 2: explicit short-name lookup across the shared search dirs.
+    // Form 3: explicit short-name lookup across the shared search dirs.
     resolve_model_in_dirs(spec, &dirs)
 }
 
@@ -1244,18 +1249,16 @@ pub fn native_model_available(spec: &str) -> bool {
 #[must_use]
 pub(crate) fn model_probe_path(spec: &str) -> Option<PathBuf> {
     let spec = spec.trim();
+    if is_release_package_spec(spec) {
+        return find_model_file("large-v3-turbo");
+    }
     let explicit_path = Path::new(spec);
     if explicit_path.is_file() {
         return header_ftype_ok(explicit_path)
             .then(|| explicit_path.canonicalize().ok())
             .flatten();
     }
-    let lookup = if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
-        "large-v3-turbo"
-    } else {
-        spec
-    };
-    find_model_file(lookup)
+    find_model_file(spec)
 }
 
 /// Cheap availability check for the exact default model selection policy.
@@ -2129,15 +2132,34 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
+    fn release_package_specs_are_only_bare_sentinels() {
+        for spec in ["", "   ", "default", "DEFAULT", "large-v3-turbo"] {
+            assert!(is_release_package_spec(spec), "expected sentinel: {spec:?}");
+        }
+        for spec in [
+            "./default",
+            "/models/default",
+            "ggml-large-v3-turbo.bin",
+            "tiny.en",
+        ] {
+            assert!(
+                !is_release_package_spec(spec),
+                "explicit path or custom name must not be a sentinel: {spec:?}"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_model_existing_path_is_canonicalized() {
         let dir = TempDir::new("path");
         let mut valid = Vec::new();
         push_valid_header(&mut valid, 1);
-        let path = write_file(dir.path(), "ggml-tiny.en.bin", &valid);
-        // Pass a relative-ish/non-canonical spec via the absolute path; result
-        // must be the canonical form of the same file.
+        let path = write_file(dir.path(), "default", &valid);
+        // Even a release-sentinel basename remains a custom model when the
+        // caller supplies an explicit absolute path.
         let resolved = resolve_model(path.to_str().expect("utf8")).expect("resolve");
         assert_eq!(resolved, path.canonicalize().expect("canon"));
+        assert!(native_model_available(path.to_str().expect("utf8")));
     }
 
     #[test]

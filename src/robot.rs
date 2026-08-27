@@ -1937,21 +1937,21 @@ where
     let whisper_package_available =
         crate::model_distribution::cached_whisper_readiness_with_cancel(&is_cancelled)?;
     let whisper_available = if let Some(spec) = configured_whisper.as_deref() {
-        crate::native_engine::resolve_model(spec).is_ok()
-    } else if whisper_package_available {
-        // The release-package readiness check immediately above already
-        // hashed all 1.6 GB and validated the compiled trust root. Avoid a
-        // redundant second hash through `resolve_model("default")`.
-        true
+        if crate::native_engine::is_release_package_spec(spec) {
+            // The readiness check immediately above already hashed all 1.6 GB
+            // and validated the compiled trust root. A configured sentinel is
+            // still the release package, not a path or short-name override.
+            whisper_package_available
+        } else {
+            crate::native_engine::resolve_model(spec).is_ok()
+        }
     } else {
-        crate::native_engine::resolve_model("default").is_ok()
+        whisper_package_available
     };
     let whisper_selection = if configured_whisper.is_some() {
         "configured"
     } else if whisper_package_available {
         "verified_release_package"
-    } else if whisper_available {
-        "auto_discovered"
     } else {
         "missing"
     };

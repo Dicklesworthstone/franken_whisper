@@ -311,6 +311,160 @@ fn agent_discovery_json_commands_are_single_line_and_path_safe() {
 }
 
 #[test]
+fn release_model_sentinels_ignore_same_named_cwd_files() {
+    let runtime = tempdir().expect("isolated runtime directory");
+    let cache = tempdir().expect("isolated model cache");
+    let home = tempdir().expect("isolated home");
+
+    let mut valid_header = Vec::new();
+    valid_header.extend_from_slice(&0x6767_6d6cu32.to_le_bytes());
+    for value in [51865i32, 1500, 384, 6, 4, 448, 384, 6, 4, 80, 1] {
+        valid_header.extend_from_slice(&value.to_le_bytes());
+    }
+    for name in ["default", "DEFAULT", "large-v3-turbo"] {
+        std::fs::write(runtime.path().join(name), &valid_header).expect("write CWD collision");
+    }
+
+    let report_for = |spec: &str| -> serde_json::Value {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_fw"))
+            .args(["models", "--json"])
+            .current_dir(runtime.path())
+            .env("HOME", home.path())
+            .env("FRANKEN_WHISPER_MODEL_DIR", cache.path())
+            .env("FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL", spec)
+            .env_remove("FRANKEN_WHISPER_TEST_MODEL_DIR")
+            .output()
+            .expect("run model report");
+        assert!(
+            output.status.success(),
+            "model report failed for {spec:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("model report JSON")
+    };
+
+    for sentinel in ["default", "DEFAULT", "large-v3-turbo"] {
+        let report = report_for(sentinel);
+        let whisper = report["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .find(|entry| entry["id"] == "native-whisper-ggml")
+            .expect("Whisper model entry");
+        assert_eq!(
+            whisper["installed"], false,
+            "bare sentinel {sentinel:?} must not resolve through CWD"
+        );
+        assert_eq!(whisper["default_release_package_installed"], false);
+    }
+
+    let missing_binary = runtime.path().join("missing-backend-binary");
+    for sentinel in ["default", "large-v3-turbo"] {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_fw"))
+            .args(["robot", "backends"])
+            .current_dir(runtime.path())
+            .env("HOME", home.path())
+            .env("FRANKEN_WHISPER_MODEL_DIR", cache.path())
+            .env("FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL", sentinel)
+            .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &missing_binary)
+            .env("FRANKEN_WHISPER_INSANELY_FAST_BIN", &missing_binary)
+            .env("FRANKEN_WHISPER_PYTHON_BIN", &missing_binary)
+            .env_remove("FRANKEN_WHISPER_TEST_MODEL_DIR")
+            .output()
+            .expect("run backend discovery");
+        assert!(output.status.success(), "backend discovery must succeed");
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("backend discovery JSON");
+        let backends = report["backends"].as_array().expect("backends array");
+        for native_name in [
+            "whisper.cpp-native",
+            "insanely-fast-native",
+            "whisper-diarization-native",
+        ] {
+            let backend = backends
+                .iter()
+                .find(|entry| entry["name"] == native_name)
+                .expect("native backend entry");
+            assert_eq!(
+                backend["available"], false,
+                "CWD collision must not make {native_name} available for {sentinel}"
+            );
+        }
+    }
+
+    let voiced_wav = runtime.path().join("voiced.wav");
+    let wav_spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&voiced_wav, wav_spec).expect("create voiced WAV");
+    for index in 0..1_600 {
+        writer
+            .write_sample(if index % 2 == 0 { 8_000_i16 } else { -8_000_i16 })
+            .expect("write voiced sample");
+    }
+    writer.finalize().expect("finalize voiced WAV");
+
+    for sentinel in ["default", "large-v3-turbo"] {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_fw"))
+            .args([
+                "robot",
+                "run",
+                "--input",
+                voiced_wav.to_str().expect("UTF-8 WAV path"),
+                "--backend",
+                "whisper-cpp",
+                "--model",
+                sentinel,
+                "--no-persist",
+                "--no-diarize",
+            ])
+            .current_dir(runtime.path())
+            .env("HOME", home.path())
+            .env("FRANKEN_WHISPER_MODEL_DIR", cache.path())
+            .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "1")
+            .env("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole")
+            .env("FRANKEN_WHISPER_WAV_PASSTHROUGH", "1")
+            .env_remove("FRANKEN_WHISPER_TEST_MODEL_DIR")
+            .output()
+            .expect("run native request");
+        assert!(!output.status.success(), "missing release package must fail");
+        let run_error = String::from_utf8(output.stdout)
+            .expect("UTF-8 robot output")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "run_error")
+            .expect("terminal run_error");
+        assert_eq!(run_error["code"], "FW-BACKEND-UNAVAILABLE");
+        let message = run_error["message"].as_str().expect("error message");
+        assert!(
+            message.contains("missing expected artifact"),
+            "execution resolver must report authenticated package absence: {message}"
+        );
+        assert!(
+            !message.contains(runtime.path().to_string_lossy().as_ref()),
+            "execution must not report the same-named CWD file: {message}"
+        );
+    }
+
+    let explicit = runtime.path().join("default");
+    let report = report_for(explicit.to_str().expect("UTF-8 explicit path"));
+    let whisper = report["models"]
+        .as_array()
+        .expect("models array")
+        .iter()
+        .find(|entry| entry["id"] == "native-whisper-ggml")
+        .expect("Whisper model entry");
+    assert_eq!(
+        whisper["installed"], true,
+        "an explicit path with a reserved basename remains a custom model"
+    );
+    assert_eq!(whisper["default_release_package_installed"], false);
+}
+
+#[test]
 fn robot_syntax_errors_are_one_json_line_with_usage_exit_code() {
     let output = run_agent_command(
         env!("CARGO_BIN_EXE_fw"),

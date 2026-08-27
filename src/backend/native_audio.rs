@@ -279,14 +279,14 @@ fn parse_pcm16_mono_wav_with_checkpoint(
     checkpoint: &mut impl FnMut() -> FwResult<()>,
 ) -> FwResult<WavPcm16Mono> {
     checkpoint()?;
-    let file_len = fs::metadata(path).map_err(FwError::Io)?.len() as usize;
+    let file = fs::File::open(path)?;
+    let file_len = file.metadata().map_err(FwError::Io)?.len();
     if file_len < 44 {
         return Err(FwError::InvalidRequest(format!(
             "wav too small: {file_len} bytes"
         )));
     }
 
-    let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);
 
     let mut header = [0u8; 12];
@@ -323,6 +323,22 @@ fn parse_pcm16_mono_wav_with_checkpoint(
             chunk_header[7],
         ]);
         let data_start = reader.stream_position().map_err(FwError::Io)?;
+        let data_end = data_start
+            .checked_add(u64::from(chunk_size))
+            .ok_or_else(|| FwError::InvalidRequest("wav chunk end overflows".to_owned()))?;
+        if data_end > file_len {
+            return Err(FwError::InvalidRequest(
+                "truncated wav chunk body".to_owned(),
+            ));
+        }
+        let padded_end = data_end
+            .checked_add(u64::from(chunk_size & 1))
+            .ok_or_else(|| FwError::InvalidRequest("wav chunk padding overflows".to_owned()))?;
+        if padded_end > file_len {
+            return Err(FwError::InvalidRequest(
+                "truncated wav chunk padding".to_owned(),
+            ));
+        }
 
         if chunk_id == b"fmt " {
             if chunk_size < 16 {
@@ -367,7 +383,7 @@ fn parse_pcm16_mono_wav_with_checkpoint(
         .ok_or_else(|| FwError::InvalidRequest("missing wav fmt audio_format".to_owned()))?;
     let data_offset =
         data_offset.ok_or_else(|| FwError::InvalidRequest("missing wav data chunk".to_owned()))?;
-    let mut data_len =
+    let data_len =
         data_len.ok_or_else(|| FwError::InvalidRequest("missing wav data chunk".to_owned()))?;
 
     if audio_format != 1 {
@@ -391,23 +407,24 @@ fn parse_pcm16_mono_wav_with_checkpoint(
         ));
     }
 
-    let available = (file_len as u64).saturating_sub(data_offset);
-    if available == 0 {
-        return Ok(WavPcm16Mono {
-            sample_rate_hz,
-            samples: Vec::new(),
-        });
-    }
-    if data_len as u64 > available {
-        data_len = available as u32;
+    if data_len % 2 != 0 {
+        return Err(FwError::InvalidRequest(
+            "wav data chunk ends inside a PCM frame".to_owned(),
+        ));
     }
 
     reader
         .seek(SeekFrom::Start(data_offset))
         .map_err(FwError::Io)?;
 
-    let mut samples = Vec::with_capacity((data_len as usize) / 2);
-    let mut remaining = data_len as usize;
+    let data_len_usize = usize::try_from(data_len)
+        .map_err(|_| FwError::InvalidRequest("wav data length exceeds usize".to_owned()))?;
+    let sample_capacity = data_len_usize / 2;
+    let mut samples = Vec::new();
+    samples.try_reserve_exact(sample_capacity).map_err(|_| {
+        FwError::InvalidRequest("wav sample buffer allocation failed".to_owned())
+    })?;
+    let mut remaining = data_len_usize;
     let mut buf = [0u8; 8192];
     let mut leftover: Option<u8> = None;
 
@@ -416,7 +433,9 @@ fn parse_pcm16_mono_wav_with_checkpoint(
         let to_read = buf.len().min(remaining);
         let read = reader.read(&mut buf[..to_read]).map_err(FwError::Io)?;
         if read == 0 {
-            break;
+            return Err(FwError::InvalidRequest(
+                "wav data chunk truncated during read".to_owned(),
+            ));
         }
         remaining = remaining.saturating_sub(read);
 
@@ -440,7 +459,18 @@ fn parse_pcm16_mono_wav_with_checkpoint(
         }
     }
 
-    // If the data chunk is truncated, leftover bytes are ignored.
+    if leftover.is_some() {
+        return Err(FwError::InvalidRequest(
+            "wav data chunk ends inside a PCM frame".to_owned(),
+        ));
+    }
+    checkpoint()?;
+    let final_file_len = reader.get_ref().metadata().map_err(FwError::Io)?.len();
+    if final_file_len != file_len {
+        return Err(FwError::InvalidRequest(
+            "wav size changed during parse".to_owned(),
+        ));
+    }
 
     Ok(WavPcm16Mono {
         sample_rate_hz,
@@ -574,7 +604,7 @@ mod tests {
     use super::{
         ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE, MAX_ENERGY_VALLEY_CANDIDATES, analyze_wav,
         collect_energy_valleys, collect_energy_valleys_with_checkpoint, energy_valleys_from_wav,
-        summarize_frame_rms_with_checkpoint,
+        parse_pcm16_mono_wav_with_checkpoint, summarize_frame_rms_with_checkpoint,
     };
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
@@ -1262,12 +1292,13 @@ mod tests {
     // ── Task #227 — native_audio pass 3 edge-case tests ────────────────
 
     #[test]
-    fn parse_wav_with_max_chunk_size_does_not_panic() {
+    fn parse_wav_rejects_truncated_declared_data() {
         let dir = tempdir().unwrap();
         let wav_path = dir.path().join("maxchunk.wav");
 
         // Build a WAV where the data chunk has chunk_size = u32::MAX.
-        // The parser should clamp via .min(bytes.len()) and not panic or loop.
+        // A torn or malicious declaration must fail closed instead of being
+        // clamped into a different logical waveform.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"RIFF");
         bytes.extend_from_slice(&100u32.to_le_bytes()); // file size (irrelevant)
@@ -1289,28 +1320,80 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 4]); // 2 samples
 
         std::fs::write(&wav_path, &bytes).unwrap();
-        // Should not panic — data is clamped to actual file length.
-        let result = analyze_wav(&wav_path, None);
-        assert!(result.is_ok(), "max chunk_size must not panic: {result:?}");
+        let error = analyze_wav(&wav_path, None).expect_err("truncated chunk must fail");
+        assert!(
+            error.contains("truncated wav chunk body"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
-    fn odd_byte_data_chunk_trailing_byte_silently_dropped() {
+    fn odd_byte_data_chunk_is_rejected_as_partial_pcm_frame() {
         let dir = tempdir().unwrap();
         let wav_path = dir.path().join("odd_data.wav");
 
-        // 5 bytes of data → chunks_exact(2) produces 2 samples, drops 1 trailing byte.
+        // Five data bytes followed by the required RIFF pad byte still contain
+        // only two complete PCM16 frames plus one invalid partial frame.
         let data_bytes: &[u8] = &[0x00, 0x40, 0x00, 0x40, 0xFF]; // 2 valid samples + 1 stray byte
-        let bytes = custom_wav(1, 1, 16000, 16, data_bytes);
+        let mut bytes = custom_wav(1, 1, 16000, 16, data_bytes);
+        bytes[4..8].copy_from_slice(&42u32.to_le_bytes());
+        bytes.push(0);
         std::fs::write(&wav_path, &bytes).unwrap();
 
-        let analysis = analyze_wav(&wav_path, None).expect("should parse without error");
-        // 2 samples at 16kHz → 0.000125 sec → 0 ms (rounds to 0), but duration_ms formula:
-        // (2.0 / 16000.0) * 1000 = 0.125 → rounds to 0.
-        // The key assertion: no panic, only 2 samples worth of data processed.
-        assert_eq!(
-            analysis.sample_rate_hz, 16000,
-            "sample rate should be parsed correctly"
+        let error = analyze_wav(&wav_path, None).expect_err("partial PCM frame must fail");
+        assert!(
+            error.contains("ends inside a PCM frame"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn truncated_silence_cannot_satisfy_native_silence_pre_gate() {
+        let dir = tempdir().expect("tempdir");
+        let wav_path = dir.path().join("torn-silence.wav");
+        write_pcm16_mono_wav(&wav_path, 16_000, &[0_i16; 640]);
+
+        let mut bytes = std::fs::read(&wav_path).expect("read fixture");
+        bytes.truncate(bytes.len() - 2);
+        std::fs::write(&wav_path, bytes).expect("write torn fixture");
+
+        let error = analyze_wav(&wav_path, None)
+            .expect_err("torn silence must reach the strict decoder as an error");
+        assert!(
+            error.contains("truncated wav chunk body"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn silence_truncated_after_sample_read_is_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let wav_path = dir.path().join("concurrently-torn-silence.wav");
+        write_pcm16_mono_wav(&wav_path, 16_000, &[0_i16; 640]);
+
+        // This fixture has exactly two chunks and one data-buffer read. The
+        // sixth checkpoint runs after the sample read and immediately before
+        // the parser's same-handle stability check.
+        let mut checkpoints = 0usize;
+        let mut checkpoint = || {
+            checkpoints += 1;
+            if checkpoints == 6 {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&wav_path)
+                    .map_err(FwError::Io)?;
+                file.set_len(file.metadata().map_err(FwError::Io)?.len() - 2)
+                    .map_err(FwError::Io)?;
+            }
+            Ok(())
+        };
+
+        let error = parse_pcm16_mono_wav_with_checkpoint(&wav_path, &mut checkpoint)
+            .expect_err("concurrently truncated silence must fail closed");
+        assert_eq!(checkpoints, 6, "fixture must reach the final stability check");
+        assert!(
+            error.to_string().contains("wav size changed during parse"),
+            "unexpected error: {error}"
         );
     }
 
