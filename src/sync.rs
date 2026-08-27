@@ -3298,6 +3298,7 @@ where
     F: FnOnce() -> FwResult<()>,
 {
     verify_schema_exists(connection)?;
+    let input_paths = require_validation_jsonl_inputs(jsonl_dir)?;
 
     // --- Collect DB run IDs ---
     let db_run_rows = connection
@@ -3321,17 +3322,14 @@ where
     // keys: both include exactly the lines with a string `id` (skipping empty lines,
     // parsing every line), so `map.keys()` == `collect_jsonl_ids(runs, "id")` and the
     // parse-error behavior is identical.
-    let runs_path = resolve_jsonl_path(jsonl_dir, "runs");
-    let jsonl_run_map = load_jsonl_run_map(&runs_path)?;
+    let jsonl_run_map = load_jsonl_run_map(&input_paths.runs)?;
     let jsonl_run_ids: HashSet<String> = jsonl_run_map.keys().cloned().collect();
 
     // --- Parse and validate JSONL children ---
-    let segments_path = resolve_jsonl_path(jsonl_dir, "segments");
-    let jsonl_segment_map = load_jsonl_segment_map(&segments_path)?;
+    let jsonl_segment_map = load_jsonl_segment_map(&input_paths.segments)?;
     let jsonl_segment_count = jsonl_segment_map.len() as u64;
 
-    let events_path = resolve_jsonl_path(jsonl_dir, "events");
-    let jsonl_event_map = load_jsonl_event_map(&events_path)?;
+    let jsonl_event_map = load_jsonl_event_map(&input_paths.events)?;
     let jsonl_event_count = jsonl_event_map.len() as u64;
 
     // --- Compare ---
@@ -3538,9 +3536,12 @@ fn load_jsonl_segment_map(
             text: json_str(&row, "text")?,
             confidence: json_nullable_f64(&row, "confidence", "segments")?,
         };
-        if map.insert((run_id, idx), value).is_some() {
+        let key = (run_id, idx);
+        if map.insert(key.clone(), value).is_some() {
             return Err(FwError::Storage(format!(
-                "duplicate composite key in segments JSONL at line {}",
+                "duplicate composite key {}/{} in segments JSONL at line {}",
+                key.0,
+                key.1,
                 line_index + 1
             )));
         }
@@ -3571,9 +3572,12 @@ fn load_jsonl_event_map(
             message: json_str(&row, "message")?,
             payload_json: json_str(&row, "payload_json")?,
         };
-        if map.insert((run_id, seq), value).is_some() {
+        let key = (run_id, seq);
+        if map.insert(key.clone(), value).is_some() {
             return Err(FwError::Storage(format!(
-                "duplicate composite key in events JSONL at line {}",
+                "duplicate composite key {}/{} in events JSONL at line {}",
+                key.0,
+                key.1,
                 line_index + 1
             )));
         }
@@ -3705,6 +3709,23 @@ fn resolve_jsonl_path(dir: &Path, stem: &str) -> PathBuf {
     }
 }
 
+fn require_validation_jsonl_inputs(dir: &Path) -> FwResult<JsonlInputPaths> {
+    let input_paths = JsonlInputPaths::resolve(dir);
+    for (logical_name, path) in [
+        ("runs.jsonl", &input_paths.runs),
+        ("segments.jsonl", &input_paths.segments),
+        ("events.jsonl", &input_paths.events),
+    ] {
+        if !path.exists() {
+            return Err(FwError::Storage(format!(
+                "missing sync validation input: {logical_name} or {logical_name}.gz in {}",
+                dir.display()
+            )));
+        }
+    }
+    Ok(input_paths)
+}
+
 /// Count the rows in a table via `SELECT COUNT(*)`.
 #[cfg(test)]
 fn count_table(connection: &Connection, table: &str) -> FwResult<u64> {
@@ -3775,7 +3796,7 @@ fn load_jsonl_run_map(
         return Ok(map);
     }
     let reader = open_jsonl_reader(path)?;
-    for line in reader.lines() {
+    for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -3783,6 +3804,12 @@ fn load_jsonl_run_map(
         }
         let value: serde_json::Value = serde_json::from_str(trimmed)?;
         if let Some(id_str) = value.get("id").and_then(serde_json::Value::as_str) {
+            if map.contains_key(id_str) {
+                return Err(FwError::Storage(format!(
+                    "duplicate run id {id_str:?} in runs JSONL at line {}",
+                    line_index + 1
+                )));
+            }
             map.insert(id_str.to_owned(), value);
         }
     }
