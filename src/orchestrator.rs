@@ -1899,6 +1899,16 @@ fn optional_stage_skip(
     }
 }
 
+fn artifact_output_prefix(input: &crate::model::InputSource, cwd: &Path) -> PathBuf {
+    let base_name = match input {
+        crate::model::InputSource::File { path } => path
+            .file_stem()
+            .unwrap_or_else(|| std::ffi::OsStr::new("transcript")),
+        _ => std::ffi::OsStr::new("transcript"),
+    };
+    cwd.join(base_name)
+}
+
 /// Inner body of [`run_pipeline`], factored out so that [`run_pipeline`] can
 /// unconditionally call `pcx.run_finalizers()` after this returns regardless
 /// of success or failure.
@@ -2050,15 +2060,8 @@ async fn run_pipeline_body(
 
     let output_formats = &request.backend_params.output_formats;
     if !output_formats.is_empty() {
-        let base_name = match &request.input {
-            crate::model::InputSource::File { path } => path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("transcript"),
-            _ => "transcript",
-        };
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let output_prefix = cwd.join(base_name);
+        let output_prefix = artifact_output_prefix(&request.input, &cwd);
 
         match crate::export::write_artifacts(output_formats, &result, &output_prefix) {
             Ok(paths) => {
@@ -7166,7 +7169,7 @@ mod tests {
         FinalizerRegistry, PipelineConfig, PipelineCx, PipelineStage, PunctuateReport,
         SeparateReport, SpeakerEmbedding, StageBudgetPolicy, VadConfig, VadRegionMs, VadReport,
         acceleration_cancellation_fence_payload, acceleration_context_payload,
-        acceleration_stream_owner_id, align_transcription_result,
+        acceleration_stream_owner_id, align_transcription_result, artifact_output_prefix,
         apply_native_diarization_projection, apply_padding, budget_duration, checkpoint_or_emit,
         clamp_diarization_turns_to_duration_ms, ctc_forced_align, diarize_segments,
         emit_diarization_report_events, event_elapsed_ms, external_diarization_fallback_admitted,
@@ -7186,6 +7189,23 @@ mod tests {
         unknown_neural_diarization_with_hard_hints, vad_energy_detect,
         vad_energy_detect_with_analysis, validate_diarization_execution_request,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_output_prefix_preserves_non_utf8_input_stem() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let input = InputSource::File {
+            path: PathBuf::from(std::ffi::OsString::from_vec(b"recording-\x80.wav".to_vec())),
+        };
+
+        let prefix = artifact_output_prefix(&input, std::path::Path::new("/tmp/output"));
+
+        assert_eq!(
+            prefix.file_name().expect("artifact file name").as_bytes(),
+            b"recording-\x80"
+        );
+    }
 
     #[test]
     fn report_event_snapshot_elision_preserves_pipeline_tail_events() {

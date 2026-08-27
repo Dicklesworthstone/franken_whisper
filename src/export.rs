@@ -25,7 +25,10 @@ pub fn write_artifacts(
             OutputFormat::JsonFull => "json_full",
             OutputFormat::Lrc => "lrc",
         };
-        let candidate = Path::new(&format!("{}.{ext}", output_prefix.display())).to_path_buf();
+        let mut candidate = output_prefix.as_os_str().to_os_string();
+        candidate.push(".");
+        candidate.push(ext);
+        let candidate = PathBuf::from(candidate);
 
         match fmt {
             OutputFormat::Txt => write_txt(&candidate, result)?,
@@ -49,6 +52,9 @@ fn write_txt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
     // on long transcripts. Explicit flush surfaces write errors (raw-File drop
     // would swallow them).
     let mut file = BufWriter::new(File::create(path)?);
+    if result.segments.is_empty() && !result.transcript.is_empty() {
+        writeln!(file, "{}", result.transcript)?;
+    }
     for seg in &result.segments {
         writeln!(file, "{}", seg.text)?;
     }
@@ -138,9 +144,11 @@ fn write_vtt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
 
 fn write_srt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
     let mut file = BufWriter::new(File::create(path)?);
-    for (i, seg) in result.segments.iter().enumerate() {
+    let mut cue_number = 0usize;
+    for seg in &result.segments {
         if let (Some(start), Some(end)) = (seg.start_sec, seg.end_sec) {
-            writeln!(file, "{}", i + 1)?;
+            cue_number += 1;
+            writeln!(file, "{cue_number}")?;
             writeln!(
                 file,
                 "{} --> {}",
@@ -790,5 +798,119 @@ mod tests {
         let txt = dir.path().join("o.txt");
         write_txt(&txt, &result).unwrap();
         assert_eq!(std::fs::read_to_string(&txt).unwrap(), "hello\nworld\n");
+    }
+
+    #[test]
+    fn srt_numbers_only_emitted_timed_cues() {
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: "timed one timed two".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![
+                TranscriptionSegment {
+                    start_sec: None,
+                    end_sec: None,
+                    text: "untimed prefix".to_owned(),
+                    speaker: None,
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(1.0),
+                    end_sec: Some(2.0),
+                    text: "timed one".to_owned(),
+                    speaker: None,
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(2.0),
+                    end_sec: None,
+                    text: "partial timestamp".to_owned(),
+                    speaker: None,
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(3.0),
+                    end_sec: Some(4.0),
+                    text: "timed two".to_owned(),
+                    speaker: None,
+                    confidence: None,
+                },
+            ],
+            acceleration: None,
+            diarization: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gapped-source.srt");
+
+        write_srt(&path, &result).expect("write SRT");
+
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read SRT"),
+            "1\n00:00:01,000 --> 00:00:02,000\ntimed one\n\n2\n00:00:03,000 --> 00:00:04,000\ntimed two\n\n"
+        );
+    }
+
+    #[test]
+    fn txt_uses_root_transcript_when_backend_emits_no_segments() {
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::InsanelyFast,
+            transcript: "root-only transcript".to_owned(),
+            language: Some("en".to_owned()),
+            segments: Vec::new(),
+            acceleration: None,
+            diarization: None,
+            raw_output: serde_json::json!({"text": "root-only transcript"}),
+            artifact_paths: Vec::new(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("root-only.txt");
+
+        write_txt(&path, &result).expect("write TXT");
+
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read TXT"),
+            "root-only transcript\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_extension_preserves_non_utf8_prefix_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: "hello".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(1.0),
+                text: "hello".to_owned(),
+                speaker: None,
+                confidence: None,
+            }],
+            acceleration: None,
+            diarization: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefix = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"artifact-\x80".to_vec()));
+        let mut expected = prefix.as_os_str().to_os_string();
+        expected.push(".txt");
+        let expected = PathBuf::from(expected);
+
+        let artifacts = write_artifacts(&[OutputFormat::Txt], &result, &prefix)
+            .expect("write artifact with non-UTF-8 prefix");
+
+        assert_eq!(artifacts, vec![expected.clone()]);
+        assert_eq!(
+            std::fs::read_to_string(expected).expect("read exact artifact path"),
+            "hello\n"
+        );
     }
 }
