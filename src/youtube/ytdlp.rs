@@ -55,6 +55,10 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(120);
 const EXPAND_TIMEOUT: Duration = Duration::from_secs(300);
 /// Downloads can legitimately run long (politeness sleeps + retries).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Defensive upper bound for a projected video id. Real YouTube ids are much
+/// shorter; this keeps malformed external-tool metadata from defeating the
+/// artifact filename component budget.
+const MAX_VIDEO_ID_BYTES: usize = 128;
 
 /// Resolved `yt-dlp` tool: absolute path, parsed version, staleness flag.
 ///
@@ -305,7 +309,7 @@ pub fn dedup_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
 /// Full per-video metadata fetched via `yt-dlp -j`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VideoMeta {
-    /// Stable YouTube video id.
+    /// Stable YouTube video id, validated as bounded ASCII `[A-Za-z0-9_-]`.
     pub id: String,
     /// Video title.
     pub title: String,
@@ -680,12 +684,19 @@ fn query_param_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-/// Split a URL into `(host, rest)` where `rest` is everything after the host
-/// (path + query). Tolerates a missing scheme. Returns `None` when no host can
-/// be isolated.
+/// Split an HTTP(S) or scheme-less URL into `(host, rest)` where `rest` is
+/// everything after the host (path + query). Returns `None` for unsupported
+/// explicit schemes or when no host can be isolated.
 fn split_host_and_rest(url: &str) -> Option<(&str, &str)> {
-    // Strip scheme if present.
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let after_scheme = match url.split_once("://") {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            rest
+        }
+        Some(_) => return None,
+        None => url,
+    };
     if after_scheme.is_empty() {
         return None;
     }
@@ -843,6 +854,25 @@ fn non_empty_json_string(value: serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(value) if !value.is_empty() => Some(value),
         _ => None,
+    }
+}
+
+/// Validate a full-metadata video id before it can reach download templates or
+/// artifact naming. The renderer appends this value to a path component, so
+/// accepting separators, controls, whitespace, or an unbounded string here
+/// would violate the path-ownership contract downstream.
+fn validate_video_id(id: String) -> FwResult<String> {
+    if !id.is_empty()
+        && id.len() <= MAX_VIDEO_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        Ok(id)
+    } else {
+        Err(FwError::InvalidRequest(format!(
+            "yt-dlp metadata contains an invalid video id; expected 1..={MAX_VIDEO_ID_BYTES} ASCII characters from [A-Za-z0-9_-]"
+        )))
     }
 }
 
@@ -1057,6 +1087,7 @@ fn parse_video_meta(line: &str) -> FwResult<VideoMeta> {
     let id = non_empty_json_string(metadata.id).ok_or_else(|| {
         FwError::InvalidRequest("yt-dlp metadata is missing an `id` field".to_owned())
     })?;
+    let id = validate_video_id(id)?;
     let title = non_empty_json_string(metadata.title).unwrap_or_default();
     let webpage_url = non_empty_json_string(metadata.webpage_url)
         .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
@@ -1081,6 +1112,7 @@ fn video_meta_from_json(value: &serde_json::Value) -> FwResult<VideoMeta> {
     let id = string_field(value, "id").ok_or_else(|| {
         FwError::InvalidRequest("yt-dlp metadata is missing an `id` field".to_owned())
     })?;
+    let id = validate_video_id(id)?;
     let title = string_field(value, "title").unwrap_or_default();
     let webpage_url = string_field(value, "webpage_url")
         .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
@@ -1612,6 +1644,25 @@ mod tests {
         assert!(matches!(err, FwError::InvalidRequest(_)));
         let text = err.to_string();
         assert!(text.contains("YouTube"), "actionable message: {text}");
+    }
+
+    #[test]
+    fn classify_non_web_schemes_rejected() {
+        for url in [
+            "file://youtube.com/watch?v=abc",
+            "ftp://youtu.be/abc",
+            "javascript://youtube.com/watch?v=abc",
+        ] {
+            assert!(
+                matches!(classify_url(url), Err(FwError::InvalidRequest(_))),
+                "unsupported explicit scheme must be rejected: {url}"
+            );
+            assert_eq!(
+                extract_video_id(url),
+                None,
+                "extractor must share the classifier's scheme gate: {url}"
+            );
+        }
     }
 
     #[test]
@@ -2303,6 +2354,27 @@ mod tests {
     }
 
     #[test]
+    fn video_meta_rejects_path_unsafe_ids() {
+        for id in ["../escape", "nested/name", r"nested\name", "id with space"] {
+            let value = serde_json::json!({"id": id, "title": "T"});
+            let line = serde_json::to_string(&value).expect("serialize metadata fixture");
+
+            let projected = parse_video_meta(&line).expect_err("unsafe id must be rejected");
+            let dom = video_meta_from_json(&value).expect_err("unsafe id must be rejected");
+            assert!(projected.to_string().contains("invalid video id"));
+            assert!(dom.to_string().contains("invalid video id"));
+        }
+    }
+
+    #[test]
+    fn video_meta_rejects_overlong_id() {
+        let id = "a".repeat(MAX_VIDEO_ID_BYTES + 1);
+        let line = serde_json::json!({"id": id, "title": "T"}).to_string();
+        let error = parse_video_meta(&line).expect_err("overlong id must be rejected");
+        assert!(error.to_string().contains("invalid video id"));
+    }
+
+    #[test]
     fn video_meta_from_json_synthesizes_webpage_url() {
         let value = serde_json::json!({"id": "abc", "title": "T"});
         let meta = video_meta_from_json(&value).unwrap();
@@ -2615,6 +2687,11 @@ mod tests {
             split_host_and_rest("https://youtu.be/x"),
             Some(("youtu.be", "/x"))
         );
+        assert_eq!(
+            split_host_and_rest("HTTPS://youtu.be/x"),
+            Some(("youtu.be", "/x"))
+        );
+        assert_eq!(split_host_and_rest("file://youtu.be/x"), None);
     }
 
     #[test]

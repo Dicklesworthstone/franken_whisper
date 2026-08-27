@@ -707,17 +707,27 @@ fn insert_opt_str(map: &mut Map<String, Value>, key: &str, value: Option<&str>) 
 ///
 /// Writes to a uniquely-named temp file in the **same directory** as `path`
 /// (so the final rename stays on one filesystem and is atomic), flushes and
-/// fsyncs it, then renames it over `path`. On any failure the temp file is
-/// cleaned up and the original file at `path`, if any, is left untouched.
+/// fsyncs it, renames it over `path`, then fsyncs the parent directory. A
+/// failure before rename leaves the original file untouched; a parent-sync
+/// failure is reported after the replacement is atomically visible so callers
+/// do not mistake an unconfirmed directory entry for a durable publication.
 ///
 /// # Errors
 ///
 /// Returns [`FwError::Io`](crate::error::FwError::Io) if the temp file cannot be
-/// created/written/synced or the rename fails.
+/// created/written/synced, the rename fails, or the parent-directory durability
+/// barrier fails.
 pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> FwResult<()> {
+    write_atomic_with_parent_sync(path.as_ref(), contents, sync_parent_dir)
+}
+
+fn write_atomic_with_parent_sync(
+    path: &Path,
+    contents: &str,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> FwResult<()> {
     use std::io::Write;
 
-    let path = path.as_ref();
     let dir = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
         Some(d) => d.to_path_buf(),
         None => std::path::PathBuf::from("."),
@@ -738,7 +748,18 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> FwResult<()> {
     // original file at `path` is never touched.
     tmp.persist(path)
         .map_err(|e| crate::error::FwError::Io(e.error))?;
+    sync_parent(&dir)?;
 
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) -> std::io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -2334,6 +2355,24 @@ mod tests {
         std::fs::write(&target, "old contents").unwrap();
         write_atomic(&target, "new contents").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new contents");
+    }
+
+    #[test]
+    fn write_atomic_propagates_parent_sync_failure_after_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.md");
+        let error = write_atomic_with_parent_sync(&target, "published", |parent| {
+            assert_eq!(parent, dir.path());
+            Err(std::io::Error::other("injected parent sync failure"))
+        })
+        .expect_err("parent sync failure must be reported");
+
+        assert!(error.to_string().contains("injected parent sync failure"));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "published",
+            "publication must precede the durability barrier"
+        );
     }
 
     #[test]
