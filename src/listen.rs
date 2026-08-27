@@ -3354,7 +3354,7 @@ pub fn run_listen_session(
             "listen persistence failed on final close: {error}"
         )));
     }
-    capture.stop();
+    capture.stop()?;
     Ok(cancelled)
 }
 

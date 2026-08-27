@@ -394,12 +394,8 @@ fn sensitive_arg_values(args: &[String]) -> Vec<String> {
     // Replace longer values first so an overlapping short secret cannot leave
     // the suffix of a longer secret visible. The lexical tie-breaker makes the
     // order deterministic and groups duplicates for `dedup`.
-    values.sort_unstable_by(|left, right| {
-        right
-            .len()
-            .cmp(&left.len())
-            .then_with(|| left.cmp(right))
-    });
+    values
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
     values.dedup();
     values
 }
@@ -1490,12 +1486,7 @@ fn append_streaming_stderr_tail(tail: &mut Vec<u8>, chunk: &[u8], capacity: usiz
 fn sanitized_streaming_stderr_tail(tail: &[u8], sensitive_values: &[String]) -> String {
     let mask = sensitive_byte_mask(tail, sensitive_values);
     let start = tail.len().saturating_sub(STREAMING_STDERR_TAIL_BYTES);
-    let rendered = render_redacted_bytes(
-        tail,
-        &mask,
-        start,
-        redaction_marker(sensitive_values),
-    );
+    let rendered = render_redacted_bytes(tail, &mask, start, redaction_marker(sensitive_values));
     let rendered = redact_sensitive_text(&rendered, sensitive_values);
     bounded_text_tail(&rendered, STREAMING_STDERR_TAIL_BYTES)
 }
@@ -1618,9 +1609,7 @@ impl StreamingChild {
                     };
                     return match outcome {
                         Ok(()) => cleanup,
-                        Err(primary) => {
-                            Err(merge_process_tree_cleanup_result(primary, cleanup))
-                        }
+                        Err(primary) => Err(merge_process_tree_cleanup_result(primary, cleanup)),
                     };
                 }
                 Ok(None) if Instant::now() < deadline => {
@@ -1729,11 +1718,7 @@ pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<Stream
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        append_streaming_stderr_tail(
-                            &mut tail,
-                            &buf[..n],
-                            stderr_tail_capacity,
-                        );
+                        append_streaming_stderr_tail(&mut tail, &buf[..n], stderr_tail_capacity);
                     }
                 }
             }
@@ -2510,7 +2495,10 @@ mod tests {
 
         let (rendered, sensitive_values) = command_error_diagnostics("prog", &args);
         assert_eq!(sensitive_values, vec![secret.to_owned()]);
-        assert!(!rendered.contains(secret), "repeated secret leaked: {rendered}");
+        assert!(
+            !rendered.contains(secret),
+            "repeated secret leaked: {rendered}"
+        );
         assert!(
             rendered.contains("--label ***"),
             "nonsensitive occurrence was not scrubbed: {rendered}"
@@ -2523,7 +2511,10 @@ mod tests {
         let args = vec!["--secret".to_owned(), secret.to_owned()];
 
         let (rendered, _) = command_error_diagnostics("prog", &args);
-        assert!(!rendered.contains(secret), "mask re-emitted the secret: {rendered}");
+        assert!(
+            !rendered.contains(secret),
+            "mask re-emitted the secret: {rendered}"
+        );
         assert!(
             rendered.contains("--secret ###"),
             "alternate marker was not selected: {rendered}"
@@ -2558,8 +2549,7 @@ mod tests {
         let api_secret = "api_secret_echo_456";
         let args = vec![
             "-c".to_owned(),
-            "printf 'benign-context:%s:%s:%s\\n' \"$1\" \"$2\" \"$3\" >&2; exit 9"
-                .to_owned(),
+            "printf 'benign-context:%s:%s:%s\\n' \"$1\" \"$2\" \"$3\" >&2; exit 9".to_owned(),
             "fw-secret-probe".to_owned(),
             "--hf-token".to_owned(),
             hf_secret.to_owned(),
@@ -2568,7 +2558,10 @@ mod tests {
 
         let error = run_command("sh", &args, None).expect_err("fixture must fail");
         let text = error.to_string();
-        assert!(text.contains("benign-context"), "benign stderr was lost: {text}");
+        assert!(
+            text.contains("benign-context"),
+            "benign stderr was lost: {text}"
+        );
         assert!(
             text.contains("--hf-token:***:--api-key=***"),
             "sensitive argv values were not replaced in context: {text}"
@@ -2589,15 +2582,13 @@ mod tests {
             secret.to_owned(),
         ];
 
-        let error = run_command_with_timeout(
-            "sh",
-            &args,
-            None,
-            Some(Duration::from_secs(1)),
-        )
-        .expect_err("fixture must time out");
+        let error = run_command_with_timeout("sh", &args, None, Some(Duration::from_secs(1)))
+            .expect_err("fixture must time out");
         let text = error.to_string();
-        assert!(text.contains("timeout-context:***"), "context was lost: {text}");
+        assert!(
+            text.contains("timeout-context:***"),
+            "context was lost: {text}"
+        );
         assert!(!text.contains(secret), "timeout leaked argv secret: {text}");
     }
 
@@ -2617,7 +2608,10 @@ mod tests {
             .expect_err("fixture must fail");
         let text = error.to_string();
         assert!(text.contains("bounded-failure"), "context was lost: {text}");
-        assert!(!text.contains(secret), "bounded failure leaked secret: {text}");
+        assert!(
+            !text.contains(secret),
+            "bounded failure leaked secret: {text}"
+        );
     }
 
     #[cfg(unix)]
@@ -2633,14 +2627,9 @@ mod tests {
         ];
         let token = CancellationToken::no_deadline();
 
-        let error = run_command_cancellable(
-            "sh",
-            &args,
-            None,
-            &token,
-            Some(Duration::from_secs(1)),
-        )
-        .expect_err("fixture must time out");
+        let error =
+            run_command_cancellable("sh", &args, None, &token, Some(Duration::from_secs(1)))
+                .expect_err("fixture must time out");
         let text = error.to_string();
         assert!(
             text.contains("cancellable-context:***"),
@@ -2665,14 +2654,9 @@ mod tests {
         ];
         let token = CancellationToken::no_deadline();
 
-        let error = run_command_cancellable(
-            "sh",
-            &args,
-            None,
-            &token,
-            Some(Duration::from_secs(5)),
-        )
-        .expect_err("fixture must fail");
+        let error =
+            run_command_cancellable("sh", &args, None, &token, Some(Duration::from_secs(5)))
+                .expect_err("fixture must fail");
         let text = error.to_string();
         assert!(
             text.contains("cancellable-failure"),
@@ -2710,8 +2694,57 @@ mod tests {
         child.kill().expect("join stderr drainer");
 
         let tail = child.stderr_tail();
-        assert!(tail.contains("stream-context:***"), "context was lost: {tail}");
-        assert!(!tail.contains(secret), "streaming tail leaked argv secret: {tail}");
+        assert!(
+            tail.contains("stream-context:***"),
+            "context was lost: {tail}"
+        );
+        assert!(
+            !tail.contains(secret),
+            "streaming tail leaked argv secret: {tail}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_child_kill_terminates_descendant_holding_pipes() {
+        use std::io::BufRead as _;
+
+        let args = vec![
+            "-c".to_owned(),
+            "sleep 30 & printf '%s\\n' \"$!\"; wait".to_owned(),
+        ];
+        let mut child = super::spawn_streaming_stdout("sh", &args).expect("spawn process tree");
+        let stdout = child.take_stdout().expect("streaming stdout");
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut descendant = String::new();
+        stdout
+            .read_line(&mut descendant)
+            .expect("read descendant pid");
+        let descendant = descendant
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .expect("valid descendant pid");
+        drop(stdout);
+
+        let started = std::time::Instant::now();
+        child.kill().expect("terminate complete process group");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "process-tree cleanup exceeded its bound: {:?}",
+            started.elapsed()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(descendant).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(descendant).is_err(),
+            "streaming descendant survived root cleanup"
+        );
     }
 
     #[test]
@@ -2731,7 +2764,10 @@ mod tests {
         let tail = super::sanitized_streaming_stderr_tail(&retained, &sensitive_values);
 
         assert!(tail.len() <= super::STREAMING_STDERR_TAIL_BYTES);
-        assert!(tail.starts_with('*'), "boundary secret prefix was not masked");
+        assert!(
+            tail.starts_with('*'),
+            "boundary secret prefix was not masked"
+        );
         assert!(
             !tail.contains(secret) && !tail.contains(&secret[1..]),
             "boundary-straddling secret leaked: {tail}"
@@ -2852,7 +2888,10 @@ mod tests {
         )
         .expect_err("fixture must fail");
         let text = error.to_string();
-        assert!(text.contains("benign failure"), "benign context was lost: {text}");
+        assert!(
+            text.contains("benign failure"),
+            "benign context was lost: {text}"
+        );
         assert!(
             text.contains("--api-key=*** and --hf-token ***"),
             "redacted context is incomplete: {text}"

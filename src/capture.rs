@@ -43,6 +43,7 @@ use crate::error::{FwError, FwResult};
 /// hundreds of milliseconds; a 1 ms poll costs nothing measurable and avoids
 /// signalling machinery inside the audio callback.
 const READ_POLL: Duration = Duration::from_millis(1);
+const PIPE_CHILD_EXIT_WAIT: Duration = Duration::from_secs(1);
 
 /// Result of one [`CaptureSource::read`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,8 +72,9 @@ pub trait CaptureSource: Send {
     /// one frame (`channels()` samples).
     fn read(&mut self, out: &mut [f32], max_wait: Duration) -> FwResult<CaptureRead>;
     /// Stop the source. Idempotent; `read` after `stop` drains any buffered
-    /// audio then reports `ended: true`.
-    fn stop(&mut self);
+    /// audio then reports `ended: true`. Cleanup failures are returned so a
+    /// live session cannot report success while an owned worker survives.
+    fn stop(&mut self) -> FwResult<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -422,20 +424,31 @@ impl CaptureSource for CpalCaptureSource {
         }
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> FwResult<()> {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
+        let mut join_error = None;
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            if join.join().is_err() {
+                join_error = Some(FwError::ContractViolation(
+                    "cpal capture worker panicked during shutdown".to_owned(),
+                ));
+            }
         }
         self.shared.ended.store(true, Ordering::Release);
+        match join_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
 impl Drop for CpalCaptureSource {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            tracing::warn!(%error, "cpal capture cleanup failed during drop");
+        }
     }
 }
 
@@ -584,8 +597,9 @@ impl CaptureSource for FixtureCaptureSource {
         })
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> FwResult<()> {
         self.stopped = true;
+        Ok(())
     }
 }
 
@@ -776,6 +790,10 @@ pub struct PipePcmSource {
     join: Option<std::thread::JoinHandle<()>>,
     /// Child owner when this pipe is a subprocess's stdout (kill-on-stop).
     child: Option<crate::process::StreamingChild>,
+    /// Only an owned child gives us authority to close the reader's pipe.
+    /// Externally owned readers such as stdin must be detached on stop rather
+    /// than joined while another process can keep them blocked indefinitely.
+    join_reader_on_stop: bool,
     sample_rate: u32,
     channels: u16,
 }
@@ -870,6 +888,7 @@ impl PipePcmSource {
             shared,
             join: Some(join),
             child: None,
+            join_reader_on_stop: false,
             sample_rate,
             channels,
         })
@@ -878,6 +897,7 @@ impl PipePcmSource {
     /// Attach the owning child process (killed on stop/drop).
     fn with_child(mut self, child: crate::process::StreamingChild) -> Self {
         self.child = Some(child);
+        self.join_reader_on_stop = true;
         self
     }
 }
@@ -925,9 +945,13 @@ impl CaptureSource for PipePcmSource {
                 let total_overruns = self.shared.overrun_frames.load(Ordering::Relaxed);
                 maybe_log_overruns(total_overruns, &self.shared.overrun_logged, "pipe");
                 debug_assert_eq!(written % ch, 0);
+                let ended = ended_flag && self.consumer.is_empty();
+                if ended && let Some(child) = self.child.as_mut() {
+                    child.finish_after_stdout_eof(PIPE_CHILD_EXIT_WAIT)?;
+                }
                 return Ok(CaptureRead {
                     frames: written / ch,
-                    ended: ended_flag && self.consumer.is_empty(),
+                    ended,
                     overrun_frames_dropped: total_overruns,
                 });
             }
@@ -935,20 +959,37 @@ impl CaptureSource for PipePcmSource {
         }
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> FwResult<()> {
         self.shared.ended.store(true, Ordering::Release);
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill(); // closes the pipe -> reader thread unblocks
-        }
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        let cleanup = match self.child.take() {
+            Some(mut child) => child.kill().map(drop),
+            None => Ok(()),
+        };
+        let join = self.join.take();
+        let reader_cleanup = if cleanup.is_ok() && self.join_reader_on_stop {
+            match join {
+                Some(join) if join.join().is_err() => Err(FwError::ContractViolation(
+                    "pipe capture reader panicked during shutdown".to_owned(),
+                )),
+                Some(_) | None => Ok(()),
+            }
+        } else {
+            // Dropping JoinHandle detaches the reader. This is required for
+            // stdin and is also the only bounded response when process-tree
+            // cleanup failed and a descendant may still retain stdout.
+            drop(join);
+            Ok(())
+        };
+        cleanup?;
+        reader_cleanup
     }
 }
 
 impl Drop for PipePcmSource {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            tracing::warn!(%error, "pipe capture cleanup failed during drop");
+        }
     }
 }
 
@@ -1384,8 +1425,9 @@ impl CaptureSource for MockCaptureSource {
         }
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> FwResult<()> {
         self.ended = true;
+        Ok(())
     }
 }
 
@@ -1481,7 +1523,7 @@ mod tests {
     #[test]
     fn fixture_stop_ends_stream_without_hanging() {
         let mut src = FixtureCaptureSource::new_unpaced(vec![0.0; 1000], 16_000, 1, 100).unwrap();
-        src.stop();
+        src.stop().expect("stop fixture source");
         let mut out = [0f32; 16];
         let r = src.read(&mut out, Duration::from_millis(1)).unwrap();
         assert_eq!((r.frames, r.ended), (0, true));
@@ -1837,6 +1879,19 @@ mod tests {
         }
     }
 
+    struct BlockingReader {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl std::io::Read for BlockingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.entered.try_send(());
+            let _ = self.release.recv();
+            Ok(0)
+        }
+    }
+
     fn drain_source(src: &mut PipePcmSource) -> Vec<f32> {
         let mut out = vec![0f32; 4096];
         let mut got = Vec::new();
@@ -1935,6 +1990,29 @@ mod tests {
         assert!(PipePcmSource::from_reader(reader, PcmFormat::S16le, 16_000, 0, 1.0).is_err());
     }
 
+    #[test]
+    fn externally_owned_blocking_reader_stop_detaches_promptly() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = BlockingReader {
+            entered: entered_tx,
+            release: release_rx,
+        };
+        let mut src = PipePcmSource::from_reader(reader, PcmFormat::S16le, 16_000, 1, 1.0).unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader entered its externally controlled blocking read");
+
+        let started = Instant::now();
+        src.stop().expect("detach externally owned reader");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "stop waited for externally owned input: {:?}",
+            started.elapsed()
+        );
+        drop(release_tx);
+    }
+
     // ---- subprocess-backed source (unix-only helpers; sh is universal) ----
 
     #[cfg(not(windows))]
@@ -1957,7 +2035,7 @@ mod tests {
         }
         assert_eq!(frames, 1600, "first batch must arrive while the child runs");
         let t_stop = Instant::now();
-        src.stop();
+        src.stop().expect("stop subprocess capture");
         assert!(
             t_stop.elapsed() < Duration::from_secs(2),
             "stop() must kill promptly, took {:?}",
@@ -1971,22 +2049,24 @@ mod tests {
         let args: Vec<String> = vec!["-c".into(), "echo device gone >&2; exit 3".into()];
         let mut src = FfmpegCaptureSource::open_with_command("sh", &args, 1.0).unwrap();
         let mut out = vec![0f32; 64];
-        // EOF arrives with no data; the error slot is only set on read
-        // failures, so a clean nonzero exit shows as `ended` — the DRIVER
-        // then consults stderr_tail via the child. Here we assert the tail
-        // made it into the source's error enrichment path when the reader
-        // errors, and at minimum that the stream ends rather than hanging.
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let r = src.read(&mut out, Duration::from_millis(50)).unwrap();
-            if r.ended {
-                break;
+        let error = loop {
+            match src.read(&mut out, Duration::from_millis(50)) {
+                Ok(read) => assert!(
+                    !read.ended,
+                    "nonzero producer exit was converted to successful EOF"
+                ),
+                Err(error) => break error,
             }
             assert!(
                 Instant::now() < deadline,
-                "failed child must end the stream"
+                "failed child did not surface its exit status"
             );
-        }
+        };
+        assert_eq!(error.error_code(), "FW-CMD-FAILED");
+        let text = error.to_string();
+        assert!(text.contains("status: 3"), "exit status was lost: {text}");
+        assert!(text.contains("device gone"), "stderr tail was lost: {text}");
     }
 
     #[cfg(not(windows))]
@@ -2094,7 +2174,7 @@ mod tests {
                 .expect("read");
             total += r.frames;
         }
-        src.stop();
+        src.stop().expect("stop cpal source");
         assert!(total > 0, "no audio frames captured from live device");
     }
 }
