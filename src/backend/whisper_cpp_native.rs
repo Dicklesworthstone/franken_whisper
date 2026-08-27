@@ -361,23 +361,14 @@ pub(crate) fn capability_probe() -> NativeProbe {
     }
 }
 
-/// Resolve the effective model spec for a request, or a [`FwError`] explaining
-/// how to provision one.
-///
 /// Precedence: `request.model` (when set), then
 /// `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then the authenticated default
-/// release package. If none resolves, returns an actionable
-/// [`FwError::BackendUnavailable`].
-fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
+/// release-package sentinel. Authentication happens once at execution.
+fn effective_model_spec(request: &TranscribeRequest) -> String {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
-        return Ok(model);
+        return model;
     }
-    native_engine::configured_or_release_model_spec().map_err(|error| {
-        FwError::BackendUnavailable(format!(
-            "native whisper.cpp engine has no usable local model: pass --model, or set \
-             $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
-        ))
-    })
+    native_engine::configured_or_release_model_spec()
 }
 
 /// Build the [`decode::DecodeParams`] for a request.
@@ -475,9 +466,9 @@ pub fn run(
         tok.checkpoint()?;
     }
 
-    // Resolve the model spec up front so an unavailability error is reported
-    // before any expensive work.
-    let spec = effective_model_spec(request)?;
+    // Select the model spec up front. Package authentication stays below the
+    // silence pre-gate so silent clips avoid hashing multi-GB weights.
+    let spec = effective_model_spec(request);
 
     // Requested audio window (bd-vgod): `--offset-ms` / `--duration-ms` slice
     // the normalized PCM before decode, so wall-clock scales with the slice.

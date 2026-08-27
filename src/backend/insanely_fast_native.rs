@@ -160,21 +160,15 @@ pub fn is_available() -> bool {
     super::whisper_cpp_native::is_available()
 }
 
-/// Resolve the effective model spec for a request, or a [`FwError`] explaining
-/// how to provision one. Identical precedence to the whisper.cpp native engine:
+/// Resolve the effective model spec for a request. Identical precedence to the
+/// whisper.cpp native engine:
 /// `request.model`, then `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, then the
-/// authenticated default release package, else an actionable
-/// [`FwError::BackendUnavailable`].
-fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
+/// authenticated default release-package sentinel.
+fn effective_model_spec(request: &TranscribeRequest) -> String {
     if let Some(model) = request.model.clone().filter(|m| !m.is_empty()) {
-        return Ok(model);
+        return model;
     }
-    native_engine::configured_or_release_model_spec().map_err(|error| {
-        FwError::BackendUnavailable(format!(
-            "native insanely-fast engine has no usable local model: pass --model, or set \
-             $FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL to a model short-name or path. {error}"
-        ))
-    })
+    native_engine::configured_or_release_model_spec()
 }
 
 /// The number of 30 s windows `samples` spans (`ceil(len / N_SAMPLES_30S)`),
@@ -353,9 +347,9 @@ pub fn run(
         tok.checkpoint()?;
     }
 
-    // Resolve the model spec up front so an unavailability error is reported
-    // before any expensive work.
-    let spec = effective_model_spec(request)?;
+    // Select the model spec up front. Package authentication stays below the
+    // silence pre-gate so silent clips avoid hashing multi-GB weights.
+    let spec = effective_model_spec(request);
 
     // Silence pre-gate: cheap energy analysis avoids a multi-GB model load on a
     // pure-silence clip (shared policy with whisper.cpp native).

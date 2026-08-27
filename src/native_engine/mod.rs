@@ -1227,27 +1227,16 @@ pub fn default_model_spec() -> Option<String> {
     }
 }
 
-/// Select the native Whisper model used when a request did not provide one.
-///
-/// An explicit `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` wins. Otherwise this
-/// delegates to [`resolve_model`] with its `default` sentinel, which requires
-/// the compiled-size/SHA-256 release package. The returned path is canonical,
-/// no network access is performed, and a non-UTF-8 path fails with an
-/// actionable error because downstream request model specifications are UTF-8
-/// strings.
-pub fn configured_or_release_model_spec() -> FwResult<String> {
+/// Select the native Whisper model spec used when a request did not provide
+/// one. An explicit `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL` wins; otherwise the
+/// `default` sentinel is preserved so the execution resolver can retain the
+/// authenticated package descriptor instead of collapsing it to a path.
+#[must_use]
+pub fn configured_or_release_model_spec() -> String {
     if let Some(spec) = default_model_spec() {
-        return Ok(spec);
+        return spec;
     }
-
-    let path = resolve_model("default")?;
-    path.into_os_string().into_string().map_err(|_| {
-        FwError::InvalidRequest(
-            "the release Whisper model path is not valid UTF-8; pass an explicit \
-             UTF-8 --model path"
-                .to_owned(),
-        )
-    })
+    "default".to_owned()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
