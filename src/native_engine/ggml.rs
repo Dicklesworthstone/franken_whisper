@@ -731,13 +731,23 @@ impl GgmlModel {
     ///   structure, or trailing bytes after the tensor directory.
     /// - [`FwError::Unsupported`] for a quantized `ftype`.
     pub fn load(path: &Path) -> FwResult<Self> {
+        Self::load_from_file(std::fs::File::open(path)?)
+    }
+
+    /// Parse a ggml model from an already-open descriptor.
+    ///
+    /// Package resolution uses this entry point so the bytes consumed by
+    /// inference are the same file generation that passed SHA-256
+    /// authentication; the cache pathname is never reopened after the trust
+    /// decision.
+    pub fn load_from_file(file: std::fs::File) -> FwResult<Self> {
         // bd-A14: opt-in streaming loader preads each tensor on demand instead
         // of holding the whole ~1.6 GB file resident (peak-RSS win, default-off).
         #[cfg(unix)]
         if stream_load_enabled() {
-            return Self::load_streamed(path);
+            return Self::load_streamed(file);
         }
-        let blob = read_blob_parallel(path)?;
+        let blob = read_blob_parallel_file(file)?;
         Self::parse(blob)
     }
 
@@ -968,12 +978,12 @@ impl GgmlModel {
     /// Errors mirror [`Self::parse`] (bad magic, malformed/truncated structure,
     /// unsupported dtype, trailing bytes).
     #[cfg(unix)]
-    fn load_streamed(path: &Path) -> FwResult<Self> {
-        let file = std::fs::File::open(path)?;
+    fn load_streamed(file: std::fs::File) -> FwResult<Self> {
         let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
         // The directory scan uses a SEPARATE buffered handle (dropped when the
         // scan ends); `file` is kept only for the on-demand payload preads.
-        let scan = std::fs::File::open(path)?;
+        let mut scan = file.try_clone()?;
+        std::io::Seek::rewind(&mut scan)?;
         let cur = StreamCursor::new(std::io::BufReader::with_capacity(1 << 20, scan), len);
         let scanned = Self::scan_streamed_inner(cur)?;
         Ok(Self {
@@ -1504,6 +1514,11 @@ impl GgmlModel {
 #[cfg(unix)]
 pub fn read_blob_parallel(path: &Path) -> std::io::Result<Vec<u8>> {
     let file = std::fs::File::open(path)?;
+    read_blob_parallel_file(file)
+}
+
+#[cfg(unix)]
+fn read_blob_parallel_file(file: std::fs::File) -> std::io::Result<Vec<u8>> {
     let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
     let mut blob = vec![0u8; len];
 
@@ -1558,7 +1573,18 @@ pub fn read_blob_parallel(path: &Path) -> std::io::Result<Vec<u8>> {
 /// Non-unix fallback: positioned reads need `FileExt`, so just read serially.
 #[cfg(not(unix))]
 pub fn read_blob_parallel(path: &Path) -> std::io::Result<Vec<u8>> {
-    std::fs::read(path)
+    read_blob_parallel_file(std::fs::File::open(path)?)
+}
+
+#[cfg(not(unix))]
+fn read_blob_parallel_file(mut file: std::fs::File) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+
+    file.rewind()?;
+    let capacity = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let mut blob = Vec::with_capacity(capacity);
+    file.read_to_end(&mut blob)?;
+    Ok(blob)
 }
 
 /// Fill `buf` completely from `file` starting at `offset`, looping over short

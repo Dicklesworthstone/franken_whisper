@@ -10922,7 +10922,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_sync_distinguishes_null_child_fields_from_empty_and_zero() {
+    fn validate_sync_distinguishes_null_speaker_from_empty_text() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("validate-child-null.sqlite3");
         let export_dir = dir.path().join("export");
@@ -10941,9 +10941,7 @@ mod tests {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("segment row"))
             .collect::<Vec<_>>();
         assert_eq!(rows[1]["speaker"], serde_json::Value::Null);
-        assert_eq!(rows[1]["confidence"], serde_json::Value::Null);
         rows[1]["speaker"] = json!("");
-        rows[1]["confidence"] = json!(0.0);
         fs::write(
             &segments_path,
             rows.iter()
@@ -10959,6 +10957,46 @@ mod tests {
         assert!(validation.child_mismatches.iter().any(|mismatch| {
             mismatch.table == "segments"
                 && mismatch.key == "child-null/1"
+                && mismatch.reason == "payload differs"
+        }));
+    }
+
+    #[test]
+    fn validate_sync_distinguishes_null_confidence_from_zero() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-child-null-confidence.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("child-null-confidence", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+
+        let segments_path = export_dir.join("segments.jsonl");
+        let mut rows = fs::read_to_string(&segments_path)
+            .expect("read segments")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("segment row"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows[1]["confidence"], serde_json::Value::Null);
+        rows[1]["confidence"] = json!(0.0);
+        fs::write(
+            &segments_path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).expect("serialize segment"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write segments");
+
+        let validation = validate_sync(&db_path, &export_dir).expect("validate zero mutation");
+        assert!(!validation.is_valid);
+        assert!(validation.child_mismatches.iter().any(|mismatch| {
+            mismatch.table == "segments"
+                && mismatch.key == "child-null-confidence/1"
                 && mismatch.reason == "payload differs"
         }));
     }

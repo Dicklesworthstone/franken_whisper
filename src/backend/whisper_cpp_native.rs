@@ -55,7 +55,7 @@ use crate::model::{
     WordTimestampParams,
 };
 use crate::native_engine::dtw::WordTiming;
-use crate::native_engine::{self, NativeWhisperModel, WhisperHParams, decode};
+use crate::native_engine::{self, WhisperHParams, decode};
 
 use super::native_audio::analyze_wav;
 
@@ -501,9 +501,13 @@ pub fn run(
     }
 
     // Resolve + load the model (cached). A resolution miss here is unavailable.
-    let model_path = native_engine::resolve_model(&spec)
-        .map_err(|e| FwError::BackendUnavailable(e.to_string()))?;
-    let model = NativeWhisperModel::load(&model_path)?;
+    let is_cancelled = || token.is_some_and(|token| token.checkpoint().is_err());
+    let model_source = native_engine::resolve_model_source_with_cancel(&spec, &is_cancelled)
+        .map_err(|error| match error {
+            error @ (FwError::Cancelled(_) | FwError::StageTimeout { .. }) => error,
+            other => FwError::BackendUnavailable(other.to_string()),
+        })?;
+    let model = model_source.load()?;
 
     // Read the normalized WAV to f32 mono samples, then apply the requested
     // window. Timestamps are shifted back into the source timebase after

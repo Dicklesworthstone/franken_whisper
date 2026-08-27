@@ -1840,13 +1840,18 @@ fn pinned_fast_lane_label(model: crate::model_distribution::FastLaneModel) -> &'
     }
 }
 
-/// Resolve and authenticate the fast-lane path before the model loader reopens
-/// it. Keeping path selection separate makes the trust-boundary policy directly
-/// testable without allocating a complete Whisper model.
+/// Resolve and authenticate the fast-lane source while retaining the verified
+/// descriptor for the model loader. Keeping source selection separate makes
+/// the trust-boundary policy directly testable without allocating a complete
+/// Whisper model.
 fn resolve_fast_model_path(
     config: &ListenConfig,
     is_cancelled: &(dyn Fn() -> bool + Sync),
-) -> FwResult<(std::path::PathBuf, String, Option<String>)> {
+) -> FwResult<(
+    crate::native_engine::ResolvedWhisperModel,
+    String,
+    Option<String>,
+)> {
     let default_spec = match config.language.as_deref() {
         Some("en") => "tiny.en",
         _ => "tiny",
@@ -1858,8 +1863,8 @@ fn resolve_fast_model_path(
             model,
             is_cancelled,
         )
-        .map(|package| package.weights_path),
-        None => crate::native_engine::resolve_model(spec),
+        .map(crate::native_engine::ResolvedWhisperModel::Authenticated),
+        None => crate::native_engine::resolve_model_source_with_cancel(spec, is_cancelled),
     };
 
     match resolved {
@@ -1879,7 +1884,9 @@ fn resolve_fast_model_path(
             let fallback = match crate::model_distribution::resolve_cached_whisper_with_cancel(
                 is_cancelled,
             ) {
-                Ok(package) => package.weights_path,
+                Ok(package) => {
+                    crate::native_engine::ResolvedWhisperModel::Authenticated(package)
+                }
                 Err(cancelled @ FwError::Cancelled(_)) => return Err(cancelled),
                 Err(_) => return Err(missing),
             };
@@ -1912,8 +1919,8 @@ fn resolve_fast_model(
     String,
     Option<String>,
 )> {
-    let (path, label, warning) = resolve_fast_model_path(config, is_cancelled)?;
-    let model = crate::native_engine::NativeWhisperModel::load(&path)?;
+    let (source, label, warning) = resolve_fast_model_path(config, is_cancelled)?;
+    let model = source.load()?;
     Ok((model, label, warning))
 }
 
@@ -2828,10 +2835,14 @@ pub fn run_listen_session(
             let (model, label) = match loaded.as_ref() {
                 Some(pair) => pair.clone(),
                 None => {
-                    let resolved = crate::native_engine::resolve_model(&spec_owned)
+                    let resolved = crate::native_engine::resolve_model_source_with_cancel(
+                        &spec_owned,
+                        is_abort,
+                    )
                         .map_err(|e| e.to_string())
-                        .and_then(|path| {
-                            crate::native_engine::NativeWhisperModel::load(&path)
+                        .and_then(|source| {
+                            source
+                                .load()
                                 .map(|m| (m, spec_owned.clone()))
                                 .map_err(|e| e.to_string())
                         });
@@ -5980,7 +5991,10 @@ mod adaptive_contract_tests {
         let (resolved, label, warning) = resolve_fast_model_path(&config, &|| false)
             .expect("an explicit custom path remains supported");
 
-        assert_eq!(resolved, path.canonicalize().expect("canonical fixture"));
+        assert_eq!(
+            resolved.path(),
+            path.canonicalize().expect("canonical fixture")
+        );
         assert_eq!(label, path.to_string_lossy().into_owned());
         assert!(warning.is_none());
     }

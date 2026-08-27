@@ -1235,24 +1235,7 @@ fn load_routing_history_details(
         return Ok(store.load_run_details(run_id)?.into_iter().collect());
     }
 
-    let summaries = store.list_recent_runs(limit)?;
-    let run_ids: Vec<String> = summaries.iter().map(|s| s.run_id.clone()).collect();
-    // Two batched queries instead of the per-run N+1 (`load_run_details` × N).
-    let details = store.load_run_details_batch(&run_ids)?;
-    if details.len() != run_ids.len() {
-        // Preserve the per-run error for any run that vanished between the list and
-        // the batched load.
-        let found: std::collections::HashSet<&str> =
-            details.iter().map(|d| d.run_id.as_str()).collect();
-        for id in &run_ids {
-            if !found.contains(id.as_str()) {
-                return Err(FwError::Storage(format!(
-                    "run `{id}` disappeared while loading routing history"
-                )));
-            }
-        }
-    }
-    Ok(details)
+    store.load_recent_run_details(limit)
 }
 
 fn backends_command_output() -> FwResult<String> {

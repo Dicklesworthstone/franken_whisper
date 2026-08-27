@@ -155,7 +155,12 @@ struct TableColumn {
 
 const PERSIST_BUSY_RETRY_ATTEMPTS: usize = 8;
 const PERSIST_BUSY_BASE_BACKOFF_MS: u64 = 5;
+// FrankenSQLite accepts at most 32,766 numbered parameters. Stay below that
+// hard ceiling so a future query can add fixed parameters without silently
+// making an otherwise valid history batch unparsable.
+const HISTORY_QUERY_PARAMETER_CHUNK: usize = 32_000;
 static PERSIST_SAVEPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
+static READ_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl std::fmt::Debug for RunStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -255,6 +260,33 @@ impl RunStore {
         &self.connection
     }
 
+    fn with_read_snapshot<T>(
+        &self,
+        operation: impl FnOnce() -> FwResult<T>,
+    ) -> FwResult<T> {
+        let savepoint_name = next_read_snapshot_name();
+        self.connection
+            .execute(&format!("SAVEPOINT {savepoint_name};"))
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+
+        match operation() {
+            Ok(value) => {
+                if let Err(error) = self
+                    .connection
+                    .execute(&format!("RELEASE SAVEPOINT {savepoint_name};"))
+                {
+                    let _ = rollback_savepoint(&self.connection, &savepoint_name);
+                    return Err(FwError::Storage(error.to_string()));
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = rollback_savepoint(&self.connection, &savepoint_name);
+                Err(error)
+            }
+        }
+    }
+
     pub fn persist_report(&self, report: &RunReport) -> FwResult<()> {
         self.persist_report_cancellable(report, None)
     }
@@ -326,6 +358,14 @@ impl RunStore {
     }
 
     pub(crate) fn list_recent_runs_cancellable(
+        &self,
+        limit: usize,
+        token: Option<&crate::orchestrator::CancellationToken>,
+    ) -> FwResult<Vec<RunSummary>> {
+        self.with_read_snapshot(|| self.list_recent_runs_cancellable_in_snapshot(limit, token))
+    }
+
+    fn list_recent_runs_cancellable_in_snapshot(
         &self,
         limit: usize,
         token: Option<&crate::orchestrator::CancellationToken>,
@@ -403,6 +443,24 @@ impl RunStore {
         &self,
         token: Option<&crate::orchestrator::CancellationToken>,
     ) -> FwResult<Option<StoredRunDetails>> {
+        self.load_latest_run_details_cancellable_with_after_id(token, || Ok(()))
+    }
+
+    fn load_latest_run_details_cancellable_with_after_id(
+        &self,
+        token: Option<&crate::orchestrator::CancellationToken>,
+        after_latest_id: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Option<StoredRunDetails>> {
+        self.with_read_snapshot(|| {
+            self.load_latest_run_details_cancellable_in_snapshot(token, after_latest_id)
+        })
+    }
+
+    fn load_latest_run_details_cancellable_in_snapshot(
+        &self,
+        token: Option<&crate::orchestrator::CancellationToken>,
+        after_latest_id: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Option<StoredRunDetails>> {
         if let Some(tok) = token {
             tok.checkpoint()?;
         }
@@ -412,10 +470,11 @@ impl RunStore {
             .connection
             .query("SELECT id FROM runs ORDER BY started_at DESC, id DESC LIMIT 1")
             .map_err(|error| FwError::Storage(error.to_string()))?;
+        after_latest_id()?;
 
         if let Some(row) = rows.into_iter().next() {
             let run_id = value_to_string(row.get(0));
-            self.load_run_details_cancellable(&run_id, token)
+            self.load_run_details_cancellable_in_snapshot(&run_id, token, || Ok(()))
         } else {
             Ok(None)
         }
@@ -425,10 +484,32 @@ impl RunStore {
         self.load_run_details_cancellable(run_id, None)
     }
 
+    #[cfg(test)]
+    fn load_run_details_with_after_run_row(
+        &self,
+        run_id: &str,
+        after_run_row: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Option<StoredRunDetails>> {
+        self.with_read_snapshot(|| {
+            self.load_run_details_cancellable_in_snapshot(run_id, None, after_run_row)
+        })
+    }
+
     pub(crate) fn load_run_details_cancellable(
         &self,
         run_id: &str,
         token: Option<&crate::orchestrator::CancellationToken>,
+    ) -> FwResult<Option<StoredRunDetails>> {
+        self.with_read_snapshot(|| {
+            self.load_run_details_cancellable_in_snapshot(run_id, token, || Ok(()))
+        })
+    }
+
+    fn load_run_details_cancellable_in_snapshot(
+        &self,
+        run_id: &str,
+        token: Option<&crate::orchestrator::CancellationToken>,
+        after_run_row: impl FnOnce() -> FwResult<()>,
     ) -> FwResult<Option<StoredRunDetails>> {
         if let Some(tok) = token {
             tok.checkpoint()?;
@@ -452,6 +533,7 @@ impl RunStore {
             .connection
             .query_with_params(&run_sql, &[SqliteValue::Text(run_id.to_owned().into())])
             .map_err(|error| FwError::Storage(error.to_string()))?;
+        after_run_row()?;
 
         let Some(row) = rows.first() else {
             return Ok(None);
@@ -571,18 +653,118 @@ impl RunStore {
     /// `load_run_details_batch_matches_per_run`). `FW_STORAGE_BATCH_HISTORY=0` falls
     /// back to the per-run path (kill-switch + A/B arm).
     pub fn load_run_details_batch(&self, run_ids: &[String]) -> FwResult<Vec<StoredRunDetails>> {
+        self.load_run_details_batch_with_configuration(
+            run_ids,
+            batch_history_enabled(),
+            |_| {},
+            || Ok(()),
+        )
+    }
+
+    /// Atomically select recent run IDs and load their complete detail rows.
+    /// The list and every parent/segment/event query share one read snapshot,
+    /// so a concurrent live flush cannot make routing history observe a list
+    /// from one database moment and details from another.
+    pub fn load_recent_run_details(&self, limit: usize) -> FwResult<Vec<StoredRunDetails>> {
+        self.load_recent_run_details_with_after_summaries(limit, || Ok(()))
+    }
+
+    fn load_recent_run_details_with_after_summaries(
+        &self,
+        limit: usize,
+        after_summaries: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Vec<StoredRunDetails>> {
+        self.with_read_snapshot(|| {
+            let summaries = self.list_recent_runs_cancellable_in_snapshot(limit, None)?;
+            after_summaries()?;
+            let run_ids = summaries
+                .into_iter()
+                .map(|summary| summary.run_id)
+                .collect::<Vec<_>>();
+            let details = self.load_run_details_batch_in_snapshot(
+                &run_ids,
+                batch_history_enabled(),
+                |_| {},
+                || Ok(()),
+            )?;
+            if details.len() != run_ids.len() {
+                return Err(FwError::Storage(
+                    "a run selected for recent history was absent from the same read snapshot"
+                        .to_owned(),
+                ));
+            }
+            Ok(details)
+        })
+    }
+
+    fn load_run_details_batch_with_after_run_rows(
+        &self,
+        run_ids: &[String],
+        after_run_rows: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Vec<StoredRunDetails>> {
+        self.load_run_details_batch_with_configuration(
+            run_ids,
+            batch_history_enabled(),
+            |_| {},
+            after_run_rows,
+        )
+    }
+
+    fn load_run_details_batch_with_configuration(
+        &self,
+        run_ids: &[String],
+        use_batched_queries: bool,
+        observe_run_query: impl FnMut(usize),
+        after_run_rows: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Vec<StoredRunDetails>> {
         if run_ids.is_empty() {
             return Ok(Vec::new());
         }
-        if !batch_history_enabled() {
+        self.with_read_snapshot(|| {
+            self.load_run_details_batch_in_snapshot(
+                run_ids,
+                use_batched_queries,
+                observe_run_query,
+                after_run_rows,
+            )
+        })
+    }
+
+    fn load_run_details_batch_in_snapshot(
+        &self,
+        run_ids: &[String],
+        use_batched_queries: bool,
+        mut observe_run_query: impl FnMut(usize),
+        after_run_rows: impl FnOnce() -> FwResult<()>,
+    ) -> FwResult<Vec<StoredRunDetails>> {
+        if run_ids.is_empty() {
+            after_run_rows()?;
+            return Ok(Vec::new());
+        }
+        if !use_batched_queries {
             let mut out = Vec::with_capacity(run_ids.len());
-            for id in run_ids {
-                if let Some(details) = self.load_run_details(id)? {
+            let mut after_run_rows = Some(after_run_rows);
+            for (index, id) in run_ids.iter().enumerate() {
+                let hook = after_run_rows.take().filter(|_| index == 0);
+                if let Some(details) = self.load_run_details_cancellable_in_snapshot(
+                    id,
+                    None,
+                    || match hook {
+                        Some(hook) => hook(),
+                        None => Ok(()),
+                    },
+                )? {
                     out.push(details);
                 }
             }
             return Ok(out);
         }
+
+        let mut seen = std::collections::HashSet::with_capacity(run_ids.len());
+        let unique_run_ids = run_ids
+            .iter()
+            .filter(|run_id| seen.insert(run_id.as_str()))
+            .collect::<Vec<_>>();
 
         // Optional-column exprs computed ONCE (not once per run) — see load_run_details.
         let replay_expr = if self.table_has_column("runs", "replay_json")? {
@@ -595,45 +777,36 @@ impl RunStore {
         } else {
             "'{}' AS acceleration_json"
         };
-        let placeholders = (1..=run_ids.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let params: Vec<SqliteValue> = run_ids
-            .iter()
-            .map(|id| SqliteValue::Text(id.clone().into()))
-            .collect();
-
-        let run_sql = format!(
-            "SELECT id, started_at, finished_at, backend, result_json, warnings_json, transcript, {replay_expr}, {acceleration_expr} \
-             FROM runs WHERE id IN ({placeholders})"
-        );
-        let run_rows = self
-            .connection
-            .query_with_params(&run_sql, &params)
-            .map_err(|error| FwError::Storage(error.to_string()))?;
         let mut run_by_id: std::collections::HashMap<String, fsqlite::Row> =
-            std::collections::HashMap::with_capacity(run_rows.len());
+            std::collections::HashMap::with_capacity(unique_run_ids.len());
         let mut native_listen_run_ids = Vec::new();
-        for row in run_rows {
-            let run_id = value_to_string(row.get(0));
-            if parse_backend(&value_to_string(row.get(3))) == BackendKind::NativeListen {
-                native_listen_run_ids.push(run_id.clone());
+        for run_id_chunk in unique_run_ids.chunks(HISTORY_QUERY_PARAMETER_CHUNK) {
+            observe_run_query(run_id_chunk.len());
+            let placeholders = numbered_placeholders(run_id_chunk.len());
+            let params = text_id_params(run_id_chunk);
+            let run_sql = format!(
+                "SELECT id, started_at, finished_at, backend, result_json, warnings_json, transcript, {replay_expr}, {acceleration_expr} \
+                 FROM runs WHERE id IN ({placeholders})"
+            );
+            let run_rows = self
+                .connection
+                .query_with_params(&run_sql, &params)
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            for row in run_rows {
+                let run_id = value_to_string(row.get(0));
+                if parse_backend(&value_to_string(row.get(3))) == BackendKind::NativeListen {
+                    native_listen_run_ids.push(run_id.clone());
+                }
+                run_by_id.insert(run_id, row);
             }
-            run_by_id.insert(run_id, row);
         }
+        after_run_rows()?;
 
         let mut segments_by_run: std::collections::HashMap<String, Vec<fsqlite::Row>> =
             std::collections::HashMap::new();
-        if !native_listen_run_ids.is_empty() {
-            let segment_placeholders = (1..=native_listen_run_ids.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let segment_params: Vec<SqliteValue> = native_listen_run_ids
-                .iter()
-                .map(|id| SqliteValue::Text(id.clone().into()))
-                .collect();
+        for run_id_chunk in native_listen_run_ids.chunks(HISTORY_QUERY_PARAMETER_CHUNK) {
+            let segment_placeholders = numbered_placeholders(run_id_chunk.len());
+            let segment_params = text_id_params(run_id_chunk);
             let segment_sql = format!(
                 "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
                  FROM segments WHERE run_id IN ({segment_placeholders}) \
@@ -651,25 +824,29 @@ impl RunStore {
             }
         }
 
-        let evt_sql = format!(
-            "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
-             FROM events WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, seq ASC"
-        );
-        let evt_rows = self
-            .connection
-            .query_with_params(&evt_sql, &params)
-            .map_err(|error| FwError::Storage(error.to_string()))?;
         let mut events_by_run: std::collections::HashMap<String, Vec<fsqlite::Row>> =
             std::collections::HashMap::new();
-        for row in evt_rows {
-            events_by_run
-                .entry(value_to_string(row.get(0)))
-                .or_default()
-                .push(row);
+        for run_id_chunk in unique_run_ids.chunks(HISTORY_QUERY_PARAMETER_CHUNK) {
+            let placeholders = numbered_placeholders(run_id_chunk.len());
+            let params = text_id_params(run_id_chunk);
+            let evt_sql = format!(
+                "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
+                 FROM events WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, seq ASC"
+            );
+            let evt_rows = self
+                .connection
+                .query_with_params(&evt_sql, &params)
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            for row in evt_rows {
+                events_by_run
+                    .entry(value_to_string(row.get(0)))
+                    .or_default()
+                    .push(row);
+            }
         }
 
-        let mut out = Vec::with_capacity(run_ids.len());
-        for run_id in run_ids {
+        let mut details_by_id = std::collections::HashMap::with_capacity(run_by_id.len());
+        for run_id in unique_run_ids {
             let Some(run_row) = run_by_id.get(run_id) else {
                 continue;
             };
@@ -681,7 +858,15 @@ impl RunStore {
                 .get(run_id)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            out.push(assemble_run_details_batched(run_row, events, segments)?);
+            let details = assemble_run_details_batched(run_row, events, segments)?;
+            details_by_id.insert(run_id.as_str().to_owned(), details);
+        }
+
+        let mut out = Vec::with_capacity(run_ids.len());
+        for run_id in run_ids {
+            if let Some(details) = details_by_id.get(run_id) {
+                out.push(details.clone());
+            }
         }
         Ok(out)
     }
@@ -2618,6 +2803,20 @@ fn batch_history_enabled() -> bool {
     std::env::var("FW_STORAGE_BATCH_HISTORY").ok().as_deref() != Some("0")
 }
 
+fn numbered_placeholders(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn text_id_params<T: AsRef<str>>(run_ids: &[T]) -> Vec<SqliteValue> {
+    run_ids
+        .iter()
+        .map(|run_id| SqliteValue::Text(run_id.as_ref().to_owned().into()))
+        .collect()
+}
+
 /// Re-authenticate nested typed contracts after deserializing canonical run
 /// JSON. Serde enforces shape, but version strings and cross-field provenance
 /// remain semantic claims and must fail closed at every durable read boundary.
@@ -3094,6 +3293,11 @@ fn next_persist_savepoint_name() -> String {
     format!("fw_persist_{id}")
 }
 
+fn next_read_snapshot_name() -> String {
+    let id = READ_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("fw_read_snapshot_{id}")
+}
+
 fn rollback_savepoint(connection: &BlockingConnection, savepoint_name: &str) -> FwResult<()> {
     let rollback_sql = format!("ROLLBACK TO SAVEPOINT {savepoint_name};");
     connection
@@ -3158,7 +3362,7 @@ mod tests {
 
     use fsqlite_types::value::SqliteValue;
 
-    use crate::error::FwError;
+    use crate::error::{FwError, FwResult};
     use crate::model::{
         AccelerationBackend, AccelerationReport, BackendKind, BackendParams, DiarizationEngine,
         DiarizationFallbackStatus, DiarizationOperationalPartitionMethod,
@@ -3336,6 +3540,72 @@ mod tests {
             evidence: vec![],
             replay: crate::model::ReplayEnvelope::default(),
         }
+    }
+
+    fn live_history_snapshot_fixture(
+        db_path: &std::path::Path,
+        run_id: &str,
+    ) -> (RunStore, RunStore) {
+        let reader = RunStore::open(db_path).expect("reader store");
+        reader
+            .listen_open_run(&super::ListenRunOpen {
+                run_id,
+                started_at_rfc3339: "2026-08-27T12:00:00Z",
+                input_path: "stdin-pcm",
+                request_json: "{}",
+            })
+            .expect("open live history fixture");
+        reader
+            .listen_flush_utterance(
+                run_id,
+                &[super::ListenSegmentRow {
+                    idx: 0,
+                    start_sec: 0.0,
+                    end_sec: 1.0,
+                    text: "before".to_owned(),
+                }],
+                &[],
+                "before",
+                "2026-08-27T12:00:01Z",
+            )
+            .expect("persist initial utterance");
+        let writer = RunStore::open(db_path).expect("writer store");
+        (reader, writer)
+    }
+
+    fn append_live_history_snapshot_mutation(writer: &RunStore, run_id: &str) -> FwResult<()> {
+        writer.listen_flush_utterance(
+            run_id,
+            &[super::ListenSegmentRow {
+                idx: 1,
+                start_sec: 1.0,
+                end_sec: 2.0,
+                text: "after".to_owned(),
+            }],
+            &[super::ListenEventRow {
+                seq: 1,
+                ts_rfc3339: "2026-08-27T12:00:02Z".to_owned(),
+                code: "listen.snapshot.after".to_owned(),
+                payload_json: "{}".to_owned(),
+            }],
+            "before after",
+            "2026-08-27T12:00:02Z",
+        )
+    }
+
+    fn assert_pre_flush_history_snapshot(details: &StoredRunDetails) {
+        assert_eq!(details.transcript, "before");
+        assert_eq!(details.segments.len(), 1);
+        assert_eq!(details.segments[0].text, "before");
+        assert!(details.events.is_empty());
+    }
+
+    fn assert_post_flush_history_snapshot(details: &StoredRunDetails) {
+        assert_eq!(details.transcript, "before after");
+        assert_eq!(details.segments.len(), 2);
+        assert_eq!(details.segments[1].text, "after");
+        assert_eq!(details.events.len(), 1);
+        assert_eq!(details.events[0].code, "listen.snapshot.after");
     }
 
     fn attach_synthetic_diarization(report: &mut RunReport, persist_profiles: bool) {
@@ -4638,9 +4908,10 @@ mod tests {
         }
 
         let duplicate_ids = vec![
-            "batch-a".to_owned(),
+            "batch-c".to_owned(),
             "batch-a".to_owned(),
             "batch-b".to_owned(),
+            "batch-a".to_owned(),
         ];
         let duplicated = store
             .load_run_details_batch(&duplicate_ids)
@@ -6411,6 +6682,189 @@ mod tests {
             assert_eq!(details.transcript, "first second third");
             assert_eq!(details.segments, expected);
         }
+    }
+
+    #[test]
+    fn single_history_details_hold_one_snapshot_across_parent_and_children() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("single_history_snapshot.sqlite3");
+        let run_id = "single-history-snapshot";
+        let (reader, writer) = live_history_snapshot_fixture(&db_path, run_id);
+
+        let details = reader
+            .load_run_details_with_after_run_row(run_id, || {
+                append_live_history_snapshot_mutation(&writer, run_id)
+            })
+            .expect("snapshot load")
+            .expect("live run");
+        assert_pre_flush_history_snapshot(&details);
+
+        let fresh = reader
+            .load_run_details(run_id)
+            .expect("fresh load")
+            .expect("live run after flush");
+        assert_post_flush_history_snapshot(&fresh);
+    }
+
+    #[test]
+    fn latest_history_details_hold_one_snapshot_from_id_through_children() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("latest_history_snapshot.sqlite3");
+        let run_id = "latest-history-snapshot";
+        let (reader, writer) = live_history_snapshot_fixture(&db_path, run_id);
+
+        let details = reader
+            .load_latest_run_details_cancellable_with_after_id(None, || {
+                append_live_history_snapshot_mutation(&writer, run_id)
+            })
+            .expect("latest snapshot load")
+            .expect("latest live run");
+        assert_pre_flush_history_snapshot(&details);
+
+        let fresh = reader
+            .load_latest_run_details()
+            .expect("fresh latest load")
+            .expect("latest live run after flush");
+        assert_post_flush_history_snapshot(&fresh);
+    }
+
+    #[test]
+    fn batch_history_details_hold_one_snapshot_across_parent_and_children() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("batch_history_snapshot.sqlite3");
+        let run_id = "batch-history-snapshot";
+        let (reader, writer) = live_history_snapshot_fixture(&db_path, run_id);
+
+        let details = reader
+            .load_run_details_batch_with_after_run_rows(&[run_id.to_owned()], || {
+                append_live_history_snapshot_mutation(&writer, run_id)
+            })
+            .expect("batch snapshot load");
+        assert_eq!(details.len(), 1);
+        assert_pre_flush_history_snapshot(&details[0]);
+
+        let fresh = reader
+            .load_run_details_batch(&[run_id.to_owned()])
+            .expect("fresh batch load");
+        assert_eq!(fresh.len(), 1);
+        assert_post_flush_history_snapshot(&fresh[0]);
+    }
+
+    #[test]
+    fn batch_history_kill_switch_holds_one_snapshot_across_runs() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("batch_history_fallback_snapshot.sqlite3");
+        let run_id = "batch-history-fallback-snapshot";
+        let (reader, writer) = live_history_snapshot_fixture(&db_path, run_id);
+
+        let mut run_query_count = 0usize;
+        let details = reader
+            .load_run_details_batch_with_configuration(
+                &[run_id.to_owned()],
+                false,
+                |_| run_query_count += 1,
+                || append_live_history_snapshot_mutation(&writer, run_id),
+            )
+            .expect("fallback snapshot load");
+        assert_eq!(run_query_count, 0);
+        assert_eq!(details.len(), 1);
+        assert_pre_flush_history_snapshot(&details[0]);
+
+        let fresh = reader
+            .load_run_details(run_id)
+            .expect("fresh fallback load")
+            .expect("live run after fallback snapshot");
+        assert_post_flush_history_snapshot(&fresh);
+    }
+
+    #[test]
+    fn recent_history_details_hold_one_snapshot_from_list_through_children() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("recent_history_snapshot.sqlite3");
+        let run_id = "recent-history-snapshot";
+        let (reader, writer) = live_history_snapshot_fixture(&db_path, run_id);
+
+        let details = reader
+            .load_recent_run_details_with_after_summaries(10, || {
+                append_live_history_snapshot_mutation(&writer, run_id)
+            })
+            .expect("recent snapshot load");
+        assert_eq!(details.len(), 1);
+        assert_pre_flush_history_snapshot(&details[0]);
+
+        let fresh = reader
+            .load_recent_run_details(10)
+            .expect("fresh recent load");
+        assert_eq!(fresh.len(), 1);
+        assert_post_flush_history_snapshot(&fresh[0]);
+    }
+
+    #[test]
+    fn batch_history_deduplicates_more_ids_than_the_sql_parameter_limit() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("batch_history_parameter_limit.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_id = "batch-history-repeated";
+        store
+            .persist_report(&minimal_report(run_id, &db_path))
+            .expect("persist report");
+
+        let run_ids = vec![run_id.to_owned(); 32_767];
+        let mut run_query_sizes = Vec::new();
+        let details = store
+            .load_run_details_batch_with_configuration(
+                &run_ids,
+                true,
+                |parameter_count| run_query_sizes.push(parameter_count),
+                || Ok(()),
+            )
+            .expect("deduplicated batch load");
+        assert_eq!(run_query_sizes, vec![1]);
+        assert_eq!(details.len(), run_ids.len());
+        assert!(details.iter().all(|details| details.run_id == run_id));
+    }
+
+    #[test]
+    fn batch_history_chunks_unique_ids_below_the_sql_parameter_limit() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("batch_history_unique_parameter_limit.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_ids = (0..32_767)
+            .map(|index| format!("missing-history-run-{index}"))
+            .collect::<Vec<_>>();
+
+        let mut run_query_sizes = Vec::new();
+        let details = store
+            .load_run_details_batch_with_configuration(
+                &run_ids,
+                true,
+                |parameter_count| run_query_sizes.push(parameter_count),
+                || Ok(()),
+            )
+            .expect("chunked batch load");
+        assert_eq!(run_query_sizes, vec![32_000, 767]);
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn history_read_snapshots_nest_inside_an_active_session() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("nested_history_snapshot.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let run_id = "nested-history-snapshot";
+        store
+            .persist_report(&minimal_report(run_id, &db_path))
+            .expect("persist report");
+
+        let session = store
+            .begin_concurrent_session("history_snapshot")
+            .expect("begin outer session");
+        let details = store
+            .load_run_details(run_id)
+            .expect("nested history load")
+            .expect("persisted run");
+        assert_eq!(details.run_id, run_id);
+        session.commit().expect("commit outer session");
     }
 
     #[test]

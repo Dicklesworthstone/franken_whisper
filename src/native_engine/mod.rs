@@ -41,6 +41,7 @@ pub mod tokenizer;
 pub mod weights;
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -1052,6 +1053,36 @@ pub fn find_model_file(short_name: &str) -> Option<PathBuf> {
 // Model resolution
 // ─────────────────────────────────────────────────────────────────────────
 
+/// A model selected for inference, preserving whether its bytes crossed the
+/// compiled package-authentication boundary.
+#[derive(Debug, Clone)]
+pub enum ResolvedWhisperModel {
+    /// User-selected path or short name. These bytes are intentionally outside
+    /// the release-package trust root and occupy a distinct cache generation.
+    Path(PathBuf),
+    /// Release package plus the still-open descriptor that passed SHA-256.
+    Authenticated(crate::model_distribution::CachedWhisperPackage),
+}
+
+impl ResolvedWhisperModel {
+    /// Display/provenance path associated with this source.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Path(path) => path,
+            Self::Authenticated(package) => &package.weights_path,
+        }
+    }
+
+    /// Load this exact source through the native model cache.
+    pub fn load(&self) -> FwResult<Arc<NativeWhisperModel>> {
+        match self {
+            Self::Path(path) => NativeWhisperModel::load(path),
+            Self::Authenticated(package) => NativeWhisperModel::load_authenticated(package),
+        }
+    }
+}
+
 /// Whether `spec` is a bare sentinel for the authenticated release package.
 /// Path-bearing spellings are deliberately excluded even when their basename
 /// is `default` or `large-v3-turbo`.
@@ -1092,6 +1123,21 @@ pub(crate) fn is_release_package_spec(spec: &str) -> bool {
 /// set `$FRANKEN_WHISPER_MODEL_DIR`) is obvious. A canonicalization failure on
 /// an existing path surfaces as [`FwError::Io`].
 pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
+    match resolve_model_source_with_cancel(spec, &|| false)? {
+        ResolvedWhisperModel::Path(path) => Ok(path),
+        ResolvedWhisperModel::Authenticated(package) => {
+            package.weights_path.canonicalize().map_err(Into::into)
+        }
+    }
+}
+
+/// Resolve a model for execution without discarding an authenticated package's
+/// verified descriptor. Hashing package bytes polls `is_cancelled`; custom
+/// paths retain the historical canonical path behavior.
+pub fn resolve_model_source_with_cancel(
+    spec: &str,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> FwResult<ResolvedWhisperModel> {
     // Tolerate blank/whitespace specs — a common "dumb error" is `--model ""`
     // from an empty shell variable. Treat those as "no model specified" rather
     // than trying to open a file literally named "" (which fails obscurely).
@@ -1101,8 +1147,8 @@ pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
     // paths. A custom file with the same basename remains selectable through
     // an explicit path spelling such as `./default` or `/models/default`.
     if is_release_package_spec(spec) {
-        let package = crate::model_distribution::resolve_cached_whisper()?;
-        return package.weights_path.canonicalize().map_err(Into::into);
+        let package = crate::model_distribution::resolve_cached_whisper_with_cancel(is_cancelled)?;
+        return Ok(ResolvedWhisperModel::Authenticated(package));
     }
 
     // Form 2: an existing explicit path wins over short-name lookup.
@@ -1110,7 +1156,7 @@ pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
         let as_path = Path::new(spec);
         if as_path.is_file() {
             if header_ftype_ok(as_path) {
-                return Ok(as_path.canonicalize()?);
+                return Ok(ResolvedWhisperModel::Path(as_path.canonicalize()?));
             }
             return Err(FwError::InvalidRequest(format!(
                 "Whisper model `{spec}` does not have a supported dense ggml f16/f32 header"
@@ -1121,7 +1167,7 @@ pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
     let dirs = model_search_dirs();
 
     // Form 3: explicit short-name lookup across the shared search dirs.
-    resolve_model_in_dirs(spec, &dirs)
+    resolve_model_in_dirs(spec, &dirs).map(ResolvedWhisperModel::Path)
 }
 
 /// Resolve a short-name `spec` against an explicit, ordered list of search
@@ -1431,7 +1477,32 @@ pub struct NativeWhisperModel {
     version_tag: OnceLock<String>,
 }
 
-/// Global, process-wide model cache keyed by canonical path.
+/// One model cache generation. Authenticated and unverified loads never share
+/// a key, and replacing a package at the same path produces a new digest key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ModelCacheKey {
+    path: PathBuf,
+    authenticated_sha256: Option<String>,
+}
+
+impl ModelCacheKey {
+    fn unverified(path: PathBuf) -> Self {
+        Self {
+            path,
+            authenticated_sha256: None,
+        }
+    }
+
+    fn authenticated(path: PathBuf, sha256: String) -> Self {
+        Self {
+            path,
+            authenticated_sha256: Some(sha256),
+        }
+    }
+}
+
+/// Global, process-wide model cache keyed by source path and authentication
+/// generation.
 ///
 /// `Weak` values mean normal [`load`](NativeWhisperModel::load) never keeps a
 /// model alive on its own. [`load_resident`](NativeWhisperModel::load_resident)
@@ -1439,14 +1510,14 @@ pub struct NativeWhisperModel {
 /// OpenAI-style loaded-model residency without mmap/unsafe.
 #[derive(Default)]
 struct ModelCache {
-    weak: HashMap<PathBuf, Weak<NativeWhisperModel>>,
-    resident: Option<(PathBuf, Arc<NativeWhisperModel>)>,
+    weak: HashMap<ModelCacheKey, Weak<NativeWhisperModel>>,
+    resident: Option<(ModelCacheKey, Arc<NativeWhisperModel>)>,
     /// In-flight cold loads keyed by canonical path (`FW_LOAD_DEDUP`). A peer parsing
     /// the same model holds this per-path lock so concurrent cold loads serialize on
     /// the parse rather than all parsing (the default path re-checks + discards the
     /// redundant parse — correct but N× parse work + peak RSS on a cold burst). Empty
     /// unless the flag is set.
-    loading: HashMap<PathBuf, Arc<Mutex<()>>>,
+    loading: HashMap<ModelCacheKey, Arc<Mutex<()>>>,
 }
 
 static MODEL_CACHE: Mutex<Option<ModelCache>> = Mutex::new(None);
@@ -1478,6 +1549,20 @@ impl NativeWhisperModel {
     ///   return for a malformed or unsupported model.
     pub fn load(path: &Path) -> FwResult<Arc<Self>> {
         Self::load_inner(path, false)
+    }
+
+    /// Load a release package from the exact descriptor that passed its
+    /// compiled SHA-256 check. The pathname is provenance only: it is not
+    /// reopened, and the digest is part of the cache generation.
+    pub fn load_authenticated(
+        package: &crate::model_distribution::CachedWhisperPackage,
+    ) -> FwResult<Arc<Self>> {
+        let key = ModelCacheKey::authenticated(
+            package.weights_path.clone(),
+            package.weights_sha256.clone(),
+        );
+        let file = package.try_clone_weights_file()?;
+        Self::load_key(key, false, Some(file))
     }
 
     /// Load a model and keep one process-wide strong resident slot alive.
@@ -1521,20 +1606,32 @@ impl NativeWhisperModel {
     }
 
     fn load_canonical(canonical: PathBuf, keep_resident: bool) -> FwResult<Arc<Self>> {
+        Self::load_key(
+            ModelCacheKey::unverified(canonical),
+            keep_resident,
+            None,
+        )
+    }
+
+    fn load_key(
+        key: ModelCacheKey,
+        keep_resident: bool,
+        authenticated_file: Option<File>,
+    ) -> FwResult<Arc<Self>> {
         // Fast path: a live cached instance.
         {
             let mut guard = lock_cache();
             let cache = guard.get_or_insert_with(ModelCache::default);
-            if let Some((resident_path, resident)) = &cache.resident
-                && resident_path == &canonical
+            if let Some((resident_key, resident)) = &cache.resident
+                && resident_key == &key
             {
                 return Ok(Arc::clone(resident));
             }
-            if let Some(weak) = cache.weak.get(&canonical)
+            if let Some(weak) = cache.weak.get(&key)
                 && let Some(existing) = weak.upgrade()
             {
                 if keep_resident {
-                    cache.resident = Some((canonical.clone(), Arc::clone(&existing)));
+                    cache.resident = Some((key.clone(), Arc::clone(&existing)));
                 }
                 return Ok(existing);
             }
@@ -1551,7 +1648,7 @@ impl NativeWhisperModel {
                 Arc::clone(
                     cache
                         .loading
-                        .entry(canonical.clone())
+                        .entry(key.clone())
                         .or_insert_with(|| Arc::new(Mutex::new(()))),
                 )
             };
@@ -1565,62 +1662,78 @@ impl NativeWhisperModel {
             {
                 let mut guard = lock_cache();
                 let cache = guard.get_or_insert_with(ModelCache::default);
-                if let Some((rp, r)) = &cache.resident
-                    && rp == &canonical
+                if let Some((resident_key, resident)) = &cache.resident
+                    && resident_key == &key
                 {
-                    return Ok(Arc::clone(r));
+                    return Ok(Arc::clone(resident));
                 }
-                if let Some(w) = cache.weak.get(&canonical)
-                    && let Some(existing) = w.upgrade()
+                if let Some(weak) = cache.weak.get(&key)
+                    && let Some(existing) = weak.upgrade()
                 {
                     if keep_resident {
-                        cache.resident = Some((canonical.clone(), Arc::clone(&existing)));
+                        cache.resident = Some((key.clone(), Arc::clone(&existing)));
                     }
                     return Ok(existing);
                 }
             }
-            let model = Self::do_parse_and_publish(canonical.clone(), keep_resident)?;
+            let model = Self::do_parse_and_publish(
+                key.clone(),
+                keep_resident,
+                authenticated_file,
+            )?;
             // Drop our in-flight marker (waiting peers hold their own `Arc` clone).
             if let Some(cache) = lock_cache().as_mut() {
-                cache.loading.remove(&canonical);
+                cache.loading.remove(&key);
             }
             return Ok(model);
         }
-        Self::do_parse_and_publish(canonical, keep_resident)
+        Self::do_parse_and_publish(key, keep_resident, authenticated_file)
     }
 
     /// Parse the ggml model, quantize weights, publish to the cache, and warm the
     /// version tag on a background thread. Shared by the plain and `FW_LOAD_DEDUP`
     /// load paths; its own re-check-under-lock still handles a racing publisher on the
     /// plain (non-deduped) path.
-    fn do_parse_and_publish(canonical: PathBuf, keep_resident: bool) -> FwResult<Arc<Self>> {
+    fn do_parse_and_publish(
+        key: ModelCacheKey,
+        keep_resident: bool,
+        authenticated_file: Option<File>,
+    ) -> FwResult<Arc<Self>> {
         // Parse outside the lock so a slow load doesn't block other paths.
         let t_parse = crate::native_engine::plat::Instant::now();
-        let ggml = ggml::GgmlModel::load(&canonical)?;
+        let ggml = match authenticated_file {
+            Some(file) => ggml::GgmlModel::load_from_file(file)?,
+            None => ggml::GgmlModel::load(&key.path)?,
+        };
         perf_span("model_parse", t_parse.elapsed().as_secs_f64() * 1e3, "");
         let t_weights = crate::native_engine::plat::Instant::now();
         let inner = decode::LoadedModel::from_ggml(ggml)?;
         perf_span("model_weights", t_weights.elapsed().as_secs_f64() * 1e3, "");
+        let version_tag = OnceLock::new();
+        if let Some(digest) = &key.authenticated_sha256 {
+            let prefix = digest.get(..12).unwrap_or(digest);
+            let _ = version_tag.set(format!("fw-native-v1+sha256:{prefix}"));
+        }
         let model = Arc::new(Self {
             inner,
-            model_path: canonical.clone(),
-            version_tag: OnceLock::new(),
+            model_path: key.path.clone(),
+            version_tag,
         });
 
         // Re-check under the lock: a racing thread may have populated the slot
         // while we were parsing. If so, prefer the already-published instance.
         let mut guard = lock_cache();
         let cache = guard.get_or_insert_with(ModelCache::default);
-        if let Some((resident_path, resident)) = &cache.resident
-            && resident_path == &canonical
+        if let Some((resident_key, resident)) = &cache.resident
+            && resident_key == &key
         {
             return Ok(Arc::clone(resident));
         }
-        if let Some(weak) = cache.weak.get(&canonical)
+        if let Some(weak) = cache.weak.get(&key)
             && let Some(existing) = weak.upgrade()
         {
             if keep_resident {
-                cache.resident = Some((canonical.clone(), Arc::clone(&existing)));
+                cache.resident = Some((key.clone(), Arc::clone(&existing)));
             }
             return Ok(existing);
         }
@@ -1628,9 +1741,9 @@ impl NativeWhisperModel {
         // just the slot we are about to overwrite, so the cache cannot grow
         // unbounded with stale entries for models that are never reloaded.
         cache.weak.retain(|_, w| w.strong_count() > 0);
-        cache.weak.insert(canonical.clone(), Arc::downgrade(&model));
+        cache.weak.insert(key.clone(), Arc::downgrade(&model));
         if keep_resident {
-            cache.resident = Some((canonical, Arc::clone(&model)));
+            cache.resident = Some((key, Arc::clone(&model)));
         }
         drop(guard);
 
@@ -2484,6 +2597,41 @@ mod tests {
             m2.version_tag(),
             "distinct file contents must hash differently"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_load_survives_path_replacement_without_cache_aliasing() {
+        let dir = TempDir::new("authenticated_replacement");
+        let original = synthetic_model_bytes();
+        let path = write_file(dir.path(), "ggml-authenticated.bin", original);
+        let verified_file = std::fs::File::open(&path).expect("open verified generation");
+        let digest = format!("{:x}", Sha256::digest(original));
+        let package = crate::model_distribution::CachedWhisperPackage::from_authenticated_test_file(
+            path.clone(),
+            digest.clone(),
+            verified_file,
+        );
+
+        // Replace the directory entry after authentication with another valid
+        // same-sized model generation whose first mel-filter value differs.
+        let mut replacement = original.to_vec();
+        replacement[56..60].copy_from_slice(&1.25_f32.to_le_bytes());
+        let replacement_path = write_file(dir.path(), "ggml-replacement.bin", &replacement);
+        std::fs::rename(&replacement_path, &path).expect("replace cache pathname");
+
+        let authenticated = NativeWhisperModel::load_authenticated(&package)
+            .expect("load verified descriptor generation");
+        let unverified = NativeWhisperModel::load(&path).expect("load replacement pathname");
+
+        assert_eq!(authenticated.loaded().filters.data[0], 0.0);
+        assert_eq!(unverified.loaded().filters.data[0], 1.25);
+        assert!(!Arc::ptr_eq(&authenticated, &unverified));
+        assert_eq!(
+            authenticated.version_tag(),
+            format!("fw-native-v1+sha256:{}", &digest[..12])
+        );
+        assert_ne!(authenticated.version_tag(), unverified.version_tag());
     }
 
     #[test]

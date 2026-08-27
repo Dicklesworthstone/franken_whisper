@@ -392,14 +392,26 @@ fn sensitive_arg_values(args: &[String]) -> Vec<String> {
         capture_next = is_sensitive_flag(arg);
     }
 
+    sort_sensitive_values(&mut values);
+    values
+}
+
+fn sort_sensitive_values(values: &mut Vec<String>) {
     // Replace longer values first so an overlapping short secret cannot leave
     // the suffix of a longer secret visible. The lexical tie-breaker makes the
     // order deterministic and groups duplicates for `dedup`.
     values
         .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
     values.dedup();
-    values
 }
+
+const SENSITIVE_INHERITED_ENVIRONMENT: [&str; 5] = [
+    "FRANKEN_WHISPER_HF_TOKEN",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HUGGINGFACE_TOKEN",
+    "FW_INITIAL_PROMPT",
+];
 
 fn redact_sensitive_text(text: &str, sensitive_values: &[String]) -> String {
     let replacement: String = std::iter::repeat_n(redaction_marker(sensitive_values), 3).collect();
@@ -514,7 +526,25 @@ fn captured_stderr_for_error(stderr: &[u8], sensitive_values: &[String]) -> Stri
 }
 
 fn command_error_diagnostics(program: &str, args: &[String]) -> (String, Vec<String>) {
-    let sensitive_values = sensitive_arg_values(args);
+    command_error_diagnostics_with_environment(program, args, |name| std::env::var(name).ok())
+}
+
+fn command_error_diagnostics_with_environment<F>(
+    program: &str,
+    args: &[String],
+    mut environment_value: F,
+) -> (String, Vec<String>)
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut sensitive_values = sensitive_arg_values(args);
+    sensitive_values.extend(
+        SENSITIVE_INHERITED_ENVIRONMENT
+            .iter()
+            .filter_map(|name| environment_value(name))
+            .filter(|value| !value.is_empty()),
+    );
+    sort_sensitive_values(&mut sensitive_values);
     let rendered = render_command_for_log(program, args);
     let rendered = redact_sensitive_text(&rendered, &sensitive_values);
     (rendered, sensitive_values)
@@ -538,103 +568,99 @@ pub fn run_command_with_timeout(
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
+    command.stdin(Stdio::null());
 
-    if let Some(limit) = timeout {
-        if bounded_process_tree_unsupported() {
-            return Err(FwError::Unsupported(
-                "bounded subprocess trees are unsupported on this platform".to_owned(),
-            ));
-        }
-        let prepared_capture = prepare_bounded_output_capture(&mut command)?;
-        let owns_process_group = configure_descendant_process_tree(&mut command);
-        let mut child = spawn_managed_child(command)?;
-        let started_at = Instant::now();
-        let (stdout_reader, stderr_reader) =
-            match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
-                Ok(readers) => readers,
-                Err(error) => {
-                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
-                    return Err(merge_process_tree_cleanup_result(error, cleanup));
-                }
-            };
-
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // A bounded command owns its complete process tree. Even
-                    // after the root exits successfully, descendants must not
-                    // retain inherited pipes or continue operator-local work.
-                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let stdout_result = stdout_reader.finish();
-                    let stderr_result = stderr_reader.finish();
-                    cleanup?;
-                    let stdout = stdout_result?;
-                    let stderr = stderr_result?;
-                    return validate_captured_command_output(
-                        &rendered,
-                        status,
-                        stdout,
-                        stderr,
-                        &sensitive_values,
-                    );
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = stdout_reader.finish();
-                    let _ = stderr_reader.finish();
-                    return Err(merge_process_tree_cleanup_result(
-                        FwError::Io(error),
-                        cleanup,
-                    ));
-                }
+    if bounded_process_tree_unsupported() {
+        return Err(FwError::Unsupported(
+            "bounded subprocess trees are unsupported on this platform".to_owned(),
+        ));
+    }
+    let prepared_capture = prepare_bounded_output_capture(&mut command)?;
+    let owns_process_group = configure_descendant_process_tree(&mut command);
+    let mut child = spawn_managed_child(command)?;
+    let started_at = Instant::now();
+    let (stdout_reader, stderr_reader) =
+        match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
+            Ok(readers) => readers,
+            Err(error) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                return Err(merge_process_tree_cleanup_result(error, cleanup));
             }
+        };
 
-            match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
-                Ok(Some(stream)) => {
-                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = stdout_reader.finish();
-                    let _ = stderr_reader.finish();
-                    return Err(merge_process_tree_cleanup_result(
-                        capture_limit_error(stream),
-                        cleanup,
-                    ));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
-                    let _ = stdout_reader.finish();
-                    let _ = stderr_reader.finish();
-                    return Err(merge_process_tree_cleanup_result(error, cleanup));
-                }
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Clean the platform ownership boundary even after the root
+                // exits successfully, so in-bound descendants cannot retain
+                // inherited pipes or continue operator-local work.
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let stdout_result = stdout_reader.finish();
+                let stderr_result = stderr_reader.finish();
+                cleanup?;
+                let stdout = stdout_result?;
+                let stderr = stderr_result?;
+                return validate_captured_command_output(
+                    &rendered,
+                    status,
+                    stdout,
+                    stderr,
+                    &sensitive_values,
+                );
             }
-
-            if started_at.elapsed() >= limit {
+            Ok(None) => {}
+            Err(error) => {
                 let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
                 let _ = stdout_reader.finish();
-                let stderr = stderr_reader
-                    .finish()
-                    .map(|capture| capture.bytes)
-                    .unwrap_or_default();
-                let stderr_str = captured_stderr_for_error(&stderr, &sensitive_values);
+                let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(
-                    FwError::from_command_timeout(
-                        rendered,
-                        saturating_duration_ms(limit),
-                        stderr_str,
-                    ),
+                    FwError::Io(error),
                     cleanup,
                 ));
             }
-
-            thread::sleep(Duration::from_millis(20));
         }
-    }
 
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    let output = command.output()?;
-    validate_command_output(&rendered, output, &sensitive_values)
+        match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
+            Ok(Some(stream)) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let _ = stdout_reader.finish();
+                let _ = stderr_reader.finish();
+                return Err(merge_process_tree_cleanup_result(
+                    capture_limit_error(stream),
+                    cleanup,
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let _ = stdout_reader.finish();
+                let _ = stderr_reader.finish();
+                return Err(merge_process_tree_cleanup_result(error, cleanup));
+            }
+        }
+
+        if let Some(limit) = timeout
+            && started_at.elapsed() >= limit
+        {
+            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let _ = stdout_reader.finish();
+            let stderr = stderr_reader
+                .finish()
+                .map(|capture| capture.bytes)
+                .unwrap_or_default();
+            let stderr_str = captured_stderr_for_error(&stderr, &sensitive_values);
+            return Err(merge_process_tree_cleanup_result(
+                FwError::from_command_timeout(
+                    rendered,
+                    saturating_duration_ms(limit),
+                    stderr_str,
+                ),
+                cleanup,
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 // The early sleeps total 50ms, preserving the original polling phase and
@@ -1484,6 +1510,31 @@ fn append_streaming_stderr_tail(tail: &mut Vec<u8>, chunk: &[u8], capacity: usiz
     }
 }
 
+#[cfg(not(windows))]
+fn drain_streaming_stderr<R: Read>(
+    mut pipe: R,
+    tail: &std::sync::Mutex<Vec<u8>>,
+    capacity: usize,
+) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut tail = tail
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                append_streaming_stderr_tail(&mut tail, &buf[..n], capacity);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                tracing::debug!(%error, "streaming stderr drain stopped after read failure");
+                break;
+            }
+        }
+    }
+}
+
 fn sanitized_streaming_stderr_tail(tail: &[u8], sensitive_values: &[String]) -> String {
     let mask = sensitive_byte_mask(tail, sensitive_values);
     let start = tail.len().saturating_sub(STREAMING_STDERR_TAIL_BYTES);
@@ -1709,21 +1760,9 @@ pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<Stream
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let stderr_join = stderr.map(|mut pipe| {
+    let stderr_join = stderr.map(|pipe| {
         let tail = std::sync::Arc::clone(&stderr_tail);
-        thread::spawn(move || {
-            use std::io::Read as _;
-            let mut buf = [0u8; 1024];
-            loop {
-                match pipe.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        append_streaming_stderr_tail(&mut tail, &buf[..n], stderr_tail_capacity);
-                    }
-                }
-            }
-        })
+        thread::spawn(move || drain_streaming_stderr(pipe, &tail, stderr_tail_capacity))
     });
     Ok(StreamingChild {
         child,
@@ -1746,7 +1785,8 @@ mod tests {
     #[cfg(unix)]
     use super::run_command_cancellable_with_input_probe_and_observer;
     use super::{
-        cancellable_poll_delay, command_error_diagnostics, render_command_for_log,
+        cancellable_poll_delay, command_error_diagnostics,
+        command_error_diagnostics_with_environment, render_command_for_log,
         run_command_cancellable, run_command_cancellable_with_input_and_probe,
         run_command_cancellable_with_probe, sensitive_arg_values,
     };
@@ -2159,6 +2199,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn run_command_without_timeout_rejects_finite_output_over_capture_limit() {
+        let args = vec![
+            "-c".to_owned(),
+            format!("head -c {} /dev/zero", super::MAX_CAPTURED_OUTPUT_BYTES + 1),
+        ];
+        let error = run_command("sh", &args, None)
+            .expect_err("timeout-free capture must enforce the output bound");
+        assert!(super::is_stdout_capture_limit_error(&error));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn timeout_terminates_the_complete_descendant_process_group() {
         let directory = tempfile::tempdir().expect("temporary pid directory");
         let pid_path = directory.path().join("descendant.pid");
@@ -2348,14 +2400,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn successful_root_cannot_leave_a_descendant_process_alive() {
-        let output = run_command_with_timeout(
+        let output = run_command(
             "sh",
             &[
                 "-c".to_owned(),
-                "sleep 60 & child=$!; printf '%s' \"$child\"; exit 0".to_owned(),
+                "sleep 60 </dev/null >/dev/null 2>&1 & child=$!; printf '%s' \"$child\"; exit 0"
+                    .to_owned(),
             ],
             None,
-            Some(Duration::from_secs(5)),
         )
         .expect("successful root command");
         let descendant_pid: i32 = String::from_utf8(output.stdout)
@@ -2372,7 +2424,7 @@ mod tests {
         }
         assert!(
             rustix::process::test_kill_process(descendant_pid).is_err(),
-            "successful bounded command left a descendant process alive"
+            "successful timeout-free command left a descendant process alive"
         );
     }
 
@@ -2477,7 +2529,8 @@ mod tests {
             format!("--auth-token={equal_secret}"),
         ];
 
-        let (rendered, sensitive_values) = command_error_diagnostics("prog", &args);
+        let (rendered, sensitive_values) =
+            command_error_diagnostics_with_environment("prog", &args, |_| None);
         assert_eq!(
             sensitive_values,
             vec![split_secret.to_owned(), equal_secret.to_owned()]
@@ -2500,7 +2553,8 @@ mod tests {
             secret.to_owned(),
         ];
 
-        let (rendered, sensitive_values) = command_error_diagnostics("prog", &args);
+        let (rendered, sensitive_values) =
+            command_error_diagnostics_with_environment("prog", &args, |_| None);
         assert_eq!(sensitive_values, vec![secret.to_owned()]);
         assert!(
             !rendered.contains(secret),
@@ -2517,7 +2571,8 @@ mod tests {
         let secret = "***";
         let args = vec!["--secret".to_owned(), secret.to_owned()];
 
-        let (rendered, _) = command_error_diagnostics("prog", &args);
+        let (rendered, _) =
+            command_error_diagnostics_with_environment("prog", &args, |_| None);
         assert!(
             !rendered.contains(secret),
             "mask re-emitted the secret: {rendered}"
@@ -2525,6 +2580,56 @@ mod tests {
         assert!(
             rendered.contains("--secret ###"),
             "alternate marker was not selected: {rendered}"
+        );
+    }
+
+    #[test]
+    fn command_diagnostics_include_known_inherited_secrets() {
+        let secret = "inherited_hf_secret_987";
+        let args = vec!["--label".to_owned(), secret.to_owned()];
+        let (rendered, sensitive_values) = command_error_diagnostics_with_environment(
+            "prog",
+            &args,
+            |name| (name == "HF_TOKEN").then(|| secret.to_owned()),
+        );
+
+        assert!(sensitive_values.iter().any(|value| value == secret));
+        assert!(!rendered.contains(secret));
+        let stderr = super::captured_stderr_for_error(secret.as_bytes(), &sensitive_values);
+        assert!(!stderr.contains(secret));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_child_stderr_redacts_inherited_hf_token() {
+        const PROBE_ENV: &str = "__FW_INHERITED_SECRET_PROBE";
+        const SECRET: &str = "inherited_hf_token_live_654321";
+        if std::env::var_os(PROBE_ENV).is_some() {
+            let args = vec![
+                "-c".to_owned(),
+                "printf 'inherited-context:%s\n' \"$HF_TOKEN\" >&2; exit 9".to_owned(),
+            ];
+            let error = run_command("sh", &args, None).expect_err("fixture must fail");
+            let text = error.to_string();
+            assert!(text.contains("inherited-context:"));
+            assert!(!text.contains(SECRET), "inherited HF token leaked: {text}");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("process::tests::failing_child_stderr_redacts_inherited_hf_token")
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PROBE_ENV, "1")
+            .env("HF_TOKEN", SECRET)
+            .output()
+            .expect("spawn inherited-secret probe");
+        assert!(
+            output.status.success(),
+            "inherited-secret probe failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -2730,6 +2835,39 @@ mod tests {
             !tail.contains(secret),
             "streaming tail leaked argv secret: {tail}"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn streaming_stderr_drain_retries_interrupted_reads() {
+        struct InterruptedOnce {
+            interrupted: bool,
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+
+        impl std::io::Read for InterruptedOnce {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                std::io::Read::read(&mut self.bytes, buf)
+            }
+        }
+
+        let tail = std::sync::Mutex::new(Vec::new());
+        super::drain_streaming_stderr(
+            InterruptedOnce {
+                interrupted: false,
+                bytes: std::io::Cursor::new(b"retained after interrupt".to_vec()),
+            },
+            &tail,
+            super::STREAMING_STDERR_TAIL_BYTES,
+        );
+        let tail = tail
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(tail, b"retained after interrupt");
     }
 
     #[cfg(unix)]
@@ -2993,6 +3131,50 @@ mod tests {
         assert!(
             stdout.contains("hello world"),
             "expected 'hello world', got: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_does_not_inherit_parent_stdin() {
+        const PROBE_ENV: &str = "__FW_NULL_STDIN_PROBE";
+        if std::env::var_os(PROBE_ENV).is_some() {
+            let args = vec![
+                "-c".to_owned(),
+                "if IFS= read -r value; then printf 'unexpected:%s' \"$value\" >&2; exit 9; fi"
+                    .to_owned(),
+            ];
+            run_command_with_timeout(
+                "sh",
+                &args,
+                None,
+                Some(Duration::from_secs(2)),
+            )
+            .expect("bounded subprocess stdin must be EOF");
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("process::tests::run_command_with_timeout_does_not_inherit_parent_stdin")
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PROBE_ENV, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn stdin probe");
+        let mut stdin = child.stdin.take().expect("probe stdin");
+        std::io::Write::write_all(&mut stdin, b"parent-only-sentinel\n")
+            .expect("write parent sentinel");
+        drop(stdin);
+        let output = child.wait_with_output().expect("wait for stdin probe");
+        assert!(
+            output.status.success(),
+            "stdin probe failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

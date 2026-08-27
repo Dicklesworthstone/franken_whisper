@@ -9,10 +9,11 @@
 
 use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -135,11 +136,47 @@ pub struct CachedSortformerPackage {
     pub package_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CachedWhisperPackage {
     pub weights_path: PathBuf,
     pub artifact_version: String,
     pub weights_sha256: String,
+    weights_file: Arc<File>,
+}
+
+impl PartialEq for CachedWhisperPackage {
+    fn eq(&self, other: &Self) -> bool {
+        self.weights_path == other.weights_path
+            && self.artifact_version == other.artifact_version
+            && self.weights_sha256 == other.weights_sha256
+    }
+}
+
+impl Eq for CachedWhisperPackage {}
+
+impl CachedWhisperPackage {
+    /// Clone the already-authenticated descriptor used to hash this package.
+    ///
+    /// Loading through this handle binds inference to the exact verified file
+    /// generation even if another process replaces the cache pathname after
+    /// resolution. The compiled digest remains the cache/version identity.
+    pub(crate) fn try_clone_weights_file(&self) -> FwResult<File> {
+        self.weights_file.try_clone().map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_authenticated_test_file(
+        weights_path: PathBuf,
+        weights_sha256: String,
+        weights_file: File,
+    ) -> Self {
+        Self {
+            weights_path,
+            artifact_version: "authenticated-test-fixture".to_owned(),
+            weights_sha256,
+            weights_file: Arc::new(weights_file),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,13 +448,18 @@ where
         .first()
         .ok_or_else(|| whisper_manifest_error("weights role is missing"))?;
     let weights_path = directory.join(&remote.filename);
-    if !file_matches_with_cancel(&weights_path, remote, &is_cancelled)? {
+    let Some(weights_file) = authenticate_cache_file_with_cancel(
+        &weights_path,
+        remote,
+        &is_cancelled,
+    )? else {
         return Err(FwError::MissingArtifact(weights_path));
-    }
+    };
     Ok(CachedWhisperPackage {
         weights_path,
         artifact_version: manifest.artifact_version,
         weights_sha256: WHISPER_WEIGHTS_SHA256.to_owned(),
+        weights_file: Arc::new(weights_file),
     })
 }
 
@@ -745,13 +787,18 @@ where
         .first()
         .ok_or_else(|| whisper_manifest_error("weights role is missing"))?;
     let weights_path = directory.join(&remote.filename);
-    if !file_matches_with_cancel(&weights_path, remote, &is_cancelled)? {
+    let Some(weights_file) = authenticate_cache_file_with_cancel(
+        &weights_path,
+        remote,
+        &is_cancelled,
+    )? else {
         return Err(FwError::MissingArtifact(weights_path));
-    }
+    };
     Ok(CachedWhisperPackage {
         weights_path,
         artifact_version: manifest.artifact_version,
         weights_sha256: model.weights_sha256().to_owned(),
+        weights_file: Arc::new(weights_file),
     })
 }
 
@@ -1110,17 +1157,36 @@ fn file_matches_with_cancel<F>(path: &Path, remote: &RemoteFile, is_cancelled: &
 where
     F: Fn() -> bool + Sync,
 {
+    authenticate_cache_file_with_cancel(path, remote, is_cancelled).map(|file| file.is_some())
+}
+
+/// Open and authenticate one cache file, returning the exact descriptor whose
+/// bytes matched the compiled manifest. The descriptor is rewound before it is
+/// returned so resident and streamed loaders start from a deterministic state.
+fn authenticate_cache_file_with_cancel<F>(
+    path: &Path,
+    remote: &RemoteFile,
+    is_cancelled: &F,
+) -> FwResult<Option<File>>
+where
+    F: Fn() -> bool + Sync,
+{
     cancellation_checkpoint(is_cancelled)?;
     let Ok(before) = std::fs::symlink_metadata(path) else {
-        return Ok(false);
+        return Ok(None);
     };
     if metadata_is_indirection(&before) || !before.is_file() || before.len() != remote.size {
-        return Ok(false);
+        return Ok(None);
     }
-    let Some(file) = open_prechecked_cache_file(path, &before)? else {
-        return Ok(false);
+    let Some(mut file) = open_prechecked_cache_file(path, &before)? else {
+        return Ok(None);
     };
-    sha256_reader_with_cancel(file, is_cancelled).map(|digest| hex32(&digest) == remote.sha256)
+    let digest = sha256_reader_with_cancel(&mut file, is_cancelled)?;
+    if hex32(&digest) != remote.sha256 {
+        return Ok(None);
+    }
+    file.rewind()?;
+    Ok(Some(file))
 }
 
 fn open_prechecked_cache_file(path: &Path, before: &std::fs::Metadata) -> FwResult<Option<File>> {
