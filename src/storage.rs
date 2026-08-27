@@ -877,7 +877,7 @@ impl RunStore {
     }
 
     /// Current schema version. Bump when adding migrations.
-    pub const SCHEMA_VERSION: u32 = 5;
+    pub const SCHEMA_VERSION: u32 = 6;
 
     fn initialize_schema(&self) -> FwResult<()> {
         // Enable WAL mode for concurrent read/write support.
@@ -1054,7 +1054,8 @@ CREATE TABLE IF NOT EXISTS _meta (
         // version=0, but CREATE TABLE IF NOT EXISTS has already supplied every
         // table that was absent. When the runs table has the v2 columns, finish
         // the index-only v3/v4 work directly. The following v5 migration owns
-        // the derived-cache rebuild after ensuring its typed evidence columns.
+        // the derived-cache rebuild after ensuring its typed evidence columns;
+        // v6 then installs the incremental-sync mutation authority.
         // This avoids replaying v4's table DDL against a brand-new current-shape
         // DB, which leaves needless freelist pages in fsqlite.
         if current == 0 {
@@ -1091,6 +1092,7 @@ CREATE TABLE IF NOT EXISTS _meta (
                     has_derived_rows |= !present.is_empty();
                 }
                 if has_v5_columns && !has_canonical_runs && !has_derived_rows {
+                    self.migrate_sync_mutation_schema_v6()?;
                     self.set_schema_version(Self::SCHEMA_VERSION)?;
                     return Ok(());
                 }
@@ -1153,6 +1155,7 @@ CREATE TABLE IF NOT EXISTS _meta (
             }
             4 => self.migrate_diarization_schema_v4(),
             5 => self.migrate_diarization_schema_v5(),
+            6 => self.migrate_sync_mutation_schema_v6(),
             _ => Err(FwError::Storage(format!(
                 "unknown migration version: {version}"
             ))),
@@ -1274,6 +1277,121 @@ CREATE TABLE IF NOT EXISTS speaker_profile_summaries (
                     .map_err(|error| FwError::Storage(error.to_string()))?;
                 Ok(())
             }
+            Err(error) => {
+                let _ = rollback_savepoint(&self.connection, SAVEPOINT);
+                Err(error)
+            }
+        }
+    }
+
+    /// Install the monotonic authority used by incremental JSONL export.
+    ///
+    /// `finished_at` is domain data: callers can backfill it or update a run
+    /// without moving it beyond a timestamp cursor.  This bounded table keeps
+    /// only the newest database-assigned sequence for each aggregate.  Triggers
+    /// advance the sequence for parent and child mutations in the same SQLite
+    /// transaction as the mutation itself, so an export snapshot can select a
+    /// complete run aggregate without relying on wall-clock spelling or caller
+    /// discipline.
+    fn migrate_sync_mutation_schema_v6(&self) -> FwResult<()> {
+        const SAVEPOINT: &str = "fw_migrate_sync_mutations_v6";
+        self.connection
+            .execute(&format!("SAVEPOINT {SAVEPOINT};"))
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+
+        let result = (|| -> FwResult<()> {
+            self.connection
+                .execute(
+                r#"
+CREATE TABLE IF NOT EXISTS sync_run_mutations (
+    mutation_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE
+);
+
+INSERT OR IGNORE INTO sync_run_mutations (run_id)
+    SELECT id FROM runs ORDER BY id;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_runs_insert
+AFTER INSERT ON runs
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_runs_update
+AFTER UPDATE ON runs
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.id);
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_runs_delete
+AFTER DELETE ON runs
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_segments_insert
+AFTER INSERT ON segments
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.run_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_segments_update
+AFTER UPDATE ON segments
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.run_id);
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.run_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_segments_delete
+AFTER DELETE ON segments
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.run_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_events_insert
+AFTER INSERT ON events
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.run_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_events_update
+AFTER UPDATE ON events
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.run_id);
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (NEW.run_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fw_sync_events_delete
+AFTER DELETE ON events
+BEGIN
+    INSERT OR REPLACE INTO sync_run_mutations (run_id) VALUES (OLD.run_id);
+END;
+"#,
+                )
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+
+            // Mutation sequences are local to one database lineage. Persist a
+            // stable random identity in the database itself so a cursor from an
+            // unrelated database can never be accepted merely because its
+            // numeric sequence happens to be in range. INSERT OR IGNORE makes
+            // reopening and interrupted migration retries retain the identity.
+            self.connection
+                .execute_with_params(
+                    "INSERT OR IGNORE INTO _meta (key, value) \
+                     VALUES ('sync_database_id', ?1);",
+                    &[text_value(uuid::Uuid::new_v4().to_string())],
+                )
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .connection
+                .execute(&format!("RELEASE SAVEPOINT {SAVEPOINT};"))
+                .map(|_| ())
+                .map_err(|error| FwError::Storage(error.to_string())),
             Err(error) => {
                 let _ = rollback_savepoint(&self.connection, SAVEPOINT);
                 Err(error)
@@ -7360,6 +7478,156 @@ mod tests {
             .expect("should exist");
         assert_eq!(details.run_id, "run-old");
         assert_eq!(details.transcript, "hello");
+        let mutation_rows = store
+            .connection
+            .query(
+                "SELECT mutation_seq FROM sync_run_mutations \
+                 WHERE run_id = 'run-old'",
+            )
+            .expect("query migrated mutation authority");
+        assert_eq!(
+            mutation_rows.len(),
+            1,
+            "v6 migration must backfill every pre-existing run"
+        );
+    }
+
+    #[test]
+    fn fresh_schema_installs_all_sync_mutation_triggers() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sync_mutation_schema.sqlite3");
+        let store = RunStore::open(&db_path).expect("open");
+
+        let table = store
+            .connection
+            .query(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'sync_run_mutations'",
+            )
+            .expect("query mutation table");
+        assert_eq!(table.len(), 1, "mutation authority table must exist");
+
+        let triggers = store
+            .connection
+            .query(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'trigger' AND name LIKE 'fw_sync_%' ORDER BY name",
+            )
+            .expect("query mutation triggers");
+        assert_eq!(
+            triggers.len(),
+            9,
+            "runs, segments, and events each require insert/update/delete triggers"
+        );
+
+        let identity_rows = store
+            .connection
+            .query("SELECT value FROM _meta WHERE key = 'sync_database_id'")
+            .expect("query sync database identity");
+        assert_eq!(identity_rows.len(), 1, "database identity must be unique");
+        let database_id = value_to_string(identity_rows[0].get(0));
+        uuid::Uuid::parse_str(&database_id).expect("database identity must be a UUID");
+        drop(store);
+
+        let reopened = RunStore::open(&db_path).expect("reopen");
+        let reopened_rows = reopened
+            .connection
+            .query("SELECT value FROM _meta WHERE key = 'sync_database_id'")
+            .expect("query reopened database identity");
+        assert_eq!(
+            value_to_string(reopened_rows[0].get(0)),
+            database_id,
+            "database identity must remain stable across restart"
+        );
+    }
+
+    #[test]
+    fn sync_mutation_sequence_tracks_aggregate_changes_and_rollbacks() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sync_mutation_changes.sqlite3");
+        let store = RunStore::open(&db_path).expect("open");
+        store
+            .persist_report(&minimal_report("mutation-run", &db_path))
+            .expect("persist parent");
+
+        let mutation_seq = || {
+            store
+                .connection
+                .query(
+                    "SELECT mutation_seq FROM sync_run_mutations \
+                     WHERE run_id = 'mutation-run'",
+                )
+                .expect("query mutation sequence")
+                .first()
+                .map(|row| value_to_i64(row.get(0)))
+                .expect("mutation sequence row")
+        };
+
+        let inserted = mutation_seq();
+        store
+            .connection
+            .execute("UPDATE runs SET transcript = 'revised' WHERE id = 'mutation-run'")
+            .expect("update parent");
+        let parent_updated = mutation_seq();
+        assert!(parent_updated > inserted);
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO segments \
+                 (run_id, idx, start_sec, end_sec, speaker, text, confidence) \
+                 VALUES ('mutation-run', 0, 0.0, 1.0, NULL, 'segment', NULL)",
+            )
+            .expect("insert segment");
+        let segment_inserted = mutation_seq();
+        assert!(segment_inserted > parent_updated);
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO events \
+                 (run_id, seq, ts_rfc3339, stage, code, message, payload_json) \
+                 VALUES ('mutation-run', 1, '2026-01-01T00:00:01Z', \
+                 'test', 'test.event', 'event', '{}')",
+            )
+            .expect("insert event");
+        let event_inserted = mutation_seq();
+        assert!(event_inserted > segment_inserted);
+
+        store.connection.execute("BEGIN").expect("begin rollback probe");
+        store
+            .connection
+            .execute("UPDATE segments SET text = 'rolled back' WHERE run_id = 'mutation-run'")
+            .expect("update inside transaction");
+        assert!(mutation_seq() > event_inserted);
+        store
+            .connection
+            .execute("ROLLBACK")
+            .expect("rollback mutation");
+        assert_eq!(
+            mutation_seq(),
+            event_inserted,
+            "a rolled-back child update must not advance the visible cursor authority"
+        );
+
+        store
+            .connection
+            .execute("DELETE FROM runs WHERE id = 'mutation-run'")
+            .expect("delete parent");
+        let rows = store
+            .connection
+            .query(
+                "SELECT mutation_seq FROM sync_run_mutations \
+                 WHERE run_id = 'mutation-run'",
+            )
+            .expect("query delete tombstone");
+        assert_eq!(rows.len(), 1, "parent deletion must retain its high-water mark");
+        assert!(value_to_i64(rows[0].get(0)) > event_inserted);
+        let count = store
+            .connection
+            .query("SELECT COUNT(*) FROM sync_run_mutations")
+            .expect("count bounded mutation rows");
+        assert_eq!(value_to_i64(count[0].get(0)), 1);
     }
 
     #[test]
@@ -9124,8 +9392,8 @@ mod tests {
     fn schema_version_is_current() {
         assert_eq!(
             RunStore::SCHEMA_VERSION,
-            5,
-            "SCHEMA_VERSION should include typed speaker-count evidence"
+            6,
+            "SCHEMA_VERSION should include incremental-sync mutation authority"
         );
     }
 

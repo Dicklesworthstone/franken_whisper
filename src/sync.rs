@@ -636,16 +636,24 @@ fn export_table_events(connection: &Connection, path: &Path) -> FwResult<(u64, S
 // Incremental Export (changed records only)
 // ---------------------------------------------------------------------------
 
-/// Tracks the position of the last incremental export so subsequent calls
-/// only emit records that appeared after the cursor.
+/// Tracks the database mutation high-water mark of the last incremental
+/// export so unchanged subsequent calls do not re-emit an aggregate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncCursor {
-    /// RFC-3339 `finished_at` timestamp of the last exported run.
+    /// Monotonic sequence assigned by SQLite triggers to the newest parent or
+    /// child mutation observed by the completed export snapshot.
+    #[serde(default)]
+    pub last_mutation_seq: i64,
+    /// Stable identity of the database lineage that assigned the mutation
+    /// sequence. Cursors without an identity are legacy and force one safe
+    /// full re-export; a different identity fails closed.
+    #[serde(default)]
+    pub database_id: Option<String>,
+    /// Informational domain timestamp of the final exported run. Selection is
+    /// never based on this caller-controlled value.
     pub last_export_rfc3339: String,
-    /// Stable run-id tie-breaker for `last_export_rfc3339`.
-    ///
-    /// This allows incremental export to include runs that share the same
-    /// timestamp without re-exporting prior rows indefinitely.
+    /// Informational run ID paired with `last_export_rfc3339` for diagnostics
+    /// and compatibility with cursor files created before schema v6.
     #[serde(default)]
     pub last_export_run_id: Option<String>,
     /// Number of runs exported in the last batch.
@@ -657,7 +665,7 @@ pub struct SyncCursor {
 pub enum ExportMode {
     /// Export every record in the database.
     Full,
-    /// Export only records whose `(finished_at, id)` tuple is strictly greater
+    /// Export only run aggregates whose database mutation sequence is greater
     /// than the cursor position, or all records when no cursor exists.
     Incremental,
 }
@@ -682,10 +690,9 @@ pub struct IncrementalExportManifest {
 const CURSOR_FILENAME: &str = "sync_cursor.json";
 const EMPTY_INCREMENTAL_CURSOR_TS: &str = "";
 
-/// Perform an incremental export: only records whose `(finished_at, id)` tuple
-/// is strictly greater than the cursor position are emitted. When no cursor
-/// file exists inside `state_root`, all records are exported (equivalent to a
-/// full export) and a new cursor file is written.
+/// Perform an incremental export using the database-owned mutation sequence.
+/// When no cursor file exists inside `state_root`, all records are exported
+/// (equivalent to a full export) and a new cursor file is written.
 pub fn export_incremental(
     db_path: &Path,
     output_dir: &Path,
@@ -710,6 +717,16 @@ fn export_incremental_inner_with_after_runs(
     after_runs: impl FnOnce(),
 ) -> FwResult<IncrementalExportManifest> {
     fs::create_dir_all(output_dir)?;
+
+    // Preserve export's fail-closed behavior for a missing/non-schema DB, then
+    // let RunStore apply the current schema migration before opening the
+    // dedicated read connection. Incremental export is a public library API
+    // and cannot assume some earlier RunStore user already installed v6.
+    let preflight = Connection::open(db_path.display().to_string())
+        .map_err(|error| FwError::Storage(error.to_string()))?;
+    verify_schema_exists(&preflight)?;
+    drop(preflight);
+    drop(RunStore::open(db_path)?);
 
     let connection = Connection::open(db_path.display().to_string())
         .map_err(|error| FwError::Storage(error.to_string()))?;
@@ -759,8 +776,9 @@ fn export_incremental_inner_with_after_runs(
         events_jsonl_sha256: events_sha256,
     };
 
-    // Determine the new cursor: the maximum `(finished_at, id)` tuple among
-    // exported runs, or retain the prior cursor when nothing was exported.
+    // The high-water mark is read inside the same snapshot as all three output
+    // tables. It therefore advances past every mutation represented by the
+    // published aggregate files, including mutations of child rows.
     let (new_cursor_ts, new_cursor_run_id) =
         match runs_export.last_position {
             Some((ts, run_id)) => (ts, Some(run_id)),
@@ -771,6 +789,8 @@ fn export_incremental_inner_with_after_runs(
         };
 
     let cursor_after = SyncCursor {
+        last_mutation_seq: runs_export.high_water_mark,
+        database_id: Some(runs_export.database_id),
         last_export_rfc3339: new_cursor_ts,
         last_export_run_id: new_cursor_run_id,
         last_run_count: runs_count,
@@ -812,6 +832,11 @@ fn load_cursor(path: &Path) -> FwResult<Option<SyncCursor>> {
     let contents = fs::read_to_string(path)?;
     let cursor: SyncCursor = serde_json::from_str(&contents)
         .map_err(|error| FwError::Storage(format!("invalid sync cursor: {error}")))?;
+    if cursor.last_mutation_seq < 0 {
+        return Err(FwError::Storage(
+            "invalid sync cursor: last_mutation_seq must be non-negative".to_owned(),
+        ));
+    }
     Ok(Some(cursor))
 }
 
@@ -832,6 +857,77 @@ struct IncrementalRunsSnapshot {
     sha256: String,
     run_ids: Vec<String>,
     last_position: Option<(String, String)>,
+    high_water_mark: i64,
+    database_id: String,
+}
+
+struct MutationAuthority {
+    database_id: String,
+    high_water_mark: i64,
+}
+
+fn load_mutation_authority(connection: &Connection) -> FwResult<MutationAuthority> {
+    let identity_rows = connection
+        .query("SELECT value FROM _meta WHERE key = 'sync_database_id'")
+        .map_err(|error| FwError::Storage(error.to_string()))?;
+    let database_id = identity_rows
+        .first()
+        .map(|row| value_to_string_sqlite(row.get(0)))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            FwError::Storage(
+                "incremental export requires a non-empty sync_database_id".to_owned(),
+            )
+        })?;
+    uuid::Uuid::parse_str(&database_id).map_err(|error| {
+        FwError::Storage(format!(
+            "invalid sync_database_id `{database_id}`: {error}"
+        ))
+    })?;
+
+    let high_water_mark = connection
+        .query("SELECT COALESCE(MAX(mutation_seq), 0) FROM sync_run_mutations")
+        .map_err(|error| FwError::Storage(error.to_string()))?
+        .first()
+        .and_then(|row| row.get(0).and_then(|value| value.as_integer()))
+        .ok_or_else(|| {
+            FwError::Storage(
+                "incremental export mutation high-water mark is not an integer".to_owned(),
+            )
+        })?;
+
+    Ok(MutationAuthority {
+        database_id,
+        high_water_mark,
+    })
+}
+
+fn validated_cursor_mutation_seq(
+    cursor: Option<&SyncCursor>,
+    authority: &MutationAuthority,
+) -> FwResult<Option<i64>> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+
+    let Some(cursor_database_id) = cursor.database_id.as_deref() else {
+        // Pre-identity cursors cannot safely interpret their database-local
+        // numeric sequence. Sequence zero re-exports every current aggregate.
+        return Ok(Some(0));
+    };
+    if cursor_database_id != authority.database_id {
+        return Err(FwError::Storage(format!(
+            "sync cursor database identity mismatch: cursor={cursor_database_id}, database={}",
+            authority.database_id
+        )));
+    }
+    if !(0..=authority.high_water_mark).contains(&cursor.last_mutation_seq) {
+        return Err(FwError::Storage(format!(
+            "invalid sync cursor: mutation sequence {} is outside database range 0..={}",
+            cursor.last_mutation_seq, authority.high_water_mark
+        )));
+    }
+    Ok(Some(cursor.last_mutation_seq))
 }
 
 fn export_table_runs_incremental_snapshot(
@@ -839,23 +935,26 @@ fn export_table_runs_incremental_snapshot(
     path: &Path,
     cursor: Option<&SyncCursor>,
 ) -> FwResult<IncrementalRunsSnapshot> {
-    let (sql, params) = match cursor {
-        Some(c) => (
-            "SELECT id, started_at, finished_at, backend, input_path, \
-             normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json \
-             FROM runs \
-             WHERE finished_at > ?1 OR (finished_at = ?1 AND id > ?2) \
-             ORDER BY finished_at ASC, id ASC"
+    let authority = load_mutation_authority(connection)?;
+    let cursor_mutation_seq = validated_cursor_mutation_seq(cursor, &authority)?;
+
+    let (sql, params) = match cursor_mutation_seq {
+        Some(last_mutation_seq) => (
+            "SELECT r.id, r.started_at, r.finished_at, r.backend, r.input_path, \
+             r.normalized_wav_path, r.request_json, r.result_json, r.warnings_json, r.transcript, r.replay_json, r.acceleration_json \
+             FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             WHERE m.mutation_seq > ?1 \
+             ORDER BY r.finished_at ASC, r.id ASC"
                 .to_owned(),
-            vec![
-                SqliteValue::Text(c.last_export_rfc3339.clone().into()),
-                SqliteValue::Text(c.last_export_run_id.clone().unwrap_or_default().into()),
-            ],
+            vec![SqliteValue::Integer(last_mutation_seq)],
         ),
         None => (
-            "SELECT id, started_at, finished_at, backend, input_path, \
-             normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json \
-             FROM runs ORDER BY finished_at ASC, id ASC"
+            "SELECT r.id, r.started_at, r.finished_at, r.backend, r.input_path, \
+             r.normalized_wav_path, r.request_json, r.result_json, r.warnings_json, r.transcript, r.replay_json, r.acceleration_json \
+             FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             ORDER BY r.finished_at ASC, r.id ASC"
                 .to_owned(),
             vec![],
         ),
@@ -897,7 +996,12 @@ fn export_table_runs_incremental_snapshot(
             "acceleration_json": value_to_json(row.get(11)),
         });
         writeln!(file, "{}", serde_json::to_string(&obj)?)?;
-        last_position = Some((finished_at, run_id.clone()));
+        let replaces_last = last_position.as_ref().is_none_or(|(last_ts, last_id)| {
+            finished_at > *last_ts || (finished_at == *last_ts && run_id > *last_id)
+        });
+        if replaces_last {
+            last_position = Some((finished_at, run_id.clone()));
+        }
         run_ids.push(run_id);
         count += 1;
     }
@@ -909,6 +1013,8 @@ fn export_table_runs_incremental_snapshot(
         sha256: file.finalize_hex(),
         run_ids,
         last_position,
+        high_water_mark: authority.high_water_mark,
+        database_id: authority.database_id,
     })
 }
 
@@ -929,19 +1035,22 @@ fn collect_exported_run_ids(
     connection: &Connection,
     cursor: Option<&SyncCursor>,
 ) -> FwResult<Vec<String>> {
-    let (sql, params) = match cursor {
-        Some(c) => (
-            "SELECT id FROM runs \
-             WHERE finished_at > ?1 OR (finished_at = ?1 AND id > ?2) \
-             ORDER BY finished_at ASC, id ASC"
+    let authority = load_mutation_authority(connection)?;
+    let cursor_mutation_seq = validated_cursor_mutation_seq(cursor, &authority)?;
+    let (sql, params) = match cursor_mutation_seq {
+        Some(last_mutation_seq) => (
+            "SELECT r.id FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             WHERE m.mutation_seq > ?1 \
+             ORDER BY r.finished_at ASC, r.id ASC"
                 .to_owned(),
-            vec![
-                SqliteValue::Text(c.last_export_rfc3339.clone().into()),
-                SqliteValue::Text(c.last_export_run_id.clone().unwrap_or_default().into()),
-            ],
+            vec![SqliteValue::Integer(last_mutation_seq)],
         ),
         None => (
-            "SELECT id FROM runs ORDER BY finished_at ASC, id ASC".to_owned(),
+            "SELECT r.id FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             ORDER BY r.finished_at ASC, r.id ASC"
+                .to_owned(),
             vec![],
         ),
     };
@@ -1091,26 +1200,29 @@ fn export_table_events_for_runs(
     Ok((count, file.finalize_hex()))
 }
 
-/// Find the maximum `(finished_at, id)` tuple among runs matching the
-/// incremental filter.
+/// Find the greatest domain tuple among aggregates mutated after `cursor`.
+/// Selection uses only the database-owned sequence; the returned domain tuple
+/// mirrors the informational position stored by the production exporter.
 #[cfg(test)]
 fn max_export_position(
     connection: &Connection,
     cursor: Option<&SyncCursor>,
 ) -> FwResult<Option<(String, String)>> {
-    let (sql, params) = match cursor {
-        Some(c) => (
-            "SELECT finished_at, id FROM runs \
-             WHERE finished_at > ?1 OR (finished_at = ?1 AND id > ?2) \
-             ORDER BY finished_at DESC, id DESC LIMIT 1"
+    let authority = load_mutation_authority(connection)?;
+    let cursor_mutation_seq = validated_cursor_mutation_seq(cursor, &authority)?;
+    let (sql, params) = match cursor_mutation_seq {
+        Some(last_mutation_seq) => (
+            "SELECT r.finished_at, r.id FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             WHERE m.mutation_seq > ?1 \
+             ORDER BY r.finished_at DESC, r.id DESC LIMIT 1"
                 .to_owned(),
-            vec![
-                SqliteValue::Text(c.last_export_rfc3339.clone().into()),
-                SqliteValue::Text(c.last_export_run_id.clone().unwrap_or_default().into()),
-            ],
+            vec![SqliteValue::Integer(last_mutation_seq)],
         ),
         None => (
-            "SELECT finished_at, id FROM runs ORDER BY finished_at DESC, id DESC LIMIT 1"
+            "SELECT r.finished_at, r.id FROM runs AS r \
+             JOIN sync_run_mutations AS m ON m.run_id = r.id \
+             ORDER BY r.finished_at DESC, r.id DESC LIMIT 1"
                 .to_owned(),
             vec![],
         ),
@@ -4330,12 +4442,44 @@ mod tests {
         estimate
     }
 
-    fn test_cursor(ts: &str, run_id: Option<&str>) -> SyncCursor {
+    fn test_cursor(
+        connection: &Connection,
+        last_mutation_seq: i64,
+        ts: &str,
+        run_id: Option<&str>,
+    ) -> SyncCursor {
         SyncCursor {
+            last_mutation_seq,
+            database_id: Some(
+                load_mutation_authority(connection)
+                    .expect("load mutation authority")
+                    .database_id,
+            ),
             last_export_rfc3339: ts.to_owned(),
             last_export_run_id: run_id.map(str::to_owned),
             last_run_count: 0,
         }
+    }
+
+    fn run_mutation_seq(connection: &Connection, run_id: &str) -> i64 {
+        connection
+            .query_with_params(
+                "SELECT mutation_seq FROM sync_run_mutations WHERE run_id = ?1",
+                &[SqliteValue::Text(run_id.to_owned().into())],
+            )
+            .expect("query run mutation sequence")
+            .first()
+            .and_then(|row| row.get(0).and_then(|value| value.as_integer()))
+            .expect("run mutation sequence")
+    }
+
+    fn mutation_high_water(connection: &Connection) -> i64 {
+        connection
+            .query("SELECT COALESCE(MAX(mutation_seq), 0) FROM sync_run_mutations")
+            .expect("query mutation high-water mark")
+            .first()
+            .and_then(|row| row.get(0).and_then(|value| value.as_integer()))
+            .expect("mutation high-water mark")
     }
 
     #[test]
@@ -10030,6 +10174,7 @@ mod tests {
             manifest.cursor_used.is_none(),
             "first export has no prior cursor"
         );
+        assert!(manifest.cursor_after.last_mutation_seq > 0);
         assert!(!manifest.cursor_after.last_export_rfc3339.is_empty());
         assert_eq!(manifest.cursor_after.last_run_count, 1);
     }
@@ -10121,12 +10266,24 @@ mod tests {
         assert_eq!(second_manifest.row_counts.segments, 2);
         assert_eq!(second_manifest.row_counts.events, 2);
         assert_eq!(
-            second_manifest.cursor_used.and_then(|cursor| cursor.last_export_run_id),
-            Some("snapshot-first".to_owned())
+            second_manifest
+                .cursor_used
+                .as_ref()
+                .and_then(|cursor| cursor.last_export_run_id.as_deref()),
+            Some("snapshot-first")
         );
         assert_eq!(
             second_manifest.cursor_after.last_export_run_id.as_deref(),
             Some("snapshot-second")
+        );
+        assert!(
+            second_manifest.cursor_after.last_mutation_seq
+                > second_manifest
+                    .cursor_used
+                    .as_ref()
+                    .expect("prior snapshot cursor")
+                    .last_mutation_seq,
+            "the concurrent commit must remain beyond the first snapshot high-water mark"
         );
 
         for (file_name, run_id_key) in [
@@ -10196,7 +10353,7 @@ mod tests {
 
         let store = RunStore::open(&db_path).expect("store open");
 
-        // First run: timestamp T1
+        // First run establishes a non-empty mutation cursor.
         let mut report1 = fixture_report("incr-old", &db_path);
         report1.finished_at_rfc3339 = "2026-01-01T00:00:05Z".to_owned();
         store.persist_report(&report1).expect("persist 1");
@@ -10207,7 +10364,7 @@ mod tests {
             export_incremental(&db_path, &export_dir_1, &state_root).expect("first export");
         assert_eq!(manifest1.row_counts.runs, 1);
 
-        // Second run: timestamp T2 > T1
+        // A later database mutation must form the next delta.
         let mut report2 = fixture_report("incr-new", &db_path);
         report2.finished_at_rfc3339 = "2026-06-15T12:00:05Z".to_owned();
         store.persist_report(&report2).expect("persist 2");
@@ -10241,6 +10398,165 @@ mod tests {
     }
 
     #[test]
+    fn incremental_export_backdated_insert_after_cursor_exports_exactly_once() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("incr_backdated_insert.sqlite3");
+        let state_root = dir.path().join("state");
+        let store = RunStore::open(&db_path).expect("store open");
+
+        let mut anchor = fixture_report("cursor-anchor", &db_path);
+        anchor.finished_at_rfc3339 = "2026-08-01T00:00:05Z".to_owned();
+        store.persist_report(&anchor).expect("persist anchor");
+        let first = export_incremental(&db_path, &dir.path().join("export1"), &state_root)
+            .expect("first export");
+        assert_eq!(first.row_counts.runs, 1);
+
+        let mut backdated = fixture_report("backdated-after-cursor", &db_path);
+        backdated.finished_at_rfc3339 = "2020-01-01T00:00:05Z".to_owned();
+        store
+            .persist_report(&backdated)
+            .expect("persist backdated run");
+
+        let second_export = dir.path().join("export2");
+        let second = export_incremental(&db_path, &second_export, &state_root)
+            .expect("export backdated delta");
+        assert_eq!(second.row_counts.runs, 1);
+        assert!(
+            second.cursor_after.last_mutation_seq > first.cursor_after.last_mutation_seq,
+            "database mutation sequence must advance independently of finished_at"
+        );
+        let row: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(second_export.join("runs.jsonl"))
+                .expect("read backdated run")
+                .trim(),
+        )
+        .expect("parse backdated run");
+        assert_eq!(row["id"], "backdated-after-cursor");
+        assert_eq!(row["finished_at"], "2020-01-01T00:00:05Z");
+
+        let third = export_incremental(&db_path, &dir.path().join("export3"), &state_root)
+            .expect("no-change export");
+        assert_eq!(third.row_counts.runs, 0, "successful delta exports once");
+        assert_eq!(
+            third.cursor_after.last_mutation_seq,
+            second.cursor_after.last_mutation_seq,
+            "no-change export must retain the exact high-water mark"
+        );
+    }
+
+    #[test]
+    fn incremental_export_parent_update_after_cursor_exports_exactly_once() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("incr_parent_update.sqlite3");
+        let state_root = dir.path().join("state");
+        let store = RunStore::open(&db_path).expect("store open");
+
+        store
+            .persist_report(&fixture_report("updated-parent", &db_path))
+            .expect("persist run");
+        export_incremental(&db_path, &dir.path().join("export1"), &state_root)
+            .expect("first export");
+
+        let writer = Connection::open(db_path.display().to_string()).expect("writer open");
+        writer
+            .execute(
+                "UPDATE runs SET finished_at = '2020-01-01T00:00:05Z', \
+                 transcript = 'revised transcript' WHERE id = 'updated-parent'",
+            )
+            .expect("update exported parent");
+
+        let second_export = dir.path().join("export2");
+        let second = export_incremental(&db_path, &second_export, &state_root)
+            .expect("export parent update");
+        assert_eq!(second.row_counts.runs, 1);
+        let row: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(second_export.join("runs.jsonl"))
+                .expect("read updated parent")
+                .trim(),
+        )
+        .expect("parse updated parent");
+        assert_eq!(row["id"], "updated-parent");
+        assert_eq!(row["transcript"], "revised transcript");
+
+        let third = export_incremental(&db_path, &dir.path().join("export3"), &state_root)
+            .expect("no-change export");
+        assert_eq!(third.row_counts.runs, 0, "parent update must not repeat");
+    }
+
+    #[test]
+    fn incremental_export_child_only_update_exports_complete_aggregate_once() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("incr_child_update.sqlite3");
+        let state_root = dir.path().join("state");
+        let store = RunStore::open(&db_path).expect("store open");
+
+        store
+            .persist_report(&fixture_report("updated-child", &db_path))
+            .expect("persist run");
+        export_incremental(&db_path, &dir.path().join("export1"), &state_root)
+            .expect("first export");
+
+        let writer = Connection::open(db_path.display().to_string()).expect("writer open");
+        writer
+            .execute(
+                "UPDATE segments SET text = 'revised segment' \
+                 WHERE run_id = 'updated-child' AND idx = 0",
+            )
+            .expect("update exported segment");
+        writer
+            .execute(
+                "UPDATE events SET message = 'revised event' \
+                 WHERE run_id = 'updated-child' AND seq = 1",
+            )
+            .expect("update exported event");
+
+        let second_export = dir.path().join("export2");
+        let second = export_incremental(&db_path, &second_export, &state_root)
+            .expect("export child update");
+        assert_eq!(second.row_counts.runs, 1);
+        assert_eq!(second.row_counts.segments, 2);
+        assert_eq!(second.row_counts.events, 2);
+
+        let segments: Vec<serde_json::Value> =
+            fs::read_to_string(second_export.join("segments.jsonl"))
+                .expect("read segments")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("parse segment"))
+                .collect();
+        assert!(segments.iter().any(|row| row["text"] == "revised segment"));
+        let events: Vec<serde_json::Value> = fs::read_to_string(second_export.join("events.jsonl"))
+            .expect("read events")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse event"))
+            .collect();
+        assert!(events.iter().any(|row| row["message"] == "revised event"));
+
+        let third = export_incremental(&db_path, &dir.path().join("export3"), &state_root)
+            .expect("no-change export");
+        assert_eq!(third.row_counts.runs, 0, "child update must not repeat");
+        assert_eq!(third.row_counts.segments, 0);
+        assert_eq!(third.row_counts.events, 0);
+
+        writer
+            .execute(
+                "DELETE FROM segments WHERE run_id = 'updated-child' AND idx = 1",
+            )
+            .expect("delete exported segment");
+        let fourth = export_incremental(
+            &db_path,
+            &dir.path().join("export4"),
+            &state_root,
+        )
+        .expect("export child deletion");
+        assert_eq!(fourth.row_counts.runs, 1);
+        assert_eq!(
+            fourth.row_counts.segments, 1,
+            "child deletion must export the complete surviving child set"
+        );
+        assert_eq!(fourth.row_counts.events, 2);
+    }
+
+    #[test]
     fn incremental_export_no_new_records_produces_zero_counts() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("incr_noop.sqlite3");
@@ -10266,6 +10582,108 @@ mod tests {
     }
 
     #[test]
+    fn incremental_export_rejects_cursor_ahead_of_database_high_water() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("incr_cursor_ahead.sqlite3");
+        let state_root = dir.path().join("state");
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("cursor-ahead", &db_path))
+            .expect("persist run");
+
+        let connection = Connection::open(db_path.display().to_string()).expect("connection");
+        let forged_sequence = mutation_high_water(&connection) + 1;
+        let cursor_path = state_root.join(CURSOR_FILENAME);
+        save_cursor(
+            &cursor_path,
+            &test_cursor(
+                &connection,
+                forged_sequence,
+                "2099-01-01T00:00:00Z",
+                Some("unrelated-database"),
+            ),
+        )
+        .expect("write mismatched cursor");
+
+        let error = export_incremental(
+            &db_path,
+            &dir.path().join("export"),
+            &state_root,
+        )
+        .expect_err("cursor from a newer or different database must fail closed");
+        assert!(
+            error.to_string().contains("outside database range"),
+            "unexpected cursor mismatch error: {error}"
+        );
+        let retained = load_cursor(&cursor_path)
+            .expect("reload cursor")
+            .expect("cursor retained");
+        assert_eq!(retained.last_mutation_seq, forged_sequence);
+    }
+
+    #[test]
+    fn incremental_export_rejects_in_range_cursor_from_different_database() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("cursor_source.sqlite3");
+        let target_db = dir.path().join("cursor_target.sqlite3");
+        let source_state = dir.path().join("source_state");
+        let target_state = dir.path().join("target_state");
+
+        let source = RunStore::open(&source_db).expect("open cursor source");
+        source
+            .persist_report(&fixture_report("source-run", &source_db))
+            .expect("persist source run");
+        let source_manifest = export_incremental(
+            &source_db,
+            &dir.path().join("source_export"),
+            &source_state,
+        )
+        .expect("export source cursor");
+
+        let target = RunStore::open(&target_db).expect("open cursor target");
+        for run_id in ["target-run-a", "target-run-b"] {
+            target
+                .persist_report(&fixture_report(run_id, &target_db))
+                .expect("persist target run");
+        }
+        let target_connection =
+            Connection::open(target_db.display().to_string()).expect("open target connection");
+        let target_authority =
+            load_mutation_authority(&target_connection).expect("load target authority");
+        assert!(
+            source_manifest.cursor_after.last_mutation_seq <= target_authority.high_water_mark,
+            "the foreign cursor must be numerically in range to exercise the identity guard"
+        );
+        assert_ne!(
+            source_manifest.cursor_after.database_id.as_deref(),
+            Some(target_authority.database_id.as_str()),
+            "independent databases must have distinct identities"
+        );
+
+        let cursor_path = target_state.join(CURSOR_FILENAME);
+        save_cursor(&cursor_path, &source_manifest.cursor_after).expect("install foreign cursor");
+        let target_export = dir.path().join("target_export");
+        let error = export_incremental(&target_db, &target_export, &target_state)
+            .expect_err("an in-range foreign cursor must fail closed");
+        assert!(
+            error.to_string().contains("database identity mismatch"),
+            "unexpected foreign cursor error: {error}"
+        );
+        assert!(
+            !target_export.join("manifest.json").exists(),
+            "identity mismatch must be rejected before snapshot publication"
+        );
+        assert!(
+            !target_export.join("runs.jsonl").exists(),
+            "identity mismatch must not publish a partial runs delta"
+        );
+        let retained = load_cursor(&cursor_path)
+            .expect("reload foreign cursor")
+            .expect("foreign cursor retained");
+        assert_eq!(retained.database_id, source_manifest.cursor_after.database_id);
+    }
+
+    #[test]
     fn incremental_export_empty_db_produces_zero_counts_and_creates_cursor() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("incr_empty.sqlite3");
@@ -10279,6 +10697,7 @@ mod tests {
         assert_eq!(manifest.row_counts.segments, 0);
         assert_eq!(manifest.row_counts.events, 0);
         assert!(manifest.cursor_used.is_none());
+        assert_eq!(manifest.cursor_after.last_mutation_seq, 0);
         assert_eq!(
             manifest.cursor_after.last_export_rfc3339,
             EMPTY_INCREMENTAL_CURSOR_TS
@@ -10365,7 +10784,7 @@ mod tests {
 
         let store = RunStore::open(&db_path).expect("store open");
 
-        // Insert three runs with ascending timestamps.
+        // Insert three runs before the first cursor is established.
         for (i, ts) in [
             "2026-01-01T00:00:00Z",
             "2026-02-01T00:00:00Z",
@@ -10383,11 +10802,19 @@ mod tests {
         let export_dir_1 = dir.path().join("export1");
         let m1 = export_incremental(&db_path, &export_dir_1, &state_root).expect("export 1");
         assert_eq!(m1.row_counts.runs, 3);
+        drop(store);
+
+        // Reopen both the database and the on-disk cursor to exercise restart.
+        let store = RunStore::open(&db_path).expect("reopen store");
 
         // Second export: no new runs.
         let export_dir_2 = dir.path().join("export2");
         let m2 = export_incremental(&db_path, &export_dir_2, &state_root).expect("export 2");
         assert_eq!(m2.row_counts.runs, 0);
+        assert_eq!(
+            m2.cursor_used.as_ref().unwrap().last_mutation_seq,
+            m1.cursor_after.last_mutation_seq,
+        );
         assert_eq!(
             m2.cursor_used.as_ref().unwrap().last_export_rfc3339,
             m1.cursor_after.last_export_rfc3339,
@@ -10473,6 +10900,8 @@ mod tests {
     #[test]
     fn sync_cursor_serde_round_trip() {
         let cursor = SyncCursor {
+            last_mutation_seq: 42,
+            database_id: Some("00000000-0000-0000-0000-000000000042".to_owned()),
             last_export_rfc3339: "2026-06-15T12:00:00Z".to_owned(),
             last_export_run_id: Some("run-42".to_owned()),
             last_run_count: 42,
@@ -10480,6 +10909,8 @@ mod tests {
         let json = serde_json::to_string_pretty(&cursor).expect("serialize");
         let parsed: SyncCursor = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.last_export_rfc3339, "2026-06-15T12:00:00Z");
+        assert_eq!(parsed.last_mutation_seq, 42);
+        assert_eq!(parsed.database_id, cursor.database_id);
         assert_eq!(parsed.last_export_run_id.as_deref(), Some("run-42"));
         assert_eq!(parsed.last_run_count, 42);
     }
@@ -10488,6 +10919,8 @@ mod tests {
     fn sync_cursor_deserializes_legacy_shape_without_run_id() {
         let legacy = r#"{"last_export_rfc3339":"2026-06-15T12:00:00Z","last_run_count":42}"#;
         let parsed: SyncCursor = serde_json::from_str(legacy).expect("deserialize legacy cursor");
+        assert_eq!(parsed.last_mutation_seq, 0);
+        assert!(parsed.database_id.is_none());
         assert_eq!(parsed.last_export_rfc3339, "2026-06-15T12:00:00Z");
         assert!(parsed.last_export_run_id.is_none());
         assert_eq!(parsed.last_run_count, 42);
@@ -10512,11 +10945,15 @@ mod tests {
                 events_jsonl_sha256: "ccc".to_owned(),
             },
             cursor_used: Some(SyncCursor {
+                last_mutation_seq: 5,
+                database_id: Some("00000000-0000-0000-0000-000000000005".to_owned()),
                 last_export_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
                 last_export_run_id: Some("run-5".to_owned()),
                 last_run_count: 5,
             }),
             cursor_after: SyncCursor {
+                last_mutation_seq: 6,
+                database_id: Some("00000000-0000-0000-0000-000000000005".to_owned()),
                 last_export_rfc3339: "2026-06-15T12:00:00Z".to_owned(),
                 last_export_run_id: Some("run-6".to_owned()),
                 last_run_count: 1,
@@ -10544,6 +10981,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("cursor_rt.json");
         let cursor = SyncCursor {
+            last_mutation_seq: 7,
+            database_id: Some("00000000-0000-0000-0000-000000000007".to_owned()),
             last_export_rfc3339: "2026-03-15T08:30:00Z".to_owned(),
             last_export_run_id: Some("run-7".to_owned()),
             last_run_count: 7,
@@ -10551,6 +10990,8 @@ mod tests {
         save_cursor(&path, &cursor).expect("save");
         let loaded = load_cursor(&path).expect("load").expect("should exist");
         assert_eq!(loaded.last_export_rfc3339, "2026-03-15T08:30:00Z");
+        assert_eq!(loaded.last_mutation_seq, 7);
+        assert_eq!(loaded.database_id, cursor.database_id);
         assert_eq!(loaded.last_export_run_id.as_deref(), Some("run-7"));
         assert_eq!(loaded.last_run_count, 7);
     }
@@ -10567,6 +11008,22 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("invalid sync cursor")
+        );
+    }
+
+    #[test]
+    fn load_cursor_rejects_negative_mutation_sequence() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("negative_cursor.json");
+        fs::write(
+            &path,
+            r#"{"last_mutation_seq":-1,"last_export_rfc3339":"","last_run_count":0}"#,
+        )
+        .expect("write negative cursor");
+        let error = load_cursor(&path).expect_err("negative cursor must fail closed");
+        assert!(
+            error.to_string().contains("must be non-negative"),
+            "unexpected negative cursor error: {error}"
         );
     }
 
@@ -10590,7 +11047,7 @@ mod tests {
         let m1 = export_incremental(&db_path, &export_dir, &state_root).expect("export");
         assert_eq!(m1.row_counts.runs, 2);
 
-        // Second export: no new runs (cursor_after == the shared timestamp).
+        // Second export: no new mutations despite the shared domain timestamp.
         let export_dir_2 = dir.path().join("export2");
         let m2 = export_incremental(&db_path, &export_dir_2, &state_root).expect("export 2");
         assert_eq!(m2.row_counts.runs, 0);
@@ -10604,7 +11061,7 @@ mod tests {
 
         let store = RunStore::open(&db_path).expect("store open");
 
-        let mut first = fixture_report("same-ts-a", &db_path);
+        let mut first = fixture_report("same-ts-z", &db_path);
         first.finished_at_rfc3339 = "2026-01-01T00:00:05Z".to_owned();
         store.persist_report(&first).expect("persist first");
 
@@ -10613,7 +11070,7 @@ mod tests {
             export_incremental(&db_path, &export_dir_1, &state_root).expect("export 1");
         assert_eq!(first_manifest.row_counts.runs, 1);
 
-        let mut second = fixture_report("same-ts-z", &db_path);
+        let mut second = fixture_report("same-ts-a", &db_path);
         second.finished_at_rfc3339 = "2026-01-01T00:00:05Z".to_owned();
         store.persist_report(&second).expect("persist second");
 
@@ -10632,7 +11089,11 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 1);
         let row: serde_json::Value = serde_json::from_str(lines[0]).expect("parse");
-        assert_eq!(row["id"].as_str(), Some("same-ts-z"));
+        assert_eq!(
+            row["id"].as_str(),
+            Some("same-ts-a"),
+            "a same-clock mutation must not depend on lexicographic ID order"
+        );
     }
 
     #[test]
@@ -10659,7 +11120,7 @@ mod tests {
     }
 
     #[test]
-    fn max_started_at_with_filter_beyond_all_timestamps_returns_none() {
+    fn max_export_position_at_mutation_high_water_returns_none() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("ts_filter.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
@@ -10668,10 +11129,15 @@ mod tests {
 
         let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
-        // With cursor far in the future, no runs match -> None.
-        let far_future = test_cursor("2099-12-31T23:59:59Z", Some("zzzzzz"));
+        // A cursor at the database high-water mark has no matching mutations.
+        let far_future = test_cursor(
+            &conn,
+            mutation_high_water(&conn),
+            "2099-12-31T23:59:59Z",
+            Some("zzzzzz"),
+        );
         let result = max_export_position(&conn, Some(&far_future)).expect("should succeed");
-        assert_eq!(result, None, "no runs after far-future timestamp");
+        assert_eq!(result, None, "no runs after the mutation high-water mark");
 
         // With no filter, should return the run's finished_at + id tuple.
         let result = max_export_position(&conn, None).expect("should succeed");
@@ -10738,6 +11204,8 @@ mod tests {
         );
 
         let cursor = SyncCursor {
+            last_mutation_seq: 7,
+            database_id: Some("00000000-0000-0000-0000-000000000007".to_owned()),
             last_export_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
             last_export_run_id: Some("run-a".to_owned()),
             last_run_count: 7,
@@ -11788,12 +12256,12 @@ mod tests {
     // -- seventeenth-pass edge case tests --
 
     #[test]
-    fn max_started_at_with_partial_filter_returns_matching_maximum() {
+    fn max_export_position_with_partial_mutation_filter_returns_matching_maximum() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("partial_filter.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
 
-        // Persist two reports with different finished timestamps.
+        // Persist two reports in a known mutation order.
         let mut early = fixture_report("run-early", &db_path);
         early.finished_at_rfc3339 = "2026-01-01T00:00:05Z".to_owned();
         store.persist_report(&early).expect("persist early");
@@ -11804,8 +12272,13 @@ mod tests {
 
         let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
-        // Cursor positioned at early should return late's tuple.
-        let after_early = test_cursor("2026-01-01T00:00:05Z", Some("run-early"));
+        // A cursor positioned at the early mutation should return late's tuple.
+        let after_early = test_cursor(
+            &conn,
+            run_mutation_seq(&conn, "run-early"),
+            "2026-01-01T00:00:05Z",
+            Some("run-early"),
+        );
         let result = max_export_position(&conn, Some(&after_early)).expect("query");
         assert_eq!(
             result,
@@ -11813,10 +12286,15 @@ mod tests {
             "should return the max among filtered runs"
         );
 
-        // Cursor positioned at late should produce no newer rows.
-        let after_late = test_cursor("2026-06-15T12:00:05Z", Some("run-late"));
+        // A cursor positioned at the late mutation should produce no newer rows.
+        let after_late = test_cursor(
+            &conn,
+            run_mutation_seq(&conn, "run-late"),
+            "2026-06-15T12:00:05Z",
+            Some("run-late"),
+        );
         let result = max_export_position(&conn, Some(&after_late)).expect("query");
-        assert_eq!(result, None, "no runs strictly after late timestamp");
+        assert_eq!(result, None, "no runs strictly after the late mutation");
     }
 
     #[test]
@@ -11838,7 +12316,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_exported_run_ids_with_after_ts_filters_correctly() {
+    fn collect_exported_run_ids_with_mutation_cursor_filters_correctly() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("collect_ids.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
@@ -11861,8 +12339,13 @@ mod tests {
         let all = collect_exported_run_ids(&conn, None).expect("all");
         assert_eq!(all.len(), 3, "no filter should return all runs");
 
-        // Cursor at run-a should return run-b and run-c (strictly after tuple).
-        let cursor = test_cursor("2026-01-01T00:00:05Z", Some("run-a"));
+        // Cursor at run-a should return later mutations run-b and run-c.
+        let cursor = test_cursor(
+            &conn,
+            run_mutation_seq(&conn, "run-a"),
+            "2026-01-01T00:00:05Z",
+            Some("run-a"),
+        );
         let filtered = collect_exported_run_ids(&conn, Some(&cursor)).expect("filtered");
         assert_eq!(filtered.len(), 2, "should exclude run-a");
         assert!(
@@ -11904,7 +12387,7 @@ mod tests {
     }
 
     #[test]
-    fn export_table_runs_incremental_filters_by_after_ts() {
+    fn export_table_runs_incremental_filters_by_mutation_sequence() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("inc_runs.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
@@ -11932,7 +12415,12 @@ mod tests {
 
         // Cursor at inc-a -> only inc-b.
         let filtered_path = dir.path().join("filtered_runs.jsonl");
-        let cursor = test_cursor("2026-01-15T00:00:05Z", Some("inc-a"));
+        let cursor = test_cursor(
+            &conn,
+            run_mutation_seq(&conn, "inc-a"),
+            "2026-01-15T00:00:05Z",
+            Some("inc-a"),
+        );
         let (filtered_count, _sha256) =
             export_table_runs_incremental(&conn, &filtered_path, Some(&cursor)).expect("filtered");
         assert_eq!(filtered_count, 1, "filter should export only inc-b");
@@ -13370,6 +13858,7 @@ mod tests {
         assert_eq!(m1.row_counts.runs, 1);
         let first_cursor_ts = m1.cursor_after.last_export_rfc3339.clone();
         let first_cursor_run_id = m1.cursor_after.last_export_run_id.clone();
+        let first_cursor_seq = m1.cursor_after.last_mutation_seq;
 
         // Second export: no new records.
         let export_dir_2 = dir.path().join("export2");
@@ -13377,6 +13866,10 @@ mod tests {
         assert_eq!(m2.row_counts.runs, 0);
 
         // Cursor values should be EXACTLY retained from the first export.
+        assert_eq!(
+            m2.cursor_after.last_mutation_seq, first_cursor_seq,
+            "mutation high-water mark should be retained when no changes exist"
+        );
         assert_eq!(
             m2.cursor_after.last_export_rfc3339, first_cursor_ts,
             "cursor timestamp should be retained when no new records exist"
@@ -13399,26 +13892,33 @@ mod tests {
         report.finished_at_rfc3339 = "2026-06-15T12:00:00Z".to_owned();
         store.persist_report(&report).expect("persist");
 
-        // Manually write a legacy cursor with last_export_run_id = None.
-        let legacy_cursor = r#"{"last_export_rfc3339":"2026-01-01T00:00:00Z","last_run_count":0}"#;
+        // Manually write a pre-identity cursor. Its numeric sequence is
+        // deliberately far ahead: without a database identity it must be
+        // ignored rather than interpreted in this database's sequence space.
+        let legacy_cursor = r#"{"last_mutation_seq":999999,"last_export_rfc3339":"2026-01-01T00:00:00Z","last_run_count":0}"#;
         fs::write(state_root.join(CURSOR_FILENAME), legacy_cursor).expect("write legacy cursor");
 
-        // Export should work — the cursor has None run_id, which is
-        // deserialized via #[serde(default)].
+        // Missing identity and run-id fields deserialize via defaults.
         let export_dir = dir.path().join("export");
         let manifest = export_incremental(&db_path, &export_dir, &state_root)
             .expect("export with legacy cursor");
 
-        // The run finished_at 2026-06-15 > cursor 2026-01-01, so it should be exported.
+        // A missing database identity deliberately treats the effective
+        // sequence as zero and causes a one-time safe full re-export.
         assert_eq!(
             manifest.row_counts.runs, 1,
-            "run after legacy cursor timestamp should be exported"
+            "current run should be re-exported after a legacy cursor upgrade"
         );
         // cursor_used should reflect the legacy cursor with None run_id.
         assert!(
             manifest.cursor_used.is_some(),
             "cursor_used should be populated"
         );
+        assert_eq!(
+            manifest.cursor_used.as_ref().unwrap().last_mutation_seq,
+            999999
+        );
+        assert!(manifest.cursor_used.as_ref().unwrap().database_id.is_none());
         assert!(
             manifest
                 .cursor_used
@@ -13432,6 +13932,10 @@ mod tests {
         assert!(
             manifest.cursor_after.last_export_run_id.is_some(),
             "cursor_after should have a run_id after export"
+        );
+        assert!(
+            manifest.cursor_after.database_id.is_some(),
+            "cursor_after should bind the upgraded cursor to this database"
         );
     }
 
@@ -13659,6 +14163,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let cursor_path = dir.path().join("nested/deep/cursor.json");
         let cursor = SyncCursor {
+            last_mutation_seq: 42,
+            database_id: Some("00000000-0000-0000-0000-000000000042".to_owned()),
             last_export_rfc3339: "2026-06-15T12:00:00Z".to_owned(),
             last_export_run_id: Some("run-xyz-123".to_owned()),
             last_run_count: 42,
@@ -13677,7 +14183,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_exported_run_ids_cursor_with_none_run_id_uses_empty_tiebreaker() {
+    fn legacy_cursor_without_mutation_sequence_safely_reexports_all_runs() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("none_run_id.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
@@ -13693,15 +14199,16 @@ mod tests {
 
         let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
-        // Cursor with None run_id → unwrap_or_default() = "".
-        // Both runs have finished_at == cursor ts, and id > "" for any real id.
-        // So both should be included.
-        let cursor = test_cursor("2026-06-01T00:00:05Z", None);
+        // Pre-v6 cursor files deserialize with sequence zero. Their legacy
+        // timestamp/run-id fields are intentionally ignored, causing one safe
+        // full re-export after migration.
+        let mut cursor = test_cursor(&conn, 0, "2026-06-01T00:00:05Z", None);
+        cursor.database_id = None;
         let ids = collect_exported_run_ids(&conn, Some(&cursor)).expect("collect");
         assert_eq!(
             ids.len(),
             2,
-            "cursor with None run_id should include all runs at same timestamp (id > empty)"
+            "legacy cursor should safely re-export every current run once"
         );
         assert!(ids.contains(&"run-a".to_owned()));
         assert!(ids.contains(&"run-b".to_owned()));
@@ -13786,6 +14293,7 @@ mod tests {
         // Older cursors without this field should deserialize to None.
         let json = r#"{"last_export_rfc3339":"2026-01-01T00:00:00Z","last_run_count":5}"#;
         let cursor: SyncCursor = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(cursor.last_mutation_seq, 0);
         assert_eq!(cursor.last_export_rfc3339, "2026-01-01T00:00:00Z");
         assert_eq!(
             cursor.last_export_run_id, None,
@@ -13796,6 +14304,7 @@ mod tests {
         // With the field present: should deserialize normally.
         let json_with = r#"{"last_export_rfc3339":"2026-06-01T00:00:00Z","last_export_run_id":"run-42","last_run_count":10}"#;
         let cursor2: SyncCursor = serde_json::from_str(json_with).expect("deserialize");
+        assert_eq!(cursor2.last_mutation_seq, 0);
         assert_eq!(cursor2.last_export_run_id, Some("run-42".to_owned()));
     }
 
@@ -13942,11 +14451,16 @@ mod tests {
         let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         let output_path = dir.path().join("runs.jsonl");
 
-        // Cursor with a future timestamp — no runs should match.
-        let cursor = test_cursor("2099-01-01T00:00:00Z", Some("zzz"));
+        // Cursor at the mutation high-water mark — no runs should match.
+        let cursor = test_cursor(
+            &conn,
+            mutation_high_water(&conn),
+            "2099-01-01T00:00:00Z",
+            Some("zzz"),
+        );
         let (count, _sha256) =
             export_table_runs_incremental(&conn, &output_path, Some(&cursor)).expect("export");
-        assert_eq!(count, 0, "no runs should match a far-future cursor");
+        assert_eq!(count, 0, "no runs should match a current high-water cursor");
 
         let content = fs::read_to_string(&output_path).expect("read");
         assert!(
@@ -14085,6 +14599,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("cursor_rt2.json");
         let cursor = SyncCursor {
+            last_mutation_seq: 7,
+            database_id: Some("00000000-0000-0000-0000-000000000007".to_owned()),
             last_export_rfc3339: "2026-02-15T10:00:00Z".to_owned(),
             last_export_run_id: Some("run-42".to_owned()),
             last_run_count: 7,
@@ -14184,7 +14700,7 @@ mod tests {
     }
 
     #[test]
-    fn max_export_position_with_cursor_filters_older_runs() {
+    fn max_export_position_with_cursor_filters_earlier_mutations() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("test.sqlite3");
         let store = RunStore::open(&db_path).expect("store open");
@@ -14196,7 +14712,12 @@ mod tests {
         store.persist_report(&r2).expect("persist");
 
         let conn = Connection::open(db_path.display().to_string()).expect("conn");
-        let cursor = test_cursor("2026-01-01T00:00:05Z", None);
+        let cursor = test_cursor(
+            &conn,
+            run_mutation_seq(&conn, "run-x"),
+            "2026-01-01T00:00:05Z",
+            None,
+        );
         let pos = max_export_position(&conn, Some(&cursor)).expect("max_export_position");
         let (ts, run_id) = pos.expect("should find run-y after cursor");
         assert_eq!(ts, "2026-01-01T00:00:10Z");
@@ -14661,6 +15182,8 @@ mod tests {
             },
             cursor_used: None,
             cursor_after: SyncCursor {
+                last_mutation_seq: 1,
+                database_id: Some("00000000-0000-0000-0000-000000000001".to_owned()),
                 last_export_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
                 last_export_run_id: Some("run-new".to_owned()),
                 last_run_count: 0,
