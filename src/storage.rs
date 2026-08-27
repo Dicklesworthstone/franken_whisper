@@ -1033,6 +1033,26 @@ CREATE TABLE IF NOT EXISTS _meta (
         Ok(())
     }
 
+    fn validate_sync_database_id(&self) -> FwResult<String> {
+        let identity_rows = self
+            .connection
+            .query("SELECT value FROM _meta WHERE key = 'sync_database_id';")
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let database_id = identity_rows
+            .first()
+            .map(|row| value_to_string(row.get(0)))
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                FwError::Storage("database schema v6 is missing sync_database_id".to_owned())
+            })?;
+        uuid::Uuid::parse_str(&database_id).map_err(|error| {
+            FwError::Storage(format!(
+                "invalid sync_database_id `{database_id}`: {error}"
+            ))
+        })?;
+        Ok(database_id)
+    }
+
     /// Run forward migrations from the current version to SCHEMA_VERSION.
     fn run_migrations(&self) -> FwResult<()> {
         let mut current = self.current_schema_version()?;
@@ -1046,6 +1066,7 @@ CREATE TABLE IF NOT EXISTS _meta (
         }
 
         if current == Self::SCHEMA_VERSION {
+            self.validate_sync_database_id()?;
             return Ok(());
         }
 
@@ -1302,7 +1323,7 @@ CREATE TABLE IF NOT EXISTS speaker_profile_summaries (
         let result = (|| -> FwResult<()> {
             self.connection
                 .execute(
-                r#"
+                    r#"
 CREATE TABLE IF NOT EXISTS sync_run_mutations (
     mutation_seq INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL UNIQUE
@@ -1383,6 +1404,9 @@ END;
                     &[text_value(uuid::Uuid::new_v4().to_string())],
                 )
                 .map_err(|error| FwError::Storage(error.to_string()))?;
+            self.validate_sync_database_id().map_err(|error| {
+                FwError::Storage(format!("v6 identity migration failed: {error}"))
+            })?;
             Ok(())
         })();
 
@@ -7538,6 +7562,62 @@ mod tests {
             value_to_string(reopened_rows[0].get(0)),
             database_id,
             "database identity must remain stable across restart"
+        );
+    }
+
+    #[test]
+    fn sync_mutation_migration_rejects_malformed_existing_database_identity() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("malformed_sync_identity.sqlite3");
+        let store = RunStore::open(&db_path).expect("open current schema");
+        store
+            .connection
+            .execute(
+                "UPDATE _meta SET value = '5' WHERE key = 'schema_version'; \
+                 UPDATE _meta SET value = 'not-a-uuid' WHERE key = 'sync_database_id';",
+            )
+            .expect("prepare malformed v5 metadata");
+        drop(store);
+
+        let error = RunStore::open(&db_path)
+            .expect_err("malformed sync identity must block the v6 migration");
+        assert!(
+            error
+                .to_string()
+                .contains("v6 identity migration failed: invalid sync_database_id"),
+            "unexpected malformed identity error: {error}"
+        );
+
+        let connection = BlockingConnection::open(db_path.display().to_string())
+            .expect("inspect failed migration");
+        let version_rows = connection
+            .query("SELECT value FROM _meta WHERE key = 'schema_version';")
+            .expect("query retained schema version");
+        assert_eq!(
+            value_to_string(version_rows[0].get(0)),
+            "5",
+            "failed identity validation must not publish schema version 6"
+        );
+    }
+
+    #[test]
+    fn current_schema_rejects_missing_database_identity() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing_sync_identity.sqlite3");
+        let store = RunStore::open(&db_path).expect("open current schema");
+        store
+            .connection
+            .execute("DELETE FROM _meta WHERE key = 'sync_database_id';")
+            .expect("remove identity");
+        drop(store);
+
+        let error =
+            RunStore::open(&db_path).expect_err("schema v6 without an identity must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("database schema v6 is missing sync_database_id"),
+            "unexpected missing identity error: {error}"
         );
     }
 

@@ -689,6 +689,7 @@ fn query_param_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 /// explicit schemes or when no host can be isolated.
 fn split_host_and_rest(url: &str) -> Option<(&str, &str)> {
     let after_scheme = match url.split_once("://") {
+        Some((scheme, _)) if !has_explicit_scheme_syntax(scheme) => url,
         Some((scheme, rest))
             if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
         {
@@ -708,6 +709,12 @@ fn split_host_and_rest(url: &str) -> Option<(&str, &str)> {
     }
     let rest = &after_scheme[host_end..];
     Some((host, rest))
+}
+
+fn has_explicit_scheme_syntax(prefix: &str) -> bool {
+    let mut bytes = prefix.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
 /// Return `true` when `host` is a YouTube web host (ignoring a `www.`/`m.`
@@ -1636,6 +1643,14 @@ mod tests {
             UrlKind::Video
         );
         assert_eq!(classify_url("youtu.be/abc").unwrap(), UrlKind::Video);
+        assert_eq!(
+            classify_url("youtube.com/watch?v=abc&next=https://example.test").unwrap(),
+            UrlKind::Video
+        );
+        assert_eq!(
+            extract_video_id("youtube.com/watch?v=abc&next=https://example.test").as_deref(),
+            Some("abc")
+        );
     }
 
     #[test]
