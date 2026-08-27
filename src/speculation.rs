@@ -754,6 +754,33 @@ impl Default for CorrectionTolerance {
     }
 }
 
+impl CorrectionTolerance {
+    /// Validate a WER threshold against the bounded drift domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FwError::InvalidRequest`] when `max_wer` is non-finite or
+    /// outside `0..=1`.
+    pub fn validate_max_wer(max_wer: f64) -> FwResult<()> {
+        if !max_wer.is_finite() || !(0.0..=1.0).contains(&max_wer) {
+            return Err(FwError::InvalidRequest(format!(
+                "speculative WER tolerance must be finite and within 0..=1, got {max_wer}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate the bounded WER correction threshold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FwError::InvalidRequest`] when the threshold is outside its
+    /// declared domain.
+    pub fn validate(&self) -> FwResult<()> {
+        Self::validate_max_wer(self.max_wer)
+    }
+}
+
 /// Aggregate statistics tracked by [`CorrectionTracker`].
 pub struct CorrectionStats {
     pub windows_processed: u64,
@@ -832,6 +859,8 @@ impl CorrectionTracker {
         quality_segments: Vec<TranscriptionSegment>,
         quality_latency_ms: u64,
     ) -> FwResult<CorrectionDecision> {
+        self.tolerance.validate()?;
+
         let seq = *self.window_to_seq.get(&window_id).ok_or_else(|| {
             FwError::InvalidRequest(format!("no partial registered for window_id {window_id}"))
         })?;
@@ -6096,6 +6125,42 @@ mod tests {
             "default max_edit_distance should be 50"
         );
         assert!(!t.always_correct, "default always_correct should be false");
+    }
+
+    #[test]
+    fn correction_tracker_rejects_invalid_wer_without_resolving_partial() {
+        let mut tracker = CorrectionTracker::new(CorrectionTolerance {
+            max_wer: f64::NAN,
+            ..CorrectionTolerance::default()
+        });
+        tracker.register_partial(PartialTranscript::new(
+            0,
+            7,
+            "fast".to_owned(),
+            vec![seg("wrong", Some(0.8))],
+            10,
+            "2026-01-01T00:00:00Z".to_owned(),
+        ));
+
+        let result = tracker.submit_quality_result(
+            7,
+            "quality",
+            vec![seg("correct", Some(0.9))],
+            20,
+        );
+        assert!(
+            matches!(result, Err(FwError::InvalidRequest(message)) if message.contains("WER tolerance")),
+            "non-finite tolerance must fail closed"
+        );
+        assert_eq!(tracker.stats().windows_processed, 0);
+        assert_eq!(tracker.stats().corrections_emitted, 0);
+        assert_eq!(tracker.stats().confirmations_emitted, 0);
+        assert!(
+            tracker
+                .get_partial(0)
+                .is_some_and(|partial| partial.status == PartialStatus::Pending),
+            "failed validation must leave the partial unresolved"
+        );
     }
 
     #[test]

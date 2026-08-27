@@ -69,9 +69,11 @@ impl SpeculativeConfig {
     /// # Errors
     ///
     /// Returns [`FwError::InvalidRequest`] when the window is empty or its
-    /// overlap would leave no positive step between consecutive windows.
+    /// overlap would leave no positive step between consecutive windows, or
+    /// when the WER correction tolerance is not a finite value in `0..=1`.
     pub fn validate(&self) -> FwResult<()> {
-        Self::validate_window_geometry(self.window_size_ms, self.overlap_ms)
+        Self::validate_window_geometry(self.window_size_ms, self.overlap_ms)?;
+        self.tolerance.validate()
     }
 }
 
@@ -1612,6 +1614,53 @@ mod tests {
         );
         assert_eq!(pipeline.window_manager().windows_pending(), 0);
         assert_eq!(pipeline.window_manager().windows_resolved(), 0);
+    }
+
+    #[test]
+    fn invalid_wer_tolerances_are_rejected_before_model_callback() {
+        for max_wer in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let config = SpeculativeConfig {
+                tolerance: CorrectionTolerance {
+                    max_wer,
+                    ..CorrectionTolerance::default()
+                },
+                ..SpeculativeConfig::default()
+            };
+            let mut pipeline =
+                SpeculativeStreamingPipeline::new(config, "test-invalid-wer".to_owned());
+            let mut callback_count = 0;
+
+            let result = pipeline.process_duration_with_models_no_checkpoint(
+                3_000,
+                "seed",
+                |_start, _end| {
+                    callback_count += 1;
+                    Ok((Vec::new(), Vec::new()))
+                },
+            );
+            assert!(
+                matches!(result, Err(FwError::InvalidRequest(message)) if message.contains("WER tolerance")),
+                "invalid WER tolerance {max_wer} must fail closed"
+            );
+            assert_eq!(
+                callback_count, 0,
+                "invalid WER tolerance {max_wer} must not run models"
+            );
+        }
+    }
+
+    #[test]
+    fn wer_tolerance_unit_interval_boundaries_are_valid() {
+        for max_wer in [0.0, 1.0] {
+            let config = SpeculativeConfig {
+                tolerance: CorrectionTolerance {
+                    max_wer,
+                    ..CorrectionTolerance::default()
+                },
+                ..SpeculativeConfig::default()
+            };
+            assert!(config.validate().is_ok(), "boundary {max_wer} is valid");
+        }
     }
 
     #[test]

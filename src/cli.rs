@@ -2230,6 +2230,9 @@ impl TranscribeArgs {
                 "--speculative-overlap-ms ({overlap_ms}) must be less than --speculative-window-ms ({window_size_ms})"
             )));
         }
+        if let Some(max_wer) = self.correction_tolerance_wer {
+            crate::speculation::CorrectionTolerance::validate_max_wer(max_wer)?;
+        }
         Ok(Some((window_size_ms, overlap_ms)))
     }
 
@@ -3944,6 +3947,44 @@ mod tests {
             .expect("geometry should be valid")
             .expect("should build config");
         assert!((config.tolerance.max_wer - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn speculative_config_and_request_reject_invalid_wer_tolerances() {
+        for max_wer in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let mut args = minimal_args();
+            args.speculative = true;
+            args.correction_tolerance_wer = Some(max_wer);
+
+            assert!(
+                matches!(args.to_speculative_config(), Err(FwError::InvalidRequest(message)) if message.contains("WER tolerance")),
+                "config must reject invalid WER tolerance {max_wer}"
+            );
+            assert!(
+                matches!(args.to_speculative_request(), Err(FwError::InvalidRequest(message)) if message.contains("WER tolerance")),
+                "request must reject invalid WER tolerance {max_wer}"
+            );
+        }
+    }
+
+    #[test]
+    fn speculative_config_accepts_wer_tolerance_boundaries() {
+        for max_wer in [0.0, 1.0] {
+            let mut args = minimal_args();
+            args.speculative = true;
+            args.correction_tolerance_wer = Some(max_wer);
+
+            let config = args
+                .to_speculative_config()
+                .expect("boundary tolerance should be valid")
+                .expect("speculative config");
+            let request = args
+                .to_speculative_request()
+                .expect("boundary tolerance should be valid")
+                .expect("speculative request");
+            assert_eq!(config.tolerance.max_wer, max_wer);
+            assert_eq!(request.max_wer_tolerance, Some(max_wer));
+        }
     }
 
     #[test]
