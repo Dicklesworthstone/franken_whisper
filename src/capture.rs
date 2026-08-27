@@ -891,7 +891,16 @@ impl PipePcmSource {
                         break; // stop() requested
                     }
                     match std::io::Read::read(&mut reader, &mut raw) {
-                        Ok(0) => break, // EOF
+                        Ok(0) => {
+                            let trailing_bytes = carry.len() + pending.len() * bps;
+                            if trailing_bytes > 0 {
+                                shared_reader.record_error(format!(
+                                    "pipe capture ended with incomplete PCM frame: {trailing_bytes} trailing byte(s); expected a multiple of {} bytes for {channels} channel(s) of {format:?}",
+                                    bps * ch
+                                ));
+                            }
+                            break;
+                        }
                         Err(error) => {
                             if error.kind() != std::io::ErrorKind::Interrupted {
                                 shared_reader
@@ -2076,6 +2085,56 @@ mod tests {
         assert_eq!(got.len(), 200);
         let expected: Vec<f32> = values.iter().map(|&v| f32::from(v) / 32_768.0).collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn pipe_rejects_truncated_samples_and_frames_at_eof() {
+        let cases = [
+            ("partial s16le sample", PcmFormat::S16le, 1, vec![0]),
+            (
+                "partial f32le sample",
+                PcmFormat::F32le,
+                1,
+                vec![0, 0, 0],
+            ),
+            (
+                "partial stereo frame",
+                PcmFormat::S16le,
+                2,
+                1_i16.to_le_bytes().to_vec(),
+            ),
+        ];
+
+        for (name, format, channels, bytes) in cases {
+            let trailing_bytes = bytes.len();
+            let reader = ChunkedReader {
+                data: bytes,
+                pos: 0,
+                sizes: vec![1],
+                call: 0,
+            };
+            let mut source =
+                PipePcmSource::from_reader(reader, format, 16_000, channels, 1.0).unwrap();
+            let mut out = [0.0f32; 4];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let error = loop {
+                match source.read(&mut out, Duration::from_millis(50)) {
+                    Ok(read) => assert!(
+                        !read.ended,
+                        "{name} was silently accepted as clean end-of-stream"
+                    ),
+                    Err(error) => break error,
+                }
+                assert!(Instant::now() < deadline, "{name} did not surface an error");
+            };
+            assert_eq!(error.error_code(), "FW-IO");
+            let message = error.to_string();
+            assert!(message.contains("incomplete PCM frame"), "{name}: {message}");
+            assert!(
+                message.contains(&format!("{trailing_bytes} trailing byte")),
+                "{name}: {message}"
+            );
+        }
     }
 
     #[test]
