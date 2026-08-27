@@ -32,6 +32,7 @@ const NUM_UNITS: usize = 128;
 
 use crate::error::{FwError, FwResult};
 use crate::native_engine::nn::{LstmState, LstmWeights};
+use crate::native_engine::weights::SafetensorsFile;
 use crate::native_engine::{Mat, nn};
 
 pub const BLOCK_LEN: usize = 512;
@@ -110,7 +111,7 @@ impl DtlnSeparator {
     /// compile-time contract; finiteness is checked per tensor.
     pub fn from_safetensors(path: &std::path::Path) -> FwResult<Self> {
         let raw = std::fs::read(path)?;
-        let tensors = parse_safetensors_f32(&raw)?;
+        let tensors = parse_safetensors_f32(raw)?;
         let get = |name: &str| -> FwResult<&SafeTensor> {
             tensors
                 .get(name)
@@ -328,77 +329,18 @@ struct SafeTensor {
     data: Vec<f32>,
 }
 
-fn parse_safetensors_f32(raw: &[u8]) -> FwResult<std::collections::BTreeMap<String, SafeTensor>> {
-    if raw.len() < 8 {
-        return Err(FwError::InvalidRequest(
-            "safetensors: truncated header".into(),
-        ));
-    }
-    let header_len = u64::from_le_bytes(raw[..8].try_into().expect("8 bytes")) as usize;
-    let header_end = 8usize
-        .checked_add(header_len)
-        .ok_or_else(|| FwError::InvalidRequest("safetensors: header length overflow".into()))?;
-    if header_end > raw.len() {
-        return Err(FwError::InvalidRequest(
-            "safetensors: header exceeds file".into(),
-        ));
-    }
-    let header: std::collections::BTreeMap<String, serde_json::Value> =
-        serde_json::from_slice(&raw[8..header_end])
-            .map_err(|e| FwError::InvalidRequest(format!("safetensors: bad header json: {e}")))?;
+fn parse_safetensors_f32(raw: Vec<u8>) -> FwResult<std::collections::BTreeMap<String, SafeTensor>> {
+    let file = SafetensorsFile::from_owned_bytes(raw)?;
     let mut out = std::collections::BTreeMap::new();
-    for (name, entry) in header {
-        if name == "__metadata__" {
-            continue;
-        }
-        let dtype = entry
-            .get("dtype")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
+    for name in file.names() {
+        let dtype = file.dtype_name(name)?;
         if dtype != "F32" {
             return Err(FwError::InvalidRequest(format!(
                 "safetensors: {name} dtype {dtype} != F32"
             )));
         }
-        let shape: Vec<usize> = entry
-            .get("shape")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_u64().map(|v| v as usize))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let offsets = entry
-            .get("data_offsets")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| FwError::InvalidRequest("safetensors: missing offsets".into()))?;
-        let start = offsets
-            .first()
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
-        let end = offsets
-            .get(1)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
-        if end < start || header_end + end > raw.len() {
-            return Err(FwError::InvalidRequest(format!(
-                "safetensors: {name} data range out of file"
-            )));
-        }
-        let bytes = &raw[header_end + start..header_end + end];
-        if !bytes.len().is_multiple_of(4) {
-            return Err(FwError::InvalidRequest(format!(
-                "safetensors: {name} byte length not f32-aligned"
-            )));
-        }
-        let data = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&chunk| f32::from_le_bytes(chunk))
-            .collect();
-        out.insert(name, SafeTensor { shape, data });
+        let (shape, data) = file.tensor_f32(name)?;
+        out.insert(name.to_owned(), SafeTensor { shape, data });
     }
     Ok(out)
 }
@@ -507,6 +449,42 @@ mod tests {
         bytes
     }
 
+    fn rewrite_contract_header(
+        bytes: &[u8],
+        mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> Vec<u8> {
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().expect("fixture header prefix"));
+        let header_len = usize::try_from(header_len).expect("fixture header length");
+        let body = &bytes[8 + header_len..];
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&bytes[8..8 + header_len]).expect("fixture header JSON");
+        mutate(header.as_object_mut().expect("fixture header object"));
+
+        let mut header_bytes = serde_json::to_vec(&header).expect("rewritten fixture header");
+        while !header_bytes.len().is_multiple_of(8) {
+            header_bytes.push(b' ');
+        }
+        let mut rewritten = u64::try_from(header_bytes.len())
+            .expect("rewritten fixture header length")
+            .to_le_bytes()
+            .to_vec();
+        rewritten.extend_from_slice(&header_bytes);
+        rewritten.extend_from_slice(body);
+        rewritten
+    }
+
+    fn assert_invalid_safetensors(bytes: &[u8], expected_detail: &str) {
+        let error = match parse_safetensors_f32(bytes.to_vec()) {
+            Ok(_) => panic!("malformed safetensors metadata was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.error_code(), "FW-INVALID-REQUEST");
+        assert!(
+            error.to_string().contains(expected_detail),
+            "expected `{expected_detail}` in `{error}`"
+        );
+    }
+
     fn write_and_load(bytes: &[u8], tag: &str) -> DtlnSeparator {
         let dir = std::env::temp_dir().join(format!("dtln_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmpdir");
@@ -518,11 +496,11 @@ mod tests {
     #[test]
     fn loader_rejects_missing_and_mistyped_entries() {
         let good = contract_fixture_bytes(0.0, false);
-        let parsed = parse_safetensors_f32(&good).expect("parses");
+        let parsed = parse_safetensors_f32(good.clone()).expect("parses");
         assert!(parsed.contains_key("s1.mask.bias"));
         let bad = String::from_utf8_lossy(&good).replacen("F32", "F16", 1);
-        assert!(parse_safetensors_f32(bad.as_bytes()).is_err());
-        assert!(parse_safetensors_f32(&good[..good.len() - 9]).is_err());
+        assert!(parse_safetensors_f32(bad.into_bytes()).is_err());
+        assert!(parse_safetensors_f32(good[..good.len() - 9].to_vec()).is_err());
         // Shape-contract enforcement through the public loader.
         let dir = std::env::temp_dir().join(format!("dtln_bad_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmpdir");
@@ -535,6 +513,74 @@ mod tests {
             DtlnSeparator::from_safetensors(&path).is_err(),
             "shape contract must fail closed"
         );
+    }
+
+    #[test]
+    fn loader_rejects_non_integer_shape_dimensions_instead_of_dropping_them() {
+        let malformed = rewrite_contract_header(&contract_fixture_bytes(0.0, false), |header| {
+            let tensor = header
+                .get_mut("s1.mask.bias")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("mask bias tensor");
+            tensor.insert("shape".to_owned(), serde_json::json!([257, "extra"]));
+        });
+        assert_invalid_safetensors(&malformed, "shape dimension");
+    }
+
+    #[test]
+    fn loader_rejects_malformed_and_overflowing_data_offsets() {
+        let fixture = contract_fixture_bytes(0.0, false);
+
+        let wrong_arity = rewrite_contract_header(&fixture, |header| {
+            let tensor = header
+                .get_mut("s1.mask.bias")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("mask bias tensor");
+            tensor.insert("data_offsets".to_owned(), serde_json::json!([0]));
+        });
+        assert_invalid_safetensors(&wrong_arity, "exactly 2 elements");
+
+        let wrong_type = rewrite_contract_header(&fixture, |header| {
+            let offsets = header
+                .get_mut("s1.mask.bias")
+                .and_then(|tensor| tensor.get_mut("data_offsets"))
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("mask bias offsets");
+            offsets[0] = serde_json::json!("not-an-offset");
+        });
+        assert_invalid_safetensors(&wrong_type, "data_offsets begin");
+
+        let descending = rewrite_contract_header(&fixture, |header| {
+            let tensor = header
+                .get_mut("s1.mask.bias")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("mask bias tensor");
+            tensor.insert("data_offsets".to_owned(), serde_json::json!([1, 0]));
+        });
+        assert_invalid_safetensors(&descending, "data_offsets begin");
+
+        let overflowing = rewrite_contract_header(&fixture, |header| {
+            let tensor = header
+                .get_mut("s1.mask.bias")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("mask bias tensor");
+            tensor.insert("data_offsets".to_owned(), serde_json::json!([0, u64::MAX]));
+        });
+        assert_invalid_safetensors(&overflowing, "offset");
+    }
+
+    #[test]
+    fn loader_rejects_tensor_byte_count_that_disagrees_with_shape() {
+        let malformed = rewrite_contract_header(&contract_fixture_bytes(0.0, false), |header| {
+            let offsets = header
+                .get_mut("s1.mask.bias")
+                .and_then(|tensor| tensor.get_mut("data_offsets"))
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("mask bias offsets");
+            let start = offsets[0].clone();
+            offsets[1] = start;
+        });
+        assert_invalid_safetensors(&malformed, "byte span");
     }
 
     #[test]
