@@ -1559,6 +1559,61 @@ fn validate_finite_aggregate(aggregate: &ConfidentialEvaluationAggregate) -> FwR
         )
         && words.micro_word_diarization_error_rate
             == word_errors.and_then(|errors| ratio(errors as f64, words.scored_word_count as f64));
+    let expected_change_precision = ratio(
+        aggregate.change_points.matched_count as f64,
+        aggregate.change_points.hypothesis_count as f64,
+    );
+    let expected_change_recall = ratio(
+        aggregate.change_points.matched_count as f64,
+        aggregate.change_points.reference_count as f64,
+    );
+    let expected_overlap_precision = ratio(
+        aggregate.overlap.true_positive_sec,
+        aggregate.overlap.true_positive_sec + aggregate.overlap.false_positive_sec,
+    );
+    let expected_overlap_recall = ratio(
+        aggregate.overlap.true_positive_sec,
+        aggregate.overlap.true_positive_sec + aggregate.overlap.false_negative_sec,
+    );
+    let derived_metrics_are_consistent = aggregate.diarization.micro_der
+        == ratio(
+            aggregate.diarization.missed_speech_sec
+                + aggregate.diarization.false_alarm_sec
+                + aggregate.diarization.speaker_confusion_sec,
+            aggregate.diarization.reference_speaker_time_sec,
+        )
+        && aggregate.change_points.precision == expected_change_precision
+        && aggregate.change_points.recall == expected_change_recall
+        && aggregate.change_points.f1 == f1(expected_change_precision, expected_change_recall)
+        && aggregate.speaker_count.exact_rate
+            == ratio(
+                aggregate.speaker_count.exact_recordings as f64,
+                aggregate.recording_count as f64,
+            )
+        && aggregate.speaker_count_posterior.top_k_coverage
+            == ratio(
+                aggregate.speaker_count_posterior.top_k_hit_count as f64,
+                aggregate.speaker_count_posterior.top_k_observation_count as f64,
+            )
+        && aggregate.speaker_count_posterior.credible_set_coverage
+            == ratio(
+                aggregate.speaker_count_posterior.credible_set_hit_count as f64,
+                aggregate
+                    .speaker_count_posterior
+                    .credible_set_observation_count as f64,
+            )
+        && aggregate.overlap.precision == expected_overlap_precision
+        && aggregate.overlap.recall == expected_overlap_recall
+        && aggregate.overlap.f1 == f1(expected_overlap_precision, expected_overlap_recall)
+        && aggregate.calibration.coverage
+            == ratio(
+                aggregate.calibration.observed_duration_sec,
+                aggregate.calibration.opportunity_duration_sec,
+            )
+        && aggregate.performance.as_ref().is_none_or(|performance| {
+            performance.real_time_factor
+                == ratio(performance.wall_time_sec, performance.audio_duration_sec)
+        });
     let durations_are_consistent = required.iter().all(|value| *value >= 0.0)
         && aggregate.calibration.observed_duration_sec
             <= aggregate.calibration.opportunity_duration_sec;
@@ -1576,6 +1631,7 @@ fn validate_finite_aggregate(aggregate: &ConfidentialEvaluationAggregate) -> FwR
         && posterior_counts_are_consistent
         && occupancy_is_consistent
         && words_are_consistent
+        && derived_metrics_are_consistent
         && durations_are_consistent
         && performance_finite
         && aggregate.performance.as_ref().is_none_or(|performance| {
@@ -1635,10 +1691,18 @@ mod tests {
 
     use super::{
         CONFIDENTIAL_EVALUATION_AGGREGATE_SCHEMA_VERSION,
-        CONFIDENTIAL_EVALUATION_MANIFEST_SCHEMA_VERSION, canonical_sha256,
-        run_confidential_evaluation, run_confidential_evaluation_with_cancel,
+        CONFIDENTIAL_EVALUATION_MANIFEST_SCHEMA_VERSION, ConfidentialEvaluationAggregate,
+        canonical_sha256, run_confidential_evaluation, run_confidential_evaluation_with_cancel,
         verify_confidential_evaluation_aggregate,
     };
+
+    fn rehash_for_test(
+        mut aggregate: ConfidentialEvaluationAggregate,
+    ) -> ConfidentialEvaluationAggregate {
+        aggregate.result_sha256.clear();
+        aggregate.result_sha256 = canonical_sha256(&aggregate).expect("recompute aggregate hash");
+        aggregate
+    }
 
     fn speaker_count_estimate() -> SpeakerCountEstimate {
         let posterior = vec![
@@ -1882,6 +1946,101 @@ mod tests {
                 .to_string()
                 .contains("aggregate_semantics")
         );
+    }
+
+    #[test]
+    fn rehashed_derived_metric_forgeries_fail_semantic_verification() {
+        let project = tempdir().expect("project");
+        let input = tempdir().expect("input");
+        let output = tempdir().expect("output");
+        let manifest = input.path().join("PRIVATE_MANIFEST_SENTINEL.json");
+        write_fixture(input.path(), &manifest, None);
+        let aggregate = run_confidential_evaluation(
+            project.path(),
+            input.path(),
+            &manifest,
+            &output.path().join("aggregate.json"),
+        )
+        .expect("aggregate");
+        verify_confidential_evaluation_aggregate(&aggregate).expect("writer aggregate verifies");
+
+        let forgeries = [
+            ("micro DER", {
+                let mut forged = aggregate.clone();
+                forged.diarization.micro_der = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("change precision", {
+                let mut forged = aggregate.clone();
+                forged.change_points.precision = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("change recall", {
+                let mut forged = aggregate.clone();
+                forged.change_points.recall = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("change F1", {
+                let mut forged = aggregate.clone();
+                forged.change_points.f1 = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("exact count rate", {
+                let mut forged = aggregate.clone();
+                forged.speaker_count.exact_rate = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("top-k coverage", {
+                let mut forged = aggregate.clone();
+                forged.speaker_count_posterior.top_k_coverage = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("credible-set coverage", {
+                let mut forged = aggregate.clone();
+                forged.speaker_count_posterior.credible_set_coverage = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("overlap precision", {
+                let mut forged = aggregate.clone();
+                forged.overlap.precision = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("overlap recall", {
+                let mut forged = aggregate.clone();
+                forged.overlap.recall = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("overlap F1", {
+                let mut forged = aggregate.clone();
+                forged.overlap.f1 = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("calibration coverage", {
+                let mut forged = aggregate.clone();
+                forged.calibration.coverage = Some(0.5);
+                rehash_for_test(forged)
+            }),
+            ("performance RTF", {
+                let mut forged = aggregate.clone();
+                forged
+                    .performance
+                    .as_mut()
+                    .expect("fixture performance")
+                    .real_time_factor = Some(0.25);
+                rehash_for_test(forged)
+            }),
+        ];
+
+        for (name, forged) in forgeries {
+            let error = match verify_confidential_evaluation_aggregate(&forged) {
+                Ok(()) => panic!("rehashed {name} forgery must fail"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("aggregate_semantics"),
+                "rehashed {name} forgery returned {error}"
+            );
+        }
     }
 
     #[test]
