@@ -348,6 +348,7 @@ fn is_sensitive_flag(flag: &str) -> bool {
             | "--auth_token"
             | "--password"
             | "--pass"
+            | "--prompt"
             | "--secret"
             | "--secret-key"
             | "--secret_key"
@@ -2417,6 +2418,7 @@ mod tests {
             "--hf-token".to_owned(),
             "hf_secret_123".to_owned(),
             "--api-key=secret_api_key".to_owned(),
+            "--prompt=private patient context".to_owned(),
             "--token-threshold".to_owned(),
             "0.1".to_owned(),
             "positional".to_owned(),
@@ -2424,6 +2426,7 @@ mod tests {
         let rendered = render_command_for_log("prog", &args);
         assert!(rendered.contains("--hf-token ***"));
         assert!(rendered.contains("--api-key=***"));
+        assert!(rendered.contains("--prompt=***"));
         assert!(rendered.contains("--token-threshold 0.1"));
         assert!(rendered.contains("positional"));
         assert!(
@@ -2434,9 +2437,13 @@ mod tests {
             !rendered.contains("secret_api_key"),
             "api key should be redacted"
         );
+        assert!(
+            !rendered.contains("private patient context"),
+            "prompt text should be redacted"
+        );
         assert_eq!(
             rendered,
-            "prog --hf-token *** --api-key=*** --token-threshold 0.1 positional"
+            "prog --hf-token *** --api-key=*** --prompt=*** --token-threshold 0.1 positional"
         );
         assert_eq!(render_command_for_log("prog", &[]), "prog");
     }
@@ -2568,6 +2575,27 @@ mod tests {
         );
         assert!(!text.contains(hf_secret), "HF token leaked: {text}");
         assert!(!text.contains(api_secret), "API key leaked: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_child_stderr_redacts_whisper_prompt_text() {
+        let prompt = "patient Jane Doe; access phrase blue orchard";
+        let args = vec![
+            "-c".to_owned(),
+            "printf 'whisper-context:%s:%s\n' \"$1\" \"$2\" >&2; exit 9".to_owned(),
+            "fw-prompt-probe".to_owned(),
+            "--prompt".to_owned(),
+            prompt.to_owned(),
+        ];
+
+        let error = run_command("sh", &args, None).expect_err("fixture must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("whisper-context:--prompt:***"),
+            "benign prompt context was lost: {text}"
+        );
+        assert!(!text.contains(prompt), "Whisper prompt leaked: {text}");
     }
 
     #[cfg(unix)]
