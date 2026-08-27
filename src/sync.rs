@@ -3265,18 +3265,33 @@ struct EventValidationRow {
 /// `.gz` variant is preferred when both exist). All database reads share one
 /// read transaction so a concurrent writer cannot produce a torn comparison.
 pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidationReport> {
+    validate_sync_with_after_run_ids(db_path, jsonl_dir, || Ok(()))
+}
+
+fn validate_sync_with_after_run_ids<F>(
+    db_path: &Path,
+    jsonl_dir: &Path,
+    after_run_ids: F,
+) -> FwResult<SyncValidationReport>
+where
+    F: FnOnce() -> FwResult<()>,
+{
     let connection = Connection::open(db_path.display().to_string())
         .map_err(|error| FwError::Storage(error.to_string()))?;
     with_read_snapshot(&connection, || {
-        validate_sync_snapshot(&connection, jsonl_dir)
+        validate_sync_snapshot(&connection, jsonl_dir, after_run_ids)
     })
 }
 
-fn validate_sync_snapshot(
+fn validate_sync_snapshot<F>(
     connection: &Connection,
     jsonl_dir: &Path,
-) -> FwResult<SyncValidationReport> {
-    verify_schema_exists(&connection)?;
+    after_run_ids: F,
+) -> FwResult<SyncValidationReport>
+where
+    F: FnOnce() -> FwResult<()>,
+{
+    verify_schema_exists(connection)?;
 
     // --- Collect DB run IDs ---
     let db_run_rows = connection
@@ -3286,6 +3301,7 @@ fn validate_sync_snapshot(
         .iter()
         .map(|row| value_to_string_sqlite(row.get(0)))
         .collect();
+    after_run_ids()?;
 
     // --- Collect child rows from this same DB snapshot ---
     let db_segment_map = load_db_segment_map(connection)?;
@@ -3298,8 +3314,7 @@ fn validate_sync_snapshot(
     // `load_jsonl_run_map` later. Load the map once and derive the id set from its
     // keys: both include exactly the lines with a string `id` (skipping empty lines,
     // parsing every line), so `map.keys()` == `collect_jsonl_ids(runs, "id")` and the
-    // parse-error behavior is identical (runs.jsonl is the only JSON-parsed file;
-    // segments/events use `count_jsonl_lines`, which does not parse).
+    // parse-error behavior is identical.
     let runs_path = resolve_jsonl_path(jsonl_dir, "runs");
     let jsonl_run_map = load_jsonl_run_map(&runs_path)?;
     let jsonl_run_ids: HashSet<String> = jsonl_run_map.keys().cloned().collect();
@@ -3395,7 +3410,6 @@ fn validate_sync_snapshot(
         &db_segment_map,
         &jsonl_segment_map,
         "segments",
-        &mut mismatched_run_ids,
         &mut child_mismatches,
         &mut child_mismatches_truncated,
     );
@@ -3403,13 +3417,12 @@ fn validate_sync_snapshot(
         &db_event_map,
         &jsonl_event_map,
         "events",
-        &mut mismatched_run_ids,
         &mut child_mismatches,
         &mut child_mismatches_truncated,
     );
 
-    // Keep diagnostics at aggregate granularity: one entry per affected run,
-    // even when many of its child rows differ.
+    // Parent-row mismatches retain the existing run-ID diagnostic contract;
+    // child-row diagnostics are structured and bounded separately.
     let mut mismatched_records: Vec<String> = mismatched_run_ids.into_iter().collect();
     mismatched_records.sort();
 
@@ -3566,7 +3579,6 @@ fn collect_child_mismatches<T: PartialEq>(
     db_rows: &HashMap<ChildValidationKey, T>,
     jsonl_rows: &HashMap<ChildValidationKey, T>,
     table: &str,
-    mismatched_run_ids: &mut HashSet<String>,
     diagnostics: &mut Vec<SyncConflict>,
     diagnostics_truncated: &mut bool,
 ) {
@@ -3585,7 +3597,6 @@ fn collect_child_mismatches<T: PartialEq>(
             (None, Some(_)) => "missing from database",
             (None, None) => continue,
         };
-        mismatched_run_ids.insert(run_id.clone());
         if diagnostics.len() < MAX_SYNC_VALIDATION_CHILD_MISMATCHES {
             diagnostics.push(SyncConflict {
                 table: table.to_owned(),
@@ -3689,6 +3700,7 @@ fn resolve_jsonl_path(dir: &Path, stem: &str) -> PathBuf {
 }
 
 /// Count the rows in a table via `SELECT COUNT(*)`.
+#[cfg(test)]
 fn count_table(connection: &Connection, table: &str) -> FwResult<u64> {
     let table_ident = sql_ident_sync(table);
     let sql = format!("SELECT COUNT(*) FROM {table_ident}");
@@ -3732,6 +3744,7 @@ fn collect_jsonl_ids(path: &Path, key: &str) -> FwResult<HashSet<String>> {
 }
 
 /// Count non-empty lines in a JSONL file.
+#[cfg(test)]
 fn count_jsonl_lines(path: &Path) -> FwResult<u64> {
     if !path.exists() {
         return Ok(0);
@@ -10894,14 +10907,60 @@ mod tests {
         assert_eq!(validation.jsonl_segment_count, segment_count as u64);
         assert_eq!(validation.db_event_count, event_count as u64);
         assert_eq!(validation.jsonl_event_count, event_count as u64);
-        assert_eq!(validation.mismatched_records, vec!["child-content"]);
+        assert!(validation.mismatched_records.is_empty());
         assert!(validation.child_mismatches.iter().any(|mismatch| {
-            mismatch.table == "segments" && mismatch.reason == "payload differs"
+            mismatch.table == "segments"
+                && mismatch.key == "child-content/0"
+                && mismatch.reason == "payload differs"
         }));
         assert!(validation.child_mismatches.iter().any(|mismatch| {
-            mismatch.table == "events" && mismatch.reason == "payload differs"
+            mismatch.table == "events"
+                && mismatch.key == "child-content/1"
+                && mismatch.reason == "payload differs"
         }));
         assert!(!validation.child_mismatches_truncated);
+    }
+
+    #[test]
+    fn validate_sync_distinguishes_null_child_fields_from_empty_and_zero() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-child-null.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("child-null", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+
+        let segments_path = export_dir.join("segments.jsonl");
+        let mut rows = fs::read_to_string(&segments_path)
+            .expect("read segments")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("segment row"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows[1]["speaker"], serde_json::Value::Null);
+        assert_eq!(rows[1]["confidence"], serde_json::Value::Null);
+        rows[1]["speaker"] = json!("");
+        rows[1]["confidence"] = json!(0.0);
+        fs::write(
+            &segments_path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).expect("serialize segment"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write segments");
+
+        let validation = validate_sync(&db_path, &export_dir).expect("validate null mutation");
+        assert!(!validation.is_valid);
+        assert!(validation.child_mismatches.iter().any(|mismatch| {
+            mismatch.table == "segments"
+                && mismatch.key == "child-null/1"
+                && mismatch.reason == "payload differs"
+        }));
     }
 
     #[test]
@@ -10978,6 +11037,48 @@ mod tests {
     }
 
     #[test]
+    fn validate_sync_reads_one_database_snapshot_during_concurrent_commit() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-snapshot.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("snapshot-run", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+        let writer = Connection::open(db_path.display().to_string()).expect("writer open");
+
+        let during_commit = validate_sync_with_after_run_ids(&db_path, &export_dir, || {
+            writer
+                .execute(
+                    "UPDATE segments SET text = 'committed after snapshot' \
+                     WHERE run_id = 'snapshot-run' AND idx = 0",
+                )
+                .expect("concurrent WAL commit");
+            Ok(())
+        })
+        .expect("validate pinned snapshot");
+        assert!(
+            during_commit.is_valid,
+            "validation must compare the pre-commit snapshot consistently"
+        );
+
+        let after_commit = validate_sync(&db_path, &export_dir).expect("validate committed state");
+        assert!(
+            !after_commit.is_valid,
+            "a later validation must observe the committed child mutation"
+        );
+        assert!(
+            after_commit
+                .child_mismatches
+                .iter()
+                .any(|mismatch| mismatch.table == "segments")
+        );
+    }
+
+    #[test]
     fn child_mismatch_diagnostics_are_bounded_without_hiding_invalidity() {
         let db_rows = (0..=MAX_SYNC_VALIDATION_CHILD_MISMATCHES)
             .map(|idx| {
@@ -10994,7 +11095,6 @@ mod tests {
             })
             .collect::<HashMap<_, _>>();
         let jsonl_rows = HashMap::new();
-        let mut run_ids = HashSet::new();
         let mut diagnostics = Vec::new();
         let mut truncated = false;
 
@@ -11002,13 +11102,11 @@ mod tests {
             &db_rows,
             &jsonl_rows,
             "events",
-            &mut run_ids,
             &mut diagnostics,
             &mut truncated,
         );
 
         assert_eq!(diagnostics.len(), MAX_SYNC_VALIDATION_CHILD_MISMATCHES);
-        assert_eq!(run_ids.len(), MAX_SYNC_VALIDATION_CHILD_MISMATCHES + 1);
         assert!(truncated);
     }
 
