@@ -11128,7 +11128,21 @@ mod tests {
         .expect("write duplicate segments");
         let duplicate = validate_sync(&db_path, &export_dir)
             .expect_err("duplicate child key must fail closed");
-        assert!(duplicate.to_string().contains("duplicate composite key"));
+        let duplicate_message = duplicate.to_string();
+        assert!(duplicate_message.contains("duplicate composite key"));
+        assert!(duplicate_message.contains("child-shape/0"));
+
+        fs::write(&segments_path, &original).expect("restore segments");
+        let events_path = export_dir.join("events.jsonl");
+        let events = fs::read_to_string(&events_path).expect("read events");
+        let first_event = events.lines().next().expect("fixture has event");
+        fs::write(&events_path, format!("{first_event}\n{first_event}\n"))
+            .expect("write duplicate events");
+        let duplicate_event = validate_sync(&db_path, &export_dir)
+            .expect_err("duplicate event key must fail closed");
+        let duplicate_event_message = duplicate_event.to_string();
+        assert!(duplicate_event_message.contains("duplicate composite key"));
+        assert!(duplicate_event_message.contains("child-shape/1"));
     }
 
     #[test]
@@ -11248,6 +11262,65 @@ mod tests {
         assert_eq!(validation.jsonl_segment_count, 0);
         assert_eq!(validation.db_event_count, 0);
         assert_eq!(validation.jsonl_event_count, 0);
+    }
+
+    #[test]
+    fn validate_sync_requires_all_canonical_jsonl_inputs() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validation-inputs.sqlite3");
+        let _store = RunStore::open(&db_path).expect("store open");
+
+        for missing_stem in ["runs", "segments", "events"] {
+            let export_dir = dir.path().join(format!("missing-{missing_stem}"));
+            fs::create_dir_all(&export_dir).expect("create incomplete export");
+            for present_stem in ["runs", "segments", "events"] {
+                if present_stem != missing_stem {
+                    fs::write(export_dir.join(format!("{present_stem}.jsonl")), "")
+                        .expect("write empty canonical input");
+                }
+            }
+
+            let error = validate_sync(&db_path, &export_dir)
+                .expect_err("incomplete validation input must fail closed");
+            let message = error.to_string();
+            assert!(
+                message.contains("missing sync validation input"),
+                "unexpected missing-input error: {message}"
+            );
+            assert!(
+                message.contains(&format!("{missing_stem}.jsonl")),
+                "missing-input error omitted logical file: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_sync_rejects_same_and_different_duplicate_run_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("duplicate-runs.sqlite3");
+        let _store = RunStore::open(&db_path).expect("store open");
+        let first = json!({"id": "duplicate-run", "marker": "first"});
+
+        for (case, second) in [
+            ("same", first.clone()),
+            (
+                "different",
+                json!({"id": "duplicate-run", "marker": "second"}),
+            ),
+        ] {
+            let export_dir = dir.path().join(format!("duplicate-{case}"));
+            write_jsonl_snapshot(&export_dir, &[first.clone(), second], &[], &[]);
+
+            let error = validate_sync(&db_path, &export_dir)
+                .expect_err("duplicate run IDs must fail before comparison");
+            let message = error.to_string();
+            assert!(
+                message.contains("duplicate run id")
+                    && message.contains("duplicate-run")
+                    && message.contains("line 2"),
+                "unexpected duplicate-run error: {message}"
+            );
+        }
     }
 
     #[test]
@@ -13657,7 +13730,7 @@ mod tests {
     }
 
     #[test]
-    fn load_jsonl_run_map_duplicate_id_last_entry_wins() {
+    fn load_jsonl_run_map_duplicate_id_is_rejected() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("dup.jsonl");
         let content = [
@@ -13668,14 +13741,11 @@ mod tests {
         .join("\n");
         fs::write(&path, content).expect("write");
 
-        let map = load_jsonl_run_map(&path).expect("load");
-        assert_eq!(map.len(), 2, "should have 2 unique IDs");
-        assert_eq!(
-            map["dup-1"]["version"].as_str(),
-            Some("second"),
-            "last entry with same id should overwrite earlier"
-        );
-        assert_eq!(map["dup-2"]["version"].as_str(), Some("only"));
+        let error = load_jsonl_run_map(&path).expect_err("duplicate run ID must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("duplicate run id"));
+        assert!(message.contains("dup-1"));
+        assert!(message.contains("line 2"));
     }
 
     #[test]
