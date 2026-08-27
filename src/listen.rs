@@ -732,6 +732,169 @@ pub struct ListenConfig {
     pub db_path: std::path::PathBuf,
 }
 
+/// Rolling buffers are a latency/backpressure tool, not session retention.
+/// Five minutes is already ten times the CLI capture default and keeps a bad
+/// agent-supplied value from becoming an unbounded allocation request.
+const MAX_LIVE_BUFFER_SEC: f64 = 300.0;
+const MAX_LISTEN_STEP_MS: u64 = 60_000;
+const MAX_LIVE_BUFFER_MS: u64 = MAX_LIVE_BUFFER_SEC as u64 * 1_000;
+const MAX_CONFIRM_QUEUE_BOUND: usize = 64;
+/// A quality-lane drain is deliberately bounded. Larger waits turn terminal
+/// cleanup into an operational hang and can exceed platform `Instant` ranges.
+const MAX_CONFIRM_DRAIN_SEC: f64 = 3_600.0;
+
+fn invalid_listen_config(field: &str, requirement: &str) -> FwError {
+    FwError::InvalidRequest(format!(
+        "listen configuration `{field}` {requirement}"
+    ))
+}
+
+fn require_finite(field: &str, value: f64) -> FwResult<()> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(invalid_listen_config(field, "must be finite"))
+    }
+}
+
+fn require_nonnegative_finite(field: &str, value: f64) -> FwResult<()> {
+    require_finite(field, value)?;
+    if value >= 0.0 {
+        Ok(())
+    } else {
+        Err(invalid_listen_config(field, "must be nonnegative"))
+    }
+}
+
+fn require_positive_bounded(field: &str, value: f64, maximum: f64) -> FwResult<()> {
+    require_finite(field, value)?;
+    if value > 0.0 && value <= maximum {
+        Ok(())
+    } else {
+        Err(invalid_listen_config(
+            field,
+            &format!("must be greater than zero and at most {maximum} seconds"),
+        ))
+    }
+}
+
+impl ListenConfig {
+    /// Validate the complete live-session numeric contract before model
+    /// resolution, capture startup, persistence, or event emission.
+    pub fn validate(&self) -> FwResult<()> {
+        if self.step_ms == 0 || self.step_ms > MAX_LISTEN_STEP_MS {
+            return Err(invalid_listen_config(
+                "step_ms",
+                &format!("must be in 1..={MAX_LISTEN_STEP_MS} milliseconds"),
+            ));
+        }
+
+        require_positive_bounded(
+            "buffer.max_buffer_sec",
+            self.buffer.max_buffer_sec,
+            MAX_LIVE_BUFFER_SEC,
+        )?;
+        require_nonnegative_finite("buffer.keep_back_sec", self.buffer.keep_back_sec)?;
+        require_nonnegative_finite("buffer.min_tail_sec", self.buffer.min_tail_sec)?;
+        if self.buffer.keep_back_sec > self.buffer.max_buffer_sec {
+            return Err(invalid_listen_config(
+                "buffer.keep_back_sec",
+                "must not exceed buffer.max_buffer_sec",
+            ));
+        }
+        if self.buffer.min_tail_sec > self.buffer.max_buffer_sec {
+            return Err(invalid_listen_config(
+                "buffer.min_tail_sec",
+                "must not exceed buffer.max_buffer_sec",
+            ));
+        }
+
+        if self.vad.min_speech_ms == 0 || self.vad.min_speech_ms > MAX_LIVE_BUFFER_MS {
+            return Err(invalid_listen_config(
+                "vad.min_speech_ms",
+                &format!("must be in 1..={MAX_LIVE_BUFFER_MS} milliseconds"),
+            ));
+        }
+        if self.vad.endpoint_ms == 0 || self.vad.endpoint_ms > MAX_LIVE_BUFFER_MS {
+            return Err(invalid_listen_config(
+                "vad.endpoint_ms",
+                &format!("must be in 1..={MAX_LIVE_BUFFER_MS} milliseconds"),
+            ));
+        }
+        if self.vad.pre_pad_ms > MAX_LIVE_BUFFER_MS {
+            return Err(invalid_listen_config(
+                "vad.pre_pad_ms",
+                &format!("must be at most {MAX_LIVE_BUFFER_MS} milliseconds"),
+            ));
+        }
+        require_finite("vad.gate_db", self.vad.gate_db)?;
+        require_finite("vad.min_voice_dbfs", self.vad.min_voice_dbfs)?;
+        require_nonnegative_finite(
+            "vad.floor_rise_db_per_sec_silence",
+            self.vad.floor_rise_db_per_sec_silence,
+        )?;
+        require_nonnegative_finite(
+            "vad.floor_rise_db_per_sec_speech",
+            self.vad.floor_rise_db_per_sec_speech,
+        )?;
+
+        require_nonnegative_finite("max_seconds", self.max_seconds)?;
+        require_finite("max_utterance_sec", self.max_utterance_sec)?;
+        if self.max_utterance_sec <= 0.0 {
+            return Err(invalid_listen_config(
+                "max_utterance_sec",
+                "must be greater than zero",
+            ));
+        }
+        require_nonnegative_finite("stats_interval_sec", self.stats_interval_sec)?;
+        require_positive_bounded(
+            "capture_buffer_sec",
+            self.capture_buffer_sec,
+            MAX_LIVE_BUFFER_SEC,
+        )?;
+        require_nonnegative_finite("confirm_drain_sec", self.confirm_drain_sec)?;
+        if self.confirm_drain_sec > MAX_CONFIRM_DRAIN_SEC {
+            return Err(invalid_listen_config(
+                "confirm_drain_sec",
+                &format!("must be at most {MAX_CONFIRM_DRAIN_SEC} seconds"),
+            ));
+        }
+        if self.alignatt_holdback_ms > MAX_LIVE_BUFFER_MS {
+            return Err(invalid_listen_config(
+                "alignatt_holdback_ms",
+                &format!("must be at most {MAX_LIVE_BUFFER_MS} milliseconds"),
+            ));
+        }
+        if self.confirm_queue_bound == 0 || self.confirm_queue_bound > MAX_CONFIRM_QUEUE_BOUND {
+            return Err(invalid_listen_config(
+                "confirm_queue_bound",
+                &format!("must be in 1..={MAX_CONFIRM_QUEUE_BOUND}"),
+            ));
+        }
+
+        if let ListenSource::StdinPcm {
+            sample_rate,
+            channels,
+            ..
+        } = &self.source
+        {
+            if *sample_rate == 0 {
+                return Err(invalid_listen_config(
+                    "source.stdin.sample_rate",
+                    "must be greater than zero",
+                ));
+            }
+            if *channels == 0 {
+                return Err(invalid_listen_config(
+                    "source.stdin.channels",
+                    "must be greater than zero",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `--quality-model` setting for the confirm lane (bd-rt-confirm-lane-3okr).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QualityModelSetting {
@@ -2497,6 +2660,7 @@ pub fn run_listen_session(
     is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> FwResult<bool> {
     use crate::native_engine::decode::{AudioCtxPolicy, DecodeParams};
+    config.validate()?;
     let mut step_ctrl = config
         .adaptive_controllers
         .then(|| AdaptiveStepController::new(config.step_ms));
@@ -5439,6 +5603,198 @@ mod adaptive_contract_tests {
 
     #[test]
     fn listen_config_default_has_controllers_off() {
-        assert!(!ListenConfig::default().adaptive_controllers);
+        let config = ListenConfig::default();
+        assert!(!config.adaptive_controllers);
+        config.validate().expect("default listen config is valid");
+    }
+
+    #[test]
+    fn listen_config_rejects_every_nonfinite_float_field() {
+        type Setter = fn(&mut ListenConfig, f64);
+        let setters: &[(&str, Setter)] = &[
+            ("buffer.max_buffer_sec", |config, value| {
+                config.buffer.max_buffer_sec = value;
+            }),
+            ("buffer.keep_back_sec", |config, value| {
+                config.buffer.keep_back_sec = value;
+            }),
+            ("buffer.min_tail_sec", |config, value| {
+                config.buffer.min_tail_sec = value;
+            }),
+            ("vad.gate_db", |config, value| {
+                config.vad.gate_db = value;
+            }),
+            ("vad.min_voice_dbfs", |config, value| {
+                config.vad.min_voice_dbfs = value;
+            }),
+            ("vad.floor_rise_db_per_sec_silence", |config, value| {
+                config.vad.floor_rise_db_per_sec_silence = value;
+            }),
+            ("vad.floor_rise_db_per_sec_speech", |config, value| {
+                config.vad.floor_rise_db_per_sec_speech = value;
+            }),
+            ("max_seconds", |config, value| {
+                config.max_seconds = value;
+            }),
+            ("max_utterance_sec", |config, value| {
+                config.max_utterance_sec = value;
+            }),
+            ("stats_interval_sec", |config, value| {
+                config.stats_interval_sec = value;
+            }),
+            ("capture_buffer_sec", |config, value| {
+                config.capture_buffer_sec = value;
+            }),
+            ("confirm_drain_sec", |config, value| {
+                config.confirm_drain_sec = value;
+            }),
+        ];
+
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for &(field, setter) in setters {
+                let mut config = ListenConfig::default();
+                setter(&mut config, value);
+                let error = config
+                    .validate()
+                    .expect_err("non-finite listen config must fail closed");
+                assert_eq!(error.error_code(), "FW-INVALID-REQUEST");
+                assert!(
+                    error.to_string().contains(field),
+                    "wrong field for {field}={value:?}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn listen_config_rejects_invalid_ranges_and_buffer_relationships() {
+        macro_rules! expect_invalid {
+            ($field:literal, $mutate:expr) => {{
+                let mut config = ListenConfig::default();
+                ($mutate)(&mut config);
+                let error = config
+                    .validate()
+                    .expect_err("invalid listen config must fail closed");
+                assert_eq!(error.error_code(), "FW-INVALID-REQUEST");
+                assert!(
+                    error.to_string().contains($field),
+                    "wrong field for {}: {error}",
+                    $field
+                );
+            }};
+        }
+
+        expect_invalid!("step_ms", |config: &mut ListenConfig| config.step_ms = 0);
+        expect_invalid!("step_ms", |config: &mut ListenConfig| {
+            config.step_ms = MAX_LISTEN_STEP_MS + 1;
+        });
+        expect_invalid!("buffer.max_buffer_sec", |config: &mut ListenConfig| {
+            config.buffer.max_buffer_sec = 0.0;
+        });
+        expect_invalid!("buffer.max_buffer_sec", |config: &mut ListenConfig| {
+            config.buffer.max_buffer_sec = MAX_LIVE_BUFFER_SEC + 1.0;
+        });
+        expect_invalid!("buffer.keep_back_sec", |config: &mut ListenConfig| {
+            config.buffer.keep_back_sec = -0.1;
+        });
+        expect_invalid!("buffer.keep_back_sec", |config: &mut ListenConfig| {
+            config.buffer.keep_back_sec = config.buffer.max_buffer_sec + 0.1;
+        });
+        expect_invalid!("buffer.min_tail_sec", |config: &mut ListenConfig| {
+            config.buffer.min_tail_sec = -0.1;
+        });
+        expect_invalid!("buffer.min_tail_sec", |config: &mut ListenConfig| {
+            config.buffer.min_tail_sec = config.buffer.max_buffer_sec + 0.1;
+        });
+        expect_invalid!("vad.min_speech_ms", |config: &mut ListenConfig| {
+            config.vad.min_speech_ms = 0;
+        });
+        expect_invalid!("vad.min_speech_ms", |config: &mut ListenConfig| {
+            config.vad.min_speech_ms = MAX_LIVE_BUFFER_MS + 1;
+        });
+        expect_invalid!("vad.endpoint_ms", |config: &mut ListenConfig| {
+            config.vad.endpoint_ms = 0;
+        });
+        expect_invalid!("vad.endpoint_ms", |config: &mut ListenConfig| {
+            config.vad.endpoint_ms = MAX_LIVE_BUFFER_MS + 1;
+        });
+        expect_invalid!("vad.pre_pad_ms", |config: &mut ListenConfig| {
+            config.vad.pre_pad_ms = MAX_LIVE_BUFFER_MS + 1;
+        });
+        expect_invalid!(
+            "vad.floor_rise_db_per_sec_silence",
+            |config: &mut ListenConfig| {
+                config.vad.floor_rise_db_per_sec_silence = -0.1;
+            }
+        );
+        expect_invalid!(
+            "vad.floor_rise_db_per_sec_speech",
+            |config: &mut ListenConfig| {
+                config.vad.floor_rise_db_per_sec_speech = -0.1;
+            }
+        );
+        expect_invalid!("max_seconds", |config: &mut ListenConfig| {
+            config.max_seconds = -0.1;
+        });
+        expect_invalid!("max_utterance_sec", |config: &mut ListenConfig| {
+            config.max_utterance_sec = 0.0;
+        });
+        expect_invalid!("stats_interval_sec", |config: &mut ListenConfig| {
+            config.stats_interval_sec = -0.1;
+        });
+        expect_invalid!("capture_buffer_sec", |config: &mut ListenConfig| {
+            config.capture_buffer_sec = 0.0;
+        });
+        expect_invalid!("capture_buffer_sec", |config: &mut ListenConfig| {
+            config.capture_buffer_sec = MAX_LIVE_BUFFER_SEC + 1.0;
+        });
+        expect_invalid!("confirm_drain_sec", |config: &mut ListenConfig| {
+            config.confirm_drain_sec = -0.1;
+        });
+        expect_invalid!("confirm_drain_sec", |config: &mut ListenConfig| {
+            config.confirm_drain_sec = MAX_CONFIRM_DRAIN_SEC + 1.0;
+        });
+        expect_invalid!("alignatt_holdback_ms", |config: &mut ListenConfig| {
+            config.alignatt_holdback_ms = MAX_LIVE_BUFFER_MS + 1;
+        });
+        expect_invalid!("confirm_queue_bound", |config: &mut ListenConfig| {
+            config.confirm_queue_bound = 0;
+        });
+        expect_invalid!("confirm_queue_bound", |config: &mut ListenConfig| {
+            config.confirm_queue_bound = MAX_CONFIRM_QUEUE_BOUND + 1;
+        });
+        expect_invalid!("source.stdin.sample_rate", |config: &mut ListenConfig| {
+            config.source = ListenSource::StdinPcm {
+                format: crate::capture::PcmFormat::S16le,
+                sample_rate: 0,
+                channels: 1,
+            };
+        });
+        expect_invalid!("source.stdin.channels", |config: &mut ListenConfig| {
+            config.source = ListenSource::StdinPcm {
+                format: crate::capture::PcmFormat::S16le,
+                sample_rate: 16_000,
+                channels: 0,
+            };
+        });
+    }
+
+    #[test]
+    fn run_listen_session_validates_before_model_capture_or_output() {
+        let mut config = ListenConfig::default();
+        config.fast_model = Some("definitely-missing-listen-validation-model".to_owned());
+        config.capture_buffer_sec = f64::INFINITY;
+        let mut emitted = false;
+        let mut emit = |_value| {
+            emitted = true;
+            Ok(())
+        };
+
+        let error = run_listen_session(&config, &mut emit, &|| false)
+            .expect_err("invalid config must fail before resolving external resources");
+
+        assert_eq!(error.error_code(), "FW-INVALID-REQUEST");
+        assert!(error.to_string().contains("capture_buffer_sec"));
+        assert!(!emitted, "invalid config emitted a session event");
     }
 }
