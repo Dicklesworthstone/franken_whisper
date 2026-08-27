@@ -359,6 +359,19 @@ struct SafeTensor {
 
 fn parse_safetensors_f32(raw: Vec<u8>) -> FwResult<std::collections::BTreeMap<String, SafeTensor>> {
     let file = SafetensorsFile::from_owned_bytes(raw)?;
+    if file.metadata().is_some() {
+        return Err(FwError::InvalidRequest(
+            "dtln: safetensors metadata is not part of the converted artifact contract".to_owned(),
+        ));
+    }
+    if let Some(name) = file
+        .names()
+        .find(|name| !EXPECTED.iter().any(|(expected, _)| *expected == *name))
+    {
+        return Err(FwError::InvalidRequest(format!(
+            "dtln: unexpected tensor {name} outside the converted artifact contract"
+        )));
+    }
     let mut out = std::collections::BTreeMap::new();
     for name in file.names() {
         let dtype = file.dtype_name(name)?;
@@ -727,6 +740,27 @@ mod tests {
             offsets[1] = start;
         });
         assert_invalid_safetensors(&malformed, "byte span");
+    }
+
+    #[test]
+    fn loader_rejects_metadata_and_extra_tensors_outside_the_pinned_contract() {
+        let fixture = contract_fixture_bytes(0.0, false);
+
+        let with_metadata = rewrite_contract_header(&fixture, |header| {
+            header.insert(
+                "__metadata__".to_owned(),
+                serde_json::json!({"unreviewed": "artifact drift"}),
+            );
+        });
+        assert_invalid_safetensors(&with_metadata, "metadata is not part");
+
+        let with_extra_tensor = rewrite_contract_header(&fixture, |header| {
+            header.insert(
+                "unexpected.tensor".to_owned(),
+                serde_json::json!({"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}),
+            );
+        });
+        assert_invalid_safetensors(&with_extra_tensor, "unexpected tensor");
     }
 
     #[test]
