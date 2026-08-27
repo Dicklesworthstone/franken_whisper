@@ -1144,7 +1144,7 @@ pub fn download_audio(
         .filter(|line| !line.is_empty())
         .rev()
         .map(PathBuf::from)
-        .find(|candidate| is_completed_owned_download_path(candidate, dest_dir, &meta.id));
+        .find(|candidate| is_reusable_download_path(candidate, dest_dir, &meta.id));
 
     if let Some(path) = printed {
         return Ok(path);
@@ -1205,10 +1205,9 @@ pub(crate) fn is_reusable_download_path(path: &Path, dest_dir: &Path, id: &str) 
     true
 }
 
-/// Validate yt-dlp's authoritative `after_move:filepath` without guessing its
-/// output container. `bestaudio/best` may legitimately select legacy video
-/// containers that are absent from the narrower resume scan allowlist; the
-/// normalizer handles those through ffmpeg.
+/// Validate the ownership and completed-file portion of the reusable-download
+/// contract. Callers additionally classify the extension before accepting the
+/// path as media, so first-run and resume behavior cannot diverge.
 fn is_completed_owned_download_path(path: &Path, dest_dir: &Path, id: &str) -> bool {
     if !is_owned_download_path(path, dest_dir, id) {
         return false;
@@ -2313,6 +2312,32 @@ mod tests {
             dir.path().join("WRONGPATH01.wav").is_file(),
             "the rejected printed path must exist so a bare is_file check would false-green"
         );
+    }
+
+    #[test]
+    fn download_audio_rejects_authoritative_non_media_printed_path() {
+        let token = CancellationToken::unbounded();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut meta = meta_for_download();
+        meta.webpage_url.push_str("&fw_stub_ext=json");
+
+        let error = download_audio(&stub_info(), &meta, dir.path(), &token)
+            .expect_err("a printed non-media sidecar must not become downloaded audio");
+        assert!(matches!(
+            error,
+            FwError::MissingArtifact(path)
+                if path == dir.path().join("dQw4w9WgXcQ.<ext>")
+        ));
+        let sidecar = dir.path().join("dQw4w9WgXcQ.json");
+        assert!(
+            sidecar.is_file(),
+            "the rejected path must exist so file ownership alone would false-green"
+        );
+        assert!(!is_reusable_download_path(
+            &sidecar,
+            dir.path(),
+            &meta.id
+        ));
     }
 
     #[test]
