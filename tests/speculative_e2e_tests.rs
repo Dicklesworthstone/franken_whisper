@@ -235,6 +235,7 @@ fn e2e_config_defaults_from_bare_speculative() {
         Command::Transcribe(args) => {
             let config = args
                 .to_speculative_config()
+                .expect("geometry should be valid")
                 .expect("should produce config when speculative=true");
             assert_eq!(config.window_size_ms, 3000);
             assert_eq!(config.overlap_ms, 500);
@@ -271,7 +272,10 @@ fn e2e_config_custom_values_propagate() {
     .expect("should parse");
     match cli.command {
         Command::Transcribe(args) => {
-            let config = args.to_speculative_config().expect("should produce config");
+            let config = args
+                .to_speculative_config()
+                .expect("geometry should be valid")
+                .expect("should produce config");
             assert_eq!(config.window_size_ms, 5000);
             assert_eq!(config.overlap_ms, 1000);
             assert_eq!(config.fast_model_name, "whisper-tiny");
@@ -294,7 +298,9 @@ fn e2e_config_none_when_not_speculative() {
     match cli.command {
         Command::Transcribe(args) => {
             assert!(
-                args.to_speculative_config().is_none(),
+                args.to_speculative_config()
+                    .expect("disabled speculative config is valid")
+                    .is_none(),
                 "should return None when speculative=false"
             );
         }
@@ -315,7 +321,10 @@ fn e2e_config_always_correct_sets_tolerance() {
     .expect("should parse");
     match cli.command {
         Command::Transcribe(args) => {
-            let config = args.to_speculative_config().expect("should produce config");
+            let config = args
+                .to_speculative_config()
+                .expect("geometry should be valid")
+                .expect("should produce config");
             assert!(
                 config.tolerance.always_correct,
                 "always_correct should be true"

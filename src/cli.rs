@@ -2054,7 +2054,7 @@ impl TranscribeArgs {
 
         let fast_model = self.fast_model.take();
         let quality_model = self.quality_model.take();
-        let speculative = self.speculative_request_with_models(fast_model, quality_model);
+        let speculative = self.speculative_request_with_models(fast_model, quality_model)?;
 
         let backend_params = BackendParams {
             output_formats,
@@ -2165,17 +2165,19 @@ impl TranscribeArgs {
 
     /// Build a `SpeculativeConfig` from CLI arguments.
     /// Returns `None` if `--speculative` is not set.
-    #[must_use]
-    pub fn to_speculative_config(&self) -> Option<crate::streaming::SpeculativeConfig> {
-        if !self.speculative {
-            return None;
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FwError::InvalidRequest`] when the configured window geometry
+    /// cannot make forward progress.
+    pub fn to_speculative_config(
+        &self,
+    ) -> FwResult<Option<crate::streaming::SpeculativeConfig>> {
+        let Some((window_size_ms, overlap_ms)) = self.speculative_window_geometry()? else {
+            return Ok(None);
+        };
 
-        let window_size_ms = self.speculative_window_ms.unwrap_or(3000);
-        let raw_overlap_ms = self.speculative_overlap_ms.unwrap_or(500);
-        let overlap_ms = raw_overlap_ms.min(window_size_ms.saturating_sub(1));
-
-        Some(crate::streaming::SpeculativeConfig {
+        Ok(Some(crate::streaming::SpeculativeConfig {
             window_size_ms,
             overlap_ms,
             fast_model_name: self
@@ -2193,7 +2195,7 @@ impl TranscribeArgs {
             },
             adaptive: !self.no_adaptive,
             emit_events: true,
-        })
+        }))
     }
 
     /// Build a serde-friendly [`SpeculativeRequest`] for storage in
@@ -2202,23 +2204,44 @@ impl TranscribeArgs {
     /// The orchestrator converts this into a
     /// [`crate::streaming::SpeculativeConfig`] at dispatch time, keeping
     /// `model.rs` free of any dependency on `streaming.rs`.
-    #[must_use]
-    pub fn to_speculative_request(&self) -> Option<crate::model::SpeculativeRequest> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FwError::InvalidRequest`] when the configured window geometry
+    /// cannot make forward progress.
+    pub fn to_speculative_request(&self) -> FwResult<Option<crate::model::SpeculativeRequest>> {
         self.speculative_request_with_models(self.fast_model.clone(), self.quality_model.clone())
+    }
+
+    fn speculative_window_geometry(&self) -> FwResult<Option<(u64, u64)>> {
+        if !self.speculative {
+            return Ok(None);
+        }
+
+        let window_size_ms = self.speculative_window_ms.unwrap_or(3000);
+        let overlap_ms = self.speculative_overlap_ms.unwrap_or(500);
+        if window_size_ms == 0 {
+            return Err(FwError::InvalidRequest(
+                "--speculative-window-ms must be greater than zero".to_owned(),
+            ));
+        }
+        if overlap_ms >= window_size_ms {
+            return Err(FwError::InvalidRequest(format!(
+                "--speculative-overlap-ms ({overlap_ms}) must be less than --speculative-window-ms ({window_size_ms})"
+            )));
+        }
+        Ok(Some((window_size_ms, overlap_ms)))
     }
 
     fn speculative_request_with_models(
         &self,
         fast_model: Option<String>,
         quality_model: Option<String>,
-    ) -> Option<crate::model::SpeculativeRequest> {
-        if !self.speculative {
-            return None;
-        }
-        let window_size_ms = self.speculative_window_ms.unwrap_or(3000);
-        let raw_overlap_ms = self.speculative_overlap_ms.unwrap_or(500);
-        let overlap_ms = raw_overlap_ms.min(window_size_ms.saturating_sub(1));
-        Some(crate::model::SpeculativeRequest {
+    ) -> FwResult<Option<crate::model::SpeculativeRequest>> {
+        let Some((window_size_ms, overlap_ms)) = self.speculative_window_geometry()? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::model::SpeculativeRequest {
             window_size_ms,
             overlap_ms,
             fast_model_name: fast_model.unwrap_or_else(|| "auto-fast".to_owned()),
@@ -2226,7 +2249,7 @@ impl TranscribeArgs {
             max_wer_tolerance: self.correction_tolerance_wer,
             adaptive: !self.no_adaptive,
             always_correct: self.always_correct,
-        })
+        }))
     }
 }
 
@@ -3838,14 +3861,21 @@ mod tests {
     fn speculative_default_is_false() {
         let args = minimal_args();
         assert!(!args.speculative);
-        assert!(args.to_speculative_config().is_none());
+        assert!(
+            args.to_speculative_config()
+                .expect("disabled speculative config is valid")
+                .is_none()
+        );
     }
 
     #[test]
     fn speculative_config_built_when_flag_set() {
         let mut args = minimal_args();
         args.speculative = true;
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert_eq!(config.window_size_ms, 3000);
         assert_eq!(config.overlap_ms, 500);
         assert!(config.adaptive);
@@ -3858,7 +3888,10 @@ mod tests {
         args.speculative = true;
         args.speculative_window_ms = Some(5000);
         args.speculative_overlap_ms = Some(1000);
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert_eq!(config.window_size_ms, 5000);
         assert_eq!(config.overlap_ms, 1000);
     }
@@ -3869,7 +3902,10 @@ mod tests {
         args.speculative = true;
         args.fast_model = Some("whisper-tiny".to_owned());
         args.quality_model = Some("whisper-large".to_owned());
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert_eq!(config.fast_model_name, "whisper-tiny");
         assert_eq!(config.quality_model_name, "whisper-large");
     }
@@ -3879,7 +3915,10 @@ mod tests {
         let mut args = minimal_args();
         args.speculative = true;
         args.no_adaptive = true;
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert!(!config.adaptive);
     }
 
@@ -3888,7 +3927,10 @@ mod tests {
         let mut args = minimal_args();
         args.speculative = true;
         args.always_correct = true;
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert!(config.tolerance.always_correct);
     }
 
@@ -3897,7 +3939,10 @@ mod tests {
         let mut args = minimal_args();
         args.speculative = true;
         args.correction_tolerance_wer = Some(0.25);
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert!((config.tolerance.max_wer - 0.25).abs() < 0.001);
     }
 
@@ -3958,7 +4003,10 @@ mod tests {
     fn speculative_config_default_model_names_are_auto_sentinels() {
         let mut args = minimal_args();
         args.speculative = true;
-        let config = args.to_speculative_config().expect("should build config");
+        let config = args
+            .to_speculative_config()
+            .expect("geometry should be valid")
+            .expect("should build config");
         assert_eq!(config.fast_model_name, "auto-fast");
         assert_eq!(config.quality_model_name, "auto-quality");
         assert!(config.emit_events);
@@ -4010,16 +4058,44 @@ mod tests {
     }
 
     #[test]
-    fn to_request_speculative_overlap_is_clamped_below_window_size() {
+    fn to_request_rejects_speculative_overlap_without_forward_progress() {
         let mut args = minimal_args();
         args.speculative = true;
-        // overlap > window: must clamp to window - 1 (matches to_speculative_config behavior).
         args.speculative_window_ms = Some(1_000);
         args.speculative_overlap_ms = Some(5_000);
-        let request = args.to_request().expect("should build");
+
+        let result = args.to_request();
+        assert!(
+            matches!(result, Err(FwError::InvalidRequest(message)) if message.contains("--speculative-overlap-ms")),
+            "oversized overlap must be rejected instead of normalized to a 1 ms step"
+        );
+    }
+
+    #[test]
+    fn to_request_accepts_speculative_overlap_with_one_ms_step() {
+        let mut args = minimal_args();
+        args.speculative = true;
+        args.speculative_window_ms = Some(1_000);
+        args.speculative_overlap_ms = Some(999);
+
+        let request = args.to_request().expect("positive step should be valid");
         let spec = request.backend_params.speculative.as_ref().expect("set");
         assert_eq!(spec.window_size_ms, 1_000);
         assert_eq!(spec.overlap_ms, 999);
+    }
+
+    #[test]
+    fn to_request_rejects_zero_speculative_window() {
+        let mut args = minimal_args();
+        args.speculative = true;
+        args.speculative_window_ms = Some(0);
+        args.speculative_overlap_ms = Some(0);
+
+        let result = args.to_request();
+        assert!(
+            matches!(result, Err(FwError::InvalidRequest(message)) if message.contains("--speculative-window-ms")),
+            "zero-sized speculative window must be rejected"
+        );
     }
 
     #[test]
@@ -4046,8 +4122,14 @@ mod tests {
         args.no_adaptive = false;
         args.always_correct = false;
 
-        let request_form = args.to_speculative_request().expect("request form");
-        let config_form = args.to_speculative_config().expect("config form");
+        let request_form = args
+            .to_speculative_request()
+            .expect("request geometry")
+            .expect("request form");
+        let config_form = args
+            .to_speculative_config()
+            .expect("config geometry")
+            .expect("config form");
         assert_eq!(request_form.fast_model_name, config_form.fast_model_name);
         assert_eq!(
             request_form.quality_model_name,

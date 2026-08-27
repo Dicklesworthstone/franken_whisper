@@ -49,6 +49,32 @@ impl Default for SpeculativeConfig {
     }
 }
 
+impl SpeculativeConfig {
+    fn validate_window_geometry(window_size_ms: u64, overlap_ms: u64) -> FwResult<()> {
+        if window_size_ms == 0 {
+            return Err(FwError::InvalidRequest(
+                "speculative window_size_ms must be greater than zero".to_owned(),
+            ));
+        }
+        if overlap_ms >= window_size_ms {
+            return Err(FwError::InvalidRequest(format!(
+                "speculative overlap_ms ({overlap_ms}) must be less than window_size_ms ({window_size_ms})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate the window geometry required for forward progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FwError::InvalidRequest`] when the window is empty or its
+    /// overlap would leave no positive step between consecutive windows.
+    pub fn validate(&self) -> FwResult<()> {
+        Self::validate_window_geometry(self.window_size_ms, self.overlap_ms)
+    }
+}
+
 /// Bridge a `TranscriptionSegment` (model) to a `TranscriptSegment` (backend).
 #[cfg(test)]
 fn to_backend_segment(s: &TranscriptionSegment) -> TranscriptSegment {
@@ -144,8 +170,17 @@ impl SpeculativeStreamingPipeline {
         };
 
         controller.observe(decision, drift);
-        let new_window_size = controller.apply();
-        self.window_manager.set_window_size(new_window_size);
+        let new_window_size = controller
+            .apply()
+            .max(self.config.overlap_ms.saturating_add(1));
+
+        // WindowManager clamps adaptive values to its documented 30 s ceiling.
+        // When a caller starts above that ceiling with an equally large overlap,
+        // retaining the current valid window is safer than letting the clamp
+        // create a zero-progress geometry.
+        if new_window_size <= 30_000 {
+            self.window_manager.set_window_size(new_window_size);
+        }
     }
 
     fn process_window_by_id<F, Q>(
@@ -302,6 +337,7 @@ impl SpeculativeStreamingPipeline {
         F: FnOnce() -> Vec<TranscriptionSegment> + Send + 'static,
         Q: FnOnce() -> Vec<TranscriptionSegment> + Send + 'static,
     {
+        self.config.validate()?;
         let window = self
             .window_manager
             .next_window(audio_position_ms, audio_hash);
@@ -319,6 +355,8 @@ impl SpeculativeStreamingPipeline {
         C: FnMut() -> FwResult<()>,
         M: FnMut(u64, u64) -> FwResult<(Vec<TranscriptionSegment>, Vec<TranscriptionSegment>)>,
     {
+        self.config.validate()?;
+
         if total_duration_ms == 0 {
             checkpoint()?;
             let result = self.build_result();
@@ -337,8 +375,12 @@ impl SpeculativeStreamingPipeline {
         while position_ms < total_duration_ms {
             checkpoint()?;
 
-            let window_size_ms = self.window_manager.current_window_size().max(1);
-            let step_ms = window_size_ms.saturating_sub(self.config.overlap_ms).max(1);
+            let window_size_ms = self.window_manager.current_window_size();
+            SpeculativeConfig::validate_window_geometry(
+                window_size_ms,
+                self.config.overlap_ms,
+            )?;
+            let step_ms = window_size_ms - self.config.overlap_ms;
 
             let audio_hash = format!("{audio_hash_seed}:{position_ms}:{window_size_ms}");
             let Some(window) = self.window_manager.next_window_bounded_receipt(
@@ -1527,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn overlap_exceeding_window_size_clamps_step_and_terminates() {
+    fn overlap_exceeding_window_size_is_rejected_before_model_callback() {
         let config = SpeculativeConfig {
             window_size_ms: 500,
             overlap_ms: 1000,
@@ -1535,15 +1577,41 @@ mod tests {
         };
         let mut pipeline = SpeculativeStreamingPipeline::new(config, "test-overlap".to_owned());
 
+        let mut callback_count = 0;
         let result = pipeline.process_duration_with_models_no_checkpoint(600, "seed", |_s, _e| {
+            callback_count += 1;
             let s = vec![seg("x", Some(0.0), Some(0.5), Some(0.8))];
             Ok((s.clone(), s))
         });
         assert!(
-            result.is_ok(),
-            "should terminate even with oversized overlap"
+            matches!(result, Err(FwError::InvalidRequest(message)) if message.contains("overlap_ms")),
+            "oversized overlap must be rejected"
         );
-        assert!(pipeline.stats().windows_processed >= 1);
+        assert_eq!(callback_count, 0, "invalid geometry must not run models");
+        assert_eq!(pipeline.stats().windows_processed, 0);
+    }
+
+    #[test]
+    fn zero_window_is_rejected_by_single_window_entry_before_lanes_run() {
+        let config = SpeculativeConfig {
+            window_size_ms: 0,
+            overlap_ms: 0,
+            ..SpeculativeConfig::default()
+        };
+        let mut pipeline = SpeculativeStreamingPipeline::new(config, "test-zero-window".to_owned());
+
+        let result = pipeline.process_window(
+            "hash",
+            0,
+            || panic!("fast lane must not run for an invalid window"),
+            || panic!("quality lane must not run for an invalid window"),
+        );
+        assert!(
+            matches!(result, Err(FwError::InvalidRequest(message)) if message.contains("greater than zero")),
+            "zero-sized window must be rejected"
+        );
+        assert_eq!(pipeline.window_manager().windows_pending(), 0);
+        assert_eq!(pipeline.window_manager().windows_resolved(), 0);
     }
 
     #[test]
