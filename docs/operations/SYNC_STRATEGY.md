@@ -15,6 +15,8 @@ Tables:
 - `runs`
 - `segments`
 - `events`
+- internal incremental-export authority:
+  - `sync_run_mutations` (one latest database sequence per run aggregate)
 - derived native-diarization indexes:
   - `diarization_reports`
   - `diarization_turns`
@@ -67,6 +69,32 @@ Rules:
 5. Atomic rename `*.tmp -> *.jsonl`.
 6. Update manifest checksums.
 7. Release lock.
+
+### Incremental Export (`db -> jsonl`, library API)
+
+Schema v6 triggers replace the single `sync_run_mutations` row for a run when
+its parent, segment, or event rows change. The resulting SQLite-assigned
+sequence, rather than `finished_at` or another caller-owned timestamp, is the
+incremental selection authority. A stable random `sync_database_id` in `_meta`
+binds that database-local sequence to its lineage.
+
+Within one read transaction, incremental export reads the sequence high-water
+mark, selects every current run above the prior cursor, and exports each
+selected run with its complete segment and event set. A concurrent commit after
+that snapshot remains above the published cursor for the next export. The
+manifest is published before `sync_cursor.json`; any failure retains the old
+cursor and may repeat work, but cannot skip an unpublished delta. A legacy
+timestamp-only cursor defaults to sequence zero and causes one safe full
+re-export. More generally, any legacy cursor without a database identity
+ignores its numeric sequence for that one upgrade export. A cursor with a
+different database identity or a sequence outside the current database range
+fails closed before snapshot publication.
+
+Deleting a segment or event marks its surviving parent, whose complete child
+set can be applied with `overwrite-strict`. The current JSONL format does not
+carry deleted-run tombstones: deleting a parent advances the local high-water
+mark, but an import into another database does not remove that run solely
+because it disappeared from an incremental snapshot.
 
 ### Import (`jsonl -> db`)
 1. Acquire lock.

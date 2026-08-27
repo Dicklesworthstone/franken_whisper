@@ -1449,7 +1449,7 @@ pub struct TranscribeArgs {
 
     /// Record consent for future reusable-profile persistence.
     ///
-    /// Schema v5 stores privacy-safe summaries only, never raw acoustic vectors.
+    /// Schema v6 stores privacy-safe summaries only, never raw acoustic vectors.
     #[arg(long)]
     pub persist_speaker_profiles: bool,
 

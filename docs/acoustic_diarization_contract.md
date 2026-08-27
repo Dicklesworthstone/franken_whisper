@@ -1227,11 +1227,11 @@ resource, privacy, or fallback rules.
 
 ## 11. Privacy and corpus handling
 
-Schema v5 may persist turns, hint audit rows, typed speaker-count outcomes,
+Schema v6 may persist turns, hint audit rows, typed speaker-count outcomes,
 per-hint dispositions, and privacy-safe profile summaries inside SQLite. It
 does not persist raw PCM, frame features, Fourier spectra, cepstra, reusable
 speaker vectors, the CLI hint-document source path, or corpus metadata.
-`persist_profiles` records explicit consent but does not expand the v5 storage
+`persist_profiles` records explicit consent but does not expand the v6 storage
 surface; reusable vectors require a separately reviewed schema and retention
 policy.
 

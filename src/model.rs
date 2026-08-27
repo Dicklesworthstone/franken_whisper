@@ -211,7 +211,7 @@ pub struct DiarizationRequest {
     /// enrollment-profile nodes admitted into the affinity graph.
     pub max_prototypes: u16,
     /// Record explicit consent for reusable-profile persistence. Default-off.
-    /// Schema v5 deliberately persists only privacy-safe summaries; raw
+    /// Schema v6 deliberately persists only privacy-safe summaries; raw
     /// acoustic vectors remain excluded until a separately reviewed schema.
     #[serde(default)]
     pub persist_profiles: bool,

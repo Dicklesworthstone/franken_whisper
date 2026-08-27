@@ -1247,7 +1247,7 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 | `--speaker-hints <PATH>` | — | Read a `speaker-hints-v1` document in place; the path is not retained, but parsed fields persist with the run unless `--no-persist` is used |
 | `--enrollment-edge-guard-ms <N>` | `100` | Remove boundary-adjacent audio before enrolling a known interval |
 | `--diarization-max-prototypes <N>` | `512` | Bounded global native-diarization prototype cap (`1..=512`) |
-| `--persist-speaker-profiles` | `false` | Record explicit persistence consent; schema v5 still stores privacy-safe summaries rather than reusable acoustic vectors |
+| `--persist-speaker-profiles` | `false` | Record explicit persistence consent; schema v6 still stores privacy-safe summaries rather than reusable acoustic vectors |
 | `--speaker-count-hard <K>` | — | Explicit hard search constraint; success still requires independent evidence for every speaker and uncertain speech remains UNKNOWN |
 | `--speaker-count-range <MIN..MAX>` | — | Soft bounded count preference; native evidence may disagree or remain unresolved |
 | `--speaker-count-prior <PRIOR>` | — | Soft point prior (`K`) or normalized distribution (`K=P,K=P`); never forces occupancy |
@@ -1999,8 +1999,12 @@ speaker_hints                (run_id, idx, speaker_ref, start_ms, end_ms, ...)
 speaker_profile_summaries    (run_id, idx, speaker_ref, reliability, ...)
           -- deterministic indexes rebuilt from runs.request_json/result_json
 
+sync_run_mutations           (mutation_seq INTEGER PK AUTOINCREMENT,
+                              run_id TEXT NOT NULL UNIQUE)
+          -- bounded database-owned high-water mark for incremental export
+
 _meta    (key TEXT PRIMARY KEY, value TEXT NOT NULL)
-          -- holds 'schema_version' => '5' among other metadata
+          -- holds 'schema_version' => '6' and a stable sync database identity
 ```
 
 **Schema Migrations.** When opening older databases, the storage layer walks forward through the migration ladder:
@@ -2011,6 +2015,9 @@ _meta    (key TEXT PRIMARY KEY, value TEXT NOT NULL)
   them from canonical typed request/result JSON.
 - **v4 → v5:** add typed speaker-count status/outcome and per-hint evidence
   columns, then rebuild the derived index from canonical run JSON.
+- **v5 → v6:** add a stable sync database identity plus the bounded per-run
+  mutation sequence and parent/child triggers used by lossless incremental
+  export; existing runs are backfilled.
 
 The legacy column-add migration runs safely:
 
@@ -2590,7 +2597,7 @@ snapshot/
   manifest.json       # row counts + SHA-256 checksums (always uncompressed)
 ```
 
-**Incremental Export (library API).** Full exports re-dump the entire database. For large databases, `sync::export_incremental()` exposes a cursor-based delta export at the library level (the CLI currently always does a full export). Incremental mode uses a cursor file (`sync_cursor.json`) tracking the last export timestamp and run ID. Only runs created after the cursor are exported. The cursor uses a composite `(finished_at, run_id)` key for deterministic deduplication, ensuring resume-safety across interrupted exports.
+**Incremental Export (library API).** Full exports re-dump the entire database. For large databases, `sync::export_incremental()` exposes a cursor-based delta export at the library level (the CLI currently always does a full export). Schema v6 maintains one bounded `sync_run_mutations` row per run aggregate; database triggers assign a monotonic sequence whenever a run, segment, or event is inserted, updated, or deleted. Incremental mode stores the database identity and snapshot sequence high-water mark in `sync_cursor.json`, so backdated inserts and child-only updates are not lost and a cursor from an unrelated database fails closed even when its numeric sequence is in range. Each selected run is exported with its complete current segment and event set from one read snapshot, and the cursor advances only after the manifest is durably published. Legacy cursors without a database identity ignore their numeric sequence and safely cause a one-time full re-export. Child deletion marks its surviving parent, whose complete aggregate can be applied with `overwrite-strict`; the current snapshot format has no deleted-run tombstone, so removing a parent run is not propagated to another database.
 
 **JSONL Compression (library API).** `sync::compress_jsonl()` / `sync::decompress_jsonl()` gzip-compress or decompress a JSONL file at the library level. The **import path transparently detects `.gz` variants** at runtime, so a snapshot whose JSONL files are gzipped out-of-band (for example via `gzip backup/*.jsonl`) is fully importable through the CLI without any flag; the import code switches to `GzDecoder` when it sees a `.gz` extension. The manifest stays uncompressed so it can be inspected without decompression.
 
@@ -3358,7 +3365,7 @@ CREATE TABLE events (
 -- Key-value schema metadata
 CREATE TABLE _meta (
     key   TEXT PRIMARY KEY,                  -- e.g. 'schema_version'
-    value TEXT NOT NULL                      -- 'schema_version' currently '5'
+    value TEXT NOT NULL                      -- 'schema_version' currently '6'
 );
 
 -- v3 migration adds indexes on hot query paths (recent-runs listing,
@@ -3367,6 +3374,9 @@ CREATE TABLE _meta (
 -- profile summaries rebuilt from canonical runs JSON.
 -- v5 adds typed speaker-count status/outcome JSON and privacy-safe per-hint
 -- disposition JSON to the derived diarization report index.
+-- v6 adds a bounded per-run mutation sequence and triggers for lossless
+-- incremental export of run, segment, and event changes, plus a stable
+-- sync database identity in _meta so cursors cannot cross database lineages.
 ```
 
 ### NDJSON Export Format
