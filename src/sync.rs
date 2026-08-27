@@ -1413,6 +1413,9 @@ fn import_runs(
             }
             let row: serde_json::Value = serde_json::from_str(line)?;
             let id = json_str(&row, "id")?;
+            let backend = json_str(&row, "backend")?;
+            let result_json = json_str(&row, "result_json")?;
+            crate::storage::validate_run_backend_json(&id, &backend, &result_json)?;
             chunk.push((id, row));
             if chunk.len() >= chunk_size {
                 count +=
@@ -1429,6 +1432,9 @@ fn import_runs(
             }
             let row: serde_json::Value = serde_json::from_str(line)?;
             let id = json_str(&row, "id")?;
+            let backend = json_str(&row, "backend")?;
+            let result_json = json_str(&row, "result_json")?;
+            crate::storage::validate_run_backend_json(&id, &backend, &result_json)?;
 
             // Per-line existing lookup (the N+1 the batched path collapses).
             let existing_rows = connection
@@ -4327,6 +4333,55 @@ mod tests {
         assert!(export_dir.join("runs.jsonl").exists());
         assert!(export_dir.join("segments.jsonl").exists());
         assert!(export_dir.join("events.jsonl").exists());
+    }
+
+    #[test]
+    fn import_rejects_parent_result_backend_mismatch_before_persisting_run() {
+        let dir = tempdir().expect("tempdir");
+        let export_dir = dir.path().join("incoherent-export");
+        let fixture_db = dir.path().join("fixture.sqlite3");
+        let report = fixture_report("sync-backend-mismatch", &fixture_db);
+        let run_row = json!({
+            "id": report.run_id,
+            "started_at": report.started_at_rfc3339,
+            "finished_at": report.finished_at_rfc3339,
+            "backend": "native-listen",
+            "input_path": report.input_path,
+            "normalized_wav_path": report.normalized_wav_path,
+            "request_json": serde_json::to_string(&report.request).expect("request json"),
+            "result_json": serde_json::to_string(&report.result).expect("result json"),
+            "warnings_json": serde_json::to_string(&report.warnings).expect("warnings json"),
+            "transcript": report.result.transcript,
+            "replay_json": serde_json::to_string(&report.replay).expect("replay json"),
+            "acceleration_json": "{}",
+        });
+        write_jsonl_snapshot(&export_dir, &[run_row], &[], &[]);
+
+        for batch_import_enabled in [false, true] {
+            let db_path = dir.path().join(format!("import-{batch_import_enabled}.sqlite3"));
+            let error = import_inner_with_batch_mode(
+                &db_path,
+                &export_dir,
+                ConflictPolicy::Reject,
+                batch_import_enabled,
+            )
+            .expect_err("incoherent parent/result backends must fail import");
+            let message = error.to_string();
+            assert!(
+                message.contains("sync-backend-mismatch"),
+                "import error omitted run id: {message}"
+            );
+            assert!(
+                message.contains("backend mismatch"),
+                "unexpected import error: {message}"
+            );
+
+            let store = RunStore::open(&db_path).expect("open rolled-back import database");
+            assert!(
+                store.list_recent_runs(1).expect("list runs").is_empty(),
+                "incoherent run must not survive the failed import"
+            );
+        }
     }
 
     #[test]
@@ -14705,6 +14760,10 @@ mod tests {
 
         // Overwrite runs.jsonl with a row that has "id" but not "started_at".
         let runs_path = export_dir.join("runs.jsonl");
+        let valid_result_json = serde_json::to_string(
+            &fixture_report("run-no-started-at", &db_path).result,
+        )
+        .expect("serialize valid result");
         let bad_row = json!({
             "id": "run-no-started-at",
             "finished_at": "2026-01-01T00:00:05Z",
@@ -14712,7 +14771,7 @@ mod tests {
             "input_path": "test.wav",
             "normalized_wav_path": "normalized.wav",
             "request_json": "{}",
-            "result_json": "{}",
+            "result_json": valid_result_json,
             "warnings_json": "[]",
             "transcript": "hello"
             // "started_at" intentionally omitted

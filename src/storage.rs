@@ -420,7 +420,8 @@ impl RunStore {
                 let run_id = value_to_string(row.get(0));
                 let started = value_to_string(row.get(1));
                 let finished = value_to_string(row.get(2));
-                let backend = parse_backend(&value_to_string(row.get(3)));
+                let backend_text = value_to_string(row.get(3));
+                let backend = parse_stored_backend(&run_id, &backend_text)?;
                 let transcript = value_to_string(row.get(4));
                 let preview = transcript.chars().take(140).collect::<String>();
 
@@ -542,7 +543,7 @@ impl RunStore {
         let run_id = value_to_string(row.get(0));
         let started_at_rfc3339 = value_to_string(row.get(1));
         let finished_at_rfc3339 = value_to_string(row.get(2));
-        let backend = parse_backend(&value_to_string(row.get(3)));
+        let backend_text = value_to_string(row.get(3));
         let result_json = value_to_string(row.get(4));
         let warnings_json = value_to_string(row.get(5));
         let transcript_fallback = value_to_string(row.get(6));
@@ -552,6 +553,7 @@ impl RunStore {
         let result: TranscriptionResult = serde_json::from_str(&result_json).map_err(|error| {
             FwError::Storage(format!("invalid result_json for run {run_id}: {error}"))
         })?;
+        let backend = validate_stored_backend_coherence(&run_id, &backend_text, result.backend)?;
         validate_stored_result_contracts(&run_id, &result)?;
 
         let warnings =
@@ -794,7 +796,10 @@ impl RunStore {
                 .map_err(|error| FwError::Storage(error.to_string()))?;
             for row in run_rows {
                 let run_id = value_to_string(row.get(0));
-                if parse_backend(&value_to_string(row.get(3))) == BackendKind::NativeListen {
+                let backend_text = value_to_string(row.get(3));
+                let result_json = value_to_string(row.get(4));
+                let backend = validate_run_backend_json(&run_id, &backend_text, &result_json)?;
+                if backend == BackendKind::NativeListen {
                     native_listen_run_ids.push(run_id.clone());
                 }
                 run_by_id.insert(run_id, row);
@@ -2464,6 +2469,7 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
         let replay_json = close.replay_json;
         let transcript = close.transcript;
         let finished_at_rfc3339 = close.finished_at_rfc3339;
+        validate_run_backend_json(run_id, "native-listen", result_json)?;
         self.retry_busy(|store| {
             let savepoint = next_persist_savepoint_name();
             store
@@ -2929,7 +2935,7 @@ fn assemble_run_details_batched(
     let run_id = value_to_string(run_row.get(0));
     let started_at_rfc3339 = value_to_string(run_row.get(1));
     let finished_at_rfc3339 = value_to_string(run_row.get(2));
-    let backend = parse_backend(&value_to_string(run_row.get(3)));
+    let backend_text = value_to_string(run_row.get(3));
     let result_json = value_to_string(run_row.get(4));
     let warnings_json = value_to_string(run_row.get(5));
     let transcript_fallback = value_to_string(run_row.get(6));
@@ -2939,6 +2945,7 @@ fn assemble_run_details_batched(
     let result: TranscriptionResult = serde_json::from_str(&result_json).map_err(|error| {
         FwError::Storage(format!("invalid result_json for run {run_id}: {error}"))
     })?;
+    let backend = validate_stored_backend_coherence(&run_id, &backend_text, result.backend)?;
     validate_stored_result_contracts(&run_id, &result)?;
     let warnings =
         parse_required_json_field::<Vec<String>>("warnings_json", &run_id, &warnings_json)?;
@@ -3233,14 +3240,44 @@ fn optional_float(value: Option<f64>) -> SqliteValue {
     }
 }
 
-fn parse_backend(value: &str) -> BackendKind {
+fn parse_stored_backend(run_id: &str, value: &str) -> FwResult<BackendKind> {
     match value {
-        "whisper_cpp" => BackendKind::WhisperCpp,
-        "insanely_fast" => BackendKind::InsanelyFast,
-        "whisper_diarization" => BackendKind::WhisperDiarization,
-        "native-listen" => BackendKind::NativeListen,
-        _ => BackendKind::Auto,
+        "auto" => Ok(BackendKind::Auto),
+        "whisper_cpp" => Ok(BackendKind::WhisperCpp),
+        "insanely_fast" => Ok(BackendKind::InsanelyFast),
+        "whisper_diarization" => Ok(BackendKind::WhisperDiarization),
+        "native-listen" => Ok(BackendKind::NativeListen),
+        _ => Err(FwError::Storage(format!(
+            "invalid backend for run {run_id}: unknown runs.backend value {value:?}"
+        ))),
     }
+}
+
+fn validate_stored_backend_coherence(
+    run_id: &str,
+    stored_backend: &str,
+    result_backend: BackendKind,
+) -> FwResult<BackendKind> {
+    let backend = parse_stored_backend(run_id, stored_backend)?;
+    if backend != result_backend {
+        return Err(FwError::Storage(format!(
+            "backend mismatch for run {run_id}: runs.backend={stored_backend:?}, \
+             result_json.backend={:?}",
+            result_backend.as_str()
+        )));
+    }
+    Ok(backend)
+}
+
+pub(crate) fn validate_run_backend_json(
+    run_id: &str,
+    stored_backend: &str,
+    result_json: &str,
+) -> FwResult<BackendKind> {
+    let result: TranscriptionResult = serde_json::from_str(result_json).map_err(|error| {
+        FwError::Storage(format!("invalid result_json for run {run_id}: {error}"))
+    })?;
+    validate_stored_backend_coherence(run_id, stored_backend, result.backend)
 }
 
 fn storage_index(value: usize, field: &str) -> FwResult<SqliteValue> {
@@ -4626,22 +4663,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_known_variants() {
-        use super::parse_backend;
-        assert_eq!(parse_backend("whisper_cpp"), BackendKind::WhisperCpp);
-        assert_eq!(parse_backend("insanely_fast"), BackendKind::InsanelyFast);
+    fn parse_stored_backend_known_variants() {
+        use super::parse_stored_backend;
         assert_eq!(
-            parse_backend("whisper_diarization"),
+            parse_stored_backend("run-known", "whisper_cpp").expect("whisper_cpp"),
+            BackendKind::WhisperCpp
+        );
+        assert_eq!(
+            parse_stored_backend("run-known", "insanely_fast").expect("insanely_fast"),
+            BackendKind::InsanelyFast
+        );
+        assert_eq!(
+            parse_stored_backend("run-known", "whisper_diarization")
+                .expect("whisper_diarization"),
             BackendKind::WhisperDiarization
         );
     }
 
     #[test]
-    fn parse_backend_unknown_falls_back_to_auto() {
-        use super::parse_backend;
-        assert_eq!(parse_backend("unknown_backend"), BackendKind::Auto);
-        assert_eq!(parse_backend(""), BackendKind::Auto);
-        assert_eq!(parse_backend("WhisperCpp"), BackendKind::Auto); // case sensitive
+    fn parse_stored_backend_unknown_is_rejected_with_run_id() {
+        use super::parse_stored_backend;
+        for invalid in ["unknown_backend", "", "WhisperCpp"] {
+            let error = parse_stored_backend("run-unknown", invalid)
+                .expect_err("unknown backend must fail closed");
+            let message = error.to_string();
+            assert!(message.contains("run-unknown"), "missing run id: {message}");
+            assert!(message.contains(invalid), "missing backend: {message}");
+        }
     }
 
     #[test]
@@ -5394,17 +5442,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_with_whitespace_falls_back_to_auto() {
-        use super::parse_backend;
-        assert_eq!(parse_backend(" whisper_cpp "), BackendKind::Auto);
-        assert_eq!(parse_backend(""), BackendKind::Auto);
+    fn parse_stored_backend_rejects_whitespace() {
+        use super::parse_stored_backend;
+        assert!(parse_stored_backend("run-ws", " whisper_cpp ").is_err());
+        assert!(parse_stored_backend("run-ws", "").is_err());
     }
 
     #[test]
-    fn parse_backend_case_sensitive() {
-        use super::parse_backend;
-        assert_eq!(parse_backend("Whisper_Cpp"), BackendKind::Auto);
-        assert_eq!(parse_backend("INSANELY_FAST"), BackendKind::Auto);
+    fn parse_stored_backend_is_case_sensitive() {
+        use super::parse_stored_backend;
+        assert!(parse_stored_backend("run-case", "Whisper_Cpp").is_err());
+        assert!(parse_stored_backend("run-case", "INSANELY_FAST").is_err());
     }
 
     #[test]
@@ -6681,6 +6729,90 @@ mod tests {
             assert_eq!(details.backend, BackendKind::NativeListen);
             assert_eq!(details.transcript, "first second third");
             assert_eq!(details.segments, expected);
+        }
+    }
+
+    #[test]
+    fn detail_loaders_reject_parent_result_backend_mismatch_before_segment_routing() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("backend_coherence.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let listen_run_id = "listen-parent-mislabeled-whisper";
+        let whisper_run_id = "whisper-parent-mislabeled-listen";
+
+        store
+            .listen_open_run(&ListenRunOpen {
+                run_id: listen_run_id,
+                started_at_rfc3339: "2026-08-27T07:10:00Z",
+                input_path: "stdin-pcm",
+                request_json: "{}",
+            })
+            .expect("open live run");
+        store
+            .listen_flush_utterance(
+                listen_run_id,
+                &[ListenSegmentRow {
+                    idx: 0,
+                    start_sec: 0.0,
+                    end_sec: 1.0,
+                    text: "durable listen segment".to_owned(),
+                }],
+                &[],
+                "durable listen segment",
+                "2026-08-27T07:10:01Z",
+            )
+            .expect("flush live utterance");
+
+        let mut whisper_report = minimal_report(whisper_run_id, &db_path);
+        whisper_report.result.segments = vec![TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(1.0),
+            text: "embedded whisper segment".to_owned(),
+            speaker: None,
+            confidence: None,
+        }];
+        store
+            .persist_report(&whisper_report)
+            .expect("persist whisper run");
+
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
+        conn.execute_with_params(
+            "UPDATE runs SET backend = 'whisper_cpp' WHERE id = ?1",
+            &[SqliteValue::Text(listen_run_id.to_owned().into())],
+        )
+        .expect("mislabel native-listen parent");
+        conn.execute_with_params(
+            "UPDATE runs SET backend = 'native-listen' WHERE id = ?1",
+            &[SqliteValue::Text(whisper_run_id.to_owned().into())],
+        )
+        .expect("mislabel whisper parent");
+
+        for run_id in [listen_run_id, whisper_run_id] {
+            let single_error = store
+                .load_run_details(run_id)
+                .expect_err("single loader must reject backend mismatch");
+            assert!(
+                single_error.to_string().contains(run_id),
+                "single-loader error omitted run id: {single_error}"
+            );
+
+            let batch_error = store
+                .load_run_details_batch_with_configuration(
+                    &[run_id.to_owned()],
+                    true,
+                    |_| {},
+                    || Ok(()),
+                )
+                .expect_err("batched loader must reject backend mismatch");
+            let batch_message = batch_error.to_string();
+            assert!(
+                batch_message.contains(run_id),
+                "batch-loader error omitted run id: {batch_message}"
+            );
+            assert!(
+                batch_message.contains("backend mismatch"),
+                "unexpected batch-loader error: {batch_message}"
+            );
         }
     }
 
@@ -9555,18 +9687,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_all_known_and_unknown() {
-        use super::parse_backend;
-        assert_eq!(parse_backend("whisper_cpp"), BackendKind::WhisperCpp);
-        assert_eq!(parse_backend("insanely_fast"), BackendKind::InsanelyFast);
+    fn parse_stored_backend_accepts_auto_and_native_listen() {
+        use super::parse_stored_backend;
         assert_eq!(
-            parse_backend("whisper_diarization"),
-            BackendKind::WhisperDiarization
+            parse_stored_backend("run-auto", "auto").expect("auto"),
+            BackendKind::Auto
         );
-        // Unknown strings (including "auto") fall back to Auto.
-        assert_eq!(parse_backend("auto"), BackendKind::Auto);
-        assert_eq!(parse_backend("something_else"), BackendKind::Auto);
-        assert_eq!(parse_backend(""), BackendKind::Auto);
+        assert_eq!(
+            parse_stored_backend("run-listen", "native-listen").expect("native-listen"),
+            BackendKind::NativeListen
+        );
+        assert!(parse_stored_backend("run-invalid", "something_else").is_err());
     }
 
     // ── Task #212 — storage pass 2 edge-case tests ──────────────────
