@@ -4074,6 +4074,16 @@ fn source_separate_stage(
     Ok(report)
 }
 
+fn apply_separate_report(inter: &mut PipelineIntermediate, report: &SeparateReport) {
+    inter.vocal_isolated = report.vocal_isolated;
+    if let (Some(output_wav), Some(output_samples)) =
+        (report.output_wav.clone(), report.output_samples)
+    {
+        inter.normalized_wav = Some(output_wav);
+        inter.normalized_duration = Some(output_samples as f64 / 16_000.0);
+    }
+}
+
 async fn execute_separate(
     pcx: &mut PipelineCx,
     log: &mut EventLog,
@@ -4127,13 +4137,7 @@ async fn execute_separate(
         }
     };
 
-    inter.vocal_isolated = report.vocal_isolated;
-    if let (Some(output_wav), Some(output_samples)) =
-        (report.output_wav.clone(), report.output_samples)
-    {
-        inter.normalized_wav = Some(output_wav);
-        inter.normalized_duration = Some(output_samples as f64 / 16_000.0);
-    }
+    apply_separate_report(inter, &report);
     inter.warnings.extend(report.notes.iter().cloned());
 
     tracing::debug!(stage = "separate", "Source separation complete");
@@ -13707,12 +13711,126 @@ mod tests {
         assert!(report.output_rms.is_none());
         assert!(report.output_samples.is_none());
         assert!(!output.exists());
+        let mut inter = super::PipelineIntermediate::new();
+        inter.normalized_wav = Some(input.clone());
+        inter.normalized_duration = Some(1.0);
+        super::apply_separate_report(&mut inter, &report);
+        assert_eq!(inter.normalized_wav.as_deref(), Some(input.as_path()));
+        assert_eq!(inter.normalized_duration, Some(1.0));
+        assert!(!inter.vocal_isolated);
         assert!(
             report
                 .notes
                 .iter()
                 .any(|note| note.contains("weights are not configured"))
         );
+    }
+
+    #[test]
+    fn source_separate_stage_short_input_passes_through_before_loading_weights() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("short.wav");
+        let output = dir.path().join("must-not-exist.wav");
+        let samples = vec![1_000i16; crate::separate::BLOCK_LEN - 1];
+        write_pcm16_mono_wav_for_vad(&input, 16_000, &samples);
+
+        let report = super::source_separate_stage(
+            &input,
+            None,
+            Some(std::path::Path::new("/nonexistent/must-not-load.safetensors")),
+            &output,
+            &CancellationToken::no_deadline(),
+        )
+        .expect("short input must pass through before model loading");
+        assert!(!report.vocal_isolated);
+        assert_eq!(report.mode, super::SeparationMode::UnavailablePassthrough);
+        assert!(report.output_wav.is_none());
+        assert!(report.output_samples.is_none());
+        assert!(!output.exists());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("requires at least 512 samples"))
+        );
+    }
+
+    #[test]
+    fn execute_separate_with_real_weights_writes_and_applies_replacement_waveform() {
+        let Some(_weights_path) = crate::separate::weights_path_from_env() else {
+            eprintln!("SKIP: FRANKEN_WHISPER_DTLN_WEIGHTS not set (model-gated)");
+            return;
+        };
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("one-frame.wav");
+        let output = dir.path().join("dtln_vocals_16k_mono.wav");
+        let samples = (0..crate::separate::BLOCK_LEN)
+            .map(|index| {
+                let phase = index as f64 * 440.0 * std::f64::consts::TAU / 16_000.0;
+                (phase.sin() * 8_000.0) as i16
+            })
+            .collect::<Vec<_>>();
+        write_pcm16_mono_wav_for_vad(&input, 16_000, &samples);
+
+        let mut pcx = PipelineCx::new(None);
+        let mut log = EventLog::new(
+            "dtln-stage-test".to_owned(),
+            "00000000000000000000000000000000".to_owned(),
+            None,
+        );
+        let mut inter = super::PipelineIntermediate::new();
+        inter.normalized_wav = Some(input.clone());
+        inter.normalized_duration = Some(99.0);
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime
+            .block_on(super::execute_separate(
+                &mut pcx,
+                &mut log,
+                StageBudgetPolicy::from_source(|_| None),
+                &dir,
+                &mut inter,
+            ))
+            .expect("real DTLN artifact must produce a replacement waveform");
+
+        assert!(inter.vocal_isolated);
+        assert_eq!(inter.normalized_wav.as_deref(), Some(output.as_path()));
+        assert_eq!(
+            inter.normalized_duration,
+            Some(crate::separate::BLOCK_LEN as f64 / 16_000.0)
+        );
+        let event = log
+            .events
+            .iter()
+            .find(|event| event.code == "separate.ok")
+            .expect("successful stage must emit separate.ok");
+        assert_eq!(event.payload.get("separation_mode"), Some(&json!("dtln")));
+        assert_eq!(
+            event.payload.get("output_samples"),
+            Some(&json!(crate::separate::BLOCK_LEN))
+        );
+        assert_eq!(event.payload.get("vocal_isolated"), Some(&json!(true)));
+        assert!(
+            event
+                .payload
+                .get("output_rms")
+                .and_then(Value::as_f64)
+                .is_some_and(f64::is_finite)
+        );
+
+        let written = crate::audio::read_normalized_wav_16k_mono_raw_with_checkpoint(
+            &output,
+            &|| Ok(()),
+        )
+        .expect("replacement WAV must be readable by the downstream raw reader");
+        assert_eq!(written.len(), crate::separate::BLOCK_LEN);
+        let original = crate::audio::read_normalized_wav_16k_mono_raw_with_checkpoint(
+            &input,
+            &|| Ok(()),
+        )
+        .expect("input WAV must remain readable for the transform comparison");
+        assert_ne!(written, original, "DTLN output must not be an input copy");
     }
 
     #[test]
