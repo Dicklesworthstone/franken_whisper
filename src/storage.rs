@@ -565,7 +565,8 @@ impl RunStore {
     /// Load full details for many runs with batched `WHERE id/run_id IN (…)`
     /// queries instead of the per-run N+1. Ordinary batch-ASR history uses runs +
     /// events; a third query loads authoritative segment rows only when the batch
-    /// contains native-listen runs. Returns existing run_ids in input order.
+    /// contains native-listen runs. Returns existing run_ids in input order,
+    /// preserving repeated IDs as repeated byte-identical detail records.
     /// Output is byte-identical to per-run `load_run_details` (asserted by
     /// `load_run_details_batch_matches_per_run`). `FW_STORAGE_BATCH_HISTORY=0` falls
     /// back to the per-run path (kill-switch + A/B arm).
@@ -672,9 +673,15 @@ impl RunStore {
             let Some(run_row) = run_by_id.get(run_id) else {
                 continue;
             };
-            let events = events_by_run.remove(run_id).unwrap_or_default();
-            let segments = segments_by_run.remove(run_id).unwrap_or_default();
-            out.push(assemble_run_details_batched(run_row, &events, &segments)?);
+            let events = events_by_run
+                .get(run_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let segments = segments_by_run
+                .get(run_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            out.push(assemble_run_details_batched(run_row, events, segments)?);
         }
         Ok(out)
     }
@@ -2636,9 +2643,7 @@ fn parse_durable_segment_rows(
                 .get(column_offset)
                 .and_then(SqliteValue::as_integer)
                 .ok_or_else(|| {
-                    FwError::Storage(format!(
-                        "invalid durable segment index for run {run_id}"
-                    ))
+                    FwError::Storage(format!("invalid durable segment index for run {run_id}"))
                 })?;
             if idx < 0 {
                 return Err(FwError::Storage(format!(
@@ -2646,18 +2651,10 @@ fn parse_durable_segment_rows(
                 )));
             }
 
-            let start_sec = parse_optional_segment_float(
-                row.get(column_offset + 1),
-                run_id,
-                idx,
-                "start_sec",
-            )?;
-            let end_sec = parse_optional_segment_float(
-                row.get(column_offset + 2),
-                run_id,
-                idx,
-                "end_sec",
-            )?;
+            let start_sec =
+                parse_optional_segment_float(row.get(column_offset + 1), run_id, idx, "start_sec")?;
+            let end_sec =
+                parse_optional_segment_float(row.get(column_offset + 2), run_id, idx, "end_sec")?;
             let speaker = match row.get(column_offset + 3) {
                 None | Some(SqliteValue::Null) => None,
                 Some(SqliteValue::Text(value)) => Some(value.to_string()),
@@ -4639,6 +4636,27 @@ mod tests {
                 "batched run `{id}` must byte-match the per-run loader"
             );
         }
+
+        let duplicate_ids = vec![
+            "batch-a".to_owned(),
+            "batch-a".to_owned(),
+            "batch-b".to_owned(),
+        ];
+        let duplicated = store
+            .load_run_details_batch(&duplicate_ids)
+            .expect("batch load with duplicate run ids");
+        assert_eq!(duplicated.len(), duplicate_ids.len());
+        for (details, id) in duplicated.iter().zip(&duplicate_ids) {
+            let per_run = store
+                .load_run_details(id)
+                .expect("per-run duplicate load")
+                .expect("duplicate run exists");
+            assert_eq!(
+                serde_json::to_string(details).expect("serialize duplicate batched details"),
+                serde_json::to_string(&per_run).expect("serialize duplicate per-run details"),
+                "every occurrence of duplicate run `{id}` must byte-match the per-run loader"
+            );
+        }
     }
 
     #[test]
@@ -6383,6 +6401,16 @@ mod tests {
         assert_eq!(batch[0].backend, BackendKind::NativeListen);
         assert_eq!(batch[0].transcript, "first second third");
         assert_eq!(batch[0].segments, expected);
+
+        let duplicate_batch = store
+            .load_run_details_batch(&[run_id.to_owned(), run_id.to_owned()])
+            .expect("load duplicate native-listen details");
+        assert_eq!(duplicate_batch.len(), 2);
+        for details in duplicate_batch {
+            assert_eq!(details.backend, BackendKind::NativeListen);
+            assert_eq!(details.transcript, "first second third");
+            assert_eq!(details.segments, expected);
+        }
     }
 
     #[test]
