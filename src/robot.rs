@@ -172,6 +172,7 @@ pub const HEALTH_REPORT_REQUIRED_FIELDS: &[&str] = &[
     "ffmpeg",
     "database",
     "resources",
+    "audio_input",
     "overall_status",
 ];
 
@@ -2620,6 +2621,13 @@ pub fn robot_schema_value() -> serde_json::Value {
                         "memory_available_bytes": 8_000_000_000_u64,
                         "memory_total_bytes": 16_000_000_000_u64,
                     },
+                    "audio_input": {
+                        "available": true,
+                        "default_device": "Built-in Microphone",
+                        "device_count": 1,
+                        "backend": "cpal",
+                        "issues": [],
+                    },
                     "overall_status": "ok",
                 }),
             },
@@ -2961,6 +2969,8 @@ fn run_complete_value(report: &RunReport) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use serde_json::json;
 
     use crate::model::{RunEvent, TranscriptionSegment};
@@ -2986,6 +2996,37 @@ mod tests {
         run_complete_value, run_error_value, run_stage_value, run_start_value,
         transcript_partial_value,
     };
+
+    const ROBOT_SCHEMA_EVENT_TYPES: [&str; 28] = [
+        "run_start",
+        "stage",
+        "run_complete",
+        "run_error",
+        "backends.discovery",
+        "routing_decision",
+        "transcript.partial",
+        "transcript.confirm",
+        "transcript.retract",
+        "transcript.correct",
+        "transcript.speculation_stats",
+        "listen.session_start",
+        "speech_started",
+        "transcript.delta",
+        "utterance_end",
+        "listen.warning",
+        "listen.session_stats",
+        "listen.controller",
+        "youtube.run_start",
+        "youtube.discovered",
+        "youtube.downloading",
+        "youtube.downloaded",
+        "youtube.transcribing",
+        "youtube.done",
+        "youtube.skipped",
+        "youtube.failed",
+        "youtube.run_complete",
+        "health.report",
+    ];
 
     #[test]
     fn error_envelope_has_terminal_shape() {
@@ -4574,31 +4615,12 @@ mod tests {
         let events = schema["events"]
             .as_object()
             .expect("events should be object");
+        let actual: HashSet<&str> = events.keys().map(String::as_str).collect();
+        let expected: HashSet<&str> = ROBOT_SCHEMA_EVENT_TYPES.into_iter().collect();
         assert_eq!(
-            events.len(),
-            18,
-            "expected 18 event types including routing history, speculation, and listen session events, got {}",
-            events.len()
+            actual, expected,
+            "schema must define the exact 28-event robot contract"
         );
-        for expected in [
-            "run_start",
-            "stage",
-            "run_complete",
-            "run_error",
-            "backends.discovery",
-            "routing_decision",
-            "transcript.partial",
-            "transcript.confirm",
-            "transcript.retract",
-            "transcript.correct",
-            "transcript.speculation_stats",
-            "health.report",
-        ] {
-            assert!(
-                events.contains_key(expected),
-                "missing schema event type `{expected}`"
-            );
-        }
     }
 
     #[test]

@@ -21,6 +21,37 @@ use franken_whisper::robot::{
 };
 use serde_json::Value;
 
+const ROBOT_SCHEMA_EVENT_TYPES: [&str; 28] = [
+    "run_start",
+    "stage",
+    "run_complete",
+    "run_error",
+    "backends.discovery",
+    "routing_decision",
+    "transcript.partial",
+    "transcript.confirm",
+    "transcript.retract",
+    "transcript.correct",
+    "transcript.speculation_stats",
+    "listen.session_start",
+    "speech_started",
+    "transcript.delta",
+    "utterance_end",
+    "listen.warning",
+    "listen.session_stats",
+    "listen.controller",
+    "youtube.run_start",
+    "youtube.discovered",
+    "youtube.downloading",
+    "youtube.downloaded",
+    "youtube.transcribing",
+    "youtube.done",
+    "youtube.skipped",
+    "youtube.failed",
+    "youtube.run_complete",
+    "health.report",
+];
+
 // ---------------------------------------------------------------------------
 // 1. Schema version is present in all event types
 // ---------------------------------------------------------------------------
@@ -296,39 +327,12 @@ fn schema_has_expected_event_types() {
         .as_object()
         .expect("events should be an object");
 
+    let actual: HashSet<&str> = events.keys().map(String::as_str).collect();
+    let expected: HashSet<&str> = ROBOT_SCHEMA_EVENT_TYPES.into_iter().collect();
     assert_eq!(
-        events.len(),
-        18,
-        "schema must define exactly 18 event types (12 batch + 6 listen), found {}",
-        events.len()
+        actual, expected,
+        "schema must define the exact 28-event robot contract"
     );
-
-    let names: HashSet<&str> = events.keys().map(|k| k.as_str()).collect();
-    for expected in [
-        "run_start",
-        "stage",
-        "run_complete",
-        "run_error",
-        "backends.discovery",
-        "routing_decision",
-        "listen.session_start",
-        "speech_started",
-        "transcript.delta",
-        "utterance_end",
-        "listen.warning",
-        "listen.session_stats",
-        "transcript.partial",
-        "transcript.confirm",
-        "transcript.retract",
-        "transcript.correct",
-        "transcript.speculation_stats",
-        "health.report",
-    ] {
-        assert!(
-            names.contains(expected),
-            "missing event type `{expected}` in schema"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -524,19 +528,7 @@ fn robot_schema_documents_all_event_types() {
         .as_object()
         .expect("events should be an object");
 
-    for event_type in [
-        "run_start",
-        "stage",
-        "run_complete",
-        "run_error",
-        "backends.discovery",
-        "transcript.partial",
-        "transcript.confirm",
-        "transcript.retract",
-        "transcript.correct",
-        "transcript.speculation_stats",
-        "health.report",
-    ] {
+    for event_type in ROBOT_SCHEMA_EVENT_TYPES {
         assert!(
             events.contains_key(event_type),
             "robot_schema_value() must document event type `{event_type}`"
