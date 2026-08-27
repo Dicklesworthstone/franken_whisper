@@ -105,6 +105,7 @@ impl ImportExec for Connection {
 const SCHEMA_VERSION: &str = "1.1";
 const EXPORT_FORMAT_VERSION: &str = "1.0";
 const LOCK_STALE_SECONDS: i64 = 300; // 5 minutes
+const MAX_SYNC_VALIDATION_CHILD_MISMATCHES: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -477,7 +478,7 @@ fn export_inner_with_after_runs(
 
     let connection = Connection::open(db_path.display().to_string())
         .map_err(|error| FwError::Storage(error.to_string()))?;
-    verify_schema_exists(&connection)?;
+    verify_schema_exists(connection)?;
 
     let (
         (runs_count, runs_sha256),
@@ -3228,19 +3229,53 @@ pub struct SyncValidationReport {
     pub missing_from_db: Vec<String>,
     /// Run IDs where the record exists in both but data differs.
     pub mismatched_records: Vec<String>,
+    /// Bounded child-row diagnostics keyed by `run_id/idx` or `run_id/seq`.
+    pub child_mismatches: Vec<SyncConflict>,
+    /// `true` when additional child-row diagnostics exceeded the report cap.
+    pub child_mismatches_truncated: bool,
     /// `true` when the database and JSONL export are in perfect agreement.
     pub is_valid: bool,
+}
+
+type ChildValidationKey = (String, i64);
+
+#[derive(Debug, PartialEq)]
+struct SegmentValidationRow {
+    start_sec: Option<f64>,
+    end_sec: Option<f64>,
+    speaker: Option<String>,
+    text: String,
+    confidence: Option<f64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EventValidationRow {
+    ts_rfc3339: String,
+    stage: String,
+    code: String,
+    message: String,
+    payload_json: String,
 }
 
 /// Validate that a SQLite database and a JSONL export directory are in sync.
 ///
 /// Opens the database, reads the runs/segments/events JSONL files from
-/// `jsonl_dir`, and compares run counts, run IDs, segment counts, and event
-/// counts. Supports reading both plain `.jsonl` and compressed `.jsonl.gz`
-/// files (the `.gz` variant is preferred when both exist).
+/// `jsonl_dir`, and compares every persisted run, segment, and event field.
+/// Supports reading both plain `.jsonl` and compressed `.jsonl.gz` files (the
+/// `.gz` variant is preferred when both exist). All database reads share one
+/// read transaction so a concurrent writer cannot produce a torn comparison.
 pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidationReport> {
     let connection = Connection::open(db_path.display().to_string())
         .map_err(|error| FwError::Storage(error.to_string()))?;
+    with_read_snapshot(&connection, || {
+        validate_sync_snapshot(&connection, jsonl_dir)
+    })
+}
+
+fn validate_sync_snapshot(
+    connection: &Connection,
+    jsonl_dir: &Path,
+) -> FwResult<SyncValidationReport> {
     verify_schema_exists(&connection)?;
 
     // --- Collect DB run IDs ---
@@ -3252,9 +3287,11 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
         .map(|row| value_to_string_sqlite(row.get(0)))
         .collect();
 
-    // --- Collect DB counts ---
-    let db_segment_count = count_table(&connection, "segments")?;
-    let db_event_count = count_table(&connection, "events")?;
+    // --- Collect child rows from this same DB snapshot ---
+    let db_segment_map = load_db_segment_map(connection)?;
+    let db_event_map = load_db_event_map(connection)?;
+    let db_segment_count = db_segment_map.len() as u64;
+    let db_event_count = db_event_map.len() as u64;
 
     // --- Read JSONL runs ONCE (the map + the id set) ---
     // `runs.jsonl` was previously read twice — `collect_jsonl_ids` here and
@@ -3267,12 +3304,14 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
     let jsonl_run_map = load_jsonl_run_map(&runs_path)?;
     let jsonl_run_ids: HashSet<String> = jsonl_run_map.keys().cloned().collect();
 
-    // --- Count JSONL segments and events ---
+    // --- Parse and validate JSONL children ---
     let segments_path = resolve_jsonl_path(jsonl_dir, "segments");
-    let jsonl_segment_count = count_jsonl_lines(&segments_path)?;
+    let jsonl_segment_map = load_jsonl_segment_map(&segments_path)?;
+    let jsonl_segment_count = jsonl_segment_map.len() as u64;
 
     let events_path = resolve_jsonl_path(jsonl_dir, "events");
-    let jsonl_event_count = count_jsonl_lines(&events_path)?;
+    let jsonl_event_map = load_jsonl_event_map(&events_path)?;
+    let jsonl_event_count = jsonl_event_map.len() as u64;
 
     // --- Compare ---
     let mut missing_from_jsonl: Vec<String> =
@@ -3285,7 +3324,7 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
     // --- Compare record content for shared run IDs ---
     // (`jsonl_run_map` already loaded above — no second read of runs.jsonl.)
     let shared_ids: Vec<&String> = db_run_ids.intersection(&jsonl_run_ids).collect();
-    let mut mismatched_records: Vec<String> = Vec::new();
+    let mut mismatched_run_ids: HashSet<String> = HashSet::new();
 
     // Prefetch the DB rows for all shared ids with one `WHERE id IN (…)` per chunk
     // instead of one `SELECT … WHERE id = ?1` per shared run (query *setup* dominates
@@ -3345,15 +3384,40 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
                 && value_to_string_sqlite(db_row.get(11))
                     == json_string_or_default(jsonl_value, "acceleration_json", "{}");
             if !matches {
-                mismatched_records.push((*id).clone());
+                mismatched_run_ids.insert((*id).clone());
             }
         }
     }
+
+    let mut child_mismatches = Vec::new();
+    let mut child_mismatches_truncated = false;
+    collect_child_mismatches(
+        &db_segment_map,
+        &jsonl_segment_map,
+        "segments",
+        &mut mismatched_run_ids,
+        &mut child_mismatches,
+        &mut child_mismatches_truncated,
+    );
+    collect_child_mismatches(
+        &db_event_map,
+        &jsonl_event_map,
+        "events",
+        &mut mismatched_run_ids,
+        &mut child_mismatches,
+        &mut child_mismatches_truncated,
+    );
+
+    // Keep diagnostics at aggregate granularity: one entry per affected run,
+    // even when many of its child rows differ.
+    let mut mismatched_records: Vec<String> = mismatched_run_ids.into_iter().collect();
     mismatched_records.sort();
 
     let is_valid = missing_from_jsonl.is_empty()
         && missing_from_db.is_empty()
         && mismatched_records.is_empty()
+        && child_mismatches.is_empty()
+        && !child_mismatches_truncated
         && db_run_ids.len() as u64 == jsonl_run_ids.len() as u64
         && db_segment_count == jsonl_segment_count
         && db_event_count == jsonl_event_count;
@@ -3368,8 +3432,250 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
         missing_from_jsonl,
         missing_from_db,
         mismatched_records,
+        child_mismatches,
+        child_mismatches_truncated,
         is_valid,
     })
+}
+
+fn load_db_segment_map(
+    connection: &Connection,
+) -> FwResult<HashMap<ChildValidationKey, SegmentValidationRow>> {
+    let rows = connection
+        .query(
+            "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
+             FROM segments ORDER BY run_id ASC, idx ASC",
+        )
+        .map_err(|error| FwError::Storage(error.to_string()))?;
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let run_id = sqlite_required_text(row.get(0), "segments.run_id")?;
+        let idx = sqlite_required_i64(row.get(1), "segments.idx")?;
+        let value = SegmentValidationRow {
+            start_sec: sqlite_nullable_f64(row.get(2), "segments.start_sec")?,
+            end_sec: sqlite_nullable_f64(row.get(3), "segments.end_sec")?,
+            speaker: sqlite_nullable_text(row.get(4), "segments.speaker")?,
+            text: sqlite_required_text(row.get(5), "segments.text")?,
+            confidence: sqlite_nullable_f64(row.get(6), "segments.confidence")?,
+        };
+        if map.insert((run_id, idx), value).is_some() {
+            return Err(FwError::Storage(
+                "duplicate composite key in SQLite segments table".to_owned(),
+            ));
+        }
+    }
+    Ok(map)
+}
+
+fn load_db_event_map(
+    connection: &Connection,
+) -> FwResult<HashMap<ChildValidationKey, EventValidationRow>> {
+    let rows = connection
+        .query(
+            "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
+             FROM events ORDER BY run_id ASC, seq ASC",
+        )
+        .map_err(|error| FwError::Storage(error.to_string()))?;
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let run_id = sqlite_required_text(row.get(0), "events.run_id")?;
+        let seq = sqlite_required_i64(row.get(1), "events.seq")?;
+        let value = EventValidationRow {
+            ts_rfc3339: sqlite_required_text(row.get(2), "events.ts_rfc3339")?,
+            stage: sqlite_required_text(row.get(3), "events.stage")?,
+            code: sqlite_required_text(row.get(4), "events.code")?,
+            message: sqlite_required_text(row.get(5), "events.message")?,
+            payload_json: sqlite_required_text(row.get(6), "events.payload_json")?,
+        };
+        if map.insert((run_id, seq), value).is_some() {
+            return Err(FwError::Storage(
+                "duplicate composite key in SQLite events table".to_owned(),
+            ));
+        }
+    }
+    Ok(map)
+}
+
+fn load_jsonl_segment_map(
+    path: &Path,
+) -> FwResult<HashMap<ChildValidationKey, SegmentValidationRow>> {
+    let mut map = HashMap::new();
+    if !path.exists() {
+        return Ok(map);
+    }
+    for (line_index, line) in open_jsonl_reader(path)?.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = serde_json::from_str(trimmed)?;
+        let run_id = json_str(&row, "run_id")?;
+        let idx = json_required_i64(&row, "idx", "segments")?;
+        let value = SegmentValidationRow {
+            start_sec: json_nullable_f64(&row, "start_sec", "segments")?,
+            end_sec: json_nullable_f64(&row, "end_sec", "segments")?,
+            speaker: json_nullable_text(&row, "speaker", "segments")?,
+            text: json_str(&row, "text")?,
+            confidence: json_nullable_f64(&row, "confidence", "segments")?,
+        };
+        if map.insert((run_id, idx), value).is_some() {
+            return Err(FwError::Storage(format!(
+                "duplicate composite key in segments JSONL at line {}",
+                line_index + 1
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn load_jsonl_event_map(
+    path: &Path,
+) -> FwResult<HashMap<ChildValidationKey, EventValidationRow>> {
+    let mut map = HashMap::new();
+    if !path.exists() {
+        return Ok(map);
+    }
+    for (line_index, line) in open_jsonl_reader(path)?.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = serde_json::from_str(trimmed)?;
+        let run_id = json_str(&row, "run_id")?;
+        let seq = json_required_i64(&row, "seq", "events")?;
+        let value = EventValidationRow {
+            ts_rfc3339: json_str(&row, "ts_rfc3339")?,
+            stage: json_str(&row, "stage")?,
+            code: json_str(&row, "code")?,
+            message: json_str(&row, "message")?,
+            payload_json: json_str(&row, "payload_json")?,
+        };
+        if map.insert((run_id, seq), value).is_some() {
+            return Err(FwError::Storage(format!(
+                "duplicate composite key in events JSONL at line {}",
+                line_index + 1
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn collect_child_mismatches<T: PartialEq>(
+    db_rows: &HashMap<ChildValidationKey, T>,
+    jsonl_rows: &HashMap<ChildValidationKey, T>,
+    table: &str,
+    mismatched_run_ids: &mut HashSet<String>,
+    diagnostics: &mut Vec<SyncConflict>,
+    diagnostics_truncated: &mut bool,
+) {
+    let mut keys: HashSet<ChildValidationKey> = db_rows.keys().cloned().collect();
+    keys.extend(jsonl_rows.keys().cloned());
+    let mut keys: Vec<ChildValidationKey> = keys.into_iter().collect();
+    keys.sort();
+
+    for key in keys {
+        let run_id = &key.0;
+        let index = key.1;
+        let reason = match (db_rows.get(&key), jsonl_rows.get(&key)) {
+            (Some(db), Some(jsonl)) if db == jsonl => continue,
+            (Some(_), Some(_)) => "payload differs",
+            (Some(_), None) => "missing from JSONL",
+            (None, Some(_)) => "missing from database",
+            (None, None) => continue,
+        };
+        mismatched_run_ids.insert(run_id.clone());
+        if diagnostics.len() < MAX_SYNC_VALIDATION_CHILD_MISMATCHES {
+            diagnostics.push(SyncConflict {
+                table: table.to_owned(),
+                key: format!("{run_id}/{index}"),
+                reason: reason.to_owned(),
+            });
+        } else {
+            *diagnostics_truncated = true;
+        }
+    }
+}
+
+fn sqlite_required_text(value: Option<&SqliteValue>, field: &str) -> FwResult<String> {
+    match value {
+        Some(SqliteValue::Text(text)) => Ok(text.to_string()),
+        _ => Err(FwError::Storage(format!(
+            "invalid non-text value in SQLite field `{field}`"
+        ))),
+    }
+}
+
+fn sqlite_required_i64(value: Option<&SqliteValue>, field: &str) -> FwResult<i64> {
+    match value {
+        Some(SqliteValue::Integer(number)) => Ok(*number),
+        _ => Err(FwError::Storage(format!(
+            "invalid non-integer value in SQLite field `{field}`"
+        ))),
+    }
+}
+
+fn sqlite_nullable_f64(value: Option<&SqliteValue>, field: &str) -> FwResult<Option<f64>> {
+    match value {
+        Some(SqliteValue::Float(number)) if number.is_finite() => Ok(Some(*number)),
+        Some(SqliteValue::Integer(number)) => Ok(Some(*number as f64)),
+        Some(SqliteValue::Null) => Ok(None),
+        _ => Err(FwError::Storage(format!(
+            "invalid numeric value in SQLite field `{field}`"
+        ))),
+    }
+}
+
+fn sqlite_nullable_text(value: Option<&SqliteValue>, field: &str) -> FwResult<Option<String>> {
+    match value {
+        Some(SqliteValue::Text(text)) => Ok(Some(text.to_string())),
+        Some(SqliteValue::Null) => Ok(None),
+        _ => Err(FwError::Storage(format!(
+            "invalid text value in SQLite field `{field}`"
+        ))),
+    }
+}
+
+fn json_required_i64(value: &serde_json::Value, key: &str, table: &str) -> FwResult<i64> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| FwError::Storage(format!("invalid `{key}` in {table} JSONL row")))
+}
+
+fn json_nullable_f64(
+    value: &serde_json::Value,
+    key: &str,
+    table: &str,
+) -> FwResult<Option<f64>> {
+    match value.get(key) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => number
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .map(Some)
+            .ok_or_else(|| {
+                FwError::Storage(format!("invalid `{key}` in {table} JSONL row"))
+            }),
+        _ => Err(FwError::Storage(format!(
+            "invalid `{key}` in {table} JSONL row"
+        ))),
+    }
+}
+
+fn json_nullable_text(
+    value: &serde_json::Value,
+    key: &str,
+    table: &str,
+) -> FwResult<Option<String>> {
+    match value.get(key) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text.clone())),
+        _ => Err(FwError::Storage(format!(
+            "invalid `{key}` in {table} JSONL row"
+        ))),
+    }
 }
 
 /// Resolve a JSONL file path, preferring `.jsonl.gz` over `.jsonl`.
@@ -10527,6 +10833,186 @@ mod tests {
     }
 
     #[test]
+    fn validate_sync_detects_same_count_child_payload_mutations() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-child-content.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("child-content", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+        assert!(
+            validate_sync(&db_path, &export_dir)
+                .expect("validate untouched export")
+                .is_valid
+        );
+
+        let segments_path = export_dir.join("segments.jsonl");
+        let mut segments = fs::read_to_string(&segments_path)
+            .expect("read segments")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("segment row"))
+            .collect::<Vec<_>>();
+        let segment_count = segments.len();
+        segments[0]["text"] = json!("same-count segment mutation");
+        fs::write(
+            &segments_path,
+            segments
+                .iter()
+                .map(|row| serde_json::to_string(row).expect("serialize segment"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write segments");
+
+        let events_path = export_dir.join("events.jsonl");
+        let mut events = fs::read_to_string(&events_path)
+            .expect("read events")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event row"))
+            .collect::<Vec<_>>();
+        let event_count = events.len();
+        events[0]["message"] = json!("same-count event mutation");
+        fs::write(
+            &events_path,
+            events
+                .iter()
+                .map(|row| serde_json::to_string(row).expect("serialize event"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write events");
+
+        let validation = validate_sync(&db_path, &export_dir).expect("validate mutations");
+        assert!(!validation.is_valid);
+        assert_eq!(validation.db_segment_count, segment_count as u64);
+        assert_eq!(validation.jsonl_segment_count, segment_count as u64);
+        assert_eq!(validation.db_event_count, event_count as u64);
+        assert_eq!(validation.jsonl_event_count, event_count as u64);
+        assert_eq!(validation.mismatched_records, vec!["child-content"]);
+        assert!(validation.child_mismatches.iter().any(|mismatch| {
+            mismatch.table == "segments" && mismatch.reason == "payload differs"
+        }));
+        assert!(validation.child_mismatches.iter().any(|mismatch| {
+            mismatch.table == "events" && mismatch.reason == "payload differs"
+        }));
+        assert!(!validation.child_mismatches_truncated);
+    }
+
+    #[test]
+    fn validate_sync_rejects_malformed_and_duplicate_child_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-child-shape.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("child-shape", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+
+        let segments_path = export_dir.join("segments.jsonl");
+        let original = fs::read_to_string(&segments_path).expect("read segments");
+        let mut rows = original
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("segment row"))
+            .collect::<Vec<_>>();
+        rows[0]
+            .as_object_mut()
+            .expect("segment object")
+            .remove("text");
+        fs::write(
+            &segments_path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).expect("serialize segment"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write malformed segments");
+        let malformed = validate_sync(&db_path, &export_dir)
+            .expect_err("missing child payload field must fail closed");
+        assert!(malformed.to_string().contains("text"));
+
+        let original_rows = original.lines().collect::<Vec<_>>();
+        assert!(original_rows.len() >= 2, "fixture must have two segments");
+        fs::write(
+            &segments_path,
+            format!("{}\n{}\n", original_rows[0], original_rows[0]),
+        )
+        .expect("write duplicate segments");
+        let duplicate = validate_sync(&db_path, &export_dir)
+            .expect_err("duplicate child key must fail closed");
+        assert!(duplicate.to_string().contains("duplicate composite key"));
+    }
+
+    #[test]
+    fn validate_sync_ignores_child_row_order() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("validate-child-order.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        store
+            .persist_report(&fixture_report("child-order", &db_path))
+            .expect("persist");
+        export(&db_path, &export_dir, &state_root).expect("export");
+
+        for filename in ["segments.jsonl", "events.jsonl"] {
+            let path = export_dir.join(filename);
+            let content = fs::read_to_string(&path).expect("read child rows");
+            let mut lines = content.lines().collect::<Vec<_>>();
+            lines.reverse();
+            fs::write(&path, lines.join("\n") + "\n").expect("reverse child rows");
+        }
+
+        let validation = validate_sync(&db_path, &export_dir).expect("validate reordered rows");
+        assert!(validation.is_valid, "row order is not part of sync identity");
+    }
+
+    #[test]
+    fn child_mismatch_diagnostics_are_bounded_without_hiding_invalidity() {
+        let db_rows = (0..=MAX_SYNC_VALIDATION_CHILD_MISMATCHES)
+            .map(|idx| {
+                (
+                    (format!("run-{idx:03}"), idx as i64),
+                    EventValidationRow {
+                        ts_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
+                        stage: "test".to_owned(),
+                        code: "test.event".to_owned(),
+                        message: "message".to_owned(),
+                        payload_json: "{}".to_owned(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let jsonl_rows = HashMap::new();
+        let mut run_ids = HashSet::new();
+        let mut diagnostics = Vec::new();
+        let mut truncated = false;
+
+        collect_child_mismatches(
+            &db_rows,
+            &jsonl_rows,
+            "events",
+            &mut run_ids,
+            &mut diagnostics,
+            &mut truncated,
+        );
+
+        assert_eq!(diagnostics.len(), MAX_SYNC_VALIDATION_CHILD_MISMATCHES);
+        assert_eq!(run_ids.len(), MAX_SYNC_VALIDATION_CHILD_MISMATCHES + 1);
+        assert!(truncated);
+    }
+
+    #[test]
     fn validate_sync_empty_db_and_empty_jsonl() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("val_empty.sqlite3");
@@ -10558,6 +11044,12 @@ mod tests {
             missing_from_jsonl: vec!["run-5".to_owned()],
             missing_from_db: vec![],
             mismatched_records: vec!["run-2".to_owned()],
+            child_mismatches: vec![SyncConflict {
+                table: "segments".to_owned(),
+                key: "run-2/0".to_owned(),
+                reason: "payload differs".to_owned(),
+            }],
+            child_mismatches_truncated: false,
             is_valid: false,
         };
         let json_text = serde_json::to_string_pretty(&report).expect("serialize");
@@ -10568,6 +11060,7 @@ mod tests {
         assert!(!deserialized.is_valid);
         assert_eq!(deserialized.missing_from_jsonl, vec!["run-5"]);
         assert_eq!(deserialized.mismatched_records, vec!["run-2"]);
+        assert_eq!(deserialized.child_mismatches.len(), 1);
     }
 
     // ── bd-246.2: Compression tests ──
@@ -13229,6 +13722,8 @@ mod tests {
             missing_from_jsonl: vec!["run-extra".to_owned()],
             missing_from_db: vec![],
             mismatched_records: vec!["run-001".to_owned(), "run-002".to_owned()],
+            child_mismatches: vec![],
+            child_mismatches_truncated: true,
             is_valid: false,
         };
         let json = serde_json::to_string(&report).expect("serialize");
@@ -13240,6 +13735,7 @@ mod tests {
         assert_eq!(parsed.missing_from_jsonl, vec!["run-extra"]);
         assert!(parsed.missing_from_db.is_empty());
         assert_eq!(parsed.mismatched_records.len(), 2);
+        assert!(parsed.child_mismatches_truncated);
         assert!(!parsed.is_valid);
     }
 

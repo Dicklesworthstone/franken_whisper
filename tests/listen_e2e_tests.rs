@@ -31,12 +31,30 @@ fn jfk_wav() -> PathBuf {
         .join("jfk.wav")
 }
 
-/// Model gate: both lanes must resolve exactly the way the binary resolves
-/// them (same `resolve_model` code path). Returns `None` after printing a
-/// SKIP line when either package is missing.
+fn fast_model_ready() -> bool {
+    static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *READY.get_or_init(|| {
+        franken_whisper::model_distribution::resolve_cached_fast_lane_with_cancel(
+            franken_whisper::model_distribution::FastLaneModel::TinyEn,
+            || false,
+        )
+        .is_ok()
+    })
+}
+
+fn quality_model_ready() -> bool {
+    static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *READY.get_or_init(|| {
+        franken_whisper::model_distribution::resolve_cached_whisper_with_cancel(|| false).is_ok()
+    })
+}
+
+/// Model gate: both lanes authenticate through the same compiled package
+/// trust roots used by the listen binary. Returns `false` after printing a
+/// SKIP line when either package is missing or corrupt.
 fn require_both_models() -> bool {
-    let fast_ok = franken_whisper::native_engine::resolve_model("tiny.en").is_ok();
-    let quality_ok = franken_whisper::native_engine::resolve_model("large-v3-turbo").is_ok();
+    let fast_ok = fast_model_ready();
+    let quality_ok = quality_model_ready();
     if !fast_ok || !quality_ok {
         eprintln!(
             "SKIP confirm_lane_e2e: missing model package(s) \
@@ -49,7 +67,7 @@ fn require_both_models() -> bool {
 }
 
 fn require_fast_model() -> bool {
-    if franken_whisper::native_engine::resolve_model("tiny.en").is_err() {
+    if !fast_model_ready() {
         eprintln!("SKIP confirm_lane_e2e: tiny.en package missing (`fw pull tiny-en`)");
         return false;
     }

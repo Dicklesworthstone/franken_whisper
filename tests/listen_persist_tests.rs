@@ -40,7 +40,14 @@ fn unique_dir(label: &str) -> PathBuf {
 }
 
 fn require_tiny_en() -> bool {
-    if franken_whisper::native_engine::resolve_model("tiny.en").is_err() {
+    static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*READY.get_or_init(|| {
+        franken_whisper::model_distribution::resolve_cached_fast_lane_with_cancel(
+            franken_whisper::model_distribution::FastLaneModel::TinyEn,
+            || false,
+        )
+        .is_ok()
+    }) {
         eprintln!("SKIP persist test: tiny.en package missing (`fw pull tiny-en`)");
         return false;
     }

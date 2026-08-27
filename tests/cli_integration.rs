@@ -465,6 +465,98 @@ fn release_model_sentinels_ignore_same_named_cwd_files() {
 }
 
 #[test]
+fn listen_pinned_fast_lane_names_reject_unauthenticated_cache_files() {
+    let runtime = tempdir().expect("isolated runtime directory");
+    let cache = tempdir().expect("isolated model cache");
+    let home = tempdir().expect("isolated home");
+    let cache_root = cache.path().join("whisper");
+
+    for (artifact_version, filename) in [
+        (
+            franken_whisper::model_distribution::TINY_EN_ARTIFACT_VERSION,
+            franken_whisper::model_distribution::TINY_EN_WEIGHTS_FILENAME,
+        ),
+        (
+            franken_whisper::model_distribution::TINY_ARTIFACT_VERSION,
+            franken_whisper::model_distribution::TINY_WEIGHTS_FILENAME,
+        ),
+    ] {
+        let directory = cache_root.join(artifact_version);
+        std::fs::create_dir_all(&directory).expect("create fast-lane package directory");
+        let mut valid_header = [0_u8; 48];
+        valid_header[0..4].copy_from_slice(&0x6767_6d6c_u32.to_le_bytes());
+        valid_header[44..48].copy_from_slice(&1_i32.to_le_bytes());
+        std::fs::write(directory.join(filename), valid_header)
+            .expect("write header-valid but unauthenticated package");
+    }
+
+    let assert_rejected = |case: &str, extra_args: &[&str], expected_filename: &str| {
+        let mut args = vec![
+            "robot",
+            "listen",
+            "--source",
+            "stdin-pcm",
+            "--quality-model",
+            "none",
+            "--no-persist",
+        ];
+        args.extend_from_slice(extra_args);
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_fw"))
+            .args(&args)
+            .current_dir(runtime.path())
+            .env("HOME", home.path())
+            .env("FRANKEN_WHISPER_MODEL_DIR", cache.path())
+            .env_remove("FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL")
+            .env_remove("FRANKEN_WHISPER_TEST_MODEL_DIR")
+            .output()
+            .unwrap_or_else(|error| panic!("run listen case {case}: {error}"));
+
+        assert!(!output.status.success(), "{case} must fail closed");
+        let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .expect("UTF-8 robot output")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("NDJSON event"))
+            .collect();
+        assert!(
+            events.iter().all(|event| event["event"] != "session_start"),
+            "{case} emitted readiness before authenticating the fast lane"
+        );
+        let error = events
+            .iter()
+            .find(|event| event["event"] == "run_error")
+            .unwrap_or_else(|| panic!("{case} missing terminal run_error: {events:?}"));
+        assert_eq!(error["code"], "FW-MISSING-ARTIFACT", "{case}");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(expected_filename)),
+            "{case} did not identify the unauthenticated package: {error}"
+        );
+    };
+
+    assert_rejected(
+        "default multilingual tiny",
+        &[],
+        franken_whisper::model_distribution::TINY_WEIGHTS_FILENAME,
+    );
+    assert_rejected(
+        "language-selected tiny.en",
+        &["--language", "en"],
+        franken_whisper::model_distribution::TINY_EN_WEIGHTS_FILENAME,
+    );
+    assert_rejected(
+        "explicit bare tiny",
+        &["--fast-model", "tiny"],
+        franken_whisper::model_distribution::TINY_WEIGHTS_FILENAME,
+    );
+    assert_rejected(
+        "explicit bare tiny.en",
+        &["--fast-model", "tiny.en"],
+        franken_whisper::model_distribution::TINY_EN_WEIGHTS_FILENAME,
+    );
+}
+
+#[test]
 fn robot_syntax_errors_are_one_json_line_with_usage_exit_code() {
     let output = run_agent_command(
         env!("CARGO_BIN_EXE_fw"),

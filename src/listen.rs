@@ -1820,45 +1820,101 @@ impl EmissionPolicy for LocalAgreementPolicy {
     }
 }
 
+/// Classify the two bare names reserved for authenticated fast-lane packages.
+/// Path-bearing spellings such as `./tiny` deliberately remain custom models.
+fn pinned_fast_lane_model(spec: &str) -> Option<crate::model_distribution::FastLaneModel> {
+    let spec = spec.trim();
+    if spec.eq_ignore_ascii_case("tiny.en") {
+        Some(crate::model_distribution::FastLaneModel::TinyEn)
+    } else if spec.eq_ignore_ascii_case("tiny") {
+        Some(crate::model_distribution::FastLaneModel::Tiny)
+    } else {
+        None
+    }
+}
+
+fn pinned_fast_lane_label(model: crate::model_distribution::FastLaneModel) -> &'static str {
+    match model {
+        crate::model_distribution::FastLaneModel::TinyEn => "tiny.en",
+        crate::model_distribution::FastLaneModel::Tiny => "tiny",
+    }
+}
+
+/// Resolve and authenticate the fast-lane path before the model loader reopens
+/// it. Keeping path selection separate makes the trust-boundary policy directly
+/// testable without allocating a complete Whisper model.
+fn resolve_fast_model_path(
+    config: &ListenConfig,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> FwResult<(std::path::PathBuf, String, Option<String>)> {
+    let default_spec = match config.language.as_deref() {
+        Some("en") => "tiny.en",
+        _ => "tiny",
+    };
+    let spec = config.fast_model.as_deref().unwrap_or(default_spec).trim();
+    let pinned_model = pinned_fast_lane_model(spec);
+    let resolved = match pinned_model {
+        Some(model) => crate::model_distribution::resolve_cached_fast_lane_with_cancel(
+            model,
+            is_cancelled,
+        )
+        .map(|package| package.weights_path),
+        None => crate::native_engine::resolve_model(spec),
+    };
+
+    match resolved {
+        Ok(path) => Ok((
+            path,
+            pinned_model.map_or_else(|| spec.to_owned(), |model| {
+                pinned_fast_lane_label(model).to_owned()
+            }),
+            None,
+        )),
+        Err(cancelled @ FwError::Cancelled(_)) => Err(cancelled),
+        Err(missing) => {
+            // Fallback contract: session MUST start when the default
+            // release package is present; degraded latency beats refusal.
+            // Cancellation during the fallback authentication is authoritative;
+            // it must never be rewritten as the earlier fast-package miss.
+            let fallback = match crate::model_distribution::resolve_cached_whisper_with_cancel(
+                is_cancelled,
+            ) {
+                Ok(package) => package.weights_path,
+                Err(cancelled @ FwError::Cancelled(_)) => return Err(cancelled),
+                Err(_) => return Err(missing),
+            };
+            let next_action = match pinned_model {
+                Some(crate::model_distribution::FastLaneModel::Tiny) => "run `fw pull tiny`",
+                Some(crate::model_distribution::FastLaneModel::TinyEn) => {
+                    "run `fw pull tiny-en`"
+                }
+                None => "pass an existing explicit model path or install a pinned fast lane",
+            };
+            Ok((
+                fallback,
+                "large-v3-turbo".to_owned(),
+                Some(format!(
+                    "fast model `{spec}` is not cached; using the turbo package as the fast lane \
+                     (higher latency). Next action: {next_action}"
+                )),
+            ))
+        }
+    }
+}
+
 /// Resolve the fast-lane model per the bd-rt-model-provision contract.
 /// Returns (loaded model, model label, fallback_warning).
 fn resolve_fast_model(
     config: &ListenConfig,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> FwResult<(
     std::sync::Arc<crate::native_engine::NativeWhisperModel>,
     String,
     Option<String>,
 )> {
-    let default_spec = match config.language.as_deref() {
-        Some("en") => "tiny.en",
-        _ => "tiny",
-    };
-    let spec = config.fast_model.as_deref().unwrap_or(default_spec);
-    match crate::native_engine::resolve_model(spec) {
-        Ok(path) => {
-            let model = crate::native_engine::NativeWhisperModel::load(&path)?;
-            Ok((model, spec.to_owned(), None))
-        }
-        Err(missing) => {
-            // Fallback contract: session MUST start when the default
-            // release package is present; degraded latency beats refusal.
-            let fallback = crate::native_engine::resolve_model("default").map_err(|_| missing)?;
-            let model = crate::native_engine::NativeWhisperModel::load(&fallback)?;
-            let hint = if spec == "tiny" {
-                "fw pull tiny"
-            } else {
-                "fw pull tiny-en"
-            };
-            Ok((
-                model,
-                "large-v3-turbo".to_owned(),
-                Some(format!(
-                    "fast model `{spec}` is not cached; using the turbo package as the fast lane \
-                     (higher latency). Install the fast-lane package with: {hint}"
-                )),
-            ))
-        }
-    }
+    let (path, label, warning) = resolve_fast_model_path(config, is_cancelled)?;
+    let model = crate::native_engine::NativeWhisperModel::load(&path)?;
+    Ok((model, label, warning))
 }
 
 /// Load a WAV file for `--source file-replay` (bounded rate/channels; the
@@ -2728,7 +2784,8 @@ pub fn run_listen_session(
     let now_ts = || chrono::Utc::now().to_rfc3339();
 
     // Model first: session_start marks "ready" (agents key on it).
-    let (model, fast_model_label, fallback_warning) = resolve_fast_model(config)?;
+    let (model, fast_model_label, fallback_warning) =
+        resolve_fast_model(config, is_cancelled)?;
     let (mut capture, capture_backend, device_label, capture_warning) =
         open_capture_source(config)?;
     // A source can supply its rate/channel layout only after opening (notably
@@ -5894,5 +5951,54 @@ mod adaptive_contract_tests {
         assert_eq!(error.error_code(), "FW-INVALID-REQUEST");
         assert!(error.to_string().contains("capture_buffer_sec"));
         assert!(!emitted, "invalid config emitted a session event");
+    }
+
+    #[test]
+    fn pinned_fast_lane_names_do_not_capture_explicit_paths() {
+        use crate::model_distribution::FastLaneModel;
+
+        assert_eq!(pinned_fast_lane_model("tiny"), Some(FastLaneModel::Tiny));
+        assert_eq!(
+            pinned_fast_lane_model("TINY.EN"),
+            Some(FastLaneModel::TinyEn)
+        );
+        assert_eq!(pinned_fast_lane_model("./tiny"), None);
+        assert_eq!(pinned_fast_lane_model("/models/tiny.en"), None);
+    }
+
+    #[test]
+    fn explicit_fast_model_path_remains_selectable() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("tiny.en");
+        let mut header = [0_u8; 48];
+        header[0..4].copy_from_slice(&0x6767_6d6c_u32.to_le_bytes());
+        header[44..48].copy_from_slice(&1_i32.to_le_bytes());
+        std::fs::write(&path, header).expect("write model header");
+
+        let mut config = ListenConfig::default();
+        config.fast_model = Some(path.to_string_lossy().into_owned());
+        let (resolved, label, warning) = resolve_fast_model_path(&config, &|| false)
+            .expect("an explicit custom path remains supported");
+
+        assert_eq!(resolved, path.canonicalize().expect("canonical fixture"));
+        assert_eq!(label, path.to_string_lossy().into_owned());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn fallback_authentication_cancellation_wins_over_primary_miss() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut config = ListenConfig::default();
+        config.fast_model = Some(
+            directory
+                .path()
+                .join("missing-custom-model.bin")
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        let error = resolve_fast_model_path(&config, &|| true)
+            .expect_err("fallback cancellation must remain authoritative");
+        assert!(matches!(error, FwError::Cancelled(_)));
     }
 }
