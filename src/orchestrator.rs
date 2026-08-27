@@ -188,6 +188,7 @@ impl PipelineConfig {
     /// Rules enforced:
     /// - `Normalize` requires `Ingest` before it.
     /// - `Backend` requires `Normalize` before it (which itself requires `Ingest`).
+    /// - `Separate` requires `Normalize` and must precede `Backend` when both run.
     /// - No duplicate stages.
     pub fn validate(&self) -> FwResult<()> {
         let mut positions = [None; DEFAULT_STAGES.len()];
@@ -272,6 +273,13 @@ impl PipelineConfig {
                         "Separate stage requires Normalize before it".to_owned(),
                     ));
                 }
+            }
+            if let Some(backend_pos) = pos(PipelineStage::Backend)
+                && sep_pos >= backend_pos
+            {
+                return Err(FwError::InvalidRequest(
+                    "Separate stage must precede Backend when both stages are present".to_owned(),
+                ));
             }
         }
 
@@ -494,6 +502,7 @@ impl PipelineCx {
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         CancellationToken {
             deadline: self.deadline,
+            deadline_failure: DeadlineFailure::Cancelled,
         }
     }
 
@@ -511,7 +520,30 @@ impl PipelineCx {
             Some(pipeline_deadline) => Some(pipeline_deadline.min(stage_deadline)),
             None => Some(stage_deadline),
         };
-        CancellationToken { deadline }
+        CancellationToken {
+            deadline,
+            deadline_failure: DeadlineFailure::Cancelled,
+        }
+    }
+
+    /// Produce a stage token whose deadline error preserves whether the
+    /// pipeline deadline or the named per-stage budget expires first.
+    fn named_stage_token(
+        &self,
+        stage: &'static str,
+        stage_budget_ms: u64,
+    ) -> CancellationToken {
+        let now = Utc::now();
+        let clamped = stage_budget_ms.min(i64::MAX as u64);
+        let stage_deadline = now
+            .checked_add_signed(chrono::Duration::milliseconds(clamped as i64))
+            .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+        named_stage_token_for_deadlines(
+            self.deadline,
+            stage_deadline,
+            stage,
+            stage_budget_ms,
+        )
     }
 
     /// Register a cleanup action to be run when the pipeline shuts down.
@@ -538,11 +570,69 @@ impl PipelineCx {
 /// Lightweight, `Send + Sync + Clone` handle that backends use to check the
 /// pipeline deadline without needing the full `PipelineCx`.
 #[derive(Debug, Clone, Copy)]
+enum DeadlineFailure {
+    Cancelled,
+    StageTimeout {
+        stage: &'static str,
+        budget_ms: u64,
+    },
+}
+
+fn named_stage_token_for_deadlines(
+    pipeline_deadline: Option<chrono::DateTime<Utc>>,
+    stage_deadline: chrono::DateTime<Utc>,
+    stage: &'static str,
+    stage_budget_ms: u64,
+) -> CancellationToken {
+    // Strict precedence is intentional: an exact tie is a stage timeout so
+    // the worker checkpoint and token-budget receiver agree.
+    if pipeline_deadline.is_some_and(|deadline| deadline < stage_deadline) {
+        CancellationToken {
+            deadline: pipeline_deadline,
+            deadline_failure: DeadlineFailure::Cancelled,
+        }
+    } else {
+        CancellationToken {
+            deadline: Some(stage_deadline),
+            deadline_failure: DeadlineFailure::StageTimeout {
+                stage,
+                budget_ms: stage_budget_ms,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct CancellationToken {
     deadline: Option<chrono::DateTime<Utc>>,
+    deadline_failure: DeadlineFailure,
 }
 
 impl CancellationToken {
+    fn expiration_error(&self) -> FwError {
+        if crate::cli::ShutdownController::is_shutting_down() {
+            return FwError::Cancelled("pipeline cancelled via Ctrl+C".to_owned());
+        }
+        match self.deadline_failure {
+            DeadlineFailure::Cancelled => {
+                FwError::Cancelled("pipeline deadline exceeded".to_owned())
+            }
+            DeadlineFailure::StageTimeout { stage, budget_ms } => FwError::StageTimeout {
+                stage: stage.to_owned(),
+                budget_ms,
+            },
+        }
+    }
+
+    fn remaining(&self) -> Option<Duration> {
+        self.deadline.map(|deadline| {
+            deadline
+                .signed_duration_since(Utc::now())
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+        })
+    }
+
     pub fn checkpoint(&self) -> FwResult<()> {
         if crate::cli::ShutdownController::is_shutting_down() {
             return Err(FwError::Cancelled(
@@ -552,7 +642,7 @@ impl CancellationToken {
         if let Some(deadline) = self.deadline
             && Utc::now() >= deadline
         {
-            return Err(FwError::Cancelled("pipeline deadline exceeded".to_owned()));
+            return Err(self.expiration_error());
         }
         Ok(())
     }
@@ -565,7 +655,10 @@ impl CancellationToken {
     /// added.
     #[must_use]
     pub fn unbounded() -> Self {
-        Self { deadline: None }
+        Self {
+            deadline: None,
+            deadline_failure: DeadlineFailure::Cancelled,
+        }
     }
 
     /// Create a token with a deadline relative to now.
@@ -575,13 +668,17 @@ impl CancellationToken {
             deadline: Some(
                 Utc::now() + chrono::Duration::milliseconds(duration.as_millis() as i64),
             ),
+            deadline_failure: DeadlineFailure::Cancelled,
         }
     }
 
     /// Create a token with no deadline (never cancels).
     #[cfg(test)]
     pub(crate) fn no_deadline() -> Self {
-        Self { deadline: None }
+        Self {
+            deadline: None,
+            deadline_failure: DeadlineFailure::Cancelled,
+        }
     }
 
     /// Returns `true` if the cancellation token has been triggered (deadline
@@ -598,6 +695,7 @@ impl CancellationToken {
     pub(crate) fn already_expired() -> Self {
         Self {
             deadline: Some(chrono::DateTime::<Utc>::MIN_UTC),
+            deadline_failure: DeadlineFailure::Cancelled,
         }
     }
 }
@@ -1381,6 +1479,44 @@ where
     T: Send + 'static,
     F: FnOnce() -> FwResult<T> + Send + 'static,
 {
+    run_stage_with_timeout(
+        stage,
+        budget_duration(budget_ms),
+        move || FwError::StageTimeout {
+            stage: stage.to_owned(),
+            budget_ms,
+        },
+        operation,
+    )
+}
+
+fn run_stage_with_token_budget<T, F>(
+    stage: &'static str,
+    budget_ms: u64,
+    token: CancellationToken,
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> FwResult<T> + Send + 'static,
+{
+    let timeout = token
+        .remaining()
+        .unwrap_or_else(|| budget_duration(budget_ms));
+    run_stage_with_timeout(stage, timeout, move || token.expiration_error(), operation)
+}
+
+fn run_stage_with_timeout<T, F, E>(
+    stage: &'static str,
+    timeout: Duration,
+    timeout_error: E,
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> FwResult<T> + Send + 'static,
+    E: FnOnce() -> FwError,
+{
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(format!("stage-{stage}"))
@@ -1390,12 +1526,9 @@ where
         })
         .map_err(FwError::Io)?;
 
-    match rx.recv_timeout(budget_duration(budget_ms)) {
+    match rx.recv_timeout(timeout) {
         Ok(result) => result,
-        Err(RecvTimeoutError::Timeout) => Err(FwError::StageTimeout {
-            stage: stage.to_owned(),
-            budget_ms,
-        }),
+        Err(RecvTimeoutError::Timeout) => Err(timeout_error()),
         Err(RecvTimeoutError::Disconnected) => Err(FwError::BackendUnavailable(format!(
             "stage `{stage}` worker exited before returning a result"
         ))),
@@ -1815,7 +1948,15 @@ async fn run_pipeline_body(
                 execute_vad(pcx, log, request, stage_budgets, &mut inter).await?;
             }
             PipelineStage::Separate => {
-                execute_separate(pcx, log, stage_budgets, run_tmp_dir, &mut inter).await?;
+                execute_separate(
+                    pcx,
+                    log,
+                    request,
+                    stage_budgets,
+                    run_tmp_dir,
+                    &mut inter,
+                )
+                .await?;
             }
             // When `request.backend_params.speculative` is set, the Backend stage
             // is replaced with a `SpeculativeStreamingPipeline`-driven path
@@ -3768,6 +3909,32 @@ fn vad_energy_detect_legacy(
     })
 }
 
+fn apply_vad_state(
+    inter: &mut PipelineIntermediate,
+    report: &VadReport,
+    analysis: Option<backend::native_audio::NativeAudioAnalysis>,
+) {
+    inter.native_audio_analysis = analysis.map(Arc::new);
+    inter.vad_regions = Some(report.regions.clone());
+    inter.vad_silence_only = report.silence_only;
+    if report.silence_only {
+        inter.result = Some(crate::model::TranscriptionResult {
+            backend: crate::model::BackendKind::Auto,
+            transcript: String::new(),
+            language: None,
+            segments: Vec::new(),
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({
+                "vad": "silence_only",
+                "detector": report.detector,
+                "fallback_triggered": report.fallback_triggered,
+            }),
+            artifact_paths: Vec::new(),
+        });
+    }
+}
+
 async fn execute_vad(
     pcx: &mut PipelineCx,
     log: &mut EventLog,
@@ -3816,30 +3983,12 @@ async fn execute_vad(
         }
     };
 
-    inter.native_audio_analysis = analysis.map(Arc::new);
+    apply_vad_state(inter, &report, analysis);
     let vad_code = if report.silence_only {
-        inter.vad_silence_only = true;
-        // Provide an empty result for silence-only audio.
-        inter.result = Some(crate::model::TranscriptionResult {
-            backend: crate::model::BackendKind::Auto,
-            transcript: String::new(),
-            language: None,
-            segments: Vec::new(),
-            acceleration: None,
-            diarization: None,
-            raw_output: json!({
-                "vad": "silence_only",
-                "detector": report.detector,
-                "fallback_triggered": report.fallback_triggered,
-            }),
-            artifact_paths: Vec::new(),
-        });
         "vad.silence"
     } else {
         "vad.ok"
     };
-
-    inter.vad_regions = Some(report.regions.clone());
 
     tracing::debug!(
         stage = "vad",
@@ -4094,6 +4243,13 @@ fn apply_separate_report(
             inter.normalized_wav = Some(output_wav.clone());
             inter.normalized_duration = Some(output_samples as f64 / 16_000.0);
             inter.normalized_input_sha256 = Some(output_sha256.clone());
+            // Every cached waveform-derived fact below describes the
+            // pre-DTLN bytes. Clear it at the same atomic replacement seam;
+            // execute_separate rebinds VAD state to the finalized output when
+            // the VAD stage actually ran before this stage.
+            inter.native_audio_analysis = None;
+            inter.vad_regions = None;
+            inter.vad_silence_only = false;
             Ok(())
         }
         (None, None, None) => {
@@ -4110,6 +4266,7 @@ fn apply_separate_report(
 async fn execute_separate(
     pcx: &mut PipelineCx,
     log: &mut EventLog,
+    request: &TranscribeRequest,
     stage_budgets: StageBudgetPolicy,
     run_tmp_dir: &tempfile::TempDir,
     inter: &mut PipelineIntermediate,
@@ -4133,21 +4290,41 @@ async fn execute_separate(
 
     let sep_wav = normalized_wav.clone();
     let cached_analysis = inter.native_audio_analysis.clone();
+    let post_vad_config = inter
+        .vad_regions
+        .is_some()
+        .then(|| VadConfig::from_request(request));
     let weights_path = crate::separate::weights_path_from_env();
     let output_wav = run_tmp_dir.path().join("dtln_vocals_16k_mono.wav");
     let sep_budget_ms = stage_budgets.separate_ms;
-    let sep_token = pcx.stage_token(sep_budget_ms); // ubs:ignore — cancellation token is not a secret
+    let sep_token = pcx.named_stage_token("separate", sep_budget_ms); // ubs:ignore — cancellation token is not a secret
 
-    let report = match run_stage_with_budget("separate", sep_budget_ms, move || {
-        source_separate_stage(
-            &sep_wav,
-            cached_analysis.as_deref(),
-            weights_path.as_deref(),
-            &output_wav,
-            &sep_token,
-        )
-    }) {
-        Ok(report) => report,
+    let (report, post_vad) = match run_stage_with_token_budget(
+        "separate",
+        sep_budget_ms,
+        sep_token,
+        move || {
+            let report = source_separate_stage(
+                &sep_wav,
+                cached_analysis.as_deref(),
+                weights_path.as_deref(),
+                &output_wav,
+                &sep_token,
+            )?;
+            let post_vad = match (post_vad_config.as_ref(), report.output_wav.as_deref()) {
+                (Some(config), Some(replacement_wav)) => Some(
+                    vad_energy_detect_with_analysis(replacement_wav, config, &sep_token)?,
+                ),
+                _ => None,
+            };
+            // Final worker-side fence after every transform-derived operation,
+            // including post-DTLN VAD. A deadline crossed during native analysis
+            // must not return an apparently successful replacement bundle.
+            sep_token.checkpoint()?;
+            Ok((report, post_vad))
+        },
+    ) {
+        Ok(outcome) => outcome,
         Err(error) => {
             let code = stage_failure_code("separate", &error);
             log.push(
@@ -4160,6 +4337,11 @@ async fn execute_separate(
         }
     };
 
+    // Observable-state fence: cancellation after the worker returns but
+    // before the replacement bundle is applied must emit the standard stage
+    // cancellation event rather than mutate PipelineIntermediate.
+    checkpoint_or_emit("separate", pcx, log)?;
+
     if let Err(error) = apply_separate_report(inter, &report) {
         let code = stage_failure_code("separate", &error);
         log.push(
@@ -4169,6 +4351,22 @@ async fn execute_separate(
             json!({"error": error.to_string(), "budget_ms": sep_budget_ms}),
         );
         return Err(error);
+    }
+    let post_vad_payload = post_vad.as_ref().map(|(post_vad_report, _)| {
+        json!({
+            "frames_total": post_vad_report.frames_total,
+            "frames_voiced": post_vad_report.frames_voiced,
+            "voice_ratio": post_vad_report.voice_ratio,
+            "silence_only": post_vad_report.silence_only,
+            "regions_count": post_vad_report.regions.len(),
+            "detector": post_vad_report.detector,
+            "fallback_triggered": post_vad_report.fallback_triggered,
+            "activity_threshold": post_vad_report.activity_threshold,
+            "notes": post_vad_report.notes.clone(),
+        })
+    });
+    if let Some((post_vad_report, post_vad_analysis)) = post_vad {
+        apply_vad_state(inter, &post_vad_report, post_vad_analysis);
     }
     inter.warnings.extend(report.notes.iter().cloned());
 
@@ -4188,6 +4386,8 @@ async fn execute_separate(
             "avg_rms": report.avg_rms,
             "output_rms": report.output_rms,
             "output_samples": report.output_samples,
+            "output_sha256": report.output_sha256,
+            "post_separation_vad": post_vad_payload,
             "active_region_count": report.active_region_count,
             "notes": report.notes,
         }),
@@ -8660,6 +8860,80 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         let result = token.checkpoint();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn named_stage_token_reports_stage_timeout() {
+        let pcx = PipelineCx::new(None);
+        let token = pcx.named_stage_token("separate", 1); // ubs:ignore — cancellation token is not a secret
+        std::thread::sleep(Duration::from_millis(10));
+        let error = token
+            .checkpoint()
+            .expect_err("named stage budget must expire");
+        assert!(matches!(
+            error,
+            FwError::StageTimeout {
+                ref stage,
+                budget_ms: 1
+            } if stage == "separate"
+        ));
+    }
+
+    #[test]
+    fn named_stage_token_reports_timeout_before_later_pipeline_deadline() {
+        let pcx = PipelineCx::new(Some(60_000));
+        let token = pcx.named_stage_token("separate", 1); // ubs:ignore — cancellation token is not a secret
+        std::thread::sleep(Duration::from_millis(10));
+        let error = token
+            .checkpoint()
+            .expect_err("shorter named stage budget must expire first");
+        assert!(matches!(
+            error,
+            FwError::StageTimeout {
+                ref stage,
+                budget_ms: 1
+            } if stage == "separate"
+        ));
+    }
+
+    #[test]
+    fn named_stage_token_tie_prefers_stage_timeout() {
+        let tied_deadline = chrono::DateTime::<Utc>::MIN_UTC;
+        let token = super::named_stage_token_for_deadlines(
+            Some(tied_deadline),
+            tied_deadline,
+            "separate",
+            30_000,
+        );
+        assert!(matches!(
+            token.deadline_failure,
+            super::DeadlineFailure::StageTimeout {
+                stage: "separate",
+                budget_ms: 30_000
+            }
+        ));
+    }
+
+    #[test]
+    fn named_stage_token_preserves_earlier_pipeline_cancellation() {
+        let pcx = PipelineCx::new(Some(1));
+        let token = pcx.named_stage_token("separate", 60_000); // ubs:ignore — cancellation token is not a secret
+        std::thread::sleep(Duration::from_millis(10));
+        let error = token
+            .checkpoint()
+            .expect_err("earlier pipeline deadline must expire");
+        assert!(matches!(error, FwError::Cancelled(_)));
+    }
+
+    #[test]
+    fn stage_receiver_preserves_earlier_pipeline_cancellation() {
+        let pcx = PipelineCx::new(Some(1));
+        let token = pcx.named_stage_token("separate", 100); // ubs:ignore — cancellation token is not a secret
+        let result = super::run_stage_with_token_budget("separate", 100, token, || {
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(())
+        });
+        assert!(matches!(result, Err(FwError::Cancelled(_))));
     }
 
     #[test]
@@ -13788,6 +14062,20 @@ mod tests {
         inter.normalized_wav = Some(input.clone());
         inter.normalized_duration = Some(1.0);
         inter.normalized_input_sha256 = Some(original_hash.clone());
+        inter.native_audio_analysis = Some(Arc::new(
+            crate::backend::native_audio::NativeAudioAnalysis {
+                duration_ms: 1_000,
+                sample_rate_hz: 16_000,
+                frame_ms: 20,
+                frame_count: 50,
+                avg_rms: 0.25,
+                max_rms: 0.5,
+                activity_threshold: 0.01,
+                active_regions: Vec::new(),
+            },
+        ));
+        inter.vad_regions = Some(vec![(0.0, 1.0)]);
+        inter.vad_silence_only = true;
 
         let mut malformed = report.clone();
         malformed.output_sha256 = None;
@@ -13801,6 +14089,9 @@ mod tests {
             inter.normalized_input_sha256.as_deref(),
             Some(original_hash.as_str())
         );
+        assert!(inter.native_audio_analysis.is_some());
+        assert_eq!(inter.vad_regions.as_deref(), Some(&[(0.0, 1.0)][..]));
+        assert!(inter.vad_silence_only);
 
         super::apply_separate_report(&mut inter, &report)
             .expect("complete replacement evidence must apply");
@@ -13811,6 +14102,9 @@ mod tests {
             inter.normalized_input_sha256.as_deref(),
             Some(replacement_hash.as_str())
         );
+        assert!(inter.native_audio_analysis.is_none());
+        assert!(inter.vad_regions.is_none());
+        assert!(!inter.vad_silence_only);
     }
 
     #[test]
@@ -13870,6 +14164,33 @@ mod tests {
         inter.normalized_duration = Some(99.0);
         let original_hash = super::sha256_file(&input).expect("hash input WAV");
         inter.normalized_input_sha256 = Some(original_hash.clone());
+        inter.native_audio_analysis = Some(Arc::new(
+            crate::backend::native_audio::NativeAudioAnalysis {
+                duration_ms: 99_000,
+                sample_rate_hz: 16_000,
+                frame_ms: 20,
+                frame_count: 4_950,
+                avg_rms: 0.5,
+                max_rms: 0.75,
+                activity_threshold: 0.01,
+                active_regions: Vec::new(),
+            },
+        ));
+        inter.vad_regions = Some(vec![(0.0, 99.0)]);
+        let request = TranscribeRequest {
+            input: InputSource::File {
+                path: input.clone(),
+            },
+            backend: BackendKind::WhisperDiarization,
+            model: None,
+            language: None,
+            translate: false,
+            diarize: true,
+            persist: false,
+            db_path: dir.path().join("storage.sqlite3"),
+            timeout_ms: None,
+            backend_params: BackendParams::default(),
+        };
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -13877,6 +14198,7 @@ mod tests {
             .block_on(super::execute_separate(
                 &mut pcx,
                 &mut log,
+                &request,
                 StageBudgetPolicy::from_source(|_| None),
                 &dir,
                 &mut inter,
@@ -13895,6 +14217,19 @@ mod tests {
             inter.normalized_input_sha256.as_deref(),
             Some(replacement_hash.as_str())
         );
+        let rebound_analysis = inter
+            .native_audio_analysis
+            .as_ref()
+            .expect("post-DTLN VAD analysis must be rebound to replacement bytes");
+        assert_eq!(rebound_analysis.duration_ms, 32);
+        assert_ne!(inter.vad_regions.as_deref(), Some(&[(0.0, 99.0)][..]));
+        assert!(inter.vad_silence_only);
+        let silence_result = inter
+            .result
+            .as_ref()
+            .expect("sub-40 ms post-DTLN VAD result must short-circuit as silence");
+        assert!(silence_result.transcript.is_empty());
+        assert!(silence_result.segments.is_empty());
         let event = log
             .events
             .iter()
@@ -13906,6 +14241,25 @@ mod tests {
             Some(&json!(crate::separate::BLOCK_LEN))
         );
         assert_eq!(event.payload.get("vocal_isolated"), Some(&json!(true)));
+        assert_eq!(
+            event.payload.get("output_sha256"),
+            Some(&json!(replacement_hash))
+        );
+        let post_vad = event
+            .payload
+            .get("post_separation_vad")
+            .and_then(Value::as_object)
+            .expect("separate.ok must carry byte-bound post-DTLN VAD evidence");
+        assert_eq!(post_vad.get("detector"), Some(&json!("native_audio_waveform")));
+        assert_eq!(
+            post_vad.get("frames_total"),
+            Some(&json!(rebound_analysis.frame_count))
+        );
+        assert_eq!(
+            post_vad.get("regions_count"),
+            Some(&json!(inter.vad_regions.as_ref().map_or(0, Vec::len)))
+        );
+        assert_eq!(post_vad.get("silence_only"), Some(&json!(true)));
         assert!(
             event
                 .payload
@@ -14234,6 +14588,24 @@ mod tests {
         assert!(
             msg.contains("Separate stage requires Normalize before it"),
             "expected Separate dependency error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_separate_after_backend_fails_closed() {
+        let config = PipelineConfig::new(vec![
+            PipelineStage::Ingest,
+            PipelineStage::Normalize,
+            PipelineStage::Backend,
+            PipelineStage::Separate,
+        ]);
+        let error = config
+            .validate()
+            .expect_err("waveform replacement after backend execution must be rejected");
+        assert!(matches!(error, FwError::InvalidRequest(_)));
+        assert!(
+            error.to_string().contains("Separate stage must precede Backend"),
+            "unexpected validation error: {error}"
         );
     }
 
