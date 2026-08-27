@@ -2426,6 +2426,50 @@ fn record_and_emit_listen_value(
     Ok(())
 }
 
+/// Record the terminal stats value, close its persistence sink, then emit the
+/// exact same owned value. Persistence closes first; when terminal emission
+/// succeeds, a close failure surfaces afterward, matching the listen error
+/// contract.
+fn close_and_emit_final_listen_value(
+    value: serde_json::Value,
+    seq: u64,
+    emit: &mut dyn FnMut(serde_json::Value) -> FwResult<()>,
+    sink: &mut Option<ListenPersistSink>,
+    persist_warnings: &[String],
+    finished_at_rfc3339: &dyn Fn() -> String,
+    language: Option<&str>,
+) -> FwResult<()> {
+    let (event_name, timestamp) = listen_event_identity(&value, seq)?;
+    if let Some(sink) = sink.as_mut() {
+        sink.record_event(seq, timestamp, event_name, &value);
+    }
+    let persist_close_error = match sink.take() {
+        Some(sink) => {
+            let finished_at_rfc3339 = finished_at_rfc3339();
+            sink.close(
+                &serde_json::Value::Array(
+                    persist_warnings
+                        .iter()
+                        .map(|reason| serde_json::json!(reason))
+                        .collect::<Vec<_>>(),
+                )
+                .to_string(),
+                &finished_at_rfc3339,
+                language,
+            )
+            .err()
+        }
+        None => None,
+    };
+    emit(value)?;
+    if let Some(error) = persist_close_error {
+        return Err(FwError::Storage(format!(
+            "listen persistence failed on final close: {error}"
+        )));
+    }
+    Ok(())
+}
+
 /// Run one live session, emitting NDJSON event values through `emit`.
 /// Returns `Ok(cancelled)` — `true` when the session ended on Ctrl-C (the
 /// caller maps that to exit code 130). Fatal errors propagate; the CLI
@@ -3324,36 +3368,18 @@ pub fn run_listen_session(
     // persisted event trail ends exactly like the stdout stream.
     let final_stats_value =
         robot::listen_session_stats_value(&run_id, seq, &now_ts(), &stats, true);
-    let (final_event_name, final_timestamp) = listen_event_identity(&final_stats_value, seq)?;
-    if let Some(sink) = persist_sink.as_mut() {
-        sink.record_event(seq, final_timestamp, final_event_name, &final_stats_value);
-    }
     // Close the run: true end time + final stats/warnings + finalized
     // replay envelope. Failure here surfaces as run_error AFTER the session
     // events were emitted (never silently lost).
-    let persist_close_error = match persist_sink.take() {
-        Some(sink) => sink
-            .close(
-                &serde_json::Value::Array(
-                    persist_warnings
-                        .iter()
-                        .map(|reason| serde_json::json!(reason))
-                        .collect::<Vec<_>>(),
-                )
-                .to_string(),
-                &now_ts(),
-                pinned_language.as_deref(),
-            )
-            .err(),
-        None => None,
-    };
-    emit(final_stats_value)?;
-    let _ = seq; // terminal event emitted; counter's job is done.
-    if let Some(error) = persist_close_error {
-        return Err(FwError::Storage(format!(
-            "listen persistence failed on final close: {error}"
-        )));
-    }
+    close_and_emit_final_listen_value(
+        final_stats_value,
+        seq,
+        emit,
+        &mut persist_sink,
+        &persist_warnings,
+        &now_ts,
+        pinned_language.as_deref(),
+    )?;
     capture.stop()?;
     Ok(cancelled)
 }
@@ -3494,7 +3520,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_events_use_one_timestamp_and_identical_persisted_payloads() {
+    fn confirm_and_terminal_events_match_exact_sqlite_payloads() {
         // Deliberately leave the unique test database in the system temp
         // directory: repository policy forbids automated file deletion.
         let dir = std::env::temp_dir().join(format!(
@@ -3506,9 +3532,10 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("create temp directory");
+        let db_path = dir.join("listen-event-exactness.sqlite3");
         let mut sink = Some(
             ListenPersistSink::open(
-                &dir.join("listen-event-exactness.sqlite3"),
+                &db_path,
                 "listen-event-exactness",
                 "2026-08-27T00:00:00Z",
                 "test-input",
@@ -3598,17 +3625,78 @@ mod tests {
                 "confirm_lag".to_owned(),
             ]
         );
-        let persisted = &sink.as_ref().expect("sink remains open").pending_events;
+        sink.as_mut()
+            .expect("sink remains open")
+            .flush_utterance("2026-08-27T00:00:05Z")
+            .expect("persist exact emitted events");
+        let final_stats_value = robot::listen_session_stats_value(
+            "listen-event-exactness",
+            seq,
+            &now_ts(),
+            &stats,
+            true,
+        );
+        {
+            let mut emit = |value| {
+                let mut bytes = Vec::new();
+                serde_json::to_writer(&mut bytes, &value).expect("serialize terminal event");
+                emitted.push((value, bytes));
+                Ok(())
+            };
+            close_and_emit_final_listen_value(
+                final_stats_value,
+                seq,
+                &mut emit,
+                &mut sink,
+                &warnings,
+                &|| "2026-08-27T00:00:06Z".to_owned(),
+                None,
+            )
+            .expect("persist, close, and emit exact terminal event");
+        }
+        assert!(sink.is_none(), "terminal event closes the persistence sink");
+        assert_eq!(clock_calls.get(), 5, "one timestamp call per event");
+        assert_eq!(
+            emitted
+                .last()
+                .and_then(|(value, _)| value["event"].as_str()),
+            Some("listen.session_stats")
+        );
+        assert_eq!(
+            emitted
+                .last()
+                .and_then(|(value, _)| value["final"].as_bool()),
+            Some(true)
+        );
+        let inspection = crate::storage::BlockingConnection::open(db_path.display().to_string())
+            .expect("open inspection connection");
+        let persisted = inspection
+            .query(
+                "SELECT seq, ts_rfc3339, code, payload_json FROM events \
+                 WHERE run_id = 'listen-event-exactness' ORDER BY seq",
+            )
+            .expect("query persisted exact events");
         assert_eq!(persisted.len(), emitted.len());
         for (row, (value, emitted_bytes)) in persisted.iter().zip(&emitted) {
-            assert_eq!(row.seq, value["seq"].as_u64().expect("event seq"));
+            let expected_seq = i64::try_from(value["seq"].as_u64().expect("event seq"))
+                .expect("event seq fits SQLite integer");
             assert_eq!(
-                row.ts_rfc3339,
-                value["ts"].as_str().expect("event timestamp")
+                row.get(0).and_then(|column| column.as_integer()),
+                Some(expected_seq)
             );
-            assert_eq!(row.code, value["event"].as_str().expect("event name"));
             assert_eq!(
-                row.payload_json.as_bytes(),
+                row.get(1).and_then(|column| column.as_text()),
+                Some(value["ts"].as_str().expect("event timestamp"))
+            );
+            assert_eq!(
+                row.get(2).and_then(|column| column.as_text()),
+                Some(value["event"].as_str().expect("event name"))
+            );
+            assert_eq!(
+                row.get(3)
+                    .and_then(|column| column.as_text())
+                    .expect("persisted payload")
+                    .as_bytes(),
                 emitted_bytes,
                 "persisted and emitted JSON must be byte-identical"
             );
