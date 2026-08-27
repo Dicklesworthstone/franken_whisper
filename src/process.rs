@@ -1515,9 +1515,10 @@ fn bounded_text_tail(text: &str, max_bytes: usize) -> String {
 /// A spawned child whose stdout is consumed incrementally by the caller.
 ///
 /// stderr is drained continuously (a child that logs megabytes can never
-/// wedge us) with only the tail retained; [`StreamingChild::kill`] SIGKILLs
-/// and reaps (idempotent), and dropping the handle does the same — no
-/// zombies, matching `run_command_cancellable`'s ownership semantics.
+/// wedge us) with only the tail retained; [`StreamingChild::kill`] terminates
+/// and reaps the complete owned process group (idempotent), and dropping the
+/// handle does the same — no zombies or pipe-holding descendants, matching
+/// `run_command_cancellable`'s ownership semantics.
 #[cfg(not(windows))]
 impl std::fmt::Debug for StreamingChild {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1536,6 +1537,7 @@ pub struct StreamingChild {
     stderr_join: Option<thread::JoinHandle<()>>,
     rendered_command: String,
     sensitive_values: Vec<String>,
+    owns_process_group: bool,
     reaped: bool,
 }
 
@@ -1563,20 +1565,88 @@ impl StreamingChild {
         self.child.try_wait().map_err(FwError::Io)
     }
 
-    /// SIGKILL + reap. Idempotent; returns the exit status when the child
-    /// was still reapable on this call.
+    /// Terminate and reap the complete owned process group. Idempotent;
+    /// returns the root exit status when cleanup ran on this call.
     pub fn kill(&mut self) -> FwResult<Option<std::process::ExitStatus>> {
         if self.reaped {
             return Ok(None);
         }
-        let _ = self.child.kill();
-        let status = self.child.wait().map_err(FwError::Io)?;
+        if let Err(error) =
+            terminate_descendant_process_tree(&mut self.child, self.owns_process_group)
+        {
+            // A descendant may still own stderr. Detach instead of converting
+            // the cleanup failure into an unbounded join; Drop will retry the
+            // process-group cleanup once more.
+            let _ = self.stderr_join.take();
+            return Err(error);
+        }
+        let status = self.child.try_wait().map_err(FwError::Io)?.ok_or_else(|| {
+            process_tree_cleanup_error(
+                "the streaming root was not reaped after process-tree termination",
+            )
+        })?;
         self.reaped = true;
         if let Some(join) = self.stderr_join.take() {
-            let _ = join.join();
+            join.join().map_err(|_| {
+                process_tree_cleanup_error("the streaming stderr drainer panicked during cleanup")
+            })?;
         }
-        tracing::debug!(command = %self.rendered_command, ?status, "streaming child killed and reaped");
+        tracing::debug!(command = %self.rendered_command, ?status, "streaming process tree terminated and reaped");
         Ok(Some(status))
+    }
+
+    /// Finish a producer after its stdout reaches EOF. Natural nonzero exits
+    /// become `FW-CMD-FAILED`; a root that closes stdout but does not exit
+    /// within `max_wait` is terminated as a complete tree and becomes
+    /// `FW-CMD-TIMEOUT`. In every branch, cleanup failure is preserved rather
+    /// than being replaced by a successful end-of-stream result.
+    pub(crate) fn finish_after_stdout_eof(&mut self, max_wait: Duration) -> FwResult<()> {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    let cleanup = self.kill().map(drop);
+                    let stderr = self.stderr_tail();
+                    let outcome = if status.success() {
+                        Ok(())
+                    } else {
+                        Err(FwError::from_command_failure(
+                            self.rendered_command.clone(),
+                            status.code().unwrap_or(-1),
+                            stderr,
+                        ))
+                    };
+                    return match outcome {
+                        Ok(()) => cleanup,
+                        Err(primary) => {
+                            Err(merge_process_tree_cleanup_result(primary, cleanup))
+                        }
+                    };
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) => {
+                    let cleanup = self.kill().map(drop);
+                    let stderr = self.stderr_tail();
+                    return Err(merge_process_tree_cleanup_result(
+                        FwError::from_command_timeout(
+                            self.rendered_command.clone(),
+                            saturating_duration_ms(max_wait),
+                            stderr,
+                        ),
+                        cleanup,
+                    ));
+                }
+                Err(error) => {
+                    let cleanup = self.kill().map(drop);
+                    return Err(merge_process_tree_cleanup_result(
+                        FwError::Io(error),
+                        cleanup,
+                    ));
+                }
+            }
+        }
     }
 
     /// The retained, argv-secret-redacted stderr tail (lossy UTF-8), for
@@ -1594,7 +1664,9 @@ impl StreamingChild {
 #[cfg(not(windows))]
 impl Drop for StreamingChild {
     fn drop(&mut self) {
-        let _ = self.kill();
+        if let Err(error) = self.kill() {
+            tracing::warn!(command = %self.rendered_command, %error, "streaming process-tree cleanup failed during drop");
+        }
     }
 }
 
@@ -1624,6 +1696,17 @@ pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<Stream
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if bounded_process_tree_unsupported() {
+        return Err(FwError::Unsupported(
+            "bounded streaming subprocess trees are unsupported on this platform".to_owned(),
+        ));
+    }
+    let owns_process_group = configure_descendant_process_tree(&mut command);
+    if !owns_process_group {
+        return Err(FwError::Unsupported(
+            "streaming subprocess capture requires a fresh caller-owned process group".to_owned(),
+        ));
+    }
     let mut child = spawn_managed_child(command).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             FwError::CommandMissing {
@@ -1663,6 +1746,7 @@ pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<Stream
         stderr_join,
         rendered_command,
         sensitive_values,
+        owns_process_group,
         reaped: false,
     })
 }
