@@ -698,7 +698,8 @@ mod tests {
         let output = sep.separate(&input).expect("separate");
         assert_eq!(
             output.len(),
-            (BLOCK_LEN * 6 - BLOCK_LEN) / BLOCK_SHIFT * BLOCK_LEN + BLOCK_LEN
+            input.len(),
+            "hop-aligned complete frames must cover the input exactly; the old oversized per-frame buffer must stay rejected"
         );
         // First hop: exactly one contributing frame, sigmoid(14) ~= 0.9999992.
         for (j, o) in output.iter().take(BLOCK_SHIFT).enumerate() {
