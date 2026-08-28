@@ -152,7 +152,7 @@ pub fn read_normalized_wav_16k_mono(path: &Path) -> FwResult<Vec<f32>> {
 }
 
 /// Read a normalized WAV with cancellation checkpoints between bounded I/O
-/// chunks and around the decoder boundary.
+/// chunks, around the decoder boundary, and around optional denoiser chunks.
 pub fn read_normalized_wav_16k_mono_with_checkpoint(
     path: &Path,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
@@ -164,8 +164,7 @@ pub fn read_normalized_wav_16k_mono_with_checkpoint(
     // golden fixtures run under. Length-preserving, so every downstream
     // timestamp is untouched.
     if let Some(denoiser) = crate::denoise::shared() {
-        let denoised = denoiser.denoise_16k(&samples);
-        checkpoint()?;
+        let denoised = denoiser.denoise_16k_with_checkpoint(&samples, checkpoint)?;
         return Ok(denoised);
     }
     Ok(samples)

@@ -80,35 +80,38 @@ impl Denoiser {
     pub fn denoise_16k_with_progress(
         &self,
         samples: &[f32],
-        mut progress: impl FnMut(usize, usize),
+        progress: impl FnMut(usize, usize),
     ) -> Vec<f32> {
-        if samples.is_empty() {
-            return Vec::new();
+        let result = denoise_16k_chunks_with_controls(
+            samples,
+            |chunk| self.denoise_16k_whole(chunk),
+            progress,
+            || Ok::<(), std::convert::Infallible>(()),
+        );
+        match result {
+            Ok(output) => output,
+            Err(never) => match never {},
         }
-        let chunk = CHUNK_SEC * RATE_16K;
-        let ctx = CTX_SEC * RATE_16K;
-        if samples.len() <= chunk + ctx {
-            progress(0, 1);
-            let denoised = self.denoise_16k_whole(samples);
-            progress(1, 1);
-            return denoised;
-        }
-        let total_chunks = samples.len().div_ceil(chunk);
-        progress(0, total_chunks);
-        let mut out = Vec::with_capacity(samples.len());
-        let mut start = 0;
-        let mut completed_chunks = 0;
-        while start < samples.len() {
-            let end = (start + chunk).min(samples.len());
-            let ctx_start = start.saturating_sub(ctx);
-            let denoised = self.denoise_16k_whole(&samples[ctx_start..end]);
-            out.extend_from_slice(&denoised[start - ctx_start..]);
-            start = end;
-            completed_chunks += 1;
-            progress(completed_chunks, total_chunks);
-        }
-        debug_assert_eq!(out.len(), samples.len());
-        out
+    }
+
+    /// Denoise while honoring a caller-owned cooperative checkpoint before
+    /// and after every bounded chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns the checkpoint error unchanged. No later chunk begins after a
+    /// checkpoint fails.
+    pub fn denoise_16k_with_checkpoint(
+        &self,
+        samples: &[f32],
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Vec<f32>> {
+        denoise_16k_chunks_with_controls(
+            samples,
+            |chunk| self.denoise_16k_whole(chunk),
+            |_, _| {},
+            || checkpoint(),
+        )
     }
 
     /// One un-chunked pass: the reference's own 24 kHz product shape, at
@@ -123,6 +126,48 @@ impl Denoiser {
         back.resize(wav16k.len(), 0.0);
         back
     }
+}
+
+fn denoise_16k_chunks_with_controls<E>(
+    samples: &[f32],
+    mut denoise_whole: impl FnMut(&[f32]) -> Vec<f32>,
+    mut progress: impl FnMut(usize, usize),
+    mut checkpoint: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<f32>, E> {
+    checkpoint()?;
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let chunk = CHUNK_SEC * RATE_16K;
+    let ctx = CTX_SEC * RATE_16K;
+    if samples.len() <= chunk + ctx {
+        progress(0, 1);
+        checkpoint()?;
+        let denoised = denoise_whole(samples);
+        checkpoint()?;
+        progress(1, 1);
+        return Ok(denoised);
+    }
+
+    let total_chunks = samples.len().div_ceil(chunk);
+    progress(0, total_chunks);
+    let mut out = Vec::with_capacity(samples.len());
+    let mut start = 0;
+    let mut completed_chunks = 0;
+    while start < samples.len() {
+        checkpoint()?;
+        let end = (start + chunk).min(samples.len());
+        let ctx_start = start.saturating_sub(ctx);
+        let denoised = denoise_whole(&samples[ctx_start..end]);
+        checkpoint()?;
+        out.extend_from_slice(&denoised[start - ctx_start..]);
+        start = end;
+        completed_chunks += 1;
+        progress(completed_chunks, total_chunks);
+    }
+    debug_assert_eq!(out.len(), samples.len());
+    Ok(out)
 }
 
 /// `FW_DENOISE=0` (or `off`/`false`/`no`) disables the stage even when the
@@ -188,9 +233,79 @@ pub fn shared() -> Option<&'static Denoiser> {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::cell::Cell;
+
+    use crate::error::FwError;
+
     /// Garbage bytes must fail hydration loudly, not build a broken model.
     #[test]
     fn malformed_artifact_is_rejected() {
         assert!(super::Denoiser::from_bytes(vec![0u8; 64]).is_err());
+    }
+
+    #[test]
+    fn chunk_loop_checks_cancellation_before_starting_chunk_work() {
+        let sample_count =
+            super::CHUNK_SEC * super::RATE_16K + super::CTX_SEC * super::RATE_16K + 1;
+        let samples = vec![0.25; sample_count];
+        let checkpoints = Cell::new(0usize);
+        let transformed_chunks = Cell::new(0usize);
+
+        let error = super::denoise_16k_chunks_with_controls(
+            &samples,
+            |chunk| {
+                transformed_chunks.set(transformed_chunks.get() + 1);
+                chunk.to_vec()
+            },
+            |_, _| {},
+            || {
+                let next = checkpoints.get() + 1;
+                checkpoints.set(next);
+                if next == 2 {
+                    Err(FwError::Cancelled("cancel before first chunk".to_owned()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("the pre-chunk checkpoint must stop denoising");
+
+        assert!(
+            matches!(error, FwError::Cancelled(ref message) if message == "cancel before first chunk")
+        );
+        assert_eq!(transformed_chunks.get(), 0);
+    }
+
+    #[test]
+    fn chunk_loop_stops_after_mid_run_cancellation() {
+        let sample_count =
+            super::CHUNK_SEC * super::RATE_16K + super::CTX_SEC * super::RATE_16K + 1;
+        let samples = vec![0.25; sample_count];
+        let checkpoints = Cell::new(0usize);
+        let transformed_chunks = Cell::new(0usize);
+
+        let error = super::denoise_16k_chunks_with_controls(
+            &samples,
+            |chunk| {
+                transformed_chunks.set(transformed_chunks.get() + 1);
+                chunk.to_vec()
+            },
+            |_, _| {},
+            || {
+                let next = checkpoints.get() + 1;
+                checkpoints.set(next);
+                if next == 3 {
+                    Err(FwError::Cancelled("cancel after first chunk".to_owned()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("the post-chunk checkpoint must stop denoising");
+
+        assert!(
+            matches!(error, FwError::Cancelled(ref message) if message == "cancel after first chunk")
+        );
+        assert_eq!(transformed_chunks.get(), 1);
     }
 }
