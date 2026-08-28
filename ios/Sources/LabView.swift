@@ -158,9 +158,10 @@ struct LabView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .background {
-                model.unloadEngineForMemoryPressure()
-            } else if phase == .active {
+            // Keep the large local model resident across an ordinary app
+            // switch. Unloading here made every keyboard handoff pay the full
+            // hydration cost. Real memory warnings still unload it above.
+            if phase == .active {
                 model.assembleEngine()
             }
         }
@@ -181,6 +182,11 @@ struct LabView: View {
                     .foregroundStyle(Lab.emerald)
 
                 switch model.liveDictationState {
+                case .starting(let stage):
+                    ProgressView().tint(Lab.emerald).scaleEffect(1.4)
+                    Text(stage)
+                        .font(.title2.bold())
+                        .multilineTextAlignment(.center)
                 case .listening:
                     Image(systemName: "waveform.circle.fill")
                         .font(.system(size: 58))
@@ -225,13 +231,22 @@ struct LabView: View {
                 if model.liveDictationState == .listening {
                     Button("Stop dictation") { model.stopLiveDictation() }
                         .buttonStyle(GhostButtonStyle(tint: Lab.danger))
-                } else if !model.isLiveDictationActive {
+                } else if case .failed = model.liveDictationState {
+                    Button("Try again") { model.retryKeyboardDictation() }
+                        .buttonStyle(PrimaryButtonStyle())
                     Button("Back to FrankenWhisper") {
                         withAnimation(.easeOut(duration: 0.18)) {
                             model.dismissKeyboardHandoff()
                         }
                     }
                     .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+                } else if model.liveDictationState != .finishing {
+                    Button("Cancel handoff") {
+                        withAnimation(.easeOut(duration: 0.18)) {
+                            model.dismissKeyboardHandoff()
+                        }
+                    }
+                    .buttonStyle(GhostButtonStyle(tint: Lab.textSecondary))
                 }
             }
             .padding(28)
@@ -244,7 +259,7 @@ struct LabView: View {
         switch model.engineState {
         case .notLoaded: "Preparing the local speech engine…"
         case .loading(let stage): stage
-        case .ready: "Activating the microphone…"
+        case .ready: "Preparing microphone access…"
         case .failed(let reason): reason
         }
     }
@@ -266,6 +281,11 @@ struct LabView: View {
                     Button("Start live dictation here") { model.startLiveDictation() }
                         .buttonStyle(PrimaryButtonStyle())
                         .disabled(model.engineState != .ready || model.isBusy)
+                case .starting(let stage):
+                    HStack(spacing: 8) {
+                        ProgressView().tint(Lab.emerald)
+                        StatusLine(kind: .neutral, text: stage)
+                    }
                 case .listening:
                     LevelMeter(level: model.recorder.level)
                     StatusLine(

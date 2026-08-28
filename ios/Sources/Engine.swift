@@ -146,6 +146,9 @@ struct RunOptions {
     var initialPrompt: String?
     var translate = false
     var diarize = false
+    /// `nil` preserves the native engine's normal timestamped transcript.
+    /// Live keyboard dictation sets this to false because it only needs text.
+    var timestamps: Bool? = nil
     var wordTimestamps = false
 
     fileprivate var json: String {
@@ -159,6 +162,9 @@ struct RunOptions {
         }
         if let initialPrompt, !initialPrompt.trimmingCharacters(in: .whitespaces).isEmpty {
             object["initial_prompt"] = initialPrompt
+        }
+        if let timestamps {
+            object["timestamps"] = timestamps
         }
         let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
         return String(decoding: data, as: UTF8.self)

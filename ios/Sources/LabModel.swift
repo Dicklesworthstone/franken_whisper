@@ -95,6 +95,7 @@ final class LabModel {
     // ── Live dictation ────────────────────────────────────────────────────
     enum LiveDictationState: Equatable {
         case idle
+        case starting(String)
         case listening
         case finishing
         case failed(String)
@@ -106,6 +107,7 @@ final class LabModel {
     private var liveDetector = LiveUtteranceDetector()
     private var liveCaptureTask: Task<Void, Never>?
     private var liveDecodeTask: Task<Void, Never>?
+    private var liveStartTask: Task<Void, Never>?
     private var liveQueue: [[Float]] = []
     private var liveSessionID = ""
     private var liveRevision = 0
@@ -134,7 +136,7 @@ final class LabModel {
     var isLiveDictationActive: Bool {
         switch liveDictationState {
         case .idle, .failed: false
-        case .listening, .finishing: true
+        case .starting, .listening, .finishing: true
         }
     }
 
@@ -179,7 +181,7 @@ final class LabModel {
                 guard self.generation == gen else { return }
                 self.engineState = .failed(error.localizedDescription)
                 if self.keyboardStartPending {
-                    self.failKeyboardDictation(
+                    self.failLiveDictation(
                         "The local speech engine could not start: \(error.localizedDescription)")
                 }
             }
@@ -275,7 +277,7 @@ final class LabModel {
         lastError = nil
 
         guard store.phase == .ready else {
-            failKeyboardDictation(
+            failLiveDictation(
                 "Download and verify the local models in FrankenWhisper before using its keyboard.")
             return
         }
@@ -288,7 +290,25 @@ final class LabModel {
     }
 
     func dismissKeyboardHandoff() {
+        keyboardStartPending = false
+        if case .starting = liveDictationState {
+            liveStartTask?.cancel()
+            liveStartTask = nil
+            micRequestInFlight = false
+            liveDictationState = .idle
+            publishLiveSnapshot(state: .idle, message: nil)
+        }
         keyboardHandoffVisible = false
+    }
+
+    func retryKeyboardDictation() {
+        keyboardStartPending = true
+        liveDictationState = .idle
+        if engineState == .ready {
+            beginKeyboardDictationIfReady()
+        } else {
+            assembleEngine()
+        }
     }
 
     private func beginKeyboardDictationIfReady() {
@@ -297,8 +317,12 @@ final class LabModel {
         startLiveDictation()
     }
 
-    private func failKeyboardDictation(_ message: String) {
+    private func failLiveDictation(_ message: String) {
         keyboardStartPending = false
+        liveCaptureTask?.cancel()
+        liveCaptureTask = nil
+        if recorder.isRecording { _ = recorder.stop() }
+        UIApplication.shared.isIdleTimerDisabled = false
         liveSessionID = UUID().uuidString
         liveRevision = 0
         liveDictationState = .failed(message)
@@ -311,31 +335,64 @@ final class LabModel {
     /// append-only text through the App Group. Apple gates that shared
     /// container behind the user's Full Access switch even without networking.
     func startLiveDictation() {
-        guard engineState == .ready, !isLiveDictationActive, !recorder.isRecording,
-              liveDecodeTask == nil, liveCaptureTask == nil, !micRequestInFlight else {
+        guard engineState == .ready else {
+            failLiveDictation("The local speech engine is not ready yet. Please try again when it finishes loading.")
             return
         }
+
+        // A capture watcher can outlive a failed/stopped recorder by one
+        // scheduler turn. Clear that stale handle so a retry cannot silently
+        // bounce off the start guard forever.
+        if !recorder.isRecording, liveCaptureTask != nil {
+            liveCaptureTask?.cancel()
+            liveCaptureTask = nil
+        }
+
+        guard !isLiveDictationActive, !recorder.isRecording else { return }
+        guard liveDecodeTask == nil else {
+            failLiveDictation("FrankenWhisper is still finishing the previous phrase. Try again in a moment.")
+            return
+        }
+        guard liveStartTask == nil, !micRequestInFlight else { return }
+
         micRequestInFlight = true
-        Task {
-            defer { self.micRequestInFlight = false }
-            guard await AVAudioApplication.requestRecordPermission() else {
-                let message = "Microphone access is off. Enable it in Settings › FrankenWhisper."
-                if self.keyboardHandoffVisible {
-                    self.failKeyboardDictation(message)
-                } else {
-                    self.lastError = message
+        liveDictationState = .starting("Checking microphone access…")
+        liveStartTask = Task {
+            defer {
+                self.micRequestInFlight = false
+                self.liveStartTask = nil
+            }
+
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted:
+                break
+            case .denied:
+                self.failLiveDictation(
+                    "Microphone access is off. Enable it in Settings › Privacy & Security › Microphone.")
+                return
+            case .undetermined:
+                self.liveDictationState = .starting("Allow microphone access to begin…")
+                guard await AVAudioApplication.requestRecordPermission() else {
+                    self.failLiveDictation(
+                        "Microphone access is off. Enable it in Settings › Privacy & Security › Microphone.")
+                    return
                 }
+            @unknown default:
+                self.failLiveDictation("iOS could not determine microphone permission. Please try again.")
                 return
             }
+
+            guard !Task.isCancelled else { return }
+            self.liveDictationState = .starting("Starting the microphone…")
             do {
                 try self.recorder.start()
             } catch {
-                let message = "Microphone unavailable: \(error.localizedDescription)"
-                if self.keyboardHandoffVisible {
-                    self.failKeyboardDictation(message)
-                } else {
-                    self.lastError = message
-                }
+                self.failLiveDictation("Microphone unavailable: \(error.localizedDescription)")
+                return
+            }
+
+            guard !Task.isCancelled else {
+                _ = self.recorder.stop()
                 return
             }
 
@@ -353,8 +410,14 @@ final class LabModel {
             EngineHooks.shared.set(span: nil, segments: nil)
             self.publishLiveSnapshot(state: .listening, message: nil)
 
+            let captureSessionID = self.liveSessionID
             self.liveCaptureTask = Task { [weak self] in
                 guard let self else { return }
+                defer {
+                    if self.liveSessionID == captureSessionID {
+                        self.liveCaptureTask = nil
+                    }
+                }
                 while !Task.isCancelled, self.recorder.isRecording {
                     try? await Task.sleep(for: .milliseconds(200))
                     guard !Task.isCancelled else { break }
@@ -429,6 +492,7 @@ final class LabModel {
             initialPrompt: prompt.isEmpty ? nil : prompt,
             translate: false,
             diarize: false,
+            timestamps: false,
             wordTimestamps: false)
 
         liveDecodeTask = Task { [engine] in
@@ -445,11 +509,9 @@ final class LabModel {
                     // Cancellation is used only for app teardown; keep any text
                     // already committed and close the session honestly.
                 } else {
-                    self.liveDictationState = .failed(error.localizedDescription)
-                    self.publishLiveSnapshot(state: .failed, message: error.localizedDescription)
-                    if self.recorder.isRecording { _ = self.recorder.stop() }
                     self.liveStopRequested = true
                     self.liveQueue.removeAll(keepingCapacity: true)
+                    self.failLiveDictation("Local dictation failed: \(error.localizedDescription)")
                     self.endLiveFinishBackgroundTask()
                 }
             }
