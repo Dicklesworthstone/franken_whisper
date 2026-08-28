@@ -7,6 +7,7 @@ struct WhisperObservatory: View {
     let state: LabModel.RunState
     let segments: [TranscriptSegment]
     let started: Date?
+    let estimatedFinishElapsed: TimeInterval?
     let cancel: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -199,10 +200,18 @@ struct WhisperObservatory: View {
 
             Spacer(minLength: 8)
             if active {
-                Text(Self.clock(elapsed(at: date)))
-                    .font(.system(size: Lab.typeSize(12), weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Lab.textSecondary)
-                    .monospacedDigit()
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text(Self.clock(elapsed(at: date)))
+                        .foregroundStyle(Lab.textSecondary)
+                    if let eta = remainingSeconds(at: date) {
+                        Text("≈ \(eta)s left")
+                            .foregroundStyle(accent)
+                            .contentTransition(.numericText())
+                            .accessibilityLabel("About \(eta) seconds remaining")
+                    }
+                }
+                .font(.system(size: Lab.typeSize(12), weight: .semibold, design: .monospaced))
+                .monospacedDigit()
             }
         }
     }
@@ -250,8 +259,17 @@ struct WhisperObservatory: View {
             metric("WINDOWS", run.map { "\($0.done)/\($0.total)" } ?? "—")
             metric("SEGMENTS", segments.count.formatted())
             metric("SPEAKERS", uniqueSpeakers == 0 ? "—" : uniqueSpeakers.formatted())
-            metric("ELAPSED", Self.clock(elapsed(at: date)))
+            if let eta = remainingSeconds(at: date) {
+                metric("ETA", "≈\(eta)s")
+            } else {
+                metric("ELAPSED", Self.clock(elapsed(at: date)))
+            }
         }
+    }
+
+    private func remainingSeconds(at date: Date) -> Int? {
+        guard active, let estimatedFinishElapsed else { return nil }
+        return max(1, Int(ceil(estimatedFinishElapsed - elapsed(at: date))))
     }
 
     private func metric(_ label: String, _ value: String) -> some View {

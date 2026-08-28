@@ -82,10 +82,10 @@ struct LabView: View {
                         }
                         .scrollIndicators(.hidden)
                         .defaultScrollAnchor(.top)
-                        .frame(maxWidth: 760)
+                        .frame(maxWidth: .infinity)
                     }
                     .padding(24)
-                    .frame(maxWidth: 1240, maxHeight: .infinity, alignment: .top)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 } else {
                     ScrollView {
@@ -708,6 +708,7 @@ struct LabView: View {
                         state: model.runState,
                         segments: model.liveSegments,
                         started: model.runStarted,
+                        estimatedFinishElapsed: model.estimatedFinishElapsed,
                         cancel: model.cancelRun
                     )
                 } else if case .staging = model.runState {
@@ -715,6 +716,7 @@ struct LabView: View {
                         state: model.runState,
                         segments: model.liveSegments,
                         started: model.runStarted,
+                        estimatedFinishElapsed: model.estimatedFinishElapsed,
                         cancel: model.cancelRun
                     )
                 } else {

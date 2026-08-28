@@ -10,6 +10,169 @@ import Foundation
 import SwiftUI
 import UIKit
 
+/// Device-local batch-transcription forecast. The first run uses a coarse hardware
+/// tier lookup; completed runs teach it real-time factor, decode-window cadence, and
+/// post-decode tail cost separately for diarized and plain transcripts. No estimate is
+/// exposed until a real 30-second inference window completes.
+private struct WhisperAdaptiveETA {
+    private static let version = "v1"
+
+    private var audioSeconds = 0.0
+    private var windowsTotal = 1
+    private var includesDiarization = false
+    private var decodeStartedElapsed: TimeInterval?
+    private var diarizationStartedElapsed: TimeInterval?
+    private var fuseStartedElapsed: TimeInterval?
+    private var hasMeasuredWindow = false
+    private(set) var predictedFinishElapsed: TimeInterval?
+
+    mutating func reset(includesDiarization: Bool) {
+        audioSeconds = 0
+        windowsTotal = 1
+        self.includesDiarization = includesDiarization
+        decodeStartedElapsed = nil
+        diarizationStartedElapsed = nil
+        fuseStartedElapsed = nil
+        hasMeasuredWindow = false
+        predictedFinishElapsed = nil
+    }
+
+    mutating func beginDecodedAudio(
+        seconds: Double,
+        windows: Int,
+        elapsed: TimeInterval
+    ) {
+        audioSeconds = max(0.1, seconds)
+        windowsTotal = max(1, windows)
+        decodeStartedElapsed = elapsed
+    }
+
+    mutating func observe(state: LabModel.RunState, elapsed: TimeInterval) {
+        switch state {
+        case .running(let done, let total, let stage) where stage == "decoding" && done > 0:
+            hasMeasuredWindow = true
+            windowsTotal = max(1, total)
+            let decodeStart = decodeStartedElapsed ?? 0
+            let measuredWindowSeconds = max(0.05, elapsed - decodeStart) / Double(done)
+            let remainingWindows = Double(max(0, total - done))
+            let tail = includesDiarization
+                ? learnedTailSecondsPerAudioSecond * audioSeconds + learnedFuseSeconds
+                : learnedFuseSeconds
+            let measuredCandidate = elapsed + measuredWindowSeconds * remainingWindows + tail
+            let priorFromRTF = learnedRealTimeFactor * audioSeconds
+            let priorFromWindows = decodeStart
+                + learnedSecondsPerWindow * Double(total)
+                + tail
+            let priorCandidate = (priorFromRTF + priorFromWindows) * 0.5
+            let confidence = min(0.90, 0.48 + 0.42 * Double(done) / Double(max(1, total)))
+            smooth(
+                toward: max(
+                    elapsed + 0.5,
+                    measuredCandidate * confidence + priorCandidate * (1 - confidence)
+                )
+            )
+
+        case .running(_, _, let stage) where stage == "labeling speakers":
+            guard hasMeasuredWindow else { return }
+            if diarizationStartedElapsed == nil { diarizationStartedElapsed = elapsed }
+            let stageStart = diarizationStartedElapsed ?? elapsed
+            smooth(
+                toward: stageStart
+                    + learnedTailSecondsPerAudioSecond * audioSeconds
+                    + learnedFuseSeconds
+            )
+
+        case .running(_, _, let stage) where stage == "fusing":
+            guard hasMeasuredWindow else { return }
+            if fuseStartedElapsed == nil { fuseStartedElapsed = elapsed }
+            smooth(toward: (fuseStartedElapsed ?? elapsed) + learnedFuseSeconds)
+
+        case .idle, .done, .failed:
+            predictedFinishElapsed = nil
+        case .staging, .running:
+            break
+        }
+    }
+
+    mutating func finish(elapsed: TimeInterval) {
+        guard audioSeconds > 0, elapsed.isFinite, elapsed > 0 else {
+            predictedFinishElapsed = nil
+            return
+        }
+        Self.update(key: realTimeFactorKey, sample: elapsed / audioSeconds)
+        if let decodeStartedElapsed {
+            let decodeEnd = diarizationStartedElapsed ?? fuseStartedElapsed ?? elapsed
+            Self.update(
+                key: secondsPerWindowKey,
+                sample: max(0.01, decodeEnd - decodeStartedElapsed) / Double(windowsTotal)
+            )
+        }
+        if let diarizationStartedElapsed {
+            let tailEnd = fuseStartedElapsed ?? elapsed
+            Self.update(
+                key: tailSecondsPerAudioSecondKey,
+                sample: max(0.01, tailEnd - diarizationStartedElapsed) / audioSeconds
+            )
+        }
+        if let fuseStartedElapsed {
+            Self.update(
+                key: fuseSecondsKey,
+                sample: max(0.01, elapsed - fuseStartedElapsed)
+            )
+        }
+        predictedFinishElapsed = nil
+    }
+
+    private mutating func smooth(toward candidate: TimeInterval) {
+        if let old = predictedFinishElapsed {
+            let smoothed = old * 0.68 + candidate * 0.32
+            predictedFinishElapsed = min(smoothed, old + 3.0)
+        } else {
+            predictedFinishElapsed = candidate
+        }
+    }
+
+    private var lane: String { includesDiarization ? "diarized" : "plain" }
+    private var realTimeFactorKey: String { "whisper.eta.\(Self.version).\(lane).rtf" }
+    private var secondsPerWindowKey: String { "whisper.eta.\(Self.version).\(lane).secondsPerWindow" }
+    private var tailSecondsPerAudioSecondKey: String {
+        "whisper.eta.\(Self.version).\(lane).tailSecondsPerAudioSecond"
+    }
+    private var fuseSecondsKey: String { "whisper.eta.\(Self.version).\(lane).fuseSeconds" }
+
+    private var learnedRealTimeFactor: Double {
+        let learned = UserDefaults.standard.double(forKey: realTimeFactorKey)
+        if learned > 0 { return learned }
+        let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let plain: Double = gib >= 8 ? 0.65 : (gib >= 6 ? 0.82 : 1.15)
+        return plain + (includesDiarization ? 0.22 : 0)
+    }
+
+    private var learnedTailSecondsPerAudioSecond: Double {
+        let learned = UserDefaults.standard.double(forKey: tailSecondsPerAudioSecondKey)
+        return learned > 0 ? learned : 0.18
+    }
+
+    private var learnedSecondsPerWindow: Double {
+        let learned = UserDefaults.standard.double(forKey: secondsPerWindowKey)
+        if learned > 0 { return learned }
+        let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        return gib >= 8 ? 16 : (gib >= 6 ? 21 : 29)
+    }
+
+    private var learnedFuseSeconds: Double {
+        let learned = UserDefaults.standard.double(forKey: fuseSecondsKey)
+        return learned > 0 ? learned : 0.8
+    }
+
+    private static func update(key: String, sample: Double) {
+        guard sample.isFinite, sample > 0 else { return }
+        let defaults = UserDefaults.standard
+        let old = defaults.double(forKey: key)
+        defaults.set(old > 0 ? old * 0.72 + sample * 0.28 : sample, forKey: key)
+    }
+}
+
 @MainActor
 @Observable
 final class LabModel {
@@ -86,11 +249,14 @@ final class LabModel {
     }
     var runState: RunState = .idle {
         didSet {
+            let now = Date()
             runActivity.transition(
                 to: runState,
-                elapsed: elapsed(at: Date()),
+                elapsed: elapsed(at: now),
                 emittedSegments: liveSegments.count
             )
+            eta.observe(state: runState, elapsed: elapsed(at: now))
+            estimatedFinishElapsed = eta.predictedFinishElapsed
         }
     }
     /// Raw `SPEAKER_NN` lane → the user's display name, seeded from the
@@ -103,6 +269,8 @@ final class LabModel {
     var liveOffsetSec: Double = 0
     var result: Transcription?
     var wallSeconds: Double = 0
+    var runAudioSeconds: Double = 0
+    var estimatedFinishElapsed: TimeInterval?
     var lastError: String?
 
     // ── Live dictation ────────────────────────────────────────────────────
@@ -156,6 +324,7 @@ final class LabModel {
     private var liveEngineGeneration = 0
     private var runTask: Task<Void, Never>?
     private let runActivity = WhisperActivityController.shared
+    private var eta = WhisperAdaptiveETA()
     private(set) var runStarted: Date?
     /// Guards the async permission → start window: a second Record tap while
     /// the system prompt is up must not install a second tap (ObjC crash).
@@ -828,6 +997,11 @@ final class LabModel {
         liveOffsetSec = 0
         result = nil
         lastError = nil
+        wallSeconds = 0
+        runAudioSeconds = input.seconds ?? 0
+        estimatedFinishElapsed = nil
+        let usesDiarization = diarize && diarizerLoaded
+        eta.reset(includesDiarization: usesDiarization)
         runStarted = Date()
         runState = .staging
         UIApplication.shared.isIdleTimerDisabled = true
@@ -843,7 +1017,7 @@ final class LabModel {
             language: language == "auto" ? nil : language,
             initialPrompt: names.isEmpty ? nil : "Speakers: \(names.joined(separator: ", ")).",
             translate: false,
-            diarize: diarize && diarizerLoaded,
+            diarize: usesDiarization,
             wordTimestamps: wordTimestamps)
         let denoise = self.denoise && denoiserLoaded
 
@@ -870,13 +1044,21 @@ final class LabModel {
                 }
                 guard self.generation == gen else { return }
                 self.liveOffsetSec = stage.skippedLeadingSec
+                self.runAudioSeconds = stage.audioSec
                 let windows = max(1, Int((stage.audioSec / 30.0).rounded(.up)))
+                self.eta.beginDecodedAudio(
+                    seconds: stage.audioSec,
+                    windows: windows,
+                    elapsed: self.elapsed(at: Date())
+                )
                 self.runState = .running(windowsDone: 0, windowsTotal: windows, stage: "decoding")
                 let result = try await engine.run(options: options)
                 guard self.generation == gen else { return }
                 self.result = result
                 self.speakerNameMap = Self.assignNames(names, to: result)
                 self.wallSeconds = Date().timeIntervalSince(self.runStarted ?? Date())
+                self.eta.finish(elapsed: self.wallSeconds)
+                self.estimatedFinishElapsed = nil
                 self.runState = .done
             } catch {
                 guard self.generation == gen else { return }

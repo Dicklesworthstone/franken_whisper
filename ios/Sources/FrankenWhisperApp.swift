@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 struct FrankenWhisperApp: App {
@@ -33,15 +34,41 @@ struct FrankenWhisperApp: App {
         WindowGroup {
             LabView()
                 .preferredColorScheme(.dark)
+                .background(CatalystWindowFreedom())
 #if targetEnvironment(macCatalyst)
-                .frame(minWidth: 680, minHeight: 560)
+                .frame(minWidth: 480, minHeight: 420)
 #endif
         }
 #if targetEnvironment(macCatalyst)
         .defaultSize(width: 1220, height: 840)
-        .windowResizability(.automatic)
+        .windowResizability(.contentMinSize)
 #endif
         .commands { WhisperCommands() }
+    }
+}
+
+private struct CatalystWindowFreedom: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> Controller { Controller() }
+    func updateUIViewController(_ controller: Controller, context: Context) { controller.configure() }
+
+    final class Controller: UIViewController {
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            configure()
+        }
+
+        override func viewDidLayoutSubviews() {
+            super.viewDidLayoutSubviews()
+            configure()
+        }
+
+        func configure() {
+#if targetEnvironment(macCatalyst)
+            guard let restrictions = view.window?.windowScene?.sizeRestrictions else { return }
+            restrictions.minimumSize = CGSize(width: 480, height: 420)
+            restrictions.maximumSize = CGSize(width: 10_000, height: 10_000)
+#endif
+        }
     }
 }
 
