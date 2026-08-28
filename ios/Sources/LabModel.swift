@@ -84,7 +84,15 @@ final class LabModel {
         case done
         case failed(String)
     }
-    var runState: RunState = .idle
+    var runState: RunState = .idle {
+        didSet {
+            runActivity.transition(
+                to: runState,
+                elapsed: elapsed(at: Date()),
+                emittedSegments: liveSegments.count
+            )
+        }
+    }
     /// Raw `SPEAKER_NN` lane → the user's display name, seeded from the
     /// pre-run field when the result lands and editable afterwards through
     /// the transcript card's rename rows.
@@ -108,7 +116,9 @@ final class LabModel {
         case finishing
         case failed(String)
     }
-    var liveDictationState: LiveDictationState = .idle
+    var liveDictationState: LiveDictationState = .idle {
+        didSet { publishLiveActivityState() }
+    }
     var liveDictationText = ""
     var liveLastPhrase = ""
     var liveQueuedUtterances = 0
@@ -145,6 +155,7 @@ final class LabModel {
     private var generation = 0
     private var liveEngineGeneration = 0
     private var runTask: Task<Void, Never>?
+    private let runActivity = WhisperActivityController.shared
     private(set) var runStarted: Date?
     /// Guards the async permission → start window: a second Record tap while
     /// the system prompt is up must not install a second tap (ObjC crash).
@@ -756,6 +767,7 @@ final class LabModel {
     }
 
     private func publishLiveSnapshot(state: DictationSnapshot.State, message: String?) {
+        publishLiveActivityState()
         DictationBridge.write(
             DictationSnapshot(
                 sessionID: liveSessionID,
@@ -767,6 +779,15 @@ final class LabModel {
                 spectrum: state == .listening ? liveSpectrum : nil,
                 expiresAt: liveSessionExpiresAt?.timeIntervalSince1970,
                 updatedAt: Date().timeIntervalSince1970))
+    }
+
+    private func publishLiveActivityState() {
+        runActivity.transitionLive(
+            to: liveDictationState,
+            sessionMinutesRemaining: liveSessionMinutesRemaining,
+            queuedPhrases: liveQueuedUtterances,
+            hasText: !liveDictationText.isEmpty
+        )
     }
 
     func acceptFile(url: URL) {

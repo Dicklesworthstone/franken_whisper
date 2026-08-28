@@ -16,7 +16,12 @@ struct FrankenWhisperApp: App {
         setenv("FW_LOAD_WORKERS", "2", 1)
         // Four rayon workers: the performance cores, leaving efficiency cores for
         // UI and the audio session instead of oversubscribing all six.
+        #if targetEnvironment(macCatalyst)
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        setenv("RAYON_NUM_THREADS", String(max(2, min(10, cores - 2))), 1)
+        #else
         setenv("RAYON_NUM_THREADS", "4", 1)
+        #endif
 
         // A finished transcript remains available to the keyboard only for the
         // lifetime of this app session. Do not resurrect dictated text from a
@@ -28,6 +33,55 @@ struct FrankenWhisperApp: App {
         WindowGroup {
             LabView()
                 .preferredColorScheme(.dark)
+        }
+        .commands { WhisperCommands() }
+    }
+}
+
+struct WhisperCommandActions {
+    let importFile: () -> Void
+    let toggleRecording: () -> Void
+    let transcribe: () -> Void
+    let stop: () -> Void
+    let canRecord: Bool
+    let canTranscribe: Bool
+    let canStop: Bool
+}
+
+private struct WhisperCommandKey: FocusedValueKey {
+    typealias Value = WhisperCommandActions
+}
+
+extension FocusedValues {
+    var whisperCommands: WhisperCommandActions? {
+        get { self[WhisperCommandKey.self] }
+        set { self[WhisperCommandKey.self] = newValue }
+    }
+}
+
+private struct WhisperCommands: Commands {
+    @FocusedValue(\.whisperCommands) private var actions
+
+    var body: some Commands {
+        CommandMenu("Transcription") {
+            Button("Open Audio…") { actions?.importFile() }
+                .keyboardShortcut("o", modifiers: [.command])
+
+            Divider()
+
+            Button("Start or Stop Recording") { actions?.toggleRecording() }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(actions?.canRecord != true)
+
+            Button("Transcribe") { actions?.transcribe() }
+                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(actions?.canTranscribe != true)
+
+            Divider()
+
+            Button("Stop Transcription") { actions?.stop() }
+                .keyboardShortcut(.escape, modifiers: [])
+                .disabled(actions?.canStop != true)
         }
     }
 }

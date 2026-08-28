@@ -28,7 +28,10 @@ targets:
         INFOPLIST_FILE: Sources/Info.plist
         CODE_SIGN_ENTITLEMENTS: FrankenWhisper.entitlements
         FRAMEWORK_SEARCH_PATHS: ["$(inherited)", "."]
-        SUPPORTS_MACCATALYST: false
+        SUPPORTS_MACCATALYST: true
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: false
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: false
+        MACCATALYST_USE_NATIVE_DESIGN: true
       configs:
         Release:
           SWIFT_COMPILATION_MODE: wholemodule
@@ -43,6 +46,13 @@ targets:
         embed: false
       - target: FrankenWhisperKeyboard
         embed: true
+        platformFilter: iOS
+      - target: FrankenWhisperWidgets
+        embed: true
+        platformFilter: iOS
+      - target: FrankenWhisperShare
+        embed: true
+        platformFilter: iOS
     entitlements:
       path: FrankenWhisper.entitlements
       properties:
@@ -64,7 +74,10 @@ targets:
             CFBundleURLName: com.frankenwhisper.FrankenWhisper.dictation
             CFBundleURLSchemes:
               - frankenwhisper
+        NSUserActivityTypes:
+          - com.frankenwhisper.workspace
         ITSAppUsesNonExemptEncryption: false
+        NSSupportsLiveActivities: true
         UILaunchScreen: {}
         NSMicrophoneUsageDescription: >-
           Recordings are transcribed entirely on this device by a local model.
@@ -78,6 +91,67 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+
+  FrankenWhisperWidgets:
+    type: app-extension
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankenwhisper.FrankenWhisper.Widgets
+        PRODUCT_NAME: FrankenWhisper Widgets
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true
+        SUPPORTS_MACCATALYST: false
+    sources:
+      - Widget
+      - Shared/FrankenWhisperSystemState.swift
+      - path: Sources/PrivacyInfo.xcprivacy
+    entitlements:
+      path: FrankenWhisperWidgets.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.frankenwhisper.dictation
+    info:
+      path: Widget/Info.plist
+      properties:
+        CFBundleDisplayName: FrankenWhisper Widgets
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+
+  FrankenWhisperShare:
+    type: app-extension
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankenwhisper.FrankenWhisper.Share
+        PRODUCT_NAME: Transcribe with FrankenWhisper
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true
+        SUPPORTS_MACCATALYST: false
+    sources:
+      - Share
+      - Shared/FrankenWhisperSystemState.swift
+      - path: Sources/PrivacyInfo.xcprivacy
+    entitlements:
+      path: FrankenWhisperShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.frankenwhisper.dictation
+    info:
+      path: Share/Info.plist
+      properties:
+        CFBundleDisplayName: Transcribe with FrankenWhisper
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsFileWithMaxCount: 1
+              NSExtensionActivationSupportsMovieWithMaxCount: 1
 
   FrankenWhisperKeyboard:
     type: app-extension
@@ -93,7 +167,7 @@ targets:
         SKIP_INSTALL: true
     sources:
       - Keyboard
-      - Shared
+      - Shared/DictationBridge.swift
     entitlements:
       path: FrankenWhisperKeyboard.entitlements
       properties:

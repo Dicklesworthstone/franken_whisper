@@ -5,11 +5,13 @@
 import SwiftUI
 
 enum Lab {
-    static let background = Color(red: 0.008, green: 0.039, blue: 0.024) // #020a06 family
-    static let panel = Color.black.opacity(0.4)
-    static let stroke = Color.white.opacity(0.06)
+    static let background = Color(red: 0.004, green: 0.024, blue: 0.019)
+    static let backgroundRaised = Color(red: 0.014, green: 0.065, blue: 0.052)
+    static let panel = Color.black.opacity(0.46)
+    static let stroke = Color.white.opacity(0.075)
     static let emerald = Color(red: 0.204, green: 0.827, blue: 0.6) // #34d399
     static let emeraldDeep = Color(red: 0.0, green: 0.259, blue: 0.145) // #004225
+    static let cyan = Color(red: 0.22, green: 0.84, blue: 0.96)
     static let textPrimary = Color(red: 0.886, green: 0.91, blue: 0.941)
     static let textSecondary = Color(red: 0.58, green: 0.639, blue: 0.722)
     static let amber = Color(red: 0.984, green: 0.749, blue: 0.141) // warnings only
@@ -27,6 +29,47 @@ enum Lab {
             hash = (hash ^ UInt32(byte)) &* 16_777_619
         }
         return palette[Int(hash % UInt32(palette.count))]
+    }
+}
+
+/// Spatial laboratory atmosphere shared by compact and desktop layouts. The
+/// grid is intentionally quiet: text and controls retain the visual hierarchy.
+struct LaboratoryBackground: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        ZStack {
+            Lab.background
+            RadialGradient(
+                colors: [Lab.emerald.opacity(0.16), .clear],
+                center: .topLeading,
+                startRadius: 0,
+                endRadius: 520
+            )
+            RadialGradient(
+                colors: [Lab.violet.opacity(0.11), .clear],
+                center: .bottomTrailing,
+                startRadius: 0,
+                endRadius: 640
+            )
+            if !reduceTransparency {
+                Canvas { context, size in
+                    let spacing: CGFloat = 44
+                    var path = Path()
+                    for x in stride(from: CGFloat.zero, through: size.width, by: spacing) {
+                        path.move(to: CGPoint(x: x, y: 0))
+                        path.addLine(to: CGPoint(x: x, y: size.height))
+                    }
+                    for y in stride(from: CGFloat.zero, through: size.height, by: spacing) {
+                        path.move(to: CGPoint(x: 0, y: y))
+                        path.addLine(to: CGPoint(x: size.width, y: y))
+                    }
+                    context.stroke(path, with: .color(Lab.emerald.opacity(0.035)), lineWidth: 0.5)
+                }
+            }
+        }
+        .ignoresSafeArea()
+        .accessibilityHidden(true)
     }
 }
 
@@ -67,8 +110,30 @@ struct LabPanel<Content: View>: View {
         content
             .padding(18)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Lab.panel, in: RoundedRectangle(cornerRadius: 18))
-            .overlay(RoundedRectangle(cornerRadius: 18).stroke(Lab.stroke, lineWidth: 1))
+            .background {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Lab.panel)
+                    .overlay {
+                        LinearGradient(
+                            colors: [Lab.emerald.opacity(0.045), .clear, Lab.violet.opacity(0.035)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    }
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(
+                        LinearGradient(
+                            colors: [Lab.emerald.opacity(0.2), Lab.stroke, Lab.violet.opacity(0.12)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+            )
+            .shadow(color: Color.black.opacity(0.28), radius: 20, y: 10)
             .overlay(alignment: .topLeading) { Bolt().offset(x: -5, y: -5) }
             .overlay(alignment: .bottomTrailing) { Bolt().offset(x: 5, y: 5) }
     }

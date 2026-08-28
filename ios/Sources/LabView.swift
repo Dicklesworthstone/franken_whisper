@@ -34,7 +34,17 @@ private extension View {
 }
 
 struct LabView: View {
+    private enum Destination: String, CaseIterable, Identifiable {
+        case transcribe = "Transcribe"
+        case live = "Live"
+        case result = "Result"
+        case models = "Models"
+
+        var id: Self { self }
+    }
+
     @State private var model = LabModel()
+    @State private var destination: Destination = .transcribe
     @State private var showDownloadConsent = false
     @State private var showClearConfirmation = false
     @State private var showFileImporter = false
@@ -45,22 +55,43 @@ struct LabView: View {
 
     var body: some View {
         ZStack {
-            Lab.background.ignoresSafeArea()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    header
-                    specimenCard
-                    signalCard
-                    dictationCard
-                    transcriptCard
-                    footer
+            LaboratoryBackground()
+            GeometryReader { geometry in
+                ScrollView {
+                    if geometry.size.width >= 940 {
+                        HStack(alignment: .top, spacing: 24) {
+                            VStack(alignment: .leading, spacing: 22) {
+                                header
+                                specimenCard
+                                dictationCard
+                                footer
+                            }
+                            .frame(width: min(390, geometry.size.width * 0.36))
+
+                            VStack(alignment: .leading, spacing: 22) {
+                                signalCard
+                                transcriptCard
+                            }
+                            .frame(maxWidth: 760)
+                        }
+                        .padding(24)
+                        .frame(maxWidth: 1220)
+                        .frame(maxWidth: .infinity)
+                    } else {
+                        VStack(alignment: .leading, spacing: 22) {
+                            header
+                            destinationPicker
+                            compactWorkspace
+                            footer
+                        }
+                        .padding(16)
+                        .frame(maxWidth: 720)
+                        .frame(maxWidth: .infinity)
+                    }
                 }
-                .padding(16)
-                .frame(maxWidth: 700)
-                .frame(maxWidth: .infinity)
+                .scrollIndicators(.hidden)
+                .scrollDismissesKeyboard(.interactively)
             }
-            .scrollIndicators(.hidden)
-            .scrollDismissesKeyboard(.interactively)
             if model.keyboardHandoffVisible {
                 keyboardHandoffOverlay
                     .transition(.opacity.combined(with: .scale(scale: 0.97)))
@@ -147,8 +178,34 @@ struct LabView: View {
         }
         .onAppear {
             model.prepareEngines()
+            consumeRequestedAction()
+            consumeStagedMedia()
         }
         .onOpenURL { url in
+            if url.scheme?.lowercased() == "frankenwhisper",
+               url.host?.lowercased() == "cancel-run"
+            {
+                model.cancelRun()
+                return
+            }
+            if url.scheme?.lowercased() == "frankenwhisper",
+               url.host?.lowercased() == "end-live"
+            {
+                model.endLiveDictationSession()
+                return
+            }
+            if url.scheme?.lowercased() == "frankenwhisper",
+               url.host?.lowercased() == "new"
+            {
+                destination = .transcribe
+                consumeStagedMedia()
+                return
+            }
+            if url.scheme?.lowercased() == "frankenwhisper",
+               url.host?.lowercased() == "dictate"
+            {
+                destination = .live
+            }
             withAnimation(.easeOut(duration: 0.18)) {
                 model.handleKeyboardURL(url)
             }
@@ -158,17 +215,101 @@ struct LabView: View {
                 model.prepareEngines()
             }
         }
+        .onChange(of: model.runState) { _, state in
+            if case .done = state {
+                withAnimation(.snappy) { destination = .result }
+            }
+        }
         .onChange(of: scenePhase) { _, phase in
             // Keep the large local model resident across an ordinary app
             // switch. Unloading here made every keyboard handoff pay the full
             // hydration cost. Real memory warnings still unload it above.
             if phase == .active {
                 model.prepareEngines()
+                consumeRequestedAction()
+                consumeStagedMedia()
             }
         }
         .sensoryFeedback(.success, trigger: model.result?.transcript)
         .sensoryFeedback(.success, trigger: model.liveLastPhrase)
         .sensoryFeedback(.impact(weight: .medium), trigger: model.recorder.isRecording)
+        .userActivity("com.frankenwhisper.workspace") { activity in
+            activity.title = "FrankenWhisper \(destination.rawValue)"
+            activity.isEligibleForHandoff = true
+            activity.userInfo = ["route": destination.rawValue]
+        }
+        .onContinueUserActivity("com.frankenwhisper.workspace") { activity in
+            guard let rawValue = activity.userInfo?["route"] as? String,
+                  let restored = Destination(rawValue: rawValue)
+            else { return }
+            destination = restored
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first else { return false }
+            model.acceptFile(url: url)
+            return true
+        }
+        .focusedSceneValue(
+            \.whisperCommands,
+            WhisperCommandActions(
+                importFile: { showFileImporter = true },
+                toggleRecording: { model.toggleRecording() },
+                transcribe: {
+                    focusedTextEntry = nil
+                    model.transcribe()
+                },
+                stop: { model.cancelRun() },
+                canRecord: model.recorder.isRecording
+                    || (!model.isBusy && !model.isLiveDictationActive),
+                canTranscribe: model.engineState == .ready && model.input != .none && !model.isBusy,
+                canStop: {
+                    if case .running = model.runState { return true }
+                    if case .staging = model.runState { return true }
+                    return false
+                }()
+            )
+        )
+    }
+
+    private var destinationPicker: some View {
+        Picker("Workspace", selection: $destination) {
+            ForEach(Destination.allCases) { destination in
+                Text(destination.rawValue).tag(destination)
+            }
+        }
+        .pickerStyle(.segmented)
+        .accessibilityLabel("FrankenWhisper workspace")
+    }
+
+    @ViewBuilder
+    private var compactWorkspace: some View {
+        switch destination {
+        case .transcribe:
+            if model.store.phase != .ready { specimenCard }
+            signalCard
+        case .live:
+            dictationCard
+        case .result:
+            transcriptCard
+        case .models:
+            specimenCard
+        }
+    }
+
+    private func consumeStagedMedia() {
+        guard let staged = FrankenWhisperSharedStore.consumeStagedMediaURL() else { return }
+        model.acceptFile(url: staged)
+    }
+
+    private func consumeRequestedAction() {
+        switch FrankenWhisperSharedStore.consumeRequestedAction() {
+        case .transcribe:
+            destination = .transcribe
+        case .live:
+            destination = .live
+        case .none:
+            break
+        }
     }
 
     // ── 03 Live Dictation ─────────────────────────────────────────────────
@@ -366,22 +507,36 @@ struct LabView: View {
     // ── Header ─────────────────────────────────────────────────────────────
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Bolt()
+        HStack(spacing: 13) {
+            MonsterStatusMark(mood: monsterMood, instrument: .hearing, accent: Lab.cyan)
+                .frame(width: 54, height: 54)
+            VStack(alignment: .leading, spacing: 5) {
                 Text("FRANKENWHISPER")
                     .font(.system(size: 22, weight: .black, design: .monospaced))
                     .kerning(2)
                     .foregroundStyle(Lab.textPrimary)
-                Bolt()
+                Text("IT_HEARS // private speech observatory")
+                    .font(.system(size: 11, design: .monospaced))
+                    .kerning(1)
+                    .foregroundStyle(Lab.textSecondary)
             }
-            Text("IT_HEARS // speech → text with speakers, entirely on this phone")
-                .font(.system(size: 11, design: .monospaced))
-                .kerning(1)
-                .foregroundStyle(Lab.textSecondary)
+            Spacer(minLength: 0)
         }
         .padding(.top, 8)
         .accessibilityElement(children: .combine)
+    }
+
+    private var monsterMood: MonsterMood {
+        if model.lastError != nil { return .error }
+        if case .failed = model.engineState { return .error }
+        if case .failed = model.liveEngineState { return .error }
+        if model.isLiveDictationActive || model.recorder.isRecording { return .working }
+        if case .running = model.runState { return .working }
+        if case .staging = model.runState { return .working }
+        if case .loading = model.engineState { return .waking }
+        if case .loading = model.liveEngineState { return .waking }
+        if model.result != nil { return .success }
+        return .idle
     }
 
     // ── 01 The Specimen ────────────────────────────────────────────────────
@@ -526,23 +681,20 @@ struct LabView: View {
 
                 optionsRows
 
-                if case .running(let done, let total, let stage) = model.runState {
-                    LabProgressBar(fraction: Double(done) / Double(max(1, total)))
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
-                        StatusLine(
-                            kind: .neutral,
-                            text: "\(stage) · window \(done)/\(total) · \(Self.clock(model.elapsed(at: context.date))) elapsed"
-                        )
-                    }
-                    Button("Abort") { model.cancelRun() }
-                        .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                if case .running = model.runState {
+                    WhisperObservatory(
+                        state: model.runState,
+                        segments: model.liveSegments,
+                        started: model.runStarted,
+                        cancel: model.cancelRun
+                    )
                 } else if case .staging = model.runState {
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
-                        StatusLine(
-                            kind: .neutral,
-                            text: "preparing audio · \(Self.clock(model.elapsed(at: context.date))) elapsed"
-                        )
-                    }
+                    WhisperObservatory(
+                        state: model.runState,
+                        segments: model.liveSegments,
+                        started: model.runStarted,
+                        cancel: model.cancelRun
+                    )
                 } else {
                     Button("Transcribe") { model.transcribe() }
                         .buttonStyle(PrimaryButtonStyle())

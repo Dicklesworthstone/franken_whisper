@@ -1,0 +1,4 @@
+module FwCore {
+    header "fw_ios.h"
+    export *
+}
