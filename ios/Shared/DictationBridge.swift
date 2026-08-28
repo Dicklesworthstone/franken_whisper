@@ -21,11 +21,17 @@ struct DictationSnapshot: Codable, Equatable {
     var text: String
     var revision: Int
     var message: String?
+    /// Normalized microphone energy and frequency bands. These are derived
+    /// locally from the current capture window and exist only to animate the
+    /// keyboard while it is actively listening.
+    var level: Float?
+    var spectrum: [Float]?
+    var expiresAt: TimeInterval?
     var updatedAt: TimeInterval
 
     static let empty = DictationSnapshot(
         sessionID: "", state: .idle, text: "", revision: 0,
-        message: nil, updatedAt: 0)
+        message: nil, level: nil, spectrum: nil, expiresAt: nil, updatedAt: 0)
 }
 
 /// A tiny control lane in the opposite direction. Once the containing app has

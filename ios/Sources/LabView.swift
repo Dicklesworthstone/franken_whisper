@@ -193,15 +193,12 @@ struct LabView: View {
                         .font(.system(size: 58))
                         .foregroundStyle(Lab.emerald)
                         .symbolEffect(.pulse)
-                    Text("FrankenWhisper is listening locally")
+                    Text("Listening")
                         .font(.title2.bold())
                         .multilineTextAlignment(.center)
                     LevelMeter(level: model.recorder.level)
                         .frame(maxWidth: 280)
-                    Text(
-                        "Swipe right across the bottom edge to return to your app. "
-                            + "Speak there; each phrase appears at your cursor after a natural pause."
-                    )
+                    Text("Return to your app and speak.")
                     .font(.system(size: 14))
                     .multilineTextAlignment(.center)
                     .foregroundStyle(Lab.textSecondary)
@@ -209,15 +206,8 @@ struct LabView: View {
                     Image(systemName: "keyboard.badge.ellipsis")
                         .font(.system(size: 52))
                         .foregroundStyle(Lab.emerald)
-                    Text("Keyboard session ready")
+                    Text("Keyboard ready · \(model.liveSessionMinutesRemaining)m")
                         .font(.title2.bold())
-                    Text(
-                        "Return to your app. For the next \(model.liveSessionMinutesRemaining) minutes, "
-                            + "Start and Finish stay inside the FrankenWhisper keyboard."
-                    )
-                    .font(.system(size: 14))
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(Lab.textSecondary)
                 case .finishing:
                     ProgressView().tint(Lab.emerald).scaleEffect(1.4)
                     Text("Finishing on device…")
@@ -237,7 +227,7 @@ struct LabView: View {
                         .multilineTextAlignment(.center)
                 }
 
-                Text("The microphone, audio, models, and transcript stay on this iPhone.")
+                Text("ON-DEVICE · NOTHING UPLOADED")
                     .font(.system(size: 11, design: .monospaced))
                     .multilineTextAlignment(.center)
                     .foregroundStyle(Lab.textSecondary.opacity(0.8))
@@ -255,7 +245,7 @@ struct LabView: View {
                     }
                     .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
                 } else if model.liveDictationState != .finishing {
-                    Button("Cancel handoff") {
+                    Button("Cancel") {
                         withAnimation(.easeOut(duration: 0.18)) {
                             model.dismissKeyboardHandoff()
                         }
@@ -283,18 +273,15 @@ struct LabView: View {
             VStack(alignment: .leading, spacing: 12) {
                 LabLabel(text: "03 · Live Dictation")
                 Text(
-                    "The first Start visibly opens FrankenWhisper because iOS forbids microphone "
-                        + "access inside custom keyboards. After that one activation, a private "
-                        + "15-minute session keeps Start and Finish in the keyboard—no repeated app switch. "
-                        + "Realtime dictation uses a much smaller multilingual model for speed; the main "
-                        + "transcription mode below keeps large-v3-turbo for full accuracy."
+                    "Fast on-device dictation. Activate once, then Start and Finish stay in the keyboard "
+                        + "for an hour. Full transcription below keeps the larger accuracy model."
                 )
                 .font(.system(size: 12, design: .monospaced))
                 .foregroundStyle(Lab.textSecondary)
 
                 switch model.liveDictationState {
                 case .idle:
-                    Button("Start 15-minute keyboard session") { model.startLiveDictation() }
+                    Button("Enable 1-hour keyboard session") { model.startLiveDictation() }
                         .buttonStyle(PrimaryButtonStyle())
                         .disabled(model.liveEngineState != .ready || model.isBusy)
                 case .starting(let stage):
@@ -314,7 +301,7 @@ struct LabView: View {
                 case .armed:
                     StatusLine(
                         kind: .ok,
-                        text: "keyboard ready · about \(model.liveSessionMinutesRemaining) min left · standby audio discarded")
+                        text: "keyboard ready · \(model.liveSessionMinutesRemaining) min left")
                     HStack(spacing: 10) {
                         Button("Start dictating") { model.startLiveDictation() }
                             .buttonStyle(PrimaryButtonStyle())
@@ -357,10 +344,7 @@ struct LabView: View {
                 }
 
                 Text(
-                    "ONE-TIME SETUP  Settings › General › Keyboard › Keyboards › Add New Keyboard "
-                        + "› FrankenWhisper, then enable Full Access. Apple requires that switch for the "
-                        + "local App Group handoff. FrankenWhisper does not transmit keyboard or dictation data. "
-                        + "The keyboard remains usable for ordinary typing without Full Access."
+                    "SETUP  Add FrankenWhisper in iOS Keyboard settings and enable Full Access for its local handoff. Nothing is uploaded."
                 )
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(Lab.textSecondary.opacity(0.8))

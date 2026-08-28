@@ -123,14 +123,18 @@ final class LabModel {
     private var liveStopRequested = false
     private var liveEndSessionRequested = false
     private var liveSessionExpiresAt: Date?
+    private var liveMeterLevel: Float = 0
+    private var liveSpectrum = [Float](repeating: 0, count: LiveSpectrumAnalyzer.bandCount)
+    private var lastLiveMeterPublishedAt: TimeInterval = 0
     var keyboardHandoffVisible = false
     private var keyboardStartPending = false
     private var lastHandledDictationCommandID = ""
     private var liveFinishBackgroundTask: UIBackgroundTaskIdentifier = .invalid
 
-    /// One explicit activation buys a useful native-feeling window. Keeping a
-    /// microphone alive indefinitely would waste battery and surprise users.
-    private static let liveSessionDuration: TimeInterval = 15 * 60
+    /// One explicit activation buys a useful native-feeling work session.
+    /// It still expires automatically so the microphone is never left alive
+    /// indefinitely after the user forgets about it.
+    private static let liveSessionDuration: TimeInterval = 60 * 60
 
     /// Mega-kernel discipline: the product split has an emergency kill switch.
     /// Set FW_IOS_LIVE_FAST_MODEL=0 before first engine use to route live work
@@ -430,8 +434,8 @@ final class LabModel {
     }
 
     /// Start one explicit, user-visible microphone session and immediately
-    /// begin its first utterance. The audio engine remains alive for fifteen
-    /// minutes after Finish, allowing subsequent keyboard starts to remain in
+    /// begin its first utterance. The audio engine remains alive for one hour
+    /// after Finish, allowing subsequent keyboard starts to remain in
     /// the caller's app. While armed, captured samples are discarded locally.
     func startLiveDictation() {
         guard liveEngineState == .ready else {
@@ -534,6 +538,7 @@ final class LabModel {
                     }
                     let fresh = self.recorder.takeAvailable()
                     if self.liveDictationState == .listening {
+                        self.updateLiveMeter(fresh)
                         for utterance in self.liveDetector.push(fresh) {
                             self.enqueueLiveUtterance(utterance)
                         }
@@ -571,6 +576,9 @@ final class LabModel {
         liveSessionID = UUID().uuidString
         liveRevision = 0
         liveStopRequested = false
+        liveMeterLevel = 0
+        liveSpectrum = [Float](repeating: 0, count: LiveSpectrumAnalyzer.bandCount)
+        lastLiveMeterPublishedAt = 0
         liveDictationState = .listening
         UIApplication.shared.isIdleTimerDisabled = true
         publishLiveSnapshot(state: .listening, message: nil)
@@ -582,6 +590,8 @@ final class LabModel {
         guard liveDictationState == .listening else { return }
         liveStopRequested = true
         liveDictationState = .finishing
+        liveMeterLevel = 0
+        liveSpectrum = [Float](repeating: 0, count: LiveSpectrumAnalyzer.bandCount)
         publishLiveSnapshot(state: .finishing, message: nil)
         if liveFinishBackgroundTask == .invalid {
             liveFinishBackgroundTask = UIApplication.shared.beginBackgroundTask(
@@ -698,7 +708,27 @@ final class LabModel {
 
     private var armedSessionMessage: String? {
         guard hasArmedDictationSession else { return nil }
-        return "Ready for another dictation · about \(liveSessionMinutesRemaining) min left"
+        return nil
+    }
+
+    private func updateLiveMeter(_ samples: [Float]) {
+        guard !samples.isEmpty else { return }
+        let frame = LiveSpectrumAnalyzer.analyze(samples)
+        liveMeterLevel = liveMeterLevel * 0.45 + frame.level * 0.55
+        if liveSpectrum.count != frame.bands.count {
+            liveSpectrum = frame.bands
+        } else {
+            for index in frame.bands.indices {
+                liveSpectrum[index] = liveSpectrum[index] * 0.35 + frame.bands[index] * 0.65
+            }
+        }
+
+        // The keyboard polls at 4 Hz. Publishing faster only burns energy in
+        // UserDefaults synchronization without making the animation smoother.
+        let now = Date().timeIntervalSince1970
+        guard now - lastLiveMeterPublishedAt >= 0.22 else { return }
+        lastLiveMeterPublishedAt = now
+        publishLiveSnapshot(state: .listening, message: nil)
     }
 
     private func finishLiveService() {
@@ -709,6 +739,8 @@ final class LabModel {
         liveSessionExpiresAt = nil
         liveEndSessionRequested = false
         liveStopRequested = false
+        liveMeterLevel = 0
+        liveSpectrum = [Float](repeating: 0, count: LiveSpectrumAnalyzer.bandCount)
         UIApplication.shared.isIdleTimerDisabled = false
         if case .failed = liveDictationState { return }
         liveDictationState = .idle
@@ -731,6 +763,9 @@ final class LabModel {
                 text: liveDictationText,
                 revision: liveRevision,
                 message: message,
+                level: state == .listening ? liveMeterLevel : 0,
+                spectrum: state == .listening ? liveSpectrum : nil,
+                expiresAt: liveSessionExpiresAt?.timeIntervalSince1970,
                 updatedAt: Date().timeIntervalSince1970))
     }
 

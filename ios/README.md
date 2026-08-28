@@ -43,19 +43,24 @@ number instead of letting App Store Connect renumber the binary.
 
 ## Live dictation keyboard (1.1)
 
-The containing app now has a continuous dictation lane: it keeps a visible
-microphone session active, splits speech at natural pauses, and decodes each
-bounded phrase through the same local Rust model. A bundled custom keyboard
-reads only the append-only committed text from an App Group and inserts it into
-the current text field.
+The containing app now has a low-latency dictation lane backed by the pinned
+74 MB multilingual Whisper tiny package. It keeps an explicitly activated,
+visible microphone session alive for at most one hour, splits speech at
+natural pauses, and decodes each bounded phrase through the same local Rust
+engine. A bundled custom keyboard reads only append-only committed text from an
+App Group and inserts it into the current text field. While listening, the app
+also publishes a normalized level plus 14 real frequency bands so the keyboard
+can render the captured signal without exposing raw microphone samples.
 
-iOS does not allow keyboard extensions to use the microphone. The user therefore
-starts the session in FrankenWhisper before switching to another app. The
-keyboard requires Full Access because Apple gates App Group access behind that
-switch. It uses the expanded sandbox only to read the locally committed
-transcript: the extension contains no network client and never receives audio
-or model bytes. Background audio mode exists solely to keep that explicit
-recording session alive while the user switches apps.
+iOS does not allow keyboard extensions to use the microphone. The first Start
+therefore opens FrankenWhisper for one visible activation; after the user
+returns, subsequent Start/Finish commands stay in the keyboard for the life of
+that one-hour session. Between utterances the microphone remains visibly
+active but incoming samples are discarded. The keyboard requires Full Access
+because Apple gates App Group access behind that switch. It uses the expanded
+sandbox only for this local command/transcript handoff: the extension contains
+no network client and never receives audio or model bytes. Background audio
+mode exists solely to keep that explicit recording session alive across apps.
 
 ## How it hangs together
 
@@ -66,8 +71,9 @@ recording session alive while the user switches apps.
   live-transcript callbacks, cooperative cancel.
 - **Models are downloaded, never bundled** (`Sources/ModelStore.swift`):
   Whisper large-v3-turbo **q8_0** (874 MB, the browser lane's
-  transcript-identical quantization), the Sortformer diarizer package
-  (492 MB + receipt), and the FastEnhancer denoiser (838 KB) — resumable
+  transcript-identical quantization), multilingual Whisper **tiny f16** (74 MB,
+  realtime/keyboard speed lane), the Sortformer diarizer package (492 MB +
+  receipt), and the FastEnhancer denoiser (838 KB) — resumable
   32 MiB ranged downloads, SHA-256 pinned to `site/model-manifest.js`,
   stored in Application Support, excluded from iCloud backup.
 - **Memory**: the q8_0 weights stay block-resident (the `target_os = "ios"`
@@ -77,6 +83,12 @@ recording session alive while the user switches apps.
   (whisper) + 0.5 GB (Sortformer); the entitlement requests the increased
   memory limit, which needs that capability on your signing profile for
   device runs.
+- **Two accuracy classes**: ordinary transcription never changes model or
+  options; it remains on large-v3-turbo with optional denoising, timestamps,
+  and Sortformer. Realtime/keyboard work uses a separate resident tiny handle,
+  greedy text-only decode, and no diarization. `FW_IOS_LIVE_FAST_MODEL=0` is
+  the diagnostic kill switch that routes live work back through the established
+  large-model path.
 - **Live transcript**: the engine's per-window segment feed and span
   heartbeat (`src/native_engine/plat.rs`, `ios_hooks`) stream through the
   C callbacks into the UI, so text appears window by window and the progress

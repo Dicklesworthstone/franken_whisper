@@ -103,6 +103,10 @@ targets:
   FrankenWhisperTests:
     type: bundle.unit-test
     platform: iOS
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
     sources:
       - Tests
       - Sources/LiveUtteranceDetector.swift
+      - Sources/LiveSpectrum.swift

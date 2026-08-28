@@ -19,6 +19,76 @@ private struct DictationStartLink: View {
     }
 }
 
+/// Smoothly interpolates the real frequency-band energy published by the
+/// containing app. No synthetic/random animation is used: silence is flat.
+private final class LiveSpectrumView: UIView {
+    private var target = [Float](repeating: 0, count: 14)
+    private var displayed = [Float](repeating: 0, count: 14)
+    private var targetLevel: Float = 0
+    private var displayedLevel: Float = 0
+    private var displayLink: CADisplayLink?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isOpaque = false
+        isAccessibilityElement = true
+        accessibilityLabel = "Live microphone spectrum"
+        let link = CADisplayLink(target: self, selector: #selector(animateFrame))
+        link.preferredFramesPerSecond = 30
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit { displayLink?.invalidate() }
+
+    func update(bands: [Float], level: Float, active: Bool) {
+        if active, bands.count == target.count {
+            target = bands.map { min(1, max(0, $0)) }
+            targetLevel = min(1, max(0, level))
+            accessibilityValue = "\(Int(targetLevel * 100)) percent"
+        } else {
+            target = [Float](repeating: 0, count: target.count)
+            targetLevel = 0
+            accessibilityValue = "silent"
+        }
+    }
+
+    @objc private func animateFrame() {
+        displayedLevel += (targetLevel - displayedLevel) * 0.2
+        for index in displayed.indices {
+            displayed[index] += (target[index] - displayed[index]) * 0.24
+        }
+        setNeedsDisplay()
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let context = UIGraphicsGetCurrentContext(), !displayed.isEmpty else { return }
+        let accent = UIColor(red: 0.34, green: 0.94, blue: 0.66, alpha: 1)
+        context.setFillColor(UIColor(white: 0.02, alpha: 0.65).cgColor)
+        UIBezierPath(roundedRect: rect, cornerRadius: 7).fill()
+
+        let gap: CGFloat = 2
+        let horizontalPadding: CGFloat = 6
+        let usableWidth = max(1, rect.width - horizontalPadding * 2)
+        let barWidth = max(2, (usableWidth - gap * CGFloat(displayed.count - 1)) / CGFloat(displayed.count))
+        let centerY = rect.midY
+        for (index, energy) in displayed.enumerated() {
+            let minimum: CGFloat = displayedLevel > 0.01 ? 2 : 1
+            let height = minimum + CGFloat(energy) * max(2, rect.height - 8)
+            let barRect = CGRect(
+                x: horizontalPadding + CGFloat(index) * (barWidth + gap),
+                y: centerY - height / 2,
+                width: barWidth,
+                height: height)
+            context.setFillColor(accent.withAlphaComponent(0.38 + CGFloat(displayedLevel) * 0.62).cgColor)
+            UIBezierPath(roundedRect: barRect, cornerRadius: barWidth / 2).fill()
+        }
+    }
+}
+
 /// A system-wide, local-only dictation keyboard. iOS never gives keyboard
 /// extensions microphone access, so the first tap makes a visible transition
 /// to the containing app, which owns capture and local inference. That app
@@ -26,7 +96,7 @@ private struct DictationStartLink: View {
 /// Start/Finish taps stay in this keyboard and cross only the App Group.
 final class KeyboardViewController: UIInputViewController {
     private let statusLabel = UILabel()
-    private let previewLabel = UILabel()
+    private let spectrumView = LiveSpectrumView()
     private let micButton = UIButton(type: .system)
     private let micContainer = UIView()
     private var micLinkHost: UIHostingController<DictationStartLink>?
@@ -75,7 +145,14 @@ final class KeyboardViewController: UIInputViewController {
     private func buildInterface() {
         statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
         statusLabel.textColor = accentColor
-        statusLabel.numberOfLines = 2
+        statusLabel.numberOfLines = 1
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        spectrumView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            spectrumView.widthAnchor.constraint(equalToConstant: 112),
+            spectrumView.heightAnchor.constraint(equalToConstant: 32),
+        ])
 
         micButton.setTitle("🎙  Start", for: .normal)
         micButton.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
@@ -107,15 +184,10 @@ final class KeyboardViewController: UIInputViewController {
             linkHost.view.bottomAnchor.constraint(equalTo: micContainer.bottomAnchor),
         ])
 
-        let statusRow = UIStackView(arrangedSubviews: [statusLabel, micContainer])
+        let statusRow = UIStackView(arrangedSubviews: [spectrumView, statusLabel, micContainer])
         statusRow.axis = .horizontal
         statusRow.spacing = 8
         statusRow.alignment = .center
-
-        previewLabel.font = .systemFont(ofSize: 11)
-        previewLabel.textColor = UIColor(white: 0.78, alpha: 1)
-        previewLabel.numberOfLines = 1
-        previewLabel.textAlignment = .center
 
         let row1 = letterRow("qwertyuiop")
         let row2 = letterRow("asdfghjkl")
@@ -138,7 +210,7 @@ final class KeyboardViewController: UIInputViewController {
         period.widthAnchor.constraint(equalToConstant: 36).isActive = true
         enter.widthAnchor.constraint(equalToConstant: 68).isActive = true
 
-        let stack = UIStackView(arrangedSubviews: [statusRow, previewLabel, row1, row2, row3, bottom])
+        let stack = UIStackView(arrangedSubviews: [statusRow, row1, row2, row3, bottom])
         stack.axis = .vertical
         stack.spacing = 7
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -148,7 +220,7 @@ final class KeyboardViewController: UIInputViewController {
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -6),
             stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
             stack.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8),
-            view.heightAnchor.constraint(greaterThanOrEqualToConstant: 300),
+            view.heightAnchor.constraint(greaterThanOrEqualToConstant: 282),
             statusRow.heightAnchor.constraint(equalToConstant: 40),
             row1.heightAnchor.constraint(equalToConstant: 42),
             row2.heightAnchor.constraint(equalToConstant: 42),
@@ -207,41 +279,35 @@ final class KeyboardViewController: UIInputViewController {
         switch snapshot.state {
         case .armed:
             if observedActiveSession { insertNewText(from: snapshot) }
-            statusLabel.text = "● READY · MIC SESSION ACTIVE"
+            statusLabel.text = "READY · \(minutesRemaining(snapshot))m"
             showActionButton(title: "🎙  Start", enabled: true)
         case .listening:
             observedActiveSession = true
-            statusLabel.text = "● LISTENING LOCALLY"
+            statusLabel.text = "● LISTENING"
             showActionButton(title: "■  Finish", enabled: true)
             insertNewText(from: snapshot)
         case .finishing:
             observedActiveSession = true
-            statusLabel.text = "FINISHING ON DEVICE…"
+            statusLabel.text = "PROCESSING…"
             showActionButton(title: "Finishing…", enabled: false)
             insertNewText(from: snapshot)
         case .failed:
-            statusLabel.text = "DICTATION NEEDS ATTENTION"
+            statusLabel.text = "NEEDS APP"
             showStartLink(title: "🎙  Retry")
         case .idle:
             if observedActiveSession { insertNewText(from: snapshot) }
-            statusLabel.text = hasFullAccess
-                ? "PRIVATE · ON-DEVICE WHISPER"
-                : "FULL ACCESS NEEDED FOR LOCAL HANDOFF"
+            statusLabel.text = hasFullAccess ? "ON-DEVICE" : "FULL ACCESS"
             showStartLink(title: "🎙  Start")
         }
+        spectrumView.update(
+            bands: snapshot.spectrum ?? [],
+            level: snapshot.level ?? 0,
+            active: snapshot.state == .listening)
+    }
 
-        if snapshot.state == .failed {
-            previewLabel.text = snapshot.message ?? "Open FrankenWhisper to retry."
-        } else if snapshot.state == .armed {
-            previewLabel.text = snapshot.message
-                ?? "Tap Start — no app switch while this private session is active."
-        } else if snapshot.text.isEmpty {
-            previewLabel.text = hasFullAccess
-                ? "First use opens FrankenWhisper once to activate its private mic session."
-                : "Typing still works. Full Access only enables the on-device app handoff."
-        } else {
-            previewLabel.text = String(snapshot.text.suffix(120))
-        }
+    private func minutesRemaining(_ snapshot: DictationSnapshot) -> Int {
+        guard let expiresAt = snapshot.expiresAt else { return 60 }
+        return max(1, Int(ceil((expiresAt - Date().timeIntervalSince1970) / 60)))
     }
 
     private func insertNewText(from snapshot: DictationSnapshot) {
@@ -272,27 +338,24 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func dictationLinkTapped() {
-        statusLabel.text = "OPENING FRANKENWHISPER…"
-        previewLabel.text = "Wait for the listening screen, then swipe back to this app."
+        statusLabel.text = "OPENING APP…"
     }
 
     @objc private func toggleDictation() {
         switch latest.state {
         case .armed:
             DictationBridge.writeCommand(.start)
-            statusLabel.text = "STARTING LOCALLY…"
-            previewLabel.text = "Stay here and begin speaking when Listening appears."
+            statusLabel.text = "STARTING…"
             micButton.isEnabled = false
         case .listening:
             DictationBridge.writeCommand(.stop)
-            statusLabel.text = "FINISHING ON DEVICE…"
+            statusLabel.text = "PROCESSING…"
             micButton.isEnabled = false
         case .finishing:
             break
         case .idle, .failed:
             guard hasFullAccess else {
-                statusLabel.text = "ENABLE FULL ACCESS IN KEYBOARD SETTINGS"
-                previewLabel.text = "Typing remains local; Full Access enables only the local app handoff."
+                statusLabel.text = "FULL ACCESS NEEDED"
                 return
             }
             // Full-access starts are rendered as a SwiftUI Link. Keeping this

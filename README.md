@@ -4714,7 +4714,15 @@ audited pointer island in `fw-ios/src/lib.rs`.
 
 A SwiftUI application under `ios/Sources/` (xcodegen project in
 `ios/project.yml`) wraps the handle in an actor and provides on-device
-transcription, speaker naming, and JSON/Markdown export.
+transcription, speaker naming, and JSON/Markdown export. Its bundled keyboard
+uses a separate resident multilingual-tiny handle for low-latency text-only
+dictation while the ordinary app path remains on large-v3-turbo. Because iOS
+does not expose the microphone to custom keyboard extensions, one explicit
+foreground activation starts a visible, time-bounded one-hour audio session;
+subsequent keyboard Start/Finish commands remain in the current app through a
+local App Group handoff, and standby samples are discarded. The session now
+lasts up to one hour; the keyboard's compact animation displays real level and
+frequency-band energy derived on-device rather than decorative motion.
 
 - Contract details (return codes 0–6, ownership, threading, staging→run flow):
   [`docs/fw_ios_contract.md`](docs/fw_ios_contract.md)
