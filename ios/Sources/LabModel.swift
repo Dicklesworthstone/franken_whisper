@@ -17,6 +17,10 @@ final class LabModel {
     let store = ModelStore()
     let recorder = AudioRecorder()
     private let engine = Engine()
+    /// A separate resident tiny model for realtime/keyboard work. Keeping it
+    /// independent prevents the full-accuracy large-v3-turbo lane from being
+    /// weakened or unloaded when the low-latency lane is used.
+    private let liveEngine = Engine()
 
     // ── Engine state ───────────────────────────────────────────────────────
     enum EngineState: Equatable {
@@ -26,6 +30,7 @@ final class LabModel {
         case failed(String)
     }
     var engineState: EngineState = .notLoaded
+    var liveEngineState: EngineState = .notLoaded
     var diarizerLoaded = false
     var denoiserLoaded = false
     private(set) var enginePausedForMemoryPressure = false
@@ -96,6 +101,9 @@ final class LabModel {
     enum LiveDictationState: Equatable {
         case idle
         case starting(String)
+        /// The microphone session is alive locally, but samples are discarded
+        /// until the keyboard sends its next Start command.
+        case armed
         case listening
         case finishing
         case failed(String)
@@ -110,14 +118,28 @@ final class LabModel {
     private var liveStartTask: Task<Void, Never>?
     private var liveQueue: [[Float]] = []
     private var liveSessionID = ""
+    private var liveServiceID = ""
     private var liveRevision = 0
     private var liveStopRequested = false
+    private var liveEndSessionRequested = false
+    private var liveSessionExpiresAt: Date?
     var keyboardHandoffVisible = false
     private var keyboardStartPending = false
     private var lastHandledDictationCommandID = ""
     private var liveFinishBackgroundTask: UIBackgroundTaskIdentifier = .invalid
 
+    /// One explicit activation buys a useful native-feeling window. Keeping a
+    /// microphone alive indefinitely would waste battery and surprise users.
+    private static let liveSessionDuration: TimeInterval = 15 * 60
+
+    /// Mega-kernel discipline: the product split has an emergency kill switch.
+    /// Set FW_IOS_LIVE_FAST_MODEL=0 before first engine use to route live work
+    /// through the established large model while investigating regressions.
+    private static let usesFastLiveModel =
+        ProcessInfo.processInfo.environment["FW_IOS_LIVE_FAST_MODEL"] != "0"
+
     private var generation = 0
+    private var liveEngineGeneration = 0
     private var runTask: Task<Void, Never>?
     private(set) var runStarted: Date?
     /// Guards the async permission → start window: a second Record tap while
@@ -126,6 +148,7 @@ final class LabModel {
 
     var isBusy: Bool {
         if isLiveDictationActive { return true }
+        if recorder.isRecording { return true }
         if isImporting { return true }
         if case .running = runState { return true }
         if case .staging = runState { return true }
@@ -135,12 +158,75 @@ final class LabModel {
 
     var isLiveDictationActive: Bool {
         switch liveDictationState {
-        case .idle, .failed: false
+        case .idle, .armed, .failed: false
         case .starting, .listening, .finishing: true
         }
     }
 
+    var hasArmedDictationSession: Bool {
+        if case .armed = liveDictationState { return true }
+        return recorder.isRecording && liveSessionExpiresAt != nil
+    }
+
+    var liveSessionMinutesRemaining: Int {
+        guard let liveSessionExpiresAt else { return 0 }
+        return max(0, Int(ceil(liveSessionExpiresAt.timeIntervalSinceNow / 60)))
+    }
+
     // ── Engine assembly ────────────────────────────────────────────────────
+
+    /// Hydrate the latency lane first. Once it is ready, hydrate the heavier
+    /// batch lane in the background unless a keyboard handoff is waiting to
+    /// start immediately. This makes a cold keyboard launch pay ~78 MB of
+    /// model load instead of the full 874 MB + auxiliary models.
+    func prepareEngines() {
+        if Self.usesFastLiveModel {
+            assembleLiveEngine()
+        } else {
+            assembleEngine()
+        }
+    }
+
+    func assembleLiveEngine() {
+        guard Self.usesFastLiveModel else {
+            if engineState == .ready {
+                liveEngineState = .ready
+                beginKeyboardDictationIfReady()
+            } else {
+                assembleEngine()
+            }
+            return
+        }
+        guard store.phase == .ready,
+              liveEngineState == .notLoaded || isFailed(liveEngineState)
+        else { return }
+
+        liveEngineGeneration += 1
+        let gen = liveEngineGeneration
+        liveEngineState = .loading(stage: "waking the realtime model")
+        let modelURL = store.url(for: ModelManifest.tiny)
+
+        Task { [liveEngine] in
+            do {
+                liveEngine.resetCancel()
+                try await liveEngine.load(modelPath: modelURL)
+                guard self.liveEngineGeneration == gen else { return }
+                self.liveEngineState = .ready
+                if self.keyboardStartPending {
+                    self.beginKeyboardDictationIfReady()
+                } else {
+                    self.assembleEngine()
+                }
+            } catch {
+                guard self.liveEngineGeneration == gen else { return }
+                self.liveEngineState = .failed(error.localizedDescription)
+                if self.keyboardStartPending {
+                    self.failLiveDictation(
+                        "The realtime speech engine could not start: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
 
     /// Load whisper (+ Sortformer + denoiser) from the verified cache. The
     /// stage markers stream through EngineHooks into `engineState`.
@@ -176,7 +262,10 @@ final class LabModel {
                 self.diarizerLoaded = diarizerOK
                 self.denoiserLoaded = denoiserOK
                 self.engineState = .ready
-                self.beginKeyboardDictationIfReady()
+                if !Self.usesFastLiveModel {
+                    self.liveEngineState = .ready
+                    self.beginKeyboardDictationIfReady()
+                }
             } catch {
                 guard self.generation == gen else { return }
                 self.engineState = .failed(error.localizedDescription)
@@ -192,8 +281,13 @@ final class LabModel {
     func unloadEngineForMemoryPressure() {
         guard !isBusy, !recorder.isRecording else { return }
         generation += 1
-        Task { [engine] in await engine.unload() }
+        liveEngineGeneration += 1
+        Task { [engine, liveEngine] in
+            await engine.unload()
+            await liveEngine.unload()
+        }
         engineState = .notLoaded
+        liveEngineState = .notLoaded
         diarizerLoaded = false
         denoiserLoaded = false
         enginePausedForMemoryPressure = true
@@ -205,16 +299,20 @@ final class LabModel {
     func clearModels() {
         guard !isBusy else { return }
         generation += 1
+        liveEngineGeneration += 1
         let gen = generation
         engineState = .loading(stage: "clearing the machine")
-        Task { [engine] in
+        liveEngineState = .loading(stage: "clearing the realtime model")
+        Task { [engine, liveEngine] in
             await engine.unload()
+            await liveEngine.unload()
             guard self.generation == gen else { return }
             self.store.clear()
             self.diarizerLoaded = false
             self.denoiserLoaded = false
             self.enginePausedForMemoryPressure = false
             self.engineState = .notLoaded
+            self.liveEngineState = .notLoaded
         }
     }
 
@@ -282,10 +380,10 @@ final class LabModel {
             return
         }
 
-        if engineState == .ready {
+        if liveEngineState == .ready {
             beginKeyboardDictationIfReady()
         } else {
-            assembleEngine()
+            assembleLiveEngine()
         }
     }
 
@@ -304,15 +402,15 @@ final class LabModel {
     func retryKeyboardDictation() {
         keyboardStartPending = true
         liveDictationState = .idle
-        if engineState == .ready {
+        if liveEngineState == .ready {
             beginKeyboardDictationIfReady()
         } else {
-            assembleEngine()
+            assembleLiveEngine()
         }
     }
 
     private func beginKeyboardDictationIfReady() {
-        guard keyboardStartPending, engineState == .ready else { return }
+        guard keyboardStartPending, liveEngineState == .ready else { return }
         keyboardStartPending = false
         startLiveDictation()
     }
@@ -323,6 +421,8 @@ final class LabModel {
         liveCaptureTask = nil
         if recorder.isRecording { _ = recorder.stop() }
         UIApplication.shared.isIdleTimerDisabled = false
+        liveSessionExpiresAt = nil
+        liveEndSessionRequested = false
         liveSessionID = UUID().uuidString
         liveRevision = 0
         liveDictationState = .failed(message)

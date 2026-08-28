@@ -20,10 +20,10 @@ private struct DictationStartLink: View {
 }
 
 /// A system-wide, local-only dictation keyboard. iOS never gives keyboard
-/// extensions microphone access, so a user tap makes a visible transition to
-/// the containing app, which owns capture and local inference. On iOS 26.4+
-/// the user then swipes back to the original app while this extension reads
-/// append-only text from the App Group and inserts it at the cursor.
+/// extensions microphone access, so the first tap makes a visible transition
+/// to the containing app, which owns capture and local inference. That app
+/// keeps a time-bounded local session armed in the background; subsequent
+/// Start/Finish taps stay in this keyboard and cross only the App Group.
 final class KeyboardViewController: UIInputViewController {
     private let statusLabel = UILabel()
     private let previewLabel = UILabel()
@@ -205,6 +205,9 @@ final class KeyboardViewController: UIInputViewController {
         }
 
         switch snapshot.state {
+        case .armed:
+            statusLabel.text = "● READY · MIC SESSION ACTIVE"
+            showActionButton(title: "🎙  Start", enabled: true)
         case .listening:
             observedActiveSession = true
             statusLabel.text = "● LISTENING LOCALLY"
@@ -228,9 +231,12 @@ final class KeyboardViewController: UIInputViewController {
 
         if snapshot.state == .failed {
             previewLabel.text = snapshot.message ?? "Open FrankenWhisper to retry."
+        } else if snapshot.state == .armed {
+            previewLabel.text = snapshot.message
+                ?? "Tap Start — no app switch while this private session is active."
         } else if snapshot.text.isEmpty {
             previewLabel.text = hasFullAccess
-                ? "Tap Start, then swipe back when FrankenWhisper is listening."
+                ? "First use opens FrankenWhisper once to activate its private mic session."
                 : "Typing still works. Full Access only enables the on-device app handoff."
         } else {
             previewLabel.text = String(snapshot.text.suffix(120))
@@ -271,6 +277,11 @@ final class KeyboardViewController: UIInputViewController {
 
     @objc private func toggleDictation() {
         switch latest.state {
+        case .armed:
+            DictationBridge.writeCommand(.start)
+            statusLabel.text = "STARTING LOCALLY…"
+            previewLabel.text = "Stay here and begin speaking when Listening appears."
+            micButton.isEnabled = false
         case .listening:
             DictationBridge.writeCommand(.stop)
             statusLabel.text = "FINISHING ON DEVICE…"

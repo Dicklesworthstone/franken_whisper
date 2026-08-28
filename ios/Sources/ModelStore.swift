@@ -28,6 +28,8 @@ enum ModelManifest {
         "https://huggingface.co/Dicklesworthstone/franken-whisper-models/resolve/main/"
     private static let ghSortformer =
         "https://github.com/Dicklesworthstone/franken_whisper/releases/download/sortformer-v2.1-f32-v1/"
+    private static let ghTiny =
+        "https://github.com/Dicklesworthstone/franken_whisper/releases/download/whisper-tiny-f16-v1/"
 
     static let whisper = ModelFile(
         label: "Whisper large-v3-turbo q8_0",
@@ -38,6 +40,17 @@ enum ModelManifest {
             hfWhisperCpp + "ggml-large-v3-turbo-q8_0.bin",
             hfOrg + "ggml-large-v3-turbo-q8_0.bin",
         ])
+
+    // The keyboard/realtime lane deliberately uses the repo's pinned tiny
+    // packages rather than paying large-v3-turbo's quality-oriented latency.
+    // The multilingual tiny package preserves the app's auto-detect contract
+    // without a model swap when the user changes languages.
+    static let tiny = ModelFile(
+        label: "Whisper tiny multilingual realtime model",
+        relativePath: "whisper/ggml-tiny.bin",
+        bytes: 77_691_713,
+        sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
+        urls: [ghTiny + "ggml-tiny.bin"])
 
     static let sortformerWeights = ModelFile(
         label: "Sortformer diarizer",
@@ -68,7 +81,9 @@ enum ModelManifest {
             hfOrg + "fastenhancer-s-48k-denoise.safetensors",
         ])
 
-    static let files: [ModelFile] = [whisper, sortformerWeights, sortformerReceipt, denoiser]
+    static let files: [ModelFile] = [
+        tiny, whisper, sortformerWeights, sortformerReceipt, denoiser,
+    ]
     static let totalBytes = files.reduce(Int64(0)) { $0 + $1.bytes }
     static let chunkBytes: Int64 = 32 * 1024 * 1024
 }

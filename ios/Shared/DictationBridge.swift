@@ -8,6 +8,9 @@ import Foundation
 struct DictationSnapshot: Codable, Equatable {
     enum State: String, Codable {
         case idle
+        /// The containing app has a time-bounded background microphone
+        /// session alive. The keyboard can start locally without opening it.
+        case armed
         case listening
         case finishing
         case failed
@@ -25,13 +28,16 @@ struct DictationSnapshot: Codable, Equatable {
         message: nil, updatedAt: 0)
 }
 
-/// A tiny control lane in the opposite direction. The keyboard can ask an
-/// already-running foreground/background host to finish the current session.
-/// Starting capture still requires the containing app to become foreground so
-/// iOS can activate the microphone with an unmistakable privacy transition.
+/// A tiny control lane in the opposite direction. Once the containing app has
+/// visibly activated a time-bounded microphone session, the keyboard can start
+/// and stop utterances without another app switch. Initial microphone
+/// activation still happens in the containing app because iOS never grants a
+/// custom keyboard microphone access.
 struct DictationCommand: Codable, Equatable {
     enum Action: String, Codable {
+        case start
         case stop
+        case endSession = "end_session"
     }
 
     var id: String
