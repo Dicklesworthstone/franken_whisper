@@ -108,7 +108,8 @@ struct LabView: View {
             Button("Not now", role: .cancel) {}
         } message: {
             Text(
-                "Whisper large-v3-turbo (q8), the Sortformer speaker diarizer, and the "
+                "Whisper large-v3-turbo (q8), a 74 MB multilingual tiny model for realtime "
+                    + "dictation, the Sortformer speaker diarizer, and the "
                     + "FastEnhancer denoiser — downloaded once over your connection, verified "
                     + "by SHA-256, and stored on this device. Everything afterwards runs offline.")
         }
@@ -145,7 +146,7 @@ struct LabView: View {
             model.unloadEngineForMemoryPressure()
         }
         .onAppear {
-            model.assembleEngine()
+            model.prepareEngines()
         }
         .onOpenURL { url in
             withAnimation(.easeOut(duration: 0.18)) {
@@ -154,7 +155,7 @@ struct LabView: View {
         }
         .onChange(of: model.store.phase) { _, phase in
             if phase == .ready, scenePhase == .active {
-                model.assembleEngine()
+                model.prepareEngines()
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -162,7 +163,7 @@ struct LabView: View {
             // switch. Unloading here made every keyboard handoff pay the full
             // hydration cost. Real memory warnings still unload it above.
             if phase == .active {
-                model.assembleEngine()
+                model.prepareEngines()
             }
         }
         .sensoryFeedback(.success, trigger: model.result?.transcript)
@@ -200,6 +201,19 @@ struct LabView: View {
                     Text(
                         "Swipe right across the bottom edge to return to your app. "
                             + "Speak there; each phrase appears at your cursor after a natural pause."
+                    )
+                    .font(.system(size: 14))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(Lab.textSecondary)
+                case .armed:
+                    Image(systemName: "keyboard.badge.ellipsis")
+                        .font(.system(size: 52))
+                        .foregroundStyle(Lab.emerald)
+                    Text("Keyboard session ready")
+                        .font(.title2.bold())
+                    Text(
+                        "Return to your app. For the next \(model.liveSessionMinutesRemaining) minutes, "
+                            + "Start and Finish stay inside the FrankenWhisper keyboard."
                     )
                     .font(.system(size: 14))
                     .multilineTextAlignment(.center)
@@ -256,8 +270,8 @@ struct LabView: View {
     }
 
     private var engineHandoffStatus: String {
-        switch model.engineState {
-        case .notLoaded: "Preparing the local speech engine…"
+        switch model.liveEngineState {
+        case .notLoaded: "Preparing the realtime speech engine…"
         case .loading(let stage): stage
         case .ready: "Preparing microphone access…"
         case .failed(let reason): reason
@@ -269,18 +283,20 @@ struct LabView: View {
             VStack(alignment: .leading, spacing: 12) {
                 LabLabel(text: "03 · Live Dictation")
                 Text(
-                    "In any app, select the FrankenWhisper keyboard and tap Start. iOS briefly "
-                        + "opens FrankenWhisper to activate the microphone; swipe back once it is "
-                        + "listening. Each phrase is inserted at your cursor after a natural pause."
+                    "The first Start visibly opens FrankenWhisper because iOS forbids microphone "
+                        + "access inside custom keyboards. After that one activation, a private "
+                        + "15-minute session keeps Start and Finish in the keyboard—no repeated app switch. "
+                        + "Realtime dictation uses a much smaller multilingual model for speed; the main "
+                        + "transcription mode below keeps large-v3-turbo for full accuracy."
                 )
                 .font(.system(size: 12, design: .monospaced))
                 .foregroundStyle(Lab.textSecondary)
 
                 switch model.liveDictationState {
                 case .idle:
-                    Button("Start live dictation here") { model.startLiveDictation() }
+                    Button("Start 15-minute keyboard session") { model.startLiveDictation() }
                         .buttonStyle(PrimaryButtonStyle())
-                        .disabled(model.engineState != .ready || model.isBusy)
+                        .disabled(model.liveEngineState != .ready || model.isBusy)
                 case .starting(let stage):
                     HStack(spacing: 8) {
                         ProgressView().tint(Lab.emerald)
@@ -295,6 +311,16 @@ struct LabView: View {
                             : "listening · pause briefly to commit a phrase")
                     Button("Stop dictation") { model.stopLiveDictation() }
                         .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                case .armed:
+                    StatusLine(
+                        kind: .ok,
+                        text: "keyboard ready · about \(model.liveSessionMinutesRemaining) min left · standby audio discarded")
+                    HStack(spacing: 10) {
+                        Button("Start dictating") { model.startLiveDictation() }
+                            .buttonStyle(PrimaryButtonStyle())
+                        Button("End session") { model.endLiveDictationSession() }
+                            .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                    }
                 case .finishing:
                     HStack(spacing: 8) {
                         ProgressView().tint(Lab.emerald)
@@ -306,7 +332,7 @@ struct LabView: View {
                     StatusLine(kind: .err, text: reason)
                     Button("Try live dictation again") { model.startLiveDictation() }
                         .buttonStyle(PrimaryButtonStyle())
-                        .disabled(model.engineState != .ready)
+                        .disabled(model.liveEngineState != .ready)
                 }
 
                 if !model.liveDictationText.isEmpty {
@@ -482,7 +508,7 @@ struct LabView: View {
             VStack(alignment: .leading, spacing: 12) {
                 LabLabel(text: "02 · The Signal")
 
-                if model.recorder.isRecording {
+                if model.recorder.isRecording && !model.hasArmedDictationSession {
                     LevelMeter(level: model.recorder.level)
                     StatusLine(
                         kind: .warn,
