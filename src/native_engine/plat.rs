@@ -306,14 +306,6 @@ mod wasm_impl {
             .is_some()
     }
 
-    /// Whether a hook is registered (decode-loop serialization guard).
-    pub fn segment_hook_active() -> bool {
-        SEGMENT_HOOK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-
     /// Forward one window's segments (JSON array) to the registered hook.
     pub fn emit_partial_segments(json: &str) {
         if let Some(hook) = SEGMENT_HOOK
@@ -427,6 +419,15 @@ mod ios_hooks {
         *SEGMENT_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Whether a hook is registered (lets the decode loop avoid serializing
+    /// segment JSON when the Swift host has not installed a callback).
+    pub fn segment_hook_active() -> bool {
+        SEGMENT_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 
     /// Forward one window's segments (JSON array) to the registered hook.
