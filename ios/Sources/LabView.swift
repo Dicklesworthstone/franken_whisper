@@ -61,6 +61,10 @@ struct LabView: View {
             }
             .scrollIndicators(.hidden)
             .scrollDismissesKeyboard(.interactively)
+            if model.keyboardHandoffVisible {
+                keyboardHandoffOverlay
+                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
+            }
         }
         .coordinateSpace(name: "lab-text-entry-space")
         .onPreferenceChange(LabTextEntryFramePreferenceKey.self) { frames in
@@ -143,6 +147,11 @@ struct LabView: View {
         .onAppear {
             model.assembleEngine()
         }
+        .onOpenURL { url in
+            withAnimation(.easeOut(duration: 0.18)) {
+                model.handleKeyboardURL(url)
+            }
+        }
         .onChange(of: model.store.phase) { _, phase in
             if phase == .ready, scenePhase == .active {
                 model.assembleEngine()
@@ -162,21 +171,99 @@ struct LabView: View {
 
     // ── 03 Live Dictation ─────────────────────────────────────────────────
 
+    private var keyboardHandoffOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.88).ignoresSafeArea()
+            VStack(spacing: 18) {
+                Text("FRANKENWHISPER KEYBOARD")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .tracking(1.5)
+                    .foregroundStyle(Lab.emerald)
+
+                switch model.liveDictationState {
+                case .listening:
+                    Image(systemName: "waveform.circle.fill")
+                        .font(.system(size: 58))
+                        .foregroundStyle(Lab.emerald)
+                        .symbolEffect(.pulse)
+                    Text("FrankenWhisper is listening locally")
+                        .font(.title2.bold())
+                        .multilineTextAlignment(.center)
+                    LevelMeter(level: model.recorder.level)
+                        .frame(maxWidth: 280)
+                    Text(
+                        "Swipe right across the bottom edge to return to your app. "
+                            + "Speak there; each phrase appears at your cursor after a natural pause."
+                    )
+                    .font(.system(size: 14))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(Lab.textSecondary)
+                case .finishing:
+                    ProgressView().tint(Lab.emerald).scaleEffect(1.4)
+                    Text("Finishing on device…")
+                        .font(.title2.bold())
+                case .failed(let reason):
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 44))
+                        .foregroundStyle(Lab.danger)
+                    Text(reason)
+                        .font(.system(size: 14))
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(Lab.textSecondary)
+                case .idle:
+                    ProgressView().tint(Lab.emerald).scaleEffect(1.4)
+                    Text(engineHandoffStatus)
+                        .font(.title2.bold())
+                        .multilineTextAlignment(.center)
+                }
+
+                Text("The microphone, audio, models, and transcript stay on this iPhone.")
+                    .font(.system(size: 11, design: .monospaced))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(Lab.textSecondary.opacity(0.8))
+
+                if model.liveDictationState == .listening {
+                    Button("Stop dictation") { model.stopLiveDictation() }
+                        .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                } else if !model.isLiveDictationActive {
+                    Button("Back to FrankenWhisper") {
+                        withAnimation(.easeOut(duration: 0.18)) {
+                            model.dismissKeyboardHandoff()
+                        }
+                    }
+                    .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+                }
+            }
+            .padding(28)
+            .frame(maxWidth: 420)
+        }
+        .zIndex(10)
+    }
+
+    private var engineHandoffStatus: String {
+        switch model.engineState {
+        case .notLoaded: "Preparing the local speech engine…"
+        case .loading(let stage): stage
+        case .ready: "Activating the microphone…"
+        case .failed(let reason): reason
+        }
+    }
+
     private var dictationCard: some View {
         LabPanel {
             VStack(alignment: .leading, spacing: 12) {
                 LabLabel(text: "03 · Live Dictation")
                 Text(
-                    "Speak here, then switch to any app and select the FrankenWhisper keyboard. "
-                        + "Each phrase is inserted after a natural pause — the microphone and the "
-                        + "Rust speech model stay inside this app."
+                    "In any app, select the FrankenWhisper keyboard and tap Start. iOS briefly "
+                        + "opens FrankenWhisper to activate the microphone; swipe back once it is "
+                        + "listening. Each phrase is inserted at your cursor after a natural pause."
                 )
                 .font(.system(size: 12, design: .monospaced))
                 .foregroundStyle(Lab.textSecondary)
 
                 switch model.liveDictationState {
                 case .idle:
-                    Button("Start live dictation") { model.startLiveDictation() }
+                    Button("Start live dictation here") { model.startLiveDictation() }
                         .buttonStyle(PrimaryButtonStyle())
                         .disabled(model.engineState != .ready || model.isBusy)
                 case .listening:
@@ -227,8 +314,7 @@ struct LabView: View {
                     "ONE-TIME SETUP  Settings › General › Keyboard › Keyboards › Add New Keyboard "
                         + "› FrankenWhisper, then enable Full Access. Apple requires that switch for the "
                         + "local App Group handoff. FrankenWhisper does not transmit keyboard or dictation data. "
-                        + "Start the session here before switching apps; iOS does not allow keyboard extensions "
-                        + "to open the microphone."
+                        + "The keyboard remains usable for ordinary typing without Full Access."
                 )
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(Lab.textSecondary.opacity(0.8))

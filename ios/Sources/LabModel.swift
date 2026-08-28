@@ -8,6 +8,7 @@
 import AVFoundation
 import Foundation
 import SwiftUI
+import UIKit
 
 @MainActor
 @Observable
@@ -109,6 +110,10 @@ final class LabModel {
     private var liveSessionID = ""
     private var liveRevision = 0
     private var liveStopRequested = false
+    var keyboardHandoffVisible = false
+    private var keyboardStartPending = false
+    private var lastHandledDictationCommandID = ""
+    private var liveFinishBackgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     private var generation = 0
     private var runTask: Task<Void, Never>?
@@ -169,9 +174,14 @@ final class LabModel {
                 self.diarizerLoaded = diarizerOK
                 self.denoiserLoaded = denoiserOK
                 self.engineState = .ready
+                self.beginKeyboardDictationIfReady()
             } catch {
                 guard self.generation == gen else { return }
                 self.engineState = .failed(error.localizedDescription)
+                if self.keyboardStartPending {
+                    self.failKeyboardDictation(
+                        "The local speech engine could not start: \(error.localizedDescription)")
+                }
             }
         }
     }
@@ -250,6 +260,51 @@ final class LabModel {
 
     // ── Live dictation ────────────────────────────────────────────────────
 
+    /// Handles the public custom URL used by the system keyboard's mic key.
+    /// The foreground transition is intentional: iOS requires the containing
+    /// app to own microphone activation. Once the indicator says listening,
+    /// the user swipes back and capture continues under the audio background
+    /// mode while all inference stays on device.
+    func handleKeyboardURL(_ url: URL) {
+        guard url.scheme?.lowercased() == "frankenwhisper",
+              url.host?.lowercased() == "dictate"
+        else { return }
+
+        keyboardHandoffVisible = true
+        keyboardStartPending = true
+        lastError = nil
+
+        guard store.phase == .ready else {
+            failKeyboardDictation(
+                "Download and verify the local models in FrankenWhisper before using its keyboard.")
+            return
+        }
+
+        if engineState == .ready {
+            beginKeyboardDictationIfReady()
+        } else {
+            assembleEngine()
+        }
+    }
+
+    func dismissKeyboardHandoff() {
+        keyboardHandoffVisible = false
+    }
+
+    private func beginKeyboardDictationIfReady() {
+        guard keyboardStartPending, engineState == .ready else { return }
+        keyboardStartPending = false
+        startLiveDictation()
+    }
+
+    private func failKeyboardDictation(_ message: String) {
+        keyboardStartPending = false
+        liveSessionID = UUID().uuidString
+        liveRevision = 0
+        liveDictationState = .failed(message)
+        publishLiveSnapshot(state: .failed, message: message)
+    }
+
     /// Start a continuous, user-visible microphone session. iOS does not let a
     /// keyboard extension access the microphone; the containing app records
     /// and runs the local model, and the local-only keyboard reads the
@@ -264,14 +319,23 @@ final class LabModel {
         Task {
             defer { self.micRequestInFlight = false }
             guard await AVAudioApplication.requestRecordPermission() else {
-                self.lastError =
-                    "Microphone access is off. Enable it in Settings › FrankenWhisper."
+                let message = "Microphone access is off. Enable it in Settings › FrankenWhisper."
+                if self.keyboardHandoffVisible {
+                    self.failKeyboardDictation(message)
+                } else {
+                    self.lastError = message
+                }
                 return
             }
             do {
                 try self.recorder.start()
             } catch {
-                self.lastError = "Microphone unavailable: \(error.localizedDescription)"
+                let message = "Microphone unavailable: \(error.localizedDescription)"
+                if self.keyboardHandoffVisible {
+                    self.failKeyboardDictation(message)
+                } else {
+                    self.lastError = message
+                }
                 return
             }
 
@@ -283,6 +347,7 @@ final class LabModel {
             self.liveSessionID = UUID().uuidString
             self.liveRevision = 0
             self.liveStopRequested = false
+            self.lastHandledDictationCommandID = DictationBridge.readCommand()?.id ?? ""
             self.liveDictationState = .listening
             UIApplication.shared.isIdleTimerDisabled = true
             EngineHooks.shared.set(span: nil, segments: nil)
@@ -293,6 +358,15 @@ final class LabModel {
                 while !Task.isCancelled, self.recorder.isRecording {
                     try? await Task.sleep(for: .milliseconds(200))
                     guard !Task.isCancelled else { break }
+                    if let command = DictationBridge.readCommand(),
+                       command.id != self.lastHandledDictationCommandID
+                    {
+                        self.lastHandledDictationCommandID = command.id
+                        if command.action == .stop {
+                            self.stopLiveDictation()
+                            break
+                        }
+                    }
                     let fresh = self.recorder.takeAvailable()
                     for utterance in self.liveDetector.push(fresh) {
                         self.enqueueLiveUtterance(utterance)
@@ -305,10 +379,17 @@ final class LabModel {
     /// Stop capture immediately, then finish any utterances already heard.
     /// The microphone indicator goes away before the final local decode ends.
     func stopLiveDictation() {
-        guard isLiveDictationActive else { return }
+        guard liveDictationState == .listening else { return }
         liveStopRequested = true
         liveDictationState = .finishing
         publishLiveSnapshot(state: .finishing, message: nil)
+        if liveFinishBackgroundTask == .invalid {
+            liveFinishBackgroundTask = UIApplication.shared.beginBackgroundTask(
+                withName: "Finish local dictation"
+            ) { [weak self] in
+                Task { @MainActor in self?.endLiveFinishBackgroundTask() }
+            }
+        }
         liveCaptureTask?.cancel()
         liveCaptureTask = nil
 
@@ -369,6 +450,7 @@ final class LabModel {
                     if self.recorder.isRecording { _ = self.recorder.stop() }
                     self.liveStopRequested = true
                     self.liveQueue.removeAll(keepingCapacity: true)
+                    self.endLiveFinishBackgroundTask()
                 }
             }
             self.liveDecodeTask = nil
@@ -399,6 +481,13 @@ final class LabModel {
         }
         liveDictationState = .idle
         publishLiveSnapshot(state: .idle, message: nil)
+        endLiveFinishBackgroundTask()
+    }
+
+    private func endLiveFinishBackgroundTask() {
+        guard liveFinishBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(liveFinishBackgroundTask)
+        liveFinishBackgroundTask = .invalid
     }
 
     private func publishLiveSnapshot(state: DictationSnapshot.State, message: String?) {
