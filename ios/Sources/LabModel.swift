@@ -429,14 +429,14 @@ final class LabModel {
         publishLiveSnapshot(state: .failed, message: message)
     }
 
-    /// Start a continuous, user-visible microphone session. iOS does not let a
-    /// keyboard extension access the microphone; the containing app records
-    /// and runs the local model, and the local-only keyboard reads the
-    /// append-only text through the App Group. Apple gates that shared
-    /// container behind the user's Full Access switch even without networking.
+    /// Start one explicit, user-visible microphone session and immediately
+    /// begin its first utterance. The audio engine remains alive for fifteen
+    /// minutes after Finish, allowing subsequent keyboard starts to remain in
+    /// the caller's app. While armed, captured samples are discarded locally.
     func startLiveDictation() {
-        guard engineState == .ready else {
-            failLiveDictation("The local speech engine is not ready yet. Please try again when it finishes loading.")
+        guard liveEngineState == .ready else {
+            failLiveDictation(
+                "The realtime speech engine is not ready yet. Please try again when it finishes loading.")
             return
         }
 
@@ -446,6 +446,11 @@ final class LabModel {
         if !recorder.isRecording, liveCaptureTask != nil {
             liveCaptureTask?.cancel()
             liveCaptureTask = nil
+        }
+
+        if recorder.isRecording, hasArmedDictationSession {
+            beginArmedUtterance()
+            return
         }
 
         guard !isLiveDictationActive, !recorder.isRecording else { return }
@@ -496,51 +501,83 @@ final class LabModel {
                 return
             }
 
-            self.liveDetector.reset()
-            self.liveQueue.removeAll(keepingCapacity: true)
-            self.liveDictationText = ""
-            self.liveLastPhrase = ""
-            self.liveQueuedUtterances = 0
-            self.liveSessionID = UUID().uuidString
-            self.liveRevision = 0
-            self.liveStopRequested = false
+            self.liveServiceID = UUID().uuidString
+            self.liveSessionExpiresAt = Date().addingTimeInterval(Self.liveSessionDuration)
+            self.liveEndSessionRequested = false
             self.lastHandledDictationCommandID = DictationBridge.readCommand()?.id ?? ""
-            self.liveDictationState = .listening
-            UIApplication.shared.isIdleTimerDisabled = true
             EngineHooks.shared.set(span: nil, segments: nil)
-            self.publishLiveSnapshot(state: .listening, message: nil)
+            self.beginArmedUtterance()
 
-            let captureSessionID = self.liveSessionID
+            let serviceID = self.liveServiceID
             self.liveCaptureTask = Task { [weak self] in
                 guard let self else { return }
                 defer {
-                    if self.liveSessionID == captureSessionID {
+                    if self.liveServiceID == serviceID {
                         self.liveCaptureTask = nil
                     }
                 }
                 while !Task.isCancelled, self.recorder.isRecording {
-                    try? await Task.sleep(for: .milliseconds(200))
+                    try? await Task.sleep(for: .milliseconds(100))
                     guard !Task.isCancelled else { break }
                     if let command = DictationBridge.readCommand(),
                        command.id != self.lastHandledDictationCommandID
                     {
                         self.lastHandledDictationCommandID = command.id
-                        if command.action == .stop {
+                        switch command.action {
+                        case .start:
+                            self.beginArmedUtterance()
+                        case .stop:
                             self.stopLiveDictation()
-                            break
+                        case .endSession:
+                            self.endLiveDictationSession()
                         }
                     }
                     let fresh = self.recorder.takeAvailable()
-                    for utterance in self.liveDetector.push(fresh) {
-                        self.enqueueLiveUtterance(utterance)
+                    if self.liveDictationState == .listening {
+                        for utterance in self.liveDetector.push(fresh) {
+                            self.enqueueLiveUtterance(utterance)
+                        }
+                    }
+                    if let expires = self.liveSessionExpiresAt, Date() >= expires {
+                        self.liveEndSessionRequested = true
+                        if self.liveDictationState == .listening {
+                            self.stopLiveDictation()
+                        } else if self.liveDecodeTask == nil, self.liveQueue.isEmpty {
+                            self.finishLiveService()
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Stop capture immediately, then finish any utterances already heard.
-    /// The microphone indicator goes away before the final local decode ends.
+    /// Begin a fresh insertion transaction while reusing the already-active
+    /// microphone and tiny model. This is the normal keyboard Start path after
+    /// the one-time foreground activation.
+    private func beginArmedUtterance() {
+        guard recorder.isRecording else { return }
+        switch liveDictationState {
+        case .armed, .starting:
+            break
+        case .idle, .listening, .finishing, .failed:
+            return
+        }
+        liveDetector.reset()
+        _ = recorder.takeAvailable() // discard standby audio captured before the tap
+        liveQueue.removeAll(keepingCapacity: true)
+        liveDictationText = ""
+        liveLastPhrase = ""
+        liveQueuedUtterances = 0
+        liveSessionID = UUID().uuidString
+        liveRevision = 0
+        liveStopRequested = false
+        liveDictationState = .listening
+        UIApplication.shared.isIdleTimerDisabled = true
+        publishLiveSnapshot(state: .listening, message: nil)
+    }
+
+    /// Finish the current insertion transaction. The time-bounded microphone
+    /// service stays armed, so the next keyboard Start does not leave the app.
     func stopLiveDictation() {
         guard liveDictationState == .listening else { return }
         liveStopRequested = true
@@ -553,10 +590,7 @@ final class LabModel {
                 Task { @MainActor in self?.endLiveFinishBackgroundTask() }
             }
         }
-        liveCaptureTask?.cancel()
-        liveCaptureTask = nil
-
-        let tail = recorder.stop()
+        let tail = recorder.takeAvailable()
         for utterance in liveDetector.push(tail) {
             enqueueLiveUtterance(utterance)
         }
@@ -566,12 +600,23 @@ final class LabModel {
         finishLiveDictationIfReady()
     }
 
+    func endLiveDictationSession() {
+        liveEndSessionRequested = true
+        if liveDictationState == .listening {
+            stopLiveDictation()
+        } else if liveDecodeTask == nil, liveQueue.isEmpty {
+            finishLiveService()
+        }
+    }
+
     func clearLiveDictationText() {
         guard !isLiveDictationActive else { return }
         liveDictationText = ""
         liveLastPhrase = ""
         liveRevision += 1
-        publishLiveSnapshot(state: .idle, message: nil)
+        publishLiveSnapshot(
+            state: hasArmedDictationSession ? .armed : .idle,
+            message: armedSessionMessage)
     }
 
     private func enqueueLiveUtterance(_ pcm: [Float]) {
@@ -595,11 +640,12 @@ final class LabModel {
             timestamps: false,
             wordTimestamps: false)
 
-        liveDecodeTask = Task { [engine] in
+        let inferenceEngine = Self.usesFastLiveModel ? liveEngine : engine
+        liveDecodeTask = Task { [inferenceEngine] in
             do {
-                engine.resetCancel()
-                _ = try await engine.stage(pcm: pcm, denoise: false)
-                let transcription = try await engine.run(options: options)
+                inferenceEngine.resetCancel()
+                _ = try await inferenceEngine.stage(pcm: pcm, denoise: false)
+                let transcription = try await inferenceEngine.run(options: options)
                 let phrase = transcription.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !phrase.isEmpty {
                     self.appendLivePhrase(phrase)
@@ -641,9 +687,34 @@ final class LabModel {
         if case .failed = liveDictationState {
             return
         }
+        if liveEndSessionRequested || !recorder.isRecording {
+            finishLiveService()
+        } else {
+            liveDictationState = .armed
+            publishLiveSnapshot(state: .armed, message: armedSessionMessage)
+        }
+        endLiveFinishBackgroundTask()
+    }
+
+    private var armedSessionMessage: String? {
+        guard hasArmedDictationSession else { return nil }
+        return "Ready for another dictation · about \(liveSessionMinutesRemaining) min left"
+    }
+
+    private func finishLiveService() {
+        liveCaptureTask?.cancel()
+        liveCaptureTask = nil
+        if recorder.isRecording { _ = recorder.stop() }
+        liveServiceID = ""
+        liveSessionExpiresAt = nil
+        liveEndSessionRequested = false
+        liveStopRequested = false
+        UIApplication.shared.isIdleTimerDisabled = false
+        if case .failed = liveDictationState { return }
         liveDictationState = .idle
         publishLiveSnapshot(state: .idle, message: nil)
         endLiveFinishBackgroundTask()
+        if engineState == .notLoaded { assembleEngine() }
     }
 
     private func endLiveFinishBackgroundTask() {
