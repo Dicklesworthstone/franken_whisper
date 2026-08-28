@@ -213,7 +213,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
-name = "ft-core"
+name = "frankentorch-core"
 version = "0.1.0"
 dependencies = [
  "half",
@@ -221,10 +221,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "ft-kernel-cpu"
-version = "0.1.0"
+name = "frankentorch-kernel-cpu"
+version = "0.1.1"
 dependencies = [
- "ft-core",
+ "frankentorch-core",
  "libm",
  "matrixmultiply",
  "rayon",
@@ -244,17 +244,18 @@ dependencies = [
 
 [[package]]
 name = "ftts-kernels"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "libc",
+ "libm",
 ]
 
 [[package]]
 name = "fw-ios"
 version = "0.1.0"
 dependencies = [
- "ft-core",
- "ft-kernel-cpu",
+ "frankentorch-core",
+ "frankentorch-kernel-cpu",
  "ft-kernel-metal",
  "ftts-kernels",
  "half",
