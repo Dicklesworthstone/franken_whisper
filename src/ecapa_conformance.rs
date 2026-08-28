@@ -1112,7 +1112,7 @@ pub fn ecapa_frontend_runtime(
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<EcapaFrontendOutput> {
     validate_ecapa_runtime_input(samples)?;
-    checkpoint()?;
+    ecapa_load_checkpoint(checkpoint)?;
 
     let frame_count = samples.len() / ECAPA_HOP_SAMPLES + 1;
     let value_count = frame_count
@@ -1126,7 +1126,7 @@ pub fn ecapa_frontend_runtime(
 
     for frame_index in 0..frame_count {
         if frame_index.is_multiple_of(16) {
-            checkpoint()?;
+            ecapa_load_checkpoint(checkpoint)?;
         }
         let frame_origin =
             frame_index as isize * ECAPA_HOP_SAMPLES as isize - (ECAPA_WINDOW_SAMPLES / 2) as isize;
@@ -1152,7 +1152,7 @@ pub fn ecapa_frontend_runtime(
             log_fbank_db.push(db);
         }
     }
-    checkpoint()?;
+    ecapa_load_checkpoint(checkpoint)?;
     finalize_ecapa_frontend(frame_count, log_fbank_db, global_max)
 }
 
@@ -1898,6 +1898,16 @@ mod tests {
         })
         .expect_err("cancelled frontend fails");
         assert!(matches!(error, FwError::Cancelled(_)));
+
+        let error = ecapa_frontend_runtime(&admitted, &|| {
+            Err(FwError::InvalidRequest(
+                "caller-private frontend checkpoint detail".to_owned(),
+            ))
+        })
+        .expect_err("non-cancellation checkpoint failure is sanitized");
+        let rendered = error.to_string();
+        assert!(rendered.contains("ecapa.checkpoint_failure"));
+        assert!(!rendered.contains("caller-private"));
     }
 
     #[test]
