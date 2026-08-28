@@ -206,6 +206,7 @@ final class KeyboardViewController: UIInputViewController {
 
         switch snapshot.state {
         case .armed:
+            if observedActiveSession { insertNewText(from: snapshot) }
             statusLabel.text = "● READY · MIC SESSION ACTIVE"
             showActionButton(title: "🎙  Start", enabled: true)
         case .listening:
