@@ -317,8 +317,16 @@ final class LabModel {
     /// Mega-kernel discipline: the product split has an emergency kill switch.
     /// Set FW_IOS_LIVE_FAST_MODEL=0 before first engine use to route live work
     /// through the established large model while investigating regressions.
-    private static let usesFastLiveModel =
+    private static let usesFastLiveModel: Bool = {
+#if targetEnvironment(macCatalyst)
+        // The custom system keyboard is an iOS feature. Loading its separate tiny
+        // latency model on macOS delayed the batch engine and consumed memory for a
+        // workflow the platform cannot expose.
+        false
+#else
         ProcessInfo.processInfo.environment["FW_IOS_LIVE_FAST_MODEL"] != "0"
+#endif
+    }()
 
     private var generation = 0
     private var liveEngineGeneration = 0

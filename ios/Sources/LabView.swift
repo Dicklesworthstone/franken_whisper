@@ -64,7 +64,9 @@ struct LabView: View {
                             VStack(alignment: .leading, spacing: 22) {
                                 header
                                 specimenCard
+#if !targetEnvironment(macCatalyst)
                                 dictationCard
+#endif
                                 footer
                             }
                             .padding(.vertical, 2)
@@ -292,12 +294,20 @@ struct LabView: View {
 
     private var destinationPicker: some View {
         Picker("Workspace", selection: $destination) {
-            ForEach(Destination.allCases) { destination in
+            ForEach(availableDestinations) { destination in
                 Text(destination.rawValue).tag(destination)
             }
         }
         .pickerStyle(.segmented)
         .accessibilityLabel("FrankenWhisper workspace")
+    }
+
+    private var availableDestinations: [Destination] {
+#if targetEnvironment(macCatalyst)
+        [.transcribe, .result, .models]
+#else
+        Destination.allCases
+#endif
     }
 
     @ViewBuilder
@@ -307,7 +317,11 @@ struct LabView: View {
             if model.store.phase != .ready { specimenCard }
             signalCard
         case .live:
+#if targetEnvironment(macCatalyst)
+            signalCard
+#else
             dictationCard
+#endif
         case .result:
             transcriptCard
         case .models:
@@ -1028,7 +1042,11 @@ struct LabView: View {
     private var footer: some View {
         VStack(spacing: 8) {
             Text("Nothing leaves this device. No accounts, no telemetry, no cloud.")
+#if targetEnvironment(macCatalyst)
+            Text("Audio and transcripts remain local to this Mac.")
+#else
             Text("The optional keyboard makes no network requests and only reads locally committed dictation text.")
+#endif
             Text("franken_whisper — the same pure-Rust engine as the CLI and the browser demo.")
             Text(
                 "If you like this free app, please show your appreciation by trying out my paid skills site at [JeffreysSkills.md](https://jeffreys-skills.md)."
