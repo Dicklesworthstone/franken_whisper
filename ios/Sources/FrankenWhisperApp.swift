@@ -33,7 +33,14 @@ struct FrankenWhisperApp: App {
         WindowGroup {
             LabView()
                 .preferredColorScheme(.dark)
+#if targetEnvironment(macCatalyst)
+                .frame(minWidth: 760, minHeight: 620)
+#endif
         }
+#if targetEnvironment(macCatalyst)
+        .defaultSize(width: 1220, height: 840)
+        .windowResizability(.contentMinSize)
+#endif
         .commands { WhisperCommands() }
     }
 }
