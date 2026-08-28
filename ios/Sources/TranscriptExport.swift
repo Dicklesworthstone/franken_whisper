@@ -99,7 +99,7 @@ enum TranscriptExport {
         var lines: [String] = [
             "# Transcript — \(context.sourceName)",
             "",
-            "- Engine: franken_whisper on iPhone (Whisper large-v3-turbo q8_0 + Sortformer diarization)",
+            "- Engine: franken_whisper on-device (Whisper large-v3-turbo q8_0 + Sortformer diarization)",
             String(
                 format: "- Audio: %.1f s · transcribed%@ in %.1f s on device",
                 result.audioSec,
@@ -167,7 +167,7 @@ enum TranscriptExport {
             ? "<div class=\"warn\">⚠ \(result.droppedWindows) window(s) dropped without output — a real content gap</div>"
             : ""
         let meta = String(
-            format: "franken_whisper on iPhone (large-v3-turbo q8_0 + Sortformer) · %.1f s of audio · processed on device in %.1f s",
+            format: "franken_whisper on-device (large-v3-turbo q8_0 + Sortformer) · %.1f s of audio · processed locally in %.1f s",
             result.audioSec, context.wallSeconds)
         return """
             <!doctype html>

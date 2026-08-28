@@ -158,7 +158,7 @@ struct WhisperObservatory: View {
                 Image(systemName: "quote.bubble.fill")
                     .foregroundStyle(accent)
                 Text(latest)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.system(size: Lab.typeSize(13), weight: .medium))
                     .foregroundStyle(Lab.textPrimary)
                     .lineLimit(2)
                     .contentTransition(.opacity)
@@ -181,7 +181,7 @@ struct WhisperObservatory: View {
                 Circle().fill(accent.opacity(0.14))
                 Circle().stroke(accent.opacity(0.6), lineWidth: 1)
                 Image(systemName: stageSymbol)
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(.system(size: Lab.typeSize(18), weight: .semibold))
                     .foregroundStyle(accent)
                     .symbolEffect(.pulse, isActive: active && !reduceMotion)
             }
@@ -189,18 +189,18 @@ struct WhisperObservatory: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(stage.uppercased())
-                    .font(.system(size: 13, weight: .black, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(13), weight: .black, design: .monospaced))
                     .tracking(1.5)
                     .foregroundStyle(Lab.textPrimary)
                 Text(detail)
-                    .font(.system(size: 12))
+                    .font(.system(size: Lab.typeSize(12)))
                     .foregroundStyle(Lab.textSecondary)
             }
 
             Spacer(minLength: 8)
             if active {
                 Text(Self.clock(elapsed(at: date)))
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(12), weight: .semibold, design: .monospaced))
                     .foregroundStyle(Lab.textSecondary)
                     .monospacedDigit()
             }
@@ -240,7 +240,7 @@ struct WhisperObservatory: View {
 
     private func instrumentLabel(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .font(.system(size: Lab.typeSize(9), weight: .bold, design: .monospaced))
             .tracking(1.2)
             .foregroundStyle(Lab.textSecondary.opacity(0.8))
     }
@@ -257,11 +257,11 @@ struct WhisperObservatory: View {
     private func metric(_ label: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label)
-                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                .font(.system(size: Lab.typeSize(8), weight: .bold, design: .monospaced))
                 .tracking(1)
                 .foregroundStyle(Lab.textSecondary.opacity(0.75))
             Text(value)
-                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .font(.system(size: Lab.typeSize(12), weight: .semibold, design: .monospaced))
                 .foregroundStyle(Lab.textPrimary)
                 .monospacedDigit()
         }

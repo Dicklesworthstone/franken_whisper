@@ -3,6 +3,7 @@
 // reads as one bench of instruments.
 
 import SwiftUI
+import UIKit
 
 enum Lab {
     static let background = Color(red: 0.004, green: 0.024, blue: 0.019)
@@ -17,6 +18,14 @@ enum Lab {
     static let amber = Color(red: 0.984, green: 0.749, blue: 0.141) // warnings only
     static let violet = Color(red: 0.655, green: 0.545, blue: 0.98) // structure/metadata
     static let danger = Color(red: 0.973, green: 0.443, blue: 0.443)
+
+    static func typeSize(_ base: CGFloat) -> CGFloat {
+#if targetEnvironment(macCatalyst)
+        return base * 1.38
+#else
+        return UIFontMetrics(forTextStyle: .body).scaledValue(for: base)
+#endif
+    }
 
     /// Deterministic per-speaker tint: the same speaker always gets the same
     /// color within a transcript, like the CLI's TUI.
@@ -78,7 +87,7 @@ struct LabLabel: View {
     let text: String
     var body: some View {
         Text(text.uppercased())
-            .font(.system(size: 11, weight: .black, design: .monospaced))
+            .font(.system(size: Lab.typeSize(11), weight: .black, design: .monospaced))
             .kerning(2.5)
             .foregroundStyle(Lab.emerald)
     }
@@ -91,14 +100,16 @@ struct Bolt: View {
             Circle()
                 .fill(
                     RadialGradient(
-                        colors: [Color(white: 0.35), Color(white: 0.05)],
-                        center: .topLeading, startRadius: 1, endRadius: 8))
-            Rectangle().fill(Color(white: 0.15)).frame(width: 1.2, height: 7).rotationEffect(.degrees(45))
-            Rectangle().fill(Color(white: 0.15)).frame(width: 1.2, height: 7).rotationEffect(.degrees(-45))
+                        colors: [Color(white: 0.42), Color(white: 0.08)],
+                        center: .topLeading, startRadius: 0, endRadius: 7))
+            Capsule()
+                .fill(Color.black.opacity(0.68))
+                .frame(width: 6, height: 1.15)
+                .rotationEffect(.degrees(-28))
         }
-        .frame(width: 13, height: 13)
-        .overlay(Circle().stroke(Color.white.opacity(0.15), lineWidth: 0.8))
-        .shadow(color: Lab.emerald.opacity(0.35), radius: 4)
+        .frame(width: 11, height: 11)
+        .overlay(Circle().stroke(Color.white.opacity(0.13), lineWidth: 0.7))
+        .shadow(color: Color.black.opacity(0.55), radius: 2, y: 1)
         .accessibilityHidden(true)
     }
 }
@@ -144,7 +155,7 @@ struct PrimaryButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 13, weight: .black, design: .monospaced))
+            .font(.system(size: Lab.typeSize(13), weight: .black, design: .monospaced))
             .kerning(1.2)
             .textCase(.uppercase)
             .foregroundStyle(.white)
@@ -169,7 +180,7 @@ struct GhostButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 12, weight: .black, design: .monospaced))
+            .font(.system(size: Lab.typeSize(12), weight: .black, design: .monospaced))
             .kerning(1.2)
             .textCase(.uppercase)
             .foregroundStyle(tint)
@@ -224,7 +235,7 @@ struct StatusLine: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Circle().fill(color).frame(width: 6, height: 6)
             Text(text)
-                .font(.system(size: 12, design: .monospaced))
+                .font(.system(size: Lab.typeSize(12), design: .monospaced))
                 .foregroundStyle(color)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -256,7 +267,7 @@ struct LevelMeter: View {
 struct LabTextFieldModifier: ViewModifier {
     func body(content: Content) -> some View {
         content
-            .font(.system(size: 13, design: .monospaced))
+            .font(.system(size: Lab.typeSize(13), design: .monospaced))
             .foregroundStyle(Lab.textPrimary)
             .tint(Lab.emerald)
             .padding(.horizontal, 12)
@@ -301,7 +312,7 @@ struct RecordButton: View {
                 Circle()
                     .stroke(isRecording ? Lab.danger : Lab.emerald, lineWidth: 2)
                 Image(systemName: isRecording ? "stop.fill" : "mic.fill")
-                    .font(.system(size: 24, weight: .bold))
+                    .font(.system(size: Lab.typeSize(24), weight: .bold))
                     .foregroundStyle(isRecording ? Lab.danger : Lab.emerald)
                     .contentTransition(.symbolEffect(.replace))
             }

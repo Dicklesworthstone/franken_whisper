@@ -2,6 +2,7 @@
 // dictation lane — 01 models, 02 batch input, 03 live dictation, 04 result.
 
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 private enum LabTextEntry: Hashable {
@@ -57,27 +58,37 @@ struct LabView: View {
         ZStack {
             LaboratoryBackground()
             GeometryReader { geometry in
-                ScrollView {
-                    if geometry.size.width >= 940 {
-                        HStack(alignment: .top, spacing: 24) {
+                if usesDashboardLayout(width: geometry.size.width) {
+                    HStack(alignment: .top, spacing: 24) {
+                        ScrollView {
                             VStack(alignment: .leading, spacing: 22) {
                                 header
                                 specimenCard
                                 dictationCard
                                 footer
                             }
-                            .frame(width: min(390, geometry.size.width * 0.36))
+                            .padding(.vertical, 2)
+                        }
+                        .scrollIndicators(.hidden)
+                        .defaultScrollAnchor(.top)
+                        .frame(width: min(410, geometry.size.width * 0.38))
 
+                        ScrollView {
                             VStack(alignment: .leading, spacing: 22) {
                                 signalCard
                                 transcriptCard
                             }
-                            .frame(maxWidth: 760)
+                            .padding(.vertical, 2)
                         }
-                        .padding(24)
-                        .frame(maxWidth: 1220)
-                        .frame(maxWidth: .infinity)
-                    } else {
+                        .scrollIndicators(.hidden)
+                        .defaultScrollAnchor(.top)
+                        .frame(maxWidth: 760)
+                    }
+                    .padding(24)
+                    .frame(maxWidth: 1240, maxHeight: .infinity, alignment: .top)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                } else {
+                    ScrollView {
                         VStack(alignment: .leading, spacing: 22) {
                             header
                             destinationPicker
@@ -88,9 +99,9 @@ struct LabView: View {
                         .frame(maxWidth: 720)
                         .frame(maxWidth: .infinity)
                     }
+                    .scrollIndicators(.hidden)
+                    .scrollDismissesKeyboard(.interactively)
                 }
-                .scrollIndicators(.hidden)
-                .scrollDismissesKeyboard(.interactively)
             }
             if model.keyboardHandoffVisible {
                 keyboardHandoffOverlay
@@ -118,7 +129,7 @@ struct LabView: View {
                 Button("Done") {
                     focusedTextEntry = nil
                 }
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: Lab.typeSize(13), weight: .semibold))
             }
         }
         .alert(
@@ -271,6 +282,14 @@ struct LabView: View {
         )
     }
 
+    private func usesDashboardLayout(width: CGFloat) -> Bool {
+#if targetEnvironment(macCatalyst)
+        return width >= 700
+#else
+        return UIDevice.current.userInterfaceIdiom == .pad ? width >= 700 : width >= 940
+#endif
+    }
+
     private var destinationPicker: some View {
         Picker("Workspace", selection: $destination) {
             ForEach(Destination.allCases) { destination in
@@ -319,7 +338,7 @@ struct LabView: View {
             Color.black.opacity(0.88).ignoresSafeArea()
             VStack(spacing: 18) {
                 Text("FRANKENWHISPER KEYBOARD")
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(12), weight: .bold, design: .monospaced))
                     .tracking(1.5)
                     .foregroundStyle(Lab.emerald)
 
@@ -331,7 +350,7 @@ struct LabView: View {
                         .multilineTextAlignment(.center)
                 case .listening:
                     Image(systemName: "waveform.circle.fill")
-                        .font(.system(size: 58))
+                        .font(.system(size: Lab.typeSize(58)))
                         .foregroundStyle(Lab.emerald)
                         .symbolEffect(.pulse)
                     Text("Listening")
@@ -340,12 +359,12 @@ struct LabView: View {
                     LevelMeter(level: model.recorder.level)
                         .frame(maxWidth: 280)
                     Text("Return to your app and speak.")
-                    .font(.system(size: 14))
+                    .font(.system(size: Lab.typeSize(14)))
                     .multilineTextAlignment(.center)
                     .foregroundStyle(Lab.textSecondary)
                 case .armed:
                     Image(systemName: "keyboard.badge.ellipsis")
-                        .font(.system(size: 52))
+                        .font(.system(size: Lab.typeSize(52)))
                         .foregroundStyle(Lab.emerald)
                     Text("Keyboard ready · \(model.liveSessionMinutesRemaining)m")
                         .font(.title2.bold())
@@ -355,10 +374,10 @@ struct LabView: View {
                         .font(.title2.bold())
                 case .failed(let reason):
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 44))
+                        .font(.system(size: Lab.typeSize(44)))
                         .foregroundStyle(Lab.danger)
                     Text(reason)
-                        .font(.system(size: 14))
+                        .font(.system(size: Lab.typeSize(14)))
                         .multilineTextAlignment(.center)
                         .foregroundStyle(Lab.textSecondary)
                 case .idle:
@@ -369,7 +388,7 @@ struct LabView: View {
                 }
 
                 Text("ON-DEVICE · NOTHING UPLOADED")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(11), design: .monospaced))
                     .multilineTextAlignment(.center)
                     .foregroundStyle(Lab.textSecondary.opacity(0.8))
 
@@ -417,7 +436,7 @@ struct LabView: View {
                     "Fast on-device dictation. Activate once, then Start and Finish stay in the keyboard "
                         + "for an hour. Full transcription below keeps the larger accuracy model."
                 )
-                .font(.system(size: 12, design: .monospaced))
+                .font(.system(size: Lab.typeSize(12), design: .monospaced))
                 .foregroundStyle(Lab.textSecondary)
 
                 switch model.liveDictationState {
@@ -465,7 +484,7 @@ struct LabView: View {
 
                 if !model.liveDictationText.isEmpty {
                     Text(model.liveDictationText)
-                        .font(.system(size: 14))
+                        .font(.system(size: Lab.typeSize(14)))
                         .foregroundStyle(Lab.textPrimary)
                         .textSelection(.enabled)
                         .padding(10)
@@ -487,7 +506,7 @@ struct LabView: View {
                 Text(
                     "SETUP  Add FrankenWhisper in iOS Keyboard settings and enable Full Access for its local handoff. Nothing is uploaded."
                 )
-                .font(.system(size: 10, design: .monospaced))
+                .font(.system(size: Lab.typeSize(10), design: .monospaced))
                 .foregroundStyle(Lab.textSecondary.opacity(0.8))
 
                 Button {
@@ -512,11 +531,14 @@ struct LabView: View {
                 .frame(width: 54, height: 54)
             VStack(alignment: .leading, spacing: 5) {
                 Text("FRANKENWHISPER")
-                    .font(.system(size: 22, weight: .black, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(22), weight: .black, design: .monospaced))
                     .kerning(2)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
+                    .allowsTightening(true)
                     .foregroundStyle(Lab.textPrimary)
                 Text("IT_HEARS // private speech observatory")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(11), design: .monospaced))
                     .kerning(1)
                     .foregroundStyle(Lab.textSecondary)
             }
@@ -552,7 +574,7 @@ struct LabView: View {
                         "The machine needs its brain: \(Self.gigabytes(ModelManifest.totalBytes)) "
                             + "of verified model weights, downloaded once."
                     )
-                    .font(.system(size: 13, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(13), design: .monospaced))
                     .foregroundStyle(Lab.textSecondary)
                     Button("Fetch the models") { showDownloadConsent = true }
                         .buttonStyle(PrimaryButtonStyle())
@@ -612,7 +634,7 @@ struct LabView: View {
                 .tint(Lab.emerald)
             StatusLine(kind: .neutral, text: stage + "…")
             Text("First assembly takes a minute; the weights stream in tensor by tensor.")
-                .font(.system(size: 11, design: .monospaced))
+                .font(.system(size: Lab.typeSize(11), design: .monospaced))
                 .foregroundStyle(Lab.textSecondary)
 
         case .ready:
@@ -653,9 +675,9 @@ struct LabView: View {
                         kind: .warn,
                         text: "recording · \(Self.clock(model.recorder.seconds)) · tap Stop when finished")
                     Text(
-                        "Speak naturally and keep the level meter moving. Audio stays in memory on this phone."
+                        "Speak naturally and keep the level meter moving. Audio stays in memory on this device."
                     )
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(11), design: .monospaced))
                     .foregroundStyle(Lab.textSecondary)
                 }
 
@@ -725,15 +747,16 @@ struct LabView: View {
             Toggle(isOn: $model.wordTimestamps) {
                 optionLabel("Word-level timestamps (DTW)")
             }
-            HStack {
-                optionLabel("Language")
-                Spacer()
-                Picker("Language", selection: $model.language) {
-                    ForEach(LabModel.languages, id: \.code) { language in
-                        Text(language.label).tag(language.code)
-                    }
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    optionLabel("Language")
+                    Spacer()
+                    languagePicker
                 }
-                .pickerStyle(.menu)
+                VStack(alignment: .leading, spacing: 2) {
+                    optionLabel("Language")
+                    languagePicker
+                }
             }
 
             // The website's speaker-names field: feeds the decoding prompt so
@@ -755,7 +778,7 @@ struct LabView: View {
                     ? "Names help spelling and label the detected voices in speaking order — they assign labels, they don't identify anyone."
                     : "Names help the model spell them correctly in the transcript."
             )
-            .font(.system(size: 10, design: .monospaced))
+            .font(.system(size: Lab.typeSize(10), design: .monospaced))
             .foregroundStyle(Lab.textSecondary.opacity(0.8))
         }
         .toggleStyle(SwitchToggleStyle(tint: Lab.emerald))
@@ -764,8 +787,21 @@ struct LabView: View {
 
     private func optionLabel(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 12, design: .monospaced))
+            .font(.system(size: Lab.typeSize(12), design: .monospaced))
             .foregroundStyle(Lab.textSecondary)
+    }
+
+    private var languagePicker: some View {
+        Picker("Language", selection: $model.language) {
+            ForEach(LabModel.languages, id: \.code) { language in
+                Text(language.label).tag(language.code)
+            }
+        }
+        .pickerStyle(.menu)
+        // Menu-style pickers can report an implausibly narrow ideal width at
+        // accessibility sizes. Preserve the selected language as one compact
+        // control; ViewThatFits moves it below the label when necessary.
+        .fixedSize(horizontal: true, vertical: true)
     }
 
     // ── 03 The Transcript ──────────────────────────────────────────────────
@@ -781,7 +817,7 @@ struct LabView: View {
                     liveView
                 } else {
                     Text("The transcript materializes here, window by window, as the model listens.")
-                        .font(.system(size: 12, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(12), design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
                 }
             }
@@ -800,7 +836,7 @@ struct LabView: View {
             HStack(spacing: 6) {
                 ProgressView().tint(Lab.emerald).scaleEffect(0.7)
                 Text("still listening…")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(11), design: .monospaced))
                     .foregroundStyle(Lab.textSecondary)
             }
         }
@@ -900,7 +936,7 @@ struct LabView: View {
     private var speakerNameEditor: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("NAME THE VOICES")
-                .font(.system(size: 10, weight: .black, design: .monospaced))
+                .font(.system(size: Lab.typeSize(10), weight: .black, design: .monospaced))
                 .kerning(1.5)
                 .foregroundStyle(Lab.textSecondary)
             ForEach(model.detectedSpeakers, id: \.self) { lane in
@@ -909,7 +945,7 @@ struct LabView: View {
                         .fill(Lab.speakerColor(lane))
                         .frame(width: 8, height: 8)
                     Text(lane)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(10), design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
                         .frame(width: 90, alignment: .leading)
                     TextField(
@@ -934,17 +970,17 @@ struct LabView: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
                 Text(model.displaySpeaker(run.speaker))
-                    .font(.system(size: 10, weight: .black, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(10), weight: .black, design: .monospaced))
                     .kerning(1.2)
                     .foregroundStyle(Lab.speakerColor(run.speaker))
                 if let start = run.startSec {
                     Text(Self.clock(start))
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(10), design: .monospaced))
                         .foregroundStyle(Lab.textSecondary)
                 }
             }
             Text(run.text)
-                .font(.system(size: 14))
+                .font(.system(size: Lab.typeSize(14)))
                 .foregroundStyle(Lab.textPrimary)
                 .textSelection(.enabled)
         }
@@ -953,11 +989,11 @@ struct LabView: View {
     private func segmentRow(_ segment: TranscriptSegment, timeOffset: Double = 0) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(segment.startSec.map { Self.clock($0 + timeOffset) } ?? "—")
-                .font(.system(size: 10, design: .monospaced))
+                .font(.system(size: Lab.typeSize(10), design: .monospaced))
                 .foregroundStyle(Lab.textSecondary)
                 .frame(width: 44, alignment: .trailing)
             Text(segment.text.trimmingCharacters(in: .whitespaces))
-                .font(.system(size: 14))
+                .font(.system(size: Lab.typeSize(14)))
                 .foregroundStyle(Lab.textPrimary)
                 .textSelection(.enabled)
         }
@@ -995,13 +1031,13 @@ struct LabView: View {
             Text(
                 "If you like this free app, please show your appreciation by trying out my paid skills site at [JeffreysSkills.md](https://jeffreys-skills.md)."
             )
-            .font(.system(size: 10, design: .monospaced))
+            .font(.system(size: Lab.typeSize(10), design: .monospaced))
             .foregroundStyle(Lab.textSecondary.opacity(0.72))
             .tint(Lab.emerald.opacity(0.8))
             .multilineTextAlignment(.center)
             .frame(maxWidth: 320)
         }
-        .font(.system(size: 10, design: .monospaced))
+        .font(.system(size: Lab.typeSize(10), design: .monospaced))
         .foregroundStyle(Lab.textSecondary.opacity(0.7))
         .multilineTextAlignment(.center)
         .frame(maxWidth: .infinity)
@@ -1019,7 +1055,7 @@ struct LabView: View {
             .opacity(model.engineState == .ready ? 1 : 0.35)
 
             Text(model.recorder.isRecording ? "listening…" : "record")
-                .font(.system(size: 11, weight: .black, design: .monospaced))
+                .font(.system(size: Lab.typeSize(11), weight: .black, design: .monospaced))
                 .kerning(1.5)
                 .textCase(.uppercase)
                 .foregroundStyle(model.recorder.isRecording ? Lab.danger : Lab.textSecondary)

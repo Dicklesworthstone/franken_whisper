@@ -36,7 +36,7 @@
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Recordings are transcribed entirely on this device by a local model. No audio, transcript, or anything else ever leaves your phone.</string>
+	<string>Recordings are transcribed entirely on this device by a local model. No audio, transcript, or anything else ever leaves this device.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>NSUserActivityTypes</key>
