@@ -31,7 +31,8 @@ done
 HEADERS=$(mktemp -d /tmp/fw-ios-headers.XXXXXX)
 cp fw-ios/include/fw_ios.h fw-ios/include/module.modulemap "$HEADERS/"
 
-CATALYST_LIB=$(mktemp /tmp/libfw_ios-maccatalyst.XXXXXX)
+CATALYST_ROOT=$(mktemp -d /tmp/fw-ios-maccatalyst.XXXXXX)
+CATALYST_LIB="$CATALYST_ROOT/libfw_ios.a"
 lipo -create \
   "$TARGET_DIR/aarch64-apple-ios-macabi/$PROFILE/libfw_ios.a" \
   "$TARGET_DIR/x86_64-apple-ios-macabi/$PROFILE/libfw_ios.a" \

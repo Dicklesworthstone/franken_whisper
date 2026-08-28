@@ -9,6 +9,7 @@ import ActivityKit
 final class WhisperActivityController {
     static let shared = WhisperActivityController()
     private var activity: Activity<FrankenWhisperRunActivityAttributes>?
+    private var startedAt: Date?
 
     private init() {}
 
@@ -23,7 +24,6 @@ final class WhisperActivityController {
         case .staging:
             begin()
         case .running(let done, let total, let stage):
-            guard let activity else { return }
             let status: FrankenWhisperRunContentState.Status
             if stage.contains("speaker") { status = .speakers }
             else if stage.contains("fus") { status = .fusing }
@@ -37,7 +37,9 @@ final class WhisperActivityController {
                 elapsedSeconds: max(0, Int(elapsed)),
                 status: status
             )
-            Task { await activity.update(ActivityContent(state: state, staleDate: nil)) }
+            if let activity {
+                Task { await activity.update(ActivityContent(state: state, staleDate: nil)) }
+            }
             publish(.working, headline: state.stage, detail: state.detail)
         case .done:
             end(status: .complete, headline: "Transcript assembled", detail: "Ready to read and export")
@@ -90,8 +92,10 @@ final class WhisperActivityController {
     }
 
     private func begin() {
-        guard activity == nil, ActivityAuthorizationInfo().areActivitiesEnabled else { return }
-        let attributes = FrankenWhisperRunActivityAttributes(runID: UUID(), startedAt: .now)
+        guard activity == nil, startedAt == nil else { return }
+        let start = Date.now
+        startedAt = start
+        let attributes = FrankenWhisperRunActivityAttributes(runID: UUID(), startedAt: start)
         let state = FrankenWhisperRunContentState(
             stage: "Preparing the signal",
             detail: "Reading audio into private on-device memory",
@@ -101,18 +105,21 @@ final class WhisperActivityController {
             elapsedSeconds: 0,
             status: .preparing
         )
-        activity = try? Activity.request(
-            attributes: attributes,
-            content: ActivityContent(state: state, staleDate: nil),
-            pushType: nil
-        )
+        if ActivityAuthorizationInfo().areActivitiesEnabled {
+            activity = try? Activity.request(
+                attributes: attributes,
+                content: ActivityContent(state: state, staleDate: nil),
+                pushType: nil
+            )
+        }
         publish(.working, headline: state.stage, detail: state.detail)
     }
 
     private func beginLive(stage: String) {
-        if activity == nil {
-            guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
-            let attributes = FrankenWhisperRunActivityAttributes(runID: UUID(), startedAt: .now)
+        if activity == nil, startedAt == nil {
+            let start = Date.now
+            startedAt = start
+            let attributes = FrankenWhisperRunActivityAttributes(runID: UUID(), startedAt: start)
             let state = FrankenWhisperRunContentState(
                 stage: "Activating the microphone",
                 detail: stage,
@@ -122,11 +129,13 @@ final class WhisperActivityController {
                 elapsedSeconds: 0,
                 status: .activating
             )
-            activity = try? Activity.request(
-                attributes: attributes,
-                content: ActivityContent(state: state, staleDate: nil),
-                pushType: nil
-            )
+            if ActivityAuthorizationInfo().areActivitiesEnabled {
+                activity = try? Activity.request(
+                    attributes: attributes,
+                    content: ActivityContent(state: state, staleDate: nil),
+                    pushType: nil
+                )
+            }
         }
         updateLive(status: .activating, headline: "Activating the microphone", detail: stage, queuedPhrases: 0)
     }
@@ -137,41 +146,53 @@ final class WhisperActivityController {
         detail: String,
         queuedPhrases: Int
     ) {
-        guard let activity else { return }
         let state = FrankenWhisperRunContentState(
             stage: headline,
             detail: detail,
             windowsDone: 0,
             windowsTotal: 0,
             emittedSegments: queuedPhrases,
-            elapsedSeconds: max(0, Int(Date().timeIntervalSince(activity.attributes.startedAt))),
+            elapsedSeconds: max(0, Int(Date().timeIntervalSince(startedAt ?? .now))),
             status: status
         )
-        Task { await activity.update(ActivityContent(state: state, staleDate: nil)) }
+        if let activity {
+            Task { await activity.update(ActivityContent(state: state, staleDate: nil)) }
+        }
         publish(.working, headline: headline, detail: detail)
     }
 
     private func end(status: FrankenWhisperRunContentState.Status, headline: String, detail: String) {
-        guard let current = activity else { return }
+        guard activity != nil || startedAt != nil else { return }
+        let current = activity
+        let start = current?.attributes.startedAt ?? startedAt ?? .now
         activity = nil
+        startedAt = nil
         let state = FrankenWhisperRunContentState(
             stage: headline,
             detail: detail,
             windowsDone: 0,
             windowsTotal: 0,
             emittedSegments: 0,
-            elapsedSeconds: max(0, Int(Date().timeIntervalSince(current.attributes.startedAt))),
+            elapsedSeconds: max(0, Int(Date().timeIntervalSince(start))),
             status: status
         )
         let dismissal: ActivityUIDismissalPolicy = status == .complete ? .after(.now + 45) : .immediate
-        Task { await current.end(ActivityContent(state: state, staleDate: nil), dismissalPolicy: dismissal) }
-        publish(status == .complete ? .complete : .ready, headline: headline, detail: detail)
+        if let current {
+            Task { await current.end(ActivityContent(state: state, staleDate: nil), dismissalPolicy: dismissal) }
+        }
+        let readiness: FrankenWhisperWidgetSnapshot.Readiness
+        switch status {
+        case .complete: readiness = .complete
+        case .failed: readiness = .needsAttention
+        default: readiness = .ready
+        }
+        publish(readiness, headline: headline, detail: detail)
     }
 
     private func detail(stage: String, windowsDone: Int, windowsTotal: Int, segments: Int) -> String {
-        if stage.contains("speaker") { return "Assigning voices to (segments) emitted phrases" }
+        if stage.contains("speaker") { return "Assigning voices to \(segments) emitted phrases" }
         if stage.contains("fus") { return "Aligning transcript and speaker timelines" }
-        return "(windowsDone) of (windowsTotal) real audio windows · (segments) phrases"
+        return "\(windowsDone) of \(windowsTotal) real audio windows · \(segments) phrases"
     }
 
     private func publish(

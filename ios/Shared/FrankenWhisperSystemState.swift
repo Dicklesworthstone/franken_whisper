@@ -58,8 +58,8 @@ struct FrankenWhisperWidgetSnapshot: Codable, Hashable {
 
     static let placeholder = FrankenWhisperWidgetSnapshot(
         readiness: .ready,
-        headline: "Observatory ready",
-        detail: "Private transcription on this device",
+        headline: "Open the Observatory",
+        detail: "Transcribe privately on this device",
         updatedAt: .now
     )
 }

@@ -68,81 +68,103 @@ struct WhisperObservatory: View {
     }
 
     var body: some View {
+        observatoryCard
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Transcription observatory")
+            .accessibilityValue("\(stage). \(detail)")
+    }
+
+    private var observatoryCard: some View {
+        observatoryTimeline
+            .padding(18)
+            .background { observatoryBackground }
+            .overlay { observatoryBorder }
+            .shadow(color: accent.opacity(active ? 0.2 : 0.06), radius: 30, y: 14)
+    }
+
+    private var observatoryTimeline: some View {
         TimelineView(
             .animation(
                 minimumInterval: animationConstrained ? 1.0 / 12.0 : 1.0 / 24.0,
                 paused: !active || reduceMotion
             )
         ) { timeline in
-            VStack(alignment: .leading, spacing: 16) {
-                header(at: timeline.date)
+            observatoryContent(at: timeline.date)
+        }
+    }
 
-                ZStack {
-                    chamberCanvas(time: timeline.date.timeIntervalSinceReferenceDate)
-                    chamberLabels
-                }
-                .frame(height: 238)
-                .accessibilityHidden(true)
-
-                metrics(at: timeline.date)
-
-                if let latest = segments.last?.text.trimmingCharacters(in: .whitespaces),
-                   !latest.isEmpty
-                {
-                    HStack(alignment: .firstTextBaseline, spacing: 9) {
-                        Image(systemName: "quote.bubble.fill")
-                            .foregroundStyle(accent)
-                        Text(latest)
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(Lab.textPrimary)
-                            .lineLimit(2)
-                            .contentTransition(.opacity)
-                    }
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-
-                if active {
-                    Button(role: .cancel, action: cancel) {
-                        Label("Abort run", systemImage: "stop.fill")
-                    }
-                    .buttonStyle(GhostButtonStyle(tint: Lab.danger))
-                }
+    private var observatoryBackground: some View {
+        RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .fill(
+                reduceTransparency
+                    ? Color(red: 0.015, green: 0.055, blue: 0.05)
+                    : Color.black.opacity(0.44)
+            )
+            .overlay {
+                LinearGradient(
+                    colors: [accent.opacity(0.12), .clear, Lab.violet.opacity(0.06)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             }
-            .animation(.snappy(duration: 0.35), value: stage)
-            .animation(.easeOut(duration: 0.25), value: segments.count)
-        }
-        .padding(18)
-        .background {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(
-                    reduceTransparency
-                        ? Color(red: 0.015, green: 0.055, blue: 0.05)
-                        : Color.black.opacity(0.44)
-                )
-                .overlay {
-                    LinearGradient(
-                        colors: [accent.opacity(0.12), .clear, Lab.violet.opacity(0.06)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    private var observatoryBorder: some View {
+        RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .strokeBorder(
+                LinearGradient(
+                    colors: [accent.opacity(0.55), Color.white.opacity(0.04), Lab.violet.opacity(0.2)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                lineWidth: 1
+            )
+    }
+
+    @ViewBuilder
+    private func observatoryContent(at date: Date) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header(at: date)
+
+            ZStack {
+                chamberCanvas(time: date.timeIntervalSinceReferenceDate)
+                chamberLabels
+            }
+            .frame(height: 238)
+            .accessibilityHidden(true)
+
+            metrics(at: date)
+
+            latestSegment
+
+            if active {
+                Button(role: .cancel, action: cancel) {
+                    Label("Abort run", systemImage: "stop.fill")
                 }
+                .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+            }
         }
-        .overlay {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [accent.opacity(0.55), Color.white.opacity(0.04), Lab.violet.opacity(0.2)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
-                )
+        .animation(.snappy(duration: 0.35), value: stage)
+        .animation(.easeOut(duration: 0.25), value: segments.count)
+    }
+
+    @ViewBuilder
+    private var latestSegment: some View {
+        if let latest = segments.last?.text.trimmingCharacters(in: .whitespaces),
+           !latest.isEmpty
+        {
+            HStack(alignment: .firstTextBaseline, spacing: 9) {
+                Image(systemName: "quote.bubble.fill")
+                    .foregroundStyle(accent)
+                Text(latest)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Lab.textPrimary)
+                    .lineLimit(2)
+                    .contentTransition(.opacity)
+            }
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         }
-        .shadow(color: accent.opacity(active ? 0.2 : 0.06), radius: 30, y: 14)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Transcription observatory")
-        .accessibilityValue("\(stage). \(detail)")
     }
 
     private var animationConstrained: Bool {
@@ -337,9 +359,8 @@ struct WhisperObservatory: View {
         let visible = min(18, max(1, run.total))
         let width = min(15, (size.width - 36) / CGFloat(visible) - 3)
         let startX = size.width * 0.5 - CGFloat(visible) * (width + 3) * 0.5
+        let completedFraction = min(1, max(0, Double(run.done) / Double(max(1, run.total))))
         for index in 0..<visible {
-            let firstRepresented = max(0, run.total - visible)
-            let complete = firstRepresented + index < run.done
             let frame = CGRect(
                 x: startX + CGFloat(index) * (width + 3),
                 y: size.height - 42,
@@ -348,8 +369,26 @@ struct WhisperObservatory: View {
             )
             context.fill(
                 Path(roundedRect: frame, cornerRadius: 3),
-                with: .color(complete ? accent.opacity(0.9) : Color.white.opacity(0.06))
+                with: .color(Color.white.opacity(0.06))
             )
+            // Each visible cell represents an equal fraction of the entire
+            // run, and its partial fill preserves early progress. A 100-window
+            // recording should visibly move after window 1, not wait until
+            // enough work has accumulated to fill 1 of 18 whole cells.
+            let cellStart = Double(index) / Double(visible)
+            let cellFill = min(1, max(0, (completedFraction - cellStart) * Double(visible)))
+            if cellFill > 0 {
+                let filled = CGRect(
+                    x: frame.minX,
+                    y: frame.minY,
+                    width: frame.width * CGFloat(cellFill),
+                    height: frame.height
+                )
+                context.fill(
+                    Path(roundedRect: filled, cornerRadius: 3),
+                    with: .color(accent.opacity(0.9))
+                )
+            }
         }
     }
 

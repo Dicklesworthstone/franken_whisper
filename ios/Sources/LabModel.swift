@@ -824,12 +824,12 @@ final class LabModel {
               !isLiveDictationActive else { return }
         generation += 1
         let gen = generation
-        runState = .staging
         liveSegments = []
         liveOffsetSec = 0
         result = nil
         lastError = nil
         runStarted = Date()
+        runState = .staging
         UIApplication.shared.isIdleTimerDisabled = true
         installHooks(gen: gen, forLoad: false)
 
@@ -1009,6 +1009,11 @@ final class LabModel {
                 Task { @MainActor in
                     guard let self, self.generation == gen else { return }
                     self.liveSegments.append(contentsOf: batch)
+                    self.runActivity.transition(
+                        to: self.runState,
+                        elapsed: self.elapsed(at: Date()),
+                        emittedSegments: self.liveSegments.count
+                    )
                 }
             })
     }
