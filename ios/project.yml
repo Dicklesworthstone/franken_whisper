@@ -12,8 +12,8 @@ settings:
     # x86_64 sim slice would need the x86_64-apple-ios Rust target added to
     # ios/build-rust.sh; until someone needs an Intel Mac, exclude it.
     "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
-    MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "2"
+    MARKETING_VERSION: "1.1"
+    CURRENT_PROJECT_VERSION: "3"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: AU8V2Z6NKY
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -36,10 +36,13 @@ targets:
           ENABLE_NS_ASSERTIONS: false
     sources:
       - Sources
+      - Shared
       - Assets.xcassets
     dependencies:
       - framework: FwCore.xcframework
         embed: false
+      - target: FrankenWhisperKeyboard
+        embed: true
     entitlements:
       path: FrankenWhisper.entitlements
       properties:
@@ -48,6 +51,8 @@ targets:
         # decode scratch, plus transient load buffers; the headroom keeps jetsam
         # away during model load.
         com.apple.developer.kernel.increased-memory-limit: true
+        com.apple.security.application-groups:
+          - group.com.frankenwhisper.dictation
     info:
       path: Sources/Info.plist
       properties:
@@ -59,6 +64,8 @@ targets:
         NSMicrophoneUsageDescription: >-
           Recordings are transcribed entirely on this device by a local model.
           No audio, transcript, or anything else ever leaves your phone.
+        UIBackgroundModes:
+          - audio
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         UISupportedInterfaceOrientations~ipad:
@@ -66,3 +73,31 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+
+  FrankenWhisperKeyboard:
+    type: app-extension
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankenwhisper.FrankenWhisper.Keyboard
+        PRODUCT_NAME: FrankenWhisper Keyboard
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_FILE: Keyboard/Info.plist
+        CODE_SIGN_ENTITLEMENTS: FrankenWhisperKeyboard.entitlements
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true
+    sources:
+      - Keyboard
+      - Shared
+    entitlements:
+      path: FrankenWhisperKeyboard.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.frankenwhisper.dictation
+
+  FrankenWhisperTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+      - Sources/LiveUtteranceDetector.swift

@@ -1,6 +1,5 @@
-// The whole main screen: the website playground's three numbered stations as
-// a native scrolling page — 01 The Specimen (models + engine), 02 The Signal
-// (microphone or file), 03 The Transcript (live windows, speakers, export).
+// The whole main screen: the website playground plus the systemwide local
+// dictation lane — 01 models, 02 batch input, 03 live dictation, 04 result.
 
 import SwiftUI
 import UniformTypeIdentifiers
@@ -52,6 +51,7 @@ struct LabView: View {
                     header
                     specimenCard
                     signalCard
+                    dictationCard
                     transcriptCard
                     footer
                 }
@@ -156,7 +156,95 @@ struct LabView: View {
             }
         }
         .sensoryFeedback(.success, trigger: model.result?.transcript)
+        .sensoryFeedback(.success, trigger: model.liveLastPhrase)
         .sensoryFeedback(.impact(weight: .medium), trigger: model.recorder.isRecording)
+    }
+
+    // ── 03 Live Dictation ─────────────────────────────────────────────────
+
+    private var dictationCard: some View {
+        LabPanel {
+            VStack(alignment: .leading, spacing: 12) {
+                LabLabel(text: "03 · Live Dictation")
+                Text(
+                    "Speak here, then switch to any app and select the FrankenWhisper keyboard. "
+                        + "Each phrase is inserted after a natural pause — the microphone and the "
+                        + "Rust speech model stay inside this app."
+                )
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(Lab.textSecondary)
+
+                switch model.liveDictationState {
+                case .idle:
+                    Button("Start live dictation") { model.startLiveDictation() }
+                        .buttonStyle(PrimaryButtonStyle())
+                        .disabled(model.engineState != .ready || model.isBusy)
+                case .listening:
+                    LevelMeter(level: model.recorder.level)
+                    StatusLine(
+                        kind: .ok,
+                        text: model.liveQueuedUtterances > 0
+                            ? "listening · \(model.liveQueuedUtterances) phrase(s) decoding locally"
+                            : "listening · pause briefly to commit a phrase")
+                    Button("Stop dictation") { model.stopLiveDictation() }
+                        .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                case .finishing:
+                    HStack(spacing: 8) {
+                        ProgressView().tint(Lab.emerald)
+                        StatusLine(
+                            kind: .neutral,
+                            text: "finishing \(max(1, model.liveQueuedUtterances)) phrase(s) on device…")
+                    }
+                case .failed(let reason):
+                    StatusLine(kind: .err, text: reason)
+                    Button("Try live dictation again") { model.startLiveDictation() }
+                        .buttonStyle(PrimaryButtonStyle())
+                        .disabled(model.engineState != .ready)
+                }
+
+                if !model.liveDictationText.isEmpty {
+                    Text(model.liveDictationText)
+                        .font(.system(size: 14))
+                        .foregroundStyle(Lab.textPrimary)
+                        .textSelection(.enabled)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                    HStack(spacing: 10) {
+                        Button {
+                            UIPasteboard.general.string = model.liveDictationText
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
+                        .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+                        Button("Clear") { model.clearLiveDictationText() }
+                            .buttonStyle(GhostButtonStyle(tint: Lab.danger))
+                            .disabled(model.isLiveDictationActive)
+                    }
+                }
+
+                Text(
+                    "ONE-TIME SETUP  Settings › General › Keyboard › Keyboards › Add New Keyboard "
+                        + "› FrankenWhisper, then enable Full Access. Apple requires that switch for the "
+                        + "local App Group handoff. FrankenWhisper does not transmit keyboard or dictation data. "
+                        + "Start the session here before switching apps; iOS does not allow keyboard extensions "
+                        + "to open the microphone."
+                )
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(Lab.textSecondary.opacity(0.8))
+
+                Button {
+                    guard let settings = URL(string: UIApplication.openSettingsURLString) else {
+                        return
+                    }
+                    UIApplication.shared.open(settings)
+                } label: {
+                    Label("Open FrankenWhisper settings", systemImage: "gearshape")
+                }
+                .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+            }
+            .animation(.snappy(duration: 0.25), value: model.liveDictationState)
+        }
     }
 
     // ── Header ─────────────────────────────────────────────────────────────
@@ -417,7 +505,7 @@ struct LabView: View {
     private var transcriptCard: some View {
         LabPanel {
             VStack(alignment: .leading, spacing: 12) {
-                LabLabel(text: "03 · The Transcript")
+                LabLabel(text: "04 · The Transcript")
 
                 if let result = model.result {
                     resultView(result)
@@ -634,6 +722,7 @@ struct LabView: View {
     private var footer: some View {
         VStack(spacing: 8) {
             Text("Nothing leaves this device. No accounts, no telemetry, no cloud.")
+            Text("The optional keyboard makes no network requests and only reads locally committed dictation text.")
             Text("franken_whisper — the same pure-Rust engine as the CLI and the browser demo.")
             Text(
                 "If you like this free app, please show your appreciation by trying out my paid skills site at [JeffreysSkills.md](https://jeffreys-skills.md)."

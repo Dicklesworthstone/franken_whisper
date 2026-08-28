@@ -41,6 +41,22 @@ xcodebuild -exportArchive \
 The export configuration preserves the checked-in marketing version and build
 number instead of letting App Store Connect renumber the binary.
 
+## Live dictation keyboard (1.1)
+
+The containing app now has a continuous dictation lane: it keeps a visible
+microphone session active, splits speech at natural pauses, and decodes each
+bounded phrase through the same local Rust model. A bundled custom keyboard
+reads only the append-only committed text from an App Group and inserts it into
+the current text field.
+
+iOS does not allow keyboard extensions to use the microphone. The user therefore
+starts the session in FrankenWhisper before switching to another app. The
+keyboard requires Full Access because Apple gates App Group access behind that
+switch. It uses the expanded sandbox only to read the locally committed
+transcript: the extension contains no network client and never receives audio
+or model bytes. Background audio mode exists solely to keep that explicit
+recording session alive while the user switches apps.
+
 ## How it hangs together
 
 - **`fw-ios/`** (repo root) is the boundary crate: a `staticlib` that mounts

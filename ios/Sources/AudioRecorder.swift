@@ -70,6 +70,13 @@ private final class CaptureSink: @unchecked Sendable {
         samples = []
         return out
     }
+
+    /// Take the samples captured since the last call while leaving the audio
+    /// engine running. Live dictation polls this; ordinary recording never
+    /// calls it and therefore still receives the entire capture from `stop()`.
+    func drainAvailable() -> [Float] {
+        drain()
+    }
 }
 
 @MainActor
@@ -140,5 +147,10 @@ final class AudioRecorder {
         sink = nil
         level = 0
         return samples
+    }
+
+    /// Drain newly captured PCM without stopping the realtime tap.
+    func takeAvailable() -> [Float] {
+        sink?.drainAvailable() ?? []
     }
 }

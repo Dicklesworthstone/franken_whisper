@@ -1,0 +1,101 @@
+import Foundation
+
+/// A small causal endpoint detector for the iOS host-pushed audio lane.
+/// It does no recognition: it only turns continuous 16 kHz PCM into bounded
+/// utterances that the same Rust engine used by batch transcription decodes.
+/// The CLI's richer AlignAtt stream remains a separate contract.
+struct LiveUtteranceDetector {
+    private static let sampleRate = 16_000
+    private static let frameSamples = 320       // 20 ms
+    private static let preRollSamples = 4_800   // 300 ms
+    private static let minSpeechFrames = 13     // 260 ms
+    private static let endpointFrames = 35      // 700 ms
+    private static let maxUtteranceSamples = 28 * sampleRate
+
+    private var pending: [Float] = []
+    private var preRoll: [Float] = []
+    private var utterance: [Float] = []
+    private var consecutiveSpeech = 0
+    private var consecutiveSilence = 0
+    private var noiseRMS: Float = 0.004
+    private(set) var isInSpeech = false
+
+    mutating func reset() {
+        self = LiveUtteranceDetector()
+    }
+
+    mutating func push(_ samples: [Float]) -> [[Float]] {
+        guard !samples.isEmpty else { return [] }
+        pending.append(contentsOf: samples)
+        var completed: [[Float]] = []
+
+        while pending.count >= Self.frameSamples {
+            let frame = Array(pending.prefix(Self.frameSamples))
+            pending.removeFirst(Self.frameSamples)
+            if let closed = consume(frame) { completed.append(closed) }
+        }
+        return completed
+    }
+
+    mutating func flush() -> [Float]? {
+        if !pending.isEmpty {
+            let tail = pending
+            pending.removeAll(keepingCapacity: true)
+            if isInSpeech {
+                utterance.append(contentsOf: tail)
+            } else {
+                preRoll.append(contentsOf: tail)
+            }
+        }
+        guard isInSpeech, utterance.count >= Self.sampleRate / 2 else {
+            reset()
+            return nil
+        }
+        let out = utterance
+        reset()
+        return out
+    }
+
+    private mutating func consume(_ frame: [Float]) -> [Float]? {
+        let meanSquare = frame.reduce(Float(0)) { $0 + $1 * $1 } / Float(frame.count)
+        let rms = sqrt(meanSquare)
+        let gate = max(0.009, noiseRMS * 3.2)
+        let voiced = rms >= gate
+
+        if !isInSpeech {
+            if !voiced {
+                noiseRMS = noiseRMS * 0.985 + rms * 0.015
+                consecutiveSpeech = 0
+            } else {
+                consecutiveSpeech += 1
+            }
+            preRoll.append(contentsOf: frame)
+            if preRoll.count > Self.preRollSamples {
+                preRoll.removeFirst(preRoll.count - Self.preRollSamples)
+            }
+            if consecutiveSpeech >= Self.minSpeechFrames {
+                isInSpeech = true
+                utterance = preRoll
+                preRoll.removeAll(keepingCapacity: true)
+                consecutiveSilence = 0
+            }
+            return nil
+        }
+
+        utterance.append(contentsOf: frame)
+        consecutiveSilence = voiced ? 0 : consecutiveSilence + 1
+        let endpoint = consecutiveSilence >= Self.endpointFrames
+        let reachedCap = utterance.count >= Self.maxUtteranceSamples
+        guard endpoint || reachedCap else { return nil }
+
+        let keepTail = endpoint ? 8 * Self.frameSamples : 0 // 160 ms of closing silence
+        let trim = max(0, consecutiveSilence * Self.frameSamples - keepTail)
+        let end = max(0, utterance.count - trim)
+        let out = Array(utterance.prefix(end))
+        isInSpeech = false
+        utterance.removeAll(keepingCapacity: true)
+        consecutiveSpeech = 0
+        consecutiveSilence = 0
+        return out.count >= Self.sampleRate / 2 ? out : nil
+    }
+}

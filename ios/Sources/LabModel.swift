@@ -91,6 +91,25 @@ final class LabModel {
     var wallSeconds: Double = 0
     var lastError: String?
 
+    // ── Live dictation ────────────────────────────────────────────────────
+    enum LiveDictationState: Equatable {
+        case idle
+        case listening
+        case finishing
+        case failed(String)
+    }
+    var liveDictationState: LiveDictationState = .idle
+    var liveDictationText = ""
+    var liveLastPhrase = ""
+    var liveQueuedUtterances = 0
+    private var liveDetector = LiveUtteranceDetector()
+    private var liveCaptureTask: Task<Void, Never>?
+    private var liveDecodeTask: Task<Void, Never>?
+    private var liveQueue: [[Float]] = []
+    private var liveSessionID = ""
+    private var liveRevision = 0
+    private var liveStopRequested = false
+
     private var generation = 0
     private var runTask: Task<Void, Never>?
     private(set) var runStarted: Date?
@@ -99,11 +118,19 @@ final class LabModel {
     private var micRequestInFlight = false
 
     var isBusy: Bool {
+        if isLiveDictationActive { return true }
         if isImporting { return true }
         if case .running = runState { return true }
         if case .staging = runState { return true }
         if case .loading = engineState { return true }
         return false
+    }
+
+    var isLiveDictationActive: Bool {
+        switch liveDictationState {
+        case .idle, .failed: false
+        case .listening, .finishing: true
+        }
     }
 
     // ── Engine assembly ────────────────────────────────────────────────────
@@ -151,7 +178,7 @@ final class LabModel {
 
     /// Frees ~1.5 GB when the system is under pressure and no run is active.
     func unloadEngineForMemoryPressure() {
-        guard !isBusy else { return }
+        guard !isBusy, !recorder.isRecording else { return }
         generation += 1
         Task { [engine] in await engine.unload() }
         engineState = .notLoaded
@@ -182,6 +209,7 @@ final class LabModel {
     // ── Input handling ─────────────────────────────────────────────────────
 
     func toggleRecording() {
+        guard !isLiveDictationActive else { return }
         if recorder.isRecording {
             let pcm = recorder.stop()
             if pcm.count >= 8_000 {  // half a second minimum
@@ -220,6 +248,170 @@ final class LabModel {
         }
     }
 
+    // ── Live dictation ────────────────────────────────────────────────────
+
+    /// Start a continuous, user-visible microphone session. iOS does not let a
+    /// keyboard extension access the microphone; the containing app records
+    /// and runs the local model, and the local-only keyboard reads the
+    /// append-only text through the App Group. Apple gates that shared
+    /// container behind the user's Full Access switch even without networking.
+    func startLiveDictation() {
+        guard engineState == .ready, !isLiveDictationActive, !recorder.isRecording,
+              liveDecodeTask == nil, liveCaptureTask == nil, !micRequestInFlight else {
+            return
+        }
+        micRequestInFlight = true
+        Task {
+            defer { self.micRequestInFlight = false }
+            guard await AVAudioApplication.requestRecordPermission() else {
+                self.lastError =
+                    "Microphone access is off. Enable it in Settings › FrankenWhisper."
+                return
+            }
+            do {
+                try self.recorder.start()
+            } catch {
+                self.lastError = "Microphone unavailable: \(error.localizedDescription)"
+                return
+            }
+
+            self.liveDetector.reset()
+            self.liveQueue.removeAll(keepingCapacity: true)
+            self.liveDictationText = ""
+            self.liveLastPhrase = ""
+            self.liveQueuedUtterances = 0
+            self.liveSessionID = UUID().uuidString
+            self.liveRevision = 0
+            self.liveStopRequested = false
+            self.liveDictationState = .listening
+            UIApplication.shared.isIdleTimerDisabled = true
+            EngineHooks.shared.set(span: nil, segments: nil)
+            self.publishLiveSnapshot(state: .listening, message: nil)
+
+            self.liveCaptureTask = Task { [weak self] in
+                guard let self else { return }
+                while !Task.isCancelled, self.recorder.isRecording {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    guard !Task.isCancelled else { break }
+                    let fresh = self.recorder.takeAvailable()
+                    for utterance in self.liveDetector.push(fresh) {
+                        self.enqueueLiveUtterance(utterance)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop capture immediately, then finish any utterances already heard.
+    /// The microphone indicator goes away before the final local decode ends.
+    func stopLiveDictation() {
+        guard isLiveDictationActive else { return }
+        liveStopRequested = true
+        liveDictationState = .finishing
+        publishLiveSnapshot(state: .finishing, message: nil)
+        liveCaptureTask?.cancel()
+        liveCaptureTask = nil
+
+        let tail = recorder.stop()
+        for utterance in liveDetector.push(tail) {
+            enqueueLiveUtterance(utterance)
+        }
+        if let final = liveDetector.flush() {
+            enqueueLiveUtterance(final)
+        }
+        finishLiveDictationIfReady()
+    }
+
+    func clearLiveDictationText() {
+        guard !isLiveDictationActive else { return }
+        liveDictationText = ""
+        liveLastPhrase = ""
+        liveRevision += 1
+        publishLiveSnapshot(state: .idle, message: nil)
+    }
+
+    private func enqueueLiveUtterance(_ pcm: [Float]) {
+        guard pcm.count >= 8_000 else { return }
+        liveQueue.append(pcm)
+        liveQueuedUtterances = liveQueue.count + (liveDecodeTask == nil ? 0 : 1)
+        processNextLiveUtterance()
+    }
+
+    private func processNextLiveUtterance() {
+        guard liveDecodeTask == nil, !liveQueue.isEmpty else { return }
+        let pcm = liveQueue.removeFirst()
+        liveQueuedUtterances = liveQueue.count + 1
+        let language = self.language == "auto" ? nil : self.language
+        let prompt = String(liveDictationText.suffix(240))
+        let options = RunOptions(
+            language: language,
+            initialPrompt: prompt.isEmpty ? nil : prompt,
+            translate: false,
+            diarize: false,
+            wordTimestamps: false)
+
+        liveDecodeTask = Task { [engine] in
+            do {
+                engine.resetCancel()
+                _ = try await engine.stage(pcm: pcm, denoise: false)
+                let transcription = try await engine.run(options: options)
+                let phrase = transcription.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !phrase.isEmpty {
+                    self.appendLivePhrase(phrase)
+                }
+            } catch {
+                if let engineError = error as? EngineError, engineError.isCancellation {
+                    // Cancellation is used only for app teardown; keep any text
+                    // already committed and close the session honestly.
+                } else {
+                    self.liveDictationState = .failed(error.localizedDescription)
+                    self.publishLiveSnapshot(state: .failed, message: error.localizedDescription)
+                    if self.recorder.isRecording { _ = self.recorder.stop() }
+                    self.liveStopRequested = true
+                    self.liveQueue.removeAll(keepingCapacity: true)
+                }
+            }
+            self.liveDecodeTask = nil
+            self.liveQueuedUtterances = self.liveQueue.count
+            if !self.liveQueue.isEmpty {
+                self.processNextLiveUtterance()
+            } else {
+                self.finishLiveDictationIfReady()
+            }
+        }
+    }
+
+    private func appendLivePhrase(_ phrase: String) {
+        let separator = liveDictationText.isEmpty ? "" : " "
+        liveDictationText += separator + phrase
+        liveLastPhrase = phrase
+        liveRevision += 1
+        let state: DictationSnapshot.State = liveStopRequested ? .finishing : .listening
+        publishLiveSnapshot(state: state, message: nil)
+    }
+
+    private func finishLiveDictationIfReady() {
+        guard liveStopRequested, liveDecodeTask == nil, liveQueue.isEmpty else { return }
+        UIApplication.shared.isIdleTimerDisabled = false
+        liveQueuedUtterances = 0
+        if case .failed = liveDictationState {
+            return
+        }
+        liveDictationState = .idle
+        publishLiveSnapshot(state: .idle, message: nil)
+    }
+
+    private func publishLiveSnapshot(state: DictationSnapshot.State, message: String?) {
+        DictationBridge.write(
+            DictationSnapshot(
+                sessionID: liveSessionID,
+                state: state,
+                text: liveDictationText,
+                revision: liveRevision,
+                message: message,
+                updatedAt: Date().timeIntervalSince1970))
+    }
+
     func acceptFile(url: URL) {
         guard !isImporting else { return }
         let scoped = url.startAccessingSecurityScopedResource()
@@ -250,7 +442,8 @@ final class LabModel {
     // ── The run ────────────────────────────────────────────────────────────
 
     func transcribe() {
-        guard engineState == .ready, input != .none, runTask == nil else { return }
+        guard engineState == .ready, input != .none, runTask == nil,
+              !isLiveDictationActive else { return }
         generation += 1
         let gen = generation
         runState = .staging

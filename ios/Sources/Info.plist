@@ -24,6 +24,10 @@
 	<false/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Recordings are transcribed entirely on this device by a local model. No audio, transcript, or anything else ever leaves your phone.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

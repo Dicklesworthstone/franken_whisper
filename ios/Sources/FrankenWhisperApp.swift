@@ -17,6 +17,11 @@ struct FrankenWhisperApp: App {
         // Four rayon workers: the performance cores, leaving efficiency cores for
         // UI and the audio session instead of oversubscribing all six.
         setenv("RAYON_NUM_THREADS", "4", 1)
+
+        // A finished transcript remains available to the keyboard only for the
+        // lifetime of this app session. Do not resurrect dictated text from a
+        // prior launch merely because the App Group defaults are persistent.
+        DictationBridge.write(.empty)
     }
 
     var body: some Scene {
