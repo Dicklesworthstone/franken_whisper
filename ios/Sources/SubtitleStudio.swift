@@ -186,7 +186,10 @@ struct SubtitleStudio: View {
         }
         .interactiveDismissDisabled(isExporting)
         .tint(Lab.emerald)
-        .onDisappear { player.pause() }
+        .onDisappear {
+            player.pause()
+            discardExportedVideo()
+        }
     }
 
     private var preview: some View {
@@ -447,7 +450,7 @@ struct SubtitleStudio: View {
             set: { value in
                 binding.wrappedValue = value
                 selectedPreset = nil
-                exportedURL = nil
+                discardExportedVideo()
                 message = nil
                 exportProgress = 0
             }
@@ -461,14 +464,14 @@ struct SubtitleStudio: View {
         textColor = .white
         highlightColor = preset.highlight
         backgroundOpacity = preset.backdrop
-        exportedURL = nil
+        discardExportedVideo()
         message = nil
         exportProgress = 0
     }
 
     private func burnInSubtitles() {
         player.pause()
-        exportedURL = nil
+        discardExportedVideo()
         message = nil
         exportProgress = 0
         isExporting = true
@@ -497,6 +500,12 @@ struct SubtitleStudio: View {
             }
             isExporting = false
         }
+    }
+
+    private func discardExportedVideo() {
+        guard let exportedURL else { return }
+        try? FileManager.default.removeItem(at: exportedURL)
+        self.exportedURL = nil
     }
 
     private func saveToPhotos(_ url: URL) {

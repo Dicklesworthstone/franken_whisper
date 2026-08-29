@@ -160,12 +160,15 @@ enum SubtitleVideoExporter {
             progress(1)
             return output
         case .cancelled:
+            try? FileManager.default.removeItem(at: output)
             throw CancellationError()
         case .failed:
+            try? FileManager.default.removeItem(at: output)
             throw SubtitleExportError.exportFailed(
                 exporter.error?.localizedDescription ?? "unknown AVFoundation error"
             )
         default:
+            try? FileManager.default.removeItem(at: output)
             throw SubtitleExportError.exportFailed("export ended unexpectedly")
         }
     }
