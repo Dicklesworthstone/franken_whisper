@@ -461,6 +461,7 @@ final class LabModel {
                     "enhance_accelerate": environment["FTTS_ENHANCE_ACCELERATE"] ?? "unset",
                     "enhance_gru_accelerate": environment["FTTS_ENHANCE_GRU_ACCELERATE"] ?? "unset",
                     "enhance_conv_accelerate": environment["FTTS_ENHANCE_CONV_ACCELERATE"] ?? "unset",
+                    "enhance_concat_accelerate": environment["FTTS_ENHANCE_CONCAT_ACCELERATE"] ?? "unset",
                 ] as [String: Any],
                 "device_model": UIDevice.current.model,
                 "system_version": UIDevice.current.systemVersion,
