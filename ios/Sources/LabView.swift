@@ -576,13 +576,11 @@ struct LabView: View {
             MonsterStatusMark(mood: monsterMood, instrument: .hearing, accent: Lab.cyan)
                 .frame(width: 54, height: 54)
             VStack(alignment: .leading, spacing: 5) {
-                Text("FRANKENWHISPER")
-                    .font(.system(size: Lab.typeSize(22), weight: .black, design: .monospaced))
-                    .kerning(2)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.5)
-                    .allowsTightening(true)
-                    .foregroundStyle(Lab.textPrimary)
+                FrankenWordmark(
+                    productInitial: "W",
+                    productRemainder: "HISPER",
+                    fullName: "FrankenWhisper"
+                )
                 Text("IT_HEARS // private speech observatory")
                     .font(.system(size: Lab.typeSize(11), design: .monospaced))
                     .kerning(1)

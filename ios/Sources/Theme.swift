@@ -41,6 +41,41 @@ enum Lab {
     }
 }
 
+/// The suite wordmark keeps every product unmistakably part of the same
+/// family while restoring the camel-case rhythm that all-uppercase type loses.
+/// The first `F` and the product initial stay full-size; the connective letters
+/// remain uppercase but read as small caps.
+struct FrankenWordmark: View {
+    let productInitial: String
+    let productRemainder: String
+    let fullName: String
+    var size: CGFloat = 22
+    var accent: Color = Lab.cyan
+
+    var body: some View {
+        (
+            Text("F")
+                .font(.system(size: Lab.typeSize(size), weight: .black, design: .monospaced))
+                .foregroundColor(accent)
+            + Text("RANKEN")
+                .font(.system(size: Lab.typeSize(size * 0.66), weight: .black, design: .monospaced))
+                .foregroundColor(Lab.textPrimary.opacity(0.88))
+            + Text(productInitial)
+                .font(.system(size: Lab.typeSize(size), weight: .black, design: .monospaced))
+                .foregroundColor(accent)
+            + Text(productRemainder)
+                .font(.system(size: Lab.typeSize(size * 0.66), weight: .black, design: .monospaced))
+                .foregroundColor(Lab.textPrimary.opacity(0.88))
+        )
+        .kerning(0.8)
+        .lineLimit(1)
+        .minimumScaleFactor(0.72)
+        .allowsTightening(true)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(fullName)
+    }
+}
+
 /// Spatial laboratory atmosphere shared by compact and desktop layouts. The
 /// grid is intentionally quiet: text and controls retain the visual hierarchy.
 struct LaboratoryBackground: View {
