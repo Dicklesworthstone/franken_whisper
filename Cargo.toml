@@ -104,7 +104,7 @@ ft-kernel-cpu = { version = "0.1.0", path = "../frankentorch/crates/ft-kernel-cp
 ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core", package = "frankentorch-core" }
 # FastEnhancer-S speech denoiser (default pipeline stage when its pinned
 # artifact is present; see src/denoise.rs). Zero required deps of its own.
-ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false }
+ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false, features = ["accelerate-sgemm"] }
 # Direct dep on `half` (same crate ft-core re-exports as `Float16`) for its
 # `HalfFloatSliceExt::convert_to_f32_slice` SIMD bulk f16->f32 dequant — the
 # `std` feature enables runtime aarch64 `fp16` / x86 `f16c` vector paths used
@@ -160,7 +160,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 ft-core = { version = "0.1.0", path = "../frankentorch/crates/ft-core", package = "frankentorch-core" }
 # FastEnhancer-S speech denoiser (default pipeline stage when its pinned
 # artifact is present; see src/denoise.rs). Zero required deps of its own.
-ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false }
+ftts-kernels = { version = "0.1", path = "../frankentts/crates/ftts-kernels", default-features = false, features = ["accelerate-sgemm"] }
 # For the hugepage_gemv_probe (madvise(MADV_HUGEPAGE) A/B on weight streaming).
 # Already a transitive dependency; dev-only, does not affect the shipped binary.
 libc = "0.2"

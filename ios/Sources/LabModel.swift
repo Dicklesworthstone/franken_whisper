@@ -378,6 +378,16 @@ final class LabModel {
             for: .documentDirectory, in: .userDomainMask
         )[0]
         let fixtureURL = documents.appendingPathComponent(fixtureName)
+        let requestedModelName = environment["FW_IOS_PROFILE_MODEL"]
+            .map { URL(fileURLWithPath: $0).lastPathComponent }
+        let profileModelURL = requestedModelName.map {
+            documents.appendingPathComponent($0)
+        } ?? store.url(for: ModelManifest.tiny)
+        let profileModelLabel = environment["FW_IOS_PROFILE_MODEL_LABEL"]
+            ?? (requestedModelName == nil ? "tiny-multilingual-f16" : "custom")
+        let profileModelSHA256 = environment["FW_IOS_PROFILE_MODEL_SHA256"]
+            ?? (requestedModelName == nil ? ModelManifest.tiny.sha256 : "host-verified")
+        let profileDenoise = environment["FW_IOS_PROFILE_DENOISE"] == "1"
         let stamp = ISO8601DateFormatter().string(from: Date())
             .replacingOccurrences(of: ":", with: "-")
         let receiptURL = documents.appendingPathComponent(
@@ -409,6 +419,9 @@ final class LabModel {
             }
             let fixtureData = try Data(contentsOf: fixtureURL, options: .mappedIfSafe)
             let pcm = try Self.decodeProfilePCM16MonoWav(fixtureData)
+            let profileModelAttributes = try FileManager.default.attributesOfItem(
+                atPath: profileModelURL.path)
+            let profileModelBytes = profileModelAttributes[.size] as? NSNumber
             let fixtureDigest = SHA256.hash(data: fixtureData)
                 .map { String(format: "%02x", $0) }.joined()
             let audioSeconds = Double(pcm.count) / 16_000.0
@@ -417,19 +430,38 @@ final class LabModel {
                 "event": "run_start",
                 "schema_version": 1,
                 "runs": runs,
-                "lane": "realtime_tiny_multilingual",
+                "lane": "realtime_model_quality_ladder",
                 "fixture": fixtureName,
                 "fixture_sha256": fixtureDigest,
                 "fixture_bytes": fixtureData.count,
                 "audio_seconds": audioSeconds,
                 "model": [
-                    "relative_path": ModelManifest.tiny.relativePath,
-                    "bytes": ModelManifest.tiny.bytes,
-                    "sha256": ModelManifest.tiny.sha256,
+                    "label": profileModelLabel,
+                    "filename": profileModelURL.lastPathComponent,
+                    "bytes": profileModelBytes?.int64Value ?? -1,
+                    "sha256": profileModelSHA256,
+                ] as [String: Any],
+                "denoiser": [
+                    "enabled": profileDenoise,
+                    "relative_path": ModelManifest.denoiser.relativePath,
+                    "bytes": ModelManifest.denoiser.bytes,
+                    "sha256": ModelManifest.denoiser.sha256,
                 ] as [String: Any],
                 "rayon_threads": environment["RAYON_NUM_THREADS"] ?? "unset",
                 "arm_dotprod": environment["FW_ARM_DOTPROD"] ?? "unset",
                 "transcript_cache": environment["FW_TRANSCRIPT_CACHE"] ?? "unset",
+                "performance_switches": [
+                    "batch_gemv_cap": environment["FW_BATCH_GEMV_CAP"] ?? "unset",
+                    "f16_batch_twopass": environment["FW_F16_BATCH_TWOPASS"] ?? "unset",
+                    "f16_compute": environment["FRANKEN_WHISPER_NATIVE_F16_COMPUTE"] ?? "unset",
+                    "mid_gemv_cap": environment["FW_MID_GEMV_CAP"] ?? "unset",
+                    "enc_int8_attn_in": environment["FW_ENC_INT8_ATTN_IN"] ?? "unset",
+                    "enc_attn_out_i8i32": environment["FW_ENC_ATTN_OUT_I8I32"] ?? "unset",
+                    "enc_int8_fc1": environment["FW_ENC_INT8_FC1"] ?? "unset",
+                    "enhance_accelerate": environment["FTTS_ENHANCE_ACCELERATE"] ?? "unset",
+                    "enhance_gru_accelerate": environment["FTTS_ENHANCE_GRU_ACCELERATE"] ?? "unset",
+                    "enhance_conv_accelerate": environment["FTTS_ENHANCE_CONV_ACCELERATE"] ?? "unset",
+                ] as [String: Any],
                 "device_model": UIDevice.current.model,
                 "system_version": UIDevice.current.systemVersion,
                 "active_processors": ProcessInfo.processInfo.activeProcessorCount,
@@ -444,7 +476,10 @@ final class LabModel {
             )
             let loadStarted = Date()
             liveEngine.resetCancel()
-            try await liveEngine.load(modelPath: store.url(for: ModelManifest.tiny))
+            try await liveEngine.load(modelPath: profileModelURL)
+            if profileDenoise {
+                try await liveEngine.loadDenoiser(at: store.url(for: ModelManifest.denoiser))
+            }
             try appendReceipt([
                 "event": "engine_loaded",
                 "load_ms": Date().timeIntervalSince(loadStarted) * 1_000,
@@ -466,7 +501,7 @@ final class LabModel {
                 liveEngine.resetCancel()
                 let wallStarted = Date()
                 let stageStarted = Date()
-                let stage = try await liveEngine.stage(pcm: pcm, denoise: false)
+                let stage = try await liveEngine.stage(pcm: pcm, denoise: profileDenoise)
                 let stageMs = Date().timeIntervalSince(stageStarted) * 1_000
                 let runStarted = Date()
                 let transcription = try await liveEngine.run(options: options)
@@ -486,6 +521,7 @@ final class LabModel {
                     "run_ms": runMs,
                     "audio_seconds": stage.audioSec,
                     "realtime_speed": stage.audioSec / max(wallMs / 1_000, 0.000_001),
+                    "transcript": transcription.transcript,
                     "transcript_sha256": transcriptDigest,
                     "transcript_bytes": transcriptData.count,
                     "matches_first_transcript": matchesFirst,

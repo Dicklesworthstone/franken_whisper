@@ -44,6 +44,7 @@ targets:
     dependencies:
       - framework: FwCore.xcframework
         embed: false
+      - sdk: Accelerate.framework
       - target: FrankenWhisperKeyboard
         embed: true
         platformFilter: iOS
