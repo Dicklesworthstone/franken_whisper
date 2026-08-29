@@ -2891,8 +2891,96 @@ fn dot_i8_4col(w: &[i8], xa: &[i8], xb: &[i8], xc: &[i8], xd: &[i8]) -> (i32, i3
     }
 }
 
-/// Scalar fallback (non-x86 / no avx2): the reference the AVX2 path reproduces exactly.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+/// AArch64 dispatch for the iOS Tiny-model logits GEMV candidate.
+///
+/// The inherited Apple-M4 evidence says LLVM's ordinary dense-int8 loop can beat a hand-SDOT
+/// kernel, so this route is deliberately **default off** until the exact A18 / Tiny logits shape
+/// wins an interleaved device A/B. Set `FW_ARM_DOTPROD=1` at process launch to enter the candidate;
+/// unset it (or set it to any other value) to retain the accepted scalar/autovectorized baseline.
+/// Both paths are integer-exact: Whisper contractions are at most 5,120 products, so their i32
+/// sums cannot overflow and reassociation cannot change the result.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
+    use std::sync::OnceLock;
+
+    static USE_DOTPROD: OnceLock<bool> = OnceLock::new();
+    let use_dotprod = *USE_DOTPROD.get_or_init(|| {
+        matches!(
+            std::env::var("FW_ARM_DOTPROD").as_deref(),
+            Ok("1" | "true" | "on" | "yes")
+        ) && std::arch::is_aarch64_feature_detected!("dotprod")
+    });
+    if use_dotprod {
+        // SAFETY: the process-sticky dispatch above proved FEAT_DotProd on this CPU. The island
+        // bounds every vector load by the common slice length and handles its tail scalarly.
+        return unsafe { dot_i8_sdot(w, x) };
+    }
+    dot_i8_scalar(w, x)
+}
+
+/// Exact AArch64 SDOT island: four independent accumulators over each 64-byte block.
+///
+/// # Safety
+///
+/// The caller must have established FEAT_DotProd. `w.len()` must equal `x.len()`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+#[allow(unsafe_code)]
+unsafe fn dot_i8_sdot(w: &[i8], x: &[i8]) -> i32 {
+    use core::arch::aarch64::{vaddq_s32, vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8};
+
+    debug_assert_eq!(w.len(), x.len(), "dot_i8 length mismatch");
+    let len = w.len();
+    let (wp, xp) = (w.as_ptr(), x.as_ptr());
+    let mut a0 = vdupq_n_s32(0);
+    let mut a1 = vdupq_n_s32(0);
+    let mut a2 = vdupq_n_s32(0);
+    let mut a3 = vdupq_n_s32(0);
+    let mut i = 0;
+    while i + 64 <= len {
+        // SAFETY: `i + 64 <= len` bounds all four unaligned 16-byte loads in both equal-length
+        // slices. `vld1q_s8` requires only byte alignment.
+        unsafe {
+            a0 = vdotq_s32(a0, vld1q_s8(wp.add(i)), vld1q_s8(xp.add(i)));
+            a1 = vdotq_s32(a1, vld1q_s8(wp.add(i + 16)), vld1q_s8(xp.add(i + 16)));
+            a2 = vdotq_s32(a2, vld1q_s8(wp.add(i + 32)), vld1q_s8(xp.add(i + 32)));
+            a3 = vdotq_s32(a3, vld1q_s8(wp.add(i + 48)), vld1q_s8(xp.add(i + 48)));
+        }
+        i += 64;
+    }
+    while i + 16 <= len {
+        // SAFETY: `i + 16 <= len` bounds both unaligned vector loads.
+        unsafe {
+            a0 = vdotq_s32(a0, vld1q_s8(wp.add(i)), vld1q_s8(xp.add(i)));
+        }
+        i += 16;
+    }
+    let mut sum = vaddvq_s32(vaddq_s32(vaddq_s32(a0, a1), vaddq_s32(a2, a3)));
+    while i < len {
+        sum += i32::from(w[i]) * i32::from(x[i]);
+        i += 1;
+    }
+    sum
+}
+
+/// Scalar/autovectorized reference used by the AArch64 A/B baseline.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_i8_scalar(w: &[i8], x: &[i8]) -> i32 {
+    let mut acc: i32 = 0;
+    for (a, b) in w.iter().zip(x.iter()) {
+        acc += (*a as i32) * (*b as i32);
+    }
+    acc
+}
+
+/// Scalar fallback (non-x86, non-AArch64): the reference the SIMD paths reproduce exactly.
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2")
+)))]
 #[inline]
 fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
     let mut acc: i32 = 0;
@@ -7745,6 +7833,31 @@ mod tests {
         let x = vec![-127i8; 5120];
         assert_eq!(dot_i8(&w, &x), scalar(&w, &x));
         assert_eq!(dot_i8(&w, &x), -82_580_480); // 5120 · 127 · (−127)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn dot_i8_sdot_matches_scalar_reference() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let mut s = 0xA18A_18A1_7D07_0001u64;
+        let mut ni8 = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 24) as i32 % 255 - 127) as i8
+        };
+        for &n in &[
+            0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 384, 1280, 5120,
+        ] {
+            let w: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            let x: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            // SAFETY: runtime detection above proved FEAT_DotProd; both slices have length `n`.
+            let got = unsafe { dot_i8_sdot(&w, &x) };
+            assert_eq!(got, dot_i8_scalar(&w, &x), "SDOT mismatch at n={n}");
+        }
     }
 
     #[test]
