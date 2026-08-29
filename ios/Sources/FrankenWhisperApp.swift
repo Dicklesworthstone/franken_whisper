@@ -15,14 +15,22 @@ struct FrankenWhisperApp: App {
         // an owned pread buffer, so a small cap trades a slower load for a lower
         // peak. Two is plenty against phone NAND.
         setenv("FW_LOAD_WORKERS", "2", 1)
-        // Four rayon workers: the performance cores, leaving efficiency cores for
-        // UI and the audio session instead of oversubscribing all six.
-        #if targetEnvironment(macCatalyst)
-        let cores = ProcessInfo.processInfo.activeProcessorCount
-        setenv("RAYON_NUM_THREADS", String(max(2, min(10, cores - 2))), 1)
-        #else
-        setenv("RAYON_NUM_THREADS", "4", 1)
-        #endif
+        // Keep an explicit launch override for physical-device A/Bs. OnceLock
+        // reads this value on first engine use, so overwriting a supplied value
+        // here would silently compare the same arm twice.
+        if ProcessInfo.processInfo.environment["RAYON_NUM_THREADS"] == nil {
+            #if targetEnvironment(macCatalyst)
+            let cores = ProcessInfo.processInfo.activeProcessorCount
+            setenv("RAYON_NUM_THREADS", String(max(2, min(10, cores - 2))), 1)
+            #else
+            setenv("RAYON_NUM_THREADS", "4", 1)
+            #endif
+        }
+        if ProcessInfo.processInfo.environment["FW_IOS_PROFILE"] == "1" {
+            // Repeated identical fixture runs must perform physical inference;
+            // the production cache remains enabled outside this hidden lane.
+            setenv("FW_TRANSCRIPT_CACHE", "0", 1)
+        }
 
         // A finished transcript remains available to the keyboard only for the
         // lifetime of this app session. Do not resurrect dictated text from a

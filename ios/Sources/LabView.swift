@@ -54,6 +54,10 @@ struct LabView: View {
     @FocusState private var focusedTextEntry: LabTextEntry?
     @Environment(\.scenePhase) private var scenePhase
 
+    private var profilingRequested: Bool {
+        ProcessInfo.processInfo.environment["FW_IOS_PROFILE"] == "1"
+    }
+
     var body: some View {
         ZStack {
             LaboratoryBackground()
@@ -190,9 +194,14 @@ struct LabView: View {
             model.unloadEngineForMemoryPressure()
         }
         .onAppear {
-            model.prepareEngines()
-            consumeRequestedAction()
-            consumeStagedMedia()
+            if !profilingRequested {
+                model.prepareEngines()
+                consumeRequestedAction()
+                consumeStagedMedia()
+            }
+        }
+        .task {
+            if profilingRequested { await model.runProfilingBenchmarkIfRequested() }
         }
         .onOpenURL { url in
             if url.scheme?.lowercased() == "frankenwhisper",
@@ -224,7 +233,7 @@ struct LabView: View {
             }
         }
         .onChange(of: model.store.phase) { _, phase in
-            if phase == .ready, scenePhase == .active {
+            if phase == .ready, scenePhase == .active, !profilingRequested {
                 model.prepareEngines()
             }
         }
@@ -237,7 +246,7 @@ struct LabView: View {
             // Keep the large local model resident across an ordinary app
             // switch. Unloading here made every keyboard handoff pay the full
             // hydration cost. Real memory warnings still unload it above.
-            if phase == .active {
+            if phase == .active, !profilingRequested {
                 model.prepareEngines()
                 consumeRequestedAction()
                 consumeStagedMedia()

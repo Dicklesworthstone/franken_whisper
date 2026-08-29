@@ -6,9 +6,33 @@
 // generation counter (a cancelled run must never overwrite a newer one).
 
 import AVFoundation
+import CryptoKit
 import Foundation
 import SwiftUI
 import UIKit
+
+private final class WhisperProfileSpanCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: [Double]] = [:]
+
+    func reset() {
+        lock.lock()
+        values.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+
+    func record(span: String, value: Double) {
+        lock.lock()
+        values[span, default: []].append(value)
+        lock.unlock()
+    }
+
+    func snapshot() -> [String: [Double]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+}
 
 /// Device-local batch-transcription forecast. The first run uses a coarse hardware
 /// tier lookup; completed runs teach it real-time factor, decode-window cadence, and
@@ -337,6 +361,205 @@ final class LabModel {
     /// Guards the async permission → start window: a second Record tap while
     /// the system prompt is up must not install a second tap (ObjC crash).
     private var micRequestInFlight = false
+
+    /// Hidden physical-device lane for the exact tiny-model realtime route.
+    /// The fixture is copied into this app's private Documents container by
+    /// the profiling host; no benchmark asset or control enters the product UI.
+    func runProfilingBenchmarkIfRequested() async {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["FW_IOS_PROFILE"] == "1" else { return }
+
+        let requestedRuns = Int(environment["FW_IOS_PROFILE_RUNS"] ?? "20") ?? 20
+        let runs = max(1, min(100, requestedRuns))
+        let fixtureName = URL(
+            fileURLWithPath: environment["FW_IOS_PROFILE_AUDIO"] ?? "fw-ios-profile.wav"
+        ).lastPathComponent
+        let documents = FileManager.default.urls(
+            for: .documentDirectory, in: .userDomainMask
+        )[0]
+        let fixtureURL = documents.appendingPathComponent(fixtureName)
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let receiptURL = documents.appendingPathComponent(
+            "fw-ios-profile-\(stamp).jsonl")
+        var receiptLines: [String] = []
+        let spans = WhisperProfileSpanCollector()
+
+        UIApplication.shared.isIdleTimerDisabled = true
+        defer {
+            UIApplication.shared.isIdleTimerDisabled = false
+            EngineHooks.shared.set(span: nil, segments: nil)
+        }
+
+        func appendReceipt(_ object: [String: Any]) throws {
+            let data = try JSONSerialization.data(
+                withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+            guard let line = String(data: data, encoding: .utf8) else {
+                throw EngineError.invalid("profiling receipt was not UTF-8")
+            }
+            receiptLines.append(line)
+            try Data((receiptLines.joined(separator: "\n") + "\n").utf8)
+                .write(to: receiptURL, options: .atomic)
+            print("FW_IOS_PROFILE \(line)")
+        }
+
+        do {
+            guard store.phase == .ready else {
+                throw EngineError.invalid("profiling requires all downloaded models")
+            }
+            let fixtureData = try Data(contentsOf: fixtureURL, options: .mappedIfSafe)
+            let pcm = try Self.decodeProfilePCM16MonoWav(fixtureData)
+            let fixtureDigest = SHA256.hash(data: fixtureData)
+                .map { String(format: "%02x", $0) }.joined()
+            let audioSeconds = Double(pcm.count) / 16_000.0
+
+            try appendReceipt([
+                "event": "run_start",
+                "schema_version": 1,
+                "runs": runs,
+                "lane": "realtime_tiny_multilingual",
+                "fixture": fixtureName,
+                "fixture_sha256": fixtureDigest,
+                "fixture_bytes": fixtureData.count,
+                "audio_seconds": audioSeconds,
+                "model": [
+                    "relative_path": ModelManifest.tiny.relativePath,
+                    "bytes": ModelManifest.tiny.bytes,
+                    "sha256": ModelManifest.tiny.sha256,
+                ] as [String: Any],
+                "rayon_threads": environment["RAYON_NUM_THREADS"] ?? "unset",
+                "arm_dotprod": environment["FW_ARM_DOTPROD"] ?? "unset",
+                "transcript_cache": environment["FW_TRANSCRIPT_CACHE"] ?? "unset",
+                "device_model": UIDevice.current.model,
+                "system_version": UIDevice.current.systemVersion,
+                "active_processors": ProcessInfo.processInfo.activeProcessorCount,
+                "physical_memory_bytes": ProcessInfo.processInfo.physicalMemory,
+                "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+                "receipt_path": receiptURL.path,
+            ])
+
+            EngineHooks.shared.set(
+                span: { span, value in spans.record(span: span, value: value) },
+                segments: nil
+            )
+            let loadStarted = Date()
+            liveEngine.resetCancel()
+            try await liveEngine.load(modelPath: store.url(for: ModelManifest.tiny))
+            try appendReceipt([
+                "event": "engine_loaded",
+                "load_ms": Date().timeIntervalSince(loadStarted) * 1_000,
+                "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+            ])
+
+            let options = RunOptions(
+                language: nil,
+                initialPrompt: nil,
+                translate: false,
+                diarize: false,
+                timestamps: false,
+                wordTimestamps: false
+            )
+            var firstTranscriptDigest: String?
+            var allTranscriptsIdentical = true
+            for index in 0..<runs {
+                spans.reset()
+                liveEngine.resetCancel()
+                let wallStarted = Date()
+                let stageStarted = Date()
+                let stage = try await liveEngine.stage(pcm: pcm, denoise: false)
+                let stageMs = Date().timeIntervalSince(stageStarted) * 1_000
+                let runStarted = Date()
+                let transcription = try await liveEngine.run(options: options)
+                let runMs = Date().timeIntervalSince(runStarted) * 1_000
+                let wallMs = Date().timeIntervalSince(wallStarted) * 1_000
+                let transcriptData = Data(transcription.transcript.utf8)
+                let transcriptDigest = SHA256.hash(data: transcriptData)
+                    .map { String(format: "%02x", $0) }.joined()
+                if firstTranscriptDigest == nil { firstTranscriptDigest = transcriptDigest }
+                let matchesFirst = transcriptDigest == firstTranscriptDigest
+                allTranscriptsIdentical = allTranscriptsIdentical && matchesFirst
+                try appendReceipt([
+                    "event": "sample",
+                    "index": index,
+                    "wall_ms": wallMs,
+                    "stage_ms": stageMs,
+                    "run_ms": runMs,
+                    "audio_seconds": stage.audioSec,
+                    "realtime_speed": stage.audioSec / max(wallMs / 1_000, 0.000_001),
+                    "transcript_sha256": transcriptDigest,
+                    "transcript_bytes": transcriptData.count,
+                    "matches_first_transcript": matchesFirst,
+                    "segments": transcription.segments.count,
+                    "dropped_windows": transcription.droppedWindows,
+                    "spans_ms": spans.snapshot(),
+                    "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+                ])
+            }
+            try appendReceipt([
+                "event": "run_complete",
+                "completed_runs": runs,
+                "all_transcripts_identical": allTranscriptsIdentical,
+                "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+            ])
+        } catch {
+            try? appendReceipt([
+                "event": "run_error",
+                "message": error.localizedDescription,
+                "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+            ])
+        }
+    }
+
+    private static func decodeProfilePCM16MonoWav(_ data: Data) throws -> [Float] {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 44,
+              String(decoding: bytes[0..<4], as: UTF8.self) == "RIFF",
+              String(decoding: bytes[8..<12], as: UTF8.self) == "WAVE"
+        else { throw EngineError.invalid("profiling fixture is not a RIFF/WAVE file") }
+
+        func u16(_ offset: Int) -> UInt16 {
+            UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+        }
+        func u32(_ offset: Int) -> UInt32 {
+            UInt32(bytes[offset])
+                | (UInt32(bytes[offset + 1]) << 8)
+                | (UInt32(bytes[offset + 2]) << 16)
+                | (UInt32(bytes[offset + 3]) << 24)
+        }
+
+        var format: (audio: UInt16, channels: UInt16, rate: UInt32, bits: UInt16)?
+        var sampleRange: Range<Int>?
+        var offset = 12
+        while offset + 8 <= bytes.count {
+            let id = String(decoding: bytes[offset..<(offset + 4)], as: UTF8.self)
+            let length = Int(u32(offset + 4))
+            let start = offset + 8
+            let end = start + length
+            guard end <= bytes.count else {
+                throw EngineError.invalid("profiling WAV contains a truncated chunk")
+            }
+            if id == "fmt ", length >= 16 {
+                format = (u16(start), u16(start + 2), u32(start + 4), u16(start + 14))
+            } else if id == "data" {
+                sampleRange = start..<end
+            }
+            offset = end + (length & 1)
+        }
+        guard let format, format.audio == 1, format.channels == 1,
+              format.rate == 16_000, format.bits == 16, let sampleRange
+        else {
+            throw EngineError.invalid("profiling WAV must be mono PCM16 at 16 kHz")
+        }
+        var pcm: [Float] = []
+        pcm.reserveCapacity(sampleRange.count / 2)
+        var cursor = sampleRange.lowerBound
+        while cursor + 1 < sampleRange.upperBound {
+            let raw = UInt16(bytes[cursor]) | (UInt16(bytes[cursor + 1]) << 8)
+            pcm.append(Float(Int16(bitPattern: raw)) / 32_768.0)
+            cursor += 2
+        }
+        return pcm
+    }
 
     var isBusy: Bool {
         if isLiveDictationActive { return true }
