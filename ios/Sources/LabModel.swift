@@ -10,6 +10,7 @@ import CryptoKit
 import Foundation
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 private final class WhisperProfileSpanCollector: @unchecked Sendable {
     private let lock = NSLock()
@@ -227,13 +228,20 @@ final class LabModel {
         case none
         case recording(pcm: [Float])
         case file(data: Data, ext: String, name: String)
+        case video(media: VideoInput, audioData: Data)
 
         var seconds: Double? {
             switch self {
             case .none: nil
             case .recording(let pcm): Double(pcm.count) / 16_000.0
             case .file: nil  // unknown until staged
+            case .video(let media, _): media.duration
             }
+        }
+
+        var isVideo: Bool {
+            if case .video = self { return true }
+            return false
         }
     }
     var input: Input = .none
@@ -243,7 +251,13 @@ final class LabModel {
         case .none: ""
         case .recording: "microphone capture"
         case .file(_, _, let name): name
+        case .video(let media, _): media.name
         }
+    }
+
+    var videoInput: VideoInput? {
+        guard case .video(let media, _) = input else { return nil }
+        return media
     }
 
     // ── Options ────────────────────────────────────────────────────────────
@@ -782,7 +796,7 @@ final class LabModel {
                         peak)
                     return
                 }
-                input = .recording(pcm: pcm)
+                replaceInput(with: .recording(pcm: pcm))
                 result = nil
                 runState = .idle
             } else {
@@ -1228,6 +1242,11 @@ final class LabModel {
     }
 
     func acceptFile(url: URL) {
+        let ext = url.pathExtension.lowercased()
+        if let type = UTType(filenameExtension: ext), type.conforms(to: .movie) {
+            acceptVideo(url: url, alreadyManaged: false)
+            return
+        }
         guard !isImporting else { return }
         let scoped = url.startAccessingSecurityScopedResource()
         isImporting = true
@@ -1240,8 +1259,9 @@ final class LabModel {
                 let data = try await Task.detached(priority: .userInitiated) {
                     try Data(contentsOf: url, options: .mappedIfSafe)
                 }.value
-                input = .file(
+                replaceInput(with: .file(
                     data: data, ext: url.pathExtension.lowercased(), name: url.lastPathComponent)
+                )
                 result = nil
                 runState = .idle
             } catch {
@@ -1250,8 +1270,71 @@ final class LabModel {
         }
     }
 
+    func acceptPickedVideo(_ picked: PickedVideo) {
+        acceptVideo(url: picked.localURL, alreadyManaged: true, picked: picked)
+    }
+
+    private func acceptVideo(
+        url: URL,
+        alreadyManaged: Bool,
+        picked: PickedVideo? = nil
+    ) {
+        guard !isImporting else { return }
+        let scoped = alreadyManaged ? false : url.startAccessingSecurityScopedResource()
+        isImporting = true
+        Task {
+            var preparedMedia: VideoInput?
+            defer {
+                if scoped { url.stopAccessingSecurityScopedResource() }
+                self.isImporting = false
+            }
+            do {
+                let media: VideoInput
+                if let picked {
+                    media = try await VideoImportService.preparePickedVideo(picked)
+                } else {
+                    media = try await VideoImportService.prepareExternalVideo(url)
+                }
+                preparedMedia = media
+                let audioData = try await Task.detached(priority: .userInitiated) {
+                    try Data(contentsOf: media.audioURL, options: .mappedIfSafe)
+                }.value
+                replaceInput(with: .video(media: media, audioData: audioData))
+                result = nil
+                runState = .idle
+                // Karaoke export needs real decoder alignment, so video input
+                // makes the word-timing requirement visible immediately.
+                wordTimestamps = true
+            } catch {
+                if let preparedMedia {
+                    VideoImportService.discard(preparedMedia)
+                } else if alreadyManaged, let picked {
+                    try? FileManager.default.removeItem(at: picked.localURL)
+                }
+                lastError = "Could not prepare that video: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func replaceInput(with newInput: Input) {
+        if case .video(let oldMedia, _) = input {
+            let replacingSameVideo: Bool
+            if case .video(let newMedia, _) = newInput {
+                replacingSameVideo = oldMedia.videoURL == newMedia.videoURL
+            } else {
+                replacingSameVideo = false
+            }
+            if !replacingSameVideo { VideoImportService.discard(oldMedia) }
+        }
+        input = newInput
+    }
+
     func reportFileImportError(_ error: Error) {
-        lastError = "Could not import that audio file: \(error.localizedDescription)"
+        lastError = "Could not import that media file: \(error.localizedDescription)"
+    }
+
+    func reportVideoPickerError(_ error: Error) {
+        lastError = "Could not open that video from Photos: \(error.localizedDescription)"
     }
 
     // ── The run ────────────────────────────────────────────────────────────
@@ -1286,7 +1369,7 @@ final class LabModel {
             initialPrompt: names.isEmpty ? nil : "Speakers: \(names.joined(separator: ", ")).",
             translate: false,
             diarize: usesDiarization,
-            wordTimestamps: wordTimestamps)
+            wordTimestamps: wordTimestamps || input.isVideo)
         let denoise = self.denoise && denoiserLoaded
 
         runTask = Task { [engine] in
@@ -1304,6 +1387,12 @@ final class LabModel {
                     stage = try await engine.stage(pcm: pcm, denoise: denoise)
                 case .file(let data, let ext, _):
                     stage = try await engine.stage(fileData: data, ext: ext, denoise: denoise)
+                case .video(_, let audioData):
+                    stage = try await engine.stage(
+                        fileData: audioData,
+                        ext: "m4a",
+                        denoise: denoise
+                    )
                 case .none:
                     // Unreachable (guarded at entry), but never strand the
                     // UI in .staging if it somehow happens.

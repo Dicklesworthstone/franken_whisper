@@ -1,9 +1,18 @@
 # FrankenWhisper for iOS
 
 The browser playground as a native SwiftUI app: download the models once, then
-record or import audio and get a speaker-attributed transcript entirely on
-device — the same pure-Rust engine (`src/native_engine`) the CLI and the
+record or import audio or video and get a speaker-attributed transcript entirely
+on device — the same pure-Rust engine (`src/native_engine`) the CLI and the
 website run, compiled for the phone through the `fw-ios` boundary crate.
+
+Videos from Photos, Files, and the Share sheet keep their pixels on the device.
+AVFoundation extracts a local audio track for the Rust engine; the original
+video is retained only in the app's purgeable cache. Decoder-provided DTW word
+alignment powers an optional Subtitle Studio with a live preview, four polished
+starting looks, font/size/text/highlight/backdrop controls, and word-level
+karaoke glow/pop animation. The burned H.264/QuickTime export can be shared or
+saved to Photos. FrankenWhisper refuses to fabricate karaoke timing when a
+decoder result does not contain real alignment data.
 
 ## Building
 
@@ -99,10 +108,12 @@ mode exists solely to keep that explicit recording session alive across apps.
   each voice can be renamed in place. Names flow into every export.
 - **Exports**: a styled self-contained HTML page and GitHub-flavored Markdown
   (both matching the browser demo's exports), plus plain text; SRT and JSON
-  live behind the "More" menu.
+  live behind the "More" menu. Video results additionally offer an entirely
+  local caption burn-in with real word-timed karaoke animation.
 - **Capture** is an `AVAudioEngine` tap converted to 16 kHz mono f32
-  (`Sources/AudioRecorder.swift`); imported files decode in Rust via the same
-  symphonia path the browser uses.
+  (`Sources/AudioRecorder.swift`); imported audio decodes in Rust via the same
+  symphonia path the browser uses, while imported video audio is extracted by
+  AVFoundation into a cache-scoped M4A before entering that same engine.
 
 ## Notes
 

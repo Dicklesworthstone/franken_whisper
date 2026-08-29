@@ -4714,7 +4714,11 @@ audited pointer island in `fw-ios/src/lib.rs`.
 
 A SwiftUI application under `ios/Sources/` (xcodegen project in
 `ios/project.yml`) wraps the handle in an actor and provides on-device
-transcription, speaker naming, and JSON/Markdown export. Its bundled keyboard
+transcription, speaker naming, and JSON/Markdown export. It can also import a
+playable video from Photos, Files, or the Share sheet, transcribe its locally
+extracted audio, and burn a customizable word-level karaoke treatment back
+into a shareable video using the decoder's real DTW alignment. Video, audio,
+transcript, and rendered export remain on the device. Its bundled keyboard
 uses a separate resident multilingual-tiny handle for low-latency text-only
 dictation while the ordinary app path remains on large-v3-turbo. Because iOS
 does not expose the microphone to custom keyboard extensions, one explicit

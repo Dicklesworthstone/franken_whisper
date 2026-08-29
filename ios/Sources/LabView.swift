@@ -1,6 +1,7 @@
 // The whole main screen: the website playground plus the systemwide local
 // dictation lane — 01 models, 02 batch input, 03 live dictation, 04 result.
 
+import PhotosUI
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -49,6 +50,8 @@ struct LabView: View {
     @State private var showDownloadConsent = false
     @State private var showClearConfirmation = false
     @State private var showFileImporter = false
+    @State private var pickedVideoItem: PhotosPickerItem?
+    @State private var showSubtitleStudio = false
     @State private var exportFormat: TranscriptFormat = .html
     @State private var textEntryFrames: [LabTextEntry: CGRect] = [:]
     @FocusState private var focusedTextEntry: LabTextEntry?
@@ -147,6 +150,11 @@ struct LabView: View {
         } message: {
             Text(model.lastError ?? "")
         }
+        .sheet(isPresented: $showSubtitleStudio) {
+            if let video = model.videoInput, let result = model.result {
+                SubtitleStudio(video: video, result: result)
+            }
+        }
         .confirmationDialog(
             "Download the models?", isPresented: $showDownloadConsent, titleVisibility: .visible
         ) {
@@ -176,7 +184,7 @@ struct LabView: View {
         }
         .fileImporter(
             isPresented: $showFileImporter,
-            allowedContentTypes: [.audio, .mpeg4Audio, .mp3, .wav],
+            allowedContentTypes: [.audio, .movie, .mpeg4Audio, .mp3, .wav],
             allowsMultipleSelection: false
         ) { result in
             switch result {
@@ -185,6 +193,21 @@ struct LabView: View {
                 model.acceptFile(url: url)
             case .failure(let error):
                 model.reportFileImportError(error)
+            }
+        }
+        .onChange(of: pickedVideoItem) { _, item in
+            guard let item else { return }
+            Task {
+                defer { pickedVideoItem = nil }
+                do {
+                    guard let picked = try await item.loadTransferable(type: PickedVideo.self)
+                    else {
+                        throw CocoaError(.fileReadUnknown)
+                    }
+                    model.acceptPickedVideo(picked)
+                } catch {
+                    model.reportVideoPickerError(error)
+                }
             }
         }
         .onReceive(
@@ -720,7 +743,7 @@ struct LabView: View {
                 if model.isImporting {
                     HStack(spacing: 8) {
                         ProgressView().tint(Lab.emerald)
-                        StatusLine(kind: .neutral, text: "reading audio file…")
+                        StatusLine(kind: .neutral, text: "preparing private local media…")
                     }
                 }
 
@@ -771,6 +794,13 @@ struct LabView: View {
             .disabled(!model.denoiserLoaded)
             Toggle(isOn: $model.wordTimestamps) {
                 optionLabel("Word-level timestamps (DTW)")
+            }
+            .disabled(model.input.isVideo)
+            if model.input.isVideo {
+                StatusLine(
+                    kind: .ok,
+                    text: "word timing is automatic for video karaoke captions"
+                )
             }
             ViewThatFits(in: .horizontal) {
                 HStack {
@@ -904,11 +934,38 @@ struct LabView: View {
 
             resultMeta(result)
 
+            if let video = model.videoInput {
+                videoSubtitleControls(video: video, result: result)
+            }
+
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) { exportControls(result) }
                 VStack(alignment: .leading, spacing: 10) { exportControls(result) }
             }
         }
+    }
+
+    private func videoSubtitleControls(video: VideoInput, result: Transcription) -> some View {
+        let wordCount = SubtitleTimeline.makeCues(from: result.words).flatMap(\.words).count
+        return VStack(alignment: .leading, spacing: 8) {
+            Button {
+                showSubtitleStudio = true
+            } label: {
+                Label("Style & burn karaoke subtitles", systemImage: "captions.bubble.fill")
+            }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(wordCount == 0)
+
+            Text(
+                wordCount > 0
+                    ? "\(wordCount) decoder-aligned words are ready to preview, style, render, save, or share."
+                    : "No word alignment was returned, so FrankenWhisper will not fabricate karaoke timing."
+            )
+            .font(.system(size: Lab.typeSize(10), design: .monospaced))
+            .foregroundStyle(wordCount > 0 ? Lab.textSecondary : Lab.danger)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Caption controls for \(video.name)")
     }
 
     /// A styled web page and GitHub Markdown are the headline exports (they
@@ -1096,6 +1153,12 @@ struct LabView: View {
             Label("Import audio", systemImage: "waveform.badge.plus")
         }
         .buttonStyle(GhostButtonStyle())
+        .disabled(model.recorder.isRecording || model.isBusy || model.engineState != .ready)
+
+        PhotosPicker(selection: $pickedVideoItem, matching: .videos) {
+            Label("Video", systemImage: "photo.on.rectangle.angled")
+        }
+        .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
         .disabled(model.recorder.isRecording || model.isBusy || model.engineState != .ready)
     }
 

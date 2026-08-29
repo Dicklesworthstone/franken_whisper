@@ -102,7 +102,7 @@ struct SpeakerRun: Codable, Identifiable, Hashable {
     var id: String { "\(startSec ?? -1)-\(speaker ?? "?")-\(segmentCount)" }
 }
 
-struct WordTiming: Codable, Hashable {
+struct WordTiming: Codable, Hashable, SubtitleTimingSource {
     var text: String
     var startSec: Double
     var endSec: Double
