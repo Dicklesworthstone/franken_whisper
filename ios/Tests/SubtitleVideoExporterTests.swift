@@ -12,7 +12,7 @@ final class SubtitleVideoExporterTests: XCTestCase {
             "VideoToolbox encoding is unavailable in this simulator runtime; "
                 + "the identical renderer is exercised by the Catalyst and device destinations."
         )
-#endif
+#else
         let source = try await makeVerticalFixture()
         let cues = [
             cue(
@@ -81,6 +81,7 @@ final class SubtitleVideoExporterTests: XCTestCase {
         }
 
         print("FW_SUBTITLE_VISUAL_QA=\(artifactDirectory.path)")
+#endif
     }
 
     private let fixtureDuration = 4.2
