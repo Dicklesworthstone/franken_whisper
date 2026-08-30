@@ -189,3 +189,14 @@ targets:
       - Sources/LiveSpectrum.swift
       - Sources/SubtitleTimeline.swift
       - Sources/SubtitleVideoExporter.swift
+
+  FrankenWhisperUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+    sources:
+      - UITests
+    dependencies:
+      - target: FrankenWhisper

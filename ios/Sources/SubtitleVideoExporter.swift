@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreImage
 import Foundation
 import UIKit
 
@@ -60,7 +61,6 @@ enum SubtitleExportError: LocalizedError {
     }
 }
 
-@MainActor
 enum SubtitleVideoExporter {
     private struct MeasuredWord {
         let word: SubtitleTimelineWord
@@ -71,11 +71,9 @@ enum SubtitleVideoExporter {
         videoURL: URL,
         cues: [SubtitleCue],
         style: SubtitleRenderStyle,
-        progress: @escaping (Double) -> Void
+        progress: @MainActor @escaping (Double) -> Void
     ) async throws -> URL {
         let asset = AVURLAsset(url: videoURL)
-        let duration = try await asset.load(.duration)
-        let totalSeconds = duration.seconds
         let videoTracks = try await asset.loadTracks(withMediaType: .video)
         guard let sourceVideo = videoTracks.first else { throw SubtitleExportError.missingVideo }
 
@@ -83,47 +81,44 @@ enum SubtitleVideoExporter {
         let preferredTransform = try await sourceVideo.load(.preferredTransform)
         let transformedRect = CGRect(origin: .zero, size: naturalSize).applying(preferredTransform)
         let renderSize = CGSize(width: abs(transformedRect.width), height: abs(transformedRect.height))
-        guard renderSize.width > 0, renderSize.height > 0 else {
+        guard renderSize.width.isFinite,
+              renderSize.height.isFinite,
+              renderSize.width > 0,
+              renderSize.height > 0,
+              renderSize.width <= 16_384,
+              renderSize.height <= 16_384
+        else {
             throw SubtitleExportError.invalidVideoSize
         }
 
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
-        let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: sourceVideo)
-        let normalizedTransform = preferredTransform.concatenating(
-            CGAffineTransform(
-                translationX: -transformedRect.minX,
-                y: -transformedRect.minY
-            )
-        )
-        layerInstruction.setTransform(normalizedTransform, at: .zero)
-        instruction.layerInstructions = [layerInstruction]
-
-        let videoComposition = AVMutableVideoComposition()
-        videoComposition.instructions = [instruction]
-        videoComposition.renderSize = renderSize
-        let nominalRate = try await sourceVideo.load(.nominalFrameRate)
-        let framesPerSecond = max(24, min(60, Int32(nominalRate.rounded())))
-        videoComposition.frameDuration = CMTime(value: 1, timescale: framesPerSecond)
-
-        let parent = CALayer()
-        parent.frame = CGRect(origin: .zero, size: renderSize)
-        let videoLayer = CALayer()
-        videoLayer.frame = parent.bounds
-        let overlay = CALayer()
-        overlay.frame = parent.bounds
-        parent.addSublayer(videoLayer)
-        parent.addSublayer(overlay)
-        addCaptionLayers(
-            cues: cues,
-            style: style,
-            renderSize: renderSize,
-            duration: totalSeconds,
-            to: overlay
-        )
-        videoComposition.animationTool = AVVideoCompositionCoreAnimationTool(
-            postProcessingAsVideoLayer: videoLayer,
-            in: parent
+        // Render against the source frame's actual composition timestamp. The
+        // previous Core Animation graph expressed every cue as a normalized
+        // fraction of the asset duration. Besides crashing the Simulator's GL
+        // compiler for realistic transcripts, that introduced a second clock
+        // between decoder timings and video presentation timestamps. This
+        // handler is called for each real frame and selects the DTW word using
+        // request.compositionTime directly.
+        let frameRenderer = SubtitleFrameRenderer(cues: cues, style: style)
+        let compositionExtent = CGRect(origin: .zero, size: renderSize)
+        let videoComposition = AVVideoComposition(
+            asset: asset,
+            applyingCIFiltersWithHandler: { request in
+                // CI filter graphs are allowed to advertise an infinite
+                // working extent. The output contract is the finite,
+                // orientation-correct track size validated above.
+                let source = request.sourceImage.cropped(to: compositionExtent)
+                guard let overlay = frameRenderer.overlay(
+                    at: request.compositionTime.seconds,
+                    renderSize: renderSize
+                ) else {
+                    request.finish(with: source, context: nil)
+                    return
+                }
+                request.finish(
+                    with: overlay.composited(over: source).cropped(to: compositionExtent),
+                    context: nil
+                )
+            }
         )
 
         guard let exporter = AVAssetExportSession(
@@ -157,7 +152,7 @@ enum SubtitleVideoExporter {
 
         switch exporter.status {
         case .completed:
-            progress(1)
+            await MainActor.run { progress(1) }
             return output
         case .cancelled:
             try? FileManager.default.removeItem(at: output)
@@ -170,6 +165,299 @@ enum SubtitleVideoExporter {
         default:
             try? FileManager.default.removeItem(at: output)
             throw SubtitleExportError.exportFailed("export ended unexpectedly")
+        }
+    }
+
+    /// Produces one transparent caption image for each visible cue/word state.
+    /// AVFoundation can request frames concurrently, so the cache is bounded
+    /// and synchronized by NSCache instead of retaining a full-frame image for
+    /// every word in a long movie.
+    private final class SubtitleFrameRenderer: @unchecked Sendable {
+        private let cues: [SubtitleCue]
+        private let style: SubtitleRenderStyle
+        private let cache = NSCache<NSString, CIImage>()
+
+        init(cues: [SubtitleCue], style: SubtitleRenderStyle) {
+            self.cues = cues
+            self.style = style
+            cache.totalCostLimit = 64 * 1_024 * 1_024
+        }
+
+        func overlay(at seconds: Double, renderSize: CGSize) -> CIImage? {
+            guard seconds.isFinite,
+                  renderSize.width.isFinite,
+                  renderSize.height.isFinite,
+                  renderSize.width > 0,
+                  renderSize.height > 0,
+                  renderSize.width <= 16_384,
+                  renderSize.height <= 16_384,
+                  let cue = activeCue(at: seconds)
+            else { return nil }
+
+            let activeWordID = cue.words.first {
+                seconds >= $0.startSec && seconds < $0.endSec
+            }?.id ?? -1
+            let width = Int(renderSize.width.rounded())
+            let height = Int(renderSize.height.rounded())
+            let key = "\(width)x\(height)-\(cue.id)-\(activeWordID)" as NSString
+            if let cached = cache.object(forKey: key) {
+                return cached
+            }
+
+            guard let image = render(
+                cue: cue,
+                activeWordID: activeWordID,
+                renderSize: CGSize(width: width, height: height)
+            ) else { return nil }
+            let overlay = CIImage(cgImage: image)
+            cache.setObject(overlay, forKey: key, cost: width * height * 4)
+            return overlay
+        }
+
+        private func activeCue(at seconds: Double) -> SubtitleCue? {
+            var low = 0
+            var high = cues.count
+            while low < high {
+                let middle = low + (high - low) / 2
+                if cues[middle].endSec <= seconds {
+                    low = middle + 1
+                } else {
+                    high = middle
+                }
+            }
+            guard low < cues.count else { return nil }
+            let cue = cues[low]
+            return seconds >= cue.startSec && seconds < cue.endSec ? cue : nil
+        }
+
+        private func render(
+            cue: SubtitleCue,
+            activeWordID: Int,
+            renderSize: CGSize
+        ) -> CGImage? {
+            let scale = min(renderSize.width, renderSize.height) / 1080
+            let font = style.font.uiFont(size: max(18, style.fontSize1080 * scale))
+            let speakerAccent = cue.speaker.map {
+                SubtitleSpeakerPalette.uiColor(for: $0.laneID)
+            } ?? style.highlightColor
+            let maxTextWidth = renderSize.width * 0.84
+            let horizontalPadding = font.pointSize * 0.50
+            let verticalPadding = font.pointSize * 0.30
+            let lineGap = font.pointSize * 0.16
+            let spacing = max(
+                (" " as NSString).size(withAttributes: [.font: font]).width,
+                font.pointSize * 0.38
+            )
+            let lines = SubtitleVideoExporter.measureLines(
+                words: cue.words,
+                font: font,
+                maximumWidth: maxTextWidth,
+                spacing: spacing
+            )
+            guard !lines.isEmpty else { return nil }
+
+            let speakerFont = style.font.uiFont(size: max(14, font.pointSize * 0.48))
+            let speakerLabel = cue.speaker?.displayName.flatMap { rawName -> String? in
+                let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { return nil }
+                return SubtitleVideoExporter.fittedLabel(
+                    name,
+                    font: speakerFont,
+                    maximumWidth: renderSize.width * 0.38
+                )
+            }
+            let speakerLabelSize = speakerLabel.map {
+                ($0 as NSString).size(withAttributes: [.font: speakerFont])
+            }
+            let speakerLabelHorizontalPadding = speakerFont.pointSize * 0.76
+            let speakerLabelWidth = speakerLabelSize.map {
+                $0.width + speakerLabelHorizontalPadding * 2
+            } ?? 0
+            let speakerLabelHeight = speakerLabelSize.map {
+                max($0.height * 1.34, speakerFont.lineHeight * 1.25)
+            } ?? 0
+
+            let lineHeight = font.lineHeight * 1.16
+            let contentHeight = CGFloat(lines.count) * lineHeight
+                + CGFloat(max(0, lines.count - 1)) * lineGap
+            let boxWidth = min(
+                renderSize.width * 0.92,
+                max(
+                    (lines.map {
+                        SubtitleVideoExporter.lineWidth($0, spacing: spacing)
+                    }.max() ?? 0) + horizontalPadding * 2,
+                    speakerLabelWidth + horizontalPadding
+                )
+            )
+            let boxHeight = contentHeight + verticalPadding * 2
+            let boxX = (renderSize.width - boxWidth) / 2
+            let bottomSafeZone = max(renderSize.height * 0.11, font.pointSize * 0.75)
+            let boxY = renderSize.height - bottomSafeZone - boxHeight
+            let boxFrame = CGRect(x: boxX, y: boxY, width: boxWidth, height: boxHeight)
+
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.opaque = false
+            let renderer = UIGraphicsImageRenderer(size: renderSize, format: format)
+            let rendered = renderer.image { context in
+                let cg = context.cgContext
+                let boxPath = UIBezierPath(
+                    roundedRect: boxFrame,
+                    cornerRadius: font.pointSize * 0.34
+                )
+                if style.backgroundOpacity > 0.001 || cue.speaker != nil {
+                    cg.saveGState()
+                    cg.setShadow(
+                        offset: CGSize(width: 0, height: font.pointSize * 0.04),
+                        blur: font.pointSize * 0.18,
+                        color: UIColor.black.withAlphaComponent(0.45).cgColor
+                    )
+                    UIColor.black.withAlphaComponent(style.backgroundOpacity).setFill()
+                    boxPath.fill()
+                    cg.restoreGState()
+                    if cue.speaker != nil {
+                        speakerAccent.withAlphaComponent(0.72).setStroke()
+                        boxPath.lineWidth = max(1.5, font.pointSize * 0.035)
+                        boxPath.stroke()
+                    }
+                }
+
+                if let speakerLabel, speakerLabelHeight > 0 {
+                    let badgeFrame = CGRect(
+                        x: boxX + horizontalPadding * 0.55,
+                        y: max(0, boxY - speakerLabelHeight - font.pointSize * 0.12),
+                        width: min(speakerLabelWidth, boxWidth - horizontalPadding),
+                        height: speakerLabelHeight
+                    )
+                    drawPill(
+                        in: badgeFrame,
+                        color: speakerAccent,
+                        fontSize: speakerFont.pointSize,
+                        context: cg
+                    )
+                    drawText(
+                        speakerLabel,
+                        font: speakerFont,
+                        color: SubtitleVideoExporter.contrastingTextColor(for: speakerAccent),
+                        frame: badgeFrame,
+                        strokeWidth: 0
+                    )
+                }
+
+                for (lineIndex, line) in lines.enumerated() {
+                    let width = SubtitleVideoExporter.lineWidth(line, spacing: spacing)
+                    var x = (renderSize.width - width) / 2
+                    let y = boxY + verticalPadding
+                        + CGFloat(lineIndex) * (lineHeight + lineGap)
+
+                    for measured in line {
+                        let frame = CGRect(
+                            x: x,
+                            y: y,
+                            width: ceil(measured.size.width) + 3,
+                            height: ceil(lineHeight) + 3
+                        )
+                        drawText(
+                            measured.word.text,
+                            font: font,
+                            color: style.textColor,
+                            frame: frame,
+                            strokeWidth: -4
+                        )
+
+                        if measured.word.id == activeWordID {
+                            let pillInset = font.pointSize * 0.13
+                            let pillFrame = frame.insetBy(
+                                dx: -pillInset,
+                                dy: -pillInset * 0.45
+                            )
+                            drawPill(
+                                in: pillFrame,
+                                color: speakerAccent,
+                                fontSize: font.pointSize,
+                                context: cg
+                            )
+                            drawText(
+                                measured.word.text,
+                                font: font,
+                                color: SubtitleVideoExporter.contrastingTextColor(
+                                    for: speakerAccent
+                                ),
+                                frame: frame,
+                                strokeWidth: 0
+                            )
+                        }
+                        x += measured.size.width + spacing
+                    }
+                }
+            }
+            return rendered.cgImage
+        }
+
+        private func drawText(
+            _ text: String,
+            font: UIFont,
+            color: UIColor,
+            frame: CGRect,
+            strokeWidth: CGFloat
+        ) {
+            var attributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: color,
+            ]
+            if strokeWidth != 0 {
+                attributes[.strokeColor] = UIColor.black.withAlphaComponent(0.94)
+                attributes[.strokeWidth] = strokeWidth
+            }
+            let string = text as NSString
+            let measured = string.size(withAttributes: attributes)
+            string.draw(
+                at: CGPoint(
+                    x: max(frame.minX + 1, frame.midX - measured.width / 2),
+                    y: max(frame.minY, frame.midY - measured.height / 2)
+                ),
+                withAttributes: attributes
+            )
+        }
+
+        private func drawPill(
+            in frame: CGRect,
+            color: UIColor,
+            fontSize: CGFloat,
+            context: CGContext
+        ) {
+            let path = UIBezierPath(
+                roundedRect: frame,
+                cornerRadius: min(frame.height / 2, fontSize * 0.26)
+            )
+            context.saveGState()
+            context.setShadow(
+                offset: .zero,
+                blur: fontSize * 0.16,
+                color: color.withAlphaComponent(0.55).cgColor
+            )
+            color.setFill()
+            path.fill()
+            context.restoreGState()
+
+            guard let gradient = CGGradient(
+                colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: [
+                    SubtitleVideoExporter.mix(color, with: .white, amount: 0.24).cgColor,
+                    color.cgColor,
+                ] as CFArray,
+                locations: [0, 1]
+            ) else { return }
+            context.saveGState()
+            context.addPath(path.cgPath)
+            context.clip()
+            context.drawLinearGradient(
+                gradient,
+                start: CGPoint(x: frame.minX, y: frame.maxY),
+                end: CGPoint(x: frame.maxX, y: frame.minY),
+                options: []
+            )
+            context.restoreGState()
         }
     }
 

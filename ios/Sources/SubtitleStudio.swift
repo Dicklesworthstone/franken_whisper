@@ -375,6 +375,7 @@ struct SubtitleStudio: View {
                 )
             }
             .buttonStyle(PrimaryButtonStyle())
+            .accessibilityIdentifier("fw.burnSubtitles")
             .disabled(isExporting)
 
             if isExporting {
@@ -396,6 +397,7 @@ struct SubtitleStudio: View {
 
             if let message {
                 StatusLine(kind: exportedURL == nil ? .err : .ok, text: message)
+                    .accessibilityIdentifier("fw.subtitleExportStatus")
             }
         }
     }
@@ -534,6 +536,10 @@ struct SubtitleStudio: View {
             backgroundOpacity: CGFloat(backgroundOpacity)
         )
 
+#if DEBUG
+        SubtitleE2ECapture.captureTimeline(cues, video: video)
+#endif
+
         Task {
             do {
                 let url = try await SubtitleVideoExporter.export(
@@ -544,6 +550,9 @@ struct SubtitleStudio: View {
                     exportProgress = progress
                 }
                 exportedURL = url
+#if DEBUG
+                SubtitleE2ECapture.captureExportedVideo(at: url)
+#endif
                 exportProgress = 1
                 message = "Captioned video ready — still entirely local."
             } catch {
@@ -588,3 +597,77 @@ struct SubtitleStudio: View {
         }
     }
 }
+
+#if DEBUG
+/// Opt-in observation only: the UI test still enters through PhotosPicker and
+/// drives the production importer, model, timeline, and exporter. Persisting
+/// their outputs lets visual QA inspect the exact artifact after XCTest exits.
+private enum SubtitleE2ECapture {
+    private static var isEnabled: Bool {
+        ProcessInfo.processInfo.environment["FW_SUBTITLE_E2E_CAPTURE"] == "1"
+    }
+
+    static func captureTimeline(_ cues: [SubtitleCue], video: VideoInput) {
+        guard isEnabled else { return }
+        let cuePayload: [[String: Any]] = cues.map { cue in
+            [
+                "id": cue.id,
+                "startSec": cue.startSec,
+                "endSec": cue.endSec,
+                "speaker": jsonString(cue.speaker?.laneID),
+                "speakerName": jsonString(cue.speaker?.displayName),
+                "words": cue.words.map { word in
+                    [
+                        "id": word.id,
+                        "text": word.text,
+                        "startSec": word.startSec,
+                        "endSec": word.endSec,
+                        "speaker": jsonString(word.speaker?.laneID),
+                    ] as [String: Any]
+                },
+            ]
+        }
+        let payload: [String: Any] = [
+            "videoFilename": video.videoURL.lastPathComponent,
+            "audioTimelineOffset": video.audioTimelineOffset,
+            "cues": cuePayload,
+        ]
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(
+                  withJSONObject: payload,
+                  options: [.prettyPrinted, .sortedKeys]
+              ),
+              let destination = uniqueDocumentURL(
+                  prefix: "subtitle-e2e-timeline",
+                  extension: "json"
+              )
+        else { return }
+        try? data.write(to: destination, options: .atomic)
+    }
+
+    static func captureExportedVideo(at source: URL) {
+        guard isEnabled,
+              let destination = uniqueDocumentURL(
+                  prefix: "subtitle-e2e-export",
+                  extension: source.pathExtension
+              )
+        else { return }
+        try? FileManager.default.copyItem(at: source, to: destination)
+    }
+
+    private static func jsonString(_ value: String?) -> Any {
+        if let value { return value }
+        return NSNull()
+    }
+
+    private static func uniqueDocumentURL(prefix: String, extension ext: String) -> URL? {
+        guard let documents = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        ).first else { return nil }
+        return documents
+            .appendingPathComponent("\(prefix)-\(UUID().uuidString)")
+            .appendingPathExtension(ext)
+    }
+}
+#endif

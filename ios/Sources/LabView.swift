@@ -770,6 +770,7 @@ struct LabView: View {
                 } else {
                     Button("Transcribe") { model.transcribe() }
                         .buttonStyle(PrimaryButtonStyle())
+                        .accessibilityIdentifier("fw.transcribe")
                         .disabled(
                             model.engineState != .ready || model.input == .none || model.isBusy
                                 || model.recorder.isRecording)
@@ -956,6 +957,7 @@ struct LabView: View {
                 Label("Style & burn karaoke subtitles", systemImage: "captions.bubble.fill")
             }
             .buttonStyle(PrimaryButtonStyle())
+            .accessibilityIdentifier("fw.subtitleStudio")
             .disabled(wordCount == 0)
 
             Text(
@@ -1161,6 +1163,7 @@ struct LabView: View {
             Label("Video", systemImage: "photo.on.rectangle.angled")
         }
         .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+        .accessibilityIdentifier("fw.videoPicker")
         .disabled(model.recorder.isRecording || model.isBusy || model.engineState != .ready)
     }
 
