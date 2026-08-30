@@ -103,6 +103,7 @@ final class ModelStore {
     var cachedBytes: Int64 = 0
 
     private var task: Task<Void, Never>?
+    private var isClearing = false
 
     let modelDirectory: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -115,18 +116,15 @@ final class ModelStore {
 
     init() {
         refreshCachedBytes()
-        // Size-only trust at launch: every byte was digest-verified when it
-        // was downloaded, the Sortformer package re-verifies against its
-        // conversion receipt inside the engine, and the denoiser artifact is
-        // hash-pinned in Rust. Re-hashing ~1.4 GB on every app start would
-        // cost tens of seconds for corruption this storage does not produce.
+        // A receipt is published only after the full digest succeeds. Size
+        // alone is insufficient: the app can be killed after the last range
+        // lands but before verification finishes. Receipts retain fast launch
+        // without trusting that crash-window file on the next run.
         if isComplete { phase = .ready }
     }
 
     var isComplete: Bool {
-        ModelManifest.files.allSatisfy { file in
-            sizeOnDisk(of: file) == file.bytes
-        }
+        ModelManifest.files.allSatisfy(hasValidVerificationReceipt)
     }
 
     private func sizeOnDisk(of file: ModelFile) -> Int64 {
@@ -134,12 +132,33 @@ final class ModelStore {
             .flatMap { $0 } ?? 0
     }
 
+    private func verificationReceiptURL(for file: ModelFile) -> URL {
+        url(for: file).appendingPathExtension("verified")
+    }
+
+    private func hasValidVerificationReceipt(for file: ModelFile) -> Bool {
+        guard sizeOnDisk(of: file) == file.bytes,
+              let value = try? String(
+                  contentsOf: verificationReceiptURL(for: file), encoding: .utf8)
+        else { return false }
+        return value == "\(file.sha256)\n"
+    }
+
+    private func markVerified(_ file: ModelFile) throws {
+        try Data("\(file.sha256)\n".utf8)
+            .write(to: verificationReceiptURL(for: file), options: .atomic)
+    }
+
+    private func removeVerificationReceipt(for file: ModelFile) {
+        try? FileManager.default.removeItem(at: verificationReceiptURL(for: file))
+    }
+
     func refreshCachedBytes() {
         cachedBytes = ModelManifest.files.reduce(Int64(0)) { $0 + sizeOnDisk(of: $1) }
     }
 
     func startDownload() {
-        guard task == nil else { return }
+        guard task == nil, !isClearing else { return }
         task = Task { [weak self] in
             await self?.run()
             self?.task = nil
@@ -148,17 +167,41 @@ final class ModelStore {
 
     func cancelDownload() {
         task?.cancel()
-        task = nil
     }
 
-    func clear() {
-        cancelDownload()
-        try? FileManager.default.removeItem(at: modelDirectory)
-        refreshCachedBytes()
-        phase = .idle
+    func clear() async {
+        guard !isClearing else { return }
+        isClearing = true
+        defer { isClearing = false }
+
+        // Keep the single-flight handle installed until cancellation has
+        // actually unwound. Clearing it eagerly allowed Retry/Clear to race an
+        // older writer against the same multi-gigabyte destination files.
+        if let activeTask = task {
+            activeTask.cancel()
+            await activeTask.value
+        }
+        do {
+            if FileManager.default.fileExists(atPath: modelDirectory.path) {
+                try FileManager.default.removeItem(at: modelDirectory)
+            }
+            refreshCachedBytes()
+            phase = .idle
+        } catch {
+            // A failed removal is not a successful clear. Preserve the real
+            // byte count and surface the filesystem error so the UI never
+            // claims that multi-gigabyte model files disappeared when they did
+            // not.
+            refreshCachedBytes()
+            phase = .failed("Could not clear downloaded models: \(error.localizedDescription)")
+        }
     }
 
     private func run() async {
+        // Partial ranges are durable resume state too. Keep the storage meter
+        // honest after cancellation or a terminal host failure, not only after
+        // a whole model happens to finish.
+        defer { refreshCachedBytes() }
         do {
             try FileManager.default.createDirectory(
                 at: modelDirectory, withIntermediateDirectories: true)
@@ -186,11 +229,18 @@ final class ModelStore {
         try FileManager.default.createDirectory(
             at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
 
+        if hasValidVerificationReceipt(for: file) { return }
+
         if sizeOnDisk(of: file) == file.bytes {
-            // Size-complete from an earlier session: verify once before trusting.
+            // A legacy cache or interrupted final verification has no durable
+            // receipt. Authenticate it once; subsequent launches stay fast.
             phase = .verifying(label: file.label)
-            if try await digest(of: destination) == file.sha256 { return }
+            if try await digest(of: destination) == file.sha256 {
+                try markVerified(file)
+                return
+            }
             try FileManager.default.removeItem(at: destination)
+            removeVerificationReceipt(for: file)
         }
 
         // Try each host in order; a host failure mid-file keeps the bytes
@@ -203,6 +253,11 @@ final class ModelStore {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                // URLSession commonly reports a cancelled async request as
+                // URLError.cancelled rather than CancellationError. Preserve
+                // the task-level meaning so Cancel returns to idle instead of
+                // rotating hosts and eventually presenting a false failure.
+                try Task.checkCancellation()
                 lastError = error
             }
         }
@@ -213,6 +268,10 @@ final class ModelStore {
         file: ModelFile, from source: String, to destination: URL, alreadyDone: Int64
     ) async throws {
         var offset = sizeOnDisk(of: file)
+        // Any write invalidates prior authentication. Usually no receipt is
+        // present here, but removing it defensively keeps future refactors from
+        // ever pairing a newly-written file with stale trust metadata.
+        removeVerificationReceipt(for: file)
         if offset > file.bytes {
             try FileManager.default.removeItem(at: destination)
             offset = 0
@@ -241,14 +300,15 @@ final class ModelStore {
             var request = URLRequest(url: url)
             request.setValue("bytes=\(offset)-\(end)", forHTTPHeaderField: "Range")
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse,
-                http.statusCode == 206 || (http.statusCode == 200 && offset == 0)
-            else {
-                throw EngineError.invalid("\(file.label): range fetch failed")
-            }
+            let received = try Self.validatedResponseLength(
+                response: response,
+                dataCount: data.count,
+                requestedRange: offset...end,
+                fileBytes: file.bytes,
+                label: file.label)
             try sink.write(contentsOf: data)
             live?.update(data: data)
-            offset += Int64(data.count)
+            offset += received
 
             let elapsed = Date().timeIntervalSince(started)
             let rate = elapsed > 1 ? Double(offset - startedOffset) / elapsed : 0
@@ -270,23 +330,86 @@ final class ModelStore {
         }
         guard digestHex == file.sha256 else {
             try? FileManager.default.removeItem(at: destination)
+            removeVerificationReceipt(for: file)
             throw EngineError.invalid("\(file.label): digest mismatch; cleared for retry")
         }
+        try markVerified(file)
+    }
+
+    /// Validate that a range response contains exactly the bytes it claims.
+    /// A zero-length 206 previously left `offset` unchanged and spun forever;
+    /// an unchecked Content-Range could append the wrong region and corrupt a
+    /// resumable download before the final digest eventually rejected it.
+    nonisolated static func validatedResponseLength(
+        response: URLResponse,
+        dataCount: Int,
+        requestedRange: ClosedRange<Int64>,
+        fileBytes: Int64,
+        label: String
+    ) throws -> Int64 {
+        guard let http = response as? HTTPURLResponse, dataCount > 0 else {
+            throw EngineError.invalid("\(label): empty or non-HTTP range response")
+        }
+
+        let received = Int64(dataCount)
+        if http.statusCode == 200 {
+            guard requestedRange.lowerBound == 0, received == fileBytes else {
+                throw EngineError.invalid("\(label): server ignored the requested range")
+            }
+            return received
+        }
+
+        guard http.statusCode == 206,
+              let header = http.value(forHTTPHeaderField: "Content-Range")
+        else {
+            throw EngineError.invalid("\(label): range fetch failed")
+        }
+        let components = header.split(separator: " ", maxSplits: 1)
+        guard components.count == 2,
+              components[0].lowercased() == "bytes"
+        else {
+            throw EngineError.invalid("\(label): malformed Content-Range")
+        }
+        let rangeAndTotal = components[1].split(separator: "/", maxSplits: 1)
+        let bounds = rangeAndTotal.first?.split(separator: "-", maxSplits: 1) ?? []
+        guard rangeAndTotal.count == 2,
+              bounds.count == 2,
+              let responseStart = Int64(bounds[0]),
+              let responseEnd = Int64(bounds[1]),
+              let responseTotal = Int64(rangeAndTotal[1]),
+              responseStart == requestedRange.lowerBound,
+              responseEnd >= responseStart,
+              responseEnd <= requestedRange.upperBound,
+              responseTotal == fileBytes,
+              received == responseEnd - responseStart + 1
+        else {
+            throw EngineError.invalid("\(label): Content-Range does not match the requested bytes")
+        }
+        return received
     }
 
     /// Streaming SHA-256 of a file, 8 MiB at a time, off the main actor.
     private nonisolated func digest(of url: URL) async throws -> String {
-        try await Task.detached(priority: .utility) {
+        let digestTask = Task.detached(priority: .utility) {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             var hasher = SHA256()
             while true {
+                try Task.checkCancellation()
                 let data = try handle.read(upToCount: 8 * 1024 * 1024) ?? Data()
                 if data.isEmpty { break }
                 hasher.update(data: data)
             }
             return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-        }.value
+        }
+        // Detached work does not inherit cancellation from its waiter. Bridge
+        // it explicitly so Cancel/Clear cannot appear frozen while a stale
+        // multi-gigabyte verification continues reading the whole file.
+        return try await withTaskCancellationHandler {
+            try await digestTask.value
+        } onCancel: {
+            digestTask.cancel()
+        }
     }
 
     private static func formatEta(seconds: Double) -> String {

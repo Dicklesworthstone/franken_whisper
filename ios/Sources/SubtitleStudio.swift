@@ -521,8 +521,7 @@ struct SubtitleStudio: View {
     }
 
     private func activeCue(at seconds: Double) -> SubtitleCue? {
-        guard seconds.isFinite else { return nil }
-        return cues.first { seconds >= $0.startSec && seconds < $0.endSec }
+        SubtitleTimeline.activeCue(in: cues, at: seconds)
     }
 
     private func resetting<Value>(_ binding: Binding<Value>) -> Binding<Value> {

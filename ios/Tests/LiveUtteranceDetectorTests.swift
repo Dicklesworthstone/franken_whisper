@@ -43,6 +43,34 @@ final class LiveUtteranceDetectorTests: XCTestCase {
         XCTAssertFalse(detector.isInSpeech)
     }
 
+    func testLargeBatchMatchesIrregularCallbackChunks() {
+        let input =
+            samples(amplitude: 0.002, frames: 9)
+            + samples(amplitude: 0.04, frames: 80)
+            + samples(amplitude: 0, frames: 42)
+            + samples(amplitude: 0.05, frames: 55)
+            + samples(amplitude: 0, frames: 41)
+
+        var batched = LiveUtteranceDetector()
+        var chunked = LiveUtteranceDetector()
+        let batchedOutput = batched.push(input)
+
+        var chunkedOutput: [[Float]] = []
+        var cursor = 0
+        let callbackSizes = [137, 911, 43, 2_047, 319, 5_003]
+        var callbackIndex = 0
+        while cursor < input.count {
+            let end = min(input.count, cursor + callbackSizes[callbackIndex % callbackSizes.count])
+            chunkedOutput.append(contentsOf: chunked.push(Array(input[cursor..<end])))
+            cursor = end
+            callbackIndex += 1
+        }
+
+        XCTAssertEqual(batchedOutput, chunkedOutput)
+        XCTAssertEqual(batched.flush(), chunked.flush())
+        XCTAssertEqual(batched.isInSpeech, chunked.isInSpeech)
+    }
+
     private func samples(amplitude: Float, frames: Int) -> [Float] {
         Array(repeating: amplitude, count: frame * frames)
     }

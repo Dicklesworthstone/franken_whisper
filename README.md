@@ -1906,9 +1906,9 @@ replay_pack/
 | `env.json` | `EnvSnapshot` | OS, architecture, backend identity/version, franken_whisper version (compile-time `CARGO_PKG_VERSION`) |
 | `manifest.json` | `PackManifest` | trace_id, run_id, start/finish timestamps, input/output SHA-256 hashes, segment/event/evidence counts |
 | `repro.lock` | `ReproLock` | Routing evidence chain, frozen replay envelope, original backend request, diarize flag |
-| `tolerance_manifest.json` | `ToleranceManifest` | Schema version (`tolerance-manifest-v1`), timestamp tolerance, text/speaker exactness flags, native rollout stage, segment/event counts |
+| `tolerance_manifest.json` | `ToleranceManifest` | Schema version (`tolerance-manifest-v2`), timestamp tolerance, text/speaker exactness flags, optional validated native rollout stage, segment/event counts |
 
-All four files are **deterministic**: the same input `RunReport` produces byte-identical output across runs and machines. If a replay pack differs between two runs of the same input, something in the pipeline changed.
+All four files are **deterministic for the same `RunReport` and runtime environment**. `env.json` deliberately records OS and architecture, so packs created on different platforms are expected to differ there; unexplained differences on the same runtime indicate pipeline or provenance drift.
 
 ### Conformance Harness
 
@@ -3546,12 +3546,19 @@ With the release profile (`opt-level = 3`, full LTO, stripped):
 ## Testing
 
 The repository has thousands of unit, integration, conformance, metamorphic,
-and model-gated tests. Release acceptance uses the complete commands below;
-model-gated cases report their external prerequisites instead of fabricating a
-pass.
+and model-gated tests. The default suite deliberately ignores models found only
+in implicit home-directory caches, keeping ordinary development checks bounded
+and deterministic. Set an explicit `FRANKEN_WHISPER_TEST_MODEL_DIR`, or opt into
+the complete local-model stress lane with `FRANKEN_WHISPER_ULTRA_STRESS=1`.
 
 ```bash
-# run all library tests
+# normal development gate (no accidental multi-minute model inference)
+cargo test
+
+# opt-in ultra stress gate using models installed in the normal local caches
+FRANKEN_WHISPER_ULTRA_STRESS=1 cargo test
+
+# library tests only
 cargo test --lib
 
 # run specific test module
@@ -3757,7 +3764,7 @@ Yes. `franken_whisper` is both a library crate and a binary. The public API expo
 Each run produces a `ReplayEnvelope` containing SHA-256 hashes of the input content, backend identity, and output payload. This allows detecting drift when re-running the same input.
 
 **Q: What's the "replay pack"?**
-A four-file deterministic bundle (`env.json`, `manifest.json`, `repro.lock`, `tolerance_manifest.json`) that captures everything needed to reproduce a run on a different machine. Same input → byte-identical pack across runs.
+A four-file deterministic bundle (`env.json`, `manifest.json`, `repro.lock`, `tolerance_manifest.json`) that captures everything needed to reproduce a run on a different machine. The same report on the same runtime is byte-identical; `env.json` intentionally differs when OS or architecture differs.
 
 **Q: How does cancellation work?**
 Ctrl+C sets a global shutdown flag. The `CancellationToken` propagates through

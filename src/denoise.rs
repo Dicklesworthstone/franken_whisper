@@ -110,7 +110,7 @@ impl Denoiser {
             samples,
             |chunk| self.denoise_16k_whole(chunk),
             |_, _| {},
-            || checkpoint(),
+            checkpoint,
         )
     }
 

@@ -875,7 +875,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Darwin's filesystem APIs reject ill-formed UTF-8 path components with
+    // EILSEQ even though Rust exposes Unix OsString byte constructors there.
+    // Exercise the byte-preservation contract only on Unix targets whose file
+    // APIs can actually create such a name.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     #[test]
     fn artifact_extension_preserves_non_utf8_prefix_bytes() {
         use std::os::unix::ffi::OsStringExt;

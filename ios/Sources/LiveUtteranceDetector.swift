@@ -28,11 +28,19 @@ struct LiveUtteranceDetector {
         guard !samples.isEmpty else { return [] }
         pending.append(contentsOf: samples)
         var completed: [[Float]] = []
+        var consumedSamples = 0
 
-        while pending.count >= Self.frameSamples {
-            let frame = Array(pending.prefix(Self.frameSamples))
-            pending.removeFirst(Self.frameSamples)
+        while pending.count - consumedSamples >= Self.frameSamples {
+            let frameEnd = consumedSamples + Self.frameSamples
+            let frame = Array(pending[consumedSamples..<frameEnd])
+            consumedSamples = frameEnd
             if let closed = consume(frame) { completed.append(closed) }
+        }
+        if consumedSamples > 0 {
+            // Remove once per callback. Removing every 20 ms frame shifted the
+            // entire remainder each time and made large catch-up batches
+            // quadratic on the latency-sensitive dictation path.
+            pending.removeFirst(consumedSamples)
         }
         return completed
     }

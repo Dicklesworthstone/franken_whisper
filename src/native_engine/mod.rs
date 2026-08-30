@@ -201,9 +201,13 @@ impl Mat {
 /// 7. `~/models/whisper` — the conventional whisper.cpp download location.
 ///
 /// Empty env vars are skipped. The home-relative entries are omitted entirely
-/// when `$HOME` is unset (rather than rooting at the filesystem root). This is
-/// the single source of truth shared by [`find_model_file`], [`resolve_model`],
-/// and [`native_model_available`], so the search order can never drift between
+/// when `$HOME` is unset (rather than rooting at the filesystem root). Unit
+/// tests also omit those implicit caches unless
+/// `FRANKEN_WHISPER_ULTRA_STRESS=1`; an explicit model/test-model directory is
+/// still honored. This keeps an ordinary `cargo test` bounded on developer
+/// machines that happen to have multi-gigabyte models installed. This is the
+/// single source of truth shared by [`find_model_file`], [`resolve_model`], and
+/// [`native_model_available`], so the search order can never drift between
 /// them.
 #[must_use]
 fn model_search_dirs() -> Vec<PathBuf> {
@@ -231,7 +235,9 @@ fn model_search_dirs() -> Vec<PathBuf> {
     {
         dirs.push(PathBuf::from(dir));
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if implicit_home_models_enabled()
+        && let Some(home) = std::env::var_os("HOME")
+    {
         let home = PathBuf::from(home);
         let cache_root = home.join(".cache").join("franken_whisper").join("models");
         dirs.push(
@@ -258,6 +264,11 @@ fn model_search_dirs() -> Vec<PathBuf> {
         dirs.push(home.join("models").join("whisper"));
     }
     dirs
+}
+
+fn implicit_home_models_enabled() -> bool {
+    !cfg!(test)
+        || std::env::var("FRANKEN_WHISPER_ULTRA_STRESS").is_ok_and(|value| value == "1")
 }
 
 /// The on-disk filename a short model name maps to (`tiny.en` → `ggml-tiny.en.bin`).

@@ -47,11 +47,13 @@ mod tests {
     }
 
     #[test]
-    fn init_respects_env_filter() {
-        // The filter should parse without error
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("franken_whisper=debug"));
-        assert!(format!("{filter:?}").contains("franken_whisper"));
+    fn env_filter_accepts_global_level() {
+        // `RUST_LOG=warn` is a valid operator choice and intentionally does
+        // not contain the crate name. The previous assertion depended on the
+        // developer's ambient environment and failed whenever a global level
+        // was configured.
+        let filter = EnvFilter::try_new("warn").expect("global level filter");
+        assert!(format!("{filter:?}").to_ascii_lowercase().contains("warn"));
     }
 
     #[test]

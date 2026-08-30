@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, ReplayEnvelope, RunEvent, RunReport, RunSummary, StoredRunDetails,
-    TranscriptionResult,
+    TranscriptionResult, TranscriptionSegment,
 };
 
 /// Resolve the request that actually governed diarization. The CLI's compact
@@ -699,6 +699,7 @@ impl RunStore {
         })
     }
 
+    #[cfg(test)]
     fn load_run_details_batch_with_after_run_rows(
         &self,
         run_ids: &[String],
@@ -1132,7 +1133,11 @@ CREATE TABLE IF NOT EXISTS _meta (
             let next = current + 1;
             tracing::info!(from = current, to = next, "Migrating schema");
             self.apply_migration(next).map_err(|error| {
-                FwError::Storage(format!("migration to v{next} failed: {error}"))
+                let detail = match error {
+                    FwError::Storage(detail) => detail,
+                    other => other.to_string(),
+                };
+                FwError::Storage(format!("migration to v{next} failed: {detail}"))
             })?;
             self.set_schema_version(next)?;
             tracing::info!(version = next, "Migration complete");
@@ -1405,7 +1410,11 @@ END;
                 )
                 .map_err(|error| FwError::Storage(error.to_string()))?;
             self.validate_sync_database_id().map_err(|error| {
-                FwError::Storage(format!("v6 identity migration failed: {error}"))
+                let detail = match error {
+                    FwError::Storage(detail) => detail,
+                    other => other.to_string(),
+                };
+                FwError::Storage(format!("v6 identity migration failed: {detail}"))
             })?;
             Ok(())
         })();
@@ -3555,9 +3564,13 @@ mod tests {
         SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
         SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
         SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
+        StoredRunDetails,
     };
 
-    use super::{BlockingConnection, RunStore, stored_projection_timeline, value_to_string};
+    use super::{
+        BlockingConnection, ListenRunOpen, ListenSegmentRow, RunStore, stored_projection_timeline,
+        value_to_i64, value_to_string,
+    };
 
     #[test]
     fn persists_and_lists_runs() {
@@ -10943,6 +10956,11 @@ mod tests {
             )],
         )
         .expect("freeze schema version");
+        conn.execute(
+            "INSERT INTO _meta (key, value) VALUES \
+             ('sync_database_id', '00000000-0000-4000-8000-000000000001');",
+        )
+        .expect("satisfy current-schema identity guard");
         conn.execute_with_params(
             "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
              normalized_wav_path, request_json, result_json, warnings_json, transcript) \

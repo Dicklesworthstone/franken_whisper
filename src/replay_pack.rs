@@ -126,9 +126,8 @@ fn rollout_stage_for_event(report: &RunReport, code: &str) -> Option<String> {
 }
 
 fn rollout_stage_from_report(report: &RunReport) -> Option<String> {
-    rollout_stage_for_event(report, "backend.ok").or_else(|| {
-        rollout_stage_for_event(report, "backend.routing.decision_contract")
-    })
+    rollout_stage_for_event(report, "backend.ok")
+        .or_else(|| rollout_stage_for_event(report, "backend.routing.decision_contract"))
 }
 
 /// Build the tolerance manifest from a completed report.
@@ -154,21 +153,20 @@ pub fn write_replay_pack(report: &RunReport, output_dir: &Path) -> FwResult<()> 
     let repro_lock = build_repro_lock(report);
     let tolerance_manifest = build_tolerance_manifest(report);
 
-    std::fs::write(
-        output_dir.join("env.json"),
-        serde_json::to_string_pretty(&env_snapshot)?,
-    )?;
-    std::fs::write(
-        output_dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)?,
-    )?;
-    std::fs::write(
-        output_dir.join("repro.lock"),
-        serde_json::to_string_pretty(&repro_lock)?,
-    )?;
-    std::fs::write(
+    // Serialize the complete generation before publishing any member. Each
+    // file then uses the repository's same-directory fsync+rename helper, so a
+    // serialization or short-write failure cannot tear an existing artifact.
+    let env_json = serde_json::to_string_pretty(&env_snapshot)?;
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    let repro_json = serde_json::to_string_pretty(&repro_lock)?;
+    let tolerance_json = serde_json::to_string_pretty(&tolerance_manifest)?;
+
+    crate::youtube::render::write_atomic(output_dir.join("env.json"), &env_json)?;
+    crate::youtube::render::write_atomic(output_dir.join("manifest.json"), &manifest_json)?;
+    crate::youtube::render::write_atomic(output_dir.join("repro.lock"), &repro_json)?;
+    crate::youtube::render::write_atomic(
         output_dir.join("tolerance_manifest.json"),
-        serde_json::to_string_pretty(&tolerance_manifest)?,
+        &tolerance_json,
     )?;
 
     Ok(())

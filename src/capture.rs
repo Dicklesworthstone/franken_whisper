@@ -487,12 +487,12 @@ impl CaptureSource for CpalCaptureSource {
             let _ = tx.send(());
         }
         let mut join_error = None;
-        if let Some(join) = self.join.take() {
-            if join.join().is_err() {
-                join_error = Some(FwError::ContractViolation(
-                    "cpal capture worker panicked during shutdown".to_owned(),
-                ));
-            }
+        if let Some(join) = self.join.take()
+            && join.join().is_err()
+        {
+            join_error = Some(FwError::ContractViolation(
+                "cpal capture worker panicked during shutdown".to_owned(),
+            ));
         }
         self.shared.ended.store(true, Ordering::Release);
         match join_error {
@@ -1029,10 +1029,12 @@ impl CaptureSource for PipePcmSource {
         let join = self.join.take();
         let reader_cleanup = if cleanup.is_ok() && self.join_reader_on_stop {
             match join {
-                Some(join) if join.join().is_err() => Err(FwError::ContractViolation(
-                    "pipe capture reader panicked during shutdown".to_owned(),
-                )),
-                Some(_) | None => Ok(()),
+                Some(join) => join.join().map_err(|_| {
+                    FwError::ContractViolation(
+                        "pipe capture reader panicked during shutdown".to_owned(),
+                    )
+                }),
+                None => Ok(()),
             }
         } else {
             // Dropping JoinHandle detaches the reader. This is required for

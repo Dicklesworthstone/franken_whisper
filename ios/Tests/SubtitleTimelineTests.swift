@@ -40,6 +40,39 @@ final class SubtitleTimelineTests: XCTestCase {
         })
     }
 
+    func testActiveCueLookupHonorsBoundariesAndGaps() throws {
+        let cues = [
+            SubtitleCue(
+                id: 0,
+                words: [SubtitleTimelineWord(
+                    id: 0, text: "one.", startSec: 0.2, endSec: 0.6, speaker: nil)]
+            ),
+            SubtitleCue(
+                id: 1,
+                words: [SubtitleTimelineWord(
+                    id: 1, text: "two.", startSec: 1.0, endSec: 1.4, speaker: nil)]
+            ),
+            SubtitleCue(
+                id: 2,
+                words: [SubtitleTimelineWord(
+                    id: 2, text: "three.", startSec: 2.0, endSec: 2.4, speaker: nil)]
+            )
+        ]
+
+        XCTAssertNil(SubtitleTimeline.activeCue(in: cues, at: 0.1))
+        XCTAssertEqual(
+            try XCTUnwrap(SubtitleTimeline.activeCue(in: cues, at: 0.2)).text,
+            "one."
+        )
+        XCTAssertNil(SubtitleTimeline.activeCue(in: cues, at: 0.6))
+        XCTAssertEqual(
+            try XCTUnwrap(SubtitleTimeline.activeCue(in: cues, at: 1.2)).text,
+            "two."
+        )
+        XCTAssertNil(SubtitleTimeline.activeCue(in: cues, at: .nan))
+        XCTAssertNil(SubtitleTimeline.activeCue(in: cues, at: 2.4))
+    }
+
     func testInvalidDecoderTimingIsRejectedRatherThanFabricated() {
         let cues = SubtitleTimeline.makeCues(from: [[
             Timing(text: "valid", startSec: 0, endSec: 0.4),

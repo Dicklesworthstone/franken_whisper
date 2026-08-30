@@ -2158,7 +2158,8 @@ mod tests {
             windows: &[],
         };
         let val = render_json(&input);
-        let pretty = serde_json::to_string_pretty(&val).unwrap();
+        let mut pretty = serde_json::to_string_pretty(&val).unwrap();
+        pretty.push('\n');
         assert_golden("json_diarized.json", &pretty);
     }
 

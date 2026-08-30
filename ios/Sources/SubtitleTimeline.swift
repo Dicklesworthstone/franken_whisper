@@ -81,6 +81,27 @@ enum SubtitleTimeline {
     static let maximumWordsPerCue = 7
     static let maximumCueDuration = 3.2
 
+    /// Locate the visible cue without scanning the entire transcript on every
+    /// preview/export frame. `makeCues` emits chronological non-overlapping
+    /// cues, so the first cue whose end lies after `seconds` is the only
+    /// possible match.
+    static func activeCue(in cues: [SubtitleCue], at seconds: Double) -> SubtitleCue? {
+        guard seconds.isFinite else { return nil }
+        var low = 0
+        var high = cues.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            if cues[middle].endSec <= seconds {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        guard low < cues.count else { return nil }
+        let cue = cues[low]
+        return seconds >= cue.startSec && seconds < cue.endSec ? cue : nil
+    }
+
     static func makeCues<T: SubtitleTimingSource>(from nestedWords: [[T]]?) -> [SubtitleCue] {
         makeCues(
             from: nestedWords,

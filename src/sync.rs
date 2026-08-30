@@ -478,7 +478,7 @@ fn export_inner_with_after_runs(
 
     let connection = Connection::open(db_path.display().to_string())
         .map_err(|error| FwError::Storage(error.to_string()))?;
-    verify_schema_exists(connection)?;
+    verify_schema_exists(&connection)?;
 
     let (
         (runs_count, runs_sha256),
@@ -13410,21 +13410,21 @@ mod tests {
                     .expect("dump runs")
                     .iter()
                     .map(run_row_to_cols)
-                    .map(|columns| strings(columns))
+                    .map(&strings)
                     .collect::<Vec<_>>(),
                 connection
                     .query("SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments ORDER BY run_id, idx")
                     .expect("dump segments")
                     .iter()
                     .map(segment_row_to_cols)
-                    .map(|columns| strings(columns))
+                    .map(&strings)
                     .collect::<Vec<_>>(),
                 connection
                     .query("SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events ORDER BY run_id, seq")
                     .expect("dump events")
                     .iter()
                     .map(event_row_to_cols)
-                    .map(|columns| strings(columns))
+                    .map(&strings)
                     .collect::<Vec<_>>(),
             )
         };

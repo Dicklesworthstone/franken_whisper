@@ -6617,6 +6617,10 @@ mod tests {
 
     #[test]
     fn gated_language_detect_jfk_turbo_matches_oracle() {
+        if !super::super::implicit_home_models_enabled() {
+            eprintln!("SKIP gated_language_detect: ultra stress mode is disabled");
+            return;
+        }
         // The ONLY coverage of the multilingual language-auto-detect path
         // (detect_language_from_enc, a port of whisper.cpp whisper_lang_auto_detect).
         // Every other on-box test uses English-only tiny.en, which skips detection
@@ -6700,6 +6704,10 @@ mod tests {
 
     #[test]
     fn gated_e2e_jfk_large_v3_turbo_no_ts_matches_oracle() {
+        if !super::super::implicit_home_models_enabled() {
+            eprintln!("SKIP gated_e2e_turbo_no_ts: ultra stress mode is disabled");
+            return;
+        }
         // Faithfulness has a MODE axis (ts / no_ts / word-ts); the flagship was
         // only proven in TS mode. no_ts uses a different SOT (`sot, <|en|>,
         // <|transcribe|>, <|notimestamps|>`) and suppresses ALL timestamp logits —
@@ -6789,6 +6797,10 @@ mod tests {
 
     #[test]
     fn gated_e2e_jfk_large_v3_turbo_autodetect_transcribes() {
+        if !super::super::implicit_home_models_enabled() {
+            eprintln!("SKIP gated_e2e_turbo_autodetect: ultra stress mode is disabled");
+            return;
+        }
         // The full multilingual pipeline end to end on the FLAGSHIP: encode →
         // auto-detect language → build the multilingual SOT (sot, <|en|>,
         // <|transcribe|>) → decode. Every other e2e test uses English-only tiny.en

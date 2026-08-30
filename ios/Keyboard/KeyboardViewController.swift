@@ -276,6 +276,19 @@ final class KeyboardViewController: UIInputViewController {
             observedActiveSession = false
         }
 
+        if let expiresAt = snapshot.expiresAt,
+           expiresAt <= Date().timeIntervalSince1970,
+           snapshot.state == .armed || snapshot.state == .listening || snapshot.state == .finishing
+        {
+            // The host can be terminated before publishing its final idle
+            // snapshot. Do not present that stale App Group value as a live
+            // microphone service forever.
+            statusLabel.text = "SESSION EXPIRED"
+            showStartLink(title: "🎙  Start")
+            spectrumView.update(bands: [], level: 0, active: false)
+            return
+        }
+
         switch snapshot.state {
         case .armed:
             if observedActiveSession { insertNewText(from: snapshot) }
@@ -307,7 +320,7 @@ final class KeyboardViewController: UIInputViewController {
 
     private func minutesRemaining(_ snapshot: DictationSnapshot) -> Int {
         guard let expiresAt = snapshot.expiresAt else { return 60 }
-        return max(1, Int(ceil((expiresAt - Date().timeIntervalSince1970) / 60)))
+        return max(0, Int(ceil((expiresAt - Date().timeIntervalSince1970) / 60)))
     }
 
     private func insertNewText(from snapshot: DictationSnapshot) {

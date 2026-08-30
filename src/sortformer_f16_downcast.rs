@@ -672,10 +672,10 @@ mod tests {
     #[test]
     fn rne_halfway_cases_choose_even_destination() {
         let cases = [
-            (1.000_488_281_25, 0x3c00),
-            (1.001_464_843_75, 0x3c02),
-            (-1.000_488_281_25, 0xbc00),
-            (-1.001_464_843_75, 0xbc02),
+            (1.000_488_3, 0x3c00),
+            (1.001_464_8, 0x3c02),
+            (-1.000_488_3, 0xbc00),
+            (-1.001_464_8, 0xbc02),
         ];
         for (value, expected) in cases {
             assert_eq!(f32_to_f16_rne_bits(value), Ok(expected));
@@ -724,7 +724,7 @@ mod tests {
 
     #[test]
     fn derivation_is_deterministic_and_preserves_i64_exactly() {
-        let f32_payload = f32_bytes(&[1.000_488_281_25, -0.0, 2.0f32.powi(-24)]);
+        let f32_payload = f32_bytes(&[1.000_488_3, -0.0, 2.0f32.powi(-24)]);
         let i64_payload = [7i64, -9i64]
             .into_iter()
             .flat_map(i64::to_le_bytes)

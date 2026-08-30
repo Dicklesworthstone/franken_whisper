@@ -613,12 +613,15 @@ final class LabModel {
     }
 
     var isBusy: Bool {
+        if runTask != nil { return true }
+        if keyboardStartPending || micRequestInFlight { return true }
         if isLiveDictationActive { return true }
         if recorder.isRecording { return true }
         if isImporting { return true }
         if case .running = runState { return true }
         if case .staging = runState { return true }
         if case .loading = engineState { return true }
+        if case .loading = liveEngineState { return true }
         return false
     }
 
@@ -627,6 +630,15 @@ final class LabModel {
         case .idle, .armed, .failed: false
         case .starting, .listening, .finishing: true
         }
+    }
+
+    /// Input pickers and external URL/drop/share handoffs all converge here.
+    /// The external paths can bypass disabled SwiftUI controls, so the model
+    /// itself must prevent a new source from replacing the media that an
+    /// active run or microphone transaction is still consuming.
+    var canAcceptInput: Bool {
+        runTask == nil && !isImporting && !recorder.isRecording && !isLiveDictationActive
+            && !keyboardStartPending && !micRequestInFlight
     }
 
     var hasArmedDictationSession: Bool {
@@ -663,9 +675,13 @@ final class LabModel {
             }
             return
         }
-        guard store.phase == .ready,
+        // Resetting the native cancellation flag is process-wide. Never do it
+        // from a background hydration while the batch engine owns that flag.
+        guard runTask == nil, !recorder.isRecording, !micRequestInFlight,
+              store.phase == .ready,
               liveEngineState == .notLoaded || isFailed(liveEngineState)
         else { return }
+        if case .loading = engineState { return }
 
         liveEngineGeneration += 1
         let gen = liveEngineGeneration
@@ -689,6 +705,11 @@ final class LabModel {
                 if self.keyboardStartPending {
                     self.failLiveDictation(
                         "The realtime speech engine could not start: \(error.localizedDescription)")
+                } else {
+                    // `prepareEngines` deliberately starts with the tiny lane.
+                    // A corrupt/unloadable realtime model must not strand the
+                    // independent full-quality transcription lane forever.
+                    self.assembleEngine()
                 }
             }
         }
@@ -697,9 +718,13 @@ final class LabModel {
     /// Load whisper (+ Sortformer + denoiser) from the verified cache. The
     /// stage markers stream through EngineHooks into `engineState`.
     func assembleEngine() {
-        guard store.phase == .ready, engineState == .notLoaded || isFailed(engineState) else {
+        guard runTask == nil, !recorder.isRecording, !isLiveDictationActive,
+              liveDecodeTask == nil, store.phase == .ready,
+              engineState == .notLoaded || isFailed(engineState)
+        else {
             return
         }
+        if case .loading = liveEngineState { return }
         enginePausedForMemoryPressure = false
         generation += 1
         let gen = generation
@@ -728,14 +753,28 @@ final class LabModel {
                 self.diarizerLoaded = diarizerOK
                 self.denoiserLoaded = denoiserOK
                 self.engineState = .ready
-                if !Self.usesFastLiveModel {
+                if Self.usesFastLiveModel {
+                    if self.liveEngineState == .ready {
+                        self.beginKeyboardDictationIfReady()
+                    } else {
+                        self.assembleLiveEngine()
+                    }
+                } else {
                     self.liveEngineState = .ready
                     self.beginKeyboardDictationIfReady()
                 }
             } catch {
                 guard self.generation == gen else { return }
                 self.engineState = .failed(error.localizedDescription)
-                if self.keyboardStartPending {
+                if Self.usesFastLiveModel {
+                    // The independent tiny lane can still provide keyboard
+                    // dictation even if the heavier batch model failed.
+                    if self.liveEngineState == .ready {
+                        self.beginKeyboardDictationIfReady()
+                    } else {
+                        self.assembleLiveEngine()
+                    }
+                } else if self.keyboardStartPending {
                     self.failLiveDictation(
                         "The local speech engine could not start: \(error.localizedDescription)")
                 }
@@ -773,12 +812,16 @@ final class LabModel {
             await engine.unload()
             await liveEngine.unload()
             guard self.generation == gen else { return }
-            self.store.clear()
+            await self.store.clear()
             self.diarizerLoaded = false
             self.denoiserLoaded = false
             self.enginePausedForMemoryPressure = false
             self.engineState = .notLoaded
             self.liveEngineState = .notLoaded
+            if self.keyboardStartPending {
+                self.failLiveDictation(
+                    "The local models were cleared. Download them again before using keyboard dictation.")
+            }
         }
     }
 
@@ -803,7 +846,7 @@ final class LabModel {
                 lastError = "Recording too short — hold the button and speak."
             }
         } else {
-            guard !micRequestInFlight else { return }
+            guard !isBusy else { return }
             micRequestInFlight = true
             result = nil
             // Ask for the microphone explicitly: a denied permission would
@@ -837,12 +880,38 @@ final class LabModel {
         else { return }
 
         keyboardHandoffVisible = true
+        // Reopening the same URL while this service is already starting or
+        // active is idempotent. Reinitializing the transaction here could
+        // mark it failed while its original permission task still proceeds.
+        if isLiveDictationActive { return }
         keyboardStartPending = true
         lastError = nil
+
+        // The keyboard arrives through an external URL, so it can bypass all
+        // of LabView's disabled controls. Never let it overlap the batch
+        // engine (both lanes use EngineHooks.shared), an in-flight import, or
+        // an ordinary recording. Most importantly, rejecting the handoff must
+        // not stop and discard that unrelated recording.
+        guard runTask == nil, !isImporting, !micRequestInFlight,
+              !recorder.isRecording || hasArmedDictationSession
+        else {
+            rejectLiveDictation(
+                "Finish the current recording, import, or transcription before starting keyboard dictation.")
+            return
+        }
 
         guard store.phase == .ready else {
             failLiveDictation(
                 "Download and verify the local models in FrankenWhisper before using its keyboard.")
+            return
+        }
+
+        // Both native handles share process-wide progress and cancellation
+        // plumbing. Queue the latency lane behind an already-running batch
+        // hydration instead of running the two engines concurrently.
+        if case .loading = engineState {
+            liveDictationState = .starting("Finishing local model setup…")
+            publishLiveSnapshot(state: .idle, message: "Finishing local model setup…")
             return
         }
 
@@ -857,8 +926,9 @@ final class LabModel {
         keyboardStartPending = false
         if case .starting = liveDictationState {
             liveStartTask?.cancel()
-            liveStartTask = nil
-            micRequestInFlight = false
+            // The task's defer owns these handles. Clearing them before the
+            // cancelled permission/start transaction unwinds would admit a
+            // second recorder start against the same AVAudioEngine tap.
             liveDictationState = .idle
             publishLiveSnapshot(state: .idle, message: nil)
         }
@@ -866,8 +936,20 @@ final class LabModel {
     }
 
     func retryKeyboardDictation() {
+        guard runTask == nil, !isImporting, !micRequestInFlight,
+              !recorder.isRecording || hasArmedDictationSession
+        else {
+            rejectLiveDictation(
+                "Finish the current recording, import, or transcription before starting keyboard dictation.")
+            return
+        }
         keyboardStartPending = true
         liveDictationState = .idle
+        if case .loading = engineState {
+            liveDictationState = .starting("Finishing local model setup…")
+            publishLiveSnapshot(state: .idle, message: "Finishing local model setup…")
+            return
+        }
         if liveEngineState == .ready {
             beginKeyboardDictationIfReady()
         } else {
@@ -879,6 +961,14 @@ final class LabModel {
         guard keyboardStartPending, liveEngineState == .ready else { return }
         keyboardStartPending = false
         startLiveDictation()
+    }
+
+    /// Refuse a new live transaction without disturbing an unrelated batch
+    /// run, file import, or ordinary microphone recording already in flight.
+    private func rejectLiveDictation(_ message: String) {
+        keyboardStartPending = false
+        liveDictationState = .failed(message)
+        publishLiveSnapshot(state: .failed, message: message)
     }
 
     private func failLiveDictation(_ message: String) {
@@ -893,6 +983,7 @@ final class LabModel {
         liveRevision = 0
         liveDictationState = .failed(message)
         publishLiveSnapshot(state: .failed, message: message)
+        endLiveFinishBackgroundTask()
     }
 
     /// Start one explicit, user-visible microphone session and immediately
@@ -900,6 +991,21 @@ final class LabModel {
     /// after Finish, allowing subsequent keyboard starts to remain in
     /// the caller's app. While armed, captured samples are discarded locally.
     func startLiveDictation() {
+        guard runTask == nil, !isImporting, !micRequestInFlight,
+              !recorder.isRecording || hasArmedDictationSession
+        else {
+            rejectLiveDictation(
+                "Finish the current recording, import, or transcription before starting keyboard dictation.")
+            return
+        }
+
+        if case .loading = engineState {
+            keyboardStartPending = true
+            liveDictationState = .starting("Finishing local model setup…")
+            publishLiveSnapshot(state: .idle, message: "Finishing local model setup…")
+            return
+        }
+
         guard liveEngineState == .ready else {
             failLiveDictation(
                 "The realtime speech engine is not ready yet. Please try again when it finishes loading.")
@@ -1130,7 +1236,6 @@ final class LabModel {
                     self.liveStopRequested = true
                     self.liveQueue.removeAll(keepingCapacity: true)
                     self.failLiveDictation("Local dictation failed: \(error.localizedDescription)")
-                    self.endLiveFinishBackgroundTask()
                 }
             }
             self.liveDecodeTask = nil
@@ -1157,6 +1262,7 @@ final class LabModel {
         UIApplication.shared.isIdleTimerDisabled = false
         liveQueuedUtterances = 0
         if case .failed = liveDictationState {
+            endLiveFinishBackgroundTask()
             return
         }
         if liveEndSessionRequested || !recorder.isRecording {
@@ -1204,7 +1310,10 @@ final class LabModel {
         liveMeterLevel = 0
         liveSpectrum = [Float](repeating: 0, count: LiveSpectrumAnalyzer.bandCount)
         UIApplication.shared.isIdleTimerDisabled = false
-        if case .failed = liveDictationState { return }
+        if case .failed = liveDictationState {
+            endLiveFinishBackgroundTask()
+            return
+        }
         liveDictationState = .idle
         publishLiveSnapshot(state: .idle, message: nil)
         endLiveFinishBackgroundTask()
@@ -1233,6 +1342,9 @@ final class LabModel {
     }
 
     private func publishLiveActivityState() {
+        // A rejected external keyboard handoff must not replace or terminate
+        // the Live Activity for a batch transcription already in progress.
+        guard runTask == nil else { return }
         runActivity.transitionLive(
             to: liveDictationState,
             sessionMinutesRemaining: liveSessionMinutesRemaining,
@@ -1241,18 +1353,32 @@ final class LabModel {
         )
     }
 
-    func acceptFile(url: URL) {
+    @discardableResult
+    func acceptFile(url: URL, removeSourceAfterImport: Bool = false) -> Bool {
+        guard canAcceptInput else {
+            if removeSourceAfterImport {
+                try? FileManager.default.removeItem(at: url)
+            }
+            lastError = "Finish the current recording, import, or transcription before replacing its input."
+            return false
+        }
         let ext = url.pathExtension.lowercased()
         if let type = UTType(filenameExtension: ext), type.conforms(to: .movie) {
-            acceptVideo(url: url, alreadyManaged: false)
-            return
+            acceptVideo(
+                url: url,
+                alreadyManaged: false,
+                removeSourceAfterImport: removeSourceAfterImport
+            )
+            return true
         }
-        guard !isImporting else { return }
         let scoped = url.startAccessingSecurityScopedResource()
         isImporting = true
         Task {
             defer {
                 if scoped { url.stopAccessingSecurityScopedResource() }
+                if removeSourceAfterImport {
+                    try? FileManager.default.removeItem(at: url)
+                }
                 self.isImporting = false
             }
             do {
@@ -1268,13 +1394,17 @@ final class LabModel {
                 lastError = "Could not read \(url.lastPathComponent): \(error.localizedDescription)"
             }
         }
+        return true
     }
 
     func acceptPickedVideo(_ picked: PickedVideo) {
-        guard !isImporting else {
+        guard canAcceptInput else {
             // The transferable has already created an app-owned cache copy. A
-            // picker completion racing another import must not orphan it.
+            // picker completion racing another operation must not orphan it or
+            // replace the source that operation is still consuming.
             try? FileManager.default.removeItem(at: picked.localURL)
+            lastError =
+                "Finish the current recording, import, or transcription before replacing its input."
             return
         }
         acceptVideo(url: picked.localURL, alreadyManaged: true, picked: picked)
@@ -1283,15 +1413,24 @@ final class LabModel {
     private func acceptVideo(
         url: URL,
         alreadyManaged: Bool,
-        picked: PickedVideo? = nil
+        picked: PickedVideo? = nil,
+        removeSourceAfterImport: Bool = false
     ) {
-        guard !isImporting else { return }
+        guard canAcceptInput else {
+            if removeSourceAfterImport || alreadyManaged {
+                try? FileManager.default.removeItem(at: url)
+            }
+            return
+        }
         let scoped = alreadyManaged ? false : url.startAccessingSecurityScopedResource()
         isImporting = true
         Task {
             var preparedMedia: VideoInput?
             defer {
                 if scoped { url.stopAccessingSecurityScopedResource() }
+                if removeSourceAfterImport {
+                    try? FileManager.default.removeItem(at: url)
+                }
                 self.isImporting = false
             }
             do {
@@ -1344,8 +1483,7 @@ final class LabModel {
     // ── The run ────────────────────────────────────────────────────────────
 
     func transcribe() {
-        guard engineState == .ready, input != .none, runTask == nil,
-              !isLiveDictationActive else { return }
+        guard engineState == .ready, input != .none, !isBusy else { return }
         generation += 1
         let gen = generation
         liveSegments = []

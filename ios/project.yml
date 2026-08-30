@@ -187,6 +187,8 @@ targets:
       - Tests
       - Sources/LiveUtteranceDetector.swift
       - Sources/LiveSpectrum.swift
+      - Sources/ModelStore.swift
+      - Shared/FrankenWhisperSystemState.swift
       - Sources/SubtitleTimeline.swift
       - Sources/SubtitleVideoExporter.swift
 

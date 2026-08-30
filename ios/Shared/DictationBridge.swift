@@ -1,10 +1,11 @@
 import Foundation
 
-/// The tiny, append-only handoff between the containing app and its keyboard.
-/// The app is the sole writer; the keyboard has read-only App Group access and
-/// never sees microphone samples or model files. Apple requires the keyboard's
-/// Full Access switch for this shared container even though no data is sent
-/// over a network. One encoded value makes each cross-process snapshot atomic.
+/// The tiny snapshot handoff between the containing app and its keyboard. The
+/// app is the sole snapshot writer; the keyboard writes only the separate
+/// command value below and never sees microphone samples or model files.
+/// Apple requires the keyboard's Full Access switch for this shared container
+/// even though no data is sent over a network. One encoded value makes each
+/// cross-process snapshot atomic.
 struct DictationSnapshot: Codable, Equatable {
     enum State: String, Codable {
         case idle
@@ -74,10 +75,12 @@ enum DictationBridge {
     }
 
     static func readCommand() -> DictationCommand? {
-        guard let defaults = UserDefaults(suiteName: appGroup),
-              let data = defaults.data(forKey: commandKey)
-        else { return nil }
+        guard let defaults = UserDefaults(suiteName: appGroup) else { return nil }
+        // Match snapshot reads: synchronize before fetching so the containing
+        // app observes the extension's newest command, not a value captured
+        // before cross-process preferences were refreshed.
         defaults.synchronize()
+        guard let data = defaults.data(forKey: commandKey) else { return nil }
         return try? JSONDecoder().decode(DictationCommand.self, from: data)
     }
 

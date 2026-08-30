@@ -963,18 +963,26 @@ pub fn verify_confidential_evaluation_aggregate(
             "confidential aggregate contains an invalid hash",
         ));
     }
-    validate_finite_aggregate(aggregate)?;
     let mut unhashed = aggregate.clone();
     let expected = unhashed.result_sha256.clone();
     unhashed.result_sha256.clear();
-    if canonical_sha256(&unhashed)? == expected {
-        Ok(())
-    } else {
-        Err(confidential_error(
+    let actual = canonical_sha256(&unhashed).map_err(|_| {
+        confidential_error(
+            "aggregate_semantics",
+            "confidential aggregate contains non-serializable values",
+        )
+    })?;
+    if actual != expected {
+        return Err(confidential_error(
             "aggregate_hash",
             "confidential aggregate self-hash does not match",
-        ))
+        ));
     }
+    // Authenticate the bytes before interpreting their internal relationships:
+    // an ordinary field edit is a hash failure, while a caller who recomputes
+    // the hash over a forged but inconsistent aggregate reaches this semantic
+    // validation and is rejected there.
+    validate_finite_aggregate(aggregate)
 }
 
 #[derive(Clone, Copy)]

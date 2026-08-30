@@ -4,6 +4,17 @@ import UniformTypeIdentifiers
 final class ShareViewController: UIViewController {
     private let statusLabel = UILabel()
     private let openButton = UIButton(type: .system)
+    private var stagedURL: URL?
+    private var cancelled = false
+
+    deinit {
+        // Covers a sheet dismissed by the system rather than our Cancel
+        // button. A successful handoff clears `stagedURL` first, so only
+        // abandoned private copies are reclaimed here.
+        if let stagedURL {
+            FrankenWhisperSharedStore.discardStagedMedia(at: stagedURL)
+        }
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -77,13 +88,18 @@ final class ShareViewController: UIViewController {
                 return
             }
             do {
-                _ = try FrankenWhisperSharedStore.stageMedia(
+                let staged = try FrankenWhisperSharedStore.stageMedia(
                     from: url,
                     preferredExtension: pair.1.preferredFilenameExtension
                 )
-                Task { @MainActor in
-                    self?.statusLabel.text = "Media secured locally. Ready for private transcription."
-                    self?.openButton.isEnabled = true
+                Task { @MainActor [weak self] in
+                    guard let self, !self.cancelled else {
+                        FrankenWhisperSharedStore.discardStagedMedia(at: staged)
+                        return
+                    }
+                    self.stagedURL = staged
+                    self.statusLabel.text = "Media secured locally. Ready for private transcription."
+                    self.openButton.isEnabled = true
                 }
             } catch {
                 Task { @MainActor in self?.showFailure("Could not stage that file: \(error.localizedDescription)") }
@@ -98,12 +114,27 @@ final class ShareViewController: UIViewController {
 
     @objc private func openObservatory() {
         guard let url = URL(string: "frankenwhisper://new") else { return }
-        extensionContext?.open(url) { [weak self] _ in
-            self?.extensionContext?.completeRequest(returningItems: nil)
+        openButton.isEnabled = false
+        extensionContext?.open(url) { [weak self] opened in
+            Task { @MainActor in
+                guard let self else { return }
+                if opened {
+                    self.stagedURL = nil
+                    self.extensionContext?.completeRequest(returningItems: nil)
+                } else {
+                    self.showFailure("FrankenWhisper could not be opened. Try again or cancel this share.")
+                    self.openButton.isEnabled = true
+                }
+            }
         }
     }
 
     @objc private func cancelShare() {
+        cancelled = true
+        if let stagedURL {
+            FrankenWhisperSharedStore.discardStagedMedia(at: stagedURL)
+            self.stagedURL = nil
+        }
         extensionContext?.cancelRequest(withError: CocoaError(.userCancelled))
     }
 }

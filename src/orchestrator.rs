@@ -7147,11 +7147,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use asupersync::runtime::RuntimeBuilder;
+    use chrono::Utc;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use crate::error::FwError;
+    use crate::error::{FwError, FwResult};
     use crate::model::{
         AcousticDiarizationRolloutStage, BackendKind, BackendParams, DiarizationConfig,
         DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus, DiarizationReport,
@@ -7176,11 +7177,13 @@ mod tests {
         external_diarization_report, finite_seconds_interval_to_ms, has_canonical_word_alignment,
         is_abbreviation_period, is_decimal_period, is_ellipsis_period, load_energy_valley_evidence,
         merge_regions_by_gap, ms_to_frames, nearest_energy_valley, normalized_pcm_duration_ms,
-        optional_stage_skip, parse_acoustic_diarization_rollout, parse_budget_ms,
-        parse_event_ts_ms, punctuate_segments, recommended_budget, resolved_diarization_engine,
+        named_stage_token_for_deadlines, optional_stage_skip, parse_acoustic_diarization_rollout,
+        parse_budget_ms, parse_event_ts_ms, punctuate_segments, recommended_budget,
+        resolved_diarization_engine,
         resolved_diarization_engine_for_rollout, result_has_external_diarization, run_pipeline,
-        run_stage_with_budget, sanitize_process_pid, selected_diarization_engine, sha256_bytes_hex,
-        sha256_file, sha256_file_with_checkpoint, sha256_json_value, silhouette_score,
+        run_stage_with_budget, run_stage_with_token_budget, sanitize_process_pid,
+        selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_file_with_checkpoint,
+        sha256_json_value, silhouette_score,
         sortformer_acoustic_fallback_eligible, sortformer_activity_shares,
         sortformer_count_request_is_capacity_eligible, source_separate,
         source_separate_with_analysis, split_long_regions, stage_budget_ms, stage_failure_code,

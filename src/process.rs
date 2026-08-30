@@ -1055,10 +1055,18 @@ fn terminate_descendant_process_tree(
         loop {
             match rustix::process::test_kill_process_group(process_group) {
                 Err(error) if error == rustix::io::Errno::SRCH => break,
-                Err(_) => {
-                    return Err(process_tree_cleanup_error(
-                        "the owned Unix process group could not be inspected after termination",
-                    ));
+                Err(error)
+                    if error == rustix::io::Errno::INTR && Instant::now() < deadline =>
+                {
+                    // Signal probes can be interrupted on Unix. That says
+                    // nothing about whether the group survived; retry within
+                    // the same bounded certification window.
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => {
+                    return Err(process_tree_cleanup_error(&format!(
+                        "the owned Unix process group could not be inspected after termination ({error})"
+                    )));
                 }
                 Ok(()) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(5));
@@ -1785,8 +1793,7 @@ mod tests {
     #[cfg(unix)]
     use super::run_command_cancellable_with_input_probe_and_observer;
     use super::{
-        cancellable_poll_delay, command_error_diagnostics,
-        command_error_diagnostics_with_environment, render_command_for_log,
+        cancellable_poll_delay, command_error_diagnostics_with_environment, render_command_for_log,
         run_command_cancellable, run_command_cancellable_with_input_and_probe,
         run_command_cancellable_with_probe, sensitive_arg_values,
     };

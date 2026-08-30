@@ -577,7 +577,7 @@ fn run_with_info_body(
                     v,
                     events.as_ref(),
                     &mut summary,
-                    std::fs::remove_file,
+                    |path| std::fs::remove_file(path),
                 )?;
                 if disposition == RenderedVideoDisposition::CleanupFailed && opts.abort_on_error {
                     abort_before_work = true;
@@ -747,7 +747,7 @@ fn run_with_info_body(
                             },
                             events.as_ref(),
                             &mut summary,
-                            std::fs::remove_file,
+                            |path| std::fs::remove_file(path),
                         )?;
                         if disposition == RenderedVideoDisposition::CleanupFailed
                             && opts.abort_on_error
@@ -1451,10 +1451,9 @@ fn transcribe_and_render(
     let t_render = std::time::Instant::now();
     render::write_atomic(&paths.md, &render::render_markdown(&input))?;
     let json = render::render_json(&input);
-    render::write_atomic(
-        &paths.json,
-        &serde_json::to_string_pretty(&json).map_err(FwError::Json)?,
-    )?;
+    let mut json_document = serde_json::to_string_pretty(&json).map_err(FwError::Json)?;
+    json_document.push('\n');
+    render::write_atomic(&paths.json, &json_document)?;
     crate::native_engine::perf_span("yt.render", t_render.elapsed().as_secs_f64() * 1e3, "");
     Ok((paths, wall_ms, rtf))
 }
@@ -2819,7 +2818,7 @@ https://youtu.be/ccccccccccc
             &events,
             &mut summary,
             &mut fail_done_save,
-            std::fs::remove_file,
+            |path| std::fs::remove_file(path),
         )
         .expect_err("final Done persistence must fail after deletion");
         assert!(error.to_string().contains("fixture done save failure"));
@@ -2837,7 +2836,7 @@ https://youtu.be/ccccccccccc
             &video,
             &events,
             &mut summary,
-            std::fs::remove_file,
+            |path| std::fs::remove_file(path),
         )
         .expect("NotFound must settle the durable cleanup intent");
         assert_eq!(recovered, RenderedVideoDisposition::Done);

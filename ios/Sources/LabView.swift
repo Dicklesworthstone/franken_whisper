@@ -62,6 +62,18 @@ struct LabView: View {
     }
 
     var body: some View {
+        commandModifiers(
+            continuityModifiers(
+                lifecycleModifiers(
+                    importModifiers(
+                        presentationModifiers(laboratoryCanvas)
+                    )
+                )
+            )
+        )
+    }
+
+    private var laboratoryCanvas: some View {
         ZStack {
             LaboratoryBackground()
             GeometryReader { geometry in
@@ -117,6 +129,10 @@ struct LabView: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.97)))
             }
         }
+    }
+
+    private func presentationModifiers<Content: View>(_ content: Content) -> some View {
+        content
         .coordinateSpace(name: "lab-text-entry-space")
         .onPreferenceChange(LabTextEntryFramePreferenceKey.self) { frames in
             textEntryFrames = frames
@@ -159,6 +175,15 @@ struct LabView: View {
                 )
             }
         }
+        .onChange(of: showSubtitleStudio) { _, isPresented in
+            // The studio's AVPlayer/exporter still owns the current movie.
+            // A queued share can safely replace it only after the sheet closes.
+            if !isPresented { consumeStagedMedia() }
+        }
+    }
+
+    private func importModifiers<Content: View>(_ content: Content) -> some View {
+        content
         .confirmationDialog(
             "Download the models?", isPresented: $showDownloadConsent, titleVisibility: .visible
         ) {
@@ -214,6 +239,10 @@ struct LabView: View {
                 }
             }
         }
+    }
+
+    private func lifecycleModifiers<Content: View>(_ content: Content) -> some View {
+        content
         .onReceive(
             NotificationCenter.default.publisher(
                 for: UIApplication.didReceiveMemoryWarningNotification)
@@ -259,6 +288,10 @@ struct LabView: View {
                 model.handleKeyboardURL(url)
             }
         }
+    }
+
+    private func continuityModifiers<Content: View>(_ content: Content) -> some View {
+        content
         .onChange(of: model.store.phase) { _, phase in
             if phase == .ready, scenePhase == .active, !profilingRequested {
                 model.prepareEngines()
@@ -268,6 +301,12 @@ struct LabView: View {
             if case .done = state {
                 withAnimation(.snappy) { destination = .result }
             }
+        }
+        .onChange(of: model.canAcceptInput) { _, canAccept in
+            // A share received during a run stays securely staged rather than
+            // replacing that run's source. Consume it as soon as every input
+            // consumer has released the old media.
+            if canAccept { consumeStagedMedia() }
         }
         .onChange(of: scenePhase) { _, phase in
             // Keep the large local model resident across an ordinary app
@@ -293,10 +332,13 @@ struct LabView: View {
             else { return }
             destination = restored
         }
+    }
+
+    private func commandModifiers<Content: View>(_ content: Content) -> some View {
+        content
         .dropDestination(for: URL.self) { urls, _ in
             guard let url = urls.first else { return false }
-            model.acceptFile(url: url)
-            return true
+            return model.acceptFile(url: url)
         }
         .focusedSceneValue(
             \.whisperCommands,
@@ -366,8 +408,12 @@ struct LabView: View {
     }
 
     private func consumeStagedMedia() {
+        guard model.canAcceptInput, !showSubtitleStudio else { return }
         guard let staged = FrankenWhisperSharedStore.consumeStagedMediaURL() else { return }
-        model.acceptFile(url: staged)
+        // The share extension copied this into the App Group solely for the
+        // handoff. LabModel owns the asynchronous read/copy lifecycle and must
+        // remove that private staging file afterward, including on failure.
+        model.acceptFile(url: staged, removeSourceAfterImport: true)
     }
 
     private func consumeRequestedAction() {

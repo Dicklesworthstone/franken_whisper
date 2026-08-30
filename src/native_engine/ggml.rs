@@ -3089,6 +3089,10 @@ mod tests {
 
     #[test]
     fn real_large_v3_turbo_hparams() {
+        if !super::super::implicit_home_models_enabled() {
+            eprintln!("SKIP real_large_v3_turbo_hparams: ultra stress mode is disabled");
+            return;
+        }
         let Some(path) = find_model_file("large-v3-turbo") else {
             eprintln!("SKIP real_large_v3_turbo_hparams: ggml-large-v3-turbo.bin not found");
             return;

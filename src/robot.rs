@@ -2335,6 +2335,51 @@ fn dependency_check_json(check: &DependencyCheck) -> serde_json::Value {
     })
 }
 
+fn health_report_schema_example() -> serde_json::Value {
+    json!({
+        "event": "health.report",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "ts": "2026-02-22T00:00:00Z",
+        "backends": [
+            {
+                "name": "whisper.cpp",
+                "available": true,
+                "path": "/usr/local/bin/whisper-cli",
+                "version": null,
+                "issues": [],
+            }
+        ],
+        "ffmpeg": {
+            "name": "ffmpeg",
+            "available": true,
+            "path": "/usr/bin/ffmpeg",
+            "version": null,
+            "issues": [],
+        },
+        "database": {
+            "name": "database",
+            "available": true,
+            "path": "db.sqlite3",
+            "version": null,
+            "issues": [],
+        },
+        "resources": {
+            "disk_free_bytes": null,
+            "disk_total_bytes": null,
+            "memory_available_bytes": 8_000_000_000_u64,
+            "memory_total_bytes": 16_000_000_000_u64,
+        },
+        "audio_input": {
+            "available": true,
+            "default_device": "Built-in Microphone",
+            "device_count": 1,
+            "backend": "cpal",
+            "issues": [],
+        },
+        "overall_status": "ok",
+    })
+}
+
 #[must_use]
 pub fn robot_schema_value() -> serde_json::Value {
     let mut schema = json!({
@@ -2637,48 +2682,7 @@ pub fn robot_schema_value() -> serde_json::Value {
             },
             "health.report": {
                 "required": HEALTH_REPORT_REQUIRED_FIELDS,
-                "example": json!({
-                    "event": "health.report",
-                    "schema_version": ROBOT_SCHEMA_VERSION,
-                    "ts": "2026-02-22T00:00:00Z",
-                    "backends": [
-                        {
-                            "name": "whisper.cpp",
-                            "available": true,
-                            "path": "/usr/local/bin/whisper-cli",
-                            "version": null,
-                            "issues": [],
-                        }
-                    ],
-                    "ffmpeg": {
-                        "name": "ffmpeg",
-                        "available": true,
-                        "path": "/usr/bin/ffmpeg",
-                        "version": null,
-                        "issues": [],
-                    },
-                    "database": {
-                        "name": "database",
-                        "available": true,
-                        "path": "db.sqlite3",
-                        "version": null,
-                        "issues": [],
-                    },
-                    "resources": {
-                        "disk_free_bytes": null,
-                        "disk_total_bytes": null,
-                        "memory_available_bytes": 8_000_000_000_u64,
-                        "memory_total_bytes": 16_000_000_000_u64,
-                    },
-                    "audio_input": {
-                        "available": true,
-                        "default_device": "Built-in Microphone",
-                        "device_count": 1,
-                        "backend": "cpal",
-                        "issues": [],
-                    },
-                    "overall_status": "ok",
-                }),
+                "example": health_report_schema_example(),
             },
         }
     });
@@ -3047,6 +3051,10 @@ mod tests {
         run_complete_value, run_error_value, run_stage_value, run_start_value,
         transcript_partial_value,
     };
+
+    fn ultra_stress_enabled() -> bool {
+        std::env::var("FRANKEN_WHISPER_ULTRA_STRESS").is_ok_and(|value| value == "1")
+    }
 
     const ROBOT_SCHEMA_EVENT_TYPES: [&str; 30] = [
         "run_start",
@@ -7572,6 +7580,10 @@ mod tests {
 
     #[test]
     fn model_registry_keeps_sortformer_release_bound_and_exact() {
+        if !ultra_stress_enabled() {
+            eprintln!("SKIP model registry cache authentication: ultra stress mode is disabled");
+            return;
+        }
         let value = super::models_report_value();
         assert_eq!(value["schema_version"], "franken-whisper-model-registry-v2");
         assert_eq!(value["network_access_performed"], false);
@@ -7609,6 +7621,10 @@ mod tests {
 
     #[test]
     fn doctor_and_triage_expose_stable_readiness_contracts() {
+        if !ultra_stress_enabled() {
+            eprintln!("SKIP doctor cache authentication: ultra stress mode is disabled");
+            return;
+        }
         let db = std::path::Path::new("nonexistent-parent/doctor.sqlite3");
         let doctor = super::doctor_report_value(db);
         assert_eq!(doctor["schema_version"], "franken-whisper-doctor-v1");

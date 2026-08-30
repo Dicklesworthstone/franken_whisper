@@ -5963,9 +5963,11 @@ mod adaptive_contract_tests {
 
     #[test]
     fn run_listen_session_validates_before_model_capture_or_output() {
-        let mut config = ListenConfig::default();
-        config.fast_model = Some("definitely-missing-listen-validation-model".to_owned());
-        config.capture_buffer_sec = f64::INFINITY;
+        let config = ListenConfig {
+            fast_model: Some("definitely-missing-listen-validation-model".to_owned()),
+            capture_buffer_sec: f64::INFINITY,
+            ..ListenConfig::default()
+        };
         let mut emitted = false;
         let mut emit = |_value| {
             emitted = true;
@@ -6002,8 +6004,10 @@ mod adaptive_contract_tests {
         header[44..48].copy_from_slice(&1_i32.to_le_bytes());
         std::fs::write(&path, header).expect("write model header");
 
-        let mut config = ListenConfig::default();
-        config.fast_model = Some(path.to_string_lossy().into_owned());
+        let config = ListenConfig {
+            fast_model: Some(path.to_string_lossy().into_owned()),
+            ..ListenConfig::default()
+        };
         let (resolved, label, warning) = resolve_fast_model_path(&config, &|| false)
             .expect("an explicit custom path remains supported");
 
@@ -6018,14 +6022,16 @@ mod adaptive_contract_tests {
     #[test]
     fn fallback_authentication_cancellation_wins_over_primary_miss() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut config = ListenConfig::default();
-        config.fast_model = Some(
-            directory
-                .path()
-                .join("missing-custom-model.bin")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        let config = ListenConfig {
+            fast_model: Some(
+                directory
+                    .path()
+                    .join("missing-custom-model.bin")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..ListenConfig::default()
+        };
 
         let error = resolve_fast_model_path(&config, &|| true)
             .expect_err("fallback cancellation must remain authoritative");

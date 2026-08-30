@@ -26,7 +26,8 @@
 #   exit1   -> generic stderr + exit 1
 #
 # Download-shape injection via URL query:
-#   fw_stub_ext=flv -> materialize and print the exact-id artifact with a .flv suffix
+#   fw_stub_ext=flv  -> materialize and print the exact-id artifact with a .flv suffix
+#   fw_stub_ext=json -> materialize and print a non-media sidecar path
 #
 # Override knobs (env):
 #   STUB_VERSION        version string printed for --version   (default 2025.01.01)
@@ -56,6 +57,7 @@ for arg in "$@"; do
     *fw_stub_fail=429*)     [ -n "$FAIL_MODE" ] || FAIL_MODE="429" ;;
     *fw_stub_fail=exit1*)   [ -n "$FAIL_MODE" ] || FAIL_MODE="exit1" ;;
     *fw_stub_ext=flv*)      OUTPUT_EXT="flv" ;;
+    *fw_stub_ext=json*)     OUTPUT_EXT="json" ;;
   esac
 done
 
