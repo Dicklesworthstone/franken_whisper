@@ -400,8 +400,21 @@ final class LabModel {
         let profileModelLabel = environment["FW_IOS_PROFILE_MODEL_LABEL"]
             ?? (requestedModelName == nil ? "tiny-multilingual-f16" : "custom")
         let profileModelSHA256 = environment["FW_IOS_PROFILE_MODEL_SHA256"]
-            ?? (requestedModelName == nil ? ModelManifest.tiny.sha256 : "host-verified")
+            ?? (requestedModelName == nil ? ModelManifest.tiny.sha256 : "unreported")
+        let profileModelSHA256Source = environment["FW_IOS_PROFILE_MODEL_SHA256"] == nil
+            ? (requestedModelName == nil ? "bundled-manifest" : "unreported")
+            : "host-provided"
         let profileDenoise = environment["FW_IOS_PROFILE_DENOISE"] == "1"
+        let requestedDenoiserName = environment["FW_IOS_PROFILE_DENOISER"]
+            .map { URL(fileURLWithPath: $0).lastPathComponent }
+        let profileDenoiserURL = requestedDenoiserName.map {
+            documents.appendingPathComponent($0)
+        } ?? store.url(for: ModelManifest.denoiser)
+        let profileDenoiserSHA256 = environment["FW_IOS_PROFILE_DENOISER_SHA256"]
+            ?? (requestedDenoiserName == nil ? ModelManifest.denoiser.sha256 : "unreported")
+        let profileDenoiserSHA256Source = environment["FW_IOS_PROFILE_DENOISER_SHA256"] == nil
+            ? (requestedDenoiserName == nil ? "bundled-manifest" : "unreported")
+            : "host-provided"
         let stamp = ISO8601DateFormatter().string(from: Date())
             .replacingOccurrences(of: ":", with: "-")
         let receiptURL = documents.appendingPathComponent(
@@ -428,14 +441,30 @@ final class LabModel {
         }
 
         do {
-            guard store.phase == .ready else {
-                throw EngineError.invalid("profiling requires all downloaded models")
+            guard FileManager.default.fileExists(atPath: profileModelURL.path) else {
+                throw EngineError.invalid(
+                    "profiling model is missing: \(profileModelURL.lastPathComponent)")
+            }
+            if profileDenoise,
+               !FileManager.default.fileExists(atPath: profileDenoiserURL.path)
+            {
+                throw EngineError.invalid(
+                    "profiling denoiser is missing: \(profileDenoiserURL.lastPathComponent)")
             }
             let fixtureData = try Data(contentsOf: fixtureURL, options: .mappedIfSafe)
             let pcm = try Self.decodeProfilePCM16MonoWav(fixtureData)
             let profileModelAttributes = try FileManager.default.attributesOfItem(
                 atPath: profileModelURL.path)
             let profileModelBytes = profileModelAttributes[.size] as? NSNumber
+            let profileDenoiserBytes: Int64
+            if profileDenoise {
+                let attributes = try FileManager.default.attributesOfItem(
+                    atPath: profileDenoiserURL.path)
+                profileDenoiserBytes = (attributes[.size] as? NSNumber)?.int64Value ?? -1
+            } else {
+                profileDenoiserBytes = requestedDenoiserName == nil
+                    ? ModelManifest.denoiser.bytes : -1
+            }
             let fixtureDigest = SHA256.hash(data: fixtureData)
                 .map { String(format: "%02x", $0) }.joined()
             let audioSeconds = Double(pcm.count) / 16_000.0
@@ -454,12 +483,14 @@ final class LabModel {
                     "filename": profileModelURL.lastPathComponent,
                     "bytes": profileModelBytes?.int64Value ?? -1,
                     "sha256": profileModelSHA256,
+                    "sha256_source": profileModelSHA256Source,
                 ] as [String: Any],
                 "denoiser": [
                     "enabled": profileDenoise,
-                    "relative_path": ModelManifest.denoiser.relativePath,
-                    "bytes": ModelManifest.denoiser.bytes,
-                    "sha256": ModelManifest.denoiser.sha256,
+                    "filename": profileDenoiserURL.lastPathComponent,
+                    "bytes": profileDenoiserBytes,
+                    "sha256": profileDenoiserSHA256,
+                    "sha256_source": profileDenoiserSHA256Source,
                 ] as [String: Any],
                 "rayon_threads": environment["RAYON_NUM_THREADS"] ?? "unset",
                 "arm_dotprod": environment["FW_ARM_DOTPROD"] ?? "unset",
@@ -476,6 +507,7 @@ final class LabModel {
                     "enhance_gru_accelerate": environment["FTTS_ENHANCE_GRU_ACCELERATE"] ?? "unset",
                     "enhance_conv_accelerate": environment["FTTS_ENHANCE_CONV_ACCELERATE"] ?? "unset",
                     "enhance_concat_accelerate": environment["FTTS_ENHANCE_CONCAT_ACCELERATE"] ?? "unset",
+                    "enhance_split_concat_accelerate": environment["FTTS_ENHANCE_SPLIT_CONCAT_ACCELERATE"] ?? "unset",
                 ] as [String: Any],
                 "device_model": UIDevice.current.model,
                 "system_version": UIDevice.current.systemVersion,
@@ -489,15 +521,15 @@ final class LabModel {
                 span: { span, value in spans.record(span: span, value: value) },
                 segments: nil
             )
-            let loadStarted = Date()
+            let loadStartedUptime = ProcessInfo.processInfo.systemUptime
             liveEngine.resetCancel()
             try await liveEngine.load(modelPath: profileModelURL)
             if profileDenoise {
-                try await liveEngine.loadDenoiser(at: store.url(for: ModelManifest.denoiser))
+                try await liveEngine.loadDenoiser(at: profileDenoiserURL)
             }
             try appendReceipt([
                 "event": "engine_loaded",
-                "load_ms": Date().timeIntervalSince(loadStarted) * 1_000,
+                "load_ms": (ProcessInfo.processInfo.systemUptime - loadStartedUptime) * 1_000,
                 "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
             ])
 
@@ -514,14 +546,15 @@ final class LabModel {
             for index in 0..<runs {
                 spans.reset()
                 liveEngine.resetCancel()
-                let wallStarted = Date()
-                let stageStarted = Date()
+                let wallStartedUptime = ProcessInfo.processInfo.systemUptime
+                let stageStartedUptime = ProcessInfo.processInfo.systemUptime
                 let stage = try await liveEngine.stage(pcm: pcm, denoise: profileDenoise)
-                let stageMs = Date().timeIntervalSince(stageStarted) * 1_000
-                let runStarted = Date()
+                let stageMs =
+                    (ProcessInfo.processInfo.systemUptime - stageStartedUptime) * 1_000
+                let runStartedUptime = ProcessInfo.processInfo.systemUptime
                 let transcription = try await liveEngine.run(options: options)
-                let runMs = Date().timeIntervalSince(runStarted) * 1_000
-                let wallMs = Date().timeIntervalSince(wallStarted) * 1_000
+                let runMs = (ProcessInfo.processInfo.systemUptime - runStartedUptime) * 1_000
+                let wallMs = (ProcessInfo.processInfo.systemUptime - wallStartedUptime) * 1_000
                 let transcriptData = Data(transcription.transcript.utf8)
                 let transcriptDigest = SHA256.hash(data: transcriptData)
                     .map { String(format: "%02x", $0) }.joined()
