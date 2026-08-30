@@ -27,17 +27,15 @@ enum Lab {
 #endif
     }
 
-    /// Deterministic per-speaker tint: the same speaker always gets the same
-    /// color within a transcript, like the CLI's TUI.
+    /// Deterministic per-speaker tint shared by the transcript, HTML export,
+    /// subtitle preview, and burned video. Numeric `SPEAKER_NN` lanes keep
+    /// their intuitive first-appearance order; arbitrary lane IDs use FNV-1a.
+    static func speakerUIColor(_ speaker: String?) -> UIColor {
+        SubtitleSpeakerPalette.uiColor(for: speaker)
+    }
+
     static func speakerColor(_ speaker: String?) -> Color {
-        guard let speaker, !speaker.isEmpty else { return textSecondary }
-        let palette: [Color] = [emerald, violet, amber, Color(red: 0.38, green: 0.72, blue: 0.96),
-                                Color(red: 0.96, green: 0.55, blue: 0.73)]
-        var hash: UInt32 = 2_166_136_261
-        for byte in speaker.utf8 {
-            hash = (hash ^ UInt32(byte)) &* 16_777_619
-        }
-        return palette[Int(hash % UInt32(palette.count))]
+        Color(speakerUIColor(speaker))
     }
 }
 

@@ -60,4 +60,73 @@ final class SubtitleTimelineTests: XCTestCase {
         XCTAssertEqual(shifted[0].words[0].startSec, 1.95, accuracy: 0.000_1)
         XCTAssertEqual(shifted[0].words[0].endSec, 2.37, accuracy: 0.000_1)
     }
+
+    func testSpeakerChangesSplitCuesAndOnlyExplicitNamesAreDisplayed() {
+        let words = [
+            [
+                Timing(text: "first", startSec: 0, endSec: 0.35),
+                Timing(text: "voice", startSec: 0.4, endSec: 0.75)
+            ],
+            [
+                Timing(text: "second", startSec: 0.8, endSec: 1.15),
+                Timing(text: "voice", startSec: 1.2, endSec: 1.55)
+            ]
+        ]
+
+        let cues = SubtitleTimeline.makeCues(
+            from: words,
+            segmentSpeakers: ["SPEAKER_00", "SPEAKER_01"],
+            speakerNames: ["SPEAKER_01": "Sarah"]
+        )
+
+        XCTAssertEqual(cues.count, 2)
+        XCTAssertEqual(cues[0].speaker?.laneID, "SPEAKER_00")
+        XCTAssertNil(cues[0].speaker?.displayName, "Anonymous lanes are color-only")
+        XCTAssertEqual(cues[1].speaker?.laneID, "SPEAKER_01")
+        XCTAssertEqual(cues[1].speaker?.displayName, "Sarah")
+    }
+
+    func testPunctuationDoesNotCrossAChangeOfSpeaker() {
+        let words = [
+            [Timing(text: "hello", startSec: 0, endSec: 0.35)],
+            [
+                Timing(text: "—", startSec: 0.4, endSec: 0.45),
+                Timing(text: "goodbye", startSec: 0.46, endSec: 0.9)
+            ]
+        ]
+
+        let cues = SubtitleTimeline.makeCues(
+            from: words,
+            segmentSpeakers: ["SPEAKER_00", "SPEAKER_01"]
+        )
+
+        XCTAssertEqual(cues.count, 2)
+        XCTAssertEqual(cues[0].text, "hello")
+        XCTAssertEqual(cues[1].text, "— goodbye")
+        XCTAssertEqual(cues[1].speaker?.laneID, "SPEAKER_01")
+    }
+
+    func testSpeakerSpanFallbackPrefersGreatestOverlapThenConfidence() {
+        let words = [[Timing(text: "hello", startSec: 0.4, endSec: 0.8)]]
+        let cues = SubtitleTimeline.makeCues(
+            from: words,
+            segmentSpeakers: [],
+            speakerSpans: [
+                SubtitleSpeakerSpan(
+                    startSec: 0.0,
+                    endSec: 0.6,
+                    laneID: "SPEAKER_00",
+                    confidence: 0.99
+                ),
+                SubtitleSpeakerSpan(
+                    startSec: 0.45,
+                    endSec: 0.9,
+                    laneID: "SPEAKER_01",
+                    confidence: 0.50
+                )
+            ]
+        )
+
+        XCTAssertEqual(cues.first?.speaker?.laneID, "SPEAKER_01")
+    }
 }

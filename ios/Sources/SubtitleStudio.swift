@@ -151,11 +151,31 @@ struct SubtitleStudio: View {
 
     private let cues: [SubtitleCue]
 
-    init(video: VideoInput, result: Transcription) {
+    init(
+        video: VideoInput,
+        result: Transcription,
+        speakerNames: [String: String] = [:]
+    ) {
         self.video = video
         self.result = result
         cues = SubtitleTimeline.offset(
-            SubtitleTimeline.makeCues(from: result.words),
+            SubtitleTimeline.makeCues(
+                from: result.words,
+                segmentSpeakers: result.segments.map(\.speaker),
+                speakerSpans: result.speakerSegments.compactMap { run in
+                    guard let start = run.startSec,
+                          let end = run.endSec,
+                          let lane = run.speaker
+                    else { return nil }
+                    return SubtitleSpeakerSpan(
+                        startSec: start,
+                        endSec: end,
+                        laneID: lane,
+                        confidence: run.speakerConfidence ?? 0
+                    )
+                },
+                speakerNames: speakerNames
+            ),
             by: video.audioTimelineOffset
         )
         _player = State(initialValue: AVPlayer(url: video.videoURL))
@@ -229,6 +249,14 @@ struct SubtitleStudio: View {
             )
             .font(.system(size: Lab.typeSize(12)))
             .foregroundStyle(Lab.textSecondary)
+            if cues.contains(where: { $0.speaker != nil }) {
+                Text(
+                    "Diarized voices keep distinct colors throughout the video. "
+                        + "A speaker label appears only when you assigned that voice a name."
+                )
+                .font(.system(size: Lab.typeSize(12)))
+                .foregroundStyle(Lab.textSecondary)
+            }
         }
         .padding(14)
         .background(Lab.panel.opacity(0.92), in: RoundedRectangle(cornerRadius: 14))
@@ -308,7 +336,9 @@ struct SubtitleStudio: View {
 
                 ColorPicker("Text color", selection: resetting($textColor), supportsOpacity: false)
                 ColorPicker(
-                    "Karaoke highlight",
+                    cues.contains(where: { $0.speaker != nil })
+                        ? "Fallback karaoke highlight"
+                        : "Karaoke highlight",
                     selection: resetting($highlightColor),
                     supportsOpacity: false
                 )
@@ -389,41 +419,62 @@ struct SubtitleStudio: View {
     }
 
     private func previewCaption(_ cue: SubtitleCue, at seconds: Double) -> some View {
-        KaraokeWordWrap(horizontalSpacing: 2, verticalSpacing: 3) {
-            ForEach(cue.words) { word in
-                let active = seconds >= word.startSec && seconds < word.endSec
-                Text(word.text)
-                    .font(fontChoice.swiftUIFont(size: CGFloat(min(36, fontSize * 0.56))))
-                    .foregroundStyle(active ? contrastingColor(for: highlightColor) : textColor)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 3)
-                    .background {
-                        Capsule(style: .continuous)
-                            .fill(
-                                active
-                                    ? AnyShapeStyle(
-                                        LinearGradient(
-                                            colors: [highlightColor.opacity(0.78), highlightColor],
-                                            startPoint: .bottomLeading,
-                                            endPoint: .topTrailing
+        let accent = cue.speaker.map { Lab.speakerColor($0.laneID) } ?? highlightColor
+        return VStack(spacing: 5) {
+            if let name = cue.speaker?.displayName {
+                Text(name)
+                    .font(.system(size: Lab.typeSize(11), weight: .black, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+                    .foregroundStyle(contrastingColor(for: accent))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(accent, in: Capsule(style: .continuous))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            KaraokeWordWrap(horizontalSpacing: 2, verticalSpacing: 3) {
+                ForEach(cue.words) { word in
+                    let active = seconds >= word.startSec && seconds < word.endSec
+                    Text(word.text)
+                        .font(fontChoice.swiftUIFont(size: CGFloat(min(36, fontSize * 0.56))))
+                        .foregroundStyle(active ? contrastingColor(for: accent) : textColor)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 3)
+                        .background {
+                            Capsule(style: .continuous)
+                                .fill(
+                                    active
+                                        ? AnyShapeStyle(
+                                            LinearGradient(
+                                                colors: [accent.opacity(0.78), accent],
+                                                startPoint: .bottomLeading,
+                                                endPoint: .topTrailing
+                                            )
                                         )
-                                    )
-                                    : AnyShapeStyle(Color.clear)
-                            )
-                            .shadow(
-                                color: active ? highlightColor.opacity(0.62) : .clear,
-                                radius: active ? 6 : 0
-                            )
-                    }
-                    .scaleEffect(active ? 1.08 : 1)
-                    .animation(.spring(response: 0.20, dampingFraction: 0.62), value: active)
-                    .shadow(color: .black.opacity(0.96), radius: 2, x: 0, y: 1)
+                                        : AnyShapeStyle(Color.clear)
+                                )
+                                .shadow(
+                                    color: active ? accent.opacity(0.62) : .clear,
+                                    radius: active ? 6 : 0
+                                )
+                        }
+                        .scaleEffect(active ? 1.08 : 1)
+                        .animation(.spring(response: 0.20, dampingFraction: 0.62), value: active)
+                        .shadow(color: .black.opacity(0.96), radius: 2, x: 0, y: 1)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.black.opacity(backgroundOpacity), in: RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.black.opacity(backgroundOpacity), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            if cue.speaker != nil {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(accent.opacity(0.62), lineWidth: 1.5)
+            }
+        }
     }
 
     private func contrastingColor(for color: Color) -> Color {

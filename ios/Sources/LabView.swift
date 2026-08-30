@@ -152,7 +152,11 @@ struct LabView: View {
         }
         .sheet(isPresented: $showSubtitleStudio) {
             if let video = model.videoInput, let result = model.result {
-                SubtitleStudio(video: video, result: result)
+                SubtitleStudio(
+                    video: video,
+                    result: result,
+                    speakerNames: model.speakerNameMap
+                )
             }
         }
         .confirmationDialog(

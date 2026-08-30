@@ -204,13 +204,39 @@ enum SubtitleVideoExporter {
             )
             guard !lines.isEmpty else { continue }
 
+            let speakerAccent = cue.speaker.map { SubtitleSpeakerPalette.uiColor(for: $0.laneID) }
+                ?? style.highlightColor
+            let speakerFont = style.font.uiFont(size: max(14, font.pointSize * 0.48))
+            let speakerLabel = cue.speaker?.displayName.flatMap { rawName -> String? in
+                let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { return nil }
+                return fittedLabel(
+                    name,
+                    font: speakerFont,
+                    maximumWidth: renderSize.width * 0.38
+                )
+            }
+            let speakerLabelSize = speakerLabel.map {
+                ($0 as NSString).size(withAttributes: [.font: speakerFont])
+            }
+            let speakerLabelHorizontalPadding = speakerFont.pointSize * 0.76
+            let speakerLabelWidth = speakerLabelSize.map {
+                $0.width + speakerLabelHorizontalPadding * 2
+            } ?? 0
+            let speakerLabelHeight = speakerLabelSize.map {
+                max($0.height * 1.34, speakerFont.lineHeight * 1.25)
+            } ?? 0
+
             let lineHeight = font.lineHeight * 1.16
             let contentHeight = CGFloat(lines.count) * lineHeight
                 + CGFloat(max(0, lines.count - 1)) * lineGap
             let boxWidth = min(
                 renderSize.width * 0.92,
-                (lines.map { lineWidth($0, spacing: spacing) }.max() ?? 0)
-                    + horizontalPadding * 2
+                max(
+                    (lines.map { lineWidth($0, spacing: spacing) }.max() ?? 0)
+                        + horizontalPadding * 2,
+                    speakerLabelWidth + horizontalPadding
+                )
             )
             let boxHeight = contentHeight + verticalPadding * 2
             let boxX = (renderSize.width - boxWidth) / 2
@@ -230,7 +256,7 @@ enum SubtitleVideoExporter {
                 forKey: "cueEntrance"
             )
 
-            if style.backgroundOpacity > 0.001 {
+            if style.backgroundOpacity > 0.001 || cue.speaker != nil {
                 let background = CALayer()
                 background.frame = CGRect(x: boxX, y: boxY, width: boxWidth, height: boxHeight)
                 background.backgroundColor = UIColor.black
@@ -240,7 +266,38 @@ enum SubtitleVideoExporter {
                 background.shadowOpacity = 0.45
                 background.shadowRadius = font.pointSize * 0.18
                 background.shadowOffset = CGSize(width: 0, height: -font.pointSize * 0.04)
+                if cue.speaker != nil {
+                    background.borderColor = speakerAccent.withAlphaComponent(0.72).cgColor
+                    background.borderWidth = max(1.5, font.pointSize * 0.035)
+                }
                 container.addSublayer(background)
+            }
+
+            // Anonymous diarization lanes affect color only. A badge is drawn
+            // exclusively for an explicit user-supplied name; raw lane IDs and
+            // synthetic "Unidentified N" labels never enter the video.
+            if let speakerLabel, speakerLabelHeight > 0 {
+                let badgeFrame = CGRect(
+                    x: boxX + horizontalPadding * 0.55,
+                    y: boxY + boxHeight + font.pointSize * 0.12,
+                    width: min(speakerLabelWidth, boxWidth - horizontalPadding),
+                    height: speakerLabelHeight
+                )
+                let badge = karaokePill(
+                    frame: badgeFrame,
+                    color: speakerAccent,
+                    fontSize: speakerFont.pointSize
+                )
+                container.addSublayer(badge)
+                container.addSublayer(
+                    textLayer(
+                        text: speakerLabel,
+                        font: speakerFont,
+                        color: contrastingTextColor(for: speakerAccent),
+                        frame: badgeFrame,
+                        strokeWidth: 0
+                    )
+                )
             }
 
             for (lineIndex, line) in lines.enumerated() {
@@ -270,7 +327,7 @@ enum SubtitleVideoExporter {
                     let pillFrame = frame.insetBy(dx: -pillInset, dy: -pillInset * 0.45)
                     let pill = karaokePill(
                         frame: pillFrame,
-                        color: style.highlightColor,
+                        color: speakerAccent,
                         fontSize: font.pointSize
                     )
                     pill.opacity = 0
@@ -291,7 +348,7 @@ enum SubtitleVideoExporter {
                     let highlight = textLayer(
                         text: measured.word.text,
                         font: font,
-                        color: contrastingTextColor(for: style.highlightColor),
+                        color: contrastingTextColor(for: speakerAccent),
                         frame: frame,
                         strokeWidth: 0
                     )
@@ -344,6 +401,27 @@ enum SubtitleVideoExporter {
     private static func lineWidth(_ line: [MeasuredWord], spacing: CGFloat) -> CGFloat {
         line.reduce(0) { $0 + $1.size.width }
             + CGFloat(max(0, line.count - 1)) * spacing
+    }
+
+    private static func fittedLabel(
+        _ label: String,
+        font: UIFont,
+        maximumWidth: CGFloat
+    ) -> String {
+        guard maximumWidth > 0 else { return "" }
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        if (label as NSString).size(withAttributes: attributes).width <= maximumWidth {
+            return label
+        }
+        var candidate = label
+        while candidate.count > 1 {
+            candidate.removeLast()
+            let truncated = candidate.trimmingCharacters(in: .whitespaces) + "\u{2026}"
+            if (truncated as NSString).size(withAttributes: attributes).width <= maximumWidth {
+                return truncated
+            }
+        }
+        return "\u{2026}"
     }
 
     private static func textLayer(
