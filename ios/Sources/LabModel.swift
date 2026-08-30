@@ -382,6 +382,8 @@ final class LabModel {
     func runProfilingBenchmarkIfRequested() async {
         let environment = ProcessInfo.processInfo.environment
         guard environment["FW_IOS_PROFILE"] == "1" else { return }
+        liveEngineGeneration += 1
+        let lifecycleToken = UInt64(liveEngineGeneration)
 
         let requestedRuns = Int(environment["FW_IOS_PROFILE_RUNS"] ?? "20") ?? 20
         let runs = max(1, min(100, requestedRuns))
@@ -523,7 +525,10 @@ final class LabModel {
             )
             let loadStartedUptime = ProcessInfo.processInfo.systemUptime
             liveEngine.resetCancel()
-            try await liveEngine.load(modelPath: profileModelURL)
+            try await liveEngine.load(
+                modelPath: profileModelURL,
+                lifecycleToken: lifecycleToken
+            )
             if profileDenoise {
                 try await liveEngine.loadDenoiser(at: profileDenoiserURL)
             }
@@ -724,7 +729,10 @@ final class LabModel {
         Task { [liveEngine] in
             do {
                 liveEngine.resetCancel()
-                try await liveEngine.load(modelPath: modelURL)
+                try await liveEngine.load(
+                    modelPath: modelURL,
+                    lifecycleToken: UInt64(gen)
+                )
                 guard self.liveEngineGeneration == gen else { return }
                 self.liveEngineState = .ready
                 if self.keyboardStartPending {
@@ -772,7 +780,10 @@ final class LabModel {
                 // Cancellation is process-wide and sticky; a run cancelled
                 // earlier must not fail the Sortformer load's checkpoints.
                 engine.resetCancel()
-                try await engine.load(modelPath: whisper)
+                try await engine.load(
+                    modelPath: whisper,
+                    lifecycleToken: UInt64(gen)
+                )
                 // The diarizer and denoiser are enhancements: a failure there
                 // degrades (no speakers / no clean-up) instead of blocking
                 // transcription. Their absence is visible in the UI.
@@ -820,9 +831,11 @@ final class LabModel {
         guard !isBusy, !recorder.isRecording else { return }
         generation += 1
         liveEngineGeneration += 1
+        let batchLifecycleToken = UInt64(generation)
+        let liveLifecycleToken = UInt64(liveEngineGeneration)
         Task { [engine, liveEngine] in
-            await engine.unload()
-            await liveEngine.unload()
+            await engine.unload(lifecycleToken: batchLifecycleToken)
+            await liveEngine.unload(lifecycleToken: liveLifecycleToken)
         }
         engineState = .notLoaded
         liveEngineState = .notLoaded
@@ -839,11 +852,12 @@ final class LabModel {
         generation += 1
         liveEngineGeneration += 1
         let gen = generation
+        let liveGen = liveEngineGeneration
         engineState = .loading(stage: "clearing the machine")
         liveEngineState = .loading(stage: "clearing the realtime model")
         Task { [engine, liveEngine] in
-            await engine.unload()
-            await liveEngine.unload()
+            await engine.unload(lifecycleToken: UInt64(gen))
+            await liveEngine.unload(lifecycleToken: UInt64(liveGen))
             guard self.generation == gen else { return }
             await self.store.clear()
             self.diarizerLoaded = false

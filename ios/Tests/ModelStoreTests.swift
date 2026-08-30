@@ -8,6 +8,15 @@ enum EngineError: Error {
 }
 
 final class ModelStoreTests: XCTestCase {
+    func testEngineLifecycleFenceRejectsDelayedOlderUnload() {
+        var fence = EngineLifecycleFence()
+
+        XCTAssertTrue(fence.accept(8))
+        XCTAssertTrue(fence.accept(9))
+        XCTAssertFalse(fence.accept(8))
+        XCTAssertEqual(fence.latestToken, 9)
+    }
+
     func testValidPartialResponseAcceptsExactReturnedRange() throws {
         let response = try httpResponse(
             status: 206,

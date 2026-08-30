@@ -2223,8 +2223,12 @@ impl ConfirmLane {
                                 {
                                     let mut state =
                                         queue_mtx.lock().expect("confirm queue poisoned");
+                                    // Disable submissions while holding the same mutex used by
+                                    // `submit`. If shutdown were published after releasing this
+                                    // lock, a producer could enqueue between `clear` and the
+                                    // worker's exit, stranding a job in a lane with no consumer.
+                                    state.shutdown = true;
                                     state.jobs.clear();
-                                    drop(state);
                                     worker_depth.store(0, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 break;
@@ -4611,6 +4615,9 @@ mod tests {
                 .any(|e| matches!(e, ConfirmLaneEvent::Verdict(_))),
             "lane disabled: no verdicts"
         );
+        // Once the worker disables itself, later producers must not be able to strand new work
+        // in its now-consumerless queue.
+        lane.submit(fake_job(3, "submitted after disable"));
         // The handle still drains cleanly (session keeps running fast-only).
         let (extra, abandoned) = lane.drain(0.05);
         assert_eq!(abandoned, 0);

@@ -17,6 +17,16 @@ settings:
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: AU8V2Z6NKY
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+schemes:
+  FrankenWhisper:
+    build:
+      targets:
+        FrankenWhisper: all
+        FrankenWhisperTests: [test]
+    test:
+      targets:
+        - FrankenWhisperTests
+        - FrankenWhisperUITests
 targets:
   FrankenWhisper:
     type: application

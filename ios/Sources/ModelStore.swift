@@ -12,6 +12,20 @@
 import CryptoKit
 import Foundation
 
+/// Rejects lifecycle messages that arrive at an engine actor after a newer
+/// user intent. Unstructured task creation order is not actor mailbox order.
+/// This small value type lives with the testable storage primitives so the
+/// exact production ordering rule is exercised without loading native models.
+struct EngineLifecycleFence {
+    private(set) var latestToken: UInt64 = 0
+
+    mutating func accept(_ token: UInt64) -> Bool {
+        guard token >= latestToken else { return false }
+        latestToken = token
+        return true
+    }
+}
+
 struct ModelFile {
     let label: String
     /// Where the app keeps the file, relative to the model directory.

@@ -179,6 +179,8 @@ struct RunOptions {
 /// cooperative-pool thread — the same accepted tradeoff as FrankenTTS.
 actor Engine {
     private var handle: OpaquePointer?
+    private var loadedModel: URL?
+    private var lifecycleFence = EngineLifecycleFence()
 
     static func decoder() -> JSONDecoder {
         let decoder = JSONDecoder()
@@ -192,13 +194,23 @@ actor Engine {
 
     /// Hydrates the whisper model from its ggml file. Multi-second on a
     /// phone; the caller watches EngineHooks for "whisper:*" stage markers.
-    func load(modelPath: URL) throws {
-        guard handle == nil else { return }
+    func load(modelPath: URL, lifecycleToken: UInt64) throws {
+        guard lifecycleFence.accept(lifecycleToken) else {
+            throw EngineError.invalid("engine lifecycle operation was superseded")
+        }
+        let requestedModel = modelPath.standardizedFileURL
+        if handle != nil, loadedModel == requestedModel { return }
+        // The physical-device profiler and realtime lane can request different
+        // model files. A non-nil handle is idempotent only for the same file.
+        if let handle { fw_engine_close(handle) }
+        handle = nil
+        loadedModel = nil
         _ = EngineHooks.install
         guard let opened = fw_engine_open(modelPath.path) else {
             throw EngineError.lastFromNative(code: 3)
         }
         handle = opened
+        loadedModel = requestedModel
     }
 
     /// Authenticate + load the Sortformer diarizer (receipt + package paths).
@@ -216,11 +228,15 @@ actor Engine {
 
     /// Drops everything (model, diarizer, denoiser, staged PCM), freeing
     /// ~1.5 GB. Safe to call at any idle moment; the next run reloads.
-    func unload() {
+    func unload(lifecycleToken: UInt64) {
+        // A delayed memory-pressure task must not close a model claimed by a
+        // newer foreground assembly that happened to reach this actor first.
+        guard lifecycleFence.accept(lifecycleToken) else { return }
         if let handle {
             fw_engine_close(handle)
         }
         handle = nil
+        loadedModel = nil
     }
 
     /// Stage microphone PCM (16 kHz mono, [-1, 1]) for the next run.

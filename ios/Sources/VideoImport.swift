@@ -65,6 +65,22 @@ enum VideoImportError: LocalizedError {
 enum VideoImportService {
     private static let directoryName = "VideoImports"
 
+    /// AVAssetExportSession is Objective-C and lacks a Sendable annotation,
+    /// while task cancellation may arrive from any executor. Its cancellation
+    /// entry point is explicitly thread-safe; keep that unchecked boundary
+    /// immutable and confined to this wrapper.
+    private final class ExportCancellation: @unchecked Sendable {
+        private let exporter: AVAssetExportSession
+
+        init(_ exporter: AVAssetExportSession) {
+            self.exporter = exporter
+        }
+
+        func cancel() {
+            exporter.cancelExport()
+        }
+    }
+
     static func prepareExternalVideo(_ source: URL) async throws -> VideoInput {
         let managed = try await Task.detached(priority: .userInitiated) {
             try copyIntoWorkspace(source)
@@ -201,12 +217,26 @@ enum VideoImportService {
         exporter.outputURL = destination
         exporter.outputFileType = .m4a
         exporter.shouldOptimizeForNetworkUse = false
+        let cancellation = ExportCancellation(exporter)
 
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            exporter.exportAsynchronously {
-                continuation.resume()
+        try Task.checkCancellation()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                exporter.exportAsynchronously {
+                    continuation.resume()
+                }
+                // Cancellation can race the tiny gap between the outer
+                // preflight check and starting the Objective-C export. Recheck
+                // after registration so that either side of that boundary
+                // reliably reaches `cancelExport()`.
+                if Task.isCancelled {
+                    cancellation.cancel()
+                }
             }
+        } onCancel: {
+            cancellation.cancel()
         }
+        try Task.checkCancellation()
         switch exporter.status {
         case .completed:
             return
