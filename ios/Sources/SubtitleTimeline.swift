@@ -33,6 +33,16 @@ struct SubtitleSpeakerSpan: Hashable {
     var confidence: Double
 }
 
+/// A diarizer-observed interval containing actual speech. Decoder DTW can
+/// occasionally pin a boundary word to the edge of a 30-second Whisper window,
+/// making that one word swallow several seconds of leading or trailing silence.
+/// These spans are used only to trim those pathological silent tails; normal
+/// word alignment remains the decoder's unmodified timing.
+struct SubtitleSpeechSpan: Hashable {
+    var startSec: Double
+    var endSec: Double
+}
+
 enum SubtitleSpeakerPalette {
     static func uiColor(for speaker: String?) -> UIColor {
         guard let speaker, !speaker.isEmpty else {
@@ -86,13 +96,17 @@ enum SubtitleTimeline {
         from nestedWords: [[T]]?,
         segmentSpeakers: [String?],
         speakerSpans: [SubtitleSpeakerSpan] = [],
+        speechSpans: [SubtitleSpeechSpan] = [],
         speakerNames: [String: String] = [:]
     ) -> [SubtitleCue] {
-        let flattened = flattenedWords(
-            from: nestedWords,
-            segmentSpeakers: segmentSpeakers,
-            speakerSpans: speakerSpans,
-            speakerNames: speakerNames
+        let flattened = trimPathologicalSilentTails(
+            in: flattenedWords(
+                from: nestedWords,
+                segmentSpeakers: segmentSpeakers,
+                speakerSpans: speakerSpans,
+                speakerNames: speakerNames
+            ),
+            speechSpans: speechSpans
         )
 
         var cues: [SubtitleCue] = []
@@ -169,6 +183,62 @@ enum SubtitleTimeline {
             }
         }
         return flattened
+    }
+
+    /// Keep genuine DTW timing authoritative unless a word spends both a
+    /// substantial absolute duration and a substantial fraction of its span
+    /// outside speech detected by Sortformer. The best-overlap turn is used
+    /// rather than the union of turns, so a single malformed word cannot bridge
+    /// multiple seconds of silence between two separate utterances.
+    private static func trimPathologicalSilentTails(
+        in words: [SubtitleTimelineWord],
+        speechSpans: [SubtitleSpeechSpan]
+    ) -> [SubtitleTimelineWord] {
+        guard !speechSpans.isEmpty else { return words }
+        let validSpans = speechSpans.filter {
+            $0.startSec.isFinite
+                && $0.endSec.isFinite
+                && $0.startSec >= 0
+                && $0.endSec > $0.startSec
+        }
+        guard !validSpans.isEmpty else { return words }
+
+        return words.map { word in
+            let duration = word.endSec - word.startSec
+            guard duration > 0 else { return word }
+
+            let candidate = validSpans.compactMap { span -> (SubtitleSpeechSpan, Double)? in
+                let overlap = min(word.endSec, span.endSec) - max(word.startSec, span.startSec)
+                return overlap > 0 ? (span, overlap) : nil
+            }
+            .max { lhs, rhs in lhs.1 < rhs.1 }
+
+            guard let (span, overlap) = candidate else { return word }
+            let outsideSpeech = duration - overlap
+            guard outsideSpeech >= 0.45,
+                  outsideSpeech / duration >= 0.35
+            else { return word }
+
+            var correctedStart = max(word.startSec, span.startSec)
+            var correctedEnd = min(word.endSec, span.endSec)
+            guard correctedEnd > correctedStart else { return word }
+
+            // An 80 ms diarizer boundary can leave a clipped word too brief to
+            // read. Grow only inside the same proven speech turn, never back
+            // into the silence that triggered the correction.
+            let minimumReadableDuration = min(0.12, span.endSec - span.startSec)
+            if correctedEnd - correctedStart < minimumReadableDuration {
+                correctedStart = max(span.startSec, correctedEnd - minimumReadableDuration)
+                if correctedEnd - correctedStart < minimumReadableDuration {
+                    correctedEnd = min(span.endSec, correctedStart + minimumReadableDuration)
+                }
+            }
+
+            var corrected = word
+            corrected.startSec = correctedStart
+            corrected.endSec = correctedEnd
+            return corrected
+        }
     }
 
     /// Word alignment is relative to the extracted audio file. Restore the

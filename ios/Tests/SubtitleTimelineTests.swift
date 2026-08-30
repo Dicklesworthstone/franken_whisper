@@ -129,4 +129,31 @@ final class SubtitleTimelineTests: XCTestCase {
 
         XCTAssertEqual(cues.first?.speaker?.laneID, "SPEAKER_01")
     }
+
+    func testPathologicalDTWSilenceIsClampedToRealSpeechTurns() {
+        let cues = SubtitleTimeline.makeCues(
+            from: [[
+                Timing(text: "The", startSec: 0, endSec: 7.84),
+                Timing(text: "twelve", startSec: 7.84, endSec: 8.18),
+                Timing(text: "auto", startSec: 14.82, endSec: 16.0),
+                Timing(text: "healthy", startSec: 19.92, endSec: 21.0),
+            ]],
+            segmentSpeakers: [],
+            speechSpans: [
+                SubtitleSpeechSpan(startSec: 7.60, endSec: 8.96),
+                SubtitleSpeechSpan(startSec: 13.60, endSec: 14.88),
+                SubtitleSpeechSpan(startSec: 19.60, endSec: 20.96),
+            ]
+        )
+        let words = cues.flatMap(\.words)
+
+        XCTAssertEqual(words[0].startSec, 7.60, accuracy: 0.000_1)
+        XCTAssertEqual(words[0].endSec, 7.84, accuracy: 0.000_1)
+        XCTAssertEqual(words[1].startSec, 7.84, accuracy: 0.000_1)
+        XCTAssertEqual(words[1].endSec, 8.18, accuracy: 0.000_1)
+        XCTAssertEqual(words[2].startSec, 14.76, accuracy: 0.000_1)
+        XCTAssertEqual(words[2].endSec, 14.88, accuracy: 0.000_1)
+        XCTAssertEqual(words[3].startSec, 19.92, accuracy: 0.000_1)
+        XCTAssertEqual(words[3].endSec, 21.0, accuracy: 0.000_1)
+    }
 }

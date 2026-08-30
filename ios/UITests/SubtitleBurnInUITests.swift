@@ -6,6 +6,12 @@ final class SubtitleBurnInUITests: XCTestCase {
     }
 
     func testImportedPhotosVideoReachesRealSubtitleExporter() throws {
+        guard ProcessInfo.processInfo.environment["FW_SUBTITLE_E2E_SAMPLE_PHOTOS"] == "1" else {
+            throw XCTSkip(
+                "Ultra-stress E2E is opt-in: boot an isolated simulator, add the operator "
+                    + "sample with simctl addmedia, then set FW_SUBTITLE_E2E_SAMPLE_PHOTOS=1."
+            )
+        }
         let app = XCUIApplication()
         app.launchEnvironment["FW_SUBTITLE_E2E_CAPTURE"] = "1"
         app.launch()

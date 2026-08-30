@@ -174,6 +174,12 @@ struct SubtitleStudio: View {
                         confidence: run.speakerConfidence ?? 0
                     )
                 },
+                speechSpans: result.turns.compactMap { turn in
+                    let start = Double(turn.startMs) / 1_000
+                    let end = Double(turn.endMs) / 1_000
+                    guard start.isFinite, end.isFinite, end > start else { return nil }
+                    return SubtitleSpeechSpan(startSec: start, endSec: end)
+                },
                 speakerNames: speakerNames
             ),
             by: video.audioTimelineOffset
@@ -537,7 +543,7 @@ struct SubtitleStudio: View {
         )
 
 #if DEBUG
-        SubtitleE2ECapture.captureTimeline(cues, video: video)
+        SubtitleE2ECapture.captureTimeline(cues, video: video, result: result)
 #endif
 
         Task {
@@ -607,7 +613,11 @@ private enum SubtitleE2ECapture {
         ProcessInfo.processInfo.environment["FW_SUBTITLE_E2E_CAPTURE"] == "1"
     }
 
-    static func captureTimeline(_ cues: [SubtitleCue], video: VideoInput) {
+    static func captureTimeline(
+        _ cues: [SubtitleCue],
+        video: VideoInput,
+        result: Transcription
+    ) {
         guard isEnabled else { return }
         let cuePayload: [[String: Any]] = cues.map { cue in
             [
@@ -627,9 +637,16 @@ private enum SubtitleE2ECapture {
                 },
             ]
         }
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let resultPayload: Any = (try? encoder.encode(result))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) }
+            ?? NSNull()
         let payload: [String: Any] = [
             "videoFilename": video.videoURL.lastPathComponent,
+            "videoDuration": video.duration,
             "audioTimelineOffset": video.audioTimelineOffset,
+            "result": resultPayload,
             "cues": cuePayload,
         ]
         guard JSONSerialization.isValidJSONObject(payload),
