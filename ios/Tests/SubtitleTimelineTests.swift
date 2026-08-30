@@ -61,6 +61,22 @@ final class SubtitleTimelineTests: XCTestCase {
         XCTAssertEqual(shifted[0].words[0].endSec, 2.37, accuracy: 0.000_1)
     }
 
+    func testNegativeAudioTrackOffsetClipsOnlyAtTheVideoBoundary() {
+        let cues = SubtitleTimeline.makeCues(from: [[
+            Timing(text: "before", startSec: 0.10, endSec: 0.35),
+            Timing(text: "visible", startSec: 0.40, endSec: 0.80),
+        ]])
+
+        let shifted = SubtitleTimeline.offset(cues, by: -0.25)
+        let words = shifted.flatMap(\.words)
+
+        XCTAssertEqual(words.map(\.text), ["before", "visible"])
+        XCTAssertEqual(words[0].startSec, 0, accuracy: 0.000_1)
+        XCTAssertEqual(words[0].endSec, 0.10, accuracy: 0.000_1)
+        XCTAssertEqual(words[1].startSec, 0.15, accuracy: 0.000_1)
+        XCTAssertEqual(words[1].endSec, 0.55, accuracy: 0.000_1)
+    }
+
     func testSpeakerChangesSplitCuesAndOnlyExplicitNamesAreDisplayed() {
         let words = [
             [
@@ -130,6 +146,29 @@ final class SubtitleTimelineTests: XCTestCase {
         XCTAssertEqual(cues.first?.speaker?.laneID, "SPEAKER_01")
     }
 
+    func testSpeakerSpanFallbackTreatsFloatingPointTieAsAConfidenceTie() {
+        let cues = SubtitleTimeline.makeCues(
+            from: [[Timing(text: "hello", startSec: 0, endSec: 5)]],
+            segmentSpeakers: [],
+            speakerSpans: [
+                SubtitleSpeakerSpan(
+                    startSec: 0.5,
+                    endSec: 1.2,
+                    laneID: "SPEAKER_00",
+                    confidence: 0.95
+                ),
+                SubtitleSpeakerSpan(
+                    startSec: 3.8,
+                    endSec: 4.5,
+                    laneID: "SPEAKER_01",
+                    confidence: 0.20
+                ),
+            ]
+        )
+
+        XCTAssertEqual(cues.first?.speaker?.laneID, "SPEAKER_00")
+    }
+
     func testPathologicalDTWSilenceIsClampedToRealSpeechTurns() {
         let cues = SubtitleTimeline.makeCues(
             from: [[
@@ -155,5 +194,35 @@ final class SubtitleTimelineTests: XCTestCase {
         XCTAssertEqual(words[2].endSec, 14.88, accuracy: 0.000_1)
         XCTAssertEqual(words[3].startSec, 19.92, accuracy: 0.000_1)
         XCTAssertEqual(words[3].endSec, 21.0, accuracy: 0.000_1)
+    }
+
+    func testOverlappingSpeakerTurnsRemainOneContinuousSpeechRegion() throws {
+        let cues = SubtitleTimeline.makeCues(
+            from: [[Timing(text: "overlap", startSec: 0, endSec: 5.0)]],
+            segmentSpeakers: [],
+            speechSpans: [
+                SubtitleSpeechSpan(startSec: 0.70, endSec: 2.05),
+                SubtitleSpeechSpan(startSec: 1.55, endSec: 2.90),
+            ]
+        )
+
+        let word = try XCTUnwrap(cues.first?.words.first)
+        XCTAssertEqual(word.startSec, 0.70, accuracy: 0.000_1)
+        XCTAssertEqual(word.endSec, 2.90, accuracy: 0.000_1)
+    }
+
+    func testSeparatedSpeechTurnsNeverBridgeTheSilentGap() throws {
+        let cues = SubtitleTimeline.makeCues(
+            from: [[Timing(text: "boundary", startSec: 0, endSec: 5)]],
+            segmentSpeakers: [],
+            speechSpans: [
+                SubtitleSpeechSpan(startSec: 0.50, endSec: 1.20),
+                SubtitleSpeechSpan(startSec: 3.80, endSec: 4.50),
+            ]
+        )
+
+        let word = try XCTUnwrap(cues.first?.words.first)
+        XCTAssertEqual(word.startSec, 0.50, accuracy: 0.000_1)
+        XCTAssertEqual(word.endSec, 1.20, accuracy: 0.000_1)
     }
 }

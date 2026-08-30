@@ -16,6 +16,22 @@ private extension SubtitleFontChoice {
     }
 }
 
+private extension View {
+    @ViewBuilder
+    func subtitleE2ETimelineAccessibility(
+        cues: [SubtitleCue],
+        video: VideoInput
+    ) -> some View {
+#if DEBUG
+        accessibilityValue(
+            SubtitleE2ECapture.timelineAccessibilityValue(cues, video: video)
+        )
+#else
+        self
+#endif
+    }
+}
+
 private enum SubtitleStylePreset: String, CaseIterable, Identifiable {
     case monsterMint = "Monster Mint"
     case electricIce = "Electric Ice"
@@ -146,8 +162,10 @@ struct SubtitleStudio: View {
     @State private var selectedPreset: SubtitleStylePreset? = .monsterMint
     @State private var exportProgress = 0.0
     @State private var isExporting = false
+    @State private var isSavingToPhotos = false
     @State private var exportedURL: URL?
     @State private var message: String?
+    @State private var messageKind = StatusLine.Kind.neutral
 
     private let cues: [SubtitleCue]
 
@@ -194,6 +212,7 @@ struct SubtitleStudio: View {
                     preview
                     disclosure
                     controls
+                        .disabled(isExporting || isSavingToPhotos)
                     exportControls
                 }
                 .padding()
@@ -206,11 +225,11 @@ struct SubtitleStudio: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
-                        .disabled(isExporting)
+                        .disabled(isExporting || isSavingToPhotos)
                 }
             }
         }
-        .interactiveDismissDisabled(isExporting)
+        .interactiveDismissDisabled(isExporting || isSavingToPhotos)
         .tint(Lab.emerald)
         .onDisappear {
             player.pause()
@@ -382,7 +401,8 @@ struct SubtitleStudio: View {
             }
             .buttonStyle(PrimaryButtonStyle())
             .accessibilityIdentifier("fw.burnSubtitles")
-            .disabled(isExporting)
+            .subtitleE2ETimelineAccessibility(cues: cues, video: video)
+            .disabled(isExporting || isSavingToPhotos)
 
             if isExporting {
                 VStack(alignment: .leading, spacing: 7) {
@@ -402,7 +422,7 @@ struct SubtitleStudio: View {
             }
 
             if let message {
-                StatusLine(kind: exportedURL == nil ? .err : .ok, text: message)
+                StatusLine(kind: messageKind, text: message)
                     .accessibilityIdentifier("fw.subtitleExportStatus")
             }
         }
@@ -417,6 +437,7 @@ struct SubtitleStudio: View {
             Label("Share video", systemImage: "square.and.arrow.up")
         }
         .buttonStyle(GhostButtonStyle(tint: Lab.emerald))
+        .disabled(isSavingToPhotos)
 
         Button {
             saveToPhotos(url)
@@ -424,6 +445,7 @@ struct SubtitleStudio: View {
             Label("Save to Photos", systemImage: "photo.badge.arrow.down")
         }
         .buttonStyle(GhostButtonStyle())
+        .disabled(isSavingToPhotos)
     }
 
     private func previewCaption(_ cue: SubtitleCue, at seconds: Double) -> some View {
@@ -560,8 +582,10 @@ struct SubtitleStudio: View {
                 SubtitleE2ECapture.captureExportedVideo(at: url)
 #endif
                 exportProgress = 1
+                messageKind = .ok
                 message = "Captioned video ready — still entirely local."
             } catch {
+                messageKind = .err
                 message = "Could not render the captioned video: \(error.localizedDescription)"
             }
             isExporting = false
@@ -575,9 +599,21 @@ struct SubtitleStudio: View {
     }
 
     private func saveToPhotos(_ url: URL) {
+        guard !isSavingToPhotos else { return }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            messageKind = .err
+            message = "That rendered video is no longer available. Burn it again to save a fresh copy."
+            exportedURL = nil
+            return
+        }
+        isSavingToPhotos = true
+        messageKind = .neutral
+        message = "Saving the captioned video to Photos…"
         Task {
+            defer { isSavingToPhotos = false }
             let authorization = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
             guard authorization == .authorized || authorization == .limited else {
+                messageKind = .warn
                 message = "Photos access is off. You can still use Share video."
                 return
             }
@@ -596,8 +632,10 @@ struct SubtitleStudio: View {
                         }
                     }
                 }
+                messageKind = .ok
                 message = "Saved to Photos."
             } catch {
+                messageKind = .err
                 message = "Could not save to Photos: \(error.localizedDescription)"
             }
         }
@@ -660,6 +698,28 @@ private enum SubtitleE2ECapture {
               )
         else { return }
         try? data.write(to: destination, options: .atomic)
+    }
+
+    /// A compact assertion surface for the opt-in UI test. It observes the
+    /// timeline produced by the real imported video and native run; it neither
+    /// injects nor rewrites any production input or result.
+    static func timelineAccessibilityValue(
+        _ cues: [SubtitleCue],
+        video: VideoInput
+    ) -> String {
+        guard isEnabled else { return "" }
+        let words = cues.flatMap(\.words)
+        guard let first = words.map(\.startSec).min(),
+              let last = words.map(\.endSec).max()
+        else { return "words=0" }
+        return String(
+            format: "first=%.3f;last=%.3f;duration=%.3f;words=%d",
+            locale: Locale(identifier: "en_US_POSIX"),
+            first,
+            last,
+            video.duration,
+            words.count
+        )
     }
 
     static func captureExportedVideo(at source: URL) {

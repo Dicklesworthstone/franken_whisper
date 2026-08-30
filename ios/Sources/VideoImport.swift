@@ -78,7 +78,18 @@ enum VideoImportService {
     }
 
     static func preparePickedVideo(_ picked: PickedVideo) async throws -> VideoInput {
-        try await prepareManagedVideo(picked.localURL, displayName: picked.originalName)
+        do {
+            return try await prepareManagedVideo(
+                picked.localURL,
+                displayName: picked.originalName
+            )
+        } catch {
+            // FileRepresentation has already copied this item into our cache.
+            // If validation or audio extraction fails, no later owner exists to
+            // reclaim that private movie.
+            try? FileManager.default.removeItem(at: picked.localURL)
+            throw error
+        }
     }
 
     static func discard(_ input: VideoInput) {
@@ -152,8 +163,11 @@ enum VideoImportService {
             duration: seconds,
             displayWidth: displayWidth,
             displayHeight: displayHeight,
+            // Preserve negative edit-list starts as well as delayed audio. The
+            // timeline shifter clips captions at video time zero; clamping here
+            // would instead move every caption in an early-starting track late.
             audioTimelineOffset: audioTimeRange.start.seconds.isFinite
-                ? max(0, audioTimeRange.start.seconds)
+                ? audioTimeRange.start.seconds
                 : 0
         )
     }

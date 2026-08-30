@@ -9,7 +9,8 @@ final class SubtitleBurnInUITests: XCTestCase {
         guard ProcessInfo.processInfo.environment["FW_SUBTITLE_E2E_SAMPLE_PHOTOS"] == "1" else {
             throw XCTSkip(
                 "Ultra-stress E2E is opt-in: boot an isolated simulator, add the operator "
-                    + "sample with simctl addmedia, then set FW_SUBTITLE_E2E_SAMPLE_PHOTOS=1."
+                    + "sample with simctl addmedia, then set FW_SUBTITLE_E2E_SAMPLE_PHOTOS=1 "
+                    + "in that simulator's launchd environment."
             )
         }
         let app = XCUIApplication()
@@ -77,6 +78,20 @@ final class SubtitleBurnInUITests: XCTestCase {
 
         let burn = app.buttons["fw.burnSubtitles"]
         XCTAssertTrue(burn.waitForExistence(timeout: 30), "Subtitle Studio did not open")
+        let timeline = try parseTimeline(burn.value as? String ?? "")
+        XCTAssertTrue(
+            7.20...8.10 ~= timeline.first,
+            "The first real caption escaped the first speech turn: \(timeline)"
+        )
+        XCTAssertTrue(
+            60.50...61.40 ~= timeline.last,
+            "The final real caption escaped the final speech turn: \(timeline)"
+        )
+        XCTAssertTrue(
+            61.70...62.10 ~= timeline.duration,
+            "The Photos picker did not select the pinned 61.9-second operator video: \(timeline)"
+        )
+        XCTAssertGreaterThan(timeline.words, 40, "The native run returned an implausibly sparse timeline")
         burn.tap()
 
         let status = app.descendants(matching: .any)["fw.subtitleExportStatus"]
@@ -87,6 +102,29 @@ final class SubtitleBurnInUITests: XCTestCase {
         XCTAssertTrue(
             status.label.contains("ready"),
             "The production exporter reported failure: \(status.label)"
+        )
+    }
+
+    private func parseTimeline(_ raw: String) throws -> (
+        first: Double,
+        last: Double,
+        duration: Double,
+        words: Int
+    ) {
+        let fields = raw.split(separator: ";").reduce(into: [String: String]()) {
+            fields, field in
+                let pair = field.split(separator: "=", maxSplits: 1)
+                guard pair.count == 2 else { return }
+                fields[String(pair[0])] = String(pair[1])
+            }
+        return (
+            first: try XCTUnwrap(fields["first"].flatMap(Double.init), "Bad timeline: \(raw)"),
+            last: try XCTUnwrap(fields["last"].flatMap(Double.init), "Bad timeline: \(raw)"),
+            duration: try XCTUnwrap(
+                fields["duration"].flatMap(Double.init),
+                "Bad timeline: \(raw)"
+            ),
+            words: try XCTUnwrap(fields["words"].flatMap(Int.init), "Bad timeline: \(raw)")
         )
     }
 }

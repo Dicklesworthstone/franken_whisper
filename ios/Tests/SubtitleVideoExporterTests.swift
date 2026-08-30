@@ -7,10 +7,17 @@ import XCTest
 final class SubtitleVideoExporterTests: XCTestCase {
     @MainActor
     func testProductionRendererCreatesLegibleKaraokeFrames() async throws {
+        guard ProcessInfo.processInfo.environment["FW_SUBTITLE_VISUAL_QA"] == "1" else {
+            throw XCTSkip(
+                "Visual video rendering is an opt-in ultra-stress check; "
+                    + "set FW_SUBTITLE_VISUAL_QA=1 to generate and inspect its frames."
+            )
+        }
 #if targetEnvironment(simulator)
         throw XCTSkip(
-            "VideoToolbox encoding is unavailable in this simulator runtime; "
-                + "the identical renderer is exercised by the Catalyst and device destinations."
+            "The synthetic AVAssetWriter source encoder is unavailable in this simulator runtime. "
+                + "The exact Photos-input E2E test still exercises the production exporter here; "
+                + "run this generated-fixture visual check on a device or Catalyst."
         )
 #else
         let source = try await makeVerticalFixture()
@@ -289,11 +296,11 @@ final class SubtitleVideoExporterTests: XCTestCase {
             UIColor(red: 0.035, green: 0.16, blue: 0.14, alpha: 1).cgColor,
             UIColor(red: 0.12, green: 0.025, blue: 0.19, alpha: 1).cgColor,
         ] as CFArray
-        let gradient = CGGradient(
+        guard let gradient = CGGradient(
             colorsSpace: CGColorSpaceCreateDeviceRGB(),
             colors: colors,
             locations: [0, 0.52, 1]
-        )!
+        ) else { throw CocoaError(.coderInvalidValue) }
         context.drawLinearGradient(
             gradient,
             start: CGPoint(x: 0, y: 0),

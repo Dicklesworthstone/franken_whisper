@@ -56,7 +56,8 @@ enum SubtitleSpeakerPalette {
             UIColor(red: 0.655, green: 0.545, blue: 0.98, alpha: 1)
         ]
         if let lane = speaker.split(separator: "_").last.flatMap({ Int($0) }) {
-            return palette[lane % palette.count]
+            let index = ((lane % palette.count) + palette.count) % palette.count
+            return palette[index]
         }
         var hash: UInt32 = 2_166_136_261
         for byte in speaker.utf8 {
@@ -70,8 +71,8 @@ struct SubtitleCue: Identifiable, Hashable {
     let id: Int
     var words: [SubtitleTimelineWord]
 
-    var startSec: Double { words.first?.startSec ?? 0 }
-    var endSec: Double { words.last?.endSec ?? startSec }
+    var startSec: Double { words.map(\.startSec).min() ?? 0 }
+    var endSec: Double { words.map(\.endSec).max() ?? startSec }
     var text: String { words.map(\.text).joined(separator: " ") }
     var speaker: SubtitleSpeaker? { words.first?.speaker }
 }
@@ -187,9 +188,10 @@ enum SubtitleTimeline {
 
     /// Keep genuine DTW timing authoritative unless a word spends both a
     /// substantial absolute duration and a substantial fraction of its span
-    /// outside speech detected by Sortformer. The best-overlap turn is used
-    /// rather than the union of turns, so a single malformed word cannot bridge
-    /// multiple seconds of silence between two separate utterances.
+    /// outside speech detected by Sortformer. Overlapping or frame-adjacent
+    /// speaker turns are first coalesced into connected speech regions. This
+    /// preserves simultaneous speakers and continuous hand-offs without ever
+    /// bridging a real silent gap between separate utterances.
     private static func trimPathologicalSilentTails(
         in words: [SubtitleTimelineWord],
         speechSpans: [SubtitleSpeechSpan]
@@ -201,19 +203,31 @@ enum SubtitleTimeline {
                 && $0.startSec >= 0
                 && $0.endSec > $0.startSec
         }
-        guard !validSpans.isEmpty else { return words }
+        let speechRegions = mergedSpeechRegions(validSpans)
+        guard !speechRegions.isEmpty else { return words }
 
         return words.map { word in
             let duration = word.endSec - word.startSec
             guard duration > 0 else { return word }
 
-            let candidate = validSpans.compactMap { span -> (SubtitleSpeechSpan, Double)? in
+            var candidate: (span: SubtitleSpeechSpan, overlap: Double)?
+            for span in speechRegions {
                 let overlap = min(word.endSec, span.endSec) - max(word.startSec, span.startSec)
-                return overlap > 0 ? (span, overlap) : nil
+                guard overlap > 0 else { continue }
+                if let current = candidate {
+                    let isMeaningfullyLarger = overlap > current.overlap + 1e-9
+                    let isEffectivelyEqual = abs(overlap - current.overlap) <= 1e-9
+                    if isMeaningfullyLarger
+                        || (isEffectivelyEqual && span.startSec < current.span.startSec) {
+                        candidate = (span, overlap)
+                    }
+                } else {
+                    candidate = (span, overlap)
+                }
             }
-            .max { lhs, rhs in lhs.1 < rhs.1 }
 
-            guard let (span, overlap) = candidate else { return word }
+            guard let candidate else { return word }
+            let (span, overlap) = candidate
             let outsideSpeech = duration - overlap
             guard outsideSpeech >= 0.45,
                   outsideSpeech / duration >= 0.35
@@ -239,6 +253,30 @@ enum SubtitleTimeline {
             corrected.endSec = correctedEnd
             return corrected
         }
+    }
+
+    /// Sortformer reports one interval per active speaker, so simultaneous
+    /// speech naturally overlaps. Its boundaries are quantized to 80 ms frames;
+    /// treating a one-frame seam as silence would create artificial holes.
+    private static func mergedSpeechRegions(
+        _ spans: [SubtitleSpeechSpan]
+    ) -> [SubtitleSpeechSpan] {
+        let frameTolerance = 0.081
+        let ordered = spans.sorted {
+            if $0.startSec == $1.startSec { return $0.endSec < $1.endSec }
+            return $0.startSec < $1.startSec
+        }
+        var regions: [SubtitleSpeechSpan] = []
+        for span in ordered {
+            guard let last = regions.last,
+                  span.startSec <= last.endSec + frameTolerance
+            else {
+                regions.append(span)
+                continue
+            }
+            regions[regions.count - 1].endSec = max(last.endSec, span.endSec)
+        }
+        return regions
     }
 
     /// Word alignment is relative to the extracted audio file. Restore the
@@ -294,25 +332,35 @@ enum SubtitleTimeline {
         for timing: T,
         in spans: [SubtitleSpeakerSpan]
     ) -> String? {
-        spans.compactMap { span -> OverlapCandidate? in
+        var best: OverlapCandidate?
+        for span in spans {
             guard span.startSec.isFinite,
                   span.endSec.isFinite,
                   span.endSec > span.startSec,
                   !span.laneID.isEmpty
-            else { return nil }
+            else { continue }
             let overlap = min(timing.endSec, span.endSec) - max(timing.startSec, span.startSec)
-            guard overlap > 0 else { return nil }
-            return OverlapCandidate(
+            guard overlap > 0 else { continue }
+            let candidate = OverlapCandidate(
                 lane: span.laneID,
                 duration: overlap,
                 confidence: span.confidence
             )
+            guard let current = best else {
+                best = candidate
+                continue
+            }
+            let durationDelta = candidate.duration - current.duration
+            let confidenceDelta = candidate.confidence - current.confidence
+            if durationDelta > 1e-9
+                || (abs(durationDelta) <= 1e-9 && confidenceDelta > 1e-9)
+                || (abs(durationDelta) <= 1e-9
+                    && abs(confidenceDelta) <= 1e-9
+                    && candidate.lane < current.lane) {
+                best = candidate
+            }
         }
-        .max {
-            if $0.duration == $1.duration { return $0.confidence < $1.confidence }
-            return $0.duration < $1.duration
-        }?
-        .lane
+        return best?.lane
     }
 
     private struct OverlapCandidate {

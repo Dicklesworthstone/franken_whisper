@@ -1271,6 +1271,12 @@ final class LabModel {
     }
 
     func acceptPickedVideo(_ picked: PickedVideo) {
+        guard !isImporting else {
+            // The transferable has already created an app-owned cache copy. A
+            // picker completion racing another import must not orphan it.
+            try? FileManager.default.removeItem(at: picked.localURL)
+            return
+        }
         acceptVideo(url: picked.localURL, alreadyManaged: true, picked: picked)
     }
 
@@ -1308,8 +1314,6 @@ final class LabModel {
             } catch {
                 if let preparedMedia {
                     VideoImportService.discard(preparedMedia)
-                } else if alreadyManaged, let picked {
-                    try? FileManager.default.removeItem(at: picked.localURL)
                 }
                 lastError = "Could not prepare that video: \(error.localizedDescription)"
             }
