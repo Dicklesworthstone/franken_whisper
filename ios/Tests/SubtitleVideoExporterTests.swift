@@ -5,6 +5,49 @@ import UIKit
 import XCTest
 
 final class SubtitleVideoExporterTests: XCTestCase {
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        func increment() {
+            lock.lock()
+            value += 1
+            lock.unlock()
+        }
+
+        func load() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    func testPreCancelledExportNeverStartsCallbackSource() async {
+        let starts = LockedCounter()
+        let cancels = LockedCounter()
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await SubtitleVideoExporter.awaitExportCompletion(
+                start: { completion in
+                    starts.increment()
+                    completion()
+                },
+                cancel: { cancels.increment() }
+            )
+        }
+
+        do {
+            try await task.value
+            XCTFail("A pre-cancelled export must throw CancellationError")
+        } catch is CancellationError {
+            // Expected: the exporter was never admitted.
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(starts.load(), 0)
+        XCTAssertEqual(cancels.load(), 0)
+    }
+
     @MainActor
     func testProductionRendererCreatesLegibleKaraokeFrames() async throws {
         guard ProcessInfo.processInfo.environment["FW_SUBTITLE_VISUAL_QA"] == "1" else {

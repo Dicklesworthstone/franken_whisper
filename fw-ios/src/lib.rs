@@ -68,7 +68,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use crate::error::{FwError, FwResult};
 use crate::native_engine::decode::{self, DecodeParams, LoadedModel};
@@ -341,14 +341,171 @@ unsafe impl<F: Copy> Send for CallbackTarget<F> {}
 #[allow(unsafe_code)]
 unsafe impl<F: Copy> Sync for CallbackTarget<F> {}
 
-fn progress_slot() -> &'static Mutex<Option<CallbackTarget<FwProgressFn>>> {
-    static SLOT: OnceLock<Mutex<Option<CallbackTarget<FwProgressFn>>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
+struct CallbackState<F: Copy> {
+    target: Option<CallbackTarget<F>>,
+    in_flight: usize,
 }
 
-fn segments_slot() -> &'static Mutex<Option<CallbackTarget<FwSegmentsFn>>> {
-    static SLOT: OnceLock<Mutex<Option<CallbackTarget<FwSegmentsFn>>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
+struct CallbackRegistry<F: Copy> {
+    state: Mutex<CallbackState<F>>,
+    quiesced: Condvar,
+    /// Serialize external calls without holding the state mutex. Besides
+    /// stable callback order, this prevents two simultaneous callbacks from
+    /// both clearing themselves and cyclically waiting for the other lease.
+    invocation_gate: Mutex<()>,
+}
+
+impl<F: Copy> CallbackRegistry<F> {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(CallbackState {
+                target: None,
+                in_flight: 0,
+            }),
+            quiesced: Condvar::new(),
+            invocation_gate: Mutex::new(()),
+        }
+    }
+
+    fn replace(&self, target: Option<CallbackTarget<F>>, owned_in_flight: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.target = None;
+        // SAFETY: a callback is allowed to clear or replace itself, so it
+        // cannot wait for its own lease. It must still wait for every lease
+        // held by another thread before the old opaque context may be freed.
+        while state.in_flight > owned_in_flight {
+            state = self
+                .quiesced
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.target = target;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CallbackKind {
+    Progress,
+    Segments,
+}
+
+thread_local! {
+    static PROGRESS_CALLBACK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEGMENTS_CALLBACK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn callback_depth(kind: CallbackKind) -> usize {
+    match kind {
+        CallbackKind::Progress => PROGRESS_CALLBACK_DEPTH.with(std::cell::Cell::get),
+        CallbackKind::Segments => SEGMENTS_CALLBACK_DEPTH.with(std::cell::Cell::get),
+    }
+}
+
+fn change_callback_depth(kind: CallbackKind, change: isize) {
+    let apply = |depth: &std::cell::Cell<usize>| {
+        if change > 0 {
+            depth.set(
+                depth
+                    .get()
+                    .checked_add(change as usize)
+                    .expect("callback nesting depth overflow"),
+            );
+        } else {
+            let decrement = change.unsigned_abs();
+            debug_assert!(depth.get() >= decrement);
+            depth.set(depth.get() - decrement);
+        }
+    };
+    match kind {
+        CallbackKind::Progress => PROGRESS_CALLBACK_DEPTH.with(apply),
+        CallbackKind::Segments => SEGMENTS_CALLBACK_DEPTH.with(apply),
+    }
+}
+
+struct CallbackInvocation<F: Copy + 'static> {
+    registry: &'static CallbackRegistry<F>,
+    target: CallbackTarget<F>,
+    kind: CallbackKind,
+    _gate: std::sync::MutexGuard<'static, ()>,
+}
+
+impl<F: Copy + 'static> CallbackInvocation<F> {
+    fn begin(registry: &'static CallbackRegistry<F>, kind: CallbackKind) -> Option<Self> {
+        let gate = registry
+            .invocation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let target = {
+            let mut state = registry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let target = state.target?;
+            state.in_flight = state
+                .in_flight
+                .checked_add(1)
+                .expect("callback in-flight count overflow");
+            target
+        };
+        change_callback_depth(kind, 1);
+        Some(Self {
+            registry,
+            target,
+            kind,
+            _gate: gate,
+        })
+    }
+}
+
+impl<F: Copy + 'static> Drop for CallbackInvocation<F> {
+    fn drop(&mut self) {
+        change_callback_depth(self.kind, -1);
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.in_flight > 0);
+        state.in_flight -= 1;
+        if state.in_flight == 0 {
+            self.registry.quiesced.notify_all();
+        }
+    }
+}
+
+fn progress_registry() -> &'static CallbackRegistry<FwProgressFn> {
+    static REGISTRY: OnceLock<CallbackRegistry<FwProgressFn>> = OnceLock::new();
+    REGISTRY.get_or_init(CallbackRegistry::new)
+}
+
+fn segments_registry() -> &'static CallbackRegistry<FwSegmentsFn> {
+    static REGISTRY: OnceLock<CallbackRegistry<FwSegmentsFn>> = OnceLock::new();
+    REGISTRY.get_or_init(CallbackRegistry::new)
+}
+
+fn emit_progress_to_callback(span: &str, value: f64) {
+    let Some(invocation) = CallbackInvocation::begin(progress_registry(), CallbackKind::Progress)
+    else {
+        return;
+    };
+    let Ok(span) = CString::new(span) else {
+        return;
+    };
+    (invocation.target.func)(invocation.target.ctx, span.as_ptr(), value);
+}
+
+fn emit_segments_to_callback(json: &str) {
+    let Some(invocation) = CallbackInvocation::begin(segments_registry(), CallbackKind::Segments)
+    else {
+        return;
+    };
+    let Ok(json) = CString::new(json) else {
+        return;
+    };
+    (invocation.target.func)(invocation.target.ctx, json.as_ptr());
 }
 
 /// Install the plat hooks exactly once; they forward through the slots above
@@ -358,26 +515,10 @@ fn ensure_hooks_installed() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         crate::native_engine::plat::set_span_hook(Box::new(|span, ms| {
-            // `try_lock`, not `lock`: a progress hook must never be able to
-            // block — or deadlock — the run it is reporting on.
-            let Ok(slot) = progress_slot().try_lock() else {
-                return;
-            };
-            let Some(target) = *slot else { return };
-            let Ok(span) = CString::new(span) else {
-                return;
-            };
-            (target.func)(target.ctx, span.as_ptr(), ms);
+            emit_progress_to_callback(span, ms);
         }));
         crate::native_engine::plat::set_segment_hook(Box::new(|json| {
-            let Ok(slot) = segments_slot().try_lock() else {
-                return;
-            };
-            let Some(target) = *slot else { return };
-            let Ok(json) = CString::new(json) else {
-                return;
-            };
-            (target.func)(target.ctx, json.as_ptr());
+            emit_segments_to_callback(json);
         }));
     });
 }
@@ -389,14 +530,7 @@ fn ensure_hooks_installed() {}
 /// analogue of the browser's `fw_stage`; spans emitted by the engine itself
 /// arrive through the same callback via the plat hook).
 fn emit_stage(name: &str, value: f64) {
-    let Ok(slot) = progress_slot().try_lock() else {
-        return;
-    };
-    let Some(target) = *slot else { return };
-    let Ok(name) = CString::new(name) else {
-        return;
-    };
-    (target.func)(target.ctx, name.as_ptr(), value);
+    emit_progress_to_callback(name, value);
 }
 
 /// See `fw_ios.h`.
@@ -411,9 +545,10 @@ fn emit_stage(name: &str, value: f64) {
 pub unsafe extern "C" fn fw_set_progress_callback(func: Option<FwProgressFn>, ctx: *mut c_void) {
     guarded((), || {
         ensure_hooks_installed();
-        if let Ok(mut slot) = progress_slot().lock() {
-            *slot = func.map(|func| CallbackTarget { func, ctx });
-        }
+        progress_registry().replace(
+            func.map(|func| CallbackTarget { func, ctx }),
+            callback_depth(CallbackKind::Progress),
+        );
     });
 }
 
@@ -426,9 +561,10 @@ pub unsafe extern "C" fn fw_set_progress_callback(func: Option<FwProgressFn>, ct
 pub unsafe extern "C" fn fw_set_segments_callback(func: Option<FwSegmentsFn>, ctx: *mut c_void) {
     guarded((), || {
         ensure_hooks_installed();
-        if let Ok(mut slot) = segments_slot().lock() {
-            *slot = func.map(|func| CallbackTarget { func, ctx });
-        }
+        segments_registry().replace(
+            func.map(|func| CallbackTarget { func, ctx }),
+            callback_depth(CallbackKind::Segments),
+        );
     });
 }
 
@@ -1057,4 +1193,51 @@ pub unsafe extern "C" fn fw_string_free(s: *mut c_char) {
     // SAFETY: documented as a pointer previously returned by this library
     // through a `char **` out-parameter and not yet freed.
     drop(unsafe { CString::from_raw(s) });
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod tests {
+    use super::*;
+
+    static CALLBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static PROGRESS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static SEGMENT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn self_clearing_progress(_ctx: *mut c_void, _span: *const c_char, _value: f64) {
+        PROGRESS_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: clearing has no context and is explicitly reentrant by contract.
+        unsafe { fw_set_progress_callback(None, std::ptr::null_mut()) };
+    }
+
+    extern "C" fn self_clearing_segments(_ctx: *mut c_void, _json: *const c_char) {
+        SEGMENT_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: clearing has no context and is explicitly reentrant by contract.
+        unsafe { fw_set_segments_callback(None, std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn ffi_callbacks_can_clear_themselves_without_deadlocking() {
+        let _guard = CALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        PROGRESS_CALLS.store(0, Ordering::Relaxed);
+        SEGMENT_CALLS.store(0, Ordering::Relaxed);
+
+        for _ in 0..10 {
+            // SAFETY: both callbacks own no context and clear themselves before return.
+            unsafe {
+                fw_set_progress_callback(Some(self_clearing_progress), std::ptr::null_mut());
+                fw_set_segments_callback(Some(self_clearing_segments), std::ptr::null_mut());
+            }
+            emit_stage("test", 0.0);
+            emit_segments_to_callback("[]");
+            // A second emission must observe the cleared slot.
+            emit_stage("test", 0.0);
+            emit_segments_to_callback("[]");
+        }
+
+        assert_eq!(PROGRESS_CALLS.load(Ordering::Relaxed), 10);
+        assert_eq!(SEGMENT_CALLS.load(Ordering::Relaxed), 10);
+    }
 }

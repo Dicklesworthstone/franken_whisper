@@ -5815,6 +5815,9 @@ mod tests {
 
     #[test]
     fn gated_window_hook_streams_each_window_in_order() {
+        let _hook_guard = crate::native_engine::plat::SEGMENT_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // bd-rt-segment-hook-vo6p acceptance: a 2-window decode fires the
         // scoped hook once per window, in order, with exactly the segments
         // the final DecodeOutput contains for those windows; the GLOBAL

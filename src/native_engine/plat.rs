@@ -264,23 +264,24 @@ mod wasm_impl {
     /// [`super::super::perf_span`] measurement is forwarded to it — the
     /// engine's progress heartbeat for the page (window counts, tick counts).
     /// Unregistered = the forward is a cheap lock + None check.
-    static SPAN_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str, f64) + Send + Sync>>> =
-        std::sync::Mutex::new(None);
+    type SpanHook = std::sync::Arc<dyn Fn(&str, f64) + Send + Sync>;
+    static SPAN_HOOK: std::sync::Mutex<Option<SpanHook>> = std::sync::Mutex::new(None);
 
     /// Register the host span hook (replaces any previous hook).
     pub fn set_span_hook(hook: Box<dyn Fn(&str, f64) + Send + Sync>) {
         *SPAN_HOOK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::from(hook));
     }
 
     /// Forward one span to the registered hook, if any.
     pub fn emit_span(span: &str, ms: f64) {
-        if let Some(hook) = SPAN_HOOK
+        let hook = SPAN_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-        {
+            .map(std::sync::Arc::clone);
+        if let Some(hook) = hook {
             hook(span, ms);
         }
     }
@@ -288,14 +289,14 @@ mod wasm_impl {
     /// Host partial-transcript hook: the decode loop feeds each finished
     /// window's segments (as JSON) to the page while the run is still going,
     /// so the transcript renders live instead of appearing all at once.
-    static SEGMENT_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>> =
-        std::sync::Mutex::new(None);
+    type SegmentHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+    static SEGMENT_HOOK: std::sync::Mutex<Option<SegmentHook>> = std::sync::Mutex::new(None);
 
     /// Register the host partial-transcript hook (replaces any previous).
     pub fn set_segment_hook(hook: Box<dyn Fn(&str) + Send + Sync>) {
         *SEGMENT_HOOK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::from(hook));
     }
 
     /// Whether a hook is registered (decode-loop serialization guard).
@@ -308,11 +309,12 @@ mod wasm_impl {
 
     /// Forward one window's segments (JSON array) to the registered hook.
     pub fn emit_partial_segments(json: &str) {
-        if let Some(hook) = SEGMENT_HOOK
+        let hook = SEGMENT_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-        {
+            .map(std::sync::Arc::clone);
+        if let Some(hook) = hook {
             hook(json);
         }
     }
@@ -336,7 +338,7 @@ pub use ios_hooks::{
 /// cache is only written after a fully successful decode).
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
 mod desktop_hooks {
-    type SegmentHook = Box<dyn Fn(&str) + Send + Sync>;
+    type SegmentHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
     static SEGMENT_HOOK: std::sync::Mutex<Option<SegmentHook>> = std::sync::Mutex::new(None);
 
@@ -345,10 +347,10 @@ mod desktop_hooks {
     /// `transcribe_samples_with_window_hook` for new desktop callers —
     /// this global exists for wasm/iOS surface parity and single-consumer
     /// processes.
-    pub fn set_segment_hook(hook: SegmentHook) {
+    pub fn set_segment_hook(hook: Box<dyn Fn(&str) + Send + Sync>) {
         *SEGMENT_HOOK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::from(hook));
     }
 
     /// Whether a hook is registered (lets the decode loop skip JSON
@@ -363,11 +365,12 @@ mod desktop_hooks {
 
     /// Forward one window's segments (JSON array) to the registered hook.
     pub fn emit_partial_segments(json: &str) {
-        if let Some(hook) = SEGMENT_HOOK
+        let hook = SEGMENT_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-        {
+            .map(std::sync::Arc::clone);
+        if let Some(hook) = hook {
             hook(json);
         }
     }
@@ -388,26 +391,27 @@ pub use desktop_hooks::{emit_partial_segments, segment_hook_active, set_segment_
 #[cfg(all(not(target_arch = "wasm32"), target_os = "ios"))]
 mod ios_hooks {
     /// Host span callback: (span name, milliseconds-or-count value).
-    pub type SpanHook = Box<dyn Fn(&str, f64) + Send + Sync>;
+    pub type SpanHook = std::sync::Arc<dyn Fn(&str, f64) + Send + Sync>;
     /// Host partial-transcript callback: one window's segments as JSON.
-    pub type SegmentHook = Box<dyn Fn(&str) + Send + Sync>;
+    pub type SegmentHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
     static SPAN_HOOK: std::sync::Mutex<Option<SpanHook>> = std::sync::Mutex::new(None);
 
     /// Register the host span hook (replaces any previous hook).
-    pub fn set_span_hook(hook: SpanHook) {
+    pub fn set_span_hook(hook: Box<dyn Fn(&str, f64) + Send + Sync>) {
         *SPAN_HOOK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::from(hook));
     }
 
     /// Forward one span to the registered hook, if any.
     pub fn emit_span(span: &str, ms: f64) {
-        if let Some(hook) = SPAN_HOOK
+        let hook = SPAN_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-        {
+            .map(std::sync::Arc::clone);
+        if let Some(hook) = hook {
             hook(span, ms);
         }
     }
@@ -415,10 +419,10 @@ mod ios_hooks {
     static SEGMENT_HOOK: std::sync::Mutex<Option<SegmentHook>> = std::sync::Mutex::new(None);
 
     /// Register the host partial-transcript hook (replaces any previous).
-    pub fn set_segment_hook(hook: SegmentHook) {
+    pub fn set_segment_hook(hook: Box<dyn Fn(&str) + Send + Sync>) {
         *SEGMENT_HOOK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::from(hook));
     }
 
     /// Whether a hook is registered (lets the decode loop avoid serializing
@@ -432,15 +436,19 @@ mod ios_hooks {
 
     /// Forward one window's segments (JSON array) to the registered hook.
     pub fn emit_partial_segments(json: &str) {
-        if let Some(hook) = SEGMENT_HOOK
+        let hook = SEGMENT_HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-        {
+            .map(std::sync::Arc::clone);
+        if let Some(hook) = hook {
             hook(json);
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) static SEGMENT_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
@@ -457,5 +465,23 @@ mod tests {
         });
         assert_eq!(sum, 3);
         assert!(super::available_parallelism().unwrap().get() >= 1);
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn segment_hook_can_replace_itself_without_deadlocking() {
+        let _guard = super::SEGMENT_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..10 {
+            let calls = std::sync::Arc::clone(&calls);
+            super::set_segment_hook(Box::new(move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::set_segment_hook(Box::new(|_| {}));
+            }));
+            super::emit_partial_segments("[]");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 10);
     }
 }

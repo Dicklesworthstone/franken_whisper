@@ -83,6 +83,30 @@ enum SubtitleVideoExporter {
         let size: CGSize
     }
 
+    /// Bridge one callback-based export without losing cancellation in the
+    /// registration gap. Factored as a seam so the pre-cancel schedule is
+    /// deterministic in unit tests without encoding a real movie.
+    static func awaitExportCompletion(
+        start: (@escaping () -> Void) -> Void,
+        cancel: @escaping @Sendable () -> Void
+    ) async throws {
+        try Task.checkCancellation()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                start { continuation.resume() }
+                // Cancellation can land after the preflight but before the
+                // callback source is fully registered. Recheck on the far side
+                // so one of the two cancellation paths always reaches it.
+                if Task.isCancelled {
+                    cancel()
+                }
+            }
+        } onCancel: {
+            cancel()
+        }
+        try Task.checkCancellation()
+    }
+
     static func export(
         videoURL: URL,
         cues: [SubtitleCue],
@@ -167,19 +191,16 @@ enum SubtitleVideoExporter {
             }
         }
         defer { progressTask.cancel() }
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                exporter.exportAsynchronously {
-                    continuation.resume()
-                }
-            }
-        } onCancel: {
-            cancellation.cancel()
-        }
-
-        if Task.isCancelled {
+        do {
+            try await awaitExportCompletion(
+                start: { completion in
+                    exporter.exportAsynchronously(completionHandler: completion)
+                },
+                cancel: { cancellation.cancel() }
+            )
+        } catch {
             try? FileManager.default.removeItem(at: output)
-            throw CancellationError()
+            throw error
         }
 
         switch exporter.status {

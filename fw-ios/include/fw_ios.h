@@ -25,8 +25,10 @@
  * fw_last_error_message reports the calling thread's last error.
  *
  * Callbacks are invoked from whichever thread runs the engine (decode loop /
- * load). They must be thread-safe, non-blocking, and must not call back into
- * the library. Clear a callback (func = NULL) before releasing its ctx.
+ * load). They must be thread-safe and non-blocking. A callback may clear or
+ * replace itself, but must not invoke engine work recursively. Clear a callback
+ * (func = NULL) before releasing its ctx; clearing from another thread waits
+ * for an in-flight callback to return.
  *
  * Cancellation: fw_request_cancel() sets a process-wide flag checked at the
  * engine's cooperative checkpoints; the in-flight call returns code 6. Call
