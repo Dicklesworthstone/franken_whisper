@@ -434,6 +434,12 @@ struct CallbackInvocation<F: Copy + 'static> {
 
 impl<F: Copy + 'static> CallbackInvocation<F> {
     fn begin(registry: &'static CallbackRegistry<F>, kind: CallbackKind) -> Option<Self> {
+        // SAFETY: a host callback that violates the boundary contract by recursively starting
+        // engine work must fail closed, not self-deadlock on this registry's non-reentrant
+        // invocation gate. Different callback kinds retain independent serialization lanes.
+        if callback_depth(kind) != 0 {
+            return None;
+        }
         let gate = registry
             .invocation_gate
             .lock()
@@ -1216,6 +1222,20 @@ mod tests {
         unsafe { fw_set_segments_callback(None, std::ptr::null_mut()) };
     }
 
+    extern "C" fn recursively_emitting_progress(
+        _ctx: *mut c_void,
+        _span: *const c_char,
+        _value: f64,
+    ) {
+        PROGRESS_CALLS.fetch_add(1, Ordering::Relaxed);
+        emit_stage("nested", 0.0);
+    }
+
+    extern "C" fn recursively_emitting_segments(_ctx: *mut c_void, _json: *const c_char) {
+        SEGMENT_CALLS.fetch_add(1, Ordering::Relaxed);
+        emit_segments_to_callback("[]");
+    }
+
     #[test]
     fn ffi_callbacks_can_clear_themselves_without_deadlocking() {
         let _guard = CALLBACK_TEST_LOCK
@@ -1235,6 +1255,33 @@ mod tests {
             // A second emission must observe the cleared slot.
             emit_stage("test", 0.0);
             emit_segments_to_callback("[]");
+        }
+
+        assert_eq!(PROGRESS_CALLS.load(Ordering::Relaxed), 10);
+        assert_eq!(SEGMENT_CALLS.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn recursive_callback_delivery_is_suppressed_before_the_invocation_gate() {
+        let _guard = CALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        PROGRESS_CALLS.store(0, Ordering::Relaxed);
+        SEGMENT_CALLS.store(0, Ordering::Relaxed);
+
+        for _ in 0..10 {
+            // SAFETY: both callbacks own no context; nested delivery is deliberately hostile.
+            unsafe {
+                fw_set_progress_callback(Some(recursively_emitting_progress), std::ptr::null_mut());
+                fw_set_segments_callback(Some(recursively_emitting_segments), std::ptr::null_mut());
+            }
+            emit_stage("outer", 0.0);
+            emit_segments_to_callback("[]");
+            // SAFETY: quiesce the context-free callbacks before the next round.
+            unsafe {
+                fw_set_progress_callback(None, std::ptr::null_mut());
+                fw_set_segments_callback(None, std::ptr::null_mut());
+            }
         }
 
         assert_eq!(PROGRESS_CALLS.load(Ordering::Relaxed), 10);
