@@ -37,6 +37,11 @@
 #   FRANKEN_WHISPER_MODEL_DIR  Override the model cache root
 #   VERSION                    Override version to install
 #
+# CPU baseline: Linux x86_64 prebuilts require x86-64-v3 (AVX2/BMI2/FMA/MOVBE:
+#   Intel Haswell 2013+ / AMD Excavator 2015+). Older CPUs are detected before
+#   the binary runs and offered --from-source with the target-cpu pin replaced
+#   by `native` (issue #5).
+#
 # Platforms (prebuilt binaries — 5 release targets):
 #   Linux x86_64          franken_whisper-X.Y.Z-linux_amd64.tar.gz
 #   Linux aarch64         franken_whisper-X.Y.Z-linux_arm64.tar.gz
@@ -301,6 +306,13 @@ Platforms (prebuilt binaries):
   macOS aarch64 (M-series) franken_whisper-X.Y.Z-darwin_arm64.tar.gz
   Windows x64              franken_whisper-X.Y.Z-windows_amd64.zip
 
+CPU baseline note:
+  Linux x86_64 prebuilts require the x86-64-v3 baseline (AVX2/BMI2/FMA/MOVBE:
+  Intel Haswell 2013+ / AMD Excavator 2015+). On older CPUs (Sandy/Ivy Bridge,
+  2012-era Mac minis) the installer refuses the prebuilt before running it and
+  offers --from-source, which it builds with -C target-cpu=native instead of
+  the pinned x86-64-v3.
+
 Windows note:
   This bash installer covers linux + darwin (and WSL). On native Windows,
   download the windows_amd64.zip from the releases page and unzip
@@ -489,6 +501,99 @@ detect_platform() {
     if [ "$os" = "windows" ]; then
         die "Native Windows is not supported by this bash installer. Download franken_whisper-<ver>-windows_amd64.zip from the releases page instead."
     fi
+}
+
+# ============================================================================
+# CPU capability preflight (issue #5)
+# ============================================================================
+# The published x86_64 binaries are compiled with `-C target-cpu=x86-64-v3`
+# (.cargo/config.toml, perf lever L7): AVX2 + BMI1/BMI2 + FMA + MOVBE, i.e.
+# Intel Haswell (2013+) / AMD Excavator (2015+). On an older CPU (Sandy/Ivy
+# Bridge, 2012-era Mac minis) even `fw --version` dies with SIGILL before
+# main() runs — rustc emits `mulx` (BMI2) straight into startup code — so the
+# CPU has to be checked BEFORE the downloaded binary is ever executed.
+#
+# Only Linux exposes /proc/cpuinfo, and linux_amd64 is exactly where the
+# reports came from. Hosts without /proc/cpuinfo (macOS) and non-x86_64
+# architectures skip the check and keep today's behavior.
+
+# The feature flags (as spelled in /proc/cpuinfo) that x86-64-v3 adds over v2
+# and that rustc actually emits unguarded with the pinned baseline.
+readonly X86_64_V3_REQUIRED_FLAGS="avx2 bmi1 bmi2 fma movbe"
+
+# Flags found missing by cpu_supports_x86_64_v3 (for diagnostics).
+CPU_MISSING_FLAGS=""
+
+cpu_supports_x86_64_v3() {
+    CPU_MISSING_FLAGS=""
+    # Only meaningful on Linux/x86_64; elsewhere assume capable (fail open —
+    # the --version probe diagnostic below still names the real cause).
+    [ "$(uname -s)" = "Linux" ] || return 0
+    case "$(uname -m)" in
+        x86_64|amd64) ;;
+        *) return 0 ;;
+    esac
+    [ -r /proc/cpuinfo ] || return 0
+
+    local flags feature missing=""
+    flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null) || return 0
+    [ -n "$flags" ] || return 0
+
+    for feature in $X86_64_V3_REQUIRED_FLAGS; do
+        case " $flags " in
+            *" $feature "*) ;;
+            *) missing="${missing:+$missing }$feature" ;;
+        esac
+    done
+
+    if [ -n "$missing" ]; then
+        CPU_MISSING_FLAGS="$missing"
+        return 1
+    fi
+    return 0
+}
+
+# Called before downloading a linux_amd64 prebuilt. When the CPU lacks the
+# x86-64-v3 baseline: explain why the prebuilt cannot run here, then offer the
+# documented --from-source fallback (build_from_source neutralizes the
+# committed target-cpu pin on such CPUs). Never lets the SIGILL happen.
+require_cpu_for_prebuilt() {
+    [ "$PLATFORM" = "linux_amd64" ] || return 0
+    cpu_supports_x86_64_v3 && return 0
+
+    if [ -n "$ARTIFACT_URL" ]; then
+        # Expert escape hatch: a custom artifact may well be a v2/native build.
+        log_warn "This CPU lacks the x86-64-v3 baseline (missing: ${CPU_MISSING_FLAGS:-unknown})."
+        log_warn "Official linux_amd64 prebuilts would crash with SIGILL here; trusting your --artifact-url to be built for this CPU."
+        return 0
+    fi
+
+    log_error "This CPU cannot run the official Linux x86_64 prebuilt binaries."
+    log_error "Prebuilts are compiled for the x86-64-v3 baseline (AVX2/BMI2/FMA/MOVBE:"
+    log_error "Intel Haswell 2013+ / AMD Excavator 2015+). Missing on this CPU: ${CPU_MISSING_FLAGS:-unknown}."
+    log_error "Running the prebuilt here would crash immediately with SIGILL (illegal instruction)."
+    log_error "A source build works: the installer replaces the pinned -C target-cpu=x86-64-v3"
+    log_error "with -C target-cpu=native on this machine (keeps AVX/F16C where present)."
+
+    if [ "$QUIET" -eq 0 ] && interactive_tty; then
+        local prompt_timeout="${FW_INSTALL_PROMPT_TIMEOUT:-120}"
+        if [[ ! "$prompt_timeout" =~ ^[0-9]+$ ]] || [ "$prompt_timeout" -eq 0 ]; then
+            prompt_timeout=120
+        fi
+        local answer="" read_status=0
+        printf 'Build from source instead (requires Rust; several GB of disk and many minutes)? (y/N): ' >/dev/tty
+        IFS= read -r -t "$prompt_timeout" answer </dev/tty || read_status=$?
+        [ "$read_status" -eq 0 ] || printf '\n' >/dev/tty
+        case "$answer" in
+            y|Y|yes|Yes|YES)
+                FROM_SOURCE=1
+                log_step "Falling back to a source build with the x86-64-v3 pin neutralized (target-cpu=native)."
+                return 0
+                ;;
+        esac
+    fi
+
+    die "Re-run with --from-source to build for this CPU: curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/main/install.sh | bash -s -- --from-source"
 }
 
 # ============================================================================
@@ -682,9 +787,26 @@ preflight_checks() {
 # Installed-version detection
 # ============================================================================
 binary_reported_version() {
-    local binary="$1" reported
+    local binary="$1" reported status=0
     [ -x "$binary" ] || return 1
-    reported=$("$binary" --version 2>/dev/null | head -1 || true)
+    # Group redirection also silences bash's own "Illegal instruction" job
+    # message if the probe dies by signal; the exit status still reports it.
+    reported=$( { "$binary" --version; } 2>/dev/null ) || status=$?
+    if [ "$status" -ge 128 ]; then
+        # Killed by signal (status - 128). 132 = SIGILL: the binary contains
+        # instructions this CPU does not implement — the prebuilts assume the
+        # x86-64-v3 baseline (AVX2/BMI2/FMA, Haswell 2013+) — issue #5.
+        if [ "$status" -eq 132 ]; then
+            log_error "$binary crashed with SIGILL (illegal instruction) while reporting its version."
+            log_error "This binary requires a newer CPU than this machine has (x86-64-v3: AVX2/BMI2/FMA,"
+            log_error "Intel Haswell 2013+ / AMD Excavator 2015+). Re-run the installer with --from-source;"
+            log_error "on a pre-v3 CPU it builds with -C target-cpu=native instead of the pinned x86-64-v3."
+        else
+            log_error "$binary was killed by signal $((status - 128)) while reporting its version."
+        fi
+        return 1
+    fi
+    reported=$(printf '%s\n' "$reported" | head -1)
     if [[ "$reported" =~ ([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?) ]]; then
         printf 'v%s\n' "${BASH_REMATCH[1]}"
         return 0
@@ -1086,7 +1208,31 @@ build_from_source() {
 
     log_step "Building with cargo (default features; this may take several minutes)..."
     local target_dir="$TMP/target"
-    if ! (cd "$fw_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --bins); then
+
+    # Pre-x86-64-v3 CPU escape hatch (issue #5): the committed .cargo/config.toml
+    # pins `-C target-cpu=x86-64-v3`, so an unmodified source build would emit
+    # the same SIGILL-ing AVX2/BMI2 code the prebuilt crashed with. A RUSTFLAGS
+    # environment variable does NOT merge with config rustflags — it replaces
+    # them outright — so the override must re-state the config's non-CPU flag
+    # (`-Z threads=4`, the nightly parallel front-end the pinned toolchain
+    # supports) and swap only the CPU pin. `target-cpu=native` keeps every
+    # feature this CPU actually has (e.g. Ivy Bridge retains AVX/F16C).
+    local rustflags_override=""
+    if [ -n "${RUSTFLAGS:-}" ]; then
+        log_warn "Honoring caller-provided RUSTFLAGS (replaces .cargo/config.toml rustflags): ${RUSTFLAGS}"
+    elif ! cpu_supports_x86_64_v3; then
+        rustflags_override="-Z threads=4 -C target-cpu=native"
+        log_warn "CPU lacks the x86-64-v3 baseline (missing: ${CPU_MISSING_FLAGS:-unknown})."
+        log_warn "Overriding the pinned target-cpu for this build: RUSTFLAGS=\"${rustflags_override}\""
+    fi
+
+    if ! (
+        cd "$fw_dir" || exit 1
+        if [ -n "$rustflags_override" ]; then
+            export RUSTFLAGS="$rustflags_override"
+        fi
+        CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --bins
+    ); then
         log_error "Source build failed."
         log_error "The pinned sibling contract was satisfied, but Cargo still failed."
         log_error "Prefer a prebuilt release binary, or reproduce with the same pinned sibling checkouts:"
@@ -1445,6 +1591,14 @@ main() {
         [ "$VERIFY" -eq 1 ] && run_self_test
         print_summary
         return 0
+    fi
+
+    # Refuse to download a prebuilt this CPU cannot execute (issue #5); may
+    # flip FROM_SOURCE=1 when the operator accepts the source fallback. Runs
+    # after the already-installed short-circuit so a working (e.g. previously
+    # source-built) installation is never disturbed by the refusal.
+    if [ "$FROM_SOURCE" -eq 0 ]; then
+        require_cpu_for_prebuilt
     fi
 
     if [ "$FROM_SOURCE" -eq 0 ] && [ -n "$VERSION" ]; then
