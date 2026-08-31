@@ -35,6 +35,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Recordings are transcribed entirely on this device by a local model. No audio, transcript, or anything else ever leaves your phone.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
