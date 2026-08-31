@@ -87,7 +87,7 @@ enum SubtitleVideoExporter {
     /// registration gap. Factored as a seam so the pre-cancel schedule is
     /// deterministic in unit tests without encoding a real movie.
     static func awaitExportCompletion(
-        start: (@escaping () -> Void) -> Void,
+        start: (@escaping @Sendable () -> Void) -> Void,
         cancel: @escaping @Sendable () -> Void
     ) async throws {
         try Task.checkCancellation()
