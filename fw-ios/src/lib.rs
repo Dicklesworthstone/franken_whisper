@@ -539,6 +539,22 @@ fn emit_stage(name: &str, value: f64) {
     emit_progress_to_callback(name, value);
 }
 
+/// Exercise progress delivery from the integration-test crate without enabling the
+/// mounted parent engine's unrelated `cfg(test)` modules.
+#[cfg(feature = "ffi-registry-test-hooks")]
+#[doc(hidden)]
+pub fn callback_test_emit_progress() {
+    emit_stage("integration-test", 0.0);
+}
+
+/// Exercise segment delivery from the integration-test crate without enabling the
+/// mounted parent engine's unrelated `cfg(test)` modules.
+#[cfg(feature = "ffi-registry-test-hooks")]
+#[doc(hidden)]
+pub fn callback_test_emit_segments() {
+    emit_segments_to_callback("[]");
+}
+
 /// See `fw_ios.h`.
 ///
 /// # Safety
@@ -1199,92 +1215,4 @@ pub unsafe extern "C" fn fw_string_free(s: *mut c_char) {
     // SAFETY: documented as a pointer previously returned by this library
     // through a `char **` out-parameter and not yet freed.
     drop(unsafe { CString::from_raw(s) });
-}
-
-#[cfg(test)]
-#[allow(unsafe_code)]
-mod tests {
-    use super::*;
-
-    static CALLBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
-    static PROGRESS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static SEGMENT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-    extern "C" fn self_clearing_progress(_ctx: *mut c_void, _span: *const c_char, _value: f64) {
-        PROGRESS_CALLS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: clearing has no context and is explicitly reentrant by contract.
-        unsafe { fw_set_progress_callback(None, std::ptr::null_mut()) };
-    }
-
-    extern "C" fn self_clearing_segments(_ctx: *mut c_void, _json: *const c_char) {
-        SEGMENT_CALLS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: clearing has no context and is explicitly reentrant by contract.
-        unsafe { fw_set_segments_callback(None, std::ptr::null_mut()) };
-    }
-
-    extern "C" fn recursively_emitting_progress(
-        _ctx: *mut c_void,
-        _span: *const c_char,
-        _value: f64,
-    ) {
-        PROGRESS_CALLS.fetch_add(1, Ordering::Relaxed);
-        emit_stage("nested", 0.0);
-    }
-
-    extern "C" fn recursively_emitting_segments(_ctx: *mut c_void, _json: *const c_char) {
-        SEGMENT_CALLS.fetch_add(1, Ordering::Relaxed);
-        emit_segments_to_callback("[]");
-    }
-
-    #[test]
-    fn ffi_callbacks_can_clear_themselves_without_deadlocking() {
-        let _guard = CALLBACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        PROGRESS_CALLS.store(0, Ordering::Relaxed);
-        SEGMENT_CALLS.store(0, Ordering::Relaxed);
-
-        for _ in 0..10 {
-            // SAFETY: both callbacks own no context and clear themselves before return.
-            unsafe {
-                fw_set_progress_callback(Some(self_clearing_progress), std::ptr::null_mut());
-                fw_set_segments_callback(Some(self_clearing_segments), std::ptr::null_mut());
-            }
-            emit_stage("test", 0.0);
-            emit_segments_to_callback("[]");
-            // A second emission must observe the cleared slot.
-            emit_stage("test", 0.0);
-            emit_segments_to_callback("[]");
-        }
-
-        assert_eq!(PROGRESS_CALLS.load(Ordering::Relaxed), 10);
-        assert_eq!(SEGMENT_CALLS.load(Ordering::Relaxed), 10);
-    }
-
-    #[test]
-    fn recursive_callback_delivery_is_suppressed_before_the_invocation_gate() {
-        let _guard = CALLBACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        PROGRESS_CALLS.store(0, Ordering::Relaxed);
-        SEGMENT_CALLS.store(0, Ordering::Relaxed);
-
-        for _ in 0..10 {
-            // SAFETY: both callbacks own no context; nested delivery is deliberately hostile.
-            unsafe {
-                fw_set_progress_callback(Some(recursively_emitting_progress), std::ptr::null_mut());
-                fw_set_segments_callback(Some(recursively_emitting_segments), std::ptr::null_mut());
-            }
-            emit_stage("outer", 0.0);
-            emit_segments_to_callback("[]");
-            // SAFETY: quiesce the context-free callbacks before the next round.
-            unsafe {
-                fw_set_progress_callback(None, std::ptr::null_mut());
-                fw_set_segments_callback(None, std::ptr::null_mut());
-            }
-        }
-
-        assert_eq!(PROGRESS_CALLS.load(Ordering::Relaxed), 10);
-        assert_eq!(SEGMENT_CALLS.load(Ordering::Relaxed), 10);
-    }
 }
