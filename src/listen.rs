@@ -2229,7 +2229,11 @@ impl ConfirmLane {
                                     // worker's exit, stranding a job in a lane with no consumer.
                                     state.shutdown = true;
                                     state.jobs.clear();
-                                    worker_depth.store(0, std::sync::atomic::Ordering::Relaxed);
+                                    // SAFETY: publish the warning before publishing idle. `drain`
+                                    // uses an Acquire load before its final channel sweep, so a
+                                    // completed warning cannot be stranded in `results_rx` merely
+                                    // because the worker reached depth zero first.
+                                    worker_depth.store(0, std::sync::atomic::Ordering::Release);
                                 }
                                 break;
                             }
@@ -2345,14 +2349,17 @@ impl ConfirmLane {
                                             }),
                                         });
                                         worker_depth
-                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                            .fetch_sub(1, std::sync::atomic::Ordering::Release);
                                         continue;
                                     }
                                 };
                                 let _ = results_tx.send(ConfirmLaneEvent::Verdict(mapped));
                             }
                         }
-                        worker_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        // SAFETY: every result publication is sequenced before this Release.
+                        // `drain` observes completion with Acquire and then performs a final
+                        // channel sweep, preserving completed verdicts at the idle boundary.
+                        worker_depth.fetch_sub(1, std::sync::atomic::Ordering::Release);
                     }
                 })
         };
@@ -2425,7 +2432,16 @@ impl ConfirmLane {
             std::time::Instant::now() + std::time::Duration::from_secs_f64(drain_sec.max(0.0));
         let mut events = Vec::new();
         loop {
-            if self.depth.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            // Drain everything already visible before consulting the depth. This also
+            // collects events completed between the session loop's last poll and drain.
+            while let Ok(event) = self.results_rx.try_recv() {
+                events.push(event);
+            }
+            // SAFETY: worker completion is a Release publication after its channel send.
+            // Seeing zero with Acquire makes the final channel sweep below observe every
+            // event from completed jobs instead of losing the last verdict at shutdown.
+            if self.depth.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                events.extend(self.results_rx.try_iter());
                 break;
             }
             let now = std::time::Instant::now();
@@ -2449,7 +2465,7 @@ impl ConfirmLane {
             queue_cv.notify_all();
         }
         self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
-        let abandoned = self.depth.load(std::sync::atomic::Ordering::Relaxed);
+        let abandoned = self.depth.load(std::sync::atomic::Ordering::Acquire);
         (events, abandoned)
     }
 }
@@ -4650,6 +4666,46 @@ mod tests {
         );
         assert!(events.is_empty(), "no verdict from an abandoned decode");
         assert!(abandoned >= 1, "the in-flight job counts as abandoned");
+    }
+
+    #[test]
+    fn drain_collects_results_that_finished_before_drain_started() {
+        // Regression for the idle-boundary publication race: the old drain checked
+        // `depth == 0` before touching the results channel and therefore discarded a
+        // verdict that was already complete when session shutdown began.
+        for utterance_id in 1..=10 {
+            let decoder: QualityDecoder = Box::new(move |job, _prev, _abort| {
+                DecodeOutcome::Segments(
+                    vec![segment(&job.committed_text)],
+                    "fake-qm".to_owned(),
+                )
+            });
+            let lane = ConfirmLane::spawn(1, decoder);
+            lane.submit(fake_job(utterance_id, "finished before drain"));
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while lane.depth.load(std::sync::atomic::Ordering::Acquire) != 0
+                && Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                lane.depth.load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "worker must complete before exercising the idle-boundary drain"
+            );
+
+            let (events, abandoned) = lane.drain(0.05);
+            assert_eq!(abandoned, 0);
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    ConfirmLaneEvent::Verdict(verdict)
+                        if verdict.utterance_id == utterance_id
+                )),
+                "completed verdict {utterance_id} was lost: {events:?}"
+            );
+        }
     }
 
     #[test]
