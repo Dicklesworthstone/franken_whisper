@@ -57,6 +57,13 @@ struct LabView: View {
     @FocusState private var focusedTextEntry: LabTextEntry?
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        let requested = ProcessInfo.processInfo.environment["FW_INITIAL_DESTINATION"]
+        _destination = State(
+            initialValue: Destination(rawValue: requested ?? "") ?? .transcribe
+        )
+    }
+
     private var profilingRequested: Bool {
         ProcessInfo.processInfo.environment["FW_IOS_PROFILE"] == "1"
     }

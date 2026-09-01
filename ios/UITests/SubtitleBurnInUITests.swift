@@ -74,10 +74,12 @@ final class SubtitleBurnInUITests: XCTestCase {
                 + "UI hierarchy:\n\(app.debugDescription)"
         )
         XCTAssertTrue(studio.isEnabled, "The native run returned no DTW word alignment")
+        keepScreenshot(app, named: "subtitle-result-ready")
         studio.tap()
 
         let burn = app.buttons["fw.burnSubtitles"]
         XCTAssertTrue(burn.waitForExistence(timeout: 30), "Subtitle Studio did not open")
+        keepScreenshot(app, named: "subtitle-studio-word-timing")
         let timeline = try parseTimeline(burn.value as? String ?? "")
         XCTAssertTrue(
             7.20...8.10 ~= timeline.first,
@@ -103,6 +105,14 @@ final class SubtitleBurnInUITests: XCTestCase {
             status.label.contains("ready"),
             "The production exporter reported failure: \(status.label)"
         )
+        keepScreenshot(app, named: "subtitle-video-ready")
+    }
+
+    private func keepScreenshot(_ app: XCUIApplication, named name: String) {
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     private func parseTimeline(_ raw: String) throws -> (
