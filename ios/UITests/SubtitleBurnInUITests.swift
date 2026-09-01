@@ -6,7 +6,10 @@ final class SubtitleBurnInUITests: XCTestCase {
     }
 
     func testImportedPhotosVideoReachesRealSubtitleExporter() throws {
-        guard ProcessInfo.processInfo.environment["FW_SUBTITLE_E2E_SAMPLE_PHOTOS"] == "1" else {
+        let ultraStressEnabled =
+            ProcessInfo.processInfo.environment["FW_SUBTITLE_E2E_SAMPLE_PHOTOS"] == "1"
+            || UserDefaults.standard.bool(forKey: "FW_SUBTITLE_E2E_SAMPLE_PHOTOS")
+        guard ultraStressEnabled else {
             throw XCTSkip(
                 "Ultra-stress E2E is opt-in: boot an isolated simulator, add the operator "
                     + "sample with simctl addmedia, then set FW_SUBTITLE_E2E_SAMPLE_PHOTOS=1 "
