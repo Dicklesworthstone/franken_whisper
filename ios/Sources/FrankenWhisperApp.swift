@@ -41,7 +41,6 @@ struct FrankenWhisperApp: App {
     var body: some Scene {
         WindowGroup {
             LabView()
-                .preferredColorScheme(.dark)
                 .background(CatalystWindowFreedom())
 #if targetEnvironment(macCatalyst)
                 .frame(minWidth: 480, minHeight: 420)

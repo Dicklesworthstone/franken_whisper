@@ -5,19 +5,32 @@
 import SwiftUI
 import UIKit
 
+enum LabAppearance: String {
+    static let storageKey = "frankenwhisper.appearance"
+    case dark
+    case light
+    var colorScheme: ColorScheme { self == .dark ? .dark : .light }
+}
+
 enum Lab {
-    static let background = Color(red: 0.004, green: 0.024, blue: 0.019)
-    static let backgroundRaised = Color(red: 0.014, green: 0.065, blue: 0.052)
-    static let panel = Color.black.opacity(0.46)
-    static let stroke = Color.white.opacity(0.075)
-    static let emerald = Color(red: 0.204, green: 0.827, blue: 0.6) // #34d399
-    static let emeraldDeep = Color(red: 0.0, green: 0.259, blue: 0.145) // #004225
-    static let cyan = Color(red: 0.22, green: 0.84, blue: 0.96)
-    static let textPrimary = Color(red: 0.886, green: 0.91, blue: 0.941)
-    static let textSecondary = Color(red: 0.58, green: 0.639, blue: 0.722)
-    static let amber = Color(red: 0.984, green: 0.749, blue: 0.141) // warnings only
-    static let violet = Color(red: 0.655, green: 0.545, blue: 0.98) // structure/metadata
-    static let danger = Color(red: 0.973, green: 0.443, blue: 0.443)
+    static let background = adaptive(dark: UIColor(red: 0.004, green: 0.024, blue: 0.019, alpha: 1), light: UIColor(red: 0.935, green: 0.970, blue: 0.950, alpha: 1))
+    static let backgroundRaised = adaptive(dark: UIColor(red: 0.014, green: 0.065, blue: 0.052, alpha: 1), light: UIColor(red: 0.835, green: 0.925, blue: 0.875, alpha: 1))
+    static let panel = adaptive(dark: UIColor(white: 0, alpha: 0.46), light: UIColor(red: 0.992, green: 0.998, blue: 0.992, alpha: 0.96))
+    static let panelStrong = adaptive(dark: UIColor(white: 0, alpha: 0.62), light: UIColor(red: 0.86, green: 0.93, blue: 0.89, alpha: 0.96))
+    static let panelSoft = adaptive(dark: UIColor(white: 1, alpha: 0.06), light: UIColor(red: 0.03, green: 0.20, blue: 0.12, alpha: 0.06))
+    static let stroke = adaptive(dark: UIColor(white: 1, alpha: 0.075), light: UIColor(red: 0.025, green: 0.23, blue: 0.14, alpha: 0.16))
+    static let emerald = adaptive(dark: UIColor(red: 0.204, green: 0.827, blue: 0.6, alpha: 1), light: UIColor(red: 0.015, green: 0.405, blue: 0.235, alpha: 1))
+    static let emeraldDeep = adaptive(dark: UIColor(red: 0.0, green: 0.259, blue: 0.145, alpha: 1), light: UIColor(red: 0.02, green: 0.34, blue: 0.19, alpha: 1))
+    static let cyan = adaptive(dark: UIColor(red: 0.22, green: 0.84, blue: 0.96, alpha: 1), light: UIColor(red: 0.015, green: 0.405, blue: 0.535, alpha: 1))
+    static let textPrimary = adaptive(dark: UIColor(red: 0.886, green: 0.91, blue: 0.941, alpha: 1), light: UIColor(red: 0.04, green: 0.12, blue: 0.08, alpha: 1))
+    static let textSecondary = adaptive(dark: UIColor(red: 0.58, green: 0.639, blue: 0.722, alpha: 1), light: UIColor(red: 0.285, green: 0.365, blue: 0.315, alpha: 1))
+    static let amber = adaptive(dark: UIColor(red: 0.984, green: 0.749, blue: 0.141, alpha: 1), light: UIColor(red: 0.65, green: 0.37, blue: 0.005, alpha: 1))
+    static let violet = adaptive(dark: UIColor(red: 0.655, green: 0.545, blue: 0.98, alpha: 1), light: UIColor(red: 0.39, green: 0.24, blue: 0.68, alpha: 1))
+    static let danger = adaptive(dark: UIColor(red: 0.973, green: 0.443, blue: 0.443, alpha: 1), light: UIColor(red: 0.70, green: 0.12, blue: 0.16, alpha: 1))
+
+    private static func adaptive(dark: UIColor, light: UIColor) -> Color {
+        Color(uiColor: UIColor { traits in traits.userInterfaceStyle == .dark ? dark : light })
+    }
 
     static func typeSize(_ base: CGFloat) -> CGFloat {
 #if targetEnvironment(macCatalyst)
@@ -36,6 +49,29 @@ enum Lab {
 
     static func speakerColor(_ speaker: String?) -> Color {
         Color(speakerUIColor(speaker))
+    }
+}
+
+struct LabAppearanceButton: View {
+    @Binding var selection: String
+    private var appearance: LabAppearance { LabAppearance(rawValue: selection) ?? .dark }
+
+    var body: some View {
+        Button {
+            selection = appearance == .dark ? LabAppearance.light.rawValue : LabAppearance.dark.rawValue
+        } label: {
+            Image(systemName: appearance == .dark ? "sun.max.fill" : "moon.stars.fill")
+                .font(.system(size: Lab.typeSize(15), weight: .bold))
+                .frame(width: 44, height: 44)
+                .background(Lab.panelStrong, in: Circle())
+                .overlay(Circle().stroke(Lab.stroke))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(appearance == .dark ? Lab.amber : Lab.cyan)
+        .accessibilityIdentifier("appearance-toggle")
+        .accessibilityLabel(appearance == .dark ? "Switch to light mode" : "Switch to dark mode")
+        .accessibilityValue(appearance == .dark ? "Dark mode" : "Light mode")
+        .accessibilityHint("Remembers this choice for future launches")
     }
 }
 
@@ -234,7 +270,7 @@ struct LabProgressBar: View {
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.white.opacity(0.06))
+                Capsule().fill(Lab.panelSoft)
                 Capsule()
                     .fill(
                         LinearGradient(
@@ -305,8 +341,8 @@ struct LabTextFieldModifier: ViewModifier {
             .tint(Lab.emerald)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
-            .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.1), lineWidth: 1))
+            .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Lab.stroke, lineWidth: 1))
     }
 }
 

@@ -36,6 +36,7 @@ private extension View {
 }
 
 struct LabView: View {
+    @AppStorage(LabAppearance.storageKey) private var appearance = LabAppearance.dark.rawValue
     private enum Destination: String, CaseIterable, Identifiable {
         case transcribe = "Transcribe"
         case live = "Live"
@@ -164,6 +165,7 @@ struct LabView: View {
                 .font(.system(size: Lab.typeSize(13), weight: .semibold))
             }
         }
+        .preferredColorScheme((LabAppearance(rawValue: appearance) ?? .dark).colorScheme)
         .alert(
             "Something snapped", isPresented: .init(
                 get: { model.lastError != nil },
@@ -644,9 +646,10 @@ struct LabView: View {
                     .foregroundStyle(Lab.textSecondary)
             }
             Spacer(minLength: 0)
+            LabAppearanceButton(selection: $appearance)
         }
         .padding(.top, 8)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 
     private var monsterMood: MonsterMood {
