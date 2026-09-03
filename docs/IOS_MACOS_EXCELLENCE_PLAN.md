@@ -46,7 +46,7 @@ acceptance remain open.
 - [ ] Keep partial transcript legible while the hero view animates.
 - [ ] Make speaker lanes accessible without relying on color alone.
 - [ ] Add selectable transcript actions, speaker rename, find, copy, share, and export.
-- [ ] Add private local history with retention, deletion, redaction, and optional Spotlight indexing.
+- [x] Add private local history with retention, deletion, redaction, and optional Spotlight indexing.
 - [ ] Add responsive iPad sidebar/workspace/inspector layout.
 - [ ] Add Mac Catalyst support and Catalyst-compatible Rust library slice.
 - [ ] Exclude the iOS keyboard extension from Mac while preserving app functionality.

@@ -53,6 +53,7 @@ struct LabView: View {
     @State private var showFileImporter = false
     @State private var pickedVideoItem: PhotosPickerItem?
     @State private var showSubtitleStudio = false
+    @State private var showHistory = false
     @State private var exportFormat: TranscriptFormat = .html
     @State private var textEntryFrames: [LabTextEntry: CGRect] = [:]
     @FocusState private var focusedTextEntry: LabTextEntry?
@@ -183,6 +184,9 @@ struct LabView: View {
                     speakerNames: model.speakerNameMap
                 )
             }
+        }
+        .sheet(isPresented: $showHistory) {
+            TranscriptHistorySheet(history: model.history)
         }
         .onChange(of: showSubtitleStudio) { _, isPresented in
             // The studio's AVPlayer/exporter still owns the current movie.
@@ -646,6 +650,32 @@ struct LabView: View {
                     .foregroundStyle(Lab.textSecondary)
             }
             Spacer(minLength: 0)
+            Button { showHistory = true } label: {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: Lab.typeSize(15), weight: .bold))
+                        .frame(width: 44, height: 44)
+                        .background(Lab.panelStrong, in: Circle())
+                        .overlay(Circle().stroke(Lab.stroke))
+                    if !model.history.entries.isEmpty {
+                        Text("\(model.history.entries.count)")
+                            .font(.system(size: Lab.typeSize(8), weight: .black, design: .monospaced))
+                            .foregroundStyle(Lab.background)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Lab.cyan, in: Capsule())
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Lab.cyan)
+            .accessibilityIdentifier("transcript-history-button")
+            .accessibilityLabel("Recent transcripts")
+            .accessibilityValue(
+                model.history.entries.isEmpty
+                    ? "Empty"
+                    : "\(model.history.entries.count) saved transcript\(model.history.entries.count == 1 ? "" : "s")"
+            )
             LabAppearanceButton(selection: $appearance)
         }
         .padding(.top, 8)

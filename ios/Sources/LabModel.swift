@@ -204,6 +204,7 @@ final class LabModel {
     // ── Collaborators ──────────────────────────────────────────────────────
     let store = ModelStore()
     let recorder = AudioRecorder()
+    let history = TranscriptHistoryStore()
     private let engine = Engine()
     /// A separate resident tiny model for realtime/keyboard work. Keeping it
     /// independent prevents the full-accuracy large-v3-turbo lane from being
@@ -1614,6 +1615,7 @@ final class LabModel {
                 self.wallSeconds = Date().timeIntervalSince(self.runStarted ?? Date())
                 self.eta.finish(elapsed: self.wallSeconds)
                 self.estimatedFinishElapsed = nil
+                self.saveCurrentResultToHistory(result)
                 self.runState = .done
             } catch {
                 guard self.generation == gen else { return }
@@ -1701,6 +1703,21 @@ final class LabModel {
             wallSeconds: wallSeconds,
             names: trimmed,
             translatedToEnglish: resultWasTranslated)
+    }
+
+    private func saveCurrentResultToHistory(_ result: Transcription) {
+        guard !result.segments.isEmpty else { return }
+        let context = exportContext
+        _ = try? history.record(
+            TranscriptHistoryResult(
+                markdown: TranscriptExport.markdown(from: result, context: context),
+                sourceName: context.sourceName,
+                language: result.language ?? (context.translatedToEnglish ? "en" : "unknown"),
+                audioSeconds: result.audioSec,
+                processingSeconds: context.wallSeconds,
+                translatedToEnglish: context.translatedToEnglish
+            )
+        )
     }
 
     // ── Hook plumbing ──────────────────────────────────────────────────────

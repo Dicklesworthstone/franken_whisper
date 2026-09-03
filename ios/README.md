@@ -14,6 +14,12 @@ karaoke glow/pop animation. The burned H.264/QuickTime export can be shared or
 saved to Photos. FrankenWhisper refuses to fabricate karaoke timing when a
 decoder result does not contain real alignment data.
 
+Finished batch transcripts also enter a private, bounded recent-results library:
+the newest 20 Markdown transcripts are retained for up to 14 days and can be
+copied, shared, or deleted individually. Source audio/video, prompts, and
+word-level timing are never copied into that history, and its files are excluded
+from device backups.
+
 ## Building
 
 ```bash
