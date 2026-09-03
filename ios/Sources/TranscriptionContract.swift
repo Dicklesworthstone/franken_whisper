@@ -61,7 +61,7 @@ struct RunOptions {
     var diarize = false
     /// `nil` preserves the native engine's normal timestamped transcript.
     /// Live keyboard dictation sets this to false because it only needs text.
-    var timestamps: Bool? = nil
+    var timestamps: Bool?
     var wordTimestamps = false
 
     var json: String {
@@ -80,6 +80,6 @@ struct RunOptions {
             object["timestamps"] = timestamps
         }
         let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
-        return String(decoding: data, as: UTF8.self)
+        return String(bytes: data, encoding: .utf8) ?? "{}"
     }
 }
