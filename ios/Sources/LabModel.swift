@@ -264,6 +264,9 @@ final class LabModel {
     var diarize = true
     var denoise = true
     var wordTimestamps = false
+    /// Batch-mode task selection. Live keyboard dictation deliberately stays
+    /// source-language transcription for predictable latency and insertion.
+    var translateToEnglish = false
     var language = "auto"
     /// The website's speaker-names field: comma- or newline-separated names
     /// and titles ("Jeff Emanuel (host), Dr. Sarah Chen (guest)"). Feeds
@@ -306,6 +309,9 @@ final class LabModel {
     /// their times for display. The final result already has it added back.
     var liveOffsetSec: Double = 0
     var result: Transcription?
+    /// Captures the task that produced `result`; the mutable option may change
+    /// while somebody is reading or exporting the finished transcript.
+    var resultWasTranslated = false
     var wallSeconds: Double = 0
     var runAudioSeconds: Double = 0
     var estimatedFinishElapsed: TimeInterval?
@@ -1536,6 +1542,7 @@ final class LabModel {
         liveSegments = []
         liveOffsetSec = 0
         result = nil
+        resultWasTranslated = false
         lastError = nil
         wallSeconds = 0
         runAudioSeconds = input.seconds ?? 0
@@ -1553,10 +1560,11 @@ final class LabModel {
         // detected speakers in order of first appearance — exactly the
         // website's behavior.
         let names = Self.parseSpeakerNames(speakerNamesRaw)
+        let translateToEnglish = self.translateToEnglish
         let options = RunOptions(
             language: language == "auto" ? nil : language,
             initialPrompt: names.isEmpty ? nil : "Speakers: \(names.joined(separator: ", ")).",
-            translate: false,
+            translate: translateToEnglish,
             diarize: usesDiarization,
             wordTimestamps: wordTimestamps || input.isVideo)
         let denoise = self.denoise && denoiserLoaded
@@ -1601,6 +1609,7 @@ final class LabModel {
                 let result = try await engine.run(options: options)
                 guard self.generation == gen else { return }
                 self.result = result
+                self.resultWasTranslated = translateToEnglish
                 self.speakerNameMap = Self.assignNames(names, to: result)
                 self.wallSeconds = Date().timeIntervalSince(self.runStarted ?? Date())
                 self.eta.finish(elapsed: self.wallSeconds)
@@ -1690,7 +1699,8 @@ final class LabModel {
         return ExportContext(
             sourceName: inputName.isEmpty ? "recording" : inputName,
             wallSeconds: wallSeconds,
-            names: trimmed)
+            names: trimmed,
+            translatedToEnglish: resultWasTranslated)
     }
 
     // ── Hook plumbing ──────────────────────────────────────────────────────

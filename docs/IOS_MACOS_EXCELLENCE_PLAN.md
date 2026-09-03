@@ -26,7 +26,8 @@ Group extension, privacy-safe widget, batch and live-dictation Live
 Activity/Dynamic Island, App Intents, deep links, and audio/video share staging
 are implemented in source. Photos/Files video import, local audio extraction,
 real DTW word-aligned karaoke preview, customizable local subtitle burn-in,
-share, and Photos save are also implemented. The pre-extension simulator build was green. YAML,
+share, Photos save, and an explicit native Translate to English batch task are
+also implemented. The pre-extension simulator build was green. YAML,
 plist, privacy-manifest, and diff hygiene checks are green. Regeneration,
 extension compilation, universal framework completion, Mac launch, and device
 acceptance remain open.

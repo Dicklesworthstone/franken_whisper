@@ -861,6 +861,22 @@ struct LabView: View {
                     text: "word timing is automatic for video karaoke captions"
                 )
             }
+            VStack(alignment: .leading, spacing: 5) {
+                optionLabel("Speech task")
+                Picker("Speech task", selection: $model.translateToEnglish) {
+                    Text("Transcribe").tag(false)
+                    Text("Translate to English").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("fw.translationTask")
+                Text(
+                    model.translateToEnglish
+                        ? "Use the selected or auto-detected source language and produce English text on device."
+                        : "Keep the transcript in the language that was spoken."
+                )
+                .font(.system(size: Lab.typeSize(10), design: .monospaced))
+                .foregroundStyle(Lab.textSecondary.opacity(0.8))
+            }
             ViewThatFits(in: .horizontal) {
                 HStack {
                     optionLabel("Language")
@@ -1143,12 +1159,15 @@ struct LabView: View {
 
     private func resultMeta(_ result: Transcription) -> some View {
         let rtf = result.audioSec > 0 ? model.wallSeconds / result.audioSec : 0
+        let languageSummary = model.resultWasTranslated
+            ? "translated to English · source \(result.language ?? "?")"
+            : "language \(result.language ?? "?")"
         return VStack(alignment: .leading, spacing: 4) {
             StatusLine(
                 kind: .neutral,
                 text: String(
-                    format: "%.1f s of audio · %.1f s on device · RTF %.2f · language %@",
-                    result.audioSec, model.wallSeconds, rtf, result.language ?? "?"))
+                    format: "%.1f s of audio · %.1f s on device · RTF %.2f · %@",
+                    result.audioSec, model.wallSeconds, rtf, languageSummary))
             if !result.turns.isEmpty {
                 // Turns' speaker_ref can be absent (anonymous lanes); the
                 // projected speaker runs always carry the display labels.

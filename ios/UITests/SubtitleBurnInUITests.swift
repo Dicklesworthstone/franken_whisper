@@ -5,6 +5,25 @@ final class SubtitleBurnInUITests: XCTestCase {
         continueAfterFailure = false
     }
 
+    func testTranslateToEnglishTaskIsDiscoverableAndOptIn() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["FW_INITIAL_DESTINATION"] = "Transcribe"
+        app.launch()
+
+        let task = app.segmentedControls["fw.translationTask"]
+        XCTAssertTrue(task.waitForExistence(timeout: 5))
+        XCTAssertTrue(
+            app.staticTexts["Keep the transcript in the language that was spoken."]
+                .waitForExistence(timeout: 2)
+        )
+        task.buttons["Translate to English"].tap()
+        XCTAssertTrue(
+            app.staticTexts[
+                "Use the selected or auto-detected source language and produce English text on device."
+            ].waitForExistence(timeout: 2)
+        )
+    }
+
     func testImportedPhotosVideoReachesRealSubtitleExporter() throws {
         let ultraStressEnabled =
             ProcessInfo.processInfo.environment["FW_SUBTITLE_E2E_SAMPLE_PHOTOS"] == "1"

@@ -50,10 +50,15 @@ struct ExportContext {
     var sourceName: String
     var wallSeconds: Double
     var names: [String: String]
+    var translatedToEnglish: Bool
 
     func display(_ speaker: String?) -> String {
         guard let speaker else { return "UNKNOWN" }
         return names[speaker] ?? speaker
+    }
+
+    var taskDescription: String {
+        translatedToEnglish ? "translated to English" : "transcribed"
     }
 }
 
@@ -101,8 +106,9 @@ enum TranscriptExport {
             "",
             "- Engine: franken_whisper on-device (Whisper large-v3-turbo q8_0 + Sortformer diarization)",
             String(
-                format: "- Audio: %.1f s · transcribed%@ in %.1f s on device",
+                format: "- Audio: %.1f s · %@%@ in %.1f s on device",
                 result.audioSec,
+                context.taskDescription,
                 result.speakerSegments.isEmpty ? "" : " + diarized",
                 context.wallSeconds),
         ]
@@ -167,8 +173,8 @@ enum TranscriptExport {
             ? "<div class=\"warn\">⚠ \(result.droppedWindows) window(s) dropped without output — a real content gap</div>"
             : ""
         let meta = String(
-            format: "franken_whisper on-device (large-v3-turbo q8_0 + Sortformer) · %.1f s of audio · processed locally in %.1f s",
-            result.audioSec, context.wallSeconds)
+            format: "franken_whisper on-device (large-v3-turbo q8_0 + Sortformer) · %.1f s of audio · %@ locally in %.1f s",
+            result.audioSec, context.taskDescription, context.wallSeconds)
         return """
             <!doctype html>
             <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">

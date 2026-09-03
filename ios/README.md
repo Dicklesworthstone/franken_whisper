@@ -106,6 +106,10 @@ mode exists solely to keep that explicit recording session alive across apps.
   Whisper's decoding prompt (so names come out spelled right) and then labels
   the detected `SPEAKER_NN` lanes in order of first appearance; after a run,
   each voice can be renamed in place. Names flow into every export.
+- **Transcribe or translate**: the batch workspace exposes the native Whisper
+  task directly. Source-language transcription remains the default; Translate
+  to English is an explicit opt-in, runs through the same local Rust decoder,
+  and is labeled in the result and human-readable exports.
 - **Exports**: a styled self-contained HTML page and GitHub-flavored Markdown
   (both matching the browser demo's exports), plus plain text; SRT and JSON
   live behind the "More" menu. Video results additionally offer an entirely

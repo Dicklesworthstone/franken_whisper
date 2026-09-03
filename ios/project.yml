@@ -204,6 +204,8 @@ targets:
       - Shared/FrankenWhisperSystemState.swift
       - Sources/SubtitleTimeline.swift
       - Sources/SubtitleVideoExporter.swift
+      - Sources/TranscriptionContract.swift
+      - Sources/TranscriptExport.swift
 
   FrankenWhisperUITests:
     type: bundle.ui-testing
