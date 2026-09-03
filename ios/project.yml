@@ -197,6 +197,7 @@ targets:
         GENERATE_INFOPLIST_FILE: true
     sources:
       - Tests
+      - Sources/Theme.swift
       - Sources/LiveUtteranceDetector.swift
       - Sources/LiveSpectrum.swift
       - Sources/ModelStore.swift

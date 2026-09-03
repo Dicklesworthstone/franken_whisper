@@ -440,7 +440,7 @@ struct LabView: View {
 
     private var keyboardHandoffOverlay: some View {
         ZStack {
-            Color.black.opacity(0.88).ignoresSafeArea()
+            Lab.background.opacity(0.96).ignoresSafeArea()
             VStack(spacing: 18) {
                 Text("FRANKENWHISPER KEYBOARD")
                     .font(.system(size: Lab.typeSize(12), weight: .bold, design: .monospaced))
@@ -594,7 +594,7 @@ struct LabView: View {
                         .textSelection(.enabled)
                         .padding(10)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                        .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 8))
                     HStack(spacing: 10) {
                         Button {
                             UIPasteboard.general.string = model.liveDictationText
