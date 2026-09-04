@@ -12,7 +12,7 @@ settings:
     # x86_64 sim slice would need the x86_64-apple-ios Rust target added to
     # ios/build-rust.sh; until someone needs an Intel Mac, exclude it.
     "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
-    MARKETING_VERSION: "1.1"
+    MARKETING_VERSION: "1.2"
     CURRENT_PROJECT_VERSION: "4"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: AU8V2Z6NKY
