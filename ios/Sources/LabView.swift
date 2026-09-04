@@ -37,6 +37,7 @@ private extension View {
 
 struct LabView: View {
     @AppStorage(LabAppearance.storageKey) private var appearance = LabAppearance.dark.rawValue
+    @AppStorage(LabTextScale.storageKey) private var uiTextScale = LabTextScale.defaultValue
     private enum Destination: String, CaseIterable, Identifiable {
         case transcribe = "Transcribe"
         case live = "Live"
@@ -71,6 +72,7 @@ struct LabView: View {
     }
 
     var body: some View {
+        let _ = uiTextScale
         commandModifiers(
             continuityModifiers(
                 lifecycleModifiers(
@@ -455,7 +457,7 @@ struct LabView: View {
                 case .starting(let stage):
                     ProgressView().tint(Lab.emerald).scaleEffect(1.4)
                     Text(stage)
-                        .font(.title2.bold())
+                        .font(.system(size: Lab.typeSize(22), weight: .bold))
                         .multilineTextAlignment(.center)
                 case .listening:
                     Image(systemName: "waveform.circle.fill")
@@ -463,7 +465,7 @@ struct LabView: View {
                         .foregroundStyle(Lab.emerald)
                         .symbolEffect(.pulse)
                     Text("Listening")
-                        .font(.title2.bold())
+                        .font(.system(size: Lab.typeSize(22), weight: .bold))
                         .multilineTextAlignment(.center)
                     LevelMeter(level: model.recorder.level)
                         .frame(maxWidth: 280)
@@ -476,11 +478,11 @@ struct LabView: View {
                         .font(.system(size: Lab.typeSize(52)))
                         .foregroundStyle(Lab.emerald)
                     Text("Keyboard ready · \(model.liveSessionMinutesRemaining)m")
-                        .font(.title2.bold())
+                        .font(.system(size: Lab.typeSize(22), weight: .bold))
                 case .finishing:
                     ProgressView().tint(Lab.emerald).scaleEffect(1.4)
                     Text("Finishing on device…")
-                        .font(.title2.bold())
+                        .font(.system(size: Lab.typeSize(22), weight: .bold))
                 case .failed(let reason):
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: Lab.typeSize(44)))
@@ -492,7 +494,7 @@ struct LabView: View {
                 case .idle:
                     ProgressView().tint(Lab.emerald).scaleEffect(1.4)
                     Text(engineHandoffStatus)
-                        .font(.title2.bold())
+                        .font(.system(size: Lab.typeSize(22), weight: .bold))
                         .multilineTextAlignment(.center)
                 }
 
@@ -1168,7 +1170,7 @@ struct LabView: View {
                 }
             }
             Text(run.text)
-                .font(.system(size: Lab.typeSize(14)))
+                .font(.system(size: Lab.contentTypeSize(14)))
                 .foregroundStyle(Lab.textPrimary)
                 .textSelection(.enabled)
         }
@@ -1181,7 +1183,7 @@ struct LabView: View {
                 .foregroundStyle(Lab.textSecondary)
                 .frame(width: 44, alignment: .trailing)
             Text(segment.text.trimmingCharacters(in: .whitespaces))
-                .font(.system(size: Lab.typeSize(14)))
+                .font(.system(size: Lab.contentTypeSize(14)))
                 .foregroundStyle(Lab.textPrimary)
                 .textSelection(.enabled)
         }

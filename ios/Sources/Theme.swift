@@ -12,6 +12,27 @@ enum LabAppearance: String {
     var colorScheme: ColorScheme { self == .dark ? .dark : .light }
 }
 
+enum LabTextScale {
+    static let storageKey = "frankenwhisper.uiTextScale"
+    static let defaultValue = 1.0
+    static let minimum = 0.8
+    static let maximum = 1.5
+    static let increment = 0.1
+
+    static var current: CGFloat {
+        let stored = UserDefaults.standard.object(forKey: storageKey) as? NSNumber
+        return CGFloat(clamped(stored?.doubleValue ?? defaultValue))
+    }
+
+    static func adjusted(_ value: Double, by steps: Int) -> Double {
+        clamped(clamped(value) + Double(steps) * increment)
+    }
+
+    static func clamped(_ value: Double) -> Double {
+        min(max(value, minimum), maximum)
+    }
+}
+
 enum Lab {
     static let background = adaptive(dark: UIColor(red: 0.004, green: 0.024, blue: 0.019, alpha: 1), light: UIColor(red: 0.935, green: 0.970, blue: 0.950, alpha: 1))
     static let backgroundRaised = adaptive(dark: UIColor(red: 0.014, green: 0.065, blue: 0.052, alpha: 1), light: UIColor(red: 0.835, green: 0.925, blue: 0.875, alpha: 1))
@@ -33,6 +54,12 @@ enum Lab {
     }
 
     static func typeSize(_ base: CGFloat) -> CGFloat {
+        contentTypeSize(base * LabTextScale.current)
+    }
+
+    /// Sizing for user-authored/generated content whose scale is controlled by
+    /// its own feature (for example burned subtitle typography), not app chrome.
+    static func contentTypeSize(_ base: CGFloat) -> CGFloat {
 #if targetEnvironment(macCatalyst)
         return base * 1.38
 #else

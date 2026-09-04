@@ -27,3 +27,12 @@ final class LiveSpectrumTests: XCTestCase {
         XCTAssertTrue((4...7).contains(peak!))
     }
 }
+
+final class LabTextScaleTests: XCTestCase {
+    func testBrowserStyleStepsClampAtSupportedBounds() {
+        XCTAssertEqual(LabTextScale.adjusted(1.0, by: 1), 1.1, accuracy: 0.000_1)
+        XCTAssertEqual(LabTextScale.adjusted(1.0, by: -1), 0.9, accuracy: 0.000_1)
+        XCTAssertEqual(LabTextScale.adjusted(99, by: 1), LabTextScale.maximum)
+        XCTAssertEqual(LabTextScale.adjusted(-99, by: -1), LabTextScale.minimum)
+    }
+}
