@@ -22,3 +22,26 @@ xcodebuild -project FrankenWhisper.xcodeproj -scheme FrankenWhisper \
   -destination 'platform=macOS,variant=Mac Catalyst' \
   -derivedDataPath "$build_root/derived-data" \
   CODE_SIGNING_ALLOWED=NO test -only-testing:FrankenWhisperTests
+
+simulator_id="${FW_IOS_SIMULATOR_ID:-}"
+if [[ -z "$simulator_id" ]]; then
+  simulator_id="$({ xcrun simctl list devices available || true; } | awk -F '[()]' '
+    /iPhone/ && /\(Booted\)$/ { print $2; found = 1; exit }
+    /iPhone/ && fallback == "" { fallback = $2 }
+    END { if (!found) print fallback }
+  ')"
+fi
+if [[ -z "$simulator_id" ]]; then
+  echo "No available iPhone Simulator for FrankenWhisper UI tests" >&2
+  exit 1
+fi
+
+# This lane may boot a shut-down device. Re-prove both audio safety layers
+# immediately before the simulator action and preserve existing windows.
+/Users/jemanuel/.local/bin/ensure-simulator-audio-safe prepare
+xcodebuild -project FrankenWhisper.xcodeproj -scheme FrankenWhisper \
+  -destination "platform=iOS Simulator,id=$simulator_id" \
+  -derivedDataPath "$build_root/derived-data" \
+  CODE_SIGNING_ALLOWED=NO test \
+  -only-testing:FrankenWhisperUITests/FrankenWhisperAppearanceUITests \
+  -only-testing:FrankenWhisperUITests/SubtitleBurnInUITests/testTranslateToEnglishTaskIsDiscoverableAndOptIn
