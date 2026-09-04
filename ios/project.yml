@@ -206,6 +206,8 @@ targets:
       - Sources/SubtitleVideoExporter.swift
       - Sources/TranscriptionContract.swift
       - Sources/TranscriptExport.swift
+    dependencies:
+      - target: FrankenWhisper
 
   FrankenWhisperUITests:
     type: bundle.ui-testing
