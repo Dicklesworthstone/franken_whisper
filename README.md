@@ -4711,10 +4711,11 @@ cross build --release --target aarch64-unknown-linux-gnu
 ### iOS (fw-ios C ABI + SwiftUI)
 
 Shipped since v0.9.3: the native engine runs on-device through **`fw-ios`**, a
-static library exposing a C ABI (`fw-ios/include/fw_ios.h`, 17 exported
+static library exposing a C ABI (`fw-ios/include/fw_ios.h`, 18 exported
 functions: engine open/close/info, Sortformer + denoiser loading, staged
-audio/PCM, full run, progress + live-transcript callbacks, cooperative
-cancellation, string release). The staticlib mounts this repo's own
+audio/PCM, full run, host-pushed AlignAtt live decode, progress +
+live-transcript callbacks, cooperative cancellation, string release). The
+staticlib mounts this repo's own
 `src/native_engine/` sources by path — one inference implementation, no FFI
 into third parties, `#![forbid(unsafe_code)]` discipline carried to the
 audited pointer island in `fw-ios/src/lib.rs`.

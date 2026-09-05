@@ -34,7 +34,7 @@ valid until the next library call on that thread).
 
 ## Exported symbols
 
-17 functions (enforced set-equality against `lib.rs` by the parity test):
+18 functions (enforced set-equality against `lib.rs` by the parity test):
 
 | Symbol | Signature sketch |
 |--------|------------------|
@@ -49,6 +49,7 @@ valid until the next library call on that thread).
 | `fw_stage_audio_file` | `int32_t (FwEngine *, bytes, len, ext, denoise, char **out_json)` — mp3/m4a/aac/wav → staged 16 kHz mono; iOS-only (else code 5) |
 | `fw_stage_pcm` | `int32_t (FwEngine *, const float *pcm, len, denoise, char **out_json)` — 16 kHz mono f32 in [-1, 1] |
 | `fw_run_prepared` | `int32_t (FwEngine *, options_json, char **out_json)` — full transcription/diarization run |
+| `fw_live_decode_pcm` | `int32_t (FwEngine *, pcm, len, options_json, char **out_json)` — host-pushed live slice decoded with dynamic context plus the shared AlignAtt commit/preview policy; endpoint calls restore full context |
 | `fw_set_progress_callback` | `void (FwProgressFn, void *ctx)` — heartbeat spans |
 | `fw_set_segments_callback` | `void (FwSegmentsFn, void *ctx)` — live per-window transcript arrays |
 | `fw_request_cancel` / `fw_reset_cancel` | `void ()` — process-wide sticky cooperative cancel (code 6 at next checkpoint); reset before next run |
@@ -107,3 +108,24 @@ minutes of work. Cancellation always aborts the whole call (code 6).
 are in the trimmed timebase; only the final result re-adds
 `skipped_leading_sec`. Hosts displaying live times should apply the staging
 response's offset themselves.
+
+## Host-pushed Live / Keyboard flow
+
+`fw_live_decode_pcm` is the iOS equivalent of the core live driver's step-decode
+and emission-policy seam. The host retains continuous microphone ownership and
+VAD because iOS keyboard extensions cannot capture audio. For every step it
+passes only the currently uncommitted 16 kHz mono slice. Rust uses
+`AudioCtxPolicy::Auto`, bypasses the batch transcript cache, records the real
+alignment-head attention tap, and applies the same AlignAtt decision as
+`fw robot listen`. The result keeps mutable `partial_tail` separate from
+append-only `commit_text`; `commit_through_sec` is relative to the supplied
+slice so the host can advance its exact sample cursor.
+
+At a detected endpoint the host sets `end_of_utterance`; Rust restores full
+30-second encoder context and commits the complete remaining decode. This API
+does not fabricate the core quality-confirm lane: `transcript.confirm` and
+`transcript.correct` require separate quality-model ownership and insertion
+recovery semantics.
+
+The ABI rejects a holdback above 300,000 ms, matching the core live buffer
+ceiling; zero still retains the policy's one-frame safety floor.

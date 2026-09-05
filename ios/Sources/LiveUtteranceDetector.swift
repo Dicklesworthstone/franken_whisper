@@ -3,7 +3,8 @@ import Foundation
 /// A small causal endpoint detector for the iOS host-pushed audio lane.
 /// It does no recognition: it only turns continuous 16 kHz PCM into bounded
 /// utterances that the same Rust engine used by batch transcription decodes.
-/// The CLI's richer AlignAtt stream remains a separate contract.
+/// Apple-specific capture stays host-owned; Rust now shares the consequential
+/// AlignAtt commit/preview policy with the CLI live driver.
 struct LiveUtteranceDetector {
     private static let sampleRate = 16_000
     private static let frameSamples = 320       // 20 ms
@@ -19,6 +20,16 @@ struct LiveUtteranceDetector {
     private var consecutiveSilence = 0
     private var noiseRMS: Float = 0.004
     private(set) var isInSpeech = false
+
+    /// Snapshot the active utterance without changing VAD state. This is the
+    /// host-owned rolling audio that Rust's true-live AlignAtt step decodes;
+    /// callers must treat it as immutable and advance their own committed
+    /// sample cursor only from `commit_through_sec`.
+    var activeUtterance: [Float]? {
+        guard isInSpeech else { return nil }
+        if pending.isEmpty { return utterance }
+        return utterance + pending
+    }
 
     mutating func reset() {
         self = LiveUtteranceDetector()

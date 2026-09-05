@@ -104,10 +104,16 @@ mode exists solely to keep that explicit recording session alive across apps.
   greedy text-only decode, and no diarization. `FW_IOS_LIVE_FAST_MODEL=0` is
   the diagnostic kill switch that routes live work back through the established
   large-model path.
-- **Live transcript**: the engine's per-window segment feed and span
+- **Live transcript**: the batch engine's per-window segment feed and span
   heartbeat (`src/native_engine/plat.rs`, `ios_hooks`) stream through the
   C callbacks into the UI, so text appears window by window and the progress
   bar counts real `encoder_window` events.
+- **Live / Keyboard AlignAtt**: the host-pushed microphone lane calls
+  `fw_live_decode_pcm` over only the uncommitted utterance slice. Mid-utterance
+  decodes use the core's dynamic encoder context, attention tap, and the exact
+  AlignAtt policy shared with `fw robot listen`, keeping mutable preview text
+  separate from append-only committed text. Endpoint decodes restore full
+  context before committing the remainder.
 - **Speaker names, like the website**: an optional pre-run names field feeds
   Whisper's decoding prompt (so names come out spelled right) and then labels
   the detected `SPEAKER_NN` lanes in order of first appearance; after a run,

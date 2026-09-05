@@ -87,6 +87,34 @@ struct StageInfo: Decodable {
     var denoised: Bool
 }
 
+struct LiveDecodeOptions: Encodable {
+    var language: String?
+    var initialPrompt: String?
+    var endOfUtterance: Bool
+    var alignattHoldbackMs: UInt64 = 200
+    var nThreads: Int = 4
+
+    var json: String {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        guard let data = try? encoder.encode(self),
+              let value = String(data: data, encoding: .utf8)
+        else { return "{}" }
+        return value
+    }
+}
+
+struct LiveDecodeResult: Decodable, Equatable {
+    var language: String?
+    var commitText: String
+    var commitThroughSec: Double?
+    var partialTail: String?
+    var commitTokens: UInt64
+    var commitConfidence: Double?
+    var holdback: Bool
+    var endOfUtterance: Bool
+}
+
 // ── The actor ──────────────────────────────────────────────────────────────
 
 /// All engine access lives here. The Rust handle is not thread-safe; the
@@ -185,6 +213,19 @@ actor Engine {
         var out: UnsafeMutablePointer<CChar>?
         let code = fw_run_prepared(handle, options.json, &out)
         return try Self.takeJSON(Transcription.self, code: code, out: out)
+    }
+
+    /// One true-live step over the host's currently uncommitted utterance
+    /// slice. Rust owns dynamic-context decode and the shared AlignAtt policy;
+    /// Swift owns capture, VAD, and the exact sample cursor.
+    func liveDecode(pcm samples: [Float], options: LiveDecodeOptions) throws -> LiveDecodeResult {
+        guard let handle else { throw EngineError.invalid("engine not loaded") }
+        var out: UnsafeMutablePointer<CChar>?
+        let code = samples.withUnsafeBufferPointer { buffer in
+            fw_live_decode_pcm(
+                handle, buffer.baseAddress, buffer.count, options.json, &out)
+        }
+        return try Self.takeJSON(LiveDecodeResult.self, code: code, out: out)
     }
 
     /// Cooperative cancel of the in-flight run: process-wide flag, checked at

@@ -71,6 +71,57 @@ final class LiveUtteranceDetectorTests: XCTestCase {
         XCTAssertEqual(batched.isInSpeech, chunked.isInSpeech)
     }
 
+    func testActiveUtteranceSnapshotIsNonMutatingAndIncludesPendingTail() {
+        var detector = LiveUtteranceDetector()
+        let speech = samples(amplitude: 0.04, frames: 20)
+        let pendingTail = Array(repeating: Float(0.05), count: 137)
+
+        XCTAssertTrue(detector.push(speech + pendingTail).isEmpty)
+        let first = detector.activeUtterance
+        let second = detector.activeUtterance
+
+        XCTAssertNotNil(first)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first?.count, 20 * frame + pendingTail.count)
+        XCTAssertTrue(detector.isInSpeech)
+    }
+
+    func testActiveUtteranceDisappearsAfterEndpoint() {
+        var detector = LiveUtteranceDetector()
+        let completed = detector.push(
+            samples(amplitude: 0.04, frames: 45)
+                + samples(amplitude: 0, frames: 40))
+
+        XCTAssertEqual(completed.count, 1)
+        XCTAssertNil(detector.activeUtterance)
+    }
+
+    func testLiveDecodeResultDecodesStableAndMutableFields() throws {
+        let json = #"""
+        {
+          "language": "en",
+          "commit_text": "stable words",
+          "commit_through_sec": 1.4,
+          "partial_tail": " changing edge",
+          "commit_tokens": 2,
+          "commit_confidence": 0.91,
+          "holdback": true,
+          "end_of_utterance": false
+        }
+        """#.data(using: .utf8)!
+
+        let result = try Engine.decoder().decode(LiveDecodeResult.self, from: json)
+
+        XCTAssertEqual(result.language, "en")
+        XCTAssertEqual(result.commitText, "stable words")
+        XCTAssertEqual(result.commitThroughSec, 1.4)
+        XCTAssertEqual(result.partialTail, " changing edge")
+        XCTAssertEqual(result.commitTokens, 2)
+        XCTAssertEqual(result.commitConfidence, 0.91)
+        XCTAssertTrue(result.holdback)
+        XCTAssertFalse(result.endOfUtterance)
+    }
+
     private func samples(amplitude: Float, frames: Int) -> [Float] {
         Array(repeating: amplitude, count: frame * frames)
     }

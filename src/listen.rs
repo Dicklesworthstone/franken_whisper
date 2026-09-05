@@ -1474,9 +1474,8 @@ impl EmissionPolicy for EndpointCommitPolicy {
 /// segments == joined deltas); token/word-grain commits need per-token
 /// text in the tap output and are this bead's recorded refinement.
 ///
-/// The boundary guard (Simul-Whisper's drop-the-edge-word) falls out of
-/// the grain: a segment whose END sits inside the holdback zone never
-/// commits.
+/// A boundary guard also keeps the slice's final segment mutable even when
+/// its attention appears safe; only audio closure lifts that guard.
 #[derive(Debug)]
 pub struct AlignAttPolicy {
     /// Danger-zone width in 20 ms encoder frames (default 10 = 200 ms).
@@ -1491,68 +1490,15 @@ impl AlignAttPolicy {
         }
     }
 
-    /// The attention-safe time boundary (slice-relative seconds): the
-    /// largest attention frame in the contiguous safe prefix of the
-    /// slice's token stream. The first token attending inside the
-    /// holdback zone stops the prefix — never commit past a hole.
-    fn safe_time_sec(
-        &self,
-        out: &crate::native_engine::decode::DecodeOutput,
-        slice_sec: f64,
-    ) -> f64 {
-        let slice_frames = (slice_sec * 50.0) as u32;
-        let limit = slice_frames.saturating_sub(self.holdback_frames);
-        let mut safe_frame: u32 = 0;
-        for window in &out.windows {
-            for tap in &window.token_attn {
-                if tap.attn_frame > limit {
-                    return f64::from(safe_frame) * 0.02;
-                }
-                safe_frame = safe_frame.max(tap.attn_frame);
-            }
+    fn shared(decision: crate::live_policy::LivePolicyDecision) -> PolicyDecision {
+        PolicyDecision {
+            commit_text: decision.commit_text,
+            commit_through_sec: decision.commit_through_sec,
+            partial_tail: decision.partial_tail,
+            commit_tokens: decision.commit_tokens,
+            commit_confidence: decision.commit_confidence,
+            holdback: decision.holdback,
         }
-        f64::from(safe_frame) * 0.02
-    }
-
-    /// Commit the first `committable` segments of the slice; everything the
-    /// driver hands us is fresh (the slice origin advances past committed
-    /// audio), so there is no cross-decode bookkeeping to get wrong.
-    fn decision(
-        out: &crate::native_engine::decode::DecodeOutput,
-        committable: usize,
-    ) -> PolicyDecision {
-        let mut decision = PolicyDecision::default();
-        let fresh = &out.segments[..committable.min(out.segments.len())];
-        if !fresh.is_empty() {
-            decision.commit_text = fresh
-                .iter()
-                .map(|segment| segment.text.trim())
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let confidences: Vec<f64> = fresh
-                .iter()
-                .filter_map(|segment| segment.confidence)
-                .collect();
-            decision.commit_confidence = if confidences.is_empty() {
-                None
-            } else {
-                Some(confidences.iter().sum::<f64>() / confidences.len() as f64)
-            };
-            decision.commit_through_sec = fresh
-                .iter()
-                .filter_map(|segment| segment.end_sec)
-                .next_back();
-            decision.commit_tokens = fresh.len() as u64;
-        }
-        let tail = out.segments[committable.min(out.segments.len())..]
-            .iter()
-            .map(|segment| segment.text.trim())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        decision.partial_tail = if tail.is_empty() { None } else { Some(tail) };
-        decision
     }
 }
 
@@ -1569,50 +1515,17 @@ impl EmissionPolicy for AlignAttPolicy {
         // music-only negative fixture; endpoint-commit did not, because it
         // only ever emits VAD-closed utterance text). The tail still flows
         // as a mutable partial; finalize/utterance close is unaffected.
-        let no_speech = out
-            .windows
-            .iter()
-            .map(|w| w.no_speech_prob)
-            .fold(0.0_f64, f64::max);
-        let avg_logprob = out
-            .windows
-            .iter()
-            .map(|w| w.avg_logprob)
-            .fold(0.0_f64, f64::min);
-        if no_speech > 0.6 || avg_logprob < -1.0 {
-            let mut decision = Self::decision(out, 0);
-            decision.holdback = true;
-            tracing::debug!(
-                slice_sec,
-                no_speech,
-                avg_logprob,
-                "alignatt step: low-confidence slice, commits held"
-            );
-            return decision;
-        }
-        let safe = self.safe_time_sec(out, slice_sec);
-        // Closure guard: NEVER commit the slice's final segment
-        // mid-utterance, no matter how early its attention sits. A decode
-        // over truncated audio routinely hallucinates a confident sentence
-        // close there (first-campaign receipt: 3.0 s slice produced
-        // "And so am I fellow Americans." with attention safely behind a
-        // 2.06 s boundary; the real audio continued "...ask not what your
-        // country can do"). A segment is trustworthy only when the decoder
-        // started another one after it.
-        let committable = out
-            .segments
-            .iter()
-            .take(out.segments.len().saturating_sub(1))
-            .take_while(|segment| segment.end_sec.is_some_and(|end| end <= safe))
-            .count();
-        let decision = Self::decision(out, committable);
+        let decision = Self::shared(crate::live_policy::alignatt_step(
+            out,
+            slice_sec,
+            self.holdback_frames,
+        ));
         tracing::debug!(
             slice_sec,
-            safe_time_sec = safe,
-            committed = committable,
             segments = out.segments.len(),
             committed_chars = decision.commit_text.len(),
             partial_chars = decision.partial_tail.as_deref().map_or(0, str::len),
+            held = decision.holdback,
             "alignatt step"
         );
         decision
@@ -1623,8 +1536,7 @@ impl EmissionPolicy for AlignAttPolicy {
         out: &crate::native_engine::decode::DecodeOutput,
         _slice_sec: f64,
     ) -> PolicyDecision {
-        // Audio complete: no holdback, no closure risk — commit everything.
-        Self::decision(out, out.segments.len())
+        Self::shared(crate::live_policy::finalize(out))
     }
 
     fn reset(&mut self) {}

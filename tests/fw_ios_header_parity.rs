@@ -144,6 +144,14 @@ fn fw_ios_header_matches_exported_abi() {
         export_symbols.contains("fw_string_free"),
         "lib.rs lost fw_string_free"
     );
+    assert!(
+        header_symbols.contains("fw_live_decode_pcm"),
+        "header lost the native live-decode seam"
+    );
+    assert!(
+        export_symbols.contains("fw_live_decode_pcm"),
+        "lib.rs lost the native live-decode seam"
+    );
 
     let missing_in_header: Vec<&String> = export_symbols.difference(&header_symbols).collect();
     let missing_in_rust: Vec<&String> = header_symbols.difference(&export_symbols).collect();

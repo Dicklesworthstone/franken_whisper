@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use fw_ios::{
     FwEngine, fw_engine_close, fw_engine_has_denoiser, fw_engine_has_sortformer,
     fw_engine_info_json, fw_engine_load_sortformer, fw_engine_open, fw_last_error_message,
-    fw_request_cancel, fw_reset_cancel, fw_run_prepared, fw_set_progress_callback,
-    fw_stage_audio_file, fw_stage_pcm, fw_string_free, fw_version,
+    fw_live_decode_pcm, fw_request_cancel, fw_reset_cancel, fw_run_prepared,
+    fw_set_progress_callback, fw_stage_audio_file, fw_stage_pcm, fw_string_free, fw_version,
 };
 
 static PROGRESS_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -103,6 +103,30 @@ fn run(engine: *mut FwEngine, options: &str) -> (i32, Option<serde_json::Value>)
     }
 }
 
+fn live_decode(
+    engine: *mut FwEngine,
+    pcm: &[f32],
+    options: &str,
+) -> (i32, Option<serde_json::Value>) {
+    let options = CString::new(options).expect("options");
+    let mut out: *mut c_char = std::ptr::null_mut();
+    let code = unsafe {
+        fw_live_decode_pcm(
+            engine,
+            pcm.as_ptr(),
+            pcm.len(),
+            options.as_ptr(),
+            &raw mut out,
+        )
+    };
+    if code == 0 {
+        (0, Some(take_json(code, out, "fw_live_decode_pcm")))
+    } else {
+        assert!(out.is_null(), "failure must not hand out a live result");
+        (code, None)
+    }
+}
+
 fn main() {
     // ── Contract stages (always run) ───────────────────────────────────────
     let version = unsafe { CStr::from_ptr(fw_version()) }.to_string_lossy();
@@ -133,6 +157,16 @@ fn main() {
         );
         assert_eq!(
             fw_run_prepared(std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut()),
+            2
+        );
+        assert_eq!(
+            fw_live_decode_pcm(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
             2
         );
         assert_eq!(
@@ -200,6 +234,39 @@ fn main() {
 
     // Options validation: malformed JSON and unknown keys are usage errors.
     let pcm = read_wav_16k_mono(&wav);
+
+    // The native Live/Keyboard path calls this dedicated seam directly: a
+    // mid-utterance step returns append-only commit fields plus a mutable
+    // tail; endpoint close commits the remaining full-context transcript.
+    let (code, _) = live_decode(engine, &pcm[..16_000.min(pcm.len())], r#"{"unknown":true}"#);
+    assert_eq!(code, 2, "unknown live option keys must be rejected");
+    let (code, _) = live_decode(
+        engine,
+        &pcm[..16_000.min(pcm.len())],
+        r#"{"alignatt_holdback_ms":300001}"#,
+    );
+    assert_eq!(code, 4, "unbounded live holdback must be rejected");
+    let (code, live_step) = live_decode(engine, &pcm, "{}");
+    assert_eq!(code, 0, "live step: {}", last_error());
+    let live_step = live_step.expect("live step json");
+    assert_eq!(live_step["end_of_utterance"], false);
+    assert!(live_step["commit_text"].is_string());
+    assert!(live_step["commit_tokens"].is_u64());
+    assert!(live_step["holdback"].is_boolean());
+    let (code, live_endpoint) = live_decode(engine, &pcm, r#"{"end_of_utterance":true}"#);
+    assert_eq!(code, 0, "live endpoint: {}", last_error());
+    let live_endpoint = live_endpoint.expect("live endpoint json");
+    assert_eq!(live_endpoint["end_of_utterance"], true);
+    assert!(
+        live_endpoint["commit_text"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("country"),
+        "endpoint transcript drifted: {live_endpoint}"
+    );
+    println!("PASS live AlignAtt step + endpoint");
+
     let staged = stage(engine, &pcm);
     println!("PASS stage: {staged}");
     let (code, _) = run(engine, "{not json");

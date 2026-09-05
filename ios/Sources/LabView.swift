@@ -564,9 +564,12 @@ struct LabView: View {
                     LevelMeter(level: model.recorder.level)
                     StatusLine(
                         kind: .ok,
-                        text: model.liveQueuedUtterances > 0
-                            ? "listening · \(model.liveQueuedUtterances) phrase(s) decoding locally"
-                            : "listening · pause briefly to commit a phrase")
+                        text: liveListeningStatus)
+                    if model.livePolicyHoldingBack {
+                        StatusLine(
+                            kind: .neutral,
+                            text: "holding the unstable edge · committed words stay append-only")
+                    }
                     Button("Stop dictation") { model.stopLiveDictation() }
                         .buttonStyle(GhostButtonStyle(tint: Lab.danger))
                 case .armed:
@@ -593,14 +596,37 @@ struct LabView: View {
                         .disabled(model.liveEngineState != .ready)
                 }
 
-                if !model.liveDictationText.isEmpty {
-                    Text(model.liveDictationText)
-                        .font(.system(size: Lab.typeSize(14)))
-                        .foregroundStyle(Lab.textPrimary)
-                        .textSelection(.enabled)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 8))
+                if !model.liveDictationText.isEmpty || !model.livePartialText.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if !model.liveDictationText.isEmpty {
+                            Text(
+                                "COMMITTED TO KEYBOARD · \(model.liveCommittedDeltaCount) "
+                                    + (model.liveCommittedDeltaCount == 1 ? "DELTA" : "DELTAS")
+                            )
+                            .font(.system(size: Lab.typeSize(9), weight: .bold, design: .monospaced))
+                            .tracking(0.8)
+                            .foregroundStyle(Lab.emerald)
+                            Text(model.liveDictationText)
+                                .font(.system(size: Lab.typeSize(14)))
+                                .foregroundStyle(Lab.textPrimary)
+                                .textSelection(.enabled)
+                                .accessibilityLabel("Committed dictation")
+                        }
+                        if !model.livePartialText.isEmpty {
+                            Text("HEARING NOW · MUTABLE PREVIEW")
+                                .font(.system(size: Lab.typeSize(9), weight: .bold, design: .monospaced))
+                                .tracking(0.8)
+                                .foregroundStyle(Lab.cyan)
+                            Text(model.livePartialText)
+                                .font(.system(size: Lab.typeSize(14)))
+                                .foregroundStyle(Lab.textSecondary)
+                                .italic()
+                                .accessibilityLabel("Uncommitted live preview")
+                        }
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Lab.panelStrong, in: RoundedRectangle(cornerRadius: 8))
                     HStack(spacing: 10) {
                         Button {
                             UIPasteboard.general.string = model.liveDictationText
@@ -632,6 +658,16 @@ struct LabView: View {
             }
             .animation(.snappy(duration: 0.25), value: model.liveDictationState)
         }
+    }
+
+    private var liveListeningStatus: String {
+        if model.liveQueuedUtterances > 0 {
+            return "listening · \(model.liveQueuedUtterances) closed phrase(s) decoding locally"
+        }
+        if model.liveIsPreviewDecoding {
+            return "listening · AlignAtt is decoding the current phrase"
+        }
+        return "listening · stable words commit while you speak"
     }
 
     // ── Header ─────────────────────────────────────────────────────────────

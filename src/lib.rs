@@ -23,6 +23,7 @@ pub mod ecapa_inference;
 pub mod error;
 pub mod export;
 pub mod listen;
+pub mod live_policy;
 pub mod logging;
 pub mod model;
 pub mod model_distribution;

@@ -44,6 +44,9 @@ pub mod model_distribution;
 // The engine itself: the exact sources the native binary ships.
 #[path = "../../src/native_engine/mod.rs"]
 pub mod native_engine;
+// The same AlignAtt commit/preview decision used by `fw robot listen`.
+#[path = "../../src/live_policy.rs"]
+pub mod live_policy;
 
 // The diarization stack, same deal — the parent's OWN sources.
 #[path = "../../src/diarization_projection.rs"]
@@ -71,7 +74,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use crate::error::{FwError, FwResult};
-use crate::native_engine::decode::{self, DecodeParams, LoadedModel};
+use crate::native_engine::decode::{self, AudioCtxPolicy, DecodeParams, LoadedModel};
 use crate::native_engine::ggml::GgmlModel;
 use crate::sortformer_inference::{SortformerPcm, SortformerSession};
 
@@ -997,6 +1000,144 @@ struct RunOptions {
     beam_size: Option<usize>,
     /// Thread-count hint; defaults to the engine's host policy.
     n_threads: Option<usize>,
+}
+
+/// A single low-latency decode over the currently uncommitted utterance
+/// slice. Capture, VAD, and the exact session clock stay host-owned; decode
+/// and the AlignAtt durability decision stay engine-owned.
+#[derive(serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LiveDecodeOptions {
+    language: Option<String>,
+    initial_prompt: Option<String>,
+    end_of_utterance: bool,
+    alignatt_holdback_ms: u64,
+    n_threads: usize,
+}
+
+// Match the core live driver's bounded holdback envelope. Apart from avoiding
+// a narrowing cast on hostile ABI input, anything larger than the five-minute
+// rolling-buffer ceiling cannot express a meaningful stability boundary.
+const MAX_LIVE_HOLDBACK_MS: u64 = 300_000;
+
+impl Default for LiveDecodeOptions {
+    fn default() -> Self {
+        Self {
+            language: None,
+            initial_prompt: None,
+            end_of_utterance: false,
+            alignatt_holdback_ms: 200,
+            n_threads: 4,
+        }
+    }
+}
+
+fn run_live_decode(
+    engine: &mut FwEngine,
+    samples: &[f32],
+    opts: &LiveDecodeOptions,
+) -> FwResult<String> {
+    let minimum_samples = if opts.end_of_utterance { 1 } else { 8_000 };
+    if samples.len() < minimum_samples {
+        return Err(FwError::InvalidRequest(
+            if opts.end_of_utterance {
+                "live endpoint decode needs non-empty 16 kHz mono PCM"
+            } else {
+                "live step decode needs at least 0.5 seconds of 16 kHz mono PCM"
+            }
+            .to_string(),
+        ));
+    }
+    if opts.alignatt_holdback_ms > MAX_LIVE_HOLDBACK_MS {
+        return Err(FwError::InvalidRequest(format!(
+            "alignatt_holdback_ms must be at most {MAX_LIVE_HOLDBACK_MS} milliseconds"
+        )));
+    }
+    let params = DecodeParams {
+        language: opts
+            .language
+            .clone()
+            .filter(|language| !language.trim().is_empty() && language != "auto"),
+        initial_prompt: opts
+            .initial_prompt
+            .clone()
+            .filter(|prompt| !prompt.trim().is_empty()),
+        timestamps: true,
+        n_threads: opts.n_threads.clamp(1, 32),
+        audio_ctx: if opts.end_of_utterance {
+            AudioCtxPolicy::Full
+        } else {
+            AudioCtxPolicy::Auto
+        },
+        suppress_nst: true,
+        bypass_transcript_cache: true,
+        record_token_attn: !opts.end_of_utterance,
+        ..DecodeParams::default()
+    };
+    let out = decode::transcribe_samples(&engine.model, samples, &params, &checkpoint)?;
+    let decision = if opts.end_of_utterance {
+        crate::live_policy::finalize(&out)
+    } else {
+        let frames = ((opts.alignatt_holdback_ms / 20).max(1)) as u32;
+        crate::live_policy::alignatt_step(&out, samples.len() as f64 / 16_000.0, frames)
+    };
+    Ok(serde_json::json!({
+        "language": out.language,
+        "commit_text": decision.commit_text,
+        "commit_through_sec": decision.commit_through_sec,
+        "partial_tail": decision.partial_tail,
+        "commit_tokens": decision.commit_tokens,
+        "commit_confidence": decision.commit_confidence,
+        "holdback": decision.holdback,
+        "end_of_utterance": opts.end_of_utterance,
+    })
+    .to_string())
+}
+
+/// Decode one host-owned live utterance slice and return the exact AlignAtt
+/// commit/preview decision used by the CLI live driver.
+///
+/// # Safety
+/// `engine` must be a live serialized handle; `pcm` must point to `len`
+/// initialized f32 values; `options_json` must be NULL or valid UTF-8 JSON;
+/// `out_json` must be NULL or a writable caller-owned string slot.
+#[unsafe(no_mangle)]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn fw_live_decode_pcm(
+    engine: *mut FwEngine,
+    pcm: *const f32,
+    len: usize,
+    options_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    guarded(EXIT_GENERIC, || {
+        clear_error();
+        // SAFETY: documented as NULL or a live serialized engine handle.
+        let Some(engine) = (unsafe { engine_mut(engine) }) else {
+            set_error("fw_live_decode_pcm: engine was NULL");
+            return EXIT_USAGE;
+        };
+        // SAFETY: documented as a pointer to `len` initialized f32 values.
+        let Some(samples) = (unsafe { ptr_island::opt_f32s(pcm, len) }) else {
+            set_error("fw_live_decode_pcm: pcm was NULL");
+            return EXIT_USAGE;
+        };
+        // SAFETY: documented as NULL or a valid NUL-terminated string.
+        let options = match unsafe { ptr_island::opt_str(options_json) } {
+            None | Some("") => LiveDecodeOptions::default(),
+            Some(raw) => match serde_json::from_str(raw) {
+                Ok(options) => options,
+                Err(error) => {
+                    set_error(format!("fw_live_decode_pcm: bad options_json: {error}"));
+                    return EXIT_USAGE;
+                }
+            },
+        };
+        match run_live_decode(engine, samples, &options) {
+            Ok(json) => deliver_json("fw_live_decode_pcm", json, out_json),
+            Err(error) => fail("fw_live_decode_pcm", &error),
+        }
+    })
 }
 
 fn run_fused(engine: &mut FwEngine, opts: &RunOptions) -> FwResult<String> {

@@ -334,12 +334,27 @@ final class LabModel {
     }
     var liveDictationText = ""
     var liveLastPhrase = ""
+    /// Mutable AlignAtt tail. It is visible in the containing app but never
+    /// crosses the App Group or enters the host text field until Rust commits
+    /// it, preserving the append-only keyboard contract.
+    var livePartialText = ""
+    var liveCommittedDeltaCount = 0
+    var livePolicyHoldingBack = false
+    var liveIsPreviewDecoding = false
     var liveQueuedUtterances = 0
     private var liveDetector = LiveUtteranceDetector()
     private var liveCaptureTask: Task<Void, Never>?
     private var liveDecodeTask: Task<Void, Never>?
     private var liveStartTask: Task<Void, Never>?
-    private var liveQueue: [[Float]] = []
+    private struct PendingLiveUtterance {
+        var pcm: [Float]
+        var committedSamples: Int
+    }
+    private var liveQueue: [PendingLiveUtterance] = []
+    private var liveUtteranceCounter = 0
+    private var activeLiveUtteranceID: Int?
+    private var activeLiveCommittedSamples = 0
+    private var activeLiveLastScheduledSamples = 0
     private var liveSessionID = ""
     private var liveServiceID = ""
     private var liveRevision = 0
@@ -1033,6 +1048,14 @@ final class LabModel {
         UIApplication.shared.isIdleTimerDisabled = false
         liveSessionExpiresAt = nil
         liveEndSessionRequested = false
+        liveQueue.removeAll(keepingCapacity: true)
+        activeLiveUtteranceID = nil
+        activeLiveCommittedSamples = 0
+        activeLiveLastScheduledSamples = 0
+        livePartialText = ""
+        livePolicyHoldingBack = false
+        liveIsPreviewDecoding = false
+        liveQueuedUtterances = 0
         liveSessionID = UUID().uuidString
         liveRevision = 0
         liveDictationState = .failed(message)
@@ -1053,7 +1076,12 @@ final class LabModel {
             return
         }
 
-        if case .loading = engineState {
+        // The default iPhone path owns a separate warm tiny engine. A
+        // background large-model hydration must not delay an already-ready
+        // realtime lane; only queue when Live still depends on that load.
+        if case .loading = engineState,
+           !Self.usesFastLiveModel || liveEngineState != .ready
+        {
             keyboardStartPending = true
             liveDictationState = .starting("Finishing local model setup…")
             publishLiveSnapshot(state: .idle, message: "Finishing local model setup…")
@@ -1161,9 +1189,7 @@ final class LabModel {
                     let fresh = self.recorder.takeAvailable()
                     if self.liveDictationState == .listening {
                         self.updateLiveMeter(fresh)
-                        for utterance in self.liveDetector.push(fresh) {
-                            self.enqueueLiveUtterance(utterance)
-                        }
+                        self.consumeLiveSamples(fresh)
                     }
                     if let expires = self.liveSessionExpiresAt, Date() >= expires {
                         self.liveEndSessionRequested = true
@@ -1194,6 +1220,13 @@ final class LabModel {
         liveQueue.removeAll(keepingCapacity: true)
         liveDictationText = ""
         liveLastPhrase = ""
+        livePartialText = ""
+        liveCommittedDeltaCount = 0
+        livePolicyHoldingBack = false
+        liveIsPreviewDecoding = false
+        activeLiveUtteranceID = nil
+        activeLiveCommittedSamples = 0
+        activeLiveLastScheduledSamples = 0
         liveQueuedUtterances = 0
         liveSessionID = UUID().uuidString
         liveRevision = 0
@@ -1223,9 +1256,7 @@ final class LabModel {
             }
         }
         let tail = recorder.takeAvailable()
-        for utterance in liveDetector.push(tail) {
-            enqueueLiveUtterance(utterance)
-        }
+        consumeLiveSamples(tail)
         if let final = liveDetector.flush() {
             enqueueLiveUtterance(final)
         }
@@ -1245,43 +1276,143 @@ final class LabModel {
         guard !isLiveDictationActive else { return }
         liveDictationText = ""
         liveLastPhrase = ""
+        livePartialText = ""
+        liveCommittedDeltaCount = 0
+        livePolicyHoldingBack = false
         liveRevision += 1
         publishLiveSnapshot(
             state: hasArmedDictationSession ? .armed : .idle,
             message: armedSessionMessage)
     }
 
+    private func consumeLiveSamples(_ samples: [Float]) {
+        guard !samples.isEmpty else { return }
+        let wasInSpeech = liveDetector.isInSpeech
+        let completed = liveDetector.push(samples)
+        if !wasInSpeech, (liveDetector.isInSpeech || !completed.isEmpty) {
+            beginLiveUtteranceTracking()
+        }
+        for utterance in completed {
+            enqueueLiveUtterance(utterance)
+        }
+        if liveDetector.isInSpeech, activeLiveUtteranceID == nil {
+            beginLiveUtteranceTracking()
+        }
+        scheduleLivePreviewIfNeeded()
+    }
+
+    private func beginLiveUtteranceTracking() {
+        liveUtteranceCounter += 1
+        activeLiveUtteranceID = liveUtteranceCounter
+        activeLiveCommittedSamples = 0
+        activeLiveLastScheduledSamples = 0
+        livePartialText = ""
+        livePolicyHoldingBack = false
+    }
+
     private func enqueueLiveUtterance(_ pcm: [Float]) {
         guard pcm.count >= 8_000 else { return }
-        liveQueue.append(pcm)
+        if activeLiveUtteranceID == nil {
+            beginLiveUtteranceTracking()
+        }
+        liveQueue.append(
+            PendingLiveUtterance(
+                pcm: pcm,
+                committedSamples: min(activeLiveCommittedSamples, pcm.count)))
+        activeLiveUtteranceID = nil
+        activeLiveCommittedSamples = 0
+        activeLiveLastScheduledSamples = 0
+        livePartialText = ""
+        livePolicyHoldingBack = false
         liveQueuedUtterances = liveQueue.count + (liveDecodeTask == nil ? 0 : 1)
         processNextLiveUtterance()
     }
 
-    private func processNextLiveUtterance() {
-        guard liveDecodeTask == nil, !liveQueue.isEmpty else { return }
-        let pcm = liveQueue.removeFirst()
-        liveQueuedUtterances = liveQueue.count + 1
-        let language = self.language == "auto" ? nil : self.language
+    private func scheduleLivePreviewIfNeeded() {
+        guard liveDecodeTask == nil, liveQueue.isEmpty,
+              let utteranceID = activeLiveUtteranceID,
+              let fullPCM = liveDetector.activeUtterance
+        else { return }
+        let start = min(activeLiveCommittedSamples, fullPCM.count)
+        let available = fullPCM.count - start
+        let newlyCaptured = fullPCM.count - activeLiveLastScheduledSamples
+        guard available >= 16_000, newlyCaptured >= 4_800 else { return }
+
+        let pcm = Array(fullPCM[start...])
+        activeLiveLastScheduledSamples = fullPCM.count
+        liveIsPreviewDecoding = true
         let prompt = String(liveDictationText.suffix(240))
-        let options = RunOptions(
+        let language = self.language == "auto" ? nil : self.language
+        let options = LiveDecodeOptions(
             language: language,
             initialPrompt: prompt.isEmpty ? nil : prompt,
-            translate: false,
-            diarize: false,
-            timestamps: false,
-            wordTimestamps: false)
+            endOfUtterance: false)
+        let inferenceEngine = Self.usesFastLiveModel ? liveEngine : engine
+
+        liveDecodeTask = Task { [inferenceEngine] in
+            do {
+                inferenceEngine.resetCancel()
+                let decision = try await inferenceEngine.liveDecode(pcm: pcm, options: options)
+                if self.activeLiveUtteranceID == utteranceID,
+                   self.activeLiveCommittedSamples == start
+                {
+                    self.applyLiveDecision(decision, baseSample: start, sliceSamples: pcm.count)
+                }
+            } catch {
+                if let engineError = error as? EngineError, engineError.isCancellation {
+                    // App teardown may cancel a preview. No committed text is lost.
+                } else if self.activeLiveUtteranceID == utteranceID {
+                    // A preview is garnish. Keep recording and let the full-context
+                    // endpoint decode decide the durable text.
+                    self.livePartialText = ""
+                    self.livePolicyHoldingBack = true
+                }
+            }
+            self.liveDecodeTask = nil
+            self.liveIsPreviewDecoding = false
+            if !self.liveQueue.isEmpty {
+                self.processNextLiveUtterance()
+            } else {
+                self.scheduleLivePreviewIfNeeded()
+                self.finishLiveDictationIfReady()
+            }
+        }
+    }
+
+    private func processNextLiveUtterance() {
+        guard liveDecodeTask == nil, !liveQueue.isEmpty else { return }
+        let utterance = liveQueue.removeFirst()
+        liveQueuedUtterances = liveQueue.count + 1
+        let start = min(utterance.committedSamples, utterance.pcm.count)
+        // AlignAtt never commits the final segment before endpoint close, but
+        // keep the host robust if a future policy legitimately advances to
+        // the exact PCM boundary. There is nothing left for the endpoint ABI
+        // to decode, and that ABI intentionally rejects an empty slice.
+        guard start < utterance.pcm.count else {
+            liveQueuedUtterances = liveQueue.count
+            if !liveQueue.isEmpty {
+                processNextLiveUtterance()
+            } else {
+                finishLiveDictationIfReady()
+            }
+            return
+        }
+        let pcm = Array(utterance.pcm[start...])
+        let language = self.language == "auto" ? nil : self.language
+        let prompt = String(liveDictationText.suffix(240))
+        let options = LiveDecodeOptions(
+            language: language,
+            initialPrompt: prompt.isEmpty ? nil : prompt,
+            endOfUtterance: true)
 
         let inferenceEngine = Self.usesFastLiveModel ? liveEngine : engine
         liveDecodeTask = Task { [inferenceEngine] in
             do {
                 inferenceEngine.resetCancel()
-                _ = try await inferenceEngine.stage(pcm: pcm, denoise: false)
-                let transcription = try await inferenceEngine.run(options: options)
-                let phrase = transcription.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !phrase.isEmpty {
-                    self.appendLivePhrase(phrase)
-                }
+                let decision = try await inferenceEngine.liveDecode(pcm: pcm, options: options)
+                self.applyLiveDecision(decision, baseSample: start, sliceSamples: pcm.count)
+                self.livePartialText = ""
+                self.livePolicyHoldingBack = false
             } catch {
                 if let engineError = error as? EngineError, engineError.isCancellation {
                     // Cancellation is used only for app teardown; keep any text
@@ -1302,10 +1433,23 @@ final class LabModel {
         }
     }
 
-    private func appendLivePhrase(_ phrase: String) {
+    private func applyLiveDecision(
+        _ decision: LiveDecodeResult,
+        baseSample: Int,
+        sliceSamples: Int
+    ) {
+        livePartialText = decision.partialTail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        livePolicyHoldingBack = decision.holdback
+        let commit = decision.commitText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let through = decision.commitThroughSec, !decision.endOfUtterance {
+            let advance = Int((through * 16_000).rounded())
+            activeLiveCommittedSamples = min(baseSample + max(0, advance), baseSample + sliceSamples)
+        }
+        guard !commit.isEmpty else { return }
         let separator = liveDictationText.isEmpty ? "" : " "
-        liveDictationText += separator + phrase
-        liveLastPhrase = phrase
+        liveDictationText += separator + commit
+        liveLastPhrase = commit
+        liveCommittedDeltaCount += 1
         liveRevision += 1
         let state: DictationSnapshot.State = liveStopRequested ? .finishing : .listening
         publishLiveSnapshot(state: state, message: nil)
@@ -1361,6 +1505,12 @@ final class LabModel {
         liveSessionExpiresAt = nil
         liveEndSessionRequested = false
         liveStopRequested = false
+        activeLiveUtteranceID = nil
+        activeLiveCommittedSamples = 0
+        activeLiveLastScheduledSamples = 0
+        livePartialText = ""
+        livePolicyHoldingBack = false
+        liveIsPreviewDecoding = false
         liveMeterLevel = 0
         liveSpectrum = [Float](repeating: 0, count: LiveSpectrumAnalyzer.bandCount)
         UIApplication.shared.isIdleTimerDisabled = false
