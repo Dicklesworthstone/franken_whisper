@@ -1,12 +1,5 @@
 import XCTest
 
-// The unit-test target compiles ModelStore without the native Engine bridge.
-// Keep this minimal error surface aligned with the one operation ModelStore
-// needs so response validation can run without loading model code.
-enum EngineError: Error {
-    case invalid(String)
-}
-
 final class ModelStoreTests: XCTestCase {
     func testEngineLifecycleFenceRejectsDelayedOlderUnload() {
         var fence = EngineLifecycleFence()
