@@ -1,3 +1,4 @@
+import FwCore
 import XCTest
 
 final class LiveUtteranceDetectorTests: XCTestCase {
@@ -97,7 +98,7 @@ final class LiveUtteranceDetectorTests: XCTestCase {
     }
 
     func testLiveDecodeResultDecodesStableAndMutableFields() throws {
-        let json = #"""
+        let json = Data(#"""
         {
           "language": "en",
           "commit_text": "stable words",
@@ -108,7 +109,7 @@ final class LiveUtteranceDetectorTests: XCTestCase {
           "holdback": true,
           "end_of_utterance": false
         }
-        """#.data(using: .utf8)!
+        """#.utf8)
 
         let result = try Engine.decoder().decode(LiveDecodeResult.self, from: json)
 
@@ -120,6 +121,18 @@ final class LiveUtteranceDetectorTests: XCTestCase {
         XCTAssertEqual(result.commitConfidence, 0.91)
         XCTAssertTrue(result.holdback)
         XCTAssertFalse(result.endOfUtterance)
+    }
+
+    func testLinkedLiveDecodeABIFailsClosedForNullEngine() {
+        var out: UnsafeMutablePointer<CChar>?
+
+        let code = fw_live_decode_pcm(nil, nil, 0, nil, &out)
+
+        XCTAssertEqual(code, 2)
+        XCTAssertNil(out)
+        XCTAssertEqual(
+            String(cString: fw_last_error_message()),
+            "fw_live_decode_pcm: engine was NULL")
     }
 
     private func samples(amplitude: Float, frames: Int) -> [Float] {

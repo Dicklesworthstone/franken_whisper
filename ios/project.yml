@@ -197,6 +197,7 @@ targets:
         GENERATE_INFOPLIST_FILE: true
     sources:
       - Tests
+      - Sources/Engine.swift
       - Sources/Theme.swift
       - Sources/LiveUtteranceDetector.swift
       - Sources/LiveSpectrum.swift
@@ -208,6 +209,8 @@ targets:
       - Sources/TranscriptExport.swift
     dependencies:
       - target: FrankenWhisper
+      - framework: FwCore.xcframework
+        embed: false
 
   FrankenWhisperUITests:
     type: bundle.ui-testing
