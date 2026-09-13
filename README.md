@@ -402,15 +402,15 @@ checkout.
 
 | Crate | Source | Purpose |
 |-------|--------|---------|
-| `asupersync` | crates.io `0.3.4` | Cancel-correct orchestration primitives |
-| `franken-kernel` | crates.io `0.3.4` | Budget, TraceId, time utilities |
-| `franken-evidence` | crates.io `0.3.4` | Evidence ledger primitives |
-| `franken-decision` | crates.io `0.3.4` | Decision contract framework |
-| `fsqlite` / `fsqlite-types` | crates.io `0.3.0`; source path `../frankensqlite` | Pure-Rust SQLite persistence and value types |
+| `asupersync` | crates.io `=0.5.0` | Cancel-correct orchestration primitives |
+| `franken-kernel` | crates.io `=0.5.0` | Budget, TraceId, time utilities |
+| `franken-evidence` | crates.io `=0.5.0` | Evidence ledger primitives |
+| `franken-decision` | crates.io `=0.5.0` | Decision contract framework |
+| `fsqlite` / `fsqlite-types` | crates.io `^0.4.0`; source path `../frankensqlite` | Pure-Rust SQLite persistence and value types |
 | `ft-core` / `ft-kernel-cpu` | crates.io `0.1.0`; source path `../frankentorch` | Required tensor types and native Whisper CPU kernels |
 | `ft-kernel-metal` *(macOS)* | crates.io `0.1.0`; source path `../frankentorch` | Automatic Metal compute for eligible large operations |
 | `ftts-kernels` | crates.io `0.1`; source path `../frankentts` | Required FastEnhancer-S denoising kernels |
-| `ftui` *(feature: `tui`)* | crates.io `0.6.0`; source path `../frankentui` | Optional terminal UI framework |
+| `ftui` *(feature: `tui`)* | crates.io `0.7.0`; source path `../frankentui` | Optional terminal UI framework |
 | `fj-lax` / `fj-core` *(feature: `fj-oracle`)* | source path `../frankenjax` | Independent differential oracle for native-kernel conformance tests (seeded, 1e-4 tolerance; see [docs/conformance-contract.md](docs/conformance-contract.md)) |
 
 ---
@@ -2665,19 +2665,19 @@ enum Finalizer {
 ```
 franken_whisper
   |
-  +-- asupersync          (crates.io ^0.3.4)  Cancel-correct orchestration
-  +-- franken-kernel      (crates.io ^0.3.4)  Budget, TraceId, time utilities
-  +-- franken-evidence    (crates.io ^0.3.4)  Evidence ledger primitives
-  +-- franken-decision    (crates.io ^0.3.4)  Decision contract framework
+  +-- asupersync          (crates.io =0.5.0)  Cancel-correct orchestration
+  +-- franken-kernel      (crates.io =0.5.0)  Budget, TraceId, time utilities
+  +-- franken-evidence    (crates.io =0.5.0)  Evidence ledger primitives
+  +-- franken-decision    (crates.io =0.5.0)  Decision contract framework
   |
-  +-- fsqlite             (crates.io 0.3.0)   Pure-Rust SQLite implementation
-  +-- fsqlite-types       (crates.io 0.3.0)   Core SQLite value types
+  +-- fsqlite             (crates.io ^0.4.0)  Pure-Rust SQLite implementation
+  +-- fsqlite-types       (crates.io ^0.4.0)  Core SQLite value types
   |
   +-- ft-core             (crates.io 0.1.0)   Tensor types
   +-- ft-kernel-cpu       (crates.io 0.1.0)   Native Whisper CPU kernels
   +-- [macOS] ft-kernel-metal (crates.io 0.1.0) Automatic Metal kernels
   +-- ftts-kernels        (crates.io 0.1)     FastEnhancer-S denoising kernels
-  +-- [optional] ftui     (crates.io 0.6.0, feature: tui) Terminal UI
+  +-- [optional] ftui     (crates.io 0.7.0, feature: tui) Terminal UI
   +-- [optional] fj-lax/fj-core (0.1.0, feature: fj-oracle) Test-only differential oracle
 ```
 
