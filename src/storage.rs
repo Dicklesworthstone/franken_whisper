@@ -52,7 +52,7 @@ fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, FrankenError
                 .map_err(|error| error.to_string());
     }
     RUNTIME.with(|runtime| match runtime {
-        Ok(runtime) => Ok(runtime.block_on(Box::pin(future))),
+        Ok(runtime) => Ok(runtime.block_on(crate::with_caller_cx(Box::pin(future)))),
         Err(error) => Err(FrankenError::Internal(format!(
             "cannot build franken_whisper storage runtime: {error}"
         ))),
@@ -3571,6 +3571,50 @@ mod tests {
         BlockingConnection, ListenRunOpen, ListenSegmentRow, RunStore, stored_projection_timeline,
         value_to_i64, value_to_string,
     };
+
+    #[test]
+    fn runtime_context_storage_executes_sql_without_regranting_caller_caps() {
+        use asupersync::{Budget, Cx, cx::cap, runtime::RuntimeBuilder, runtime::SpawnError};
+
+        assert!(Cx::current().is_none());
+        let runtime = RuntimeBuilder::new().worker_threads(1).build().unwrap();
+        let parent = runtime.request_cx_with_budget(Budget::INFINITE.with_cost_quota(17));
+        {
+            let _parent = Cx::set_current(Some(parent.clone()));
+            {
+                let _restricted = parent.restrict::<cap::None>().set_current_restricted();
+                super::block_on(async {
+                    let cx = Cx::current().expect("storage kept its caller");
+                    assert_eq!(cx.task_id(), parent.task_id());
+                    assert_eq!(cx.budget(), parent.budget());
+                    assert!(!cx.capabilities().spawn);
+                    assert!(matches!(
+                        cx.spawn_blocking(|_| 42),
+                        Err(SpawnError::RuntimeUnavailable)
+                    ));
+                })
+                .unwrap();
+                let connection = BlockingConnection::open(":memory:").unwrap();
+                connection
+                    .execute("CREATE TABLE caller_values (value INTEGER)")
+                    .unwrap();
+                connection
+                    .execute_with_params(
+                        "INSERT INTO caller_values VALUES (?)",
+                        &[SqliteValue::Integer(42)],
+                    )
+                    .unwrap();
+                let rows = connection.query("SELECT value FROM caller_values").unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(42)));
+                assert!(!Cx::current().unwrap().capabilities().spawn);
+                assert_eq!(Cx::current().unwrap().task_id(), parent.task_id());
+            }
+            assert_eq!(Cx::current().unwrap().capabilities(), parent.capabilities());
+            assert!(Cx::current().unwrap().checkpoint().is_ok());
+        }
+        assert!(Cx::current().is_none());
+    }
 
     #[test]
     fn persists_and_lists_runs() {

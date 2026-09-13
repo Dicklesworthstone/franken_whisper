@@ -1611,7 +1611,9 @@ impl FrankenWhisperEngine {
         let handle = self
             .runtime
             .handle()
-            .spawn(async move { run_pipeline(request, &state_root, event_tx, &config).await });
+            .spawn(crate::with_caller_cx(async move {
+                run_pipeline(request, &state_root, event_tx, &config).await
+            }));
 
         self.runtime.block_on(handle)
     }
