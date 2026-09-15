@@ -44,4 +44,5 @@ xcodebuild -project FrankenWhisper.xcodeproj -scheme FrankenWhisper \
   -derivedDataPath "$build_root/derived-data" \
   CODE_SIGNING_ALLOWED=NO test \
   -only-testing:FrankenWhisperUITests/FrankenWhisperAppearanceUITests \
-  -only-testing:FrankenWhisperUITests/SubtitleBurnInUITests/testTranslateToEnglishTaskIsDiscoverableAndOptIn
+  -only-testing:FrankenWhisperUITests/SubtitleBurnInUITests/testTranslateToEnglishTaskIsDiscoverableAndOptIn \
+  -only-testing:FrankenWhisperUITests/SubtitleBurnInUITests/testAdvancedPromptAndBeamControlsAreDiscoverableWithoutAudio

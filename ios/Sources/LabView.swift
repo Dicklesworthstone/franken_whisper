@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 
 private enum LabTextEntry: Hashable {
     case speakerNames
+    case vocabulary
     case speakerLane(String)
 }
 
@@ -55,6 +56,7 @@ struct LabView: View {
     @State private var pickedVideoItem: PhotosPickerItem?
     @State private var showSubtitleStudio = false
     @State private var showHistory = false
+    @State private var showAdvancedDecoding = false
     @State private var exportFormat: TranscriptFormat = .html
     @State private var textEntryFrames: [LabTextEntry: CGRect] = [:]
     @FocusState private var focusedTextEntry: LabTextEntry?
@@ -978,6 +980,56 @@ struct LabView: View {
             )
             .font(.system(size: Lab.typeSize(10), design: .monospaced))
             .foregroundStyle(Lab.textSecondary.opacity(0.8))
+
+            DisclosureGroup(isExpanded: $showAdvancedDecoding) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Decode mode", selection: $model.decodeMode) {
+                        ForEach(DecodeMode.allCases) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("fw.decodeMode")
+
+                    Text(
+                        model.decodeMode == .fast
+                            ? "Greedy decoding is fastest and remains the default."
+                            : "Beam 5 compares several hypotheses for tougher audio and uses more time and battery."
+                    )
+                    .font(.system(size: Lab.typeSize(10), design: .monospaced))
+                    .foregroundStyle(Lab.textSecondary.opacity(0.8))
+
+                    TextField(
+                        "Vocabulary or context — names, jargon, topic…",
+                        text: $model.vocabularyPrompt,
+                        axis: .vertical
+                    )
+                    .focused($focusedTextEntry, equals: .vocabulary)
+                    .labTextField()
+                    .textInputAutocapitalization(.sentences)
+                    .autocorrectionDisabled()
+                    .submitLabel(.done)
+                    .reportLabTextEntryFrame(.vocabulary)
+                    .accessibilityIdentifier("fw.vocabularyPrompt")
+                    .onChange(of: model.vocabularyPrompt) { _, value in
+                        if value.count > TranscriptionPrompt.maxContextCharacters {
+                            model.vocabularyPrompt = String(
+                                value.prefix(TranscriptionPrompt.maxContextCharacters)
+                            )
+                        }
+                    }
+
+                    Text("This biases spelling locally and is never saved in transcript history.")
+                        .font(.system(size: Lab.typeSize(10), design: .monospaced))
+                        .foregroundStyle(Lab.textSecondary.opacity(0.8))
+                }
+                .padding(.top, 6)
+            } label: {
+                Label("Advanced decoding", systemImage: "slider.horizontal.3")
+                    .font(.system(size: Lab.typeSize(12), weight: .bold, design: .monospaced))
+                    .foregroundStyle(Lab.textPrimary)
+                    .accessibilityIdentifier("fw.advancedDecoding")
+            }
         }
         .toggleStyle(SwitchToggleStyle(tint: Lab.emerald))
         .disabled(model.isBusy)

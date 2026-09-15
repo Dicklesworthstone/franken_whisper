@@ -122,6 +122,11 @@ mode exists solely to keep that explicit recording session alive across apps.
   task directly. Source-language transcription remains the default; Translate
   to English is an explicit opt-in, runs through the same local Rust decoder,
   and is labeled in the result and human-readable exports.
+- **Advanced decoding without clutter**: a compact disclosure exposes the
+  native engine's byte-identical greedy default, its real beam-5 careful mode,
+  and a bounded in-memory vocabulary/context prompt. Speaker-name prompting is
+  preserved and composed with that context; live keyboard dictation keeps its
+  separate low-latency policy.
 - **Exports**: a styled self-contained HTML page and GitHub-flavored Markdown
   (both matching the browser demo's exports), plus plain text; SRT and JSON
   live behind the "More" menu. Video results additionally offer an entirely

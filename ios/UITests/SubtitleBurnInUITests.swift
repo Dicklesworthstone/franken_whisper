@@ -24,6 +24,33 @@ final class SubtitleBurnInUITests: XCTestCase {
         )
     }
 
+    func testAdvancedPromptAndBeamControlsAreDiscoverableWithoutAudio() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["FW_INITIAL_DESTINATION"] = "Transcribe"
+        app.launch()
+
+        let disclosure = app.buttons["fw.advancedDecoding"]
+        XCTAssertTrue(disclosure.waitForExistence(timeout: 5))
+        disclosure.tap()
+        app.swipeUp()
+
+        // SwiftUI can expose a segmented Picker as either a segmented control
+        // or a generic accessibility container depending on the host OS.
+        let decodeMode = app.descendants(matching: .any)["fw.decodeMode"]
+        XCTAssertTrue(decodeMode.waitForExistence(timeout: 3))
+        XCTAssertTrue(decodeMode.buttons["Fast"].exists)
+        XCTAssertTrue(decodeMode.buttons["Careful"].exists)
+        decodeMode.buttons["Careful"].tap()
+        XCTAssertTrue(
+            app.staticTexts[
+                "Beam 5 compares several hypotheses for tougher audio and uses more time and battery."
+            ].waitForExistence(timeout: 2)
+        )
+        XCTAssertTrue(app.descendants(matching: .any)["fw.vocabularyPrompt"].exists)
+        keepScreenshot(app, named: "advanced-decoding-controls")
+        decodeMode.buttons["Fast"].tap()
+    }
+
     func testImportedPhotosVideoReachesRealSubtitleExporter() throws {
         let ultraStressEnabled =
             ProcessInfo.processInfo.environment["FW_SUBTITLE_E2E_SAMPLE_PHOTOS"] == "1"

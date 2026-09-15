@@ -54,6 +54,34 @@ struct Transcription: Codable {
     }
 }
 
+enum DecodeMode: String, CaseIterable, Identifiable {
+    case fast
+    case careful
+
+    var id: Self { self }
+    var label: String { self == .fast ? "Fast" : "Careful" }
+    var beamSize: Int? { self == .careful ? 5 : nil }
+}
+
+enum TranscriptionPrompt {
+    static let maxContextCharacters = 800
+
+    static func combined(speakerNames: [String], context: String) -> String? {
+        var parts: [String] = []
+        if !speakerNames.isEmpty {
+            parts.append("Speakers: \(speakerNames.joined(separator: ", ")).")
+        }
+
+        let trimmedContext = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedContext.isEmpty {
+            parts.append("Context: \(trimmedContext)")
+        }
+
+        guard !parts.isEmpty else { return nil }
+        return String(parts.joined(separator: " ").prefix(maxContextCharacters))
+    }
+}
+
 struct RunOptions {
     var language: String?
     var initialPrompt: String?
@@ -63,6 +91,9 @@ struct RunOptions {
     /// Live keyboard dictation sets this to false because it only needs text.
     var timestamps: Bool?
     var wordTimestamps = false
+    /// `nil` keeps the engine's byte-identical greedy default. The careful
+    /// UI mode sends five, matching whisper.cpp's quality-oriented default.
+    var beamSize: Int?
 
     var json: String {
         var object: [String: Any] = [
@@ -78,6 +109,9 @@ struct RunOptions {
         }
         if let timestamps {
             object["timestamps"] = timestamps
+        }
+        if let beamSize {
+            object["beam_size"] = beamSize
         }
         let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
         return String(bytes: data, encoding: .utf8) ?? "{}"

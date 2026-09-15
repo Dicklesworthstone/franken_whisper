@@ -269,6 +269,14 @@ final class LabModel {
     /// source-language transcription for predictable latency and insertion.
     var translateToEnglish = false
     var language = "auto"
+    var decodeMode = DecodeMode(
+        rawValue: UserDefaults.standard.string(forKey: "fw.decode-mode") ?? ""
+    ) ?? .fast {
+        didSet { UserDefaults.standard.set(decodeMode.rawValue, forKey: "fw.decode-mode") }
+    }
+    /// Optional proper nouns, jargon, or domain context for batch decoding.
+    /// Kept only in this in-memory workspace and never written to history.
+    var vocabularyPrompt = ""
     /// The website's speaker-names field: comma- or newline-separated names
     /// and titles ("Jeff Emanuel (host), Dr. Sarah Chen (guest)"). Feeds
     /// Whisper's decoding prompt so the names come out spelled right, then
@@ -1714,10 +1722,14 @@ final class LabModel {
         let translateToEnglish = self.translateToEnglish
         let options = RunOptions(
             language: language == "auto" ? nil : language,
-            initialPrompt: names.isEmpty ? nil : "Speakers: \(names.joined(separator: ", ")).",
+            initialPrompt: TranscriptionPrompt.combined(
+                speakerNames: names,
+                context: vocabularyPrompt
+            ),
             translate: translateToEnglish,
             diarize: usesDiarization,
-            wordTimestamps: wordTimestamps || input.isVideo)
+            wordTimestamps: wordTimestamps || input.isVideo,
+            beamSize: decodeMode.beamSize)
         let denoise = self.denoise && denoiserLoaded
 
         runTask = Task { [engine] in
