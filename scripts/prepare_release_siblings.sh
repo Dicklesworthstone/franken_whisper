@@ -4,9 +4,9 @@
 # overwritten: a mismatch fails closed with an actionable error.
 set -euo pipefail
 
-FRANKENSQLITE_REVISION="d57d68984f2d2cee3e1cd6812ca1a4145a651b48"
+FRANKENSQLITE_REVISION="a8b76fb810ff0e26bb49c81add43c7709e1e7302"
 FRANKENTORCH_REVISION="db0d11d77ea03d688d4c9d95a095c1a7ee08b066"
-FRANKENTUI_REVISION="052f1ecee072110657af3be10455d165d898aa91"
+FRANKENTUI_REVISION="351908eb2d2e1e143282e91ff5139dde20bac167"
 FRANKENTTS_REVISION="aa5ee59f48f9d48f3bcf9314f9bdca7aac2ea6d8"
 FRANKENJAX_REVISION="ec74b7b24a7935683f06fbd88129ce3a7cf9c7fc"
 
@@ -78,7 +78,7 @@ require_sibling \
     "$FRANKENTUI_REVISION"
 require_sibling \
     "frankentts" \
-    "https://github.com/Dicklesworthstone/frankentts.git" \
+    "https://github.com/Dicklesworthstone/franken_tts.git" \
     "$FRANKENTTS_REVISION"
 require_sibling \
     "frankenjax" \

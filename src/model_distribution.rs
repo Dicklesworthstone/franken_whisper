@@ -1039,12 +1039,12 @@ where
     // evidence. Only a fully verified descriptor is published under the
     // manifest filename, and publication never replaces an existing name.
     let (staging_path, staging_file) = create_staging_file(final_path)?;
-    let download = runtime.block_on(download_remote_file(
+    let download = runtime.block_on(crate::with_caller_cx(download_remote_file(
         remote,
         &staging_path,
         staging_file,
         is_cancelled,
-    ));
+    )));
     download?;
     cancellation_checkpoint(is_cancelled)?;
     quarantine_invalid_existing(final_path)?;
