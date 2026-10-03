@@ -18,6 +18,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ---
 
+## Unreleased installer follow-up
+
+- Admit the exact flat `CHANGELOG.md` release-archive member once in the
+  documented `main/install.sh`, retaining duplicate, path and non-regular tar
+  rejection. The published v0.10.0 bundled/tagged installer predates this fix
+  and rejects its archive; use the canonical main installer
+  ([#9](https://github.com/Dicklesworthstone/franken_whisper/issues/9)).
+  Published v0.10.0 tags and signed asset bytes remain unchanged.
+
 ## [0.10.0] - 2026-10-02
 
 This cut contains 461 commits (454 non-merge commits) after `v0.9.3`, before

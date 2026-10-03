@@ -294,6 +294,7 @@ fn installer_accepts_the_exact_dsr_release_archive_members() {
         "NOTICE.sortformer.txt",
         "THIRD_PARTY_NOTICES.md",
         "AGENTS.md",
+        "CHANGELOG.md",
     ] {
         fs::write(stage.join(member), member).expect("write archive member");
     }
@@ -313,6 +314,7 @@ fn installer_accepts_the_exact_dsr_release_archive_members() {
             "NOTICE.sortformer.txt",
             "THIRD_PARTY_NOTICES.md",
             "AGENTS.md",
+            "CHANGELOG.md",
         ])
         .status()
         .expect("create release archive");
@@ -327,6 +329,54 @@ fn installer_accepts_the_exact_dsr_release_archive_members() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn installer_rejects_duplicate_or_nested_changelog_members() {
+    for members in [
+        vec!["franken_whisper", "fw", "CHANGELOG.md", "CHANGELOG.md"],
+        vec!["franken_whisper", "fw", "docs/CHANGELOG.md"],
+    ] {
+        let root = tempfile::tempdir().expect("temporary changelog archive harness");
+        let archive = root.path().join("release.tar.gz");
+        write_flat_targz(&archive, &members);
+        let output = source_and_run(
+            root.path(),
+            &format!("validate_archive_members \"{}\" tar.gz", archive.display()),
+        );
+        assert!(
+            !output.status.success(),
+            "members must be rejected: {members:?}"
+        );
+    }
+}
+
+#[test]
+fn installer_rejects_symlink_changelog_member() {
+    let root = tempfile::tempdir().expect("temporary symlink archive harness");
+    let stage = root.path().join("stage");
+    fs::create_dir(&stage).expect("create symlink archive stage");
+    for member in ["franken_whisper", "fw"] {
+        fs::write(stage.join(member), member).expect("write regular archive member");
+    }
+    std::os::unix::fs::symlink("/etc/passwd", stage.join("CHANGELOG.md"))
+        .expect("create rejected metadata symlink");
+    let archive = root.path().join("release.tar.gz");
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&stage)
+        .args(["franken_whisper", "fw", "CHANGELOG.md"])
+        .status()
+        .expect("create symlink archive");
+    assert!(status.success());
+    let output = source_and_run(
+        root.path(),
+        &format!("validate_archive_members \"{}\" tar.gz", archive.display()),
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("non-regular entry"));
 }
 
 /// Build a flat ustar tar.gz containing exactly `members`, each a regular
@@ -395,6 +445,8 @@ fn installer_ignores_macos_appledouble_sidecar_members() {
             "THIRD_PARTY_NOTICES.md",
             "._AGENTS.md",
             "AGENTS.md",
+            "._CHANGELOG.md",
+            "CHANGELOG.md",
             "._.DS_Store",
             ".DS_Store",
         ],

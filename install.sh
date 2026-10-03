@@ -1051,7 +1051,7 @@ is_macos_sidecar_member() {
     esac
     shadowed="${name#._}"
     case "$shadowed" in
-        "$BINARY_NAME"|"$ALIAS_NAME"|"README.md"|"LICENSE"|"NOTICE.sortformer.txt"|"THIRD_PARTY_NOTICES.md"|"AGENTS.md"|".DS_Store")
+        "$BINARY_NAME"|"$ALIAS_NAME"|"README.md"|"LICENSE"|"NOTICE.sortformer.txt"|"THIRD_PARTY_NOTICES.md"|"AGENTS.md"|"CHANGELOG.md"|".DS_Store")
             return 0 ;;
         *) return 1 ;;
     esac
@@ -1062,7 +1062,7 @@ is_macos_sidecar_member() {
 # regular, non-symlink binaries before installation.
 validate_archive_members() {
     local archive="$1" archive_ext="$2" members member normalized
-    local binary_count=0 alias_count=0 readme_count=0 license_count=0 sortformer_notice_count=0 third_party_count=0 agents_count=0
+    local binary_count=0 alias_count=0 readme_count=0 license_count=0 sortformer_notice_count=0 third_party_count=0 agents_count=0 changelog_count=0
     if [ "$archive_ext" = "zip" ]; then
         members=$(unzip -Z1 "$archive") || return 1
     else
@@ -1082,6 +1082,7 @@ validate_archive_members() {
             "NOTICE.sortformer.txt") sortformer_notice_count=$((sortformer_notice_count + 1)) ;;
             "THIRD_PARTY_NOTICES.md") third_party_count=$((third_party_count + 1)) ;;
             "AGENTS.md") agents_count=$((agents_count + 1)) ;;
+            "CHANGELOG.md") changelog_count=$((changelog_count + 1)) ;;
             *)
                 if is_macos_sidecar_member "$normalized"; then
                     continue
@@ -1094,7 +1095,8 @@ validate_archive_members() {
     [ "$binary_count" -eq 1 ] && [ "$alias_count" -eq 1 ] && \
         [ "$readme_count" -le 1 ] && [ "$license_count" -le 1 ] && \
         [ "$sortformer_notice_count" -le 1 ] && \
-        [ "$third_party_count" -le 1 ] && [ "$agents_count" -le 1 ] || {
+        [ "$third_party_count" -le 1 ] && [ "$agents_count" -le 1 ] && \
+        [ "$changelog_count" -le 1 ] || {
         log_error "Archive must contain exactly one $BINARY_NAME, exactly one $ALIAS_NAME, and no duplicate allowlisted members"
         return 1
     }
