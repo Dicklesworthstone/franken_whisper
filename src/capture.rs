@@ -2162,6 +2162,16 @@ mod tests {
         assert!(error.to_string().contains("capture ring capacity"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_capture_refuses_before_program_lookup() {
+        let error =
+            FfmpegCaptureSource::open_with_command("definitely-missing-capture-producer", &[], 1.0)
+                .expect_err("Windows streaming capture must refuse before resolving the program");
+        assert!(matches!(error, FwError::Unsupported(_)));
+        assert!(error.to_string().contains("use the cpal capture backend"));
+    }
+
     #[test]
     fn pipe_zero_config_rejected() {
         let reader = ChunkedReader {

@@ -1585,6 +1585,45 @@ pub struct StreamingChild {
     _never_constructed: std::convert::Infallible,
 }
 
+// Shared capture code needs the same interface on every target. Windows
+// spawning still returns Unsupported, so this uninhabited handle cannot reach
+// any of these methods and does not imply Windows streaming-process support.
+#[cfg(windows)]
+impl std::fmt::Debug for StreamingChild {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self._never_constructed {}
+    }
+}
+
+#[cfg(windows)]
+impl StreamingChild {
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        match self._never_constructed {}
+    }
+
+    #[must_use]
+    pub fn rendered_command(&self) -> &str {
+        match self._never_constructed {}
+    }
+
+    pub fn try_wait(&mut self) -> FwResult<Option<std::process::ExitStatus>> {
+        match self._never_constructed {}
+    }
+
+    pub fn kill(&mut self) -> FwResult<Option<std::process::ExitStatus>> {
+        match self._never_constructed {}
+    }
+
+    pub(crate) fn finish_after_stdout_eof(&mut self, _max_wait: Duration) -> FwResult<()> {
+        match self._never_constructed {}
+    }
+
+    #[must_use]
+    pub fn stderr_tail(&self) -> String {
+        match self._never_constructed {}
+    }
+}
+
 #[cfg(not(windows))]
 impl StreamingChild {
     /// Take the live stdout pipe (once). The caller owns read pacing;

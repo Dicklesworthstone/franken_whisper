@@ -42,6 +42,9 @@ that every optional browser, GPU, oracle or Apple-device surface is certified.
 - Match the standalone WASM lockfile's package names to the pinned tensor
   manifests, preserving all dependency versions, registry checksums and the
   existing `wasm-bindgen` version.
+- Restore the Windows streaming-child interface required by shared capture
+  code. Windows ffmpeg streaming capture still returns explicit unsupported
+  guidance; its unconstructible handle does not add process support.
 - Retain actionable native-model provisioning guidance after authenticated
   resolution fails. Fence successful stage-worker results against the original
   cancellation deadline even when the receiving thread resumes late.
