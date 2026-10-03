@@ -6142,12 +6142,8 @@ mod tests {
             "2026-01-01T00:00:00Z".to_owned(),
         ));
 
-        let result = tracker.submit_quality_result(
-            7,
-            "quality",
-            vec![seg("correct", Some(0.9))],
-            20,
-        );
+        let result =
+            tracker.submit_quality_result(7, "quality", vec![seg("correct", Some(0.9))], 20);
         assert!(
             matches!(result, Err(FwError::InvalidRequest(message)) if message.contains("WER tolerance")),
             "non-finite tolerance must fail closed"

@@ -1572,10 +1572,9 @@ pub struct HealthReport {
     pub ffmpeg: DependencyCheck,
     pub database: DependencyCheck,
     pub resources: ResourceSnapshot,
-    /// Audio input availability (bd-rt-device-probe-wh02): enumeration-only
-    /// metadata — the probe NEVER opens a stream, because opening triggers
-    /// the macOS TCC microphone prompt as a health-check side effect. An
-    /// explicit live open/read test is a separate, deliberate driver action.
+    /// Audio input availability (bd-rt-device-probe-wh02). Machine diagnostics
+    /// defer hardware enumeration: native audio drivers can emit diagnostics
+    /// outside Rust logging. `fw robot listen --list-devices` is the explicit probe.
     /// Additive to the 1.x schema (never in the required-field constants);
     /// does not participate in `overall_status` (a headless box without a
     /// mic is healthy for every batch workload).
@@ -1586,6 +1585,8 @@ pub struct HealthReport {
 /// Enumeration-only audio input snapshot for `health.report.audio_input`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioInputCheck {
+    /// False means availability and device count have not been measured.
+    pub probed: bool,
     pub available: bool,
     pub default_device: Option<String>,
     pub device_count: usize,
@@ -1731,7 +1732,7 @@ fn parse_meminfo_kb(s: &str) -> Option<u64> {
     numeric_part.parse::<u64>().ok().map(|kb| kb * 1024)
 }
 
-/// Build a comprehensive health report by probing all subsystems.
+/// Build a health report without probing optional audio hardware.
 #[must_use]
 pub fn build_health_report(db_path: &Path) -> HealthReport {
     let ts = chrono::Utc::now().to_rfc3339();
@@ -1770,31 +1771,16 @@ pub fn build_health_report(db_path: &Path) -> HealthReport {
         CheckStatus::Unavailable
     };
 
-    let audio_input = match crate::capture::enumerate_input_devices() {
-        Ok(devices) => AudioInputCheck {
-            available: !devices.is_empty(),
-            default_device: devices
-                .iter()
-                .find(|d| d.is_default)
-                .map(|d| d.name.clone()),
-            device_count: devices.len(),
-            backend: "cpal",
-            issues: if devices.is_empty() {
-                vec![
-                    "no audio input devices enumerated; live capture unavailable (batch                      transcription unaffected)"
-                        .to_owned(),
-                ]
-            } else {
-                vec![]
-            },
-        },
-        Err(error) => AudioInputCheck {
-            available: false,
-            default_device: None,
-            device_count: 0,
-            backend: "cpal",
-            issues: vec![error.to_string()],
-        },
+    let audio_input = AudioInputCheck {
+        probed: false,
+        available: false,
+        default_device: None,
+        device_count: 0,
+        backend: "cpal",
+        issues: vec![
+            "audio input not probed; use `fw robot listen --list-devices` to enumerate hardware"
+                .to_owned(),
+        ],
     };
 
     HealthReport {
@@ -1828,6 +1814,7 @@ pub fn health_report_value(report: &HealthReport) -> serde_json::Value {
             "memory_total_bytes": report.resources.memory_total_bytes,
         },
         "audio_input": {
+            "probed": report.audio_input.probed,
             "available": report.audio_input.available,
             "default_device": report.audio_input.default_device,
             "device_count": report.audio_input.device_count,
@@ -2370,6 +2357,7 @@ fn health_report_schema_example() -> serde_json::Value {
             "memory_total_bytes": 16_000_000_000_u64,
         },
         "audio_input": {
+            "probed": true,
             "available": true,
             "default_device": "Built-in Microphone",
             "device_count": 1,
@@ -3338,11 +3326,7 @@ mod tests {
 
         let schema = robot_schema_value();
         for (event_name, value, required) in [
-            (
-                "listen.device",
-                device_event,
-                LISTEN_DEVICE_REQUIRED_FIELDS,
-            ),
+            ("listen.device", device_event, LISTEN_DEVICE_REQUIRED_FIELDS),
             (
                 "routing_history.complete",
                 routing_event,
@@ -6364,6 +6348,7 @@ mod tests {
                 memory_total_bytes: Some(16_000_000_000),
             },
             audio_input: super::AudioInputCheck {
+                probed: true,
                 available: true,
                 default_device: Some("MacBook Pro Microphone".to_owned()),
                 device_count: 1,
@@ -6815,6 +6800,9 @@ mod tests {
     #[test]
     fn build_health_report_returns_valid_report() {
         let report = super::build_health_report(std::path::Path::new("/tmp/test_health.sqlite3"));
+        assert!(!report.audio_input.probed);
+        assert!(report.audio_input.default_device.is_none());
+        assert!(report.audio_input.issues[0].contains("fw robot listen --list-devices"));
         // Timestamp should be non-empty.
         assert!(!report.ts.is_empty(), "timestamp should be non-empty");
         // Should have at least one backend.

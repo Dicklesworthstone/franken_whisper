@@ -15,12 +15,6 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{FwError, FwResult};
 use crate::native_engine::weights::SafetensorsFile;
-use crate::sortformer_f16_contract::{
-    SORTFORMER_F16_DERIVATION_METHOD, SORTFORMER_F16_DERIVATION_METHOD_VERSION,
-    SORTFORMER_F16_DERIVATION_RECEIPT_SCHEMA, SortformerF16ArtifactDtype,
-    SortformerF16DerivationIdentity, SortformerF16DerivationReceipt,
-    SortformerF16PackageIdentity, SortformerF16TensorRecord, SortformerF16TensorTransform,
-};
 use crate::sortformer_conformance::{
     SORTFORMER_CONVERSION_RECEIPT_SHA256, VerifiedSortformerPackage,
     load_verified_sortformer_package_from_bytes,
@@ -28,6 +22,12 @@ use crate::sortformer_conformance::{
 #[cfg(test)]
 use crate::sortformer_conformance::{
     SORTFORMER_MODEL_ID, SORTFORMER_MODEL_REVISION, SORTFORMER_PACKAGE_SHA256,
+};
+use crate::sortformer_f16_contract::{
+    SORTFORMER_F16_DERIVATION_METHOD, SORTFORMER_F16_DERIVATION_METHOD_VERSION,
+    SORTFORMER_F16_DERIVATION_RECEIPT_SCHEMA, SortformerF16ArtifactDtype,
+    SortformerF16DerivationIdentity, SortformerF16DerivationReceipt, SortformerF16PackageIdentity,
+    SortformerF16TensorRecord, SortformerF16TensorTransform,
 };
 const PACKAGE_FORMAT: &str = "safetensors";
 const BYTE_ORDER: &str = "little_endian";
@@ -187,17 +187,15 @@ fn downcast_package(
             })
             .collect::<FwResult<Vec<_>>>()?;
         let elements = shape.iter().try_fold(1u64, |product, &dimension| {
-            product.checked_mul(dimension).ok_or_else(|| {
-                downcast_error("source_shape", "tensor element count overflows u64")
-            })
+            product
+                .checked_mul(dimension)
+                .ok_or_else(|| downcast_error("source_shape", "tensor element count overflows u64"))
         })?;
         let source_raw = source.tensor_raw_bytes(name)?;
-        let source_bytes = u64::try_from(source_raw.len()).map_err(|_| {
-            downcast_error("source_bounds", "tensor byte count does not fit u64")
-        })?;
-        let begin = u64::try_from(payload.len()).map_err(|_| {
-            downcast_error("package_bounds", "output offset does not fit u64")
-        })?;
+        let source_bytes = u64::try_from(source_raw.len())
+            .map_err(|_| downcast_error("source_bounds", "tensor byte count does not fit u64"))?;
+        let begin = u64::try_from(payload.len())
+            .map_err(|_| downcast_error("package_bounds", "output offset does not fit u64"))?;
 
         let (source_dtype, destination_dtype, transform) = match source.dtype_name(name)? {
             "F32" => {
@@ -226,8 +224,7 @@ fn downcast_package(
                 census.i64_tensors = checked_add(census.i64_tensors, 1, "i64 tensor count")?;
                 census.i64_elements =
                     checked_add(census.i64_elements, elements, "i64 element count")?;
-                census.i64_bytes =
-                    checked_add(census.i64_bytes, source_bytes, "i64 byte count")?;
+                census.i64_bytes = checked_add(census.i64_bytes, source_bytes, "i64 byte count")?;
                 (
                     SortformerF16ArtifactDtype::I64,
                     SortformerF16ArtifactDtype::I64,
@@ -242,18 +239,17 @@ fn downcast_package(
             }
         };
 
-        let end = u64::try_from(payload.len()).map_err(|_| {
-            downcast_error("package_bounds", "output offset does not fit u64")
-        })?;
+        let end = u64::try_from(payload.len())
+            .map_err(|_| downcast_error("package_bounds", "output offset does not fit u64"))?;
         let begin_usize = usize::try_from(begin).map_err(|_| {
             downcast_error("package_bounds", "output tensor start does not fit usize")
         })?;
         let end_usize = usize::try_from(end).map_err(|_| {
             downcast_error("package_bounds", "output tensor end does not fit usize")
         })?;
-        let destination_raw = payload.get(begin_usize..end_usize).ok_or_else(|| {
-            downcast_error("package_bounds", "output tensor span is unavailable")
-        })?;
+        let destination_raw = payload
+            .get(begin_usize..end_usize)
+            .ok_or_else(|| downcast_error("package_bounds", "output tensor span is unavailable"))?;
         records.push(SortformerF16TensorRecord {
             name: name.to_owned(),
             shape: shape.clone(),
@@ -351,9 +347,9 @@ fn source_payload_upper_bound(source: &SafetensorsFile) -> FwResult<usize> {
                 ));
             }
         };
-        total.checked_add(output_len).ok_or_else(|| {
-            downcast_error("package_bounds", "output payload size overflows usize")
-        })
+        total
+            .checked_add(output_len)
+            .ok_or_else(|| downcast_error("package_bounds", "output payload size overflows usize"))
     })
 }
 
@@ -464,8 +460,8 @@ fn f32_to_f16_rne_bits(value: f32) -> Result<u16, ()> {
         let mut half_exponent = (unbiased + 15) as u16;
         let retained = mantissa >> 13;
         let remainder = mantissa & 0x1fff;
-        let rounded = retained
-            + u32::from(remainder > 0x1000 || (remainder == 0x1000 && retained & 1 != 0));
+        let rounded =
+            retained + u32::from(remainder > 0x1000 || (remainder == 0x1000 && retained & 1 != 0));
         let half_mantissa = if rounded == 0x400 {
             half_exponent += 1;
             0
@@ -487,18 +483,14 @@ fn f32_to_f16_rne_bits(value: f32) -> Result<u16, ()> {
     let remainder_mask = (1u32 << shift) - 1;
     let remainder = significand & remainder_mask;
     let halfway = 1u32 << (shift - 1);
-    let rounded = retained
-        + u32::from(remainder > halfway || (remainder == halfway && retained & 1 != 0));
+    let rounded =
+        retained + u32::from(remainder > halfway || (remainder == halfway && retained & 1 != 0));
     Ok(sign | rounded as u16)
 }
 
 fn checked_add(left: u64, right: u64, label: &str) -> FwResult<u64> {
-    left.checked_add(right).ok_or_else(|| {
-        downcast_error(
-            "package_census",
-            &format!("derived {label} overflows u64"),
-        )
-    })
+    left.checked_add(right)
+        .ok_or_else(|| downcast_error("package_census", &format!("derived {label} overflows u64")))
 }
 
 fn downcast_checkpoint(checkpoint: &(dyn Fn() -> FwResult<()> + Sync)) -> FwResult<()> {
@@ -733,23 +725,33 @@ mod tests {
             ("z.control", "I64", &[2], i64_payload.clone()),
             ("a.weight", "F32", &[3], f32_payload),
         ]);
-        let first = downcast_package(&source, &synthetic_parent(), &|| Ok(()))
-            .expect("first derivation");
-        let second = downcast_package(&source, &synthetic_parent(), &|| Ok(()))
-            .expect("second derivation");
+        let first =
+            downcast_package(&source, &synthetic_parent(), &|| Ok(())).expect("first derivation");
+        let second =
+            downcast_package(&source, &synthetic_parent(), &|| Ok(())).expect("second derivation");
         assert_eq!(first.package_bytes(), second.package_bytes());
         assert_eq!(first.receipt_bytes(), second.receipt_bytes());
 
         let derived = SafetensorsFile::from_bytes(first.package_bytes()).expect("derived package");
-        assert_eq!(derived.names().collect::<Vec<_>>(), ["a.weight", "z.control"]);
-        assert_eq!(derived.dtype_name("a.weight").expect("weight dtype"), "F16");
-        assert_eq!(derived.dtype_name("z.control").expect("control dtype"), "I64");
         assert_eq!(
-            derived.tensor_raw_bytes("a.weight").expect("weight payload"),
+            derived.names().collect::<Vec<_>>(),
+            ["a.weight", "z.control"]
+        );
+        assert_eq!(derived.dtype_name("a.weight").expect("weight dtype"), "F16");
+        assert_eq!(
+            derived.dtype_name("z.control").expect("control dtype"),
+            "I64"
+        );
+        assert_eq!(
+            derived
+                .tensor_raw_bytes("a.weight")
+                .expect("weight payload"),
             [0x00, 0x3c, 0x00, 0x80, 0x01, 0x00]
         );
         assert_eq!(
-            derived.tensor_raw_bytes("z.control").expect("control payload"),
+            derived
+                .tensor_raw_bytes("z.control")
+                .expect("control payload"),
             i64_payload
         );
         assert_eq!(first.receipt().package.f16_tensors, 1);
@@ -861,7 +863,10 @@ mod tests {
             "control".to_owned(),
             SortformerF16ArtifactDtype::I64,
             vec![u64::try_from(payload_len / 8).expect("fixture shape fits u64")],
-            [0, u64::try_from(payload_len).expect("fixture length fits u64")],
+            [
+                0,
+                u64::try_from(payload_len).expect("fixture length fits u64"),
+            ],
         )];
         let calls = AtomicUsize::new(0);
         let package = serialize_safetensors(&records, payload.clone(), &|| {
@@ -870,7 +875,9 @@ mod tests {
         })
         .expect("serialize chunked payload");
         let header_len = usize::try_from(u64::from_le_bytes(
-            package[..8].try_into().expect("header prefix is eight bytes"),
+            package[..8]
+                .try_into()
+                .expect("header prefix is eight bytes"),
         ))
         .expect("header length fits usize");
         assert_eq!(&package[8 + header_len..], payload.as_slice());
@@ -921,12 +928,8 @@ mod tests {
 
     #[test]
     fn unsupported_or_nonfinite_source_fails_before_artifact_emission() {
-        let nonfinite = synthetic_package(&[(
-            "weight",
-            "F32",
-            &[2],
-            f32_bytes(&[1.0, f32::INFINITY]),
-        )]);
+        let nonfinite =
+            synthetic_package(&[("weight", "F32", &[2], f32_bytes(&[1.0, f32::INFINITY]))]);
         let error = downcast_package(&nonfinite, &synthetic_parent(), &|| Ok(()))
             .expect_err("nonfinite source must fail");
         assert!(error.to_string().contains("nonfinite_source"));

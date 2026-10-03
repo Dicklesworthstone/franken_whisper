@@ -323,3 +323,9 @@ fw-wasm/target/
 
 # Threaded wasm-bindgen output (built by site/build-wasm.sh; same as site/pkg/)
 /site/pkg-threaded/
+
+# Retained local recovery and evaluation outputs are not release inputs.
+.beads/.beads.db.schema-migration-*.vacuum*
+/artifacts/
+/*.json_full
+/ios/FwCore.xcframework.previous-*/

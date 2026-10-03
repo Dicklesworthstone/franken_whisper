@@ -528,22 +528,13 @@ impl PipelineCx {
 
     /// Produce a stage token whose deadline error preserves whether the
     /// pipeline deadline or the named per-stage budget expires first.
-    fn named_stage_token(
-        &self,
-        stage: &'static str,
-        stage_budget_ms: u64,
-    ) -> CancellationToken {
+    fn named_stage_token(&self, stage: &'static str, stage_budget_ms: u64) -> CancellationToken {
         let now = Utc::now();
         let clamped = stage_budget_ms.min(i64::MAX as u64);
         let stage_deadline = now
             .checked_add_signed(chrono::Duration::milliseconds(clamped as i64))
             .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
-        named_stage_token_for_deadlines(
-            self.deadline,
-            stage_deadline,
-            stage,
-            stage_budget_ms,
-        )
+        named_stage_token_for_deadlines(self.deadline, stage_deadline, stage, stage_budget_ms)
     }
 
     /// Register a cleanup action to be run when the pipeline shuts down.
@@ -572,10 +563,7 @@ impl PipelineCx {
 #[derive(Debug, Clone, Copy)]
 enum DeadlineFailure {
     Cancelled,
-    StageTimeout {
-        stage: &'static str,
-        budget_ms: u64,
-    },
+    StageTimeout { stage: &'static str, budget_ms: u64 },
 }
 
 fn named_stage_token_for_deadlines(
@@ -1503,7 +1491,19 @@ where
     let timeout = token
         .remaining()
         .unwrap_or_else(|| budget_duration(budget_ms));
-    run_stage_with_timeout(stage, timeout, move || token.expiration_error(), operation)
+    run_stage_with_timeout(
+        stage,
+        timeout,
+        move || token.expiration_error(),
+        move || {
+            let value = operation()?;
+            // The receiver may be descheduled until the result is already
+            // queued. Fence successful work against the same deadline on the
+            // worker, rather than admitting a late result from a ready channel.
+            token.checkpoint()?;
+            Ok(value)
+        },
+    )
 }
 
 fn run_stage_with_timeout<T, F, E>(
@@ -1976,15 +1976,7 @@ async fn run_pipeline_body(
                 execute_vad(pcx, log, request, stage_budgets, &mut inter).await?;
             }
             PipelineStage::Separate => {
-                execute_separate(
-                    pcx,
-                    log,
-                    request,
-                    stage_budgets,
-                    run_tmp_dir,
-                    &mut inter,
-                )
-                .await?;
+                execute_separate(pcx, log, request, stage_budgets, run_tmp_dir, &mut inter).await?;
             }
             // When `request.backend_params.speculative` is set, the Backend stage
             // is replaced with a `SpeculativeStreamingPipeline`-driven path
@@ -2415,13 +2407,9 @@ async fn execute_backend(
     let backend_wav = normalized_wav.clone();
     let backend_dir = run_tmp_dir.path().to_path_buf();
     let backend_budget_ms = stage_budgets.backend_ms;
-    let cancel_token =
-        pcx.named_stage_token("backend", backend_budget_ms); // ubs:ignore — token is not a secret
-    let execution_result = run_stage_with_token_budget(
-        "backend",
-        backend_budget_ms,
-        cancel_token,
-        move || {
+    let cancel_token = pcx.named_stage_token("backend", backend_budget_ms); // ubs:ignore — token is not a secret
+    let execution_result =
+        run_stage_with_token_budget("backend", backend_budget_ms, cancel_token, move || {
             let tok = Some(&cancel_token);
             if let Some(order) = backend_order {
                 backend::execute_with_order(
@@ -2441,8 +2429,7 @@ async fn execute_backend(
                     tok,
                 )
             }
-        },
-    );
+        });
 
     if let Some((top_backend, predicted_success)) = adaptive_prediction {
         let top_succeeded = match &execution_result {
@@ -2728,8 +2715,7 @@ async fn execute_backend_speculative(
     );
 
     let backend_budget_ms = stage_budgets.backend_ms;
-    let cancel_token =
-        pcx.named_stage_token("backend", backend_budget_ms); // ubs:ignore — token, not a secret
+    let cancel_token = pcx.named_stage_token("backend", backend_budget_ms); // ubs:ignore — token, not a secret
     let normalized_wav = normalized_wav.clone();
     let backend_dir = run_tmp_dir.path().to_path_buf();
     let base_request = backend_request_for_waveform(request, inter.vocal_isolated);
@@ -2747,11 +2733,8 @@ async fn execute_backend_speculative(
         Vec<crate::model::TranscriptionSegment>,
     );
 
-    let outcome: FwResult<SpecOutcome> = run_stage_with_token_budget(
-        "backend",
-        backend_budget_ms,
-        cancel_token,
-        move || {
+    let outcome: FwResult<SpecOutcome> =
+        run_stage_with_token_budget("backend", backend_budget_ms, cancel_token, move || {
             let tok = cancel_token;
             let mut pipeline =
                 crate::streaming::SpeculativeStreamingPipeline::new(spec_config.clone(), run_id);
@@ -2823,8 +2806,7 @@ async fn execute_backend_speculative(
             // instead of cloning it via `events().to_vec()`.
             let emitted = pipeline.into_events();
             Ok((inner_result, emitted, stats, merged))
-        },
-    );
+        });
 
     let (inner_result, emitted_events, stats, merged) = match outcome {
         Ok(value) => value,
@@ -4219,10 +4201,8 @@ fn source_separate_stage(
     };
 
     let checkpoint = || token.checkpoint();
-    let samples = audio::read_normalized_wav_16k_mono_raw_with_checkpoint(
-        normalized_wav,
-        &checkpoint,
-    )?;
+    let samples =
+        audio::read_normalized_wav_16k_mono_raw_with_checkpoint(normalized_wav, &checkpoint)?;
     if samples.len() < crate::separate::BLOCK_LEN {
         report.vocal_isolated = false;
         report.mode = SeparationMode::UnavailablePassthrough;
@@ -4243,11 +4223,7 @@ fn source_separate_stage(
     let separated = separator.separate_with_checkpoint(&samples, &checkpoint)?;
     let input_rms = waveform_rms(&samples);
     let output_rms = waveform_rms(&separated);
-    audio::write_normalized_wav_16k_mono_with_checkpoint(
-        output_wav,
-        &separated,
-        &checkpoint,
-    )?;
+    audio::write_normalized_wav_16k_mono_with_checkpoint(output_wav, &separated, &checkpoint)?;
     let output_sha256 = sha256_file_with_checkpoint(output_wav, &checkpoint)?;
 
     report.vocal_isolated = true;
@@ -4334,11 +4310,8 @@ async fn execute_separate(
     let sep_budget_ms = stage_budgets.separate_ms;
     let sep_token = pcx.named_stage_token("separate", sep_budget_ms); // ubs:ignore — cancellation token is not a secret
 
-    let (report, post_vad) = match run_stage_with_token_budget(
-        "separate",
-        sep_budget_ms,
-        sep_token,
-        move || {
+    let (report, post_vad) =
+        match run_stage_with_token_budget("separate", sep_budget_ms, sep_token, move || {
             let report = source_separate_stage(
                 &sep_wav,
                 cached_analysis.as_deref(),
@@ -4347,9 +4320,11 @@ async fn execute_separate(
                 &sep_token,
             )?;
             let post_vad = match (post_vad_config.as_ref(), report.output_wav.as_deref()) {
-                (Some(config), Some(replacement_wav)) => Some(
-                    vad_energy_detect_with_analysis(replacement_wav, config, &sep_token)?,
-                ),
+                (Some(config), Some(replacement_wav)) => Some(vad_energy_detect_with_analysis(
+                    replacement_wav,
+                    config,
+                    &sep_token,
+                )?),
                 _ => None,
             };
             // Final worker-side fence after every transform-derived operation,
@@ -4357,20 +4332,19 @@ async fn execute_separate(
             // must not return an apparently successful replacement bundle.
             sep_token.checkpoint()?;
             Ok((report, post_vad))
-        },
-    ) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let code = stage_failure_code("separate", &error);
-            log.push(
-                "separate",
-                &code,
-                stage_failure_message(&error, "source separation failed"),
-                json!({"error": error.to_string(), "budget_ms": sep_budget_ms}),
-            );
-            return Err(error);
-        }
-    };
+        }) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let code = stage_failure_code("separate", &error);
+                log.push(
+                    "separate",
+                    &code,
+                    stage_failure_message(&error, "source separation failed"),
+                    json!({"error": error.to_string(), "budget_ms": sep_budget_ms}),
+                );
+                return Err(error);
+            }
+        };
 
     // Observable-state fence: cancellation after the worker returns but
     // before the replacement bundle is applied must emit the standard stage
@@ -7172,21 +7146,21 @@ mod tests {
         FinalizerRegistry, PipelineConfig, PipelineCx, PipelineStage, PunctuateReport,
         SeparateReport, SpeakerEmbedding, StageBudgetPolicy, VadConfig, VadRegionMs, VadReport,
         acceleration_cancellation_fence_payload, acceleration_context_payload,
-        acceleration_stream_owner_id, align_transcription_result, artifact_output_prefix,
-        apply_native_diarization_projection, apply_padding, budget_duration, checkpoint_or_emit,
-        clamp_diarization_turns_to_duration_ms, ctc_forced_align, diarize_segments,
-        emit_diarization_report_events, event_elapsed_ms, external_diarization_fallback_admitted,
-        external_diarization_report, finite_seconds_interval_to_ms, has_canonical_word_alignment,
-        is_abbreviation_period, is_decimal_period, is_ellipsis_period, load_energy_valley_evidence,
-        merge_regions_by_gap, ms_to_frames, nearest_energy_valley, normalized_pcm_duration_ms,
-        named_stage_token_for_deadlines, optional_stage_skip, parse_acoustic_diarization_rollout,
+        acceleration_stream_owner_id, align_transcription_result,
+        apply_native_diarization_projection, apply_padding, artifact_output_prefix,
+        budget_duration, checkpoint_or_emit, clamp_diarization_turns_to_duration_ms,
+        ctc_forced_align, diarize_segments, emit_diarization_report_events, event_elapsed_ms,
+        external_diarization_fallback_admitted, external_diarization_report,
+        finite_seconds_interval_to_ms, has_canonical_word_alignment, is_abbreviation_period,
+        is_decimal_period, is_ellipsis_period, load_energy_valley_evidence, merge_regions_by_gap,
+        ms_to_frames, named_stage_token_for_deadlines, nearest_energy_valley,
+        normalized_pcm_duration_ms, optional_stage_skip, parse_acoustic_diarization_rollout,
         parse_budget_ms, parse_event_ts_ms, punctuate_segments, recommended_budget,
-        resolved_diarization_engine,
-        resolved_diarization_engine_for_rollout, result_has_external_diarization, run_pipeline,
-        run_stage_with_budget, run_stage_with_token_budget, sanitize_process_pid,
-        selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_file_with_checkpoint,
-        sha256_json_value, silhouette_score,
-        sortformer_acoustic_fallback_eligible, sortformer_activity_shares,
+        resolved_diarization_engine, resolved_diarization_engine_for_rollout,
+        result_has_external_diarization, run_pipeline, run_stage_with_budget,
+        run_stage_with_token_budget, sanitize_process_pid, selected_diarization_engine,
+        sha256_bytes_hex, sha256_file, sha256_file_with_checkpoint, sha256_json_value,
+        silhouette_score, sortformer_acoustic_fallback_eligible, sortformer_activity_shares,
         sortformer_count_request_is_capacity_eligible, source_separate,
         source_separate_with_analysis, split_long_regions, stage_budget_ms, stage_failure_code,
         stage_failure_message, stage_latency_profile, state_root, tiny_diarize_boundary_hints,
@@ -8406,11 +8380,8 @@ mod tests {
         let token = named_stage_token_for_deadlines(None, deadline, "backend", budget_ms as u64);
         let worker_token = token;
 
-        let result: FwResult<()> = run_stage_with_token_budget(
-            "backend",
-            budget_ms as u64,
-            token,
-            move || {
+        let result: FwResult<()> =
+            run_stage_with_token_budget("backend", budget_ms as u64, token, move || {
                 worker_active.store(true, Ordering::SeqCst);
                 loop {
                     match worker_token.checkpoint() {
@@ -8422,8 +8393,7 @@ mod tests {
                         }
                     }
                 }
-            },
-        );
+            });
 
         assert!(matches!(result, Err(FwError::StageTimeout { .. })));
         assert!(quiesced.load(Ordering::SeqCst));
@@ -14219,7 +14189,9 @@ mod tests {
         let report = super::source_separate_stage(
             &input,
             None,
-            Some(std::path::Path::new("/nonexistent/must-not-load.safetensors")),
+            Some(std::path::Path::new(
+                "/nonexistent/must-not-load.safetensors",
+            )),
             &output,
             &CancellationToken::no_deadline(),
         )
@@ -14351,7 +14323,10 @@ mod tests {
             .get("post_separation_vad")
             .and_then(Value::as_object)
             .expect("separate.ok must carry byte-bound post-DTLN VAD evidence");
-        assert_eq!(post_vad.get("detector"), Some(&json!("native_audio_waveform")));
+        assert_eq!(
+            post_vad.get("detector"),
+            Some(&json!("native_audio_waveform"))
+        );
         assert_eq!(
             post_vad.get("frames_total"),
             Some(&json!(rebound_analysis.frame_count))
@@ -14369,17 +14344,13 @@ mod tests {
                 .is_some_and(f64::is_finite)
         );
 
-        let written = crate::audio::read_normalized_wav_16k_mono_raw_with_checkpoint(
-            &output,
-            &|| Ok(()),
-        )
-        .expect("replacement WAV must be readable by the downstream raw reader");
+        let written =
+            crate::audio::read_normalized_wav_16k_mono_raw_with_checkpoint(&output, &|| Ok(()))
+                .expect("replacement WAV must be readable by the downstream raw reader");
         assert_eq!(written.len(), crate::separate::BLOCK_LEN);
-        let original = crate::audio::read_normalized_wav_16k_mono_raw_with_checkpoint(
-            &input,
-            &|| Ok(()),
-        )
-        .expect("input WAV must remain readable for the transform comparison");
+        let original =
+            crate::audio::read_normalized_wav_16k_mono_raw_with_checkpoint(&input, &|| Ok(()))
+                .expect("input WAV must remain readable for the transform comparison");
         assert_ne!(written, original, "DTLN output must not be an input copy");
     }
 
@@ -14705,7 +14676,9 @@ mod tests {
             .expect_err("waveform replacement after backend execution must be rejected");
         assert!(matches!(error, FwError::InvalidRequest(_)));
         assert!(
-            error.to_string().contains("Separate stage must precede Backend"),
+            error
+                .to_string()
+                .contains("Separate stage must precede Backend"),
             "unexpected validation error: {error}"
         );
     }

@@ -312,9 +312,10 @@ fn read_dtln_weights(
         if count == 0 {
             break;
         }
-        let next_len = raw.len().checked_add(count).ok_or_else(|| {
-            FwError::InvalidRequest("dtln: weight size overflowed".to_owned())
-        })?;
+        let next_len = raw
+            .len()
+            .checked_add(count)
+            .ok_or_else(|| FwError::InvalidRequest("dtln: weight size overflowed".to_owned()))?;
         if next_len as u64 > MAX_DTLN_SAFETENSORS_BYTES {
             return Err(FwError::InvalidRequest(
                 "dtln: weights exceed the 4 MiB safety limit".to_owned(),
@@ -344,9 +345,7 @@ fn open_dtln_weights_nonblocking(path: &std::path::Path) -> FwResult<std::fs::Fi
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
-    .map_err(|_| {
-        FwError::InvalidRequest("dtln: weights could not be opened safely".to_owned())
-    })?;
+    .map_err(|_| FwError::InvalidRequest("dtln: weights could not be opened safely".to_owned()))?;
     Ok(std::fs::File::from(descriptor))
 }
 
@@ -359,9 +358,7 @@ fn open_dtln_weights_nonblocking(path: &std::path::Path) -> FwResult<std::fs::Fi
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|_| {
-            FwError::InvalidRequest("dtln: weights could not be opened safely".to_owned())
-        })
+        .map_err(|_| FwError::InvalidRequest("dtln: weights could not be opened safely".to_owned()))
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]
@@ -372,18 +369,16 @@ fn open_dtln_weights_nonblocking(_path: &std::path::Path) -> FwResult<std::fs::F
 }
 
 fn metadata_is_indirection(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
 
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
-    false
+    metadata.file_type().is_symlink()
 }
 
 /// row-major [len, cols] times vector: out[j] = sum_i v[i] * w[i*cols + j].

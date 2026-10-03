@@ -3592,18 +3592,16 @@ fn open_prechecked_regular_artifact(
 }
 
 fn metadata_is_indirection(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
 
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
-    false
+    metadata.file_type().is_symlink()
 }
 
 fn read_bounded_file(
@@ -4030,15 +4028,12 @@ mod tests {
                 .map(|index| u8::try_from(index % 251).expect("bounded byte pattern"))
                 .collect::<Vec<_>>();
             let checkpoints = AtomicUsize::new(0);
-            let observed = sha256_bytes_with_checkpoint(
-                &bytes,
-                SortformerArtifactDomain::Conversion,
-                &|| {
+            let observed =
+                sha256_bytes_with_checkpoint(&bytes, SortformerArtifactDomain::Conversion, &|| {
                     checkpoints.fetch_add(1, Ordering::SeqCst);
                     Ok(())
-                },
-            )
-            .expect("checkpointed digest");
+                })
+                .expect("checkpointed digest");
             let chunks = length.div_ceil(READ_CHUNK_BYTES);
 
             assert_eq!(observed, sha256_bytes(&bytes));
@@ -4050,12 +4045,9 @@ mod tests {
             .collect::<Vec<_>>();
         let mut boundary_mutation = bytes.clone();
         boundary_mutation[READ_CHUNK_BYTES] ^= 1;
-        let original = sha256_bytes_with_checkpoint(
-            &bytes,
-            SortformerArtifactDomain::Conversion,
-            &|| Ok(()),
-        )
-        .expect("checkpointed original boundary digest");
+        let original =
+            sha256_bytes_with_checkpoint(&bytes, SortformerArtifactDomain::Conversion, &|| Ok(()))
+                .expect("checkpointed original boundary digest");
         let mutated = sha256_bytes_with_checkpoint(
             &boundary_mutation,
             SortformerArtifactDomain::Conversion,
@@ -4069,10 +4061,8 @@ mod tests {
     fn checkpointed_sha256_observes_terminal_cancellation_without_leaking_details() {
         let bytes = vec![0x5a; READ_CHUNK_BYTES + 1];
         let checkpoints = AtomicUsize::new(0);
-        let error = sha256_bytes_with_checkpoint(
-            &bytes,
-            SortformerArtifactDomain::Conversion,
-            &|| {
+        let error =
+            sha256_bytes_with_checkpoint(&bytes, SortformerArtifactDomain::Conversion, &|| {
                 if checkpoints.fetch_add(1, Ordering::SeqCst) == 2 {
                     Err(FwError::Cancelled(
                         "terminal cancellation detail must not escape".to_owned(),
@@ -4080,9 +4070,8 @@ mod tests {
                 } else {
                     Ok(())
                 }
-            },
-        )
-        .expect_err("terminal checkpoint must remain cancellation-aware");
+            })
+            .expect_err("terminal checkpoint must remain cancellation-aware");
 
         assert_eq!(checkpoints.load(Ordering::SeqCst), 3);
         match error {

@@ -6960,8 +6960,7 @@ mod tests {
             let f_pre = 1.4 + input * -0.8 + expected_h * -0.3;
             let g_pre = -0.5 + input * 0.7 + expected_h * 0.2;
             let o_pre = 2.8 + input * 1.5 + expected_h * 0.6;
-            expected_c =
-                hard_sigmoid(f_pre) * expected_c + hard_sigmoid(i_pre) * g_pre.tanh();
+            expected_c = hard_sigmoid(f_pre) * expected_c + hard_sigmoid(i_pre) * g_pre.tanh();
             expected_h = hard_sigmoid(o_pre) * expected_c.tanh();
             expected_rows.push(expected_h);
         }
@@ -6970,9 +6969,7 @@ mod tests {
         let hard = hard_weights
             .lstm_forward(&x, &mut hard_state)
             .expect("hard-sigmoid forward");
-        for (t, (&observed, &expected)) in
-            hard.data.iter().zip(expected_rows.iter()).enumerate()
-        {
+        for (t, (&observed, &expected)) in hard.data.iter().zip(expected_rows.iter()).enumerate() {
             assert!(
                 (observed - expected).abs() <= 1e-6,
                 "hard-sigmoid row {t}: {observed} vs {expected}"
@@ -6989,9 +6986,7 @@ mod tests {
             hard.data
                 .iter()
                 .zip(&logistic.data)
-                .any(|(hard_value, logistic_value)| {
-                    (hard_value - logistic_value).abs() > 1e-3
-                }),
+                .any(|(hard_value, logistic_value)| { (hard_value - logistic_value).abs() > 1e-3 }),
             "the fixture must distinguish hard sigmoid from logistic sigmoid"
         );
     }

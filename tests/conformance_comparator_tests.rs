@@ -1575,9 +1575,7 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
             ..Default::default()
         };
         let t = std::time::Instant::now();
-        let out = model
-            .transcribe(input, &params, &noop)
-            .expect("transcribe");
+        let out = model.transcribe(input, &params, &noop).expect("transcribe");
         (out, t.elapsed())
     };
 
@@ -1589,10 +1587,7 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
 
     let (full, full_wall) = run(&samples, native_engine::decode::AudioCtxPolicy::Full);
     let (auto, auto_wall) = run(&samples, native_engine::decode::AudioCtxPolicy::Auto);
-    let (fixed, fixed_wall) = run(
-        &samples,
-        native_engine::decode::AudioCtxPolicy::fixed(512),
-    );
+    let (fixed, fixed_wall) = run(&samples, native_engine::decode::AudioCtxPolicy::fixed(512));
 
     // Timestamp decoding may legitimately split even a short input into more
     // than one seek. Check the exact physical work for every seek the model
@@ -1622,9 +1617,7 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
                         window.window_offset_sec
                     );
                     let seek_cs = seek_cs_rounded as usize;
-                    let remaining_real_frames = input_real_frames
-                        .saturating_sub(seek_cs)
-                        .min(3000);
+                    let remaining_real_frames = input_real_frames.saturating_sub(seek_cs).min(3000);
                     let enc_ctx = match policy {
                         // Full preserves the historical default: the first
                         // seek is padded, while later partial tails use the
@@ -1710,10 +1703,7 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
     // timestamps may legitimately create more than one seek here, so aggregate
     // work must not assume exactly one accepted window.
     let ceiling_input = vec![0.0; 200 + 160 * 2999];
-    let (auto_sub_500ms, _) = run(
-        sub_500ms_input,
-        native_engine::decode::AudioCtxPolicy::Auto,
-    );
+    let (auto_sub_500ms, _) = run(sub_500ms_input, native_engine::decode::AudioCtxPolicy::Auto);
     assert_policy_work(
         "sub-500ms Auto",
         49,
@@ -1721,10 +1711,7 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         &auto_sub_500ms,
     );
 
-    let (auto_ceiling, _) = run(
-        &ceiling_input,
-        native_engine::decode::AudioCtxPolicy::Auto,
-    );
+    let (auto_ceiling, _) = run(&ceiling_input, native_engine::decode::AudioCtxPolicy::Auto);
     assert_policy_work(
         "ceiling Auto",
         3000,
@@ -1732,10 +1719,7 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         &auto_ceiling,
     );
 
-    let (auto_floor, _) = run(
-        floor_input,
-        native_engine::decode::AudioCtxPolicy::Auto,
-    );
+    let (auto_floor, _) = run(floor_input, native_engine::decode::AudioCtxPolicy::Auto);
     let (fixed_floor, _) = run(
         floor_input,
         native_engine::decode::AudioCtxPolicy::fixed(512),

@@ -288,17 +288,14 @@ impl CpalCaptureSource {
                 let sample_format = supported.sample_format();
                 let config: cpal::StreamConfig = supported.into();
 
-                let capacity_samples = match capture_ring_capacity_samples(
-                    sample_rate,
-                    channels,
-                    ring_capacity_sec,
-                ) {
-                    Ok(capacity) => capacity,
-                    Err(error) => {
-                        let _ = setup_tx.send(CpalSetup::Failed(error.to_string()));
-                        return;
-                    }
-                };
+                let capacity_samples =
+                    match capture_ring_capacity_samples(sample_rate, channels, ring_capacity_sec) {
+                        Ok(capacity) => capacity,
+                        Err(error) => {
+                            let _ = setup_tx.send(CpalSetup::Failed(error.to_string()));
+                            return;
+                        }
+                    };
                 let ring = HeapRb::<f32>::new(capacity_samples);
                 let (mut producer, consumer) = ring.split();
                 if cons_tx.send(consumer).is_err() {
@@ -2093,12 +2090,7 @@ mod tests {
     fn pipe_rejects_truncated_samples_and_frames_at_eof() {
         let cases = [
             ("partial s16le sample", PcmFormat::S16le, 1, vec![0]),
-            (
-                "partial f32le sample",
-                PcmFormat::F32le,
-                1,
-                vec![0, 0, 0],
-            ),
+            ("partial f32le sample", PcmFormat::F32le, 1, vec![0, 0, 0]),
             (
                 "partial stereo frame",
                 PcmFormat::S16le,
@@ -2131,7 +2123,10 @@ mod tests {
             };
             assert_eq!(error.error_code(), "FW-IO");
             let message = error.to_string();
-            assert!(message.contains("incomplete PCM frame"), "{name}: {message}");
+            assert!(
+                message.contains("incomplete PCM frame"),
+                "{name}: {message}"
+            );
             assert!(
                 message.contains(&format!("{trailing_bytes} trailing byte")),
                 "{name}: {message}"

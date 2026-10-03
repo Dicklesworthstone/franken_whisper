@@ -650,11 +650,7 @@ pub fn run_command_with_timeout(
                 .unwrap_or_default();
             let stderr_str = captured_stderr_for_error(&stderr, &sensitive_values);
             return Err(merge_process_tree_cleanup_result(
-                FwError::from_command_timeout(
-                    rendered,
-                    saturating_duration_ms(limit),
-                    stderr_str,
-                ),
+                FwError::from_command_timeout(rendered, saturating_duration_ms(limit), stderr_str),
                 cleanup,
             ));
         }
@@ -1055,9 +1051,7 @@ fn terminate_descendant_process_tree(
         loop {
             match rustix::process::test_kill_process_group(process_group) {
                 Err(error) if error == rustix::io::Errno::SRCH => break,
-                Err(error)
-                    if error == rustix::io::Errno::INTR && Instant::now() < deadline =>
-                {
+                Err(error) if error == rustix::io::Errno::INTR && Instant::now() < deadline => {
                     // Signal probes can be interrupted on Unix. That says
                     // nothing about whether the group survived; retry within
                     // the same bounded certification window.
@@ -1519,19 +1513,13 @@ fn append_streaming_stderr_tail(tail: &mut Vec<u8>, chunk: &[u8], capacity: usiz
 }
 
 #[cfg(not(windows))]
-fn drain_streaming_stderr<R: Read>(
-    mut pipe: R,
-    tail: &std::sync::Mutex<Vec<u8>>,
-    capacity: usize,
-) {
+fn drain_streaming_stderr<R: Read>(mut pipe: R, tail: &std::sync::Mutex<Vec<u8>>, capacity: usize) {
     let mut buf = [0u8; 1024];
     loop {
         match pipe.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let mut tail = tail
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 append_streaming_stderr_tail(&mut tail, &buf[..n], capacity);
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -2578,8 +2566,7 @@ mod tests {
         let secret = "***";
         let args = vec!["--secret".to_owned(), secret.to_owned()];
 
-        let (rendered, _) =
-            command_error_diagnostics_with_environment("prog", &args, |_| None);
+        let (rendered, _) = command_error_diagnostics_with_environment("prog", &args, |_| None);
         assert!(
             !rendered.contains(secret),
             "mask re-emitted the secret: {rendered}"
@@ -2594,11 +2581,10 @@ mod tests {
     fn command_diagnostics_include_known_inherited_secrets() {
         let secret = "inherited_hf_secret_987";
         let args = vec!["--label".to_owned(), secret.to_owned()];
-        let (rendered, sensitive_values) = command_error_diagnostics_with_environment(
-            "prog",
-            &args,
-            |name| (name == "HF_TOKEN").then(|| secret.to_owned()),
-        );
+        let (rendered, sensitive_values) =
+            command_error_diagnostics_with_environment("prog", &args, |name| {
+                (name == "HF_TOKEN").then(|| secret.to_owned())
+            });
 
         assert!(sensitive_values.iter().any(|value| value == secret));
         assert!(!rendered.contains(secret));
@@ -3151,13 +3137,8 @@ mod tests {
                 "if IFS= read -r value; then printf 'unexpected:%s' \"$value\" >&2; exit 9; fi"
                     .to_owned(),
             ];
-            run_command_with_timeout(
-                "sh",
-                &args,
-                None,
-                Some(Duration::from_secs(2)),
-            )
-            .expect("bounded subprocess stdin must be EOF");
+            run_command_with_timeout("sh", &args, None, Some(Duration::from_secs(2)))
+                .expect("bounded subprocess stdin must be EOF");
             return;
         }
 

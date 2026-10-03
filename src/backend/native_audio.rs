@@ -435,9 +435,9 @@ fn parse_pcm16_mono_wav_with_checkpoint(
         .map_err(|_| FwError::InvalidRequest("wav data length exceeds usize".to_owned()))?;
     let sample_capacity = data_len_usize / 2;
     let mut samples = Vec::new();
-    samples.try_reserve_exact(sample_capacity).map_err(|_| {
-        FwError::InvalidRequest("wav sample buffer allocation failed".to_owned())
-    })?;
+    samples
+        .try_reserve_exact(sample_capacity)
+        .map_err(|_| FwError::InvalidRequest("wav sample buffer allocation failed".to_owned()))?;
     let mut remaining = data_len_usize;
     let mut buf = [0u8; 8192];
     let mut leftover: Option<u8> = None;
@@ -1429,7 +1429,10 @@ mod tests {
 
         let error = parse_pcm16_mono_wav_with_checkpoint(&wav_path, &mut checkpoint)
             .expect_err("concurrently truncated silence must fail closed");
-        assert_eq!(checkpoints, 6, "fixture must reach the final stability check");
+        assert_eq!(
+            checkpoints, 6,
+            "fixture must reach the final stability check"
+        );
         assert!(
             error.to_string().contains("wav size changed during parse"),
             "unexpected error: {error}"

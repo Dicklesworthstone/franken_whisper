@@ -60,6 +60,186 @@ fn installer_script_is_valid_bash() {
     assert!(status.success());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn non_runnable_linux_upgrade_preserves_both_commands_and_reports_alsa_prerequisite() {
+    let root = tempfile::tempdir().expect("create installer validation workspace");
+    let destination = root.path().join("installed");
+    fs::create_dir(&destination).expect("create old installation");
+    fs::write(destination.join("fw"), b"original short command").expect("write old alias");
+    fs::write(
+        destination.join("franken_whisper"),
+        b"original long command",
+    )
+    .expect("write old primary");
+    let invalid = root.path().join("invalid-executable");
+    fs::write(&invalid, b"\x7fELF\x00\x00\x00\x00").expect("write non-runnable executable");
+    fs::set_permissions(&invalid, fs::Permissions::from_mode(0o700)).expect("set executable mode");
+    let output = source_and_run(
+        root.path(),
+        &format!(
+            "DEST='{}'\nVERSION=v0.10.0\ninstall_binary_pair '{}' '{}'",
+            destination.display(),
+            invalid.display(),
+            invalid.display()
+        ),
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("libasound.so.2"), "stderr: {error}");
+    assert!(
+        error.contains("existing installation was not replaced"),
+        "stderr: {error}"
+    );
+    assert_eq!(
+        fs::read(destination.join("fw")).expect("read original alias"),
+        b"original short command"
+    );
+    assert_eq!(
+        fs::read(destination.join("franken_whisper")).expect("read original primary"),
+        b"original long command"
+    );
+}
+
+fn resolve_release_version(api_response: &str, redirect: &str) -> std::process::Output {
+    source_and_run(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &format!(
+            r#"
+VERSION=""
+QUIET=1
+MAX_RETRIES=1
+curl() {{
+    case "${{@: -1}}" in
+        */releases\?per_page=50)
+            cat <<'FW_RELEASES'
+{api_response}
+FW_RELEASES
+            ;;
+        */releases/latest) printf '%s\n' '{redirect}' ;;
+        *) return 99 ;;
+    esac
+}}
+resolve_version
+printf 'resolved=%s\n' "$VERSION"
+"#
+        ),
+    )
+}
+
+#[test]
+fn latest_version_skips_prerelease_and_draft_records_after_their_tags() {
+    let output = resolve_release_version(
+        r#"[
+  {
+    "tag_name": "v9.0.0",
+    "draft": false,
+    "prerelease": true
+  },
+  {
+    "tag_name": "v8.0.0",
+    "draft": true,
+    "prerelease": false
+  },
+  {
+    "tag_name": "v0.10.0",
+    "draft": false,
+    "prerelease": false
+  },
+  {
+    "tag_name": "v0.9.3",
+    "draft": false,
+    "prerelease": false
+  }
+]"#,
+        "https://example.invalid/tag/v99.0.0",
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"resolved=v0.10.0\n");
+}
+
+#[test]
+fn latest_version_skips_model_head_and_requires_both_stable_flags() {
+    let output = resolve_release_version(
+        r#"[
+  {
+    "tag_name": "whisper-tiny-f16-v1",
+    "draft": false,
+    "prerelease": false
+  },
+  {
+    "tag_name": "v9.0.0"
+  },
+  {
+    "draft": false,
+    "prerelease": false,
+    "tag_name": "v0.10.0-rc.1"
+  },
+  {
+    "draft": false,
+    "prerelease": false,
+    "tag_name": "v0.9.3",
+    "assets": [
+      {
+        "tag_name": "v99.0.0",
+        "draft": true,
+        "prerelease": true
+      }
+    ]
+  }
+]"#,
+        "https://example.invalid/tag/v99.0.0",
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"resolved=v0.9.3\n");
+}
+
+#[test]
+fn latest_version_fails_without_a_qualifying_stable_tag() {
+    let api_response = r#"[
+  {
+    "tag_name": "v9.0.0",
+    "draft": false,
+    "prerelease": true
+  },
+  {
+    "tag_name": "v8.0.0",
+    "draft": true,
+    "prerelease": false
+  },
+  {
+    "tag_name": "sortformer-f16-v1",
+    "draft": false,
+    "prerelease": false
+  }
+]"#;
+    for redirect in [
+        "https://example.invalid/tag/whisper-tiny-f16-v1",
+        "https://example.invalid/tag/v0.10.0-rc.1",
+    ] {
+        let output = resolve_release_version(api_response, redirect);
+        assert!(
+            !output.status.success(),
+            "redirect must not qualify: {redirect}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("Could not resolve the latest release"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
 #[test]
 fn public_site_examples_match_the_cli_contract() {
     let site = fs::read_to_string(

@@ -144,18 +144,16 @@ fn read_speaker_hints(path: &Path) -> FwResult<Vec<KnownSpeakerInterval>> {
 }
 
 fn metadata_is_indirection(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
 
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
-    false
+    metadata.file_type().is_symlink()
 }
 
 fn parse_speaker_count_range(value: &str) -> FwResult<(u32, u32)> {
@@ -2170,9 +2168,7 @@ impl TranscribeArgs {
     ///
     /// Returns [`FwError::InvalidRequest`] when the configured window geometry
     /// cannot make forward progress.
-    pub fn to_speculative_config(
-        &self,
-    ) -> FwResult<Option<crate::streaming::SpeculativeConfig>> {
+    pub fn to_speculative_config(&self) -> FwResult<Option<crate::streaming::SpeculativeConfig>> {
         let Some((window_size_ms, overlap_ms)) = self.speculative_window_geometry()? else {
             return Ok(None);
         };

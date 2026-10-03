@@ -372,12 +372,12 @@ pub fn run(
                 .and_then(|token| token.checkpoint().err())
                 .unwrap_or(error),
             error @ FwError::StageTimeout { .. } => error,
-            other => FwError::BackendUnavailable(other.to_string()),
+            other => FwError::BackendUnavailable(format!(
+                "{other}; select a model with --model or FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL, or provision the default with `fw pull whisper`"
+            )),
         })?;
     let model_path = model_source.path().to_path_buf();
-    let checkpoint = || {
-        token.map_or(Ok(()), crate::orchestrator::CancellationToken::checkpoint)
-    };
+    let checkpoint = || token.map_or(Ok(()), crate::orchestrator::CancellationToken::checkpoint);
     let model = model_source.load_with_checkpoint(&checkpoint)?;
 
     let samples = read_normalized_wav(normalized_wav)?;

@@ -267,8 +267,7 @@ fn model_search_dirs() -> Vec<PathBuf> {
 }
 
 fn implicit_home_models_enabled() -> bool {
-    !cfg!(test)
-        || std::env::var("FRANKEN_WHISPER_ULTRA_STRESS").is_ok_and(|value| value == "1")
+    !cfg!(test) || std::env::var("FRANKEN_WHISPER_ULTRA_STRESS").is_ok_and(|value| value == "1")
 }
 
 /// The on-disk filename a short model name maps to (`tiny.en` → `ggml-tiny.en.bin`).
@@ -1604,13 +1603,7 @@ impl NativeWhisperModel {
             package.weights_sha256.clone(),
         );
         let file = package.try_clone_weights_file()?;
-        Self::load_key(
-            key,
-            false,
-            Some(file),
-            checkpoint,
-            warm_version_tag,
-        )
+        Self::load_key(key, false, Some(file), checkpoint, warm_version_tag)
     }
 
     /// Load a model and keep one process-wide strong resident slot alive.
@@ -2640,8 +2633,8 @@ mod tests {
         let dir = TempDir::new("resident_cache");
         let path = write_file(dir.path(), "ggml-resident.bin", synthetic_model_bytes());
 
-        let a = NativeWhisperModel::load_inner(&path, true, &|| Ok(()), true)
-            .expect("resident load a");
+        let a =
+            NativeWhisperModel::load_inner(&path, true, &|| Ok(()), true).expect("resident load a");
         let _ = a.version_tag();
         let weak = Arc::downgrade(&a);
         drop(a);
@@ -2649,8 +2642,8 @@ mod tests {
         let retained = weak
             .upgrade()
             .expect("resident cache must keep the model alive after caller drop");
-        let b = NativeWhisperModel::load_inner(&path, true, &|| Ok(()), true)
-            .expect("resident load b");
+        let b =
+            NativeWhisperModel::load_inner(&path, true, &|| Ok(()), true).expect("resident load b");
         assert!(
             Arc::ptr_eq(&retained, &b),
             "resident reload must return the retained Arc"

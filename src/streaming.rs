@@ -378,10 +378,7 @@ impl SpeculativeStreamingPipeline {
             checkpoint()?;
 
             let window_size_ms = self.window_manager.current_window_size();
-            SpeculativeConfig::validate_window_geometry(
-                window_size_ms,
-                self.config.overlap_ms,
-            )?;
+            SpeculativeConfig::validate_window_geometry(window_size_ms, self.config.overlap_ms)?;
             let step_ms = window_size_ms - self.config.overlap_ms;
 
             let audio_hash = format!("{audio_hash_seed}:{position_ms}:{window_size_ms}");

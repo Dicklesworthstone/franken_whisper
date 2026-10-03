@@ -332,9 +332,7 @@ pub fn decode_frames_to_raw<R: Read>(reader: &mut R) -> FwResult<(DecodeReport, 
 
 fn next_sequence_number(seq: u64) -> FwResult<u64> {
     seq.checked_add(1).ok_or_else(|| {
-        FwError::InvalidRequest(format!(
-            "tty-audio sequence space exhausted at seq {seq}"
-        ))
+        FwError::InvalidRequest(format!("tty-audio sequence space exhausted at seq {seq}"))
     })
 }
 

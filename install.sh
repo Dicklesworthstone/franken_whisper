@@ -599,12 +599,45 @@ require_cpu_for_prebuilt() {
 # ============================================================================
 # Version Resolution
 # ============================================================================
+# Read GitHub's pretty-printed release list without requiring jq or Python.
+# Only release-level fields (four-space indentation) are considered; wait for
+# the record's closing brace so tag_name may precede draft/prerelease. Missing
+# flags fail closed, and model-package tags never qualify as CLI versions.
+select_stable_release_tag() {
+    awk '
+        /^  \{[[:space:]]*$/ { tag = ""; draft = ""; prerelease = ""; in_release = 1 }
+        in_release && /^    "tag_name"[[:space:]]*:/ {
+            tag = $0
+            sub(/^    "tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)
+            sub(/"[[:space:]]*,?[[:space:]]*$/, "", tag)
+        }
+        in_release && /^    "draft"[[:space:]]*:/ {
+            draft = $0
+            sub(/^    "draft"[[:space:]]*:[[:space:]]*/, "", draft)
+            sub(/[[:space:]]*,?[[:space:]]*$/, "", draft)
+        }
+        in_release && /^    "prerelease"[[:space:]]*:/ {
+            prerelease = $0
+            sub(/^    "prerelease"[[:space:]]*:[[:space:]]*/, "", prerelease)
+            sub(/[[:space:]]*,?[[:space:]]*$/, "", prerelease)
+        }
+        /^  \}[[:space:]]*,?[[:space:]]*$/ {
+            if (in_release && draft == "false" && prerelease == "false" &&
+                tag ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/) {
+                print tag
+                exit
+            }
+            in_release = 0
+        }
+    '
+}
+
 resolve_version() {
     if [ -n "$VERSION" ]; then return 0; fi
 
     log_step "Resolving latest version..."
     # Model packages are published as releases too (e.g. whisper-tiny-f16-v1) and can
-    # hold GitHub's "Latest" flag, so list recent releases and take the newest vX.Y.Z tag.
+    # hold GitHub's "Latest" flag, so take the first stable exact vX.Y.Z tag.
     local releases_url="https://api.github.com/repos/${OWNER}/${REPO}/releases?per_page=50"
     local tag="" attempts=0
 
@@ -614,16 +647,14 @@ resolve_version() {
             tag=$(curl -fsSL "${PROXY_ARGS[@]}" \
                 --connect-timeout 10 --max-time 30 \
                 -H "Accept: application/vnd.github.v3+json" \
-                "$releases_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' \
-                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || echo "")
+                "$releases_url" 2>/dev/null | select_stable_release_tag || echo "")
         elif command -v wget &>/dev/null; then
-            tag=$(wget -qO- --timeout=30 "$releases_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' \
-                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || echo "")
+            tag=$(wget -qO- --timeout=30 "$releases_url" 2>/dev/null | select_stable_release_tag || echo "")
         fi
         [ -z "$tag" ] && [ $attempts -lt $MAX_RETRIES ] && sleep 2
     done
 
-    if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]]; then
+    if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         VERSION="$tag"
         log_success "Latest version: $VERSION"
         return 0
@@ -636,7 +667,7 @@ resolve_version() {
         tag=$(curl -fsSL "${PROXY_ARGS[@]}" -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||' || echo "")
     fi
 
-    if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]] && [[ "$tag" != *"/"* ]]; then
+    if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         VERSION="$tag"
         log_success "Latest version (via redirect): $VERSION"
         return 0
@@ -963,6 +994,9 @@ validate_binary_for_install() {
     local reported expected
     if ! reported=$(binary_reported_version "$src"); then
         log_error "$label failed --version validation"
+        if [ "$(uname -s)" = "Linux" ]; then
+            log_error "Linux releases require the ALSA runtime (libasound.so.2), including for file transcription. Install your distribution's ALSA runtime package and retry."
+        fi
         return 1
     fi
     if [ -n "$VERSION" ]; then

@@ -1269,13 +1269,9 @@ pub(crate) fn is_reusable_download_path(path: &Path, dest_dir: &Path, id: &str) 
     let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
         return false;
     };
-    if !REUSABLE_MEDIA_EXTENSIONS
+    REUSABLE_MEDIA_EXTENSIONS
         .iter()
         .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-    {
-        return false;
-    }
-    true
 }
 
 /// Validate the ownership and completed-file portion of the reusable-download
@@ -1783,7 +1779,10 @@ mod tests {
         for (url, expected) in [
             ("https://www.youtube.com/watch?v=watch123#t=42", "watch123"),
             ("https://youtu.be/short123#t=42", "short123"),
-            ("https://www.youtube.com/shorts/shorts123#comments", "shorts123"),
+            (
+                "https://www.youtube.com/shorts/shorts123#comments",
+                "shorts123",
+            ),
             ("https://www.youtube.com/live/live123#t=1", "live123"),
             ("https://www.youtube.com/embed/embed123#player", "embed123"),
         ] {
@@ -2328,12 +2327,9 @@ mod tests {
         assert_eq!(meta.live_status.as_deref(), Some("not_live"));
         assert!(meta.description.is_some());
 
-        let fragmented = fetch_metadata(
-            &stub_info(),
-            "youtube.com/watch?v=fragment123#t=42",
-            &token,
-        )
-        .expect("fragmented metadata URL should parse");
+        let fragmented =
+            fetch_metadata(&stub_info(), "youtube.com/watch?v=fragment123#t=42", &token)
+                .expect("fragmented metadata URL should parse");
         assert_eq!(fragmented.id, "fragment123");
     }
 
@@ -2493,11 +2489,7 @@ mod tests {
             sidecar.is_file(),
             "the rejected path must exist so file ownership alone would false-green"
         );
-        assert!(!is_reusable_download_path(
-            &sidecar,
-            dir.path(),
-            &meta.id
-        ));
+        assert!(!is_reusable_download_path(&sidecar, dir.path(), &meta.id));
     }
 
     #[test]

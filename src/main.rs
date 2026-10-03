@@ -10,8 +10,8 @@ use franken_whisper::cli::{
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
-    backends_discovery_value, build_backends_report, build_health_report, emit_health_report,
-    emit_event_value, emit_pretty_run_report, emit_robot_complete, emit_robot_error_from_fw,
+    backends_discovery_value, build_backends_report, build_health_report, emit_event_value,
+    emit_health_report, emit_pretty_run_report, emit_robot_complete, emit_robot_error_from_fw,
     emit_robot_stage, emit_robot_start, listen_device_value, robot_schema_value,
     routing_decision_line, routing_history_complete_value,
 };

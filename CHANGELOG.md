@@ -2,13 +2,13 @@
 
 All notable changes to [franken_whisper](https://github.com/Dicklesworthstone/franken_whisper) are documented in this file.
 
-Scope window: project inception through HEAD on 2026-08-24.
+Scope window: project inception through the 0.10.0 release cut on 2026-10-02.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased | commits on `main` | 2026-08-15 → 2026-08-24 | Realtime `fw robot listen` driver; AlignAtt; default-off adaptive controllers; docs-reorg follow-through |
+| `v0.10.0` | Release cut | 2026-10-02 | Native loading and cancellation hardening; decode recovery; realtime listen; v3 installer preflight and source escape |
 | [`v0.9.3`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.3) | Release | 2026-08-15 | fw-ios C ABI + SwiftUI; installer/diarization follow-through |
 | [`v0.9.2`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.2) | Release | 2026-08-13 | Prior tagged line |
 
@@ -18,13 +18,51 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ---
 
-## [Unreleased]
+## [0.10.0] - 2026-10-02
+
+This cut contains 461 commits (454 non-merge commits) after `v0.9.3`, before
+release-worker repairs and metadata. Platform, registry and installer results
+are recorded with the published release; preparing this entry does not assert
+that every optional browser, GPU, oracle or Apple-device surface is certified.
+
+### Release fixes
+
+- Keep authenticated native model descriptors open through loading and separate
+  trusted and custom cache generations. Decoder recovery admits previously
+  unclosed timestamp windows without discarding prior accepted text.
+- Join cancelled stage workers before continuing, retain the pre-commit storage
+  cancellation fence, and preserve transcript text in exported artifacts.
+- Keep the Linux x86-64-v3 default. The installer checks CPU support before using
+  that binary and provides the explicit `--from-source` escape for older CPUs
+  ([#5](https://github.com/Dicklesworthstone/franken_whisper/issues/5)).
+- Resolve CLI releases separately from model-package releases, excluding draft
+  and prerelease records and requiring an exact stable `vX.Y.Z` tag.
+- Resolve the lockfile against the five existing pinned sibling manifests;
+  retain those source revisions while refreshing compatible registry versions.
+- Retain actionable native-model provisioning guidance after authenticated
+  resolution fails. Fence successful stage-worker results against the original
+  cancellation deadline even when the receiving thread resumes late.
+- Defer optional audio-device enumeration in machine health and doctor reports;
+  report `audio_input.probed: false` and direct explicit hardware discovery to
+  `fw robot listen --list-devices`, keeping native ALSA/JACK diagnostics off machine stderr.
+- Assert the unchanged normalized confidence contract in the word-split bridge
+  regression while preserving its raw confidence and zero-duration observation.
+- Disclose unqualified developer-converter fixture and performance-ledger audit
+  surfaces ([#6](https://github.com/Dicklesworthstone/franken_whisper/issues/6));
+  the outside-repository output boundary and evidence predicate remain enforced.
+- Apply the pinned Rust formatter to the release source.
+- Publish archive SHA-256 sidecars and epoch-2 minisign signatures. The public
+  verification key is `signing/minisign-epoch2.pub`; the installer retains its
+  mandatory SHA-256 verification.
+
+Compare: [`v0.9.3...v0.10.0`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.9.3...v0.10.0).
 
 ### Delivered capability
 
 - Remaining root planning and operator docs now live under `docs/planning/` and `docs/operations/`.
 - Skill-loop scratch, beads recovery snapshots, and the root `AGENT_NAME` leak are gone from the index.
 - **Realtime mic streaming driver `fw robot listen`.** Capture→VAD→decode→policy→NDJSON loop over the native engine: cpal capture with ffmpeg fallback (`src/capture.rs`), causal 20 ms energy VAD with endpoint lifecycle events (`speech_started` / `transcript.delta` / `utterance_end`), bounded session buffer with prompt carry, AlignAtt as the default emission policy, and the six core listen events added to the robot schema additively (`ROBOT_SCHEMA_VERSION` now `1.1.0`).
+  Linux prebuilts now require the system ALSA runtime (`libasound.so.2`) even for file transcription. Source builds require ALSA development headers and `pkg-config`. The installer validates both binaries before replacing the previous installation and gives ALSA prerequisite guidance when Linux executable validation fails.
 - **Greedy-decoder per-token alignment-head attention tap.** `DecodeParams::record_token_attn` records each token's argmax encoder frame into `WindowStats::token_attn` (greedy-only; bd-rt-attn-tap-dfti), the shipped data source for the default AlignAtt emission policy (`bd-rt-alignatt-fry9`).
 - **Default-off live adaptive controllers.** `--adaptive` bounds step cadence and AlignAtt holdback changes, records `listen.controller` evidence, and uses Brier-gated deterministic fallback (`bd-rt-adaptive-contract-yw68`). The default remains fixed until retained evidence authorizes a flip.
 - **Live-streaming documentation wave (bd-rt-docs-7aa6).** README gained a "Real-Time Streaming (`fw robot listen`)" section (quickstart, agent integration loops, event contract with lifecycle invariants, emission-policy guide, confirm lane, persistence, and latency expectations citing the 2026-08-23 PERF_LEDGER campaign — including its failed A/A nulls and therefore no comparative claims); the Robot Event Catalog, JSON Schema Reference, `robot schema` key dump, and Use Cases Gallery cover the live family; Pre-Flight gained live-session sizing. `docs/realtime-streaming.md` records the current AlignAtt default and shipped default-off adaptive contract. Deterministic file-replay/golden lifecycle certification remains open as `bd-rt-e2e-0zo5`.

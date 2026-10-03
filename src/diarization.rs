@@ -40056,17 +40056,10 @@ mod tests {
 
     #[test]
     fn ecapa_short_tracklet_padding_emits_typed_provenance() {
-        let mut embedding =
-            [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
+        let mut embedding = [0.0_f32; crate::ecapa_conformance::ECAPA_EMBEDDING_DIMENSIONS];
         embedding[0] = 1.0;
-        let tracklet = profile_tracklet(
-            0,
-            0,
-            500,
-            0.0,
-            0.0,
-            super::MIN_ECAPA_TRACKLET_VOICED_FRAMES,
-        );
+        let tracklet =
+            profile_tracklet(0, 0, 500, 0.0, 0.0, super::MIN_ECAPA_TRACKLET_VOICED_FRAMES);
 
         let mut short_source = vec![0.25_f32; super::ECAPA_MINIMUM_RUNTIME_SAMPLES - 3];
         short_source[0] = 0.125;
@@ -40085,7 +40078,11 @@ mod tests {
             )
             .expect("short tracklet representation");
 
-        assert_eq!(short_calls.len(), 1, "short tracklet has no held-out window");
+        assert_eq!(
+            short_calls.len(),
+            1,
+            "short tracklet has no held-out window"
+        );
         let padded = &short_calls[0];
         assert_eq!(padded.len(), super::ECAPA_MINIMUM_RUNTIME_SAMPLES);
         let offset = (super::ECAPA_MINIMUM_RUNTIME_SAMPLES - short_source.len()) / 2;
@@ -40095,10 +40092,7 @@ mod tests {
             &padded[offset..offset + short_source.len()],
             short_source.as_slice()
         );
-        assert_eq!(
-            &padded[offset + short_source.len()..],
-            &[0.0, 0.0]
-        );
+        assert_eq!(&padded[offset + short_source.len()..], &[0.0, 0.0]);
         assert_eq!(
             short_summary.status,
             NeuralSpeakerRepresentationStatus::Degraded

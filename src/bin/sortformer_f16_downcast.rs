@@ -121,12 +121,8 @@ fn publish_artifact_pair_with_after_receipt(
 ) -> Result<(), String> {
     verify_repository_boundary_identity(repository)?;
     publish_exact(output_package, package_bytes, "output package")?;
-    let package_identity = confirm_existing_exact(
-        output_package,
-        None,
-        package_bytes,
-        "output package",
-    )?;
+    let package_identity =
+        confirm_existing_exact(output_package, None, package_bytes, "output package")?;
     publish_exact(output_receipt, receipt_bytes, "output receipt").map_err(|error| {
         format!(
             "{error}; artifact-pair completion is not confirmed: the output package was \
@@ -134,19 +130,16 @@ fn publish_artifact_pair_with_after_receipt(
              unconfirmed; inspect both output paths and retry only with identical bytes and paths"
         )
     })?;
-    let receipt_identity = confirm_existing_exact(
-        output_receipt,
-        None,
-        receipt_bytes,
-        "output receipt",
-    )
-    .map_err(|error| {
-        format!(
-            "{error}; artifact-pair completion is uncertain: receipt publication returned \
+    let receipt_identity =
+        confirm_existing_exact(output_receipt, None, receipt_bytes, "output receipt").map_err(
+            |error| {
+                format!(
+                    "{error}; artifact-pair completion is uncertain: receipt publication returned \
              success, but its identity/durability could not be confirmed; inspect both output \
              paths and retry only with identical bytes and paths"
-        )
-    })?;
+                )
+            },
+        )?;
     after_receipt_publish().map_err(|error| {
         format!(
             "{error}; artifact-pair completion is uncertain after receipt publication; inspect \
@@ -309,8 +302,7 @@ fn verify_repository_boundary_identity(_repository: &RepositoryBoundary) -> Resu
 fn verify_repository_cli_source(repository: &RepositoryBoundary) -> Result<(), String> {
     use rustix::fs::{Mode, OFlags, openat};
 
-    let directory_flags =
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let src = File::from(
         openat(&repository.directory, "src", directory_flags, Mode::empty())
             .map_err(|_| "trusted repository src directory could not be opened".to_owned())?,
@@ -433,11 +425,7 @@ fn existing_leaf_identity(
 ) -> Result<Option<(u64, u64)>, String> {
     use rustix::fs::{AtFlags, statat};
 
-    match statat(
-        &target.directory,
-        &target.name,
-        AtFlags::SYMLINK_NOFOLLOW,
-    ) {
+    match statat(&target.directory, &target.name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(metadata) => {
             #[cfg(target_vendor = "apple")]
             let device = metadata.st_dev as u64;
@@ -508,7 +496,9 @@ fn read_bounded_file(
         || metadata.len() > max_bytes
         || expected_bytes.is_some_and(|expected| metadata.len() != expected)
     {
-        return Err(format!("{label} size is outside the authenticated envelope"));
+        return Err(format!(
+            "{label} size is outside the authenticated envelope"
+        ));
     }
     let read_limit = max_bytes
         .checked_add(1)
@@ -524,8 +514,8 @@ fn read_bounded_file(
     reader
         .read_to_end(&mut bytes)
         .map_err(|_| format!("{label} could not be read"))?;
-    let observed = u64::try_from(bytes.len())
-        .map_err(|_| format!("{label} size does not fit u64"))?;
+    let observed =
+        u64::try_from(bytes.len()).map_err(|_| format!("{label} size does not fit u64"))?;
     if observed > max_bytes || expected_bytes.is_some_and(|expected| observed != expected) {
         return Err(format!("{label} size changed while it was read"));
     }
@@ -547,9 +537,7 @@ fn open_readonly_nonblocking(path: &Path, label: &str) -> Result<File, String> {
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn open_readonly_nonblocking(_path: &Path, label: &str) -> Result<File, String> {
-    Err(format!(
-        "{label} cannot be opened safely on this platform"
-    ))
+    Err(format!("{label} cannot be opened safely on this platform"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -601,8 +589,8 @@ fn publish_exact_with_hooks(
     use rustix::fs::{Mode, OFlags, RenameFlags, fchmod, openat, renameat_with};
 
     verify_output_parent_identity(target)?;
-    let expected = u64::try_from(bytes.len())
-        .map_err(|_| format!("{label} size does not fit u64"))?;
+    let expected =
+        u64::try_from(bytes.len()).map_err(|_| format!("{label} size does not fit u64"))?;
     if let Some(existing) = open_output_leaf(target, label, true)? {
         let existing_bytes = read_bounded_file(&existing, expected, Some(expected), label)?;
         verify_output_leaf_identity(target, &existing, label)?;
@@ -622,10 +610,7 @@ fn publish_exact_with_hooks(
 
     let mut staged = None;
     for _ in 0..8 {
-        let name = OsString::from(format!(
-            ".sortformer-f16-stage-{}",
-            Uuid::new_v4().simple()
-        ));
+        let name = OsString::from(format!(".sortformer-f16-stage-{}", Uuid::new_v4().simple()));
         match openat(
             &target.directory,
             &name,
@@ -640,8 +625,9 @@ fn publish_exact_with_hooks(
             Err(_) => return Err(format!("{label} staging file could not be created")),
         }
     }
-    let (staging_name, mut staging_file) = staged
-        .ok_or_else(|| format!("{label} staging file could not be created after bounded retries"))?;
+    let (staging_name, mut staging_file) = staged.ok_or_else(|| {
+        format!("{label} staging file could not be created after bounded retries")
+    })?;
     if fchmod(&staging_file, Mode::RUSR | Mode::WUSR).is_err() {
         return Err(format!(
             "{label} staging permissions could not be restricted{}",
@@ -654,20 +640,18 @@ fn publish_exact_with_hooks(
             )
         ));
     }
-    let staging_metadata = staging_file
-        .metadata()
-        .map_err(|_| {
-            format!(
-                "{label} staging identity could not be inspected{}",
-                staging_diagnostic_suffix(
-                    target,
-                    &staging_name,
-                    &staging_file,
-                    label,
-                    StagingContentState::CreatedEmpty,
-                )
+    let staging_metadata = staging_file.metadata().map_err(|_| {
+        format!(
+            "{label} staging identity could not be inspected{}",
+            staging_diagnostic_suffix(
+                target,
+                &staging_name,
+                &staging_file,
+                label,
+                StagingContentState::CreatedEmpty,
             )
-        })?;
+        )
+    })?;
     if !staging_metadata.is_file()
         || staging_metadata.uid() != rustix::process::geteuid().as_raw()
         || staging_metadata.mode() & 0o7777 != 0o600
@@ -717,8 +701,7 @@ fn publish_exact_with_hooks(
             StagingContentState::FullSynced { expected },
         )
     };
-    verify_output_parent_identity(target)
-        .map_err(|error| format!("{error}{}", full_synced()))?;
+    verify_output_parent_identity(target).map_err(|error| format!("{error}{}", full_synced()))?;
     verify_named_leaf_identity(target, &staging_name, &staging_file, label)
         .map_err(|error| format!("{error}{}", full_synced()))?;
     (hooks.before_rename)().map_err(|error| format!("{error}{}", full_synced()))?;
@@ -782,7 +765,10 @@ fn publish_exact_with_hooks(
         ));
     }
     (hooks.sync_parent)(&target.directory).map_err(|_| {
-        committed_uncertain(label, "its directory entry synchronization was not confirmed")
+        committed_uncertain(
+            label,
+            "its directory entry synchronization was not confirmed",
+        )
     })?;
     verify_output_parent_identity(target).map_err(|_| {
         committed_uncertain(label, "its parent identity changed after synchronization")
@@ -795,7 +781,9 @@ fn publish_exact_with_hooks(
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn publish_exact(_target: &OutputTarget, _bytes: &[u8], label: &str) -> Result<(), String> {
-    Err(format!("{label} cannot be published safely on this platform"))
+    Err(format!(
+        "{label} cannot be published safely on this platform"
+    ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -881,7 +869,9 @@ fn confirm_existing_exact_with_hooks(
     if let Some(retained_identity) = retained_identity
         && !same_open_file_identity(retained_identity, &current, label)?
     {
-        return Err(format!("{label} inode changed during artifact-pair publication"));
+        return Err(format!(
+            "{label} inode changed during artifact-pair publication"
+        ));
     }
     verify_open_output_bytes(target, &current, bytes, label)?;
     (hooks.sync_file)(&current)
@@ -891,7 +881,9 @@ fn confirm_existing_exact_with_hooks(
     let confirmed = open_output_leaf(target, label, true)?
         .ok_or_else(|| format!("{label} disappeared after synchronization"))?;
     if !same_open_file_identity(&current, &confirmed, label)? {
-        return Err(format!("{label} inode changed during artifact-pair publication"));
+        return Err(format!(
+            "{label} inode changed during artifact-pair publication"
+        ));
     }
     verify_open_output_bytes(target, &confirmed, bytes, label)?;
     Ok(confirmed)
@@ -904,13 +896,15 @@ fn verify_open_output_bytes(
     bytes: &[u8],
     label: &str,
 ) -> Result<(), String> {
-    let expected = u64::try_from(bytes.len())
-        .map_err(|_| format!("{label} size does not fit u64"))?;
+    let expected =
+        u64::try_from(bytes.len()).map_err(|_| format!("{label} size does not fit u64"))?;
     let observed = read_bounded_file(current, expected, Some(expected), label)?;
     verify_output_parent_identity(target)?;
     verify_output_leaf_identity(target, current, label)?;
     if observed != bytes {
-        return Err(format!("{label} bytes changed during artifact-pair publication"));
+        return Err(format!(
+            "{label} bytes changed during artifact-pair publication"
+        ));
     }
     Ok(())
 }
@@ -985,8 +979,10 @@ fn classify_failed_rename(
     if final_state == Some(OutputLeafState::Expected) {
         return FailedRenameDisposition::PublishedUncertain;
     }
-    if matches!(final_state, Some(OutputLeafState::Missing | OutputLeafState::Other))
-        && staging_state == Some(OutputLeafState::Expected)
+    if matches!(
+        final_state,
+        Some(OutputLeafState::Missing | OutputLeafState::Other)
+    ) && staging_state == Some(OutputLeafState::Expected)
     {
         return if destination_existed {
             FailedRenameDisposition::CollisionWithNamedStage
@@ -1335,9 +1331,8 @@ mod tests {
             before_rename: &before_rename,
         };
 
-        let error =
-            publish_exact_with_hooks(&target, b"identical", "test artifact", &hooks)
-                .expect_err("existing identical bytes must not bypass file synchronization");
+        let error = publish_exact_with_hooks(&target, b"identical", "test artifact", &hooks)
+            .expect_err("existing identical bytes must not bypass file synchronization");
 
         assert!(error.contains("existing test artifact bytes could not be synchronized"));
         assert_eq!(file_sync_calls.load(Ordering::SeqCst), 1);
@@ -1351,9 +1346,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("create output directory");
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
-        let write_staging = |_: &mut File, _: &[u8]| {
-            Err(io::Error::other("synthetic write failure"))
-        };
+        let write_staging =
+            |_: &mut File, _: &[u8]| Err(io::Error::other("synthetic write failure"));
         let before_rename = || Ok(());
         let hooks = PublishHooks {
             write_staging: &write_staging,
@@ -1511,12 +1505,14 @@ mod tests {
             before_rename: &create_collision,
         };
 
-        let error =
-            publish_exact_with_hooks(&target, b"derived artifact", "test artifact", &hooks)
-                .expect_err("no-clobber rename must reject a last-moment collision");
+        let error = publish_exact_with_hooks(&target, b"derived artifact", "test artifact", &hooks)
+            .expect_err("no-clobber rename must reject a last-moment collision");
 
         assert!(error.contains("could not be published without overwriting"));
-        assert_eq!(std::fs::read(&output).expect("read collision"), b"competitor");
+        assert_eq!(
+            std::fs::read(&output).expect("read collision"),
+            b"competitor"
+        );
         let stages = std::fs::read_dir(directory.path())
             .expect("read output directory")
             .filter_map(Result::ok)
@@ -1545,9 +1541,8 @@ mod tests {
         let package = test_output_target(&package_path);
         let receipt = test_output_target(&receipt_path);
 
-        let error =
-            publish_artifact_pair(&repository, &package, &receipt, b"package", b"receipt")
-                .expect_err("receipt collision must leave an explicit partial pair");
+        let error = publish_artifact_pair(&repository, &package, &receipt, b"package", b"receipt")
+            .expect_err("receipt collision must leave an explicit partial pair");
 
         assert!(error.contains("artifact-pair completion is not confirmed"));
         assert!(error.contains("output package was confirmed before the receipt attempt"));
@@ -1722,14 +1717,9 @@ mod tests {
             sync_parent: &sync_parent,
         };
 
-        let error = confirm_existing_exact_with_hooks(
-            &target,
-            None,
-            b"package",
-            "output package",
-            &hooks,
-        )
-        .expect_err("mismatched bytes must be rejected before synchronization");
+        let error =
+            confirm_existing_exact_with_hooks(&target, None, b"package", "output package", &hooks)
+                .expect_err("mismatched bytes must be rejected before synchronization");
 
         assert!(error.contains("output package bytes changed"));
         assert_eq!(file_sync_calls.load(Ordering::SeqCst), 0);
@@ -1761,14 +1751,9 @@ mod tests {
             sync_parent: &sync_parent,
         };
 
-        let error = confirm_existing_exact_with_hooks(
-            &target,
-            None,
-            b"package",
-            "output package",
-            &hooks,
-        )
-        .expect_err("post-sync byte mutation must invalidate confirmation");
+        let error =
+            confirm_existing_exact_with_hooks(&target, None, b"package", "output package", &hooks)
+                .expect_err("post-sync byte mutation must invalidate confirmation");
 
         assert!(error.contains("output package bytes changed"));
         assert_eq!(file_sync_calls.load(Ordering::SeqCst), 1);
@@ -1933,11 +1918,8 @@ mod tests {
         std::fs::create_dir_all(&bin).expect("create synthetic repository tree");
         let mut different_source = COMPILED_CLI_SOURCE.to_vec();
         different_source[0] ^= 1;
-        std::fs::write(
-            bin.join("sortformer_f16_downcast.rs"),
-            &different_source,
-        )
-        .expect("write same-length different converter source");
+        std::fs::write(bin.join("sortformer_f16_downcast.rs"), &different_source)
+            .expect("write same-length different converter source");
 
         let error = bind_repository_boundary(outer.path())
             .err()

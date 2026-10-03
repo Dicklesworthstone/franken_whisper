@@ -6402,14 +6402,8 @@ mod tests {
             bypass_transcript_cache: true,
             ..e2e_params()
         };
-        let out = transcribe_samples_uncached(
-            &model,
-            &silence_then_tail,
-            &params,
-            &noop,
-            None,
-        )
-        .expect("decode silence followed by genuine final-tail speech");
+        let out = transcribe_samples_uncached(&model, &silence_then_tail, &params, &noop, None)
+            .expect("decode silence followed by genuine final-tail speech");
         let text = out
             .segments
             .iter()
@@ -6417,7 +6411,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
 
-        assert!(out.windows.len() >= 2, "fixture must exercise a later window");
+        assert!(
+            out.windows.len() >= 2,
+            "fixture must exercise a later window"
+        );
         assert!(
             text.to_lowercase().contains("country"),
             "genuine later-tail speech must be retained: {text:?}"

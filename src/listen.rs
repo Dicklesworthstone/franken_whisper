@@ -748,9 +748,7 @@ const MAX_VAD_FLOOR_RISE_DB_PER_SEC: f64 = 1_000.0;
 const MAX_CONFIRM_DRAIN_SEC: f64 = 3_600.0;
 
 fn invalid_listen_config(field: &str, requirement: &str) -> FwError {
-    FwError::InvalidRequest(format!(
-        "listen configuration `{field}` {requirement}"
-    ))
+    FwError::InvalidRequest(format!("listen configuration `{field}` {requirement}"))
 }
 
 fn require_finite(field: &str, value: f64) -> FwResult<()> {
@@ -1771,20 +1769,20 @@ fn resolve_fast_model_path(
     let spec = config.fast_model.as_deref().unwrap_or(default_spec).trim();
     let pinned_model = pinned_fast_lane_model(spec);
     let resolved = match pinned_model {
-        Some(model) => crate::model_distribution::resolve_cached_fast_lane_with_cancel(
-            model,
-            is_cancelled,
-        )
-        .map(crate::native_engine::ResolvedWhisperModel::Authenticated),
+        Some(model) => {
+            crate::model_distribution::resolve_cached_fast_lane_with_cancel(model, is_cancelled)
+                .map(crate::native_engine::ResolvedWhisperModel::Authenticated)
+        }
         None => crate::native_engine::resolve_model_source_with_cancel(spec, is_cancelled),
     };
 
     match resolved {
         Ok(path) => Ok((
             path,
-            pinned_model.map_or_else(|| spec.to_owned(), |model| {
-                pinned_fast_lane_label(model).to_owned()
-            }),
+            pinned_model.map_or_else(
+                || spec.to_owned(),
+                |model| pinned_fast_lane_label(model).to_owned(),
+            ),
             None,
         )),
         Err(cancelled @ FwError::Cancelled(_)) => Err(cancelled),
@@ -1793,20 +1791,17 @@ fn resolve_fast_model_path(
             // release package is present; degraded latency beats refusal.
             // Cancellation during the fallback authentication is authoritative;
             // it must never be rewritten as the earlier fast-package miss.
-            let fallback = match crate::model_distribution::resolve_cached_whisper_with_cancel(
-                is_cancelled,
-            ) {
-                Ok(package) => {
-                    crate::native_engine::ResolvedWhisperModel::Authenticated(package)
-                }
-                Err(cancelled @ FwError::Cancelled(_)) => return Err(cancelled),
-                Err(_) => return Err(missing),
-            };
+            let fallback =
+                match crate::model_distribution::resolve_cached_whisper_with_cancel(is_cancelled) {
+                    Ok(package) => {
+                        crate::native_engine::ResolvedWhisperModel::Authenticated(package)
+                    }
+                    Err(cancelled @ FwError::Cancelled(_)) => return Err(cancelled),
+                    Err(_) => return Err(missing),
+                };
             let next_action = match pinned_model {
                 Some(crate::model_distribution::FastLaneModel::Tiny) => "run `fw pull tiny`",
-                Some(crate::model_distribution::FastLaneModel::TinyEn) => {
-                    "run `fw pull tiny-en`"
-                }
+                Some(crate::model_distribution::FastLaneModel::TinyEn) => "run `fw pull tiny-en`",
                 None => "pass an existing explicit model path or install a pinned fast lane",
             };
             Ok((
@@ -2730,8 +2725,7 @@ pub fn run_listen_session(
     let now_ts = || chrono::Utc::now().to_rfc3339();
 
     // Model first: session_start marks "ready" (agents key on it).
-    let (model, fast_model_label, fallback_warning) =
-        resolve_fast_model(config, is_cancelled)?;
+    let (model, fast_model_label, fallback_warning) = resolve_fast_model(config, is_cancelled)?;
     let (mut capture, capture_backend, device_label, capture_warning) =
         open_capture_source(config)?;
     // A source can supply its rate/channel layout only after opening (notably
@@ -2778,22 +2772,22 @@ pub fn run_listen_session(
                         &spec_owned,
                         is_abort,
                     )
-                        .map_err(|e| e.to_string())
-                        .and_then(|source| {
-                            let checkpoint = || {
-                                if is_abort() {
-                                    Err(FwError::Cancelled(
-                                        "confirm lane model load abandoned".to_owned(),
-                                    ))
-                                } else {
-                                    Ok(())
-                                }
-                            };
-                            source
-                                .load_with_checkpoint(&checkpoint)
-                                .map(|m| (m, spec_owned.clone()))
-                                .map_err(|e| e.to_string())
-                        });
+                    .map_err(|e| e.to_string())
+                    .and_then(|source| {
+                        let checkpoint = || {
+                            if is_abort() {
+                                Err(FwError::Cancelled(
+                                    "confirm lane model load abandoned".to_owned(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        source
+                            .load_with_checkpoint(&checkpoint)
+                            .map(|m| (m, spec_owned.clone()))
+                            .map_err(|e| e.to_string())
+                    });
                     match resolved {
                         Ok(pair) => {
                             loaded = Some(pair.clone());
@@ -4587,10 +4581,7 @@ mod tests {
         // verdict that was already complete when session shutdown began.
         for utterance_id in 1..=10 {
             let decoder: QualityDecoder = Box::new(move |job, _prev, _abort| {
-                DecodeOutcome::Segments(
-                    vec![segment(&job.committed_text)],
-                    "fake-qm".to_owned(),
-                )
+                DecodeOutcome::Segments(vec![segment(&job.committed_text)], "fake-qm".to_owned())
             });
             let lane = ConfirmLane::spawn(1, decoder);
             lane.submit(fake_job(utterance_id, "finished before drain"));
@@ -5856,15 +5847,13 @@ mod adaptive_contract_tests {
         expect_invalid!(
             "vad.floor_rise_db_per_sec_silence",
             |config: &mut ListenConfig| {
-                config.vad.floor_rise_db_per_sec_silence =
-                    MAX_VAD_FLOOR_RISE_DB_PER_SEC + 1.0;
+                config.vad.floor_rise_db_per_sec_silence = MAX_VAD_FLOOR_RISE_DB_PER_SEC + 1.0;
             }
         );
         expect_invalid!(
             "vad.floor_rise_db_per_sec_speech",
             |config: &mut ListenConfig| {
-                config.vad.floor_rise_db_per_sec_speech =
-                    MAX_VAD_FLOOR_RISE_DB_PER_SEC + 1.0;
+                config.vad.floor_rise_db_per_sec_speech = MAX_VAD_FLOOR_RISE_DB_PER_SEC + 1.0;
             }
         );
         expect_invalid!("max_seconds", |config: &mut ListenConfig| {

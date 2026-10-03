@@ -43,12 +43,12 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::conformance::DTW_PROJECTION_SCHEMA_VERSION;
+#[cfg(test)]
+use crate::diarization_projection::CanonicalProjectionUnit;
 use crate::diarization_projection::{
     CANONICAL_PROJECTION_EPSILON_SEC, CANONICAL_PROJECTION_MIN_DURATION_SEC,
     ProjectionUnitProvenance, normalize_dtw_projection_units,
 };
-#[cfg(test)]
-use crate::diarization_projection::CanonicalProjectionUnit;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, DiarizationEngine, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
@@ -499,7 +499,9 @@ pub fn run(
                 .and_then(|token| token.checkpoint().err())
                 .unwrap_or(error),
             error @ FwError::StageTimeout { .. } => error,
-            other => FwError::BackendUnavailable(other.to_string()),
+            other => FwError::BackendUnavailable(format!(
+                "{other}; select a model with --model or FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL, or provision the default with `fw pull whisper`"
+            )),
         })?;
     let model_path = model_source.path().to_path_buf();
     let checkpoint = checkpoint_for(token);

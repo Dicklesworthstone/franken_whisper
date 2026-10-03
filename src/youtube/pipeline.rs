@@ -653,16 +653,12 @@ fn run_with_info_body(
                         // the consumer side instead. Capture-mode serialization
                         // of plain values cannot fail in practice.
                         if !work_item.reuses_audio() {
-                            let _ = events
-                                .emit("downloading", serde_json::json!({ "id": video.id }));
+                            let _ =
+                                events.emit("downloading", serde_json::json!({ "id": video.id }));
                         }
                         let reused = work_item.reuses_audio();
-                        let outcome = execute_download_work(
-                            &info,
-                            &work_item,
-                            &audio_dir,
-                            &dl_token,
-                        );
+                        let outcome =
+                            execute_download_work(&info, &work_item, &audio_dir, &dl_token);
                         if let Ok((audio_path, _meta)) = &outcome {
                             let bytes = std::fs::metadata(audio_path).ok().map(|m| m.len());
                             let _ = events.emit(
@@ -956,13 +952,11 @@ where
         DownloadWork::Fetch(video) => retry_download_stage(&video.id, token, || {
             download_one_attempt(info, video, audio_dir, token)
         }),
-        DownloadWork::Reuse { video, audio_path } => {
-            retry_download_stage(&video.id, token, || {
-                let meta = fetch_metadata(info, &video.url, token)?;
-                validate_metadata_identity(video, &meta)?;
-                Ok((audio_path.clone(), meta))
-            })
-        }
+        DownloadWork::Reuse { video, audio_path } => retry_download_stage(&video.id, token, || {
+            let meta = fetch_metadata(info, &video.url, token)?;
+            validate_metadata_identity(video, &meta)?;
+            Ok((audio_path.clone(), meta))
+        }),
     }
 }
 
@@ -1467,9 +1461,7 @@ fn project_native_windows(raw: &serde_json::Value) -> FwResult<Vec<RenderWindowS
     let schema_version = raw
         .get("schema_version")
         .and_then(serde_json::Value::as_str);
-    let in_process = raw
-        .get("in_process")
-        .and_then(serde_json::Value::as_bool);
+    let in_process = raw.get("in_process").and_then(serde_json::Value::as_bool);
     match (schema_version, in_process) {
         (Some("native-v2"), Some(true)) => {}
         (Some("native-v2"), _) | (_, Some(true)) => {
@@ -1689,8 +1681,8 @@ mod tests {
                 "no_speech_prob": 1.5
             }]
         });
-        let error = project_native_windows(&out_of_range)
-            .expect_err("out-of-range probability must fail");
+        let error =
+            project_native_windows(&out_of_range).expect_err("out-of-range probability must fail");
         assert!(matches!(error, FwError::ContractViolation(_)));
     }
 
@@ -1728,11 +1720,7 @@ mod tests {
             audio_path: recorded_path.display().to_string(),
             attempts: 0,
         };
-        let selected = select_download_work(
-            &recorded_video,
-            Some(&recorded_state),
-            &audio_dir,
-        );
+        let selected = select_download_work(&recorded_video, Some(&recorded_state), &audio_dir);
         assert!(matches!(
             selected,
             DownloadWork::Reuse { ref audio_path, .. } if audio_path == &recorded_path
@@ -1741,11 +1729,8 @@ mod tests {
         let orphaned_video = vr("orphaned001");
         let orphaned_path = audio_dir.join("orphaned001.wav");
         std::fs::write(&orphaned_path, b"orphaned sentinel").expect("orphaned audio");
-        let selected = select_download_work(
-            &orphaned_video,
-            Some(&VideoState::Pending),
-            &audio_dir,
-        );
+        let selected =
+            select_download_work(&orphaned_video, Some(&VideoState::Pending), &audio_dir);
         assert!(matches!(
             selected,
             DownloadWork::Reuse { ref audio_path, .. } if audio_path == &orphaned_path
@@ -1844,8 +1829,14 @@ mod tests {
         )
         .expect_err("metadata identity divergence must fail closed");
 
-        assert!(error.contains("resolved999"), "resolved id diagnostic: {error}");
-        assert!(error.contains("manifest001"), "manifest id diagnostic: {error}");
+        assert!(
+            error.contains("resolved999"),
+            "resolved id diagnostic: {error}"
+        );
+        assert!(
+            error.contains("manifest001"),
+            "manifest id diagnostic: {error}"
+        );
         assert_eq!(
             std::fs::read(&audio_path).expect("reused audio remains present"),
             b"owned reusable audio",
@@ -1985,7 +1976,11 @@ mod tests {
         ]);
         let videos = resolve_videos(&stub_info(), &opts, &token).expect("resolve");
 
-        assert_eq!(videos.len(), 1, "equivalent URL encodings are one work item");
+        assert_eq!(
+            videos.len(),
+            1,
+            "equivalent URL encodings are one work item"
+        );
         assert_eq!(videos[0].id, "abc-123_XYZ");
     }
 
@@ -2454,9 +2449,8 @@ https://youtu.be/ccccccccccc
         manifest.save(&manifest_path).expect("seed manifest");
         let paths = naming::output_paths(dir.path(), "rendered_cleanup0001");
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(
-            std::sync::Arc::clone(&buffer),
-        ));
+        let events =
+            YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(std::sync::Arc::clone(&buffer)));
         let mut summary = YoutubeRunSummary::default();
 
         let disposition = settle_rendered_video(
@@ -2530,9 +2524,8 @@ https://youtu.be/ccccccccccc
         manifest.save(&manifest_path).expect("seed manifest");
         let paths = naming::output_paths(dir.path(), "rendered_notfound001");
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(
-            std::sync::Arc::clone(&buffer),
-        ));
+        let events =
+            YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(std::sync::Arc::clone(&buffer)));
         let mut summary = YoutubeRunSummary::default();
 
         let disposition = settle_rendered_video(
@@ -2913,9 +2906,8 @@ https://youtu.be/ccccccccccc
         manifest.upsert_discovered(&video);
         manifest.save(&manifest_path).expect("seed manifest");
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(
-            std::sync::Arc::clone(&buffer),
-        ));
+        let events =
+            YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(std::sync::Arc::clone(&buffer)));
         let mut summary = YoutubeRunSummary::default();
 
         record_and_emit_failure(
@@ -2955,9 +2947,8 @@ https://youtu.be/ccccccccccc
     #[test]
     fn finalize_run_emits_exactly_one_cancelled_terminal_event() {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events = YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(
-            std::sync::Arc::clone(&buffer),
-        ));
+        let events =
+            YoutubeEventEmitter::new(YoutubeRobotEvents::Capture(std::sync::Arc::clone(&buffer)));
         events
             .emit("run_start", serde_json::json!({ "n_urls": 1 }))
             .expect("start event");
@@ -2975,7 +2966,10 @@ https://youtu.be/ccccccccccc
             .filter(|event| event["event"] == "youtube.run_complete")
             .collect();
         assert_eq!(terminals.len(), 1);
-        assert_eq!(parsed.last().expect("last event")["event"], "youtube.run_complete");
+        assert_eq!(
+            parsed.last().expect("last event")["event"],
+            "youtube.run_complete"
+        );
         assert_eq!(terminals[0]["cancelled"], true);
     }
 
@@ -3034,7 +3028,10 @@ https://youtu.be/ccccccccccc
             .filter(|event| event["id"] == "AFTERABORT1")
             .filter(|event| event["event"] != "youtube.discovered")
             .count();
-        assert_eq!(later_work_events, 0, "later waves must not start after abort");
+        assert_eq!(
+            later_work_events, 0,
+            "later waves must not start after abort"
+        );
 
         let manifest = Manifest::load(&dir.path().join(MANIFEST_NAME)).expect("manifest");
         assert!(matches!(

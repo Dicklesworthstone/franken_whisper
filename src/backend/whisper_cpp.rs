@@ -470,8 +470,7 @@ mod tests {
             .expect("non-word adapter must leave the observation untouched");
         assert_eq!(unchanged, zero_width);
         assert!(
-            crate::diarization_projection::validate_projection_segments(&unchanged, false)
-                .is_err()
+            crate::diarization_projection::validate_projection_segments(&unchanged, false).is_err()
         );
 
         let mut no_timestamps = minimal_request();

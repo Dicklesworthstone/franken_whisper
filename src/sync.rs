@@ -779,14 +779,13 @@ fn export_incremental_inner_with_after_runs(
     // The high-water mark is read inside the same snapshot as all three output
     // tables. It therefore advances past every mutation represented by the
     // published aggregate files, including mutations of child rows.
-    let (new_cursor_ts, new_cursor_run_id) =
-        match runs_export.last_position {
-            Some((ts, run_id)) => (ts, Some(run_id)),
-            None => cursor_used
-                .as_ref()
-                .map(|c| (c.last_export_rfc3339.clone(), c.last_export_run_id.clone()))
-                .unwrap_or_else(|| (EMPTY_INCREMENTAL_CURSOR_TS.to_owned(), None)),
-        };
+    let (new_cursor_ts, new_cursor_run_id) = match runs_export.last_position {
+        Some((ts, run_id)) => (ts, Some(run_id)),
+        None => cursor_used
+            .as_ref()
+            .map(|c| (c.last_export_rfc3339.clone(), c.last_export_run_id.clone()))
+            .unwrap_or_else(|| (EMPTY_INCREMENTAL_CURSOR_TS.to_owned(), None)),
+    };
 
     let cursor_after = SyncCursor {
         last_mutation_seq: runs_export.high_water_mark,
@@ -875,14 +874,10 @@ fn load_mutation_authority(connection: &Connection) -> FwResult<MutationAuthorit
         .map(|row| value_to_string_sqlite(row.get(0)))
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            FwError::Storage(
-                "incremental export requires a non-empty sync_database_id".to_owned(),
-            )
+            FwError::Storage("incremental export requires a non-empty sync_database_id".to_owned())
         })?;
     uuid::Uuid::parse_str(&database_id).map_err(|error| {
-        FwError::Storage(format!(
-            "invalid sync_database_id `{database_id}`: {error}"
-        ))
+        FwError::Storage(format!("invalid sync_database_id `{database_id}`: {error}"))
     })?;
 
     let high_water_mark = connection
@@ -2040,13 +2035,8 @@ fn flush_segment_chunk(
             overwritten_run_ids,
             state,
         )?;
-        if skip_preexisting_child_row(
-            &run_id,
-            &row,
-            conflict_policy,
-            inserted_run_ids,
-            &["text"],
-        )? {
+        if skip_preexisting_child_row(&run_id, &row, conflict_policy, inserted_run_ids, &["text"])?
+        {
             count += 1;
             continue;
         }
@@ -2788,10 +2778,7 @@ fn validate_export_format_version(manifest: &SyncManifest) -> FwResult<()> {
     Ok(())
 }
 
-fn validate_checksums(
-    manifest: &SyncManifest,
-    input_dir: &Path,
-) -> FwResult<JsonlInputPaths> {
+fn validate_checksums(manifest: &SyncManifest, input_dir: &Path) -> FwResult<JsonlInputPaths> {
     let input_paths = JsonlInputPaths::resolve(input_dir);
     validate_checksums_for_paths(manifest, &input_paths)?;
     Ok(input_paths)
@@ -3661,9 +3648,7 @@ fn load_jsonl_segment_map(
     Ok(map)
 }
 
-fn load_jsonl_event_map(
-    path: &Path,
-) -> FwResult<HashMap<ChildValidationKey, EventValidationRow>> {
+fn load_jsonl_event_map(path: &Path) -> FwResult<HashMap<ChildValidationKey, EventValidationRow>> {
     let mut map = HashMap::new();
     if !path.exists() {
         return Ok(map);
@@ -3777,20 +3762,14 @@ fn json_required_i64(value: &serde_json::Value, key: &str, table: &str) -> FwRes
         .ok_or_else(|| FwError::Storage(format!("invalid `{key}` in {table} JSONL row")))
 }
 
-fn json_nullable_f64(
-    value: &serde_json::Value,
-    key: &str,
-    table: &str,
-) -> FwResult<Option<f64>> {
+fn json_nullable_f64(value: &serde_json::Value, key: &str, table: &str) -> FwResult<Option<f64>> {
     match value.get(key) {
         Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::Number(number)) => number
             .as_f64()
             .filter(|number| number.is_finite())
             .map(Some)
-            .ok_or_else(|| {
-                FwError::Storage(format!("invalid `{key}` in {table} JSONL row"))
-            }),
+            .ok_or_else(|| FwError::Storage(format!("invalid `{key}` in {table} JSONL row"))),
         _ => Err(FwError::Storage(format!(
             "invalid `{key}` in {table} JSONL row"
         ))),
@@ -4529,7 +4508,9 @@ mod tests {
         write_jsonl_snapshot(&export_dir, &[run_row], &[], &[]);
 
         for batch_import_enabled in [false, true] {
-            let db_path = dir.path().join(format!("import-{batch_import_enabled}.sqlite3"));
+            let db_path = dir
+                .path()
+                .join(format!("import-{batch_import_enabled}.sqlite3"));
             let error = import_inner_with_batch_mode(
                 &db_path,
                 &export_dir,
@@ -4607,7 +4588,10 @@ mod tests {
                 .lines()
                 .map(|line| serde_json::from_str(line).expect("parse snapshot row"))
                 .collect();
-            assert!(!rows.is_empty(), "{file_name} should contain first run rows");
+            assert!(
+                !rows.is_empty(),
+                "{file_name} should contain first run rows"
+            );
             assert!(
                 rows.iter()
                     .all(|row| row[run_id_key] == "full-snapshot-first"),
@@ -5248,7 +5232,9 @@ mod tests {
             .err()
             .expect("fresh corrupt lock must block acquisition");
         assert!(
-            error.to_string().contains("potentially active partial lock"),
+            error
+                .to_string()
+                .contains("potentially active partial lock"),
             "unexpected error: {error}"
         );
         assert_eq!(
@@ -5278,7 +5264,9 @@ mod tests {
             .err()
             .expect("fresh non-UTF-8 lock must block acquisition");
         assert!(
-            error.to_string().contains("potentially active partial lock"),
+            error
+                .to_string()
+                .contains("potentially active partial lock"),
             "unexpected error: {error}"
         );
         assert_eq!(
@@ -5368,7 +5356,9 @@ mod tests {
             .err()
             .expect("fresh partial lock must block second acquisition");
         assert!(
-            error.to_string().contains("potentially active partial lock"),
+            error
+                .to_string()
+                .contains("potentially active partial lock"),
             "unexpected error: {error}"
         );
         assert!(
@@ -10242,26 +10232,23 @@ mod tests {
             ("segments.jsonl", "run_id"),
             ("events.jsonl", "run_id"),
         ] {
-            let rows: Vec<serde_json::Value> =
-                fs::read_to_string(first_export_dir.join(file_name))
-                    .expect("read first snapshot file")
-                    .lines()
-                    .map(|line| serde_json::from_str(line).expect("parse first snapshot row"))
-                    .collect();
-            assert!(!rows.is_empty(), "{file_name} should contain first run rows");
+            let rows: Vec<serde_json::Value> = fs::read_to_string(first_export_dir.join(file_name))
+                .expect("read first snapshot file")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("parse first snapshot row"))
+                .collect();
             assert!(
-                rows.iter()
-                    .all(|row| row[run_id_key] == "snapshot-first"),
+                !rows.is_empty(),
+                "{file_name} should contain first run rows"
+            );
+            assert!(
+                rows.iter().all(|row| row[run_id_key] == "snapshot-first"),
                 "{file_name} must wholly exclude the concurrent run"
             );
         }
 
-        let second_manifest = export_incremental_inner(
-            &db_path,
-            &second_export_dir,
-            &state_root,
-        )
-        .expect("next delta export");
+        let second_manifest = export_incremental_inner(&db_path, &second_export_dir, &state_root)
+            .expect("next delta export");
         assert_eq!(second_manifest.row_counts.runs, 1);
         assert_eq!(second_manifest.row_counts.segments, 2);
         assert_eq!(second_manifest.row_counts.events, 2);
@@ -10299,8 +10286,7 @@ mod tests {
                     .collect();
             assert!(!rows.is_empty(), "{file_name} should contain next run rows");
             assert!(
-                rows.iter()
-                    .all(|row| row[run_id_key] == "snapshot-second"),
+                rows.iter().all(|row| row[run_id_key] == "snapshot-second"),
                 "{file_name} must wholly include only the concurrent run in the next delta"
             );
         }
@@ -10438,8 +10424,7 @@ mod tests {
             .expect("no-change export");
         assert_eq!(third.row_counts.runs, 0, "successful delta exports once");
         assert_eq!(
-            third.cursor_after.last_mutation_seq,
-            second.cursor_after.last_mutation_seq,
+            third.cursor_after.last_mutation_seq, second.cursor_after.last_mutation_seq,
             "no-change export must retain the exact high-water mark"
         );
     }
@@ -10511,8 +10496,8 @@ mod tests {
             .expect("update exported event");
 
         let second_export = dir.path().join("export2");
-        let second = export_incremental(&db_path, &second_export, &state_root)
-            .expect("export child update");
+        let second =
+            export_incremental(&db_path, &second_export, &state_root).expect("export child update");
         assert_eq!(second.row_counts.runs, 1);
         assert_eq!(second.row_counts.segments, 2);
         assert_eq!(second.row_counts.events, 2);
@@ -10538,16 +10523,10 @@ mod tests {
         assert_eq!(third.row_counts.events, 0);
 
         writer
-            .execute(
-                "DELETE FROM segments WHERE run_id = 'updated-child' AND idx = 1",
-            )
+            .execute("DELETE FROM segments WHERE run_id = 'updated-child' AND idx = 1")
             .expect("delete exported segment");
-        let fourth = export_incremental(
-            &db_path,
-            &dir.path().join("export4"),
-            &state_root,
-        )
-        .expect("export child deletion");
+        let fourth = export_incremental(&db_path, &dir.path().join("export4"), &state_root)
+            .expect("export child deletion");
         assert_eq!(fourth.row_counts.runs, 1);
         assert_eq!(
             fourth.row_counts.segments, 1,
@@ -10605,12 +10584,8 @@ mod tests {
         )
         .expect("write mismatched cursor");
 
-        let error = export_incremental(
-            &db_path,
-            &dir.path().join("export"),
-            &state_root,
-        )
-        .expect_err("cursor from a newer or different database must fail closed");
+        let error = export_incremental(&db_path, &dir.path().join("export"), &state_root)
+            .expect_err("cursor from a newer or different database must fail closed");
         assert!(
             error.to_string().contains("outside database range"),
             "unexpected cursor mismatch error: {error}"
@@ -10633,12 +10608,9 @@ mod tests {
         source
             .persist_report(&fixture_report("source-run", &source_db))
             .expect("persist source run");
-        let source_manifest = export_incremental(
-            &source_db,
-            &dir.path().join("source_export"),
-            &source_state,
-        )
-        .expect("export source cursor");
+        let source_manifest =
+            export_incremental(&source_db, &dir.path().join("source_export"), &source_state)
+                .expect("export source cursor");
 
         let target = RunStore::open(&target_db).expect("open cursor target");
         for run_id in ["target-run-a", "target-run-b"] {
@@ -10680,7 +10652,10 @@ mod tests {
         let retained = load_cursor(&cursor_path)
             .expect("reload foreign cursor")
             .expect("foreign cursor retained");
-        assert_eq!(retained.database_id, source_manifest.cursor_after.database_id);
+        assert_eq!(
+            retained.database_id,
+            source_manifest.cursor_after.database_id
+        );
     }
 
     #[test]
@@ -11594,8 +11569,8 @@ mod tests {
             format!("{}\n{}\n", original_rows[0], original_rows[0]),
         )
         .expect("write duplicate segments");
-        let duplicate = validate_sync(&db_path, &export_dir)
-            .expect_err("duplicate child key must fail closed");
+        let duplicate =
+            validate_sync(&db_path, &export_dir).expect_err("duplicate child key must fail closed");
         let duplicate_message = duplicate.to_string();
         assert!(duplicate_message.contains("duplicate composite key"));
         assert!(duplicate_message.contains("child-shape/0"));
@@ -11606,8 +11581,8 @@ mod tests {
         let first_event = events.lines().next().expect("fixture has event");
         fs::write(&events_path, format!("{first_event}\n{first_event}\n"))
             .expect("write duplicate events");
-        let duplicate_event = validate_sync(&db_path, &export_dir)
-            .expect_err("duplicate event key must fail closed");
+        let duplicate_event =
+            validate_sync(&db_path, &export_dir).expect_err("duplicate event key must fail closed");
         let duplicate_event_message = duplicate_event.to_string();
         assert!(duplicate_event_message.contains("duplicate composite key"));
         assert!(duplicate_event_message.contains("child-shape/1"));
@@ -11635,7 +11610,10 @@ mod tests {
         }
 
         let validation = validate_sync(&db_path, &export_dir).expect("validate reordered rows");
-        assert!(validation.is_valid, "row order is not part of sync identity");
+        assert!(
+            validation.is_valid,
+            "row order is not part of sync identity"
+        );
     }
 
     #[test]
@@ -11991,8 +11969,8 @@ mod tests {
         source_store
             .persist_report(&source_report)
             .expect("persist source report");
-        let manifest = export(&source_db, &plain_export_dir, &export_state_root)
-            .expect("plain export");
+        let manifest =
+            export(&source_db, &plain_export_dir, &export_state_root).expect("plain export");
 
         fs::create_dir_all(&gzip_export_dir).expect("gzip export dir");
         fs::copy(
@@ -12044,8 +12022,8 @@ mod tests {
         assert_eq!(imported.segments, source_report.result.segments);
         assert_eq!(imported.events.len(), source_report.events.len());
 
-        let validation = validate_sync(&target_db, &gzip_export_dir)
-            .expect("validate gzip-only import");
+        let validation =
+            validate_sync(&target_db, &gzip_export_dir).expect("validate gzip-only import");
         assert!(validation.is_valid, "gzip-only import must round-trip");
     }
 
@@ -13392,12 +13370,11 @@ mod tests {
             .persist_report(&fixture_report(run_id, &source_db))
             .expect("persist");
         export(&source_db, &export_dir, &state_root).expect("export");
-        import(&target_db, &export_dir, &state_root, ConflictPolicy::Skip)
-            .expect("seed target");
+        import(&target_db, &export_dir, &state_root, ConflictPolicy::Skip).expect("seed target");
 
         let dump_target = || {
-            let connection = Connection::open(target_db.display().to_string())
-                .expect("open target connection");
+            let connection =
+                Connection::open(target_db.display().to_string()).expect("open target connection");
             let strings = |columns: Vec<SqliteValue>| -> Vec<String> {
                 columns
                     .iter()
@@ -13564,12 +13541,7 @@ mod tests {
             "message": "child-only archive event",
             "payload_json": "{}"
         })];
-        write_jsonl_snapshot(
-            &export_dir,
-            &[],
-            &child_only_segments,
-            &child_only_events,
-        );
+        write_jsonl_snapshot(&export_dir, &[], &child_only_segments, &child_only_events);
 
         for batch_import_enabled in [false, true] {
             let child_only_result = import_inner_with_batch_mode(
@@ -15380,10 +15352,9 @@ mod tests {
 
         // Overwrite runs.jsonl with a row that has "id" but not "started_at".
         let runs_path = export_dir.join("runs.jsonl");
-        let valid_result_json = serde_json::to_string(
-            &fixture_report("run-no-started-at", &db_path).result,
-        )
-        .expect("serialize valid result");
+        let valid_result_json =
+            serde_json::to_string(&fixture_report("run-no-started-at", &db_path).result)
+                .expect("serialize valid result");
         let bad_row = json!({
             "id": "run-no-started-at",
             "finished_at": "2026-01-01T00:00:05Z",

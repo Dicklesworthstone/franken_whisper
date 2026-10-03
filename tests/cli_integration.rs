@@ -402,7 +402,11 @@ fn release_model_sentinels_ignore_same_named_cwd_files() {
     let mut writer = hound::WavWriter::create(&voiced_wav, wav_spec).expect("create voiced WAV");
     for index in 0..1_600 {
         writer
-            .write_sample(if index % 2 == 0 { 8_000_i16 } else { -8_000_i16 })
+            .write_sample(if index % 2 == 0 {
+                8_000_i16
+            } else {
+                -8_000_i16
+            })
             .expect("write voiced sample");
     }
     writer.finalize().expect("finalize voiced WAV");
@@ -430,7 +434,10 @@ fn release_model_sentinels_ignore_same_named_cwd_files() {
             .env_remove("FRANKEN_WHISPER_TEST_MODEL_DIR")
             .output()
             .expect("run native request");
-        assert!(!output.status.success(), "missing release package must fail");
+        assert!(
+            !output.status.success(),
+            "missing release package must fail"
+        );
         let run_error = String::from_utf8(output.stdout)
             .expect("UTF-8 robot output")
             .lines()
@@ -3717,7 +3724,14 @@ fn split_on_word_bridge_preserves_zero_duration_observation_in_final_json() {
     assert_eq!(segments[0]["start_sec"], 0.0);
     assert_eq!(segments[0]["end_sec"], 1.0);
     assert_eq!(segments[1]["text"], "zero-width");
-    assert_eq!(segments[1]["confidence"], 0.72);
+    let total_confidence = 0.91 + 0.72 + 0.83;
+    for (segment, raw_confidence) in segments.iter().zip([0.91, 0.72, 0.83]) {
+        assert_eq!(segment["confidence"], raw_confidence / total_confidence);
+    }
+    assert_eq!(
+        report["result"]["raw_output"]["transcription"][1]["confidence"],
+        0.72
+    );
     assert!(segments[1]["start_sec"].is_null());
     assert!(segments[1]["end_sec"].is_null());
     assert_eq!(segments[2]["text"], "third");

@@ -260,10 +260,7 @@ impl RunStore {
         &self.connection
     }
 
-    fn with_read_snapshot<T>(
-        &self,
-        operation: impl FnOnce() -> FwResult<T>,
-    ) -> FwResult<T> {
+    fn with_read_snapshot<T>(&self, operation: impl FnOnce() -> FwResult<T>) -> FwResult<T> {
         let savepoint_name = next_read_snapshot_name();
         self.connection
             .execute(&format!("SAVEPOINT {savepoint_name};"))
@@ -749,14 +746,12 @@ impl RunStore {
             let mut after_run_rows = Some(after_run_rows);
             for (index, id) in run_ids.iter().enumerate() {
                 let hook = after_run_rows.take().filter(|_| index == 0);
-                if let Some(details) = self.load_run_details_cancellable_in_snapshot(
-                    id,
-                    None,
-                    || match hook {
+                if let Some(details) =
+                    self.load_run_details_cancellable_in_snapshot(id, None, || match hook {
                         Some(hook) => hook(),
                         None => Ok(()),
-                    },
-                )? {
+                    })?
+                {
                     out.push(details);
                 }
             }
@@ -1047,9 +1042,7 @@ CREATE TABLE IF NOT EXISTS _meta (
                 FwError::Storage("database schema v6 is missing sync_database_id".to_owned())
             })?;
         uuid::Uuid::parse_str(&database_id).map_err(|error| {
-            FwError::Storage(format!(
-                "invalid sync_database_id `{database_id}`: {error}"
-            ))
+            FwError::Storage(format!("invalid sync_database_id `{database_id}`: {error}"))
         })?;
         Ok(database_id)
     }
@@ -3563,8 +3556,8 @@ mod tests {
         SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange,
         SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
         SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
-        SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
-        StoredRunDetails,
+        SpeakerProfileSummary, StoredRunDetails, TranscribeRequest, TranscriptionResult,
+        TranscriptionSegment,
     };
 
     use super::{
@@ -4873,8 +4866,7 @@ mod tests {
             BackendKind::InsanelyFast
         );
         assert_eq!(
-            parse_stored_backend("run-known", "whisper_diarization")
-                .expect("whisper_diarization"),
+            parse_stored_backend("run-known", "whisper_diarization").expect("whisper_diarization"),
             BackendKind::WhisperDiarization
         );
     }
@@ -7158,7 +7150,9 @@ mod tests {
     #[test]
     fn batch_history_chunks_unique_ids_below_the_sql_parameter_limit() {
         let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("batch_history_unique_parameter_limit.sqlite3");
+        let db_path = dir
+            .path()
+            .join("batch_history_unique_parameter_limit.sqlite3");
         let store = RunStore::open(&db_path).expect("store");
         let run_ids = (0..32_767)
             .map(|index| format!("missing-history-run-{index}"))
@@ -7731,7 +7725,10 @@ mod tests {
         let event_inserted = mutation_seq();
         assert!(event_inserted > segment_inserted);
 
-        store.connection.execute("BEGIN").expect("begin rollback probe");
+        store
+            .connection
+            .execute("BEGIN")
+            .expect("begin rollback probe");
         store
             .connection
             .execute("UPDATE segments SET text = 'rolled back' WHERE run_id = 'mutation-run'")
@@ -7758,7 +7755,11 @@ mod tests {
                  WHERE run_id = 'mutation-run'",
             )
             .expect("query delete tombstone");
-        assert_eq!(rows.len(), 1, "parent deletion must retain its high-water mark");
+        assert_eq!(
+            rows.len(),
+            1,
+            "parent deletion must retain its high-water mark"
+        );
         assert!(value_to_i64(rows[0].get(0)) > event_inserted);
         let count = store
             .connection

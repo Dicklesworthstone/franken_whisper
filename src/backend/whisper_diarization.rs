@@ -365,13 +365,9 @@ fn is_speaker_label(label: &str) -> bool {
 /// Matches compact speaker labels like "s0", "s1", "s02".
 fn matches_short_speaker_label(lowered: &str) -> bool {
     let lowered = lowered.trim();
-    if lowered.len() >= 2
+    lowered.len() >= 2
         && lowered.starts_with('s')
         && lowered[1..].chars().all(|c| c.is_ascii_digit())
-    {
-        return true;
-    }
-    false
 }
 
 #[cfg(test)]
