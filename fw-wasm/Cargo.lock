@@ -152,7 +152,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
-name = "ft-core"
+name = "frankentorch-core"
 version = "0.1.0"
 dependencies = [
  "half",
@@ -160,10 +160,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "ft-kernel-cpu"
+name = "frankentorch-kernel-cpu"
 version = "0.1.0"
 dependencies = [
- "ft-core",
+ "frankentorch-core",
  "libm",
  "matrixmultiply",
  "rayon",
@@ -205,8 +205,8 @@ dependencies = [
 name = "fw-wasm"
 version = "0.1.0"
 dependencies = [
- "ft-core",
- "ft-kernel-cpu",
+ "frankentorch-core",
+ "frankentorch-kernel-cpu",
  "ftts-kernels",
  "half",
  "js-sys",

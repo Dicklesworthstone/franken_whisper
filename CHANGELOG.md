@@ -39,6 +39,9 @@ that every optional browser, GPU, oracle or Apple-device surface is certified.
   and prerelease records and requiring an exact stable `vX.Y.Z` tag.
 - Resolve the lockfile against the five existing pinned sibling manifests;
   retain those source revisions while refreshing compatible registry versions.
+- Match the standalone WASM lockfile's package names to the pinned tensor
+  manifests, preserving all dependency versions, registry checksums and the
+  existing `wasm-bindgen` version.
 - Retain actionable native-model provisioning guidance after authenticated
   resolution fails. Fence successful stage-worker results against the original
   cancellation deadline even when the receiving thread resumes late.
