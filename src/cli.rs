@@ -1332,6 +1332,9 @@ pub enum SyncCommand {
     Export(SyncExportArgs),
     #[command(name = "import-jsonl")]
     Import(SyncImportArgs),
+    /// Compare a database against a full JSONL snapshot without importing.
+    #[command(name = "validate-jsonl")]
+    Validate(SyncValidateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1344,9 +1347,31 @@ pub struct SyncExportArgs {
     #[arg(long)]
     pub output: PathBuf,
 
-    /// State root for lock files.
+    /// State root for lock files (and `sync_cursor.json` with --incremental).
     #[arg(long, default_value = ".franken_whisper")]
     pub state_root: PathBuf,
+
+    /// Export only run aggregates changed since the cursor in
+    /// `<state-root>/sync_cursor.json` (all runs on first use), plus an
+    /// explicit deleted-run channel; the cursor advances after publication.
+    #[arg(long)]
+    pub incremental: bool,
+
+    /// Gzip the JSONL files (`*.jsonl.gz`); import reads them transparently
+    /// and manifest checksums cover the uncompressed bytes.
+    #[arg(long)]
+    pub gzip: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SyncValidateArgs {
+    /// Path to frankensqlite database file.
+    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    pub db: PathBuf,
+
+    /// Directory containing a full JSONL snapshot.
+    #[arg(long)]
+    pub input: PathBuf,
 }
 
 #[derive(Debug, Args)]

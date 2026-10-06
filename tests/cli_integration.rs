@@ -1987,6 +1987,150 @@ fn sync_export_empty_db_valid_manifest() {
     assert_eq!(parsed.schema_version, "1.1");
 }
 
+/// The sync CLI exposes incremental export (with the deleted-run channel),
+/// gzip archives, and standalone validation, and import does not report a
+/// spurious validation failure for a partial (incremental) archive.
+#[test]
+fn sync_cli_incremental_gzip_export_import_and_validate() {
+    use std::process::Command as ProcessCommand;
+
+    let dir = tempdir().expect("tempdir");
+    let source_db = dir.path().join("source.sqlite3");
+    let target_db = dir.path().join("target.sqlite3");
+    let state_root = dir.path().join("state");
+    let target_state = dir.path().join("target_state");
+    let store = RunStore::open(&source_db).expect("store");
+    for run_id in ["cli-keep", "cli-gone"] {
+        store
+            .persist_report(&fixture_report(run_id, &source_db))
+            .expect("persist");
+    }
+    drop(store);
+
+    let fw = |args: &[&str]| {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+            .args(args)
+            .output()
+            .expect("run franken_whisper");
+        let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+        let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+        (output.status.success(), stdout, stderr)
+    };
+    let path = |p: &std::path::Path| p.to_str().expect("utf-8 path").to_owned();
+
+    // Full snapshot validates against its own database.
+    let full = dir.path().join("full");
+    let (ok, _, stderr) = fw(&[
+        "sync",
+        "export-jsonl",
+        "--db",
+        &path(&source_db),
+        "--output",
+        &path(&full),
+        "--state-root",
+        &path(&state_root),
+    ]);
+    assert!(ok, "full export failed: {stderr}");
+    let (ok, stdout, stderr) = fw(&[
+        "sync",
+        "validate-jsonl",
+        "--db",
+        &path(&source_db),
+        "--input",
+        &path(&full),
+    ]);
+    assert!(
+        ok,
+        "validation of a fresh full snapshot must pass: {stdout}{stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("report json");
+    assert_eq!(report["is_valid"], true);
+
+    // First incremental export (gzip) carries both runs to the target.
+    let inc1 = dir.path().join("inc1");
+    let (ok, stdout, stderr) = fw(&[
+        "sync",
+        "export-jsonl",
+        "--incremental",
+        "--gzip",
+        "--db",
+        &path(&source_db),
+        "--output",
+        &path(&inc1),
+        "--state-root",
+        &path(&state_root),
+    ]);
+    assert!(ok, "incremental export failed: {stderr}");
+    let manifest: serde_json::Value = serde_json::from_str(&stdout).expect("manifest json");
+    assert_eq!(manifest["export_mode"], "incremental");
+    assert_eq!(manifest["row_counts"]["runs"], 2);
+    assert!(inc1.join("runs.jsonl.gz").exists() && !inc1.join("runs.jsonl").exists());
+    let (ok, stdout, stderr) = fw(&[
+        "sync",
+        "import-jsonl",
+        "--db",
+        &path(&target_db),
+        "--input",
+        &path(&inc1),
+        "--state-root",
+        &path(&target_state),
+    ]);
+    assert!(ok, "gzip incremental import failed: {stdout}{stderr}");
+    let result: serde_json::Value = serde_json::from_str(&stdout).expect("import json");
+    assert_eq!(result["runs_imported"], 2);
+    assert_eq!(result["archive_mode"], "incremental");
+    assert!(result["validation_ok"].is_null(), "{result}");
+
+    // Delete one run at the source; the next incremental export propagates it.
+    let conn =
+        franken_whisper::storage::BlockingConnection::open(path(&source_db)).expect("open source");
+    for sql in [
+        "DELETE FROM segments WHERE run_id = 'cli-gone'",
+        "DELETE FROM events WHERE run_id = 'cli-gone'",
+        "DELETE FROM runs WHERE id = 'cli-gone'",
+    ] {
+        conn.execute(sql).expect("delete");
+    }
+    drop(conn);
+    let inc2 = dir.path().join("inc2");
+    let (ok, stdout, stderr) = fw(&[
+        "sync",
+        "export-jsonl",
+        "--incremental",
+        "--db",
+        &path(&source_db),
+        "--output",
+        &path(&inc2),
+        "--state-root",
+        &path(&state_root),
+    ]);
+    assert!(ok, "second incremental export failed: {stderr}");
+    let manifest: serde_json::Value = serde_json::from_str(&stdout).expect("manifest json");
+    assert_eq!(manifest["row_counts"]["runs"], 0);
+    assert_eq!(manifest["deleted_runs"]["count"], 1);
+    let (ok, stdout, stderr) = fw(&[
+        "sync",
+        "import-jsonl",
+        "--db",
+        &path(&target_db),
+        "--input",
+        &path(&inc2),
+        "--state-root",
+        &path(&target_state),
+    ]);
+    assert!(ok, "tombstone import failed: {stdout}{stderr}");
+    let result: serde_json::Value = serde_json::from_str(&stdout).expect("import json");
+    assert_eq!(result["runs_deleted"], 1);
+    let remaining: Vec<String> = RunStore::open(&target_db)
+        .expect("target")
+        .list_recent_runs(0)
+        .expect("list")
+        .into_iter()
+        .map(|summary| summary.run_id)
+        .collect();
+    assert_eq!(remaining, ["cli-keep"]);
+}
+
 #[test]
 fn sync_round_trip_preserves_data() {
     let dir = tempdir().expect("tempdir");

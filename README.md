@@ -1555,19 +1555,20 @@ One-way JSONL snapshot export / import with distributed lock safety.
 # full export to JSONL
 franken_whisper sync export-jsonl --output ./snapshot [--db <PATH>] [--state-root <PATH>]
 
-# import with a conflict policy
+# incremental export: only run aggregates changed since <state-root>/sync_cursor.json,
+# plus an explicit deleted-run channel; add --gzip for *.jsonl.gz files
+franken_whisper sync export-jsonl --incremental [--gzip] --output ./delta [--state-root <PATH>]
+
+# import with a conflict policy (plain or gzip archives, full or incremental)
 franken_whisper sync import-jsonl --input ./snapshot \
   --conflict-policy reject|skip|overwrite|overwrite-strict \
   [--db <PATH>] [--state-root <PATH>]
+
+# compare a database against a full snapshot without importing (exit 1 on mismatch)
+franken_whisper sync validate-jsonl --input ./snapshot [--db <PATH>]
 ```
 
-An export produces `runs.jsonl`, `segments.jsonl`, `events.jsonl`, and `manifest.json` (with row counts and SHA-256 checksums). Import automatically runs `validate_sync()` after the row inserts and reports `validation_ok` plus per-table count comparison in the result JSON.
-
-**Library-level capabilities** that are not yet exposed at the CLI:
-
-- `sync::export_incremental()`: cursor-based delta export (uses `sync_cursor.json`)
-- `sync::compress_jsonl()` / `sync::decompress_jsonl()`: gzip-compress or decompress a JSONL file. The import path transparently reads `*.jsonl.gz` when present.
-- `sync::validate_sync()`: standalone validation function (auto-called on import, callable directly from the library)
+An export produces `runs.jsonl`, `segments.jsonl`, `events.jsonl`, and `manifest.json` (with row counts and SHA-256 checksums over the uncompressed bytes). An incremental export also writes `deleted_runs.jsonl`, declared in the manifest, so runs deleted at the source are removed downstream; absence from a partial snapshot never implies deletion. Import of a full snapshot automatically runs `validate_sync()` after the row inserts and reports `validation_ok` plus per-table count comparison; for an incremental archive it reports `archive_mode: "incremental"`, `runs_deleted`, and skips the full-snapshot comparison (`validation_ok: null`).
 
 ### `tty-audio`
 

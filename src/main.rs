@@ -1076,10 +1076,42 @@ fn run(cli: Cli) -> FwResult<()> {
         }
         Command::Sync { command } => match command {
             SyncCommand::Export(args) => {
-                let manifest =
-                    franken_whisper::sync::export(&args.db, &args.output, &args.state_root)?;
+                let manifest = if args.incremental {
+                    serde_json::to_value(franken_whisper::sync::export_incremental(
+                        &args.db,
+                        &args.output,
+                        &args.state_root,
+                    )?)?
+                } else {
+                    serde_json::to_value(franken_whisper::sync::export(
+                        &args.db,
+                        &args.output,
+                        &args.state_root,
+                    )?)?
+                };
+                let compressed = if args.gzip {
+                    franken_whisper::sync::gzip_export_files(&args.output)?
+                } else {
+                    Vec::new()
+                };
+                let mut manifest = manifest;
+                if let serde_json::Value::Object(ref mut map) = manifest {
+                    map.insert("gzip_files".to_owned(), serde_json::json!(compressed));
+                }
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
                 Ok(())
+            }
+            SyncCommand::Validate(args) => {
+                let report = franken_whisper::sync::validate_sync(&args.db, &args.input)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.is_valid {
+                    Ok(())
+                } else {
+                    Err(franken_whisper::error::FwError::Storage(
+                        "database does not match the JSONL snapshot; see the printed report"
+                            .to_owned(),
+                    ))
+                }
             }
             SyncCommand::Import(args) => {
                 let result = franken_whisper::sync::import(
@@ -1088,15 +1120,18 @@ fn run(cli: Cli) -> FwResult<()> {
                     &args.state_root,
                     args.conflict_policy,
                 )?;
-                let validation = franken_whisper::sync::validate_sync(&args.db, &args.input);
+                // A full-snapshot comparison is meaningless against an
+                // incremental (partial) archive: it would always report the
+                // database's other runs as missing from the archive.
+                let incremental = franken_whisper::sync::archive_is_incremental(&args.input)?;
+                let validation = (!incremental)
+                    .then(|| franken_whisper::sync::validate_sync(&args.db, &args.input));
                 let (validation_report, validation_error) = match validation {
-                    Ok(report) => (Some(report), None),
-                    Err(error) => (None, Some(error.to_string())),
+                    Some(Ok(report)) => (Some(report), None),
+                    Some(Err(error)) => (None, Some(error.to_string())),
+                    None => (None, None),
                 };
-                let validation_ok = validation_report
-                    .as_ref()
-                    .map(|report| report.is_valid)
-                    .unwrap_or(false);
+                let validation_ok = validation_report.as_ref().map(|report| report.is_valid);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -1105,6 +1140,7 @@ fn run(cli: Cli) -> FwResult<()> {
                         "events_imported": result.events_imported,
                         "runs_deleted": result.runs_deleted,
                         "conflicts": result.conflicts,
+                        "archive_mode": if incremental { "incremental" } else { "full" },
                         "validation_ok": validation_ok,
                         "validation": validation_report,
                         "validation_error": validation_error,

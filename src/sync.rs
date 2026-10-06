@@ -3544,6 +3544,48 @@ pub fn decompress_jsonl(input_path: &Path, output_path: &Path) -> FwResult<()> {
     Ok(())
 }
 
+/// Gzip every JSONL file an export wrote into `output_dir` (`runs`,
+/// `segments`, `events`, and `deleted_runs` when present), replacing each
+/// plain file with its `.jsonl.gz` counterpart. Manifest checksums cover the
+/// uncompressed logical bytes, so the archive validates unchanged. Returns the
+/// compressed file names.
+///
+/// # Errors
+///
+/// Propagates I/O failures; a plain file is removed only after its compressed
+/// replacement has been durably published.
+pub fn gzip_export_files(output_dir: &Path) -> FwResult<Vec<String>> {
+    let mut compressed = Vec::new();
+    for stem in ["runs", "segments", "events", DELETED_RUNS_STEM] {
+        let plain = output_dir.join(format!("{stem}.jsonl"));
+        if !plain.exists() {
+            continue;
+        }
+        let gz_name = format!("{stem}.jsonl.gz");
+        compress_jsonl(&plain, &output_dir.join(&gz_name))?;
+        fs::remove_file(&plain)?;
+        compressed.push(gz_name);
+    }
+    sync_parent_dir(&output_dir.join("manifest.json"))?;
+    Ok(compressed)
+}
+
+/// Whether the archive in `input_dir` is an incremental (partial) snapshot,
+/// as declared by its manifest's `export_mode`.
+///
+/// # Errors
+///
+/// Returns an error when `manifest.json` is missing or is not valid JSON.
+pub fn archive_is_incremental(input_dir: &Path) -> FwResult<bool> {
+    let manifest_text = fs::read_to_string(input_dir.join("manifest.json"))?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+        .map_err(|error| FwError::Storage(format!("invalid manifest: {error}")))?;
+    Ok(manifest
+        .get("export_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("incremental"))
+}
+
 /// Open a JSONL file for reading, transparently decompressing if the path
 /// ends with `.gz`.
 fn open_jsonl_reader(path: &Path) -> FwResult<Box<dyn BufRead>> {
