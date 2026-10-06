@@ -1454,7 +1454,7 @@ fn checkpoint_or_emit(
 /// value; the reservation is virtual and only committed lazily. Release builds
 /// measured comfortable headroom at the default size.
 #[must_use]
-const fn stage_thread_stack_bytes() -> usize {
+pub(crate) const fn stage_thread_stack_bytes() -> usize {
     if cfg!(debug_assertions) {
         64 * 1024 * 1024
     } else {
@@ -1488,15 +1488,37 @@ where
     T: Send + 'static,
     F: FnOnce() -> FwResult<T> + Send + 'static,
 {
+    run_stage_with_token_budget_streaming(stage, budget_ms, token, &mut |_| {}, move |_| {
+        operation()
+    })
+}
+
+/// Like [`run_stage_with_token_budget`], but the operation may publish
+/// [`RunEvent`]s while it runs. Each published event is handed to `on_event`
+/// on the calling thread as soon as it arrives — not after the stage
+/// completes — so stage progress reaches the run's live event stream in real
+/// time (bd-r4dy). Events published before a timeout are still forwarded.
+fn run_stage_with_token_budget_streaming<T, F>(
+    stage: &'static str,
+    budget_ms: u64,
+    token: CancellationToken,
+    on_event: &mut dyn FnMut(RunEvent),
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(StageEventPublisher) -> FwResult<T> + Send + 'static,
+{
     let timeout = token
         .remaining()
         .unwrap_or_else(|| budget_duration(budget_ms));
-    run_stage_with_timeout(
+    run_stage_with_timeout_streaming(
         stage,
         timeout,
         move || token.expiration_error(),
-        move || {
-            let value = operation()?;
+        on_event,
+        move |publisher| {
+            let value = operation(publisher)?;
             // The receiver may be descheduled until the result is already
             // queued. Fence successful work against the same deadline on the
             // worker, rather than admitting a late result from a ready channel.
@@ -1504,6 +1526,14 @@ where
             Ok(value)
         },
     )
+}
+
+/// Publishes [`RunEvent`]s from a stage worker to the supervising thread.
+pub(crate) type StageEventPublisher = Box<dyn Fn(RunEvent) + Send + Sync>;
+
+enum StageMessage<T> {
+    Event(RunEvent),
+    Finished(FwResult<T>),
 }
 
 fn run_stage_with_timeout<T, F, E>(
@@ -1517,36 +1547,71 @@ where
     F: FnOnce() -> FwResult<T> + Send + 'static,
     E: FnOnce() -> FwError,
 {
-    let (tx, rx) = mpsc::sync_channel(1);
+    run_stage_with_timeout_streaming(stage, timeout, timeout_error, &mut |_| {}, move |_| {
+        operation()
+    })
+}
+
+fn run_stage_with_timeout_streaming<T, F, E>(
+    stage: &'static str,
+    timeout: Duration,
+    timeout_error: E,
+    on_event: &mut dyn FnMut(RunEvent),
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(StageEventPublisher) -> FwResult<T> + Send + 'static,
+    E: FnOnce() -> FwError,
+{
+    let (tx, rx) = mpsc::channel::<StageMessage<T>>();
+    let event_tx = tx.clone();
+    let publisher: StageEventPublisher = Box::new(move |event| {
+        let _ = event_tx.send(StageMessage::Event(event));
+    });
     let worker = std::thread::Builder::new()
         .name(format!("stage-{stage}"))
         .stack_size(stage_thread_stack_bytes())
         .spawn(move || {
-            let _ = tx.send(operation());
+            let _ = tx.send(StageMessage::Finished(operation(publisher)));
         })
         .map_err(FwError::Io)?;
 
-    match rx.recv_timeout(timeout) {
-        Ok(result) => match worker.join() {
-            Ok(()) => result,
-            Err(_) => Err(FwError::BackendUnavailable(format!(
-                "stage `{stage}` worker panicked after returning a result"
-            ))),
-        },
-        Err(RecvTimeoutError::Timeout) => {
-            let error = timeout_error();
-            // Stage operations receive a token with the same deadline as this
-            // receiver. Join after expiry so their cooperative checkpoint can
-            // unwind native work before a later stage starts; dropping this
-            // handle would detach CPU, memory, and file I/O past the timeout.
-            let _ = worker.join();
-            Err(error)
-        }
-        Err(RecvTimeoutError::Disconnected) => {
-            let _ = worker.join();
-            Err(FwError::BackendUnavailable(format!(
-                "stage `{stage}` worker exited before returning a result"
-            )))
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(StageMessage::Event(event)) => on_event(event),
+            Ok(StageMessage::Finished(result)) => {
+                return match worker.join() {
+                    Ok(()) => result,
+                    Err(_) => Err(FwError::BackendUnavailable(format!(
+                        "stage `{stage}` worker panicked after returning a result"
+                    ))),
+                };
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let error = timeout_error();
+                // Stage operations receive a token with the same deadline as this
+                // receiver. Join after expiry so their cooperative checkpoint can
+                // unwind native work before a later stage starts; dropping this
+                // handle would detach CPU, memory, and file I/O past the timeout.
+                let _ = worker.join();
+                // Progress published before the deadline still reaches the
+                // stream; a result that raced the deadline is not admitted.
+                for message in rx.try_iter() {
+                    if let StageMessage::Event(event) = message {
+                        on_event(event);
+                    }
+                }
+                return Err(error);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = worker.join();
+                return Err(FwError::BackendUnavailable(format!(
+                    "stage `{stage}` worker exited before returning a result"
+                )));
+            }
         }
     }
 }
@@ -2724,95 +2789,97 @@ async fn execute_backend_speculative(
 
     /// Internal carry value: the speculation pipeline's inner result is
     /// reified as a `Result` so the wrapping stage-supervisor closure
-    /// can always succeed with the partial events / stats / merged segments,
+    /// can always succeed with the stats / merged segments / lane telemetry,
     /// regardless of whether the pipeline itself errored mid-run.
     type SpecOutcome = (
         FwResult<crate::model::TranscriptionResult>,
-        Vec<crate::model::RunEvent>,
         crate::speculation::SpeculationStats,
         Vec<crate::model::TranscriptionSegment>,
+        SpeculativeLaneTelemetry,
     );
 
-    let outcome: FwResult<SpecOutcome> =
-        run_stage_with_token_budget("backend", backend_budget_ms, cancel_token, move || {
+    // Speculation events are forwarded into the run's event log the moment the
+    // pipeline produces them, so fast-lane partials reach NDJSON consumers
+    // while the quality lane of the same window is still decoding (bd-r4dy).
+    let outcome: FwResult<SpecOutcome> = run_stage_with_token_budget_streaming(
+        "backend",
+        backend_budget_ms,
+        cancel_token,
+        &mut |event| log.push(&event.stage, &event.code, &event.message, event.payload),
+        move |publish| {
             let tok = cancel_token;
             let mut pipeline =
-                crate::streaming::SpeculativeStreamingPipeline::new(spec_config.clone(), run_id);
-            let fast_model = spec_config.fast_model_name.clone();
-            let quality_model = spec_config.quality_model_name.clone();
+                crate::streaming::SpeculativeStreamingPipeline::new(spec_config.clone(), run_id)
+                    .with_event_sink(Box::new(move |event| publish(event.clone())));
 
-            let inner_result = pipeline.process_file_with_models(
+            // Per-lane requests override the model name AND force the backend
+            // kind to the resolved sticky value.
+            let mut fast_req = base_request.clone();
+            fast_req.backend = resolved_backend;
+            fast_req.model = Some(spec_config.fast_model_name.clone());
+            let mut quality_req = base_request;
+            quality_req.backend = resolved_backend;
+            quality_req.model = Some(spec_config.quality_model_name.clone());
+
+            let overlap_ms = spec_config.overlap_ms;
+            let telemetry = Mutex::new(SpeculativeLaneTelemetry::default());
+            // Backends see only the window's slice, so their timestamps are
+            // slice-relative: localize them to absolute time and keep only the
+            // window's owned span before the pipeline merges windows.
+            let run_lane = |lane: SpeculativeLane,
+                            lane_request: &TranscribeRequest,
+                            slice: &SpeculativeWindowSlice|
+             -> FwResult<Vec<crate::model::TranscriptionSegment>> {
+                let execution = crate::backend::execute(
+                    lane_request,
+                    &slice.path,
+                    &backend_dir,
+                    per_invocation_timeout,
+                    Some(&tok),
+                )?;
+                telemetry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record(lane, &execution);
+                Ok(slice
+                    .window
+                    .localize_segments(overlap_ms, execution.result.segments))
+            };
+
+            let inner_result = pipeline.process_file_with_lanes(
                 &normalized_wav,
                 || tok.checkpoint(),
-                |audio_path, start_ms, end_ms| {
-                    let slice_path = crate::audio::slice_pcm_wav_to_temp_path(
+                |audio_path, window| {
+                    crate::audio::slice_pcm_wav_to_temp_path(
                         audio_path,
                         &backend_dir,
-                        start_ms,
-                        end_ms,
-                    )?;
-                    // Build per-lane requests by overriding the model name AND
-                    // forcing the backend kind to the resolved sticky value.
-                    let mut fast_req = base_request.clone();
-                    fast_req.backend = resolved_backend;
-                    fast_req.model = Some(fast_model.clone());
-                    let mut quality_req = base_request.clone();
-                    quality_req.backend = resolved_backend;
-                    quality_req.model = Some(quality_model.clone());
-
-                    let fast_execution = crate::backend::execute(
-                        &fast_req,
-                        &slice_path,
-                        &backend_dir,
-                        per_invocation_timeout,
-                        Some(&tok),
-                    );
-                    let fast_segments = match fast_execution {
-                        Ok(execution) => execution.result.segments,
-                        Err(error) => {
-                            let _ = std::fs::remove_file(&slice_path);
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = tok.checkpoint() {
-                        let _ = std::fs::remove_file(&slice_path);
-                        return Err(error);
-                    }
-                    let quality_execution = crate::backend::execute(
-                        &quality_req,
-                        &slice_path,
-                        &backend_dir,
-                        per_invocation_timeout,
-                        Some(&tok),
-                    );
-                    let quality_segments = match quality_execution {
-                        Ok(execution) => execution.result.segments,
-                        Err(error) => {
-                            let _ = std::fs::remove_file(&slice_path);
-                            return Err(error);
-                        }
-                    };
-                    let _ = std::fs::remove_file(&slice_path);
-                    Ok((fast_segments, quality_segments))
+                        window.start_ms,
+                        window.end_ms,
+                    )
+                    .map(|path| SpeculativeWindowSlice { path, window })
                 },
+                |slice| run_lane(SpeculativeLane::Fast, &fast_req, slice),
+                |slice| run_lane(SpeculativeLane::Quality, &quality_req, slice),
             );
 
-            // Always carry partial events + stats + merged segments out, so
-            // the outer handler can forward speculation events to the NDJSON
-            // log regardless of whether the pipeline succeeded or failed.
+            // Always carry stats + merged segments out, so the outer handler
+            // can report progress regardless of whether the pipeline failed.
             let stats = pipeline.stats();
-            let merged = pipeline.merged_transcript();
-            // Move the event vector out last (consuming the terminal pipeline)
-            // instead of cloning it via `events().to_vec()`.
-            let emitted = pipeline.into_events();
-            Ok((inner_result, emitted, stats, merged))
-        });
+            let mut merged = pipeline.merged_transcript();
+            crate::streaming::repair_seam_overlaps(&mut merged);
+            let telemetry = telemetry
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok((inner_result, stats, merged, telemetry))
+        },
+    );
 
-    let (inner_result, emitted_events, stats, merged) = match outcome {
+    let (inner_result, stats, merged, telemetry) = match outcome {
         Ok(value) => value,
         Err(error) => {
             // The stage supervisor itself failed (stage-budget timeout, panic,
-            // …). No events to forward; just emit the terminal backend.* event.
+            // …). Speculation events published before the failure were already
+            // forwarded; just emit the terminal backend.* event.
             let code = stage_failure_code("backend", &error);
             log.push(
                 "backend",
@@ -2829,13 +2896,9 @@ async fn execute_backend_speculative(
         }
     };
 
-    // Forward any speculation events that the pipeline produced before
-    // returning (success OR failure). These are the partial transcripts,
-    // confirmations, retractions, corrections, and the aggregate stats
-    // event the speculation pipeline emits internally.
-    for event in emitted_events {
-        log.push(&event.stage, &event.code, &event.message, event.payload);
-    }
+    let inner_result = inner_result.and_then(|spec_result| {
+        conformance::validate_segment_invariants(&merged).map(|()| spec_result)
+    });
 
     match inner_result {
         Ok(spec_result) => {
@@ -2846,11 +2909,13 @@ async fn execute_backend_speculative(
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            // Record backend identity/version so the run's ReplayEnvelope is
-            // populated even for speculative runs. Speculative streams are
-            // bridge-backed today (native engines don't yet participate in
-            // dual-model dispatch).
-            let backend_runtime = backend::runtime_metadata(resolved_backend);
+            // Record the identity of the engine that actually served the
+            // quality lane (the merged transcript's authority) so the run's
+            // ReplayEnvelope is populated and honest for speculative runs.
+            let backend_runtime = telemetry
+                .quality_runtime
+                .clone()
+                .unwrap_or_else(|| backend::runtime_metadata(resolved_backend));
             let output_payload_hash = sha256_segments(&merged);
 
             log.push(
@@ -2863,10 +2928,13 @@ async fn execute_backend_speculative(
                     "windows_processed": stats.windows_processed,
                     "confirmations_emitted": stats.confirmations_emitted,
                     "corrections_emitted": stats.corrections_emitted,
-                    "implementation": "bridge",
+                    "implementation": telemetry.implementation_label(),
+                    "fast_lane_implementation": SpeculativeLaneTelemetry::label(&telemetry.fast_implementations),
+                    "quality_lane_implementation": SpeculativeLaneTelemetry::label(&telemetry.quality_implementations),
+                    "lane_concurrency": "concurrent",
                     "execution_mode": "speculative_streaming",
-                    "native_rollout_stage": serde_json::Value::Null,
-                    "native_fallback_error": serde_json::Value::Null,
+                    "native_rollout_stage": telemetry.rollout_stage,
+                    "native_fallback_error": telemetry.native_fallback_error,
                     "backend_identity": backend_runtime.identity,
                     "backend_version": backend_runtime.version,
                 }),
@@ -2912,6 +2980,80 @@ async fn execute_backend_speculative(
             );
             Err(error)
         }
+    }
+}
+
+/// Which speculative lane produced a backend execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpeculativeLane {
+    Fast,
+    Quality,
+}
+
+/// A per-window WAV slice shared by both speculative lanes; the file is removed
+/// once both lanes have finished with the window.
+struct SpeculativeWindowSlice {
+    path: PathBuf,
+    window: crate::streaming::LaneWindow,
+}
+
+impl Drop for SpeculativeWindowSlice {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// What actually served each speculative lane, accumulated across windows so
+/// the stage reports the real implementation instead of assuming a bridge.
+#[derive(Debug, Default)]
+struct SpeculativeLaneTelemetry {
+    fast_implementations: BTreeSet<&'static str>,
+    quality_implementations: BTreeSet<&'static str>,
+    quality_runtime: Option<backend::BackendRuntimeMetadata>,
+    rollout_stage: Option<String>,
+    native_fallback_error: Option<String>,
+}
+
+impl SpeculativeLaneTelemetry {
+    fn record(&mut self, lane: SpeculativeLane, execution: &backend::BackendExecution) {
+        let implementation = execution.implementation.as_str();
+        match lane {
+            SpeculativeLane::Fast => {
+                self.fast_implementations.insert(implementation);
+            }
+            SpeculativeLane::Quality => {
+                self.quality_implementations.insert(implementation);
+                if self.quality_runtime.is_none() {
+                    self.quality_runtime = Some(execution.runtime.clone());
+                }
+            }
+        }
+        if self.rollout_stage.is_none() {
+            self.rollout_stage = Some(execution.rollout_stage.clone());
+        }
+        if self.native_fallback_error.is_none() {
+            self.native_fallback_error = execution.native_fallback_error.clone();
+        }
+    }
+
+    /// `native`/`bridge` when every execution agrees, `mixed` otherwise, and
+    /// `none` before any lane has run.
+    fn label(implementations: &BTreeSet<&'static str>) -> &'static str {
+        let mut iter = implementations.iter();
+        match (iter.next(), iter.next()) {
+            (None, _) => "none",
+            (Some(only), None) => only,
+            (Some(_), Some(_)) => "mixed",
+        }
+    }
+
+    fn implementation_label(&self) -> &'static str {
+        let all: BTreeSet<&'static str> = self
+            .fast_implementations
+            .union(&self.quality_implementations)
+            .copied()
+            .collect();
+        Self::label(&all)
     }
 }
 
@@ -7117,6 +7259,7 @@ impl EventLog {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::hint::black_box;
     use std::path::PathBuf;
     use std::sync::{Arc, mpsc};
@@ -7168,6 +7311,7 @@ mod tests {
         unknown_neural_diarization_with_hard_hints, vad_energy_detect,
         vad_energy_detect_with_analysis, validate_diarization_execution_request,
     };
+    use super::{SpeculativeLaneTelemetry, run_stage_with_timeout_streaming};
 
     #[cfg(unix)]
     #[test]
@@ -9592,6 +9736,79 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), FwError::InvalidRequest(_)));
+    }
+
+    fn stage_event(code: &str) -> RunEvent {
+        RunEvent {
+            seq: 0,
+            ts_rfc3339: Utc::now().to_rfc3339(),
+            stage: "speculation".to_owned(),
+            code: code.to_owned(),
+            message: String::new(),
+            payload: json!({}),
+        }
+    }
+
+    #[test]
+    fn streaming_stage_forwards_events_before_the_operation_finishes() {
+        // The worker refuses to finish until the supervisor has acknowledged
+        // its first event, which is only possible if published events are
+        // forwarded live rather than collected after the stage returns.
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let mut forwarded = Vec::new();
+        let result = run_stage_with_timeout_streaming(
+            "test",
+            Duration::from_secs(30),
+            || FwError::StageTimeout {
+                stage: "test".to_owned(),
+                budget_ms: 30_000,
+            },
+            &mut |event: RunEvent| {
+                forwarded.push(event.code);
+                let _ = ack_tx.send(());
+            },
+            move |publish| {
+                publish(stage_event("transcript.partial"));
+                ack_rx.recv_timeout(Duration::from_secs(10)).map_err(|_| {
+                    FwError::InvalidRequest("event was not forwarded live".to_owned())
+                })?;
+                publish(stage_event("transcript.confirm"));
+                Ok(7)
+            },
+        );
+        assert_eq!(result.expect("stage succeeds"), 7);
+        assert_eq!(forwarded, ["transcript.partial", "transcript.confirm"]);
+    }
+
+    #[test]
+    fn streaming_stage_keeps_events_published_before_a_timeout() {
+        let mut forwarded = Vec::new();
+        let result: FwResult<()> = run_stage_with_timeout_streaming(
+            "test",
+            Duration::from_millis(50),
+            || FwError::StageTimeout {
+                stage: "test".to_owned(),
+                budget_ms: 50,
+            },
+            &mut |event: RunEvent| forwarded.push(event.code),
+            |publish| {
+                publish(stage_event("transcript.partial"));
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(FwError::StageTimeout { .. })));
+        assert_eq!(forwarded, ["transcript.partial"]);
+    }
+
+    #[test]
+    fn speculative_lane_telemetry_labels_reflect_what_ran() {
+        let mut implementations = BTreeSet::new();
+        assert_eq!(SpeculativeLaneTelemetry::label(&implementations), "none");
+        implementations.insert("native");
+        assert_eq!(SpeculativeLaneTelemetry::label(&implementations), "native");
+        implementations.insert("bridge");
+        assert_eq!(SpeculativeLaneTelemetry::label(&implementations), "mixed");
     }
 
     // ── budget_duration edge cases ──

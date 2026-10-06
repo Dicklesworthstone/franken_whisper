@@ -1,16 +1,20 @@
 //! Speculative cancel-correct streaming pipeline.
 //!
-//! Orchestrates [`WindowManager`](crate::speculation::WindowManager),
-//! [`CorrectionTracker`](crate::speculation::CorrectionTracker), and
-//! [`ConcurrentTwoLaneExecutor`](crate::backend::ConcurrentTwoLaneExecutor)
-//! to run fast + quality models in parallel with real-time correction.
+//! Orchestrates [`WindowManager`](crate::speculation::WindowManager) and
+//! [`CorrectionTracker`](crate::speculation::CorrectionTracker) to run fast +
+//! quality model lanes concurrently with real-time correction: for every
+//! window the quality lane runs on a scoped worker thread while the fast lane
+//! runs on the caller, and the fast lane's `transcript.partial` events are
+//! emitted (through an optional [`SpeculationEventSink`]) the moment it
+//! returns, before the quality lane resolves the window.
 
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::audio;
+#[cfg(test)]
 use crate::backend::{ConcurrentTwoLaneExecutor, QualitySelector, TranscriptSegment};
 use crate::error::{FwError, FwResult};
 use crate::model::{BackendKind, RunEvent, TranscriptionResult, TranscriptionSegment};
@@ -77,6 +81,114 @@ impl SpeculativeConfig {
     }
 }
 
+/// Observer invoked synchronously with every speculation event the moment the
+/// pipeline produces it.
+///
+/// The pipeline still retains its own copy of each event (see
+/// [`SpeculativeStreamingPipeline::events`]); the sink exists so a caller can
+/// forward `transcript.partial` events to a live NDJSON stream while the
+/// quality lane is still decoding, instead of after the whole run (bd-r4dy).
+pub type SpeculationEventSink = Box<dyn FnMut(&RunEvent) + Send>;
+
+/// Bounds of one speculation window, as handed to window-preparation callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneWindow {
+    pub window_id: u64,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// Duration of the whole input the window schedule covers.
+    pub total_duration_ms: u64,
+}
+
+impl LaneWindow {
+    /// Absolute time span (`[start, end)` in ms) this window is authoritative
+    /// for. Consecutive windows overlap by exactly `overlap_ms` (each window
+    /// starts `overlap_ms` before its predecessor ends); every overlap is split
+    /// at its midpoint, so each instant of audio is owned by exactly one window.
+    /// The first window owns from 0 and the final window owns to infinity.
+    #[must_use]
+    pub fn owned_range_ms(&self, overlap_ms: u64) -> (u64, u64) {
+        let half = overlap_ms / 2;
+        let start = if self.start_ms == 0 {
+            0
+        } else {
+            self.start_ms.saturating_add(half)
+        };
+        let end = if self.end_ms >= self.total_duration_ms {
+            u64::MAX
+        } else {
+            self.end_ms.saturating_sub(overlap_ms - half)
+        };
+        (start, end)
+    }
+
+    /// Convert segments a backend produced for this window's audio slice
+    /// (timestamps relative to the slice start) into absolute time, keeping
+    /// only segments anchored inside [`Self::owned_range_ms`] so overlapping
+    /// windows do not transcribe the same speech twice.
+    ///
+    /// A segment is anchored at its midpoint (or its only timestamp).
+    /// Untimed segments and segments with non-finite timestamps are kept as-is
+    /// so downstream conformance validation, not silent dropping, decides them.
+    #[must_use]
+    pub fn localize_segments(
+        &self,
+        overlap_ms: u64,
+        segments: Vec<TranscriptionSegment>,
+    ) -> Vec<TranscriptionSegment> {
+        let offset_sec = self.start_ms as f64 / 1000.0;
+        let (owned_start_ms, owned_end_ms) = self.owned_range_ms(overlap_ms);
+        segments
+            .into_iter()
+            .filter_map(|mut segment| {
+                segment.start_sec = segment.start_sec.map(|value| value + offset_sec);
+                segment.end_sec = segment.end_sec.map(|value| value + offset_sec);
+                let anchor_sec = match (segment.start_sec, segment.end_sec) {
+                    (Some(start), Some(end)) => Some((start + end) / 2.0),
+                    (Some(only), None) | (None, Some(only)) => Some(only),
+                    (None, None) => None,
+                };
+                let Some(anchor_sec) = anchor_sec.filter(|value| value.is_finite()) else {
+                    return Some(segment);
+                };
+                let anchor_ms = anchor_sec * 1000.0;
+                let owned = anchor_ms >= owned_start_ms as f64
+                    && (owned_end_ms == u64::MAX || anchor_ms < owned_end_ms as f64);
+                owned.then_some(segment)
+            })
+            .collect()
+    }
+}
+
+/// Remove residual overlap at window seams in a merged, start-ordered
+/// transcript: a segment that starts before its predecessor ends is moved to
+/// start at the predecessor's end (and its end is raised to its new start if
+/// needed), so the merged transcript satisfies the monotonic segment contract.
+pub fn repair_seam_overlaps(segments: &mut [TranscriptionSegment]) {
+    let mut previous_end: Option<f64> = None;
+    for segment in segments.iter_mut() {
+        if let (Some(prev_end), Some(start)) = (previous_end, segment.start_sec)
+            && start.is_finite()
+            && start < prev_end
+        {
+            segment.start_sec = Some(prev_end);
+            if let Some(end) = segment.end_sec
+                && end.is_finite()
+                && end < prev_end
+            {
+                segment.end_sec = Some(prev_end);
+            }
+        }
+        if let Some(end) = segment.end_sec.filter(|value| value.is_finite()) {
+            previous_end = Some(previous_end.map_or(end, |prev: f64| prev.max(end)));
+        }
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Bridge a `TranscriptionSegment` (model) to a `TranscriptSegment` (backend).
 #[cfg(test)]
 fn to_backend_segment(s: &TranscriptionSegment) -> TranscriptSegment {
@@ -98,6 +210,7 @@ fn bridge_and_store_segments(
     bridged
 }
 
+#[cfg(test)]
 fn store_segments_without_executor_payload(
     holder: &Mutex<Vec<TranscriptionSegment>>,
     original: Vec<TranscriptionSegment>,
@@ -106,9 +219,22 @@ fn store_segments_without_executor_payload(
     Vec::new()
 }
 
+#[cfg(test)]
 fn take_stored_segments(holder: &Mutex<Vec<TranscriptionSegment>>) -> Vec<TranscriptionSegment> {
     let mut stored = holder.lock().unwrap_or_else(|error| error.into_inner());
     std::mem::take(&mut *stored)
+}
+
+/// Run a one-shot lane closure at most once; a second call yields no segments.
+fn take_lane_once<F>(slot: &Mutex<Option<F>>) -> Vec<TranscriptionSegment>
+where
+    F: FnOnce() -> Vec<TranscriptionSegment>,
+{
+    let lane = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    lane.map_or_else(Vec::new, |lane| lane())
 }
 
 /// The speculative streaming pipeline orchestrator.
@@ -123,6 +249,7 @@ pub struct SpeculativeStreamingPipeline {
     adaptive_controller: Option<SpeculationWindowController>,
     next_seq: AtomicU64,
     events: Vec<RunEvent>,
+    event_sink: Option<SpeculationEventSink>,
     run_id: String,
 }
 
@@ -142,8 +269,16 @@ impl SpeculativeStreamingPipeline {
             adaptive_controller,
             next_seq: AtomicU64::new(0),
             events: Vec::new(),
+            event_sink: None,
             run_id,
         }
+    }
+
+    /// Install a sink that observes every speculation event as it is produced.
+    #[must_use]
+    pub fn with_event_sink(mut self, sink: SpeculationEventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
     }
 
     fn next_seq(&self) -> u64 {
@@ -151,14 +286,18 @@ impl SpeculativeStreamingPipeline {
     }
 
     fn push_event(&mut self, code: &str, message: &str, payload: serde_json::Value) {
-        self.events.push(RunEvent {
+        let event = RunEvent {
             seq: self.events.len() as u64,
             ts_rfc3339: chrono::Utc::now().to_rfc3339(),
             stage: "speculation".to_owned(),
             code: code.to_owned(),
             message: message.to_owned(),
             payload,
-        });
+        };
+        if let Some(sink) = self.event_sink.as_mut() {
+            sink(&event);
+        }
+        self.events.push(event);
     }
 
     fn apply_adaptive_window_update(&mut self, decision: &CorrectionDecision) {
@@ -185,58 +324,72 @@ impl SpeculativeStreamingPipeline {
         }
     }
 
-    fn process_window_by_id<F, Q>(
+    /// Run the fast and quality lanes of one window concurrently.
+    ///
+    /// The quality lane runs on a scoped worker thread while the fast lane runs
+    /// on the calling thread. As soon as the fast lane returns, its segments
+    /// are registered and emitted as `transcript.partial` events — while the
+    /// quality lane is still running — and the window is then resolved against
+    /// the quality result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fast lane's error (only after the quality lane has been
+    /// joined, so no lane outlives the call), else the quality lane's error,
+    /// else any correction-tracker failure.
+    fn process_window_lanes<W, F, Q>(
         &mut self,
         window_id: u64,
-        fast_fn: F,
-        quality_fn: Q,
+        input: &W,
+        fast_lane: &F,
+        quality_lane: &Q,
     ) -> FwResult<CorrectionDecision>
     where
-        F: FnOnce() -> Vec<TranscriptionSegment> + Send + 'static,
-        Q: FnOnce() -> Vec<TranscriptionSegment> + Send + 'static,
+        W: Sync + ?Sized,
+        F: Fn(&W) -> FwResult<Vec<TranscriptionSegment>> + Sync + ?Sized,
+        Q: Fn(&W) -> FwResult<Vec<TranscriptionSegment>> + Sync + ?Sized,
     {
         let seq = self.next_seq();
+        std::thread::scope(|scope| {
+            let quality_handle = std::thread::Builder::new()
+                .name("speculation-quality-lane".to_owned())
+                .stack_size(crate::orchestrator::stage_thread_stack_bytes())
+                .spawn_scoped(scope, || {
+                    let started = Instant::now();
+                    let result = quality_lane(input);
+                    (result, elapsed_ms(started))
+                })
+                .map_err(FwError::Io)?;
 
-        let executor = ConcurrentTwoLaneExecutor::new(QualitySelector::SpeculativeCorrect);
+            let started = Instant::now();
+            let fast_result = fast_lane(input);
+            let fast_latency_ms = elapsed_ms(started);
+            let fast_recorded = fast_result
+                .map(|segments| self.record_fast_lane(seq, window_id, segments, fast_latency_ms));
 
-        // Capture original model segments directly in bridge closures to avoid
-        // precision-lossy round-trip (model → backend → model) that turns
-        // `confidence: None` into `Some(0.0)` and truncates sub-ms timestamps.
-        let fast_holder: Arc<Mutex<Vec<TranscriptionSegment>>> = Arc::new(Mutex::new(Vec::new()));
-        let quality_holder: Arc<Mutex<Vec<TranscriptionSegment>>> =
-            Arc::new(Mutex::new(Vec::new()));
-        let fast_holder_bridge = fast_holder.clone();
-        let quality_holder_bridge = quality_holder.clone();
+            let (quality_result, quality_latency_ms) = quality_handle
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            fast_recorded?;
+            self.resolve_quality_lane(window_id, quality_result?, quality_latency_ms)
+        })
+    }
 
-        // `SpeculativeCorrect` ignores both executor payloads, and this pipeline's
-        // early/compare callbacks are no-ops. Preserve the original model segments
-        // in the holders without cloning text into an unobserved backend view.
-        let fast_bridge = move || -> Vec<TranscriptSegment> {
-            store_segments_without_executor_payload(fast_holder_bridge.as_ref(), fast_fn())
-        };
-        let quality_bridge = move || -> Vec<TranscriptSegment> {
-            store_segments_without_executor_payload(quality_holder_bridge.as_ref(), quality_fn())
-        };
-
-        let result = executor.execute_with_early_emit(
-            fast_bridge,
-            quality_bridge,
-            |_primary_result, _latency_ms| {},
-            |_primary, _secondary, _p_lat, _q_lat| {},
-        );
-
-        let fast_segments = take_stored_segments(fast_holder.as_ref());
-
-        // Register with tracker and window manager.
+    /// Register the fast lane's segments and emit them as speculative partials.
+    fn record_fast_lane(
+        &mut self,
+        seq: u64,
+        window_id: u64,
+        fast_segments: Vec<TranscriptionSegment>,
+        fast_latency_ms: u64,
+    ) {
         let fast_ts = chrono::Utc::now().to_rfc3339();
 
         // Emit the speculative partial events first: they only borrow the fast
         // segments/timestamp, so the single `PartialTranscript` built afterward can
         // MOVE `fast_segments`/`fast_ts` in and be cloned just once for the window
-        // manager — one deep segment-vector clone instead of two. The tracker and
-        // window-manager updates emit no events, and the correction decision below
-        // is built from tracker state either way, so the event stream and all state
-        // are byte-identical to registering before emission.
+        // manager. The tracker and window-manager updates emit no events, so the
+        // event stream and all state are identical to registering before emission.
         if self.config.emit_events {
             for segment in &fast_segments {
                 let payload =
@@ -254,23 +407,28 @@ impl SpeculativeStreamingPipeline {
             window_id,
             self.config.fast_model_name.clone(),
             fast_segments,
-            result.primary_latency_ms,
+            fast_latency_ms,
             fast_ts,
         );
         self.correction_tracker.register_partial(partial.clone());
         self.window_manager.record_fast_result(window_id, partial);
+    }
 
-        // Use captured original model segments (no round-trip conversion).
-        let quality_segments = take_stored_segments(quality_holder.as_ref());
+    /// Resolve a window against the quality lane and emit confirm/correct events.
+    fn resolve_quality_lane(
+        &mut self,
+        window_id: u64,
+        quality_segments: Vec<TranscriptionSegment>,
+        quality_latency_ms: u64,
+    ) -> FwResult<CorrectionDecision> {
         self.window_manager
             .record_quality_result(window_id, quality_segments.clone());
 
-        // Submit to correction tracker.
         let decision = self.correction_tracker.submit_quality_result(
             window_id,
             &self.config.quality_model_name,
             quality_segments,
-            result.secondary_latency_ms,
+            quality_latency_ms,
         )?;
 
         self.window_manager.resolve_window(window_id);
@@ -283,7 +441,7 @@ impl SpeculativeStreamingPipeline {
                         *seq,
                         window_id,
                         drift,
-                        result.secondary_latency_ms,
+                        quality_latency_ms,
                         &self.config.quality_model_name,
                     );
                     self.push_event(
@@ -322,12 +480,32 @@ impl SpeculativeStreamingPipeline {
         Ok(decision)
     }
 
+    fn process_window_by_id<F, Q>(
+        &mut self,
+        window_id: u64,
+        fast_fn: F,
+        quality_fn: Q,
+    ) -> FwResult<CorrectionDecision>
+    where
+        F: FnOnce() -> Vec<TranscriptionSegment> + Send,
+        Q: FnOnce() -> Vec<TranscriptionSegment> + Send,
+    {
+        let fast_slot = Mutex::new(Some(fast_fn));
+        let quality_slot = Mutex::new(Some(quality_fn));
+        self.process_window_lanes(
+            window_id,
+            &(),
+            &|(): &()| Ok(take_lane_once(&fast_slot)),
+            &|(): &()| Ok(take_lane_once(&quality_slot)),
+        )
+    }
+
     /// Process a single window using provided model closures.
     ///
-    /// Both closures are run in parallel on separate threads via
-    /// [`ConcurrentTwoLaneExecutor`]. The fast model result is captured
-    /// via the early-emit callback, then compared with the quality result
-    /// to produce a [`CorrectionDecision`].
+    /// The quality closure runs on a worker thread concurrently with the fast
+    /// closure; the fast result is emitted as speculative partials as soon as
+    /// it is available, then compared with the quality result to produce a
+    /// [`CorrectionDecision`].
     pub fn process_window<F, Q>(
         &mut self,
         audio_hash: &str,
@@ -336,8 +514,8 @@ impl SpeculativeStreamingPipeline {
         quality_fn: Q,
     ) -> FwResult<CorrectionDecision>
     where
-        F: FnOnce() -> Vec<TranscriptionSegment> + Send + 'static,
-        Q: FnOnce() -> Vec<TranscriptionSegment> + Send + 'static,
+        F: FnOnce() -> Vec<TranscriptionSegment> + Send,
+        Q: FnOnce() -> Vec<TranscriptionSegment> + Send,
     {
         self.config.validate()?;
         let window = self
@@ -346,30 +524,36 @@ impl SpeculativeStreamingPipeline {
         self.process_window_by_id(window.window_id, fast_fn, quality_fn)
     }
 
-    fn process_duration_loop<C, M>(
+    fn push_stats_event(&mut self) {
+        if self.config.emit_events {
+            let stats = self.stats();
+            self.push_event(
+                "transcript.speculation_stats",
+                "speculative pipeline aggregate statistics",
+                crate::robot::speculation_stats_value(&self.run_id, &stats),
+            );
+        }
+    }
+
+    /// Walk the bounded window schedule over `total_duration_ms`, handing each
+    /// window to `process_window`, then emit the aggregate stats event.
+    fn run_windows<C, P>(
         &mut self,
         total_duration_ms: u64,
         audio_hash_seed: &str,
         checkpoint: &mut C,
-        model_runner: &mut M,
+        process_window: &mut P,
     ) -> FwResult<TranscriptionResult>
     where
         C: FnMut() -> FwResult<()>,
-        M: FnMut(u64, u64) -> FwResult<(Vec<TranscriptionSegment>, Vec<TranscriptionSegment>)>,
+        P: FnMut(&mut Self, LaneWindow) -> FwResult<()>,
     {
         self.config.validate()?;
 
         if total_duration_ms == 0 {
             checkpoint()?;
             let result = self.build_result();
-            if self.config.emit_events {
-                let stats = self.stats();
-                self.push_event(
-                    "transcript.speculation_stats",
-                    "speculative pipeline aggregate statistics",
-                    crate::robot::speculation_stats_value(&self.run_id, &stats),
-                );
-            }
+            self.push_stats_event();
             return Ok(result);
         }
 
@@ -390,11 +574,14 @@ impl SpeculativeStreamingPipeline {
                 break;
             };
 
-            let (fast_segments, quality_segments) = model_runner(window.start_ms, window.end_ms)?;
-            self.process_window_by_id(
-                window.window_id,
-                move || fast_segments,
-                move || quality_segments,
+            process_window(
+                self,
+                LaneWindow {
+                    window_id: window.window_id,
+                    start_ms: window.start_ms,
+                    end_ms: window.end_ms,
+                    total_duration_ms,
+                },
             )?;
 
             if window.end_ms >= total_duration_ms {
@@ -405,19 +592,16 @@ impl SpeculativeStreamingPipeline {
         }
 
         let result = self.build_result();
-        if self.config.emit_events {
-            let stats = self.stats();
-            self.push_event(
-                "transcript.speculation_stats",
-                "speculative pipeline aggregate statistics",
-                crate::robot::speculation_stats_value(&self.run_id, &stats),
-            );
-        }
+        self.push_stats_event();
         Ok(result)
     }
 
-    /// Process an audio duration by repeatedly invoking model callbacks for each
-    /// speculation window.
+    /// Process an audio duration by repeatedly invoking a callback that returns
+    /// both lanes' segments for each speculation window.
+    ///
+    /// The callback computes both results before the window is processed, so
+    /// the lanes cannot overlap; use [`Self::process_duration_with_lanes`] to
+    /// run real fast/quality inference concurrently.
     pub fn process_duration_with_models<C, M>(
         &mut self,
         total_duration_ms: u64,
@@ -429,11 +613,21 @@ impl SpeculativeStreamingPipeline {
         C: FnMut() -> FwResult<()>,
         M: FnMut(u64, u64) -> FwResult<(Vec<TranscriptionSegment>, Vec<TranscriptionSegment>)>,
     {
-        self.process_duration_loop(
+        self.run_windows(
             total_duration_ms,
             audio_hash_seed,
             &mut checkpoint,
-            &mut model_runner,
+            &mut |pipeline, window| {
+                let (fast_segments, quality_segments) =
+                    model_runner(window.start_ms, window.end_ms)?;
+                pipeline
+                    .process_window_by_id(
+                        window.window_id,
+                        move || fast_segments,
+                        move || quality_segments,
+                    )
+                    .map(drop)
+            },
         )
     }
 
@@ -455,21 +649,59 @@ impl SpeculativeStreamingPipeline {
         )
     }
 
-    /// Process an audio file by probing duration and invoking model callbacks
-    /// for each bounded speculation window.
-    pub fn process_file_with_models<C, M>(
+    /// Process an audio duration with independent fast and quality lanes.
+    ///
+    /// For every bounded window, `prepare` builds the shared lane input (for
+    /// example a sliced WAV), then `fast_lane` and `quality_lane` run on it
+    /// concurrently. Fast-lane partials are emitted as soon as the fast lane
+    /// returns, while the quality lane is still running. The prepared input is
+    /// dropped once both lanes finish, so it may own window-scoped resources.
+    pub fn process_duration_with_lanes<C, P, W, F, Q>(
         &mut self,
-        audio_path: &Path,
-        checkpoint: C,
-        mut model_runner: M,
+        total_duration_ms: u64,
+        audio_hash_seed: &str,
+        mut checkpoint: C,
+        mut prepare: P,
+        fast_lane: F,
+        quality_lane: Q,
     ) -> FwResult<TranscriptionResult>
     where
         C: FnMut() -> FwResult<()>,
-        M: FnMut(
-            &Path,
-            u64,
-            u64,
-        ) -> FwResult<(Vec<TranscriptionSegment>, Vec<TranscriptionSegment>)>,
+        P: FnMut(LaneWindow) -> FwResult<W>,
+        W: Sync,
+        F: Fn(&W) -> FwResult<Vec<TranscriptionSegment>> + Sync,
+        Q: Fn(&W) -> FwResult<Vec<TranscriptionSegment>> + Sync,
+    {
+        self.run_windows(
+            total_duration_ms,
+            audio_hash_seed,
+            &mut checkpoint,
+            &mut |pipeline, window| {
+                let input = prepare(window)?;
+                pipeline
+                    .process_window_lanes(window.window_id, &input, &fast_lane, &quality_lane)
+                    .map(drop)
+            },
+        )
+    }
+
+    /// Process an audio file by probing its duration and running independent
+    /// fast and quality lanes over each bounded speculation window (see
+    /// [`Self::process_duration_with_lanes`]).
+    pub fn process_file_with_lanes<C, P, W, F, Q>(
+        &mut self,
+        audio_path: &Path,
+        checkpoint: C,
+        mut prepare: P,
+        fast_lane: F,
+        quality_lane: Q,
+    ) -> FwResult<TranscriptionResult>
+    where
+        C: FnMut() -> FwResult<()>,
+        P: FnMut(&Path, LaneWindow) -> FwResult<W>,
+        W: Sync,
+        F: Fn(&W) -> FwResult<Vec<TranscriptionSegment>> + Sync,
+        Q: Fn(&W) -> FwResult<Vec<TranscriptionSegment>> + Sync,
     {
         let duration_sec =
             audio::probe_duration_seconds_with_timeout(audio_path, Duration::from_secs(10))
@@ -481,11 +713,13 @@ impl SpeculativeStreamingPipeline {
                 })?;
         let total_duration_ms = (duration_sec * 1000.0).round() as u64;
         let hash_seed = audio_path.display().to_string();
-        self.process_duration_with_models(
+        self.process_duration_with_lanes(
             total_duration_ms,
             &hash_seed,
             checkpoint,
-            |start_ms, end_ms| model_runner(audio_path, start_ms, end_ms),
+            |window| prepare(audio_path, window),
+            fast_lane,
+            quality_lane,
         )
     }
 
@@ -974,9 +1208,10 @@ mod tests {
 
     #[test]
     fn poisoned_mutex_recovers_via_into_inner() {
-        // Verify the pattern used in process_window_by_id: if one lane panics
+        // Verify the pattern used by the one-shot lane slots: if one lane panics
         // while holding a Mutex, the other lane (and the caller) can still
         // recover the stored data via `unwrap_or_else(|e| e.into_inner())`.
+        use std::sync::Arc;
         let holder: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
         let h = holder.clone();
 
@@ -2088,16 +2323,18 @@ mod tests {
     }
 
     #[test]
-    fn process_file_with_models_returns_error_for_nonexistent_path() {
+    fn process_file_with_lanes_returns_error_for_nonexistent_path() {
         let mut pipeline = SpeculativeStreamingPipeline::new(
             SpeculativeConfig::default(),
             "test-nonexistent".to_owned(),
         );
 
-        let result = pipeline.process_file_with_models(
+        let result = pipeline.process_file_with_lanes(
             std::path::Path::new("/nonexistent/audio_file_12345.wav"),
             || Ok(()),
-            |_path, _s, _e| panic!("model runner should not be called"),
+            |_path, _window| -> FwResult<()> { panic!("window preparation should not be called") },
+            |(): &()| panic!("fast lane should not be called"),
+            |(): &()| panic!("quality lane should not be called"),
         );
 
         assert!(result.is_err(), "should fail for nonexistent file");
@@ -2881,5 +3118,355 @@ mod tests {
             result.transcript.contains("w0"),
             "transcript should contain output from first window"
         );
+    }
+
+    // -- bd-r4dy: concurrent lanes and live partial delivery ---------------
+
+    #[test]
+    fn fast_partials_reach_the_sink_while_the_quality_lane_is_still_running() {
+        use std::sync::mpsc;
+
+        let (partial_seen_tx, partial_seen_rx) = mpsc::channel::<()>();
+        let partial_seen_tx = Mutex::new(partial_seen_tx);
+        let partial_seen_rx = Mutex::new(partial_seen_rx);
+        let mut pipeline = SpeculativeStreamingPipeline::new(
+            SpeculativeConfig {
+                window_size_ms: 1000,
+                overlap_ms: 0,
+                adaptive: false,
+                ..SpeculativeConfig::default()
+            },
+            "live-partials".to_owned(),
+        )
+        .with_event_sink(Box::new(move |event| {
+            if event.code == "transcript.partial" {
+                let _ = partial_seen_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .send(());
+            }
+        }));
+
+        // The quality lane refuses to finish until the fast lane's partial has
+        // been delivered to the sink. Sequential lanes, or partials buffered
+        // until the window resolves, would make it observe a timeout instead.
+        let quality_saw_partial_first = std::sync::atomic::AtomicBool::new(false);
+        let result = pipeline.process_duration_with_lanes(
+            1000,
+            "seed",
+            || Ok(()),
+            Ok,
+            |_window: &LaneWindow| Ok(vec![seg("fast words", Some(0.0), Some(0.9), Some(0.9))]),
+            |_window: &LaneWindow| {
+                let delivered = partial_seen_rx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(Duration::from_secs(10))
+                    .is_ok();
+                quality_saw_partial_first.store(delivered, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![seg("fast words", Some(0.0), Some(0.9), Some(0.9))])
+            },
+        );
+
+        result.expect("lanes succeed");
+        assert!(
+            quality_saw_partial_first.load(std::sync::atomic::Ordering::SeqCst),
+            "the fast partial must be delivered before the quality lane returns"
+        );
+        let codes: Vec<&str> = pipeline.events().iter().map(|e| e.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            [
+                "transcript.partial",
+                "transcript.confirm",
+                "transcript.speculation_stats"
+            ]
+        );
+    }
+
+    #[test]
+    fn lanes_run_concurrently_within_a_window() {
+        use std::sync::Barrier;
+
+        // Both lanes must be inside their closures at the same time to pass
+        // the two-party barrier; sequential lanes would block forever, so the
+        // barrier wait is bounded by a watchdog flag instead.
+        let barrier = Barrier::new(2);
+        let mut pipeline = SpeculativeStreamingPipeline::new(
+            SpeculativeConfig {
+                window_size_ms: 1000,
+                overlap_ms: 0,
+                adaptive: false,
+                emit_events: false,
+                ..SpeculativeConfig::default()
+            },
+            "concurrent".to_owned(),
+        );
+        let started = Instant::now();
+        pipeline
+            .process_duration_with_lanes(
+                3000,
+                "seed",
+                || Ok(()),
+                Ok,
+                |window: &LaneWindow| {
+                    barrier.wait();
+                    Ok(vec![seg(
+                        "a",
+                        Some(window.start_ms as f64 / 1000.0),
+                        Some(window.end_ms as f64 / 1000.0),
+                        Some(0.9),
+                    )])
+                },
+                |window: &LaneWindow| {
+                    barrier.wait();
+                    Ok(vec![seg(
+                        "a",
+                        Some(window.start_ms as f64 / 1000.0),
+                        Some(window.end_ms as f64 / 1000.0),
+                        Some(0.9),
+                    )])
+                },
+            )
+            .expect("lanes succeed");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert_eq!(pipeline.stats().windows_processed, 3);
+    }
+
+    #[test]
+    fn fast_lane_error_joins_quality_lane_and_surfaces_fast_error() {
+        let quality_finished = std::sync::atomic::AtomicBool::new(false);
+        let mut pipeline = SpeculativeStreamingPipeline::new(
+            SpeculativeConfig {
+                window_size_ms: 1000,
+                overlap_ms: 0,
+                adaptive: false,
+                ..SpeculativeConfig::default()
+            },
+            "fast-error".to_owned(),
+        );
+        let error = pipeline
+            .process_duration_with_lanes(
+                1000,
+                "seed",
+                || Ok(()),
+                Ok,
+                |_window: &LaneWindow| {
+                    Err(FwError::BackendUnavailable("fast lane down".to_owned()))
+                },
+                |_window: &LaneWindow| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    quality_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Vec::new())
+                },
+            )
+            .expect_err("fast lane failure must fail the run");
+        assert!(error.to_string().contains("fast lane down"), "{error}");
+        assert!(
+            quality_finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the quality lane must be joined before the error is returned"
+        );
+        assert!(
+            !pipeline
+                .events()
+                .iter()
+                .any(|event| event.code == "transcript.partial"),
+            "a failed fast lane emits no partials"
+        );
+    }
+
+    #[test]
+    fn quality_lane_error_surfaces_after_fast_partials_were_emitted() {
+        let mut pipeline = SpeculativeStreamingPipeline::new(
+            SpeculativeConfig {
+                window_size_ms: 1000,
+                overlap_ms: 0,
+                adaptive: false,
+                ..SpeculativeConfig::default()
+            },
+            "quality-error".to_owned(),
+        );
+        let error = pipeline
+            .process_duration_with_lanes(
+                1000,
+                "seed",
+                || Ok(()),
+                Ok,
+                |_window: &LaneWindow| Ok(vec![seg("early", Some(0.0), Some(0.5), Some(0.5))]),
+                |_window: &LaneWindow| {
+                    Err(FwError::BackendUnavailable("quality lane down".to_owned()))
+                },
+            )
+            .expect_err("quality lane failure must fail the run");
+        assert!(error.to_string().contains("quality lane down"), "{error}");
+        assert_eq!(
+            pipeline
+                .events()
+                .iter()
+                .filter(|event| event.code == "transcript.partial")
+                .count(),
+            1,
+            "fast partials emitted before the quality failure are retained"
+        );
+    }
+
+    #[test]
+    fn prepared_window_input_is_dropped_after_both_lanes_finish() {
+        struct DropProbe<'a> {
+            window_id: u64,
+            dropped: &'a Mutex<Vec<u64>>,
+        }
+        impl Drop for DropProbe<'_> {
+            fn drop(&mut self) {
+                self.dropped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(self.window_id);
+            }
+        }
+
+        let dropped = Mutex::new(Vec::new());
+        let mut pipeline = SpeculativeStreamingPipeline::new(
+            SpeculativeConfig {
+                window_size_ms: 1000,
+                overlap_ms: 0,
+                adaptive: false,
+                emit_events: false,
+                ..SpeculativeConfig::default()
+            },
+            "drop-probe".to_owned(),
+        );
+        pipeline
+            .process_duration_with_lanes(
+                2500,
+                "seed",
+                || Ok(()),
+                |window| {
+                    Ok(DropProbe {
+                        window_id: window.window_id,
+                        dropped: &dropped,
+                    })
+                },
+                |probe: &DropProbe<'_>| {
+                    assert!(
+                        !dropped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains(&probe.window_id)
+                    );
+                    Ok(Vec::new())
+                },
+                |probe: &DropProbe<'_>| {
+                    assert!(
+                        !dropped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains(&probe.window_id)
+                    );
+                    Ok(Vec::new())
+                },
+            )
+            .expect("lanes succeed");
+        let dropped = dropped
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            dropped.len(),
+            3,
+            "one prepared input per window: {dropped:?}"
+        );
+    }
+
+    // -- window-relative to absolute segment localization ------------------
+
+    fn lane_window(start_ms: u64, end_ms: u64, total_duration_ms: u64) -> LaneWindow {
+        LaneWindow {
+            window_id: 0,
+            start_ms,
+            end_ms,
+            total_duration_ms,
+        }
+    }
+
+    #[test]
+    fn owned_ranges_of_consecutive_windows_tile_the_timeline() {
+        // window 3000, overlap 500 → step 2500; odd overlap exercises rounding.
+        for overlap in [0_u64, 500, 501] {
+            let window = 3000_u64;
+            let total = 9000_u64;
+            let mut start = 0_u64;
+            let mut previous_end: Option<u64> = None;
+            loop {
+                let end = (start + window).min(total);
+                let (own_start, own_end) = lane_window(start, end, total).owned_range_ms(overlap);
+                match previous_end {
+                    None => assert_eq!(own_start, 0),
+                    Some(prev) => assert_eq!(own_start, prev, "overlap {overlap}: gap or overlap"),
+                }
+                assert!(own_start >= start && (own_end == u64::MAX || own_end <= end));
+                if end >= total {
+                    assert_eq!(own_end, u64::MAX);
+                    break;
+                }
+                previous_end = Some(own_end);
+                start = end - overlap;
+            }
+        }
+    }
+
+    #[test]
+    fn localize_segments_offsets_and_keeps_only_owned_speech() {
+        // Middle window [2500, 5500) of a 9000 ms input with 500 ms overlap
+        // owns [2750, 5250).
+        let window = lane_window(2500, 5500, 9000);
+        let localized = window.localize_segments(
+            500,
+            vec![
+                seg("seam-left", Some(0.0), Some(0.4), Some(0.9)), // mid 2.70 s → previous window
+                seg("owned", Some(0.4), Some(1.0), Some(0.9)),     // mid 3.20 s → kept
+                seg("tail", Some(2.6), Some(2.9), Some(0.9)),      // mid 5.25 s → next window
+                seg("untimed", None, None, Some(0.9)),             // kept for validation
+            ],
+        );
+        let texts: Vec<&str> = localized.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["owned", "untimed"]);
+        assert_eq!(localized[0].start_sec, Some(2.9));
+        assert_eq!(localized[0].end_sec, Some(3.5));
+    }
+
+    #[test]
+    fn localize_segments_final_window_owns_trailing_speech_past_its_end() {
+        let window = lane_window(5000, 8000, 8000);
+        let localized =
+            window.localize_segments(500, vec![seg("tail", Some(2.9), Some(3.4), Some(0.9))]);
+        assert_eq!(localized.len(), 1);
+        assert_eq!(localized[0].start_sec, Some(7.9));
+    }
+
+    #[test]
+    fn localize_segments_keeps_non_finite_timestamps_for_validation() {
+        let window = lane_window(1000, 4000, 9000);
+        let localized =
+            window.localize_segments(0, vec![seg("nan", Some(f64::NAN), Some(1.0), None)]);
+        assert_eq!(localized.len(), 1);
+    }
+
+    #[test]
+    fn repair_seam_overlaps_makes_merged_segments_monotonic() {
+        let mut merged = vec![
+            seg("a", Some(0.0), Some(2.9), None),
+            seg("b", Some(2.7), Some(3.5), None),
+            seg("c", Some(3.0), Some(3.2), None),
+            seg("untimed", None, None, None),
+            seg("d", Some(4.0), Some(5.0), None),
+        ];
+        repair_seam_overlaps(&mut merged);
+        assert_eq!(merged[1].start_sec, Some(2.9));
+        assert_eq!(merged[1].end_sec, Some(3.5));
+        assert_eq!(merged[2].start_sec, Some(3.5));
+        assert_eq!(merged[2].end_sec, Some(3.5));
+        assert_eq!(merged[4].start_sec, Some(4.0));
+        crate::conformance::validate_segment_invariants(&merged)
+            .expect("repaired transcript satisfies the monotonic segment contract");
     }
 }

@@ -5614,6 +5614,120 @@ fn speculative_cli_dispatch_emits_partial_confirm_and_stats_events() {
     );
 }
 
+/// bd-r4dy: backends only see a window's audio slice, so their timestamps are
+/// slice-relative. A multi-window speculative run must localize every window's
+/// segments to absolute time, stream partials before the backend stage
+/// completes, and report what actually served the lanes.
+#[cfg(unix)]
+#[test]
+fn speculative_cli_multi_window_run_localizes_segments_and_streams_partials_first() {
+    use std::fs;
+
+    if !ffmpeg_available() {
+        return;
+    }
+
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    fs::create_dir_all(&state_root).expect("state root");
+    let input_wav = dir.path().join("speculative_multi_window.wav");
+    let status = ProcessCommand::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=16000:duration=2.5",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+        ])
+        .arg(&input_wav)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg should synthesize a 2.5 s wav");
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    // Every invocation reports one segment at slice-relative [0.0, 0.5].
+    let stub_bin = write_whisper_cpp_stub_binary(&bin_dir);
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args([
+            "robot",
+            "run",
+            "--input",
+            input_wav.to_str().expect("utf-8 path"),
+            "--backend",
+            "whisper-cpp",
+            "--no-diarize",
+            "--no-persist",
+            "--speculative",
+            "--fast-model",
+            "tiny",
+            "--quality-model",
+            "large",
+            "--speculative-window-ms",
+            "1000",
+            "--speculative-overlap-ms",
+            "0",
+            "--no-adaptive",
+        ])
+        .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
+        .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
+        .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0")
+        .output()
+        .expect("robot run should execute");
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf-8");
+    assert!(
+        output.status.success(),
+        "speculative run should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with('{'))
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+
+    let position = |code: &str| {
+        events
+            .iter()
+            .position(|event| event["code"] == code)
+            .unwrap_or_else(|| panic!("missing {code} event"))
+    };
+    assert!(
+        position("transcript.partial") < position("backend.ok"),
+        "speculative partials must stream before the backend stage completes"
+    );
+
+    let backend_ok = &events[position("backend.ok")]["payload"];
+    assert_eq!(backend_ok["windows_processed"], 3);
+    assert_eq!(backend_ok["implementation"], "bridge");
+    assert_eq!(backend_ok["fast_lane_implementation"], "bridge");
+    assert_eq!(backend_ok["quality_lane_implementation"], "bridge");
+    assert_eq!(backend_ok["lane_concurrency"], "concurrent");
+
+    let last = events.last().expect("run_complete");
+    assert_eq!(last["event"], "run_complete");
+    let starts: Vec<f64> = last["segments"]
+        .as_array()
+        .expect("segments array")
+        .iter()
+        .map(|segment| segment["start_sec"].as_f64().expect("timed segment"))
+        .collect();
+    assert_eq!(
+        starts,
+        [0.0, 1.0, 2.0],
+        "each window's slice-relative segment must be shifted to its window start"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn speculative_cli_without_flag_uses_single_backend_dispatch() {

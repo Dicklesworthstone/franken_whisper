@@ -371,6 +371,15 @@ impl RunStore {
             tok.checkpoint()?;
         }
 
+        // `started_at` is stored verbatim (sync import preserves the archive's
+        // spelling), and valid RFC3339 offsets or fractional-second spellings
+        // are not lexicographically chronological, so SQL `ORDER BY started_at`
+        // can list the wrong runs (bd-9otn). Order by the parsed instant here.
+        let mut selected = self.run_ids_newest_first()?;
+        if limit > 0 {
+            selected.truncate(limit);
+        }
+
         // Project only the 140-char preview in SQL (fsqlite's `ColumnSubstrPrefix`
         // fast path) so a large transcript is never materialized or transferred
         // just to be truncated. `substr(transcript, 1, 140)` returns the first 140
@@ -379,40 +388,46 @@ impl RunStore {
         // projection (`<blob:<=140>` vs the full `<blob:N>`), so if the projected
         // result contains any BLOB transcript we re-run with the full column and
         // fall back to the historical rendering — byte-exact for every DB state.
-        let build_sql = |expr: &str| {
-            if limit > 0 {
-                format!(
-                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
-                     ORDER BY started_at DESC, id DESC LIMIT {limit}"
-                )
-            } else {
-                format!(
-                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
-                     ORDER BY started_at DESC, id DESC"
-                )
+        let mut rows_by_id: std::collections::HashMap<String, Row> =
+            std::collections::HashMap::with_capacity(selected.len());
+        for run_id_chunk in selected.chunks(HISTORY_QUERY_PARAMETER_CHUNK) {
+            if let Some(tok) = token {
+                tok.checkpoint()?;
             }
-        };
+            let placeholders = numbered_placeholders(run_id_chunk.len());
+            let params = text_id_params(run_id_chunk);
+            let build_sql = |expr: &str| {
+                format!(
+                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
+                     WHERE id IN ({placeholders})"
+                )
+            };
+            let rows = self
+                .connection
+                .query_with_params(&build_sql("substr(transcript, 1, 140)"), &params)
+                .map_err(|error| FwError::Storage(error.to_string()))?;
 
-        let rows = self
-            .connection
-            .query(&build_sql("substr(transcript, 1, 140)"))
-            .map_err(|error| FwError::Storage(error.to_string()))?;
+            // BLOB transcripts render by byte length, which the projection would
+            // shorten; re-run with the full column so the preview matches the
+            // historical `<blob:N>` marker exactly.
+            let rows = if rows
+                .iter()
+                .any(|row| matches!(row.get(4), Some(SqliteValue::Blob(_))))
+            {
+                self.connection
+                    .query_with_params(&build_sql("transcript"), &params)
+                    .map_err(|error| FwError::Storage(error.to_string()))?
+            } else {
+                rows
+            };
+            for row in rows {
+                rows_by_id.insert(value_to_string(row.get(0)), row);
+            }
+        }
 
-        // BLOB transcripts render by byte length, which the projection would
-        // shorten; re-run with the full column so the preview matches the
-        // historical `<blob:N>` marker exactly.
-        let rows = if rows
+        selected
             .iter()
-            .any(|row| matches!(row.get(4), Some(SqliteValue::Blob(_))))
-        {
-            self.connection
-                .query(&build_sql("transcript"))
-                .map_err(|error| FwError::Storage(error.to_string()))?
-        } else {
-            rows
-        };
-
-        rows.into_iter()
+            .filter_map(|run_id| rows_by_id.remove(run_id))
             .map(|row| {
                 let run_id = value_to_string(row.get(0));
                 let started = value_to_string(row.get(1));
@@ -431,6 +446,27 @@ impl RunStore {
                 })
             })
             .collect()
+    }
+
+    /// Every run ID ordered newest first by the instant its `started_at`
+    /// denotes (see [`started_at_order_key`]), ties broken by ID descending.
+    fn run_ids_newest_first(&self) -> FwResult<Vec<String>> {
+        let rows = self
+            .connection
+            .query("SELECT id, started_at FROM runs")
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let mut keyed: Vec<(StartedAtOrderKey, String)> = rows
+            .into_iter()
+            .map(|row| {
+                let started_at = value_to_string(row.get(1));
+                (
+                    started_at_order_key(started_at),
+                    value_to_string(row.get(0)),
+                )
+            })
+            .collect();
+        keyed.sort_unstable_by(|left, right| right.cmp(left));
+        Ok(keyed.into_iter().map(|(_, run_id)| run_id).collect())
     }
 
     pub fn load_latest_run_details(&self) -> FwResult<Option<StoredRunDetails>> {
@@ -463,15 +499,11 @@ impl RunStore {
             tok.checkpoint()?;
         }
 
-        // Use SQL ORDER BY and LIMIT 1 for efficient latest-run lookup.
-        let rows = self
-            .connection
-            .query("SELECT id FROM runs ORDER BY started_at DESC, id DESC LIMIT 1")
-            .map_err(|error| FwError::Storage(error.to_string()))?;
+        // Latest by the instant `started_at` denotes, not its text spelling.
+        let latest = self.run_ids_newest_first()?.into_iter().next();
         after_latest_id()?;
 
-        if let Some(row) = rows.into_iter().next() {
-            let run_id = value_to_string(row.get(0));
+        if let Some(run_id) = latest {
             self.load_run_details_cancellable_in_snapshot(&run_id, token, || Ok(()))
         } else {
             Ok(None)
@@ -2951,6 +2983,19 @@ fn persist_skip_stmt_sp_enabled() -> bool {
 /// `FW_STORAGE_BATCH_HISTORY=0` restores the per-run path (kill-switch + A/B).
 fn batch_history_enabled() -> bool {
     std::env::var("FW_STORAGE_BATCH_HISTORY").ok().as_deref() != Some("0")
+}
+
+/// Sort key for a stored `started_at` value: a valid RFC3339 timestamp orders
+/// by the UTC instant it denotes (so `+02:00` offsets and fractional-second
+/// spellings compare chronologically); any other spelling orders before every
+/// valid instant, among themselves by text.
+type StartedAtOrderKey = (Option<chrono::DateTime<chrono::Utc>>, String);
+
+fn started_at_order_key(started_at: String) -> StartedAtOrderKey {
+    match chrono::DateTime::parse_from_rfc3339(&started_at) {
+        Ok(instant) => (Some(instant.with_timezone(&chrono::Utc)), String::new()),
+        Err(_) => (None, started_at),
+    }
 }
 
 fn numbered_placeholders(count: usize) -> String {
@@ -7307,6 +7352,58 @@ mod tests {
             .expect("exists");
         assert_eq!(latest.run_id, "run-late-first");
         assert_eq!(latest.transcript, "late run");
+    }
+
+    /// bd-9otn: valid RFC3339 spellings whose text order disagrees with their
+    /// instant order must still list and select chronologically.
+    #[test]
+    fn recent_and_latest_order_by_rfc3339_instant_not_text_spelling() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("instant_order.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+
+        // As text, "not-a-time" sorts above every digit-led spelling and the
+        // +02:00 spelling (instant 10:30Z) sorts above 11:00Z. By instant the
+        // order is 11:00Z, 10:30Z, 10:15:00.5Z, 10:15:00Z, then the
+        // unparseable spelling last.
+        for (run_id, started_at) in [
+            ("run-offset", "2026-03-01T12:30:00+02:00"),
+            ("run-fraction", "2026-03-01T10:15:00.5Z"),
+            ("run-plain", "2026-03-01T10:15:00Z"),
+            ("run-latest-utc", "2026-03-01T11:00:00Z"),
+            ("run-garbage", "not-a-time"),
+        ] {
+            let mut report = minimal_report(run_id, &db_path);
+            report.started_at_rfc3339 = started_at.to_owned();
+            store.persist_report(&report).expect("persist");
+        }
+
+        let listed: Vec<String> = store
+            .list_recent_runs(0)
+            .expect("list")
+            .into_iter()
+            .map(|summary| summary.run_id)
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "run-latest-utc",
+                "run-offset",
+                "run-fraction",
+                "run-plain",
+                "run-garbage"
+            ]
+        );
+        // Stored spellings are preserved verbatim.
+        let first_two = store.list_recent_runs(2).expect("list two");
+        assert_eq!(first_two.len(), 2);
+        assert_eq!(first_two[1].started_at_rfc3339, "2026-03-01T12:30:00+02:00");
+
+        let latest = store
+            .load_latest_run_details()
+            .expect("query")
+            .expect("exists");
+        assert_eq!(latest.run_id, "run-latest-utc");
     }
 
     #[test]
