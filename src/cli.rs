@@ -361,8 +361,12 @@ pub enum Command {
     /// Internal process-tree cancellation probe. This is intentionally absent from help.
     #[command(name = "__comparison-cancel-probe", hide = true)]
     ComparisonCancelProbe(ComparisonCancelProbeArgs),
-    /// Launch the optional human-oriented terminal interface.
-    Tui,
+    /// Launch the optional human-oriented terminal interface (run history
+    /// browser; `tui listen` shows a live transcription session).
+    Tui {
+        #[command(subcommand)]
+        command: Option<TuiCommand>,
+    },
     /// Download YouTube audio (videos / playlists / a URL file) and
     /// transcribe each into a markdown + JSON pair; or search / enrich the
     /// YouTube catalog as deduped agent-curated JSON.
@@ -1288,7 +1292,8 @@ pub struct ListenArgs {
     #[arg(long, default_value_t = 9.0)]
     pub vad_gate_db: f64,
 
-    /// Sustained voice required before an utterance opens (ms).
+    /// Voiced audio required before an utterance opens (ms), counted within
+    /// a window twice as long.
     #[arg(long, default_value_t = 250)]
     pub vad_min_speech_ms: u64,
 
@@ -1324,6 +1329,103 @@ pub struct ListenArgs {
     /// List input devices as NDJSON and exit (no session).
     #[arg(long)]
     pub list_devices: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TuiCommand {
+    /// Watch a live listen session (same flags as `robot listen`): committed
+    /// text, in-place partials, utterance boundaries, confirm-lane verdicts,
+    /// warnings, and session stats. The robot NDJSON contract is unaffected.
+    Listen(Box<ListenArgs>),
+}
+
+impl ListenArgs {
+    /// Build the live-session configuration these flags describe; shared by
+    /// `robot listen` and `tui listen` so both drive the identical session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FwError::InvalidRequest`] when `--source file-replay` lacks
+    /// `--input`. Numeric validation happens in the session itself.
+    pub fn to_listen_config(&self) -> FwResult<crate::listen::ListenConfig> {
+        use crate::capture::PcmFormat;
+        use crate::listen::{
+            CaptureBackend, ListenConfig, ListenPolicy, ListenSource, QualityModelSetting,
+            SessionBufferConfig, StreamingVadConfig,
+        };
+
+        let source = match self.source {
+            ListenSourceArg::Mic => ListenSource::Mic {
+                device: self.mic_device.clone(),
+                backend: match self.capture_backend {
+                    CaptureBackendArg::Auto => CaptureBackend::Auto,
+                    CaptureBackendArg::Cpal => CaptureBackend::Cpal,
+                    CaptureBackendArg::Ffmpeg => CaptureBackend::Ffmpeg,
+                },
+            },
+            ListenSourceArg::StdinPcm => ListenSource::StdinPcm {
+                format: match self.stdin_format {
+                    StdinFormatArg::S16le => PcmFormat::S16le,
+                    StdinFormatArg::F32le => PcmFormat::F32le,
+                },
+                sample_rate: self.stdin_rate,
+                channels: self.stdin_channels,
+            },
+            ListenSourceArg::FileReplay => {
+                let Some(path) = self.input.clone() else {
+                    return Err(FwError::InvalidRequest(
+                        "--source file-replay requires --input PATH".to_owned(),
+                    ));
+                };
+                ListenSource::FileReplay {
+                    path,
+                    realtime_pace: self.realtime_pace,
+                }
+            }
+        };
+        let policy = match self.policy {
+            ListenPolicyArg::Alignatt => ListenPolicy::AlignAtt,
+            ListenPolicyArg::EndpointCommit => ListenPolicy::EndpointCommit,
+            ListenPolicyArg::LocalAgreement => ListenPolicy::LocalAgreement,
+        };
+        let mut buffer = SessionBufferConfig {
+            max_buffer_sec: self.max_buffer_sec,
+            ..SessionBufferConfig::default()
+        };
+        buffer.prompt_carry = !self.no_context;
+        let vad = StreamingVadConfig {
+            gate_db: self.vad_gate_db,
+            min_speech_ms: self.vad_min_speech_ms,
+            endpoint_ms: self.vad_endpoint_ms,
+            ..StreamingVadConfig::default()
+        };
+        Ok(ListenConfig {
+            source,
+            fast_model: self.fast_model.clone(),
+            language: self.language.clone(),
+            step_ms: self.step_ms,
+            buffer,
+            vad,
+            vad_enabled: !self.no_vad,
+            max_seconds: self.max_seconds,
+            max_utterance_sec: self.max_utterance_sec,
+            emit_partials: !self.no_partials,
+            stats_interval_sec: self.stats_interval_sec,
+            capture_buffer_sec: self.capture_buffer_sec,
+            policy,
+            alignatt_holdback_ms: self.alignatt_holdback_ms,
+            adaptive_controllers: self.adaptive,
+            quality_model: match self.quality_model.as_str() {
+                "auto" => QualityModelSetting::Auto,
+                "none" => QualityModelSetting::Disabled,
+                spec => QualityModelSetting::Explicit(spec.to_owned()),
+            },
+            confirm_queue_bound: self.confirm_queue_bound,
+            confirm_drain_sec: self.confirm_drain_sec,
+            persist: !self.no_persist,
+            db_path: self.db.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Subcommand)]

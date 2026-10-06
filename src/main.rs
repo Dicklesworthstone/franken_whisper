@@ -6,7 +6,7 @@ use franken_whisper::cli;
 use franken_whisper::cli::{
     Cli, Command, ControlFrameKind, DifferentialOracleCommand, PublicCorpusCommand, PullModelArg,
     RobotCommand, RobotDocsCommand, RunsOutputFormat, ShutdownController, SyncCommand,
-    TtyAudioCommand, TtyAudioControlCommand,
+    TtyAudioCommand, TtyAudioControlCommand, TuiCommand,
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
@@ -183,12 +183,6 @@ fn sortformer_audio_duration_ms(sample_count: usize) -> FwResult<u64> {
 }
 
 fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
-    use franken_whisper::capture::PcmFormat;
-    use franken_whisper::cli::{
-        CaptureBackendArg, ListenPolicyArg, ListenSourceArg, StdinFormatArg,
-    };
-    use franken_whisper::listen::{CaptureBackend, ListenConfig, ListenSource};
-
     if args.list_devices {
         for device in franken_whisper::capture::enumerate_input_devices()? {
             emit_event_value(&listen_device_value(&device))?;
@@ -196,78 +190,7 @@ fn run_robot_listen(args: franken_whisper::cli::ListenArgs) -> FwResult<()> {
         return Ok(());
     }
 
-    let source = match args.source {
-        ListenSourceArg::Mic => ListenSource::Mic {
-            device: args.mic_device.clone(),
-            backend: match args.capture_backend {
-                CaptureBackendArg::Auto => CaptureBackend::Auto,
-                CaptureBackendArg::Cpal => CaptureBackend::Cpal,
-                CaptureBackendArg::Ffmpeg => CaptureBackend::Ffmpeg,
-            },
-        },
-        ListenSourceArg::StdinPcm => ListenSource::StdinPcm {
-            format: match args.stdin_format {
-                StdinFormatArg::S16le => PcmFormat::S16le,
-                StdinFormatArg::F32le => PcmFormat::F32le,
-            },
-            sample_rate: args.stdin_rate,
-            channels: args.stdin_channels,
-        },
-        ListenSourceArg::FileReplay => {
-            let Some(path) = args.input.clone() else {
-                return Err(FwError::InvalidRequest(
-                    "--source file-replay requires --input PATH".to_owned(),
-                ));
-            };
-            ListenSource::FileReplay {
-                path,
-                realtime_pace: args.realtime_pace,
-            }
-        }
-    };
-    let policy = match args.policy {
-        ListenPolicyArg::Alignatt => franken_whisper::listen::ListenPolicy::AlignAtt,
-        ListenPolicyArg::EndpointCommit => franken_whisper::listen::ListenPolicy::EndpointCommit,
-        ListenPolicyArg::LocalAgreement => franken_whisper::listen::ListenPolicy::LocalAgreement,
-    };
-
-    let mut buffer_config = franken_whisper::listen::SessionBufferConfig {
-        max_buffer_sec: args.max_buffer_sec,
-        ..franken_whisper::listen::SessionBufferConfig::default()
-    };
-    buffer_config.prompt_carry = !args.no_context;
-    let vad_config = franken_whisper::listen::StreamingVadConfig {
-        gate_db: args.vad_gate_db,
-        min_speech_ms: args.vad_min_speech_ms,
-        endpoint_ms: args.vad_endpoint_ms,
-        ..franken_whisper::listen::StreamingVadConfig::default()
-    };
-    let config = ListenConfig {
-        source,
-        fast_model: args.fast_model.clone(),
-        language: args.language.clone(),
-        step_ms: args.step_ms,
-        buffer: buffer_config,
-        vad: vad_config,
-        vad_enabled: !args.no_vad,
-        max_seconds: args.max_seconds,
-        max_utterance_sec: args.max_utterance_sec,
-        emit_partials: !args.no_partials,
-        stats_interval_sec: args.stats_interval_sec,
-        capture_buffer_sec: args.capture_buffer_sec,
-        policy,
-        alignatt_holdback_ms: args.alignatt_holdback_ms,
-        adaptive_controllers: args.adaptive,
-        quality_model: match args.quality_model.as_str() {
-            "auto" => franken_whisper::listen::QualityModelSetting::Auto,
-            "none" => franken_whisper::listen::QualityModelSetting::Disabled,
-            spec => franken_whisper::listen::QualityModelSetting::Explicit(spec.to_owned()),
-        },
-        confirm_queue_bound: args.confirm_queue_bound,
-        confirm_drain_sec: args.confirm_drain_sec,
-        persist: !args.no_persist,
-        db_path: args.db.clone(),
-    };
+    let config = args.to_listen_config()?;
 
     // NOTE: main() already installed the Ctrl-C handler; installing twice
     // errors (ctrlc rejects a second handler).
@@ -1215,7 +1138,10 @@ fn run(cli: Cli) -> FwResult<()> {
                 tty_audio::emit_retransmit_loop_from_stdin(recovery.into(), rounds)
             }
         },
-        Command::Tui => franken_whisper::tui::run_tui(),
+        Command::Tui { command: None } => franken_whisper::tui::run_tui(),
+        Command::Tui {
+            command: Some(TuiCommand::Listen(args)),
+        } => franken_whisper::tui::run_live_listen_tui(args.to_listen_config()?),
         Command::Youtube(command) => match command {
             cli::YoutubeCommand::Run(args) => {
                 let opts = args.to_options()?;

@@ -1612,21 +1612,38 @@ Full protocol spec: [`docs/tty-audio-protocol.md`](docs/tty-audio-protocol.md). 
 
 ### `tui`
 
-Interactive terminal UI for human operators (feature-gated; requires `--features tui`).
+Interactive terminal UI for human operators (feature-gated; build with
+`--features tui`).
 
 ```bash
-franken_whisper --features tui tui     # when invoked via cargo run
+# browse persisted runs, transcript timelines, and stage events
+franken_whisper tui
+
+# watch a live session: accepts every `robot listen` flag
+franken_whisper tui listen --source mic --language en
+franken_whisper tui listen --source file-replay --input talk.wav --realtime-pace
 ```
 
-**Features:**
+**Run history (`tui`):**
 
-- Live transcription view with auto-scroll
-- Speaker labels, timestamps, and confidence scores per segment
 - Browsable run history with timing and backend info
-- Timeline view of pipeline stages with duration bars
-- Event detail panes for individual NDJSON events
-- Segment retention cap (10,000 segments, oldest-first drain)
-- Vim-style keybindings; focus cycling between panes
+- Transcript timeline with speaker labels, timestamps, and confidence
+- Stage-event pane for the run's NDJSON events
+- Focus cycling between panes, paging, live reload from SQLite
+
+**Live session (`tui listen`):**
+
+- Runs the same session as `robot listen` (identical configuration, persistence,
+  and confirm lane) on a worker thread and renders its event stream; the robot
+  NDJSON contract is unchanged
+- Append-only committed text per utterance, with the mutable partial tail shown
+  in-place and an open-utterance marker
+- Confirm-lane verdicts: `✓` confirmed (with drift WER) or `✎` corrected text
+  shown beneath the fast-lane text — humans see revisions that agents receive
+  as separate events
+- Warnings pane, session-stats footer (TTFT, step latency, capture overruns)
+- Bounded retention (10,000 utterances, oldest-first drain); `q`/Ctrl+C
+  cancels the session and waits for its cleanup
 
 Built on the [FrankenTUI](https://github.com/Dicklesworthstone/frankentui) framework.
 

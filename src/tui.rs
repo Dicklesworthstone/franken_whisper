@@ -1586,6 +1586,531 @@ mod enabled {
             .map_err(FwError::from)
     }
 
+    // -----------------------------------------------------------------------
+    // Live listen view (bd-rt-tui-live-zx0x)
+    // -----------------------------------------------------------------------
+
+    /// Oldest utterances drain once a live session exceeds this many, so an
+    /// unbounded microphone session holds bounded memory.
+    const LIVE_MAX_UTTERANCES: usize = 10_000;
+
+    /// Quality-lane verdict on a closed utterance.
+    #[derive(Debug, Clone, PartialEq)]
+    enum LiveVerdict {
+        Confirmed { wer: f64 },
+        Corrected { text: String },
+    }
+
+    /// One utterance as a human sees it: append-only committed text, the
+    /// mutable partial tail, and any later quality verdict.
+    #[derive(Debug, Clone, PartialEq)]
+    struct LiveUtterance {
+        id: u64,
+        t_session_sec: f64,
+        committed: String,
+        partial: String,
+        closed: bool,
+        end_reason: Option<String>,
+        verdict: Option<LiveVerdict>,
+    }
+
+    /// Everything the live view renders, derived only from listen NDJSON
+    /// event values — the same stream `robot listen` prints — so the view
+    /// has no private channel into the driver and is testable headless.
+    #[derive(Debug, Default)]
+    struct LiveSessionState {
+        header: String,
+        utterances: std::collections::VecDeque<LiveUtterance>,
+        warnings: Vec<String>,
+        stats: String,
+        finished: Option<String>,
+        events_seen: u64,
+    }
+
+    impl LiveSessionState {
+        fn utterance_mut(&mut self, event: &serde_json::Value) -> Option<&mut LiveUtterance> {
+            let id = event.get("utterance_id")?.as_u64()?;
+            self.utterances
+                .iter_mut()
+                .rev()
+                .find(|utterance| utterance.id == id)
+        }
+
+        fn apply(&mut self, event: &serde_json::Value) {
+            self.events_seen = self.events_seen.saturating_add(1);
+            let text_of = |key: &str| {
+                event
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            match event.get("event").and_then(serde_json::Value::as_str) {
+                Some("listen.session_start") => {
+                    self.header = format!(
+                        "source={} device={} fast={} quality={} policy={}",
+                        text_of("source"),
+                        text_of("device"),
+                        text_of("fast_model"),
+                        event
+                            .get("quality_model")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("none"),
+                        text_of("policy"),
+                    );
+                }
+                Some("speech_started") => {
+                    let Some(id) = event
+                        .get("utterance_id")
+                        .and_then(serde_json::Value::as_u64)
+                    else {
+                        return;
+                    };
+                    self.utterances.push_back(LiveUtterance {
+                        id,
+                        t_session_sec: event
+                            .get("t_session_sec")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0),
+                        committed: String::new(),
+                        partial: String::new(),
+                        closed: false,
+                        end_reason: None,
+                        verdict: None,
+                    });
+                    while self.utterances.len() > LIVE_MAX_UTTERANCES {
+                        self.utterances.pop_front();
+                    }
+                }
+                Some("transcript.delta") => {
+                    let text = text_of("text");
+                    if let Some(utterance) = self.utterance_mut(event) {
+                        utterance.committed.push_str(&text);
+                        utterance.partial.clear();
+                    }
+                }
+                Some("transcript.partial") => {
+                    let text = text_of("text");
+                    if let Some(utterance) = self.utterance_mut(event) {
+                        utterance.partial = text;
+                    }
+                }
+                Some("utterance_end") => {
+                    let reason = text_of("reason");
+                    if let Some(utterance) = self.utterance_mut(event) {
+                        utterance.closed = true;
+                        utterance.partial.clear();
+                        utterance.end_reason = Some(reason);
+                    }
+                }
+                Some("transcript.confirm") => {
+                    let wer = event
+                        .pointer("/drift/wer_approx")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0);
+                    if let Some(utterance) = self.utterance_mut(event) {
+                        utterance.verdict = Some(LiveVerdict::Confirmed { wer });
+                    }
+                }
+                Some("transcript.correct") => {
+                    let text = event
+                        .get("segments")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|segments| {
+                            segments
+                                .iter()
+                                .filter_map(|segment| {
+                                    segment.get("text").and_then(serde_json::Value::as_str)
+                                })
+                                .map(str::trim)
+                                .filter(|text| !text.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default();
+                    if let Some(utterance) = self.utterance_mut(event) {
+                        utterance.verdict = Some(LiveVerdict::Corrected { text });
+                    }
+                }
+                Some("listen.warning") => {
+                    self.warnings
+                        .push(format!("{}: {}", text_of("reason"), text_of("detail")));
+                    if self.warnings.len() > 8 {
+                        self.warnings.remove(0);
+                    }
+                }
+                Some("listen.session_stats") => {
+                    let number = |key: &str| {
+                        event
+                            .get(key)
+                            .and_then(serde_json::Value::as_f64)
+                            .map_or_else(|| "-".to_owned(), |value| format!("{value:.1}"))
+                    };
+                    self.stats = format!(
+                        "audio {}s · wall {}s · utterances {} · deltas {} · ttft {}ms · step {}ms · overruns {}",
+                        number("audio_sec"),
+                        number("wall_sec"),
+                        number("utterances"),
+                        number("deltas"),
+                        number("ttft_ms"),
+                        number("mean_step_latency_ms"),
+                        number("capture_overruns"),
+                    );
+                }
+                Some("run_error") => {
+                    let message = event
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("session failed");
+                    self.finished = Some(format!("error: {message}"));
+                }
+                _ => {}
+            }
+        }
+
+        /// Transcript lines, newest last: committed text, the in-flight
+        /// partial in angle quotes, and verdict markers (✓ confirmed,
+        /// ✎ corrected — humans should see revisions, unlike the append-only
+        /// agent contract).
+        fn transcript_lines(&self) -> Vec<String> {
+            if self.utterances.is_empty() {
+                return vec!["(waiting for speech...)".to_owned()];
+            }
+            let mut lines = Vec::with_capacity(self.utterances.len());
+            for utterance in &self.utterances {
+                let mut line = format!(
+                    "#{:<3} {:>7.2}s  {}",
+                    utterance.id,
+                    utterance.t_session_sec,
+                    utterance.committed.trim()
+                );
+                if !utterance.partial.is_empty() {
+                    line.push_str(&format!(" «{}»", utterance.partial.trim()));
+                }
+                if !utterance.closed {
+                    line.push_str(" ▌");
+                }
+                match &utterance.verdict {
+                    Some(LiveVerdict::Confirmed { wer }) => {
+                        line.push_str(&format!("  ✓ (wer {wer:.2})"));
+                    }
+                    Some(LiveVerdict::Corrected { text }) => {
+                        line.push_str(&format!("\n             ✎ {text}"));
+                    }
+                    None => {}
+                }
+                lines.push(line);
+            }
+            lines
+        }
+    }
+
+    enum LiveSessionMessage {
+        Event(serde_json::Value),
+        Finished(Result<bool, String>),
+    }
+
+    struct LiveListenApp {
+        state: LiveSessionState,
+        events: std::sync::mpsc::Receiver<LiveSessionMessage>,
+        scroll_from_bottom: u16,
+    }
+
+    impl LiveListenApp {
+        fn drain_events(&mut self) {
+            while let Ok(message) = self.events.try_recv() {
+                match message {
+                    LiveSessionMessage::Event(event) => self.state.apply(&event),
+                    LiveSessionMessage::Finished(outcome) => {
+                        self.state.finished.get_or_insert(match outcome {
+                            Ok(true) => "session cancelled".to_owned(),
+                            Ok(false) => "session complete".to_owned(),
+                            Err(error) => format!("error: {error}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    impl Model for LiveListenApp {
+        type Message = Msg;
+
+        fn update(&mut self, msg: Msg) -> Cmd<Self::Message> {
+            match msg {
+                Msg::Key(key) if key.kind == KeyEventKind::Press => {
+                    if (key.modifiers.contains(Modifiers::CTRL) && key.code == KeyCode::Char('c'))
+                        || key.code == KeyCode::Char('q')
+                    {
+                        return Cmd::quit();
+                    }
+                    match key.code {
+                        KeyCode::Up => {
+                            self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(1);
+                        }
+                        KeyCode::Down => {
+                            self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(1);
+                        }
+                        KeyCode::End => self.scroll_from_bottom = 0,
+                        _ => {}
+                    }
+                }
+                Msg::Tick => self.drain_events(),
+                Msg::Ignore | Msg::Key(_) => {}
+            }
+            Cmd::none()
+        }
+
+        fn view(&self, frame: &mut Frame) {
+            let full = Rect::from_size(frame.buffer.width(), frame.buffer.height());
+            let shell = Flex::vertical()
+                .constraints([
+                    Constraint::Fixed(1),
+                    Constraint::Fill,
+                    Constraint::Fixed(4),
+                    Constraint::Fixed(1),
+                ])
+                .split(full);
+
+            Paragraph::new(format!(
+                "franken_whisper :: live listen :: {}",
+                self.state.header
+            ))
+            .style(Style::new().fg(PackedRgba::rgb(160, 230, 255)).bold())
+            .render(shell[0], frame);
+
+            let lines = self.state.transcript_lines();
+            let rendered = lines.join("\n");
+            let total_rows = u16::try_from(rendered.lines().count()).unwrap_or(u16::MAX);
+            let visible = shell[1].height.saturating_sub(2);
+            let top = total_rows
+                .saturating_sub(visible)
+                .saturating_sub(self.scroll_from_bottom);
+            Paragraph::new(rendered)
+                .scroll((top, 0))
+                .block(
+                    Block::bordered()
+                        .title("Live transcript")
+                        .border_style(Style::new().fg(PackedRgba::rgb(120, 220, 160)).bold()),
+                )
+                .render(shell[1], frame);
+
+            let warnings = if self.state.warnings.is_empty() {
+                "no warnings".to_owned()
+            } else {
+                self.state.warnings.join("\n")
+            };
+            Paragraph::new(warnings)
+                .block(
+                    Block::bordered()
+                        .title("Warnings")
+                        .border_style(Style::new().fg(PackedRgba::rgb(255, 180, 120))),
+                )
+                .render(shell[2], frame);
+
+            let status = self.state.finished.as_deref().unwrap_or("listening");
+            Paragraph::new(format!(
+                "{status} | {} | events {} | Up/Down scroll · End follow · q quit",
+                if self.state.stats.is_empty() {
+                    "stats pending"
+                } else {
+                    self.state.stats.as_str()
+                },
+                self.state.events_seen
+            ))
+            .style(Style::new().fg(PackedRgba::rgb(210, 210, 210)))
+            .render(shell[3], frame);
+        }
+
+        fn subscriptions(&self) -> Vec<Box<dyn Subscription<Self::Message>>> {
+            vec![Box::new(Every::new(Duration::from_millis(100), || {
+                Msg::Tick
+            }))]
+        }
+    }
+
+    /// Run a live listen session behind the human TUI. The session runs on a
+    /// worker thread with exactly the configuration `robot listen` would use;
+    /// its event values flow over a channel into the view. Quitting the TUI
+    /// cancels the session and waits for it to finish its own cleanup
+    /// (persistence flush, capture teardown).
+    pub fn run_live_listen_tui(config: crate::listen::ListenConfig) -> FwResult<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let session_stop = Arc::clone(&stop);
+        let worker = std::thread::Builder::new()
+            .name("tui-listen-session".to_owned())
+            .spawn(move || {
+                let event_sender = sender.clone();
+                let mut emit = |value: serde_json::Value| {
+                    // A closed view simply stops observing; the session keeps
+                    // its own contract until the stop flag ends it.
+                    let _ = event_sender.send(LiveSessionMessage::Event(value));
+                    Ok(())
+                };
+                let is_cancelled = || {
+                    session_stop.load(Ordering::SeqCst)
+                        || crate::cli::ShutdownController::is_shutting_down()
+                };
+                let outcome = crate::listen::run_listen_session(&config, &mut emit, &is_cancelled)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(LiveSessionMessage::Finished(outcome));
+            })
+            .map_err(FwError::Io)?;
+
+        let app = LiveListenApp {
+            state: LiveSessionState::default(),
+            events: receiver,
+            scroll_from_bottom: 0,
+        };
+        let ui_result = App::new(app)
+            .screen_mode(ScreenMode::InlineAuto {
+                min_height: 16,
+                max_height: 40,
+            })
+            .run()
+            .map_err(FwError::from);
+        stop.store(true, Ordering::SeqCst);
+        let _ = worker.join();
+        ui_result
+    }
+
+    #[cfg(test)]
+    mod live_tests {
+        use super::{LIVE_MAX_UTTERANCES, LiveSessionState, LiveVerdict};
+        use crate::model::TranscriptionSegment;
+        use crate::robot;
+
+        fn session_events() -> Vec<serde_json::Value> {
+            let mut partial = robot::transcript_partial_value(
+                "run",
+                3,
+                "t",
+                &TranscriptionSegment {
+                    start_sec: Some(0.4),
+                    end_sec: Some(1.0),
+                    text: "ask not wh".to_owned(),
+                    speaker: None,
+                    confidence: None,
+                },
+            );
+            partial["utterance_id"] = serde_json::json!(1);
+            vec![
+                serde_json::json!({"event": "listen.session_start", "source": "file-replay",
+                    "device": "jfk.wav", "fast_model": "tiny.en", "quality_model": null,
+                    "policy": "alignatt"}),
+                serde_json::json!({"event": "speech_started", "utterance_id": 1, "t_session_sec": 0.42}),
+                robot::transcript_delta_value("run", 2, "t", 1, "And so ", 0.4, 0.9, 2, Some(0.9)),
+                partial,
+                robot::transcript_delta_value("run", 4, "t", 1, "ask not", 0.9, 1.2, 2, Some(0.9)),
+                serde_json::json!({"event": "utterance_end", "utterance_id": 1, "reason": "vad_endpoint"}),
+                robot::listen_transcript_confirm_value("run", 6, "t", 1, "turbo", 0.05, 0.0, 1, 40),
+                serde_json::json!({"event": "listen.warning", "reason": "capture_overrun", "detail": "1 frame"}),
+                serde_json::json!({"event": "listen.session_stats", "audio_sec": 11.0, "wall_sec": 3.5,
+                    "utterances": 1, "deltas": 2, "ttft_ms": 310.0, "mean_step_latency_ms": 80.0,
+                    "capture_overruns": 1}),
+            ]
+        }
+
+        #[test]
+        fn live_state_tracks_committed_text_partials_and_verdicts() {
+            let mut state = LiveSessionState::default();
+            let events = session_events();
+            // Mid-utterance, after the partial: committed text plus the
+            // in-flight tail and the open marker.
+            for event in &events[..4] {
+                state.apply(event);
+            }
+            assert_eq!(
+                state.transcript_lines(),
+                ["#1      0.42s  And so «ask not wh» ▌"]
+            );
+            for event in &events[4..] {
+                state.apply(event);
+            }
+            assert_eq!(
+                state.transcript_lines(),
+                ["#1      0.42s  And so ask not  ✓ (wer 0.05)"]
+            );
+            assert!(state.header.contains("fast=tiny.en"), "{}", state.header);
+            assert!(state.header.contains("quality=none"), "{}", state.header);
+            assert_eq!(state.warnings, ["capture_overrun: 1 frame"]);
+            assert!(state.stats.contains("ttft 310.0ms"), "{}", state.stats);
+            assert_eq!(state.events_seen, events.len() as u64);
+        }
+
+        #[test]
+        fn live_state_shows_corrections_and_ignores_unknown_utterances() {
+            let mut state = LiveSessionState::default();
+            state.apply(&serde_json::json!({"event": "speech_started", "utterance_id": 7, "t_session_sec": 1.0}));
+            state.apply(&robot::transcript_delta_value(
+                "run",
+                2,
+                "t",
+                7,
+                "helo wrld",
+                1.0,
+                2.0,
+                3,
+                None,
+            ));
+            // A delta for an utterance that never started is ignored, not a panic.
+            state.apply(&robot::transcript_delta_value(
+                "run", 3, "t", 99, "stray", 1.0, 2.0, 1, None,
+            ));
+            state.apply(&serde_json::json!({"event": "utterance_end", "utterance_id": 7, "reason": "vad_endpoint"}));
+            state.apply(&robot::listen_transcript_correct_value(
+                "run",
+                5,
+                "t",
+                7,
+                1,
+                &[TranscriptionSegment {
+                    start_sec: Some(1.0),
+                    end_sec: Some(2.0),
+                    text: " hello world ".to_owned(),
+                    speaker: None,
+                    confidence: None,
+                }],
+                "turbo",
+                0.5,
+                0.0,
+                2,
+                90,
+            ));
+            assert_eq!(
+                state.utterances[0].verdict,
+                Some(LiveVerdict::Corrected {
+                    text: "hello world".to_owned()
+                })
+            );
+            assert_eq!(
+                state.transcript_lines(),
+                ["#7      1.00s  helo wrld\n             ✎ hello world"]
+            );
+            state.apply(
+                &serde_json::json!({"event": "run_error", "message": "capture device lost"}),
+            );
+            assert_eq!(
+                state.finished.as_deref(),
+                Some("error: capture device lost")
+            );
+        }
+
+        #[test]
+        fn live_state_bounds_retained_utterances() {
+            let mut state = LiveSessionState::default();
+            for id in 1..=(LIVE_MAX_UTTERANCES as u64 + 5) {
+                state.apply(&serde_json::json!({"event": "speech_started", "utterance_id": id}));
+            }
+            assert_eq!(state.utterances.len(), LIVE_MAX_UTTERANCES);
+            assert_eq!(state.utterances.front().map(|u| u.id), Some(6));
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use std::path::PathBuf;
@@ -2715,10 +3240,11 @@ mod enabled {
             let last_run_id = app.runs[3].run_id.clone();
 
             // Delete that run from the DB via raw SQL.
-            let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+            let conn = crate::storage::BlockingConnection::open(db_path.display().to_string())
+                .expect("conn");
             conn.execute_with_params(
                 "DELETE FROM runs WHERE id = ?1",
-                &[fsqlite_types::value::SqliteValue::Text(last_run_id)],
+                &[fsqlite_types::value::SqliteValue::Text(last_run_id.into())],
             )
             .expect("delete run");
 
@@ -2759,12 +3285,12 @@ mod enabled {
 
             let store = RunStore::open(&db_path).expect("store");
             store
-                .connection
+                .connection()
                 .execute_with_params(
                     "UPDATE runs SET warnings_json = ?1 WHERE id = ?2",
                     &[
-                        SqliteValue::Text("{bad json".to_owned()),
-                        SqliteValue::Text("run-001".to_owned()),
+                        SqliteValue::Text("{bad json".to_owned().into()),
+                        SqliteValue::Text("run-001".to_owned().into()),
                     ],
                 )
                 .expect("corrupt selected run");
@@ -5338,10 +5864,18 @@ mod enabled {
 }
 
 #[cfg(feature = "tui")]
-pub use enabled::run_tui;
+pub use enabled::{run_live_listen_tui, run_tui};
 
 #[cfg(not(feature = "tui"))]
 pub fn run_tui() -> FwResult<()> {
+    Err(FwError::Unsupported(
+        "tui feature is disabled; rebuild with `--features tui`".to_owned(),
+    ))
+}
+
+/// Live listen view; requires the `tui` feature.
+#[cfg(not(feature = "tui"))]
+pub fn run_live_listen_tui(_config: crate::listen::ListenConfig) -> FwResult<()> {
     Err(FwError::Unsupported(
         "tui feature is disabled; rebuild with `--features tui`".to_owned(),
     ))
