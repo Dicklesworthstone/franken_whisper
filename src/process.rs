@@ -1051,6 +1051,7 @@ fn terminate_descendant_process_tree(
         loop {
             match rustix::process::test_kill_process_group(process_group) {
                 Err(error) if error == rustix::io::Errno::SRCH => break,
+                Ok(()) if process_group_members_are_all_reaped_zombies(process_group) => break,
                 Err(error) if error == rustix::io::Errno::INTR && Instant::now() < deadline => {
                     // Signal probes can be interrupted on Unix. That says
                     // nothing about whether the group survived; retry within
@@ -1079,6 +1080,88 @@ fn terminate_descendant_process_tree(
         }
     }
     Ok(())
+}
+
+/// Whether every process still carrying `process_group` as its process group
+/// is a dead zombie.
+///
+/// After `SIGKILL`, a descendant reparented to an init that never reaps (PID 1
+/// in many containers runs no reaper) lingers as a zombie: it executes nothing
+/// and holds no memory, CPU, or file descriptors, but keeps the group ID alive
+/// for a `kill(-pgid, 0)` probe forever. Such a group is fully terminated. A
+/// zombie thread-group leader whose other threads still run is not dead, so a
+/// member counts only when its state is `Z`/`X` with a single thread.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_group_members_are_all_reaped_zombies(process_group: rustix::process::Pid) -> bool {
+    let target = process_group.as_raw_nonzero().get();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    let mut saw_member = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .is_some_and(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        // A process that exits between listing and reading is no longer a
+        // member; any other unreadable entry is judged by its absence.
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(member) = parse_proc_stat_group_member(&stat) else {
+            return false;
+        };
+        if member.process_group != target {
+            continue;
+        }
+        saw_member = true;
+        if !member.is_dead_zombie() {
+            return false;
+        }
+    }
+    saw_member
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn process_group_members_are_all_reaped_zombies(_process_group: rustix::process::Pid) -> bool {
+    false
+}
+
+/// The `/proc/<pid>/stat` fields that decide process-group liveness.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcStatGroupMember {
+    state: char,
+    process_group: i32,
+    num_threads: i64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+impl ProcStatGroupMember {
+    fn is_dead_zombie(self) -> bool {
+        matches!(self.state, 'Z' | 'X') && self.num_threads <= 1
+    }
+}
+
+/// Parse state, process group, and thread count from a `/proc/<pid>/stat`
+/// line. The command name is parenthesized and may itself contain spaces or
+/// parentheses, so fields are read after its last `)`.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn parse_proc_stat_group_member(stat: &str) -> Option<ProcStatGroupMember> {
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = after_comm.split_ascii_whitespace().collect();
+    // Field numbers from proc(5): 3 state, 5 pgrp, 20 num_threads.
+    let state = fields.first()?.chars().next()?;
+    let process_group = fields.get(2)?.parse().ok()?;
+    let num_threads = fields.get(17)?.parse().ok()?;
+    Some(ProcStatGroupMember {
+        state,
+        process_group,
+        num_threads,
+    })
 }
 
 #[cfg(windows)]
@@ -1819,11 +1902,55 @@ mod tests {
 
     #[cfg(unix)]
     use super::run_command_cancellable_with_input_probe_and_observer;
+    use super::{ProcStatGroupMember, parse_proc_stat_group_member};
     use super::{
         cancellable_poll_delay, command_error_diagnostics_with_environment, render_command_for_log,
         run_command_cancellable, run_command_cancellable_with_input_and_probe,
         run_command_cancellable_with_probe, sensitive_arg_values,
     };
+
+    #[test]
+    fn proc_stat_parser_reads_fields_after_a_hostile_command_name() {
+        // A zombie as reported by Linux, with a command name containing spaces
+        // and parentheses that must not shift the field positions.
+        let stat = "81 (sh (x) y) Z 1 81 0 0 -1 4227340 94 203 30 11 0 2 0 1 20 0 1 0 272 \
+                    0 0 18446744073709551615 0 0 0 0 0 0 0 0 65538 1 0 0 17 2 0 0 0 0 0";
+        let member = parse_proc_stat_group_member(stat).expect("parse");
+        assert_eq!(
+            member,
+            ProcStatGroupMember {
+                state: 'Z',
+                process_group: 81,
+                num_threads: 1,
+            }
+        );
+        assert!(member.is_dead_zombie());
+    }
+
+    #[test]
+    fn only_single_threaded_zombies_count_as_dead_group_members() {
+        let running = ProcStatGroupMember {
+            state: 'S',
+            process_group: 7,
+            num_threads: 1,
+        };
+        assert!(!running.is_dead_zombie());
+        // A zombie leader whose other threads still run is alive.
+        let zombie_leader_with_threads = ProcStatGroupMember {
+            state: 'Z',
+            process_group: 7,
+            num_threads: 3,
+        };
+        assert!(!zombie_leader_with_threads.is_dead_zombie());
+        let dead = ProcStatGroupMember {
+            state: 'X',
+            process_group: 7,
+            num_threads: 0,
+        };
+        assert!(dead.is_dead_zombie());
+        assert_eq!(parse_proc_stat_group_member("12 (truncated"), None);
+        assert_eq!(parse_proc_stat_group_member("12 (sh) Z 1"), None);
+    }
 
     struct PlatformCommand {
         program: &'static str,
