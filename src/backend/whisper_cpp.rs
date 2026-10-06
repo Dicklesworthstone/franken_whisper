@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backend::{extract_segments_from_json, transcript_from_segments};
@@ -10,7 +10,9 @@ use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, OutputFormat, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
 };
-use crate::process::{command_exists, run_command_cancellable, run_command_with_timeout};
+use crate::process::{
+    command_exists, run_command_cancellable, run_command_with_timeout, utf8_path_arg,
+};
 
 const DEFAULT_WHISPER_CPP_BIN: &str = "whisper-cli";
 
@@ -31,6 +33,18 @@ pub fn run(
 ) -> FwResult<TranscriptionResult> {
     let binary = binary();
     let output_prefix = work_dir.join("whispercpp_output");
+    // `build_args` renders paths into String argv; reject any path that would
+    // not survive that conversion byte-for-byte.
+    utf8_path_arg(normalized_wav)?;
+    utf8_path_arg(&output_prefix)?;
+    if let Some(model_path) = request
+        .backend_params
+        .vad
+        .as_ref()
+        .and_then(|vad| vad.model_path.as_deref())
+    {
+        utf8_path_arg(model_path)?;
+    }
     let args = build_args(request, normalized_wav, &output_prefix);
 
     if let Some(tok) = token {
@@ -39,7 +53,7 @@ pub fn run(
         run_command_with_timeout(&binary, &args, None, Some(timeout))?;
     }
 
-    let json_path = Path::new(&format!("{}.json", output_prefix.display())).to_path_buf();
+    let json_path = prefixed_artifact_path(&output_prefix, "json");
     if !json_path.exists() {
         return Err(FwError::MissingArtifact(json_path));
     }
@@ -65,7 +79,7 @@ pub fn run(
     let mut artifact_paths = vec![json_path.display().to_string()];
     for fmt in &request.backend_params.output_formats {
         let ext = output_format_extension(*fmt);
-        let candidate = Path::new(&format!("{}.{ext}", output_prefix.display())).to_path_buf();
+        let candidate = prefixed_artifact_path(&output_prefix, ext);
         if candidate.exists() {
             artifact_paths.push(candidate.display().to_string());
         }
@@ -81,6 +95,15 @@ pub fn run(
         raw_output: raw,
         artifact_paths,
     })
+}
+
+/// `<prefix>.<ext>`, the artifact name `whisper-cli -of <prefix>` writes,
+/// built from the prefix's exact OS bytes rather than its display string.
+fn prefixed_artifact_path(output_prefix: &Path, ext: &str) -> PathBuf {
+    let mut path = output_prefix.as_os_str().to_owned();
+    path.push(".");
+    path.push(ext);
+    PathBuf::from(path)
 }
 
 /// Canonicalize the one degenerate timestamp shape that `whisper-cli` can

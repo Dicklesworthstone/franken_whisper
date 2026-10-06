@@ -5,7 +5,9 @@ use std::time::Duration;
 use crate::backend::{extract_segments_from_json, transcript_from_segments};
 use crate::error::{FwError, FwResult};
 use crate::model::{BackendKind, SpeakerCountRequest, TranscribeRequest, TranscriptionResult};
-use crate::process::{command_exists, run_command_cancellable, run_command_with_timeout};
+use crate::process::{
+    command_exists, run_command_cancellable, run_command_with_timeout, utf8_path_arg,
+};
 
 const DEFAULT_BIN: &str = "insanely-fast-whisper";
 
@@ -32,6 +34,10 @@ pub fn run(
     {
         fs::create_dir_all(parent)?;
     }
+    // `build_args` renders paths into String argv; reject any path that would
+    // not survive that conversion byte-for-byte.
+    utf8_path_arg(normalized_wav)?;
+    utf8_path_arg(&output_path)?;
     let args = build_args(request, normalized_wav, &output_path);
 
     if let Some(tok) = token {

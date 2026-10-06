@@ -6,7 +6,9 @@ use serde_json::json;
 
 use crate::error::{FwError, FwResult};
 use crate::model::{BackendKind, TranscribeRequest, TranscriptionResult, TranscriptionSegment};
-use crate::process::{command_exists, run_command_cancellable, run_command_with_timeout};
+use crate::process::{
+    command_exists, run_command_cancellable, run_command_with_timeout, utf8_path_arg,
+};
 
 const DEFAULT_PYTHON_BIN: &str = "python3";
 
@@ -36,9 +38,9 @@ pub fn run(
     let bp = &request.backend_params;
 
     let mut args = vec![
-        script.display().to_string(),
+        utf8_path_arg(&script)?.to_owned(),
         "-a".to_owned(),
-        local_audio.display().to_string(),
+        utf8_path_arg(&local_audio)?.to_owned(),
     ];
 
     if let Some(language) = &request.language {

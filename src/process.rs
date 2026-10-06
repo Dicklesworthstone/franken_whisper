@@ -253,6 +253,25 @@ pub fn command_exists(program: &str) -> bool {
     which::which(program).is_ok()
 }
 
+/// Borrow `path` as an exact UTF-8 command-line argument (bd-dckt).
+///
+/// External tools receive `String` argv, and `Path::display` replaces
+/// non-UTF-8 bytes, which would silently point the tool at a different
+/// (nonexistent or colliding) file. Such a path is rejected instead.
+///
+/// # Errors
+///
+/// Returns [`FwError::InvalidRequest`] when `path` is not valid UTF-8.
+pub(crate) fn utf8_path_arg(path: &Path) -> FwResult<&str> {
+    path.to_str().ok_or_else(|| {
+        FwError::InvalidRequest(format!(
+            "path `{}` is not valid UTF-8 and cannot be passed to an external tool \
+             without changing which file it names",
+            path.display()
+        ))
+    })
+}
+
 pub fn run_command(program: &str, args: &[String], cwd: Option<&Path>) -> FwResult<Output> {
     run_command_with_timeout(program, args, cwd, None)
 }
@@ -1902,7 +1921,31 @@ mod tests {
 
     #[cfg(unix)]
     use super::run_command_cancellable_with_input_probe_and_observer;
-    use super::{ProcStatGroupMember, parse_proc_stat_group_member};
+    use super::{ProcStatGroupMember, parse_proc_stat_group_member, utf8_path_arg};
+
+    #[test]
+    fn utf8_path_arg_is_exact_for_utf8_paths() {
+        let path = std::path::Path::new("/tmp/caf\u{e9} dir/input.wav");
+        assert_eq!(
+            utf8_path_arg(path).expect("utf-8 path"),
+            "/tmp/caf\u{e9} dir/input.wav"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn utf8_path_arg_rejects_paths_display_would_rewrite() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // `Path::display` would turn the 0xFF byte into U+FFFD and name a
+        // different file; the command boundary must refuse instead.
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/in\xFFput.wav"));
+        let error = utf8_path_arg(path).expect_err("non-UTF-8 path must be rejected");
+        assert!(
+            matches!(error, crate::error::FwError::InvalidRequest(_)),
+            "{error:?}"
+        );
+    }
     use super::{
         cancellable_poll_delay, command_error_diagnostics_with_environment, render_command_for_log,
         run_command_cancellable, run_command_cancellable_with_input_and_probe,
