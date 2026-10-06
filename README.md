@@ -99,7 +99,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
   for video and exotic codecs, and is auto-provisioned on Linux x86_64 if
   missing.
 - **Native engine rollout governance.** In-process Rust replacements follow a 5-stage rollout (Shadow → Validated → Fallback → Primary → Sole). The shipped default is `Sole`, so bridges run only after an explicit operator opt-out or rollout override.
-- **TTY audio transport.** Compressed audio (mu-law + zlib + base64) over PTY links with handshake, integrity hashes, deterministic retransmission, and an adaptive bitrate controller. Transcript-streaming control frames (protocol v2) carry speculation events end-to-end over the same link.
+- **TTY audio transport.** Compressed audio (mu-law + zlib + base64) over PTY links with handshake, integrity hashes, deterministic retransmission, and an adaptive bitrate controller. A transcript-streaming control-frame vocabulary (protocol v2) is defined with library emitters and parsers; no CLI command yet streams a live transcription over the link (handshakes still negotiate v1).
 - **Word-level timestamps.** First-class support via `whisper.cpp`'s word-timestamp pipeline, with the cancellation token threaded into the inner extraction loop.
 
 ### Why franken_whisper?
@@ -2472,7 +2472,7 @@ link_quality   = 1.0 - frame_loss_rate
 
 Quality transitions trigger compression changes on subsequent frames; this gives automatic adaptation without manual tuning.
 
-**Transcript Streaming over TTY (Protocol v2).** Beyond raw audio, the TTY protocol supports real-time transcript streaming via three control frame types:
+**Transcript Streaming over TTY (Protocol v2, library-level).** Beyond raw audio, the TTY protocol defines three transcript control frame types. The library can emit and parse them (`tty_audio::emit_tty_transcript_*`), but no CLI command currently produces them from a live or speculative run, and handshakes still negotiate protocol v1:
 
 | Frame Type | Direction | Purpose |
 |------------|-----------|---------|
@@ -3793,7 +3793,7 @@ cleanup is verified; if cleanup cannot be certified, the command returns an
 error that retains the original cancellation outcome.
 
 **Q: What's the TTY audio module for?**
-It enables audio transport over constrained TTY/PTY links where binary data can't flow directly. Audio is compressed (mu-law + zlib), base64-encoded, and transmitted as NDJSON lines with sequence numbers, CRC32, and SHA-256 integrity hashes. Protocol v2 also carries transcript streaming control frames, so speculative transcription can run end-to-end over the same link.
+It enables audio transport over constrained TTY/PTY links where binary data can't flow directly. Audio is compressed (mu-law + zlib), base64-encoded, and transmitted as NDJSON lines with sequence numbers, CRC32, and SHA-256 integrity hashes. Protocol v2 also defines transcript control frames (partial / retract / correct) with library emitters and parsers; wiring a live CLI producer onto the link is not done yet.
 
 **Q: How does the Bayesian router differ from a simple priority list?**
 A priority list always tries backends in the same order. The Bayesian router learns from outcomes: if a backend starts failing, its posterior degrades and traffic shifts to alternatives. When the model is poorly calibrated (Brier > 0.35), it falls back to static priority automatically, but **continues recording calibration observations** so it can resume adaptive routing once the data improves.
@@ -4071,7 +4071,7 @@ The conformance harness compares segment output across engines using a 50 ms can
 
 ### End-to-end dual-model speculative streaming
 
-A fast model and a quality model run in parallel on overlapping windows; partial transcripts emit immediately and corrections issue when the quality model disagrees. The `CorrectionTracker` adaptively adjusts confirmation thresholds, and the entire speculation flow can run over a TTY link via protocol v2 transcript control frames.
+A fast model and a quality model run in parallel on overlapping windows; partial transcripts emit immediately and corrections issue when the quality model disagrees. The `CorrectionTracker` adaptively adjusts confirmation thresholds. Speculation events stream into the robot NDJSON log as they are produced; the protocol v2 TTY transcript frames that could carry them over a TTY link exist at the library level only.
 
 ### Full audit trail on every run
 

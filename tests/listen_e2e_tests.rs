@@ -157,6 +157,12 @@ fn confirm_lane_e2e_turbo_verifies_fast_lane_utterances() {
         "large-v3-turbo",
         "--policy",
         "alignatt",
+        // Unpaced replay finishes the fast lane in seconds, so the default
+        // 10 s wall-clock drain abandons every verdict on hosts where one
+        // turbo confirm (model load + full-window encode) takes longer. This
+        // test asserts verdict content, not latency: give the drain its cap.
+        "--confirm-drain-sec",
+        "3600",
     ]);
     assert_eq!(code, 0, "listen session must exit 0; stderr:\n{stderr}");
     NdjsonStreamValidator::new(StreamOutcome::Success)
