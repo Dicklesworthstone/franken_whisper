@@ -1933,21 +1933,28 @@ fn make_segment(
 // Tail-window encoder-context truncation (whisper.cpp's audio_ctx / -ac feature)
 // ---------------------------------------------------------------------------
 
-/// Whether tail-window encoder-context truncation is enabled.
+/// Whether tail-window encoder-context truncation is enabled (opt-in).
 ///
 /// Controlled by the `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE` environment
 /// variable, read **once** (process-lifetime cached via [`OnceLock`]):
-/// - unset / any value other than `"0"`/`"false"` ⇒ **enabled** (the default).
-/// - `"0"` or `"false"` (ASCII-case-insensitive) ⇒ **disabled**, restoring the
-///   exact pre-optimization behavior (every window runs a full 3000-frame /
-///   1500-ctx encoder pass). This is the kill switch / golden-equivalence
-///   escape hatch.
+/// - unset, `"0"`, or `"false"` (ASCII-case-insensitive) ⇒ **disabled** (the
+///   default): every window runs the full 3000-frame / 1500-ctx encoder pass,
+///   exactly like whisper.cpp's default.
+/// - any other value ⇒ **enabled**: non-first partial tail windows encode only
+///   their real audio (`audio_ctx`-style speed lever).
+///
+/// DEFAULT OFF (DISC-004, 2026-10-06): a truncated tail context makes the
+/// decoder hallucinate prior content. large-v3-turbo on JFK×4 emitted a fifth,
+/// verbatim copy of the sentence inside the 0.62 s final window (floors of 64,
+/// 250, and 500 encoder frames all did; only the full context did not), and
+/// tiny.en on gapless JFK×3 re-rendered the final tile (the long-red bd-4ep1
+/// pin). Full context matched whisper.cpp v1.8.2 on every fixture measured.
 fn tail_truncate_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE")
-            .map_or(true, |v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .is_ok_and(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
     })
 }
 
@@ -6699,6 +6706,60 @@ mod tests {
             ranked[0].1 > 0.9,
             "p(en) must be dominant (~0.96 oracle), got {:.4}",
             ranked[0].1
+        );
+    }
+
+    /// DISC-004 regression: JFK ×4 with 1.5 s digital-silence gaps ends in a
+    /// 0.62 s final window. With a truncated tail encoder context turbo
+    /// hallucinated a fifth verbatim copy of the sentence there (47.88-47.90 s);
+    /// whisper.cpp v1.8.2 emits exactly four segments ending at 47.88 s, as the
+    /// default full-context tail must.
+    #[test]
+    fn gated_turbo_tiled_jfk_final_window_emits_no_repeat() {
+        if !super::super::implicit_home_models_enabled() {
+            eprintln!("SKIP gated_turbo_tiled_jfk_tail: ultra stress mode is disabled");
+            return;
+        }
+        let Some(path) = super::super::find_model_file("large-v3-turbo") else {
+            eprintln!("SKIP gated_turbo_tiled_jfk_tail: ggml-large-v3-turbo.bin not found");
+            return;
+        };
+        let Some(jfk) = load_jfk_samples() else {
+            eprintln!("SKIP gated_turbo_tiled_jfk_tail: jfk.wav missing");
+            return;
+        };
+        let gap = vec![0.0_f32; SAMPLE_RATE * 3 / 2];
+        let mut tiled = jfk.clone();
+        for _ in 0..3 {
+            tiled.extend_from_slice(&gap);
+            tiled.extend_from_slice(&jfk);
+        }
+        let model = GgmlModel::load(&path).expect("load turbo");
+        let loaded = LoadedModel::from_ggml(model).expect("build turbo engine");
+        let params = DecodeParams {
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+        let out = transcribe_samples(&loaded, &tiled, &params, &noop)
+            .expect("transcribe tiled jfk on turbo");
+        let country: usize = out
+            .segments
+            .iter()
+            .map(|s| s.text.to_lowercase().matches("country").count())
+            .sum();
+        assert_eq!(
+            country, 8,
+            "four spoken sentences must render exactly four times: {:?}",
+            out.segments
+        );
+        let last_end = out
+            .segments
+            .last()
+            .and_then(|s| s.end_sec)
+            .expect("timed segments");
+        assert!(
+            (last_end - 47.88).abs() <= 0.1,
+            "final segment must end where the speech does (wc 47.88 s), got {last_end}"
         );
     }
 

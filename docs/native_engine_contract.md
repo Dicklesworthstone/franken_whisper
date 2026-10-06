@@ -372,15 +372,16 @@ Set `FRANKEN_WHISPER_PERF_SPANS=1` to emit per-stage timing spans
 `version_tag`, …) on stderr as NDJSON, for the profile-driven optimization
 loop. Off by default (zero overhead — a single `OnceLock`-cached env read).
 
-### 8.3 Tail-truncation kill switch
+### 8.3 Tail-truncation opt-in
 
-`FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE=0` (or `false`, read once via
-`OnceLock`) disables the default-on tail-window encoder-context truncation,
-restoring exact full-pad (3000-frame / 1500-ctx) behavior — verified
-byte-identical to the goldens for both tiny.en and large-v3-turbo. The
-lever mirrors whisper.cpp's sanctioned `audio_ctx` / `-ac` optimization,
-never touches the content-bearing first window, and confines its output
-divergence to spurious trailing-silence hallucinations on tail windows.
+Tail-window encoder-context truncation is **off by default**: every window,
+including a file's short final window, runs the full-pad (3000-frame /
+1500-ctx) encoder pass exactly like whisper.cpp's default. Setting
+`FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE` to any value other than `0`/`false`
+(read once via `OnceLock`) opts in to the `audio_ctx`-style truncation of
+non-first partial windows — faster, but measured to hallucinate repeated
+content in short final windows and to stretch final end timestamps, so it
+is not transcript-equivalent.
 Full accuracy/precision analysis: `DISCREPANCIES.md` **DISC-004**.
 
 ### 8.4 Promotion-criteria status (RTF gate)

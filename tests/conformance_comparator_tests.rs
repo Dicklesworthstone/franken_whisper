@@ -1619,17 +1619,11 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
                     let seek_cs = seek_cs_rounded as usize;
                     let remaining_real_frames = input_real_frames.saturating_sub(seek_cs).min(3000);
                     let enc_ctx = match policy {
-                        // Full preserves the historical default: the first
-                        // seek is padded, while later partial tails use the
-                        // original 64-frame-floor truncation math.
-                        native_engine::decode::AudioCtxPolicy::Full
-                            if seek_cs == 0 || remaining_real_frames >= 3000 =>
-                        {
-                            1500
-                        }
-                        native_engine::decode::AudioCtxPolicy::Full => {
-                            remaining_real_frames.div_ceil(2).clamp(64, 1500)
-                        }
+                        // Full is the whisper.cpp default: every seek, tail
+                        // included, encodes the full padded window (the
+                        // opt-in tail truncation env flag is asserted unset
+                        // above; DISC-004).
+                        native_engine::decode::AudioCtxPolicy::Full => 1500,
                         reduced => reduced.effective_enc_ctx(remaining_real_frames),
                     };
                     enc_ctx * 2
@@ -1645,8 +1639,8 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
     //
     // Segmentation can differ by policy (a slightly different transcript can
     // move the final timestamp and spawn an extra tail seek), so derive every
-    // exact aggregate from the observed seeks. Full retains the historical
-    // full-first/default-tail rule; Auto's 512-frame quality floor and Fixed's
+    // exact aggregate from the observed seeks. Full encodes every seek at full
+    // context; Auto's 512-frame quality floor and Fixed's
     // shrink-to-real semantics remain part of their expectations.
     assert_policy_work(
         "whole-jfk Full",
