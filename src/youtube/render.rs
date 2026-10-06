@@ -225,16 +225,115 @@ fn format_upload_date(raw: &str) -> String {
     }
 }
 
-/// Append the title as a single normalized Markdown H1.
-fn push_title_heading(out: &mut String, title: &str) {
-    out.push_str("# ");
-    let mut first = true;
-    for word in title.split_whitespace() {
-        if !first {
+/// Characters that can open or close an inline Markdown/HTML construct
+/// anywhere in a line — code spans, emphasis, strikethrough, links and images,
+/// raw HTML and autolinks, entity references — plus the escape character.
+fn is_inline_markdown_active(ch: char) -> bool {
+    matches!(
+        ch,
+        '\\' | '`' | '*' | '_' | '~' | '[' | ']' | '<' | '>' | '&'
+    )
+}
+
+/// Append one whitespace-free word as inert Markdown text.
+///
+/// Every inline-active character is backslash-escaped, except an underscore
+/// between two alphanumerics (`whisper_cpp`), which CommonMark never treats as
+/// emphasis.
+fn push_inert_word(out: &mut String, word: &str) {
+    let mut previous: Option<char> = None;
+    let mut chars = word.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let intraword_underscore = ch == '_'
+            && previous.is_some_and(char::is_alphanumeric)
+            && chars.peek().is_some_and(|next| next.is_alphanumeric());
+        if is_inline_markdown_active(ch) && !intraword_underscore {
+            out.push('\\');
+        }
+        out.push(ch);
+        previous = Some(ch);
+    }
+}
+
+/// Append untrusted text (titles, channels, descriptions, speaker labels,
+/// transcript text) as inert Markdown prose (bd-xpns).
+///
+/// Whitespace runs, including newlines, collapse to one space so the text can
+/// never end the current block or start a new one, and inline constructs are
+/// escaped (see [`push_inert_word`]). Returns whether anything was written.
+fn push_inert_markdown(out: &mut String, text: &str) -> bool {
+    let mut wrote = false;
+    for word in text.split_whitespace() {
+        if wrote {
             out.push(' ');
         }
-        out.push_str(word);
-        first = false;
+        push_inert_word(out, word);
+        wrote = true;
+    }
+    wrote
+}
+
+/// Like [`push_inert_markdown`] for text that begins a block (the quoted
+/// description intro): a leading ATX heading, list, thematic-break, setext, or
+/// table marker is escaped too, so the text stays a plain paragraph.
+fn push_inert_markdown_block(out: &mut String, text: &str) {
+    for (index, word) in text.split_whitespace().enumerate() {
+        if index > 0 {
+            out.push(' ');
+            push_inert_word(out, word);
+            continue;
+        }
+        let digits = word.bytes().take_while(u8::is_ascii_digit).count();
+        if (1..=9).contains(&digits) && matches!(word.as_bytes().get(digits), Some(b'.' | b')')) {
+            // Ordered-list marker such as `1.` or `2)`.
+            out.push_str(&word[..digits]);
+            out.push('\\');
+            push_inert_word(out, &word[digits..]);
+        } else {
+            if word.starts_with(['#', '-', '+', '=', '|']) {
+                out.push('\\');
+            }
+            push_inert_word(out, word);
+        }
+    }
+}
+
+/// Append a link destination that cannot break out of `(...)`: characters a
+/// plain CommonMark destination cannot hold verbatim are percent-encoded.
+/// Ordinary `https://` watch URLs pass through unchanged.
+fn push_link_destination(out: &mut String, url: &str) {
+    use std::fmt::Write as _;
+
+    for byte in url.bytes() {
+        if byte.is_ascii_control()
+            || byte == b' '
+            || matches!(byte, b'<' | b'>' | b'(' | b')' | b'\\' | b'`' | b'"')
+        {
+            write!(out, "%{byte:02X}").expect("writing to a String cannot fail");
+        } else if byte.is_ascii() {
+            out.push(char::from(byte));
+        } else {
+            // Non-ASCII bytes are valid in a destination, but encode them so
+            // the output never splits a UTF-8 sequence across escapes.
+            write!(out, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+}
+
+/// Append the title as a single normalized, inert Markdown H1.
+fn push_title_heading(out: &mut String, title: &str) {
+    out.push_str("# ");
+    let words: Vec<&str> = title.split_whitespace().collect();
+    for (index, word) in words.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        // A final all-`#` word would be read as the heading's closing sequence
+        // and silently dropped.
+        if index + 1 == words.len() && index > 0 && word.bytes().all(|b| b == b'#') {
+            out.push('\\');
+        }
+        push_inert_word(out, word);
     }
     out.push_str("\n\n");
 }
@@ -249,7 +348,7 @@ fn push_metadata_line(out: &mut String, video: &RenderVideo) {
         .filter(|channel| !channel.trim().is_empty())
     {
         out.push_str("**Channel:** ");
-        out.push_str(channel);
+        push_inert_markdown(out, channel);
         has_part = true;
     }
     if let Some(date) = video
@@ -261,7 +360,7 @@ fn push_metadata_line(out: &mut String, video: &RenderVideo) {
             out.push_str(" · ");
         }
         out.push_str("**Uploaded:** ");
-        out.push_str(&format_upload_date(date));
+        push_inert_markdown(out, &format_upload_date(date));
         has_part = true;
     }
     if let Some(duration) = video.duration_sec {
@@ -287,9 +386,9 @@ fn push_source_line(out: &mut String, video: &RenderVideo, run: &RenderRun) {
         .unwrap_or(&video.webpage_url);
 
     out.push_str("**Source:** [");
-    out.push_str(display_url);
+    push_inert_markdown(out, display_url);
     out.push_str("](");
-    out.push_str(&video.webpage_url);
+    push_link_destination(out, &video.webpage_url);
     out.push_str(") · **Transcribed:** franken_whisper");
     if let Some(tag) = run
         .version_tag
@@ -297,12 +396,12 @@ fn push_source_line(out: &mut String, video: &RenderVideo, run: &RenderRun) {
         .filter(|tag| !tag.trim().is_empty())
     {
         out.push(' ');
-        out.push_str(tag);
+        push_inert_markdown(out, tag);
     }
     out.push_str(" (");
-    out.push_str(&run.engine);
+    push_inert_markdown(out, &run.engine);
     out.push_str(", ");
-    out.push_str(&run.model);
+    push_inert_markdown(out, &run.model);
     out.push(')');
     if let Some(rtf) = run.rtf {
         out.push_str(" · RTF ");
@@ -419,7 +518,7 @@ fn paragraph_text(p: &Paragraph<'_>) -> String {
         if !out.is_empty() {
             out.push(' ');
         }
-        out.push_str(piece);
+        push_inert_markdown(&mut out, piece);
     }
     out
 }
@@ -439,7 +538,7 @@ fn push_paragraph_text(out: &mut String, p: &Paragraph<'_>) -> bool {
         if wrote_text {
             out.push(' ');
         }
-        out.push_str(piece);
+        push_inert_markdown(out, piece);
         wrote_text = true;
     }
     wrote_text
@@ -490,7 +589,7 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
     // Optional description intro.
     if let Some(intro) = description_intro(v.description.as_deref()) {
         out.push_str("> ");
-        out.push_str(&intro);
+        push_inert_markdown_block(&mut out, &intro);
         out.push_str("\n\n");
     }
 
@@ -507,7 +606,7 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
             push_timestamp_link(&mut out, &v.id, p.start_sec);
             if let Some(spk) = p.speaker.filter(|s| !s.trim().is_empty()) {
                 out.push(' ');
-                out.push_str(spk);
+                push_inert_markdown(&mut out, spk);
                 out.push(':');
             }
             out.push(' ');
@@ -535,14 +634,21 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
 
 /// Footer line: full provenance including backend, wall time, and RTF.
 fn footer_line(r: &RenderRun) -> String {
+    let inert = |text: &str| {
+        let mut escaped = String::with_capacity(text.len());
+        push_inert_markdown(&mut escaped, text);
+        escaped
+    };
     let version = match r.version_tag.as_deref().filter(|t| !t.trim().is_empty()) {
-        Some(tag) => format!("franken_whisper {tag}"),
+        Some(tag) => format!("franken_whisper {}", inert(tag)),
         None => "franken_whisper".to_owned(),
     };
     let wall = format_wall(r.wall_ms);
     let mut s = format!(
         "Transcribed by {version} ({}, {}, {}) in {wall}",
-        r.engine, r.model, r.backend
+        inert(&r.engine),
+        inert(&r.model),
+        inert(&r.backend)
     );
     if let Some(rtf) = r.rtf {
         s.push_str(&format!(" — RTF {}", format_rtf(rtf)));
@@ -863,9 +969,28 @@ mod tests {
             .join(",")
     }
 
+    fn historical_inert(text: &str) -> String {
+        let mut escaped = String::new();
+        push_inert_markdown(&mut escaped, text);
+        escaped
+    }
+
     fn historical_push_title_heading(out: &mut String, title: &str) {
+        let words: Vec<&str> = title.split_whitespace().collect();
+        let rendered: Vec<String> = words
+            .iter()
+            .enumerate()
+            .map(|(index, word)| {
+                let mut rendered = String::new();
+                if index + 1 == words.len() && index > 0 && word.bytes().all(|b| b == b'#') {
+                    rendered.push('\\');
+                }
+                push_inert_word(&mut rendered, word);
+                rendered
+            })
+            .collect();
         out.push_str("# ");
-        out.push_str(&title.split_whitespace().collect::<Vec<_>>().join(" "));
+        out.push_str(&rendered.join(" "));
         out.push_str("\n\n");
     }
 
@@ -876,14 +1001,17 @@ mod tests {
             .as_deref()
             .filter(|channel| !channel.trim().is_empty())
         {
-            parts.push(format!("**Channel:** {channel}"));
+            parts.push(format!("**Channel:** {}", historical_inert(channel)));
         }
         if let Some(date) = video
             .upload_date
             .as_deref()
             .filter(|date| !date.trim().is_empty())
         {
-            parts.push(format!("**Uploaded:** {}", format_upload_date(date)));
+            parts.push(format!(
+                "**Uploaded:** {}",
+                historical_inert(&format_upload_date(date))
+            ));
         }
         if let Some(duration) = video.duration_sec {
             parts.push(format!("**Duration:** {}", format_duration(duration)));
@@ -900,8 +1028,17 @@ mod tests {
             .as_deref()
             .filter(|tag| !tag.trim().is_empty())
         {
-            Some(tag) => format!("franken_whisper {tag} ({}, {})", run.engine, run.model),
-            None => format!("franken_whisper ({}, {})", run.engine, run.model),
+            Some(tag) => format!(
+                "franken_whisper {} ({}, {})",
+                historical_inert(tag),
+                historical_inert(&run.engine),
+                historical_inert(&run.model)
+            ),
+            None => format!(
+                "franken_whisper ({}, {})",
+                historical_inert(&run.engine),
+                historical_inert(&run.model)
+            ),
         };
         let display_url = video
             .webpage_url
@@ -909,9 +1046,11 @@ mod tests {
             .or_else(|| video.webpage_url.strip_prefix("http://"))
             .unwrap_or(&video.webpage_url)
             .to_owned();
+        let mut destination = String::new();
+        push_link_destination(&mut destination, &video.webpage_url);
         let mut parts = vec![format!(
-            "**Source:** [{}]({})",
-            display_url, video.webpage_url
+            "**Source:** [{}]({destination})",
+            historical_inert(&display_url)
         )];
         parts.push(format!("**Transcribed:** {provider}"));
         if let Some(rtf) = run.rtf {
@@ -2413,5 +2552,109 @@ mod tests {
             "ORIGINAL",
             "original target contents must survive a failed persist"
         );
+    }
+
+    // -- bd-xpns: untrusted text renders as inert Markdown ------------------
+
+    #[test]
+    fn untrusted_text_cannot_inject_html_links_images_or_blocks() {
+        let mut video = sample_video();
+        video.title =
+            "<script>alert(1)</script> ![x](https://t.example/p.png) Episode #".to_owned();
+        video.channel = Some("[click](javascript:alert(1)) **bold**".to_owned());
+        video.description = Some("# Not a heading\n- not a list <img src=x onerror=y>".to_owned());
+        video.webpage_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ) [x](y".to_owned();
+        let segs = vec![
+            seg_spk(
+                0.0,
+                1.0,
+                "hello <b>bold</b>\n\n# fake heading",
+                "[S](u)",
+                0.9,
+            ),
+            seg_spk(1.0, 2.0, "`code` and ~~strike~~ & AT&T", "[S](u)", 0.9),
+        ];
+        let input = RenderInput {
+            video,
+            run: sample_run(),
+            segments: &segs,
+            windows: &[],
+        };
+        let md = render_markdown(&input);
+
+        assert!(md.starts_with(
+            "# \\<script\\>alert(1)\\</script\\> !\\[x\\](https://t.example/p.png) Episode \\#\n\n"
+        ), "{md}");
+        assert!(
+            md.contains("**Channel:** \\[click\\](javascript:alert(1)) \\*\\*bold\\*\\*"),
+            "{md}"
+        );
+        assert!(
+            md.contains("> \\# Not a heading - not a list \\<img src=x onerror=y\\>"),
+            "{md}"
+        );
+        assert!(
+            md.contains("](https://www.youtube.com/watch?v=dQw4w9WgXcQ%29%20[x]%28y)"),
+            "the source link destination must not close early: {md}"
+        );
+        assert!(md.contains(
+            "\\[S\\](u): hello \\<b\\>bold\\</b\\> # fake heading \\`code\\` and \\~\\~strike\\~\\~ \\& AT\\&T\n\n"
+        ), "{md}");
+        // No unescaped HTML opener survives anywhere in the document; our own
+        // markup never emits `<`.
+        let bytes = md.as_bytes();
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte == b'<' {
+                assert_eq!(
+                    bytes[index - 1],
+                    b'\\',
+                    "unescaped `<` at byte {index}: {md}"
+                );
+            }
+        }
+        // Untrusted newlines cannot open new blocks: every body line is ours.
+        assert!(!md.contains("\n# fake heading"), "{md}");
+    }
+
+    #[test]
+    fn ordinary_metadata_and_identifiers_stay_byte_identical() {
+        let mut out = String::new();
+        assert!(push_inert_markdown(
+            &mut out,
+            "SPEAKER_00 whisper_cpp large-v3 tiny.en v0.2.0 C++ 2024-01-15 café"
+        ));
+        assert_eq!(
+            out,
+            "SPEAKER_00 whisper_cpp large-v3 tiny.en v0.2.0 C++ 2024-01-15 café"
+        );
+        let mut destination = String::new();
+        push_link_destination(
+            &mut destination,
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1",
+        );
+        assert_eq!(
+            destination,
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1"
+        );
+    }
+
+    #[test]
+    fn edge_underscores_and_ordered_list_markers_are_escaped() {
+        let mut out = String::new();
+        push_inert_markdown(&mut out, "_emph_ snake_case __init__");
+        assert_eq!(out, "\\_emph\\_ snake_case \\_\\_init\\_\\_");
+
+        for (intro, expected) in [
+            ("1. first", "1\\. first"),
+            ("12) twelfth", "12\\) twelfth"),
+            ("--- rule", "\\--- rule"),
+            ("+ plus", "\\+ plus"),
+            ("2024 was great", "2024 was great"),
+            ("> quote", "\\> quote"),
+        ] {
+            let mut out = String::new();
+            push_inert_markdown_block(&mut out, intro);
+            assert_eq!(out, expected, "intro={intro:?}");
+        }
     }
 }
