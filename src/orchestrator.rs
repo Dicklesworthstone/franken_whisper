@@ -2739,7 +2739,19 @@ async fn execute_backend_speculative(
     // talks to the same engine (per design note above). Failures here surface
     // before any backend.start event is emitted so the stream layout matches
     // the pre-speculative dispatch path.
-    let resolved_backend = backend::resolve_static_backend(request)?;
+    //
+    // Resolve against the lane models actually requested: whether an engine
+    // can serve a request depends on the model it names, and the base request
+    // names none (its default model need not be installed). The quality lane
+    // is the merged transcript's authority, so it picks the engine; the fast
+    // lane must then be servable by that same engine.
+    let mut quality_probe = request.clone();
+    quality_probe.model = Some(spec_request.quality_model_name.clone());
+    let resolved_backend = backend::resolve_static_backend(&quality_probe)?;
+    let mut fast_probe = request.clone();
+    fast_probe.backend = resolved_backend;
+    fast_probe.model = Some(spec_request.fast_model_name.clone());
+    backend::resolve_static_backend(&fast_probe)?;
 
     // Convert the serde-friendly request shape into the execution-shape config.
     let spec_config = crate::streaming::SpeculativeConfig {

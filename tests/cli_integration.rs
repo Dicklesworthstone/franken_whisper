@@ -5872,6 +5872,109 @@ fn speculative_cli_multi_window_run_localizes_segments_and_streams_partials_firs
     );
 }
 
+/// Model-gated: speculative mode on the native engine with only the requested
+/// lane model installed. Backend resolution must consider the lane models
+/// (the default large-v3-turbo package is absent from this model dir), both
+/// lanes must report the native implementation, and the merged transcript
+/// must keep every JFK word at absolute, monotonic timestamps.
+#[test]
+fn speculative_native_lanes_resolve_by_lane_model_and_merge_in_absolute_time() {
+    let Ok(package) = franken_whisper::model_distribution::resolve_cached_fast_lane_with_cancel(
+        franken_whisper::model_distribution::FastLaneModel::TinyEn,
+        || false,
+    ) else {
+        eprintln!("SKIP speculative_native_lanes: tiny.en package missing (`fw pull tiny-en`)");
+        return;
+    };
+    let jfk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native/jfk.wav");
+    if !jfk.exists() {
+        eprintln!("SKIP speculative_native_lanes: tests/fixtures/native/jfk.wav missing");
+        return;
+    }
+    let dir = tempdir().expect("tempdir");
+    let model_dir = dir.path().join("models");
+    std::fs::create_dir_all(&model_dir).expect("model dir");
+    let model_copy = model_dir.join("ggml-tiny.en.bin");
+    if std::fs::hard_link(&package.weights_path, &model_copy).is_err() {
+        std::fs::copy(&package.weights_path, &model_copy).expect("copy tiny.en");
+    }
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args(["robot", "run", "--input"])
+        .arg(&jfk)
+        .args([
+            "--no-diarize",
+            "--no-persist",
+            "--backend",
+            "whisper-cpp",
+            "--speculative",
+            "--fast-model",
+            "tiny.en",
+            "--quality-model",
+            "tiny.en",
+            "--speculative-window-ms",
+            "4000",
+            "--speculative-overlap-ms",
+            "1000",
+            "--no-adaptive",
+        ])
+        .env("FRANKEN_WHISPER_MODEL_DIR", &model_dir)
+        .env("FRANKEN_WHISPER_STATE_DIR", dir.path().join("state"))
+        .env_remove("FRANKEN_WHISPER_TEST_MODEL_DIR")
+        .output()
+        .expect("run speculative native");
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf-8");
+    assert!(
+        output.status.success(),
+        "speculative native run failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with('{'))
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let backend_ok = events
+        .iter()
+        .find(|event| event["code"] == "backend.ok")
+        .expect("backend.ok");
+    assert_eq!(backend_ok["payload"]["implementation"], "native");
+    assert_eq!(backend_ok["payload"]["fast_lane_implementation"], "native");
+    assert_eq!(
+        backend_ok["payload"]["quality_lane_implementation"],
+        "native"
+    );
+
+    let last = events.last().expect("run_complete");
+    assert_eq!(last["event"], "run_complete", "{last}");
+    let segments = last["segments"].as_array().expect("segments");
+    let mut previous_end = 0.0_f64;
+    for segment in segments {
+        let start = segment["start_sec"].as_f64().expect("timed start");
+        let end = segment["end_sec"].as_f64().expect("timed end");
+        assert!(start >= previous_end - 1e-9 && end >= start, "{segments:?}");
+        previous_end = end;
+    }
+    assert!(
+        previous_end > 8.0,
+        "segments must reach the JFK tail: {segments:?}"
+    );
+    let transcript = last["transcript"]
+        .as_str()
+        .expect("transcript")
+        .to_lowercase();
+    for phrase in [
+        "fellow americans",
+        "what your country can do",
+        "for your country",
+    ] {
+        assert!(
+            transcript.contains(phrase),
+            "missing {phrase:?}: {transcript}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn speculative_cli_without_flag_uses_single_backend_dispatch() {
