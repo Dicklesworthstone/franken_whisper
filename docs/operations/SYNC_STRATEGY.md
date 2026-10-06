@@ -91,10 +91,27 @@ different database identity or a sequence outside the current database range
 fails closed before snapshot publication.
 
 Deleting a segment or event marks its surviving parent, whose complete child
-set can be applied with `overwrite-strict`. The current JSONL format does not
-carry deleted-run tombstones: deleting a parent advances the local high-water
-mark, but an import into another database does not remove that run solely
-because it disappeared from an incremental snapshot.
+set can be applied with `overwrite-strict`.
+
+Deleting a parent run is published through an explicit, versioned channel
+(`deleted-runs-v1`). The `runs` delete trigger refreshes the run's mutation
+row, so within the same snapshot every run whose mutation row is above the
+cursor but whose `runs` row is absent is written to `deleted_runs.jsonl` as
+`{"run_id": ..., "mutation_seq": ...}`. The incremental manifest declares the
+channel under `deleted_runs` (`format_version`, `file`, `count`, `sha256`). A
+re-inserted run is a live run again and is exported normally, never as a
+tombstone.
+
+Import honors deletions only when the manifest declares the channel; absence
+from a partial snapshot never implies deletion, and a stray undeclared
+`deleted_runs.jsonl` is ignored. A declared channel fails closed on an unknown
+format version, a non-canonical file name, a missing file, a checksum or count
+mismatch, a malformed or duplicate record, or a run that the same archive both
+carries and deletes. Inside the import transaction each listed run that exists
+in the target is removed with its segments and events (derived diarization
+rows are rebuilt from the surviving canonical runs). Under `skip`, an existing
+target run is preserved and reported as a conflict instead. The import result
+reports `runs_deleted`.
 
 ### Import (`jsonl -> db`)
 1. Acquire lock.

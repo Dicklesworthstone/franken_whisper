@@ -685,6 +685,38 @@ pub struct IncrementalExportManifest {
     pub cursor_used: Option<SyncCursor>,
     /// Updated cursor that should be persisted and passed to the next call.
     pub cursor_after: SyncCursor,
+    /// Explicit channel of runs deleted at the source since the cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_runs: Option<DeletedRunsChannel>,
+}
+
+/// Format version of `deleted_runs.jsonl`; importers fail closed on any other.
+pub const DELETED_RUNS_FORMAT_VERSION: &str = "deleted-runs-v1";
+const DELETED_RUNS_STEM: &str = "deleted_runs";
+
+/// Manifest entry declaring an archive's explicit deleted-run channel
+/// (bd-768k).
+///
+/// An incremental snapshot carries only changed aggregates, so a run's absence
+/// from it never implies deletion. A run whose newest database mutation is its
+/// own deletion is instead published as a [`DeletedRunRecord`] in
+/// `deleted_runs.jsonl`, and an importer removes exactly the listed aggregates.
+/// Archives without this entry delete nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedRunsChannel {
+    pub format_version: String,
+    pub file: String,
+    pub count: u64,
+    pub sha256: String,
+}
+
+/// One line of `deleted_runs.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletedRunRecord {
+    pub run_id: String,
+    /// Source-lineage mutation sequence of the deletion (see [`SyncCursor`]).
+    pub mutation_seq: i64,
 }
 
 const CURSOR_FILENAME: &str = "sync_cursor.json";
@@ -735,36 +767,43 @@ fn export_incremental_inner_with_after_runs(
     let cursor_path = state_root.join(CURSOR_FILENAME);
     let cursor_used = load_cursor(&cursor_path)?;
 
-    let (runs_export, (segments_count, segments_sha256), (events_count, events_sha256)) =
-        with_read_snapshot(&connection, || {
-            // --- runs ---
-            let runs_tmp = output_dir.join("runs.jsonl.tmp");
-            let runs_final = output_dir.join("runs.jsonl");
-            let runs_export = export_table_runs_incremental_snapshot(
-                &connection,
-                &runs_tmp,
-                cursor_used.as_ref(),
-            )?;
-            atomic_rename(&runs_tmp, &runs_final)?;
+    let (
+        runs_export,
+        (segments_count, segments_sha256),
+        (events_count, events_sha256),
+        (deleted_count, deleted_sha256),
+    ) = with_read_snapshot(&connection, || {
+        // --- runs ---
+        let runs_tmp = output_dir.join("runs.jsonl.tmp");
+        let runs_final = output_dir.join("runs.jsonl");
+        let runs_export =
+            export_table_runs_incremental_snapshot(&connection, &runs_tmp, cursor_used.as_ref())?;
+        atomic_rename(&runs_tmp, &runs_final)?;
 
-            after_runs();
+        after_runs();
 
-            // --- segments ---
-            let segments_tmp = output_dir.join("segments.jsonl.tmp");
-            let segments_final = output_dir.join("segments.jsonl");
-            let segments =
-                export_table_segments_for_runs(&connection, &segments_tmp, &runs_export.run_ids)?;
-            atomic_rename(&segments_tmp, &segments_final)?;
+        // --- segments ---
+        let segments_tmp = output_dir.join("segments.jsonl.tmp");
+        let segments_final = output_dir.join("segments.jsonl");
+        let segments =
+            export_table_segments_for_runs(&connection, &segments_tmp, &runs_export.run_ids)?;
+        atomic_rename(&segments_tmp, &segments_final)?;
 
-            // --- events ---
-            let events_tmp = output_dir.join("events.jsonl.tmp");
-            let events_final = output_dir.join("events.jsonl");
-            let events =
-                export_table_events_for_runs(&connection, &events_tmp, &runs_export.run_ids)?;
-            atomic_rename(&events_tmp, &events_final)?;
+        // --- events ---
+        let events_tmp = output_dir.join("events.jsonl.tmp");
+        let events_final = output_dir.join("events.jsonl");
+        let events = export_table_events_for_runs(&connection, &events_tmp, &runs_export.run_ids)?;
+        atomic_rename(&events_tmp, &events_final)?;
 
-            Ok((runs_export, segments, events))
-        })?;
+        // --- deleted runs (explicit tombstones, bd-768k) ---
+        let deleted_tmp = output_dir.join(format!("{DELETED_RUNS_STEM}.jsonl.tmp"));
+        let deleted_final = output_dir.join(format!("{DELETED_RUNS_STEM}.jsonl"));
+        let deleted =
+            export_deleted_runs_snapshot(&connection, &deleted_tmp, cursor_used.as_ref())?;
+        atomic_rename(&deleted_tmp, &deleted_final)?;
+
+        Ok((runs_export, segments, events, deleted))
+    })?;
     let runs_count = runs_export.count;
     let runs_sha256 = runs_export.sha256;
 
@@ -809,6 +848,12 @@ fn export_incremental_inner_with_after_runs(
         checksums,
         cursor_used: cursor_used.clone(),
         cursor_after: cursor_after.clone(),
+        deleted_runs: Some(DeletedRunsChannel {
+            format_version: DELETED_RUNS_FORMAT_VERSION.to_owned(),
+            file: format!("{DELETED_RUNS_STEM}.jsonl"),
+            count: deleted_count,
+            sha256: deleted_sha256,
+        }),
     };
 
     let manifest_path = output_dir.join("manifest.json");
@@ -923,6 +968,52 @@ fn validated_cursor_mutation_seq(
         )));
     }
     Ok(Some(cursor.last_mutation_seq))
+}
+
+/// Write every run whose newest mutation after the cursor is its own deletion.
+///
+/// The `runs` delete trigger refreshes the run's `sync_run_mutations` row, and
+/// a later re-insert refreshes it again, so "mutation row present, run row
+/// absent" identifies exactly the runs that are deleted as of this snapshot.
+fn export_deleted_runs_snapshot(
+    connection: &Connection,
+    path: &Path,
+    cursor: Option<&SyncCursor>,
+) -> FwResult<(u64, String)> {
+    let authority = load_mutation_authority(connection)?;
+    let cursor_mutation_seq = validated_cursor_mutation_seq(cursor, &authority)?;
+    let base = "SELECT m.run_id, m.mutation_seq FROM sync_run_mutations AS m \
+                WHERE NOT EXISTS (SELECT 1 FROM runs AS r WHERE r.id = m.run_id)";
+    let rows = match cursor_mutation_seq {
+        Some(last_mutation_seq) => connection.query_with_params(
+            &format!("{base} AND m.mutation_seq > ?1 ORDER BY m.mutation_seq ASC, m.run_id ASC"),
+            &[SqliteValue::Integer(last_mutation_seq)],
+        ),
+        None => connection.query(&format!("{base} ORDER BY m.mutation_seq ASC, m.run_id ASC")),
+    }
+    .map_err(|error| FwError::Storage(error.to_string()))?;
+
+    let mut file = HashingWriter::new(BufWriter::new(fs::File::create(path)?));
+    let mut count = 0u64;
+    for row in rows {
+        let mutation_seq = match row.get(1) {
+            Some(SqliteValue::Integer(value)) => *value,
+            _ => {
+                return Err(FwError::Storage(
+                    "deleted-run mutation sequence is not an integer".to_owned(),
+                ));
+            }
+        };
+        let record = DeletedRunRecord {
+            run_id: value_to_string_sqlite(row.get(0)),
+            mutation_seq,
+        };
+        writeln!(file, "{}", serde_json::to_string(&record)?)?;
+        count += 1;
+    }
+    file.flush()?;
+    file.get_ref().get_ref().sync_all()?;
+    Ok((count, file.finalize_hex()))
 }
 
 fn export_table_runs_incremental_snapshot(
@@ -1269,6 +1360,9 @@ pub struct ImportResult {
     pub runs_imported: u64,
     pub segments_imported: u64,
     pub events_imported: u64,
+    /// Run aggregates removed because the archive's explicit deleted-run
+    /// channel listed them (see [`DeletedRunsChannel`]).
+    pub runs_deleted: u64,
     pub conflicts: Vec<SyncConflict>,
 }
 
@@ -1345,6 +1439,9 @@ fn import_inner_with_batch_mode(
     // Resolve the physical inputs once. Checksum validation and row import must
     // consume the same plain-or-gzip files even if the directory changes later.
     let input_paths = validate_checksums(&manifest, input_dir)?;
+    // Deletions are honored only when the manifest explicitly declares the
+    // channel; a missing or partial snapshot never implies deletion.
+    let deleted_runs = load_deleted_runs_channel(&manifest_text, input_dir)?;
 
     // Open DB and ensure schema exists
     if let Some(parent) = db_path.parent()
@@ -1365,6 +1462,7 @@ fn import_inner_with_batch_mode(
         connection,
         &input_paths,
         &manifest,
+        &deleted_runs,
         conflict_policy,
         batch_import_enabled,
     );
@@ -1411,6 +1509,7 @@ fn import_tables(
     connection: &Connection,
     input_paths: &JsonlInputPaths,
     manifest: &SyncManifest,
+    deleted_runs: &[DeletedRunRecord],
     conflict_policy: ConflictPolicy,
     batch_import_enabled: bool,
 ) -> FwResult<ImportResult> {
@@ -1478,12 +1577,161 @@ fn import_tables(
         )));
     }
 
+    let runs_deleted = apply_deleted_runs(
+        connection,
+        deleted_runs,
+        &run_tracking.imported_run_ids,
+        conflict_policy,
+        &mut conflicts,
+    )
+    .map_err(|error| FwError::Storage(format!("deleted-runs import failed: {error}")))?;
+
     Ok(ImportResult {
         runs_imported,
         segments_imported,
         events_imported,
+        runs_deleted,
         conflicts,
     })
+}
+
+/// Read and verify the archive's declared deleted-run channel, if any.
+///
+/// Fails closed on an unknown format version, a file name other than the
+/// canonical one, a missing file, a checksum or count mismatch, malformed or
+/// duplicate records, and negative mutation sequences.
+fn load_deleted_runs_channel(
+    manifest_text: &str,
+    input_dir: &Path,
+) -> FwResult<Vec<DeletedRunRecord>> {
+    #[derive(Deserialize)]
+    struct DeletedRunsSection {
+        #[serde(default)]
+        deleted_runs: Option<DeletedRunsChannel>,
+    }
+    let section: DeletedRunsSection = serde_json::from_str(manifest_text)
+        .map_err(|error| FwError::Storage(format!("invalid manifest: {error}")))?;
+    let Some(channel) = section.deleted_runs else {
+        return Ok(Vec::new());
+    };
+    if channel.format_version != DELETED_RUNS_FORMAT_VERSION {
+        return Err(FwError::Storage(format!(
+            "unsupported deleted-runs format `{}` (expected `{DELETED_RUNS_FORMAT_VERSION}`)",
+            channel.format_version
+        )));
+    }
+    let canonical_file = format!("{DELETED_RUNS_STEM}.jsonl");
+    if channel.file != canonical_file {
+        return Err(FwError::Storage(format!(
+            "deleted-runs channel must name `{canonical_file}`, not `{}`",
+            channel.file
+        )));
+    }
+    let path = resolve_jsonl_path(input_dir, DELETED_RUNS_STEM);
+    if !path.exists() {
+        return Err(FwError::Storage(format!(
+            "missing export file: {canonical_file} or {canonical_file}.gz in {}",
+            input_dir.display()
+        )));
+    }
+    let actual = sha256_jsonl_file(&path)?;
+    if actual != channel.sha256 {
+        return Err(FwError::Storage(format!(
+            "checksum mismatch for {} (logical {canonical_file} bytes): expected {}, got {actual}",
+            path.display(),
+            channel.sha256
+        )));
+    }
+
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, line) in open_jsonl_reader(&path)?.lines().enumerate() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record: DeletedRunRecord = serde_json::from_str(line).map_err(|error| {
+            FwError::Storage(format!(
+                "{canonical_file} line {}: invalid record: {error}",
+                index + 1
+            ))
+        })?;
+        if record.run_id.is_empty() || record.mutation_seq < 0 {
+            return Err(FwError::Storage(format!(
+                "{canonical_file} line {}: run_id must be non-empty and mutation_seq non-negative",
+                index + 1
+            )));
+        }
+        if !seen.insert(record.run_id.clone()) {
+            return Err(FwError::Storage(format!(
+                "{canonical_file} line {}: duplicate run_id `{}`",
+                index + 1,
+                record.run_id
+            )));
+        }
+        records.push(record);
+    }
+    if records.len() as u64 != channel.count {
+        return Err(FwError::Storage(format!(
+            "row count mismatch for {canonical_file}: expected {}, found {}",
+            channel.count,
+            records.len()
+        )));
+    }
+    Ok(records)
+}
+
+/// Remove the run aggregates the archive explicitly lists as deleted.
+///
+/// A run listed as deleted cannot also be carried by the same snapshot. Under
+/// [`ConflictPolicy::Skip`] an existing target run is preserved and reported as
+/// a conflict; every other policy mirrors the source deletion. Runs absent from
+/// the target are already in the deleted state.
+fn apply_deleted_runs(
+    connection: &Connection,
+    deleted_runs: &[DeletedRunRecord],
+    archive_run_ids: &HashSet<String>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+) -> FwResult<u64> {
+    let mut deleted = 0u64;
+    for record in deleted_runs {
+        if archive_run_ids.contains(&record.run_id) {
+            return Err(FwError::Storage(format!(
+                "archive both carries and deletes run `{}`",
+                record.run_id
+            )));
+        }
+        let params = [SqliteValue::Text(record.run_id.clone().into())];
+        let exists = !connection
+            .query_with_params("SELECT 1 FROM runs WHERE id = ?1", &params)
+            .map_err(|error| FwError::Storage(error.to_string()))?
+            .is_empty();
+        if !exists {
+            continue;
+        }
+        if conflict_policy == ConflictPolicy::Skip {
+            conflicts.push(SyncConflict {
+                table: "runs".to_owned(),
+                key: record.run_id.clone(),
+                reason: "run deleted at source; existing target run preserved by skip policy"
+                    .to_owned(),
+            });
+            continue;
+        }
+        for sql in [
+            "DELETE FROM segments WHERE run_id = ?1",
+            "DELETE FROM events WHERE run_id = ?1",
+            "DELETE FROM runs WHERE id = ?1",
+        ] {
+            connection
+                .import_exec(sql, &params)
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+        }
+        deleted += 1;
+    }
+    Ok(deleted)
 }
 
 #[derive(Default)]
@@ -10926,6 +11174,7 @@ mod tests {
                 last_export_run_id: Some("run-5".to_owned()),
                 last_run_count: 5,
             }),
+            deleted_runs: None,
             cursor_after: SyncCursor {
                 last_mutation_seq: 6,
                 database_id: Some("00000000-0000-0000-0000-000000000005".to_owned()),
@@ -14130,6 +14379,224 @@ mod tests {
         );
     }
 
+    // -- bd-768k: explicit deleted-run channel ------------------------------
+
+    fn delete_run_aggregate(db_path: &Path, run_id: &str) {
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
+        let params = [SqliteValue::Text(run_id.to_owned().into())];
+        for sql in [
+            "DELETE FROM segments WHERE run_id = ?1",
+            "DELETE FROM events WHERE run_id = ?1",
+            "DELETE FROM runs WHERE id = ?1",
+        ] {
+            conn.execute_with_params(sql, &params).expect("delete");
+        }
+    }
+
+    fn run_ids_in(db_path: &Path) -> Vec<String> {
+        let mut ids: Vec<String> = RunStore::open(db_path)
+            .expect("open")
+            .list_recent_runs(0)
+            .expect("list")
+            .into_iter()
+            .map(|summary| summary.run_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn incremental_export_propagates_parent_run_deletion_downstream() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let target = dir.path().join("target.sqlite3");
+        let state = dir.path().join("state");
+        let target_state = dir.path().join("target_state");
+        let store = RunStore::open(&source).expect("source");
+        for run_id in ["run-keep", "run-gone"] {
+            store
+                .persist_report(&fixture_report(run_id, &source))
+                .expect("persist");
+        }
+
+        // Baseline: both runs reach the target; nothing is deleted yet.
+        let first = dir.path().join("export-1");
+        let manifest = export_incremental(&source, &first, &state).expect("export 1");
+        assert_eq!(manifest.deleted_runs.as_ref().expect("channel").count, 0);
+        let imported =
+            import(&target, &first, &target_state, ConflictPolicy::Reject).expect("import 1");
+        assert_eq!(imported.runs_deleted, 0);
+        assert_eq!(run_ids_in(&target), ["run-gone", "run-keep"]);
+
+        // Delete one aggregate at the source; the next incremental snapshot
+        // carries no runs, so only the explicit channel can convey it.
+        delete_run_aggregate(&source, "run-gone");
+        let second = dir.path().join("export-2");
+        let manifest = export_incremental(&source, &second, &state).expect("export 2");
+        assert_eq!(manifest.row_counts.runs, 0);
+        let channel = manifest.deleted_runs.expect("channel");
+        assert_eq!(channel.format_version, DELETED_RUNS_FORMAT_VERSION);
+        assert_eq!(channel.count, 1);
+        let records = fs::read_to_string(second.join("deleted_runs.jsonl")).expect("read");
+        let record: DeletedRunRecord =
+            serde_json::from_str(records.trim()).expect("one tombstone record");
+        assert_eq!(record.run_id, "run-gone");
+
+        let imported =
+            import(&target, &second, &target_state, ConflictPolicy::Reject).expect("import 2");
+        assert_eq!(imported.runs_deleted, 1);
+        assert_eq!(run_ids_in(&target), ["run-keep"]);
+        let target_store = RunStore::open(&target).expect("target");
+        assert!(
+            target_store
+                .load_run_details("run-gone")
+                .expect("query")
+                .is_none(),
+            "the deleted aggregate (segments and events included) must be gone"
+        );
+
+        // The tombstone is consumed by the cursor: a third export is empty and
+        // re-importing an old tombstone for an absent run is a no-op.
+        let third = dir.path().join("export-3");
+        let manifest = export_incremental(&source, &third, &state).expect("export 3");
+        assert_eq!(manifest.deleted_runs.expect("channel").count, 0);
+        let replay = import(&target, &second, &target_state, ConflictPolicy::Reject)
+            .expect("replay import 2");
+        assert_eq!(replay.runs_deleted, 0);
+    }
+
+    #[test]
+    fn reinserted_run_is_not_published_as_deleted() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let state = dir.path().join("state");
+        let store = RunStore::open(&source).expect("source");
+        store
+            .persist_report(&fixture_report("run-x", &source))
+            .expect("persist");
+        export_incremental(&source, &dir.path().join("e1"), &state).expect("export 1");
+        delete_run_aggregate(&source, "run-x");
+        store
+            .persist_report(&fixture_report("run-x", &source))
+            .expect("re-persist");
+        let manifest =
+            export_incremental(&source, &dir.path().join("e2"), &state).expect("export 2");
+        assert_eq!(manifest.row_counts.runs, 1, "the live run is re-exported");
+        assert_eq!(manifest.deleted_runs.expect("channel").count, 0);
+    }
+
+    #[test]
+    fn skip_policy_preserves_target_run_listed_as_deleted() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let target = dir.path().join("target.sqlite3");
+        let state = dir.path().join("state");
+        let store = RunStore::open(&source).expect("source");
+        store
+            .persist_report(&fixture_report("run-gone", &source))
+            .expect("persist");
+        let first = dir.path().join("e1");
+        export_incremental(&source, &first, &state).expect("export 1");
+        import(
+            &target,
+            &first,
+            &dir.path().join("t1"),
+            ConflictPolicy::Reject,
+        )
+        .expect("import 1");
+
+        delete_run_aggregate(&source, "run-gone");
+        let second = dir.path().join("e2");
+        export_incremental(&source, &second, &state).expect("export 2");
+        let imported = import(
+            &target,
+            &second,
+            &dir.path().join("t2"),
+            ConflictPolicy::Skip,
+        )
+        .expect("skip import");
+        assert_eq!(imported.runs_deleted, 0);
+        assert_eq!(imported.conflicts.len(), 1);
+        assert_eq!(imported.conflicts[0].key, "run-gone");
+        assert_eq!(run_ids_in(&target), ["run-gone"]);
+    }
+
+    #[test]
+    fn deleted_run_channel_fails_closed_on_tampering() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let state = dir.path().join("state");
+        let store = RunStore::open(&source).expect("source");
+        store
+            .persist_report(&fixture_report("run-gone", &source))
+            .expect("persist");
+        export_incremental(&source, &dir.path().join("e1"), &state).expect("export 1");
+        delete_run_aggregate(&source, "run-gone");
+        let archive = dir.path().join("e2");
+        export_incremental(&source, &archive, &state).expect("export 2");
+
+        let tombstones = archive.join("deleted_runs.jsonl");
+        let original = fs::read_to_string(&tombstones).expect("read");
+        fs::write(&tombstones, original.replace("run-gone", "run-othr")).expect("tamper");
+        let error = import(
+            &dir.path().join("target.sqlite3"),
+            &archive,
+            &dir.path().join("t"),
+            ConflictPolicy::Reject,
+        )
+        .expect_err("checksum mismatch must fail closed");
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+
+        fs::write(&tombstones, &original).expect("restore");
+        let manifest_path = archive.join("manifest.json");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest");
+        fs::write(
+            &manifest_path,
+            manifest.replace(DELETED_RUNS_FORMAT_VERSION, "deleted-runs-v99"),
+        )
+        .expect("bump version");
+        let error = import(
+            &dir.path().join("target.sqlite3"),
+            &archive,
+            &dir.path().join("t"),
+            ConflictPolicy::Reject,
+        )
+        .expect_err("unknown channel format must fail closed");
+        assert!(error.to_string().contains("deleted-runs format"), "{error}");
+    }
+
+    #[test]
+    fn full_export_without_channel_never_implies_deletion() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let target = dir.path().join("target.sqlite3");
+        let store = RunStore::open(&target).expect("target");
+        store
+            .persist_report(&fixture_report("run-target-only", &target))
+            .expect("persist target run");
+        RunStore::open(&source)
+            .expect("source")
+            .persist_report(&fixture_report("run-source", &source))
+            .expect("persist source run");
+        let archive = dir.path().join("full");
+        export(&source, &archive, &dir.path().join("s")).expect("full export");
+        // A stale tombstone file that the manifest does not declare is ignored.
+        fs::write(
+            archive.join("deleted_runs.jsonl"),
+            "{\"run_id\":\"run-target-only\",\"mutation_seq\":1}\n",
+        )
+        .expect("stale file");
+        let imported = import(
+            &target,
+            &archive,
+            &dir.path().join("t"),
+            ConflictPolicy::Reject,
+        )
+        .expect("import");
+        assert_eq!(imported.runs_deleted, 0);
+        assert_eq!(run_ids_in(&target), ["run-source", "run-target-only"]);
+    }
+
     #[test]
     fn save_and_load_cursor_round_trip_preserves_run_id() {
         let dir = tempdir().expect("tempdir");
@@ -15153,6 +15620,7 @@ mod tests {
                 events_jsonl_sha256: "ccc".to_owned(),
             },
             cursor_used: None,
+            deleted_runs: None,
             cursor_after: SyncCursor {
                 last_mutation_seq: 1,
                 database_id: Some("00000000-0000-0000-0000-000000000001".to_owned()),
@@ -15174,6 +15642,7 @@ mod tests {
             runs_imported: 5,
             segments_imported: 20,
             events_imported: 15,
+            runs_deleted: 0,
             conflicts: vec![SyncConflict {
                 table: "runs".to_owned(),
                 key: "run-1".to_owned(),

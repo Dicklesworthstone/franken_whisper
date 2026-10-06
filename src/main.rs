@@ -1103,6 +1103,7 @@ fn run(cli: Cli) -> FwResult<()> {
                         "runs_imported": result.runs_imported,
                         "segments_imported": result.segments_imported,
                         "events_imported": result.events_imported,
+                        "runs_deleted": result.runs_deleted,
                         "conflicts": result.conflicts,
                         "validation_ok": validation_ok,
                         "validation": validation_report,
