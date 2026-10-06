@@ -308,3 +308,85 @@ fn local_agreement_e2e_stream_is_contract_valid_and_labeled() {
         Some("local-agreement")
     );
 }
+
+/// Word error rate of `hypothesis` against `reference` after lowercasing and
+/// stripping punctuation (word-level Levenshtein / reference length).
+fn normalized_wer(reference: &str, hypothesis: &str) -> f64 {
+    let words = |text: &str| -> Vec<String> {
+        text.split_whitespace()
+            .map(|word| {
+                word.chars()
+                    .filter(|ch| ch.is_alphanumeric() || *ch == '\'')
+                    .collect::<String>()
+                    .to_lowercase()
+            })
+            .filter(|word| !word.is_empty())
+            .collect()
+    };
+    let reference = words(reference);
+    let hypothesis = words(hypothesis);
+    let mut previous: Vec<usize> = (0..=hypothesis.len()).collect();
+    for (i, ref_word) in reference.iter().enumerate() {
+        let mut current = vec![i + 1; hypothesis.len() + 1];
+        for (j, hyp_word) in hypothesis.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ref_word != hyp_word);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        previous = current;
+    }
+    previous[hypothesis.len()] as f64 / reference.len().max(1) as f64
+}
+
+const JFK_REFERENCE: &str = "And so my fellow Americans, ask not what your country can do \
+                             for you, ask what you can do for your country.";
+
+/// Declared live-transcript quality bound for the tiny.en fast lane on JFK:
+/// every emission policy must keep the whole speech. Dropping one phrase
+/// (e.g. "what your country can do", 5 of 22 words, the onset regression the
+/// voiced-density VAD fixed) costs far more than this bound allows.
+const JFK_LIVE_WER_BOUND: f64 = 0.15;
+
+#[test]
+fn live_transcript_keeps_all_speech_for_every_policy() {
+    if !require_fast_model() {
+        return;
+    }
+    for policy in ["alignatt", "local-agreement", "endpoint-commit"] {
+        let (events, code, stderr) = run_listen(&[
+            "--fast-model",
+            "tiny.en",
+            "--language",
+            "en",
+            "--quality-model",
+            "none",
+            "--no-persist",
+            "--policy",
+            policy,
+        ]);
+        assert_eq!(code, 0, "{policy}: listen must exit 0; stderr:\n{stderr}");
+        NdjsonStreamValidator::new(StreamOutcome::Success)
+            .validate(&events)
+            .unwrap_or_else(|error| panic!("{policy}: contract violation: {error:?}"));
+        let committed = events
+            .iter()
+            .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("utterance_end"))
+            .filter_map(|e| e.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let wer = normalized_wer(JFK_REFERENCE, &committed);
+        assert!(
+            wer <= JFK_LIVE_WER_BOUND,
+            "{policy}: live WER {wer:.3} exceeds {JFK_LIVE_WER_BOUND}: {committed:?}"
+        );
+    }
+}
+
+#[test]
+fn normalized_wer_counts_dropped_phrases() {
+    assert_eq!(normalized_wer(JFK_REFERENCE, JFK_REFERENCE), 0.0);
+    let dropped =
+        "And so my fellow Americans asked not for you ask what you can do for your country";
+    let wer = normalized_wer(JFK_REFERENCE, dropped);
+    assert!((wer - 6.0 / 22.0).abs() < 1e-9, "{wer}");
+    assert!(wer > JFK_LIVE_WER_BOUND);
+}

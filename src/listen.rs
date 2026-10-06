@@ -387,7 +387,8 @@ pub trait VoiceClassifier: Send {
 /// collision with transcribe's flag).
 #[derive(Debug, Clone)]
 pub struct StreamingVadConfig {
-    /// Sustained voice required before an utterance opens.
+    /// Voiced audio required before an utterance opens, counted within a
+    /// window twice as long (so brief inter-syllable dips do not reset it).
     pub min_speech_ms: u64,
     /// Sustained silence that closes an utterance.
     pub endpoint_ms: u64,
@@ -411,9 +412,6 @@ pub struct StreamingVadConfig {
     /// only for sustained-tone speech (singing), at the cost of slower
     /// hum recovery.
     pub floor_rise_db_per_sec_speech: f64,
-    /// Consecutive unvoiced frames tolerated inside a voiced run before the
-    /// run resets (grace for glottal gaps).
-    pub voiced_run_grace_frames: u32,
 }
 
 impl Default for StreamingVadConfig {
@@ -426,7 +424,6 @@ impl Default for StreamingVadConfig {
             min_voice_dbfs: -55.0,
             floor_rise_db_per_sec_silence: 10.0,
             floor_rise_db_per_sec_speech: 10.0,
-            voiced_run_grace_frames: 2,
         }
     }
 }
@@ -460,8 +457,15 @@ pub struct StreamingVad {
     state: VadState,
     /// Running noise floor estimate, dBFS.
     noise_floor_db: f64,
-    /// Current voiced run: (start_frame, voiced_frames, grace_left).
-    voiced_run: Option<(u64, u32, u32)>,
+    /// Voiced frame indices inside the onset window (silence state only).
+    ///
+    /// Speech opens once `min_speech_ms` worth of voiced frames fall within a
+    /// window twice that long. Requiring an unbroken run instead let ordinary
+    /// inter-syllable dips just under the gate reset onset over and over, so
+    /// whole spoken phrases never opened an utterance and were silently lost
+    /// (JFK 5.5-6.9 s, "what your country can do"); a density window still
+    /// rejects sparse transients such as keystrokes.
+    onset_window: std::collections::VecDeque<u64>,
     /// Unvoiced frames since the last voiced frame (in Speech state).
     unvoiced_run: u32,
     /// Frame AFTER the last voiced frame (end of voiced audio).
@@ -493,7 +497,7 @@ impl StreamingVad {
             frames: 0,
             state: VadState::Silence,
             noise_floor_db: -70.0,
-            voiced_run: None,
+            onset_window: std::collections::VecDeque::new(),
             unvoiced_run: 0,
             last_voiced_end: 0,
             floor_time_sec: 0.0,
@@ -584,28 +588,26 @@ impl StreamingVad {
 
         match self.state {
             VadState::Silence => {
+                let needed_frames = self.cfg.min_speech_ms.div_ceil(20);
+                let window_frames = needed_frames.saturating_mul(2).max(1);
                 if voiced {
-                    let (start, count, _grace) = self.voiced_run.unwrap_or((
-                        frame_index,
-                        0,
-                        self.cfg.voiced_run_grace_frames,
-                    ));
-                    let count = count + 1;
-                    self.voiced_run = Some((start, count, self.cfg.voiced_run_grace_frames));
-                    if u64::from(count) * 20 >= self.cfg.min_speech_ms {
-                        self.state = VadState::Speech;
-                        self.unvoiced_run = 0;
-                        let pre_pad_sec = self.cfg.pre_pad_ms as f64 / 1000.0;
-                        let t = (vad_frame_to_sec(start) - pre_pad_sec).max(self.floor_time_sec);
-                        edges.push(VadEdge::SpeechStarted { t_sec: t });
-                        self.voiced_run = None;
-                    }
-                } else if let Some((start, count, grace)) = self.voiced_run {
-                    if grace > 0 {
-                        self.voiced_run = Some((start, count, grace - 1));
-                    } else {
-                        self.voiced_run = None;
-                    }
+                    self.onset_window.push_back(frame_index);
+                }
+                while self
+                    .onset_window
+                    .front()
+                    .is_some_and(|&first| frame_index - first >= window_frames)
+                {
+                    self.onset_window.pop_front();
+                }
+                if voiced && self.onset_window.len() as u64 >= needed_frames {
+                    let start = self.onset_window.front().copied().unwrap_or(frame_index);
+                    self.state = VadState::Speech;
+                    self.unvoiced_run = 0;
+                    let pre_pad_sec = self.cfg.pre_pad_ms as f64 / 1000.0;
+                    let t = (vad_frame_to_sec(start) - pre_pad_sec).max(self.floor_time_sec);
+                    edges.push(VadEdge::SpeechStarted { t_sec: t });
+                    self.onset_window.clear();
                 }
             }
             VadState::Speech => {
@@ -618,7 +620,7 @@ impl StreamingVad {
                         let t = vad_frame_to_sec(self.last_voiced_end);
                         self.floor_time_sec = t;
                         edges.push(VadEdge::Endpoint { t_sec: t });
-                        self.voiced_run = None;
+                        self.onset_window.clear();
                         self.unvoiced_run = 0;
                     }
                 }
@@ -4858,6 +4860,41 @@ mod tests {
             edges.is_empty(),
             "blip must not open an utterance: {edges:?}"
         );
+    }
+
+    /// Regression for the dropped JFK phrase: real speech whose syllables
+    /// dip under the gate for several frames at a time (here 3-frame dips
+    /// after every 3 voiced frames, 50% voiced) must still open an utterance.
+    #[test]
+    fn vad_choppy_speech_with_multi_frame_dips_opens() {
+        let mut vad = StreamingVad::new(StreamingVadConfig::default());
+        let _ = edges_of(&mut vad, &frames_at_db(-60.0, 50));
+        let mut audio = Vec::new();
+        for _ in 0..8 {
+            audio.extend(frames_at_db(-20.0, 3));
+            audio.extend(frames_at_db(-60.0, 3));
+        }
+        let edges = edges_of(&mut vad, &audio);
+        let Some(VadEdge::SpeechStarted { t_sec }) = edges.first() else {
+            panic!("choppy speech must open an utterance: {edges:?}");
+        };
+        // Onset = first voiced frame (t=1.0 s) minus the 200 ms pre-pad.
+        assert!((t_sec - 0.8).abs() < 0.021, "onset {t_sec}");
+    }
+
+    /// Sparse transients (one 20 ms click every 120 ms, ~17% voiced) must
+    /// not accumulate into an utterance however long they continue.
+    #[test]
+    fn vad_sparse_clicks_never_open() {
+        let mut vad = StreamingVad::new(StreamingVadConfig::default());
+        let _ = edges_of(&mut vad, &frames_at_db(-60.0, 50));
+        let mut audio = Vec::new();
+        for _ in 0..60 {
+            audio.extend(frames_at_db(-20.0, 1));
+            audio.extend(frames_at_db(-60.0, 5));
+        }
+        let edges = edges_of(&mut vad, &audio);
+        assert!(edges.is_empty(), "clicks opened an utterance: {edges:?}");
     }
 
     #[test]
