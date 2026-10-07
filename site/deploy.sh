@@ -32,7 +32,7 @@ trap 'rm -rf "$STAGE"' EXIT
 
 # demo.html/demo.js/fw-worker.js are the superseded first-cut demo (kept in
 # the repo for history, replaced by the playground on the index page).
-rsync -a --exclude build-wasm.sh --exclude deploy.sh --exclude .wrangler \
+rsync -a --exclude build-wasm.sh --exclude deploy.sh --exclude .wrangler --exclude .cloudflare \
   --exclude demo.js --exclude fw-worker.js . "$STAGE/"
 
 for f in "$STAGE"/index.html "$STAGE"/app.js "$STAGE"/chrome.js \

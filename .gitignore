@@ -310,6 +310,8 @@ __pycache__/
 # Eidetic / Wrangler / Claude local runtime
 .ee/
 .wrangler/
+# cf (Cloudflare CLI) account cache: account id + email, never commit or deploy
+.cloudflare/
 .claude/
 .repo_janitor_workspace/
 .skill-loop-progress.md
