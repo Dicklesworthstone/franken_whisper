@@ -150,6 +150,15 @@ unconfirmed jobs drops the OLDEST with a `confirm_lag` warning; session end
 waits at most `--confirm-drain-sec` (default 10 s) before abandoning in-flight
 jobs with a `confirm_drain_timeout` warning.
 
+Unpaced `--source file-replay` (no `--realtime-pace`) is the deterministic
+evaluation mode and has no real-time deadline, so there the lane is lossless
+(bd-fdk6): a full queue makes the fast lane wait instead of dropping the
+oldest job, and a session that ends on its own drains every queued and
+in-flight confirm with no wall-clock cap. `--confirm-drain-sec` then applies
+only to an interrupted (Ctrl-C) replay. The verdict stream of an unpaced
+replay therefore no longer depends on host speed. The `confirm_drain_timeout`
+detail records which drain ran (`"drain": "bounded" | "until_idle"`).
+
 Enablement matrix (resolved up front so `session_start` is truthful):
 `auto` ⇒ ON iff the turbo package is installed AND the fast lane did not fall
 back to turbo (self-confirmation is meaningless); `none` ⇒ off; explicit spec

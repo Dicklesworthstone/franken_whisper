@@ -1308,12 +1308,15 @@ pub struct ListenArgs {
     pub quality_model: String,
 
     /// Seconds the session end waits for in-flight quality confirms before
-    /// abandoning them with a `confirm_drain_timeout` warning.
+    /// abandoning them with a `confirm_drain_timeout` warning. An unpaced
+    /// file replay that ends on its own drains every confirm instead; this
+    /// cap then applies only when it is interrupted.
     #[arg(long, default_value_t = 10.0)]
     pub confirm_drain_sec: f64,
 
     /// Max unconfirmed utterances in the confirm queue before the oldest is
-    /// dropped (`confirm_lag` warning). The live lane never blocks.
+    /// dropped (`confirm_lag` warning). The live lane never blocks; an
+    /// unpaced file replay waits for a free slot instead of dropping.
     #[arg(long, default_value_t = 4)]
     pub confirm_queue_bound: usize,
 

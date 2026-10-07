@@ -1991,6 +1991,34 @@ pub const CONFIRM_DRAIN_DEFAULT_SEC: f64 = 10.0;
 
 const CONFIRM_QUALITY_MODEL_DEFAULT: &str = "large-v3-turbo";
 
+/// What `ConfirmLane::submit` does when the queue is at its bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfirmBackpressure {
+    /// Live capture: never block the fast lane; drop the OLDEST unconfirmed
+    /// job and report it (`confirm_lag`).
+    DropOldest,
+    /// Unpaced file replay (bd-fdk6): there is no real-time deadline, so the
+    /// fast lane waits for a free slot instead of dropping work. Together with
+    /// [`ConfirmLane::drain_until_idle`] this makes the verdict stream
+    /// independent of host speed.
+    Block,
+}
+
+impl ConfirmBackpressure {
+    /// `Block` exactly for as-fast-as-possible file replay — the deterministic
+    /// evaluation mode. Every real-time source (mic, stdin PCM, paced replay)
+    /// keeps the never-block live contract.
+    pub(crate) fn for_source(source: &ListenSource) -> Self {
+        match source {
+            ListenSource::FileReplay {
+                realtime_pace: false,
+                ..
+            } => Self::Block,
+            _ => Self::DropOldest,
+        }
+    }
+}
+
 /// One closed utterance awaiting quality-lane re-transcription.
 pub(crate) struct ConfirmJob {
     pub utterance_id: u32,
@@ -2057,9 +2085,29 @@ struct ConfirmQueueState {
     shutdown: bool,
 }
 
+type ConfirmQueue = std::sync::Arc<(std::sync::Mutex<ConfirmQueueState>, std::sync::Condvar)>;
+
+/// Marks the queue shut down and wakes every waiter when the worker thread
+/// exits for ANY reason (clean shutdown, poison pill, abort, or a panicking
+/// decoder), so a producer blocked under [`ConfirmBackpressure::Block`] can
+/// never wait on a lane that has no consumer.
+struct ConfirmWorkerExit(ConfirmQueue);
+
+impl Drop for ConfirmWorkerExit {
+    fn drop(&mut self) {
+        let (queue_mtx, queue_cv) = &*self.0;
+        queue_mtx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown = true;
+        queue_cv.notify_all();
+    }
+}
+
 /// Handle owned by the session loop: bounded job queue + results channel.
 pub(crate) struct ConfirmLane {
-    shared: std::sync::Arc<(std::sync::Mutex<ConfirmQueueState>, std::sync::Condvar)>,
+    shared: ConfirmQueue,
+    backpressure: ConfirmBackpressure,
     abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     results_tx: std::sync::mpsc::Sender<ConfirmLaneEvent>,
     results_rx: std::sync::mpsc::Receiver<ConfirmLaneEvent>,
@@ -2070,8 +2118,12 @@ impl ConfirmLane {
     /// Spawn the single background worker. `decoder` runs entirely on the
     /// worker thread; the tracker lives there too.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn spawn(bound: usize, mut decoder: QualityDecoder) -> Self {
-        let shared = std::sync::Arc::new((
+    pub(crate) fn spawn(
+        bound: usize,
+        backpressure: ConfirmBackpressure,
+        mut decoder: QualityDecoder,
+    ) -> Self {
+        let shared: ConfirmQueue = std::sync::Arc::new((
             std::sync::Mutex::new(ConfirmQueueState {
                 jobs: std::collections::VecDeque::new(),
                 bound,
@@ -2090,6 +2142,7 @@ impl ConfirmLane {
             std::thread::Builder::new()
                 .name("fw-confirm".to_owned())
                 .spawn(move || {
+                    let _exit = ConfirmWorkerExit(std::sync::Arc::clone(&worker_shared));
                     let (queue_mtx, queue_cv) = &*worker_shared;
                     let mut tracker = crate::speculation::CorrectionTracker::new(
                         crate::speculation::CorrectionTolerance::default(),
@@ -2102,6 +2155,9 @@ impl ConfirmLane {
                             let mut state = queue_mtx.lock().expect("confirm queue poisoned");
                             loop {
                                 if let Some(job) = state.jobs.pop_front() {
+                                    // A slot just freed: wake a producer blocked
+                                    // under `ConfirmBackpressure::Block`.
+                                    queue_cv.notify_all();
                                     break Some(job);
                                 }
                                 if state.shutdown {
@@ -2275,8 +2331,14 @@ impl ConfirmLane {
         if spawned.is_err() {
             // Worker threads are best-effort infrastructure; if the OS
             // refuses the thread the session degrades to fast-only.
+            if backpressure == ConfirmBackpressure::Block {
+                // No consumer will ever free a slot: refuse jobs rather than
+                // block the fast lane forever.
+                shared.0.lock().expect("confirm queue poisoned").shutdown = true;
+            }
             return Self {
                 shared,
+                backpressure,
                 abort,
                 results_tx: std::sync::mpsc::channel().0,
                 results_rx: std::sync::mpsc::channel().1,
@@ -2285,18 +2347,26 @@ impl ConfirmLane {
         }
         Self {
             shared,
+            backpressure,
             abort,
             results_tx,
             results_rx,
             depth,
         }
     }
-    /// Enqueue one closed utterance. NEVER blocks: when the queue is at its
-    /// bound, the oldest unconfirmed job is dropped and reported so the
-    /// session loop can emit the `confirm_lag` warning.
+    /// Enqueue one closed utterance. Under [`ConfirmBackpressure::DropOldest`]
+    /// this NEVER blocks: when the queue is at its bound, the oldest
+    /// unconfirmed job is dropped and reported so the session loop can emit
+    /// the `confirm_lag` warning. Under [`ConfirmBackpressure::Block`] it waits
+    /// for the worker to take a job (or for the lane to shut down).
     pub(crate) fn submit(&self, job: ConfirmJob) {
         let (queue_mtx, queue_cv) = &*self.shared;
         let mut state = queue_mtx.lock().expect("confirm queue poisoned");
+        if self.backpressure == ConfirmBackpressure::Block {
+            while !state.shutdown && state.jobs.len() >= state.bound.max(1) {
+                state = queue_cv.wait(state).expect("confirm queue poisoned");
+            }
+        }
         if state.shutdown {
             return;
         }
@@ -2339,6 +2409,27 @@ impl ConfirmLane {
     pub(crate) fn drain(&self, drain_sec: f64) -> (Vec<ConfirmLaneEvent>, usize) {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs_f64(drain_sec.max(0.0));
+        self.drain_inner(Some(deadline), &|| false)
+    }
+
+    /// Session-end collection for unpaced file replay (bd-fdk6): wait for
+    /// EVERY queued and in-flight confirm, with no wall-clock deadline, so the
+    /// verdict stream does not depend on host speed. Stops early only when
+    /// `is_cancelled` fires (Ctrl-C) or the worker thread has exited; whatever
+    /// is still unfinished then is reported as abandoned, exactly like
+    /// [`Self::drain`].
+    pub(crate) fn drain_until_idle(
+        &self,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> (Vec<ConfirmLaneEvent>, usize) {
+        self.drain_inner(None, is_cancelled)
+    }
+
+    fn drain_inner(
+        &self,
+        deadline: Option<std::time::Instant>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> (Vec<ConfirmLaneEvent>, usize) {
         let mut events = Vec::new();
         loop {
             // Drain everything already visible before consulting the depth. This also
@@ -2353,12 +2444,29 @@ impl ConfirmLane {
                 events.extend(self.results_rx.try_iter());
                 break;
             }
-            let now = std::time::Instant::now();
-            if now >= deadline {
+            // A worker that exited (poison pill, abort, panic) can never finish
+            // the remaining depth; `ConfirmWorkerExit` published `shutdown`
+            // after the worker's last send, so sweep once more and stop.
+            if self
+                .shared
+                .0
+                .lock()
+                .expect("confirm queue poisoned")
+                .shutdown
+            {
+                events.extend(self.results_rx.try_iter());
                 break;
             }
-            let wait =
-                std::time::Duration::from_millis(50).min(deadline.saturating_duration_since(now));
+            if is_cancelled() {
+                break;
+            }
+            let now = std::time::Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                break;
+            }
+            let wait = deadline.map_or(std::time::Duration::from_millis(50), |deadline| {
+                std::time::Duration::from_millis(50).min(deadline.saturating_duration_since(now))
+            });
             match self.results_rx.recv_timeout(wait) {
                 Ok(event) => events.push(event),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -2828,7 +2936,11 @@ pub fn run_listen_session(
                 Err(error) => DecodeOutcome::Failed(error.to_string()),
             }
         });
-        ConfirmLane::spawn(config.confirm_queue_bound, decoder)
+        ConfirmLane::spawn(
+            config.confirm_queue_bound,
+            ConfirmBackpressure::for_source(&config.source),
+            decoder,
+        )
     });
 
     // Persistence sink (bd-rt-persist-a66y): one run row per session,
@@ -3561,10 +3673,18 @@ pub fn run_listen_session(
 
     // Terminal: confirm-lane drain (bd-rt-confirm-lane-3okr) — a bounded
     // wait so in-flight quality decodes land before history freezes; then
-    // the final stats. run_error is the fatal terminal and is emitted by
-    // the CLI wrapper when this function errors.
+    // the final stats. Unpaced file replay that ended on its own drains to
+    // idle instead (bd-fdk6: the verdict stream must not depend on host
+    // speed); an interrupted session keeps the bounded wait. run_error is
+    // the fatal terminal and is emitted by the CLI wrapper when this
+    // function errors.
     if let Some(lane) = confirm_lane.as_ref() {
-        let (events, abandoned) = lane.drain(config.confirm_drain_sec);
+        let drain_until_idle = !cancelled && lane.backpressure == ConfirmBackpressure::Block;
+        let (events, abandoned) = if drain_until_idle {
+            lane.drain_until_idle(&|| is_cancelled())
+        } else {
+            lane.drain(config.confirm_drain_sec)
+        };
         for event in events {
             handle_confirm_event(
                 event,
@@ -3588,7 +3708,8 @@ pub fn run_listen_session(
                 serde_json::json!({
                     "detail": "session ended before the quality lane drained",
                     "abandoned_utterances": abandoned,
-                    "drain_sec": config.confirm_drain_sec,
+                    "drain": if drain_until_idle { "until_idle" } else { "bounded" },
+                    "drain_sec": (!drain_until_idle).then_some(config.confirm_drain_sec),
                 }),
             ));
         }
@@ -4427,7 +4548,7 @@ mod tests {
             ));
             DecodeOutcome::Segments(vec![segment(&job.committed_text)], "fake-qm".to_owned())
         });
-        let lane = ConfirmLane::spawn(4, decoder);
+        let lane = ConfirmLane::spawn(4, ConfirmBackpressure::DropOldest, decoder);
         lane.submit(fake_job(1, "hello world"));
         lane.submit(fake_job(2, "second utterance"));
         let events = collect(&lane, 2, 5);
@@ -4465,7 +4586,7 @@ mod tests {
                 "fake-qm".to_owned(),
             )
         });
-        let lane = ConfirmLane::spawn(4, decoder);
+        let lane = ConfirmLane::spawn(4, ConfirmBackpressure::DropOldest, decoder);
         lane.submit(fake_job(1, "hello"));
         let events = collect(&lane, 1, 5);
         assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
@@ -4489,7 +4610,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             DecodeOutcome::Segments(vec![segment(&job.committed_text)], "fake-qm".to_owned())
         });
-        let lane = ConfirmLane::spawn(4, decoder);
+        let lane = ConfirmLane::spawn(4, ConfirmBackpressure::DropOldest, decoder);
         for id in 1..=6 {
             lane.submit(fake_job(id, "text"));
         }
@@ -4514,12 +4635,101 @@ mod tests {
         assert_eq!(abandoned, 0);
     }
 
+    fn verdict_ids(events: &[ConfirmLaneEvent]) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ConfirmLaneEvent::Verdict(v) => Some(v.utterance_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn backpressure_blocks_only_for_unpaced_file_replay() {
+        let replay = |realtime_pace| ListenSource::FileReplay {
+            path: std::path::PathBuf::from("fixture.wav"),
+            realtime_pace,
+        };
+        assert_eq!(
+            ConfirmBackpressure::for_source(&replay(false)),
+            ConfirmBackpressure::Block
+        );
+        assert_eq!(
+            ConfirmBackpressure::for_source(&replay(true)),
+            ConfirmBackpressure::DropOldest
+        );
+        assert_eq!(
+            ConfirmBackpressure::for_source(&ListenSource::Mic {
+                device: None,
+                backend: CaptureBackend::Auto,
+            }),
+            ConfirmBackpressure::DropOldest
+        );
+    }
+
+    #[test]
+    fn block_backpressure_confirms_every_job_and_drains_past_the_bounded_budget() {
+        // Slow quality lane + bound 1: drop-oldest would shed most of these,
+        // and a 50 ms bounded drain would abandon the tail.
+        let decoder: QualityDecoder = Box::new(move |job, _prev, _abort| {
+            std::thread::sleep(Duration::from_millis(40));
+            DecodeOutcome::Segments(vec![segment(&job.committed_text)], "fake-qm".to_owned())
+        });
+        let lane = ConfirmLane::spawn(1, ConfirmBackpressure::Block, decoder);
+        for id in 1..=5 {
+            lane.submit(fake_job(id, "text"));
+        }
+        let (events, abandoned) = lane.drain_until_idle(&|| false);
+        assert_eq!(abandoned, 0);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ConfirmLaneEvent::DroppedOldest { .. })),
+            "block backpressure must never drop work: {events:?}"
+        );
+        assert_eq!(verdict_ids(&events), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn drain_until_idle_stops_when_cancelled() {
+        let decoder: QualityDecoder = Box::new(move |_job, _prev, abort| {
+            while !abort() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            DecodeOutcome::Aborted
+        });
+        let lane = ConfirmLane::spawn(4, ConfirmBackpressure::Block, decoder);
+        lane.submit(fake_job(1, "never finishes"));
+        let started = Instant::now();
+        let (events, abandoned) =
+            lane.drain_until_idle(&|| started.elapsed() > Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(abandoned, 1);
+        assert!(verdict_ids(&events).is_empty());
+    }
+
+    #[test]
+    fn block_backpressure_never_strands_the_producer_when_the_worker_dies() {
+        let decoder: QualityDecoder = Box::new(move |_job, _prev, _abort| {
+            panic!("simulated quality-lane crash");
+        });
+        let lane = ConfirmLane::spawn(1, ConfirmBackpressure::Block, decoder);
+        // The first job crashes the worker; later submissions must return
+        // (refused) instead of waiting on a lane with no consumer.
+        for id in 1..=3 {
+            lane.submit(fake_job(id, "text"));
+        }
+        let (events, _abandoned) = lane.drain_until_idle(&|| false);
+        assert!(verdict_ids(&events).is_empty());
+    }
+
     #[test]
     fn quality_model_unavailable_disables_lane_without_killing_it() {
         let decoder: QualityDecoder = Box::new(move |_job, _prev, _abort| {
             DecodeOutcome::Unavailable("package not installed".to_owned())
         });
-        let lane = ConfirmLane::spawn(4, decoder);
+        let lane = ConfirmLane::spawn(4, ConfirmBackpressure::DropOldest, decoder);
         lane.submit(fake_job(1, "one"));
         lane.submit(fake_job(2, "two"));
         let events = collect(&lane, 1, 5);
@@ -4564,7 +4774,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        let lane = ConfirmLane::spawn(4, decoder);
+        let lane = ConfirmLane::spawn(4, ConfirmBackpressure::DropOldest, decoder);
         lane.submit(fake_job(1, "stuck"));
         let started = Instant::now();
         let (events, abandoned) = lane.drain(0.2);
@@ -4585,7 +4795,7 @@ mod tests {
             let decoder: QualityDecoder = Box::new(move |job, _prev, _abort| {
                 DecodeOutcome::Segments(vec![segment(&job.committed_text)], "fake-qm".to_owned())
             });
-            let lane = ConfirmLane::spawn(1, decoder);
+            let lane = ConfirmLane::spawn(1, ConfirmBackpressure::DropOldest, decoder);
             lane.submit(fake_job(utterance_id, "finished before drain"));
 
             let deadline = Instant::now() + Duration::from_secs(5);
