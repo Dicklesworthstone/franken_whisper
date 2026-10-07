@@ -1055,7 +1055,7 @@ jfk-style single-sentence utterances close before policies can differ; continuou
 | `--step-ms` / `--max-buffer-sec` | 300 / 12 | decode cadence; rolling buffer cap |
 | `--adaptive` | off | adapt cadence and AlignAtt holdback within fixed bounds; Brier calibration failures deterministically restore configured values and emit `listen.controller` evidence |
 | `--language` | detect-and-pin | ISO 639-1 hint |
-| `--max-seconds` / `--max-utterance-sec` | 0 / 90 | session length cap (0 = unbounded); force-close long open speech |
+| `--max-seconds` / `--max-utterance-sec` | 0 / 90 | listening-time cap from capture start, model load excluded (0 = unbounded); force-close long open speech |
 | `--no-partials` | off | suppress mutable partial previews (first remedy for slow consumers) |
 | `--stats-interval-sec` | 30 | `listen.session_stats` heartbeat interval (0 = final only) |
 | `--no-context` / `--capture-buffer-sec` | off / 30 | disable prompt carry; capture ring capacity |

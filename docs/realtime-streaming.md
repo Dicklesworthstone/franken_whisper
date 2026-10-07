@@ -212,7 +212,7 @@ with `fw pull tiny` / `fw pull tiny-en`.
 | `--adaptive` | off | bd-rt-adaptive-contract-yw68: adapt step cadence (±50 ms within [200, 1000]) and AlignAtt holdback (±2 frames within [5, 25]) under the alien-artifact contract; Brier-gated deterministic fallback to these configured values; every decision emits a `listen.controller` event and live state rides `listen.session_stats.controllers` |
 | `--max-buffer-sec` | 12 | rolling buffer cap |
 | `--language` | detect-and-pin | ISO 639-1 hint |
-| `--max-seconds` | 0 (unbounded) | end the session after N seconds |
+| `--max-seconds` | 0 (unbounded) | end the session after N seconds of listening, counted from capture start (model load excluded) |
 | `--max-utterance-sec` | 90 | force-close pathologically long open speech |
 | `--no-partials` | off | suppress mutable `transcript.partial` previews (first remedy for slow consumers) |
 | `--stats-interval-sec` | 30 | `listen.session_stats` heartbeat interval (0 = final only) |

@@ -3105,6 +3105,11 @@ pub fn run_listen_session(
     let mut resampled: Vec<f32> = Vec::new();
     let mut source_ended = false;
     let mut cancelled = false;
+    // `--max-seconds` bounds the listening itself: it starts when capture
+    // reading begins, not at process start, so a slow model load (e.g. the
+    // turbo fast-lane fallback) cannot consume the whole budget and end the
+    // session before a single frame is read.
+    let capture_started = std::time::Instant::now();
 
     let checkpoint = || -> FwResult<()> {
         if is_cancelled() {
@@ -3219,7 +3224,7 @@ pub fn run_listen_session(
             cancelled = true;
         }
         let out_of_time = config.max_seconds > 0.0
-            && session_started.elapsed().as_secs_f64() >= config.max_seconds;
+            && capture_started.elapsed().as_secs_f64() >= config.max_seconds;
         if cancelled || out_of_time || source_ended {
             // Final flush when speech is open.
             if in_speech {

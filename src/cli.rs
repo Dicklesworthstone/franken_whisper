@@ -1264,7 +1264,8 @@ pub struct ListenArgs {
     #[arg(long)]
     pub language: Option<String>,
 
-    /// End the session after this many seconds (0 = unbounded).
+    /// End the session after listening for this many seconds, counted from
+    /// when capture starts (model loading excluded; 0 = unbounded).
     #[arg(long, default_value_t = 0.0)]
     pub max_seconds: f64,
 
