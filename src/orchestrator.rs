@@ -2553,6 +2553,11 @@ async fn execute_backend(
             "native_fallback_error": execution.native_fallback_error.clone(),
         }),
     );
+    if execution.implementation == backend::BackendImplementation::Native {
+        inter
+            .warnings
+            .extend(backend::native_ignored_option_warnings(request));
+    }
     let backend_output_sha256 = match sha256_json_value(&execution.result.raw_output) {
         Ok(hash) => Some(hash),
         Err(error) => {
@@ -2835,6 +2840,14 @@ async fn execute_backend_speculative(
 
             let overlap_ms = spec_config.overlap_ms;
             let telemetry = Mutex::new(SpeculativeLaneTelemetry::default());
+            // The lanes run concurrently, and bridge backends write fixed-name
+            // artifacts (e.g. `whispercpp_output.json`) into their work dir: a
+            // shared dir lets one lane read the other's half-written output.
+            // Each lane gets its own; windows within a lane stay sequential.
+            let fast_lane_dir = backend_dir.join("speculative-fast-lane");
+            let quality_lane_dir = backend_dir.join("speculative-quality-lane");
+            std::fs::create_dir_all(&fast_lane_dir)?;
+            std::fs::create_dir_all(&quality_lane_dir)?;
             // Backends see only the window's slice, so their timestamps are
             // slice-relative: localize them to absolute time and keep only the
             // window's owned span before the pipeline merges windows.
@@ -2842,10 +2855,14 @@ async fn execute_backend_speculative(
                             lane_request: &TranscribeRequest,
                             slice: &SpeculativeWindowSlice|
              -> FwResult<Vec<crate::model::TranscriptionSegment>> {
+                let lane_dir = match lane {
+                    SpeculativeLane::Fast => &fast_lane_dir,
+                    SpeculativeLane::Quality => &quality_lane_dir,
+                };
                 let execution = crate::backend::execute(
                     lane_request,
                     &slice.path,
-                    &backend_dir,
+                    lane_dir,
                     per_invocation_timeout,
                     Some(&tok),
                 )?;

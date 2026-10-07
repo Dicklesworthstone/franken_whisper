@@ -1635,7 +1635,9 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub split_on_word: bool,
 
-    /// Best-of sampling count (whisper.cpp).
+    /// Sampling candidates per temperature-fallback rung (whisper.cpp
+    /// `--best-of`, default 5). On the native engine, passing it enables the
+    /// quality-gated fallback for this run.
     #[arg(long)]
     pub best_of: Option<u32>,
 
@@ -1651,23 +1653,30 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub max_segment_length: Option<u32>,
 
-    /// Sampling temperature (whisper.cpp).
+    /// Initial sampling temperature (whisper.cpp bridge only; the native
+    /// engine's first pass is greedy and reports a warning when this is > 0).
     #[arg(long)]
     pub temperature: Option<f32>,
 
-    /// Temperature increment on fallback (whisper.cpp).
+    /// Temperature step of the fallback ladder, within [0, 1] (whisper.cpp
+    /// default 0.2; 0 = no retries). On the native engine, passing it enables
+    /// the quality-gated fallback for this run.
     #[arg(long)]
     pub temperature_increment: Option<f32>,
 
-    /// Entropy threshold for decoder (whisper.cpp).
+    /// Token-entropy threshold below which a window is a repetition loop and
+    /// is retried (default 2.4). On the native engine, passing it enables the
+    /// fallback for this run.
     #[arg(long)]
     pub entropy_threshold: Option<f32>,
 
-    /// Log-prob threshold for decoder (whisper.cpp).
+    /// Average log-prob threshold below which a window is retried (default
+    /// -1.0). On the native engine, passing it enables the fallback for this run.
     #[arg(long)]
     pub logprob_threshold: Option<f32>,
 
-    /// No-speech probability threshold (whisper.cpp).
+    /// No-speech probability threshold for treating a low-confidence window
+    /// as silence (default 0.6).
     #[arg(long)]
     pub no_speech_threshold: Option<f32>,
 
@@ -1725,7 +1734,8 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub carry_initial_prompt: bool,
 
-    /// Disable temperature fallback during decoding (whisper.cpp).
+    /// Disable temperature fallback during decoding (whisper.cpp; on the
+    /// native engine it overrides every flag that would enable it).
     #[arg(long)]
     pub no_fallback: bool,
 
@@ -1751,7 +1761,8 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub duration_ms: Option<u64>,
 
-    /// Audio context size, 0 = all (whisper.cpp).
+    /// Encoder audio context in frames, 0 = full 30 s window (whisper.cpp;
+    /// the native engine maps N > 0 to a fixed encoder context).
     #[arg(long)]
     pub audio_ctx: Option<i32>,
 
@@ -2019,6 +2030,39 @@ pub enum TtyAudioControlCommand {
 }
 
 impl TranscribeArgs {
+    /// Reject decoding flags no engine can honor before any work starts: a NaN
+    /// threshold would silently disable its gate (every comparison is false),
+    /// and the native engine maps these values per request (bd-6goy).
+    fn validate_decoding_flags(&self) -> FwResult<()> {
+        let invalid = |message: String| Err(FwError::InvalidRequest(message));
+        for (flag, value) in [
+            ("--temperature", self.temperature),
+            ("--temperature-increment", self.temperature_increment),
+            ("--entropy-threshold", self.entropy_threshold),
+            ("--logprob-threshold", self.logprob_threshold),
+            ("--no-speech-threshold", self.no_speech_threshold),
+        ] {
+            if let Some(value) = value
+                && !value.is_finite()
+            {
+                return invalid(format!("{flag} must be a finite number, got {value}"));
+            }
+        }
+        if self.temperature.is_some_and(|t| t < 0.0) {
+            return invalid("--temperature must be >= 0".to_owned());
+        }
+        if self
+            .temperature_increment
+            .is_some_and(|inc| !(0.0..=1.0).contains(&inc))
+        {
+            return invalid("--temperature-increment must be within [0, 1]".to_owned());
+        }
+        if self.best_of == Some(0) {
+            return invalid("--best-of must be at least 1".to_owned());
+        }
+        Ok(())
+    }
+
     /// Build a request while retaining these CLI arguments.
     ///
     /// Terminal production call sites should prefer [`Self::into_request`] so
@@ -2031,6 +2075,7 @@ impl TranscribeArgs {
     /// strings and paths instead of cloning them immediately before the CLI
     /// object is discarded.
     pub fn into_request(mut self) -> FwResult<TranscribeRequest> {
+        self.validate_decoding_flags()?;
         let effective_diarize = self.diarize || !self.no_diarize;
         let mut mode_count = 0usize;
         if self.input.is_some() {
@@ -3089,6 +3134,44 @@ mod tests {
         assert_eq!(dp.beam_size, Some(5));
         assert!(dp.best_of.is_none());
         assert!(dp.temperature.is_none());
+    }
+
+    #[test]
+    fn decoding_flags_reject_values_that_would_disable_their_gate() {
+        let rejects = |mutate: fn(&mut TranscribeArgs), needle: &str| {
+            let mut args = minimal_args();
+            mutate(&mut args);
+            let error = args.to_request().expect_err("invalid decoding flag");
+            assert!(error.to_string().contains(needle), "{error}");
+        };
+        rejects(
+            |a| a.logprob_threshold = Some(f32::NAN),
+            "--logprob-threshold",
+        );
+        rejects(
+            |a| a.entropy_threshold = Some(f32::INFINITY),
+            "--entropy-threshold",
+        );
+        rejects(
+            |a| a.no_speech_threshold = Some(f32::NEG_INFINITY),
+            "--no-speech-threshold",
+        );
+        rejects(|a| a.temperature = Some(-0.1), "--temperature");
+        rejects(
+            |a| a.temperature_increment = Some(1.5),
+            "--temperature-increment",
+        );
+        rejects(
+            |a| a.temperature_increment = Some(-0.2),
+            "--temperature-increment",
+        );
+        rejects(|a| a.best_of = Some(0), "--best-of");
+
+        let mut args = minimal_args();
+        args.temperature_increment = Some(0.0);
+        args.best_of = Some(1);
+        args.logprob_threshold = Some(-2.5);
+        args.to_request().expect("boundary values are valid");
     }
 
     #[test]

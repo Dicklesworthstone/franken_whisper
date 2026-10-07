@@ -284,6 +284,30 @@ The fallback policy is fail-closed, not fail-open:
 - Contract violations increment the adaptive routing calibration penalty for that engine.
 - After `ADAPTIVE_FALLBACK_BRIER_THRESHOLD` (0.35) consecutive poor scores, the engine is deprioritized in routing.
 
+### 6.4 Per-request whisper.cpp decoding controls (bd-6goy)
+
+The native backends map the whisper.cpp decoding flags onto
+`DecodeParams` per request (`backend::apply_native_decode_controls`). A
+request that passes none of them decodes byte-identically to the default
+(greedy, no ladder, whisper.cpp thresholds):
+
+| Flag | Native effect |
+|---|---|
+| `--beam-size N` | beam search on temperature-0 windows (clamped to 1..8) |
+| `--best-of N`, `--temperature-increment X`, `--entropy-threshold X`, `--logprob-threshold X` | enable the quality-gated temperature-fallback ladder for this run, with these values (ladder rungs are `k * X` up to 1.0; `0` = no rungs) |
+| `--no-fallback` | ladder off; wins over every flag above |
+| `--no-speech-threshold X` | moves the silent-window gate only |
+| `--audio-ctx N` (N > 0) | fixed encoder context (`AudioCtxPolicy::fixed`); 0 = full window |
+
+`FW_TEMP_FALLBACK` / `FW_TEMP_BEST_OF` / `FW_BEAM_SIZE` remain the process-wide
+operator hatches (`FW_TEMP_FALLBACK` only applies when the request makes no
+explicit choice). Flags the engine cannot honor — `--temperature > 0` (the
+first pass is greedy), `--max-segment-length`, `--detect-language-only`,
+`--carry-initial-prompt`, `--word-threshold`, `--suppress-regex` — are reported
+as run warnings (`native engine ignored unsupported option ...`) instead of
+being dropped silently. The CLI rejects non-finite thresholds, a negative
+`--temperature`, a `--temperature-increment` outside [0, 1], and `--best-of 0`.
+
 ## 7. Implementation Guidance
 
 ### 7.1 File Organization

@@ -105,7 +105,7 @@ fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
         .map_or_else(native_engine::default_threads, |t| {
             usize::try_from(t).unwrap_or_else(|_| native_engine::default_threads())
         });
-    decode::DecodeParams {
+    let mut params = decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
         // Same quality knobs as the sequential native backend: a request prompt
@@ -134,7 +134,9 @@ fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
         n_threads,
         max_text_ctx: None,
         ..decode::DecodeParams::default()
-    }
+    };
+    super::apply_native_decode_controls(&mut params, request);
+    params
 }
 
 /// Bridge an optional orchestrator [`CancellationToken`] into the engine's
@@ -495,6 +497,94 @@ mod tests {
         let dp = decode_params(&req);
         assert_eq!(dp.initial_prompt.as_deref(), Some("clinical notes"));
         assert_eq!(dp.beam_size, Some(4));
+    }
+
+    #[test]
+    fn decode_params_map_fallback_thresholds_and_audio_ctx_only_when_passed() {
+        use crate::model::DecodingParams;
+        use crate::native_engine::decode::AudioCtxPolicy;
+
+        // No decoding flags: none of the bd-6goy controls are set, so the
+        // engine decodes byte-identically to before (greedy, no ladder).
+        let dp = decode_params(&request());
+        assert_eq!(dp.temperature_fallback, None);
+        assert_eq!(dp.best_of, None);
+        assert_eq!(dp.temperature_increment_milli, None);
+        assert_eq!(dp.logprob_threshold_milli, None);
+        assert_eq!(dp.no_speech_threshold_milli, None);
+        assert_eq!(dp.entropy_threshold_milli, None);
+        assert_eq!(dp.audio_ctx, AudioCtxPolicy::Full);
+
+        let mut req = request();
+        req.backend_params.decoding = Some(DecodingParams {
+            best_of: Some(3),
+            temperature_increment: Some(0.25),
+            entropy_threshold: Some(2.2),
+            logprob_threshold: Some(-0.75),
+            no_speech_threshold: Some(0.65),
+            ..DecodingParams::default()
+        });
+        req.backend_params.audio_ctx = Some(768);
+        let dp = decode_params(&req);
+        assert_eq!(dp.temperature_fallback, Some(true));
+        assert_eq!(dp.best_of, Some(3));
+        assert_eq!(dp.temperature_increment_milli, Some(250));
+        assert_eq!(dp.entropy_threshold_milli, Some(2200));
+        assert_eq!(dp.logprob_threshold_milli, Some(-750));
+        assert_eq!(dp.no_speech_threshold_milli, Some(650));
+        assert_eq!(dp.audio_ctx, AudioCtxPolicy::fixed(768));
+
+        // --no-fallback wins over every flag that would enable the ladder.
+        req.backend_params.no_fallback = true;
+        assert_eq!(decode_params(&req).temperature_fallback, Some(false));
+
+        // --no-speech-threshold alone only moves the silence gate.
+        let mut req = request();
+        req.backend_params.decoding = Some(DecodingParams {
+            no_speech_threshold: Some(0.8),
+            ..DecodingParams::default()
+        });
+        req.backend_params.audio_ctx = Some(0);
+        let dp = decode_params(&req);
+        assert_eq!(dp.temperature_fallback, None);
+        assert_eq!(dp.no_speech_threshold_milli, Some(800));
+        assert_eq!(dp.audio_ctx, AudioCtxPolicy::Full, "0 = full context");
+    }
+
+    #[test]
+    fn native_reports_whisper_cpp_options_it_cannot_honor() {
+        use crate::model::DecodingParams;
+
+        assert!(super::super::native_ignored_option_warnings(&request()).is_empty());
+        let mut req = request();
+        req.backend_params.decoding = Some(DecodingParams {
+            temperature: Some(0.0),
+            ..DecodingParams::default()
+        });
+        assert!(
+            super::super::native_ignored_option_warnings(&req).is_empty(),
+            "temperature 0 is exactly the native greedy first pass"
+        );
+        req.backend_params.decoding = Some(DecodingParams {
+            temperature: Some(0.4),
+            max_segment_length: Some(40),
+            ..DecodingParams::default()
+        });
+        req.backend_params.detect_language_only = true;
+        req.backend_params.suppress_regex = Some("[0-9]".to_owned());
+        let warnings = super::super::native_ignored_option_warnings(&req);
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.starts_with("native engine ignored"))
+        );
+        assert!(warnings.iter().any(|w| w.contains("--temperature")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("--detect-language-only"))
+        );
     }
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {

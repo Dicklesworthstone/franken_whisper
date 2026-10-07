@@ -277,7 +277,7 @@ fn total_threads_for(request: &TranscribeRequest) -> usize {
 /// caller-chosen `threads_per_worker` (the rest of the params are window-shape
 /// independent).
 fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> decode::DecodeParams {
-    decode::DecodeParams {
+    let mut params = decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
         // Beam width (`--beam-size`) is a per-window decode param, so it applies
@@ -304,7 +304,9 @@ fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> deco
         n_threads: threads_per_worker,
         max_text_ctx: None,
         ..decode::DecodeParams::default()
-    }
+    };
+    super::apply_native_decode_controls(&mut params, request);
+    params
 }
 
 /// One contiguous range's decode result, tagged with its starting window index

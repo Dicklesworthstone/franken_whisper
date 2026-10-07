@@ -255,6 +255,30 @@ pub struct DecodeParams {
     /// hypotheses per step and selects the best length-normalized sequence score.
     /// Clamped to `[1, 8]`. `FW_BEAM_SIZE` overrides this field when set.
     pub beam_size: Option<usize>,
+    /// Per-request temperature fallback (whisper `--no-fallback` /
+    /// `--temperature-increment` / `--best-of`, bd-6goy). `None` = the process
+    /// default ([`temp_fallback_enabled`]: `FW_TEMP_FALLBACK`, off when unset ⇒
+    /// byte-identical greedy); `Some(true)` / `Some(false)` turn the
+    /// whisper.cpp quality-gated ladder on / off for this request.
+    pub temperature_fallback: Option<bool>,
+    /// Sampling candidates per `t > 0` ladder rung (whisper `--best-of`,
+    /// default 5). `FW_TEMP_BEST_OF` overrides when set; clamped to `[1, 32]`.
+    pub best_of: Option<usize>,
+    /// Ladder step in thousandths of a temperature unit (whisper
+    /// `--temperature-increment`, default 200 = 0.2): rung `k` decodes at
+    /// `k * step / 1000` while that is at most 1.0. Integer so `DecodeParams`
+    /// stays `Eq + Hash` (the transcript-cache key). `Some(0)` = no rungs.
+    pub temperature_increment_milli: Option<u32>,
+    /// Window quality-gate thresholds in thousandths (whisper
+    /// `--logprob-threshold` -1.0, `--no-speech-threshold` 0.6,
+    /// `--entropy-threshold` 2.4). `None` keeps the whisper.cpp default ⇒
+    /// byte-identical. The logprob/no-speech pair also decides silent windows
+    /// on the greedy path, exactly as upstream.
+    pub logprob_threshold_milli: Option<i32>,
+    /// See [`Self::logprob_threshold_milli`].
+    pub no_speech_threshold_milli: Option<i32>,
+    /// See [`Self::logprob_threshold_milli`].
+    pub entropy_threshold_milli: Option<i32>,
     /// Suppress non-speech tokens (whisper `--suppress-nst` /
     /// `suppress_non_speech_tokens`): masks the vocab's symbol/non-speech tokens
     /// during decoding for cleaner text. `false` = whisper.cpp default
@@ -977,9 +1001,55 @@ fn retry_failed_window_enabled() -> bool {
     })
 }
 
+/// whisper.cpp's default `temperature_inc` (0.2), in thousandths.
+const TEMP_INCREMENT_DEFAULT_MILLI: u32 = 200;
+
+/// Smallest admitted ladder step (0.01): bounds a request to 100 rungs.
+const TEMP_INCREMENT_MIN_MILLI: u32 = 10;
+
 /// whisper.cpp's temperature-fallback ladder (initial greedy pass at 0.0, then
-/// `temperature_inc = 0.2` per retry): the retry temperatures, in order.
-const TEMP_FALLBACK_LADDER: [f64; 5] = [0.2, 0.4, 0.6, 0.8, 1.0];
+/// one retry per `temperature_inc` step up to 1.0): the retry temperatures, in
+/// order. Each rung is `k * step / 1000` (one correctly rounded division, not
+/// an accumulated sum), so the default step yields exactly the historical
+/// `[0.2, 0.4, 0.6, 0.8, 1.0]` and every seeded rung stays byte-identical.
+fn temperature_ladder(params: &DecodeParams) -> Vec<f64> {
+    let step = match params.temperature_increment_milli {
+        Some(0) => return Vec::new(),
+        Some(step) => step.max(TEMP_INCREMENT_MIN_MILLI),
+        None => TEMP_INCREMENT_DEFAULT_MILLI,
+    };
+    (1_u32..)
+        .map_while(|k| k.checked_mul(step).filter(|&t| t <= 1000))
+        .map(|t| f64::from(t) / 1000.0)
+        .collect()
+}
+
+/// The window quality-gate thresholds a request decodes under: whisper.cpp's
+/// defaults unless the request overrides them (bd-6goy).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct QualityGates {
+    logprob: f64,
+    no_speech: f64,
+    entropy: f64,
+}
+
+impl QualityGates {
+    fn for_params(params: &DecodeParams) -> Self {
+        let milli =
+            |value: Option<i32>, default: f64| value.map_or(default, |m| f64::from(m) / 1000.0);
+        Self {
+            logprob: milli(params.logprob_threshold_milli, LOGPROB_THRESHOLD),
+            no_speech: milli(params.no_speech_threshold_milli, NO_SPEECH_THRESHOLD),
+            entropy: milli(params.entropy_threshold_milli, ENTROPY_THRESHOLD),
+        }
+    }
+
+    /// whisper.cpp 7606-7607: a window is silence when the no-speech
+    /// probability is high AND the decode is low-confidence.
+    fn is_no_speech(self, no_speech_prob: f64, avg_logprob: f64) -> bool {
+        no_speech_prob > self.no_speech && avg_logprob < self.logprob
+    }
+}
 
 /// Above this retry temperature the carried prior-window prompt is dropped for the
 /// attempt (whisper.cpp conditions on no previous text once `t > 0.5`) — which is
@@ -1043,21 +1113,30 @@ fn temp_fallback_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FW_TEMP_FALLBACK").is_some())
 }
 
+/// Whether a request decodes with the fallback ladder: its explicit
+/// [`DecodeParams::temperature_fallback`] choice, else the process default.
+fn temp_fallback_on(params: &DecodeParams) -> bool {
+    params
+        .temperature_fallback
+        .unwrap_or_else(temp_fallback_enabled)
+}
+
 /// whisper.cpp `greedy.best_of` (default 5): how many independent sampling
 /// candidates each `t > 0` ladder rung decodes before the best
 /// [`sequence_score`] wins. `FW_TEMP_BEST_OF` overrides (clamped to [1, 32]);
 /// `1` restores the single-candidate ladder byte-for-byte (first candidate of
 /// every rung draws from the identical seed stream). Only read under
 /// [`temp_fallback_enabled`], so the default path never consults it.
-fn temp_best_of() -> usize {
+fn temp_best_of(params: &DecodeParams) -> usize {
     use std::sync::OnceLock;
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
+    static ENV: OnceLock<Option<usize>> = OnceLock::new();
+    ENV.get_or_init(|| {
         std::env::var("FW_TEMP_BEST_OF")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(5, |n| n.clamp(1, 32))
     })
+    .or(params.best_of)
+    .map_or(5, |n| n.clamp(1, 32))
 }
 
 /// whisper.cpp `whisper_sequence_score` under the default `length_penalty =
@@ -2409,7 +2488,7 @@ fn decode_independent_no_timestamp_window(
     } else {
         EMPTY_WINDOW_AVG_LOGPROB
     };
-    let is_no_speech = no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
+    let is_no_speech = QualityGates::for_params(params).is_no_speech(no_speech_prob, avg_logprob);
 
     work.accepted_windows = 1;
     work.accepted_result_tokens = result_len;
@@ -2951,7 +3030,7 @@ fn transcribe_samples_uncached(
         && cfg.no_timestamps
         && prompt_carry_disabled
         && !params.word_timestamps
-        && !temp_fallback_enabled()
+        && !temp_fallback_on(params)
         && std::env::var_os("PROBE_DUMP_TOKENS").is_none()
         && independent_window_lanes > 1
         && let Some(language) = used_language.as_deref()
@@ -3035,9 +3114,15 @@ fn transcribe_samples_uncached(
         // Set for one iteration when retrying a failed window with the carried prompt
         // cleared (FW_RETRY_FAILED_WINDOW). Reset once the window completes.
         let mut force_empty_prompt = false;
-        // FW_TEMP_FALLBACK ladder position for the CURRENT seek: 0 = the normal
-        // greedy pass; k > 0 = re-decoding at TEMP_FALLBACK_LADDER[k - 1]. Reset to 0
-        // once a window is accepted, so every window starts greedy.
+        // Request-resolved fallback controls (bd-6goy): the ladder is consulted
+        // only when `fallback_on`, so the default path stays byte-identical.
+        let fallback_on = temp_fallback_on(params);
+        let ladder = temperature_ladder(params);
+        let best_of = temp_best_of(params);
+        let gates = QualityGates::for_params(params);
+        // Fallback ladder position for the CURRENT seek: 0 = the normal greedy
+        // pass; k > 0 = re-decoding at ladder[k - 1]. Reset to 0 once a window is
+        // accepted, so every window starts greedy.
         let mut temp_attempt: usize = 0;
         // The temperature the current attempt decodes at (0.0 = argmax/greedy path).
         let mut window_temp: f64 = 0.0;
@@ -3395,7 +3480,7 @@ fn transcribe_samples_uncached(
             // Never entered at window_temp == 0.0, so the greedy pass and the
             // whole default path are untouched.
             let (decoded, plogs, result_len, seek_delta_cs, avg_logprob, no_speech_prob) =
-                if temp_fallback_enabled() && window_temp > 0.0 {
+                if fallback_on && window_temp > 0.0 {
                     let cand = WindowCandidate {
                         score: sequence_score(&plogs, result_len),
                         decoded,
@@ -3412,7 +3497,7 @@ fn transcribe_samples_uncached(
                         Some(b) if b.score >= cand.score => b,
                         _ => cand,
                     };
-                    if cand_idx + 1 < temp_best_of() {
+                    if cand_idx + 1 < best_of {
                         rung_best = Some(best);
                         cand_idx += 1;
                         retry_enc_cache = Some((frame_offset, enc));
@@ -3442,10 +3527,9 @@ fn transcribe_samples_uncached(
             // no-speech / failed-window gate (whisper.cpp 7606-7607): treat as
             // silence, emit nothing, advance the full window. At a completed
             // t > 0 rung this evaluates the ADOPTED best candidate.
-            let is_no_speech =
-                no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
+            let is_no_speech = gates.is_no_speech(no_speech_prob, avg_logprob);
 
-            // FW_TEMP_FALLBACK (default-off, bd-6goy / bd-r0qd fix-spec #3): the
+            // Temperature fallback (default-off, bd-6goy / bd-r0qd fix-spec #3): the
             // whisper.cpp fallback ladder. A non-silent window that closed no
             // timestamp, averaged below the logprob threshold, or looped into a
             // low-entropy repetitive tail (whisper.cpp entropy_thold, 7540)
@@ -3461,7 +3545,7 @@ fn transcribe_samples_uncached(
             let tail_entropy = {
                 let take = result_len.min(decoded.len());
                 // Only priced when the gate is on: the default path never counts.
-                if temp_fallback_enabled() && take > ENTROPY_WINDOW {
+                if fallback_on && take > ENTROPY_WINDOW {
                     Some(token_tail_entropy(&decoded[..take]))
                 } else {
                     None
@@ -3469,13 +3553,13 @@ fn transcribe_samples_uncached(
             };
             let quality_failed = !is_no_speech
                 && (result_len == 0
-                    || avg_logprob < LOGPROB_THRESHOLD
-                    || tail_entropy.is_some_and(|e| e < ENTROPY_THRESHOLD));
-            if temp_fallback_enabled()
+                    || avg_logprob < gates.logprob
+                    || tail_entropy.is_some_and(|e| e < gates.entropy));
+            if fallback_on
                 && quality_failed
-                && temp_attempt < TEMP_FALLBACK_LADDER.len()
+                && let Some(&next_temp) = ladder.get(temp_attempt)
             {
-                window_temp = TEMP_FALLBACK_LADDER[temp_attempt];
+                window_temp = next_temp;
                 temp_attempt += 1;
                 work.temperature_fallback_retries += 1;
                 cand_idx = 0;
@@ -3508,7 +3592,7 @@ fn transcribe_samples_uncached(
             // should avoid this path; it remains a conservative fallback and supports
             // the explicit historical-context overrides above.
             if retry_failed_window_enabled()
-                && !temp_fallback_enabled()
+                && !fallback_on
                 && result_len == 0
                 && !is_no_speech
                 && !force_empty_prompt
@@ -4812,6 +4896,84 @@ mod tests {
         assert!(token_tail_entropy(&distinct) > ENTROPY_THRESHOLD);
         // Empty input is defined (0.0), matching "no evidence of a loop".
         assert_eq!(token_tail_entropy(&[]), 0.0);
+    }
+
+    #[test]
+    fn default_temperature_ladder_is_bit_identical_to_the_historical_constant() {
+        // The FW_TEMP_FALLBACK path was pinned to this literal ladder; seeded
+        // sampling rungs stay byte-exact only if the computed ladder matches it
+        // bit for bit (one correctly rounded division per rung, no running sum).
+        let historical = [0.2_f64, 0.4, 0.6, 0.8, 1.0];
+        let ladder = temperature_ladder(&DecodeParams::default());
+        assert_eq!(ladder.len(), historical.len());
+        for (rung, expected) in ladder.iter().zip(historical) {
+            assert_eq!(rung.to_bits(), expected.to_bits());
+        }
+        let step = |milli| DecodeParams {
+            temperature_increment_milli: Some(milli),
+            ..DecodeParams::default()
+        };
+        assert_eq!(temperature_ladder(&step(250)), vec![0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(temperature_ladder(&step(300)), vec![0.3, 0.6, 0.9]);
+        assert!(temperature_ladder(&step(0)).is_empty(), "0 = no retries");
+        assert!(temperature_ladder(&step(1500)).is_empty());
+        // A sub-0.01 step is clamped, bounding the ladder at 100 rungs.
+        assert_eq!(temperature_ladder(&step(1)).len(), 100);
+    }
+
+    #[test]
+    fn quality_gates_default_to_whisper_cpp_and_take_request_overrides() {
+        let defaults = QualityGates::for_params(&DecodeParams::default());
+        assert_eq!(
+            defaults,
+            QualityGates {
+                logprob: LOGPROB_THRESHOLD,
+                no_speech: NO_SPEECH_THRESHOLD,
+                entropy: ENTROPY_THRESHOLD,
+            }
+        );
+        let custom = QualityGates::for_params(&DecodeParams {
+            logprob_threshold_milli: Some(-500),
+            no_speech_threshold_milli: Some(900),
+            entropy_threshold_milli: Some(2000),
+            ..DecodeParams::default()
+        });
+        assert_eq!(custom.logprob, -0.5);
+        assert_eq!(custom.no_speech, 0.9);
+        assert_eq!(custom.entropy, 2.0);
+        // Silence needs BOTH a high no-speech probability and low confidence.
+        assert!(defaults.is_no_speech(0.7, -1.5));
+        assert!(!defaults.is_no_speech(0.7, -0.5));
+        assert!(!defaults.is_no_speech(0.5, -1.5));
+        assert!(
+            !custom.is_no_speech(0.7, -1.5),
+            "0.7 is under the raised 0.9 bar"
+        );
+    }
+
+    #[test]
+    fn request_fallback_choice_wins_over_the_process_default() {
+        // FW_TEMP_FALLBACK is unset in the unit-test environment.
+        if std::env::var_os("FW_TEMP_FALLBACK").is_some() {
+            return;
+        }
+        assert!(!temp_fallback_on(&DecodeParams::default()));
+        let with = |choice| DecodeParams {
+            temperature_fallback: Some(choice),
+            ..DecodeParams::default()
+        };
+        assert!(temp_fallback_on(&with(true)));
+        assert!(!temp_fallback_on(&with(false)));
+        if std::env::var_os("FW_TEMP_BEST_OF").is_none() {
+            assert_eq!(temp_best_of(&DecodeParams::default()), 5);
+            let best_of = |n| DecodeParams {
+                best_of: Some(n),
+                ..DecodeParams::default()
+            };
+            assert_eq!(temp_best_of(&best_of(3)), 3);
+            assert_eq!(temp_best_of(&best_of(0)), 1);
+            assert_eq!(temp_best_of(&best_of(99)), 32);
+        }
     }
 
     #[test]

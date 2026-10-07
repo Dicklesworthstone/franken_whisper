@@ -755,13 +755,20 @@ fn write_whisper_cpp_stub_binary(dir: &std::path::Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
     let stub_path = dir.join("whisper_cpp_stub.sh");
+    // `FW_TEST_STUB_LOG` (optional) records `<model>\t<output prefix>` per
+    // invocation so tests can assert which work directory each run used.
     let script = r#"#!/bin/bash
 set -euo pipefail
 out_prefix=""
+model=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -of)
       out_prefix="$2"
+      shift 2
+      ;;
+    -m)
+      model="$2"
       shift 2
       ;;
     *)
@@ -772,6 +779,9 @@ done
 if [[ -z "${out_prefix}" ]]; then
   echo "missing -of output prefix" >&2
   exit 2
+fi
+if [[ -n "${FW_TEST_STUB_LOG:-}" ]]; then
+  printf '%s\t%s\n' "${model}" "${out_prefix}" >> "${FW_TEST_STUB_LOG}"
 fi
 printf '%s\n' '{"text":"stub transcript","language":"en","segments":[{"start":0.0,"end":0.5,"text":"stub transcript","speaker":"SPEAKER_00","confidence":0.9}]}' > "${out_prefix}.json"
 "#;
@@ -5799,6 +5809,7 @@ fn speculative_cli_multi_window_run_localizes_segments_and_streams_partials_firs
     fs::create_dir_all(&bin_dir).expect("bin dir");
     // Every invocation reports one segment at slice-relative [0.0, 0.5].
     let stub_bin = write_whisper_cpp_stub_binary(&bin_dir);
+    let stub_log = dir.path().join("stub_invocations.log");
 
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
         .args([
@@ -5825,6 +5836,7 @@ fn speculative_cli_multi_window_run_localizes_segments_and_streams_partials_firs
         .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
         .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
         .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0")
+        .env("FW_TEST_STUB_LOG", &stub_log)
         .output()
         .expect("robot run should execute");
     let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
@@ -5832,6 +5844,35 @@ fn speculative_cli_multi_window_run_localizes_segments_and_streams_partials_firs
     assert!(
         output.status.success(),
         "speculative run should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // The lanes run concurrently and the bridge writes a fixed-name JSON into
+    // its work dir: each lane must own a distinct dir, or one lane can read
+    // the other's half-written output (seen as `EOF while parsing` under load).
+    let invocations = fs::read_to_string(&stub_log).expect("stub invocation log");
+    let lane_dirs = |model: &str| -> std::collections::BTreeSet<PathBuf> {
+        invocations
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(logged_model, _)| *logged_model == model)
+            .map(|(_, prefix)| {
+                std::path::Path::new(prefix)
+                    .parent()
+                    .expect("prefix has a parent dir")
+                    .to_path_buf()
+            })
+            .collect()
+    };
+    let (fast_dirs, quality_dirs) = (lane_dirs("tiny"), lane_dirs("large"));
+    assert_eq!(fast_dirs.len(), 1, "fast lane work dirs: {invocations}");
+    assert_eq!(
+        quality_dirs.len(),
+        1,
+        "quality lane work dirs: {invocations}"
+    );
+    assert!(
+        fast_dirs.is_disjoint(&quality_dirs),
+        "concurrent lanes must not share a work dir: {invocations}"
     );
     let events: Vec<serde_json::Value> = stdout
         .lines()

@@ -387,7 +387,7 @@ fn decode_params(
         .map_or_else(native_engine::default_threads, |t| {
             usize::try_from(t).unwrap_or_else(|_| native_engine::default_threads())
         });
-    decode::DecodeParams {
+    let mut params = decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
         // Initial prompt (whisper `--prompt`): the engine tokenizes it and seeds
@@ -425,13 +425,15 @@ fn decode_params(
         } else {
             None
         },
-        // Streaming encoder-context policy stays at the byte-exact default for
-        // bridge backends (the knob is per-request on the engine; the live
-        // driver opts in, not the batch bridges).
+        // Full encoder context unless the request passes `--audio-ctx`
+        // (applied by `apply_native_decode_controls` below).
         audio_ctx: decode::AudioCtxPolicy::Full,
         bypass_transcript_cache: false,
         record_token_attn: false,
-    }
+        ..decode::DecodeParams::default()
+    };
+    super::apply_native_decode_controls(&mut params, request);
+    params
 }
 
 /// Bridge an optional orchestrator [`CancellationToken`] into the engine's

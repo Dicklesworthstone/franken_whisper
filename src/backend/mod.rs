@@ -1411,6 +1411,93 @@ pub fn is_available(kind: BackendKind) -> bool {
     }
 }
 
+/// Thousandths of `value`, saturating (the request validator already rejects
+/// non-finite values; the clamp only bounds the cast).
+fn milli_i32(value: f32) -> i32 {
+    (f64::from(value) * 1000.0)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+/// Map the request's whisper.cpp decoding controls onto the in-process
+/// engine's per-request [`DecodeParams`](native_engine::decode::DecodeParams)
+/// (bd-6goy). Only flags the caller actually passed change anything, so a
+/// request without them decodes byte-identically to before:
+///
+/// - `--best-of`, `--temperature-increment`, `--entropy-threshold`, or
+///   `--logprob-threshold` turn the whisper.cpp quality-gated temperature
+///   fallback ON for this request (they only mean something with it);
+///   `--no-fallback` forces it OFF and wins over all of them.
+/// - The thresholds and the ladder step carry their values; `--no-speech-
+///   threshold` alone only moves the silent-window gate, as upstream.
+/// - `--audio-ctx N` (N > 0) selects a fixed encoder context; 0 / unset keeps
+///   the full 30 s window.
+pub(crate) fn apply_native_decode_controls(
+    params: &mut native_engine::decode::DecodeParams,
+    request: &TranscribeRequest,
+) {
+    let backend_params = &request.backend_params;
+    if let Some(decoding) = backend_params.decoding.as_ref() {
+        params.best_of = decoding.best_of.map(|n| n as usize);
+        params.temperature_increment_milli = decoding
+            .temperature_increment
+            .map(|inc| u32::try_from(milli_i32(inc).max(0)).unwrap_or(0));
+        params.entropy_threshold_milli = decoding.entropy_threshold.map(milli_i32);
+        params.logprob_threshold_milli = decoding.logprob_threshold.map(milli_i32);
+        params.no_speech_threshold_milli = decoding.no_speech_threshold.map(milli_i32);
+        if decoding.best_of.is_some()
+            || decoding.temperature_increment.is_some()
+            || decoding.entropy_threshold.is_some()
+            || decoding.logprob_threshold.is_some()
+        {
+            params.temperature_fallback = Some(true);
+        }
+    }
+    if backend_params.no_fallback {
+        params.temperature_fallback = Some(false);
+    }
+    if let Some(ctx) = backend_params.audio_ctx
+        && let Ok(ctx) = usize::try_from(ctx)
+        && ctx > 0
+    {
+        params.audio_ctx = native_engine::decode::AudioCtxPolicy::fixed(ctx);
+    }
+}
+
+/// Request options the in-process engine cannot honor, as run warnings (so a
+/// whisper.cpp flag never silently does nothing on the default native path).
+#[must_use]
+pub(crate) fn native_ignored_option_warnings(request: &TranscribeRequest) -> Vec<String> {
+    let backend_params = &request.backend_params;
+    let decoding = backend_params.decoding.as_ref();
+    let mut ignored = Vec::new();
+    if decoding
+        .and_then(|d| d.temperature)
+        .is_some_and(|temperature| temperature > 0.0)
+    {
+        ignored.push("--temperature (the native first pass is greedy; use --temperature-increment/--best-of for the fallback ladder)");
+    }
+    if decoding.and_then(|d| d.max_segment_length).is_some() {
+        ignored.push("--max-segment-length");
+    }
+    if backend_params.detect_language_only {
+        ignored.push("--detect-language-only");
+    }
+    if backend_params.carry_initial_prompt {
+        ignored.push("--carry-initial-prompt");
+    }
+    if backend_params.word_threshold.is_some() {
+        ignored.push("--word-threshold");
+    }
+    if backend_params.suppress_regex.is_some() {
+        ignored.push("--suppress-regex");
+    }
+    ignored
+        .into_iter()
+        .map(|option| format!("native engine ignored unsupported option {option}"))
+        .collect()
+}
+
 /// Returns per-backend diagnostic info for the `robot backends` command.
 pub fn diagnostics() -> Vec<serde_json::Value> {
     vec![
