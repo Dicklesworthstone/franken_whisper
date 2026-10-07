@@ -3594,7 +3594,29 @@ fn align_transcription_result(
         });
     }
 
-    let mut report = ctc_forced_align(&mut result.segments, audio_duration_sec, config, token)?;
+    // bd-azpf: the in-process engine's segment boundaries are the model's own
+    // timestamp tokens. The character-density heuristic only rewrites
+    // segments that already carry timestamps, so applying it here would trade
+    // model evidence for a uniform speech-rate guess (up to the drift guard).
+    // Keep the model boundaries; only the bounded energy-valley snap below
+    // may refine them.
+    let mut report = if has_native_model_timestamps(&result.raw_output) {
+        token.checkpoint()?;
+        AlignmentReport {
+            segments_total: result.segments.len(),
+            segments_corrected: 0,
+            segments_fallback: result.segments.len(),
+            method: "native_timestamp_tokens",
+            energy_valley_snaps: 0,
+            energy_evidence_available: false,
+            notes: vec![
+                "preserved the native engine's timestamp-token boundaries; character-density heuristic skipped"
+                    .to_owned(),
+            ],
+        }
+    } else {
+        ctc_forced_align(&mut result.segments, audio_duration_sec, config, token)?
+    };
 
     if let Some(profile) = energy_valleys {
         report.energy_evidence_available = true;
@@ -3718,6 +3740,7 @@ async fn execute_align(
     inter.warnings.extend(report.notes.iter().cloned());
 
     let align_code = if report.method == "dtw_attention"
+        || report.method == "native_timestamp_tokens"
         || report.segments_corrected > 0
         || report.energy_valley_snaps > 0
     {
@@ -6694,6 +6717,13 @@ fn tiny_diarize_boundary_hints(
         boundaries_ms,
         tiny_diarize_hint_evidence(true, accepted_count, "accepted"),
     )
+}
+
+/// Whether a backend result came from the in-process native engine, whose
+/// segment times are decoded timestamp tokens rather than estimates.
+fn has_native_model_timestamps(raw_output: &Value) -> bool {
+    raw_output.get("in_process").and_then(Value::as_bool) == Some(true)
+        && raw_output.get("implementation").and_then(Value::as_str) == Some("real-inference")
 }
 
 fn has_canonical_word_alignment(raw_output: &Value) -> bool {
@@ -12900,6 +12930,89 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&result.segments).expect("serialize preserved segments"),
             original_json
+        );
+    }
+
+    #[test]
+    fn native_results_keep_model_timestamps_and_only_energy_snap() {
+        let native_raw = json!({
+            "engine": "whisper.cpp-native",
+            "in_process": true,
+            "implementation": "real-inference",
+        });
+        // Boundaries a char-density pass would move: 8 + 12 chars over 2 s
+        // puts the heuristic boundary at 0.8 s, inside the 0.5 s drift guard.
+        let segments = vec![
+            make_segment(0.0, 1.04, "abcdefgh"),
+            make_segment(1.04, 2.0, "abcdefghijkl"),
+        ];
+        let mut without_evidence = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: String::new(),
+            language: Some("en".to_owned()),
+            segments: segments.clone(),
+            acceleration: None,
+            diarization: None,
+            raw_output: native_raw.clone(),
+            artifact_paths: Vec::new(),
+        };
+        let report = align_transcription_result(
+            &mut without_evidence,
+            Some(2.0),
+            &AlignConfig::default(),
+            None,
+            &CancellationToken::no_deadline(),
+        )
+        .expect("native alignment");
+        assert_eq!(report.method, "native_timestamp_tokens");
+        assert_eq!(report.segments_corrected, 0);
+        assert_eq!(
+            serde_json::to_value(&without_evidence.segments).expect("serialize"),
+            serde_json::to_value(&segments).expect("serialize"),
+            "model timestamps must survive untouched"
+        );
+
+        // With energy evidence, only the bounded valley snap may refine them.
+        let mut with_evidence = without_evidence.clone();
+        with_evidence.segments = segments;
+        let valleys = crate::backend::native_audio::EnergyValleyProfile {
+            frame_ms: 20,
+            activity_threshold: 0.05,
+            valleys: vec![crate::backend::native_audio::EnergyValley {
+                timestamp_ms: 1_000,
+                rms: 0.0,
+            }],
+        };
+        let report = align_transcription_result(
+            &mut with_evidence,
+            Some(2.0),
+            &AlignConfig::default(),
+            Some(&valleys),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("native alignment with evidence");
+        assert_eq!(report.method, "native_timestamp_tokens");
+        assert_eq!(report.energy_valley_snaps, 1);
+        assert_eq!(with_evidence.segments[0].start_sec, Some(0.0));
+        assert_eq!(with_evidence.segments[0].end_sec, Some(1.0));
+        assert_eq!(with_evidence.segments[1].start_sec, Some(1.0));
+        assert_eq!(with_evidence.segments[1].end_sec, Some(2.0));
+
+        // Non-native results keep the existing heuristic path.
+        let mut bridge = without_evidence.clone();
+        bridge.raw_output = json!({});
+        let report = align_transcription_result(
+            &mut bridge,
+            Some(2.0),
+            &AlignConfig::default(),
+            None,
+            &CancellationToken::no_deadline(),
+        )
+        .expect("bridge alignment");
+        assert_eq!(report.method, "char_density_heuristic");
+        assert_eq!(
+            report.segments_corrected, 2,
+            "fixture must be one the heuristic rewrites"
         );
     }
 
