@@ -56,9 +56,52 @@ fn write_txt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
         writeln!(file, "{}", result.transcript)?;
     }
     for seg in &result.segments {
+        write_speaker_prefix(&mut file, seg)?;
         writeln!(file, "{}", seg.text)?;
     }
     file.flush()?;
+    Ok(())
+}
+
+/// The segment's diarization label, ready to embed in a line-oriented format:
+/// `None` for undiarized or blank labels (so undiarized output stays
+/// byte-identical), with line breaks folded to spaces so a hostile or malformed
+/// backend label cannot split a cue or a transcript line.
+fn speaker_label(seg: &TranscriptionSegment) -> Option<std::borrow::Cow<'_, str>> {
+    let speaker = seg.speaker.as_deref()?.trim();
+    if speaker.is_empty() {
+        return None;
+    }
+    if speaker.contains(['\n', '\r']) {
+        Some(std::borrow::Cow::Owned(speaker.replace(['\n', '\r'], " ")))
+    } else {
+        Some(std::borrow::Cow::Borrowed(speaker))
+    }
+}
+
+/// `[SPEAKER_01] ` prefix used by the TXT, SRT, and LRC writers for diarized
+/// segments (the shape the README documents for those formats).
+fn write_speaker_prefix(
+    writer: &mut impl Write,
+    seg: &TranscriptionSegment,
+) -> std::io::Result<()> {
+    match speaker_label(seg) {
+        Some(speaker) => write!(writer, "[{speaker}] "),
+        None => Ok(()),
+    }
+}
+
+/// WebVTT voice-span annotation text: `&`, `<`, and `>` are escaped so the
+/// label cannot terminate the `<v ...>` tag early or inject markup.
+fn write_vtt_voice_annotation(writer: &mut impl Write, speaker: &str) -> std::io::Result<()> {
+    for ch in speaker.chars() {
+        match ch {
+            '&' => writer.write_all(b"&amp;")?,
+            '<' => writer.write_all(b"&lt;")?,
+            '>' => writer.write_all(b"&gt;")?,
+            _ => write!(writer, "{ch}")?,
+        }
+    }
     Ok(())
 }
 
@@ -135,7 +178,14 @@ fn write_vtt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
                 format_timestamp_vtt(start),
                 format_timestamp_vtt(end)
             )?;
-            writeln!(file, "{}\n", seg.text)?;
+            match speaker_label(seg) {
+                Some(speaker) => {
+                    file.write_all(b"<v ")?;
+                    write_vtt_voice_annotation(&mut file, &speaker)?;
+                    writeln!(file, ">{}</v>\n", seg.text)?;
+                }
+                None => writeln!(file, "{}\n", seg.text)?,
+            }
         }
     }
     file.flush()?;
@@ -155,6 +205,7 @@ fn write_srt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
                 format_timestamp_srt(start),
                 format_timestamp_srt(end)
             )?;
+            write_speaker_prefix(&mut file, seg)?;
             writeln!(file, "{}\n", seg.text)?;
         }
     }
@@ -227,7 +278,9 @@ fn write_lrc(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
             let m = total_ms / 60_000;
             let s = (total_ms % 60_000) / 1000;
             let cs = (total_ms % 1000) / 10;
-            writeln!(file, "[{:02}:{:02}.{:02}] {}", m, s, cs, seg.text)?;
+            write!(file, "[{m:02}:{s:02}.{cs:02}] ")?;
+            write_speaker_prefix(&mut file, seg)?;
+            writeln!(file, "{}", seg.text)?;
         }
     }
     file.flush()?;
@@ -798,6 +851,70 @@ mod tests {
         let txt = dir.path().join("o.txt");
         write_txt(&txt, &result).unwrap();
         assert_eq!(std::fs::read_to_string(&txt).unwrap(), "hello\nworld\n");
+    }
+
+    #[test]
+    fn diarized_segments_carry_speaker_labels_in_every_text_format() {
+        let segment =
+            |start: f64, end: f64, text: &str, speaker: Option<&str>| TranscriptionSegment {
+                start_sec: Some(start),
+                end_sec: Some(end),
+                text: text.to_owned(),
+                speaker: speaker.map(str::to_owned),
+                confidence: None,
+            };
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: "hello there all clear".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![
+                segment(0.0, 1.5, "hello there", Some("SPEAKER_00")),
+                segment(1.5, 3.0, "unlabelled", None),
+                segment(3.0, 4.0, "blank label", Some("  ")),
+                segment(4.0, 5.25, "all clear", Some("Ann <&> Bo\nb")),
+            ],
+            acceleration: None,
+            diarization: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let txt = dir.path().join("d.txt");
+        write_txt(&txt, &result).expect("write TXT");
+        assert_eq!(
+            std::fs::read_to_string(&txt).expect("read TXT"),
+            "[SPEAKER_00] hello there\nunlabelled\nblank label\n[Ann <&> Bo b] all clear\n"
+        );
+
+        let srt = dir.path().join("d.srt");
+        write_srt(&srt, &result).expect("write SRT");
+        assert_eq!(
+            std::fs::read_to_string(&srt).expect("read SRT"),
+            "1\n00:00:00,000 --> 00:00:01,500\n[SPEAKER_00] hello there\n\n\
+             2\n00:00:01,500 --> 00:00:03,000\nunlabelled\n\n\
+             3\n00:00:03,000 --> 00:00:04,000\nblank label\n\n\
+             4\n00:00:04,000 --> 00:00:05,250\n[Ann <&> Bo b] all clear\n\n"
+        );
+
+        let vtt = dir.path().join("d.vtt");
+        write_vtt(&vtt, &result).expect("write VTT");
+        assert_eq!(
+            std::fs::read_to_string(&vtt).expect("read VTT"),
+            "WEBVTT\n\n\
+             00:00:00.000 --> 00:00:01.500\n<v SPEAKER_00>hello there</v>\n\n\
+             00:00:01.500 --> 00:00:03.000\nunlabelled\n\n\
+             00:00:03.000 --> 00:00:04.000\nblank label\n\n\
+             00:00:04.000 --> 00:00:05.250\n<v Ann &lt;&amp;&gt; Bo b>all clear</v>\n\n"
+        );
+
+        let lrc = dir.path().join("d.lrc");
+        write_lrc(&lrc, &result).expect("write LRC");
+        assert_eq!(
+            std::fs::read_to_string(&lrc).expect("read LRC"),
+            "[00:00.00] [SPEAKER_00] hello there\n[00:01.50] unlabelled\n\
+             [00:03.00] blank label\n[00:04.00] [Ann <&> Bo b] all clear\n"
+        );
     }
 
     #[test]

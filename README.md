@@ -4971,12 +4971,12 @@ Each integration is essentially "spawn the binary, parse one JSON line at a time
 
 `franken_whisper transcribe` can emit several text formats in parallel by combining flags. The same `RunReport` drives every formatter, so a single transcription can produce a `.txt`, a `.vtt`, an `.srt`, a `.csv`, an extended `.json`, and an `.lrc` together. Sample shapes:
 
-**`--output-txt`** is a plain text dump (whisper.cpp side-output style):
+**`--output-txt`** is a plain text dump, one segment per line (whisper.cpp side-output style). Diarized segments are prefixed with their speaker label; undiarized output is the bare text:
 
 ```
-[00:00.000 --> 00:02.500]  Hello, this is a test recording.
-[00:02.500 --> 00:05.100]  The system is working as expected.
-[00:05.100 --> 00:07.300]  [SPEAKER_01] All clear on my end.
+Hello, this is a test recording.
+The system is working as expected.
+[SPEAKER_01] All clear on my end.
 ```
 
 **`--output-vtt`** is WebVTT subtitles (HTML5-native):
@@ -5013,10 +5013,10 @@ The system is working as expected.
 **`--output-csv`** is a segment-per-row tabular form for spreadsheet ingestion:
 
 ```csv
-idx,start_sec,end_sec,speaker,text,confidence
-0,0.000,2.500,,Hello, this is a test recording.,0.93
-1,2.500,5.100,,The system is working as expected.,0.91
-2,5.100,7.300,SPEAKER_01,All clear on my end.,0.88
+start,end,speaker,text
+0,2.5,"","Hello, this is a test recording."
+2.5,5.1,"","The system is working as expected."
+5.1,7.3,"SPEAKER_01","All clear on my end."
 ```
 
 **`--output-json-full`** is extended JSON with full segment + acceleration + replay metadata (a superset of `--json`'s default summary form).
@@ -5024,10 +5024,9 @@ idx,start_sec,end_sec,speaker,text,confidence
 **`--output-lrc`** is LRC karaoke format keyed to milliseconds:
 
 ```
-[ti:test recording]
-[00:00.00]Hello, this is a test recording.
-[00:02.50]The system is working as expected.
-[00:05.10][SPEAKER_01] All clear on my end.
+[00:00.00] Hello, this is a test recording.
+[00:02.50] The system is working as expected.
+[00:05.10] [SPEAKER_01] All clear on my end.
 ```
 
 **Combining outputs.** Output flags are additive; supply as many as you want. Each writes to a sibling file next to `--transcript-path` (or a default derived from the input filename). The flags don't suppress JSON on stdout: `--json --output-srt --output-vtt` writes the full JSON report to stdout *and* drops two subtitle files on disk.
