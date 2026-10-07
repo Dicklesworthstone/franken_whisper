@@ -1864,6 +1864,21 @@ impl NativeWhisperModel {
         decode::transcribe_samples(&self.inner, samples, params, checkpoint)
     }
 
+    /// Detect the spoken language of 16 kHz mono `samples` without decoding
+    /// any text (whisper `--detect-language`); see
+    /// [`decode::detect_language_samples`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates encoder/decoder failures and `checkpoint` cancellation.
+    pub fn detect_language(
+        &self,
+        samples: &[f32],
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<decode::LanguageDetection> {
+        decode::detect_language_samples(&self.inner, samples, checkpoint)
+    }
+
     /// A stable identity string for this model's weights, of the form
     /// `"fw-native-v1+sha256:{first 12 hex of the model file's sha256}"`.
     ///

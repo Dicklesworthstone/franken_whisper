@@ -543,6 +543,13 @@ pub fn run(
         tok.checkpoint()?;
     }
 
+    // `--detect-language-only` (whisper `--detect-language`): report the
+    // detected language and its posterior without decoding any text.
+    if request.backend_params.detect_language_only {
+        let detection = model.detect_language(&samples, &checkpoint)?;
+        return Ok(language_detection_result(&spec, &detection));
+    }
+
     // Word-timestamp policy: decide whether to ask the engine for real
     // attention-DTW word times. DTW runs when per-word output is requested
     // (a word/maxlen split or `split_on_word`) — the engine then records
@@ -1105,6 +1112,45 @@ fn raw_output_json(
 /// Build the empty-but-valid result for a pure-silence clip, taken **without
 /// loading the model** (the energy pre-gate already proved there is nothing to
 /// transcribe — saves a potentially multi-GB model load).
+/// How many of the most probable languages a detection result reports.
+const DETECTED_LANGUAGE_TOP_K: usize = 10;
+
+/// The `--detect-language-only` result: no transcript or segments, the
+/// detected language, and the top of the language posterior in `raw_output`.
+fn language_detection_result(
+    spec: &str,
+    detection: &native_engine::decode::LanguageDetection,
+) -> TranscriptionResult {
+    let probabilities: Vec<Value> = detection
+        .probabilities
+        .iter()
+        .take(DETECTED_LANGUAGE_TOP_K)
+        .map(|(language, probability)| json!({ "language": language, "probability": probability }))
+        .collect();
+    TranscriptionResult {
+        backend: BackendKind::WhisperCpp,
+        transcript: String::new(),
+        language: Some(detection.language.clone()),
+        segments: Vec::new(),
+        acceleration: None,
+        diarization: None,
+        raw_output: json!({
+            "engine": "whisper.cpp-native",
+            "schema_version": SCHEMA_VERSION,
+            "in_process": true,
+            "implementation": "real-inference",
+            "model": spec,
+            "detect_language_only": true,
+            "language": detection.language,
+            "multilingual_model": detection.multilingual,
+            "language_probabilities": probabilities,
+            "windows": [],
+            "word_timestamps": "none",
+        }),
+        artifact_paths: Vec::new(),
+    }
+}
+
 fn silence_result(
     request: &TranscribeRequest,
     spec: &str,
@@ -1147,6 +1193,31 @@ mod tests {
     use crate::orchestrator::CancellationToken;
 
     use super::*;
+
+    #[test]
+    fn language_detection_result_reports_language_without_transcript() {
+        let probabilities: Vec<(String, f32)> = (0..12)
+            .map(|rank| (format!("l{rank}"), 0.5_f32 / (rank as f32 + 1.0)))
+            .collect();
+        let detection = native_engine::decode::LanguageDetection {
+            language: "l0".to_owned(),
+            probabilities,
+            multilingual: true,
+        };
+        let result = language_detection_result("large-v3-turbo", &detection);
+        assert_eq!(result.language.as_deref(), Some("l0"));
+        assert!(result.transcript.is_empty());
+        assert!(result.segments.is_empty());
+        assert_eq!(result.raw_output["detect_language_only"], true);
+        assert_eq!(result.raw_output["language"], "l0");
+        assert_eq!(result.raw_output["multilingual_model"], true);
+        let reported = result.raw_output["language_probabilities"]
+            .as_array()
+            .expect("posterior array");
+        assert_eq!(reported.len(), DETECTED_LANGUAGE_TOP_K, "top-k only");
+        assert_eq!(reported[0]["language"], "l0");
+        assert_eq!(reported[0]["probability"], 0.5);
+    }
 
     fn native_request() -> TranscribeRequest {
         TranscribeRequest {

@@ -555,14 +555,17 @@ mod tests {
     fn native_reports_whisper_cpp_options_it_cannot_honor() {
         use crate::model::DecodingParams;
 
-        assert!(super::super::native_ignored_option_warnings(&request()).is_empty());
+        let warnings_for = |req: &TranscribeRequest| {
+            super::super::native_ignored_option_warnings(req, BackendKind::WhisperDiarization)
+        };
+        assert!(warnings_for(&request()).is_empty());
         let mut req = request();
         req.backend_params.decoding = Some(DecodingParams {
             temperature: Some(0.0),
             ..DecodingParams::default()
         });
         assert!(
-            super::super::native_ignored_option_warnings(&req).is_empty(),
+            warnings_for(&req).is_empty(),
             "temperature 0 is exactly the native greedy first pass"
         );
         req.backend_params.decoding = Some(DecodingParams {
@@ -572,7 +575,16 @@ mod tests {
         });
         req.backend_params.detect_language_only = true;
         req.backend_params.suppress_regex = Some("[0-9]".to_owned());
-        let warnings = super::super::native_ignored_option_warnings(&req);
+        // The whisper.cpp-native backend implements language-only detection.
+        let whisper_cpp_warnings =
+            super::super::native_ignored_option_warnings(&req, BackendKind::WhisperCpp);
+        assert_eq!(whisper_cpp_warnings.len(), 3, "{whisper_cpp_warnings:?}");
+        assert!(
+            !whisper_cpp_warnings
+                .iter()
+                .any(|w| w.contains("--detect-language-only"))
+        );
+        let warnings = warnings_for(&req);
         assert_eq!(warnings.len(), 4, "{warnings:?}");
         assert!(
             warnings

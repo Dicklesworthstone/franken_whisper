@@ -1867,6 +1867,25 @@ fn optional_stage_skip(
     stage: PipelineStage,
     request: &TranscribeRequest,
 ) -> Option<(String, Value)> {
+    // A language-only detection produces no transcript, so there is nothing
+    // to separate, align, punctuate, or attribute to speakers.
+    if request.backend_params.detect_language_only
+        && matches!(
+            stage,
+            PipelineStage::Separate
+                | PipelineStage::Align
+                | PipelineStage::Punctuate
+                | PipelineStage::Diarize
+        )
+    {
+        return Some((
+            "detect_language_only".to_owned(),
+            stage_skip_payload(
+                "detect_language_only",
+                json!({"detect_language_only": true}),
+            ),
+        ));
+    }
     match stage {
         PipelineStage::Vad => {
             if request.backend_params.vad.is_none() {
@@ -2556,7 +2575,10 @@ async fn execute_backend(
     if execution.implementation == backend::BackendImplementation::Native {
         inter
             .warnings
-            .extend(backend::native_ignored_option_warnings(request));
+            .extend(backend::native_ignored_option_warnings(
+                request,
+                execution.result.backend,
+            ));
     }
     let backend_output_sha256 = match sha256_json_value(&execution.result.raw_output) {
         Ok(hash) => Some(hash),

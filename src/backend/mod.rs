@@ -1467,7 +1467,10 @@ pub(crate) fn apply_native_decode_controls(
 /// Request options the in-process engine cannot honor, as run warnings (so a
 /// whisper.cpp flag never silently does nothing on the default native path).
 #[must_use]
-pub(crate) fn native_ignored_option_warnings(request: &TranscribeRequest) -> Vec<String> {
+pub(crate) fn native_ignored_option_warnings(
+    request: &TranscribeRequest,
+    resolved: BackendKind,
+) -> Vec<String> {
     let backend_params = &request.backend_params;
     let decoding = backend_params.decoding.as_ref();
     let mut ignored = Vec::new();
@@ -1480,7 +1483,8 @@ pub(crate) fn native_ignored_option_warnings(request: &TranscribeRequest) -> Vec
     if decoding.and_then(|d| d.max_segment_length).is_some() {
         ignored.push("--max-segment-length");
     }
-    if backend_params.detect_language_only {
+    // The whisper.cpp-native backend implements language-only detection.
+    if backend_params.detect_language_only && resolved != BackendKind::WhisperCpp {
         ignored.push("--detect-language-only");
     }
     if backend_params.carry_initial_prompt {

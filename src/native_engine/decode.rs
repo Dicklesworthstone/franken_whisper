@@ -4309,6 +4309,107 @@ fn resolve_language_fast(m: &LoadedModel, params: &DecodeParams) -> Option<Strin
 /// Isomorphism vs the previous separate-encode path: the encoder output for
 /// window 0 is the same tensor either way (encoding is deterministic), so the
 /// detection logits — and every downstream token — are unchanged.
+/// Result of [`detect_language_samples`] (whisper.cpp `whisper_lang_auto_detect`
+/// / `whisper-cli --detect-language`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LanguageDetection {
+    /// The detected language code (the posterior's argmax).
+    pub language: String,
+    /// Softmax over the language-token logits, most probable first.
+    pub probabilities: Vec<(String, f32)>,
+    /// `false` for an English-only model, which has no language tokens: the
+    /// answer is `"en"` without running the model.
+    pub multilingual: bool,
+}
+
+/// Detect the spoken language from the first 30 s window — exactly the
+/// inputs and decision rule the decode loop uses for auto-detection (window-0
+/// encode, one decoder step on `<|startoftranscript|>`, first strict argmax
+/// over the language tokens in [`LANGUAGES`] order), without decoding any
+/// text. Also returns the full posterior, which the decode path never needs.
+///
+/// # Errors
+///
+/// Propagates mel/encoder/decoder failures and `checkpoint` cancellation.
+pub fn detect_language_samples(
+    m: &LoadedModel,
+    samples_16k_mono: &[f32],
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<LanguageDetection> {
+    if !m.tokenizer.is_multilingual() {
+        return Ok(LanguageDetection {
+            language: "en".to_owned(),
+            probabilities: vec![("en".to_owned(), 1.0)],
+            multilingual: false,
+        });
+    }
+    checkpoint()?;
+    let mel_threads = super::host_parallelism().min(16);
+    let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
+    let frames = FRAMES_PER_CHUNK.min(full_mel.n_frames);
+    let enc = encoder::forward_from_full_mel_window(
+        &m.encoder,
+        &full_mel,
+        0,
+        frames,
+        super::default_threads(),
+        checkpoint,
+    )?;
+    let mut st = DecoderState::new(&m.decoder, &enc)?;
+    let logits = decoder::forward_step(&m.decoder, &mut st, &[m.tokenizer.sot], checkpoint)?;
+
+    let mut language_logits: Vec<(&str, f32)> = Vec::new();
+    for (code, lang_id, _) in LANGUAGES {
+        if *lang_id >= m.tokenizer.num_languages() {
+            continue;
+        }
+        let tok = m.tokenizer.sot + 1 + *lang_id;
+        if let Ok(idx) = usize::try_from(tok)
+            && let Some(&logit) = logits.get(idx)
+        {
+            language_logits.push((code, logit));
+        }
+    }
+    // Same decision rule as `detect_language_from_enc`: the first strictly
+    // greater logit wins, so the reported language always matches what an
+    // auto-detecting transcription of the same audio would decode with.
+    let mut language = "en";
+    let mut best = f32::NEG_INFINITY;
+    for &(code, logit) in &language_logits {
+        if logit > best {
+            best = logit;
+            language = code;
+        }
+    }
+    let max = language_logits
+        .iter()
+        .map(|&(_, logit)| logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let weights: Vec<f64> = language_logits
+        .iter()
+        .map(|&(_, logit)| f64::from(logit - max).exp())
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let mut probabilities: Vec<(String, f32)> = language_logits
+        .iter()
+        .zip(&weights)
+        .map(|(&(code, _), &weight)| {
+            let probability = if total > 0.0 && total.is_finite() {
+                (weight / total) as f32
+            } else {
+                0.0
+            };
+            (code.to_owned(), probability)
+        })
+        .collect();
+    probabilities.sort_by(|a, b| b.1.total_cmp(&a.1));
+    Ok(LanguageDetection {
+        language: language.to_owned(),
+        probabilities,
+        multilingual: true,
+    })
+}
+
 fn detect_language_from_enc(
     m: &LoadedModel,
     st: &mut DecoderState,
@@ -6806,6 +6907,54 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn gated_detect_language_samples_reports_jfk_posterior() {
+        // Model-gated: the `--detect-language-only` entry point must make the
+        // same decision as auto-detection and return a normalized posterior.
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_detect_language_samples: jfk.wav missing");
+            return;
+        };
+        if let Some(path) = super::super::find_model_file("large-v3-turbo") {
+            let m = LoadedModel::from_ggml(GgmlModel::load(&path).expect("load turbo"))
+                .expect("build turbo engine");
+            let detection = detect_language_samples(&m, &samples, &noop).expect("detect");
+            assert!(detection.multilingual);
+            assert_eq!(detection.language, "en");
+            assert_eq!(
+                detection.probabilities[0].0, "en",
+                "argmax leads the posterior"
+            );
+            assert!(
+                detection
+                    .probabilities
+                    .windows(2)
+                    .all(|pair| pair[0].1 >= pair[1].1),
+                "posterior sorted most probable first"
+            );
+            let total: f32 = detection.probabilities.iter().map(|(_, p)| p).sum();
+            assert!((total - 1.0).abs() < 1e-3, "posterior sums to {total}");
+            assert!(
+                detection.probabilities[0].1 > 0.5,
+                "en must dominate JFK: {:?}",
+                &detection.probabilities[..3]
+            );
+        } else {
+            eprintln!("SKIP gated_detect_language_samples(turbo): model missing");
+        }
+        if let Some(path) = super::super::find_model_file("tiny.en") {
+            let m = LoadedModel::from_ggml(GgmlModel::load(&path).expect("load tiny.en"))
+                .expect("build tiny.en engine");
+            let detection = detect_language_samples(&m, &samples, &noop).expect("detect");
+            assert!(
+                !detection.multilingual,
+                "English-only models skip detection"
+            );
+            assert_eq!(detection.language, "en");
+            assert_eq!(detection.probabilities, vec![("en".to_owned(), 1.0)]);
         }
     }
 
