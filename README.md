@@ -999,7 +999,8 @@ franken_whisper deliberately downloads with the forgiving `bestaudio/best` forma
 ### Quickstart
 
 ```bash
-# Live microphone -> agent-consumable NDJSON (default: tiny.en fast lane, AlignAtt policy)
+# Live microphone -> agent-consumable NDJSON (default: multilingual tiny fast
+# lane, tiny.en with --language en; AlignAtt policy)
 fw robot listen | jq -r 'select(.event == "transcript.delta") | .text'
 
 # No device needed: pipe any producer in as raw PCM (16 kHz mono s16le shown; rate/channels configurable)
@@ -1178,7 +1179,7 @@ franken_whisper transcribe [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--db <PATH>` | `.franken_whisper/storage.sqlite3` | SQLite database path |
+| `--db <PATH>` | `$FRANKEN_WHISPER_DB`, else `<state dir>/storage.sqlite3` | SQLite database path |
 | `--no-persist` | `false` | Skip persistence entirely |
 | `--timeout <SEC>` | — | Overall pipeline deadline (seconds) |
 
@@ -1214,7 +1215,7 @@ franken_whisper transcribe [OPTIONS]
 |------|---------|-------------|
 | `--offset-ms <N>` | 0 | Start transcription at offset (ms); honored by the native engine (PCM sliced before decode) and the whisper.cpp bridge (`-ot`). Emitted timestamps stay in source-file time |
 | `--duration-ms <N>` | — | Transcribe only this duration (ms); wall-clock scales with the slice. Backends that cannot honor the window record it in `warnings` |
-| `--audio-ctx <N>` | — | Audio context size (tokens) |
+| `--audio-ctx <N>` | — | Encoder audio context in frames (0 = full 30 s window); the native engine maps N > 0 to a fixed encoder context |
 | `--word-threshold <F>` | — | Per-word confidence threshold (drop words below) |
 | `--suppress-regex <REGEX>` | — | Suppress tokens matching regex |
 
@@ -1492,7 +1493,7 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 | `run_complete` | Transcription finished with full result |
 | `run_error` | Pipeline failed with structured error code |
 | `backends.discovery` | Backend availability + per-backend capabilities |
-| `routing_decision` | Backend routing decision with posterior snapshot and evidence |
+| `routing_decision` | Backend routing decision: chosen action, calibration score, e-process, fallback state, recommended order |
 | `health.report` | System health (backend / ffmpeg / DB / resource status) |
 | `transcript.partial` | Speculative fast-model partial transcript (immediate) |
 | `transcript.confirm` | Quality model confirms partial (drift within tolerance) |
@@ -1529,11 +1530,13 @@ gap is never stderr-only.
   "schema_version": "1.1.0",
   "ts": "2026-04-25T00:00:00Z",
   "backends": [
-    {"name": "whisper.cpp", "available": true, "path": "/usr/local/bin/whisper-cli", "version": "1.7.2", "issues": []}
+    {"name": "whisper.cpp", "available": false, "path": null, "version": null, "issues": ["whisper.cpp backend not available"]},
+    {"name": "whisper.cpp-native", "available": true, "path": null, "version": null, "issues": []}
   ],
   "ffmpeg": {"name": "ffmpeg", "available": true, "path": "/usr/bin/ffmpeg", "version": null, "issues": []},
-  "database": {"name": "database", "available": true, "path": ".franken_whisper/storage.sqlite3", "version": "schema_v4", "issues": []},
-  "resources": {"disk_free_bytes": 12345, "disk_total_bytes": 67890, "memory_available_bytes": 11111, "memory_total_bytes": 22222},
+  "audio_input": {"probed": false, "available": false, "default_device": null, "device_count": 0, "backend": "cpal", "issues": ["audio input not probed; use `fw robot listen --list-devices` to enumerate hardware"]},
+  "database": {"name": "database", "available": true, "path": ".franken_whisper/storage.sqlite3", "version": null, "issues": []},
+  "resources": {"disk_free_bytes": 52341293056, "disk_total_bytes": 270582939648, "memory_available_bytes": 15991492608, "memory_total_bytes": 16876511232},
   "overall_status": "ok"
 }
 ```
@@ -1667,8 +1670,8 @@ Built on the [FrankenTUI](https://github.com/Dicklesworthstone/frankentui) frame
 | `HF_TOKEN` | — | HuggingFace token (fallback) |
 | `FRANKEN_WHISPER_DIARIZATION_DEVICE` | — | GPU device for the diarization backend |
 | `FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT` | `shadow` | Legacy acoustic-only admission control; `auto` now selects native Sortformer and uses acoustic through the explicit fallback policy |
-| `FRANKEN_WHISPER_STATE_DIR` | `.franken_whisper` | State directory root |
-| `FRANKEN_WHISPER_DB` | `.franken_whisper/storage.sqlite3` | SQLite database path |
+| `FRANKEN_WHISPER_STATE_DIR` | `.franken_whisper` | State directory root: default database location, sync locks/cursor, per-run work dirs |
+| `FRANKEN_WHISPER_DB` | `<state dir>/storage.sqlite3` | Run-history database used by every command when `--db` is not given |
 | `FRANKEN_WHISPER_FFMPEG_BIN` | auto | Explicit ffmpeg binary path |
 | `FRANKEN_WHISPER_FFPROBE_BIN` | auto | Explicit ffprobe binary path |
 | `FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG` | `1` | Auto-provision local ffmpeg/ffprobe when missing (`0`/`false` disables) |
@@ -1880,7 +1883,7 @@ Each stage runs under an independent millisecond budget. Defaults:
 | Acceleration | 20 s | CPU confidence mass normalization |
 | Align | 30 s | CTC forced alignment |
 | Punctuate | 10 s | Punctuation model inference |
-| Diarize | 30 s | Speaker clustering |
+| Diarize | 900 s (15 min) | Speaker diarization (native Sortformer / acoustic) |
 | Persist | 20 s | SQLite transaction |
 | Probe *(internal)* | 8 s | Backend / ffmpeg / database probing before pipeline starts |
 | Cleanup *(internal)* | 5 s | Finalizer total budget |
@@ -4052,9 +4055,11 @@ fn query_history(db_path: &str, limit: usize) -> Result<(), Box<dyn std::error::
 ### Monitoring Routing Decisions
 
 ```bash
-# See how the Bayesian router is performing
+# See how the Bayesian router is performing (NDJSON: one routing_decision per
+# line, then a routing_history.complete summary)
 franken_whisper robot routing-history --limit 20 2>/dev/null \
-  | jq '.[] | {decision_id, chosen_action, calibration_score, brier_score, fallback_active}'
+  | jq -c 'select(.event == "routing_decision")
+           | {decision_id, chosen_action, calibration_score, e_process, fallback_active}'
 
 # Track correction rates in speculative mode
 franken_whisper robot run --input audio.mp3 --speculative \
@@ -4478,35 +4483,25 @@ The whole flow is end-to-end safe to ship over TTY: every event has a wire-effic
 
 ### State Directory Layout
 
-The state directory (default `.franken_whisper/`, override via `FRANKEN_WHISPER_STATE_DIR`) holds everything `franken_whisper` writes to disk:
+The state directory is `$FRANKEN_WHISPER_STATE_DIR` when set, otherwise `.franken_whisper/` under the current directory. It is the default home of the run-history database (every `--db` defaults to `<state dir>/storage.sqlite3`; `FRANKEN_WHISPER_DB` overrides that default for all commands), of sync locks and the incremental cursor (sync `--state-root`), and of per-run work directories:
 
 ```
-.franken_whisper/
-├── storage.sqlite3              # primary SQLite database (WAL mode)
-├── storage.sqlite3-wal          # SQLite write-ahead log
-├── storage.sqlite3-shm          # SQLite shared memory file (transient)
+<state dir>/
+├── storage.sqlite3              # run-history database (unless --db / FRANKEN_WHISPER_DB)
+├── storage.sqlite3-wal          # write-ahead log
+├── storage.sqlite3-shm          # shared memory file (transient)
 ├── locks/
-│   └── sync.lock                # JSON lock file for sync export/import
-│                                # { "pid", "created_at_rfc3339", "operation" }
-├── tools/
-│   └── ffmpeg/
-│       └── bin/
-│           ├── ffmpeg           # auto-provisioned static binary (Linux x86_64)
-│           └── ffprobe          # auto-provisioned static binary
-├── work/
-│   └── fw-run-{uuid}/           # per-run work directory (LIFO finalizers clean up)
-│       ├── normalized_16k_mono.wav
-│       ├── backend_output.json  # raw backend output preserved for replay
-│       └── ...                  # any subprocess scratch files
-└── snapshots/                   # (when sync export-jsonl --output is relative)
-    └── {timestamp}/
-        ├── runs.jsonl(.gz)
-        ├── segments.jsonl(.gz)
-        ├── events.jsonl(.gz)
-        └── manifest.json
+│   ├── sync.lock                # JSON lock file for sync export/import
+│   │                            # { "pid", "created_at_rfc3339", "operation" }
+│   └── sync.lock.guard          # advisory lock serializing lock acquisition
+├── sync_cursor.json             # incremental export cursor (--incremental)
+└── tmp/
+    └── fw-run-{id}/             # per-run work directory (LIFO finalizers clean up)
+        ├── normalized_16k_mono.wav
+        └── ...                  # backend / subprocess scratch files
 ```
 
-The state directory respects `XDG_STATE_HOME`: when set, `tools/` is rooted at `$XDG_STATE_HOME/franken_whisper/` so multiple project trees can share auto-provisioned ffmpeg without duplicating downloads.
+Auto-provisioned ffmpeg/ffprobe live under `tools/ffmpeg/bin/` of a separate tools root: `$FRANKEN_WHISPER_STATE_DIR` when set, else `$XDG_STATE_HOME/franken_whisper`, else `~/.local/state/franken_whisper`, so multiple project trees share one download.
 
 ### CLI Exit Codes
 
@@ -4880,8 +4875,8 @@ transcript.retract: event, schema_version, run_id, retracted_seq, window_id, rea
                     quality_model_id, ts
 transcript.correct: event, schema_version, run_id, correction_id, replaces_seq, window_id,
                     segments, drift, latency_ms, ts
-health.report     : event, schema_version, ts, backends, ffmpeg, database, resources,
-                    overall_status
+health.report     : event, schema_version, ts, backends, ffmpeg, audio_input, database,
+                    resources, overall_status
 transcript.speculation_stats: event, schema_version, run_id, windows_processed,
                     corrections_emitted, confirmations_emitted, correction_rate,
                     mean_fast_latency_ms, mean_quality_latency_ms,
@@ -5034,7 +5029,7 @@ start,end,speaker,text
 [00:05.10] [SPEAKER_01] All clear on my end.
 ```
 
-**Combining outputs.** Output flags are additive; supply as many as you want. Each writes to a sibling file next to `--transcript-path` (or a default derived from the input filename). The flags don't suppress JSON on stdout: `--json --output-srt --output-vtt` writes the full JSON report to stdout *and* drops two subtitle files on disk.
+**Combining outputs.** Output flags are additive; supply as many as you want. Each writes `<stem>.<ext>` in the current directory, where `<stem>` is the input file's name without its extension (`transcript` for stdin/mic input). The flags don't suppress JSON on stdout: `--json --output-srt --output-vtt` writes the full JSON report to stdout *and* drops two subtitle files on disk.
 
 ---
 
@@ -5047,48 +5042,49 @@ start,end,speaker,text
   "event": "health.report",
   "schema_version": "1.1.0",
   "ts": "2026-05-17T12:34:56Z",
-  "backends": [                       // one entry per known backend
+  "backends": [                       // one entry per backend (bridge + native)
     {
-      "name": "whisper.cpp",          // human-readable backend name
-      "available": true,              // PATH probe + override env var honored
-      "path": "/usr/local/bin/whisper-cli",  // resolved binary path (null if missing)
-      "version": "1.7.2",             // probed via `--version` invocation (null if probe fails)
-      "issues": []                    // free-text problems (e.g., "version too old")
+      "name": "whisper.cpp",          // bridge: external whisper-cli
+      "available": false,
+      "path": null,                   // not populated today (always null)
+      "version": null,                // not populated today (always null)
+      "issues": ["whisper.cpp backend not available"]
     },
-    {"name": "insanely-fast-whisper", "available": false, "path": null, "version": null,
-     "issues": ["binary not found on PATH; override via FRANKEN_WHISPER_INSANELY_FAST_BIN"]},
-    {"name": "whisper-diarization",   "available": true,  "path": "/usr/bin/python3",
-     "version": "3.11.4", "issues": []}
+    {"name": "whisper.cpp-native", "available": true, "path": null, "version": null, "issues": []}
+    // ... insanely-fast-whisper / insanely-fast-native,
+    //     whisper-diarization / whisper-diarization-native
   ],
   "ffmpeg": {                         // single dependency, same shape
     "name": "ffmpeg", "available": true,
-    "path": "/usr/bin/ffmpeg", "version": "6.0", "issues": []
+    "path": "/usr/bin/ffmpeg",        // resolved via override, PATH, or provisioned bundle
+    "version": null, "issues": []
   },
-  "database": {                       // SQLite store at --db
+  "audio_input": {                    // microphone capture readiness (not probed here)
+    "probed": false, "available": false, "default_device": null,
+    "device_count": 0, "backend": "cpal",
+    "issues": ["audio input not probed; use `fw robot listen --list-devices` to enumerate hardware"]
+  },
+  "database": {                       // store at --db: parent dir exists/writable, file writable
     "name": "database", "available": true,
     "path": ".franken_whisper/storage.sqlite3",
-    "version": "schema_v4",
+    "version": null,                  // not populated today (always null)
     "issues": []
-    // The full StorageDiagnostics (page_count, page_size, journal_mode,
-    // wal_checkpoint{busy, log_frames, checkpointed_frames}, freelist_count,
-    // integrity_check) is available via the library's RunStore.diagnostics();
-    // the robot event surfaces only the user-relevant subset.
   },
   "resources": {                      // host headroom
-    "disk_free_bytes": 50000000000,
+    "disk_free_bytes": 50000000000,   // filesystem holding the database (statvfs; Unix)
     "disk_total_bytes": 250000000000,
-    "memory_available_bytes": 8000000000,
+    "memory_available_bytes": 8000000000,  // /proc/meminfo (Linux)
     "memory_total_bytes": 16000000000
   },
-  "overall_status": "ok"              // "ok" / "degraded" / "error"
+  "overall_status": "ok"              // "ok" / "degraded" / "unavailable"
 }
 ```
 
 **`overall_status` derivation.**
 
-- `ok`: at least one backend available, ffmpeg present (or not needed for current workload), database healthy.
-- `degraded`: one or more backends missing but at least one usable; or ffmpeg missing but the built-in decoder covers the formats actually being used.
-- `error`: no backends available, OR database integrity check failed, OR critical dependency missing.
+- `ok`: at least one backend available, ffmpeg available, and the database check passes.
+- `degraded`: otherwise, when at least one backend or ffmpeg is available.
+- `unavailable`: no backend and no ffmpeg available.
 
 **Field stability.** The schema is part of the `1.x` contract (currently `1.1.0`; the listen event family was an additive minor bump). New fields may be added but no existing fields will be renamed or removed within the 1.x line. Agents should ignore unknown fields rather than fail on them.
 
@@ -5109,11 +5105,11 @@ Each `FW-*` error has a characteristic in-the-wild signature. Knowing what to lo
 | `FW-INVALID-REQUEST` | `"--input, --stdin, --mic are mutually exclusive"` | Contradictory CLI flags, malformed JSON request via library | Drop one of the conflicting flags |
 | `FW-STORAGE` | `"database is busy"` or `"PRAGMA integrity_check: out of order"` | Concurrent writer, corrupted DB, disk full | `franken_whisper robot health`; consider JSONL rebuild |
 | `FW-UNSUPPORTED` | `"backend X does not support diarization"` | Requested capability the chosen backend lacks | Switch backends or remove the capability flag |
-| `FW-MISSING-ARTIFACT` | `"backend completed but did not produce expected output file"` | Backend version skew, model didn't load | Inspect the work dir under `.franken_whisper/work/` |
+| `FW-MISSING-ARTIFACT` | `"backend completed but did not produce expected output file"` | Backend version skew, model didn't load | Inspect the per-run work dir under `<state dir>/tmp/` |
 | `FW-CANCELLED` | `"cancelled at stage backend"` | Ctrl+C or deadline hit | Re-run with longer timeout if intended |
 | `FW-STAGE-TIMEOUT` | `"stage `normalize` exceeded budget of 180000 ms"` | Pathological input, contention | Raise the relevant `FRANKEN_WHISPER_STAGE_BUDGET_*_MS` |
 
-In robot mode each of these arrives as a `run_error` event with `code` set to one of the six `FW-ROBOT-*` codes (see the error-code mapping table earlier). The internal `FW-*` variant is preserved in the `message` field for further triage.
+In robot mode each of these arrives as a `run_error` event whose `code` is the `FW-*` code itself, with the human-readable detail in `message`.
 
 ---
 
@@ -5271,7 +5267,7 @@ errors rather than being reported as successful cancellation.
 
 | Scenario | Recipe |
 |----------|--------|
-| **"Why did the router pick that backend?"** | `franken_whisper robot routing-history --limit 1 --run-id <RUN_ID> \| jq` — inspect the posterior snapshot, calibration score, and Brier score at decision time |
+| **"Why did the router pick that backend?"** | `franken_whisper robot routing-history --limit 1 --run-id <RUN_ID> \| jq` — inspect the chosen action, calibration score, e-process, fallback state, and recommended order at decision time |
 | **"What did the backend actually output?"** | `RUST_LOG=franken_whisper::backend=trace franken_whisper transcribe ...` and inspect the rendered subprocess command (with secrets redacted) |
 | **"Where did the time go?"** | Look at the `orchestration.latency_profile` event; `service_ms` per stage and per-stage tuning recommendation |
 | **"Why is SQLite slow?"** | `franken_whisper robot health` → `database.wal_checkpoint.log_frames` and `database.freelist_count`; if either is climbing, run `PRAGMA wal_checkpoint(TRUNCATE); VACUUM;` |
@@ -5397,7 +5393,7 @@ Before deploying `franken_whisper` to a production workflow, walk through:
 - [ ] **Backup strategy.** Schedule periodic `sync export-jsonl` + off-host copy. Test the restore path at least once.
 - [ ] **Concurrent agent expectations documented.** If multiple processes will write to the same DB, all must use `RunStore::begin_concurrent_session()` (or accept SQLITE_BUSY retries on conflict).
 - [ ] **Native rollout stage chosen.** Default `sole` is the all-native product path. Set another stage only when you deliberately want bridge compatibility behavior.
-- [ ] **Error handling integrated.** Your downstream consumer differentiates `run_complete` from `run_error` events in robot mode, and handles each `FW-ROBOT-*` code appropriately.
+- [ ] **Error handling integrated.** Your downstream consumer differentiates `run_complete` from `run_error` events in robot mode, and handles each `run_error.code` (`FW-*`) appropriately.
 - [ ] **Disk monitoring in place.** Alert on `disk_free_bytes / disk_total_bytes < 0.10` and on `wal_checkpoint.log_frames` climbing across consecutive `robot health` probes.
 - [ ] **Live sessions sized** (`fw robot listen`). The confirm lane keeps a second model in memory alongside the resident fast lane — plan RAM for both (tiny fast lane + large-v3-turbo quality lane), or set `--quality-model none` on memory-constrained hosts. Grant microphone access BEFORE headless/SSH deployment (macOS TCC prompts never render over SSH); `fw robot listen --list-devices` proves capture works. Decode throughput follows the global Rayon pool, which is built once at first use (`ensure_default_rayon_pool`, src/backend/mod.rs) — set `RAYON_NUM_THREADS` explicitly when sizing a dedicated live host for latency rather than throughput.
 
@@ -5412,10 +5408,13 @@ franken_whisper robot schema | jq '.events | keys'
 # [
 #   "backends.discovery",
 #   "health.report",
+#   "listen.controller",
+#   "listen.device",
 #   "listen.session_start",
 #   "listen.session_stats",
 #   "listen.warning",
 #   "routing_decision",
+#   "routing_history.complete",
 #   "run_complete",
 #   "run_error",
 #   "run_start",
@@ -5427,7 +5426,10 @@ franken_whisper robot schema | jq '.events | keys'
 #   "transcript.partial",
 #   "transcript.retract",
 #   "transcript.speculation_stats",
-#   "utterance_end"
+#   "utterance_end",
+#   "youtube.discovered", "youtube.done", "youtube.downloaded",
+#   "youtube.downloading", "youtube.failed", "youtube.run_complete",
+#   "youtube.run_start", "youtube.skipped", "youtube.transcribing"
 # ]
 
 franken_whisper robot schema | jq '.events["run_complete"].required'
@@ -5435,9 +5437,10 @@ franken_whisper robot schema | jq '.events["run_complete"].required'
 #  "finished_at", "backend", "language", "transcript", "segments",
 #  "acceleration", "diarization", "warnings", "evidence"]
 
-franken_whisper robot schema | jq '.events["routing_decision"].payload'
-# describes the loss_matrix, posterior snapshot, calibration metrics,
-# fallback_active flag, evidence ledger entry, etc.
+franken_whisper robot schema | jq '.events["routing_decision"]'
+# {"required": ["event", "schema_version", "run_id", "ts", "code"],
+#  "example": { ... decision_id, chosen_action, calibration_score,
+#               e_process, fallback_active, recommended_order, mode ... }}
 ```
 
 The schema document is part of the `1.x` contract (currently `1.1.0`): adding new event types requires a minor-version bump, and renaming or removing required fields requires a major-version bump. Schema version is reported on every event so agents can detect mismatch instantly.
@@ -5455,14 +5458,15 @@ for f in videos/*.mp4; do
   franken_whisper transcribe --input "$f" --backend whisper-cpp --model large-v3 \
     --output-srt --json > /dev/null
 done
-# Each video gets a sibling .srt file alongside it.
+# Artifacts land in the current directory, named after each input's stem
+# (videos/talk.mp4 -> ./talk.srt).
 ```
 
 ### Build a searchable transcript archive
 
 ```bash
 franken_whisper sync export-jsonl --output ./archive
-jq -r '.run_id + "\t" + .transcript' ./archive/runs.jsonl > transcripts.tsv
+jq -r '.id + "\t" + .transcript' ./archive/runs.jsonl > transcripts.tsv
 # Now feed transcripts.tsv into any full-text index.
 ```
 
@@ -5478,7 +5482,8 @@ franken_whisper robot run --input meeting.mp3 --backend auto 2>/dev/null \
 
 ```bash
 franken_whisper robot routing-history --limit 100 \
-  | jq '.[] | select(.fallback_active == true) | {decision_id, observed_state, brier_score}'
+  | jq -c 'select(.event == "routing_decision" and .fallback_active == true)
+           | {run_id, decision_id, calibration_score, e_process, mode}'
 ```
 
 ### Validate all replay packs in a directory

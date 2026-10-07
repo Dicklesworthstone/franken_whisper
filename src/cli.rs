@@ -41,6 +41,24 @@ struct SpeakerHintsDocument {
     known_intervals: Vec<KnownSpeakerInterval>,
 }
 
+/// Default state root: `$FRANKEN_WHISPER_STATE_DIR` when set and non-blank
+/// (the same rule the pipeline uses for its work directories), else
+/// `.franken_whisper` under the current directory.
+#[must_use]
+pub fn default_state_root() -> PathBuf {
+    std::env::var_os("FRANKEN_WHISPER_STATE_DIR")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map_or_else(|| PathBuf::from(".franken_whisper"), PathBuf::from)
+}
+
+/// Default run-history database: `storage.sqlite3` under
+/// [`default_state_root`]. `--db` and `FRANKEN_WHISPER_DB` take precedence
+/// (declared on each `--db` argument).
+#[must_use]
+pub fn default_db_path() -> PathBuf {
+    default_state_root().join("storage.sqlite3")
+}
+
 fn parse_speaker_hints(bytes: &[u8]) -> FwResult<Vec<KnownSpeakerInterval>> {
     let parsed: SpeakerHintsFile = serde_json::from_slice(bytes).map_err(|_| {
         FwError::InvalidRequest(
@@ -446,7 +464,7 @@ pub struct PullArgs {
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Path to the frankensqlite database file to inspect.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Emit one JSON object with no terminal decoration.
@@ -1123,7 +1141,7 @@ pub enum RobotCommand {
 #[derive(Debug, Args)]
 pub struct HealthArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Exit non-zero when the report is not fully healthy.
@@ -1134,7 +1152,7 @@ pub struct HealthArgs {
 #[derive(Debug, Args)]
 pub struct RoutingHistoryArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Filter to a specific run by ID.
@@ -1326,7 +1344,7 @@ pub struct ListenArgs {
     pub no_persist: bool,
 
     /// Database file for run history (same store as batch runs).
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// List input devices as NDJSON and exit (no session).
@@ -1445,7 +1463,7 @@ pub enum SyncCommand {
 #[derive(Debug, Args)]
 pub struct SyncExportArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Output directory for JSONL snapshot.
@@ -1453,7 +1471,7 @@ pub struct SyncExportArgs {
     pub output: PathBuf,
 
     /// State root for lock files (and `sync_cursor.json` with --incremental).
-    #[arg(long, default_value = ".franken_whisper")]
+    #[arg(long, default_value_os_t = default_state_root())]
     pub state_root: PathBuf,
 
     /// Export only run aggregates changed since the cursor in
@@ -1471,7 +1489,7 @@ pub struct SyncExportArgs {
 #[derive(Debug, Args)]
 pub struct SyncValidateArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Directory containing a full JSONL snapshot.
@@ -1482,7 +1500,7 @@ pub struct SyncValidateArgs {
 #[derive(Debug, Args)]
 pub struct SyncImportArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Directory containing JSONL snapshot to import.
@@ -1490,7 +1508,7 @@ pub struct SyncImportArgs {
     pub input: PathBuf,
 
     /// State root for lock files.
-    #[arg(long, default_value = ".franken_whisper")]
+    #[arg(long, default_value_os_t = default_state_root())]
     pub state_root: PathBuf,
 
     /// Conflict resolution policy.
@@ -1582,7 +1600,7 @@ pub struct TranscribeArgs {
     pub persist_speaker_profiles: bool,
 
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Disable persistence in frankensqlite.
@@ -1875,7 +1893,7 @@ pub struct TranscribeArgs {
 #[derive(Debug, Args)]
 pub struct RunsArgs {
     /// Path to frankensqlite database file.
-    #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
+    #[arg(long, env = "FRANKEN_WHISPER_DB", default_value_os_t = default_db_path())]
     pub db: PathBuf,
 
     /// Fetch a specific run by ID (prints full JSON details).

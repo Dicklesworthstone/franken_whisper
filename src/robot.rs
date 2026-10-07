@@ -1690,19 +1690,57 @@ pub fn check_database(db_path: &Path) -> DependencyCheck {
     }
 }
 
-/// Gather system resource information (disk and memory).
+/// Gather system resource information: memory, and disk space on the
+/// filesystem that holds (or will hold) `storage_path`.
 #[must_use]
-pub fn snapshot_resources() -> ResourceSnapshot {
-    // We intentionally provide a best-effort snapshot without unsafe code.
-    // On Linux we parse /proc/meminfo; on other platforms we return None.
+pub fn snapshot_resources(storage_path: &Path) -> ResourceSnapshot {
+    // Best-effort and without unsafe code: /proc/meminfo for memory, statvfs
+    // for disk; anything unavailable on this platform stays None.
     let (memory_available_bytes, memory_total_bytes) = read_meminfo();
+    let (disk_free_bytes, disk_total_bytes) = disk_space_for(storage_path);
 
     ResourceSnapshot {
-        disk_free_bytes: None,
-        disk_total_bytes: None,
+        disk_free_bytes,
+        disk_total_bytes,
         memory_available_bytes,
         memory_total_bytes,
     }
+}
+
+/// `(available-to-unprivileged, total)` bytes of the filesystem containing
+/// the nearest existing ancestor of `path` (the store may not exist yet).
+#[cfg(unix)]
+fn disk_space_for(path: &Path) -> (Option<u64>, Option<u64>) {
+    let Some(existing) = path.ancestors().find(|ancestor| {
+        let probe = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        probe.exists()
+    }) else {
+        return (None, None);
+    };
+    let probe = if existing.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        existing
+    };
+    match rustix::fs::statvfs(probe) {
+        Ok(stats) => {
+            let fragment = stats.f_frsize;
+            (
+                stats.f_bavail.checked_mul(fragment),
+                stats.f_blocks.checked_mul(fragment),
+            )
+        }
+        Err(_) => (None, None),
+    }
+}
+
+#[cfg(not(unix))]
+fn disk_space_for(_path: &Path) -> (Option<u64>, Option<u64>) {
+    (None, None)
 }
 
 /// Parse `/proc/meminfo` for MemTotal and MemAvailable (Linux only).
@@ -1759,7 +1797,7 @@ pub fn build_health_report(db_path: &Path) -> HealthReport {
 
     let ffmpeg = check_ffmpeg();
     let database = check_database(db_path);
-    let resources = snapshot_resources();
+    let resources = snapshot_resources(db_path);
 
     // Determine overall status.
     let any_backend_available = backends.iter().any(|b| b.available);
@@ -6778,7 +6816,15 @@ mod tests {
 
     #[test]
     fn snapshot_resources_returns_valid_struct() {
-        let snap = super::snapshot_resources();
+        let snap =
+            super::snapshot_resources(std::path::Path::new(".franken_whisper/storage.sqlite3"));
+        #[cfg(unix)]
+        {
+            // The nearest existing ancestor (the cwd) always has a filesystem.
+            let free = snap.disk_free_bytes.expect("disk free on unix");
+            let total = snap.disk_total_bytes.expect("disk total on unix");
+            assert!(total > 0 && free <= total, "free {free} / total {total}");
+        }
         // On Linux with /proc/meminfo, memory fields should be Some.
         // On other platforms, they may be None. Either way the struct is valid.
         if let Some(avail) = snap.memory_available_bytes {
@@ -7073,7 +7119,7 @@ mod tests {
 
     #[test]
     fn snapshot_resources_memory_fields_not_swapped() {
-        let snap = super::snapshot_resources();
+        let snap = super::snapshot_resources(std::path::Path::new("."));
         if let (Some(avail), Some(total)) = (snap.memory_available_bytes, snap.memory_total_bytes) {
             assert!(
                 avail <= total,

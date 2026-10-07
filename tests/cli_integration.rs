@@ -5768,6 +5768,84 @@ fn speculative_cli_dispatch_emits_partial_confirm_and_stats_events() {
     );
 }
 
+/// The default run-history database follows `FRANKEN_WHISPER_STATE_DIR`
+/// (as the pipeline's work dirs already did), and `FRANKEN_WHISPER_DB`
+/// overrides it for every command — so a service with a state dir never
+/// writes its history into whatever directory it was started from.
+#[cfg(unix)]
+#[test]
+fn default_history_db_follows_state_dir_and_db_env() {
+    use std::fs;
+
+    if !ffmpeg_available() {
+        return;
+    }
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let workdir = dir.path().join("cwd");
+    fs::create_dir_all(&workdir).expect("cwd");
+    let input_wav = dir.path().join("history_input.wav");
+    generate_voiced_wav(&input_wav);
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    let stub_bin = write_whisper_cpp_stub_binary(&bin_dir);
+
+    let fw = || {
+        let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
+        command
+            .current_dir(&workdir)
+            .env_remove("FRANKEN_WHISPER_DB")
+            .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+            .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
+            .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0");
+        command
+    };
+
+    // Persisted run with no --db: the store lands under the state dir.
+    let output = fw()
+        .args([
+            "robot",
+            "run",
+            "--input",
+            input_wav.to_str().expect("utf-8 path"),
+            "--backend",
+            "whisper-cpp",
+            "--no-diarize",
+        ])
+        .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
+        .output()
+        .expect("robot run");
+    assert!(
+        output.status.success(),
+        "persisted run should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state_root.join("storage.sqlite3").exists());
+    assert!(
+        !workdir.join(".franken_whisper/storage.sqlite3").exists(),
+        "history must not be written relative to the working directory"
+    );
+
+    let list_runs = |command: &mut ProcessCommand| -> Vec<serde_json::Value> {
+        let output = command
+            .args(["runs", "--format", "json"])
+            .output()
+            .expect("fw runs");
+        assert!(output.status.success());
+        serde_json::from_slice(&output.stdout).expect("runs json")
+    };
+    let mut via_state_dir = fw();
+    via_state_dir.env("FRANKEN_WHISPER_STATE_DIR", &state_root);
+    assert_eq!(list_runs(&mut via_state_dir).len(), 1);
+
+    // FRANKEN_WHISPER_DB wins over a different state dir.
+    let mut via_db_env = fw();
+    via_db_env
+        .env("FRANKEN_WHISPER_STATE_DIR", dir.path().join("elsewhere"))
+        .env("FRANKEN_WHISPER_DB", state_root.join("storage.sqlite3"));
+    assert_eq!(list_runs(&mut via_db_env).len(), 1);
+}
+
 /// bd-r4dy: backends only see a window's audio slice, so their timestamps are
 /// slice-relative. A multi-window speculative run must localize every window's
 /// segments to absolute time, stream partials before the backend stage

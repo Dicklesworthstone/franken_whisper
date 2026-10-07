@@ -1573,9 +1573,10 @@ mod enabled {
     }
 
     pub fn run_tui() -> FwResult<()> {
-        let db_path = std::env::var("FRANKEN_WHISPER_DB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(".franken_whisper/storage.sqlite3"));
+        // Same precedence as every CLI `--db` default.
+        let db_path = std::env::var_os("FRANKEN_WHISPER_DB")
+            .filter(|value| !value.is_empty())
+            .map_or_else(crate::cli::default_db_path, PathBuf::from);
 
         App::new(WhisperTuiApp::new(db_path))
             .screen_mode(ScreenMode::InlineAuto {
