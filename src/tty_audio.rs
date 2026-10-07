@@ -364,6 +364,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
     let mut frames_decoded = 0u64;
     let mut highest_contiguous_seq = None;
     let mut contiguous_prefix_intact = true;
+    let mut missing_frames = 0u64;
 
     let mut expected_seq = 0u64;
 
@@ -384,6 +385,17 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
 
         // Gap detection.
         if frame.seq > expected_seq {
+            // Sequence numbers are input-controlled: one frame claiming seq
+            // 2^40 must not turn into a retransmit plan that materializes
+            // 2^40 missing sequences. Bound the total recoverable loss.
+            missing_frames = missing_frames.saturating_add(frame.seq - expected_seq);
+            if missing_frames > MAX_RECOVERABLE_MISSING_FRAMES {
+                return Err(FwError::InvalidRequest(format!(
+                    "tty-audio stream is missing {missing_frames} frames (gap at expected {}, got {}); \
+                     more than the recoverable bound of {MAX_RECOVERABLE_MISSING_FRAMES}",
+                    expected_seq, frame.seq
+                )));
+            }
             gaps.push(SequenceGap {
                 expected: expected_seq,
                 got: frame.seq,
@@ -951,6 +963,12 @@ fn compress_chunk(input: &[u8]) -> FwResult<Vec<u8>> {
 /// A 2× safety margin gives 80 000 bytes.  Anything larger is treated as a
 /// decompression bomb and rejected.
 const MAX_DECOMPRESSED_FRAME_BYTES: usize = 80_000;
+
+/// Upper bound on the total number of missing sequence numbers a decode may
+/// recover from (summed over every gap). Retransmit plans list each missing
+/// sequence, so this caps them at 8 MiB of `u64`s; at the protocol's typical
+/// 20-200 ms per frame it is still hours of lost audio.
+const MAX_RECOVERABLE_MISSING_FRAMES: u64 = 1 << 20;
 
 fn decompress_chunk(input: &[u8]) -> FwResult<Vec<u8>> {
     let mut out = Vec::new();
@@ -1914,10 +1932,11 @@ mod tests {
     use base64::engine::general_purpose::STANDARD_NO_PAD;
 
     use super::{
-        CODEC_MULAW_ZLIB_B64, DEFAULT_PROTOCOL_VERSION, DecodeRecoveryPolicy, MIN_PROTOCOL_VERSION,
-        SUPPORTED_PROTOCOL_VERSION, SessionCloseReason, TranscriptSegmentCompact, TtyAudioFrame,
-        compress_chunk, crc32_of, decode_frames_to_raw, decode_frames_to_raw_with_policy,
-        decompress_chunk, emit_control_frame_to_writer, emit_retransmit_loop_from_reader,
+        CODEC_MULAW_ZLIB_B64, DEFAULT_PROTOCOL_VERSION, DecodeRecoveryPolicy,
+        MAX_RECOVERABLE_MISSING_FRAMES, MIN_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSION,
+        SessionCloseReason, TranscriptSegmentCompact, TtyAudioFrame, compress_chunk, crc32_of,
+        decode_frames_to_raw, decode_frames_to_raw_with_policy, decompress_chunk,
+        emit_control_frame_to_writer, emit_retransmit_loop_from_reader,
         emit_tty_transcript_partial, emit_tty_transcript_retract, ensure_parent_dir,
         mulaw_chunk_size, parse_audio_frames_for_decode, parse_frame_line, parse_frames,
         retransmit_plan_from_reader, sha256_hex, write_audio_frame_line,
@@ -2295,9 +2314,18 @@ mod tests {
         let ndjson = frames_to_ndjson(&[frame]);
         let mut reader = ndjson.as_bytes();
 
+        // A lone frame at u64::MAX is a 2^64-frame gap, so the recoverable-loss
+        // bound rejects it before the sequence-space guard is reached.
         let error =
             decode_frames_to_raw_with_policy(&mut reader, DecodeRecoveryPolicy::SkipMissing)
                 .expect_err("sequence exhaustion must fail instead of wrapping expected_seq");
+        assert!(error.to_string().contains("recoverable bound"), "{error}");
+    }
+
+    #[test]
+    fn next_sequence_number_fails_closed_at_the_end_of_sequence_space() {
+        assert_eq!(super::next_sequence_number(41).expect("in range"), 42);
+        let error = super::next_sequence_number(u64::MAX).expect_err("no wrap to zero");
         assert!(
             error
                 .to_string()
@@ -2317,11 +2345,7 @@ mod tests {
         let error =
             decode_frames_to_raw_with_policy(&mut reader, DecodeRecoveryPolicy::SkipMissing)
                 .expect_err("recovery must fail instead of wrapping expected_seq");
-        assert!(
-            error
-                .to_string()
-                .contains("sequence space exhausted at seq 18446744073709551615")
-        );
+        assert!(error.to_string().contains("recoverable bound"), "{error}");
     }
 
     #[test]
@@ -2716,6 +2740,58 @@ mod tests {
             error
                 .to_string()
                 .contains("frame received after session_close at seq 1")
+        );
+    }
+
+    #[test]
+    fn skip_missing_rejects_gaps_beyond_the_recoverable_bound() {
+        let handshake = serde_json::to_string(&TtyControlFrame::Handshake {
+            min_version: MIN_PROTOCOL_VERSION,
+            max_version: SUPPORTED_PROTOCOL_VERSION,
+            supported_codecs: vec![CODEC_MULAW_ZLIB_B64.to_owned()],
+        })
+        .expect("serialize handshake");
+        let ndjson_for = |far_seq: u64| {
+            format!(
+                "{handshake}\n{}\n{}\n",
+                serde_json::to_string(&make_frame(0, b"chunk-zero")).expect("first frame"),
+                serde_json::to_string(&make_frame(far_seq, b"chunk-far")).expect("far frame"),
+            )
+        };
+
+        // A hostile sequence jump must fail before any plan materializes it.
+        let error = retransmit_plan_from_reader(
+            &mut ndjson_for(1 << 40).as_bytes(),
+            DecodeRecoveryPolicy::SkipMissing,
+        )
+        .expect_err("a 2^40-frame gap is not recoverable");
+        assert!(error.to_string().contains("recoverable bound"), "{error}");
+
+        // The largest admissible gap still yields a complete plan.
+        let edge = MAX_RECOVERABLE_MISSING_FRAMES + 1;
+        let plan = retransmit_plan_from_reader(
+            &mut ndjson_for(edge).as_bytes(),
+            DecodeRecoveryPolicy::SkipMissing,
+        )
+        .expect("a gap at the bound is recoverable");
+        assert_eq!(
+            plan.requested_sequences.len() as u64,
+            MAX_RECOVERABLE_MISSING_FRAMES
+        );
+        assert_eq!(
+            plan.requested_ranges,
+            vec![RetransmitRange {
+                start_seq: 1,
+                end_seq: MAX_RECOVERABLE_MISSING_FRAMES,
+            }]
+        );
+        assert!(
+            retransmit_plan_from_reader(
+                &mut ndjson_for(edge + 1).as_bytes(),
+                DecodeRecoveryPolicy::SkipMissing,
+            )
+            .is_err(),
+            "one frame past the bound must fail closed"
         );
     }
 

@@ -4315,6 +4315,11 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
             return Err(bad("truncated chunk padding"));
         }
     }
+    // 1-7 trailing bytes are a torn chunk header, not a clean end of file
+    // (bd-2skl; matches the strict pre-gate parser in native_audio).
+    if pos != bytes.len() {
+        return Err(bad("truncated chunk header"));
+    }
     if bits != 16 {
         return Err(bad("only 16-bit PCM supported"));
     }
@@ -5722,6 +5727,26 @@ mod tests {
                 .to_string()
                 .contains("inside a PCM frame")
         );
+    }
+
+    #[test]
+    fn wav_reader_rejects_every_torn_trailing_chunk_header() {
+        let wav = synthetic_pcm_wav(1, &0_i16.to_le_bytes());
+        assert!(
+            read_wav_16k_mono(&wav).is_ok(),
+            "the untorn file must parse"
+        );
+        for trailing in 1..8 {
+            let mut torn = wav.clone();
+            torn.extend(std::iter::repeat_n(0_u8, trailing));
+            assert!(
+                read_wav_16k_mono(&torn)
+                    .expect_err("a partial chunk header is not a clean EOF")
+                    .to_string()
+                    .contains("truncated chunk header"),
+                "{trailing} trailing byte(s)"
+            );
+        }
     }
 
     #[test]

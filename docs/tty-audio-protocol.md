@@ -234,6 +234,10 @@ Decode continues processing later frames after encountering violations. Dropped 
 - `dropped_frames` -- union of all frames that could not be included in the output
 
 Unsupported protocol/codec/shape still fail immediately even under `skip_missing`.
+So does a stream whose gaps add up to more than 1,048,576 missing sequence
+numbers: sequence numbers are sender-controlled, and a retransmit plan lists
+every missing sequence, so an unbounded jump (one frame claiming seq 2^40)
+would otherwise demand an unbounded allocation.
 
 ---
 

@@ -595,14 +595,14 @@ pub fn run_command_with_timeout(
         ));
     }
     let prepared_capture = prepare_bounded_output_capture(&mut command)?;
-    let owns_process_group = configure_descendant_process_tree(&mut command);
+    let process_tree = configure_descendant_process_tree(&mut command);
     let mut child = spawn_managed_child(command)?;
     let started_at = Instant::now();
     let (stdout_reader, stderr_reader) =
         match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
             Ok(readers) => readers,
             Err(error) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 return Err(merge_process_tree_cleanup_result(error, cleanup));
             }
         };
@@ -613,7 +613,7 @@ pub fn run_command_with_timeout(
                 // Clean the platform ownership boundary even after the root
                 // exits successfully, so in-bound descendants cannot retain
                 // inherited pipes or continue operator-local work.
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let stdout_result = stdout_reader.finish();
                 let stderr_result = stderr_reader.finish();
                 cleanup?;
@@ -629,7 +629,7 @@ pub fn run_command_with_timeout(
             }
             Ok(None) => {}
             Err(error) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let _ = stdout_reader.finish();
                 let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(
@@ -641,7 +641,7 @@ pub fn run_command_with_timeout(
 
         match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
             Ok(Some(stream)) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let _ = stdout_reader.finish();
                 let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(
@@ -651,7 +651,7 @@ pub fn run_command_with_timeout(
             }
             Ok(None) => {}
             Err(error) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let _ = stdout_reader.finish();
                 let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(error, cleanup));
@@ -661,7 +661,7 @@ pub fn run_command_with_timeout(
         if let Some(limit) = timeout
             && started_at.elapsed() >= limit
         {
-            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
             let _ = stdout_reader.finish();
             let stderr = stderr_reader
                 .finish()
@@ -842,9 +842,9 @@ fn run_command_cancellable_with_optional_input(
         prepare_parent_liveness_lease(&mut command)?;
     }
 
-    let owns_process_group = configure_descendant_process_tree(&mut command);
+    let process_tree = configure_descendant_process_tree(&mut command);
     #[cfg(unix)]
-    if observer.is_some() && !owns_process_group {
+    if observer.is_some() && !process_tree.owns_process_group {
         return Err(FwError::Unsupported(
             "process-tree observation requires a fresh caller-owned process group".to_owned(),
         ));
@@ -859,19 +859,19 @@ fn run_command_cancellable_with_optional_input(
         match start_bounded_output_capture(&mut child, prepared_capture, &rendered) {
             Ok(readers) => readers,
             Err(error) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 return Err(merge_process_tree_cleanup_result(error, cleanup));
             }
         };
     loop {
         if let Err(err) = token.checkpoint() {
-            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
             let _ = stdout_reader.finish();
             let _ = stderr_reader.finish();
             return Err(merge_process_tree_cleanup_result(err, cleanup));
         }
         if additional_cancel.is_some_and(|probe| probe()) {
-            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
             let _ = stdout_reader.finish();
             let _ = stderr_reader.finish();
             return Err(merge_process_tree_cleanup_result(
@@ -884,7 +884,7 @@ fn run_command_cancellable_with_optional_input(
         if let Some(limit) = hard_timeout
             && started_at.elapsed() >= limit
         {
-            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
             let _ = stdout_reader.finish();
             let stderr = stderr_reader
                 .finish()
@@ -899,7 +899,7 @@ fn run_command_cancellable_with_optional_input(
 
         match bounded_output_limit_stream(&stdout_reader, &stderr_reader) {
             Ok(Some(stream)) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let _ = stdout_reader.finish();
                 let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(
@@ -909,7 +909,7 @@ fn run_command_cancellable_with_optional_input(
             }
             Ok(None) => {}
             Err(error) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let _ = stdout_reader.finish();
                 let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(error, cleanup));
@@ -921,7 +921,7 @@ fn run_command_cancellable_with_optional_input(
                 // Close inherited stdin/stdout/stderr in any descendants before
                 // joining I/O helpers; otherwise a successful root could leave
                 // the bounded caller blocked forever.
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let stdout_result = stdout_reader.finish();
                 let stderr_result = stderr_reader.finish();
                 cleanup?;
@@ -937,7 +937,7 @@ fn run_command_cancellable_with_optional_input(
             }
             Ok(None) => {}
             Err(error) => {
-                let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+                let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
                 let _ = stdout_reader.finish();
                 let _ = stderr_reader.finish();
                 return Err(merge_process_tree_cleanup_result(
@@ -950,7 +950,7 @@ fn run_command_cancellable_with_optional_input(
         if let Some(observer) = observer.as_deref_mut()
             && let Err(error) = observer(child.id())
         {
-            let cleanup = terminate_descendant_process_tree(&mut child, owns_process_group);
+            let cleanup = terminate_descendant_process_tree(&mut child, &process_tree);
             let _ = stdout_reader.finish();
             let _ = stderr_reader.finish();
             return Err(merge_process_tree_cleanup_result(error, cleanup));
@@ -961,27 +961,72 @@ fn run_command_cancellable_with_optional_input(
     }
 }
 
+/// Environment variable listing the ownership tokens of every bounded process
+/// tree a process belongs to (`:`-separated; a nested owner appends its own).
+#[cfg(unix)]
+const PROCESS_TREE_TOKENS_ENV: &str = "FRANKEN_WHISPER_PROCESS_TREE_TOKENS";
+
+/// How a spawned child's process tree is owned and later terminated.
+struct ProcessTreeOwnership {
+    /// The child roots a fresh Unix process group (`process_group(0)`).
+    owns_process_group: bool,
+    /// Unique token stamped into the child's environment. Every descendant
+    /// inherits it, including one that `setsid`s out of the process group,
+    /// so cleanup can find and kill such escapees (bd-jedl). `None` when the
+    /// tree is not owned here.
+    #[cfg(unix)]
+    tree_token: Option<String>,
+}
+
+#[cfg(unix)]
+fn next_process_tree_token() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!("fwtree-{}-{sequence}-{nanos}", std::process::id())
+}
+
 /// Put each bounded child at the root of a process tree that cancellation can
 /// terminate as one unit. On Unix, `process_group(0)` creates a group whose id
-/// is the child pid. Windows tree ownership is established later by
-/// `spawn_managed_child`, which assigns the suspended root to a Job Object
-/// before allowing it to run.
-fn configure_descendant_process_tree(command: &mut Command) -> bool {
+/// is the child pid, and a fresh tree token in the environment marks every
+/// descendant, even ones that leave the group. Windows tree ownership is
+/// established later by `spawn_managed_child`, which assigns the suspended
+/// root to a Job Object before allowing it to run.
+fn configure_descendant_process_tree(command: &mut Command) -> ProcessTreeOwnership {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
 
         let externally_owned =
             PROCESS_TREE_EXTERNALLY_OWNED.load(std::sync::atomic::Ordering::Acquire);
-        if !externally_owned {
-            command.process_group(0);
+        if externally_owned {
+            return ProcessTreeOwnership {
+                owns_process_group: false,
+                tree_token: None,
+            };
         }
-        !externally_owned
+        command.process_group(0);
+        let token = next_process_tree_token();
+        // Keep any tokens inherited from an outer owner so ITS cleanup still
+        // recognizes this subtree.
+        let tokens = match std::env::var(PROCESS_TREE_TOKENS_ENV) {
+            Ok(inherited) if !inherited.is_empty() => format!("{inherited}:{token}"),
+            _ => token.clone(),
+        };
+        command.env(PROCESS_TREE_TOKENS_ENV, tokens);
+        ProcessTreeOwnership {
+            owns_process_group: true,
+            tree_token: Some(token),
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = command;
-        false
+        ProcessTreeOwnership {
+            owns_process_group: false,
+        }
     }
 }
 
@@ -1034,10 +1079,12 @@ fn wait_for_child_reap(child: &mut ManagedChild, deadline: Instant) -> FwResult<
 #[cfg(unix)]
 fn terminate_descendant_process_tree(
     child: &mut ManagedChild,
-    owns_process_group: bool,
+    process_tree: &ProcessTreeOwnership,
 ) -> FwResult<()> {
     let deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
-    let process_group = owns_process_group.then(|| rustix::process::Pid::from_child(child));
+    let process_group = process_tree
+        .owns_process_group
+        .then(|| rustix::process::Pid::from_child(child));
     let mut group_signal_error = None;
     if let Some(process_group) = process_group
         && let Err(error) =
@@ -1098,7 +1145,107 @@ fn terminate_descendant_process_tree(
             }
         }
     }
+    if let Some(token) = process_tree.tree_token.as_deref() {
+        terminate_escaped_tree_members(token, deadline)?;
+    }
     Ok(())
+}
+
+/// Kill every live process that carries `token` in its environment but left
+/// the owned process group (bd-jedl: `setsid`, daemonizing helpers). Rescans
+/// until a pass finds none, so an escapee forking during cleanup is caught
+/// too; still finding one at `deadline` is a certification failure. Each
+/// pass runs at least once, even when the group cleanup used up the window.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn terminate_escaped_tree_members(token: &str, deadline: Instant) -> FwResult<()> {
+    loop {
+        if signal_processes_carrying_tree_token(token) == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(process_tree_cleanup_error(
+                "descendants that left the owned process group survived termination",
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Without `/proc` there is no portable way to enumerate escapees; the
+/// process-group boundary remains the containment guarantee there.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn terminate_escaped_tree_members(_token: &str, _deadline: Instant) -> FwResult<()> {
+    Ok(())
+}
+
+/// One `/proc` pass: SIGKILL each live process whose environment carries
+/// `token`; returns how many were signalled. Zombies have no readable
+/// environment, so already-killed escapees drop out of later passes. The
+/// identity is pinned with a pidfd and the environment re-read through it
+/// before signalling, so a recycled pid can never receive the kill.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn signal_processes_carrying_tree_token(token: &str) -> usize {
+    let own_pid = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let mut signalled = 0;
+    for entry in entries.flatten() {
+        let Some(raw_pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if u32::try_from(raw_pid).ok() == Some(own_pid) {
+            continue;
+        }
+        let environ_path = entry.path().join("environ");
+        // Cheap pre-filter: other users' and exited processes fail here.
+        if !std::fs::read(&environ_path)
+            .is_ok_and(|bytes| environ_carries_tree_token(&bytes, token))
+        {
+            continue;
+        }
+        let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
+            continue;
+        };
+        match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+            Ok(pidfd) => {
+                if std::fs::read(&environ_path)
+                    .is_ok_and(|bytes| environ_carries_tree_token(&bytes, token))
+                    && rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL)
+                        .is_ok()
+                {
+                    signalled += 1;
+                }
+            }
+            // Pre-5.3 kernels have no pidfd; fall back to a plain kill.
+            Err(rustix::io::Errno::NOSYS) => {
+                if rustix::process::kill_process(pid, rustix::process::Signal::KILL).is_ok() {
+                    signalled += 1;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    signalled
+}
+
+/// Whether a NUL-separated `/proc/<pid>/environ` image lists `token` among
+/// its `FRANKEN_WHISPER_PROCESS_TREE_TOKENS` entries.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn environ_carries_tree_token(environ: &[u8], token: &str) -> bool {
+    let prefix = format!("{PROCESS_TREE_TOKENS_ENV}=");
+    environ
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+        .any(|tokens| {
+            tokens
+                .split(|byte| *byte == b':')
+                .any(|candidate| candidate == token.as_bytes())
+        })
 }
 
 /// Whether every process still carrying `process_group` as its process group
@@ -1186,7 +1333,7 @@ fn parse_proc_stat_group_member(stat: &str) -> Option<ProcStatGroupMember> {
 #[cfg(windows)]
 fn terminate_descendant_process_tree(
     child: &mut ManagedChild,
-    _owns_process_group: bool,
+    _process_tree: &ProcessTreeOwnership,
 ) -> FwResult<()> {
     child.kill().map_err(|_| {
         process_tree_cleanup_error("the owned Windows Job Object rejected termination")
@@ -1196,7 +1343,7 @@ fn terminate_descendant_process_tree(
 #[cfg(not(any(unix, windows)))]
 fn terminate_descendant_process_tree(
     child: &mut ManagedChild,
-    _owns_process_group: bool,
+    _process_tree: &ProcessTreeOwnership,
 ) -> FwResult<()> {
     child
         .kill()
@@ -1678,7 +1825,7 @@ pub struct StreamingChild {
     stderr_join: Option<thread::JoinHandle<()>>,
     rendered_command: String,
     sensitive_values: Vec<String>,
-    owns_process_group: bool,
+    process_tree: ProcessTreeOwnership,
     reaped: bool,
 }
 
@@ -1751,9 +1898,7 @@ impl StreamingChild {
         if self.reaped {
             return Ok(None);
         }
-        if let Err(error) =
-            terminate_descendant_process_tree(&mut self.child, self.owns_process_group)
-        {
+        if let Err(error) = terminate_descendant_process_tree(&mut self.child, &self.process_tree) {
             // A descendant may still own stderr. Detach instead of converting
             // the cleanup failure into an unbounded join; Drop will retry the
             // process-group cleanup once more.
@@ -1879,8 +2024,8 @@ pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<Stream
             "bounded streaming subprocess trees are unsupported on this platform".to_owned(),
         ));
     }
-    let owns_process_group = configure_descendant_process_tree(&mut command);
-    if !owns_process_group {
+    let process_tree = configure_descendant_process_tree(&mut command);
+    if !process_tree.owns_process_group {
         return Err(FwError::Unsupported(
             "streaming subprocess capture requires a fresh caller-owned process group".to_owned(),
         ));
@@ -1908,7 +2053,7 @@ pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<Stream
         stderr_join,
         rendered_command,
         sensitive_values,
-        owns_process_group,
+        process_tree,
         reaped: false,
     })
 }
@@ -1921,6 +2066,8 @@ mod tests {
 
     #[cfg(unix)]
     use super::run_command_cancellable_with_input_probe_and_observer;
+    #[cfg(target_os = "linux")]
+    use super::{PROCESS_TREE_TOKENS_ENV, environ_carries_tree_token};
     use super::{ProcStatGroupMember, parse_proc_stat_group_member, utf8_path_arg};
 
     #[test]
@@ -2443,6 +2590,110 @@ mod tests {
             rustix::process::test_kill_process(descendant_pid).is_err(),
             "timeout left a descendant process alive"
         );
+    }
+
+    /// Live = present in `/proc` and not a dead zombie (killed escapees are
+    /// reparented to an init that may never reap them).
+    #[cfg(target_os = "linux")]
+    fn linux_process_is_live(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| parse_proc_stat_group_member(&stat))
+            .is_some_and(|member| !member.is_dead_zombie())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_escapee_terminated(pid_path: &std::path::Path) {
+        let escapee: i32 = std::fs::read_to_string(pid_path)
+            .expect("escapee pid fixture")
+            .trim()
+            .parse()
+            .expect("numeric escapee pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while linux_process_is_live(escapee) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !linux_process_is_live(escapee),
+            "a descendant that left the process group via setsid survived cleanup"
+        );
+    }
+
+    /// The escapee keeps the inherited stdout/stderr pipes, so a cleanup that
+    /// missed it would also wedge the bounded output capture.
+    #[cfg(target_os = "linux")]
+    fn setsid_escape_fixture(pid_path: &std::path::Path, root_tail: &str) -> Vec<String> {
+        vec![
+            "-c".to_owned(),
+            format!(
+                "setsid sleep 60 </dev/null & printf '%s' \"$!\" > \"$1\"; sleep 0.3; {root_tail}"
+            ),
+            "fw-process-escape-test".to_owned(),
+            pid_path.to_string_lossy().into_owned(),
+        ]
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeout_terminates_descendants_that_setsid_out_of_the_group() {
+        if !command_exists("setsid") {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("escapee.pid");
+        let args = setsid_escape_fixture(&pid_path, "sleep 60");
+        let started = std::time::Instant::now();
+        let result = run_command_with_timeout("sh", &args, None, Some(Duration::from_millis(800)));
+        assert!(result.is_err(), "fixture must hit the timeout");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_escapee_terminated(&pid_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_root_exit_still_terminates_setsid_escapees() {
+        if !command_exists("setsid") {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("temporary pid directory");
+        let pid_path = directory.path().join("escapee.pid");
+        // The root waits until the escapee exists, then exits 0 with the
+        // daemonized child still running.
+        let args = setsid_escape_fixture(&pid_path, "exit 0");
+        let started = std::time::Instant::now();
+        run_command_with_timeout("sh", &args, None, Some(Duration::from_secs(30)))
+            .expect("root exits successfully");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_escapee_terminated(&pid_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn environ_token_matching_is_exact_per_list_entry() {
+        let environ = |value: &str| {
+            format!("PATH=/bin\0{PROCESS_TREE_TOKENS_ENV}={value}\0HOME=/root\0").into_bytes()
+        };
+        assert!(environ_carries_tree_token(
+            &environ("fwtree-1-2-3"),
+            "fwtree-1-2-3"
+        ));
+        assert!(environ_carries_tree_token(
+            &environ("fwtree-9-0-0:fwtree-1-2-3"),
+            "fwtree-1-2-3"
+        ));
+        assert!(!environ_carries_tree_token(
+            &environ("fwtree-1-2-33"),
+            "fwtree-1-2-3"
+        ));
+        assert!(!environ_carries_tree_token(
+            &environ("xfwtree-1-2-3"),
+            "fwtree-1-2-3"
+        ));
+        assert!(!environ_carries_tree_token(
+            b"OTHER=fwtree-1-2-3\0",
+            "fwtree-1-2-3"
+        ));
+        assert!(!environ_carries_tree_token(b"", "fwtree-1-2-3"));
     }
 
     #[cfg(windows)]

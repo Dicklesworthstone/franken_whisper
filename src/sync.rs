@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use chrono::Utc;
 use flate2::Compression;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 // The JSONL sync drives the database synchronously from the CLI. `fsqlite`'s
 // own `Connection` is async as of the frankensqlite async migration, so this
@@ -167,6 +167,12 @@ impl SyncLock {
         fs::create_dir_all(&locks_dir)?;
         let path = locks_dir.join("sync.lock");
 
+        // Serialize check -> archive -> create across processes (bd-ci9x).
+        // Released (dropped) once the new lock file exists: from then on the
+        // file itself excludes contenders, and a contender that sees it
+        // partially written fails closed below.
+        let acquisition_guard = lock_acquisition_guard(&locks_dir)?;
+
         if path.exists()
             && let Some(info) = read_lock_info(&path)?
         {
@@ -199,6 +205,7 @@ impl SyncLock {
                     path.display()
                 ))
             })?;
+        drop(acquisition_guard);
         after_create();
         file.write_all(payload.as_bytes())?;
         file.sync_all()?;
@@ -257,6 +264,53 @@ impl SyncLock {
 impl Drop for SyncLock {
     fn drop(&mut self) {
         let _ = self.release_inner();
+    }
+}
+
+/// How long a contender waits for another process's (sub-millisecond)
+/// check -> archive -> create critical section before failing closed.
+const LOCK_ACQUISITION_GUARD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take the OS advisory lock on `locks/sync.lock.guard` that makes lock
+/// acquisition atomic across processes (bd-ci9x). Without it, two contenders
+/// that both judged the same dead holder's lock stale could each "archive"
+/// it — the second renaming away the FIRST contender's freshly created lock —
+/// and both proceed as writers. The OS releases the guard when the returned
+/// file is dropped or the process dies, so a crash can never wedge it.
+fn lock_acquisition_guard(locks_dir: &Path) -> FwResult<fs::File> {
+    let guard_path = locks_dir.join("sync.lock.guard");
+    let guard = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&guard_path)
+        .map_err(|error| {
+            FwError::Storage(format!(
+                "failed to open sync lock guard {}: {error}",
+                guard_path.display()
+            ))
+        })?;
+    let deadline = std::time::Instant::now() + LOCK_ACQUISITION_GUARD_WAIT;
+    loop {
+        match guard.try_lock() {
+            Ok(()) => return Ok(guard),
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(FwError::Storage(format!(
+                    "timed out waiting for sync lock guard {}",
+                    guard_path.display()
+                )));
+            }
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(FwError::Storage(format!(
+                    "failed to lock sync lock guard {}: {error}",
+                    guard_path.display()
+                )));
+            }
+        }
     }
 }
 
@@ -442,6 +496,26 @@ pub fn export(db_path: &Path, output_dir: &Path, state_root: &Path) -> FwResult<
     export_inner(db_path, output_dir)
 }
 
+/// [`export`], then compress the archive per `compression`, all under ONE
+/// sync lock: no concurrent export or import can interleave with (or read)
+/// the window between publishing plain JSONL and replacing it with `.gz`.
+/// Returns the manifest plus the compressed file names (empty for
+/// [`CompressionMode::None`]).
+pub fn export_with_compression(
+    db_path: &Path,
+    output_dir: &Path,
+    state_root: &Path,
+    compression: CompressionMode,
+) -> FwResult<(SyncManifest, Vec<String>)> {
+    let _lock = SyncLock::acquire(state_root, "export")?;
+    let manifest = export_inner(db_path, output_dir)?;
+    let compressed = match compression {
+        CompressionMode::None => Vec::new(),
+        CompressionMode::Gzip => gzip_export_files(output_dir)?,
+    };
+    Ok((manifest, compressed))
+}
+
 fn with_read_snapshot<T>(
     connection: &Connection,
     operation: impl FnOnce() -> FwResult<T>,
@@ -507,6 +581,7 @@ fn export_inner_with_after_runs(
 
         Ok((runs, segments, events))
     })?;
+    remove_stale_compressed_jsonl(output_dir, &["runs", "segments", "events"])?;
 
     // Checksums streamed while writing (HashingWriter) — no second pass to re-read
     // the JSONL files. Identical digest to `sha256_file` of the written bytes.
@@ -734,6 +809,23 @@ pub fn export_incremental(
     export_incremental_inner(db_path, output_dir, state_root)
 }
 
+/// [`export_incremental`] plus compression under the same single sync lock;
+/// see [`export_with_compression`].
+pub fn export_incremental_with_compression(
+    db_path: &Path,
+    output_dir: &Path,
+    state_root: &Path,
+    compression: CompressionMode,
+) -> FwResult<(IncrementalExportManifest, Vec<String>)> {
+    let _lock = SyncLock::acquire(state_root, "export_incremental")?;
+    let manifest = export_incremental_inner(db_path, output_dir, state_root)?;
+    let compressed = match compression {
+        CompressionMode::None => Vec::new(),
+        CompressionMode::Gzip => gzip_export_files(output_dir)?,
+    };
+    Ok((manifest, compressed))
+}
+
 fn export_incremental_inner(
     db_path: &Path,
     output_dir: &Path,
@@ -804,6 +896,10 @@ fn export_incremental_inner_with_after_runs(
 
         Ok((runs_export, segments, events, deleted))
     })?;
+    remove_stale_compressed_jsonl(
+        output_dir,
+        &["runs", "segments", "events", DELETED_RUNS_STEM],
+    )?;
     let runs_count = runs_export.count;
     let runs_sha256 = runs_export.sha256;
 
@@ -3532,7 +3628,7 @@ pub fn compress_jsonl(input_path: &Path, output_path: &Path) -> FwResult<()> {
 pub fn decompress_jsonl(input_path: &Path, output_path: &Path) -> FwResult<()> {
     let tmp = output_path.with_extension("tmp");
     let input = fs::File::open(input_path)?;
-    let mut decoder = GzDecoder::new(BufReader::new(input));
+    let mut decoder = MultiGzDecoder::new(BufReader::new(input));
     let mut writer = BufWriter::new(fs::File::create(&tmp)?);
 
     std::io::copy(&mut decoder, &mut writer)?;
@@ -3554,7 +3650,7 @@ pub fn decompress_jsonl(input_path: &Path, output_path: &Path) -> FwResult<()> {
 ///
 /// Propagates I/O failures; a plain file is removed only after its compressed
 /// replacement has been durably published.
-pub fn gzip_export_files(output_dir: &Path) -> FwResult<Vec<String>> {
+fn gzip_export_files(output_dir: &Path) -> FwResult<Vec<String>> {
     let mut compressed = Vec::new();
     for stem in ["runs", "segments", "events", DELETED_RUNS_STEM] {
         let plain = output_dir.join(format!("{stem}.jsonl"));
@@ -3568,6 +3664,25 @@ pub fn gzip_export_files(output_dir: &Path) -> FwResult<Vec<String>> {
     }
     sync_parent_dir(&output_dir.join("manifest.json"))?;
     Ok(compressed)
+}
+
+/// Remove a `{stem}.jsonl.gz` left in `output_dir` by an earlier compressed
+/// export before a plain export publishes its manifest. Readers prefer the
+/// `.gz` spelling, so a stale compressed file would shadow the freshly
+/// written `{stem}.jsonl` and make the new archive fail its checksums.
+fn remove_stale_compressed_jsonl(output_dir: &Path, stems: &[&str]) -> FwResult<()> {
+    let mut removed = false;
+    for stem in stems {
+        match fs::remove_file(output_dir.join(format!("{stem}.jsonl.gz"))) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if removed {
+        sync_parent_dir(&output_dir.join("manifest.json"))?;
+    }
+    Ok(())
 }
 
 /// Whether the archive in `input_dir` is an incremental (partial) snapshot,
@@ -3591,7 +3706,10 @@ pub fn archive_is_incremental(input_dir: &Path) -> FwResult<bool> {
 fn open_jsonl_reader(path: &Path) -> FwResult<Box<dyn BufRead>> {
     let file = fs::File::open(path)?;
     if path.extension().is_some_and(|ext| ext == "gz") {
-        let decoder = GzDecoder::new(BufReader::new(file));
+        // Multi-member aware: bgzip/pigz output and concatenated gzip files
+        // are valid `.gz` streams; a single-member decoder would stop at the
+        // first member and silently truncate the logical JSONL.
+        let decoder = MultiGzDecoder::new(BufReader::new(file));
         Ok(Box::new(BufReader::new(decoder)))
     } else {
         Ok(Box::new(BufReader::new(file)))
@@ -3769,24 +3887,20 @@ where
         if let Some(db_row) = db_run_map.get(*id)
             && let Some(jsonl_value) = jsonl_run_map.get(*id)
         {
-            let matches = value_to_string_sqlite(db_row.get(1))
-                == json_str_or_empty(jsonl_value, "started_at")
-                && value_to_string_sqlite(db_row.get(2))
-                    == json_str_or_empty(jsonl_value, "finished_at")
-                && value_to_string_sqlite(db_row.get(3))
-                    == json_str_or_empty(jsonl_value, "backend")
-                && value_to_string_sqlite(db_row.get(4))
-                    == json_str_or_empty(jsonl_value, "input_path")
-                && value_to_string_sqlite(db_row.get(5))
-                    == json_str_or_empty(jsonl_value, "normalized_wav_path")
-                && value_to_string_sqlite(db_row.get(6))
-                    == json_str_or_empty(jsonl_value, "request_json")
-                && value_to_string_sqlite(db_row.get(7))
-                    == json_str_or_empty(jsonl_value, "result_json")
-                && value_to_string_sqlite(db_row.get(8))
-                    == json_str_or_empty(jsonl_value, "warnings_json")
-                && value_to_string_sqlite(db_row.get(9))
-                    == json_str_or_empty(jsonl_value, "transcript")
+            let matches = [
+                "started_at",
+                "finished_at",
+                "backend",
+                "input_path",
+                "normalized_wav_path",
+                "request_json",
+                "result_json",
+                "warnings_json",
+                "transcript",
+            ]
+            .iter()
+            .enumerate()
+            .all(|(offset, key)| run_field_matches(db_row.get(offset + 1), jsonl_value, key))
                 && value_to_string_sqlite(db_row.get(10))
                     == json_string_or_default(jsonl_value, "replay_json", "{}")
                 && value_to_string_sqlite(db_row.get(11))
@@ -4184,27 +4298,41 @@ fn load_jsonl_run_map(
             continue;
         }
         let value: serde_json::Value = serde_json::from_str(trimmed)?;
-        if let Some(id_str) = value.get("id").and_then(serde_json::Value::as_str) {
-            if map.contains_key(id_str) {
-                return Err(FwError::Storage(format!(
-                    "duplicate run id {id_str:?} in runs JSONL at line {}",
-                    line_index + 1
-                )));
-            }
-            map.insert(id_str.to_owned(), value);
+        // A canonical run row without a string id cannot be matched against the
+        // database; dropping it would let a damaged archive validate (bd-8l6f).
+        let Some(id_str) = value.get("id").and_then(serde_json::Value::as_str) else {
+            return Err(FwError::Storage(format!(
+                "run row without a string `id` in runs JSONL at line {}",
+                line_index + 1
+            )));
+        };
+        if map.contains_key(id_str) {
+            return Err(FwError::Storage(format!(
+                "duplicate run id {id_str:?} in runs JSONL at line {}",
+                line_index + 1
+            )));
         }
+        map.insert(id_str.to_owned(), value);
     }
     Ok(map)
 }
 
-/// Extract a string field from a JSON value, returning an empty string on
-/// missing or non-string values.
-fn json_str_or_empty(value: &serde_json::Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_owned()
+/// Exact JSONL-vs-SQLite comparison for one exported run column: the key must
+/// be present, a JSON string matches only the identical TEXT value, and JSON
+/// null matches only SQL NULL. A missing key or a changed type is a mismatch
+/// (bd-8l6f) instead of collapsing to "" on both sides.
+fn run_field_matches(
+    db_value: Option<&SqliteValue>,
+    jsonl_row: &serde_json::Value,
+    key: &str,
+) -> bool {
+    match (jsonl_row.get(key), db_value) {
+        (Some(serde_json::Value::String(text)), Some(SqliteValue::Text(_))) => {
+            value_to_string_sqlite(db_value) == *text
+        }
+        (Some(serde_json::Value::Null), None | Some(SqliteValue::Null)) => true,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5659,6 +5787,67 @@ mod tests {
             !archived_during_race,
             "contender must not archive the first acquisition's partial lock"
         );
+    }
+
+    #[test]
+    fn concurrent_stale_lock_takeover_grants_exactly_one_writer() {
+        // bd-ci9x: every contender judges the dead holder's lock stale at the
+        // same moment. Without the acquisition guard a later contender could
+        // archive an earlier contender's FRESH lock and also proceed.
+        const CONTENDERS: usize = 8;
+        for round in 0..20 {
+            let dir = tempdir().expect("tempdir");
+            let state_root = dir.path().join("state");
+            let locks_dir = state_root.join("locks");
+            fs::create_dir_all(&locks_dir).expect("locks dir");
+            let stale = LockInfo {
+                pid: u32::MAX - 1,
+                created_at_rfc3339: "2000-01-01T00:00:00Z".to_owned(),
+                operation: "export".to_owned(),
+            };
+            fs::write(
+                locks_dir.join("sync.lock"),
+                serde_json::to_string_pretty(&stale).expect("serialize"),
+            )
+            .expect("write stale lock");
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS));
+            let handles: Vec<_> = (0..CONTENDERS)
+                .map(|index| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let state_root = state_root.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        SyncLock::acquire(&state_root, &format!("contender-{index}"))
+                    })
+                })
+                .collect();
+            // Keep every granted lock alive until all contenders finished, so
+            // a release can never make room for a second grant.
+            let results: Vec<FwResult<SyncLock>> = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("contender thread"))
+                .collect();
+            let granted = results.iter().filter(|result| result.is_ok()).count();
+            assert_eq!(
+                granted, 1,
+                "round {round}: exactly one writer may hold the lock"
+            );
+            let stale_archives = fs::read_dir(&locks_dir)
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("sync.lock.stale.")
+                })
+                .count();
+            assert_eq!(
+                stale_archives, 1,
+                "round {round}: only the dead holder's lock may be archived"
+            );
+        }
     }
 
     #[test]
@@ -12246,6 +12435,101 @@ mod tests {
     }
 
     #[test]
+    fn plain_reexport_over_a_gzip_archive_does_not_leave_stale_gz_shadows() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let target_db = dir.path().join("target.sqlite3");
+        let export_dir = dir.path().join("archive");
+        let state_root = dir.path().join("state");
+        let source_store = RunStore::open(&source_db).expect("source store");
+        source_store
+            .persist_report(&fixture_report("reexport-1", &source_db))
+            .expect("persist first report");
+
+        let (_, compressed) =
+            export_with_compression(&source_db, &export_dir, &state_root, CompressionMode::Gzip)
+                .expect("gzip export");
+        assert_eq!(
+            compressed,
+            vec!["runs.jsonl.gz", "segments.jsonl.gz", "events.jsonl.gz"]
+        );
+        assert!(!export_dir.join("runs.jsonl").exists());
+
+        // New data, then a PLAIN export into the same directory. Readers prefer
+        // `.gz`, so stale compressed files would shadow the fresh plain ones.
+        source_store
+            .persist_report(&fixture_report("reexport-2", &source_db))
+            .expect("persist second report");
+        let (manifest, compressed) =
+            export_with_compression(&source_db, &export_dir, &state_root, CompressionMode::None)
+                .expect("plain re-export");
+        assert!(compressed.is_empty());
+        for stem in ["runs", "segments", "events"] {
+            assert!(
+                !export_dir.join(format!("{stem}.jsonl.gz")).exists(),
+                "stale {stem}.jsonl.gz must be gone"
+            );
+        }
+
+        let result = import(
+            &target_db,
+            &export_dir,
+            &dir.path().join("import_state"),
+            ConflictPolicy::Reject,
+        )
+        .expect("import the plain re-export");
+        assert_eq!(result.runs_imported, manifest.row_counts.runs);
+        assert_eq!(manifest.row_counts.runs, 2);
+    }
+
+    #[test]
+    fn multi_member_gzip_reads_every_member() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("rows.jsonl.gz");
+        let mut bytes = Vec::new();
+        for member in ["{\"id\":\"a\"}\n", "{\"id\":\"b\"}\n"] {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(member.as_bytes())
+                .expect("compress member");
+            bytes.extend(encoder.finish().expect("finish member"));
+        }
+        fs::write(&path, bytes).expect("write concatenated gzip");
+
+        let lines: Vec<String> = open_jsonl_reader(&path)
+            .expect("open multi-member gzip")
+            .lines()
+            .collect::<Result<_, _>>()
+            .expect("read lines");
+        assert_eq!(lines, vec!["{\"id\":\"a\"}", "{\"id\":\"b\"}"]);
+        assert_eq!(
+            sha256_jsonl_file(&path).expect("logical hash"),
+            sha256_reader(&b"{\"id\":\"a\"}\n{\"id\":\"b\"}\n"[..]).expect("plain hash")
+        );
+    }
+
+    #[test]
+    fn compressed_export_holds_the_sync_lock_through_compression() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let state_root = dir.path().join("state");
+        RunStore::open(&source_db)
+            .expect("source store")
+            .persist_report(&fixture_report("locked-1", &source_db))
+            .expect("persist report");
+        let held = SyncLock::acquire(&state_root, "other").expect("hold lock");
+        let error = export_with_compression(
+            &source_db,
+            &dir.path().join("archive"),
+            &state_root,
+            CompressionMode::Gzip,
+        )
+        .expect_err("export must not run while another sync holds the lock");
+        assert!(error.to_string().contains("lock"), "{error}");
+        drop(held);
+    }
+
+    #[test]
     fn gzip_only_export_imports_logical_jsonl_bytes_exactly() {
         let dir = tempdir().expect("tempdir");
         let source_db = dir.path().join("gzip_source.sqlite3");
@@ -12438,22 +12722,25 @@ mod tests {
     }
 
     #[test]
-    fn json_str_or_empty_returns_empty_for_non_string_types() {
-        let obj = json!({
+    fn run_field_matches_requires_present_key_and_identical_type() {
+        let row = json!({
             "name": "alice",
+            "empty": "",
             "age": 42,
-            "active": true,
-            "scores": [1, 2, 3],
-            "meta": {"nested": "object"},
             "gone": null
         });
-        assert_eq!(json_str_or_empty(&obj, "name"), "alice");
-        assert_eq!(json_str_or_empty(&obj, "age"), "");
-        assert_eq!(json_str_or_empty(&obj, "active"), "");
-        assert_eq!(json_str_or_empty(&obj, "scores"), "");
-        assert_eq!(json_str_or_empty(&obj, "meta"), "");
-        assert_eq!(json_str_or_empty(&obj, "gone"), "");
-        assert_eq!(json_str_or_empty(&obj, "missing_key"), "");
+        let text = |value: &str| SqliteValue::Text(value.to_owned().into());
+        assert!(run_field_matches(Some(&text("alice")), &row, "name"));
+        assert!(!run_field_matches(Some(&text("bob")), &row, "name"));
+        assert!(run_field_matches(Some(&text("")), &row, "empty"));
+        assert!(run_field_matches(Some(&SqliteValue::Null), &row, "gone"));
+        assert!(run_field_matches(None, &row, "gone"));
+        // The bd-8l6f collapses: missing key vs empty TEXT, null vs empty
+        // TEXT, empty string vs NULL, and a non-string JSON value.
+        assert!(!run_field_matches(Some(&text("")), &row, "missing_key"));
+        assert!(!run_field_matches(Some(&text("")), &row, "gone"));
+        assert!(!run_field_matches(Some(&SqliteValue::Null), &row, "empty"));
+        assert!(!run_field_matches(Some(&text("42")), &row, "age"));
     }
 
     #[test]
@@ -13108,24 +13395,32 @@ mod tests {
     }
 
     #[test]
-    fn load_jsonl_run_map_skips_non_string_and_missing_ids() {
+    fn load_jsonl_run_map_rejects_rows_without_a_string_id() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("mixed.jsonl");
-        let content = [
-            r#"{"id": "valid-1", "text": "ok"}"#,
-            r#"{"id": 42, "text": "integer id"}"#,
-            r#"{"id": null, "text": "null id"}"#,
-            r#"{"text": "no id field"}"#,
-            "",
-            r#"{"id": "valid-2", "text": "also ok"}"#,
-        ]
-        .join("\n");
-        fs::write(&path, content).expect("write");
+        for (line, bad_row) in [
+            (2, r#"{"id": 42, "text": "integer id"}"#),
+            (2, r#"{"id": null, "text": "null id"}"#),
+            (2, r#"{"text": "no id field"}"#),
+        ] {
+            let content = [r#"{"id": "valid-1", "text": "ok"}"#, bad_row, ""].join("\n");
+            fs::write(&path, content).expect("write");
+            let error = load_jsonl_run_map(&path)
+                .expect_err("a run row without a string id must fail closed");
+            assert!(
+                error.to_string().contains(&format!("line {line}")),
+                "{error}"
+            );
+        }
 
+        // Blank lines are still skipped.
+        fs::write(
+            &path,
+            [r#"{"id": "valid-1"}"#, "", "   ", r#"{"id": "valid-2"}"#].join("\n"),
+        )
+        .expect("write");
         let map = load_jsonl_run_map(&path).expect("load");
         assert_eq!(map.len(), 2);
-        assert!(map.contains_key("valid-1"));
-        assert!(map.contains_key("valid-2"));
     }
 
     #[test]

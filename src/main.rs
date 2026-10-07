@@ -999,25 +999,29 @@ fn run(cli: Cli) -> FwResult<()> {
         }
         Command::Sync { command } => match command {
             SyncCommand::Export(args) => {
-                let manifest = if args.incremental {
-                    serde_json::to_value(franken_whisper::sync::export_incremental(
+                let compression = if args.gzip {
+                    franken_whisper::sync::CompressionMode::Gzip
+                } else {
+                    franken_whisper::sync::CompressionMode::None
+                };
+                let (mut manifest, compressed) = if args.incremental {
+                    let (manifest, compressed) =
+                        franken_whisper::sync::export_incremental_with_compression(
+                            &args.db,
+                            &args.output,
+                            &args.state_root,
+                            compression,
+                        )?;
+                    (serde_json::to_value(manifest)?, compressed)
+                } else {
+                    let (manifest, compressed) = franken_whisper::sync::export_with_compression(
                         &args.db,
                         &args.output,
                         &args.state_root,
-                    )?)?
-                } else {
-                    serde_json::to_value(franken_whisper::sync::export(
-                        &args.db,
-                        &args.output,
-                        &args.state_root,
-                    )?)?
+                        compression,
+                    )?;
+                    (serde_json::to_value(manifest)?, compressed)
                 };
-                let compressed = if args.gzip {
-                    franken_whisper::sync::gzip_export_files(&args.output)?
-                } else {
-                    Vec::new()
-                };
-                let mut manifest = manifest;
                 if let serde_json::Value::Object(ref mut map) = manifest {
                     map.insert("gzip_files".to_owned(), serde_json::json!(compressed));
                 }
