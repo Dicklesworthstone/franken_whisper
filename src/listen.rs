@@ -1752,6 +1752,25 @@ fn pinned_fast_lane_label(model: crate::model_distribution::FastLaneModel) -> &'
     }
 }
 
+/// Resolve a listen-lane model spec: the bare pinned names (`tiny`,
+/// `tiny.en`) always go through the authenticated fast-lane package (size +
+/// SHA-256 + bound descriptor), every other spelling through the generic
+/// resolver (release sentinels are authenticated there; explicit paths are
+/// the caller's choice). Shared by the fast and confirm lanes so a pinned
+/// name can never load an unauthenticated same-named file.
+fn resolve_listen_model_source(
+    spec: &str,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+) -> FwResult<crate::native_engine::ResolvedWhisperModel> {
+    match pinned_fast_lane_model(spec) {
+        Some(model) => {
+            crate::model_distribution::resolve_cached_fast_lane_with_cancel(model, is_cancelled)
+                .map(crate::native_engine::ResolvedWhisperModel::Authenticated)
+        }
+        None => crate::native_engine::resolve_model_source_with_cancel(spec, is_cancelled),
+    }
+}
+
 /// Resolve and authenticate the fast-lane source while retaining the verified
 /// descriptor for the model loader. Keeping source selection separate makes
 /// the trust-boundary policy directly testable without allocating a complete
@@ -1770,13 +1789,7 @@ fn resolve_fast_model_path(
     };
     let spec = config.fast_model.as_deref().unwrap_or(default_spec).trim();
     let pinned_model = pinned_fast_lane_model(spec);
-    let resolved = match pinned_model {
-        Some(model) => {
-            crate::model_distribution::resolve_cached_fast_lane_with_cancel(model, is_cancelled)
-                .map(crate::native_engine::ResolvedWhisperModel::Authenticated)
-        }
-        None => crate::native_engine::resolve_model_source_with_cancel(spec, is_cancelled),
-    };
+    let resolved = resolve_listen_model_source(spec, is_cancelled);
 
     match resolved {
         Ok(path) => Ok((
@@ -2878,26 +2891,23 @@ pub fn run_listen_session(
             let (model, label) = match loaded.as_ref() {
                 Some(pair) => pair.clone(),
                 None => {
-                    let resolved = crate::native_engine::resolve_model_source_with_cancel(
-                        &spec_owned,
-                        is_abort,
-                    )
-                    .map_err(|e| e.to_string())
-                    .and_then(|source| {
-                        let checkpoint = || {
-                            if is_abort() {
-                                Err(FwError::Cancelled(
-                                    "confirm lane model load abandoned".to_owned(),
-                                ))
-                            } else {
-                                Ok(())
-                            }
-                        };
-                        source
-                            .load_with_checkpoint(&checkpoint)
-                            .map(|m| (m, spec_owned.clone()))
-                            .map_err(|e| e.to_string())
-                    });
+                    let resolved = resolve_listen_model_source(&spec_owned, is_abort)
+                        .map_err(|e| e.to_string())
+                        .and_then(|source| {
+                            let checkpoint = || {
+                                if is_abort() {
+                                    Err(FwError::Cancelled(
+                                        "confirm lane model load abandoned".to_owned(),
+                                    ))
+                                } else {
+                                    Ok(())
+                                }
+                            };
+                            source
+                                .load_with_checkpoint(&checkpoint)
+                                .map(|m| (m, spec_owned.clone()))
+                                .map_err(|e| e.to_string())
+                        });
                     match resolved {
                         Ok(pair) => {
                             loaded = Some(pair.clone());
@@ -3519,6 +3529,11 @@ pub fn run_listen_session(
 
         // -- buffer cap ----------------------------------------------------
         if let Some(forced) = buffer.enforce_cap() {
+            // The decode origin just moved without a commit: history a policy
+            // kept across steps (LocalAgreement's previous hypothesis)
+            // describes audio that is no longer decoded, so agreeing against
+            // it could commit text for the wrong window.
+            policy.reset();
             emit_seq!(robot::listen_warning_value(
                 &run_id,
                 seq,
