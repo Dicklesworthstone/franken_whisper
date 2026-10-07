@@ -1490,6 +1490,14 @@ pub struct NativeWhisperModel {
     version_tag: OnceLock<String>,
 }
 
+/// An authenticated weights descriptor plus the `fstat` fingerprint it was
+/// hashed under (bd-iej1); the loader re-verifies it after reading every
+/// weight byte, before publishing the model under the authenticated digest.
+struct AuthenticatedWeights {
+    file: File,
+    fingerprint: crate::model_distribution::WeightsFingerprint,
+}
+
 /// One model cache generation. Authenticated and unverified loads never share
 /// a key, and replacing a package at the same path produces a new digest key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1603,7 +1611,22 @@ impl NativeWhisperModel {
             package.weights_sha256.clone(),
         );
         let file = package.try_clone_weights_file()?;
-        Self::load_key(key, false, Some(file), checkpoint, warm_version_tag)
+        // bd-iej1: the descriptor must still be the generation that was hashed
+        // (checked again after parsing, before the model is published).
+        package
+            .weights_fingerprint()
+            .verify(&file, &package.weights_path)?;
+        let authenticated = AuthenticatedWeights {
+            file,
+            fingerprint: package.weights_fingerprint().clone(),
+        };
+        Self::load_key(
+            key,
+            false,
+            Some(authenticated),
+            checkpoint,
+            warm_version_tag,
+        )
     }
 
     /// Load a model and keep one process-wide strong resident slot alive.
@@ -1671,7 +1694,7 @@ impl NativeWhisperModel {
     fn load_key(
         key: ModelCacheKey,
         keep_resident: bool,
-        authenticated_file: Option<File>,
+        authenticated: Option<AuthenticatedWeights>,
         checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
         warm_version_tag: bool,
     ) -> FwResult<Arc<Self>> {
@@ -1745,7 +1768,7 @@ impl NativeWhisperModel {
             let result = Self::do_parse_and_publish(
                 key.clone(),
                 keep_resident,
-                authenticated_file,
+                authenticated,
                 checkpoint,
                 warm_version_tag,
             );
@@ -1758,7 +1781,7 @@ impl NativeWhisperModel {
         Self::do_parse_and_publish(
             key,
             keep_resident,
-            authenticated_file,
+            authenticated,
             checkpoint,
             warm_version_tag,
         )
@@ -1771,21 +1794,31 @@ impl NativeWhisperModel {
     fn do_parse_and_publish(
         key: ModelCacheKey,
         keep_resident: bool,
-        authenticated_file: Option<File>,
+        authenticated: Option<AuthenticatedWeights>,
         checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
         warm_version_tag: bool,
     ) -> FwResult<Arc<Self>> {
         checkpoint()?;
         // Parse outside the lock so a slow load doesn't block other paths.
         let t_parse = crate::native_engine::plat::Instant::now();
-        let ggml = match authenticated_file {
-            Some(file) => ggml::GgmlModel::load_from_file_with_checkpoint(file, checkpoint)?,
+        let mut post_load_check = None;
+        let ggml = match authenticated {
+            Some(AuthenticatedWeights { file, fingerprint }) => {
+                post_load_check = Some((file.try_clone()?, fingerprint));
+                ggml::GgmlModel::load_from_file_with_checkpoint(file, checkpoint)?
+            }
             None => ggml::GgmlModel::load_with_checkpoint(&key.path, checkpoint)?,
         };
         perf_span("model_parse", t_parse.elapsed().as_secs_f64() * 1e3, "");
         let t_weights = crate::native_engine::plat::Instant::now();
         let inner = decode::LoadedModel::from_ggml_with_checkpoint(ggml, checkpoint)?;
         perf_span("model_weights", t_weights.elapsed().as_secs_f64() * 1e3, "");
+        // bd-iej1: every weight byte has now been read (resident or streamed).
+        // Refuse to publish under the authenticated digest if the descriptor
+        // was rewritten in place at any point since it was hashed.
+        if let Some((file, fingerprint)) = &post_load_check {
+            fingerprint.verify(file, &key.path)?;
+        }
         let version_tag = OnceLock::new();
         if let Some(digest) = &key.authenticated_sha256 {
             let prefix = digest.get(..12).unwrap_or(digest);
@@ -2804,6 +2837,44 @@ mod tests {
             format!("fw-native-v1+sha256:{}", &digest[..12])
         );
         assert_ne!(authenticated.version_tag(), unverified.version_tag());
+    }
+
+    #[test]
+    fn authenticated_load_rejects_an_in_place_rewrite_after_verification() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        // bd-iej1: rewriting the SAME inode after authentication (no rename)
+        // must not reach inference under the authenticated digest.
+        let dir = TempDir::new("authenticated_in_place");
+        let original = synthetic_model_bytes();
+        let path = write_file(dir.path(), "ggml-in-place.bin", original);
+        let verified_file = std::fs::File::open(&path).expect("open verified generation");
+        let digest = format!("{:x}", Sha256::digest(original));
+        let package = crate::model_distribution::CachedWhisperPackage::from_authenticated_test_file(
+            path.clone(),
+            digest,
+            verified_file,
+        );
+
+        // Ensure the rewrite lands on a later timestamp tick on coarse clocks.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open for in-place rewrite");
+        writer.seek(SeekFrom::Start(56)).expect("seek");
+        writer
+            .write_all(&1.25_f32.to_le_bytes())
+            .expect("rewrite filter bytes");
+        writer.sync_all().expect("sync rewrite");
+
+        let Err(error) = NativeWhisperModel::load_authenticated(&package) else {
+            panic!("an in-place rewrite after authentication must fail closed");
+        };
+        assert!(
+            error.to_string().contains("changed after verification"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -136,12 +136,75 @@ pub struct CachedSortformerPackage {
     pub package_sha256: String,
 }
 
+/// `fstat` identity of an authenticated weights descriptor (bd-iej1): size,
+/// modification time, and on Unix the inode change time and link count. An
+/// in-place write advances `mtime` and `ctime`; `ctime` cannot be set back by
+/// an unprivileged process. Replacing or unlinking the *pathname* also
+/// advances the old inode's `ctime` (its link count drops) without touching
+/// its bytes, so a `ctime` change is accepted only when the link count fell
+/// and size and `mtime` are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WeightsFingerprint {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    changed: (i64, i64),
+    #[cfg(unix)]
+    links: u64,
+}
+
+impl WeightsFingerprint {
+    fn of(file: &File) -> FwResult<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            changed: {
+                use std::os::unix::fs::MetadataExt as _;
+                (metadata.ctime(), metadata.ctime_nsec())
+            },
+            #[cfg(unix)]
+            links: {
+                use std::os::unix::fs::MetadataExt as _;
+                metadata.nlink()
+            },
+        })
+    }
+
+    /// Whether `current` still describes the bytes this fingerprint hashed.
+    fn still_matches(&self, current: &Self) -> bool {
+        if current.len != self.len || current.modified != self.modified {
+            return false;
+        }
+        #[cfg(unix)]
+        if current.changed != self.changed && current.links >= self.links {
+            return false;
+        }
+        true
+    }
+
+    /// Fail closed when `file` no longer matches the authenticated identity.
+    pub(crate) fn verify(&self, file: &File, path: &Path) -> FwResult<()> {
+        if self.still_matches(&Self::of(file)?) {
+            Ok(())
+        } else {
+            Err(FwError::ContractViolation(format!(
+                "authenticated model weights {} changed after verification; \
+                 re-run `fw pull` to restore the verified package",
+                path.display()
+            )))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedWhisperPackage {
     pub weights_path: PathBuf,
     pub artifact_version: String,
     pub weights_sha256: String,
     weights_file: Arc<File>,
+    weights_fingerprint: WeightsFingerprint,
 }
 
 impl PartialEq for CachedWhisperPackage {
@@ -164,17 +227,28 @@ impl CachedWhisperPackage {
         self.weights_file.try_clone().map_err(Into::into)
     }
 
+    /// The `fstat` identity recorded while the descriptor was hashed. Loaders
+    /// re-check it on the same descriptor before and after parsing, so an
+    /// in-place rewrite after authentication fails closed instead of feeding
+    /// unauthenticated bytes to inference under the authenticated digest.
+    pub(crate) fn weights_fingerprint(&self) -> &WeightsFingerprint {
+        &self.weights_fingerprint
+    }
+
     #[cfg(test)]
     pub(crate) fn from_authenticated_test_file(
         weights_path: PathBuf,
         weights_sha256: String,
         weights_file: File,
     ) -> Self {
+        let weights_fingerprint =
+            WeightsFingerprint::of(&weights_file).expect("fingerprint test fixture");
         Self {
             weights_path,
             artifact_version: "authenticated-test-fixture".to_owned(),
             weights_sha256,
             weights_file: Arc::new(weights_file),
+            weights_fingerprint,
         }
     }
 }
@@ -448,7 +522,7 @@ where
         .first()
         .ok_or_else(|| whisper_manifest_error("weights role is missing"))?;
     let weights_path = directory.join(&remote.filename);
-    let Some(weights_file) =
+    let Some((weights_file, weights_fingerprint)) =
         authenticate_cache_file_with_cancel(&weights_path, remote, &is_cancelled)?
     else {
         return Err(FwError::MissingArtifact(weights_path));
@@ -458,6 +532,7 @@ where
         artifact_version: manifest.artifact_version,
         weights_sha256: WHISPER_WEIGHTS_SHA256.to_owned(),
         weights_file: Arc::new(weights_file),
+        weights_fingerprint,
     })
 }
 
@@ -785,7 +860,7 @@ where
         .first()
         .ok_or_else(|| whisper_manifest_error("weights role is missing"))?;
     let weights_path = directory.join(&remote.filename);
-    let Some(weights_file) =
+    let Some((weights_file, weights_fingerprint)) =
         authenticate_cache_file_with_cancel(&weights_path, remote, &is_cancelled)?
     else {
         return Err(FwError::MissingArtifact(weights_path));
@@ -795,6 +870,7 @@ where
         artifact_version: manifest.artifact_version,
         weights_sha256: model.weights_sha256().to_owned(),
         weights_file: Arc::new(weights_file),
+        weights_fingerprint,
     })
 }
 
@@ -1216,13 +1292,15 @@ where
 }
 
 /// Open and authenticate one cache file, returning the exact descriptor whose
-/// bytes matched the compiled manifest. The descriptor is rewound before it is
-/// returned so resident and streamed loaders start from a deterministic state.
+/// bytes matched the compiled manifest plus its `fstat` fingerprint. The
+/// descriptor is rewound before it is returned so resident and streamed
+/// loaders start from a deterministic state. A file written while it was
+/// being hashed (fingerprint changed across the hash) is not authenticated.
 fn authenticate_cache_file_with_cancel<F>(
     path: &Path,
     remote: &RemoteFile,
     is_cancelled: &F,
-) -> FwResult<Option<File>>
+) -> FwResult<Option<(File, WeightsFingerprint)>>
 where
     F: Fn() -> bool + Sync,
 {
@@ -1236,12 +1314,15 @@ where
     let Some(mut file) = open_prechecked_cache_file(path, &before)? else {
         return Ok(None);
     };
+    let fingerprint = WeightsFingerprint::of(&file)?;
     let digest = sha256_reader_with_cancel(&mut file, is_cancelled)?;
-    if hex32(&digest) != remote.sha256 {
+    if hex32(&digest) != remote.sha256
+        || !fingerprint.still_matches(&WeightsFingerprint::of(&file)?)
+    {
         return Ok(None);
     }
     file.rewind()?;
-    Ok(Some(file))
+    Ok(Some((file, fingerprint)))
 }
 
 fn open_prechecked_cache_file(path: &Path, before: &std::fs::Metadata) -> FwResult<Option<File>> {
