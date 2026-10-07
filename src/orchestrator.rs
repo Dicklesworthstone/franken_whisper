@@ -2878,6 +2878,7 @@ async fn execute_backend_speculative(
             // can report progress regardless of whether the pipeline failed.
             let stats = pipeline.stats();
             let mut merged = pipeline.merged_transcript();
+            crate::streaming::dedupe_seam_repeats(&mut merged);
             crate::streaming::repair_seam_overlaps(&mut merged);
             let telemetry = telemetry
                 .into_inner()

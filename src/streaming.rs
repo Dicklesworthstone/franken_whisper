@@ -160,6 +160,65 @@ impl LaneWindow {
     }
 }
 
+/// Drop words that two adjacent windows both transcribed at a seam.
+///
+/// Midpoint ownership ([`LaneWindow::localize_segments`]) cannot split a single
+/// segment that runs past its window's owned span, so the next window may
+/// re-transcribe that segment's last words ("…for your country." followed by
+/// "Country."). For each pair of start-ordered segments that overlap in time,
+/// the longest prefix of the later segment's words that equals a suffix of the
+/// earlier segment's words (case- and punctuation-insensitive) is removed from
+/// the later segment; a segment left empty is dropped. Segments that do not
+/// overlap in time are never touched, so genuinely repeated speech survives.
+/// Run before [`repair_seam_overlaps`], which erases the overlap evidence.
+pub fn dedupe_seam_repeats(segments: &mut Vec<TranscriptionSegment>) {
+    fn normalized(word: &str) -> String {
+        word.chars()
+            .filter(|ch| ch.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+
+    let mut index = 1;
+    while index < segments.len() {
+        let overlaps = match (segments[index - 1].end_sec, segments[index].start_sec) {
+            (Some(previous_end), Some(start)) => {
+                previous_end.is_finite() && start.is_finite() && start < previous_end
+            }
+            _ => false,
+        };
+        if !overlaps {
+            index += 1;
+            continue;
+        }
+        let earlier: Vec<String> = segments[index - 1]
+            .text
+            .split_whitespace()
+            .map(normalized)
+            .collect();
+        let later_words: Vec<&str> = segments[index].text.split_whitespace().collect();
+        let later: Vec<String> = later_words.iter().map(|word| normalized(word)).collect();
+        let max_repeat = earlier.len().min(later.len());
+        let repeated = (1..=max_repeat)
+            .rev()
+            .find(|&k| {
+                earlier[earlier.len() - k..] == later[..k]
+                    && later[..k].iter().all(|w| !w.is_empty())
+            })
+            .unwrap_or(0);
+        if repeated == 0 {
+            index += 1;
+            continue;
+        }
+        if repeated == later_words.len() {
+            segments.remove(index);
+            continue;
+        }
+        segments[index].text = later_words[repeated..].join(" ");
+        index += 1;
+    }
+}
+
 /// Remove residual overlap at window seams in a merged, start-ordered
 /// transcript: a segment that starts before its predecessor ends is moved to
 /// start at the predecessor's end (and its end is raised to its new start if
@@ -3468,5 +3527,60 @@ mod tests {
         assert_eq!(merged[4].start_sec, Some(4.0));
         crate::conformance::validate_segment_invariants(&merged)
             .expect("repaired transcript satisfies the monotonic segment contract");
+    }
+
+    #[test]
+    fn dedupe_seam_repeats_drops_words_both_windows_transcribed() {
+        // The observed native turbo seam: the window ending at 10.5 s kept a
+        // segment running to 10.49 s; the final window re-transcribed its
+        // last word and starts before that end.
+        let mut merged = vec![
+            seg(
+                "What your country can do for you.",
+                Some(5.49),
+                Some(7.99),
+                None,
+            ),
+            seg(
+                "ask what you can do for your country.",
+                Some(7.99),
+                Some(10.49),
+                None,
+            ),
+            seg("Country.", Some(10.2), Some(10.99), None),
+        ];
+        dedupe_seam_repeats(&mut merged);
+        let texts: Vec<&str> = merged.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "What your country can do for you.",
+                "ask what you can do for your country."
+            ]
+        );
+    }
+
+    #[test]
+    fn dedupe_seam_repeats_trims_only_the_repeated_prefix() {
+        let mut merged = vec![
+            seg("we choose to go to the moon", Some(0.0), Some(3.1), None),
+            seg("The Moon in this decade", Some(2.6), Some(5.0), None),
+        ];
+        dedupe_seam_repeats(&mut merged);
+        assert_eq!(merged[1].text, "in this decade");
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn dedupe_seam_repeats_keeps_repeated_speech_that_does_not_overlap() {
+        // Real repetition is separated in time; only overlapping seams merge.
+        let mut merged = vec![
+            seg("ask not", Some(0.0), Some(1.0), None),
+            seg("ask not", Some(1.0), Some(2.0), None),
+            seg("untimed ask not", None, None, None),
+        ];
+        dedupe_seam_repeats(&mut merged);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[1].text, "ask not");
     }
 }
