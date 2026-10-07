@@ -3281,7 +3281,12 @@ pub fn evaluate_backend_selection(
 
     // bd-efr.2: Include Brier score from calibration state.
     let brier_score = rs_ref.and_then(|rs| rs.brier_score());
-    let router_state_fallback_reason = rs_ref.and_then(|rs| rs.fallback_reason());
+    // A process that has not routed yet has no router state: that is the
+    // same "no outcomes observed" condition as an empty state.
+    let router_state_fallback_reason = rs_ref.map_or_else(
+        || RouterState::new().fallback_reason(),
+        RouterState::fallback_reason,
+    );
     // Last use of the borrowed state; release the lock before the post-decision
     // `ROUTER_STATE` update at the tail (std `Mutex` is not reentrant).
     drop(rs_guard);
