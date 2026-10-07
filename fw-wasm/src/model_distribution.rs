@@ -9,7 +9,7 @@
 //! caller that strays onto a disk path gets a named error, not a trap.
 
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{FwError, FwResult};
 
@@ -39,6 +39,26 @@ impl CachedWhisperPackage {
     pub(crate) fn try_clone_weights_file(&self) -> FwResult<File> {
         Err(FwError::Unsupported(
             "authenticated cache file handles are unavailable in this embedding".to_string(),
+        ))
+    }
+
+    /// The native loader's bd-iej1 seam. No descriptor was ever hashed here,
+    /// so the fingerprint can only fail closed (see [`WeightsFingerprint`]).
+    pub(crate) fn weights_fingerprint(&self) -> &WeightsFingerprint {
+        &WeightsFingerprint(())
+    }
+}
+
+/// Mirror of the canonical `fstat` fingerprint of an authenticated weights
+/// descriptor (bd-iej1). Embeddings never authenticate a cache file, so every
+/// verification fails closed, like [`CachedWhisperPackage::try_clone_weights_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WeightsFingerprint(());
+
+impl WeightsFingerprint {
+    pub(crate) fn verify(&self, _file: &File, _path: &Path) -> FwResult<()> {
+        Err(FwError::Unsupported(
+            "authenticated weights fingerprints are unavailable in this embedding".to_string(),
         ))
     }
 }
