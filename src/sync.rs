@@ -5426,7 +5426,8 @@ mod tests {
         );
         assert!(
             error.to_string().contains(
-                "expected exactly acoustic-diarization-v3 or neural-diarization-common-v2"
+                "expected exactly acoustic-diarization-v3, neural-diarization-common-v2 or \
+                 sortformer-diarization-v1"
             ),
             "unknown acoustic contract versions must remain fail-closed: {error}"
         );

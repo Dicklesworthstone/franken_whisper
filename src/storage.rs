@@ -1610,16 +1610,18 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                         contract_version,
                         Some(crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION)
                             | Some(crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION)
+                            | Some(crate::diarization::SORTFORMER_DIARIZATION_CONTRACT_VERSION)
                     );
                     if !contract_supported || value.get("speaker_count").is_none() {
                         return Err(FwError::Storage(format!(
                             "cannot rebuild diarization report for run {run_id}: contract {:?} \
-                             is unsupported; expected exactly {} or {}; export or recover the \
-                             canonical run JSON with a matching franken_whisper version before \
-                             migrating",
+                             is unsupported; expected exactly {}, {} or {}; export or recover \
+                             the canonical run JSON with a matching franken_whisper version \
+                             before migrating",
                             contract_version,
                             crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION,
                             crate::diarization::NEURAL_DIARIZATION_CONTRACT_VERSION,
+                            crate::diarization::SORTFORMER_DIARIZATION_CONTRACT_VERSION,
                         )));
                     }
                     serde_json::from_value::<crate::model::DiarizationReport>(value.clone())
@@ -4077,6 +4079,106 @@ mod tests {
         value_to_string(rows[0].get(0))
             .parse()
             .expect("row count should be an integer")
+    }
+
+    #[test]
+    fn default_sortformer_reports_survive_a_diarization_index_rebuild() {
+        // `auto` diarization (the default) writes Sortformer reports; the
+        // rebuild that JSONL import runs must accept them like the others.
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("sortformer.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-sortformer-rebuild", &db_path);
+        report.request.diarize = true;
+        report.result.segments = vec![TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(6.0),
+            text: "test".to_owned(),
+            speaker: Some("SPEAKER_00".to_owned()),
+            confidence: Some(0.9),
+        }];
+        report.result.diarization = Some(DiarizationReport {
+            implementation: "native-sortformer-v1".to_owned(),
+            contract_version: crate::diarization::SORTFORMER_DIARIZATION_CONTRACT_VERSION
+                .to_owned(),
+            feature_schema: "sortformer-activity-80ms-v1".to_owned(),
+            speaker_evidence_mode: crate::model::DiarizationSpeakerEvidenceMode::SortformerActivity,
+            normalized_input_sha256:
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+            hint_document_sha256: None,
+            turns: vec![DiarizationTurn {
+                start_ms: 0,
+                end_ms: 6_000,
+                speaker_ref: Some("SPEAKER_00".to_owned()),
+                speaker_confidence: Some(0.9),
+                change_confidence: None,
+                overlap_suspected: false,
+                hard_hint_attributed: false,
+            }],
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "SPEAKER_00".to_owned(),
+                frame_count: 75,
+                voiced_duration_ms: 6_000,
+                reliability: 0.9,
+                voice_profile_count: 1,
+                channel_profile_count: 0,
+                training_accepted_count: 1,
+                training_downweighted_count: 0,
+                training_quarantined_count: 0,
+                anchored: false,
+                soft_hint_contradiction: None,
+            }],
+            hint_evidence: Vec::new(),
+            speaker_queries: Vec::new(),
+            speaker_count: SpeakerCountOutcome {
+                request: SpeakerCountRequest::Infer,
+                estimate: None,
+                status: SpeakerCountOutcomeStatus::Unresolved,
+                supported_speaker_count: 1,
+                active_speaker_refs: vec!["SPEAKER_00".to_owned()],
+                dominant_speaker_share: 1.0,
+                unknown_voiced_share: 0.0,
+                reasons: vec![SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved],
+                speaker_evidence: vec![SpeakerEvidenceSummary {
+                    speaker_ref: "SPEAKER_00".to_owned(),
+                    assigned_tracklet_count: 1,
+                    independent_tracklet_count: 1,
+                    recurrence_episode_count: 1,
+                    voiced_frame_count: 75,
+                    independent_voiced_frame_count: 75,
+                    voiced_duration_ms: 6_000,
+                    mean_assignment_confidence: 0.9,
+                    profile_reliability: 0.9,
+                    hard_anchored: false,
+                    separated_from_supported_speakers: true,
+                    reasons: vec![SpeakerEvidenceReason::SupportedByLearnedModelActivity],
+                    supported: true,
+                }],
+            },
+            fallback_status: DiarizationFallbackStatus::SpeakerCountUnresolved,
+            operational_partition: None,
+            neural_representation: None,
+            speaker_segments: Vec::new(),
+            diagnostics: Vec::new(),
+        });
+        store
+            .persist_report(&report)
+            .expect("sortformer report persists");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+
+        store
+            .rebuild_diarization_index()
+            .expect("rebuild accepts the default sortformer contract");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+        assert_eq!(table_row_count(&store, "diarization_turns"), 1);
+        let loaded = store
+            .load_run_details("run-sortformer-rebuild")
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            loaded.diarization.expect("report").contract_version,
+            crate::diarization::SORTFORMER_DIARIZATION_CONTRACT_VERSION
+        );
     }
 
     #[test]

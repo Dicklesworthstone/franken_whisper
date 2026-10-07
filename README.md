@@ -421,7 +421,8 @@ checkout.
 ### 1. Basic Transcription
 
 ```bash
-# plain text
+# one "[HH:MM:SS.mmm --> HH:MM:SS.mmm]  [SPEAKER_00] text" line per segment
+# (plain text with --no-timestamps)
 franken_whisper transcribe --input audio.mp3
 
 # full JSON report (segments + timing + backend identity + replay envelope)
@@ -1682,7 +1683,7 @@ Built on the [FrankenTUI](https://github.com/Dicklesworthstone/frankentui) frame
 | `FRANKEN_WHISPER_MODEL_DIR` | `~/.cache/franken_whisper/models` | Shared root for native Whisper, Sortformer, auxiliary discovery, and `fw pull all`; overrides must be absolute |
 | `FRANKEN_WHISPER_STAGE_BUDGET_DIARIZE_MS` | `900000` | Bounded native diarization budget (15 minutes); raise for multi-hour recordings on slower hosts |
 | `XDG_STATE_HOME` | `$HOME/.local/state` | Base for auto-provisioned ffmpeg + per-user tool state |
-| `RUST_LOG` | — | tracing filter (e.g. `franken_whisper=debug`) |
+| `RUST_LOG` | `franken_whisper=warn` | tracing filter (e.g. `info` for per-stage and routing diagnostics, `franken_whisper=debug`) |
 
 **Per-stage budget overrides.** Every pipeline stage has an independent millisecond budget overridable via environment variable:
 

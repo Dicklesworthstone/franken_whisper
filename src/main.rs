@@ -384,7 +384,10 @@ fn run(cli: Cli) -> FwResult<()> {
             if json {
                 emit_pretty_run_report(report)?;
             } else {
-                println!("{}", report.result.transcript);
+                print!(
+                    "{}",
+                    franken_whisper::export::render_console_transcript(&report.result)
+                );
             }
             Ok(())
         }

@@ -2,19 +2,23 @@
 //!
 //! Initializes a `tracing` subscriber with:
 //! - `RUST_LOG` environment filter support
-//! - Default level: INFO
+//! - Default level: WARN (`RUST_LOG=info` restores the per-stage and routing
+//!   diagnostics; run outcomes are already in the command's own output)
 //! - JSON output when `RUST_LOG_FORMAT=json`
 //! - Human-readable output otherwise
 
 use tracing_subscriber::EnvFilter;
+
+/// Filter used when `RUST_LOG` is unset.
+const DEFAULT_FILTER: &str = "franken_whisper=warn";
 
 /// Initialize the global tracing subscriber.
 ///
 /// Call this once at program startup (main.rs).
 /// Safe to call multiple times (subsequent calls are no-ops).
 pub fn init() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("franken_whisper=info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
 
     let is_json = std::env::var("RUST_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
@@ -57,13 +61,13 @@ mod tests {
     }
 
     #[test]
-    fn default_filter_parses_info_level() {
+    fn default_filter_targets_the_crate_at_warn() {
         // Validates the exact filter string used in production init().
-        let filter = EnvFilter::new("franken_whisper=info");
-        let dbg = format!("{filter:?}");
+        let filter = EnvFilter::try_new(DEFAULT_FILTER).expect("default filter parses");
+        let dbg = format!("{filter:?}").to_ascii_lowercase();
         assert!(
-            dbg.contains("franken_whisper"),
-            "default filter should target franken_whisper crate: {dbg}"
+            dbg.contains("franken_whisper") && dbg.contains("warn"),
+            "default filter should target franken_whisper crate at warn: {dbg}"
         );
     }
 

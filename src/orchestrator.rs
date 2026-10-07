@@ -6360,7 +6360,7 @@ fn run_native_sortformer_diarization(
         sortformer_activity_shares(&turns, timed_speech_ms)?;
     let report = DiarizationReport {
         implementation: "native-sortformer-v1".to_owned(),
-        contract_version: "sortformer-diarization-v1".to_owned(),
+        contract_version: diarization::SORTFORMER_DIARIZATION_CONTRACT_VERSION.to_owned(),
         feature_schema: "sortformer-activity-80ms-v1".to_owned(),
         speaker_evidence_mode: DiarizationSpeakerEvidenceMode::SortformerActivity,
         normalized_input_sha256: normalized_input_sha256.to_owned(),

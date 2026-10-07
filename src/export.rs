@@ -63,6 +63,40 @@ fn write_txt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
     Ok(())
 }
 
+/// The transcript `fw transcribe` prints in human mode: one whisper.cpp-style
+/// `[HH:MM:SS.mmm --> HH:MM:SS.mmm]` line per timed segment, with the
+/// `[SPEAKER] ` prefix of the TXT format on diarized segments. A result with
+/// no timed segment (e.g. `--no-timestamps`) prints its plain transcript.
+#[must_use]
+pub fn render_console_transcript(result: &TranscriptionResult) -> String {
+    let timed = result
+        .segments
+        .iter()
+        .any(|seg| seg.start_sec.is_some() && seg.end_sec.is_some());
+    if !timed {
+        return format!("{}\n", result.transcript);
+    }
+    let mut out = Vec::new();
+    for seg in &result.segments {
+        let text = seg.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        // Writes into a Vec cannot fail.
+        if let (Some(start), Some(end)) = (seg.start_sec, seg.end_sec) {
+            let _ = write!(
+                out,
+                "[{} --> {}]  ",
+                format_timestamp_vtt(start),
+                format_timestamp_vtt(end)
+            );
+        }
+        let _ = write_speaker_prefix(&mut out, seg);
+        let _ = writeln!(out, "{text}");
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The segment's diarization label, ready to embed in a line-oriented format:
 /// `None` for undiarized or blank labels (so undiarized output stays
 /// byte-identical), with line breaks folded to spaces so a hostile or malformed
@@ -851,6 +885,47 @@ mod tests {
         let txt = dir.path().join("o.txt");
         write_txt(&txt, &result).unwrap();
         assert_eq!(std::fs::read_to_string(&txt).unwrap(), "hello\nworld\n");
+    }
+
+    #[test]
+    fn console_transcript_shows_timed_speaker_lines_or_plain_text() {
+        let segment = |start: Option<f64>, end: Option<f64>, text: &str, speaker: Option<&str>| {
+            TranscriptionSegment {
+                start_sec: start,
+                end_sec: end,
+                text: text.to_owned(),
+                speaker: speaker.map(str::to_owned),
+                confidence: None,
+            }
+        };
+        let mut result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: "hello there. all clear".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![
+                segment(Some(0.02), Some(10.44), " hello there.", Some("SPEAKER_00")),
+                segment(Some(10.44), Some(3_725.5), "all clear", None),
+                segment(Some(3_725.5), Some(3_726.0), "  ", None),
+            ],
+            acceleration: None,
+            diarization: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: Vec::new(),
+        };
+        assert_eq!(
+            render_console_transcript(&result),
+            "[00:00:00.020 --> 00:00:10.440]  [SPEAKER_00] hello there.\n\
+             [00:00:10.440 --> 01:02:05.500]  all clear\n"
+        );
+        // --no-timestamps: nothing to place on a timeline, print the text.
+        for seg in &mut result.segments {
+            seg.start_sec = None;
+            seg.end_sec = None;
+        }
+        assert_eq!(
+            render_console_transcript(&result),
+            "hello there. all clear\n"
+        );
     }
 
     #[test]

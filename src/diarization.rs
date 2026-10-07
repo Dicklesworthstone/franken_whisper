@@ -47,6 +47,9 @@ pub const ACOUSTIC_DIARIZATION_CONTRACT_VERSION: &str = "acoustic-diarization-v3
 /// acoustic segmentation, constraints, clustering, temporal, and projection
 /// stack.
 pub const NEURAL_DIARIZATION_CONTRACT_VERSION: &str = "neural-diarization-common-v2";
+/// Stable contract identity of native Streaming Sortformer reports (the
+/// `auto` default engine).
+pub const SORTFORMER_DIARIZATION_CONTRACT_VERSION: &str = "sortformer-diarization-v1";
 /// Versioned direct cosine use of the pinned 192-coordinate ECAPA embedding in
 /// the common diarizer's identity-coordinate contract.
 pub const ECAPA_SPEAKER_REPRESENTATION_VERSION: &str = "ecapa-tdnn-voxceleb-cosine-v6-development";
