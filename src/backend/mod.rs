@@ -1243,9 +1243,27 @@ pub struct BackendSelectionOutcome {
     pub recommended_order: Vec<BackendKind>,
     pub evidence_entries: Vec<Value>,
     pub fallback_triggered: bool,
+    /// Why the static order was used, when the router recorded one.
+    pub fallback_reason: Option<String>,
     pub calibration_score: f64,
     pub e_process: f64,
     pub ci_width: f64,
+}
+
+impl BackendSelectionOutcome {
+    /// Whether the static-order fallback signals a detected problem
+    /// (calibration drift, a contract failure) rather than the router's
+    /// steady state: no outcomes observed yet — every fresh process — or a
+    /// native rollout stage that pins the static order. Only the former is
+    /// worth a run warning; both stay in the routing evidence.
+    #[must_use]
+    pub fn fallback_needs_attention(&self) -> bool {
+        self.fallback_triggered
+            && !self.fallback_reason.as_deref().is_some_and(|reason| {
+                reason == "insufficient_data"
+                    || reason.starts_with("native_rollout_forced_static_order(")
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1531,6 +1549,11 @@ pub(crate) fn native_ignored_option_warnings(
     {
         ignored.push("--max-segment-length");
     }
+    if backend_params.timestamp_level == Some(crate::model::TimestampLevel::Word)
+        && resolved == BackendKind::WhisperDiarization
+    {
+        ignored.push("--timestamp-level word");
+    }
     if backend_params.carry_initial_prompt {
         ignored.push("--carry-initial-prompt");
     }
@@ -1544,6 +1567,109 @@ pub(crate) fn native_ignored_option_warnings(
         .into_iter()
         .map(|option| format!("native engine ignored unsupported option {option}"))
         .collect()
+}
+
+/// The requested `--offset-ms` / `--duration-ms` audio window, if any (bd-vgod).
+///
+/// Returns `None` when neither flag is set (or both are zero-effect), so the
+/// unwindowed path stays byte-identical to the pre-window behavior.
+pub(crate) fn requested_audio_window(request: &TranscribeRequest) -> Option<(u64, Option<u64>)> {
+    let offset_ms = request.backend_params.offset_ms.unwrap_or(0);
+    let duration_ms = request.backend_params.duration_ms.filter(|d| *d > 0);
+    if offset_ms == 0 && duration_ms.is_none() {
+        None
+    } else {
+        Some((offset_ms, duration_ms))
+    }
+}
+
+/// Convert a ms-domain window into clamped sample bounds over 16 kHz PCM.
+pub(crate) fn window_sample_bounds(
+    len: usize,
+    offset_ms: u64,
+    duration_ms: Option<u64>,
+) -> (usize, usize) {
+    const SAMPLES_PER_MS: u64 = (native_engine::mel::SAMPLE_RATE as u64) / 1000;
+    let start = usize::try_from(offset_ms.saturating_mul(SAMPLES_PER_MS))
+        .unwrap_or(usize::MAX)
+        .min(len);
+    let end = match duration_ms {
+        Some(duration_ms) => usize::try_from(
+            offset_ms
+                .saturating_add(duration_ms)
+                .saturating_mul(SAMPLES_PER_MS),
+        )
+        .unwrap_or(usize::MAX)
+        .min(len),
+        None => len,
+    };
+    (start, end.max(start))
+}
+
+/// Apply the requested audio window to normalized 16 kHz samples, returning
+/// the decode input and its offset (ms) in the source timebase. `None` means
+/// the window starts at or past the end of the audio (an empty slice).
+pub(crate) fn windowed_samples(
+    samples: Vec<f32>,
+    window: Option<(u64, Option<u64>)>,
+) -> Option<(Vec<f32>, u64)> {
+    let Some((offset_ms, duration_ms)) = window else {
+        return Some((samples, 0));
+    };
+    let (start, end) = window_sample_bounds(samples.len(), offset_ms, duration_ms);
+    (start < end).then(|| (samples[start..end].to_vec(), offset_ms))
+}
+
+/// Record a windowed run's provenance on a native result's `raw_output`.
+/// Timestamps of windowed native runs are always in the source timebase.
+pub(crate) fn tag_audio_window(
+    raw_output: &mut Value,
+    window: Option<(u64, Option<u64>)>,
+    empty_slice: bool,
+) {
+    let (Value::Object(map), Some((offset_ms, duration_ms))) = (raw_output, window) else {
+        return;
+    };
+    let mut tag = serde_json::json!({
+        "offset_ms": offset_ms,
+        "duration_ms": duration_ms,
+        "timebase": "source",
+    });
+    if empty_slice {
+        tag["empty_slice"] = Value::Bool(true);
+    }
+    map.insert("audio_window".to_owned(), tag);
+}
+
+/// Shift every emitted timestamp in a decode output by a uniform offset,
+/// keeping windowed runs in the source-file timebase.
+pub(crate) fn shift_decode_output(
+    output: &mut native_engine::decode::DecodeOutput,
+    offset_sec: f64,
+) {
+    for segment in &mut output.segments {
+        if let Some(start) = segment.start_sec.as_mut() {
+            *start += offset_sec;
+        }
+        if let Some(end) = segment.end_sec.as_mut() {
+            *end += offset_sec;
+        }
+    }
+    if let Some(word_timings) = output.word_timings.as_mut() {
+        for words in word_timings.iter_mut() {
+            for word in words.iter_mut() {
+                word.start_sec += offset_sec;
+                word.end_sec += offset_sec;
+            }
+        }
+    }
+    for window in &mut output.windows {
+        window.window_offset_sec += offset_sec;
+    }
+    for dropped in &mut output.dropped_windows {
+        dropped.start_sec += offset_sec;
+        dropped.end_sec += offset_sec;
+    }
 }
 
 /// Returns per-backend diagnostic info for the `robot backends` command.
@@ -2867,7 +2993,7 @@ fn static_fallback_selection_outcome(
             .map(|k| k.as_str().to_owned())
             .collect(),
         fallback_active: true,
-        fallback_reason,
+        fallback_reason: fallback_reason.clone(),
         posterior_snapshot: Vec::new(),
         calibration_score,
         brier_score: None,
@@ -2895,6 +3021,7 @@ fn static_fallback_selection_outcome(
         recommended_order,
         evidence_entries,
         fallback_triggered: true,
+        fallback_reason,
         calibration_score,
         e_process,
         ci_width,
@@ -3243,6 +3370,7 @@ pub fn evaluate_backend_selection(
         recommended_order,
         evidence_entries,
         fallback_triggered: fallback_active,
+        fallback_reason,
         calibration_score,
         e_process,
         ci_width,
@@ -4435,8 +4563,8 @@ mod tests {
         posterior_success_probability, prior_for, probe_system_health,
         probe_system_health_uncached, quality_proxy, runtime_metadata,
         runtime_metadata_with_implementation, sanitize_timestamp, segment_end, segment_start,
-        static_fallback_selection_outcome, transcript_from_segments, unavailable_reason,
-        update_router_state,
+        static_fallback_selection_outcome, tag_audio_window, transcript_from_segments,
+        unavailable_reason, update_router_state, windowed_samples,
     };
     use crate::conformance::NativeEngineRolloutStage;
     use crate::model::{
@@ -4468,6 +4596,45 @@ mod tests {
             timeout_ms: None,
             backend_params: crate::model::BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn windowed_samples_slice_the_requested_window_or_report_an_empty_one() {
+        let samples: Vec<f32> = (0..48_000).map(|i| i as f32).collect();
+        // No window: the samples pass through untouched at offset 0.
+        let (all, offset) = windowed_samples(samples.clone(), None).expect("unwindowed");
+        assert_eq!((all.len(), offset), (48_000, 0));
+        // 1 s offset, 0.5 s duration at 16 kHz.
+        let (slice, offset) =
+            windowed_samples(samples.clone(), Some((1_000, Some(500)))).expect("window");
+        assert_eq!(offset, 1_000);
+        assert_eq!(slice.len(), 8_000);
+        assert_eq!(slice[0], 16_000.0);
+        // Open-ended window runs to the end; a window past EOF is empty.
+        let (tail, _) = windowed_samples(samples.clone(), Some((2_000, None))).expect("tail");
+        assert_eq!(tail.len(), 16_000);
+        assert!(windowed_samples(samples, Some((3_000, Some(1_000)))).is_none());
+    }
+
+    #[test]
+    fn audio_window_tag_records_source_timebase_provenance() {
+        use serde_json::{Value, json};
+
+        let mut raw = json!({"engine": "insanely-fast-native"});
+        tag_audio_window(&mut raw, None, false);
+        assert!(
+            raw.get("audio_window").is_none(),
+            "unwindowed runs carry no tag"
+        );
+
+        tag_audio_window(&mut raw, Some((3_000, Some(4_000))), false);
+        assert_eq!(
+            raw["audio_window"],
+            json!({"offset_ms": 3_000, "duration_ms": 4_000, "timebase": "source"})
+        );
+        tag_audio_window(&mut raw, Some((9_000, None)), true);
+        assert_eq!(raw["audio_window"]["empty_slice"], json!(true));
+        assert_eq!(raw["audio_window"]["duration_ms"], Value::Null);
     }
 
     #[test]
@@ -9646,6 +9813,39 @@ mod tests {
             NativeEngineRolloutStage::Primary,
         );
         assert_eq!(reason.as_deref(), Some("insufficient_data"));
+    }
+
+    #[test]
+    fn only_anomalous_routing_fallbacks_need_attention() {
+        let outcome = |triggered: bool, reason: Option<&str>| super::BackendSelectionOutcome {
+            routing_log: serde_json::Value::Null,
+            recommended_order: Vec::new(),
+            evidence_entries: Vec::new(),
+            fallback_triggered: triggered,
+            fallback_reason: reason.map(str::to_owned),
+            calibration_score: 0.0,
+            e_process: 0.0,
+            ci_width: 0.0,
+        };
+        // Steady state of every fresh process and of a pinned rollout stage.
+        assert!(!outcome(true, Some("insufficient_data")).fallback_needs_attention());
+        assert!(
+            !outcome(true, Some("native_rollout_forced_static_order(sole)"))
+                .fallback_needs_attention()
+        );
+        assert!(!outcome(false, None).fallback_needs_attention());
+        // Detected problems still warn.
+        assert!(
+            outcome(true, Some("brier_score_above_threshold(0.900 > 0.35)"))
+                .fallback_needs_attention()
+        );
+        assert!(
+            outcome(true, Some("contract_validation_error: bad loss")).fallback_needs_attention()
+        );
+        assert!(
+            outcome(true, None).fallback_needs_attention(),
+            "a contract-side fallback with no router reason is a calibration breach"
+        );
     }
 
     #[test]

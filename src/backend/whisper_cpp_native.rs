@@ -51,13 +51,14 @@ use crate::diarization_projection::{
 };
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    BackendKind, DiarizationEngine, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
-    WordTimestampParams,
+    BackendKind, DiarizationEngine, TimestampLevel, TranscribeRequest, TranscriptionResult,
+    TranscriptionSegment, WordTimestampParams,
 };
 use crate::native_engine::dtw::WordTiming;
 use crate::native_engine::{self, WhisperHParams, decode};
 
 use super::native_audio::analyze_wav;
+use super::{requested_audio_window, shift_decode_output, tag_audio_window, windowed_samples};
 
 /// Stable schema tag for the honest native raw-output metadata.
 const SCHEMA_VERSION: &str = "native-v2";
@@ -184,6 +185,10 @@ pub(crate) fn request_word_timestamp_mode(request: &TranscribeRequest) -> WordTi
             max_len: Some(max_len),
             ..WordTimestampParams::default()
         })),
+        // insanely-fast-whisper's `--timestamp-level word`: one segment per word.
+        None if request.backend_params.timestamp_level == Some(TimestampLevel::Word) => {
+            WordTimestampMode::Word
+        }
         None => WordTimestampMode::None,
     }
 }
@@ -534,31 +539,14 @@ pub fn run(
     // Read the normalized WAV to f32 mono samples, then apply the requested
     // window. Timestamps are shifted back into the source timebase after
     // decode so diarization/VAD/alignment stay consistent with the full clip.
-    let full_samples = read_normalized_wav(normalized_wav)?;
-    let (samples, window_offset_ms) = match audio_window {
-        Some((offset_ms, duration_ms)) => {
-            let (start, end) = window_sample_bounds(full_samples.len(), offset_ms, duration_ms);
-            if start >= end {
-                // Offset at/past EOF: an empty-but-valid result, honestly
-                // tagged with the requested (empty) window, beats a decode
-                // error for a region probe.
-                let mut result = silence_result(request, &spec, 0);
-                if let Value::Object(map) = &mut result.raw_output {
-                    map.insert(
-                        "audio_window".to_owned(),
-                        json!({
-                            "offset_ms": offset_ms,
-                            "duration_ms": duration_ms,
-                            "timebase": "source",
-                            "empty_slice": true,
-                        }),
-                    );
-                }
-                return Ok(result);
-            }
-            (full_samples[start..end].to_vec(), offset_ms)
-        }
-        None => (full_samples, 0),
+    let Some((samples, window_offset_ms)) =
+        windowed_samples(read_normalized_wav(normalized_wav)?, audio_window)
+    else {
+        // Offset at/past EOF: an empty-but-valid result, honestly tagged with
+        // the requested (empty) window, beats a decode error for a region probe.
+        let mut result = silence_result(request, &spec, 0);
+        tag_audio_window(&mut result.raw_output, audio_window, true);
+        return Ok(result);
     };
 
     if let Some(tok) = token {
@@ -646,16 +634,7 @@ pub fn run(
         false,
         dtw_projection.as_ref(),
     );
-    if let (Value::Object(map), Some((offset_ms, duration_ms))) = (&mut raw_output, audio_window) {
-        map.insert(
-            "audio_window".to_owned(),
-            json!({
-                "offset_ms": offset_ms,
-                "duration_ms": duration_ms,
-                "timebase": "source",
-            }),
-        );
-    }
+    tag_audio_window(&mut raw_output, audio_window, false);
     // Additive native-v2 route provenance: which encoder route actually ran
     // (gpu_fused vs cpu:<decline reason>). A silent GPU->CPU fallback is
     // invisible without this.
@@ -993,67 +972,6 @@ fn read_normalized_wav(path: &Path) -> FwResult<Vec<f32>> {
     decode::read_wav_16k_mono(&bytes)
 }
 
-/// The requested `--offset-ms` / `--duration-ms` audio window, if any.
-///
-/// Returns `None` when neither flag is set (or both are zero-effect), so the
-/// unwindowed path stays byte-identical to the pre-window behavior.
-fn requested_audio_window(request: &TranscribeRequest) -> Option<(u64, Option<u64>)> {
-    let offset_ms = request.backend_params.offset_ms.unwrap_or(0);
-    let duration_ms = request.backend_params.duration_ms.filter(|d| *d > 0);
-    if offset_ms == 0 && duration_ms.is_none() {
-        None
-    } else {
-        Some((offset_ms, duration_ms))
-    }
-}
-
-/// Convert a ms-domain window into clamped sample bounds over 16 kHz PCM.
-fn window_sample_bounds(len: usize, offset_ms: u64, duration_ms: Option<u64>) -> (usize, usize) {
-    const SAMPLES_PER_MS: u64 = (native_engine::mel::SAMPLE_RATE as u64) / 1000;
-    let start = usize::try_from(offset_ms.saturating_mul(SAMPLES_PER_MS))
-        .unwrap_or(usize::MAX)
-        .min(len);
-    let end = match duration_ms {
-        Some(duration_ms) => usize::try_from(
-            offset_ms
-                .saturating_add(duration_ms)
-                .saturating_mul(SAMPLES_PER_MS),
-        )
-        .unwrap_or(usize::MAX)
-        .min(len),
-        None => len,
-    };
-    (start, end.max(start))
-}
-
-/// Shift every emitted timestamp in a decode output by a uniform offset,
-/// keeping windowed runs in the source-file timebase.
-fn shift_decode_output(output: &mut decode::DecodeOutput, offset_sec: f64) {
-    for segment in &mut output.segments {
-        if let Some(start) = segment.start_sec.as_mut() {
-            *start += offset_sec;
-        }
-        if let Some(end) = segment.end_sec.as_mut() {
-            *end += offset_sec;
-        }
-    }
-    if let Some(word_timings) = output.word_timings.as_mut() {
-        for words in word_timings.iter_mut() {
-            for word in words.iter_mut() {
-                word.start_sec += offset_sec;
-                word.end_sec += offset_sec;
-            }
-        }
-    }
-    for window in &mut output.windows {
-        window.window_offset_sec += offset_sec;
-    }
-    for dropped in &mut output.dropped_windows {
-        dropped.start_sec += offset_sec;
-        dropped.end_sec += offset_sec;
-    }
-}
-
 /// The honest raw-output metadata JSON for a real-inference run.
 #[allow(clippy::too_many_arguments)]
 fn raw_output_json(
@@ -1173,7 +1091,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use crate::backend::Engine;
+    use crate::backend::{Engine, window_sample_bounds};
     use crate::model::{
         BackendKind, BackendParams, DiarizationEngine, DiarizationRequest, InputSource,
         TranscribeRequest, TranscriptionSegment, WordTimestampParams,
@@ -1839,6 +1757,32 @@ mod tests {
         assert_eq!(
             request_word_timestamp_mode(&request),
             WordTimestampMode::Word
+        );
+    }
+
+    #[test]
+    fn timestamp_level_word_requests_one_segment_per_word() {
+        use crate::model::DecodingParams;
+
+        let mut request = native_request();
+        request.backend_params.timestamp_level = Some(TimestampLevel::Chunk);
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::None
+        );
+        request.backend_params.timestamp_level = Some(TimestampLevel::Word);
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::Word
+        );
+        // An explicit --max-segment-length still decides the grouping.
+        request.backend_params.decoding = Some(DecodingParams {
+            max_segment_length: Some(30),
+            ..DecodingParams::default()
+        });
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::MaxLen(30)
         );
     }
 

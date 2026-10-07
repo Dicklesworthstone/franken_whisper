@@ -1213,8 +1213,8 @@ franken_whisper transcribe [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--offset-ms <N>` | 0 | Start transcription at offset (ms); honored by the native engine (PCM sliced before decode) and the whisper.cpp bridge (`-ot`). Emitted timestamps stay in source-file time |
-| `--duration-ms <N>` | — | Transcribe only this duration (ms); wall-clock scales with the slice. Backends that cannot honor the window record it in `warnings` |
+| `--offset-ms <N>` | 0 | Start transcription at offset (ms); honored by every native backend (PCM sliced before decode) and the whisper.cpp bridge (`-ot`). Emitted timestamps stay in source-file time; VAD and diarization still cover the whole clip |
+| `--duration-ms <N>` | — | Transcribe only this duration (ms); wall-clock scales with the slice. Bridges that cannot honor the window (insanely-fast-whisper, whisper-diarization) record it in `warnings` |
 | `--audio-ctx <N>` | — | Encoder audio context in frames (0 = full 30 s window); the native engine maps N > 0 to a fixed encoder context |
 | `--word-threshold <F>` | — | Per-word confidence threshold (drop words below) |
 | `--suppress-regex <REGEX>` | — | Suppress tokens matching regex |
@@ -1242,7 +1242,7 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 | `--gpu-device <DEV>` | auto | GPU device (`0`, `cuda:0`, `mps`) |
 | `--flash-attention` | `false` | Enable Flash Attention 2 |
 | `--hf-token <TOKEN>` | env | HuggingFace token for diarization |
-| `--timestamp-level` | `chunk` | `chunk` or `word` granularity |
+| `--timestamp-level` | `chunk` | `chunk` or `word` granularity (`word` emits one segment per word) |
 | `--transcript-path <PATH>` | — | Override transcript output path |
 
 **Diarization:**

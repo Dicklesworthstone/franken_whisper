@@ -2422,10 +2422,14 @@ async fn execute_backend(
     } else if let Some(selection) =
         backend::evaluate_backend_selection(request, normalized_duration, pcx.trace_id())
     {
-        if selection.fallback_triggered {
-            inter
-                .warnings
-                .push("backend selection contract fallback trigger activated".to_owned());
+        if selection.fallback_needs_attention() {
+            inter.warnings.push(format!(
+                "backend selection contract fallback trigger activated ({})",
+                selection
+                    .fallback_reason
+                    .as_deref()
+                    .unwrap_or("decision contract fallback")
+            ));
         }
         pcx.record_evidence_values(&selection.evidence_entries);
         log.push(
@@ -2683,16 +2687,19 @@ fn surface_backend_result_diagnostics(
         );
     }
 
-    // Audio-window flags on a backend that does not honor them: loud ignore.
+    // Audio-window flags: every in-process native engine and the whisper.cpp
+    // bridge (`-ot`/`-d`) honor them; the other bridges cannot (loud ignore).
     let window_requested = request.backend_params.offset_ms.is_some_and(|v| v > 0)
         || request.backend_params.duration_ms.is_some_and(|v| v > 0);
-    if window_requested && result.backend != BackendKind::WhisperCpp {
+    let window_honored = result.backend == BackendKind::WhisperCpp
+        || is_native_in_process_result(&result.raw_output);
+    if window_requested && !window_honored {
         inter.warnings.push(format!(
             "--offset-ms/--duration-ms are not supported by backend `{}`; the full input was transcribed",
             result.backend.as_str()
         ));
     }
-    if window_requested && result.backend == BackendKind::WhisperCpp && request.diarize {
+    if window_requested && window_honored && request.diarize {
         inter.warnings.push(
             "audio window applied to transcription only; diarization/VAD still cover the full \
              normalized clip"
@@ -3600,7 +3607,7 @@ fn align_transcription_result(
     // model evidence for a uniform speech-rate guess (up to the drift guard).
     // Keep the model boundaries; only the bounded energy-valley snap below
     // may refine them.
-    let mut report = if has_native_model_timestamps(&result.raw_output) {
+    let mut report = if is_native_in_process_result(&result.raw_output) {
         token.checkpoint()?;
         AlignmentReport {
             segments_total: result.segments.len(),
@@ -3609,10 +3616,9 @@ fn align_transcription_result(
             method: "native_timestamp_tokens",
             energy_valley_snaps: 0,
             energy_evidence_available: false,
-            notes: vec![
-                "preserved the native engine's timestamp-token boundaries; character-density heuristic skipped"
-                    .to_owned(),
-            ],
+            // The method names the outcome; a note would surface as a run
+            // warning on every default native run.
+            notes: Vec::new(),
         }
     } else {
         ctc_forced_align(&mut result.segments, audio_duration_sec, config, token)?
@@ -6721,7 +6727,7 @@ fn tiny_diarize_boundary_hints(
 
 /// Whether a backend result came from the in-process native engine, whose
 /// segment times are decoded timestamp tokens rather than estimates.
-fn has_native_model_timestamps(raw_output: &Value) -> bool {
+fn is_native_in_process_result(raw_output: &Value) -> bool {
     raw_output.get("in_process").and_then(Value::as_bool) == Some(true)
         && raw_output.get("implementation").and_then(Value::as_str) == Some("real-inference")
 }

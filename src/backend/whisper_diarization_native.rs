@@ -231,9 +231,19 @@ pub fn run(
     // silence pre-gate so silent clips avoid hashing multi-GB weights.
     let spec = effective_model_spec(request);
 
+    // Requested audio window (`--offset-ms` / `--duration-ms`): the normalized
+    // PCM is sliced before decode and timestamps are shifted back into the
+    // source timebase, exactly as on whisper.cpp native.
+    let audio_window = super::requested_audio_window(request);
+
     // Silence pre-gate: cheap energy analysis avoids a multi-GB model load on a
-    // pure-silence clip (shared policy with the sibling native engines).
-    let analysis = analyze_wav(normalized_wav, request.backend_params.duration_ms).ok();
+    // pure-silence clip (shared policy with the sibling native engines). The
+    // analyzer scans the whole clip, so a windowed request skips it.
+    let analysis = if audio_window.is_none() {
+        analyze_wav(normalized_wav, None).ok()
+    } else {
+        None
+    };
     if let Some(analysis) = analysis.as_ref()
         && analysis.active_regions.is_empty()
     {
@@ -260,7 +270,13 @@ pub fn run(
     let checkpoint = checkpoint_for(token);
     let model = model_source.load_with_checkpoint(&checkpoint)?;
 
-    let samples = read_normalized_wav(normalized_wav)?;
+    let Some((samples, window_offset_ms)) =
+        super::windowed_samples(read_normalized_wav(normalized_wav)?, audio_window)
+    else {
+        let mut result = silence_result(request, &spec, 0);
+        super::tag_audio_window(&mut result.raw_output, audio_window, true);
+        return Ok(result);
+    };
 
     if let Some(tok) = token {
         tok.checkpoint()?;
@@ -279,7 +295,7 @@ pub fn run(
 
     // Real ASR: the engine decides what (and when) words were spoken.
     let params = decode_params(request);
-    let output = model.transcribe(&samples, &params, &checkpoint)?;
+    let mut output = model.transcribe(&samples, &params, &checkpoint)?;
 
     if let Some(tok) = token {
         tok.checkpoint()?;
@@ -287,18 +303,22 @@ pub fn run(
 
     // Legacy diarization: assign provisional speaker labels from transcript
     // timing/text features. This path cannot fuse soft acoustic count evidence
-    // and never forces cluster collapse from count cardinality alone.
-    let mut segments = output.segments.clone();
+    // and never forces cluster collapse from count cardinality alone. It runs
+    // in the decoded audio's own timebase; a windowed run is shifted after.
     let duration_sec = audio_duration_sec(request, &output);
     let diarize_token = token
         .copied()
         .unwrap_or_else(crate::orchestrator::CancellationToken::unbounded);
     let report = orchestrator::diarize_segments(
-        &mut segments,
+        &mut output.segments,
         duration_sec,
         &speaker_count,
         &diarize_token,
     )?;
+    if window_offset_ms > 0 {
+        super::shift_decode_output(&mut output, window_offset_ms as f64 / 1000.0);
+    }
+    let segments = std::mem::take(&mut output.segments);
 
     let transcript = super::transcript_from_segments(&segments);
     let language = output.language.clone().or_else(|| request.language.clone());
@@ -309,7 +329,7 @@ pub fn run(
         .as_ref()
         .map(super::native_audio::NativeAudioAnalysis::as_json);
     let version_tag = model.version_tag_with_checkpoint(&checkpoint)?;
-    let raw_output = raw_output_json(
+    let mut raw_output = raw_output_json(
         &spec,
         &model_path,
         version_tag,
@@ -318,6 +338,7 @@ pub fn run(
         audio_provenance,
         false,
     );
+    super::tag_audio_window(&mut raw_output, audio_window, false);
 
     Ok(TranscriptionResult {
         backend: BackendKind::WhisperDiarization,
@@ -587,8 +608,9 @@ mod tests {
         // Every native backend implements language-only detection.
         req.backend_params.detect_language_only = true;
         req.backend_params.suppress_regex = Some("[0-9]".to_owned());
+        req.backend_params.timestamp_level = Some(crate::model::TimestampLevel::Word);
         let warnings = warnings_for(&req);
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
         assert!(
             warnings
                 .iter()
@@ -598,15 +620,22 @@ mod tests {
         assert!(warnings.iter().any(|w| w.contains("--max-segment-length")));
         assert!(warnings.iter().any(|w| w.contains("--suppress-regex")));
         assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("--timestamp-level word"))
+        );
+        assert!(
             !warnings
                 .iter()
                 .any(|w| w.contains("--detect-language-only"))
         );
-        // The transcription backends regroup words to --max-segment-length.
+        // The transcription backends regroup words to --max-segment-length
+        // and split them for --timestamp-level word.
         for resolved in [BackendKind::WhisperCpp, BackendKind::InsanelyFast] {
             let warnings = super::super::native_ignored_option_warnings(&req, resolved);
             assert_eq!(warnings.len(), 2, "{resolved:?}: {warnings:?}");
             assert!(!warnings.iter().any(|w| w.contains("--max-segment-length")));
+            assert!(!warnings.iter().any(|w| w.contains("--timestamp-level")));
         }
     }
 

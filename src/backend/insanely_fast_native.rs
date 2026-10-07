@@ -281,11 +281,9 @@ fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> deco
         language: request.language.clone(),
         translate: request.translate,
         // Beam width (`--beam-size`) is a per-window decode param, so it applies
-        // correctly within every range. NOTE: `initial_prompt` is deliberately NOT
-        // wired here — this backend shares one `params` across all ranges, so a
-        // prompt would re-seed EVERY range's first window (per-range bd-r0qd risk +
-        // divergence from whisper.cpp's once-at-start prompt). Faithful streaming
-        // prompt = first-range-only, which needs per-range params (follow-up).
+        // correctly within every range. `initial_prompt` is NOT set here: these
+        // params are shared by every range, and a prompt must seed only the
+        // clip's first window (see [`first_range_params`]).
         beam_size: request
             .backend_params
             .decoding
@@ -307,6 +305,23 @@ fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> deco
     };
     super::apply_native_decode_controls(&mut params, request);
     params
+}
+
+/// Params for the range that starts at window 0: the shared params plus the
+/// user prompt (whisper `--prompt`). Like the sequential engine, the prompt
+/// seeds only the clip's first window and then ages out of the carried
+/// context; later ranges start from an empty context, as before.
+fn first_range_params(
+    params: &decode::DecodeParams,
+    request: &TranscribeRequest,
+) -> decode::DecodeParams {
+    let mut first = params.clone();
+    first.initial_prompt = request
+        .backend_params
+        .prompt
+        .clone()
+        .filter(|prompt| !prompt.is_empty());
+    first
 }
 
 /// One contiguous range's decode result, tagged with its starting window index
@@ -353,13 +368,21 @@ pub fn run(
     // silence pre-gate so silent clips avoid hashing multi-GB weights.
     let spec = effective_model_spec(request);
 
+    // Requested audio window (`--offset-ms` / `--duration-ms`): the normalized
+    // PCM is sliced before decode and timestamps are shifted back into the
+    // source timebase, exactly as on whisper.cpp native.
+    let audio_window = super::requested_audio_window(request);
+
     // Silence pre-gate: cheap energy analysis avoids a multi-GB model load on a
-    // pure-silence clip (shared policy with whisper.cpp native).
-    let analysis = analyze_wav(normalized_wav, request.backend_params.duration_ms).ok();
-    if let Some(analysis) = analysis.as_ref()
-        && analysis.active_regions.is_empty()
-    {
-        return Ok(silence_result(request, &spec, analysis.duration_ms));
+    // pure-silence clip (shared policy with whisper.cpp native). The analyzer
+    // scans the whole clip, so a windowed request skips it.
+    if audio_window.is_none() {
+        let analysis = analyze_wav(normalized_wav, None).ok();
+        if let Some(analysis) = analysis.as_ref()
+            && analysis.active_regions.is_empty()
+        {
+            return Ok(silence_result(request, &spec, analysis.duration_ms));
+        }
     }
 
     if let Some(tok) = token {
@@ -382,7 +405,13 @@ pub fn run(
     let checkpoint = || token.map_or(Ok(()), crate::orchestrator::CancellationToken::checkpoint);
     let model = model_source.load_with_checkpoint(&checkpoint)?;
 
-    let samples = read_normalized_wav(normalized_wav)?;
+    let Some((samples, window_offset_ms)) =
+        super::windowed_samples(read_normalized_wav(normalized_wav)?, audio_window)
+    else {
+        let mut result = silence_result(request, &spec, 0);
+        super::tag_audio_window(&mut result.raw_output, audio_window, true);
+        return Ok(result);
+    };
 
     if let Some(tok) = token {
         tok.checkpoint()?;
@@ -411,13 +440,18 @@ pub fn run(
     let ranges = plan_ranges(win_count, n_workers);
 
     let params = decode_params(request, threads_per_worker);
+    let first_params = first_range_params(&params, request);
 
     // Decode each contiguous range with the real sequential decode (parallel
     // across workers); merge in range order, offsetting timestamps by each
     // range's base start time.
-    let range_results = decode_ranges_parallel(&model, &samples, &ranges, &params, token)?;
+    let range_results =
+        decode_ranges_parallel(&model, &samples, &ranges, &params, &first_params, token)?;
 
-    let merged = merge_ranges(&range_results);
+    let mut merged = merge_ranges(&range_results);
+    if window_offset_ms > 0 {
+        shift_merged_output(&mut merged, window_offset_ms as f64 / 1000.0);
+    }
     // Seams are the hard cuts BETWEEN ranges: one fewer than the number of
     // (non-empty) ranges actually decoded.
     let seams = ranges.len().saturating_sub(1);
@@ -434,7 +468,7 @@ pub fn run(
     let language = merged.language.or_else(|| request.language.clone());
     let version_tag = model.version_tag_with_checkpoint(&checkpoint)?;
 
-    let raw_output = raw_output_json(
+    let mut raw_output = raw_output_json(
         &spec,
         &model_path,
         version_tag,
@@ -448,6 +482,7 @@ pub fn run(
         request.backend_params.split_on_word,
         false,
     );
+    super::tag_audio_window(&mut raw_output, audio_window, false);
 
     Ok(TranscriptionResult {
         backend: BackendKind::InsanelyFast,
@@ -474,6 +509,9 @@ pub fn run(
 /// ranges. With a single range (1 worker) this is byte-identical to the
 /// sequential [`whisper_cpp_native`](super::whisper_cpp_native) path.
 ///
+/// The range starting at window 0 decodes with `first_params` (which may carry
+/// the user prompt); every other range decodes with `params`.
+///
 /// Cancellation + first-error: a shared [`AtomicBool`] short-circuits remaining
 /// ranges the moment any range errors (or the token expires); the first error
 /// observed is returned. For a **fixed** range partition the merged result is
@@ -483,6 +521,7 @@ fn decode_ranges_parallel(
     samples: &[f32],
     ranges: &[(usize, usize)],
     params: &decode::DecodeParams,
+    first_params: &decode::DecodeParams,
     token: Option<&crate::orchestrator::CancellationToken>,
 ) -> FwResult<Vec<RangeResult>> {
     let stop = AtomicBool::new(false);
@@ -498,6 +537,11 @@ fn decode_ranges_parallel(
             if span.is_empty() {
                 continue;
             }
+            let params = if start_window == 0 {
+                first_params
+            } else {
+                params
+            };
             scope.spawn(move || {
                 // A worker's checkpoint: honor the orchestrator token AND the
                 // shared stop flag so a sibling's error/cancellation halts every
@@ -613,6 +657,22 @@ fn merge_ranges(results: &[RangeResult]) -> MergedOutput {
         segments,
         windows,
         language,
+    }
+}
+
+/// Shift a merged whole-window result into the source timebase of a windowed
+/// (`--offset-ms`) run.
+fn shift_merged_output(merged: &mut MergedOutput, offset_sec: f64) {
+    for segment in &mut merged.segments {
+        if let Some(start) = segment.start_sec.as_mut() {
+            *start += offset_sec;
+        }
+        if let Some(end) = segment.end_sec.as_mut() {
+            *end += offset_sec;
+        }
+    }
+    for window in &mut merged.windows {
+        window.window_offset_sec += offset_sec;
     }
 }
 
@@ -759,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_params_maps_beam_size_but_not_prompt() {
+    fn decode_params_seed_the_prompt_into_the_first_range_only() {
         use crate::model::DecodingParams;
         let mut req = request();
         assert_eq!(decode_params(&req, 4).beam_size, None);
@@ -769,10 +829,21 @@ mod tests {
             ..DecodingParams::default()
         });
         assert_eq!(decode_params(&req, 4).beam_size, Some(3));
-        // initial_prompt is deliberately NOT wired here (shared params re-seed
-        // every range); it stays None even when the request carries a prompt.
+        // The prompt seeds only the clip's first window: the shared params
+        // never carry it, the window-0 range's params do.
         req.backend_params.prompt = Some("domain terms".to_owned());
-        assert_eq!(decode_params(&req, 4).initial_prompt, None);
+        let shared = decode_params(&req, 4);
+        assert_eq!(shared.initial_prompt, None);
+        let first = first_range_params(&shared, &req);
+        let mut expected = shared.clone();
+        expected.initial_prompt = Some("domain terms".to_owned());
+        assert_eq!(
+            first, expected,
+            "only the prompt differs from the shared params"
+        );
+        // An empty prompt is no prompt.
+        req.backend_params.prompt = Some(String::new());
+        assert_eq!(first_range_params(&shared, &req), shared);
     }
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
@@ -1017,6 +1088,28 @@ mod tests {
         // Window stats offset too.
         assert_eq!(merged.windows[1].window_offset_sec, 60.0);
         assert_eq!(merged.language, Some("en".to_owned()));
+    }
+
+    #[test]
+    fn windowed_merge_moves_segments_and_windows_into_source_time() {
+        let results = vec![
+            RangeResult {
+                start_window: 0,
+                output: out_with_segment(0.5, 2.0, "first", 0.0),
+            },
+            RangeResult {
+                start_window: 1,
+                output: out_with_segment(1.0, 4.0, "second", 0.0),
+            },
+        ];
+        let mut merged = merge_ranges(&results);
+        shift_merged_output(&mut merged, 60.0);
+        assert_eq!(merged.segments[0].start_sec, Some(60.5));
+        assert_eq!(merged.segments[0].end_sec, Some(62.0));
+        assert_eq!(merged.segments[1].start_sec, Some(91.0));
+        assert_eq!(merged.segments[1].end_sec, Some(94.0));
+        assert_eq!(merged.windows[0].window_offset_sec, 60.0);
+        assert_eq!(merged.windows[1].window_offset_sec, 90.0);
     }
 
     // ── Model resolution / availability ───────────────────────────────────
@@ -1271,8 +1364,8 @@ mod tests {
         let (n_workers, tpw) = plan_workers(win_count, batch_size, total_threads);
         let ranges = plan_ranges(win_count, n_workers);
         let params = det_params(tpw);
-        let results =
-            decode_ranges_parallel(model, samples, &ranges, &params, None).expect("decode");
+        let results = decode_ranges_parallel(model, samples, &ranges, &params, &params, None)
+            .expect("decode");
         let merged = merge_ranges(&results);
         let text: String = merged
             .segments
