@@ -383,6 +383,112 @@ fn live_transcript_keeps_all_speech_for_every_policy() {
     }
 }
 
+/// Spawn `fw robot listen --source stdin-pcm` (tiny.en, no confirm lane, no
+/// persistence) and hand stdin to `feed`, which owns writing and closing it.
+/// Returns (events, exit code, wall seconds).
+fn run_stdin_listen(
+    extra_args: &[&str],
+    feed: impl FnOnce(std::process::ChildStdin) + Send + 'static,
+) -> (Vec<serde_json::Value>, i32, f64) {
+    let started = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args(["robot", "listen", "--source", "stdin-pcm"])
+        .args(["--fast-model", "tiny.en", "--language", "en"])
+        .args(["--quality-model", "none", "--no-persist"])
+        .args(extra_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn fw robot listen");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let feeder = std::thread::spawn(move || feed(stdin));
+    let stdout = child.stdout.take().expect("piped stdout");
+    let events: Vec<serde_json::Value> = BufReader::new(stdout)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str(&line).ok())
+        .collect();
+    let status = child.wait().expect("wait for fw");
+    feeder.join().expect("stdin feeder");
+    (
+        events,
+        status.code().unwrap_or(-1),
+        started.elapsed().as_secs_f64(),
+    )
+}
+
+/// bd-rt-e2e-0zo5 error path: a stdin stream that ends inside a PCM frame is
+/// malformed input, not a clean end of session.
+#[test]
+fn stdin_pcm_ending_inside_a_sample_fails_the_session() {
+    if !require_fast_model() {
+        return;
+    }
+    let (events, code, _) = run_stdin_listen(&[], |mut stdin| {
+        use std::io::Write as _;
+        // 0.5 s of s16le silence plus one stray byte (half a sample).
+        let mut bytes = vec![0_u8; 16_000];
+        bytes.push(0x7f);
+        let _ = stdin.write_all(&bytes);
+        // Dropping stdin closes the pipe: EOF lands mid-sample.
+    });
+    assert_ne!(code, 0, "a torn PCM stream must not exit successfully");
+    let error = events
+        .iter()
+        .find(|event| event["event"] == "run_error")
+        .unwrap_or_else(|| panic!("expected run_error, got {events:?}"));
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("incomplete PCM frame") || message.contains("trailing byte"),
+        "{message}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "listen.session_stats" && event["final"] == true),
+        "a failed session must not also report a successful final stats event"
+    );
+}
+
+/// bd-rt-e2e-0zo5: `--max-seconds` bounds an endless live stream, measured
+/// from capture start (model load excluded), and ends the session cleanly.
+#[test]
+fn max_seconds_bounds_an_endless_stdin_stream() {
+    if !require_fast_model() {
+        return;
+    }
+    let (events, code, wall_sec) = run_stdin_listen(&["--max-seconds", "2"], |mut stdin| {
+        use std::io::Write as _;
+        // 100 ms chunks of silence until the session closes the pipe (or a
+        // generous safety cap, so a regression cannot hang the suite).
+        let chunk = vec![0_u8; 3_200];
+        for _ in 0..3_000 {
+            if stdin.write_all(&chunk).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    assert_eq!(
+        code, 0,
+        "a time-bounded session ends successfully: {events:?}"
+    );
+    let final_stats = events
+        .iter()
+        .find(|event| event["event"] == "listen.session_stats" && event["final"] == true)
+        .unwrap_or_else(|| panic!("expected final stats, got {events:?}"));
+    let audio_sec = final_stats["audio_sec"].as_f64().expect("audio_sec");
+    assert!(
+        audio_sec >= 1.5,
+        "the budget must cover listening time, not model load: audio_sec={audio_sec}"
+    );
+    assert!(
+        wall_sec < 240.0,
+        "session must end near its budget: {wall_sec:.1}s"
+    );
+}
+
 #[test]
 fn normalized_wer_counts_dropped_phrases() {
     assert_eq!(normalized_wer(JFK_REFERENCE, JFK_REFERENCE), 0.0);
