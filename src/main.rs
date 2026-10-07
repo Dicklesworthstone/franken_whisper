@@ -450,9 +450,13 @@ fn run(cli: Cli) -> FwResult<()> {
                 Ok(())
             }
             RobotCommand::RoutingHistory(args) => {
-                let store = RunStore::open(&args.db)?;
-                let details_list =
-                    load_routing_history_details(&store, args.run_id.as_deref(), args.limit)?;
+                // A missing store is empty history: never create one here.
+                let details_list = match open_existing_history(&args.db)? {
+                    Some(store) => {
+                        load_routing_history_details(&store, args.run_id.as_deref(), args.limit)?
+                    }
+                    None => Vec::new(),
+                };
 
                 let mut records = 0_usize;
                 for details in details_list {
@@ -579,7 +583,25 @@ fn run(cli: Cli) -> FwResult<()> {
             }
         },
         Command::Runs(args) => {
-            let store = RunStore::open(&args.db)?;
+            // Querying history must not create a database: a mistyped or
+            // never-used `--db` path is reported, not silently initialized.
+            let Some(store) = open_existing_history(&args.db)? else {
+                if let Some(run_id) = &args.id {
+                    return Err(FwError::InvalidRequest(format!(
+                        "no run found with id `{run_id}`: no run history database at {}",
+                        args.db.display()
+                    )));
+                }
+                match args.format {
+                    RunsOutputFormat::Plain => eprintln!(
+                        "no run history at {} (runs are recorded by `fw transcribe`; select another store with --db)",
+                        args.db.display()
+                    ),
+                    RunsOutputFormat::Json => println!("[]"),
+                    RunsOutputFormat::Ndjson => {}
+                }
+                return Ok(());
+            };
 
             if let Some(run_id) = &args.id {
                 match store.load_run_details(run_id)? {
@@ -1193,6 +1215,15 @@ fn run(cli: Cli) -> FwResult<()> {
     }
 }
 
+/// Open a run-history store only if it already exists; `Ok(None)` for a
+/// missing path, so read-only history commands never create a database.
+fn open_existing_history(db: &std::path::Path) -> FwResult<Option<RunStore>> {
+    if !db.try_exists()? {
+        return Ok(None);
+    }
+    RunStore::open(db).map(Some)
+}
+
 fn load_routing_history_details(
     store: &RunStore,
     run_id: Option<&str>,
@@ -1323,6 +1354,33 @@ mod tests {
             super::sortformer_audio_duration_ms(16_001).expect("one second plus one sample"),
             1_001
         );
+    }
+
+    #[test]
+    fn history_queries_never_create_a_missing_database() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("never-created.sqlite3");
+        assert!(
+            super::open_existing_history(&missing)
+                .expect("probe")
+                .is_none()
+        );
+        let created: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(created.is_empty(), "no files may be created: {created:?}");
+
+        let existing = dir.path().join("existing.sqlite3");
+        RunStore::open(&existing)
+            .expect("create store")
+            .persist_report(&fixture_report("history-run", &existing))
+            .expect("persist");
+        let store = super::open_existing_history(&existing)
+            .expect("open")
+            .expect("existing store opens");
+        assert_eq!(store.list_recent_runs(5).expect("list").len(), 1);
     }
 
     #[test]

@@ -166,6 +166,28 @@ pub(crate) fn word_timestamp_mode(params: Option<&WordTimestampParams>) -> WordT
     }
 }
 
+/// The word-timestamp mode a request asks for: its explicit
+/// `word_timestamps` params, else whisper.cpp's `--max-segment-length`
+/// (`-ml N`: 1 = one word per segment, N > 1 = segments of at most N
+/// characters, regrouped at word boundaries like `-ml N -sow`).
+pub(crate) fn request_word_timestamp_mode(request: &TranscribeRequest) -> WordTimestampMode {
+    if let Some(params) = request.backend_params.word_timestamps.as_ref() {
+        return word_timestamp_mode(Some(params));
+    }
+    let max_segment_length = request
+        .backend_params
+        .decoding
+        .as_ref()
+        .and_then(|decoding| decoding.max_segment_length);
+    match max_segment_length {
+        Some(max_len) => word_timestamp_mode(Some(&WordTimestampParams {
+            max_len: Some(max_len),
+            ..WordTimestampParams::default()
+        })),
+        None => WordTimestampMode::None,
+    }
+}
+
 /// Honestly report whether the native whisper.cpp engine can run.
 ///
 /// Availability is probed **without a request context** (the router calls this
@@ -559,7 +581,7 @@ pub fn run(
     // attention-DTW word times. DTW runs when per-word output is requested
     // (a word/maxlen split or `split_on_word`) — the engine then records
     // cross-attention and aligns each word to audio frames (bd-rjsx).
-    let word_mode = word_timestamp_mode(request.backend_params.word_timestamps.as_ref());
+    let word_mode = request_word_timestamp_mode(request);
     let native_acoustic_diarization = native_acoustic_diarization_requested(request);
     let want_words = word_mode != WordTimestampMode::None
         || request.backend_params.split_on_word
@@ -1776,6 +1798,48 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         let result = finalize_segments(&segs, false, Some(&cancellation));
         assert!(matches!(result.unwrap_err(), FwError::Cancelled(_)));
+    }
+
+    #[test]
+    fn max_segment_length_drives_the_word_mode_when_no_word_params_are_given() {
+        use crate::model::DecodingParams;
+
+        let mut request = native_request();
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::None
+        );
+        let with_max = |max_len| {
+            Some(DecodingParams {
+                max_segment_length: Some(max_len),
+                ..DecodingParams::default()
+            })
+        };
+        request.backend_params.decoding = with_max(1);
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::Word
+        );
+        request.backend_params.decoding = with_max(42);
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::MaxLen(42)
+        );
+        request.backend_params.decoding = with_max(0);
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::None
+        );
+        // Explicit word-timestamp params win over --max-segment-length.
+        request.backend_params.decoding = with_max(42);
+        request.backend_params.word_timestamps = Some(WordTimestampParams {
+            enabled: true,
+            ..WordTimestampParams::default()
+        });
+        assert_eq!(
+            request_word_timestamp_mode(&request),
+            WordTimestampMode::Word
+        );
     }
 
     #[test]

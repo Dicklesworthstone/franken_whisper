@@ -82,7 +82,7 @@ use crate::native_engine::mel::N_SAMPLES_30S;
 use crate::native_engine::{self, NativeWhisperModel, decode};
 
 use super::native_audio::analyze_wav;
-use super::whisper_cpp_native::{WordTimestampMode, build_segments, word_timestamp_mode};
+use super::whisper_cpp_native::{WordTimestampMode, build_segments, request_word_timestamp_mode};
 
 /// Stable schema tag for the honest native raw-output metadata (shared with the
 /// whisper.cpp native engine so the evidence ledger has one schema).
@@ -422,7 +422,7 @@ pub fn run(
     // (non-empty) ranges actually decoded.
     let seams = ranges.len().saturating_sub(1);
 
-    let word_mode = word_timestamp_mode(request.backend_params.word_timestamps.as_ref());
+    let word_mode = request_word_timestamp_mode(request);
     let segments = build_segments(
         &merged.segments,
         word_mode,

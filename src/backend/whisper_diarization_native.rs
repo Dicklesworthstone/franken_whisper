@@ -566,7 +566,9 @@ mod tests {
     fn native_reports_whisper_cpp_options_it_cannot_honor() {
         use crate::model::DecodingParams;
 
-        let warnings_for = super::super::native_ignored_option_warnings;
+        let warnings_for = |req: &TranscribeRequest| {
+            super::super::native_ignored_option_warnings(req, BackendKind::WhisperDiarization)
+        };
         assert!(warnings_for(&request()).is_empty());
         let mut req = request();
         req.backend_params.decoding = Some(DecodingParams {
@@ -600,6 +602,12 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("--detect-language-only"))
         );
+        // The transcription backends regroup words to --max-segment-length.
+        for resolved in [BackendKind::WhisperCpp, BackendKind::InsanelyFast] {
+            let warnings = super::super::native_ignored_option_warnings(&req, resolved);
+            assert_eq!(warnings.len(), 2, "{resolved:?}: {warnings:?}");
+            assert!(!warnings.iter().any(|w| w.contains("--max-segment-length")));
+        }
     }
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {

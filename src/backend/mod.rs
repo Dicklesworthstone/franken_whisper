@@ -1511,7 +1511,10 @@ pub(crate) fn native_language_detection_result(
 /// Request options the in-process engine cannot honor, as run warnings (so a
 /// whisper.cpp flag never silently does nothing on the default native path).
 #[must_use]
-pub(crate) fn native_ignored_option_warnings(request: &TranscribeRequest) -> Vec<String> {
+pub(crate) fn native_ignored_option_warnings(
+    request: &TranscribeRequest,
+    resolved: BackendKind,
+) -> Vec<String> {
     let backend_params = &request.backend_params;
     let decoding = backend_params.decoding.as_ref();
     let mut ignored = Vec::new();
@@ -1521,7 +1524,11 @@ pub(crate) fn native_ignored_option_warnings(request: &TranscribeRequest) -> Vec
     {
         ignored.push("--temperature (the native first pass is greedy; use --temperature-increment/--best-of for the fallback ladder)");
     }
-    if decoding.and_then(|d| d.max_segment_length).is_some() {
+    // whisper.cpp-native and insanely-fast-native regroup words to the limit;
+    // the diarization backend keeps the engine's segments.
+    if decoding.and_then(|d| d.max_segment_length).is_some()
+        && resolved == BackendKind::WhisperDiarization
+    {
         ignored.push("--max-segment-length");
     }
     if backend_params.carry_initial_prompt {

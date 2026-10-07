@@ -2575,7 +2575,10 @@ async fn execute_backend(
     if execution.implementation == backend::BackendImplementation::Native {
         inter
             .warnings
-            .extend(backend::native_ignored_option_warnings(request));
+            .extend(backend::native_ignored_option_warnings(
+                request,
+                execution.result.backend,
+            ));
     }
     let backend_output_sha256 = match sha256_json_value(&execution.result.raw_output) {
         Ok(hash) => Some(hash),
@@ -3347,8 +3350,10 @@ fn ctc_forced_align(
 
     let sec_per_char = duration / total_chars as f64;
     let mut cursor = 0.0f64;
+    // Per segment: the authoritative original span, if this pass replaced it.
+    let mut replaced: Vec<Option<(f64, f64)>> = vec![None; total];
 
-    for segment in segments.iter_mut() {
+    for (index, segment) in segments.iter_mut().enumerate() {
         // Cancellation check per segment for responsive shutdown.
         token.checkpoint()?;
 
@@ -3400,11 +3405,59 @@ fn ctc_forced_align(
         if aligned_start.is_finite() && aligned_end.is_finite() {
             segment.start_sec = Some(aligned_start);
             segment.end_sec = Some(aligned_end);
+            replaced[index] = Some((os, oe));
             corrected += 1;
         } else {
             // Non-finite aligned values: keep the authoritative original.
             fallback += 1;
         }
+    }
+
+    // A correction is only safe if it stays clear of its neighbors' final
+    // spans: a corrected segment next to one that fell back to its original
+    // offsets could otherwise overlap it (e.g. a corrected end landing past
+    // the next segment's original start), producing overlapping subtitle
+    // cues. Revert any correction involved in an overlap to its authoritative
+    // original; each pass reverts at least one segment, so this terminates.
+    const OVERLAP_EPSILON_SEC: f64 = 1e-6;
+    let mut reverted = 0usize;
+    loop {
+        let mut changed = false;
+        for index in 1..total {
+            let (Some(previous_end), Some(next_start)) =
+                (segments[index - 1].end_sec, segments[index].start_sec)
+            else {
+                continue;
+            };
+            if previous_end <= next_start + OVERLAP_EPSILON_SEC {
+                continue;
+            }
+            // Prefer reverting the segment that was moved; if both were,
+            // revert the earlier one first.
+            let culprit = if replaced[index - 1].is_some() {
+                index - 1
+            } else if replaced[index].is_some() {
+                index
+            } else {
+                continue; // both original: the backend's own overlap stands
+            };
+            if let Some((original_start, original_end)) = replaced[culprit].take() {
+                segments[culprit].start_sec = Some(original_start);
+                segments[culprit].end_sec = Some(original_end);
+                reverted += 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if reverted > 0 {
+        corrected -= reverted;
+        fallback += reverted;
+        notes.push(format!(
+            "{reverted} corrected segment(s) reverted to original offsets to keep segments non-overlapping"
+        ));
     }
 
     Ok(AlignmentReport {
@@ -13367,6 +13420,49 @@ mod tests {
             "first segment end should be original"
         );
         assert_eq!(report.segments_fallback + report.segments_corrected, 2);
+    }
+
+    #[test]
+    fn ctc_align_never_leaves_a_correction_overlapping_a_fallback_neighbor() {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = AlignConfig::default(); // 0.5 s drift guard
+        // 30 chars over 3 s => 0.1 s/char.
+        // s0 (12 chars): aligned [0, 1.2] vs original [0, 1.0] -> within drift, corrected.
+        // s1 (2 chars): aligned [1.2, 1.4] vs original [1.0, 2.0] -> end drift 0.6, fallback.
+        // Without reconciliation s0's corrected end (1.2) overlaps s1's start (1.0).
+        let mut segments = vec![
+            make_segment(0.0, 1.0, "aaaaaaaaaaaa"),
+            make_segment(1.0, 2.0, "bb"),
+            make_segment(2.0, 3.0, "cccccccccccccccc"),
+        ];
+        let report = ctc_forced_align(&mut segments, Some(3.0), &config, &token).unwrap();
+
+        for pair in segments.windows(2) {
+            let (previous_end, next_start) = (
+                pair[0].end_sec.expect("timed"),
+                pair[1].start_sec.expect("timed"),
+            );
+            assert!(
+                previous_end <= next_start + 1e-9,
+                "segments overlap: {previous_end} > {next_start}"
+            );
+        }
+        assert_eq!(segments[0].start_sec, Some(0.0));
+        assert_eq!(
+            segments[0].end_sec,
+            Some(1.0),
+            "s0 reverted to its original"
+        );
+        assert_eq!(report.segments_corrected, 1, "only s2 keeps its correction");
+        assert_eq!(report.segments_fallback, 2);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("reverted to original offsets")),
+            "{:?}",
+            report.notes
+        );
     }
 
     #[test]

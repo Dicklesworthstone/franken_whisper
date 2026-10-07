@@ -298,14 +298,15 @@ request that passes none of them decodes byte-identically to the default
 | `--no-fallback` | ladder off; wins over every flag above |
 | `--no-speech-threshold X` | moves the silent-window gate only |
 | `--audio-ctx N` (N > 0) | fixed encoder context (`AudioCtxPolicy::fixed`); 0 = full window |
+| `--max-segment-length N` | whisper.cpp `-ml N` when no explicit word-timestamp params are given: 1 = one word per segment, N > 1 = segments of at most N characters regrouped at word boundaries (like `-ml N -sow`); whisper.cpp-native uses attention-DTW word times, insanely-fast-native interpolated ones; the diarization backend keeps engine segments and warns |
+| `--detect-language-only` | every native backend returns the detected language and its top-10 posterior with no transcript; downstream speaker stages skip |
 
 `FW_TEMP_FALLBACK` / `FW_TEMP_BEST_OF` / `FW_BEAM_SIZE` remain the process-wide
 operator hatches (`FW_TEMP_FALLBACK` only applies when the request makes no
 explicit choice). Flags the engine cannot honor — `--temperature > 0` (the
-first pass is greedy), `--max-segment-length`, `--detect-language-only`,
-`--carry-initial-prompt`, `--word-threshold`, `--suppress-regex` — are reported
-as run warnings (`native engine ignored unsupported option ...`) instead of
-being dropped silently. The CLI rejects non-finite thresholds, a negative
+first pass is greedy), `--carry-initial-prompt`, `--word-threshold`,
+`--suppress-regex` — are reported as run warnings (`native engine ignored
+unsupported option ...`) instead of being dropped silently. The CLI rejects non-finite thresholds, a negative
 `--temperature`, a `--temperature-increment` outside [0, 1], and `--best-of 0`.
 
 ## 7. Implementation Guidance
