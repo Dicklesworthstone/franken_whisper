@@ -1207,7 +1207,7 @@ franken_whisper transcribe [OPTIONS]
 | `--tiny-diarize` | `false` | Enable TinyDiarize (speaker-turn token injection) |
 | `--normalize-segment-text` | `false` | Opt in to rule-based segment-text normalization (sentence-casing + terminal periods); off by default so `segments[].text` stays byte-faithful to the transcript |
 | `--prompt <TEXT>` | — | Initial prompt to guide transcription style |
-| `--carry-initial-prompt` | `false` | Carry prompt across segments |
+| `--carry-initial-prompt` | `false` | Keep the prompt as a prefix of every 30 s window's context, not just the first |
 
 **Audio Windowing (whisper.cpp):**
 

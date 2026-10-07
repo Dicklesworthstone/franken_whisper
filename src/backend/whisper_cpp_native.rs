@@ -137,9 +137,141 @@ impl DtwProjectionReport {
 #[derive(Debug, Clone)]
 struct DtwSegmentsOutcome {
     segments: Vec<TranscriptionSegment>,
+    /// Engine segment each output unit came from (1:1 with `segments` unless
+    /// a `MaxLen` grouping merged units).
+    unit_source_segments: Vec<usize>,
     #[cfg(test)]
     canonical_units: Vec<CanonicalProjectionUnit>,
     report: DtwProjectionReport,
+}
+
+/// `raw_output` key of the [`DiarizationWordUnitPlan`].
+pub(crate) const DIARIZATION_WORD_UNITS_KEY: &str = "diarization_word_units";
+
+/// How the per-word units emitted only so native diarization can attribute
+/// speakers word by word map back onto the engine's own segments.
+///
+/// The caller did not ask for word-level output, so once speakers are
+/// attributed the orchestrator collapses the units back with [`Self::regroup`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DiarizationWordUnitPlan {
+    /// Number of word units the backend emitted.
+    pub(crate) units: usize,
+    /// One entry per engine segment that produced units, in order.
+    pub(crate) segments: Vec<EngineSegmentUnits>,
+}
+
+/// One engine segment and the contiguous word-unit range it produced.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EngineSegmentUnits {
+    pub(crate) unit_start: usize,
+    pub(crate) unit_end: usize,
+    pub(crate) start_sec: Option<f64>,
+    pub(crate) end_sec: Option<f64>,
+    pub(crate) text: String,
+}
+
+impl DiarizationWordUnitPlan {
+    /// Plan from the engine segments and each unit's source segment index;
+    /// `None` if an index does not name an engine segment.
+    fn new(
+        engine_segments: &[TranscriptionSegment],
+        unit_source_segments: &[usize],
+    ) -> Option<Self> {
+        let mut segments = Vec::new();
+        let mut unit_start = 0;
+        while let Some(&source) = unit_source_segments.get(unit_start) {
+            let run = unit_source_segments[unit_start..]
+                .iter()
+                .take_while(|&&index| index == source)
+                .count();
+            let engine = engine_segments.get(source)?;
+            segments.push(EngineSegmentUnits {
+                unit_start,
+                unit_end: unit_start + run,
+                start_sec: engine.start_sec,
+                end_sec: engine.end_sec,
+                text: engine.text.trim().to_owned(),
+            });
+            unit_start += run;
+        }
+        Some(Self {
+            units: unit_source_segments.len(),
+            segments,
+        })
+    }
+
+    /// Collapse speaker-attributed word units into the engine's segments,
+    /// split only where the attributed speaker changes. A run covering a whole
+    /// engine segment keeps that segment's text and timestamps; a split keeps
+    /// the engine bounds at the segment's outer edges and the word units'
+    /// times at the speaker change.
+    ///
+    /// Returns `None` (keep the units) when `units` no longer has the shape
+    /// this plan describes.
+    pub(crate) fn regroup(
+        &self,
+        units: &[TranscriptionSegment],
+    ) -> Option<Vec<TranscriptionSegment>> {
+        let mut expected_start = 0;
+        for segment in &self.segments {
+            if segment.unit_start != expected_start || segment.unit_end <= segment.unit_start {
+                return None;
+            }
+            expected_start = segment.unit_end;
+        }
+        if expected_start != self.units || units.len() != self.units {
+            return None;
+        }
+
+        let mut regrouped = Vec::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            let words = &units[segment.unit_start..segment.unit_end];
+            // Spaced scripts rejoin words with a space; unspaced ones do not.
+            let separator = if segment.text.contains(char::is_whitespace) {
+                " "
+            } else {
+                ""
+            };
+            let mut run_start = 0;
+            while run_start < words.len() {
+                let speaker = &words[run_start].speaker;
+                let run_end = run_start
+                    + words[run_start..]
+                        .iter()
+                        .take_while(|word| &word.speaker == speaker)
+                        .count();
+                let run = &words[run_start..run_end];
+                let whole = run_start == 0 && run_end == words.len();
+                let confidences: Vec<f64> = run.iter().filter_map(|word| word.confidence).collect();
+                regrouped.push(TranscriptionSegment {
+                    start_sec: if run_start == 0 {
+                        segment.start_sec
+                    } else {
+                        run[0].start_sec
+                    },
+                    end_sec: if run_end == words.len() {
+                        segment.end_sec
+                    } else {
+                        run[run.len() - 1].end_sec
+                    },
+                    text: if whole {
+                        segment.text.clone()
+                    } else {
+                        run.iter()
+                            .map(|word| word.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join(separator)
+                    },
+                    speaker: speaker.clone(),
+                    confidence: (!confidences.is_empty())
+                        .then(|| confidences.iter().sum::<f64>() / confidences.len() as f64),
+                });
+                run_start = run_end;
+            }
+        }
+        Some(regrouped)
+    }
 }
 
 /// Map the request's [`WordTimestampParams`] to a [`WordTimestampMode`].
@@ -424,6 +556,8 @@ fn decode_params(
             .prompt
             .clone()
             .filter(|p| !p.is_empty()),
+        // whisper `--carry-initial-prompt`: the prompt prefixes every window.
+        carry_initial_prompt: request.backend_params.carry_initial_prompt,
         // Beam width (whisper `--beam-size`): the engine beam-searches temp-0
         // windows when > 1; the decoder clamps to [1, 8]. None → greedy.
         beam_size: request
@@ -593,7 +727,7 @@ pub fn run(
         .word_timings
         .as_ref()
         .filter(|w| w.iter().any(|seg| !seg.is_empty()));
-    let (segments, dtw_projection) = if let Some(word_timings) = dtw_words {
+    let (segments, dtw_projection, word_unit_plan) = if let Some(word_timings) = dtw_words {
         let outcome = build_segments_dtw(
             &output.segments,
             word_timings,
@@ -601,7 +735,13 @@ pub fn run(
             request.backend_params.no_timestamps,
             token,
         )?;
-        (outcome.segments, Some(outcome.report))
+        // Word units the caller did not ask for exist only so diarization can
+        // attribute speakers per word; record how to collapse them afterwards.
+        let word_unit_plan = (word_mode == WordTimestampMode::None
+            && !request.backend_params.split_on_word)
+            .then(|| DiarizationWordUnitPlan::new(&output.segments, &outcome.unit_source_segments))
+            .flatten();
+        (outcome.segments, Some(outcome.report), word_unit_plan)
     } else {
         (
             build_segments(
@@ -611,6 +751,7 @@ pub fn run(
                 request.backend_params.no_timestamps,
                 token,
             )?,
+            None,
             None,
         )
     };
@@ -643,6 +784,9 @@ pub fn run(
             "encoder_route".to_owned(),
             json!(native_engine::encoder::last_encoder_route()),
         );
+        if let Some(plan) = word_unit_plan {
+            map.insert(DIARIZATION_WORD_UNITS_KEY.to_owned(), json!(plan));
+        }
     }
 
     Ok(TranscriptionResult {
@@ -786,6 +930,7 @@ fn build_segments_dtw(
 
     Ok(DtwSegmentsOutcome {
         segments,
+        unit_source_segments: normalized.unit_source_segments,
         #[cfg(test)]
         canonical_units: normalized.canonical_units,
         report,
@@ -1961,6 +2106,175 @@ mod tests {
         assert!(out[0].end_sec <= out[1].start_sec);
         assert_eq!(outcome.report.decoder_word_units, 2);
         assert!(outcome.report.word_aligned_safe);
+    }
+
+    fn timed_word(text: &str, start_sec: f64, end_sec: f64) -> WordTiming {
+        WordTiming {
+            text: text.to_owned(),
+            start_sec,
+            end_sec,
+        }
+    }
+
+    fn engine_segment(start: f64, end: f64, text: &str) -> TranscriptionSegment {
+        TranscriptionSegment {
+            start_sec: Some(start),
+            end_sec: Some(end),
+            text: text.to_owned(),
+            speaker: None,
+            confidence: Some(0.9),
+        }
+    }
+
+    /// Diarization-only DTW units for two engine segments, with the plan the
+    /// backend records for them.
+    fn diarization_units() -> (Vec<TranscriptionSegment>, DiarizationWordUnitPlan) {
+        let engine = vec![
+            engine_segment(0.0, 3.0, " ask not what your country"),
+            engine_segment(3.0, 5.0, " can do"),
+        ];
+        let timings = vec![
+            vec![
+                timed_word("ask", 0.1, 0.5),
+                timed_word("not", 0.5, 1.0),
+                timed_word("what", 1.2, 1.6),
+                timed_word("your", 1.6, 2.0),
+                timed_word("country", 2.0, 2.9),
+            ],
+            vec![timed_word("can", 3.1, 3.6), timed_word("do", 3.6, 4.8)],
+        ];
+        let outcome =
+            build_segments_dtw(&engine, &timings, WordTimestampMode::None, false, None).unwrap();
+        assert_eq!(outcome.unit_source_segments, vec![0, 0, 0, 0, 0, 1, 1]);
+        let plan =
+            DiarizationWordUnitPlan::new(&engine, &outcome.unit_source_segments).expect("plan");
+        (outcome.segments, plan)
+    }
+
+    fn label(units: &mut [TranscriptionSegment], speakers: &[Option<&str>]) {
+        for (unit, speaker) in units.iter_mut().zip(speakers) {
+            unit.speaker = speaker.map(str::to_owned);
+        }
+    }
+
+    #[test]
+    fn diarization_word_units_collapse_back_into_engine_segments() {
+        let (mut units, plan) = diarization_units();
+        assert_eq!(plan.units, 7);
+        assert_eq!(plan.segments.len(), 2);
+        assert_eq!(plan.segments[0].text, "ask not what your country");
+
+        let a = Some("SPEAKER_00");
+        label(&mut units, &[a, a, a, a, a, a, a]);
+        let regrouped = plan.regroup(&units).expect("regroup");
+        // One speaker throughout: the engine's own segments, text and times.
+        assert_eq!(regrouped.len(), 2);
+        assert_eq!(regrouped[0].text, "ask not what your country");
+        assert_eq!(
+            (regrouped[0].start_sec, regrouped[0].end_sec),
+            (Some(0.0), Some(3.0))
+        );
+        assert_eq!(regrouped[1].text, "can do");
+        assert_eq!(
+            (regrouped[1].start_sec, regrouped[1].end_sec),
+            (Some(3.0), Some(5.0))
+        );
+        assert!(regrouped.iter().all(|s| s.speaker.as_deref() == a));
+    }
+
+    #[test]
+    fn diarization_word_units_split_only_at_speaker_changes() {
+        let (mut units, plan) = diarization_units();
+        let (a, b) = (Some("SPEAKER_00"), Some("SPEAKER_01"));
+        label(&mut units, &[a, a, b, b, b, b, None]);
+        let regrouped = plan.regroup(&units).expect("regroup");
+        let shape: Vec<_> = regrouped
+            .iter()
+            .map(|s| {
+                (
+                    s.start_sec.unwrap(),
+                    s.end_sec.unwrap(),
+                    s.speaker.as_deref(),
+                    s.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                // Engine start, word-unit end at the speaker change.
+                (0.0, 1.0, a, "ask not"),
+                // Word-unit start at the change, engine end.
+                (1.2, 3.0, b, "what your country"),
+                (3.0, 3.6, b, "can"),
+                // Unattributed words stay unknown rather than inheriting.
+                (3.6, 5.0, None, "do"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diarization_word_units_keep_unspaced_scripts_unspaced() {
+        let engine = vec![engine_segment(0.0, 2.0, "你好世界")];
+        let timings = vec![vec![
+            timed_word("你好", 0.1, 0.9),
+            timed_word("世界", 0.9, 1.8),
+        ]];
+        let outcome =
+            build_segments_dtw(&engine, &timings, WordTimestampMode::None, false, None).unwrap();
+        let plan =
+            DiarizationWordUnitPlan::new(&engine, &outcome.unit_source_segments).expect("plan");
+        let mut units = outcome.segments;
+        label(&mut units, &[Some("SPEAKER_00"), Some("SPEAKER_01")]);
+        let regrouped = plan.regroup(&units).expect("regroup");
+        assert_eq!(regrouped[0].text, "你好");
+        assert_eq!(regrouped[1].text, "世界");
+    }
+
+    #[test]
+    fn diarization_word_unit_plan_refuses_a_changed_unit_list() {
+        let (units, plan) = diarization_units();
+        assert!(plan.regroup(&units[..6]).is_none(), "a unit went missing");
+        let mut torn = plan.clone();
+        torn.segments[1].unit_start = 4;
+        assert!(torn.regroup(&units).is_none(), "ranges must tile the units");
+        // An index that names no engine segment cannot form a plan.
+        assert!(DiarizationWordUnitPlan::new(&[], &[0]).is_none());
+    }
+
+    #[test]
+    fn regroup_applies_the_recorded_plan_once_and_updates_provenance() {
+        let (mut units, plan) = diarization_units();
+        let a = Some("SPEAKER_00");
+        label(&mut units, &[a, a, a, a, a, a, a]);
+        let mut result = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "ask not what your country can do".to_owned(),
+            language: Some("en".to_owned()),
+            segments: units,
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({
+                "projection_timeline": {"output_segments": 7},
+                DIARIZATION_WORD_UNITS_KEY: plan,
+            }),
+            artifact_paths: Vec::new(),
+        };
+        assert_eq!(
+            crate::backend::regroup_diarization_word_units(&mut result),
+            Some(7)
+        );
+        assert_eq!(result.segments.len(), 2);
+        assert_eq!(
+            result.raw_output["projection_timeline"]["output_segments"],
+            2
+        );
+        // The unit list no longer matches the plan, so a second pass is a no-op.
+        assert_eq!(
+            crate::backend::regroup_diarization_word_units(&mut result),
+            None
+        );
+        assert_eq!(result.segments.len(), 2);
     }
 
     #[test]

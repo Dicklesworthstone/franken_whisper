@@ -2104,6 +2104,23 @@ async fn run_pipeline_body(
         }
     }
 
+    // Word units that existed only for speaker attribution become the engine's
+    // segments again, split where the attributed speaker changes.
+    if let Some(result) = inter.result.as_mut()
+        && let Some(units) = backend::regroup_diarization_word_units(result)
+    {
+        if let Some(report) = result.diarization.as_mut() {
+            report.speaker_segments =
+                diarization::build_speaker_attributed_segments(&result.segments, &report.turns);
+        }
+        log.push(
+            "orchestration",
+            "orchestration.segments_regrouped",
+            "collapsed diarization word units into speaker-split segments",
+            json!({"word_units": units, "segments": result.segments.len()}),
+        );
+    }
+
     // Emit tail-latency decomposition artifacts and deterministic budget-tuning
     // guidance derived from observed stage timings for this run.
     let latency_profile = stage_latency_profile(&log.events, stage_budgets);
@@ -3172,8 +3189,10 @@ async fn execute_accelerate(
                 return Err(error);
             }
         };
+    // Acceleration notes describe the (only, deterministic CPU) normalization
+    // that ran; they live on `result.acceleration` and the stage event, not in
+    // run warnings.
     inter.result = Some(updated_result);
-    inter.warnings.extend(acceleration.notes.iter().cloned());
 
     let stream_owner_id =
         acceleration_stream_owner_id(trace_id_str, request, acceleration.backend.as_str());
@@ -3594,10 +3613,9 @@ fn align_transcription_result(
             method: "dtw_attention",
             energy_valley_snaps: 0,
             energy_evidence_available: false,
-            notes: vec![
-                "preserved authoritative canonical DTW projection timeline; character-density fallback skipped"
-                    .to_owned(),
-            ],
+            // Notes become run warnings; the method already names this
+            // normal outcome.
+            notes: Vec::new(),
         });
     }
 
@@ -3616,8 +3634,6 @@ fn align_transcription_result(
             method: "native_timestamp_tokens",
             energy_valley_snaps: 0,
             energy_evidence_available: false,
-            // The method names the outcome; a note would surface as a run
-            // warning on every default native run.
             notes: Vec::new(),
         }
     } else {
@@ -3641,29 +3657,34 @@ fn align_transcription_result(
     Ok(report)
 }
 
+/// The energy-valley profile for alignment, or why it is unavailable (the
+/// reason becomes a run warning; availability is the normal case and is
+/// recorded in the align payload's `energy_evidence_available`).
 fn load_energy_valley_evidence(
     normalized_wav: Option<&Path>,
     token: &CancellationToken,
-) -> FwResult<(Option<backend::native_audio::EnergyValleyProfile>, String)> {
+) -> FwResult<(
+    Option<backend::native_audio::EnergyValleyProfile>,
+    Option<String>,
+)> {
     token.checkpoint()?;
     match normalized_wav {
         Some(path) => match backend::native_audio::energy_valleys_from_wav(path, token) {
-            Ok(profile) => Ok((
-                Some(profile),
-                "native frame-RMS energy evidence available".to_owned(),
-            )),
+            Ok(profile) => Ok((Some(profile), None)),
             Err(error @ (FwError::Cancelled(_) | FwError::StageTimeout { .. })) => Err(error),
             Err(error) => Ok((
                 None,
-                format!(
+                Some(format!(
                     "normalized PCM energy evidence unavailable ({error}); energy-valley snapping failed closed"
-                ),
+                )),
             )),
         },
         None => Ok((
             None,
-            "normalized PCM energy evidence was not produced; energy-valley snapping failed closed"
-                .to_owned(),
+            Some(
+                "normalized PCM energy evidence was not produced; energy-valley snapping failed closed"
+                    .to_owned(),
+            ),
         )),
     }
 }
@@ -3698,19 +3719,15 @@ async fn execute_align(
     let audio_duration = inter.normalized_duration;
     let normalized_wav = inter.normalized_wav.clone();
 
-    let (updated_result, report) = match run_stage_with_budget(
-        "align",
-        align_budget_ms,
-        move || {
+    let (updated_result, report) =
+        match run_stage_with_budget("align", align_budget_ms, move || {
             let config = AlignConfig::default();
             align_token.checkpoint()?;
             let canonical_dtw = has_canonical_word_alignment(&result.raw_output);
+            // Canonical DTW geometry is preserved byte-exact, so no
+            // energy-valley refinement is attempted for it.
             let (energy_valleys, energy_evidence_note) = if canonical_dtw {
-                (
-                    None,
-                    "authoritative canonical DTW geometry preserved byte-exact; energy-valley refinement not attempted"
-                        .to_owned(),
-                )
+                (None, None)
             } else {
                 load_energy_valley_evidence(normalized_wav.as_deref(), &align_token)?
             };
@@ -3721,26 +3738,25 @@ async fn execute_align(
                 energy_valleys.as_ref(),
                 &align_token,
             )?;
-            report.notes.push(energy_evidence_note);
+            report.notes.extend(energy_evidence_note);
             align_token.checkpoint()?;
             Ok((result, report))
-        },
-    ) {
-        Ok(output) => output,
-        Err(error) => {
-            let code = stage_failure_code("align", &error);
-            log.push(
-                "align",
-                &code,
-                stage_failure_message(&error, "alignment stage failed"),
-                json!({
-                    "error": error.to_string(),
-                    "budget_ms": stage_budgets.align_ms,
-                }),
-            );
-            return Err(error);
-        }
-    };
+        }) {
+            Ok(output) => output,
+            Err(error) => {
+                let code = stage_failure_code("align", &error);
+                log.push(
+                    "align",
+                    &code,
+                    stage_failure_message(&error, "alignment stage failed"),
+                    json!({
+                        "error": error.to_string(),
+                        "budget_ms": stage_budgets.align_ms,
+                    }),
+                );
+                return Err(error);
+            }
+        };
 
     inter.result = Some(updated_result);
     inter.warnings.extend(report.notes.iter().cloned());
@@ -12927,11 +12943,11 @@ mod tests {
         assert_eq!(report.segments_fallback, 2);
         assert_eq!(report.energy_valley_snaps, 0);
         assert!(!report.energy_evidence_available);
+        assert_eq!(report.method, "dtw_attention");
         assert!(
-            report
-                .notes
-                .iter()
-                .any(|note| note.contains("canonical DTW"))
+            report.notes.is_empty(),
+            "the normal canonical path raises no run warning: {:?}",
+            report.notes
         );
         assert_eq!(
             serde_json::to_value(&result.segments).expect("serialize preserved segments"),
@@ -13164,6 +13180,7 @@ mod tests {
         let (profile, absent_reason) = load_energy_valley_evidence(None, &token)
             .expect("missing normalized audio is nonfatal");
         assert!(profile.is_none());
+        let absent_reason = absent_reason.expect("absence is explained");
         assert!(absent_reason.contains("was not produced"));
         assert!(absent_reason.contains("failed closed"));
 
@@ -13172,6 +13189,7 @@ mod tests {
         let (profile, error_reason) = load_energy_valley_evidence(Some(&missing), &token)
             .expect("unreadable normalized audio is nonfatal evidence absence");
         assert!(profile.is_none());
+        let error_reason = error_reason.expect("failure is explained");
         assert!(error_reason.contains("energy evidence unavailable"));
         assert!(error_reason.contains("i/o failure"));
         assert!(error_reason.contains("failed closed"));

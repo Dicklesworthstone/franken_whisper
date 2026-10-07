@@ -116,6 +116,7 @@ fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
             .prompt
             .clone()
             .filter(|p| !p.is_empty()),
+        carry_initial_prompt: request.backend_params.carry_initial_prompt,
         beam_size: request
             .backend_params
             .decoding

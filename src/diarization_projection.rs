@@ -95,6 +95,8 @@ impl CanonicalProjectionUnit {
 #[derive(Debug, Clone)]
 pub(crate) struct DtwProjectionNormalization {
     pub(crate) segments: Vec<TranscriptionSegment>,
+    /// Engine segment each unit in `segments` came from (same length, ascending).
+    pub(crate) unit_source_segments: Vec<usize>,
     #[cfg(test)]
     pub(crate) canonical_units: Vec<CanonicalProjectionUnit>,
     pub(crate) input_timed_segments: usize,
@@ -242,9 +244,14 @@ where
         .iter()
         .map(CanonicalProjectionUnit::as_segment)
         .collect();
+    let unit_source_segments = canonical_units
+        .iter()
+        .map(|unit| unit.source_segment_index)
+        .collect();
 
     Ok(DtwProjectionNormalization {
         segments,
+        unit_source_segments,
         #[cfg(test)]
         canonical_units,
         input_timed_segments,

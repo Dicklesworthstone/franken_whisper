@@ -250,6 +250,12 @@ pub struct DecodeParams {
     /// `FW_INITIAL_PROMPT` env var overrides this field when set (a dev/testing
     /// hatch, mirroring the other `FW_*` gates).
     pub initial_prompt: Option<String>,
+    /// Keep the initial prompt in every window's carried context (whisper
+    /// `--carry-initial-prompt`, whisper.cpp `prompt_past0`): its last
+    /// `max(1, max_prompt_ctx - 1)` tokens prefix each carried prompt and the
+    /// rolling decoded context fills the remaining budget. `false` (default)
+    /// seeds only the first window, byte-identical to before.
+    pub carry_initial_prompt: bool,
     /// Beam width for temperature-0 decoding (whisper `--beam-size`). `None` or
     /// `Some(1)` = greedy (byte-identical default); `Some(n)` keeps the `n` best
     /// hypotheses per step and selects the best length-normalized sequence score.
@@ -972,6 +978,44 @@ fn seeded_prompt_past(prompt: Option<&str>, tokenizer: &Tokenizer) -> Vec<i32> {
         Some(p) if !p.is_empty() => tokenizer.encode(p),
         _ => Vec::new(),
     }
+}
+
+/// Split the seeded user-prompt tokens into the static carried prefix
+/// (whisper.cpp `prompt_past0`) and the initial rolling context
+/// (`prompt_past1`). Without `carry_initial_prompt` the prompt is only the
+/// first window's rolling context; with it, the prompt's last
+/// `max(1, max_prompt_ctx - 1)` tokens become the static prefix
+/// (whisper.cpp 6919-6932) and the rolling context starts empty.
+fn split_carried_prompt(
+    prompt_tokens: Vec<i32>,
+    params: &DecodeParams,
+    max_prompt_ctx: usize,
+) -> (Vec<i32>, Vec<i32>) {
+    if !params.carry_initial_prompt || prompt_tokens.is_empty() {
+        return (Vec::new(), prompt_tokens);
+    }
+    let keep = max_prompt_ctx.saturating_sub(1).max(1);
+    let start = prompt_tokens.len().saturating_sub(keep);
+    (prompt_tokens[start..].to_vec(), Vec::new())
+}
+
+/// The carried part of a window prompt: `[sot_prev, static…, rolling tail…]`
+/// where the rolling tail fills what the static prefix leaves of the
+/// `max_prompt_ctx` budget (whisper.cpp 7085-7104).
+fn carried_prompt_tokens(
+    sot_prev: i32,
+    prompt_static: &[i32],
+    prompt_past: &[i32],
+    max_prompt_ctx: usize,
+) -> Vec<i32> {
+    let take = prompt_past
+        .len()
+        .min(max_prompt_ctx.saturating_sub(1 + prompt_static.len()));
+    let mut carried = Vec::with_capacity(1 + prompt_static.len() + take);
+    carried.push(sot_prev);
+    carried.extend_from_slice(prompt_static);
+    carried.extend_from_slice(&prompt_past[prompt_past.len() - take..]);
+    carried
 }
 
 /// Default-OFF: on a window that fails to close any timestamp (`result_len == 0`,
@@ -2973,8 +3017,16 @@ fn transcribe_samples_uncached(
     // it when set (dev/testing hatch). Its tokens are carried as previous context
     // on the first window and age out via the max_prompt_ctx truncation as decoded
     // text accumulates. Unset → no-op (byte-identical default).
-    let prompt = initial_prompt_from_env().or(params.initial_prompt.as_deref());
-    let mut prompt_past: Vec<i32> = seeded_prompt_past(prompt, &m.tokenizer);
+    //
+    // `carry_initial_prompt` instead keeps the prompt as a static prefix of
+    // every carried prompt (whisper.cpp prompt_past0), so the rolling context
+    // starts empty.
+    let user_prompt = initial_prompt_from_env().or(params.initial_prompt.as_deref());
+    let (mut prompt_static, mut prompt_past) = split_carried_prompt(
+        seeded_prompt_past(user_prompt, &m.tokenizer),
+        params,
+        max_prompt_ctx,
+    );
 
     // Beam width (whisper `--beam-size`): field or FW_BEAM_SIZE override, resolved
     // once. 1 = greedy (byte-identical default).
@@ -3252,6 +3304,7 @@ fn transcribe_samples_uncached(
             // non-first window with under 5 s of audio left drops the carried prompt
             // to avoid repetition/hallucination on the tail.
             if should_clear_short_tail_prompt(seek_cs, seek_end_cs) {
+                prompt_static.clear();
                 prompt_past.clear();
             }
 
@@ -3267,17 +3320,26 @@ fn transcribe_samples_uncached(
             // (whisper.cpp `no_context` / `--no-context`; bd-r0qd escape hatch,
             // `FW_NO_CONTEXT=1`), the tiny.en segment-TS policy suppresses window
             // 2+ carry, this is a failed-window retry (`force_empty_prompt`), or a
-            // FW_TEMP_FALLBACK attempt above the prompt-reset temperature.
+            // FW_TEMP_FALLBACK attempt above the prompt-reset temperature. The
+            // tiny.en policy drops only the rolling decoded context: a carried
+            // user prompt (`carry_initial_prompt`) still prefixes the window.
+            let rolling_context: &[i32] = if suppress_tiny_en_ts_context && seek_cs > 0 {
+                &[]
+            } else {
+                &prompt_past
+            };
             let prompt_carried = !condition_on_prev_disabled()
                 && !force_empty_prompt
                 && window_temp <= TEMP_PROMPT_RESET
-                && !prompt_past.is_empty()
-                && max_prompt_ctx > 1
-                && !(suppress_tiny_en_ts_context && seek_cs > 0);
+                && (!rolling_context.is_empty() || !prompt_static.is_empty())
+                && max_prompt_ctx > 1;
             if prompt_carried {
-                prompt.push(tk.sot_prev);
-                let take = prompt_past.len().min(max_prompt_ctx.saturating_sub(1));
-                prompt.extend_from_slice(&prompt_past[prompt_past.len() - take..]);
+                prompt = carried_prompt_tokens(
+                    tk.sot_prev,
+                    &prompt_static,
+                    rolling_context,
+                    max_prompt_ctx,
+                );
             }
             prompt.extend_from_slice(&sot_seq);
 
@@ -6801,6 +6863,58 @@ mod tests {
             BEAM_PUNCTUATION_VARIANTS.contains(&beam.as_str()),
             "beam=5 produced an unreviewed punctuation variant: {beam}"
         );
+    }
+
+    #[test]
+    fn carried_prompt_is_a_static_prefix_only_when_requested() {
+        let tokens = vec![10, 11, 12, 13, 14];
+        let mut params = DecodeParams::default();
+        // Default: the prompt is only the first window's rolling context.
+        assert_eq!(
+            split_carried_prompt(tokens.clone(), &params, 224),
+            (Vec::new(), tokens.clone())
+        );
+        params.carry_initial_prompt = true;
+        assert_eq!(
+            split_carried_prompt(tokens.clone(), &params, 224),
+            (tokens.clone(), Vec::new())
+        );
+        // whisper.cpp keeps the prompt's LAST max(1, ctx - 1) tokens.
+        assert_eq!(
+            split_carried_prompt(tokens.clone(), &params, 4),
+            (vec![12, 13, 14], Vec::new())
+        );
+        assert_eq!(
+            split_carried_prompt(tokens, &params, 1),
+            (vec![14], Vec::new())
+        );
+        assert_eq!(
+            split_carried_prompt(Vec::new(), &params, 224),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn carried_prompt_fills_the_budget_left_by_the_static_prefix() {
+        const PREV: i32 = 50_360;
+        let rolling = [1, 2, 3, 4, 5, 6];
+        // No static prefix: [prev] + the rolling tail within ctx - 1 tokens,
+        // exactly the historical uncarried layout.
+        assert_eq!(
+            carried_prompt_tokens(PREV, &[], &rolling, 4),
+            vec![PREV, 4, 5, 6]
+        );
+        // The static prefix comes first and shrinks the rolling share.
+        assert_eq!(
+            carried_prompt_tokens(PREV, &[90, 91], &rolling, 6),
+            vec![PREV, 90, 91, 4, 5, 6]
+        );
+        // A prefix that fills the budget leaves no rolling tokens.
+        assert_eq!(
+            carried_prompt_tokens(PREV, &[90, 91, 92], &rolling, 4),
+            vec![PREV, 90, 91, 92]
+        );
+        assert_eq!(carried_prompt_tokens(PREV, &[90], &[], 224), vec![PREV, 90]);
     }
 
     #[test]

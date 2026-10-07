@@ -1554,9 +1554,6 @@ pub(crate) fn native_ignored_option_warnings(
     {
         ignored.push("--timestamp-level word");
     }
-    if backend_params.carry_initial_prompt {
-        ignored.push("--carry-initial-prompt");
-    }
     if backend_params.word_threshold.is_some() {
         ignored.push("--word-threshold");
     }
@@ -1639,6 +1636,35 @@ pub(crate) fn tag_audio_window(
         tag["empty_slice"] = Value::Bool(true);
     }
     map.insert("audio_window".to_owned(), tag);
+}
+
+/// Collapse the per-word units whisper.cpp-native emitted only so native
+/// diarization could attribute speakers word by word back into the engine's
+/// segments, split where the attributed speaker changes. Returns the number of
+/// word units collapsed, or `None` when the result carries no applicable plan.
+pub(crate) fn regroup_diarization_word_units(result: &mut TranscriptionResult) -> Option<usize> {
+    let plan = result
+        .raw_output
+        .get(whisper_cpp_native::DIARIZATION_WORD_UNITS_KEY)
+        .cloned()
+        .and_then(|plan| {
+            serde_json::from_value::<whisper_cpp_native::DiarizationWordUnitPlan>(plan).ok()
+        })?;
+    let segments = plan.regroup(&result.segments)?;
+    let units = result.segments.len();
+    result.segments = segments;
+    // Keep the projection provenance truthful about what the run outputs.
+    if let Some(timeline) = result
+        .raw_output
+        .get_mut("projection_timeline")
+        .and_then(Value::as_object_mut)
+    {
+        timeline.insert(
+            "output_segments".to_owned(),
+            Value::from(result.segments.len()),
+        );
+    }
+    Some(units)
 }
 
 /// Shift every emitted timestamp in a decode output by a uniform offset,

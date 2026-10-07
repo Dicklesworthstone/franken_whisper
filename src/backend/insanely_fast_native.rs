@@ -281,9 +281,16 @@ fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> deco
         language: request.language.clone(),
         translate: request.translate,
         // Beam width (`--beam-size`) is a per-window decode param, so it applies
-        // correctly within every range. `initial_prompt` is NOT set here: these
-        // params are shared by every range, and a prompt must seed only the
-        // clip's first window (see [`first_range_params`]).
+        // correctly within every range. These params are shared by every range,
+        // so they carry the prompt only when it prefixes every window
+        // (`--carry-initial-prompt`); otherwise it seeds only the clip's first
+        // window (see [`first_range_params`]).
+        initial_prompt: request
+            .backend_params
+            .prompt
+            .clone()
+            .filter(|prompt| !prompt.is_empty() && request.backend_params.carry_initial_prompt),
+        carry_initial_prompt: request.backend_params.carry_initial_prompt,
         beam_size: request
             .backend_params
             .decoding
@@ -844,6 +851,14 @@ mod tests {
         // An empty prompt is no prompt.
         req.backend_params.prompt = Some(String::new());
         assert_eq!(first_range_params(&shared, &req), shared);
+
+        // A carried prompt prefixes every window of every range.
+        req.backend_params.prompt = Some("domain terms".to_owned());
+        req.backend_params.carry_initial_prompt = true;
+        let carried = decode_params(&req, 4);
+        assert!(carried.carry_initial_prompt);
+        assert_eq!(carried.initial_prompt.as_deref(), Some("domain terms"));
+        assert_eq!(first_range_params(&carried, &req), carried);
     }
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {

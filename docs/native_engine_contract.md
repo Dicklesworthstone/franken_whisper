@@ -300,12 +300,15 @@ request that passes none of them decodes byte-identically to the default
 | `--audio-ctx N` (N > 0) | fixed encoder context (`AudioCtxPolicy::fixed`); 0 = full window |
 | `--max-segment-length N` | whisper.cpp `-ml N` when no explicit word-timestamp params are given: 1 = one word per segment, N > 1 = segments of at most N characters regrouped at word boundaries (like `-ml N -sow`); whisper.cpp-native uses attention-DTW word times, insanely-fast-native interpolated ones; the diarization backend keeps engine segments and warns |
 | `--detect-language-only` | every native backend returns the detected language and its top-10 posterior with no transcript; downstream speaker stages skip |
+| `--prompt TEXT` | seeds the first window's carried context (insanely-fast-native: the range starting at window 0) |
+| `--carry-initial-prompt` | `DecodeParams::carry_initial_prompt`: the prompt's last `max(1, ctx - 1)` tokens prefix every window's carried prompt and the rolling decoded context fills the rest (whisper.cpp `prompt_past0`); the short-tail clear drops both, and tiny.en's segment-timestamp policy drops only the rolling part |
+| `--timestamp-level word` | one segment per word on whisper.cpp-native and insanely-fast-native; the diarization backend keeps engine segments and warns |
 
 `FW_TEMP_FALLBACK` / `FW_TEMP_BEST_OF` / `FW_BEAM_SIZE` remain the process-wide
 operator hatches (`FW_TEMP_FALLBACK` only applies when the request makes no
 explicit choice). Flags the engine cannot honor — `--temperature > 0` (the
-first pass is greedy), `--carry-initial-prompt`, `--word-threshold`,
-`--suppress-regex` — are reported as run warnings (`native engine ignored
+first pass is greedy), `--word-threshold`, `--suppress-regex` — are reported
+as run warnings (`native engine ignored
 unsupported option ...`) instead of being dropped silently. The CLI rejects non-finite thresholds, a negative
 `--temperature`, a `--temperature-increment` outside [0, 1], and `--best-of 0`.
 
@@ -446,7 +449,8 @@ never on additive fields.
 | `dropped_windows` | array | Long-form windows discarded with no transcript output (see §9.4, bd-nqzf). Empty on healthy runs. |
 | `decode_work` | object | Recovery counters: `prompt_reset_retries`, `temperature_fallback_retries`. |
 | `word_timestamps` | string | `"dtw"` (real cross-attention DTW alignment, bd-rjsx), `"interpolated"` (segment-proportional), or `"none"`. |
-| `audio_window` | object *(optional)* | Present only on `--offset-ms`/`--duration-ms` runs: `offset_ms`, `duration_ms`, `timebase: "source"` (bd-vgod). Timestamps stay in the source-file timebase. |
+| `audio_window` | object *(optional)* | Present only on `--offset-ms`/`--duration-ms` runs: `offset_ms`, `duration_ms`, `timebase: "source"` (bd-vgod). Timestamps stay in the source-file timebase. All three native backends honor the window. |
+| `diarization_word_units` | object *(optional)* | Present when DTW word units were produced only for native diarization (no word-level output requested): `units` and, per engine segment, `unit_start`/`unit_end`/`start_sec`/`end_sec`/`text`. After diarization the orchestrator collapses the units back into the engine's segments, split only where the attributed speaker changes (event `orchestration.segments_regrouped`); `projection_timeline.output_segments` then counts the regrouped segments. |
 
 ### 9.2 `encoder_int8_policy` object
 
