@@ -1464,13 +1464,54 @@ pub(crate) fn apply_native_decode_controls(
     }
 }
 
+/// How many of the most probable languages a detection result reports.
+const DETECTED_LANGUAGE_TOP_K: usize = 10;
+
+/// The native `--detect-language-only` result (whisper `--detect-language`):
+/// no transcript or segments, the detected language, and the top of the
+/// language posterior in `raw_output`. Shared by every native backend.
+pub(crate) fn native_language_detection_result(
+    backend: BackendKind,
+    engine: &str,
+    spec: &str,
+    detection: &native_engine::decode::LanguageDetection,
+) -> TranscriptionResult {
+    let probabilities: Vec<Value> = detection
+        .probabilities
+        .iter()
+        .take(DETECTED_LANGUAGE_TOP_K)
+        .map(|(language, probability)| {
+            serde_json::json!({ "language": language, "probability": probability })
+        })
+        .collect();
+    TranscriptionResult {
+        backend,
+        transcript: String::new(),
+        language: Some(detection.language.clone()),
+        segments: Vec::new(),
+        acceleration: None,
+        diarization: None,
+        raw_output: serde_json::json!({
+            "engine": engine,
+            "schema_version": "native-v2",
+            "in_process": true,
+            "implementation": "real-inference",
+            "model": spec,
+            "detect_language_only": true,
+            "language": detection.language,
+            "multilingual_model": detection.multilingual,
+            "language_probabilities": probabilities,
+            "windows": [],
+            "word_timestamps": "none",
+        }),
+        artifact_paths: Vec::new(),
+    }
+}
+
 /// Request options the in-process engine cannot honor, as run warnings (so a
 /// whisper.cpp flag never silently does nothing on the default native path).
 #[must_use]
-pub(crate) fn native_ignored_option_warnings(
-    request: &TranscribeRequest,
-    resolved: BackendKind,
-) -> Vec<String> {
+pub(crate) fn native_ignored_option_warnings(request: &TranscribeRequest) -> Vec<String> {
     let backend_params = &request.backend_params;
     let decoding = backend_params.decoding.as_ref();
     let mut ignored = Vec::new();
@@ -1482,10 +1523,6 @@ pub(crate) fn native_ignored_option_warnings(
     }
     if decoding.and_then(|d| d.max_segment_length).is_some() {
         ignored.push("--max-segment-length");
-    }
-    // The whisper.cpp-native backend implements language-only detection.
-    if backend_params.detect_language_only && resolved != BackendKind::WhisperCpp {
-        ignored.push("--detect-language-only");
     }
     if backend_params.carry_initial_prompt {
         ignored.push("--carry-initial-prompt");

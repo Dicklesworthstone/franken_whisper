@@ -676,7 +676,12 @@ The bounded hint file can be a bare interval array or this versioned form:
 
 `fw pull` is restartable across verified per-file cache hits, cooperative under
 Ctrl+C, and never emits cache paths in JSON mode. The installer invokes
-`fw pull all` by default; inference stays offline. The focused diarization command
+`fw pull all` by default; inference stays offline. Behind a TLS-inspecting
+proxy, point `FRANKEN_WHISPER_CA_BUNDLE` (or the conventional `SSL_CERT_FILE`)
+at a PEM bundle to add its roots; every artifact stays pinned to its SHA-256
+digest and size, so an added root cannot change which bytes are accepted. An
+unusable `FRANKEN_WHISPER_CA_BUNDLE` is an error; an unusable `SSL_CERT_FILE`
+is logged and ignored. The focused diarization command
 rehashes the cached package and conversion receipt, runs completely offline,
 and emits one path-free `sortformer-diarization-v1` object with turns, inferred
 active-lane count, timing, and the candid capacity status

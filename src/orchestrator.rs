@@ -2575,10 +2575,7 @@ async fn execute_backend(
     if execution.implementation == backend::BackendImplementation::Native {
         inter
             .warnings
-            .extend(backend::native_ignored_option_warnings(
-                request,
-                execution.result.backend,
-            ));
+            .extend(backend::native_ignored_option_warnings(request));
     }
     let backend_output_sha256 = match sha256_json_value(&execution.result.raw_output) {
         Ok(hash) => Some(hash),

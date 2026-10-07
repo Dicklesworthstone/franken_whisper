@@ -266,6 +266,17 @@ pub fn run(
         tok.checkpoint()?;
     }
 
+    // `--detect-language-only`: report the language without decoding text.
+    if request.backend_params.detect_language_only {
+        let detection = model.detect_language(&samples, &checkpoint)?;
+        return Ok(super::native_language_detection_result(
+            BackendKind::WhisperDiarization,
+            "whisper-diarization-native",
+            &spec,
+            &detection,
+        ));
+    }
+
     // Real ASR: the engine decides what (and when) words were spoken.
     let params = decode_params(request);
     let output = model.transcribe(&samples, &params, &checkpoint)?;
@@ -555,9 +566,7 @@ mod tests {
     fn native_reports_whisper_cpp_options_it_cannot_honor() {
         use crate::model::DecodingParams;
 
-        let warnings_for = |req: &TranscribeRequest| {
-            super::super::native_ignored_option_warnings(req, BackendKind::WhisperDiarization)
-        };
+        let warnings_for = super::super::native_ignored_option_warnings;
         assert!(warnings_for(&request()).is_empty());
         let mut req = request();
         req.backend_params.decoding = Some(DecodingParams {
@@ -573,27 +582,21 @@ mod tests {
             max_segment_length: Some(40),
             ..DecodingParams::default()
         });
+        // Every native backend implements language-only detection.
         req.backend_params.detect_language_only = true;
         req.backend_params.suppress_regex = Some("[0-9]".to_owned());
-        // The whisper.cpp-native backend implements language-only detection.
-        let whisper_cpp_warnings =
-            super::super::native_ignored_option_warnings(&req, BackendKind::WhisperCpp);
-        assert_eq!(whisper_cpp_warnings.len(), 3, "{whisper_cpp_warnings:?}");
-        assert!(
-            !whisper_cpp_warnings
-                .iter()
-                .any(|w| w.contains("--detect-language-only"))
-        );
         let warnings = warnings_for(&req);
-        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(
             warnings
                 .iter()
                 .all(|w| w.starts_with("native engine ignored"))
         );
         assert!(warnings.iter().any(|w| w.contains("--temperature")));
+        assert!(warnings.iter().any(|w| w.contains("--max-segment-length")));
+        assert!(warnings.iter().any(|w| w.contains("--suppress-regex")));
         assert!(
-            warnings
+            !warnings
                 .iter()
                 .any(|w| w.contains("--detect-language-only"))
         );

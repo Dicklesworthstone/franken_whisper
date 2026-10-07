@@ -388,6 +388,17 @@ pub fn run(
         tok.checkpoint()?;
     }
 
+    // `--detect-language-only`: report the language without decoding text.
+    if request.backend_params.detect_language_only {
+        let detection = model.detect_language(&samples, &checkpoint)?;
+        return Ok(super::native_language_detection_result(
+            BackendKind::InsanelyFast,
+            "insanely-fast-native",
+            &spec,
+            &detection,
+        ));
+    }
+
     // Size the worker pool from the 30 s-window count, then partition the clip
     // into that many CONTIGUOUS, 30 s-aligned ranges (one per worker).
     let win_count = n_windows(&samples);

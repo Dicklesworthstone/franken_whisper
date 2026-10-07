@@ -901,11 +901,70 @@ impl std::fmt::Display for DownloadError {
     }
 }
 
-fn streaming_client() -> Client {
-    Client::builder()
+/// PEM bundle of extra trust anchors for model downloads. `SSL_CERT_FILE` is
+/// honored as the conventional fallback. Every artifact is pinned to a
+/// SHA-256 digest and size, so an added root cannot change which bytes are
+/// accepted; it only lets a TLS-inspecting proxy's certificate chain verify.
+const CA_BUNDLE_ENV: &str = "FRANKEN_WHISPER_CA_BUNDLE";
+
+/// Upper bound on a CA bundle read (system bundles are ~200 KiB).
+const MAX_CA_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The configured CA bundle path, if any: [`CA_BUNDLE_ENV`], else
+/// `SSL_CERT_FILE`. Empty values count as unset.
+fn configured_ca_bundle() -> Option<(&'static str, PathBuf)> {
+    [CA_BUNDLE_ENV, "SSL_CERT_FILE"]
+        .into_iter()
+        .find_map(|name| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .map(|value| (name, PathBuf::from(value)))
+        })
+}
+
+/// Load every certificate of a PEM bundle, failing loudly: a configured
+/// bundle that cannot be used must not silently fall back to the built-in
+/// roots (the download would then fail with an opaque TLS error).
+fn load_ca_bundle(variable: &str, path: &Path) -> FwResult<Vec<asupersync::tls::Certificate>> {
+    let unusable = |detail: String| {
+        FwError::InvalidRequest(format!(
+            "{variable}={} is not a usable PEM CA bundle: {detail}",
+            path.display()
+        ))
+    };
+    let mut pem = Vec::new();
+    File::open(path)
+        .map_err(|error| unusable(error.to_string()))?
+        .take(MAX_CA_BUNDLE_BYTES + 1)
+        .read_to_end(&mut pem)
+        .map_err(|error| unusable(error.to_string()))?;
+    if pem.len() as u64 > MAX_CA_BUNDLE_BYTES {
+        return Err(unusable(format!("larger than {MAX_CA_BUNDLE_BYTES} bytes")));
+    }
+    asupersync::tls::Certificate::from_pem(&pem).map_err(|error| unusable(error.to_string()))
+}
+
+fn streaming_client() -> FwResult<Client> {
+    let mut builder = Client::builder()
         .max_body_size(MAX_HTTP_BODY_BYTES)
-        .request_timeout(DOWNLOAD_REQUEST_TIMEOUT)
-        .build()
+        .request_timeout(DOWNLOAD_REQUEST_TIMEOUT);
+    if let Some((variable, path)) = configured_ca_bundle() {
+        match load_ca_bundle(variable, &path) {
+            Ok(certificates) => {
+                for certificate in certificates {
+                    builder = builder.add_root_certificate(certificate);
+                }
+            }
+            // The fw-specific variable is an explicit request: fail loudly.
+            Err(error) if variable == CA_BUNDLE_ENV => return Err(error),
+            // A stale generic SSL_CERT_FILE (set for other tools) must not
+            // break downloads that the built-in roots can verify.
+            Err(error) => {
+                tracing::warn!(%error, "ignoring unusable SSL_CERT_FILE for model downloads");
+            }
+        }
+    }
+    Ok(builder.build())
 }
 
 async fn stream_url<F, S>(
@@ -1064,7 +1123,7 @@ async fn download_remote_file<F>(
 where
     F: Fn() -> bool + Sync,
 {
-    let client = streaming_client();
+    let client = streaming_client()?;
     let mut hash = Sha256::new();
     let mut received = 0_u64;
     let cx = Cx::current().ok_or_else(|| {
@@ -1683,6 +1742,36 @@ mod tests {
             "2efddd2d681136ddede12497e67caf4cf2444f15de824ee671ebbc93fe276d13"
         );
         assert!(String::from_utf8_lossy(notice).contains(SORTFORMER_REQUIRED_NOTICE));
+    }
+
+    #[test]
+    fn ca_bundle_loads_every_pem_certificate_and_fails_loudly_otherwise() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("proxy-ca.pem");
+        // Two PEM blocks (the loader extracts DER; X.509 validation happens
+        // in the TLS handshake, not here).
+        std::fs::write(
+            &bundle,
+            "-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n\
+             -----BEGIN CERTIFICATE-----\nAwQF\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write bundle");
+        assert_eq!(
+            load_ca_bundle(CA_BUNDLE_ENV, &bundle)
+                .expect("valid bundle")
+                .len(),
+            2
+        );
+
+        let not_pem = dir.path().join("not-a-bundle.txt");
+        std::fs::write(&not_pem, "plain text, no certificates").expect("write");
+        let missing = dir.path().join("missing.pem");
+        for path in [&not_pem, &missing] {
+            let error = load_ca_bundle("SSL_CERT_FILE", path).expect_err("unusable bundle");
+            let message = error.to_string();
+            assert!(message.contains("SSL_CERT_FILE="), "{message}");
+            assert!(message.contains("not a usable PEM CA bundle"), "{message}");
+        }
     }
 
     #[test]
