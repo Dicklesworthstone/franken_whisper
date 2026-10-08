@@ -18,6 +18,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- Native DTW word timestamps were one token late (bd-dtw-word-lag-10ov):
+  the alignment rows started at the first text token instead of
+  `<|notimestamps|>`, the row that emits it, so every word carried the next
+  token's interval. The rows now follow whisper.cpp
+  (`sot_sequence_length` excludes `not`), and attention is normalized over
+  every recorded token row as whisper.cpp and OpenAI do. See DISC-009 in
+  `docs/planning/DISCREPANCIES.md`.
+
 ## Unreleased installer follow-up
 
 - Admit the exact flat `CHANGELOG.md` release-archive member once in the

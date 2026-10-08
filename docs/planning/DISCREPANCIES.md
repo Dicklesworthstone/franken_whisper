@@ -133,3 +133,59 @@
   `src/native_engine/decode.rs::unclosed_window_rescue_is_first_window_only`
   and `gated_max_context_zero_disables_prompt_carry`.
 - **Review date:** 2026-08-24
+
+## DISC-009: Native DTW word timings lagged one token (RESOLVED)
+
+- **Reference:** whisper.cpp v1.8.6 `whisper_exp_compute_token_level_timestamps_dtw`
+  (`src/whisper.cpp` 8823-8975) and OpenAI `timing.py::find_alignment`. The
+  alignment prompt is `sot [lang] not <text> eot`; `sot_sequence_length` is
+  taken BEFORE `<|notimestamps|>` is pushed (8857); every head is z-normalized
+  over all token rows (8915) before the view drops the sot sequence and `eot`
+  (8933), so the DTW rows are `[not, text_0 .. text_{n-1}]`. The frame where the
+  path leaves row r is the END of text token r (8945-8970): the `not` row is the
+  one that emits `text_0`.
+- **Our impl (until bd-dtw-word-lag-10ov):** `decode.rs::window_word_timings`
+  took `sot_len` after pushing `not`, so the DTW rows started at `text_0`'s input
+  row, which attends to `text_1`'s audio; `dtw::token_timestamps` also
+  normalized over the text rows only (the "fix #3" of commit 0553cbbd, whose
+  rationale reversed the source's order).
+- **Impact (before the fix):** every word carried the next token's interval
+  (first word of a clip pinned to 0.0 and stretched; multi-token words started
+  at the end of their first token). Reference: whisper-cli 1.8.6
+  `--dtw large.v3.turbo -nfa -ojf -l en` on the same `large-v3-turbo` f16 ggml
+  bytes (macOS, Metal; `-nfa` is required, flash attention silently disables
+  DTW). fw flags: `--json --no-diarize --no-persist --language en
+  --max-segment-length 1 --split-on-word`, default greedy decode, default
+  int8 encoder policy. 8 narration clips, 155-156 words, mean |dstart| /
+  |dend| against the same reference word (k=0) and against the next one (k=+1):
+
+  | build | host | k=0 | k=+1 |
+  |---|---|---|---|
+  | fw 0.8.0 | macOS | 0.302 / 0.294 s | 0.046 / 0.054 s |
+  | fw 0.10.0 | trj (Linux x86_64) | 0.299 / 0.289 s | 0.054 / 0.066 s |
+  | this fix | trj (Linux x86_64) | **0.027 / 0.032 s** | 0.332 / 0.347 s |
+
+- **Fix:** `dtw_alignment_prompt` returns whisper.cpp's `sot_sequence_length`
+  (`not` excluded) and `token_timestamps` aligns rows `[not, text...]` after
+  normalizing over every recorded row. Both corrections landed together; the
+  per-correction split was not measured separately. The residual (~1.5 encoder
+  frames) includes the cross-host reference (Metal f16 vs x86 int8 encoder)
+  and fw's segment-bounded word grouping (a word's end is the next word's start;
+  a segment's last word ends at its timestamp token).
+- **Resolution:** **RESOLVED** (2026-10-08). DTW word timestamps change for
+  every run that requests them, toward the reference; transcripts and segment
+  text are unchanged.
+- **Tests affected:**
+  `src/native_engine/dtw.rs::token_timestamps_time_each_token_by_the_row_that_emits_it`,
+  `token_timestamps_normalize_over_every_recorded_row` and the reworked
+  `token_timestamps_*` cells;
+  `src/native_engine/decode.rs::dtw_alignment_rows_start_at_the_notimestamps_row`.
+  `gated_e2e_dtw_word_timestamps_jfk_tiny_en` now checks both "ask" intervals
+  against whisper.cpp's own DTW (`whisper-cli 1.8.6 -m ggml-tiny.en.bin
+  --dtw tiny.en -nfa -ojf`: 2.26-3.88 s and 8.02-8.66 s, ±0.2 s). Its old
+  first-"ask" band (3.29 ± 0.75 s) came from whisper-cli's non-DTW `-ml 1`
+  times and admitted the lagged 3.88 s; the fixed engine gives 2.26-3.88 s.
+  On that clip the fixed native DTW matches whisper.cpp's word boundaries
+  within 0.02 s for 21 of 22 words (mean |dstart| 0.003 s, |dend| 0.013 s;
+  the clip's last end is clamped to the segment end).
+- **Review date:** 2026-10-08

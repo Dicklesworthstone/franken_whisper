@@ -15,16 +15,18 @@
 //! 2. Stack the selected heads' `[tokens, frames]` weight matrices, restrict the
 //!    frame axis to the window's *actual* (unpadded) audio length, and discard
 //!    the padded tail (whisper.cpp `n_audio_tokens = n_frames/2`, 8898).
-//! 3. **Normalize** each head over the token axis (subtract mean / divide std —
-//!    OpenAI `dim=-2`; whisper.cpp `ggml_norm`, 8929).
+//! 3. **Normalize** each head over the token axis, all recorded rows included
+//!    (subtract mean / divide std — OpenAI `dim=-2`; whisper.cpp `ggml_norm`).
 //! 4. **Median-filter** each token row over the frame axis (width 7, reflect
 //!    padding; whisper.cpp `median_filter`, 8802-8835).
-//! 5. **Average** the heads, **negate** to a cost matrix, run **DTW**
-//!    ([`dtw_path`]), and read each token's END boundary off the frame at which
-//!    the path leaves that token's row, scaled by 0.02 s/frame (encoder frames
-//!    are 20 ms; whisper.cpp `time_index * 2` centiseconds, 8975). A token's
-//!    *start* is the previous token's end (the first token starts at the window
-//!    start), reconciled by the decode caller — see fix #4 in [`token_timestamps`].
+//! 5. Keep the rows `[<|notimestamps|>, text...]` — the row that READS `not`
+//!    is the one that EMITS the first text token — **average** the heads,
+//!    **negate** to a cost matrix, run **DTW** ([`dtw_path`]), and read each
+//!    text token's END boundary off the frame at which the path leaves the row
+//!    that emits it, scaled by 0.02 s/frame (encoder frames are 20 ms;
+//!    whisper.cpp `time_index * 2` centiseconds). A token's *start* is the
+//!    previous token's end (the first token starts at the window start),
+//!    reconciled by the decode caller — see [`token_timestamps`].
 //!
 //! Token start times are then aggregated into **word** times by the
 //! space-prefix convention (a word begins at the first token whose decoded bytes
@@ -577,57 +579,64 @@ pub fn dtw_path(cost: &Mat) -> Vec<(usize, usize)> {
 /// - `attn`: the decoder's recorded weights, one `[tokens, enc_frames]` matrix
 ///   per `(layer, head)` in `layer * n_head + head` order (the exact shape
 ///   produced by [`crate::native_engine::decoder::DecoderState::cross_attn_weights`]).
-///   The recorded prompt is `sot_sequence (sot[,lang],not) + <text tokens> +
-///   eot`, so the rows are `[<sot-seq rows>, <text rows>, <eot row>]`.
+///   The recorded prompt is `sot [lang] not <text tokens> eot`.
 /// - `n_head`: the model's `n_text_head` (used to map `(layer, head)` → index).
 /// - `heads`: the selected alignment heads from [`alignment_heads`].
-/// - `first_text_row`: index of the first **text** token row in `attn`
-///   (= `sot_sequence_length`). Upstream removes the `sot_sequence_length + 1`
-///   leading rows (sot seq + ... actually sot seq, with the trailing eot row
-///   dropped separately) **before** normalization (whisper.cpp 8946-8947), so
-///   the z-norm / median-filter / DTW statistics see text rows only. We slice
-///   the attention matrices to `[first_text_row, first_text_row + n_text_rows)`
-///   up front to match those upstream stats exactly.
-/// - `n_text_rows`: number of text token rows (excludes the trailing eot row,
-///   whisper.cpp's `- sot_sequence_length - 1` view, 8947).
+/// - `sot_sequence_len`: whisper.cpp's `sot_sequence_length` — the number of
+///   rows before `<|notimestamps|>` (`sot`, plus the language token on
+///   multilingual models; whisper.cpp v1.8.6 `src/whisper.cpp` 8851-8858 takes
+///   it BEFORE pushing `not`). It is therefore also the index of the `not` row.
+/// - `n_text_tokens`: number of text tokens (rows after `not`, before `eot`).
 /// - `n_audio_frames`: the window's *actual* audio length in encoder frames
 ///   (`audio_len_sec / 0.02`), so the padded tail is excluded
-///   (whisper.cpp `n_audio_tokens = n_frames/2`, 8898).
+///   (whisper.cpp `n_audio_tokens = n_frames/2`, 8883).
 /// - `medfilt_width`: median-filter width (use [`DEFAULT_MEDFILT_WIDTH`]).
 ///
-/// The returned vector has one **end** time per text token (length
-/// `n_text_rows`), in order — the frame at which the DTW path leaves that
-/// token's row (whisper.cpp 8958-8985 END-boundary convention, see below). An
-/// empty result is returned when no usable heads/frames/text-tokens are present.
+/// Line numbers below cite whisper.cpp v1.8.6 `src/whisper.cpp`.
 ///
-/// # Boundary convention (fix #4)
+/// # Rows (bd-dtw-word-lag-10ov)
 ///
-/// Upstream (whisper.cpp 8958-8985) walks the DTW path with `last_v = 0` and,
-/// each time the path's token index `v` changes, assigns that step's frame to
-/// the token it is *leaving* (the previous `tok_i`), then advances `tok_i`.
-/// Hence the recorded time is the frame where the path ENTERS THE NEXT ROW,
-/// which is the **END boundary** of the current token (not the first frame it
-/// enters). We reproduce that here: `ends[r]` = `FRAME_SEC * frame` at the step
-/// where the path transitions from row `r` to row `r+1`. The final text token's
-/// exit is never observed (the path ends inside its row), so it is left to the
-/// caller to close at the window/segment end — exactly as upstream leaves the
-/// last token's `t_dtw` unset and derives it from the segment bound.
+/// The DTW matrix is the view `[not, text_0 .. text_{n-1}]` (whisper.cpp 8933
+/// drops the `sot_sequence_length` leading rows and the trailing `eot` row;
+/// OpenAI `timing.py` slices `matrix[len(sot_sequence):-1]`). A decoder row's
+/// attention describes the token it EMITS, not the token it reads: the `not`
+/// row emits `text_0`, row `text_k` emits `text_{k+1}`. Starting the matrix at
+/// `text_0` (as this port did until bd-dtw-word-lag-10ov) shifts every
+/// boundary one token late, so each word got the next token's interval.
 ///
-/// Port of whisper.cpp `whisper_exp_compute_token_level_timestamps_dtw`
-/// (8837-8990): select heads → restrict frames → **slice to text rows** →
-/// z-normalize per head over the token axis → median-filter each token row over
-/// frames → average heads → negate → DTW → token END-boundary times.
+/// # Normalization
+///
+/// Each head is z-normalized over ALL recorded token rows (sot sequence, `not`,
+/// text, `eot`) per frame, then median-filtered — whisper.cpp `ggml_norm`
+/// (8915) runs on the full `[n_tokens, n_audio_tokens, n_heads]` tensor before
+/// the view (8933), and OpenAI normalizes `weights` over `dim=-2` before
+/// slicing. (The earlier text-rows-only normalization claimed the opposite
+/// order; the source does not support it.)
+///
+/// # Boundary convention
+///
+/// Upstream (whisper.cpp 8945-8970) walks the DTW path with `last_v = 0` and,
+/// each time the path's row index `v` changes, assigns that step's frame to
+/// the next text token, then advances. DTW row `r` emits `text_r`, so the frame
+/// where the path leaves row `r` is the **END boundary** of `text_r`:
+/// `ends[r]` = `FRAME_SEC * frame` at the step from row `r` to `r+1`. Every
+/// text token's end is observed (the path ends inside the last text token's
+/// input row, which emits `eot`).
+///
+/// The returned vector has one end time per text token (length
+/// `n_text_tokens`), in order; it is empty when no usable heads, frames or
+/// text tokens are present.
 #[must_use]
 pub fn token_timestamps(
     attn: &[Mat],
     n_head: usize,
     heads: &[(usize, usize)],
-    first_text_row: usize,
-    n_text_rows: usize,
+    sot_sequence_len: usize,
+    n_text_tokens: usize,
     n_audio_frames: usize,
     medfilt_width: usize,
 ) -> Vec<f32> {
-    if attn.is_empty() || n_head == 0 || n_text_rows == 0 {
+    if attn.is_empty() || n_head == 0 || n_text_tokens == 0 {
         return Vec::new();
     }
     let all_rows = attn[0].rows;
@@ -635,11 +644,13 @@ pub fn token_timestamps(
     if all_rows == 0 || enc_frames == 0 {
         return Vec::new();
     }
-    // Text rows must fit inside the recorded matrix.
-    if first_text_row + n_text_rows > all_rows {
+    // DTW rows: `not` plus one row per text token; they must fit inside the
+    // recorded matrix.
+    let first_row = sot_sequence_len;
+    let n_tokens = n_text_tokens + 1;
+    if first_row + n_tokens > all_rows {
         return Vec::new();
     }
-    let n_tokens = n_text_rows;
     // Restrict to the window's real audio length (exclude padded tail).
     let n_frames = n_audio_frames.min(enc_frames).max(1);
 
@@ -656,41 +667,40 @@ pub fn token_timestamps(
         return Vec::new();
     }
 
-    // Accumulator for the head-averaged, normalized+filtered matrix, laid out
-    // [n_tokens (text rows), n_frames].
+    // Accumulator for the head-averaged, normalized+filtered DTW rows, laid
+    // out [n_tokens (`not` + text rows), n_frames].
     let mut avg = vec![0.0f32; n_tokens * n_frames];
+    let kept = first_row * n_frames..(first_row + n_tokens) * n_frames;
 
     for m in &selected {
-        // Copy this head, sliced to the TEXT rows only and restricted to
-        // [n_tokens, n_frames]. Upstream removes the sot-sequence + eot rows
-        // BEFORE ggml_norm (whisper.cpp 8946-8947), so the per-frame mean/std
-        // below see text rows only (fix #3).
-        let mut head = vec![0.0f32; n_tokens * n_frames];
-        for t in 0..n_tokens {
-            let src_row = first_text_row + t;
-            let src = &m.data[src_row * enc_frames..src_row * enc_frames + n_frames];
+        // Copy every recorded row of this head, restricted to [all_rows,
+        // n_frames]: the per-frame mean/std below span all token rows, exactly
+        // like whisper.cpp's ggml_norm before its view (8915 vs 8933).
+        let mut head = vec![0.0f32; all_rows * n_frames];
+        for t in 0..all_rows {
+            let src = &m.data[t * enc_frames..t * enc_frames + n_frames];
             head[t * n_frames..(t + 1) * n_frames].copy_from_slice(src);
         }
 
         // z-normalize over the TOKEN axis, per frame (OpenAI dim=-2;
-        // whisper.cpp ggml_norm after permute, 8929). i.e. for each frame
-        // column, subtract the column mean and divide by the column std.
-        normalize_over_tokens(&mut head, n_tokens, n_frames);
+        // whisper.cpp ggml_norm, 8915): for each frame column, subtract the
+        // column mean and divide by the column std.
+        normalize_over_tokens(&mut head, all_rows, n_frames);
 
-        // median-filter each token row over the frame axis (whisper.cpp 8936).
-        for t in 0..n_tokens {
-            let row = &mut head[t * n_frames..(t + 1) * n_frames];
+        // Median-filter each kept row over the frame axis (whisper.cpp 8922);
+        // the filter is per row, so the dropped rows need none.
+        for row in head[kept.clone()].chunks_exact_mut(n_frames) {
             median_filter(row, medfilt_width);
         }
 
-        for (a, &h) in avg.iter_mut().zip(head.iter()) {
+        for (a, &h) in avg.iter_mut().zip(&head[kept.clone()]) {
             *a += h;
         }
     }
 
     let inv = 1.0 / selected.len() as f32;
     // Average over heads, then negate for the cost matrix (whisper.cpp
-    // ggml_mean + ggml_scale(-1), 8946-8947).
+    // ggml_mean + ggml_scale(-1), 8927-8928).
     let mut cost_data = avg;
     for v in &mut cost_data {
         *v = -(*v * inv);
@@ -699,9 +709,10 @@ pub fn token_timestamps(
 
     let path = dtw_path(&cost);
 
-    // Token END-boundary extraction (fix #4 — whisper.cpp 8958-8985): walk the
-    // path; each time the row index changes, the frame at that transition is the
-    // END boundary of the row we are LEAVING. `time = frame * 0.02`.
+    // Token END-boundary extraction (whisper.cpp 8945-8970): walk the path;
+    // each time the row index changes, the frame at that transition is the
+    // END boundary of the row we are LEAVING, i.e. of the text token that row
+    // emits. `time = frame * 0.02`.
     let mut ends = vec![f32::NAN; n_tokens];
     let mut last_tok: i64 = 0;
     for &(tok, frame) in &path {
@@ -722,10 +733,10 @@ pub fn token_timestamps(
             last_tok = v;
         }
     }
-    // The final text token's exit is never observed (the path terminates inside
-    // its row); upstream leaves it for the segment bound. Default any unobserved
-    // (NaN) row to the last real frame's time, never going backwards — callers
-    // typically override the last token's end with the segment/window end.
+    // The last DTW row (the final text token's input row, which emits `eot`)
+    // is never left; it carries no text token. Every text row's exit is on the
+    // path, but default any unobserved (NaN) row to the last real frame's time,
+    // never going backwards, so a degenerate path cannot leak NaN.
     let last_frame_t = (n_frames.saturating_sub(1)) as f32 * FRAME_SEC;
     let mut prev = 0.0f32;
     for t in &mut ends {
@@ -735,6 +746,7 @@ pub fn token_timestamps(
             prev = *t;
         }
     }
+    ends.truncate(n_text_tokens);
     ends
 }
 
@@ -1205,62 +1217,86 @@ mod tests {
 
     // ── token_timestamps ─────────────────────────────────────────────────
 
+    /// Frames each synthetic token owns: wider than half the default median
+    /// window, so the width-7 filter keeps every block.
+    const BLOCK: usize = 6;
+
+    /// A one-head attention recording of the alignment prompt
+    /// `sot lang not text_0 .. text_{n-1} eot` (sot_sequence_length = 2) in
+    /// which the row that EMITS each token attends to that token's block of
+    /// audio: `not` → block 0 (`text_0`), `text_k` → block `k + 1` (it emits
+    /// `text_{k+1}`, or `eot` after the last text token). The sot, lang and eot
+    /// rows attend uniformly. Returns the recording and its frame count.
+    fn emitting_row_attention(n_text: usize) -> (Vec<Mat>, usize) {
+        let all_rows = 2 + 1 + n_text + 1;
+        let enc_frames = (n_text + 1) * BLOCK;
+        let mut data = vec![0.1f32; all_rows * enc_frames];
+        for block in 0..=n_text {
+            let row = 2 + block;
+            for frame in block * BLOCK..(block + 1) * BLOCK {
+                data[row * enc_frames + frame] = 1.0;
+            }
+        }
+        (vec![Mat::from_vec(all_rows, enc_frames, data)], enc_frames)
+    }
+
+    #[test]
+    fn token_timestamps_time_each_token_by_the_row_that_emits_it() {
+        // bd-dtw-word-lag-10ov regression: text token k must END where its own
+        // audio block ends, (k + 1) * BLOCK frames. Starting the DTW rows one
+        // row late (at text_0 instead of <|notimestamps|>) gave token k the
+        // NEXT token's end, (k + 2) * BLOCK.
+        let n_text = 3;
+        let (attn, enc_frames) = emitting_row_attention(n_text);
+        let ends = token_timestamps(&attn, 1, &[(0, 0)], 2, n_text, enc_frames, 7);
+        assert_eq!(ends.len(), n_text, "one end per text token");
+        for (k, end) in ends.iter().enumerate() {
+            let expected = ((k + 1) * BLOCK) as f32 * FRAME_SEC;
+            assert!(
+                (end - expected).abs() <= FRAME_SEC + 1e-6,
+                "text token {k} must end at its own block seam {expected}, got {ends:?}"
+            );
+        }
+    }
+
     #[test]
     fn token_timestamps_diagonal_attention() {
-        // Synthetic: 3 text tokens, 6 frames, attention peaks on a diagonal-ish
-        // mapping token t -> frame 2t. One head, head index 0. All rows are
-        // text rows (first_text_row=0, n_text_rows=3). Returns END boundaries.
-        let n_tokens = 3;
-        let enc_frames = 6;
-        let mut data = vec![0.01f32; n_tokens * enc_frames];
-        for t in 0..n_tokens {
-            data[t * enc_frames + (2 * t)] = 1.0;
+        // 3 text tokens; DTW rows [not, t0, t1, t2] peak on a diagonal (row r
+        // -> frame 2r). sot_sequence_len = 0: the recording starts at `not`.
+        let n_rows = 4;
+        let enc_frames = 8;
+        let mut data = vec![0.01f32; n_rows * enc_frames];
+        for r in 0..n_rows {
+            data[r * enc_frames + (2 * r)] = 1.0;
         }
-        let attn = vec![Mat::from_vec(n_tokens, enc_frames, data)];
-        // n_head=1, head (0,0); first_text_row=0, n_text_rows=3.
-        let ends = token_timestamps(&attn, 1, &[(0, 0)], 0, n_tokens, enc_frames, 7);
-        assert_eq!(ends.len(), n_tokens);
-        // END boundaries monotonic non-decreasing.
+        let attn = vec![Mat::from_vec(n_rows, enc_frames, data)];
+        let ends = token_timestamps(&attn, 1, &[(0, 0)], 0, 3, enc_frames, 7);
+        assert_eq!(ends.len(), 3);
+        // END boundaries monotonic non-decreasing and inside the real audio.
         for w in ends.windows(2) {
             assert!(w[1] >= w[0], "ends not monotonic: {ends:?}");
         }
-        // Token 0's END boundary is at/after frame 0 (it must be > 0 — the path
-        // leaves row 0 at some real frame).
-        assert!(ends[0] >= 0.0);
+        let last = (enc_frames - 1) as f32 * FRAME_SEC;
+        assert!(ends.iter().all(|&t| (0.0..=last).contains(&t)), "{ends:?}");
     }
 
     #[test]
     fn token_timestamps_end_boundary_convention() {
-        // The END-boundary convention (fix #4) records, for each row, the frame
-        // at which the DTW path LEAVES that row (= enters the next). Use a clear
-        // block-diagonal: 3 tokens over 9 frames, each token owning a 3-frame
-        // block. The path tracks the blocks, so token 0's END boundary lands
-        // near the block-0/block-1 seam (~frame 3), well above token 0's own
-        // first frame (0) — i.e. the time is the END, not the start. The last
-        // token's exit is unobserved and defaults to the last real frame.
-        let n_tokens = 3;
-        let enc_frames = 9;
-        let mut data = vec![0.0f32; n_tokens * enc_frames];
-        for t in 0..n_tokens {
-            for f in (t * 3)..(t * 3 + 3) {
-                data[t * enc_frames + f] = 1.0;
-            }
-        }
-        let attn = vec![Mat::from_vec(n_tokens, enc_frames, data)];
-        let ends = token_timestamps(&attn, 1, &[(0, 0)], 0, n_tokens, enc_frames, 7);
-        assert_eq!(ends.len(), 3);
-        // Monotonic non-decreasing END boundaries.
-        assert!(ends[0] <= ends[1] && ends[1] <= ends[2], "{ends:?}");
-        // Token 0's END boundary is strictly past its first frame (0): it is the
-        // frame the path EXITS row 0, an END boundary.
+        // The frame at which the path LEAVES a row is the END of the token that
+        // row emits: with BLOCK-frame blocks the ends sit on the block seams,
+        // never at a token's own first frame.
+        let n_text = 2;
+        let (attn, enc_frames) = emitting_row_attention(n_text);
+        let ends = token_timestamps(&attn, 1, &[(0, 0)], 2, n_text, enc_frames, 7);
+        assert_eq!(ends.len(), 2);
+        assert!(ends[0] < ends[1], "{ends:?}");
         assert!(
-            ends[0] >= 2.0 * FRAME_SEC - 1e-6,
-            "token 0 END should be near the block seam, got {ends:?}"
+            ends[0] >= (BLOCK - 1) as f32 * FRAME_SEC - 1e-6,
+            "token 0 ends near its block seam, not at its first frame: {ends:?}"
         );
-        // The last token defaults to the last real frame's time.
         assert!(
-            (ends[2] - (enc_frames - 1) as f32 * FRAME_SEC).abs() < 1e-6,
-            "last token end defaults to last frame, got {ends:?}"
+            ends[1] < (enc_frames - 1) as f32 * FRAME_SEC,
+            "the last text token's end is observed, not defaulted: {ends:?}"
         );
     }
 
@@ -1269,63 +1305,64 @@ mod tests {
         assert!(token_timestamps(&[], 1, &[(0, 0)], 0, 1, 10, 7).is_empty());
         let attn = vec![Mat::from_vec(0, 6, vec![])];
         assert!(token_timestamps(&attn, 1, &[(0, 0)], 0, 1, 6, 7).is_empty());
-        // Zero text rows requested → empty.
+        // Zero text tokens requested → empty.
         let attn = vec![Mat::from_vec(3, 6, vec![0.0; 18])];
         assert!(token_timestamps(&attn, 1, &[(0, 0)], 0, 0, 6, 7).is_empty());
-        // Text rows out of range → empty.
+        // `not` + text rows out of range → empty.
         assert!(token_timestamps(&attn, 1, &[(0, 0)], 2, 5, 6, 7).is_empty());
+        // Three rows hold `not` + two text tokens, not three.
+        assert!(token_timestamps(&attn, 1, &[(0, 0)], 0, 3, 6, 7).is_empty());
+        assert_eq!(token_timestamps(&attn, 1, &[(0, 0)], 0, 2, 6, 7).len(), 2);
     }
 
     #[test]
-    fn token_timestamps_slices_text_rows() {
-        // 4 rows: row 0 = sot, rows 1-2 = text, row 3 = eot. first_text_row=1,
-        // n_text_rows=2. Only the two text rows should be timed.
-        let all_rows = 4;
-        let enc_frames = 6;
-        let mut data = vec![0.01f32; all_rows * enc_frames];
-        // text row 1 (token 0) peaks at frame 1; text row 2 (token 1) at frame 4.
-        data[enc_frames + 1] = 1.0;
-        data[2 * enc_frames + 4] = 1.0;
-        let attn = vec![Mat::from_vec(all_rows, enc_frames, data)];
-        let ends = token_timestamps(&attn, 1, &[(0, 0)], 1, 2, enc_frames, 7);
-        assert_eq!(ends.len(), 2, "one end per text token");
-        assert!(ends[0] <= ends[1], "ends monotonic: {ends:?}");
+    fn token_timestamps_normalize_over_every_recorded_row() {
+        // whisper.cpp z-normalizes over ALL token rows (sot sequence and eot
+        // included) before its view drops them. Rows [sot, not, t0, eot] over 2
+        // frames, median filter off (width 1) so the cost is exactly -z:
+        //   frame 0: [0.0, 0.5, 0.4, 0.0]   frame 1: [0.0, 0.3, 0.6, 0.0]
+        // Over all four rows, t0 is above the frame-0 mean and `not` above the
+        // frame-1 mean, so both off-diagonal costs are negative and the cheaper
+        // one (t0 at frame 0) wins: the path enters t0's row at frame 0, and
+        // text token 0 (emitted by the `not` row) ends at 0.00 s. Normalizing
+        // over the kept rows only makes both off-diagonal costs +1, the path
+        // goes diagonal, and the end would be 0.02 s.
+        let data = vec![0.0, 0.0, 0.5, 0.3, 0.4, 0.6, 0.0, 0.0];
+        let attn = vec![Mat::from_vec(4, 2, data)];
+        let ends = token_timestamps(&attn, 1, &[(0, 0)], 1, 1, 2, 1);
+        assert_eq!(ends, vec![0.0]);
     }
 
     #[test]
     fn token_timestamps_no_selected_heads() {
         // Head (1,0) requested but only one head matrix present (index 0).
-        let attn = vec![Mat::from_vec(2, 4, vec![0.0; 8])];
+        let attn = vec![Mat::from_vec(3, 4, vec![0.0; 12])];
         assert!(token_timestamps(&attn, 1, &[(1, 0)], 0, 2, 4, 7).is_empty());
     }
 
     #[test]
     fn token_timestamps_restricts_padded_frames() {
-        // 2 tokens, 6 enc frames but only 3 real audio frames. A strong
-        // attention spike in the padded region (frame 5) must be ignored.
-        let n_tokens = 2;
+        // DTW rows [not, t0, t1], 6 enc frames but only 3 real audio frames. A
+        // strong attention spike in the padded region (frame 5) is ignored.
+        let n_rows = 3;
         let enc_frames = 6;
-        let mut data = vec![0.01f32; n_tokens * enc_frames];
-        data[0] = 1.0; // token 0 -> frame 0 (real)
-        data[enc_frames + 5] = 5.0; // token 1 -> frame 5 (PADDED, ignored)
-        data[enc_frames + 2] = 1.0; // token 1 -> frame 2 (real)
-        let attn = vec![Mat::from_vec(n_tokens, enc_frames, data)];
-        let times = token_timestamps(&attn, 1, &[(0, 0)], 0, n_tokens, 3, 7);
+        let mut data = vec![0.01f32; n_rows * enc_frames];
+        data[0] = 1.0; // not (emits t0) -> frame 0 (real)
+        data[enc_frames + 1] = 1.0; // t0 (emits t1) -> frame 1 (real)
+        data[enc_frames + 5] = 5.0; // PADDED, ignored
+        data[2 * enc_frames + 2] = 1.0; // t1 (emits eot) -> frame 2 (real)
+        let attn = vec![Mat::from_vec(n_rows, enc_frames, data)];
+        let times = token_timestamps(&attn, 1, &[(0, 0)], 0, 2, 3, 7);
+        assert_eq!(times.len(), 2);
         // Max possible time is bounded by 3 frames * 0.02 = 0.06s.
         assert!(times.iter().all(|&t| t <= 0.06 + 1e-6), "{times:?}");
     }
 
     #[test]
     fn token_timestamps_deterministic() {
-        let n_tokens = 4;
-        let enc_frames = 8;
-        let mut data = vec![0.0f32; n_tokens * enc_frames];
-        for t in 0..n_tokens {
-            data[t * enc_frames + (2 * t)] = 1.0;
-        }
-        let attn = vec![Mat::from_vec(n_tokens, enc_frames, data)];
-        let a = token_timestamps(&attn, 1, &[(0, 0)], 0, n_tokens, enc_frames, 7);
-        let b = token_timestamps(&attn, 1, &[(0, 0)], 0, n_tokens, enc_frames, 7);
+        let (attn, enc_frames) = emitting_row_attention(4);
+        let a = token_timestamps(&attn, 1, &[(0, 0)], 2, 4, enc_frames, 7);
+        let b = token_timestamps(&attn, 1, &[(0, 0)], 2, 4, enc_frames, 7);
         assert_eq!(a, b);
     }
 
