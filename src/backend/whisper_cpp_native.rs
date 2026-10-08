@@ -264,14 +264,27 @@ impl DiarizationWordUnitPlan {
                             .join(separator)
                     },
                     speaker: speaker.clone(),
-                    confidence: (!confidences.is_empty())
-                        .then(|| confidences.iter().sum::<f64>() / confidences.len() as f64),
+                    confidence: run_confidence(&confidences),
                 });
                 run_start = run_end;
             }
         }
         Some(regrouped)
     }
+}
+
+/// The confidence of one regrouped run: the mean of its words' values, or
+/// `None` when no word has one. Every word unit of an engine segment carries
+/// that segment's value, so a uniform run returns the value itself: summing n
+/// copies and dividing by n can drift by an ulp (`(0.1 + 0.1 + 0.1) / 3` is
+/// `0.10000000000000002`), which made `acceleration.raw_confidences` differ
+/// from the backend's own value after a diarization regroup.
+fn run_confidence(confidences: &[f64]) -> Option<f64> {
+    let (&first, rest) = confidences.split_first()?;
+    if rest.iter().all(|value| value.to_bits() == first.to_bits()) {
+        return Some(first);
+    }
+    Some(confidences.iter().sum::<f64>() / confidences.len() as f64)
 }
 
 /// Map the request's [`WordTimestampParams`] to a [`WordTimestampMode`].
@@ -2338,6 +2351,61 @@ mod tests {
                 .raw_confidences
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn regroup_returns_a_segments_own_confidence_exactly() {
+        // Every word unit of an engine segment carries that segment's value.
+        // Averaging n copies drifts by an ulp (five copies of 0.8123456789
+        // average to 0.8123456789000001; three of 0.1 to 0.10000000000000002),
+        // so raw_confidences stopped being the backend's own value whenever
+        // diarization regrouped the units.
+        let (mut units, plan) = diarization_units();
+        let a = Some("SPEAKER_00");
+        label(&mut units, &[a, a, a, a, a, a, a]);
+        let (first, second) = (0.8123456789, 0.1);
+        for (index, unit) in units.iter_mut().enumerate() {
+            unit.confidence = Some(if index < 5 { first } else { second });
+        }
+        let raw: Vec<Option<f64>> = units.iter().map(|unit| unit.confidence).collect();
+        let mut result = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "ask not what your country can do".to_owned(),
+            language: Some("en".to_owned()),
+            segments: units,
+            acceleration: Some(crate::model::AccelerationReport {
+                backend: crate::model::AccelerationBackend::None,
+                input_values: 7,
+                normalized_confidences: true,
+                pre_mass: None,
+                post_mass: None,
+                notes: Vec::new(),
+                raw_confidences: raw,
+            }),
+            diarization: None,
+            raw_output: json!({ DIARIZATION_WORD_UNITS_KEY: plan }),
+            artifact_paths: Vec::new(),
+        };
+        assert_eq!(
+            crate::backend::regroup_diarization_word_units(&mut result),
+            Some(7)
+        );
+        let confidences: Vec<Option<f64>> = result
+            .segments
+            .iter()
+            .map(|segment| segment.confidence)
+            .collect();
+        assert_eq!(confidences, vec![Some(first), Some(second)]);
+        assert_eq!(
+            result.acceleration.expect("acceleration").raw_confidences,
+            vec![Some(first), Some(second)],
+            "the regrouped raw value is the engine segment's own value, bit for bit"
+        );
+
+        // A run that mixes values still averages them.
+        assert_eq!(super::run_confidence(&[0.5, 1.0]), Some(0.75));
+        assert_eq!(super::run_confidence(&[0.1, 0.1, 0.1]), Some(0.1));
+        assert_eq!(super::run_confidence(&[]), None);
     }
 
     #[test]
