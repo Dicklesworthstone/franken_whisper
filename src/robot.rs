@@ -5506,7 +5506,11 @@ mod tests {
             }
             // The advertised FW-BATCH-INCOMPLETE must be observable on the
             // stream, and it must be the process outcome's own code.
-            assert_eq!(value.get("code").and_then(Value::as_str), code, "{tally:?}");
+            assert_eq!(
+                value.get("code").and_then(serde_json::Value::as_str),
+                code,
+                "{tally:?}"
+            );
             assert_eq!(
                 tally.outcome().err().map(|error| error.error_code()),
                 code,
