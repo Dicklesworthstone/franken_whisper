@@ -2559,7 +2559,10 @@ output[i] = safe[i] / mass                 -- normalize to sum = 1.0
 Non-finite values (NaN, infinity) map to 0.0 in the output. If the sum is near zero (all values degenerate), the result falls back to a uniform distribution `1/N`. The `layer_norm_cpu` helper clamps its epsilon floor to a safe minimum to prevent division by zero on pathological inputs.
 
 `segments[].confidence` is therefore a share of the run's total, not a
-per-segment probability. The backend's own per-segment values are kept in
+per-segment probability. (When native whisper.cpp diarization splits the run
+into per-word units and collapses them back into segments afterwards, each
+segment keeps its words' common share, so those values no longer sum to 1.)
+The backend's own per-segment values are kept in
 `acceleration.raw_confidences`, an array parallel to `segments` (`null` where
 the backend reported no usable value and step 2's fallback weight was used).
 For the native engine that value is `exp(mean text-token log-prob)` of the
