@@ -755,6 +755,16 @@ pub fn record_adaptive_prediction(top_ranked_succeeded: bool) {
     }
 }
 
+/// Forget every recorded routing outcome, returning the router to the state a
+/// fresh process starts in. A batch calls this before each input so the
+/// adaptive router cannot learn across inputs: each input then routes exactly
+/// as it would in its own single-input process (bd-batch-transcribe-rraf).
+pub fn reset_router_state() {
+    if let Ok(mut guard) = ROUTER_STATE.lock() {
+        *guard = None;
+    }
+}
+
 /// Get a snapshot of the current router state. Returns `None` if no
 /// outcomes have been recorded yet.
 #[must_use]
@@ -8095,6 +8105,27 @@ mod tests {
         if let Ok(mut state) = super::ROUTER_STATE.lock() {
             *state = None;
         }
+    }
+
+    #[test]
+    fn reset_router_state_returns_to_the_fresh_process_state() {
+        let _guard = ROUTER_STATE_TEST_MUTEX
+            .lock()
+            .expect("router state test lock");
+        for _ in 0..super::ADAPTIVE_MIN_SAMPLES {
+            update_router_state(BackendKind::WhisperCpp, true, 100, None);
+        }
+        assert!(
+            super::router_state_snapshot().is_some_and(|state| state.has_sufficient_data()),
+            "recorded outcomes make the adaptive router eligible"
+        );
+
+        super::reset_router_state();
+
+        assert!(
+            super::router_state_snapshot().is_none(),
+            "a reset batch input routes like a fresh process (no router state)"
+        );
     }
 
     // -- RouterState serialization --

@@ -860,6 +860,30 @@ franken_whisper transcribe --mic --mic-device "hw:0" --json
 cat audio.mp3 | franken_whisper transcribe --stdin --json
 ```
 
+### 6. Batch Transcription (many files, one model load)
+
+Repeat `--input`, or pass `--inputs-from FILE` (one path per line; `-` reads
+the list from stdin). One process loads and authenticates the native models
+once and runs every input through the normal pipeline, so each input's result
+matches a single-input run with the same flags.
+
+```bash
+ls narration/*.wav | fw transcribe --inputs-from - --json --no-diarize --no-persist \
+  --language en --max-segment-length 1 --split-on-word
+```
+
+`--json` prints one NDJSON record per input, in input order:
+`{"schema_version":"franken-whisper-batch-result-v1","index":0,"total":2,"input":"a.wav","status":"ok","report":{...}}`,
+where `report` is exactly what single-input `fw transcribe --json` prints, or
+`"status":"error","error":{"code":"FW-...","message":"..."}`. A failed input
+does not stop the batch; the process exits 1 (`FW-BATCH-INCOMPLETE`) if any
+input failed. `fw robot run` accepts the same flags: each input's `run_start`,
+`run_complete` and `run_error` carry `"batch":{"index","total","input"}`, and
+the stream ends with a `batch.complete` event. Agents can feature-detect this
+through `fw capabilities --json | jq .batch`. `--stdin`, `--mic`,
+`--speaker-hints` and `--transcript-path` apply to one recording and are
+rejected in batch mode.
+
 ---
 
 ## YouTube Ingestion
@@ -1149,7 +1173,8 @@ franken_whisper transcribe [OPTIONS]
 
 | Flag | Description |
 |------|-------------|
-| `--input <PATH>` | Audio or video file path |
+| `--input <PATH>` | Audio or video file path; repeat it for batch mode |
+| `--inputs-from <FILE>` | Batch mode: one input path per line (`-` = stdin); see [Batch Transcription](#6-batch-transcription-many-files-one-model-load) |
 | `--stdin` | Read audio bytes from stdin |
 | `--mic` | Capture from microphone via ffmpeg |
 
@@ -2317,10 +2342,12 @@ The cancellation token is threaded through every pipeline stage, including the i
 | `FW-MISSING-ARTIFACT` | Expected output file not produced by backend |
 | `FW-CANCELLED` | Operation cancelled via token or Ctrl+C |
 | `FW-STAGE-TIMEOUT` | Pipeline stage exceeded its budget |
+| `FW-BATCH-INCOMPLETE` | A batch finished but at least one input failed (exit 1; each failed input carries its own code) |
 
 **Robot Error Contract.** Public robot `run_error` envelopes expose the same
-13 variant-specific codes as `FwError::error_code()`; agents do not need to
-reverse-map a coarse error family. Even Clap-level syntax failures produce one
+variant-specific codes as `FwError::error_code()`; agents do not need to
+reverse-map a coarse error family. A batch never ends in a `run_error` for
+`FW-BATCH-INCOMPLETE`: it ends with `batch.complete` (`status: incomplete`). Even Clap-level syntax failures produce one
 path-safe `FW-INVALID-REQUEST` JSON object on stdout and exit with usage code
 2. Semantically invalid requests emit `run_start` followed by the exact
 terminal error. There is no robot path that degrades to human-readable stderr.
@@ -5415,6 +5442,7 @@ Before deploying `franken_whisper` to a production workflow, walk through:
 franken_whisper robot schema | jq '.events | keys'
 # [
 #   "backends.discovery",
+#   "batch.complete",
 #   "health.report",
 #   "listen.controller",
 #   "listen.device",

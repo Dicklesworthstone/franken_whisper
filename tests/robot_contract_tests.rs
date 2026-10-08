@@ -22,11 +22,12 @@ use franken_whisper::robot::{
 };
 use serde_json::Value;
 
-const ROBOT_SCHEMA_EVENT_TYPES: [&str; 30] = [
+const ROBOT_SCHEMA_EVENT_TYPES: [&str; 31] = [
     "run_start",
     "stage",
     "run_complete",
     "run_error",
+    "batch.complete",
     "backends.discovery",
     "routing_decision",
     "routing_history.complete",
@@ -337,7 +338,7 @@ fn schema_has_expected_event_types() {
     let expected: HashSet<&str> = ROBOT_SCHEMA_EVENT_TYPES.into_iter().collect();
     assert_eq!(
         actual, expected,
-        "schema must define the exact 30-event robot contract"
+        "schema must define the exact 31-event robot contract"
     );
 }
 

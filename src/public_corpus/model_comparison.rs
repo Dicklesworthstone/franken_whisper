@@ -3489,7 +3489,8 @@ fn classify_ecapa_failure(error: &FwError) -> Option<ModelComparisonOutcomeCode>
         | FwError::BackendUnavailable(_)
         | FwError::Storage(_)
         | FwError::Unsupported(_)
-        | FwError::MissingArtifact(_) => Some(ModelComparisonOutcomeCode::EcapaExecutionFailed),
+        | FwError::MissingArtifact(_)
+        | FwError::BatchIncomplete { .. } => Some(ModelComparisonOutcomeCode::EcapaExecutionFailed),
     }
 }
 

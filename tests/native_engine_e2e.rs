@@ -1215,3 +1215,136 @@ fn gated_diarize_flag_with_legacy_backend_runs_acoustic_diarization() {
         );
     }
 }
+
+// ===========================================================================
+// (g) batch mode (bd-batch-transcribe-rraf): one process, one model load,
+//     every input byte-identical to its own single-input run.
+// ===========================================================================
+
+/// Copy the first `seconds` of `source` into `dest` (same WAV spec).
+fn write_wav_prefix(source: &Path, dest: &Path, seconds: f64) {
+    let mut reader = hound::WavReader::open(source).expect("open source wav");
+    let spec = reader.spec();
+    let keep = (f64::from(spec.sample_rate) * seconds) as usize * usize::from(spec.channels);
+    let samples: Vec<i16> = reader
+        .samples::<i16>()
+        .take(keep)
+        .map(|sample| sample.expect("source sample"))
+        .collect();
+    let mut writer = hound::WavWriter::create(dest, spec).expect("create prefix wav");
+    for sample in samples {
+        writer.write_sample(sample).expect("write sample");
+    }
+    writer.finalize().expect("finalize prefix wav");
+}
+
+/// The per-input result fields a batch must reproduce exactly: transcript,
+/// language, segments (DTW word timestamps and confidences) and the
+/// acceleration report the confidences came from.
+fn batch_comparable(result: &Value) -> Value {
+    serde_json::json!({
+        "backend": result["backend"],
+        "language": result["language"],
+        "transcript": result["transcript"],
+        "segments": result["segments"],
+        "acceleration": result["acceleration"],
+        "word_timestamps": result["raw_output"]["word_timestamps"],
+    })
+}
+
+#[test]
+fn gated_batch_matches_single_input_runs() {
+    // tiny.en when provisioned; otherwise the default release package, which
+    // also exercises the once-per-batch package authentication.
+    let model_args: &[&str] = if tiny_en_available() {
+        &["--model", "tiny.en"]
+    } else if large_v3_turbo_available() {
+        &[]
+    } else {
+        eprintln!("SKIP gated_batch_matches_single_input_runs: no native whisper model");
+        return;
+    };
+    let state = tempfile::tempdir().expect("tempdir");
+    let jfk = jfk_wav();
+    let head = state.path().join("jfk_head.wav");
+    write_wav_prefix(&jfk, &head, 4.5);
+    let missing = state.path().join("missing.wav");
+    let env = bridge_bins_missing();
+    let mut flags = model_args.to_vec();
+    flags.extend([
+        "--language",
+        "en",
+        "--no-diarize",
+        "--no-persist",
+        "--max-segment-length",
+        "1",
+        "--split-on-word",
+        "--json",
+    ]);
+
+    let single = |clip: &Path| -> Value {
+        let mut args = vec!["--input", clip.to_str().expect("utf8")];
+        args.extend(&flags);
+        let run = run_transcribe(&args, &env, state.path());
+        assert!(
+            run.status.success(),
+            "single run failed\nstdout:\n{}\nstderr:\n{}",
+            run.stdout,
+            run.stderr
+        );
+        batch_comparable(&run.report()["result"])
+    };
+    let single_jfk = single(&jfk);
+    let single_head = single(&head);
+    assert_ne!(single_jfk["transcript"], single_head["transcript"]);
+    assert!(
+        single_jfk["segments"]
+            .as_array()
+            .is_some_and(|segments| segments.len() > 5),
+        "word mode yields per-word segments"
+    );
+
+    // The repeated head clip also exercises the in-process transcript cache.
+    let order = [&head, &missing, &jfk, &head];
+    let list = state.path().join("inputs.txt");
+    std::fs::write(
+        &list,
+        order
+            .iter()
+            .map(|path| format!("{}\n", path.display()))
+            .collect::<String>(),
+    )
+    .expect("write input list");
+    let mut args = vec!["--inputs-from", list.to_str().expect("utf8")];
+    args.extend(&flags);
+    let run = run_transcribe(&args, &env, state.path());
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "the missing input makes the batch exit 1\nstderr:\n{}",
+        run.stderr
+    );
+    let records = strict_ndjson_lines(&run);
+    assert_eq!(records.len(), 4, "one record per input:\n{}", run.stdout);
+    let expected = [
+        Some(&single_head),
+        None,
+        Some(&single_jfk),
+        Some(&single_head),
+    ];
+    for (index, record) in records.iter().enumerate() {
+        assert_eq!(record["index"], index);
+        assert_eq!(record["input"], order[index].to_str().expect("utf8"));
+        match expected[index] {
+            Some(single) => {
+                assert_eq!(record["status"], "ok", "{record:#?}");
+                assert_eq!(
+                    &batch_comparable(&record["report"]["result"]),
+                    single,
+                    "batch input {index} must be byte-identical to its single-input run"
+                );
+            }
+            None => assert_eq!(record["status"], "error", "{record:#?}"),
+        }
+    }
+}

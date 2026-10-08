@@ -1684,6 +1684,48 @@ impl FrankenWhisperEngine {
     }
 }
 
+/// Transcribes many inputs in one process with one model load
+/// (bd-batch-transcribe-rraf).
+///
+/// Holds one [`FrankenWhisperEngine`] and a
+/// [`crate::native_engine::ModelResidency`] for its whole lifetime, so the
+/// first input authenticates and parses the native models and every later
+/// input reuses them. Each input still runs the complete single-input pipeline,
+/// and the adaptive router is reset before each input so routing cannot learn
+/// across inputs: every input's result equals what a single-input process
+/// produces for the same request. Inputs are independent; a failed input does
+/// not affect the next one.
+pub struct BatchTranscriber {
+    engine: FrankenWhisperEngine,
+    _residency: crate::native_engine::ModelResidency,
+}
+
+impl BatchTranscriber {
+    /// Create the engine and begin model residency.
+    pub fn new() -> FwResult<Self> {
+        Ok(Self {
+            engine: FrankenWhisperEngine::new()?,
+            _residency: crate::native_engine::ModelResidency::begin(),
+        })
+    }
+
+    /// Transcribe one batch input.
+    pub fn transcribe(&self, request: TranscribeRequest) -> FwResult<RunReport> {
+        backend::reset_router_state();
+        self.engine.transcribe(request)
+    }
+
+    /// Transcribe one batch input, streaming its stage events to `event_tx`.
+    pub fn transcribe_with_stream(
+        &self,
+        request: TranscribeRequest,
+        event_tx: Sender<StreamedRunEvent>,
+    ) -> FwResult<RunReport> {
+        backend::reset_router_state();
+        self.engine.transcribe_with_stream(request, event_tx)
+    }
+}
+
 async fn run_pipeline(
     request: TranscribeRequest,
     state_root: &Path,
@@ -6188,6 +6230,39 @@ fn sortformer_acoustic_fallback_eligible(error: &FwError) -> bool {
     )
 }
 
+/// Residency key for the verified native Sortformer session.
+const SORTFORMER_RESIDENT_SESSION: &str = "sortformer.session";
+
+/// The verified native Sortformer session: authenticated, parsed and built
+/// once per batch while a [`crate::native_engine::ModelResidency`] is alive,
+/// and per run otherwise. Diarization borrows the session immutably, so a
+/// reused session yields exactly what a freshly built one would.
+fn resident_sortformer_session(
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<Arc<crate::sortformer_inference::SortformerSession>> {
+    if let Some(session) = crate::native_engine::resident_component::<
+        crate::sortformer_inference::SortformerSession,
+    >(SORTFORMER_RESIDENT_SESSION)
+    {
+        return Ok(session);
+    }
+    let cached =
+        crate::model_distribution::resolve_cached_sortformer_with_cancel(|| checkpoint().is_err())?;
+    checkpoint()?;
+    let package = crate::sortformer_conformance::load_verified_sortformer_package_with_checkpoint(
+        &cached.receipt_path,
+        &cached.package_path,
+        checkpoint,
+    )?;
+    let session = Arc::new(
+        crate::sortformer_inference::SortformerSession::from_verified_package_with_checkpoint(
+            &package, checkpoint,
+        )?,
+    );
+    crate::native_engine::retain_resident_component(SORTFORMER_RESIDENT_SESSION, &session);
+    Ok(session)
+}
+
 fn run_native_sortformer_diarization(
     samples: &[f32],
     normalized_input_sha256: &str,
@@ -6203,18 +6278,7 @@ fn run_native_sortformer_diarization(
                 .to_owned(),
         ));
     }
-    let cached =
-        crate::model_distribution::resolve_cached_sortformer_with_cancel(|| checkpoint().is_err())?;
-    checkpoint()?;
-    let package = crate::sortformer_conformance::load_verified_sortformer_package_with_checkpoint(
-        &cached.receipt_path,
-        &cached.package_path,
-        checkpoint,
-    )?;
-    let session =
-        crate::sortformer_inference::SortformerSession::from_verified_package_with_checkpoint(
-            &package, checkpoint,
-        )?;
+    let session = resident_sortformer_session(checkpoint)?;
     let output = session.diarize_with_checkpoint(
         crate::sortformer_inference::SortformerPcm::mono_16khz(samples),
         checkpoint,

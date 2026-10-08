@@ -10,14 +10,18 @@ use franken_whisper::cli::{
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
-    backends_discovery_value, build_backends_report, build_health_report, emit_event_value,
-    emit_health_report, emit_pretty_run_report, emit_robot_complete, emit_robot_error_from_fw,
+    BatchItem, BatchTally, backends_discovery_value, batch_complete_value, batch_error_value,
+    batch_result_value, build_backends_report, build_health_report, emit_batch_record,
+    emit_event_value, emit_health_report, emit_pretty_run_report, emit_robot_batch_complete,
+    emit_robot_batch_error, emit_robot_batch_start, emit_robot_complete, emit_robot_error_from_fw,
     emit_robot_stage, emit_robot_start, listen_device_value, robot_schema_value,
     routing_decision_line, routing_history_complete_value,
 };
 use franken_whisper::storage::RunStore;
 use franken_whisper::tty_audio;
-use franken_whisper::{FrankenWhisperEngine, FwError, FwResult};
+use franken_whisper::{
+    BatchTranscriber, FrankenWhisperEngine, FwError, FwResult, RunReport, TranscribeRequest,
+};
 
 pub(crate) fn main() {
     franken_whisper::logging::init();
@@ -373,9 +377,154 @@ fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
     }
 }
 
+/// `fw transcribe` batch mode (bd-batch-transcribe-rraf): one engine and one
+/// model residency serve every input. With `--json`, stdout carries exactly
+/// one compact batch record per attempted input, in input order; otherwise
+/// each transcript prints under a `==> INPUT <==` header and failures go to
+/// stderr. A failed input never stops the batch.
+fn run_transcribe_batch(args: cli::TranscribeArgs) -> FwResult<()> {
+    let json = args.json;
+    let batch = args.into_batch()?;
+    let total = batch.inputs.len();
+    let transcriber = BatchTranscriber::new()?;
+    let mut tally = BatchTally {
+        total,
+        succeeded: 0,
+        failed: 0,
+    };
+    for (index, path) in batch.inputs.iter().enumerate() {
+        if ShutdownController::is_shutting_down() {
+            break;
+        }
+        let item = BatchItem::new(index, total, path);
+        match transcriber.transcribe(batch.request_for(path)) {
+            Ok(report) => {
+                tally.succeeded += 1;
+                if json {
+                    emit_batch_record(&batch_result_value(&item, report)?)?;
+                } else {
+                    if tally.succeeded > 1 {
+                        println!();
+                    }
+                    println!("==> {} <==", item.input);
+                    print!(
+                        "{}",
+                        franken_whisper::export::render_console_transcript(&report.result)
+                    );
+                }
+            }
+            Err(error) => {
+                tally.failed += 1;
+                if json {
+                    emit_batch_record(&batch_error_value(&item, &error))?;
+                } else {
+                    eprintln!("error: {}: {error}", item.input);
+                }
+            }
+        }
+    }
+    batch_outcome(&tally)
+}
+
+/// `fw robot run` batch mode: each input streams its own `run_start` (tagged
+/// with `batch`), stage events and `run_complete` / `run_error`, in input
+/// order, and `batch.complete` is the final line. A batch-level failure
+/// (unreadable list, invalid shared flags) emits one untagged `run_error`.
+fn run_robot_batch(args: cli::TranscribeArgs) -> FwResult<()> {
+    let summary = args.robot_summary();
+    let prepared = args
+        .into_batch()
+        .and_then(|batch| Ok((batch, BatchTranscriber::new()?)));
+    let (batch, transcriber) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            emit_robot_error_from_fw(&error)?;
+            return Err(error);
+        }
+    };
+    let total = batch.inputs.len();
+    let mut tally = BatchTally {
+        total,
+        succeeded: 0,
+        failed: 0,
+    };
+    for (index, path) in batch.inputs.iter().enumerate() {
+        if ShutdownController::is_shutting_down() {
+            break;
+        }
+        let item = BatchItem::new(index, total, path);
+        emit_robot_batch_start(summary.clone(), &item)?;
+        match stream_robot_run(&transcriber, batch.request_for(path))? {
+            Ok(report) => {
+                tally.succeeded += 1;
+                emit_robot_batch_complete(&report, &item)?;
+            }
+            Err(error) => {
+                tally.failed += 1;
+                emit_robot_batch_error(&error, &item)?;
+            }
+        }
+    }
+    emit_event_value(&batch_complete_value(&tally))?;
+    batch_outcome(&tally)
+}
+
+/// Run one batch input on a scoped worker thread, streaming its stage events
+/// to stdout as they happen. The outer error is an stdout failure; the inner
+/// result is the run's own outcome.
+fn stream_robot_run(
+    transcriber: &BatchTranscriber,
+    request: TranscribeRequest,
+) -> FwResult<FwResult<RunReport>> {
+    let (event_tx, event_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || transcriber.transcribe_with_stream(request, event_tx));
+        loop {
+            match event_rx.recv_timeout(Duration::from_millis(40)) {
+                Ok(streamed) => emit_robot_stage(&streamed.run_id, &streamed.event)?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if worker.is_finished() {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        while let Ok(streamed) = event_rx.try_recv() {
+            emit_robot_stage(&streamed.run_id, &streamed.event)?;
+        }
+        Ok(worker.join().unwrap_or_else(|_| {
+            Err(FwError::ContractViolation(
+                "robot worker thread panicked".to_owned(),
+            ))
+        }))
+    })
+}
+
+/// Map a finished batch onto the process outcome: interrupted batches exit
+/// as cancelled (130 via the shutdown controller), batches with a failed
+/// input exit 1 with `FW-BATCH-INCOMPLETE`.
+fn batch_outcome(tally: &BatchTally) -> FwResult<()> {
+    if tally.skipped() > 0 {
+        return Err(FwError::Cancelled(
+            "batch interrupted before every input was attempted".to_owned(),
+        ));
+    }
+    if tally.failed > 0 {
+        return Err(FwError::BatchIncomplete {
+            failed: tally.failed,
+            total: tally.total,
+        });
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> FwResult<()> {
     match cli.command {
         Command::Transcribe(args) => {
+            if args.is_batch() {
+                return run_transcribe_batch(*args);
+            }
             let json = args.json;
             let request = (*args).into_request()?;
             let engine = FrankenWhisperEngine::new()?;
@@ -392,6 +541,7 @@ fn run(cli: Cli) -> FwResult<()> {
             Ok(())
         }
         Command::Robot { command } => match command {
+            RobotCommand::Run(args) if args.is_batch() => run_robot_batch(*args),
             RobotCommand::Run(args) => {
                 emit_robot_start(args.robot_summary())?;
                 let request = match (*args).into_request() {

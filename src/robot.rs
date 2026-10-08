@@ -292,6 +292,148 @@ pub fn emit_pretty_run_report(report: RunReport) -> FwResult<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Batch mode (bd-batch-transcribe-rraf)
+// ---------------------------------------------------------------------------
+
+/// Schema id of each `fw transcribe --json` batch record.
+pub const BATCH_RESULT_SCHEMA_VERSION: &str = "franken-whisper-batch-result-v1";
+pub const BATCH_RESULT_REQUIRED_FIELDS: &[&str] =
+    &["schema_version", "index", "total", "input", "status"];
+pub const BATCH_COMPLETE_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "total",
+    "succeeded",
+    "failed",
+    "skipped",
+    "status",
+];
+
+/// One input's position in a batch. Robot `run_start`, `run_complete` and
+/// `run_error` events carry it as `batch`; `fw transcribe --json` batch
+/// records carry its fields at top level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BatchItem {
+    /// Zero-based position in input order.
+    pub index: usize,
+    /// Number of inputs in the batch.
+    pub total: usize,
+    /// The input path exactly as given.
+    pub input: String,
+}
+
+impl BatchItem {
+    #[must_use]
+    pub fn new(index: usize, total: usize, input: &Path) -> Self {
+        Self {
+            index,
+            total,
+            input: input.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// How a batch ended, as reported by `batch.complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchTally {
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+}
+
+impl BatchTally {
+    /// Inputs never attempted (an interrupted batch stops early).
+    #[must_use]
+    pub const fn skipped(&self) -> usize {
+        self.total
+            .saturating_sub(self.succeeded)
+            .saturating_sub(self.failed)
+    }
+
+    /// `ok` when every input succeeded, `cancelled` when the batch stopped
+    /// before attempting every input, `incomplete` when an input failed.
+    #[must_use]
+    pub const fn status(&self) -> &'static str {
+        if self.skipped() > 0 {
+            "cancelled"
+        } else if self.failed > 0 {
+            "incomplete"
+        } else {
+            "ok"
+        }
+    }
+}
+
+/// The `fw transcribe --json` batch record for a successful input. `report`
+/// is the exact object a single-input `fw transcribe --json` prints.
+pub fn batch_result_value(item: &BatchItem, report: RunReport) -> FwResult<Value> {
+    Ok(json!({
+        "schema_version": BATCH_RESULT_SCHEMA_VERSION,
+        "index": item.index,
+        "total": item.total,
+        "input": item.input,
+        "status": "ok",
+        "report": owned_run_report_value(report)?,
+    }))
+}
+
+/// The `fw transcribe --json` batch record for a failed input.
+#[must_use]
+pub fn batch_error_value(item: &BatchItem, error: &FwError) -> Value {
+    json!({
+        "schema_version": BATCH_RESULT_SCHEMA_VERSION,
+        "index": item.index,
+        "total": item.total,
+        "input": item.input,
+        "status": "error",
+        "error": {
+            "code": error.error_code(),
+            "message": error.to_string(),
+        },
+    })
+}
+
+/// Emit one compact `fw transcribe --json` batch record line.
+pub fn emit_batch_record(value: &Value) -> FwResult<()> {
+    emit_line(value)
+}
+
+/// The robot `batch.complete` terminal event.
+#[must_use]
+pub fn batch_complete_value(tally: &BatchTally) -> Value {
+    json!({
+        "event": "batch.complete",
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "total": tally.total,
+        "succeeded": tally.succeeded,
+        "failed": tally.failed,
+        "skipped": tally.skipped(),
+        "status": tally.status(),
+    })
+}
+
+/// Emit `run_start` for one batch input.
+pub fn emit_robot_batch_start(request_summary: Value, item: &BatchItem) -> FwResult<()> {
+    let mut value = run_start_value(request_summary);
+    value["batch"] = serde_json::to_value(item)?;
+    emit_line(&value)
+}
+
+/// Emit `run_complete` for one batch input.
+pub fn emit_robot_batch_complete(report: &RunReport, item: &BatchItem) -> FwResult<()> {
+    let mut complete = BorrowedComplete::new(report);
+    complete.batch = Some(item);
+    emit_line(&complete)
+}
+
+/// Emit `run_error` for one batch input.
+pub fn emit_robot_batch_error(error: &FwError, item: &BatchItem) -> FwResult<()> {
+    let mut value = run_error_value(&error.to_string(), error.error_code());
+    value["batch"] = serde_json::to_value(item)?;
+    emit_line(&value)
+}
+
 fn owned_run_report_value(report: RunReport) -> serde_json::Result<Value> {
     let acceleration_context = acceleration_context_ref_from_evidence(&report.evidence).cloned();
     let RunReport {
@@ -1926,10 +2068,13 @@ pub fn capabilities_value() -> serde_json::Value {
             {"command": "fw robot schema", "output": "json"},
             {"command": "fw robot backends", "output": "json"},
             {"command": "fw robot run --input AUDIO", "output": "ndjson"},
+            {"command": "fw robot run --inputs-from LIST", "output": "ndjson"},
+            {"command": "fw transcribe --inputs-from LIST --json", "output": "ndjson"},
             {"command": "fw youtube run --url URL --json-summary", "output": "json"},
             {"command": "fw youtube search QUERY [--limit N] [--flat]", "output": "json"},
             {"command": "fw youtube enrich URL_OR_ID...", "output": "json"},
         ],
+        "batch": batch_capability_value(),
         "privacy": {
             "agent_discovery_network_access": false,
             "inference_model_downloads_automatic": false,
@@ -1941,6 +2086,43 @@ pub fn capabilities_value() -> serde_json::Value {
         "process_exit_codes": process_exit_codes,
         "error_codes": error_codes,
         "robot_schema_version": ROBOT_SCHEMA_VERSION,
+    })
+}
+
+/// The batch-mode contract advertised by `fw capabilities --json` so agents
+/// can feature-detect it (bd-batch-transcribe-rraf).
+fn batch_capability_value() -> Value {
+    let transcribe_json = json!({
+        "format": "ndjson",
+        "schema_version": BATCH_RESULT_SCHEMA_VERSION,
+        "required": BATCH_RESULT_REQUIRED_FIELDS,
+        "status": ["ok", "error"],
+        "ok": "`report` is the object single-input `fw transcribe --json` prints",
+        "error": "`error` is {code, message} with a stable FW-* code",
+        "order": "one line per attempted input, in input order",
+    });
+    let robot_run = json!({
+        "per_input": ["run_start", "stage*", "run_complete | run_error"],
+        "batch_field": "run_start, run_complete and run_error carry batch {index, total, input}",
+        "terminal": "batch.complete",
+        "terminal_required": BATCH_COMPLETE_REQUIRED_FIELDS,
+    });
+    json!({
+        "supported": true,
+        "commands": ["fw transcribe", "fw robot run"],
+        "flags": {
+            "--input PATH": "repeatable; two or more select batch mode",
+            "--inputs-from FILE": "one path per line, `-` reads stdin; always batch mode",
+        },
+        "input_order": "every --input, then each --inputs-from line; blank lines skipped",
+        "model_loads": "once per process; every input reuses the authenticated, parsed models",
+        "per_input_result": "identical to a single-input run with the same flags",
+        "transcribe_json": transcribe_json,
+        "robot_run": robot_run,
+        "failure_isolation": "a failed input does not stop the batch",
+        "exit_code_when_any_input_fails": 1,
+        "error_code_when_any_input_fails": "FW-BATCH-INCOMPLETE",
+        "unsupported_with": ["--stdin", "--mic", "--speaker-hints", "--transcript-path"],
     })
 }
 
@@ -2329,7 +2511,13 @@ pub const fn robot_docs_guide() -> &'static str {
 8. Curate the YouTube catalog with `fw youtube search QUERY` (deduped JSON hits;\n\
    `--flat` for cheap sweeps) and `fw youtube enrich URL_OR_ID...`; ingestion is\n\
    `fw youtube run --url URL` (`--robot` streams per-video NDJSON events;\n\
-   `--json-summary` prints one final JSON blob).\n"
+   `--json-summary` prints one final JSON blob).\n\
+9. Batch many files in one process (the model loads once): repeat `--input` or\n\
+   pass `--inputs-from LIST` (one path per line, `-` = stdin). `fw transcribe\n\
+   --inputs-from LIST --json` prints one NDJSON record per input in input order\n\
+   ({index, total, input, status: ok|error, report|error}); `fw robot run` tags\n\
+   each input's run_start/run_complete/run_error with `batch` and ends with\n\
+   `batch.complete`. A failed input never stops the batch; exit 1 if any failed.\n"
 }
 
 /// Emit a single `health.report` NDJSON line to stdout.
@@ -2718,6 +2906,7 @@ pub fn robot_schema_value() -> serde_json::Value {
             },
         }
     });
+    insert_batch_schema(&mut schema);
     let serde_json::Value::Object(youtube_events) = youtube_event_schema_value() else {
         unreachable!("youtube schema events are constructed as an object")
     };
@@ -2730,6 +2919,47 @@ pub fn robot_schema_value() -> serde_json::Value {
     events.extend(youtube_events);
     events.insert("health.report".to_owned(), health_report);
     schema
+}
+
+/// Batch-mode schema additions (bd-batch-transcribe-rraf): the optional
+/// `batch` object on a batch input's run_start / run_complete / run_error,
+/// and the `batch.complete` terminal.
+fn insert_batch_schema(schema: &mut Value) {
+    let batch_field = json!({
+        "batch": {
+            "present": "only when the run is one input of a batch (`--inputs-from` or repeated `--input`)",
+            "fields": {
+                "index": "zero-based input position",
+                "total": "number of inputs in the batch",
+                "input": "the input path as given",
+            },
+        },
+    });
+    let events = schema["events"]
+        .as_object_mut()
+        .expect("robot schema events must be an object");
+    for event in ["run_start", "run_complete", "run_error"] {
+        if let Some(entry) = events.get_mut(event).and_then(Value::as_object_mut) {
+            entry.insert("optional".to_owned(), batch_field.clone());
+        }
+    }
+    events.insert(
+        "batch.complete".to_owned(),
+        json!({
+            "required": BATCH_COMPLETE_REQUIRED_FIELDS,
+            "terminal": true,
+            "statuses": {
+                "ok": "every input succeeded",
+                "incomplete": "at least one input failed (process exit 1)",
+                "cancelled": "interrupted before every input was attempted",
+            },
+            "example": batch_complete_value(&BatchTally {
+                total: 3,
+                succeeded: 2,
+                failed: 1,
+            }),
+        }),
+    );
 }
 
 fn youtube_event_schema_value() -> serde_json::Value {
@@ -2987,6 +3217,9 @@ struct BorrowedComplete<'a> {
     evidence: &'a [Value],
     #[serde(skip_serializing_if = "Option::is_none")]
     acceleration_context: Option<&'a Value>,
+    /// Present only on a batch input's `run_complete`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch: Option<&'a BatchItem>,
 }
 
 impl<'a> BorrowedComplete<'a> {
@@ -3007,6 +3240,7 @@ impl<'a> BorrowedComplete<'a> {
             warnings: &report.warnings,
             evidence: &report.evidence,
             acceleration_context: acceleration_context_ref_from_evidence(&report.evidence),
+            batch: None,
         }
     }
 }
@@ -3088,11 +3322,12 @@ mod tests {
         std::env::var("FRANKEN_WHISPER_ULTRA_STRESS").is_ok_and(|value| value == "1")
     }
 
-    const ROBOT_SCHEMA_EVENT_TYPES: [&str; 30] = [
+    const ROBOT_SCHEMA_EVENT_TYPES: [&str; 31] = [
         "run_start",
         "stage",
         "run_complete",
         "run_error",
+        "batch.complete",
         "backends.discovery",
         "routing_decision",
         "routing_history.complete",
@@ -4758,7 +4993,7 @@ mod tests {
         let expected: HashSet<&str> = ROBOT_SCHEMA_EVENT_TYPES.into_iter().collect();
         assert_eq!(
             actual, expected,
-            "schema must define the exact 30-event robot contract"
+            "schema must define the exact 31-event robot contract"
         );
     }
 
@@ -5120,6 +5355,152 @@ mod tests {
                 "missing required field `{field}` in run_complete output"
             );
         }
+    }
+
+    #[test]
+    fn batch_records_wrap_the_single_run_report_and_errors() {
+        use crate::error::FwError;
+
+        let report = test_report(vec![], vec![]);
+        let item = super::BatchItem::new(1, 3, std::path::Path::new("clips/b c.wav"));
+        let single = owned_run_report_value(report.clone()).expect("single-input report");
+        let ok = super::batch_result_value(&item, report).expect("ok record");
+        for field in super::BATCH_RESULT_REQUIRED_FIELDS {
+            assert!(ok.get(*field).is_some(), "ok record lacks `{field}`");
+        }
+        assert_eq!(ok["schema_version"], super::BATCH_RESULT_SCHEMA_VERSION);
+        assert_eq!(ok["index"], 1);
+        assert_eq!(ok["total"], 3);
+        assert_eq!(ok["input"], "clips/b c.wav");
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(
+            ok["report"], single,
+            "a batch record embeds exactly the single-input --json report"
+        );
+        assert!(ok.get("error").is_none());
+
+        let error = FwError::MissingArtifact(std::path::PathBuf::from("clips/missing.wav"));
+        let failed = super::batch_error_value(&item, &error);
+        for field in super::BATCH_RESULT_REQUIRED_FIELDS {
+            assert!(failed.get(*field).is_some(), "error record lacks `{field}`");
+        }
+        assert_eq!(failed["status"], "error");
+        assert_eq!(failed["error"]["code"], "FW-MISSING-ARTIFACT");
+        assert_eq!(failed["error"]["message"], error.to_string());
+        assert!(failed.get("report").is_none());
+        for record in [&ok, &failed] {
+            let line = serde_json::to_string(record).expect("serialize record");
+            assert!(!line.contains('\n'), "one record per NDJSON line");
+        }
+    }
+
+    #[test]
+    fn batch_run_events_add_only_the_batch_object() {
+        let report = test_report(vec![], vec![]);
+        let item = super::BatchItem::new(0, 2, std::path::Path::new("a.wav"));
+        let plain = serde_json::to_value(BorrowedComplete::new(&report)).expect("plain");
+        assert!(
+            plain.get("batch").is_none(),
+            "single-run run_complete is unchanged"
+        );
+        let mut tagged = BorrowedComplete::new(&report);
+        tagged.batch = Some(&item);
+        let mut tagged = serde_json::to_value(tagged).expect("tagged");
+        assert_eq!(
+            tagged["batch"],
+            json!({"index": 0, "total": 2, "input": "a.wav"})
+        );
+        tagged
+            .as_object_mut()
+            .expect("run_complete object")
+            .remove("batch");
+        assert_eq!(tagged, plain);
+    }
+
+    #[test]
+    fn batch_complete_reports_ok_incomplete_and_cancelled() {
+        use super::{BATCH_COMPLETE_REQUIRED_FIELDS, BatchTally, batch_complete_value};
+
+        for (tally, status, skipped) in [
+            (
+                BatchTally {
+                    total: 2,
+                    succeeded: 2,
+                    failed: 0,
+                },
+                "ok",
+                0,
+            ),
+            (
+                BatchTally {
+                    total: 0,
+                    succeeded: 0,
+                    failed: 0,
+                },
+                "ok",
+                0,
+            ),
+            (
+                BatchTally {
+                    total: 3,
+                    succeeded: 2,
+                    failed: 1,
+                },
+                "incomplete",
+                0,
+            ),
+            (
+                BatchTally {
+                    total: 4,
+                    succeeded: 1,
+                    failed: 1,
+                },
+                "cancelled",
+                2,
+            ),
+        ] {
+            let value = batch_complete_value(&tally);
+            assert_eq!(value["event"], "batch.complete");
+            assert_eq!(value["status"], status, "{tally:?}");
+            assert_eq!(value["skipped"], skipped, "{tally:?}");
+            for field in BATCH_COMPLETE_REQUIRED_FIELDS {
+                assert!(value.get(*field).is_some(), "missing `{field}`");
+            }
+        }
+    }
+
+    #[test]
+    fn batch_mode_is_feature_detectable() {
+        let capabilities = super::capabilities_value();
+        let batch = &capabilities["batch"];
+        assert_eq!(batch["supported"], true);
+        assert_eq!(
+            batch["transcribe_json"]["schema_version"],
+            super::BATCH_RESULT_SCHEMA_VERSION
+        );
+        assert_eq!(batch["robot_run"]["terminal"], "batch.complete");
+        assert_eq!(
+            batch["error_code_when_any_input_fails"],
+            "FW-BATCH-INCOMPLETE"
+        );
+        assert!(capabilities["error_codes"].as_array().is_some_and(|codes| {
+            codes
+                .iter()
+                .any(|code| code["code"] == "FW-BATCH-INCOMPLETE")
+        }));
+
+        let schema = robot_schema_value();
+        assert_eq!(
+            schema["events"]["batch.complete"]["required"],
+            json!(super::BATCH_COMPLETE_REQUIRED_FIELDS)
+        );
+        for event in ["run_start", "run_complete", "run_error"] {
+            assert!(
+                schema["events"][event]["optional"]["batch"].is_object(),
+                "{event} documents its optional batch object"
+            );
+        }
+        assert!(super::robot_docs_guide().contains("--inputs-from"));
     }
 
     #[test]

@@ -1171,7 +1171,13 @@ pub fn resolve_model_source_with_cancel(
     // paths. A custom file with the same basename remains selectable through
     // an explicit path spelling such as `./default` or `/models/default`.
     if is_release_package_spec(spec) {
+        // A batch residency authenticates the package once (see
+        // [`ModelResidency`]); single runs always hash.
+        if let Some(package) = resident_release_package() {
+            return Ok(ResolvedWhisperModel::Authenticated(package));
+        }
         let package = crate::model_distribution::resolve_cached_whisper_with_cancel(is_cancelled)?;
+        remember_release_package(&package);
         return Ok(ResolvedWhisperModel::Authenticated(package));
     }
 
@@ -1553,6 +1559,142 @@ fn load_dedup_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FW_LOAD_DEDUP").ok().as_deref() == Some("1"))
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Batch model residency (bd-batch-transcribe-rraf)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Process-wide state behind [`ModelResidency`]: the number of live guards
+/// and everything they retain. Empty whenever no guard is alive.
+struct ResidencyState {
+    guards: usize,
+    models: Vec<Arc<NativeWhisperModel>>,
+    release_package: Option<crate::model_distribution::CachedWhisperPackage>,
+    components: Vec<(&'static str, Arc<dyn std::any::Any + Send + Sync>)>,
+}
+
+static RESIDENCY: Mutex<ResidencyState> = Mutex::new(ResidencyState {
+    guards: 0,
+    models: Vec::new(),
+    release_package: None,
+    components: Vec::new(),
+});
+
+fn lock_residency() -> std::sync::MutexGuard<'static, ResidencyState> {
+    RESIDENCY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keeps native models resident across the runs of one batch.
+///
+/// While at least one guard is alive:
+/// - every native Whisper model a run loads stays resident (the guard holds a
+///   strong `Arc`, so the [`Weak`] model cache keeps returning it instead of
+///   re-parsing the file);
+/// - the release package's SHA-256 authentication runs once, and later
+///   resolutions reuse the verified descriptor;
+/// - components registered through [`retain_resident_component`] (the native
+///   Sortformer session) are reused.
+///
+/// A batch of N inputs therefore pays the multi-GB hash and parse once instead
+/// of N times. Each run still executes the normal pipeline against the same
+/// in-memory weights a single-input run would load, so per-input results are
+/// unchanged. Reusing the authenticated descriptor is sound because inference
+/// reads only the in-memory weights parsed from the verified bytes; every load
+/// still re-checks the descriptor's `fstat` fingerprint and fails closed if the
+/// file was rewritten in place after authentication. Dropping the last guard
+/// releases everything it retained.
+#[must_use = "dropping the guard ends model residency immediately"]
+pub struct ModelResidency {
+    _private: (),
+}
+
+impl ModelResidency {
+    /// Begin batch residency (guards nest; the last drop releases).
+    pub fn begin() -> Self {
+        lock_residency().guards += 1;
+        Self { _private: () }
+    }
+}
+
+impl Drop for ModelResidency {
+    fn drop(&mut self) {
+        let released = {
+            let mut state = lock_residency();
+            state.guards = state.guards.saturating_sub(1);
+            (state.guards == 0).then(|| {
+                (
+                    std::mem::take(&mut state.models),
+                    state.release_package.take(),
+                    std::mem::take(&mut state.components),
+                )
+            })
+        };
+        // Free the (multi-GB) weights outside the lock.
+        drop(released);
+    }
+}
+
+/// Whether a [`ModelResidency`] guard is currently alive.
+#[must_use]
+pub fn residency_active() -> bool {
+    lock_residency().guards > 0
+}
+
+/// Retain `model` for the active residency; a no-op without a guard, so a
+/// single run keeps the load-per-run lifetime of the [`Weak`] cache.
+fn retain_resident_model(model: &Arc<NativeWhisperModel>) {
+    let mut state = lock_residency();
+    if state.guards > 0 && !state.models.iter().any(|kept| Arc::ptr_eq(kept, model)) {
+        state.models.push(Arc::clone(model));
+    }
+}
+
+/// The release package this residency already authenticated, if any.
+fn resident_release_package() -> Option<crate::model_distribution::CachedWhisperPackage> {
+    let state = lock_residency();
+    if state.guards > 0 {
+        state.release_package.clone()
+    } else {
+        None
+    }
+}
+
+/// Remember an authenticated release package for the active residency.
+fn remember_release_package(package: &crate::model_distribution::CachedWhisperPackage) {
+    let mut state = lock_residency();
+    if state.guards > 0 && state.release_package.is_none() {
+        state.release_package = Some(package.clone());
+    }
+}
+
+/// Fetch the component the active residency retained under `key`, if any.
+#[must_use]
+pub fn resident_component<T: std::any::Any + Send + Sync>(key: &'static str) -> Option<Arc<T>> {
+    let state = lock_residency();
+    if state.guards == 0 {
+        return None;
+    }
+    state
+        .components
+        .iter()
+        .find(|(kept, _)| *kept == key)
+        .and_then(|(_, value)| Arc::clone(value).downcast::<T>().ok())
+}
+
+/// Retain `value` under `key` until the active residency ends; a no-op without
+/// a guard. The first value retained under a key wins.
+pub fn retain_resident_component<T: std::any::Any + Send + Sync>(
+    key: &'static str,
+    value: &Arc<T>,
+) {
+    let mut state = lock_residency();
+    if state.guards > 0 && !state.components.iter().any(|(kept, _)| *kept == key) {
+        let erased: Arc<dyn std::any::Any + Send + Sync> = value.clone();
+        state.components.push((key, erased));
+    }
+}
+
 impl NativeWhisperModel {
     /// Load (or fetch from the global cache) the model at `path`.
     ///
@@ -1692,6 +1834,24 @@ impl NativeWhisperModel {
     }
 
     fn load_key(
+        key: ModelCacheKey,
+        keep_resident: bool,
+        authenticated: Option<AuthenticatedWeights>,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+        warm_version_tag: bool,
+    ) -> FwResult<Arc<Self>> {
+        let model = Self::load_key_cached(
+            key,
+            keep_resident,
+            authenticated,
+            checkpoint,
+            warm_version_tag,
+        )?;
+        retain_resident_model(&model);
+        Ok(model)
+    }
+
+    fn load_key_cached(
         key: ModelCacheKey,
         keep_resident: bool,
         authenticated: Option<AuthenticatedWeights>,
@@ -2619,6 +2779,11 @@ mod tests {
 
     #[test]
     fn cache_returns_same_arc_then_reloads_after_drop() {
+        // A concurrently running residency test would retain this model and
+        // keep its `Weak` alive; serialize on the shared lifetime lock.
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("cache");
         let path = write_file(dir.path(), "ggml-cache.bin", synthetic_model_bytes());
 
@@ -2696,6 +2861,102 @@ mod tests {
             Arc::ptr_eq(&retained, &b),
             "resident reload must return the retained Arc"
         );
+    }
+
+    #[test]
+    fn batch_residency_retains_loaded_models_until_the_last_guard_drops() {
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new("batch_residency");
+        let path = write_file(dir.path(), "ggml-batch.bin", synthetic_model_bytes());
+
+        let outer = ModelResidency::begin();
+        let inner = ModelResidency::begin();
+        assert!(residency_active());
+        // `load_with_checkpoint` spawns no version-tag warm thread, so the
+        // only strong references are this test's and the residency's.
+        let first = NativeWhisperModel::load_with_checkpoint(&path, &|| Ok(())).expect("load");
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        let second =
+            NativeWhisperModel::load_with_checkpoint(&path, &|| Ok(())).expect("second load");
+        assert!(
+            weak.upgrade()
+                .is_some_and(|kept| Arc::ptr_eq(&kept, &second)),
+            "a batch reuses the resident model instead of re-parsing the file"
+        );
+        drop(second);
+        drop(inner);
+        assert!(
+            weak.upgrade().is_some(),
+            "a nested guard's drop must not end the outer residency"
+        );
+        drop(outer);
+        assert!(!residency_active());
+        assert!(
+            weak.upgrade().is_none(),
+            "the last guard releases every retained model"
+        );
+    }
+
+    #[test]
+    fn batch_residency_reuses_the_authenticated_release_package() {
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = TempDir::new("batch_release_package");
+        let bytes = synthetic_model_bytes();
+        let path = write_file(dir.path(), "ggml-batch-package.bin", bytes);
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let package = crate::model_distribution::CachedWhisperPackage::from_authenticated_test_file(
+            path.clone(),
+            digest,
+            std::fs::File::open(&path).expect("open verified generation"),
+        );
+
+        remember_release_package(&package);
+        assert!(
+            resident_release_package().is_none(),
+            "without a guard every resolution re-authenticates"
+        );
+        let residency = ModelResidency::begin();
+        remember_release_package(&package);
+        let reused = resident_release_package().expect("the residency keeps the package");
+        assert_eq!(reused, package);
+        let a = NativeWhisperModel::load_authenticated_with_checkpoint(&reused, &|| Ok(()))
+            .expect("first authenticated load");
+        let b = NativeWhisperModel::load_authenticated_with_checkpoint(&reused, &|| Ok(()))
+            .expect("second authenticated load");
+        assert!(Arc::ptr_eq(&a, &b), "one parse per batch");
+        drop(residency);
+        assert!(resident_release_package().is_none());
+    }
+
+    #[test]
+    fn batch_residency_components_live_only_inside_a_residency() {
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let value = Arc::new(7_u32);
+        retain_resident_component("test.batch_component", &value);
+        assert!(resident_component::<u32>("test.batch_component").is_none());
+
+        let residency = ModelResidency::begin();
+        retain_resident_component("test.batch_component", &value);
+        retain_resident_component("test.batch_component", &Arc::new(9_u32));
+        assert_eq!(
+            resident_component::<u32>("test.batch_component").as_deref(),
+            Some(&7),
+            "the first retained value wins"
+        );
+        assert!(
+            resident_component::<String>("test.batch_component").is_none(),
+            "a type mismatch is a miss, not a panic"
+        );
+        drop(residency);
+        assert!(resident_component::<u32>("test.batch_component").is_none());
+        assert_eq!(Arc::strong_count(&value), 1, "the residency released it");
     }
 
     #[test]

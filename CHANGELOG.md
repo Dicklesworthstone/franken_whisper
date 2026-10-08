@@ -22,6 +22,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ### Added
 
+- Batch transcription (bd-batch-transcribe-rraf): `fw transcribe` and
+  `fw robot run` accept a repeatable `--input` and `--inputs-from FILE`
+  (one path per line, `-` reads stdin). One process authenticates and loads
+  the native models once, resets adaptive routing before each input, and
+  runs every input through the normal pipeline, so each result matches a
+  single-input run with the same flags. `fw transcribe --json` prints one
+  NDJSON record per input in input order
+  (`franken-whisper-batch-result-v1`: `index`, `total`, `input`,
+  `status: ok|error`, `report` or `error`); robot runs tag each input's
+  `run_start` / `run_complete` / `run_error` with `batch` and end with
+  `batch.complete`. A failed input does not stop the batch; the process
+  exits 1 with `FW-BATCH-INCOMPLETE` when any input failed. Advertised as
+  `batch` in `fw capabilities --json`, in `fw robot schema` and in
+  `fw robot-docs guide`. Library users get `BatchTranscriber` and
+  `native_engine::ModelResidency`. Measurements are in `docs/PERF_LEDGER.md`.
 - `acceleration.raw_confidences` (bd-raw-segment-confidence-isdm): the
   backend's own per-segment confidence before the acceleration stage rescales
   `segments[].confidence` to sum to 1, parallel to `segments`, `null` where

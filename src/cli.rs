@@ -1519,9 +1519,18 @@ pub struct SyncImportArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct TranscribeArgs {
-    /// Path to input audio/video file.
-    #[arg(long)]
-    pub input: Option<PathBuf>,
+    /// Path to input audio/video file. Repeat it to transcribe several files in
+    /// one process (batch mode: the native model loads once).
+    #[arg(long, value_name = "PATH")]
+    pub input: Vec<PathBuf>,
+
+    /// Batch mode: read input paths from FILE, one per line (`-` reads stdin).
+    ///
+    /// Lines are taken verbatim apart from the line terminator; blank lines
+    /// are skipped. Inputs run in order: every `--input`, then each listed
+    /// path. Output is one NDJSON record per input (see `fw robot-docs guide`).
+    #[arg(long, value_name = "FILE")]
+    pub inputs_from: Option<PathBuf>,
 
     /// Read audio bytes from stdin.
     #[arg(long)]
@@ -2048,6 +2057,62 @@ pub enum TtyAudioControlCommand {
     },
 }
 
+/// A parsed batch (bd-batch-transcribe-rraf): the ordered inputs and the
+/// request they all share.
+#[derive(Debug, Clone)]
+pub struct TranscribeBatch {
+    /// Input files in processing (and output) order.
+    pub inputs: Vec<PathBuf>,
+    template: TranscribeRequest,
+}
+
+impl TranscribeBatch {
+    /// The request for one input: the shared request with `path` as its file.
+    #[must_use]
+    pub fn request_for(&self, path: &Path) -> TranscribeRequest {
+        let mut request = self.template.clone();
+        request.input = InputSource::File {
+            path: path.to_path_buf(),
+        };
+        request
+    }
+}
+
+/// Parse an `--inputs-from` list: one path per line, taken verbatim apart
+/// from its `\n` / `\r\n` terminator; blank (or whitespace-only) lines are
+/// skipped and order is preserved.
+#[must_use]
+pub fn parse_input_list(text: &str) -> Vec<PathBuf> {
+    text.split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .filter(|line| !line.trim().is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Read and parse an `--inputs-from` list; `-` reads it from stdin.
+fn read_input_list(list: &Path) -> FwResult<Vec<PathBuf>> {
+    let text = if list.as_os_str() == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|error| {
+                FwError::InvalidRequest(format!(
+                    "cannot read the --inputs-from list from stdin: {error}"
+                ))
+            })?;
+        text
+    } else {
+        std::fs::read_to_string(list).map_err(|error| {
+            FwError::InvalidRequest(format!(
+                "cannot read the --inputs-from list `{}`: {error}",
+                list.display()
+            ))
+        })?
+    };
+    Ok(parse_input_list(&text))
+}
+
 impl TranscribeArgs {
     /// Reject decoding flags no engine can honor before any work starts: a NaN
     /// threshold would silently disable its gate (every comparison is false),
@@ -2095,9 +2160,15 @@ impl TranscribeArgs {
     /// object is discarded.
     pub fn into_request(mut self) -> FwResult<TranscribeRequest> {
         self.validate_decoding_flags()?;
-        let effective_diarize = self.diarize || !self.no_diarize;
+        if self.is_batch() {
+            return Err(FwError::InvalidRequest(
+                "several inputs select batch mode, which yields one request per input; \
+                 build them with `into_batch`"
+                    .to_owned(),
+            ));
+        }
         let mut mode_count = 0usize;
-        if self.input.is_some() {
+        if !self.input.is_empty() {
             mode_count += 1;
         }
         if self.stdin {
@@ -2117,21 +2188,8 @@ impl TranscribeArgs {
                 "--input, --stdin, and --mic are mutually exclusive".to_owned(),
             ));
         }
-        if !effective_diarize
-            && (self.speaker_hints.is_some()
-                || self.persist_speaker_profiles
-                || self.diarization_engine != DiarizationEngine::Auto
-                || self.diarization_fallback != DiarizationFallbackPolicy::Acoustic
-                || self.speaker_count_hard.is_some()
-                || self.speaker_count_range.is_some()
-                || self.speaker_count_prior.is_some())
-        {
-            return Err(FwError::InvalidRequest(
-                "diarization controls cannot be combined with --no-diarize".to_owned(),
-            ));
-        }
 
-        let input = if let Some(path) = self.input.take() {
+        let input = if let Some(path) = self.input.pop() {
             InputSource::File { path }
         } else if self.stdin {
             InputSource::Stdin {
@@ -2145,6 +2203,72 @@ impl TranscribeArgs {
                 ffmpeg_source: self.mic_ffmpeg_source.take(),
             }
         };
+        self.into_request_for(input)
+    }
+
+    /// Whether these arguments select batch mode: more than one `--input`, or
+    /// any `--inputs-from` list (even one naming zero or one path).
+    #[must_use]
+    pub fn is_batch(&self) -> bool {
+        self.input.len() > 1 || self.inputs_from.is_some()
+    }
+
+    /// Consume batch-mode arguments into the ordered input list plus the
+    /// request every input shares, reading the `--inputs-from` list (stdin for
+    /// `-`). Inputs keep their order: every `--input`, then each listed path.
+    ///
+    /// # Errors
+    ///
+    /// [`FwError::InvalidRequest`] for flags that cannot apply to a batch
+    /// (`--stdin`, `--mic`, one recording's `--speaker-hints`, one output
+    /// file's `--transcript-path`), an unreadable or non-UTF-8 list, and every
+    /// error a single request reports for the shared flags.
+    pub fn into_batch(mut self) -> FwResult<TranscribeBatch> {
+        self.validate_decoding_flags()?;
+        if self.stdin || self.mic {
+            return Err(FwError::InvalidRequest(
+                "batch mode (repeated --input or --inputs-from) transcribes files; \
+                 it cannot be combined with --stdin or --mic"
+                    .to_owned(),
+            ));
+        }
+        if self.speaker_hints.is_some() {
+            return Err(FwError::InvalidRequest(
+                "--speaker-hints describes one recording and cannot apply to a batch".to_owned(),
+            ));
+        }
+        if self.transcript_path.is_some() {
+            return Err(FwError::InvalidRequest(
+                "--transcript-path names one output file and cannot be shared by a batch"
+                    .to_owned(),
+            ));
+        }
+        let mut inputs = std::mem::take(&mut self.input);
+        if let Some(list) = self.inputs_from.take() {
+            inputs.extend(read_input_list(&list)?);
+        }
+        let template = self.into_request_for(InputSource::File {
+            path: PathBuf::new(),
+        })?;
+        Ok(TranscribeBatch { inputs, template })
+    }
+
+    /// Build the request for `input` from every non-input flag.
+    fn into_request_for(mut self, input: InputSource) -> FwResult<TranscribeRequest> {
+        let effective_diarize = self.diarize || !self.no_diarize;
+        if !effective_diarize
+            && (self.speaker_hints.is_some()
+                || self.persist_speaker_profiles
+                || self.diarization_engine != DiarizationEngine::Auto
+                || self.diarization_fallback != DiarizationFallbackPolicy::Acoustic
+                || self.speaker_count_hard.is_some()
+                || self.speaker_count_range.is_some()
+                || self.speaker_count_prior.is_some())
+        {
+            return Err(FwError::InvalidRequest(
+                "diarization controls cannot be combined with --no-diarize".to_owned(),
+            ));
+        }
 
         // Build output format list from individual flags.
         let mut output_formats = Vec::new();
@@ -2452,7 +2576,8 @@ mod tests {
 
     fn minimal_args() -> TranscribeArgs {
         TranscribeArgs {
-            input: Some(PathBuf::from("test.wav")),
+            input: vec![PathBuf::from("test.wav")],
+            inputs_from: None,
             stdin: false,
             mic: false,
             mic_seconds: 15,
@@ -2541,7 +2666,7 @@ mod tests {
     #[test]
     fn consuming_request_is_byte_identical_to_borrowed_request() {
         let mut args = minimal_args();
-        args.input = Some(PathBuf::from("audio/naïve input.wav"));
+        args.input = vec![PathBuf::from("audio/naïve input.wav")];
         args.model = Some("models/large-v3-turbo".to_owned());
         args.language = Some("日本語".to_owned());
         args.db = PathBuf::from("state/telemetry.sqlite3");
@@ -2567,9 +2692,126 @@ mod tests {
     }
 
     #[test]
+    fn input_list_keeps_order_and_verbatim_paths_and_skips_blank_lines() {
+        let list = "b.wav\r\n\n  \nsub dir/a b.wav\n c.wav \nlast.wav";
+        assert_eq!(
+            parse_input_list(list),
+            vec![
+                PathBuf::from("b.wav"),
+                PathBuf::from("sub dir/a b.wav"),
+                PathBuf::from(" c.wav "),
+                PathBuf::from("last.wav"),
+            ]
+        );
+        assert!(parse_input_list("").is_empty());
+        assert!(parse_input_list("\n\r\n \t\n").is_empty());
+    }
+
+    #[test]
+    fn batch_mode_is_selected_by_repeated_input_or_any_input_list() {
+        let mut args = minimal_args();
+        assert!(!args.is_batch(), "one --input stays a single run");
+        args.input.push(PathBuf::from("second.wav"));
+        assert!(args.is_batch());
+        let mut listed = minimal_args();
+        listed.input.clear();
+        listed.inputs_from = Some(PathBuf::from("list.txt"));
+        assert!(
+            listed.is_batch(),
+            "--inputs-from is batch even for one path"
+        );
+
+        let error = args
+            .into_request()
+            .expect_err("a batch is not one request")
+            .to_string();
+        assert!(error.contains("batch mode"), "{error}");
+    }
+
+    #[test]
+    fn batch_requests_are_byte_identical_to_single_input_requests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let list = dir.path().join("inputs.txt");
+        std::fs::write(&list, "listed one.wav\nlisted-two.wav\n").expect("write list");
+        let mut args = minimal_args();
+        args.input = vec![PathBuf::from("first.wav"), PathBuf::from("second.wav")];
+        args.inputs_from = Some(list);
+        args.language = Some("en".to_owned());
+        args.no_diarize = true;
+        args.no_persist = true;
+        args.max_segment_length = Some(1);
+        args.split_on_word = true;
+
+        let batch = args.clone().into_batch().expect("batch");
+        assert_eq!(
+            batch.inputs,
+            vec![
+                PathBuf::from("first.wav"),
+                PathBuf::from("second.wav"),
+                PathBuf::from("listed one.wav"),
+                PathBuf::from("listed-two.wav"),
+            ],
+            "every --input first, then the list, each in order"
+        );
+        for path in &batch.inputs {
+            let mut single = args.clone();
+            single.input = vec![path.clone()];
+            single.inputs_from = None;
+            let single = single.into_request().expect("single request");
+            assert_eq!(
+                serde_json::to_vec(&batch.request_for(path)).expect("serialize batch request"),
+                serde_json::to_vec(&single).expect("serialize single request"),
+                "batch input {} must run exactly the single-input request",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn batch_rejects_flags_that_cannot_apply_to_many_inputs() {
+        let batch_args = || {
+            let mut args = minimal_args();
+            args.input.push(PathBuf::from("second.wav"));
+            args
+        };
+        let mut with_stdin = batch_args();
+        with_stdin.stdin = true;
+        let mut with_mic = batch_args();
+        with_mic.mic = true;
+        let mut with_hints = batch_args();
+        with_hints.speaker_hints = Some(PathBuf::from("hints.json"));
+        let mut with_transcript_path = batch_args();
+        with_transcript_path.transcript_path = Some(PathBuf::from("out.json"));
+        let mut unreadable_list = batch_args();
+        unreadable_list.inputs_from = Some(PathBuf::from("/nonexistent/fw-batch-list.txt"));
+        for (args, needle) in [
+            (with_stdin, "--stdin or --mic"),
+            (with_mic, "--stdin or --mic"),
+            (with_hints, "--speaker-hints"),
+            (with_transcript_path, "--transcript-path"),
+            (unreadable_list, "--inputs-from list"),
+        ] {
+            let error = args.into_batch().expect_err("rejected batch").to_string();
+            assert!(error.contains(needle), "`{error}` should mention {needle}");
+        }
+    }
+
+    #[test]
+    fn empty_input_list_is_a_valid_empty_batch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let list = dir.path().join("empty.txt");
+        std::fs::write(&list, "\n\n").expect("write list");
+        let mut args = minimal_args();
+        args.input.clear();
+        args.inputs_from = Some(list);
+        let batch = args.into_batch().expect("empty batch");
+        assert!(batch.inputs.is_empty());
+    }
+
+    #[test]
     fn consuming_request_preserves_validation_errors() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         let retained = args
             .to_request()
             .expect_err("retained no-input error")
@@ -2596,7 +2838,7 @@ mod tests {
     #[test]
     fn no_input_specified_returns_error() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         let err = args.to_request().expect_err("should fail with no input");
         let text = err.to_string();
         assert!(
@@ -2627,7 +2869,7 @@ mod tests {
     #[test]
     fn stdin_input_produces_stdin_variant() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.stdin = true;
         let request = args.to_request().expect("should succeed");
         assert!(matches!(request.input, InputSource::Stdin { .. }));
@@ -2636,7 +2878,7 @@ mod tests {
     #[test]
     fn mic_input_produces_microphone_variant() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.mic = true;
         args.mic_seconds = 30;
         args.mic_device = Some("hw:1".to_owned());
@@ -3307,7 +3549,7 @@ mod tests {
     #[test]
     fn mic_with_ffmpeg_overrides_produces_microphone_variant() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.mic = true;
         args.mic_seconds = 60;
         args.mic_ffmpeg_format = Some("pulse".to_owned());
@@ -3582,7 +3824,7 @@ mod tests {
     #[test]
     fn stdin_and_mic_returns_error() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.stdin = true;
         args.mic = true;
         let err = args.to_request().expect_err("should fail");
@@ -3683,7 +3925,7 @@ mod tests {
     #[test]
     fn mic_default_seconds_used_when_not_overridden() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.mic = true;
         // mic_seconds stays at default 15
         let request = args.to_request().expect("should succeed");
@@ -3706,7 +3948,7 @@ mod tests {
     #[test]
     fn stdin_hint_extension_is_none() {
         let mut args = minimal_args();
-        args.input = None;
+        args.input.clear();
         args.stdin = true;
         let request = args.to_request().expect("should succeed");
         match &request.input {
