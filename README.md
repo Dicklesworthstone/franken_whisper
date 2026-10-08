@@ -863,8 +863,9 @@ cat audio.mp3 | franken_whisper transcribe --stdin --json
 ### 6. Batch Transcription (many files, one model load)
 
 Repeat `--input`, or pass `--inputs-from FILE` (one path per line; `-` reads
-the list from stdin; lines are taken verbatim, blank lines are skipped, and a
-relative path resolves against the current directory). One process loads and
+the list from stdin; lines are taken verbatim, blank lines are skipped, a
+leading UTF-8 byte order mark is ignored, and a relative path resolves against
+the current directory). One process loads and
 authenticates the native models once and runs every input through the normal
 pipeline, so each input's result matches a single-input run with the same
 flags. (A repeated input is answered from the in-process transcript cache:
@@ -884,7 +885,13 @@ does not stop the batch; the process exits 1 (`FW-BATCH-INCOMPLETE`) if any
 input failed. `fw robot run` accepts the same flags: each input's `run_start`,
 `run_complete` and `run_error` carry `"batch":{"index","total","input"}`, and
 the stream ends with a `batch.complete` event, which carries
-`"code":"FW-BATCH-INCOMPLETE"` when an input failed. Agents can feature-detect
+`"code":"FW-BATCH-INCOMPLETE"` when an input failed. Ctrl+C stops the batch
+after the running input (which reports `FW-CANCELLED`); the process exits 130
+and `batch.complete` says `"status":"cancelled"`, `"code":"FW-CANCELLED"`, even
+when the interrupted input was the last one. A batch that is invalid as a whole
+(shared flags, an unreadable list) fails before any input runs, like an invalid
+single run: `run_start`, then `run_error`, neither tagged with `batch`, and no
+`batch.complete`. Agents can feature-detect
 this through `fw capabilities --json | jq .batch`. `--stdin`, `--mic`,
 `--speaker-hints` and `--transcript-path` apply to one recording and are
 rejected in batch mode. `--output-*` files go to `./<input stem>.<ext>` as in

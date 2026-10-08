@@ -340,6 +340,11 @@ pub struct BatchTally {
     pub total: usize,
     pub succeeded: usize,
     pub failed: usize,
+    /// Ctrl+C interrupted the batch, so the process exits 130. The input it
+    /// interrupted is counted in `failed` (its own error is `FW-CANCELLED`);
+    /// the inputs it kept from starting are `skipped`. Set even when the
+    /// interrupted input was the last one and nothing was skipped.
+    pub interrupted: bool,
 }
 
 impl BatchTally {
@@ -351,11 +356,18 @@ impl BatchTally {
             .saturating_sub(self.failed)
     }
 
-    /// `ok` when every input succeeded, `cancelled` when the batch stopped
-    /// before attempting every input, `incomplete` when an input failed.
+    /// Whether the batch was interrupted: flagged, or stopped before
+    /// attempting every input.
+    const fn cancelled(&self) -> bool {
+        self.interrupted || self.skipped() > 0
+    }
+
+    /// `ok` when every input succeeded, `cancelled` when Ctrl+C interrupted
+    /// the batch (whether or not inputs were left unattempted),
+    /// `incomplete` when an input failed.
     #[must_use]
     pub const fn status(&self) -> &'static str {
-        if self.skipped() > 0 {
+        if self.cancelled() {
             "cancelled"
         } else if self.failed > 0 {
             "incomplete"
@@ -364,17 +376,18 @@ impl BatchTally {
         }
     }
 
-    /// The batch's process outcome: [`FwError::Cancelled`] when it stopped
-    /// before attempting every input, [`FwError::BatchIncomplete`] when an
-    /// input failed. `batch.complete` reports the same error's code.
+    /// The batch's process outcome: [`FwError::Cancelled`] when it was
+    /// interrupted (exit 130), [`FwError::BatchIncomplete`] when an input
+    /// failed (exit 1). `batch.complete` reports the same error's code, so
+    /// its `status` and `code` always agree with the exit status.
     ///
     /// # Errors
     ///
     /// As described above; `Ok(())` only when every input succeeded.
     pub fn outcome(&self) -> FwResult<()> {
-        if self.skipped() > 0 {
+        if self.cancelled() {
             return Err(FwError::Cancelled(
-                "batch interrupted before every input was attempted".to_owned(),
+                "batch interrupted before every input finished".to_owned(),
             ));
         }
         if self.failed > 0 {
@@ -2135,7 +2148,8 @@ fn batch_capability_value() -> Value {
         "batch_field": "run_start, run_complete and run_error carry batch {index, total, input}",
         "terminal": "batch.complete",
         "terminal_required": BATCH_COMPLETE_REQUIRED_FIELDS,
-        "terminal_code": "present unless status is ok: FW-BATCH-INCOMPLETE (an input failed) or FW-CANCELLED (interrupted)",
+        "terminal_code": "present unless status is ok: FW-BATCH-INCOMPLETE (an input failed, exit 1) or FW-CANCELLED (interrupted by Ctrl+C, exit 130)",
+        "batch_level_failure": "invalid shared flags or an unreadable --inputs-from list fail the whole batch before any input runs: run_start then run_error, both without `batch`, and no batch.complete (as for an invalid single run)",
     });
     json!({
         "supported": true,
@@ -2982,15 +2996,17 @@ fn insert_batch_schema(schema: &mut Value) {
             "statuses": {
                 "ok": "every input succeeded",
                 "incomplete": "at least one input failed (process exit 1)",
-                "cancelled": "interrupted before every input was attempted",
+                "cancelled": "interrupted by Ctrl+C (process exit 130), whether or not inputs were left unattempted",
             },
             "optional": {
                 "code": "present unless status is ok: FW-BATCH-INCOMPLETE (incomplete) or FW-CANCELLED (cancelled)",
             },
+            "not_emitted_when": "the whole batch is invalid before any input runs (shared flags, unreadable list): the stream is run_start then run_error",
             "example": batch_complete_value(&BatchTally {
                 total: 3,
                 succeeded: 2,
                 failed: 1,
+                interrupted: false,
             }),
         }),
     );
@@ -5461,6 +5477,7 @@ mod tests {
                     total: 2,
                     succeeded: 2,
                     failed: 0,
+                    interrupted: false,
                 },
                 "ok",
                 0,
@@ -5471,6 +5488,7 @@ mod tests {
                     total: 0,
                     succeeded: 0,
                     failed: 0,
+                    interrupted: false,
                 },
                 "ok",
                 0,
@@ -5481,6 +5499,7 @@ mod tests {
                     total: 3,
                     succeeded: 2,
                     failed: 1,
+                    interrupted: false,
                 },
                 "incomplete",
                 0,
@@ -5491,9 +5510,36 @@ mod tests {
                     total: 4,
                     succeeded: 1,
                     failed: 1,
+                    interrupted: true,
                 },
                 "cancelled",
                 2,
+                Some("FW-CANCELLED"),
+            ),
+            // Ctrl+C during the LAST input: nothing was skipped, the
+            // interrupted input failed with FW-CANCELLED and the process
+            // exits 130, so the batch is cancelled, not incomplete.
+            (
+                BatchTally {
+                    total: 2,
+                    succeeded: 1,
+                    failed: 1,
+                    interrupted: true,
+                },
+                "cancelled",
+                0,
+                Some("FW-CANCELLED"),
+            ),
+            // Ctrl+C after the last input already succeeded.
+            (
+                BatchTally {
+                    total: 2,
+                    succeeded: 2,
+                    failed: 0,
+                    interrupted: true,
+                },
+                "cancelled",
+                0,
                 Some("FW-CANCELLED"),
             ),
         ] {

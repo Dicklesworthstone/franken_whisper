@@ -6623,3 +6623,195 @@ fn batch_human_output_prints_each_transcript_under_its_input() {
         "transcripts are printed:\n{stdout}"
     );
 }
+
+/// A whisper.cpp bridge stub that appends one line to `$FW_TEST_STUB_CALL_LOG`
+/// per transcription call (one with `-f`; probes are not logged) and answers
+/// the first at once but blocks every later one, so a test can interrupt a
+/// batch while its last input is running.
+#[cfg(unix)]
+fn write_whisper_cpp_blocking_stub_binary(dir: &std::path::Path) -> PathBuf {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let stub_path = dir.join("whisper_cpp_blocking_stub.sh");
+    let script = r#"#!/bin/bash
+set -euo pipefail
+out_prefix=""
+input=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -of)
+      out_prefix="$2"
+      shift 2
+      ;;
+    -f)
+      input="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [[ -z "${out_prefix}" || -z "${input}" ]]; then
+  exit 0
+fi
+echo call >> "${FW_TEST_STUB_CALL_LOG}"
+calls="$(wc -l < "${FW_TEST_STUB_CALL_LOG}")"
+if [[ "${calls}" -ge 2 ]]; then
+  sleep 60
+fi
+printf '{"text":"clip","language":"en","segments":[{"start":0.0,"end":0.1,"text":"clip","confidence":0.8}]}\n' > "${out_prefix}.json"
+"#;
+    fs::write(&stub_path, script).expect("write blocking stub");
+    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&stub_path, perms).expect("chmod");
+    stub_path
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_interrupted_during_its_last_input_reports_cancelled() {
+    // Ctrl+C while the LAST input runs: every input was attempted, the
+    // interrupted one fails with FW-CANCELLED and the process exits 130.
+    // batch.complete must agree with that exit status (cancelled /
+    // FW-CANCELLED), not report an `incomplete` batch, whose documented
+    // exit status is 1.
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let call_log = dir.path().join("stub-calls.log");
+    let stub_bin = write_whisper_cpp_blocking_stub_binary(dir.path());
+    let clips = batch_fixture_clips(dir.path());
+    let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args([
+            "robot",
+            "run",
+            "--input",
+            clips[0].to_str().expect("utf8"),
+            "--input",
+            clips[1].to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--no-persist",
+            "--no-diarize",
+        ])
+        .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
+        .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0")
+        .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
+        .env("FW_TEST_STUB_CALL_LOG", &call_log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn franken_whisper robot batch");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let calls = std::fs::read_to_string(&call_log)
+            .map(|log| log.lines().count())
+            .unwrap_or(0);
+        if calls >= 2 {
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("inspect robot batch") {
+            let output = child.wait_with_output().expect("collect early exit");
+            panic!(
+                "robot batch exited as {status} before its last input started; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("terminate stalled robot batch");
+            let output = child.wait_with_output().expect("collect stalled batch");
+            panic!(
+                "the last batch input never reached the bridge; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let signal_status = ProcessCommand::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("invoke kill -INT");
+    assert!(signal_status.success(), "deliver SIGINT to the robot batch");
+    let output = child
+        .wait_with_output()
+        .expect("reap interrupted robot batch");
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "an interrupted batch exits 130; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = ndjson_lines(&output);
+    let errors: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["event"] == "run_error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{events:#?}");
+    assert_eq!(
+        errors[0]["batch"]["index"], 1,
+        "the last input was interrupted"
+    );
+    assert_eq!(errors[0]["code"], "FW-CANCELLED");
+
+    let terminal = events.last().expect("terminal event");
+    assert_eq!(terminal["event"], "batch.complete", "{events:#?}");
+    assert_eq!(terminal["succeeded"], 1);
+    assert_eq!(terminal["failed"], 1);
+    assert_eq!(terminal["skipped"], 0);
+    assert_eq!(
+        terminal["status"], "cancelled",
+        "exit 130 is a cancelled batch, not an incomplete one: {terminal}"
+    );
+    assert_eq!(terminal["code"], "FW-CANCELLED", "{terminal}");
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_level_robot_failure_opens_with_run_start_like_a_single_run() {
+    // The robot contract: a semantically invalid request emits run_start
+    // followed by the terminal run_error. A batch whose shared flags are
+    // invalid fails before any input runs, so its stream is exactly that
+    // pair, untagged (no `batch` object) and without batch.complete.
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_checksum_stub_binary(dir.path());
+    let clips = batch_fixture_clips(dir.path());
+    let hints = dir.path().join("hints.json");
+    std::fs::write(&hints, "[]").expect("write speaker hints");
+    for invalid in [
+        vec!["--speaker-hints", hints.to_str().expect("utf8")],
+        vec!["--inputs-from", "/nonexistent/fw-batch-list.txt"],
+    ] {
+        let mut args = vec![
+            "robot",
+            "run",
+            "--input",
+            clips[0].to_str().expect("utf8"),
+            "--input",
+            clips[1].to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--no-persist",
+        ];
+        args.extend(&invalid);
+        let output = run_fw_with_stub(&args, None, &stub_bin, &state_root);
+        assert_eq!(output.status.code(), Some(1), "{invalid:?}");
+        let events = ndjson_lines(&output);
+        assert_eq!(events.len(), 2, "{invalid:?}: {events:#?}");
+        assert_eq!(events[0]["event"], "run_start", "{invalid:?}: {events:#?}");
+        assert!(events[0].get("batch").is_none(), "{invalid:?}");
+        assert_eq!(events[1]["event"], "run_error", "{invalid:?}");
+        assert_eq!(events[1]["code"], "FW-INVALID-REQUEST", "{invalid:?}");
+        assert!(events[1].get("batch").is_none(), "{invalid:?}");
+    }
+}

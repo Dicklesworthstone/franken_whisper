@@ -391,6 +391,7 @@ fn run_transcribe_batch(args: cli::TranscribeArgs) -> FwResult<()> {
         total,
         succeeded: 0,
         failed: 0,
+        interrupted: false,
     };
     for (index, path) in batch.inputs.iter().enumerate() {
         if ShutdownController::is_shutting_down() {
@@ -424,14 +425,17 @@ fn run_transcribe_batch(args: cli::TranscribeArgs) -> FwResult<()> {
         }
     }
     // Interrupted batches exit as cancelled (130 via the shutdown
-    // controller); a failed input makes the process exit 1.
+    // controller), even when Ctrl+C hit the last input; a failed input makes
+    // the process exit 1.
+    tally.interrupted = ShutdownController::is_shutting_down();
     tally.outcome()
 }
 
 /// `fw robot run` batch mode: each input streams its own `run_start` (tagged
 /// with `batch`), stage events and `run_complete` / `run_error`, in input
 /// order, and `batch.complete` is the final line. A batch-level failure
-/// (unreadable list, invalid shared flags) emits one untagged `run_error`.
+/// (unreadable list, invalid shared flags) is reported like an invalid single
+/// run: an untagged `run_start`, then the terminal `run_error`.
 fn run_robot_batch(args: cli::TranscribeArgs) -> FwResult<()> {
     let summary = args.robot_summary();
     let prepared = args
@@ -440,6 +444,7 @@ fn run_robot_batch(args: cli::TranscribeArgs) -> FwResult<()> {
     let (batch, transcriber) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
+            emit_robot_start(summary)?;
             emit_robot_error_from_fw(&error)?;
             return Err(error);
         }
@@ -449,6 +454,7 @@ fn run_robot_batch(args: cli::TranscribeArgs) -> FwResult<()> {
         total,
         succeeded: 0,
         failed: 0,
+        interrupted: false,
     };
     for (index, path) in batch.inputs.iter().enumerate() {
         if ShutdownController::is_shutting_down() {
@@ -467,6 +473,9 @@ fn run_robot_batch(args: cli::TranscribeArgs) -> FwResult<()> {
             }
         }
     }
+    // Ctrl+C during the last input leaves nothing skipped, but the process
+    // still exits 130: batch.complete must say cancelled, not incomplete.
+    tally.interrupted = ShutdownController::is_shutting_down();
     emit_event_value(&batch_complete_value(&tally))?;
     tally.outcome()
 }

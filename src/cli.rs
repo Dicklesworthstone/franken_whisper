@@ -1527,10 +1527,11 @@ pub struct TranscribeArgs {
     /// Batch mode: read input paths from FILE, one per line (`-` reads stdin).
     ///
     /// Lines are taken verbatim apart from the line terminator (no trimming,
-    /// no comment syntax); blank lines are skipped, and a relative path
-    /// resolves against the current directory, not the list's. Inputs run in
-    /// order: every `--input`, then each listed path. With `--json`, output is
-    /// one NDJSON record per input (see `fw robot-docs guide`).
+    /// no comment syntax; a leading UTF-8 BOM is ignored); blank lines are
+    /// skipped, and a relative path resolves against the current directory,
+    /// not the list's. Inputs run in order: every `--input`, then each listed
+    /// path. With `--json`, output is one NDJSON record per input (see
+    /// `fw robot-docs guide`).
     #[arg(long, value_name = "FILE")]
     pub inputs_from: Option<PathBuf>,
 
@@ -2082,9 +2083,11 @@ impl TranscribeBatch {
 
 /// Parse an `--inputs-from` list: one path per line, taken verbatim apart
 /// from its `\n` / `\r\n` terminator; blank (or whitespace-only) lines are
-/// skipped and order is preserved.
+/// skipped and order is preserved. A leading UTF-8 byte order mark (Windows
+/// editors write one) is an encoding marker, not part of the first path.
 #[must_use]
 pub fn parse_input_list(text: &str) -> Vec<PathBuf> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     text.split('\n')
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .filter(|line| !line.trim().is_empty())
@@ -2749,6 +2752,22 @@ mod tests {
         );
         assert!(parse_input_list("").is_empty());
         assert!(parse_input_list("\n\r\n \t\n").is_empty());
+    }
+
+    #[test]
+    fn input_list_ignores_a_leading_utf8_byte_order_mark() {
+        // Windows editors save UTF-8 lists with a BOM; it is an encoding
+        // marker, not part of the first path, which would otherwise fail as
+        // a missing file. Only a leading BOM is dropped.
+        assert_eq!(
+            parse_input_list("\u{feff}a.wav\r\nb.wav\r\n"),
+            vec![PathBuf::from("a.wav"), PathBuf::from("b.wav")]
+        );
+        assert!(parse_input_list("\u{feff}").is_empty());
+        assert_eq!(
+            parse_input_list("a.wav\n\u{feff}b.wav"),
+            vec![PathBuf::from("a.wav"), PathBuf::from("\u{feff}b.wav")]
+        );
     }
 
     #[test]
