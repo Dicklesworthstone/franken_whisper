@@ -20,6 +20,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ## Unreleased
 
+### Added
+
+- `acceleration.raw_confidences` (bd-raw-segment-confidence-isdm): the
+  backend's own per-segment confidence before the acceleration stage rescales
+  `segments[].confidence` to sum to 1, parallel to `segments`, `null` where
+  the text-length fallback weight stood in. It survives the diarization
+  word-unit regroup and persists with the run.
+
 ### Fixed
 
 - Native DTW word timestamps were one token late (bd-dtw-word-lag-10ov):

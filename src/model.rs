@@ -4068,6 +4068,14 @@ pub struct AccelerationReport {
     pub pre_mass: Option<f64>,
     pub post_mass: Option<f64>,
     pub notes: Vec<String>,
+    /// The backend's own confidence for each segment before normalization,
+    /// parallel to `segments` (bd-raw-segment-confidence-isdm). `None` where
+    /// the backend reported no usable (finite, positive) value, so the
+    /// normalized `confidence` was derived from the text-length fallback
+    /// weight. Empty when no confidences were normalized, or when a later
+    /// stage could not keep it parallel to `segments`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_confidences: Vec<Option<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4723,12 +4731,24 @@ mod tests {
             pre_mass: Some(0.8),
             post_mass: Some(1.0),
             notes: vec!["normalized".to_owned()],
+            raw_confidences: vec![Some(0.8), None],
         };
         let json = serde_json::to_string(&report).unwrap();
         let deserialized: AccelerationReport = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.backend, AccelerationBackend::Frankentorch);
         assert_eq!(deserialized.input_values, 100);
         assert!(deserialized.normalized_confidences);
+        assert_eq!(deserialized.raw_confidences, vec![Some(0.8), None]);
+    }
+
+    #[test]
+    fn acceleration_report_without_raw_confidences_keeps_its_historical_json() {
+        // Reports persisted before bd-raw-segment-confidence-isdm deserialize
+        // with an empty vector, and an empty vector is omitted on output.
+        let historical = r#"{"backend":"none","input_values":2,"normalized_confidences":true,"pre_mass":1.5,"post_mass":1.0,"notes":[]}"#;
+        let report: AccelerationReport = serde_json::from_str(historical).unwrap();
+        assert!(report.raw_confidences.is_empty());
+        assert_eq!(serde_json::to_string(&report).unwrap(), historical);
     }
 
     #[test]
@@ -4845,6 +4865,7 @@ mod tests {
             pre_mass: None,
             post_mass: None,
             notes: vec![],
+            raw_confidences: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: AccelerationReport = serde_json::from_str(&json).unwrap();
@@ -5026,6 +5047,7 @@ mod tests {
                 pre_mass: Some(0.7),
                 post_mass: Some(1.0),
                 notes: vec!["jax accelerated".to_owned()],
+                raw_confidences: Vec::new(),
             }),
             replay: ReplayEnvelope {
                 input_content_hash: Some("sha256-abc".to_owned()),
@@ -5665,6 +5687,7 @@ mod tests {
                 pre_mass: None,
                 post_mass: Some(0.99),
                 notes: vec!["jax".to_owned(), "fast".to_owned()],
+                raw_confidences: Vec::new(),
             }),
             diarization: None,
             raw_output: json!({}),

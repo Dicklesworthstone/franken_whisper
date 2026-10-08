@@ -2278,6 +2278,69 @@ mod tests {
     }
 
     #[test]
+    fn regroup_keeps_raw_confidences_parallel_to_the_segments() {
+        // bd-raw-segment-confidence-isdm: the raw per-unit confidences are
+        // averaged over exactly the speaker runs the normalized ones are.
+        let (mut units, plan) = diarization_units();
+        let (a, b) = (Some("SPEAKER_00"), Some("SPEAKER_01"));
+        label(&mut units, &[a, a, b, b, b, b, None]);
+        let acceleration = |raw_confidences| crate::model::AccelerationReport {
+            backend: crate::model::AccelerationBackend::None,
+            input_values: 7,
+            normalized_confidences: true,
+            pre_mass: Some(4.0),
+            post_mass: Some(1.0),
+            notes: Vec::new(),
+            raw_confidences,
+        };
+        let result_with = |raw_confidences| TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "ask not what your country can do".to_owned(),
+            language: Some("en".to_owned()),
+            segments: units.clone(),
+            acceleration: Some(acceleration(raw_confidences)),
+            diarization: None,
+            raw_output: json!({ DIARIZATION_WORD_UNITS_KEY: plan.clone() }),
+            artifact_paths: Vec::new(),
+        };
+
+        let mut result = result_with(vec![
+            Some(0.5),
+            Some(0.5),
+            Some(0.5),
+            Some(0.75),
+            Some(1.0),
+            Some(0.25),
+            None,
+        ]);
+        assert_eq!(
+            crate::backend::regroup_diarization_word_units(&mut result),
+            Some(7)
+        );
+        assert_eq!(result.segments.len(), 4);
+        assert_eq!(
+            result.acceleration.expect("acceleration").raw_confidences,
+            vec![Some(0.5), Some(0.75), Some(0.25), None],
+            "a run of units averages their raw values; an all-None run stays None"
+        );
+
+        // A raw vector that no longer matches the units is dropped, never
+        // misaligned.
+        let mut stale = result_with(vec![Some(0.5); 3]);
+        assert_eq!(
+            crate::backend::regroup_diarization_word_units(&mut stale),
+            Some(7)
+        );
+        assert!(
+            stale
+                .acceleration
+                .expect("acceleration")
+                .raw_confidences
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn dtw_adapter_normalizes_zero_width_terminal_word_for_acoustic_projection() {
         let engine = vec![TranscriptionSegment {
             start_sec: Some(0.0),

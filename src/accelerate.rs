@@ -25,6 +25,7 @@ pub(crate) fn apply_with_token(
             pre_mass: None,
             post_mass: None,
             notes: vec!["no segments available for acceleration".to_owned()],
+            raw_confidences: Vec::new(),
         };
         result.acceleration = Some(report.clone());
         return Ok(report);
@@ -49,6 +50,7 @@ fn build_report(
     pre_mass: Option<f64>,
     notes: Vec<String>,
 ) -> AccelerationReport {
+    let raw_confidences = raw_confidences(&result.segments);
     apply_confidences(&mut result.segments, &values);
 
     let post_mass = Some(values.iter().copied().sum::<f64>());
@@ -59,7 +61,22 @@ fn build_report(
         pre_mass,
         post_mass,
         notes,
+        raw_confidences,
     }
+}
+
+/// The backend's own per-segment confidences, captured before normalization
+/// overwrites them; `None` where the backend reported no usable value (the
+/// normalization then weighs that segment with the text-length fallback).
+fn raw_confidences(segments: &[TranscriptionSegment]) -> Vec<Option<f64>> {
+    segments
+        .iter()
+        .map(|segment| {
+            segment
+                .confidence
+                .filter(|confidence| confidence.is_finite() && *confidence > 0.0)
+        })
+        .collect()
 }
 
 fn confidence_vector(segments: &[TranscriptionSegment]) -> Vec<f64> {
@@ -1123,6 +1140,39 @@ mod tests {
             assert!(c.is_finite(), "confidence must be finite, got {c}");
             assert!((0.0..=1.0).contains(&c), "confidence in [0,1], got {c}");
         }
+    }
+
+    #[test]
+    fn apply_reports_raw_confidences_before_normalizing() {
+        // bd-raw-segment-confidence-isdm: segment confidences are rescaled to
+        // sum to 1 (and the fallback weight stands in for unusable values), so
+        // the report keeps each segment's own value, None where the fallback
+        // was used.
+        let mut result = make_result(vec![
+            seg("first", Some(0.9)),
+            seg("missing", None),
+            seg("zero", Some(0.0)),
+            seg("last", Some(0.6)),
+        ]);
+        let report = super::apply(&mut result);
+        assert_eq!(
+            report.raw_confidences,
+            vec![Some(0.9), None, None, Some(0.6)]
+        );
+        assert_eq!(
+            result.acceleration.as_ref().map(|r| &r.raw_confidences),
+            Some(&report.raw_confidences)
+        );
+        let normalized: f64 = result
+            .segments
+            .iter()
+            .map(|segment| segment.confidence.expect("normalized"))
+            .sum();
+        assert!(
+            (normalized - 1.0).abs() < 1e-12,
+            "normalized sum {normalized}"
+        );
+        assert!(result.segments[0].confidence < Some(0.9));
     }
 
     // --- Direct build_report tests ---

@@ -1652,6 +1652,29 @@ pub(crate) fn regroup_diarization_word_units(result: &mut TranscriptionResult) -
         })?;
     let segments = plan.regroup(&result.segments)?;
     let units = result.segments.len();
+    // Keep the acceleration report's raw confidences parallel to the new
+    // segments: regroup a copy of the units carrying the raw values, which
+    // averages them over exactly the runs the normalized values were averaged
+    // over. Drop them rather than misalign when that is not possible.
+    if let Some(report) = result.acceleration.as_mut() {
+        let regrouped_raw = (report.raw_confidences.len() == units)
+            .then(|| {
+                let mut raw_units = result.segments.clone();
+                for (unit, raw) in raw_units.iter_mut().zip(&report.raw_confidences) {
+                    unit.confidence = *raw;
+                }
+                plan.regroup(&raw_units)
+            })
+            .flatten()
+            .map(|raw_segments| {
+                raw_segments
+                    .into_iter()
+                    .map(|segment| segment.confidence)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|raw| raw.len() == segments.len());
+        report.raw_confidences = regrouped_raw.unwrap_or_default();
+    }
     result.segments = segments;
     // Keep the projection provenance truthful about what the run outputs.
     if let Some(timeline) = result

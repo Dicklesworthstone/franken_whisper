@@ -406,6 +406,12 @@ fn owned_acceleration_value(report: AccelerationReport) -> serde_json::Result<Va
         serde_json::to_value(report.post_mass)?,
     );
     object.insert("notes".to_owned(), owned_string_array(report.notes));
+    if !report.raw_confidences.is_empty() {
+        object.insert(
+            "raw_confidences".to_owned(),
+            serde_json::to_value(report.raw_confidences)?,
+        );
+    }
     Ok(Value::Object(object))
 }
 
@@ -3876,6 +3882,7 @@ mod tests {
             pre_mass: Some(-0.0),
             post_mass: None,
             notes: vec!["accelerated\npath".to_owned(), "λ".to_owned()],
+            raw_confidences: vec![Some(0.9), None, Some(1.0)],
         });
         rich.result.raw_output = json!({
             "segments": [{"text": "raw", "tokens": [1, 2, 3]}],
@@ -3966,6 +3973,7 @@ mod tests {
             pre_mass: Some(9.75),
             post_mass: Some(9.5),
             notes: vec!["native acceleration accepted".to_owned()],
+            raw_confidences: Vec::new(),
         });
         report.result.raw_output = json!({
             "model": "tiny.en",
@@ -4381,6 +4389,7 @@ mod tests {
             pre_mass: Some(3.5),
             post_mass: None,
             notes: vec!["accelerated\npath".to_owned()],
+            raw_confidences: Vec::new(),
         });
         rich.warnings = vec!["warning \"quoted\"".to_owned()];
         rich.evidence = vec![
@@ -4567,6 +4576,7 @@ mod tests {
             pre_mass: Some(127.75),
             post_mass: Some(127.5),
             notes: (0..8).map(|index| format!("note-{index}")).collect(),
+            raw_confidences: Vec::new(),
         });
         heavy.warnings = (0..16)
             .map(|index| format!("heavy warning {index}"))
@@ -4825,6 +4835,7 @@ mod tests {
                     pre_mass: Some(0.95),
                     post_mass: Some(0.99),
                     notes: vec!["accelerated".to_owned()],
+                    raw_confidences: Vec::new(),
                 }),
                 diarization: None,
                 raw_output: json!({}),
@@ -5174,6 +5185,7 @@ mod tests {
             pre_mass: Some(0.95),
             post_mass: Some(0.88),
             notes: vec!["batch mode".to_owned(), "GPU A100".to_owned()],
+            raw_confidences: Vec::new(),
         });
         let value = run_complete_value(&report);
         let serialized = serde_json::to_string(&value).expect("serialize");
@@ -5243,6 +5255,7 @@ mod tests {
             pre_mass: None,
             post_mass: None,
             notes: vec![],
+            raw_confidences: Vec::new(),
         });
         let value = run_complete_value(&report);
         assert_eq!(value["acceleration"]["backend"], "frankenjax");
