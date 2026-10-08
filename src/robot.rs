@@ -363,6 +363,28 @@ impl BatchTally {
             "ok"
         }
     }
+
+    /// The batch's process outcome: [`FwError::Cancelled`] when it stopped
+    /// before attempting every input, [`FwError::BatchIncomplete`] when an
+    /// input failed. `batch.complete` reports the same error's code.
+    ///
+    /// # Errors
+    ///
+    /// As described above; `Ok(())` only when every input succeeded.
+    pub fn outcome(&self) -> FwResult<()> {
+        if self.skipped() > 0 {
+            return Err(FwError::Cancelled(
+                "batch interrupted before every input was attempted".to_owned(),
+            ));
+        }
+        if self.failed > 0 {
+            return Err(FwError::BatchIncomplete {
+                failed: self.failed,
+                total: self.total,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The `fw transcribe --json` batch record for a successful input. `report`
@@ -399,10 +421,13 @@ pub fn emit_batch_record(value: &Value) -> FwResult<()> {
     emit_line(value)
 }
 
-/// The robot `batch.complete` terminal event.
+/// The robot `batch.complete` terminal event. A batch that did not fully
+/// succeed also carries `code`, the FW-* code of its process outcome
+/// ([`BatchTally::outcome`]), so `FW-BATCH-INCOMPLETE` is observable on the
+/// stream instead of only through the exit status.
 #[must_use]
 pub fn batch_complete_value(tally: &BatchTally) -> Value {
-    json!({
+    let mut value = json!({
         "event": "batch.complete",
         "schema_version": ROBOT_SCHEMA_VERSION,
         "total": tally.total,
@@ -410,7 +435,11 @@ pub fn batch_complete_value(tally: &BatchTally) -> Value {
         "failed": tally.failed,
         "skipped": tally.skipped(),
         "status": tally.status(),
-    })
+    });
+    if let Err(error) = tally.outcome() {
+        value["code"] = Value::from(error.error_code());
+    }
+    value
 }
 
 /// Emit `run_start` for one batch input.
@@ -2106,6 +2135,7 @@ fn batch_capability_value() -> Value {
         "batch_field": "run_start, run_complete and run_error carry batch {index, total, input}",
         "terminal": "batch.complete",
         "terminal_required": BATCH_COMPLETE_REQUIRED_FIELDS,
+        "terminal_code": "present unless status is ok: FW-BATCH-INCOMPLETE (an input failed) or FW-CANCELLED (interrupted)",
     });
     json!({
         "supported": true,
@@ -2123,6 +2153,7 @@ fn batch_capability_value() -> Value {
         "exit_code_when_any_input_fails": 1,
         "error_code_when_any_input_fails": "FW-BATCH-INCOMPLETE",
         "unsupported_with": ["--stdin", "--mic", "--speaker-hints", "--transcript-path"],
+        "output_files": "--output-* files go to ./<input stem>.<ext>; a batch naming two different inputs with one stem is rejected before any work",
     })
 }
 
@@ -2952,6 +2983,9 @@ fn insert_batch_schema(schema: &mut Value) {
                 "ok": "every input succeeded",
                 "incomplete": "at least one input failed (process exit 1)",
                 "cancelled": "interrupted before every input was attempted",
+            },
+            "optional": {
+                "code": "present unless status is ok: FW-BATCH-INCOMPLETE (incomplete) or FW-CANCELLED (cancelled)",
             },
             "example": batch_complete_value(&BatchTally {
                 total: 3,
@@ -5421,7 +5455,7 @@ mod tests {
     fn batch_complete_reports_ok_incomplete_and_cancelled() {
         use super::{BATCH_COMPLETE_REQUIRED_FIELDS, BatchTally, batch_complete_value};
 
-        for (tally, status, skipped) in [
+        for (tally, status, skipped, code) in [
             (
                 BatchTally {
                     total: 2,
@@ -5430,6 +5464,7 @@ mod tests {
                 },
                 "ok",
                 0,
+                None,
             ),
             (
                 BatchTally {
@@ -5439,6 +5474,7 @@ mod tests {
                 },
                 "ok",
                 0,
+                None,
             ),
             (
                 BatchTally {
@@ -5448,6 +5484,7 @@ mod tests {
                 },
                 "incomplete",
                 0,
+                Some("FW-BATCH-INCOMPLETE"),
             ),
             (
                 BatchTally {
@@ -5457,6 +5494,7 @@ mod tests {
                 },
                 "cancelled",
                 2,
+                Some("FW-CANCELLED"),
             ),
         ] {
             let value = batch_complete_value(&tally);
@@ -5466,6 +5504,14 @@ mod tests {
             for field in BATCH_COMPLETE_REQUIRED_FIELDS {
                 assert!(value.get(*field).is_some(), "missing `{field}`");
             }
+            // The advertised FW-BATCH-INCOMPLETE must be observable on the
+            // stream, and it must be the process outcome's own code.
+            assert_eq!(value.get("code").and_then(Value::as_str), code, "{tally:?}");
+            assert_eq!(
+                tally.outcome().err().map(|error| error.error_code()),
+                code,
+                "{tally:?}"
+            );
         }
     }
 

@@ -1526,9 +1526,11 @@ pub struct TranscribeArgs {
 
     /// Batch mode: read input paths from FILE, one per line (`-` reads stdin).
     ///
-    /// Lines are taken verbatim apart from the line terminator; blank lines
-    /// are skipped. Inputs run in order: every `--input`, then each listed
-    /// path. Output is one NDJSON record per input (see `fw robot-docs guide`).
+    /// Lines are taken verbatim apart from the line terminator (no trimming,
+    /// no comment syntax); blank lines are skipped, and a relative path
+    /// resolves against the current directory, not the list's. Inputs run in
+    /// order: every `--input`, then each listed path. With `--json`, output is
+    /// one NDJSON record per input (see `fw robot-docs guide`).
     #[arg(long, value_name = "FILE")]
     pub inputs_from: Option<PathBuf>,
 
@@ -2113,6 +2115,43 @@ fn read_input_list(list: &Path) -> FwResult<Vec<PathBuf>> {
     Ok(parse_input_list(&text))
 }
 
+/// `--output-*` files land in the current directory as `<input stem>.<ext>`
+/// (`orchestrator::artifact_output_prefix`), so two different batch inputs
+/// with one stem (`day1/part1.wav`, `day2/part1.mp3`) would overwrite each
+/// other's files and leave the earlier record's `artifact_paths` naming the
+/// later input's transcript. Such a batch is rejected before any work; the
+/// same path repeated rewrites identical files and is allowed.
+fn reject_shared_artifact_prefixes(inputs: &[PathBuf]) -> FwResult<()> {
+    use std::collections::hash_map::{Entry, HashMap};
+
+    let mut owners: HashMap<PathBuf, &Path> = HashMap::new();
+    for input in inputs {
+        let prefix = crate::orchestrator::artifact_output_prefix(
+            &InputSource::File {
+                path: input.clone(),
+            },
+            Path::new(""),
+        );
+        match owners.entry(prefix) {
+            Entry::Occupied(owner) if *owner.get() != input.as_path() => {
+                return Err(FwError::InvalidRequest(format!(
+                    "batch inputs `{}` and `{}` would write the same --output-* files \
+                     (`{}.*` in the current directory); rename one or run them in \
+                     separate batches",
+                    owner.get().display(),
+                    input.display(),
+                    owner.key().display()
+                )));
+            }
+            Entry::Occupied(_) => {}
+            Entry::Vacant(slot) => {
+                slot.insert(input);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl TranscribeArgs {
     /// Reject decoding flags no engine can honor before any work starts: a NaN
     /// threshold would silently disable its gate (every comparison is false),
@@ -2221,8 +2260,10 @@ impl TranscribeArgs {
     ///
     /// [`FwError::InvalidRequest`] for flags that cannot apply to a batch
     /// (`--stdin`, `--mic`, one recording's `--speaker-hints`, one output
-    /// file's `--transcript-path`), an unreadable or non-UTF-8 list, and every
-    /// error a single request reports for the shared flags.
+    /// file's `--transcript-path`), an unreadable or non-UTF-8 list, two
+    /// different inputs whose `--output-*` files would overwrite each other
+    /// (same file stem), and every error a single request reports for the
+    /// shared flags.
     pub fn into_batch(mut self) -> FwResult<TranscribeBatch> {
         self.validate_decoding_flags()?;
         if self.stdin || self.mic {
@@ -2250,6 +2291,9 @@ impl TranscribeArgs {
         let template = self.into_request_for(InputSource::File {
             path: PathBuf::new(),
         })?;
+        if !template.backend_params.output_formats.is_empty() {
+            reject_shared_artifact_prefixes(&inputs)?;
+        }
         Ok(TranscribeBatch { inputs, template })
     }
 
@@ -2806,6 +2850,45 @@ mod tests {
         args.inputs_from = Some(list);
         let batch = args.into_batch().expect("empty batch");
         assert!(batch.inputs.is_empty());
+    }
+
+    #[test]
+    fn batch_rejects_inputs_whose_output_files_would_collide() {
+        // `--output-*` files go to `./<input stem>.<ext>`: two inputs with one
+        // stem would overwrite each other's files, and the earlier record's
+        // artifact_paths would name the later input's transcript.
+        let batch_args = |inputs: &[&str], output_srt: bool| {
+            let mut args = minimal_args();
+            args.input = inputs.iter().map(PathBuf::from).collect();
+            args.output_srt = output_srt;
+            args
+        };
+        let error = batch_args(
+            &["day1/part1.wav", "day2/notes.wav", "day2/part1.mp3"],
+            true,
+        )
+        .into_batch()
+        .expect_err("colliding output prefixes")
+        .to_string();
+        assert!(
+            error.contains("day1/part1.wav")
+                && error.contains("day2/part1.mp3")
+                && error.contains("--output-*"),
+            "{error}"
+        );
+
+        // Without output files nothing is written, so the same stems are fine;
+        // the same path twice rewrites identical files.
+        for (inputs, output_srt) in [
+            (&["day1/part1.wav", "day2/part1.mp3"][..], false),
+            (&["day1/part1.wav", "day1/part1.wav"][..], true),
+            (&["day1/part1.wav", "day2/part2.wav"][..], true),
+        ] {
+            let batch = batch_args(inputs, output_srt)
+                .into_batch()
+                .unwrap_or_else(|error| panic!("{inputs:?} (srt {output_srt}): {error}"));
+            assert_eq!(batch.inputs.len(), inputs.len());
+        }
     }
 
     #[test]

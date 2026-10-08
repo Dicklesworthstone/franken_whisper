@@ -2027,7 +2027,9 @@ fn optional_stage_skip(
     }
 }
 
-fn artifact_output_prefix(input: &crate::model::InputSource, cwd: &Path) -> PathBuf {
+/// Where a run's `--output-*` files go: `cwd/<input file stem>` (the batch
+/// parser uses this to reject inputs that would overwrite each other's files).
+pub(crate) fn artifact_output_prefix(input: &crate::model::InputSource, cwd: &Path) -> PathBuf {
     let base_name = match input {
         crate::model::InputSource::File { path } => path
             .file_stem()

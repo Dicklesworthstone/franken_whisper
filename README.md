@@ -863,9 +863,13 @@ cat audio.mp3 | franken_whisper transcribe --stdin --json
 ### 6. Batch Transcription (many files, one model load)
 
 Repeat `--input`, or pass `--inputs-from FILE` (one path per line; `-` reads
-the list from stdin). One process loads and authenticates the native models
-once and runs every input through the normal pipeline, so each input's result
-matches a single-input run with the same flags.
+the list from stdin; lines are taken verbatim, blank lines are skipped, and a
+relative path resolves against the current directory). One process loads and
+authenticates the native models once and runs every input through the normal
+pipeline, so each input's result matches a single-input run with the same
+flags. (A repeated input is answered from the in-process transcript cache:
+same transcript, segments and timings, but its `raw_output.decode_work` retry
+counters read 0 because no decode ran.)
 
 ```bash
 ls narration/*.wav | fw transcribe --inputs-from - --json --no-diarize --no-persist \
@@ -879,10 +883,14 @@ where `report` is exactly what single-input `fw transcribe --json` prints, or
 does not stop the batch; the process exits 1 (`FW-BATCH-INCOMPLETE`) if any
 input failed. `fw robot run` accepts the same flags: each input's `run_start`,
 `run_complete` and `run_error` carry `"batch":{"index","total","input"}`, and
-the stream ends with a `batch.complete` event. Agents can feature-detect this
-through `fw capabilities --json | jq .batch`. `--stdin`, `--mic`,
+the stream ends with a `batch.complete` event, which carries
+`"code":"FW-BATCH-INCOMPLETE"` when an input failed. Agents can feature-detect
+this through `fw capabilities --json | jq .batch`. `--stdin`, `--mic`,
 `--speaker-hints` and `--transcript-path` apply to one recording and are
-rejected in batch mode.
+rejected in batch mode. `--output-*` files go to `./<input stem>.<ext>` as in
+a single run, so a batch that names two different inputs with the same stem
+(`day1/part1.wav`, `day2/part1.wav`) is rejected before any work instead of
+letting one input's files overwrite the other's.
 
 ---
 
@@ -2347,7 +2355,8 @@ The cancellation token is threaded through every pipeline stage, including the i
 **Robot Error Contract.** Public robot `run_error` envelopes expose the same
 variant-specific codes as `FwError::error_code()`; agents do not need to
 reverse-map a coarse error family. A batch never ends in a `run_error` for
-`FW-BATCH-INCOMPLETE`: it ends with `batch.complete` (`status: incomplete`). Even Clap-level syntax failures produce one
+`FW-BATCH-INCOMPLETE`: it ends with `batch.complete` (`status: incomplete`,
+`code: FW-BATCH-INCOMPLETE`). Even Clap-level syntax failures produce one
 path-safe `FW-INVALID-REQUEST` JSON object on stdout and exit with usage code
 2. Semantically invalid requests emit `run_start` followed by the exact
 terminal error. There is no robot path that degrades to human-readable stderr.
@@ -2554,7 +2563,10 @@ per-segment probability. The backend's own per-segment values are kept in
 `acceleration.raw_confidences`, an array parallel to `segments` (`null` where
 the backend reported no usable value and step 2's fallback weight was used).
 For the native engine that value is `exp(mean text-token log-prob)` of the
-decoded segment; in word mode every word carries its segment's value.
+decoded segment; in word mode (`--max-segment-length 1`) every word carries
+its segment's value, a `--max-segment-length N > 1` group carries the mean of
+its words' values, and segments rebuilt from diarization word units carry
+their engine segment's value unchanged.
 
 This confidence-normalization stage is deliberately CPU-only. Native Whisper
 inference acceleration is separate and uses the required FrankenTorch kernels

@@ -6450,6 +6450,10 @@ fn batch_robot_run_tags_each_input_and_ends_with_batch_complete() {
     assert_eq!(terminal["failed"], 1);
     assert_eq!(terminal["skipped"], 0);
     assert_eq!(terminal["status"], "incomplete");
+    assert_eq!(
+        terminal["code"], "FW-BATCH-INCOMPLETE",
+        "the advertised batch error code is on the stream"
+    );
 
     let inputs = [&clips[1], &missing, &clips[0]];
     let mut index = 0usize;
@@ -6547,6 +6551,10 @@ fn batch_empty_and_stdin_lists() {
     assert_eq!(events[0]["event"], "batch.complete");
     assert_eq!(events[0]["total"], 0);
     assert_eq!(events[0]["status"], "ok");
+    assert!(
+        events[0].get("code").is_none(),
+        "an ok batch carries no code"
+    );
 
     // A one-path stdin list is still batch mode: one NDJSON record.
     let list = format!("{}\r\n", clips[0].display());

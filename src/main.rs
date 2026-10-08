@@ -423,7 +423,9 @@ fn run_transcribe_batch(args: cli::TranscribeArgs) -> FwResult<()> {
             }
         }
     }
-    batch_outcome(&tally)
+    // Interrupted batches exit as cancelled (130 via the shutdown
+    // controller); a failed input makes the process exit 1.
+    tally.outcome()
 }
 
 /// `fw robot run` batch mode: each input streams its own `run_start` (tagged
@@ -466,7 +468,7 @@ fn run_robot_batch(args: cli::TranscribeArgs) -> FwResult<()> {
         }
     }
     emit_event_value(&batch_complete_value(&tally))?;
-    batch_outcome(&tally)
+    tally.outcome()
 }
 
 /// Run one batch input on a scoped worker thread, streaming its stage events
@@ -499,24 +501,6 @@ fn stream_robot_run(
             ))
         }))
     })
-}
-
-/// Map a finished batch onto the process outcome: interrupted batches exit
-/// as cancelled (130 via the shutdown controller), batches with a failed
-/// input exit 1 with `FW-BATCH-INCOMPLETE`.
-fn batch_outcome(tally: &BatchTally) -> FwResult<()> {
-    if tally.skipped() > 0 {
-        return Err(FwError::Cancelled(
-            "batch interrupted before every input was attempted".to_owned(),
-        ));
-    }
-    if tally.failed > 0 {
-        return Err(FwError::BatchIncomplete {
-            failed: tally.failed,
-            total: tally.total,
-        });
-    }
-    Ok(())
 }
 
 fn run(cli: Cli) -> FwResult<()> {
