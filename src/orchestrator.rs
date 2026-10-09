@@ -1694,7 +1694,8 @@ impl FrankenWhisperEngine {
 /// and the adaptive router is reset before each input so routing cannot learn
 /// across inputs: every input's result equals what a single-input process
 /// produces for the same request. Inputs are independent; a failed input does
-/// not affect the next one.
+/// not affect the next one, and neither does a panicking one (see
+/// [`Self::transcribe`]).
 pub struct BatchTranscriber {
     engine: FrankenWhisperEngine,
     _residency: crate::native_engine::ModelResidency,
@@ -1710,19 +1711,67 @@ impl BatchTranscriber {
     }
 
     /// Transcribe one batch input.
+    ///
+    /// A panic inside the run becomes this input's
+    /// [`FwError::ContractViolation`] (`input run panicked: ...`), so the batch
+    /// goes on with the next input (bd-batch-panic-isolation-p7fa). That takes
+    /// an unwinding build: the shipped release profile sets `panic = "abort"`,
+    /// where a panic still ends the process.
     pub fn transcribe(&self, request: TranscribeRequest) -> FwResult<RunReport> {
         backend::reset_router_state();
-        self.engine.transcribe(request)
+        isolate_input_panic(|| self.engine.transcribe(request))
     }
 
     /// Transcribe one batch input, streaming its stage events to `event_tx`.
+    /// A panic is isolated as in [`Self::transcribe`].
     pub fn transcribe_with_stream(
         &self,
         request: TranscribeRequest,
         event_tx: Sender<StreamedRunEvent>,
     ) -> FwResult<RunReport> {
         backend::reset_router_state();
-        self.engine.transcribe_with_stream(request, event_tx)
+        isolate_input_panic(|| self.engine.transcribe_with_stream(request, event_tx))
+    }
+}
+
+/// Run one batch input, returning a panic as that input's error.
+///
+/// Unwind safety: a run's own state (request, event log, temporary directory)
+/// unwinds with it, and the engine keeps none between runs. Every
+/// process-wide mutex a run touches tolerates poisoning (the router and
+/// health caches then read as empty, the model cache and batch residency
+/// recover their contents), so a later input never observes a lock its
+/// panicking predecessor held.
+fn isolate_input_panic(run: impl FnOnce() -> FwResult<RunReport>) -> FwResult<RunReport> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_owned());
+        Err(FwError::ContractViolation(format!(
+            "input run panicked: {detail}"
+        )))
+    })
+}
+
+/// Environment variable naming the input file stem whose run panics, in debug
+/// builds only (bd-batch-panic-isolation-p7fa). Batch tests use it to prove that a
+/// panicking input is isolated; release builds compile the hook out, so no
+/// environment can trigger it in a shipped binary.
+#[cfg(debug_assertions)]
+const TEST_PANIC_INPUT_STEM_ENV: &str = "FRANKEN_WHISPER_TEST_PANIC_INPUT_STEM";
+
+/// Panic inside the pipeline task when the input file's stem equals
+/// [`TEST_PANIC_INPUT_STEM_ENV`]. It fires after the first stage event, so a
+/// robot stream shows the run started before it failed.
+#[cfg(debug_assertions)]
+fn inject_test_panic_for_input(request: &TranscribeRequest) {
+    if let crate::model::InputSource::File { path } = &request.input
+        && let Some(stem) = std::env::var_os(TEST_PANIC_INPUT_STEM_ENV)
+        && path.file_stem() == Some(stem.as_os_str())
+    {
+        panic!("injected test panic for input `{}`", path.display());
     }
 }
 
@@ -1763,6 +1812,8 @@ async fn run_pipeline(
             "safe_mode": "deterministic configurable stage order",
         }),
     );
+    #[cfg(debug_assertions)]
+    inject_test_panic_for_input(&request);
 
     let result = run_pipeline_body(
         &mut pcx,
@@ -7532,6 +7583,39 @@ mod tests {
         vad_energy_detect_with_analysis, validate_diarization_execution_request,
     };
     use super::{SpeculativeLaneTelemetry, run_stage_with_timeout_streaming};
+
+    #[test]
+    fn isolate_input_panic_turns_a_panic_into_that_inputs_error() {
+        // bd-batch-panic-isolation-p7fa: a literal panic carries `&str`, a
+        // formatted one `String`; both keep their text. Any other payload is
+        // still an error, and a run's own error passes through unchanged.
+        type Run = Box<dyn FnOnce() -> FwResult<RunReport>>;
+        let detail = String::from("formatted payload");
+        let cases: [(Run, &str); 3] = [
+            (
+                Box::new(|| -> FwResult<RunReport> { panic!("literal payload") }),
+                "input run panicked: literal payload",
+            ),
+            (
+                Box::new(move || -> FwResult<RunReport> { panic!("{detail}") }),
+                "input run panicked: formatted payload",
+            ),
+            (
+                Box::new(|| -> FwResult<RunReport> { std::panic::panic_any(7_u32) }),
+                "input run panicked: non-string panic payload",
+            ),
+        ];
+        for (run, message) in cases {
+            match super::isolate_input_panic(run) {
+                Err(FwError::ContractViolation(text)) => assert_eq!(text, message),
+                other => panic!("expected a contract violation, got {other:?}"),
+            }
+        }
+
+        let error = super::isolate_input_panic(|| Err(FwError::Cancelled("ctrl-c".to_owned())))
+            .expect_err("the run's own error");
+        assert_eq!(error.error_code(), "FW-CANCELLED");
+    }
 
     #[cfg(unix)]
     #[test]

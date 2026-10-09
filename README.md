@@ -882,7 +882,17 @@ ls narration/*.wav | fw transcribe --inputs-from - --json --no-diarize --no-pers
 where `report` is exactly what single-input `fw transcribe --json` prints, or
 `"status":"error","error":{"code":"FW-...","message":"..."}`. A failed input
 does not stop the batch; the process exits 1 (`FW-BATCH-INCOMPLETE`) if any
-input failed. `fw robot run` accepts the same flags: each input's `run_start`,
+input failed. `fw transcribe --json` prints no summary line, so its exit status
+is the batch outcome: 0 when every input succeeded, 1 when an input failed or
+the whole batch was invalid (then no records are printed and stderr says why),
+130 when interrupted; the `FW-BATCH-INCOMPLETE` code itself appears only on the
+robot stream below. `--timeout` bounds each input separately, not the batch: an
+input that runs past it fails on its own and the next input starts with a fresh
+budget (wrap the command in `timeout(1)` for a whole-batch limit). A panic
+inside one input's run fails only that input, with `FW-CONTRACT-VIOLATION`, in
+both commands, in an unwinding build (debug builds, library use); the shipped
+release binary is built with `panic = "abort"`, so there a panic still ends the
+process. `fw robot run` accepts the same flags: each input's `run_start`,
 `run_complete` and `run_error` carry `"batch":{"index","total","input"}`, and
 the stream ends with a `batch.complete` event, which carries
 `"code":"FW-BATCH-INCOMPLETE"` when an input failed. Ctrl+C stops the batch
@@ -897,7 +907,11 @@ this through `fw capabilities --json | jq .batch`. `--stdin`, `--mic`,
 rejected in batch mode. `--output-*` files go to `./<input stem>.<ext>` as in
 a single run, so a batch that names two different inputs with the same stem
 (`day1/part1.wav`, `day2/part1.wav`) is rejected before any work instead of
-letting one input's files overwrite the other's.
+letting one input's files overwrite the other's. Stems are compared ignoring
+case (`Talk.wav` and `talk.mp3` collide: `./Talk.srt` and `./talk.srt` are one
+file on the default macOS and Windows file systems), on every OS, so a batch is
+accepted or rejected the same way everywhere; one file named twice (`a.wav`,
+`./a.wav`) is just a repeated input.
 
 ---
 
@@ -1222,7 +1236,7 @@ franken_whisper transcribe [OPTIONS]
 |------|---------|-------------|
 | `--db <PATH>` | `$FRANKEN_WHISPER_DB`, else `<state dir>/storage.sqlite3` | SQLite database path |
 | `--no-persist` | `false` | Skip persistence entirely |
-| `--timeout <SEC>` | — | Overall pipeline deadline (seconds) |
+| `--timeout <SEC>` | — | Pipeline deadline (seconds) for one run; in batch mode it bounds each input separately |
 
 **Inference Tuning (whisper.cpp):**
 
@@ -2234,7 +2248,7 @@ In robot mode the pipeline emits events in real time via an `mpsc` channel:
                   +-------------------+
 ```
 
-The CLI thread polls the receive end of the channel every 40 ms, formatting each event as a single NDJSON line on stdout. The pipeline worker thread runs `transcribe_with_stream()` which emits `StreamedRunEvent` wrappers containing `(run_id, RunEvent)` pairs. When the worker completes, the CLI emits a final `run_complete` or `run_error` event. If the worker thread itself panics, the CLI emits a structured `run_error` envelope rather than printing a Rust panic message; the contract on stdout is preserved unconditionally.
+The CLI thread polls the receive end of the channel every 40 ms, formatting each event as a single NDJSON line on stdout. The pipeline worker thread runs `transcribe_with_stream()` which emits `StreamedRunEvent` wrappers containing `(run_id, RunEvent)` pairs. When the worker completes, the CLI emits a final `run_complete` or `run_error` event (in batch mode each input ends that way and the stream's last event is `batch.complete`). If the worker thread itself panics, the CLI emits a structured `run_error` envelope on stdout (the panic message goes to stderr). That recovery needs an unwinding build: the shipped release binary is built with `panic = "abort"`, so there a panic aborts the process and the stream ends without a terminal event.
 
 **Schema Contract Guarantees:**
 
@@ -2245,7 +2259,7 @@ The CLI thread polls the receive end of the channel every 40 ms, formatting each
 | `ts` non-decreasing per run | Generated from `Utc::now().to_rfc3339()` |
 | `run_complete` is always the final success event | Emitted only after pipeline returns |
 | Stage events follow pipeline order | Orchestrator executes stages sequentially |
-| Worker-thread panics emit `run_error`, not a panic | `emit_robot_error_from_fw` wraps panic recovery |
+| Worker-thread panics emit `run_error`, not a panic (unwinding builds only; the release binary aborts) | `emit_robot_error_from_fw` wraps panic recovery |
 
 ### TTY Handshake Protocol
 
@@ -2568,7 +2582,9 @@ Non-finite values (NaN, infinity) map to 0.0 in the output. If the sum is near z
 `segments[].confidence` is therefore a share of the run's total, not a
 per-segment probability. (When native whisper.cpp diarization splits the run
 into per-word units and collapses them back into segments afterwards, each
-segment keeps its words' common share, so those values no longer sum to 1.)
+segment gets the mean of its words' shares (one common share when the engine
+segment reported a confidence; text-length fallback weights otherwise differ
+per word), so those values no longer sum to 1.)
 The backend's own per-segment values are kept in
 `acceleration.raw_confidences`, an array parallel to `segments` (`null` where
 the backend reported no usable value and step 2's fallback weight was used).

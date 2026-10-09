@@ -319,7 +319,8 @@ pub struct BatchItem {
     pub index: usize,
     /// Number of inputs in the batch.
     pub total: usize,
-    /// The input path exactly as given.
+    /// The input path as given; a non-UTF-8 path is converted lossily (bytes
+    /// that are not UTF-8 become U+FFFD), so match records by `index`.
     pub input: String,
 }
 
@@ -2142,6 +2143,7 @@ fn batch_capability_value() -> Value {
         "ok": "`report` is the object single-input `fw transcribe --json` prints",
         "error": "`error` is {code, message} with a stable FW-* code",
         "order": "one line per attempted input, in input order",
+        "outcome": "no summary line: the exit status is the batch outcome (0 every input ok; 1 an input failed, or the whole batch was invalid and printed no records, with the reason on stderr; 130 interrupted); FW-BATCH-INCOMPLETE itself appears only on the robot stream",
     });
     let robot_run = json!({
         "per_input": ["run_start", "stage*", "run_complete | run_error"],
@@ -2163,11 +2165,12 @@ fn batch_capability_value() -> Value {
         "per_input_result": "identical to a single-input run with the same flags",
         "transcribe_json": transcribe_json,
         "robot_run": robot_run,
-        "failure_isolation": "a failed input does not stop the batch",
+        "failure_isolation": "a failed input does not stop the batch; a panicking input fails alone with FW-CONTRACT-VIOLATION in unwinding builds (the shipped release binary aborts on any panic)",
+        "timeout": "--timeout SEC bounds each input separately: an input that exceeds it fails alone and the batch goes on; there is no whole-batch deadline",
         "exit_code_when_any_input_fails": 1,
         "error_code_when_any_input_fails": "FW-BATCH-INCOMPLETE",
         "unsupported_with": ["--stdin", "--mic", "--speaker-hints", "--transcript-path"],
-        "output_files": "--output-* files go to ./<input stem>.<ext>; a batch naming two different inputs with one stem is rejected before any work",
+        "output_files": "--output-* files go to ./<input stem>.<ext>; a batch naming two different files whose stems are equal ignoring case (one file on case-insensitive file systems) is rejected before any work",
     })
 }
 
@@ -2562,7 +2565,9 @@ pub const fn robot_docs_guide() -> &'static str {
    --inputs-from LIST --json` prints one NDJSON record per input in input order\n\
    ({index, total, input, status: ok|error, report|error}); `fw robot run` tags\n\
    each input's run_start/run_complete/run_error with `batch` and ends with\n\
-   `batch.complete`. A failed input never stops the batch; exit 1 if any failed.\n"
+   `batch.complete`. A failed input never stops the batch; exit 1 if any failed.\n\
+   A single `--input` is a plain run (no batch records), so use `--inputs-from`\n\
+   when a list may hold one path. `--timeout` bounds each input, not the batch.\n"
 }
 
 /// Emit a single `health.report` NDJSON line to stdout.
@@ -2976,7 +2981,7 @@ fn insert_batch_schema(schema: &mut Value) {
             "fields": {
                 "index": "zero-based input position",
                 "total": "number of inputs in the batch",
-                "input": "the input path as given",
+                "input": "the input path as given (a non-UTF-8 path is converted lossily; match by index)",
             },
         },
     });
@@ -5579,6 +5584,19 @@ mod tests {
             batch["error_code_when_any_input_fails"],
             "FW-BATCH-INCOMPLETE"
         );
+        // Contract details an agent needs before relying on a batch
+        // (bd-batch-timeout-scope-gbyf, bd-batch-output-case-collision-8y2r).
+        for key in ["timeout", "output_files", "failure_isolation"] {
+            assert!(batch[key].is_string(), "capabilities.batch.{key}");
+        }
+        assert!(
+            batch["timeout"]
+                .as_str()
+                .is_some_and(|text| text.contains("each input separately")),
+            "{}",
+            batch["timeout"]
+        );
+        assert!(batch["transcribe_json"]["outcome"].is_string());
         assert!(capabilities["error_codes"].as_array().is_some_and(|codes| {
             codes
                 .iter()

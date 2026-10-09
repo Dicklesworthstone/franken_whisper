@@ -52,6 +52,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
   (`sot_sequence_length` excludes `not`), and attention is normalized over
   every recorded token row as whisper.cpp and OpenAI do. See DISC-009 in
   `docs/planning/DISCREPANCIES.md`.
+- Batch mode: a panic inside one input's run no longer ends a
+  `fw transcribe` batch while `fw robot run` carried on
+  (bd-batch-panic-isolation-p7fa). `BatchTranscriber` returns the panic as
+  that input's `FW-CONTRACT-VIOLATION` error in both commands, the batch goes
+  on and exits 1. This needs an unwinding build; the shipped release binary
+  uses `panic = "abort"`, where a panic still ends the process.
+- Batch mode: the `--output-*` collision check compares input stems ignoring
+  case, so `Talk.wav` + `talk.mp3` (one `./talk.srt` on macOS and Windows
+  file systems) is rejected before any work, and one file named two ways
+  (`a.wav`, `./a.wav`) is a repeated input rather than a collision
+  (bd-batch-output-case-collision-8y2r).
+- `--timeout` is documented as bounding each batch input separately (help,
+  README, `fw capabilities` `batch.timeout`), which is what it always did
+  (bd-batch-timeout-scope-gbyf).
 
 ## Unreleased installer follow-up
 

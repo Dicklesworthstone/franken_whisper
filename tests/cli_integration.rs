@@ -6239,6 +6239,18 @@ fn run_fw_with_stub(
     stub_bin: &std::path::Path,
     state_root: &std::path::Path,
 ) -> std::process::Output {
+    run_fw_with_stub_env(args, &[], stdin_payload, stub_bin, state_root)
+}
+
+/// [`run_fw_with_stub`] with extra environment variables for the process.
+#[cfg(unix)]
+fn run_fw_with_stub_env(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin_payload: Option<&[u8]>,
+    stub_bin: &std::path::Path,
+    state_root: &std::path::Path,
+) -> std::process::Output {
     use std::io::Write as _;
 
     let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
@@ -6248,6 +6260,7 @@ fn run_fw_with_stub(
     cmd.env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0");
     cmd.env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0");
     cmd.env("FRANKEN_WHISPER_STATE_DIR", state_root);
+    cmd.envs(envs.iter().copied());
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -6627,7 +6640,8 @@ fn batch_human_output_prints_each_transcript_under_its_input() {
 /// A whisper.cpp bridge stub that appends one line to `$FW_TEST_STUB_CALL_LOG`
 /// per transcription call (one with `-f`; probes are not logged) and answers
 /// the first at once but blocks every later one, so a test can interrupt a
-/// batch while its last input is running.
+/// batch while its last input is running. With `$FW_TEST_STUB_BLOCK_ONLY_CALL`
+/// set to N it blocks only the Nth call and answers the others at once.
 #[cfg(unix)]
 fn write_whisper_cpp_blocking_stub_binary(dir: &std::path::Path) -> PathBuf {
     use std::fs;
@@ -6658,7 +6672,11 @@ if [[ -z "${out_prefix}" || -z "${input}" ]]; then
 fi
 echo call >> "${FW_TEST_STUB_CALL_LOG}"
 calls="$(wc -l < "${FW_TEST_STUB_CALL_LOG}")"
-if [[ "${calls}" -ge 2 ]]; then
+if [[ -n "${FW_TEST_STUB_BLOCK_ONLY_CALL:-}" ]]; then
+  if [[ "${calls}" -eq "${FW_TEST_STUB_BLOCK_ONLY_CALL}" ]]; then
+    sleep 60
+  fi
+elif [[ "${calls}" -ge 2 ]]; then
   sleep 60
 fi
 printf '{"text":"clip","language":"en","segments":[{"start":0.0,"end":0.1,"text":"clip","confidence":0.8}]}\n' > "${out_prefix}.json"
@@ -6814,4 +6832,160 @@ fn batch_level_robot_failure_opens_with_run_start_like_a_single_run() {
         assert_eq!(events[1]["code"], "FW-INVALID-REQUEST", "{invalid:?}");
         assert!(events[1].get("batch").is_none(), "{invalid:?}");
     }
+}
+
+/// A panic inside one batch input's run is that input's error, in
+/// `fw transcribe --json` and `fw robot run` alike: the input reports
+/// FW-CONTRACT-VIOLATION, the inputs after it still run (and still equal their
+/// single-input runs), and the process exits 1 (bd-batch-panic-isolation-p7fa).
+/// The panic comes from the debug-only `FRANKEN_WHISPER_TEST_PANIC_INPUT_STEM`
+/// hook, which release builds compile out, so the test exists only where the
+/// hook does.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn batch_isolates_a_panicking_input_in_both_commands() {
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_checksum_stub_binary(dir.path());
+    let clips = batch_fixture_clips(dir.path());
+    let singles: Vec<serde_json::Value> = [&clips[0], &clips[2]]
+        .into_iter()
+        .map(|clip| single_run_result(clip, &stub_bin, &state_root))
+        .collect();
+    let panic_env = [("FRANKEN_WHISPER_TEST_PANIC_INPUT_STEM", "b")];
+    let batch_args = |command: &[&'static str]| {
+        let mut args: Vec<&str> = command.to_vec();
+        for clip in &clips {
+            args.push("--input");
+            args.push(clip.to_str().expect("utf8"));
+        }
+        args.extend(["--backend", "whisper-cpp", "--no-persist"]);
+        args
+    };
+
+    let output = run_fw_with_stub_env(
+        &batch_args(&["transcribe", "--json"]),
+        &panic_env,
+        None,
+        &stub_bin,
+        &state_root,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a panicking input fails only itself; the batch exits 1\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("batch incomplete: 1 of 3 inputs failed"),
+        "{stderr}"
+    );
+    let records = ndjson_lines(&output);
+    assert_eq!(records.len(), 3, "one record per input: {records:#?}");
+    assert_eq!(records[1]["status"], "error", "{records:#?}");
+    assert_eq!(records[1]["error"]["code"], "FW-CONTRACT-VIOLATION");
+    let panic_message = records[1]["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .to_owned();
+    assert!(
+        panic_message.contains("panicked") && panic_message.contains("injected test panic"),
+        "the record names the panic: {panic_message}"
+    );
+    for (record, single) in [(&records[0], &singles[0]), (&records[2], &singles[1])] {
+        assert_eq!(record["status"], "ok", "{record:#?}");
+        assert_eq!(&comparable_result(&record["report"]["result"]), single);
+    }
+
+    let output = run_fw_with_stub_env(
+        &batch_args(&["robot", "run"]),
+        &panic_env,
+        None,
+        &stub_bin,
+        &state_root,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let events = ndjson_lines(&output);
+    let terminal = events.last().expect("terminal event");
+    assert_eq!(terminal["event"], "batch.complete", "{events:#?}");
+    assert_eq!(terminal["succeeded"], 2);
+    assert_eq!(terminal["failed"], 1);
+    assert_eq!(terminal["skipped"], 0);
+    assert_eq!(terminal["status"], "incomplete");
+    assert_eq!(terminal["code"], "FW-BATCH-INCOMPLETE");
+    let errors: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["event"] == "run_error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{events:#?}");
+    assert_eq!(errors[0]["batch"]["index"], 1);
+    assert_eq!(errors[0]["code"], "FW-CONTRACT-VIOLATION");
+    assert_eq!(
+        errors[0]["message"], panic_message,
+        "both commands report the same error for the same panic"
+    );
+    let completes: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["event"] == "run_complete")
+        .collect();
+    assert_eq!(completes.len(), 2, "{events:#?}");
+    for (complete, single) in completes.into_iter().zip(&singles) {
+        assert_eq!(&comparable_result(complete), single);
+    }
+}
+
+/// `--timeout` bounds each batch input separately, as `--help`, the README
+/// and `fw capabilities` say (bd-batch-timeout-scope-gbyf): the input whose
+/// bridge call hangs fails on its own when its budget runs out, and the input
+/// after it starts with a fresh budget and succeeds. Under a whole-batch
+/// deadline the last input would start with the budget already spent.
+#[cfg(unix)]
+#[test]
+fn batch_timeout_bounds_each_input_separately() {
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let call_log = dir.path().join("stub-calls.log");
+    let stub_bin = write_whisper_cpp_blocking_stub_binary(dir.path());
+    let clips = batch_fixture_clips(dir.path());
+    let mut args = vec!["transcribe", "--json", "--timeout", "6"];
+    for clip in &clips {
+        args.push("--input");
+        args.push(clip.to_str().expect("utf8"));
+    }
+    args.extend(["--backend", "whisper-cpp", "--no-persist"]);
+
+    let started = std::time::Instant::now();
+    let output = run_fw_with_stub_env(
+        &args,
+        &[
+            ("FW_TEST_STUB_CALL_LOG", call_log.to_str().expect("utf8")),
+            ("FW_TEST_STUB_BLOCK_ONLY_CALL", "2"),
+        ],
+        None,
+        &stub_bin,
+        &state_root,
+    );
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    let records = ndjson_lines(&output);
+    let statuses: Vec<&str> = records
+        .iter()
+        .map(|record| record["status"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        statuses,
+        ["ok", "error", "ok"],
+        "only the hung input fails; the next one gets its own budget: {records:#?}"
+    );
+    assert!(
+        records[1]["error"]["code"]
+            .as_str()
+            .is_some_and(|code| code.starts_with("FW-")),
+        "{records:#?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(50),
+        "the hung bridge call ends at its input's deadline, not after its 60 s sleep: {elapsed:?}"
+    );
 }

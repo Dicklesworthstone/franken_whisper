@@ -381,7 +381,9 @@ fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
 /// model residency serve every input. With `--json`, stdout carries exactly
 /// one compact batch record per attempted input, in input order; otherwise
 /// each transcript prints under a `==> INPUT <==` header and failures go to
-/// stderr. A failed input never stops the batch.
+/// stderr. A failed input never stops the batch; neither does a panicking one
+/// in an unwinding build, since [`BatchTranscriber`] returns its panic as the
+/// input's error, exactly as for `fw robot run`.
 fn run_transcribe_batch(args: cli::TranscribeArgs) -> FwResult<()> {
     let json = args.json;
     let batch = args.into_batch()?;
@@ -504,6 +506,9 @@ fn stream_robot_run(
         while let Ok(streamed) = event_rx.try_recv() {
             emit_robot_stage(&streamed.run_id, &streamed.event)?;
         }
+        // BatchTranscriber already returns a run's panic as its error (the
+        // same one `fw transcribe` reports); this only covers a panic outside
+        // the run itself.
         Ok(worker.join().unwrap_or_else(|_| {
             Err(FwError::ContractViolation(
                 "robot worker thread panicked".to_owned(),

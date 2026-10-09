@@ -2922,8 +2922,9 @@ mod tests {
         );
         // Control: without a guard, a run's dropped handle frees the parse
         // (the cache holds only a `Weak`), so the next run parses again.
-        let unguarded = NativeWhisperModel::load_authenticated_with_checkpoint(&package, &|| Ok(()))
-            .expect("unguarded authenticated load");
+        let unguarded =
+            NativeWhisperModel::load_authenticated_with_checkpoint(&package, &|| Ok(()))
+                .expect("unguarded authenticated load");
         let unguarded_weak = Arc::downgrade(&unguarded);
         drop(unguarded);
         assert!(
