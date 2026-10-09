@@ -92,12 +92,20 @@ fn word_error_rate(reference: &str, candidate: &str) -> f64 {
     prev[candidate.len()] as f64 / reference.len() as f64
 }
 
-/// Absolute path to the in-repo audio fixture.
+/// Absolute path to the audio fixture. It is gitignored (no media in the
+/// repo) and provisioned with the model by `scripts/fetch_test_models.sh`, so
+/// a model without it fails here by name instead of inside each scenario.
 fn jfk_wav() -> PathBuf {
-    PathBuf::from(concat!(
+    let path = PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/native/jfk.wav"
-    ))
+    ));
+    assert!(
+        path.is_file(),
+        "{} is missing: run scripts/fetch_test_models.sh (it fetches the pinned whisper.cpp sample)",
+        path.display()
+    );
+    path
 }
 
 /// Gate: is the real `tiny.en` model resolvable on this machine? Mirrors the
@@ -1044,9 +1052,24 @@ fn gated_primary_stage_prefers_native() {
 fn bridge_only_missing_bridge_errors_honestly() {
     // This scenario needs NO model: it asserts the honest failure when the
     // native path is disabled and the bridge binary is absent. It must NOT
-    // silently succeed via some hidden path.
+    // silently succeed via some hidden path. Its input is a synthetic WAV, not
+    // the provisioned fixture: with a missing input file it would fail (and
+    // pass) for the wrong reason.
     let state = tempfile::tempdir().expect("tempdir");
-    let wav = jfk_wav();
+    let wav = state.path().join("silence.wav");
+    {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav, spec).expect("create silence wav");
+        for _ in 0..16_000 {
+            writer.write_sample(0_i16).expect("write sample");
+        }
+        writer.finalize().expect("finalize silence wav");
+    }
 
     let env = [
         ("FRANKEN_WHISPER_NATIVE_EXECUTION", "0"),
