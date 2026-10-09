@@ -124,7 +124,7 @@ model whose calibration row measured a pooled corpus WER delta ≤ 0.0; the
 2026-10-08 rows are +0.00104 (turbo) and +0.00078 (tiny.en), so neither
 qualifies (DISC-010). `FW_ENC_ATTN_OUT_I8I32=1` opts into int8 for any model;
 measured cost of the default on the 124.5 s track01 whole job at 8 threads:
-turbo 1.39× slower and +1.8 GB peak RSS, tiny.en 1.08× slower.
+turbo 1.38× slower and +1.8 GB peak RSS, tiny.en 1.12× slower.
 `FW_ENC_INT8_FC1` is inert while the full-int8 branch is selected.
 
 ## Remaining levers — all need the model-bench + corpus-WER loop + owner sign-off

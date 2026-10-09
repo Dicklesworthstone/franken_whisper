@@ -76,7 +76,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
   test-clean utterances (turbo 195 vs 187 of 7,659 words, tiny.en 395 vs
   389), over its 0.0 WER-delta budget, and lowered turbo's language-ID
   confidence. `FW_ENC_ATTN_OUT_I8I32=1` still selects it; the f32 default
-  costs 1.39× on a turbo whole job and about 1.8 GB more peak memory.
+  costs 1.38× on a turbo whole job (1.12× on tiny.en) and about 1.8 GB
+  more peak memory for turbo.
   `raw_output.encoder_int8_policy` gains `measured_corpus_wer_delta`, and
   `fw capabilities --json` lists the policy under
   `native_compute.encoder_precision`. See DISC-010 in

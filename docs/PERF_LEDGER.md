@@ -49,6 +49,80 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-10-08 — `encoder-int8-calibration-2026-10-08`: default encoder back to f32; int8 opt-in (bd-int8-encoder-mishears-m1q9, bd-2lmj) — **measured cost 1.378× on a turbo whole job, accepted for word accuracy**
+
+**Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken, one
+binary, the two arms forced by `FW_ENC_ATTN_OUT_I8I32`; the ratio is a
+slowdown the default now pays. No incumbent arm; not campaign output.
+
+**Decision contract.** State: compiled CPU class, each calibrated model's
+measured pooled corpus WER delta (int8 minus f32), operator override.
+Actions: f32 or quality-safe int8 encoder. Loss: an int8 word error is the
+high-loss outcome; f32 costs only time and memory. Admission: int8 only when
+the delta is ≤ 0.0 (budget unchanged). Confidence terms: paired bootstrap CI95
+and P(delta > 0) below. Fallback: f32 for non-AVX2 builds, unknown shapes and
+every over-budget row; `FW_ENC_ATTN_OUT_I8I32=1` / `=0` force either arm.
+
+**Calibration run.** x86_64 AVX2 host, release `fw` built from `7735501c`
+(ELF SHA-256 `a777128b2d703bfa2362ba6d27e8e1124af7a7863af5fbb6b4633c7bad5f041e`),
+batch mode, greedy, `--language en --threads 8`, one 8-thread CCD per job.
+Models: `ggml-large-v3-turbo.bin` SHA-256 `1fc70f77…e2bc69`,
+`ggml-tiny.en.bin` `921e4cf8…920b1f`. Corpus (389 utterances, 7,659 reference
+words): the 61 narration WAVs from the bug report with their spoken text, and
+LibriSpeech test-clean (archive MD5 `32fa31d27d2e1cad72775fee3f4849a9`, the
+published value), every 8th utterance id in sorted order (328). Scoring:
+lowercase, punctuation stripped, numbers spelled out, Whisper's
+British→American spelling map (`english.json` from openai/whisper v20240930),
+word Levenshtein; paired bootstrap over utterances, 10,000 resamples.
+
+| model | WER f32 | WER int8 | delta | CI95 | P(delta>0) | utterances int8 worse / better | letters CER f32 → int8 |
+|---|---|---|---|---|---|---|---|
+| large-v3-turbo | 187/7659 = 0.02442 | 195/7659 = 0.02546 | **+0.00104** | [−0.00149, +0.00430] | 0.73 | 8 / 10 | 0.00997 → 0.01115 |
+| tiny.en | 389/7659 = 0.05079 | 395/7659 = 0.05157 | **+0.00078** | [−0.00114, +0.00266] | 0.77 | 16 / 12 | 0.02107 → 0.02139 |
+
+Per sub-corpus (turbo): narration +6 words (3 / 0 utterances: the reported
+"sits", "wide", "Man-Im"), LibriSpeech +2 (5 / 10), including one int8
+utterance that dropped nine words (`8230-279154-0040`). tiny.en: narration +1,
+LibriSpeech +5. Both pooled deltas are over budget, so both calibration rows
+select f32. Forward and reverse partial reruns of one LibriSpeech shard gave
+byte-identical transcripts for the 51 overlapping inputs (both arms are
+deterministic).
+
+**Default after the change** (release `fw` from `7f9abaf6`, ELF SHA-256
+`dc1dd03c29512239bc1e72b55a4b2f5d490fca0f57e5e058fef8067dcf844005`, no
+override): the three bug-report lines read "sit", "y", "Franken Manim … Manim";
+the `7735501c` binary's default reads "sits", "wide", "Franken-Man-Im …
+Man-Im". Reports carry `encoder_int8_policy.reason =
+"calibration_wer_budget_exceeded"` and `measured_corpus_wer_delta`.
+
+**Cost.** Same `7f9abaf6` binary, rounds of int8, f32, int8, f32 (order
+alternating each round), so each arm has an A/A null in the same
+invocation; 4 rounds, 8 threads pinned to CPUs 64-71, load average 7.8-10.3 on
+a 128-thread host, 124.5 s `track01` (16 kHz WAV
+`22b1a314…63517f`), whole job including model load:
+
+| model | median wall int8 | median wall f32 | f32/int8 (8 pairs) | A/A int8 | A/A f32 | peak RSS int8 → f32 |
+|---|---|---|---|---|---|---|
+| large-v3-turbo | 12.46 s | 17.14 s | **1.378** [1.359, 1.406] | 1.006 [0.998, 1.009] | 1.008 [0.996, 1.039] | 2.83 → 4.68 GB |
+| tiny.en | 1.08 s | 1.21 s | **1.120** [1.101, 1.130] | 0.995 [0.991, 1.000] | 1.004 [0.992, 1.017] | 0.22 → 0.23 GB |
+
+During the corpus runs, three or four concurrent 8-thread turbo batch jobs on
+separate CCDs (and another tenant's fw jobs) slowed each other from about 3 s
+to 20-30 s per utterance, in both arms. That interaction was not isolated;
+no concurrency-scaling ratio is claimed for either arm.
+
+**Language ID (bd-2lmj).** `decode::tests::gated_language_detect_jfk_turbo_matches_oracle`
+at `7f9abaf6`: p(en) 0.9339 with the default encoder (passes the unchanged
+> 0.9 bound); with the calibration rows set back to 0.0 (old default int8),
+0.8891 (fails). whisper.cpp v1.8.2 reported 0.963 on that host (bead text).
+
+**Verdict.** KEEP f32 as the default encoder for every model; int8 remains an
+opt-in for throughput-bound work. The README incumbent ratios (2.99× turbo,
+1.52× / 1.51× tiny.en) were measured with the int8 encoder and are now labeled
+as such; the default's incumbent ratios need a new `examples/incumbent_ab.rs`
+run. Details and the retry predicate: `docs/planning/DISCREPANCIES.md` DISC-010
+and `docs/NEGATIVE_EVIDENCE.md` (2026-10-08).
+
 ## 2026-10-08 — batch mode: one model authentication + load for N inputs (bd-batch-transcribe-rraf) — **KEEP — 2.52-2.58× wall on 20 short clips, outputs byte-identical**
 
 **Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken: a

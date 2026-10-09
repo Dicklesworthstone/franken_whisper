@@ -242,11 +242,13 @@
   decision and the measured delta in `raw_output.encoder_int8_policy`, and
   `fw capabilities --json` lists the per-model defaults under
   `native_compute.encoder_precision`.
-- **Cost (same binary, alternating arm order, 4 pairs, 8 threads pinned to
-  one CCD, quiet host):** turbo whole job on the 124.5 s `track01` clip:
-  median 18.0 s f32 vs 12.9 s int8 (per-pair f32/int8 1.34–1.47, median
-  1.39×), peak RSS 4.67 GB vs 2.83 GB. tiny.en: 1.25 s vs 1.15 s (1.08×),
-  235 MB vs 217 MB (`docs/PERF_LEDGER.md` under this calibration id). The
+- **Cost (same binary, both arms and an A/A null for each in one invocation,
+  alternating order, 4 rounds, 8 threads pinned to one CCD, quiet host):**
+  turbo whole job on the 124.5 s `track01` clip: median 17.14 s f32 vs
+  12.46 s int8, f32/int8 1.378× (range 1.359–1.406; A/A nulls 1.006 and
+  1.008), peak RSS 4.68 GB vs 2.83 GB. tiny.en: 1.21 s vs 1.08 s, 1.120×
+  (1.101–1.130; nulls 0.995 and 1.004), 0.23 GB vs 0.22 GB
+  (`docs/PERF_LEDGER.md` under this calibration id). The
   README's whisper.cpp ratios (2.99× turbo, 1.52× / 1.51× tiny.en)
   were measured with the int8 encoder and describe the opt-in, not the
   default; the default's incumbent ratio has not been re-certified.
