@@ -49,6 +49,80 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-10-09 — model load under `--threads N`: tiled f16→f32 transpose and streaming load by default (bd-ct0y) — **single clip at `--threads 8`: load spans 856 → 442 ms, wall 0.923× (CI95 0.903–0.937); peak RSS 4.56 → 3.22 GB; transcripts byte-identical; thread bound unchanged**
+
+**Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken
+(`12d558bf` before, `ca714d8b` after), no incumbent arm, not campaign
+output. It pays back the model-load cost that bounding the load to the run's
+N workers added (previous row).
+
+- **Where the load went** (`examples/load_phase_probe.rs`, large-v3-turbo,
+  inside an 8-worker `with_compute_threads` pool, before the change):
+  whole-file read 174–210 ms, all kernel time (397 k minor faults on the
+  fresh 1.6 GB blob plus the page-cache copy, 1.36–1.41 s of system CPU);
+  encoder weight build 393–421 ms (2.14–2.24 s of user CPU in the f16→f32
+  transpose, ~3.5 ns per element, plus 0.8–1.0 s of system CPU faulting in
+  the 2.5 GB of f32 output); decoder build 102–117 ms, concurrent with the
+  encoder. So the cost was I/O-side page faulting and a slow conversion
+  loop, both paid at N-way parallelism.
+- **What changed.** (1) `encoder::dequant_transpose_f16_bytes` converts each
+  64-wide tile row with `half`'s SIMD `convert_to_f32_slice` into an L1 tile
+  and stores the transpose contiguously: encoder build 222–251 ms, user CPU
+  0.71–0.83 s, at 8 workers. (2) The bd-A14 streaming loader is on by
+  default (kill-switch `FW_STREAM_LOAD=0`): no whole-file blob, payloads are
+  pread into buffers reused through a per-model `ReadBufferPool` instead of a
+  fresh `Vec` per tensor, and the directory scan's `BufReader` is 64 KiB
+  instead of 1 MiB (each payload seek refilled the whole buffer: `model_parse`
+  50 → 8 ms). Both run on the run's pool; no thread is added.
+- **ELF SHA-256:** before `da72a3981e715b5502b940b27514d005207a927561c22edc0b2750b934e06e82`
+  (`12d558bf`), after `bde48de521c4ca04e7ae4f2b45bf9701d8106d74377b284eaa555f915bb1d882`
+  (built from a tree whose `src/`, `tests/`, `examples/` and `Cargo.toml` are
+  identical to `ca714d8b`), both `cargo build --release --bin fw`.
+- **Host:** AMD Threadripper PRO 5995WX, 64 cores / 128 threads, 1 NUMA
+  node; shared with other tenants (load average below); every arm pinned to
+  CPUs 32–63. Diagnostic paired ratios, not an idle-host verdict.
+- **Workload / matched parameters:** `fw transcribe --json --no-diarize
+  --no-persist --language en --max-segment-length 1 --split-on-word`, default
+  model (authenticated large-v3-turbo f16 package), greedy, DTW word
+  timestamps, `narration_v5/c1.wav`. Arms rotate order every round; ratios
+  are medians of per-round ratios against `before`, bootstrap CI95.
+
+**`--threads 8`, 15 rounds, load average 4.4–11.2 (median 9.8):**
+
+| arm | wall (median) | `model_parse` | `model_weights` | ratio vs before |
+|---|---|---|---|---|
+| before | 5.145 s | 182.5 ms | 674.0 ms | — |
+| before, identical copy (A/A) | 5.086 s | 183.4 ms | 664.4 ms | 0.990 [0.963, 1.006] |
+| after | 4.698 s | 8.2 ms | 433.5 ms | 0.923 [0.903, 0.937], 15/15 rounds faster |
+| after, identical copy (A/A) | 4.678 s | 8.2 ms | 439.4 ms | 0.913; 0.996 [0.980, 1.009] vs after |
+| after, `FW_STREAM_LOAD=0` | 4.916 s | 182.8 ms | 466.8 ms | 0.952 [0.937, 0.967] |
+
+- **Default width** (no `--threads`; 32 workers under the pin), 10 rounds,
+  load average 8.7–16.0: load spans 89 + 453 → 8 + 341 ms, but whole-process
+  wall 0.987 [0.938, 1.002] does not separate from its A/A (0.992
+  [0.940, 1.041]).
+- **Cold page cache** (`load_phase_probe`, a private copy of the model evicted
+  with `posix_fadvise(DONTNEED)` before every load, `fincore` 0 pages;
+  load average 6.4–8.6): 8 workers, streaming 574 ms [530–614] vs resident
+  626 ms [617–638] (process 0.856 vs 1.019 s, 6 rounds each); 32 workers,
+  468 ms [452–472] vs 458 ms [436–491] (process 0.793 vs 0.898 s, 4 rounds).
+  This is the cold-cache evidence the 2026-07-14 note asked for before the
+  streaming default flip.
+- **Peak RSS** (`wait4` maxrss): `--threads 8` 4.56 GB before, 3.21–3.23 GB
+  after, 4.55 GB after with `FW_STREAM_LOAD=0`; `--threads 1` 4.55 → 3.12 GB.
+  **Peak threads** (sampled every 1 ms): 14 at `--threads 8` and 7 at
+  `--threads 1` in every arm, before and after (N + 6).
+- **Equivalence:** EQUIV_PLACEHOLDER
+- **Planted negatives:** skipping one column per tile in the transpose fails
+  the bit-identity test at `[384, 1536]`; a pooled payload that dereferences
+  the whole buffer fails `pooled_reads_match_resident_bytes_and_reuse_buffers`
+  and `streamed_dir_matches_resident` ("payload bytes differ"); a pool that
+  never takes buffers back fails both pool-count assertions (0 vs 2).
+- **Not claimed:** no idle-host verdict; no whole-process speedup at the
+  default width (within noise there); cold-cache numbers are the load phases
+  only; the old binary from the previous row is not an arm here (it also
+  differs in the encoder precision default).
+
 ## 2026-10-09 — `--threads N` bounds every pool of a run (bd-threads-flag-unbounded-f4pq) — **thread creations per short clip 1,380 → N + 8; peak threads 86 → N + 6; transcripts byte-identical; single-clip `--threads 8` pays +8.7% in model load, parallel and batch runs are faster**
 
 **Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken (the
