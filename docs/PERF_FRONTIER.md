@@ -75,10 +75,11 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
   64 KiB checksum read buffer (~1.16×); per-statement-savepoint skip on persist (1.48×)
   + sync import; DB-level N+1 → `IN (…)` on incremental export (1.32×); app-level N+1
   batch on routing history (**~14×**).
-- **Transcription hot path — at its byte-exact ceiling**: encoder full int8 already
-  default-ON for **both calibrated models — turbo AND tiny.en** (`calibrated_encoder_int8_model`
-  = `tiny_en || is_large_v3_turbo`, shipped `a997f37`, ~1.47× encoder; `FW_ENC_ATTN_OUT_I8I32=0`
-  kills); int8 logits head default-ON; `nn::quantize_act_i8_into` already AVX2-vectorized w/ correct
+- **Transcription hot path — at its byte-exact ceiling**: encoder full int8 (shipped `a997f37`,
+  ~1.47× encoder) was default-ON for turbo and tiny.en from 2026-07-10 until 2026-10-08, when
+  calibration `encoder-int8-calibration-2026-10-08` measured both over the 0.0 WER-delta budget;
+  it is now opt-in (`FW_ENC_ATTN_OUT_I8I32=1`) and the default encoder is f32 (DISC-010);
+  int8 logits head default-ON; `nn::quantize_act_i8_into` already AVX2-vectorized w/ correct
   round-half-away; SDPA poly-exp shipped for turbo; decode alloc-light rewrite landed. Measured/closed.
 - **Flag audit (2026-07-12): every byte-exact `FW_*` win is already default-ON** — nothing dormant
   to flip. Verified default-ON: `FW_I8_BATCH_4COL`, `FW_I8_BATCH_2COL`, `FW_I7_M2N4`,
@@ -115,13 +116,16 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
   cross, mel) is personally re-verified closed this session, and the load path is floored (above) —
   the autonomous byte-exact frontier is empirically exhausted; remaining levers are owner/infra only.**
 
-## tiny.en full-int8 configuration
+## Encoder precision (tiny.en and turbo)
 
-Commit `a997f37` supplies the current default: `calibrated_encoder_int8_model()`
-returns `tiny_en || is_large_v3_turbo`, so tiny.en uses the quality-gated full
-int8 encoder (q/k/v/fc1/fc2 i7 plus attention-out i8). Setting
-`FW_ENC_ATTN_OUT_I8I32=0` selects the f32 path. `FW_ENC_INT8_FC1` is inert while
-the full-int8 branch is selected.
+The default encoder is f32 for every model. `encoder_int8_policy_decision`
+admits the full int8 encoder (q/k/v/fc1/fc2 i7 plus attention-out i8) only for a
+model whose calibration row measured a pooled corpus WER delta ≤ 0.0; the
+2026-10-08 rows are +0.00104 (turbo) and +0.00078 (tiny.en), so neither
+qualifies (DISC-010). `FW_ENC_ATTN_OUT_I8I32=1` opts into int8 for any model;
+measured cost of the default on the 124.5 s track01 whole job at 8 threads:
+turbo 1.39× slower and +1.8 GB peak RSS, tiny.en 1.08× slower.
+`FW_ENC_INT8_FC1` is inert while the full-int8 branch is selected.
 
 ## Remaining levers — all need the model-bench + corpus-WER loop + owner sign-off
 

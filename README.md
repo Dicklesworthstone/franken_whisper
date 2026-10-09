@@ -13,7 +13,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming (true-live mic/pipe streaming via `fw robot listen`; batch robot mode streams sequenced stage events), DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native large-v3-turbo engine is 2.99× faster than whisper.cpp on a 124.5-second whole job; tiny.en is 1.52× faster on a 124.5-second transcribe-only workload and 1.51× faster on a 300-second transcribe-only workload.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming (true-live mic/pipe streaming via `fw robot listen`; batch robot mode streams sequenced stage events), DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native large-v3-turbo engine is 2.99× faster than whisper.cpp on a 124.5-second whole job; tiny.en is 1.52× faster on a 124.5-second transcribe-only workload and 1.51× faster on a 300-second transcribe-only workload. These ratios were measured with the int8 encoder, which is now opt-in (`FW_ENC_ATTN_OUT_I8I32=1`); the default f32 encoder is slower (turbo whole job 1.39× in a same-binary A/B).**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -64,7 +64,7 @@ Release archives also carry [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md),
 which records the licensed libc++ selection logic translated into safe Rust for
 the pinned PyTorch CPU top-k parity contract.
 
-> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md).
+> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md). These rows ran the int8 encoder, the default when they were measured. The default encoder is now f32 because int8 measured more word errors on a 389-utterance corpus ([DISC-010](docs/planning/DISCREPANCIES.md)); `FW_ENC_ATTN_OUT_I8I32=1` restores the measured configuration. The default's incumbent ratios have not been re-certified.
 >
 > | Model / workload | Mode | Matched-greedy result |
 > |---|---|---|
@@ -3560,7 +3560,10 @@ The `BackendParams` aggregate is the catch-all for every backend-specific tuning
 The competitive rows below come from live `whisper-cli` incumbent arms in
 `examples/incumbent_ab.rs`: both binaries run side-by-side in the same
 invocation at 32 requested threads and matched greedy decode settings
-(`whisper-cli -bs 1 -bo 1`).
+(`whisper-cli -bs 1 -bo 1`). They were measured with the int8 encoder, which
+is now an opt-in (`FW_ENC_ATTN_OUT_I8I32=1`); the default encoder is f32
+([DISC-010](docs/planning/DISCREPANCIES.md)), and its incumbent ratios have
+not been re-certified.
 
 | Comparison (matched-greedy) | Model | Clip / mode | Result |
 |---|---|---|---|

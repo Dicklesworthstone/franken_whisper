@@ -67,6 +67,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
   README, `fw capabilities` `batch.timeout`), which is what it always did
   (bd-batch-timeout-scope-gbyf).
 
+### Changed
+
+- The native encoder defaults to f32 again for `tiny.en` and
+  `large-v3-turbo` on x86_64 AVX2 builds (bd-int8-encoder-mishears-m1q9,
+  bd-2lmj). The int8 encoder that was the default since 2026-07-10 measured
+  more word errors than f32 on 61 TTS narration lines plus 328 LibriSpeech
+  test-clean utterances (turbo 195 vs 187 of 7,659 words, tiny.en 395 vs
+  389), over its 0.0 WER-delta budget, and lowered turbo's language-ID
+  confidence. `FW_ENC_ATTN_OUT_I8I32=1` still selects it; the f32 default
+  costs 1.39× on a turbo whole job and about 1.8 GB more peak memory.
+  `raw_output.encoder_int8_policy` gains `measured_corpus_wer_delta`, and
+  `fw capabilities --json` lists the policy under
+  `native_compute.encoder_precision`. See DISC-010 in
+  `docs/planning/DISCREPANCIES.md`.
+
 ## Unreleased installer follow-up
 
 - Admit the exact flat `CHANGELOG.md` release-archive member once in the
