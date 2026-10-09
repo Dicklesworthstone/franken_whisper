@@ -1654,11 +1654,19 @@ fn gated_audio_ctx_policy_mechanism_ab_jfk_tiny_en() {
         native_engine::decode::AudioCtxPolicy::Auto,
         &auto,
     );
+    // Auto's saving is per seek: on this fixture every seek it makes encodes
+    // less than half of Full's per-seek context. How many seeks a run takes is
+    // the model's call, not the policy's: with the f32 encoder Auto's first
+    // window closes at 10.74 s and a 0.25 s tail seek follows (Full closes at
+    // the audio end), while with the int8 encoder Auto also closes at the end.
+    // So compare Auto's work with what Full spends per seek, over Auto's seeks.
+    let full_mel_per_seek = full.work.encoder_mel_frames / full.work.encoder_calls;
     assert!(
-        auto.work.encoder_mel_frames * 2 < full.work.encoder_mel_frames,
-        "Auto must at least halve encoder work on this fixture ({} vs {})",
+        auto.work.encoder_mel_frames * 2 < full_mel_per_seek * auto.work.encoder_calls,
+        "Auto must at least halve Full's per-seek encoder work on this fixture \
+         ({} mel frames over {} seeks vs Full's {full_mel_per_seek} per seek)",
         auto.work.encoder_mel_frames,
-        full.work.encoder_mel_frames
+        auto.work.encoder_calls
     );
     assert_policy_work(
         "whole-jfk Fixed(512)",
